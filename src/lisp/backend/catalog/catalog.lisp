@@ -24,7 +24,16 @@
   table-oid
   columns           ; list of attnums
   unique-p
-  primary-p)
+  primary-p
+  constraint-p      ; a table constraint depends on this index
+  nulls-not-distinct-p)
+
+(defun pg-index-constraint-owned-p (index)
+  "Return whether a table constraint depends on INDEX.
+
+Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
+  (or (pg-index-constraint-p index)
+      (pg-index-primary-p index)))
 
 (defstruct database
   name
@@ -79,7 +88,9 @@
     :table-oid ,(pg-index-table-oid i)
     :columns ,(pg-index-columns i)
     :unique ,(pg-index-unique-p i)
-    :primary ,(pg-index-primary-p i)))
+    :primary ,(pg-index-primary-p i)
+      :constraint ,(pg-index-constraint-p i)
+    :nulls-not-distinct ,(pg-index-nulls-not-distinct-p i)))
 
 (defun index-from-sexp (s)
   (make-pg-index :oid (getf s :oid)
@@ -88,7 +99,9 @@
                  :table-oid (getf s :table-oid)
                  :columns (getf s :columns)
                  :unique-p (getf s :unique)
-                 :primary-p (getf s :primary)))
+                 :primary-p (getf s :primary)
+                   :constraint-p (getf s :constraint)
+                 :nulls-not-distinct-p (getf s :nulls-not-distinct)))
 
 (defun database-to-sexp (db)
   `(:name ,(database-name db)
@@ -198,6 +211,12 @@
 (defun lookup-table (name)
   (gethash (strip-schema name) (database-tables (current-database))))
 
+(defun ensure-current-table (class)
+  "Raise 42P01 when CLASS was dropped or replaced after it was resolved."
+  (unless (eq class (lookup-table (pg-class-name class)))
+    (ereport "42P01" "relation \"~a\" does not exist" (pg-class-name class)))
+  class)
+
 (defun lookup-index (name)
   (gethash (strip-schema name) (database-indexes (current-database))))
 
@@ -210,6 +229,11 @@
   (loop for idx being the hash-values of (database-indexes (current-database))
         when (= (pg-index-oid idx) oid)
           return idx))
+
+(defun find-table-by-oid (oid)
+  (loop for table being the hash-values of (database-tables (current-database))
+        when (= (pg-class-oid table) oid)
+          return table))
 
 (defun table-indexes (class)
   (loop for oid in (pg-class-indexes class)
@@ -238,14 +262,25 @@
   (let ((base (format nil "~a_~a" table-name suffix)))
     (if (or (gethash base (database-tables db))
             (gethash base (database-indexes db)))
-        (loop for n from 2
+        (loop for n from 1
               for candidate = (format nil "~a~a" base n)
               unless (or (gethash candidate (database-tables db))
                          (gethash candidate (database-indexes db)))
                 return candidate)
         base)))
 
-(defun create-index* (db name table cols &key unique primary)
+(defun generate-unique-index-name (db table-name table attnums)
+  "Generate PostgreSQL's default unique-constraint name for ATTNUMS."
+  (generate-index-name
+   db table-name
+   (format nil "~{~a~^_~}_key"
+           (mapcar (lambda (attnum)
+                     (pg-column-name
+                      (aref (pg-class-columns table) (1- attnum))))
+                   attnums))))
+
+(defun create-index* (db name table cols
+                         &key unique primary constraint nulls-not-distinct)
   (check-new-relation-name db name)
   (let* ((oid (allocate-oid))
          (idx (make-pg-index :oid oid
@@ -254,15 +289,29 @@
                              :table-oid (pg-class-oid table)
                              :columns cols
                              :unique-p unique
-                             :primary-p primary)))
+                             :primary-p primary
+                              :constraint-p constraint
+                             :nulls-not-distinct-p nulls-not-distinct)))
     (btree-init oid)
     (setf (gethash name (database-indexes db)) idx)
     (push oid (pg-class-indexes table))
     idx))
 
+(defun rename-index* (db old-name new-name)
+  "Rename an index relation, retaining its OID and physical index file."
+  (let ((idx (gethash old-name (database-indexes db))))
+    (unless idx
+      (ereport "42704" "index \"~a\" does not exist" old-name))
+    (unless (string= old-name new-name)
+      (check-new-relation-name db new-name)
+      (remhash old-name (database-indexes db))
+      (setf (pg-index-name idx) new-name
+            (gethash new-name (database-indexes db)) idx))
+    idx))
+
 (defun create-table* (db name columns)
-  "COLUMNS is a list of plists with :name :type :typmod :notnull :primary
-and :unique. Returns the new pg-class."
+  "COLUMNS is a list of plists with :name :type :typmod :notnull :primary,
+:unique, and :nulls-not-distinct. Returns the new pg-class."
   (check-new-relation-name db name)
   (let* ((oid (allocate-oid))
          (cols (coerce
@@ -281,25 +330,36 @@ and :unique. Returns the new pg-class."
                                :columns cols
                                :indexes '())))
     (setf (gethash name (database-tables db)) class)
-    ;; Per-column PRIMARY KEY / UNIQUE.
-    (loop for def in columns
-          for col across cols
-          do (cond
-               ((getf def :primary)
-                (setf (pg-column-notnull col) t)
-                (create-index* db
-                               (generate-index-name db name "pkey")
-                               class (list (pg-column-attnum col))
-                               :unique t :primary t))
-               ((getf def :unique)
-                (create-index* db
-                               (generate-index-name db
-                                                    name
-                                                    (format nil "~a_key"
-                                                            (pg-column-name col)))
-                               class (list (pg-column-attnum col))
-                               :unique t))))
-    class))
+      (handler-case
+          (progn
+            ;; Per-column PRIMARY KEY / UNIQUE.
+            (loop for def in columns
+                  for col across cols
+                  do (cond
+                       ((getf def :primary)
+                          (setf (pg-column-notnull col) t)
+                          (create-index* db
+                                         (generate-index-name db name "pkey")
+                                         class (list (pg-column-attnum col))
+                                         :unique t :primary t :constraint t))
+                       ((getf def :unique)
+                        (create-index* db
+                                       (generate-index-name
+                                        db name
+                                        (format nil "~a_key"
+                                                (pg-column-name col)))
+                                       class (list (pg-column-attnum col))
+                                       :unique t
+                                       :constraint t
+                                       :nulls-not-distinct
+                                       (getf def :nulls-not-distinct)))))
+            class)
+        (error (e)
+          ;; A column constraint can fail after the table and earlier indexes
+          ;; have been installed.  Roll all of them back as one CREATE TABLE.
+          (when (eq class (gethash name (database-tables db)))
+            (drop-table* db name))
+          (error e)))))
 
 (defun drop-table* (db name)
   (let ((class (gethash name (database-tables db))))

@@ -98,6 +98,32 @@
     (check (minusp (key-compare (k "b" :varchar) (k "aa" :varchar)))
            "varchar key encoding is length-first")))
 
+(defun test-index-catalog-roundtrip ()
+  (let* ((idx (make-pg-index :oid 42 :name "nnd" :relfilenode 42
+                             :table-oid 41 :columns '(1) :unique-p t
+                             :constraint-p t
+                             :nulls-not-distinct-p t))
+         (copy (index-from-sexp (index-to-sexp idx))))
+    (check (pg-index-nulls-not-distinct-p copy)
+           "NULLS NOT DISTINCT survives catalog serialization")
+    (check (pg-index-constraint-p copy)
+           "constraint ownership survives catalog serialization"))
+  (let ((legacy-pk (index-from-sexp '(:primary t))))
+    (check (not (pg-index-constraint-p legacy-pk))
+           "legacy catalog has no constraint ownership flag")
+    (check (pg-index-constraint-owned-p legacy-pk)
+           "legacy primary index remains constraint-owned")))
+
+(defun test-relation-build-own-xid ()
+  (let ((relfilenode 987653)
+        (xid 987654))
+    (setf (gethash relfilenode *relation-writers*) (list xid))
+    (let ((token (acquire-relation-build-lock relfilenode xid)))
+      (check (eq token (gethash relfilenode *relation-builders*))
+             "relation build ignores its own writer XID")
+      (release-relation-build-lock relfilenode token))
+    (remhash relfilenode *relation-writers*)))
+
 (defun test-visibility ()
   (let ((snap (make-snapshot-struct :xmin 10 :xmax 1000 :xip '() :curcid 5)))
     ;; Committed insert, never deleted -> visible.
@@ -201,6 +227,8 @@
       (test-page-compaction)
       (test-tuple-roundtrip)
       (test-key-order)
+      (test-index-catalog-roundtrip)
+        (test-relation-build-own-xid)
       (test-visibility)
       (test-btree-duplicate-keys)
       (test-btree-mixed-duplicate-keys)

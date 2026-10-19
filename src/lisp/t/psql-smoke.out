@@ -35,8 +35,262 @@ INSERT 0 1
 ERROR:  duplicate key value violates unique constraint "un_a_key"
 1
 DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "unique_mix_key"
+INSERT 0 1
+INSERT 0 1
+1|-9223372036854775808|alpha
+1|9223372036854775807|alpha
+|9223372036854775807|alpha
+|9223372036854775807|alpha
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "unique_nnd_i_idx"
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+CREATE INDEX
+ERROR:  could not create unique index "unique_nnd_build_idx"
+DELETE 1
+CREATE INDEX
+ERROR:  duplicate key value violates unique constraint "unique_nnd_build_idx"
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "unique_nnd_constraint_i_key"
+DROP TABLE
+ERROR:  column "missing" does not exist
+CREATE TABLE
+DROP TABLE
+ERROR:  relation "unique_create_duplicate_key" already exists
+CREATE TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "unique_nnd_table_key"
+INSERT 0 1
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "unique_nnd_table_key"
+1|
+|1
+|2
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ALTER TABLE
+ERROR:  duplicate key value violates unique constraint "unique_alter_key"
+DROP TABLE
+CREATE TABLE
+ALTER TABLE
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "unique_alter_add_key"
+INSERT 0 1
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+ERROR:  could not create unique index "unique_alter_build_key"
+INSERT 0 1
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+ERROR:  could not create unique index "primary_alter_build_pkey"
+INSERT 0 1
+DROP TABLE
+CREATE TABLE
+ERROR:  column "test1" does not exist
+DROP TABLE
+CREATE TABLE
+ALTER TABLE
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "unique_alter_composite_key"
+INSERT 0 3
+4|4
+4|5
+5|4
+5|5
+DROP TABLE
+CREATE TABLE
+ALTER TABLE
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "atacc1_test_key"
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+CREATE INDEX
+ALTER TABLE
+ERROR:  cannot drop index "unique_using_pk_idx" because constraint "unique_using_pk_idx" on table "unique_using_pk" requires it
+ERROR:  duplicate key value violates unique constraint "unique_using_pk_idx"
+ERROR:  null value in column "i" violates not-null constraint
+1|9223372036854775807
+2|-9223372036854775808
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+ERROR:  syntax error at or near "using"
+LINE 1: ... unique_using_named add unique nulls not distinct using inde...
+                                                             ^
+ALTER TABLE
+ERROR:  index "unique_using_named_key" is already associated with a constraint
+ERROR:  cannot drop index "unique_using_named_key" because constraint "unique_using_named_key" on table "unique_using_named" requires it
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "unique_using_named_key"
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+ERROR:  primary keys cannot use NULLS NOT DISTINCT indexes
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "primary_inline_pkey"
+ERROR:  null value in column "i" violates not-null constraint
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "primary_composite_inline_pkey"
+INSERT 0 1
+ERROR:  null value in column "i" violates not-null constraint
+ERROR:  null value in column "b" violates not-null constraint
+DROP TABLE
+CREATE TABLE
+ALTER TABLE
+INSERT 0 1
+ERROR:  null value in column "i" violates not-null constraint
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ERROR:  column "i" of relation "primary_alter_existing_null" contains null values
+INSERT 0 1
+DROP TABLE
+CREATE TABLE
+ERROR:  column "missing" does not exist
+DROP TABLE
+CREATE TABLE
+ALTER TABLE
+ERROR:  multiple primary keys for table "primary_alter_composite" are not allowed
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "primary_alter_composite_pk"
+INSERT 0 3
+ERROR:  null value in column "i" violates not-null constraint
+ERROR:  null value in column "b" violates not-null constraint
+DROP TABLE
+CREATE TABLE
+ALTER TABLE
+INSERT 0 1
+ERROR:  null value in column "test" violates not-null constraint
+ALTER TABLE
+ERROR:  null value in column "test" violates not-null constraint
+ALTER TABLE
+INSERT 0 1
+DROP TABLE
+CREATE TABLE
+ALTER TABLE
+ERROR:  null value in column "i" violates not-null constraint
+DROP TABLE
+CREATE TABLE
+ALTER TABLE
+CREATE INDEX
+INSERT 0 1
+ALTER TABLE
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "primary_replace_using_pkey"
+ERROR:  null value in column "a" violates not-null constraint
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+NOTICE:  constraint "primary_replace_absent" of relation "primary_replace_missing" does not exist, skipping
+ALTER TABLE
+INSERT 0 1
+DROP INDEX
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+INSERT 0 1
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "unique_null_modes_nnd"
+DROP INDEX
+INSERT 0 1
+DROP TABLE
+CREATE TABLE
+ALTER TABLE
+ALTER INDEX
+ALTER TABLE
+ERROR:  cannot drop index "unique_constraint_renamed" because constraint "unique_constraint_renamed" on table "unique_constraint_rename" requires it
+ALTER TABLE
+INSERT 0 2
+DROP TABLE
+CREATE TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+CREATE INDEX
+ERROR:  column "i" of relation "unique_pk_using_fail" contains null values
+INSERT 0 1
+DROP INDEX
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+ALTER TABLE
+ERROR:  cannot drop index "unique_drop_backed_idx" because constraint "unique_drop_backed_idx" on table "unique_drop_atomic" requires it
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "unique_drop_raw_first_idx"
+ERROR:  cannot drop index "unique_drop_backed_idx" because constraint "unique_drop_backed_idx" on table "unique_drop_atomic" requires it
+ERROR:  duplicate key value violates unique constraint "unique_drop_raw_last_idx"
+DROP INDEX
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+INSERT 0 1
+CREATE TABLE
+CREATE INDEX
+ALTER TABLE
+CREATE TABLE
+CREATE INDEX
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "text_unique_idx"
+ERROR:  value too long for type character varying(126)
+126
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+ERROR:  duplicate key value violates unique constraint "unique_update_i_key"
+DELETE 1
+INSERT 0 1
+1|one
+2|two again
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+ERROR:  could not create unique index "unique_build_idx"
+DELETE 1
+CREATE INDEX
+ERROR:  duplicate key value violates unique constraint "unique_build_idx"
+DROP TABLE
 DROP INDEX
 DROP TABLE
 DROP TABLE
 DROP TABLE
+CREATE TABLE
+ALTER TABLE
 1
+ERROR:  duplicate key value violates unique constraint "unique_nnd_restart_idx"
+ERROR:  index "unique_using_restart_idx" is already associated with a constraint
+ERROR:  cannot drop index "unique_using_restart_idx" because constraint "unique_using_restart_idx" on table "unique_using_restart" requires it
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "unique_using_restart_idx"
+ALTER TABLE
+ERROR:  null value in column "i" violates not-null constraint
+DROP TABLE
+DROP TABLE
+DROP TABLE

@@ -1,0 +1,10 @@
+insert into unique_nnd_restart values (null);
+alter table unique_using_restart add unique using index unique_using_restart_idx;
+drop index unique_using_restart_idx;
+insert into unique_using_restart values (1);
+insert into unique_using_restart values (1);
+alter table primary_restart drop constraint primary_restart_pk;
+insert into primary_restart values (null);
+drop table primary_restart;
+drop table unique_nnd_restart;
+drop table unique_using_restart;

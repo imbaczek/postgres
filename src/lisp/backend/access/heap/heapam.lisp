@@ -206,6 +206,7 @@
 (defun heapam-delete-tid (relfilenode columns block offnum xid cid)
   "Mark TID deleted by XID, waiting for a concurrent deleter if needed.
 Return T if this transaction actually deleted it."
+  (register-relation-writer relfilenode xid)
   (loop
     (let ((action
             (with-write-lock

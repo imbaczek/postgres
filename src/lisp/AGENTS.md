@@ -59,13 +59,14 @@ given, and the Unix socket is `chmod`ed to `0700`.
 ```sh
 ./t/run-unit-tests.sh   # page/tuple/index/visibility checks
 ./t/psql-smoke.sh       # psql acceptance, diffed against t/psql-smoke.out
+./t/unique-index-concurrency.sh # unique-index and relation-DDL races
 ./t/index-stress.sh     # repeated same-key updates (slow)
 ./t/hot-reload.sh       # SIGHUP reloads a running server
 ./t/control-repl.sh     # control REPL over TCP + Unix socket, reload, SQL intact
 ./t/shutdown.sh         # signals, shutdown modes, cancel/terminate admin functions
 ```
 
-Each test boots its own throwaway server on its own port (5461–5466), so they are
+Each test boots its own throwaway server on its own port (5461–5467), so they are
 safe to run while a dev server is listening on 5433.
 
 ## Conventions

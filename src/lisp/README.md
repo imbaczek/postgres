@@ -122,7 +122,9 @@ exercises all of this, including smart/fast/immediate shutdown and escalation.
 ## Supported SQL
 
 Types: `int`/`integer`/`int4`, `bigint`/`int8`, `varchar(n)` / `character
-varying(n)` with `n <= 126`. `varchar` without a length is treated as 126.
+varying(n)` with `n <= 126`, and `text`. For now, `text` is an alias for
+`varchar(126)`; distinct text/varchar type semantics and OIDs are a TODO.
+`varchar` without a length is also treated as 126.
 
 DDL:
 
@@ -131,10 +133,18 @@ CREATE TABLE t (a int, b varchar(20), PRIMARY KEY (a));
 CREATE TABLE t (a int UNIQUE, b varchar(20));
 DROP TABLE [IF EXISTS] t;
 CREATE UNIQUE INDEX name ON t (cols);
+CREATE UNIQUE INDEX name ON t (cols) NULLS NOT DISTINCT;
 CREATE INDEX name ON t (cols);          -- accepted; no scan path uses it
 DROP INDEX [IF EXISTS] name;
+ALTER INDEX name RENAME TO new_name;
 ALTER TABLE t ADD PRIMARY KEY (cols);
-ALTER TABLE t ADD UNIQUE (cols);
+ALTER TABLE t ADD PRIMARY KEY USING INDEX name;
+ALTER TABLE t ADD UNIQUE [NULLS NOT DISTINCT] (cols);
+ALTER TABLE t ADD UNIQUE USING INDEX name;
+ALTER TABLE t RENAME CONSTRAINT old_name TO new_name;
+ALTER TABLE t DROP CONSTRAINT name;     -- UNIQUE and PRIMARY KEY constraints
+ALTER TABLE t DROP CONSTRAINT old_name,
+  ADD CONSTRAINT new_name PRIMARY KEY USING INDEX index_name;
 ```
 
 DML:
@@ -172,6 +182,7 @@ Meta-commands that need `pg_catalog` and regular-expression operators (`\d`,
 cd src/lisp
 ./t/run-unit-tests.sh     # Lisp-level page/tuple/index/visibility tests
 ./t/psql-smoke.sh         # boots a server and diffs psql output against a golden file
+./t/unique-index-concurrency.sh # unique-index build/drop writer races
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
 ./t/hot-reload.sh         # SIGHUP reloads code in a running server
 ./t/control-repl.sh       # control REPL over TCP + Unix socket, reload, SQL intact
@@ -185,6 +196,10 @@ transcript with `t/psql-smoke.out`.
 `t/index-stress.sh` updates a single unique value a thousand times, then checks
 that a fresh transaction still sees the live tuple as a duplicate.  It exercises
 the case where equal index keys straddle many leaf splits.
+
+`t/unique-index-concurrency.sh` checks that unique-index builds and `DROP INDEX`
+wait for active writers, and that `DROP TABLE` serializes with builds, readers,
+and writers.
 
 ## Storage and concurrency
 
@@ -238,7 +253,9 @@ the case where equal index keys straddle many leaf splits.
   recycled only when the table has no indexes (to avoid dangling index TIDs).
 - Byte-wise comparison only, i.e. C-like collation for ASCII. Index key
   encoding is length-first and is used internally only.
-- Numeric/float, date/time, boolean `text`, and other types are unsupported.
+- Numeric/float, date/time, boolean, and other types are unsupported. `text` is
+  temporarily treated as `varchar(126)`; full text/varchar semantics remain a
+  TODO.
 - Extended query protocol (Parse/Bind/Describe/Execute/Sync) is not
   implemented; `psql` is unaffected, other drivers are.
 - `pg_terminate_backend` (and fast/immediate shutdown) unwinds the target with

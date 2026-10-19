@@ -49,18 +49,25 @@
            (when (or (null where) (true-p (eval-expr where nil)))
              (push (cons values nil) rows))))
         (t
-         (heapam-scan (pg-class-relfilenode table)
-                      (pg-class-columns table)
-                      *current-snapshot*
-                      (lambda (tuple)
-                        (check-for-interrupts)
-                        (let ((env (htup-values tuple)))
-                          (when (or (null where) (true-p (eval-expr where env)))
-                            (push (cons (map 'vector
-                                             (lambda (tg) (eval-expr (getf tg :expr) env))
-                                             targets)
-                                        env)
-                                  rows)))))))
+           (let ((relfilenode (pg-class-relfilenode table))
+                 (xid (get-current-xid)))
+             ;; Keep DROP TABLE from removing storage during this scan or
+             ;; before the surrounding transaction releases its relation use.
+             (register-relation-reader relfilenode xid)
+             (with-write-lock
+               (ensure-current-table table))
+             (heapam-scan relfilenode
+                          (pg-class-columns table)
+                          *current-snapshot*
+                          (lambda (tuple)
+                            (check-for-interrupts)
+                            (let ((env (htup-values tuple)))
+                              (when (or (null where) (true-p (eval-expr where env)))
+                                (push (cons (map 'vector
+                                                 (lambda (tg) (eval-expr (getf tg :expr) env))
+                                                 targets)
+                                            env)
+                                      rows))))))))
       (setf rows (nreverse rows))
       (when order
         (setf rows (stable-sort rows

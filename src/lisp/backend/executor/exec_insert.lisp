@@ -80,15 +80,16 @@
 (defun check-unique-indexes (table values exclude-tid)
   "Return :ok, (:violation . index-name), or (:wait . xid).
 
-PostgreSQL's default unique-index semantics treat NULLs as distinct, so
-a key containing any NULL can never conflict."
+Default unique indexes treat NULLs as distinct; NULLS NOT DISTINCT indexes
+check NULL-containing keys for conflicts too."
   (let ((wait nil)
         (violation nil)
         (my-xid (backend-xid *backend*)))
     (dolist (idx (unique-indexes table))
       (let* ((types (index-types idx table))
              (vals (index-values idx table values)))
-        (unless (key-has-null-p vals)
+        (unless (and (key-has-null-p vals)
+                     (not (pg-index-nulls-not-distinct-p idx)))
           (let ((tids (btree-search (pg-index-relfilenode idx)
                                     (encode-index-key vals types))))
             (dolist (tid tids)
@@ -111,36 +112,38 @@ a key containing any NULL can never conflict."
           (t :ok))))
 
 (defun insert-tuple-with-unique (table values &key exclude-tid)
-  (loop
-    (let ((wait-xid nil))
-      (with-write-lock
-        (let ((check (check-unique-indexes table values exclude-tid)))
-          (cond
-            ((eq check :ok)
-             (let* ((xid (get-current-xid))
-                    (columns (pg-class-columns table)))
-               (multiple-value-bind (block off)
-                   (heapam-insert (pg-class-relfilenode table)
-                                  columns values xid
-                                  (backend-command-id *backend*)
-                                  :allow-reuse (null (pg-class-indexes table)))
-                 (dolist (idx (table-indexes table))
-                   (let* ((types (index-types idx table))
-                          (key (encode-index-key
-                                (index-values idx table values)
-                                types)))
-                     (btree-insert (pg-index-relfilenode idx)
-                                   key block off)))
-                 (return-from insert-tuple-with-unique
-                   (values block off)))))
-            ((eq (car check) :violation)
-             (ereport "23505"
-                      "duplicate key value violates unique constraint \"~a\""
-                      (cdr check)))
-            (t
-             (setf wait-xid (cdr check))))))
-      (when wait-xid
-        (wait-for-xid wait-xid)))))
+  (let* ((xid (get-current-xid))
+         (relfilenode (pg-class-relfilenode table)))
+    (register-relation-writer relfilenode xid)
+    (loop
+      (let ((wait-xid nil))
+        (with-write-lock
+            (ensure-current-table table)
+          (let ((check (check-unique-indexes table values exclude-tid)))
+            (cond
+              ((eq check :ok)
+               (let ((columns (pg-class-columns table)))
+                 (multiple-value-bind (block off)
+                     (heapam-insert relfilenode columns values xid
+                                    (backend-command-id *backend*)
+                                    :allow-reuse (null (pg-class-indexes table)))
+                   (dolist (idx (table-indexes table))
+                     (let* ((types (index-types idx table))
+                            (key (encode-index-key
+                                  (index-values idx table values)
+                                  types)))
+                       (btree-insert (pg-index-relfilenode idx)
+                                     key block off)))
+                   (return-from insert-tuple-with-unique
+                     (values block off)))))
+              ((eq (car check) :violation)
+               (ereport "23505"
+                        "duplicate key value violates unique constraint \"~a\""
+                        (cdr check)))
+              (t
+               (setf wait-xid (cdr check))))))
+        (when wait-xid
+          (wait-for-xid wait-xid))))))
 
 (defun exec-insert (stream ast)
   (let ((table (resolve-table-or-error (getf ast :table))))
