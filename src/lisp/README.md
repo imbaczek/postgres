@@ -31,7 +31,8 @@ psql -h 127.0.0.1 -p 5439 -U postgres -d postgres
 
 Options: `-p PORT` (default 5433), `-h HOST` (default 127.0.0.1), `-D PGDATA`
 (default `./pgdata`). PGDATA is created on first boot with `PG_VERSION`,
-`global/`, `base/`, `pg_xact`, and `pg_catalog.dat`.
+`global/`, `base/`, `pg_xact`, and `pg_catalog.dat`. Ports are validated at
+startup (1..65535) and a missing option value is a clean error, not a crash.
 
 Authentication and authorization are accepted and ignored: any user/database is
 trusted, and `postgres` is always the effective role. Only the simple query
@@ -54,12 +55,16 @@ partway can leave a mixed image, so restart if the reload log shows an error.
 `t/hot-reload.sh` exercises this.
 
 For interactive work there is also an out-of-band control REPL. It is **off by
-default** because it evaluates arbitrary Lisp; enable it explicitly, and it only
-ever listens on loopback and/or a Unix socket:
+default** because it evaluates arbitrary Lisp; enable it explicitly:
 
 ```sh
 ./pg-lisp.sh -p 5439 --control-port 5490 --control-socket /tmp/pg.sock
 ```
+
+`--control-port` binds a TCP listener on `127.0.0.1` only; `--control-socket`
+binds an AF_UNIX socket and `chmod`s the node to `0700`. Either or both may be
+given. A `SIGTERM` or `SIGINT` removes the Unix socket on the way out, and a
+stale socket is deleted at startup, so restarts are clean.
 
 Then connect with any line-oriented client. Over TCP:
 
@@ -76,9 +81,11 @@ nc -U /tmp/pg.sock         # or: socat - UNIX-CONNECT:/tmp/pg.sock
 The REPL starts in the `pg` package and prints the value of each form you type.
 Two helpers are provided: `(reload)` recompiles and reloads in place, and
 `(quit)` closes the connection. Any other Lisp can be evaluated too, e.g. to
-inspect server state. `t/control-repl.sh` exercises both transports and a reload
-through the REPL. Note that `telnet` sends terminal-negotiation bytes that the
-reader will parse as Lisp; use `nc`/`socat` instead.
+inspect server state. Reader evaluation (`#.`) is disabled, so a form is never
+executed merely by being read; `eval` then runs the parsed form. `t/control-repl.sh`
+exercises both transports and a reload through the REPL. Note that `telnet` sends
+terminal-negotiation bytes that the reader will parse as Lisp; use `nc`/`socat`
+instead.
 
 ## Supported SQL
 

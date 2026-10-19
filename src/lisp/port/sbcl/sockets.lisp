@@ -16,6 +16,17 @@
 (defun accept-connection (listener)
   (sb-bsd-sockets:socket-accept listener))
 
+(defun accept-connection-or-nil (listener name)
+  "Accept one connection; on error log, pause briefly, and return NIL.
+
+The pause keeps a persistently failing listener (say, fd exhaustion) from
+spinning at full speed while it retries."
+  (handler-case (accept-connection listener)
+    (error (e)
+      (format *error-output* "~&pg-lisp: ~a accept: ~a~%" name e)
+      (sleep 0.1)
+      nil)))
+
 (defun socket->stream (sock)
   (sb-bsd-sockets:socket-make-stream
    sock

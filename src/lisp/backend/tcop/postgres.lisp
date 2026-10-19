@@ -155,6 +155,18 @@
 
 ;;; ---- server main ----
 
+(defun arg-value (rest arg)
+  "Return the value following ARG in REST, or fail with a message."
+  (or (cadr rest)
+      (error "option ~a requires a value" arg)))
+
+(defun parse-port-arg (arg value)
+  "Parse VALUE as a TCP port for option ARG, enforcing 1..65535."
+  (let ((n (ignore-errors (parse-integer value))))
+    (unless (and n (<= 1 n 65535))
+      (error "option ~a expects a port in 1..65535, got ~s" arg value))
+    n))
+
 (defun parse-args (argv)
   (let ((port 5433)
         (host "127.0.0.1")
@@ -165,21 +177,21 @@
           for arg = (car rest)
           do (cond
                ((member arg '("-p" "--port") :test #'string=)
-                (setf port (parse-integer (cadr rest))))
+                (setf port (parse-port-arg arg (arg-value rest arg))))
                ((and (> (length arg) 7) (string= arg "--port=" :end1 7))
-                (setf port (parse-integer arg :start 7)))
+                (setf port (parse-port-arg "--port" (subseq arg 7))))
                ((member arg '("-h" "--host") :test #'string=)
-                (setf host (cadr rest)))
+                (setf host (arg-value rest arg)))
                ((member arg '("-D" "--pgdata") :test #'string=)
-                (setf pgdata (cadr rest)))
+                (setf pgdata (arg-value rest arg)))
                ((and (> (length arg) 9) (string= arg "--pgdata=" :end1 9))
                 (setf pgdata (subseq arg 9)))
                ((member arg '("-C" "--control-port") :test #'string=)
-                (setf control-port (parse-integer (cadr rest))))
+                (setf control-port (parse-port-arg arg (arg-value rest arg))))
                ((and (> (length arg) 15) (string= arg "--control-port=" :end1 15))
-                (setf control-port (parse-integer arg :start 15)))
+                (setf control-port (parse-port-arg "--control-port" (subseq arg 15))))
                ((string= arg "--control-socket")
-                (setf control-socket (cadr rest)))
+                (setf control-socket (arg-value rest arg)))
                ((and (> (length arg) 17) (string= arg "--control-socket=" :end1 17))
                 (setf control-socket (subseq arg 17)))))
     (values host port (or pgdata (sb-ext:posix-getenv "PGDATA") "./pgdata")
@@ -204,10 +216,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
 (defun serve (host port)
   (let ((listener (make-listener host port)))
     (loop
-      (let ((sock (handler-case (accept-connection listener)
-                    (error (e)
-                      (format *error-output* "~&pg-lisp: accept: ~a~%" e)
-                      nil))))
+      (let ((sock (accept-connection-or-nil listener "backend")))
         (when sock
           (sb-thread:make-thread
            (lambda () (handle-connection sock))

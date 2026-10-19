@@ -14,6 +14,9 @@
 
 (in-package #:pg)
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
+
 ;;; ---- in-image reload ----
 
 ;; The process's real stdout/stderr, captured at startup so that a reload
@@ -89,64 +92,108 @@ actual work happens on a helper thread."
   "Close the current control REPL connection."
   (throw *control-quit-tag* nil))
 
+(defvar *control-socket-path* nil)
+
+(defun cleanup-control-socket ()
+  "Remove the Unix control socket, if one was created."
+  (when *control-socket-path*
+    (ignore-errors (delete-file *control-socket-path*))
+    (setf *control-socket-path* nil)))
+
+(defun terminate-server (&rest signal-info)
+  "SIGTERM/SIGINT handler: drop the control socket and exit cleanly."
+  (declare (ignore signal-info))
+  (cleanup-control-socket)
+  (sb-ext:exit :code 0))
+
+(defun enable-cleanup ()
+  "Arrange for the Unix control socket to be removed on exit."
+  (pushnew 'cleanup-control-socket sb-ext:*exit-hooks*)
+  (sb-sys:enable-interrupt sb-unix:sigterm #'terminate-server)
+  (sb-sys:enable-interrupt sb-unix:sigint #'terminate-server)
+  (values))
+
 (defun make-local-listener (path)
-  "Return a listening AF_UNIX stream socket bound to PATH."
+  "Return a listening AF_UNIX stream socket bound to PATH.
+
+The socket node is chmod'ed to 0700: it evaluates arbitrary Lisp, and it is
+the node's mode (not the containing directory) that decides who may connect."
   (ignore-errors (delete-file path))
   (let ((s (make-instance 'sb-bsd-sockets:local-socket
                           :type :stream :protocol 0)))
     (sb-bsd-sockets:socket-bind s (namestring path))
     (sb-bsd-sockets:socket-listen s 16)
+    (handler-case (sb-posix:chmod (namestring path) #o700)
+      (error (e)
+        (format *error-output* "~&pg-lisp: warning: cannot chmod ~a: ~a~%"
+                path e)))
     s))
 
 (defun control-accept-loop (listener name)
   (loop
-    (let ((sock (handler-case (accept-connection listener)
-                  (error (e)
-                    (format *error-output* "~&pg-lisp: ~a accept: ~a~%" name e)
-                    nil))))
+    (let ((sock (accept-connection-or-nil listener name)))
       (when sock
         (sb-thread:make-thread
          (lambda () (control-serve sock))
          :name "pg control connection")))))
 
 (defun control-eval (stream form)
-  "Evaluate FORM with output rebound to the control connection."
+  "Evaluate FORM, printing its values (or an error) to STREAM."
   (handler-case
-      (format stream "~&~{~s~^~%~}~%"
-              (multiple-value-list (eval form)))
+      (format stream "~&~{~s~^~%~}~%" (multiple-value-list (eval form)))
     (error (e)
       (format stream "~&;; error: ~a~%" e))))
+
+(defun read-control-form (stream)
+  "Read one form, with reader evaluation disabled.
+
+The binding must cover READ only: EVAL may run code that reads source (a
+reload, say), which legitimately uses #. for compile-time constants."
+  (let ((*read-eval* nil))
+    (read stream nil :eof)))
+
+(defun control-read-eval-loop (stream)
+  "Read forms from STREAM until EOF, printing each result."
+  (loop
+    (format stream "~&pg> ")
+    (finish-output stream)
+    (let ((form (handler-case (read-control-form stream)
+                  (error (e)
+                    (format stream "~&;; read error: ~a~%" e)
+                    :skip))))
+      (cond
+        ((eq form :eof) (return))
+        ((eq form :skip))
+        (t (control-eval stream form))))))
 
 (defun control-serve (sock)
   "Read-eval-print loop for one control connection."
   (let ((stream nil))
     (unwind-protect
-         (progn
-           (setf stream (sb-bsd-sockets:socket-make-stream
-                         sock :input t :output t
-                         :element-type 'character :buffering :line))
-           (let ((*standard-output* stream)
-                 (*error-output* stream)
-                 (*trace-output* stream)
-                 (*query-io* stream)
-                 (*package* (find-package '#:pg)))
-             (format stream "~&pg-lisp control REPL~%server ~a, package ~a~%~
-                             (reload) reloads code, (quit) disconnects.~%"
-                     *server-version* (package-name *package*))
-             (finish-output stream)
-             (catch *control-quit-tag*
-               (loop
-                 (format stream "~&pg> ")
+         (handler-case
+             (progn
+               (setf stream (sb-bsd-sockets:socket-make-stream
+                             sock :input t :output t
+                             :element-type 'character :buffering :line))
+               (let ((*standard-output* stream)
+                     (*error-output* stream)
+                     (*trace-output* stream)
+                     (*query-io* stream)
+                     (*package* (find-package '#:pg)))
+                 (format stream "~&pg-lisp control REPL~%server ~a, package ~a~%~
+                                 (reload) reloads code, (quit) disconnects.~%"
+                         *server-version* (package-name *package*))
                  (finish-output stream)
-                 (let ((form (handler-case (read stream nil :eof)
-                               (error (e)
-                                 (format stream "~&;; read error: ~a~%" e)
-                                 :skip))))
-                   (cond
-                     ((eq form :eof) (return))
-                     ((eq form :skip))
-                     (t (control-eval stream form))))))
-             (format stream "~&bye~%")))
+                 (catch *control-quit-tag*
+                   (control-read-eval-loop stream))
+                 (format stream "~&bye~%")))
+           ;; A client that vanished shows up as a stream error; anything else
+           ;; is a bug worth logging.
+           (stream-error () nil)
+           (error (e)
+             (format *error-output* "~&pg-lisp: control connection error: ~a~%"
+                     e)
+             nil))
       (when stream
         (ignore-errors (finish-output stream))
         (ignore-errors (close stream)))
@@ -156,6 +203,8 @@ actual work happens on a helper thread."
   "Start the control REPL on loopback TCP PORT and/or Unix SOCKET-PATH.
 
 Both are optional; with neither, no control plane is started."
+  (when (or port socket-path)
+    (enable-cleanup))
   (when port
     (let ((listener (make-listener "127.0.0.1" port)))
       (format t "~&pg-lisp: control REPL on 127.0.0.1:~a~%" port)
@@ -166,6 +215,7 @@ Both are optional; with neither, no control plane is started."
   (when socket-path
     (let* ((pn (pathname socket-path))
            (listener (make-local-listener pn)))
+      (setf *control-socket-path* (namestring pn))
       (format t "~&pg-lisp: control REPL on ~a~%" (namestring pn))
       (finish-output)
       (sb-thread:make-thread
