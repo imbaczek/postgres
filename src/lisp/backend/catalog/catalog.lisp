@@ -123,6 +123,18 @@
 (defun catalog-path ()
   (pgdata-path "global/pg_catalog.dat"))
 
+(defun fsync-directory (dir)
+  "Fsync DIR so that a rename inside it survives a crash."
+  (let* ((name (namestring dir))
+         (trimmed (if (and (> (length name) 1)
+                           (char= (char name (1- (length name))) #\/))
+                      (subseq name 0 (1- (length name)))
+                      name))
+         (fd (sb-posix:open trimmed sb-posix:o-rdonly)))
+    (unwind-protect
+         (sb-posix:fsync fd)
+      (sb-posix:close fd))))
+
 (defun save-catalog ()
   (ensure-directories-exist (catalog-path))
   (let ((tmp (pgdata-path "global/pg_catalog.tmp")))
@@ -138,8 +150,11 @@
           (terpri s)))
       (finish-output s)
       (sb-posix:fsync (sb-sys:fd-stream-fd s)))
-    (ignore-errors (delete-file (catalog-path)))
-    (rename-file tmp (catalog-path)))
+    ;; RENAME(2) atomically replaces the destination.  Deleting the old
+    ;; catalog first would open a window in which neither name exists, so a
+    ;; crash there would lose the whole catalog.
+    (sb-posix:rename (namestring tmp) (namestring (catalog-path)))
+    (fsync-directory (pgdata-path "global/")))
   (values))
 
 (defun load-catalog ()

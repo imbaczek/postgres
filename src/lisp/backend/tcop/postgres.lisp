@@ -128,24 +128,29 @@
 
 (defun handle-connection (sock)
   (let ((stream nil))
-    (handler-case
-        (progn
-          (setf stream (socket->stream sock))
-          (let ((*backend* (make-backend :stream stream :database "postgres")))
-            (let ((body (read-startup-until-ready stream)))
-              (when body
-                (process-startup stream body)
-                (backend-loop stream)))))
-      (pg-error (e)
-        (when stream (ignore-errors (send-error-response stream e))))
-      (error (e)
-        (when stream
-          (ignore-errors
-           (send-error-response
-            stream
-            (make-condition 'pg-error :sqlstate "XX000"
-                            :message (princ-to-string e)))))))
-    (close-connection sock stream)))
+    (unwind-protect
+         (handler-case
+             (progn
+               (setf stream (socket->stream sock))
+               (let ((*backend* (make-backend :stream stream
+                                              :database "postgres")))
+                 ;; A dropped connection must not strand an open transaction.
+                 (unwind-protect
+                      (let ((body (read-startup-until-ready stream)))
+                        (when body
+                          (process-startup stream body)
+                          (backend-loop stream)))
+                   (end-backend-session))))
+           (pg-error (e)
+             (when stream (ignore-errors (send-error-response stream e))))
+           (error (e)
+             (when stream
+               (ignore-errors
+                (send-error-response
+                 stream
+                 (make-condition 'pg-error :sqlstate "XX000"
+                                 :message (princ-to-string e)))))))
+      (close-connection sock stream))))
 
 ;;; ---- server main ----
 

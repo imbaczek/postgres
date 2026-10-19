@@ -55,12 +55,12 @@
   (let ((xmin (htup-xmin tuple))
         (xmax (htup-xmax tuple)))
     (cond
-      ((and my-xid (= xmin my-xid)) :violation)
+      ;; Our own tuple: a live version conflicts, a version we already
+      ;; deleted (e.g. an earlier UPDATE in this transaction) does not.
+      ((and my-xid (= xmin my-xid))
+       (if (= xmax my-xid) :free :violation))
       ((xid-aborted-p xmin) :free)
-      ((xid-in-progress-p xmin)
-       (if (and my-xid (= xmin my-xid))
-           :violation
-           (cons :wait xmin)))
+      ((xid-in-progress-p xmin) (cons :wait xmin))
       ((xid-committed-p xmin)
        (cond
          ((zerop xmax) :violation)
@@ -70,30 +70,38 @@
          (t :violation)))
       (t (cons :wait xmin)))))
 
+(defun key-has-null-p (values)
+  (some (lambda (v) (eq v +null+)) values))
+
 (defun check-unique-indexes (table values exclude-tid)
-  "Return :ok, (:violation . index-name), or (:wait . xid)."
+  "Return :ok, (:violation . index-name), or (:wait . xid).
+
+PostgreSQL's default unique-index semantics treat NULLs as distinct, so
+a key containing any NULL can never conflict."
   (let ((wait nil)
         (violation nil)
         (my-xid (backend-xid *backend*)))
     (dolist (idx (unique-indexes table))
       (let* ((types (index-types idx table))
-             (key (encode-index-key (index-values idx table values) types))
-             (tids (btree-search (pg-index-relfilenode idx) key)))
-        (dolist (tid tids)
-          (unless (and exclude-tid
-                       (= (car tid) (car exclude-tid))
-                       (= (cdr tid) (cdr exclude-tid)))
-            (let ((tuple (heapam-get-tuple (pg-class-relfilenode table)
-                                           (car tid) (cdr tid)
-                                           (pg-class-columns table))))
-              (when tuple
-                (let ((status (unique-conflict-status tuple idx my-xid)))
-                  (cond
-                    ((eq status :violation)
-                     (setf violation (pg-index-name idx)))
-                    ((eq status :free) nil)
-                    (t
-                     (setf wait (cdr status)))))))))))
+             (vals (index-values idx table values)))
+        (unless (key-has-null-p vals)
+          (let ((tids (btree-search (pg-index-relfilenode idx)
+                                    (encode-index-key vals types))))
+            (dolist (tid tids)
+              (unless (and exclude-tid
+                           (= (car tid) (car exclude-tid))
+                           (= (cdr tid) (cdr exclude-tid)))
+                (let ((tuple (heapam-get-tuple (pg-class-relfilenode table)
+                                               (car tid) (cdr tid)
+                                               (pg-class-columns table))))
+                  (when tuple
+                    (let ((status (unique-conflict-status tuple idx my-xid)))
+                      (cond
+                        ((eq status :violation)
+                         (setf violation (pg-index-name idx)))
+                        ((eq status :free) nil)
+                        (t
+                         (setf wait (cdr status)))))))))))))
     (cond (violation (cons :violation violation))
           (wait (cons :wait wait))
           (t :ok))))

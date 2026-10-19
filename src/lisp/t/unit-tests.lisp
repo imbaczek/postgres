@@ -125,6 +125,68 @@
       (check (not (heap-tuple-visible-p 200 0 5 snap3 200))
              "own insert invisible in same command"))))
 
+(defun test-btree-duplicate-keys ()
+  ;; Insert many entries with one key so the leaves holding them must split.
+  ;; Repeatedly updating an indexed value produces exactly this shape: a long
+  ;; run of index entries with equal keys spread over several leaves.
+  (let* ((rel 987654)
+         (key (encode-index-key (list 42) (list :int4)))
+         (n 2000))
+    (btree-init rel)
+    (dotimes (i n)
+      (btree-insert rel key 0 i))
+    (let ((found (btree-search rel key)))
+      (check (= (length found) n)
+             "duplicate keys are found across leaf splits")
+      (check (= (length (remove-duplicates found :test #'equal)) n)
+             "every duplicate-key TID is distinct")
+      (check (null (btree-search rel (encode-index-key (list 43) (list :int4))))
+             "an absent key is not found"))))
+
+(defun test-btree-mixed-duplicate-keys ()
+  ;; Interleave two keys so splits produce equal separators for both, which
+  ;; stresses the key-range order that search assumes.
+  (let* ((rel 987655)
+         (ka (encode-index-key (list 1) (list :int4)))
+         (kb (encode-index-key (list 2) (list :int4)))
+         (n 3000))
+    (btree-init rel)
+    (dotimes (i n)
+      (btree-insert rel (if (evenp i) ka kb) 0 i))
+    (let ((fa (btree-search rel ka))
+          (fb (btree-search rel kb)))
+      (check (= (length fa) (/ n 2)) "even entries found (mixed keys)")
+      (check (= (length fb) (/ n 2)) "odd entries found (mixed keys)")
+      (check (every (lambda (tid) (evenp (cdr tid))) fa)
+             "key A search returned only key-A TIDs")
+      (check (every (lambda (tid) (oddp (cdr tid))) fb)
+             "key B search returned only key-B TIDs"))))
+
+(defun test-parse-error-aborts-transaction ()
+  (let ((path (merge-pathnames "parse-error.out" *pgdata*)))
+    (setf (backend-state *backend*) :in-progress
+          (backend-explicit *backend*) t
+          (backend-command-id *backend*) 0)
+    (with-open-file (stream path
+                            :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create
+                            :element-type '(unsigned-byte 8))
+      (exec-simple-query stream "select from;"))
+    (check (eq (backend-state *backend*) :aborted)
+           "a parse error aborts an explicit transaction")
+    (with-open-file (stream path
+                            :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create
+                            :element-type '(unsigned-byte 8))
+      (exec-simple-query stream "select 1;"))
+    (check (eq (backend-state *backend*) :aborted)
+           "aborted transaction stays aborted")
+    (abort-transaction)
+    (check (eq (backend-state *backend*) :idle)
+           "abort clears the transaction state")))
+
 (defun run-unit-tests ()
   (setf *test-failures* 0
         *test-checks* 0)
@@ -132,17 +194,19 @@
               (format nil "pg-unit-~a/" (random 1000000))
               #p"/tmp/opencode/")))
     (ensure-directories-exist dir)
-    (let ((*pgdata* dir))
-      (clog-init))
-    (test-page-roundtrip)
-    (test-page-compaction)
-    (test-tuple-roundtrip)
-    (test-key-order)
-    (test-visibility)
+    (let ((*pgdata* dir)
+          (*backend* (make-backend)))
+      (clog-init)
+      (test-page-roundtrip)
+      (test-page-compaction)
+      (test-tuple-roundtrip)
+      (test-key-order)
+      (test-visibility)
+      (test-btree-duplicate-keys)
+      (test-btree-mixed-duplicate-keys)
+      (test-parse-error-aborts-transaction))
     (ignore-errors
-      (dolist (f (directory (merge-pathnames "*.*" dir)))
-        (delete-file f))
-      (sb-posix:rmdir (namestring dir))))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))
   (format t "~&unit-tests: ~a checks, ~a failures~%"
           *test-checks* *test-failures*)
   (when (plusp *test-failures*)

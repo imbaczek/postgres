@@ -90,11 +90,16 @@ Meta-commands that need `pg_catalog` and regular-expression operators (`\d`,
 cd src/lisp
 ./t/run-unit-tests.sh     # Lisp-level page/tuple/index/visibility tests
 ./t/psql-smoke.sh         # boots a server and diffs psql output against a golden file
+./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
 ```
 
 `t/psql-smoke.sh` is the acceptance test: it launches the server on a throwaway
 PGDATA, runs `t/psql-smoke.sql` through a real `psql`, and compares the
 transcript with `t/psql-smoke.out`.
+
+`t/index-stress.sh` updates a single unique value a thousand times, then checks
+that a fresh transaction still sees the live tuple as a duplicate.  It exercises
+the case where equal index keys straddle many leaf splits.
 
 ## Storage and concurrency
 
@@ -111,9 +116,18 @@ transcript with `t/psql-smoke.out`.
 - Commit order: fsync every dirty heap/index file, then write + fsync CLog
   COMMITTED, then let the tuple become visible.
 - The catalog (`pg_class`/`pg_attribute`/`pg_index` as structs) is serialized to
-  `$PGDATA/global/pg_catalog.dat` and fsynced at each DDL commit.
-- Unique b-trees are real file-backed B+trees. A uniqueness probe that lands on
-  an in-progress conflicting tuple blocks until that XID ends, then re-evaluates.
+  `$PGDATA/global/pg_catalog.dat` and fsynced at each DDL commit. It is replaced
+  atomically (write a temp file, `rename`, then fsync the directory), so a crash
+  never leaves the catalog missing.
+- Unique b-trees are real file-backed B+trees. Because duplicate keys can
+  straddle a leaf split, a lookup visits every leaf that can hold the key. A
+  uniqueness probe that lands on an in-progress conflicting tuple blocks until
+  that XID ends, then re-evaluates.
+- `UNIQUE` and `PRIMARY KEY` follow PostgreSQL's default NULLS DISTINCT
+  semantics: a key containing a NULL never conflicts, though the index entry is
+  still written.
+- A disconnecting backend aborts any transaction it left open, so an abandoned
+  XID (and the in-progress tuple it wrote) cannot block other sessions.
 - Writers take a single global write mutex; DDL also takes a catalog mutex;
   page I/O is serialized under an smgr mutex. Readers do not block.
 

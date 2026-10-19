@@ -98,8 +98,9 @@
                  (< (third a) (third b))))
         (minusp c))))
 
-(defun internal-entry-less-p (a b)
-  (key< (car a) (car b)))
+;;; Internal-page insertion places a split's separator immediately after the
+;;; child it came from (see btree-insert-rec) instead of re-sorting, so equal
+;;; separators keep their key-range order even though KEY< is not a total order.
 
 ;;; ---- meta ----
 
@@ -139,28 +140,53 @@
 
 ;;; ---- search ----
 
+(defun btree-collect-equal (relfilenode level block key acc)
+  "Push all TIDs whose key equals KEY in the subtree at BLOCK onto ACC.
+
+Separators store the minimum key of each child.  Duplicate keys can
+straddle a leaf split, so the same key may occur in several sibling
+subtrees; visit every child that can contain KEY instead of descending
+to a single leaf."
+  (let ((page (buf-read relfilenode block)))
+    (unless page
+      (ereport "XX000" "index page ~a is missing" block))
+    (if (zerop level)
+        (progn
+          (dolist (e (btree-page-entries page nil))
+            (when (key= (first e) key)
+              (push (cons (second e) (third e)) acc)))
+          acc)
+        (let ((entries (btree-page-entries page t)))
+          (when (null entries)
+            (return-from btree-collect-equal acc))
+          ;; J is the last child whose minimum key is <= KEY.
+          (let ((j 0))
+            (loop for e in entries
+                  for i from 0
+                  when (key<= (car e) key)
+                    do (setf j i))
+            ;; If separators equal KEY, the run of such separators plus the
+            ;; child immediately to its left can all contain KEY.
+            (let ((start j))
+              (when (key= (car (nth j entries)) key)
+                (loop while (and (> start 0)
+                                 (key= (car (nth (1- start) entries)) key))
+                      do (decf start))
+                (when (> start 0)
+                  (decf start)))
+              (loop for i from start to j
+                    do (setf acc
+                             (btree-collect-equal
+                              relfilenode (1- level)
+                              (cdr (nth i entries))
+                              key acc))))
+            acc)))))
+
 (defun btree-search (relfilenode key)
   "Return a list of (block . off) heap TIDs for entries whose key equals KEY."
   (btree-ensure-init relfilenode)
   (multiple-value-bind (level root) (btree-read-meta relfilenode)
-    (loop
-      (let ((page (buf-read relfilenode root)))
-        (unless page
-          (ereport "XX000" "index page ~a is missing" root))
-        (if (zerop level)
-            (return
-              (loop for e in (btree-page-entries page nil)
-                    when (key= (first e) key)
-                      collect (cons (second e) (third e))))
-            (let* ((entries (btree-page-entries page t))
-                   (chosen nil))
-              (loop for e in entries
-                    when (key<= (car e) key)
-                      do (setf chosen (cdr e)))
-              (unless chosen
-                (setf chosen (cdr (first entries))))
-              (setf root chosen)
-              (decf level)))))))
+    (nreverse (btree-collect-equal relfilenode level root key '()))))
 
 ;;; ---- insert ----
 
@@ -211,8 +237,9 @@
                                 key tid-block tid-off)
             (if (not split-p)
                 (values nil nil nil)
-                (let* ((all (sort (cons (cons sep new-block) entries)
-                                  #'internal-entry-less-p))
+                (let* ((all (append (subseq entries 0 (1+ chosen-index))
+                                  (list (cons sep new-block))
+                                  (subseq entries (1+ chosen-index))))
                        (built (btree-page-build all t)))
                   (if built
                       (progn

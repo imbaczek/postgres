@@ -145,6 +145,18 @@
           (backend-dirty-relations b) '()))
   (values))
 
+(defun end-backend-session ()
+  "Abort any transaction still open when a client disconnects.
+
+A backend that vanishes mid-transaction must not leave its XID in
+*active-xids*; otherwise another session waiting on a conflicting unique
+key would block forever, and aborted heap changes would never be
+reclaimable."
+  (when *backend*
+    (when (or (backend-xid *backend*)
+              (not (eq (backend-state *backend*) :idle)))
+      (abort-transaction))))
+
 (defun transaction-status-char ()
   (case (and *backend* (backend-state *backend*))
     (:in-progress #\T)

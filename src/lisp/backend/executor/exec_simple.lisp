@@ -6,6 +6,19 @@
   (member (getf ast :type)
           '(:create-table :drop-table :create-index :drop-index :alter-table)))
 
+(defun note-query-error ()
+  "Record that the current statement failed, matching PostgreSQL.
+
+An error inside an explicit transaction block moves it to the aborted
+state even when it happens while parsing, before EXECUTE-STATEMENT has
+run, so the next command reports 25P02.  An implicit transaction is
+rolled back immediately."
+  (when *backend*
+    (when (eq (backend-state *backend*) :in-progress)
+      (if (backend-explicit *backend*)
+          (setf (backend-state *backend*) :aborted)
+          (abort-transaction)))))
+
 ;;; ---- transaction commands ----
 
 (defun command-begin (stream)
@@ -79,19 +92,21 @@
   (smgr-fsync (pg-index-relfilenode idx)))
 
 (defun build-unique-index (idx table name)
-  (heapam-scan (pg-class-relfilenode table)
-               (pg-class-columns table)
-               *current-snapshot*
-               (lambda (tuple)
-                 (let* ((types (index-types idx table))
-                        (key (encode-index-key
-                              (index-values idx table (htup-values tuple))
-                              types)))
-                   (when (btree-search (pg-index-relfilenode idx) key)
-                     (ereport "23505"
-                              "could not create unique index \"~a\"" name))
-                   (btree-insert (pg-index-relfilenode idx)
-                                 key (htup-block tuple) (htup-offnum tuple))))))
+  (heapam-scan
+   (pg-class-relfilenode table)
+   (pg-class-columns table)
+   *current-snapshot*
+   (lambda (tuple)
+     (let* ((types (index-types idx table))
+            (vals (index-values idx table (htup-values tuple)))
+            (key (encode-index-key vals types)))
+       ;; NULLs are distinct, so they cannot violate uniqueness.
+       (unless (key-has-null-p vals)
+         (when (btree-search (pg-index-relfilenode idx) key)
+           (ereport "23505"
+                    "could not create unique index \"~a\"" name)))
+       (btree-insert (pg-index-relfilenode idx)
+                     key (htup-block tuple) (htup-offnum tuple))))))
 
 (defun check-not-null-existing (table attnums constraint-name)
   (heapam-scan
@@ -330,8 +345,10 @@
             (dolist (ast stmts)
               (execute-statement stream ast))))
     (pg-error (e)
+      (note-query-error)
       (send-error-response stream e))
     (error (e)
+      (note-query-error)
       (send-error-response
        stream
        (make-condition 'pg-error

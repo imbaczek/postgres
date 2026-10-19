@@ -28,6 +28,13 @@ ALTER TABLE
 INSERT 0 1
 ERROR:  duplicate key value violates unique constraint "nn_pkey"
 5
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "un_a_key"
+1
+DROP TABLE
 DROP INDEX
 DROP TABLE
 DROP TABLE
