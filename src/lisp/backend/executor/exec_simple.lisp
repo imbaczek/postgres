@@ -97,6 +97,7 @@ rolled back immediately."
    (pg-class-columns table)
    *current-snapshot*
    (lambda (tuple)
+     (check-for-interrupts)
      (let* ((types (index-types idx table))
             (vals (index-values idx table (htup-values tuple)))
             (key (encode-index-key vals types)))
@@ -114,6 +115,7 @@ rolled back immediately."
    (pg-class-columns table)
    *current-snapshot*
    (lambda (tuple)
+     (check-for-interrupts)
      (let ((values (htup-values tuple)))
        (dolist (attnum attnums)
          (when (eq (aref values (1- attnum)) +null+)
@@ -315,10 +317,13 @@ rolled back immediately."
                 (:alter-table (exec-alter-table stream ast))
                 (t (ereport "0A000" "unsupported statement")))
             (error (e)
-              (if implicit
-                  (abort-transaction)
-                  (setf (backend-state *backend*) :aborted))
-              (error e)))))
+              (if (fatal-error-p e)
+                  (error e)
+                  (progn
+                    (if implicit
+                        (abort-transaction)
+                        (setf (backend-state *backend*) :aborted))
+                    (error e)))))))
       (when implicit
         (commit-transaction)))))
 
@@ -338,19 +343,34 @@ rolled back immediately."
       (otherwise (execute-in-transaction stream ast)))))
 
 (defun exec-simple-query (stream query)
-  (handler-case
-      (let ((stmts (parse-statements query)))
-        (if (null stmts)
-            (send-empty-query-response stream)
-            (dolist (ast stmts)
-              (execute-statement stream ast))))
-    (pg-error (e)
-      (note-query-error)
-      (send-error-response stream e))
-    (error (e)
-      (note-query-error)
-      (send-error-response
-       stream
-       (make-condition 'pg-error
-                       :sqlstate "XX000"
-                       :message (princ-to-string e))))))
+  (let ((backend *backend*))
+    ;; Mark the backend as executing a command, so pg_cancel_backend()
+    ;; knows a pending cancel is meaningful (an idle cancel is ignored).
+    (when backend
+      (setf (backend-executing backend) t
+            (backend-cancel-pending backend) nil))
+    (unwind-protect
+         (handler-case
+             (let ((stmts (parse-statements query)))
+               (if (null stmts)
+                   (send-empty-query-response stream)
+                   (dolist (ast stmts)
+                     (check-for-interrupts)
+                     (execute-statement stream ast))))
+           (pg-error (e)
+             ;; A FATAL must end the connection; let it reach handle-connection.
+             (if (fatal-error-p e)
+                 (error e)
+                 (progn
+                   (note-query-error)
+                   (send-error-response stream e))))
+           (error (e)
+             (note-query-error)
+             (send-error-response
+              stream
+              (make-condition 'pg-error
+                              :sqlstate "XX000"
+                              :message (princ-to-string e)))))
+      (when backend
+        (setf (backend-executing backend) nil
+              (backend-cancel-pending backend) nil)))))

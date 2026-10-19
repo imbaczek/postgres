@@ -100,17 +100,12 @@ actual work happens on a helper thread."
     (ignore-errors (delete-file *control-socket-path*))
     (setf *control-socket-path* nil)))
 
-(defun terminate-server (&rest signal-info)
-  "SIGTERM/SIGINT handler: drop the control socket and exit cleanly."
-  (declare (ignore signal-info))
-  (cleanup-control-socket)
-  (sb-ext:exit :code 0))
-
 (defun enable-cleanup ()
-  "Arrange for the Unix control socket to be removed on exit."
+  "Arrange for the Unix control socket to be removed on exit.
+
+SIGTERM/SIGINT/SIGQUIT are handled by the shutdown machinery in
+postmaster.lisp; a clean exit runs this hook, an immediate shutdown skips it."
   (pushnew 'cleanup-control-socket sb-ext:*exit-hooks*)
-  (sb-sys:enable-interrupt sb-unix:sigterm #'terminate-server)
-  (sb-sys:enable-interrupt sb-unix:sigint #'terminate-server)
   (values))
 
 (defun make-local-listener (path)

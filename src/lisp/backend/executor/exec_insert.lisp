@@ -154,6 +154,7 @@ a key containing any NULL can never conflict."
                  (loop for i from 1 to (length columns) collect i)))
            (count 0))
       (dolist (row (getf ast :rows))
+        (check-for-interrupts)
         (unless (= (length row) (length attnums))
           (ereport "42601"
                    "INSERT has more target columns than expressions"))

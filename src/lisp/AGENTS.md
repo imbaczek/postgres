@@ -61,9 +61,10 @@ given, and the Unix socket is `chmod`ed to `0700`.
 ./t/index-stress.sh     # repeated same-key updates (slow)
 ./t/hot-reload.sh       # SIGHUP reloads a running server
 ./t/control-repl.sh     # control REPL over TCP + Unix socket, reload, SQL intact
+./t/shutdown.sh         # signals, shutdown modes, cancel/terminate admin functions
 ```
 
-Each test boots its own throwaway server on its own port (5461–5465), so they are
+Each test boots its own throwaway server on its own port (5461–5466), so they are
 safe to run while a dev server is listening on 5433.
 
 ## Conventions
@@ -73,4 +74,8 @@ safe to run while a dev server is listening on 5433.
 - Wire-protocol integers are big-endian; on-disk page integers are little-endian.
   Do not mix them.
 - Lock order is write-lock → smgr/catalog, never the reverse.
-- Project workflow: review each milestone with nemotron 3.5.
+- **Compatibility target:** the eventual, far-away goal is byte-for-byte,
+  bug-for-bug compatibility with PostgreSQL. When in doubt, port the original
+  behavior rather than inventing a simpler one. The MVP subset is a scope
+  limit, not a license to diverge inside that scope.
+- Project workflow: review each milestone with a subagent.

@@ -4,15 +4,31 @@
 
 (defstruct backend
   stream
+  (pid 0)
   (database "postgres")
   (xid nil)
   (state :idle)                 ; :idle | :in-progress | :aborted
   (explicit nil)
   (command-id 0)
   (snapshot nil)
-  (dirty-relations '()))
+  (dirty-relations '())
+  ;; Interrupt state: the equivalents of QueryCancelPending and the
+  ;; backend's own thread, used by pg_cancel_backend()/pg_terminate_backend().
+  (executing nil)
+  (cancel-pending nil)
+  (thread nil))
 
 (defvar *backend* nil)
+
+(defun check-for-interrupts ()
+  "Port of PostgreSQL's CHECK_FOR_INTERRUPTS().
+
+A pending PG_CANCEL_BACKEND() request raises 57014 here, at a safe point.
+PG_TERMINATE_BACKEND() is delivered as a FATAL condition from
+INTERRUPT-THREAD, so it needs no flag."
+  (when (and *backend* (backend-cancel-pending *backend*))
+    (setf (backend-cancel-pending *backend*) nil)
+    (ereport "57014" "canceling statement due to user request")))
 
 ;;; ---- pg_control: nextXid, fsynced write-ahead of XID allocation ----
 
@@ -78,6 +94,7 @@
   "Block until XID ends. Called without the write lock held."
   (loop
     (unless (xid-active-p xid) (return))
+    (check-for-interrupts)
     (sb-thread:with-mutex (*xact-cv-mutex*)
       (when (xid-active-p xid)
         (sb-thread:condition-wait *xact-cv* *xact-cv-mutex* :timeout 1))))

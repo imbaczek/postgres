@@ -63,8 +63,8 @@ default** because it evaluates arbitrary Lisp; enable it explicitly:
 
 `--control-port` binds a TCP listener on `127.0.0.1` only; `--control-socket`
 binds an AF_UNIX socket and `chmod`s the node to `0700`. Either or both may be
-given. A `SIGTERM` or `SIGINT` removes the Unix socket on the way out, and a
-stale socket is deleted at startup, so restarts are clean.
+given. A clean shutdown removes the Unix socket on the way out, and a stale
+socket is deleted at startup, so restarts are clean.
 
 Then connect with any line-oriented client. Over TCP:
 
@@ -86,6 +86,38 @@ executed merely by being read; `eval` then runs the parsed form. `t/control-repl
 exercises both transports and a reload through the REPL. Note that `telnet` sends
 terminal-negotiation bytes that the reader will parse as Lisp; use `nc`/`socat`
 instead.
+
+## Shutdown and backend signaling
+
+Signals follow PostgreSQL's postmaster:
+
+| Signal | Mode | Behavior |
+| --- | --- | --- |
+| `SIGTERM` | smart | stop accepting new clients, wait for connected ones to leave, then exit 0 |
+| `SIGINT` (Ctrl-C) | fast | abort active transactions, disconnect clients, exit 0 |
+| `SIGQUIT` | immediate | exit 1 at once, skipping cleanup |
+
+A later signal may escalate (smart → fast → immediate), never de-escalate.
+While shutting down, new connections are rejected with `FATAL 57P03`
+("the database system is shutting down") before authentication, exactly like
+PostgreSQL's `canAcceptConnections()`.
+
+The SQL admin functions mirror `signalfuncs.c`:
+
+```sql
+SELECT pg_backend_pid();
+SELECT pg_cancel_backend(pid);                 -- ERROR 57014 in the target
+SELECT pg_terminate_backend(pid [, timeout]);  -- FATAL 57P01, connection ends
+SELECT pg_reload_conf();                       -- same as SIGHUP
+```
+
+`pg_cancel_backend` cancels the running statement at a safe point; a cancel
+aimed at an idle backend is ignored, as in PostgreSQL. `pg_terminate_backend`
+delivers the FATAL even to an idle backend and returns true once the signal is
+sent. With a positive millisecond `timeout` it waits for the backend to
+disappear and returns false if it does not; a negative timeout raises `22003`.
+An unknown PID produces a `WARNING` and returns false. `t/shutdown.sh`
+exercises all of this, including smart/fast/immediate shutdown and escalation.
 
 ## Supported SQL
 
@@ -127,7 +159,8 @@ Expressions: column references, integer and string literals, `+ - * / %`,
 comparisons, `AND` / `OR` / `NOT`, `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE`, and
 parentheses. Scalar functions: `version()`, `current_database()`,
 `current_schema()`, `current_catalog()`, `current_user`, `session_user`, `user`,
-`length()`.
+`length()`, `pg_backend_pid()`, `pg_cancel_backend(pid)`,
+`pg_terminate_backend(pid [, timeout])`, `pg_reload_conf()`.
 
 `SET` and `SHOW` are accepted broadly and mostly remembered per session.
 Meta-commands that need `pg_catalog` and regular-expression operators (`\d`,
@@ -142,6 +175,7 @@ cd src/lisp
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
 ./t/hot-reload.sh         # SIGHUP reloads code in a running server
 ./t/control-repl.sh       # control REPL over TCP + Unix socket, reload, SQL intact
+./t/shutdown.sh           # signals, shutdown modes, cancel/terminate admin functions
 ```
 
 `t/psql-smoke.sh` is the acceptance test: it launches the server on a throwaway
@@ -207,6 +241,11 @@ the case where equal index keys straddle many leaf splits.
 - Numeric/float, date/time, boolean `text`, and other types are unsupported.
 - Extended query protocol (Parse/Bind/Describe/Execute/Sync) is not
   implemented; `psql` is unaffected, other drivers are.
+- `pg_terminate_backend` (and fast/immediate shutdown) unwinds the target with
+  an SBCL thread interrupt at an arbitrary point instead of PostgreSQL's
+  deferred safe-point check. A terminate in the middle of a page write can
+  leave a torn page; the no-WAL crash model already tolerates that, but it is a
+  real divergence from the original signal handling.
 - `\d`, `\dt`, `\l` fail because the catalog SQL uses constructs beyond this
   subset (regex operators, `pg_catalog` functions); `psql` prints an error and
   shows no listing.

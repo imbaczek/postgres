@@ -37,14 +37,17 @@
         (sqlstate (if (typep condition 'pg-error)
                       (pg-error-sqlstate condition)
                       "XX000"))
+        (severity (if (typep condition 'pg-error)
+                      (pg-error-severity condition)
+                      "ERROR"))
         (message (if (typep condition 'pg-error)
                      (pg-error-message condition)
                      (princ-to-string condition))))
     (flet ((field (code value)
              (payload-push-byte p (char-code code))
              (payload-push-cstring p value)))
-      (field #\S "ERROR")
-      (field #\V "ERROR")
+      (field #\S severity)
+      (field #\V severity)
       (field #\C sqlstate)
       (field #\M message)
       (when (and (typep condition 'pg-error) (pg-error-detail condition))
@@ -56,17 +59,29 @@
     (vector-push-extend 0 p)
     (write-message stream #\E p)))
 
-(defun send-notice (stream message)
-  (let ((p (make-payload)))
+(defun send-notice (stream message &optional (severity "NOTICE"))
+  (let ((p (make-payload))
+        (sqlstate (if (string= severity "NOTICE") "00000" "01000")))
     (flet ((field (code value)
              (payload-push-byte p (char-code code))
              (payload-push-cstring p value)))
-      (field #\S "NOTICE")
-      (field #\V "NOTICE")
-      (field #\C "00000")
+      (field #\S severity)
+      (field #\V severity)
+      (field #\C sqlstate)
       (field #\M message))
     (vector-push-extend 0 p)
     (write-message stream #\N p)))
+
+(defun warning-notice (control-string &rest args)
+  "Send a WARNING to the current frontend connection, if there is one.
+
+PostgreSQL reports an unknown PID from PG_CANCEL_BACKEND() /
+PG_TERMINATE_BACKEND() with ereport(WARNING) and returns false; this is the
+closest equivalent."
+  (when *output-stream*
+    (send-notice *output-stream*
+                 (apply #'format nil control-string args)
+                 "WARNING")))
 
 ;;; A result column description for RowDescription.
 (defstruct result-column

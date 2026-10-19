@@ -9,6 +9,7 @@
                  (pg-class-columns table)
                  *current-snapshot*
                  (lambda (tuple)
+                   (check-for-interrupts)
                    (when (or (null where)
                              (true-p (eval-expr where (htup-values tuple))))
                      (push (cons (htup-block tuple) (htup-offnum tuple))
@@ -46,6 +47,7 @@
       (when tids
         (let ((xid (get-current-xid)))
           (dolist (tid tids)
+            (check-for-interrupts)
             (let ((tuple (heapam-get-tuple rel (car tid) (cdr tid) columns)))
               (when (and tuple
                          (htup-visible-p tuple *current-snapshot*))

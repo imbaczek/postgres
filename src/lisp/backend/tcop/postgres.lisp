@@ -56,6 +56,10 @@
       (ereport "0A000"
                (format nil "unsupported frontend protocol ~a.~a"
                        major (logand code #xFFFF))))
+    ;; Reject new clients once a shutdown is underway, before authentication,
+    ;; exactly as PostgreSQL's canAcceptConnections() does.
+    (unless (conns-allowed-p)
+      (ereport-fatal "57P03" "the database system is shutting down"))
     (let* ((params (parse-startup-params body))
            (app (or (cdr (assoc "application_name" params :test #'string=))
                     ""))
@@ -83,7 +87,7 @@
       (send-parameter-status stream "default_transaction_read_only" "off")
       (send-parameter-status stream "in_hot_standby" "off")
       (send-backend-key-data stream
-                             (incf *pid-counter*)
+                             (setf (backend-pid *backend*) (incf *pid-counter*))
                              (incf *secret-counter*))
       (send-ready-for-query stream #\I))))
 
@@ -128,18 +132,27 @@
         (otherwise (handle-unsupported-message stream message))))))
 
 (defun handle-connection (sock)
-  (let ((stream nil))
+  (let ((stream nil)
+        (backend nil)
+        (registered nil))
     (unwind-protect
          (handler-case
              (progn
                (setf stream (socket->stream sock))
                (let ((*backend* (make-backend :stream stream
-                                              :database "postgres")))
+                                              :database "postgres"
+                                              :thread sb-thread:*current-thread*))
+                     (*output-stream* stream))
+                 (setf backend *backend*)
                  ;; A dropped connection must not strand an open transaction.
                  (unwind-protect
                       (let ((body (read-startup-until-ready stream)))
                         (when body
                           (process-startup stream body)
+                          ;; From here on the backend is visible to
+                          ;; pg_cancel_backend()/pg_terminate_backend().
+                          (register-backend *backend*)
+                          (setf registered t)
                           (backend-loop stream)))
                    (end-backend-session))))
            (pg-error (e)
@@ -151,7 +164,12 @@
                  stream
                  (make-condition 'pg-error :sqlstate "XX000"
                                  :message (princ-to-string e)))))))
-      (close-connection sock stream))))
+      ;; Send the final error and close the socket *before* unregistering:
+      ;; during a fast shutdown the last backend's UNREGISTER-BACKEND exits
+      ;; the process, and the client must still receive its FATAL.
+      (close-connection sock stream)
+      (when registered
+        (unregister-backend backend)))))
 
 ;;; ---- server main ----
 
@@ -232,6 +250,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
     (xact-init)
     (catalog-init)
     (enable-reload)
+    (enable-shutdown-handlers)
     (start-control-plane :port control-port :socket-path control-socket)
     (format t "~&pg-lisp: minimal PostgreSQL-compatible server~%")
     (format t "pg-lisp: data directory ~a~%" *pgdata*)

@@ -43,6 +43,9 @@
        (:module "btree"
         :serial t
         :components ((:file "btree")))))
+     (:module "postmaster"
+      :serial t
+      :components ((:file "postmaster")))
      (:module "catalog"
       :serial t
       :components ((:file "catalog")

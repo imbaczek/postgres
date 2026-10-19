@@ -53,6 +53,7 @@
                       (pg-class-columns table)
                       *current-snapshot*
                       (lambda (tuple)
+                        (check-for-interrupts)
                         (let ((env (htup-values tuple)))
                           (when (or (null where) (true-p (eval-expr where env)))
                             (push (cons (map 'vector
