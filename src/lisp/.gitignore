@@ -1,0 +1,3 @@
+# Runtime PGDATA created by the launcher (default: ./pgdata)
+/pgdata/
+*.fasl

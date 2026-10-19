@@ -1,0 +1,33 @@
+-- t/psql-smoke.sql -- fixed acceptance script driven by t/psql-smoke.sh.
+
+create table smoke (id int, name varchar(20));
+insert into smoke values (3, 'c'), (1, 'a'), (2, 'b');
+select id, name from smoke where id >= 2 order by id;
+update smoke set name = 'bb' where id = 2;
+select name from smoke where id = 2;
+create unique index smoke_id on smoke (id);
+insert into smoke values (1, 'dup');
+delete from smoke where id = 3;
+select id from smoke order by id;
+begin;
+insert into smoke values (10, 'x');
+rollback;
+select id from smoke order by id;
+begin;
+insert into smoke values (20, 'y');
+commit;
+select id from smoke order by id;
+create table nn (a int not null);
+insert into nn values (null);
+create table vc (s varchar(3));
+insert into vc values ('abcd');
+select s from vc;
+alter table nn add primary key (a);
+insert into nn values (5);
+insert into nn values (5);
+select a from nn order by a;
+drop index smoke_id;
+drop table smoke;
+drop table nn;
+drop table vc;
+select 1 as ok;

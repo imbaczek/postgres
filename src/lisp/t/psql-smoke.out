@@ -1,0 +1,35 @@
+CREATE TABLE
+INSERT 0 3
+2|b
+3|c
+UPDATE 1
+bb
+CREATE INDEX
+ERROR:  duplicate key value violates unique constraint "smoke_id"
+DELETE 1
+1
+2
+BEGIN
+INSERT 0 1
+ROLLBACK
+1
+2
+BEGIN
+INSERT 0 1
+COMMIT
+1
+2
+20
+CREATE TABLE
+ERROR:  null value in column "a" violates not-null constraint
+CREATE TABLE
+ERROR:  value too long for type character varying(3)
+ALTER TABLE
+INSERT 0 1
+ERROR:  duplicate key value violates unique constraint "nn_pkey"
+5
+DROP INDEX
+DROP TABLE
+DROP TABLE
+DROP TABLE
+1
