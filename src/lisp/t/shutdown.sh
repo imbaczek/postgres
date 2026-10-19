@@ -18,6 +18,8 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-shutdown.XXXXXX")
 LOG="$TMP/server.log"
 SRV=
 STALLED=
+. "$BASE/t/test-support.sh"
+test_debug_setup shutdown "$PORT" "$TMP" "$LOG"
 
 cleanup() {
     close_fd7
@@ -32,7 +34,7 @@ cleanup() {
     fi
     rm -rf "$TMP"
 }
-trap cleanup EXIT INT TERM
+test_debug_install_traps cleanup
 
 fail() {
     echo "shutdown: FAIL $1" >&2
@@ -62,8 +64,7 @@ close_fds() { close_fd7; close_fd8; }
 start_server() {
     rm -rf "$TMP/data"
     : > "$LOG"
-    "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/data" > "$LOG" 2>&1 &
-    SRV=$!
+    test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
     i=0
     while [ "$i" -lt 150 ]; do
         if psqlq -c '' >/dev/null 2>&1; then

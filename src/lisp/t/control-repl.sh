@@ -13,17 +13,19 @@ CPORT=${CPORT:-5465}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-control.XXXXXX")
 SOCK="$TMP/control.sock"
 LOG="$TMP/server.log"
+SRV=
+. "$BASE/t/test-support.sh"
+test_debug_setup control-repl "$PORT" "$TMP" "$LOG"
 
 cleanup() {
     kill "$SRV" 2>/dev/null || true
     wait "$SRV" 2>/dev/null || true
     rm -rf "$TMP"
 }
-trap cleanup EXIT INT TERM
+test_debug_install_traps cleanup
 
-"$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/data" \
-    --control-port "$CPORT" --control-socket "$SOCK" > "$LOG" 2>&1 &
-SRV=$!
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" \
+    --control-port "$CPORT" --control-socket "$SOCK"
 
 i=0
 while [ "$i" -lt 150 ]; do

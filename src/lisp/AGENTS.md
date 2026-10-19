@@ -136,6 +136,22 @@ Remove the trace and its temporary helper after the demo:
 Each test boots its own throwaway server on its own port (5461–5470), so they are
 safe to run while a dev server is listening on 5433.
 
+For a live debugger when a server-backed test fails, set `DEBUG_ON_FAILURE=1`:
+
+```sh
+DEBUG_ON_FAILURE=1 ./t/index-stress.sh
+```
+
+The test opens Swank on `SQL port + 1000` (6462 for the example). If an
+assertion fails while the server is running, it prints the SQL port, Swank
+port, PGDATA, and log path, then waits for Enter before cleanup. Set
+`DEBUG_SWANK_PORT` to choose another Swank port. Run the test in a terminal or
+tmux pane so the pause can wait while you attach with `M-x slime-connect`. If
+the server has already exited, the test reports that there is no live listener
+and cleans up without pausing.
+The dedicated `t/swank.sh` test controls listener states itself and does not use
+this mode.
+
 ## Conventions
 
 - Match PostgreSQL's naming and directory shape; keep to the supported MVP

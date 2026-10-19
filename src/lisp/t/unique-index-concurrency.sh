@@ -12,6 +12,8 @@ BUILDER=
 DROPPER=
 STALE_INSERT=
 READER=
+. "$BASE/t/test-support.sh"
+test_debug_setup unique-index-concurrency "$PORT" "$TMP" "$LOG"
 
 cleanup() {
     [ -z "$BUILDER" ] || kill "$BUILDER" 2>/dev/null || true
@@ -28,10 +30,9 @@ cleanup() {
     [ -z "$SRV" ] || wait "$SRV" 2>/dev/null || true
     rm -rf "$TMP"
 }
-trap cleanup EXIT INT TERM
+test_debug_install_traps cleanup
 
-"$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/data" > "$LOG" 2>&1 &
-SRV=$!
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
 
 i=0
 while [ "$i" -lt 150 ]; do

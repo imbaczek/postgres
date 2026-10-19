@@ -208,6 +208,15 @@ the case where equal index keys straddle many leaf splits.
 wait for active writers, and that `DROP TABLE` serializes with builds, readers,
 and writers.
 
+For live debugging, server-backed tests accept `DEBUG_ON_FAILURE=1`. The test
+starts Swank on `SQL port + 1000`; if an assertion fails while the server is
+running, it prints the SQL and Swank ports, PGDATA, and log path, then waits for
+Enter before cleaning up. Set `DEBUG_SWANK_PORT` to choose a different Swank
+port, and run the test in a terminal or tmux pane to attach with
+`M-x slime-connect`. If the server has already exited, the test reports that
+there is no live listener and cleans up without pausing. The dedicated
+`t/swank.sh` listener test controls its own listener states.
+
 ## Compilation and formatting
 
 `./t/compile.sh` force-compiles the `pg` ASDF system and fails on compiler

@@ -12,6 +12,9 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-reload.XXXXXX")
 SRC="$BASE/include/pg-protocol.lisp"
 BAK="$TMP/pg-protocol.lisp.bak"
 LOG="$TMP/server.log"
+SRV=
+. "$BASE/t/test-support.sh"
+test_debug_setup hot-reload "$PORT" "$TMP" "$LOG"
 
 cp "$SRC" "$BAK"
 restore() {
@@ -20,10 +23,9 @@ restore() {
     wait "$SRV" 2>/dev/null || true
     rm -rf "$TMP"
 }
-trap restore EXIT INT TERM
+test_debug_install_traps restore
 
-"$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/data" > "$LOG" 2>&1 &
-SRV=$!
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
 
 i=0
 while [ "$i" -lt 150 ]; do

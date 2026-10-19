@@ -11,17 +11,19 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-smoke.XXXXXX")
 LOG="$TMP/server.log"
 OUT="$TMP/out"
 GOLDEN="$BASE/t/psql-smoke.out"
+SRV=
+. "$BASE/t/test-support.sh"
+test_debug_setup psql-smoke "$PORT" "$TMP" "$LOG"
 
 cleanup() {
     kill "$SRV" 2>/dev/null || true
     wait "$SRV" 2>/dev/null || true
     rm -rf "$TMP"
 }
-trap cleanup EXIT INT TERM
+test_debug_install_traps cleanup
 
 start_server() {
-    "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/data" >> "$LOG" 2>&1 &
-    SRV=$!
+    test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
 
     i=0
     while [ "$i" -lt 150 ]; do
