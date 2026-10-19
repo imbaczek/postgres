@@ -67,10 +67,11 @@ given, and the Unix socket is `chmod`ed to `0700`.
 ./t/index-stress.sh     # repeated same-key updates (slow)
 ./t/hot-reload.sh       # SIGHUP reloads a running server
 ./t/control-repl.sh     # control REPL over TCP + Unix socket, reload, SQL intact
+./t/swank.sh            # Swank preload, bind options, invalid/occupied ports
 ./t/shutdown.sh         # signals, shutdown modes, cancel/terminate admin functions
 ```
 
-Each test boots its own throwaway server on its own port (5461–5467), so they are
+Each test boots its own throwaway server on its own port (5461–5470), so they are
 safe to run while a dev server is listening on 5433.
 
 ## Conventions

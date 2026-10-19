@@ -4,9 +4,12 @@
 (require :asdf)
 
 (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
-  (pushnew here asdf:*central-registry* :test #'equal))
+  (pushnew here asdf:*central-registry* :test #'equal)
+  (pushnew (merge-pathnames "vendor/swank/" here)
+           asdf:*central-registry* :test #'equal))
 
 (asdf:load-system "pg")
+(asdf:load-system "pg-swank")
 
 (handler-case
     (pg:main)

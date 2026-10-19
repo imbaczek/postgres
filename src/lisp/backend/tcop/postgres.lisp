@@ -186,12 +186,20 @@
       (error "option ~a expects a port in 1..65535, got ~s" arg value))
     n))
 
+(defun parse-bind-address-arg (arg value)
+  "Parse a non-empty listener address for option ARG."
+  (unless (and (stringp value) (plusp (length value)))
+    (error "option ~a expects a non-empty bind address" arg))
+  value)
+
 (defun parse-args (argv)
   (let ((port 5433)
         (host "127.0.0.1")
         (pgdata nil)
         (control-port nil)
-        (control-socket nil))
+        (control-socket nil)
+        (swank-port nil)
+        (swank-bind-address "127.0.0.1"))
     (loop for rest on argv
           for arg = (car rest)
           do (cond
@@ -212,9 +220,22 @@
                ((string= arg "--control-socket")
                 (setf control-socket (arg-value rest arg)))
                ((and (> (length arg) 17) (string= arg "--control-socket=" :end1 17))
-                (setf control-socket (subseq arg 17)))))
+                (setf control-socket (subseq arg 17)))
+               ((string= arg "--swank-port")
+                (setf swank-port (parse-port-arg arg (arg-value rest arg))))
+               ((and (>= (length arg) 13) (string= arg "--swank-port=" :end1 13))
+                (setf swank-port (parse-port-arg "--swank-port" (subseq arg 13))))
+               ((string= arg "--swank-bind-address")
+                (setf swank-bind-address
+                      (parse-bind-address-arg
+                       arg (arg-value rest arg))))
+               ((and (>= (length arg) 21)
+                     (string= arg "--swank-bind-address=" :end1 21))
+                (setf swank-bind-address
+                      (parse-bind-address-arg
+                       "--swank-bind-address" (subseq arg 21))))))
     (values host port (or pgdata (sb-ext:posix-getenv "PGDATA") "./pgdata")
-            control-port control-socket)))
+            control-port control-socket swank-port swank-bind-address)))
 
 (defun directory-pathname (path)
   "Return PATH as an absolute directory pathname (trailing slash).
@@ -273,7 +294,8 @@ CL's RENAME-FILE merges a relative target with the source's directory."
 ;;; ---- hot reload (SIGHUP) and control REPL live in tcop/control.lisp ----
 
 (defun main ()
-  (multiple-value-bind (host port pgdata control-port control-socket)
+  (multiple-value-bind (host port pgdata control-port control-socket
+                        swank-port swank-bind-address)
       (parse-args (cdr sb-ext:*posix-argv*))
     (setf *pgdata* (directory-pathname pgdata))
     (capture-server-streams)
@@ -281,6 +303,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
     (catalog-init)
     (enable-reload)
     (enable-shutdown-handlers)
+    (start-swank-listener swank-port swank-bind-address)
     (start-control-plane :port control-port :socket-path control-socket)
     (format t "~&pg-lisp: minimal PostgreSQL-compatible server~%")
     (format t "pg-lisp: data directory ~a~%" *pgdata*)

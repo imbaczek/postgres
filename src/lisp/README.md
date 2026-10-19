@@ -33,6 +33,11 @@ Options: `-p PORT` (default 5433), `-h HOST` (default 127.0.0.1), `-D PGDATA`
 (default `./pgdata`). PGDATA is created on first boot with `PG_VERSION`,
 `global/`, `base/`, `pg_xact`, and `pg_catalog.dat`. Ports are validated at
 startup (1..65535) and a missing option value is a clean error, not a crash.
+`--swank-port PORT` optionally opens the Swank listener on `127.0.0.1`; the
+Swank code is loaded in the image by default, but the listener stays off unless
+this option is supplied. `--swank-bind-address ADDR` selects another interface
+when `--swank-port` is also set; its default is `127.0.0.1`, and the address
+option by itself never starts a listener.
 
 Authentication and authorization are accepted and ignored: any user/database is
 trusted, and `postgres` is always the effective role. Only the simple query
@@ -186,6 +191,7 @@ cd src/lisp
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
 ./t/hot-reload.sh         # SIGHUP reloads code in a running server
 ./t/control-repl.sh       # control REPL over TCP + Unix socket, reload, SQL intact
+./t/swank.sh              # Swank preload, bind options, invalid/occupied ports
 ./t/shutdown.sh           # signals, shutdown modes, cancel/terminate admin functions
 ```
 
@@ -233,16 +239,19 @@ It only adjusts indentation; it does not reflow long lines. The inferior Lisp
 defaults to the sibling `../sbcl/run-sbcl.sh`; select another launcher with
 `--lisp /path/to/launcher` or `PG_LISP_INFERIOR=/path/to/launcher`.
 
-Format all Common Lisp sources, including `pg.asd`, from the repository root:
+Format project Common Lisp sources, including `pg.asd`, from the repository
+root. The pinned Swank sources keep their upstream formatting:
 
 ```sh
 git ls-files -z -- 'src/lisp/*.lisp' 'src/lisp/**/*.lisp' \
-  'src/lisp/*.asd' 'src/lisp/**/*.asd' |
+  'src/lisp/*.asd' 'src/lisp/**/*.asd' \
+  ':(exclude)src/lisp/vendor/swank/**' |
   xargs -0 src/lisp/t/format.sh
 ```
 
-The tracked pre-commit hook checks the staged versions of changed `.lisp` and
-`.asd` files. Enable it in this clone from the repository root with:
+The tracked pre-commit hook checks staged project `.lisp` and `.asd` files; it
+skips the pinned Swank source to preserve upstream formatting. Enable it in
+this clone from the repository root with:
 
 ```sh
 git config core.hooksPath .githooks
@@ -251,6 +260,31 @@ git config core.hooksPath .githooks
 The hook requires the same Emacs, SLIME, and inferior Lisp setup as the batch
 formatter. It reports files that need formatting; run the formatter and stage
 those files before committing.
+
+## SLIME debugging
+
+The launcher loads the vendored Swank server from SLIME v2.32 into the Lisp
+image on every start, without opening a network port. Enable the listener
+explicitly when you want to debug the running server:
+
+```sh
+./pg-lisp.sh -p 5439 -D /tmp/pgdata --swank-port 4005
+```
+
+Connect from Emacs with the matching SLIME v2.32 frontend using
+`M-x slime-connect`, host `127.0.0.1`, and port `4005`. By default the listener
+binds to `127.0.0.1`, even when the SQL server is exposed on another address
+with `-h`. For remote debugging, keep that loopback binding and use an SSH local
+forward, for example `ssh -L 4005:127.0.0.1:4005 db-host`; connect Emacs to
+`127.0.0.1:4005`.
+
+To bind another interface directly, pass `--swank-bind-address ADDR` with
+`--swank-port` (use `0.0.0.0` to listen on all IPv4 interfaces). Direct Swank
+connections can evaluate Lisp in the server process and use unencrypted TCP, so
+expose them only on a trusted, access-controlled network. See the [SLIME manual
+on setting up the Lisp image](https://slime.common-lisp.dev/doc/html/Setting-up-the-lisp-image.html)
+for its SSH tunnelling guidance. The pinned server source and commit are
+recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
 
 ## Storage and concurrency
 

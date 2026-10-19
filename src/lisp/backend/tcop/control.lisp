@@ -213,3 +213,26 @@ Both are optional; with neither, no control plane is started."
        (lambda () (control-accept-loop listener "control unix"))
        :name "pg control unix")))
   (values))
+
+(defun start-swank-listener (port bind-address)
+  "Start the optional Swank listener on BIND-ADDRESS and PORT."
+  (when port
+    (let* ((package (find-package "SWANK"))
+           (create-server (and package (find-symbol "CREATE-SERVER" package)))
+           (global-debugger (and package (find-symbol "*GLOBAL-DEBUGGER*" package))))
+      (unless (and create-server (fboundp create-server))
+        (error "pinned Swank system is not loaded"))
+      ;; A Swank connection can still debug its own requests, but must not
+      ;; redirect unhandled errors from SQL or control threads to Emacs.
+      (when global-debugger
+        (set global-debugger nil))
+      (handler-case
+          (funcall create-server :port port
+                                 :interface bind-address
+                                 :style :spawn
+                                 :dont-close t)
+        (error (e)
+          (error "cannot start Swank on ~a:~a: ~a" bind-address port e)))
+      (format t "~&pg-lisp: Swank listening on ~a:~a~%" bind-address port)
+      (finish-output)))
+  (values))

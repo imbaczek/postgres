@@ -4,11 +4,20 @@ set -euo pipefail
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
-mapfile -d '' staged_files < <(
+mapfile -d '' candidate_files < <(
     git diff --cached --name-only -z --diff-filter=ACMR -- \
         'src/lisp/*.lisp' 'src/lisp/**/*.lisp' \
         'src/lisp/*.asd' 'src/lisp/**/*.asd'
 )
+
+staged_files=()
+for staged_path in "${candidate_files[@]}"; do
+    # Keep the pinned upstream Swank source at its original formatting.
+    case "$staged_path" in
+        src/lisp/vendor/swank/*) continue ;;
+    esac
+    staged_files+=("$staged_path")
+done
 
 if ((${#staged_files[@]} == 0)); then
     exit 0

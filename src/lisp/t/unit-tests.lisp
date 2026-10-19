@@ -33,6 +33,44 @@
       (check (= (page-add-item p item :allow-reuse t) 1)
              "dead slot is reused when ALLOW-REUSE"))))
 
+(defun test-swank-arguments ()
+  (multiple-value-bind (host port pgdata control-port control-socket
+                        swank-port swank-bind-address)
+      (parse-args '("--swank-port=4512" "--swank-bind-address=0.0.0.0"))
+    (declare (ignore pgdata control-port control-socket))
+    (check (string= host "127.0.0.1") "default SQL host is unchanged")
+    (check (= port 5433) "default SQL port is unchanged")
+    (check (= swank-port 4512) "Swank port accepts --option=value")
+    (check (string= swank-bind-address "0.0.0.0")
+           "Swank bind address accepts --option=value"))
+  (multiple-value-bind (host port pgdata control-port control-socket
+                        swank-port swank-bind-address)
+      (parse-args '("--swank-bind-address" "0.0.0.0"))
+    (declare (ignore host port pgdata control-port control-socket))
+    (check (null swank-port) "Swank bind address alone does not enable listener")
+    (check (string= swank-bind-address "0.0.0.0")
+           "Swank bind address is preserved without a listener"))
+  (check (handler-case
+             (progn (parse-args '("--swank-port=")) nil)
+           (error () t))
+         "empty Swank port is rejected")
+  (check (handler-case
+             (progn (parse-args '("--swank-port")) nil)
+           (error () t))
+         "missing Swank port is rejected")
+  (check (handler-case
+             (progn (parse-args '("--swank-port" "65536")) nil)
+           (error () t))
+         "out-of-range Swank port is rejected")
+  (check (handler-case
+             (progn (parse-args '("--swank-bind-address=")) nil)
+           (error () t))
+         "empty Swank bind address is rejected")
+  (check (handler-case
+             (progn (parse-args '("--swank-bind-address")) nil)
+           (error () t))
+         "missing Swank bind address is rejected"))
+
 (defun test-live-page-items-stop ()
   (let ((page (page-init (make-page)))
         (page-evaluations 0)
@@ -345,6 +383,7 @@
     (let ((*pgdata* dir)
           (*backend* (make-backend)))
       (clog-init)
+      (test-swank-arguments)
       (test-page-roundtrip)
       (test-live-page-items-stop)
       (test-page-compaction)
