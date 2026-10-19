@@ -33,6 +33,28 @@
       (check (= (page-add-item p item :allow-reuse t) 1)
              "dead slot is reused when ALLOW-REUSE"))))
 
+(defun test-live-page-items-stop ()
+  (let ((page (page-init (make-page)))
+        (page-evaluations 0)
+        (seen '()))
+    (dotimes (i 3)
+      (page-add-item page (make-array 8 :element-type '(unsigned-byte 8)
+                                        :initial-element i)))
+    (page-mark-dead page 2)
+    (do-live-page-items ((progn (incf page-evaluations) page) offnum off len)
+      (check (and (plusp off) (plusp len)) "live page item has storage")
+      (push offnum seen))
+    (check (equal (nreverse seen) '(1 3))
+           "live page iteration skips dead slots")
+    (check (= page-evaluations 1) "live page iterator evaluates PAGE once")
+    (flet ((first-live-item ()
+             (do-live-page-items (page offnum off len)
+               (when (and (plusp off) (plusp len))
+                 (return-from first-live-item offnum)))
+             nil))
+      (check (equal (first-live-item) 1)
+             "live page iteration preserves nonlocal early return"))))
+
 (defun test-page-compaction ()
   (let ((p (page-init (make-page))))
     (dotimes (i 64)
@@ -103,16 +125,116 @@
                              :table-oid 41 :columns '(1) :unique-p t
                              :constraint-p t
                              :nulls-not-distinct-p t))
-         (copy (index-from-sexp (index-to-sexp idx))))
+         (sexp (index-to-sexp idx))
+         (copy (index-from-sexp sexp)))
+    (check (equal sexp
+                  '(:oid 42 :name "nnd" :relfilenode 42 :table-oid 41
+                    :columns (1) :unique t :primary nil :constraint t
+                    :nulls-not-distinct t))
+           "index catalog encoding is the compatible flat plist")
     (check (pg-index-nulls-not-distinct-p copy)
            "NULLS NOT DISTINCT survives catalog serialization")
     (check (pg-index-constraint-p copy)
            "constraint ownership survives catalog serialization"))
+  (let* ((class (make-pg-class
+                 :oid 50 :name "codec" :relfilenode 51
+                 :columns (vector (make-pg-column :name "value" :type :int4
+                                                  :typmod -1 :attnum 1
+                                                  :notnull t))
+                 :indexes '(52)))
+         (sexp (class-to-sexp class))
+         (copy (class-from-sexp sexp)))
+    (check (equal sexp
+                  '(:oid 50 :name "codec" :relfilenode 51
+                    :columns ((:name "value" :type :int4 :typmod -1
+                               :attnum 1 :notnull t))
+                    :indexes (52)))
+           "class and column codecs use compatible flat plists")
+    (check (vectorp (pg-class-columns copy))
+           "class codec restores columns as a vector")
+    (check (string= (pg-column-name (aref (pg-class-columns copy) 0)) "value")
+           "class codec round-trips column mappings"))
   (let ((legacy-pk (index-from-sexp '(:primary t))))
     (check (not (pg-index-constraint-p legacy-pk))
            "legacy catalog has no constraint ownership flag")
     (check (pg-index-constraint-owned-p legacy-pk)
            "legacy primary index remains constraint-owned")))
+
+(defun test-sql-strict-let-evaluation ()
+  (let ((evaluations '()))
+    (check (eq +null+
+               (sql-strict-let ((left (progn (push :left evaluations) +null+))
+                                (right (progn (push :right evaluations) 7)))
+                 :body-must-not-run))
+           "strict let returns NULL when any binding is NULL")
+    (check (equal (nreverse evaluations) '(:left :right))
+           "strict let evaluates every binding once before NULL check"))
+  (let ((evaluations 0))
+    (check (= 9
+              (sql-strict-let ((left (progn (incf evaluations) 4))
+                               (right (progn (incf evaluations) 5)))
+                (+ left right)))
+           "strict let returns body result for non-NULL bindings")
+    (check (= evaluations 2) "strict let bindings run once each")))
+
+(defun test-error-cleanup-and-fatal-rethrow ()
+  (let* ((fatal (make-condition 'pg-error :severity "FATAL"
+                                          :sqlstate "XX000" :message "test fatal"))
+         (cleanup-count 0)
+         (caught nil))
+    (handler-case
+        (with-error-cleanup (condition (incf cleanup-count))
+          (error fatal))
+      (pg-error (condition)
+        (setf caught condition)))
+    (check (= cleanup-count 1) "error cleanup runs before rethrow")
+    (check (eq caught fatal) "error cleanup re-signals the original condition"))
+  (let* ((fatal (make-condition 'pg-error :severity "FATAL"
+                                          :sqlstate "XX000" :message "test fatal"))
+         (handler-ran nil)
+         (caught nil))
+    (handler-case
+        (handler-case-nonfatal
+         (error fatal)
+         (condition
+          (setf handler-ran (typep condition 'error))))
+      (pg-error (condition)
+        (setf caught condition)))
+    (check (not handler-ran) "nonfatal handler skips FATAL errors")
+    (check (eq caught fatal) "nonfatal handler re-signals the original FATAL"))
+  (check (eq :handled
+             (handler-case-nonfatal
+              (error "test nonfatal")
+              (condition
+               (if (typep condition 'error) :handled :unexpected))))
+         "nonfatal handler handles ordinary errors"))
+
+(defun test-create-table-cleanup-after-fsync-error ()
+  (let* ((*catalog* (make-catalog))
+         (*backend* (make-backend))
+         (db (make-database :name "postgres" :oid 1))
+         (original-fsync-index (symbol-function 'fsync-index))
+         (caught nil))
+    (setf (backend-database *backend*) "postgres"
+          (gethash "postgres" (catalog-databases *catalog*)) db)
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'fsync-index)
+                 (lambda (index)
+                   (declare (ignore index))
+                   (error "injected final index fsync failure")))
+           (handler-case
+               (exec-create-table
+                nil
+                '(:name "cleanup_test"
+                  :columns ((:name "value" :type :int4 :typmod -1 :unique t))))
+             (error (condition)
+               (setf caught condition)))
+           (check (typep caught 'error)
+                  "CREATE TABLE re-signals final index fsync failure")
+           (check (null (gethash "cleanup_test" (database-tables db)))
+                  "CREATE TABLE cleanup removes table after final fsync failure"))
+      (setf (symbol-function 'fsync-index) original-fsync-index))))
 
 (defun test-relation-build-own-xid ()
   (let ((relfilenode 987653)
@@ -224,10 +346,14 @@
           (*backend* (make-backend)))
       (clog-init)
       (test-page-roundtrip)
+      (test-live-page-items-stop)
       (test-page-compaction)
       (test-tuple-roundtrip)
       (test-key-order)
       (test-index-catalog-roundtrip)
+      (test-sql-strict-let-evaluation)
+      (test-error-cleanup-and-fatal-rethrow)
+      (test-create-table-cleanup-after-fsync-error)
       (test-relation-build-own-xid)
       (test-visibility)
       (test-btree-duplicate-keys)

@@ -67,14 +67,14 @@
     (cons key child)))
 
 (defun btree-page-entries (page internal-p)
-  (loop for i from 1 to (page-lp-count page)
-        for raw = (multiple-value-bind (off flags len) (page-get-lp page i)
-                    (when (= flags +lp-normal+)
-                      (subseq page off (+ off len))))
-        when raw
-          collect (if internal-p
-                      (decode-internal-entry raw)
-                      (decode-leaf-entry raw))))
+  (let ((entries '()))
+    (do-live-page-items (page offnum off len)
+      (let ((raw (subseq page off (+ off len))))
+        (push (if internal-p
+                  (decode-internal-entry raw)
+                  (decode-leaf-entry raw))
+              entries)))
+    (nreverse entries)))
 
 (defun btree-page-build (entries internal-p)
   (let ((page (make-page)))

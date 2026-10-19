@@ -22,6 +22,14 @@
   (and (typep condition 'pg-error)
        (string= (pg-error-severity condition) "FATAL")))
 
+(defmacro handler-case-nonfatal (form (condition &body handler-body))
+  "Handle ERROR from FORM, re-signaling fatal PG errors before HANDLER-BODY."
+  `(handler-case ,form
+     (error (,condition)
+       (if (fatal-error-p ,condition)
+           (error ,condition)
+           (progn ,@handler-body)))))
+
 (defun make-pg-error (severity sqlstate control-string args)
   "Build, but do not signal, a PG-ERROR.
 

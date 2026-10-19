@@ -75,6 +75,23 @@
             (logand (ash v -15) #x3)
             (logand (ash v -17) #x3FFF))))
 
+(defmacro do-live-page-items ((page offnum off len) &body body)
+  "Run BODY for each normal line pointer on PAGE.
+
+PAGE and its line-pointer count are each evaluated once. OFFNUM, OFF, and LEN
+are bound for each live item; dead and unused slots are skipped."
+  (let ((page-value (gensym "PAGE-"))
+        (line-pointer-count (gensym "LINE-POINTER-COUNT-"))
+        (flags (gensym "FLAGS-")))
+    `(let* ((,page-value ,page)
+            (,line-pointer-count (page-lp-count ,page-value)))
+       (loop for ,offnum from 1 to ,line-pointer-count
+             do (multiple-value-bind (,off ,flags ,len)
+                    (page-get-lp ,page-value ,offnum)
+                  (declare (ignorable ,len))
+                  (when (= ,flags +lp-normal+)
+                    ,@body))))))
+
 (defun page-set-lp (page offnum off flags len)
   (page-set-u32 page (+ +size-of-page-header+
                         (* (1- offnum) +size-of-item-id+))

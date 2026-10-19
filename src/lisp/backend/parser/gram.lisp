@@ -22,45 +22,37 @@
                              (token-value tok))))
              :position (1+ (token-pos tok)))))
 
-(defun kw-p (p keyword)
-  (and (eq (pkind p) :ident)
-       (string= (pval p) keyword)))
+(defmacro define-token-matchers (kind predicate matcher expecter value
+                                 &key normalize)
+  "Define PREDICATE, MATCHER, and EXPECTER for one parser token kind."
+  `(progn
+     (defun ,predicate (p ,value)
+       (and (eq (pkind p) ,kind)
+            (string= (pval p)
+                     ,(if normalize `(,normalize ,value) value))))
+     (defun ,matcher (p ,value)
+       (when (,predicate p ,value)
+         (pnext p)
+         t))
+     (defun ,expecter (p ,value)
+       (unless (,matcher p ,value)
+         (syntax-error p (format nil "expected \"~a\"" ,value)))
+       t)))
 
-(defun match-kw (p keyword)
-  (when (kw-p p keyword)
-    (pnext p)
-    t))
+(define-token-matchers :ident kw-p match-kw expect-kw keyword)
+(define-token-matchers :punct punct-p match-punct expect-punct ch
+  :normalize string)
+(define-token-matchers :op op-p match-op expect-op op)
 
-(defun expect-kw (p keyword)
-  (unless (match-kw p keyword)
-    (syntax-error p (format nil "expected \"~a\"" keyword)))
-  t)
-
-(defun punct-p (p ch)
-  (and (eq (pkind p) :punct) (string= (pval p) (string ch))))
-
-(defun match-punct (p ch)
-  (when (punct-p p ch)
-    (pnext p)
-    t))
-
-(defun expect-punct (p ch)
-  (unless (match-punct p ch)
-    (syntax-error p (format nil "expected \"~a\"" ch)))
-  t)
-
-(defun op-p (p op)
-  (and (eq (pkind p) :op) (string= (pval p) op)))
-
-(defun match-op (p op)
-  (when (op-p p op)
-    (pnext p)
-    t))
-
-(defun expect-op (p op)
-  (unless (match-op p op)
-    (syntax-error p (format nil "expected \"~a\"" op)))
-  t)
+(defmacro with-parens ((parser &key opening-consumed) &body body)
+  "Evaluate BODY between required parentheses and return all its values."
+  (let ((parser-value (gensym "PARSER-")))
+    `(let ((,parser-value ,parser))
+       ,@(unless opening-consumed
+           `((expect-punct ,parser-value #\()) )
+       (multiple-value-prog1
+           (progn ,@body)
+         (expect-punct ,parser-value #\))))))
 
 (defun pident (p)
   (if (eq (pkind p) :ident)
@@ -203,18 +195,17 @@
   (let ((table (strip-schema (pident p)))
         (columns nil))
     (when (match-punct p #\()
-      (setf columns (parse-ident-list p))
-      (expect-punct p #\)))
+      (setf columns
+            (with-parens (p :opening-consumed t)
+              (parse-ident-list p))))
     (expect-kw p "values")
     (let ((rows (loop collect (parse-values-row p)
                       while (match-punct p #\,))))
       (list :type :insert :table table :columns columns :rows rows))))
 
 (defun parse-values-row (p)
-  (expect-punct p #\()
-  (let ((row (parse-expr-list p)))
-    (expect-punct p #\))
-    row))
+  (with-parens (p)
+    (parse-expr-list p)))
 
 (defun parse-ident-list (p)
   (loop collect (pident p) while (match-punct p #\,)))
@@ -332,8 +323,8 @@
 
 (defun parse-varchar-typmod (p)
   (let ((n (if (match-punct p #\()
-               (prog1 (parse-integer-literal p)
-                 (expect-punct p #\)))
+               (with-parens (p :opening-consumed t)
+                 (parse-integer-literal p))
                126)))
     (when (> n 126)
       (ereport "0A000" "varchar length greater than 126 is not supported"))
@@ -356,17 +347,13 @@
     (cond
       ((match-kw p "primary")
        (expect-kw p "key")
-       (expect-punct p #\()
-       (let ((cols (parse-ident-list p)))
-         (expect-punct p #\))
-         (list :kind :primary :name cname :columns cols)))
+       (list :kind :primary :name cname
+             :columns (with-parens (p) (parse-ident-list p))))
       ((match-kw p "unique")
        (let ((nulls-not-distinct (parse-unique-null-treatment p)))
-         (expect-punct p #\()
-         (let ((cols (parse-ident-list p)))
-           (expect-punct p #\))
-           (list :kind :unique :name cname :columns cols
-                 :nulls-not-distinct nulls-not-distinct))))
+         (list :kind :unique :name cname
+               :columns (with-parens (p) (parse-ident-list p))
+               :nulls-not-distinct nulls-not-distinct)))
       (t
        (ereport "0A000" "unsupported table constraint")))))
 
@@ -490,12 +477,9 @@
                 (list :action :add-primary-key
                       :using-index (strip-schema (pident p))
                       :constraint-name cname))
-              (progn
-                (expect-punct p #\()
-                (let ((cols (parse-ident-list p)))
-                  (expect-punct p #\))
-                  (list :action :add-primary-key :columns cols
-                        :constraint-name cname)))))
+              (list :action :add-primary-key
+                    :columns (with-parens (p) (parse-ident-list p))
+                    :constraint-name cname)))
          ((match-kw p "unique")
           (multiple-value-bind (nulls-not-distinct null-treatment-specified)
               (parse-unique-null-treatment p)
@@ -508,13 +492,10 @@
                         :using-index (strip-schema (pident p))
                         :constraint-name cname
                         :nulls-not-distinct nulls-not-distinct))
-                (progn
-                  (expect-punct p #\()
-                  (let ((cols (parse-ident-list p)))
-                    (expect-punct p #\))
-                    (list :action :add-unique :columns cols
-                          :constraint-name cname
-                          :nulls-not-distinct nulls-not-distinct))))))
+                (list :action :add-unique
+                      :columns (with-parens (p) (parse-ident-list p))
+                      :constraint-name cname
+                      :nulls-not-distinct nulls-not-distinct))))
          (t
           (ereport "0A000" "unsupported ALTER TABLE action")))))
     (t
@@ -664,9 +645,8 @@
     ((eq (pkind p) :string)
      (list :const (token-value (pnext p))))
     ((match-punct p #\()
-     (let ((e (parse-expr p)))
-       (expect-punct p #\))
-       e))
+     (with-parens (p :opening-consumed t)
+       (parse-expr p)))
     ((match-kw p "null") (list :const +null+))
     ((match-kw p "true") (list :bool t))
     ((match-kw p "false") (list :bool nil))
@@ -679,8 +659,8 @@
          ((match-punct p #\()
           (let ((args (if (match-punct p #\))
                           '()
-                          (prog1 (parse-expr-list p)
-                            (expect-punct p #\))))))
+                          (with-parens (p :opening-consumed t)
+                            (parse-expr-list p)))))
             (list :func name args)))
          ((member name '("current_user" "session_user" "user"
                          "current_database" "current_schema" "current_catalog")

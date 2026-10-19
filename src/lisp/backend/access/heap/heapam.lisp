@@ -244,17 +244,13 @@ Return the number of tuples pruned."
   (let ((page (buf-read relfilenode block)))
     (unless page
       (return-from heapam-prune-page 0))
-    (let ((pruned 0)
-          (n (page-lp-count page)))
-      (loop for i from 1 to n
-            do (multiple-value-bind (off flags len) (page-get-lp page i)
-                 (declare (ignore len))
-                 (when (= flags +lp-normal+)
-                   (let* ((xmin (page-u32 page off))
-                          (xmax (page-u32 page (+ off 4))))
-                     (when (tuple-prunable-p xmin xmax)
-                       (page-mark-dead page i)
-                       (incf pruned))))))
+    (let ((pruned 0))
+      (do-live-page-items (page i off len)
+        (let* ((xmin (page-u32 page off))
+               (xmax (page-u32 page (+ off 4))))
+          (when (tuple-prunable-p xmin xmax)
+            (page-mark-dead page i)
+            (incf pruned))))
       (when (plusp pruned)
         (page-compact page)
         (buf-write relfilenode block page)
@@ -269,23 +265,19 @@ Return the number of tuples pruned."
                         (and *backend* (backend-xid *backend*))))
 
 (defun heapam-scan-page (page block columns snapshot callback)
-  (let ((n (page-lp-count page)))
-    (dotimes (i n)
-      (let ((offnum (1+ i)))
-        (multiple-value-bind (off flags len) (page-get-lp page offnum)
-          (when (= flags +lp-normal+)
-            (let ((bytes (subseq page off (+ off len))))
-              (multiple-value-bind (values xmin xmax cid infomask)
-                  (deform-heap-tuple bytes columns)
-                (when (heap-tuple-visible-p
-                       xmin xmax cid snapshot
-                       (and *backend* (backend-xid *backend*)))
-                  (let ((tuple (make-htup :block block :offnum offnum
-                                          :xmin xmin :xmax xmax
-                                          :cid cid :infomask infomask
-                                          :values values)))
-                    (when (eq (funcall callback tuple) :stop)
-                      (return-from heapam-scan-page :stop))))))))))))
+  (do-live-page-items (page offnum off len)
+    (let ((bytes (subseq page off (+ off len))))
+      (multiple-value-bind (values xmin xmax cid infomask)
+          (deform-heap-tuple bytes columns)
+        (when (heap-tuple-visible-p
+               xmin xmax cid snapshot
+               (and *backend* (backend-xid *backend*)))
+          (let ((tuple (make-htup :block block :offnum offnum
+                                  :xmin xmin :xmax xmax
+                                  :cid cid :infomask infomask
+                                  :values values)))
+            (when (eq (funcall callback tuple) :stop)
+              (return-from heapam-scan-page :stop))))))))
 
 (defun heapam-scan (relfilenode columns snapshot callback)
   "Call CALLBACK with each visible HTUP. CALLBACK may return :stop."

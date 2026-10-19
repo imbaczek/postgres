@@ -2,6 +2,15 @@
 
 (in-package #:pg)
 
+(defmacro sql-strict-let (bindings &body body)
+  "Evaluate all BINDINGS once, returning SQL NULL if any value is NULL."
+  `(let* ,bindings
+     (if (or ,@(mapcar (lambda (binding)
+                         `(eq ,(first binding) +null+))
+                       bindings))
+         +null+
+         (progn ,@body))))
+
 (defun type-oid (type)
   (case type
     (:int4 +int4oid+)
@@ -207,38 +216,35 @@ exist\" messages."
               (type-of a) (type-of b)))))
 
 (defun sql-compare (op a b)
-  (if (or (eq a +null+) (eq b +null+))
-      +null+
-      (let ((c (compare-3way a b)))
-        (cond
-          ((string= op "=") (zerop c))
-          ((string= op "<>") (not (zerop c)))
-          ((string= op "<") (minusp c))
-          ((string= op "<=") (not (plusp c)))
-          ((string= op ">") (plusp c))
-          ((string= op ">=") (not (minusp c)))
-          (t (ereport "XX000" "bad comparison operator ~a" op))))))
+  (sql-strict-let ((left a) (right b))
+    (let ((c (compare-3way left right)))
+      (cond
+        ((string= op "=") (zerop c))
+        ((string= op "<>") (not (zerop c)))
+        ((string= op "<") (minusp c))
+        ((string= op "<=") (not (plusp c)))
+        ((string= op ">") (plusp c))
+        ((string= op ">=") (not (minusp c)))
+        (t (ereport "XX000" "bad comparison operator ~a" op))))))
 
 (defun sql-arith (op a b)
-  (if (or (eq a +null+) (eq b +null+))
-      +null+
-      (progn
-        (unless (and (integerp a) (integerp b))
-          (ereport "42883" "operator does not exist: ~a ~a ~a"
-                   (type-of a) op (type-of b)))
-        (cond
-          ((string= op "+") (+ a b))
-          ((string= op "-") (- a b))
-          ((string= op "*") (* a b))
-          ((string= op "/")
-           (when (zerop b)
-             (ereport "22012" "division by zero"))
-           (truncate a b))
-          ((string= op "%")
-           (when (zerop b)
-             (ereport "22012" "division by zero"))
-           (mod a b))
-          (t (ereport "XX000" "bad arithmetic operator ~a" op))))))
+  (sql-strict-let ((left a) (right b))
+    (unless (and (integerp left) (integerp right))
+      (ereport "42883" "operator does not exist: ~a ~a ~a"
+               (type-of left) op (type-of right)))
+    (cond
+      ((string= op "+") (+ left right))
+      ((string= op "-") (- left right))
+      ((string= op "*") (* left right))
+      ((string= op "/")
+       (when (zerop right)
+         (ereport "22012" "division by zero"))
+       (truncate left right))
+      ((string= op "%")
+       (when (zerop right)
+         (ereport "22012" "division by zero"))
+       (mod left right))
+      (t (ereport "XX000" "bad arithmetic operator ~a" op)))))
 
 (defun sql-3val-and (a b)
   (cond ((or (eq a nil) (eq b nil)) nil)
@@ -264,13 +270,12 @@ exist\" messages."
              ((eq value +null+) 0)
              ((integerp value) value)
              ((stringp value)
-              (handler-case (parse-integer value :junk-allowed nil)
-                (error (e)
-                  (if (fatal-error-p e)
-                      (error e)
-                      (ereport "22P02"
-                               "invalid input syntax for type integer: \"~a\""
-                               value)))))
+              (handler-case-nonfatal
+               (parse-integer value :junk-allowed nil)
+               (e
+                (ereport "22P02"
+                         "invalid input syntax for type integer: \"~a\""
+                         value))))
              (t (ereport "22P02"
                          "invalid input syntax for type integer: \"~a\""
                          value)))))
@@ -283,13 +288,12 @@ exist\" messages."
              ((eq value +null+) 0)
              ((integerp value) value)
              ((stringp value)
-              (handler-case (parse-integer value :junk-allowed nil)
-                (error (e)
-                  (if (fatal-error-p e)
-                      (error e)
-                      (ereport "22P02"
-                               "invalid input syntax for type bigint: \"~a\""
-                               value)))))
+              (handler-case-nonfatal
+               (parse-integer value :junk-allowed nil)
+               (e
+                (ereport "22P02"
+                         "invalid input syntax for type bigint: \"~a\""
+                         value))))
              (t (ereport "22P02"
                          "invalid input syntax for type bigint: \"~a\""
                          value)))))
@@ -321,8 +325,8 @@ exist\" messages."
      (admin-reload-conf))
     ((member name '("length" "char_length" "character_length")
              :test #'string=)
-     (let ((v (first args)))
-       (if (eq v +null+) +null+ (length v))))
+     (sql-strict-let ((value (first args)))
+       (length value)))
     (t
      (ereport "42883" "function ~a(...) does not exist" name))))
 
@@ -342,13 +346,11 @@ exist\" messages."
            (sql-compare op l r)
            (sql-arith op l r))))
     (:unary
-     (let ((v (eval-expr (third expr) env)))
-       (if (eq v +null+)
-           +null+
-           (cond
-             ((string= (second expr) "-") (- v))
-             (t (ereport "42883" "unsupported unary operator ~a"
-                         (second expr)))))))
+     (sql-strict-let ((value (eval-expr (third expr) env)))
+       (cond
+         ((string= (second expr) "-") (- value))
+         (t (ereport "42883" "unsupported unary operator ~a"
+                     (second expr))))))
     (:and (sql-3val-and (eval-expr (second expr) env)
                         (eval-expr (third expr) env)))
     (:or (sql-3val-or (eval-expr (second expr) env)

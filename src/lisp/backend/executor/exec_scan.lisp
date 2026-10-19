@@ -2,6 +2,24 @@
 
 (in-package #:pg)
 
+(defmacro do-table-tuples ((tuple table &key relfilenode) &body body)
+  "Run BODY for visible tuples in TABLE, checking interrupts per tuple.
+
+An already-bound RELFILENODE may be supplied when relation registration must
+precede scanning. Registration and locking remain the caller's responsibility."
+  (let ((table-value (gensym "TABLE-"))
+        (rel (gensym "RELFILENODE-"))
+        (columns (gensym "COLUMNS-"))
+        (snapshot (gensym "SNAPSHOT-")))
+    `(let* ((,table-value ,table)
+            (,rel ,(or relfilenode `(pg-class-relfilenode ,table-value)))
+            (,columns (pg-class-columns ,table-value))
+            (,snapshot *current-snapshot*))
+       (heapam-scan ,rel ,columns ,snapshot
+                    (lambda (,tuple)
+                      (check-for-interrupts)
+                      ,@body)))))
+
 (defun target->result-column (target)
   (let ((oid (type-oid (getf target :type))))
     (make-result-column :name (getf target :name)
@@ -56,18 +74,15 @@
            (register-relation-reader relfilenode xid)
            (with-write-lock
              (ensure-current-table table))
-           (heapam-scan relfilenode
-                        (pg-class-columns table)
-                        *current-snapshot*
-                        (lambda (tuple)
-                          (check-for-interrupts)
-                          (let ((env (htup-values tuple)))
-                            (when (or (null where) (true-p (eval-expr where env)))
-                              (push (cons (map 'vector
-                                               (lambda (tg) (eval-expr (getf tg :expr) env))
-                                               targets)
-                                          env)
-                                    rows))))))))
+           (do-table-tuples (tuple table :relfilenode relfilenode)
+             (let ((env (htup-values tuple)))
+               (when (or (null where) (true-p (eval-expr where env)))
+                 (push (cons (map 'vector
+                                  (lambda (tg)
+                                    (eval-expr (getf tg :expr) env))
+                                  targets)
+                             env)
+                       rows)))))))
       (setf rows (nreverse rows))
       (when order
         (setf rows (stable-sort rows

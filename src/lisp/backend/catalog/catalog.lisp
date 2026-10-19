@@ -50,58 +50,66 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
 
 ;;; ---- serialization ----
 
-(defun column-to-sexp (c)
-  `(:name ,(pg-column-name c)
-    :type ,(pg-column-type c)
-    :typmod ,(pg-column-typmod c)
-    :attnum ,(pg-column-attnum c)
-    :notnull ,(pg-column-notnull c)))
+(defmacro define-catalog-codec (name constructor &body fields)
+  "Define NAME-TO-SEXP and NAME-FROM-SEXP from explicit field mappings.
 
-(defun column-from-sexp (s)
-  (make-pg-column :name (getf s :name)
-                  :type (getf s :type)
-                  :typmod (getf s :typmod)
-                  :attnum (getf s :attnum)
-                  :notnull (getf s :notnull)))
+Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
+  (let ((to-sexp (intern (format nil "~a-TO-SEXP" name) *package*))
+        (from-sexp (intern (format nil "~a-FROM-SEXP" name) *package*)))
+    `(progn
+       (defun ,to-sexp (object)
+         (list
+          ,@(loop for field in fields
+                  append
+                  (destructuring-bind (key accessor constructor-key
+                                       &key encode decode)
+                      field
+                    (declare (ignore constructor-key decode))
+                    `(,key
+                      ,(if encode
+                           `(funcall ,encode (,accessor object))
+                           `(,accessor object)))))))
+       (defun ,from-sexp (sexp)
+         (,constructor
+          ,@(loop for field in fields
+                  append
+                  (destructuring-bind (key accessor constructor-key
+                                       &key encode decode)
+                      field
+                    (declare (ignore accessor encode))
+                    `(,constructor-key
+                      ,(if decode
+                           `(funcall ,decode (getf sexp ,key))
+                           `(getf sexp ,key))))))))))
 
-(defun class-to-sexp (c)
-  `(:oid ,(pg-class-oid c)
-    :name ,(pg-class-name c)
-    :relfilenode ,(pg-class-relfilenode c)
-    :columns ,(loop for col across (pg-class-columns c)
-                    collect (column-to-sexp col))
-    :indexes ,(pg-class-indexes c)))
+(define-catalog-codec column make-pg-column
+  (:name pg-column-name :name)
+  (:type pg-column-type :type)
+  (:typmod pg-column-typmod :typmod)
+  (:attnum pg-column-attnum :attnum)
+  (:notnull pg-column-notnull :notnull))
 
-(defun class-from-sexp (s)
-  (make-pg-class :oid (getf s :oid)
-                 :name (getf s :name)
-                 :relfilenode (getf s :relfilenode)
-                 :columns (coerce (mapcar #'column-from-sexp
-                                          (getf s :columns))
-                                  'vector)
-                 :indexes (getf s :indexes)))
+(define-catalog-codec class make-pg-class
+  (:oid pg-class-oid :oid)
+  (:name pg-class-name :name)
+  (:relfilenode pg-class-relfilenode :relfilenode)
+  (:columns pg-class-columns :columns
+            :encode (lambda (columns)
+                      (loop for col across columns collect (column-to-sexp col)))
+            :decode (lambda (columns)
+                      (coerce (mapcar #'column-from-sexp columns) 'vector)))
+  (:indexes pg-class-indexes :indexes))
 
-(defun index-to-sexp (i)
-  `(:oid ,(pg-index-oid i)
-    :name ,(pg-index-name i)
-    :relfilenode ,(pg-index-relfilenode i)
-    :table-oid ,(pg-index-table-oid i)
-    :columns ,(pg-index-columns i)
-    :unique ,(pg-index-unique-p i)
-    :primary ,(pg-index-primary-p i)
-    :constraint ,(pg-index-constraint-p i)
-    :nulls-not-distinct ,(pg-index-nulls-not-distinct-p i)))
-
-(defun index-from-sexp (s)
-  (make-pg-index :oid (getf s :oid)
-                 :name (getf s :name)
-                 :relfilenode (getf s :relfilenode)
-                 :table-oid (getf s :table-oid)
-                 :columns (getf s :columns)
-                 :unique-p (getf s :unique)
-                 :primary-p (getf s :primary)
-                 :constraint-p (getf s :constraint)
-                 :nulls-not-distinct-p (getf s :nulls-not-distinct)))
+(define-catalog-codec index make-pg-index
+  (:oid pg-index-oid :oid)
+  (:name pg-index-name :name)
+  (:relfilenode pg-index-relfilenode :relfilenode)
+  (:table-oid pg-index-table-oid :table-oid)
+  (:columns pg-index-columns :columns)
+  (:unique pg-index-unique-p :unique-p)
+  (:primary pg-index-primary-p :primary-p)
+  (:constraint pg-index-constraint-p :constraint-p)
+  (:nulls-not-distinct pg-index-nulls-not-distinct-p :nulls-not-distinct-p))
 
 (defun database-to-sexp (db)
   `(:name ,(database-name db)

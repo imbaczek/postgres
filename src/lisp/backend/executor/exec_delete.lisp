@@ -5,15 +5,10 @@
 
 (defun collect-matching-tids (table where)
   (let ((tids '()))
-    (heapam-scan (pg-class-relfilenode table)
-                 (pg-class-columns table)
-                 *current-snapshot*
-                 (lambda (tuple)
-                   (check-for-interrupts)
-                   (when (or (null where)
-                             (true-p (eval-expr where (htup-values tuple))))
-                     (push (cons (htup-block tuple) (htup-offnum tuple))
-                           tids))))
+    (do-table-tuples (tuple table)
+      (when (or (null where)
+                (true-p (eval-expr where (htup-values tuple))))
+        (push (cons (htup-block tuple) (htup-offnum tuple)) tids)))
     (nreverse tids)))
 
 (defun exec-delete (stream ast)

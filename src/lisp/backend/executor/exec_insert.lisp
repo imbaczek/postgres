@@ -9,13 +9,12 @@
      (let ((n (cond
                 ((integerp value) value)
                 ((stringp value)
-                 (handler-case (parse-integer value :junk-allowed nil)
-                   (error (e)
-                     (if (fatal-error-p e)
-                         (error e)
-                         (ereport "22P02"
-                                  "invalid input syntax for type integer: \"~a\""
-                                  value)))))
+                 (handler-case-nonfatal
+                  (parse-integer value :junk-allowed nil)
+                  (e
+                   (ereport "22P02"
+                            "invalid input syntax for type integer: \"~a\""
+                            value))))
                 (t (ereport "22P02" "invalid input syntax for type integer")))))
        (unless (<= +int4-min+ n +int4-max+)
          (ereport "22003" "integer out of range"))
@@ -24,13 +23,12 @@
      (let ((n (cond
                 ((integerp value) value)
                 ((stringp value)
-                 (handler-case (parse-integer value :junk-allowed nil)
-                   (error (e)
-                     (if (fatal-error-p e)
-                         (error e)
-                         (ereport "22P02"
-                                  "invalid input syntax for type bigint: \"~a\""
-                                  value)))))
+                 (handler-case-nonfatal
+                  (parse-integer value :junk-allowed nil)
+                  (e
+                   (ereport "22P02"
+                            "invalid input syntax for type bigint: \"~a\""
+                            value))))
                 (t (ereport "22P02" "invalid input syntax for type bigint")))))
        (unless (<= +int8-min+ n +int8-max+)
          (ereport "22003" "bigint out of range"))
