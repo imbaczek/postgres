@@ -110,7 +110,8 @@ exist\" messages."
      (let* ((name (second expr))
             (args (mapcar (lambda (a) (analyze-expr a table)) (third expr))))
        (cond
-         ((member name '("version" "current_database" "current_schema"
+         ((member name '("version" "pg_lisp_runtime"
+                         "current_database" "current_schema"
                          "current_catalog" "current_user" "session_user" "user")
                   :test #'string=)
           (when args
@@ -305,6 +306,9 @@ exist\" messages."
   (cond
     ((string= name "version")
      "PostgreSQL 16.0 (pg-lisp 0.1)")
+    ((string= name "pg_lisp_runtime")
+     (format nil "~a ~a" (lisp-implementation-type)
+             (lisp-implementation-version)))
     ((string= name "current_database")
      (backend-database *backend*))
     ((string= name "current_schema") "public")

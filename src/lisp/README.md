@@ -172,9 +172,10 @@ SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
 
 Expressions: column references, integer and string literals, `+ - * / %`,
 comparisons, `AND` / `OR` / `NOT`, `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE`, and
-parentheses. Scalar functions: `version()`, `current_database()`,
-`current_schema()`, `current_catalog()`, `current_user`, `session_user`, `user`,
-`length()`, `pg_backend_pid()`, `pg_cancel_backend(pid)`,
+parentheses. Scalar functions: `version()`, `pg_lisp_runtime()`,
+`current_database()`, `current_schema()`, `current_catalog()`, `current_user`,
+`session_user`, `user`, `length()`, `pg_backend_pid()`,
+`pg_cancel_backend(pid)`,
 `pg_terminate_backend(pid [, timeout])`, `pg_reload_conf()`.
 
 `SET` and `SHOW` are accepted broadly and mostly remembered per session.
