@@ -12,7 +12,7 @@
 set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
-SBCL=${SBCL:-"$BASE/../../../sbcl/run-sbcl.sh"}
+SBCL=${SBCL:-sbcl}
 PORT=${PORT:-5466}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-shutdown.XXXXXX")
 LOG="$TMP/server.log"

@@ -7,7 +7,7 @@
 set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
-SBCL="${SBCL:-$BASE/../../../sbcl/run-sbcl.sh}"
+SBCL=${SBCL:-sbcl}
 PORT=${PORT:-5464}
 CPORT=${CPORT:-5465}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-control.XXXXXX")

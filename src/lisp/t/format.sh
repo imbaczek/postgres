@@ -3,12 +3,10 @@
 set -eu
 
 BASE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-REPO_ROOT=$(CDPATH= cd -- "$BASE/../.." && pwd)
-DEFAULT_SBCL="$REPO_ROOT/../sbcl/run-sbcl.sh"
 EMACS=${EMACS:-emacs}
 CHECK=0
 
-LISP=${PG_LISP_INFERIOR:-${SBCL:-$DEFAULT_SBCL}}
+LISP=${PG_LISP_INFERIOR:-${SBCL:-sbcl}}
 
 usage() {
     echo "Usage: $0 [--check] [--lisp PATH] [--] FILE..." >&2

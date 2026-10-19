@@ -3,7 +3,7 @@
 set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
-SBCL="$BASE/../../../sbcl/run-sbcl.sh"
+SBCL=${SBCL:-sbcl}
 
 exec "$SBCL" --non-interactive \
     --eval '(require :asdf)' \

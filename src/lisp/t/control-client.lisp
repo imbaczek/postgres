@@ -3,7 +3,7 @@
 ;;;; Usage: control-client.lisp tcp HOST:PORT  |  control-client.lisp unix PATH
 ;;;; Reads forms from stdin (one per line), sends them to the control REPL,
 ;;;; and prints everything the server sends back until it closes the socket.
-;;;; Invoked by t/control-repl.sh via run-sbcl.sh --script.
+;;;; Invoked by t/control-repl.sh with SBCL's --script option.
 
 (require :sb-bsd-sockets)
 

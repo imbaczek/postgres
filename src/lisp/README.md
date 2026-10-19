@@ -10,8 +10,8 @@ It is an educational port, not a production database. See "Known gaps" below.
 
 ## Requirements
 
-- SBCL at `/home/imbaczek/proj/sbcl/run-sbcl.sh` (any recent SBCL with threads
-  and `sb-bsd-sockets` should work; the launcher assumes that path).
+- SBCL with threads and `sb-bsd-sockets`, available as `sbcl` on `PATH`; set
+  `SBCL=/path/to/sbcl` to use another executable.
 - `psql` 16.x for the acceptance test.
 - x86_64 Linux. Wire integers are big-endian; on-disk page integers are
   little-endian (native x86).
@@ -210,8 +210,8 @@ and writers.
 ## Compilation and formatting
 
 `./t/compile.sh` force-compiles the `pg` ASDF system and fails on compiler
-warnings. It uses `../sbcl/run-sbcl.sh` beside the repository; set
-`SBCL=/path/to/launcher` to override.
+warnings. It uses `sbcl` from `PATH` by default; set `SBCL=/path/to/sbcl` to
+override.
 
 The batch formatter requires GNU Emacs and SLIME. Follow the
 [MELPA setup guide](https://melpa.org/#/getting-started), then install SLIME
@@ -236,8 +236,8 @@ Format selected files or check them without writing:
 The formatter starts a separate SLIME inferior process, loads `pg` so SLIME can
 learn the system's macro indentation, and applies Emacs Lisp-mode indentation.
 It only adjusts indentation; it does not reflow long lines. The inferior Lisp
-defaults to the sibling `../sbcl/run-sbcl.sh`; select another launcher with
-`--lisp /path/to/launcher` or `PG_LISP_INFERIOR=/path/to/launcher`.
+defaults to `SBCL` if set, or `sbcl` from `PATH`; select another executable with
+`--lisp /path/to/sbcl` or `PG_LISP_INFERIOR=/path/to/sbcl`.
 
 Format project Common Lisp sources, including `pg.asd`, from the repository
 root. The pinned Swank sources keep their upstream formatting:

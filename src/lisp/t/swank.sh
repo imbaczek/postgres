@@ -3,7 +3,7 @@
 set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
-SBCL=${SBCL:-$BASE/../../../sbcl/run-sbcl.sh}
+SBCL=${SBCL:-sbcl}
 PORT=${PORT:-5468}
 SWANK_PORT=${SWANK_PORT:-5469}
 WILDCARD_PORT=${WILDCARD_PORT:-5470}

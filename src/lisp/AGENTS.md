@@ -6,12 +6,12 @@ storage/concurrency rules.
 
 ## Lisp host
 
-Use `../sbcl/run-sbcl.sh` (absolute: `/home/imbaczek/proj/sbcl/run-sbcl.sh`) as
-the SBCL. Do not assume a system `sbcl`. The server launcher is `./pg-lisp.sh`.
-When you delegate to a reviewer or subagent, tell it the same.
+The scripts default to `sbcl` from `PATH`. Set `SBCL` to a local executable or
+wrapper when needed; do not hard-code a machine-specific path. The server
+launcher is `./pg-lisp.sh`.
 
 Run `./t/compile.sh` for a forced ASDF compile with compiler warnings treated
-as errors. It uses the sibling SBCL build by default; set `SBCL` to override it.
+as errors. It uses `sbcl` from `PATH` by default and honors `SBCL` overrides.
 `./t/format.sh` uses Emacs + SLIME and the same inferior Lisp by default.
 
 ## Work the Lisp way: reload, don't restart

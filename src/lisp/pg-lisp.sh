@@ -3,11 +3,11 @@
 set -e
 
 BASE=$(cd "$(dirname "$0")" && pwd)
-SBCL="$BASE/../../../sbcl/run-sbcl.sh"
+SBCL=${SBCL:-sbcl}
 
-if [ ! -x "$SBCL" ]; then
-    echo "pg-lisp: cannot find SBCL at $SBCL" >&2
-    exit 1
+if ! command -v "$SBCL" >/dev/null 2>&1; then
+    echo "pg-lisp: cannot find SBCL executable '$SBCL' (set SBCL to override)" >&2
+    exit 127
 fi
 
 exec "$SBCL" --script "$BASE/boot.lisp" "$@"
