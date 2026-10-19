@@ -3,7 +3,6 @@
 (in-package #:pg)
 
 ;; DEFVAR so that hot reload does not reset them to zero.
-(defvar *pid-counter* 0)
 (defvar *secret-counter* 0)
 
 ;;; ---- startup ----
@@ -87,7 +86,7 @@
       (send-parameter-status stream "default_transaction_read_only" "off")
       (send-parameter-status stream "in_hot_standby" "off")
       (send-backend-key-data stream
-                             (setf (backend-pid *backend*) (incf *pid-counter*))
+                             (backend-pid *backend*)
                              (incf *secret-counter*))
       (send-ready-for-query stream #\I))))
 
@@ -133,27 +132,28 @@
 
 (defun handle-connection (sock)
   (let ((stream nil)
-        (backend nil)
-        (registered nil))
+        (backend nil))
     (unwind-protect
          (handler-case
              (progn
                (setf stream (socket->stream sock))
                (let ((*backend* (make-backend :stream stream
                                               :database "postgres"
-                                              :thread sb-thread:*current-thread*))
+                                              :thread sb-thread:*current-thread*
+                                              :pid (sb-thread:thread-os-tid
+                                                    sb-thread:*current-thread*)))
                      (*output-stream* stream))
                  (setf backend *backend*)
                  ;; A dropped connection must not strand an open transaction.
                  (unwind-protect
-                      (let ((body (read-startup-until-ready stream)))
-                        (when body
-                          (process-startup stream body)
-                          ;; From here on the backend is visible to
-                          ;; pg_cancel_backend()/pg_terminate_backend().
-                          (register-backend *backend*)
-                          (setf registered t)
-                          (backend-loop stream)))
+                       (progn
+                         ;; Register before waiting for StartupMessage so fast
+                         ;; shutdown can terminate stalled startup handshakes.
+                         (register-backend *backend*)
+                         (let ((body (read-startup-until-ready stream)))
+                           (when body
+                             (process-startup stream body)
+                             (backend-loop stream))))
                    (end-backend-session))))
            (pg-error (e)
              (when stream (ignore-errors (send-error-response stream e))))
@@ -165,11 +165,12 @@
                  (make-condition 'pg-error :sqlstate "XX000"
                                  :message (princ-to-string e)))))))
       ;; Send the final error and close the socket *before* unregistering:
-      ;; during a fast shutdown the last backend's UNREGISTER-BACKEND exits
+      ;; during a fast shutdown the last connection's CONNECTION-FINISHED exits
       ;; the process, and the client must still receive its FATAL.
       (close-connection sock stream)
-      (when registered
-        (unregister-backend backend)))))
+      (when backend
+        (unregister-backend backend))
+      (connection-finished))))
 
 ;;; ---- server main ----
 
@@ -233,12 +234,41 @@ CL's RENAME-FILE merges a relative target with the source's directory."
 
 (defun serve (host port)
   (let ((listener (make-listener host port)))
+    (sb-thread:with-mutex (*accept-lock*)
+      (setf *accept-stop-requested* nil))
     (loop
-      (let ((sock (accept-connection-or-nil listener "backend")))
+      (let ((ready (sb-sys:wait-until-fd-usable
+                    (sb-bsd-sockets:socket-file-descriptor listener)
+                    :input 0.1 nil))
+            (sock nil)
+            (stop nil)
+            (accept-error nil))
+        ;; ACCEPT is called only after readiness and while holding the same
+        ;; lock that shutdown uses to stop the listener.  Counting the socket
+        ;; in this critical section closes the accept/accounting race.
+        (sb-thread:with-mutex (*accept-lock*)
+          (setf stop *accept-stop-requested*)
+          (when (and ready (not stop))
+            (handler-case
+                (setf sock (accept-connection listener))
+              (error (e)
+                (setf accept-error e)))
+            (when sock
+              (connection-started))))
+        (when stop
+          (return))
+        (when accept-error
+          (format *error-output* "~&pg-lisp: backend accept: ~a~%" accept-error)
+          (sleep 0.1))
         (when sock
-          (sb-thread:make-thread
-           (lambda () (handle-connection sock))
-           :name "pg backend"))))))
+          (handler-case
+              (sb-thread:make-thread
+               (lambda () (handle-connection sock))
+               :name "pg backend")
+            (error (e)
+              (format *error-output* "~&pg-lisp: backend: ~a~%" e)
+              (connection-finished)
+              (ignore-errors (close-connection sock nil)))))))))
 
 ;;; ---- hot reload (SIGHUP) and control REPL live in tcop/control.lisp ----
 

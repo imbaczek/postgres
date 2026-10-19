@@ -54,26 +54,21 @@
       ok)))
 
 (defvar *reload-requested* nil)
-(defvar *reload-mutex* (sb-thread:make-mutex :name "pg reload mutex"))
-(defvar *reload-cv* (sb-thread:make-waitqueue :name "pg reload waitqueue"))
 
 (defun request-reload (&rest signal-info)
-  "SIGHUP handler: wake the reloader thread and return immediately.
+  "SIGHUP handler: record the request and return immediately.
 
-Signal handlers must be quick, and ASDF must not run inside one, so the
-actual work happens on a helper thread."
+Signal handlers run in whichever thread the OS delivered the signal to, so
+this must not take a lock (the signal may land in the reloader itself).  ASDF
+must not run inside a handler either; the reloader thread polls the flag."
   (declare (ignore signal-info))
-  (sb-thread:with-mutex (*reload-mutex*)
-    (setf *reload-requested* t)
-    (sb-thread:condition-broadcast *reload-cv*)))
+  (setf *reload-requested* t))
 
 (defun reload-loop ()
   (loop
-    (sb-thread:with-mutex (*reload-mutex*)
-      (loop until *reload-requested*
-            do (sb-thread:condition-wait *reload-cv* *reload-mutex*))
-      (setf *reload-requested* nil))
-    (reload)))
+    (if (sb-ext:compare-and-swap *reload-requested* t nil)
+        (reload)
+        (sleep 0.05))))
 
 (defun enable-reload ()
   "Install the SIGHUP handler and start the reloader thread."
@@ -104,7 +99,8 @@ actual work happens on a helper thread."
   "Arrange for the Unix control socket to be removed on exit.
 
 SIGTERM/SIGINT/SIGQUIT are handled by the shutdown machinery in
-postmaster.lisp; a clean exit runs this hook, an immediate shutdown skips it."
+postmaster.lisp; each shutdown mode exits through SB-EXT:EXIT and runs this
+hook."
   (pushnew 'cleanup-control-socket sb-ext:*exit-hooks*)
   (values))
 

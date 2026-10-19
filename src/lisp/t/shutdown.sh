@@ -7,19 +7,25 @@
 #   * cancelling/terminating a backend blocked on a unique conflict
 #   * SIGTERM = smart shutdown (wait for clients, reject new ones)
 #   * SIGINT  = fast shutdown (terminate clients, deliver FATAL)
-#   * SIGQUIT = immediate shutdown (no cleanup, exit status 1)
+#   * SIGQUIT = immediate shutdown (do not wait for clients; still exit 0)
 #   * smart -> fast escalation
 set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
+SBCL=${SBCL:-"$BASE/../../../sbcl/run-sbcl.sh"}
 PORT=${PORT:-5466}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-shutdown.XXXXXX")
 LOG="$TMP/server.log"
 SRV=
+STALLED=
 
 cleanup() {
     close_fd7
     close_fd8
+    if [ -n "$STALLED" ]; then
+        kill "$STALLED" 2>/dev/null || true
+        wait "$STALLED" 2>/dev/null || true
+    fi
     if [ -n "$SRV" ]; then
         kill -9 "$SRV" 2>/dev/null || true
         wait "$SRV" 2>/dev/null || true
@@ -122,6 +128,23 @@ case "$pid" in
 esac
 [ "$pid" -gt 0 ] || fail "pg_backend_pid returned $pid"
 
+# PIDs are OS thread ids, so concurrent connections must never collide.  (A
+# shared counter used to race here and leak *N-BACKENDS*, which made smart and
+# fast shutdown wait forever.)
+mkdir -p "$TMP/pids"
+pids_jobs=
+i=0
+while [ "$i" -lt 30 ]; do
+    (psqlq -c 'select pg_backend_pid()' > "$TMP/pids/$i" 2>&1) &
+    pids_jobs="$pids_jobs $!"
+    i=$((i + 1))
+done
+for j in $pids_jobs; do wait "$j"; done
+dups=$(cat "$TMP"/pids/* | sort | uniq -d)
+[ -z "$dups" ] || fail "duplicate backend pids: $dups"
+n=$(cat "$TMP"/pids/* | grep -cE '^[0-9]+$' || true)
+[ "$n" -eq 30 ] || fail "expected 30 backend pids, got $n"
+
 out=$(printf 'begin;\nselect pg_cancel_backend(pg_backend_pid());\nselect 1;\ncommit;\n' |
       PGPASSWORD=x psql -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres 2>&1 || true)
 echo "$out" | grep -q 'canceling statement due to user request' \
@@ -144,6 +167,34 @@ echo "$out" | grep -q '^f$' \
 out=$(q 'select pg_terminate_backend(1, -1)' 2>&1 || true)
 echo "$out" | grep -q '"timeout" must not be negative' \
     || fail "negative timeout was not rejected"
+
+# Argument coercion: PID is int4 and timeout is int8; neither function is
+# strict, so NULL is 0, and a string literal is parsed like the target type.
+out=$(q 'select pg_terminate_backend(null)' 2>&1 || true)
+echo "$out" | grep -q 'WARNING:  PID 0 is not a PostgreSQL backend process' \
+    || fail "NULL pid did not coerce to 0"
+out=$(q "select pg_terminate_backend(999999, '5')" 2>&1 || true)
+echo "$out" | grep -q 'WARNING:  PID 999999 is not a PostgreSQL backend process' \
+    || fail "string timeout did not coerce to bigint"
+echo "$out" | grep -q '^f$' || fail "string-timeout call did not return false"
+out=$(q "select pg_terminate_backend('abc')" 2>&1 || true)
+echo "$out" | grep -q 'invalid input syntax for type integer: "abc"' \
+    || fail "bad pid string was not rejected with 22P02"
+out=$(q 'select pg_terminate_backend(999999, 9223372036854775808)' 2>&1 || true)
+echo "$out" | grep -q 'bigint out of range' \
+    || fail "timeout outside bigint range was accepted"
+out=$(q 'select pg_cancel_backend(true)' 2>&1 || true)
+echo "$out" | grep -q 'function pg_cancel_backend(boolean) does not exist' \
+    || fail "boolean pid did not fail function resolution"
+out=$(q 'select pg_terminate_backend(1, true)' 2>&1 || true)
+echo "$out" | grep -q 'function pg_terminate_backend(integer, boolean) does not exist' \
+    || fail "boolean timeout did not fail function resolution"
+out=$(q 'select pg_cancel_backend(null)' 2>&1 || true)
+echo "$out" | grep -q 'WARNING:  PID 0 is not a PostgreSQL backend process' \
+    || fail "NULL cancel pid did not warn about PID 0"
+out=$(q 'select pg_backend_pid(1)' 2>&1 || true)
+echo "$out" | grep -q 'function pg_backend_pid(integer) does not exist' \
+    || fail "arity error did not name the argument type"
 
 before=$(grep -c 'reload complete' "$LOG" 2>/dev/null || true)
 [ "$(q 'select pg_reload_conf()')" = "t" ] \
@@ -237,6 +288,36 @@ grep -q 'received smart shutdown request' "$LOG" \
 grep -q 'database system is shut down' "$LOG" \
     || fail "missing shutdown-complete log line"
 
+# ---- SIGINT: fast shutdown with a stalled startup handshake --------------
+
+start_server
+STALLED_PORT=$PORT STALLED_READY="$TMP/stalled-ready" \
+    "$SBCL" --script "$BASE/t/stalled-startup-client.lisp" &
+STALLED=$!
+i=0
+while [ "$i" -lt 50 ] && [ ! -f "$TMP/stalled-ready" ] \
+      && kill -0 "$STALLED" 2>/dev/null; do
+    i=$((i + 1))
+    sleep 0.1
+done
+[ -f "$TMP/stalled-ready" ] || fail "startup-stalled client did not connect"
+kill -0 "$STALLED" 2>/dev/null \
+    || fail "startup-stalled client exited before shutdown"
+
+kill -INT "$SRV"
+wait_for_exit || fail "fast shutdown did not terminate a stalled startup"
+set +e
+wait "$SRV" 2>/dev/null
+status=$?
+set -e
+SRV=
+[ "$status" -eq 0 ] || fail "startup-stalled fast shutdown exited with status $status"
+kill "$STALLED" 2>/dev/null || true
+wait "$STALLED" 2>/dev/null || true
+STALLED=
+grep -q 'received fast shutdown request' "$LOG" \
+    || fail "missing fast shutdown log line for startup-stalled client"
+
 # ---- SIGINT: fast shutdown with a blocked backend ------------------------
 
 start_server
@@ -282,12 +363,13 @@ wait "$SRV" 2>/dev/null
 status=$?
 set -e
 SRV=
-[ "$status" -eq 1 ] || fail "immediate shutdown exited with status $status"
+[ "$status" -eq 0 ] || fail "immediate shutdown exited with status $status"
 grep -q 'received immediate shutdown request' "$LOG" \
     || fail "missing immediate shutdown log line"
-if grep -q 'database system is shut down' "$LOG"; then
-    fail "immediate shutdown ran the clean-exit path"
-fi
+# PostgreSQL's postmaster still exits cleanly (UnlinkLockFiles logs this and
+# removes the socket); only the children are killed abruptly.
+grep -q 'database system is shut down' "$LOG" \
+    || fail "missing shutdown-complete log line after immediate shutdown"
 
 # ---- smart -> fast escalation --------------------------------------------
 

@@ -132,34 +132,42 @@ INTERRUPT-THREAD, so it needs no flag."
       (setf (backend-snapshot b) snap)
       snap)))
 
+(defun reset-backend-transaction (b)
+  (setf (backend-xid b) nil
+        (backend-state b) :idle
+        (backend-explicit b) nil
+        (backend-command-id b) 0
+        (backend-snapshot b) nil
+        (backend-dirty-relations b) '())
+  (values))
+
 (defun commit-transaction ()
   (let ((b *backend*))
-    (when (backend-xid b)
-      ;; Step 1: make heap and index pages durable.
-      (dolist (rel (backend-dirty-relations b))
-        (smgr-fsync rel))
-      ;; Step 2: log the commit.
-      (clog-set (backend-xid b) +clog-committed+ :fsync t)
-      (release-xid (backend-xid b)))
-    (setf (backend-xid b) nil
-          (backend-state b) :idle
-          (backend-explicit b) nil
-          (backend-command-id b) 0
-          (backend-snapshot b) nil
-          (backend-dirty-relations b) '()))
+    (if (backend-xid b)
+        (progn
+          ;; Step 1: make heap and index pages durable.
+          (dolist (rel (backend-dirty-relations b))
+            (smgr-fsync rel))
+          ;; Step 2: log the commit.  The CLog write and the reset of the
+          ;; backend's xid must not be split by a terminate/FATAL interrupt:
+          ;; otherwise END-BACKEND-SESSION could still see the xid and abort an
+          ;; already-durable commit.
+          (sb-sys:without-interrupts
+            (clog-set (backend-xid b) +clog-committed+ :fsync t)
+            (release-xid (backend-xid b))
+            (reset-backend-transaction b)))
+        (reset-backend-transaction b)))
   (values))
 
 (defun abort-transaction ()
   (let ((b *backend*))
-    (when (backend-xid b)
-      (clog-set (backend-xid b) +clog-aborted+ :fsync t)
-      (release-xid (backend-xid b)))
-    (setf (backend-xid b) nil
-          (backend-state b) :idle
-          (backend-explicit b) nil
-          (backend-command-id b) 0
-          (backend-snapshot b) nil
-          (backend-dirty-relations b) '()))
+    (sb-sys:without-interrupts
+      (when (backend-xid b)
+        ;; Never downgrade a commit that already reached the CLog.
+        (when (= (clog-get (backend-xid b)) +clog-in-progress+)
+          (clog-set (backend-xid b) +clog-aborted+ :fsync t))
+        (release-xid (backend-xid b)))
+      (reset-backend-transaction b)))
   (values))
 
 (defun end-backend-session ()

@@ -17,6 +17,28 @@
   (let ((tail (member :typmod expr)))
     (and tail (second tail))))
 
+(defun typed-arg-name (expr)
+  "PostgreSQL-style name for an argument's type, for \"function ... does not
+exist\" messages."
+  (case (expr-type expr)
+    (:int4 "integer")
+    (:int8 "bigint")
+    (:varchar "character varying")
+    (:bool "boolean")
+    (t "text")))
+
+(defun call-signature (args)
+  (format nil "~{~a~^, ~}" (mapcar #'typed-arg-name args)))
+
+(defun admin-arg-coercible-p (expr target-type)
+  "Whether EXPR can resolve to an admin function's declared integer type."
+  (or (and (eq (first expr) :const)
+           (or (eq (second expr) +null+)
+               (stringp (second expr))))
+      (case target-type
+        (:int4 (eq (expr-type expr) :int4))
+        (:int8 (member (expr-type expr) '(:int4 :int8))))))
+
 (defun analyze-expr (expr table)
   "Resolve column references and annotate expression types."
   (case (first expr)
@@ -83,31 +105,42 @@
                          "current_catalog" "current_user" "session_user" "user")
                   :test #'string=)
           (when args
-            (ereport "42883" "function ~a() does not exist" name))
+            (ereport "42883" "function ~a(~a) does not exist"
+                     name (call-signature args)))
           (list :func name args :type :text :typmod -1))
          ((member name '("length" "char_length" "character_length")
                   :test #'string=)
           (unless (= (length args) 1)
-            (ereport "42883" "function ~a() does not exist" name))
+            (ereport "42883" "function ~a(~a) does not exist"
+                     name (call-signature args)))
           (list :func name args :type :int4 :typmod -1))
          ((string= name "pg_backend_pid")
           (when args
-            (ereport "42883" "function ~a() does not exist" name))
+            (ereport "42883" "function ~a(~a) does not exist"
+                     name (call-signature args)))
           (list :func name args :type :int4 :typmod -1))
          ((string= name "pg_cancel_backend")
-          (unless (= (length args) 1)
-            (ereport "42883" "function ~a(...) does not exist" name))
+           (unless (and (= (length args) 1)
+                        (admin-arg-coercible-p (first args) :int4))
+            (ereport "42883" "function ~a(~a) does not exist"
+                     name (call-signature args)))
           (list :func name args :type :bool :typmod -1))
          ((string= name "pg_terminate_backend")
-          (unless (<= 1 (length args) 2)
-            (ereport "42883" "function ~a(...) does not exist" name))
+           (unless (and (<= 1 (length args) 2)
+                        (admin-arg-coercible-p (first args) :int4)
+                        (or (= (length args) 1)
+                            (admin-arg-coercible-p (second args) :int8)))
+            (ereport "42883" "function ~a(~a) does not exist"
+                     name (call-signature args)))
           (list :func name args :type :bool :typmod -1))
          ((string= name "pg_reload_conf")
           (when args
-            (ereport "42883" "function ~a() does not exist" name))
+            (ereport "42883" "function ~a(~a) does not exist"
+                     name (call-signature args)))
           (list :func name args :type :bool :typmod -1))
          (t
-          (ereport "42883" "function ~a(...) does not exist" name)))))
+          (ereport "42883" "function ~a(~a) does not exist"
+                   name (call-signature args))))))
     (t
      (ereport "XX000" "cannot analyze expression ~a" expr))))
 
@@ -222,6 +255,48 @@
         (a nil)
         (t t)))
 
+;;; Admin-function argument coercion.  PostgreSQL resolves the calls against
+;;; pg_proc (PID integer, timeout bigint) and the functions are not strict, so
+;;; a NULL argument is 0 and a string literal is parsed as the target type.
+
+(defun admin-pid-arg (value)
+  (let ((n (cond
+             ((eq value +null+) 0)
+             ((integerp value) value)
+             ((stringp value)
+              (handler-case (parse-integer value :junk-allowed nil)
+                (error (e)
+                  (if (fatal-error-p e)
+                      (error e)
+                      (ereport "22P02"
+                               "invalid input syntax for type integer: \"~a\""
+                               value)))))
+             (t (ereport "22P02"
+                         "invalid input syntax for type integer: \"~a\""
+                         value)))))
+    (unless (<= +int4-min+ n +int4-max+)
+      (ereport "22003" "integer out of range"))
+    n))
+
+(defun admin-timeout-arg (value)
+  (let ((n (cond
+             ((eq value +null+) 0)
+             ((integerp value) value)
+             ((stringp value)
+              (handler-case (parse-integer value :junk-allowed nil)
+                (error (e)
+                  (if (fatal-error-p e)
+                      (error e)
+                      (ereport "22P02"
+                               "invalid input syntax for type bigint: \"~a\""
+                               value)))))
+             (t (ereport "22P02"
+                         "invalid input syntax for type bigint: \"~a\""
+                         value)))))
+    (unless (<= +int8-min+ n +int8-max+)
+      (ereport "22003" "bigint out of range"))
+    n))
+
 (defun eval-func (name args)
   (cond
     ((string= name "version")
@@ -236,9 +311,12 @@
     ((string= name "pg_backend_pid")
      (if *backend* (backend-pid *backend*) 0))
     ((string= name "pg_cancel_backend")
-     (admin-cancel-backend (first args)))
+     (admin-cancel-backend (admin-pid-arg (first args))))
     ((string= name "pg_terminate_backend")
-     (admin-terminate-backend (first args) (or (second args) 0)))
+     (admin-terminate-backend (admin-pid-arg (first args))
+                              (if (rest args)
+                                  (admin-timeout-arg (second args))
+                                  0)))
     ((string= name "pg_reload_conf")
      (admin-reload-conf))
     ((member name '("length" "char_length" "character_length")

@@ -6,6 +6,14 @@
 ;;;; thread per connection, so the "children" are the backends in
 ;;;; *BACKEND-REGISTRY*: SIGTERM/SIGINT/SIGQUIT to the process map to
 ;;;; smart/fast/immediate shutdown exactly as they do for the postmaster.
+;;;;
+;;;; Signal handlers only record the requested mode; a dedicated worker thread
+;;;; (the analogue of the postmaster's main loop, which acts on signals only
+;;;; once it returns to its event loop) does the real work.  SBCL runs an
+;;;; ENABLE-INTERRUPT handler in whichever thread the OS delivered the signal
+;;;; to -- possibly a backend that already holds *SHUTDOWN-LOCK* or
+;;;; *WRITE-LOCK*, or even a backend about to be terminated -- so the handler
+;;;; must not take locks, interrupt threads, or exit.
 
 (in-package #:pg)
 
@@ -23,8 +31,20 @@
 (defvar *shutdown-lock* (sb-thread:make-mutex :name "pg shutdown lock"))
 (defvar *shutdown-finished* nil)
 
+;; Requested vs processed level.  Handlers only raise *PM-REQUESTED-MODE*, a
+;; plain fixnum store with no lock; the worker observes it.  The mode is
+;; monotonic (upward only), so there is nothing to reset and no lost-wakeup
+;; window.
+(defvar *pm-requested-mode* +no-shutdown+)
+(defvar *pm-processed-mode* +no-shutdown+)
+(defvar *postmaster-thread* nil)
+
+(defun shutdown-mode ()
+  "The current shutdown level, read under the lock."
+  (sb-thread:with-mutex (*shutdown-lock*) *shutdown*))
+
 (defun shutdown-in-progress-p ()
-  (> *shutdown* +no-shutdown+))
+  (> (shutdown-mode) +no-shutdown+))
 
 (defun conns-allowed-p ()
   "CanAcceptConnections(): no new clients once shutdown has begun."
@@ -36,22 +56,25 @@
   (finish-output *error-output*))
 
 ;;; ---- backend registry ----
+;;;
+;;; *N-CONNECTIONS* counts every accepted connection, including one still in
+;;; the startup handshake; the postmaster must not exit while one is alive, or
+;;; a client connecting during shutdown would lose the race and get a reset
+;;; instead of FATAL 57P03.  Backends enter the registry before reading the
+;;; startup packet so fast shutdown can interrupt a stalled handshake too.
 
-;; PID -> backend, for pg_cancel_backend() and pg_terminate_backend().
-;; A backend is registered once its startup packet has been accepted, and
-;; unregistered when it disconnects.
 (defvar *backend-registry* (make-hash-table :test #'eql))
 (defvar *backend-registry-lock*
   (sb-thread:make-mutex :name "pg backend registry lock"))
+(defvar *accept-lock* (sb-thread:make-mutex :name "pg accept lock"))
+(defvar *accept-stop-requested* nil)
 (defvar *n-backends* 0)
+(defvar *n-connections* 0)
 
 (defun list-backends ()
   (sb-thread:with-mutex (*backend-registry-lock*)
     (loop for backend being the hash-values of *backend-registry*
           collect backend)))
-
-(defun backend-count ()
-  (sb-thread:with-mutex (*backend-registry-lock*) *n-backends*))
 
 (defun lookup-backend (pid)
   (sb-thread:with-mutex (*backend-registry-lock*)
@@ -59,8 +82,43 @@
 
 (defun register-backend (backend)
   (sb-thread:with-mutex (*backend-registry-lock*)
-    (setf (gethash (backend-pid backend) *backend-registry*) backend)
-    (incf *n-backends*))
+    (sb-sys:without-interrupts
+      (setf (gethash (backend-pid backend) *backend-registry*) backend)
+      (incf *n-backends*)))
+  ;; Close the race where fast shutdown snapshots the registry just before
+  ;; this backend is added.  The caller is the backend thread itself.
+  (when (and (eq backend *backend*)
+             (>= (shutdown-mode) +fast-shutdown+))
+    (ereport-fatal "57P01"
+                   "terminating connection due to administrator command"))
+  (values))
+
+(defun unregister-backend (backend)
+  (sb-thread:with-mutex (*backend-registry-lock*)
+    (sb-sys:without-interrupts
+      (when (eq (gethash (backend-pid backend) *backend-registry*) backend)
+        (remhash (backend-pid backend) *backend-registry*)
+        (decf *n-backends*))))
+  (values))
+
+(defun connection-started ()
+  (sb-thread:with-mutex (*backend-registry-lock*)
+    (sb-sys:without-interrupts
+      (incf *n-connections*)))
+  (values))
+
+(defun connection-finished ()
+  "A connection (registered or not) has gone.  Stop the postmaster if this
+was the last one and a smart/fast shutdown is in progress."
+  (let ((last nil))
+    (sb-thread:with-mutex (*backend-registry-lock*)
+      (sb-sys:without-interrupts
+        (decf *n-connections*)
+        (let ((mode (sb-thread:with-mutex (*shutdown-lock*) *shutdown*)))
+          (setf last (and (<= +smart-shutdown+ mode +fast-shutdown+)
+                          (zerop *n-connections*))))))
+    (when last
+      (finish-shutdown)))
   (values))
 
 ;;; ---- pg_cancel_backend / pg_terminate_backend ----
@@ -110,40 +168,54 @@ command (idle) is ignored; the connection and its transaction state survive."
 ;;; ---- shutdown state machine ----
 
 (defun finish-shutdown ()
-  "Exit once every client backend has gone (smart/fast shutdown)."
+  "Exit once every client connection has gone (smart/fast shutdown)."
+  (let ((go nil))
+    ;; Serialize the zero-connection check with ACCEPT plus its connection
+    ;; count update.  Otherwise shutdown can exit in the gap after ACCEPT
+    ;; returns but before the new socket is counted.
+    (sb-thread:with-mutex (*accept-lock*)
+      (when (and (<= +smart-shutdown+ (shutdown-mode) +fast-shutdown+)
+                 (sb-thread:with-mutex (*backend-registry-lock*)
+                   (zerop *n-connections*)))
+        (sb-thread:with-mutex (*shutdown-lock*)
+          (when (and (not *shutdown-finished*)
+                     (<= +smart-shutdown+ *shutdown* +fast-shutdown+))
+            (setf *accept-stop-requested* t
+                  *shutdown-finished* t
+                  go t)))))
+    (when go
+      (admin-log "database system is shut down")
+      (sb-ext:exit :code 0))))
+
+(defun maybe-finish-shutdown ()
+  (when (and (shutdown-in-progress-p)
+             (sb-thread:with-mutex (*backend-registry-lock*)
+               (zerop *n-connections*)))
+    (finish-shutdown)))
+
+(defun immediate-shutdown ()
+  "Exit without waiting for the backends, like PostgreSQL's immediate shutdown.
+
+Non-fatal immediate shutdown still lets the postmaster exit cleanly: status 0,
+the socket removed, and \"database system is shut down\" logged (in PostgreSQL
+that log comes from the UnlinkLockFiles proc_exit callback).  Only the children
+are killed abruptly."
   (let ((go nil))
     (sb-thread:with-mutex (*shutdown-lock*)
       (unless *shutdown-finished*
         (setf *shutdown-finished* t
               go t)))
     (when go
-      (admin-log "database system is shut down")
-      (sb-ext:exit :code 0))))
-
-(defun maybe-finish-shutdown ()
-  (when (and (shutdown-in-progress-p) (zerop (backend-count)))
-    (finish-shutdown)))
-
-(defun unregister-backend (backend)
-  (let ((last nil))
-    (sb-thread:with-mutex (*backend-registry-lock*)
-      (when (eq (gethash (backend-pid backend) *backend-registry*) backend)
-        (remhash (backend-pid backend) *backend-registry*)
-        (decf *n-backends*))
-      ;; An immediate shutdown does not wait for backends; do not race it
-      ;; into the clean-exit path with status 0.
-      (setf last (and (<= +smart-shutdown+ *shutdown* +fast-shutdown+)
-                      (zerop *n-backends*))))
-    (when last
-      (finish-shutdown)))
-  (values))
-
-(defun immediate-shutdown ()
-  "Exit without cleanup, like PostgreSQL's immediate shutdown.
-
-There is no WAL to recover, so the only cleanup skipped is removing the
-Unix control socket; the next start deletes a stale node anyway."
-  (sb-ext:exit :code 1 :abort t))
+      ;; quickdie() tells each child why.  Idle backends can be told safely;
+      ;; a busy one may not be able to read the message before the socket dies.
+      (dolist (backend (list-backends))
+        (unless (backend-executing backend)
+          (ignore-errors
+            (send-notice (backend-stream backend)
+                         "terminating connection due to immediate shutdown command"
+                         "WARNING"))))
+      (admin-log "database system is shut down")))
+  (sb-ext:exit :code 0))
 
 (defun act-on-shutdown (mode)
   (case mode
@@ -169,28 +241,59 @@ Unix control socket; the next start deletes a stale node anyway."
     (when raised
       (act-on-shutdown mode))))
 
-;;; ---- signal handlers ----
+;;; ---- signal handlers and the postmaster worker ----
+
+(defun request-shutdown (mode)
+  ;; Called from a signal handler: no locks, no allocation, no blocking.
+  ;; Multiple handlers can run in different threads; CAS keeps escalation
+  ;; monotonic even when their reads and writes interleave.
+  (loop
+    for current = *pm-requested-mode*
+    do (when (>= current mode)
+         (return))
+       (when (= (sb-ext:compare-and-swap *pm-requested-mode* current mode)
+                current)
+         (return)))
+  (values))
 
 (defun request-smart-shutdown (&rest signal-info)
   (declare (ignore signal-info))
-  (process-shutdown-request +smart-shutdown+))
+  (request-shutdown +smart-shutdown+))
 
 (defun request-fast-shutdown (&rest signal-info)
   "SIGINT, i.e. Ctrl-C in a terminal, is PostgreSQL's fast shutdown."
   (declare (ignore signal-info))
-  (process-shutdown-request +fast-shutdown+))
+  (request-shutdown +fast-shutdown+))
 
 (defun request-immediate-shutdown (&rest signal-info)
   (declare (ignore signal-info))
-  (process-shutdown-request +immediate-shutdown+))
+  (request-shutdown +immediate-shutdown+))
+
+(defun postmaster-worker-loop ()
+  (loop
+    (let ((target *pm-requested-mode*))
+      (when (> target *pm-processed-mode*)
+        (setf *pm-processed-mode* target)
+        (handler-case (process-shutdown-request target)
+          (error (e)
+            (admin-log "shutdown processing failed: ~a" e)))))
+    (sleep 0.05)))
 
 (defun enable-shutdown-handlers ()
   (sb-sys:enable-interrupt sb-unix:sigterm #'request-smart-shutdown)
   (sb-sys:enable-interrupt sb-unix:sigint #'request-fast-shutdown)
   (sb-sys:enable-interrupt sb-unix:sigquit #'request-immediate-shutdown)
+  (unless (and *postmaster-thread*
+               (sb-thread:thread-alive-p *postmaster-thread*))
+    (setf *postmaster-thread*
+          (sb-thread:make-thread #'postmaster-worker-loop
+                                 :name "pg postmaster")))
   (values))
 
 ;;; ---- SQL entry points ----
+;;;
+;;; Argument coercion to the declared parameter types happens in ANALYZE, so
+;;; these see only integers (PID int4, timeout int8).
 
 (defun wait-until-termination (pid timeout-ms)
   "PostgreSQL's pg_wait_until_termination(): poll every 100 ms."
@@ -219,8 +322,6 @@ Unix control socket; the next start deletes a stale node anyway."
        nil))))
 
 (defun admin-terminate-backend (pid timeout)
-  (unless (integerp timeout)
-    (ereport "22023" "invalid parameter value"))
   (when (minusp timeout)
     (ereport "22003" "\"timeout\" must not be negative"))
   (let ((backend (lookup-backend pid)))

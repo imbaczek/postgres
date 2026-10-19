@@ -42,7 +42,8 @@ A **restart** is still required when:
   stale);
 - you change code that runs only once at startup and is already executing or
   already installed: `boot.lisp`, `pg-lisp.sh`, the accept loops (`serve`,
-  `control-accept-loop`), `main`, and the handlers installed by `enable-reload` /
+  `control-accept-loop`), `main`, the reload and postmaster worker threads, and
+  the handlers installed by `enable-reload` / `enable-shutdown-handlers` /
   `enable-cleanup`;
 - you add or remove files in `pg.asd`.
 
