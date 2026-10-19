@@ -2,8 +2,9 @@
 
 (in-package #:pg)
 
-(defparameter *pid-counter* 0)
-(defparameter *secret-counter* 0)
+;; DEFVAR so that hot reload does not reset them to zero.
+(defvar *pid-counter* 0)
+(defvar *secret-counter* 0)
 
 ;;; ---- startup ----
 
@@ -201,14 +202,58 @@ CL's RENAME-FILE merges a relative target with the source's directory."
            (lambda () (handle-connection sock))
            :name "pg backend"))))))
 
+;;; ---- hot reload (SIGHUP) ----
+;;;
+;;; SIGHUP recompiles and reloads the "pg" system in the running image, the
+;;; same way PostgreSQL reloads configuration on SIGHUP.  Functions are
+;;; redefined in place, so connections and global state survive; only source
+;;; changes that alter a DEFSTRUCT layout need a real restart.  The signal
+;;; handler only wakes a helper thread, because ASDF must not run in a signal
+;;; handler.
+
+(defvar *reload-requested* nil)
+(defvar *reload-mutex* (sb-thread:make-mutex :name "pg reload mutex"))
+(defvar *reload-cv* (sb-thread:make-waitqueue :name "pg reload waitqueue"))
+
+(defun request-reload (&rest signal-info)
+  "SIGHUP handler: hand the work to the reloader thread and return."
+  (declare (ignore signal-info))
+  (sb-thread:with-mutex (*reload-mutex*)
+    (setf *reload-requested* t)
+    (sb-thread:condition-broadcast *reload-cv*)))
+
+(defun reload-loop ()
+  (loop
+    (sb-thread:with-mutex (*reload-mutex*)
+      (loop until *reload-requested*
+            do (sb-thread:condition-wait *reload-cv* *reload-mutex*))
+      (setf *reload-requested* nil))
+    (handler-case
+        (progn
+          (format t "~&pg-lisp: reloading code...~%")
+          (finish-output)
+          (asdf:load-system "pg" :force t)
+          (format t "~&pg-lisp: reload complete~%")
+          (finish-output))
+      (error (e)
+        (format *error-output* "~&pg-lisp: reload failed: ~a~%" e)
+        (finish-output *error-output*)))))
+
+(defun enable-reload ()
+  (sb-sys:enable-interrupt sb-unix:sighup #'request-reload)
+  (sb-thread:make-thread #'reload-loop :name "pg reloader")
+  (values))
+
 (defun main ()
   (multiple-value-bind (host port pgdata)
       (parse-args (cdr sb-ext:*posix-argv*))
     (setf *pgdata* (directory-pathname pgdata))
     (xact-init)
     (catalog-init)
+    (enable-reload)
     (format t "~&pg-lisp: minimal PostgreSQL-compatible server~%")
     (format t "pg-lisp: data directory ~a~%" *pgdata*)
     (format t "pg-lisp: listening on ~a:~a~%" host port)
+    (format t "pg-lisp: send SIGHUP to reload code~%")
     (finish-output)
     (serve host port)))

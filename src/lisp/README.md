@@ -38,6 +38,21 @@ trusted, and `postgres` is always the effective role. Only the simple query
 protocol (`Q`) is implemented, which is all `psql` uses for the supported
 statements.
 
+## Hot reload
+
+Send `SIGHUP` to a running server and it recompiles and reloads the `pg` system
+in place, like PostgreSQL reloading configuration:
+
+```sh
+kill -HUP "$(pgrep -f 'sbcl.*boot.lisp')"
+```
+
+Functions are redefined live, so existing connections and global state (xact
+counters, catalog, relation files) survive. Two caveats: a change to a
+`DEFSTRUCT` layout needs a real restart, and a reload whose compilation fails
+partway can leave a mixed image, so restart if the reload log shows an error.
+`t/hot-reload.sh` exercises this.
+
 ## Supported SQL
 
 Types: `int`/`integer`/`int4`, `bigint`/`int8`, `varchar(n)` / `character
@@ -91,6 +106,7 @@ cd src/lisp
 ./t/run-unit-tests.sh     # Lisp-level page/tuple/index/visibility tests
 ./t/psql-smoke.sh         # boots a server and diffs psql output against a golden file
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
+./t/hot-reload.sh         # SIGHUP reloads code in a running server
 ```
 
 `t/psql-smoke.sh` is the acceptance test: it launches the server on a throwaway
