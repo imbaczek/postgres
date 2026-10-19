@@ -108,16 +108,16 @@
     ((match-kw p "drop") (parse-drop p))
     ((match-kw p "alter") (parse-alter p))
     ((match-kw p "begin") (match-kw p "work") (match-kw p "transaction")
-     (list :type :begin))
+                          (list :type :begin))
     ((match-kw p "start") (expect-kw p "transaction") (list :type :begin))
     ((match-kw p "commit") (match-kw p "work") (match-kw p "transaction")
-     (list :type :commit))
+                           (list :type :commit))
     ((match-kw p "end") (match-kw p "work") (match-kw p "transaction")
-     (list :type :commit))
+                        (list :type :commit))
     ((match-kw p "rollback") (match-kw p "work") (match-kw p "transaction")
-     (list :type :rollback))
+                             (list :type :rollback))
     ((match-kw p "abort") (match-kw p "work") (match-kw p "transaction")
-     (list :type :rollback))
+                          (list :type :rollback))
     ((match-kw p "set") (parse-set p))
     ((match-kw p "show") (parse-show p))
     ((match-kw p "reset") (parse-reset p))
@@ -284,8 +284,8 @@
     (multiple-value-setq (type typmod) (parse-type p))
     (let ((notnull nil)
           (primary nil)
-            (unique nil)
-            (nulls-not-distinct nil))
+          (unique nil)
+          (nulls-not-distinct nil))
       (loop
         (cond
           ((match-kw p "not")
@@ -296,8 +296,8 @@
            (expect-kw p "key")
            (setf primary t notnull t))
           ((match-kw p "unique")
-             (setf unique t
-                   nulls-not-distinct (parse-unique-null-treatment p)))
+           (setf unique t
+                 nulls-not-distinct (parse-unique-null-treatment p)))
           ((match-kw p "default")
            (ereport "0A000" "DEFAULT is not supported"))
           ((match-kw p "check")
@@ -306,8 +306,8 @@
            (ereport "0A000" "foreign keys are not supported"))
           (t (return))))
       (list :name name :type type :typmod typmod
-              :notnull notnull :primary primary :unique unique
-              :nulls-not-distinct nulls-not-distinct))))
+            :notnull notnull :primary primary :unique unique
+            :nulls-not-distinct nulls-not-distinct))))
 
 (defun parse-type (p)
   (cond
@@ -361,12 +361,12 @@
          (expect-punct p #\))
          (list :kind :primary :name cname :columns cols)))
       ((match-kw p "unique")
-         (let ((nulls-not-distinct (parse-unique-null-treatment p)))
-           (expect-punct p #\()
-           (let ((cols (parse-ident-list p)))
-         (expect-punct p #\))
-             (list :kind :unique :name cname :columns cols
-                   :nulls-not-distinct nulls-not-distinct))))
+       (let ((nulls-not-distinct (parse-unique-null-treatment p)))
+         (expect-punct p #\()
+         (let ((cols (parse-ident-list p)))
+           (expect-punct p #\))
+           (list :kind :unique :name cname :columns cols
+                 :nulls-not-distinct nulls-not-distinct))))
       (t
        (ereport "0A000" "unsupported table constraint")))))
 
@@ -392,21 +392,21 @@
           (unless (match-punct p #\,)
             (return)))
         (expect-punct p #\))
-          (let ((nulls-not-distinct
-                  (if unique
-                      (parse-unique-null-treatment p)
-                      (when (kw-p p "nulls")
-                        (ereport "0A000"
-                                 "NULLS NOT DISTINCT requires a unique index")))))
-            (when (match-kw p "where")
-              (ereport "0A000" "partial indexes are not supported"))
-            (list :type :create-index
-                  :name name
-                  :table table
-                  :columns (nreverse cols)
-                  :unique unique
-                  :nulls-not-distinct nulls-not-distinct
-                  :if-not-exists if-not-exists))))))
+        (let ((nulls-not-distinct
+                (if unique
+                    (parse-unique-null-treatment p)
+                    (when (kw-p p "nulls")
+                      (ereport "0A000"
+                               "NULLS NOT DISTINCT requires a unique index")))))
+          (when (match-kw p "where")
+            (ereport "0A000" "partial indexes are not supported"))
+          (list :type :create-index
+                :name name
+                :table table
+                :columns (nreverse cols)
+                :unique unique
+                :nulls-not-distinct nulls-not-distinct
+                :if-not-exists if-not-exists))))))
 
 (defun parse-drop (p)
   (cond
@@ -459,66 +459,66 @@
 
 (defun parse-alter-table-action (p)
   (cond
-      ((match-kw p "rename")
-       (expect-kw p "constraint")
-       (let ((constraint-name (pident p)))
-         (expect-kw p "to")
-         (list :action :rename-constraint
-               :constraint-name constraint-name
-               :new-name (pident p))))
-      ((match-kw p "drop")
-       (expect-kw p "constraint")
-       (let ((constraint-if-exists (when (match-kw p "if")
-                                     (expect-kw p "exists")
-                                     t))
-             (constraint-name (pident p)))
-         (match-kw p "restrict")
-         (list
-               :constraint-if-exists constraint-if-exists
-               :action :drop-constraint
-               :constraint-name constraint-name)))
-      ((match-kw p "add")
-       (let ((cname nil))
-         (when (match-kw p "constraint")
-           (setf cname (pident p)))
-         (cond
-           ((match-kw p "primary")
-            (expect-kw p "key")
+    ((match-kw p "rename")
+     (expect-kw p "constraint")
+     (let ((constraint-name (pident p)))
+       (expect-kw p "to")
+       (list :action :rename-constraint
+             :constraint-name constraint-name
+             :new-name (pident p))))
+    ((match-kw p "drop")
+     (expect-kw p "constraint")
+     (let ((constraint-if-exists (when (match-kw p "if")
+                                   (expect-kw p "exists")
+                                   t))
+           (constraint-name (pident p)))
+       (match-kw p "restrict")
+       (list
+        :constraint-if-exists constraint-if-exists
+        :action :drop-constraint
+        :constraint-name constraint-name)))
+    ((match-kw p "add")
+     (let ((cname nil))
+       (when (match-kw p "constraint")
+         (setf cname (pident p)))
+       (cond
+         ((match-kw p "primary")
+          (expect-kw p "key")
+          (if (match-kw p "using")
+              (progn
+                (expect-kw p "index")
+                (list :action :add-primary-key
+                      :using-index (strip-schema (pident p))
+                      :constraint-name cname))
+              (progn
+                (expect-punct p #\()
+                (let ((cols (parse-ident-list p)))
+                  (expect-punct p #\))
+                  (list :action :add-primary-key :columns cols
+                        :constraint-name cname)))))
+         ((match-kw p "unique")
+          (multiple-value-bind (nulls-not-distinct null-treatment-specified)
+              (parse-unique-null-treatment p)
+            (when (and null-treatment-specified (kw-p p "using"))
+              (syntax-error p))
             (if (match-kw p "using")
                 (progn
                   (expect-kw p "index")
-                  (list :action :add-primary-key
+                  (list :action :add-unique
                         :using-index (strip-schema (pident p))
-                        :constraint-name cname))
+                        :constraint-name cname
+                        :nulls-not-distinct nulls-not-distinct))
                 (progn
                   (expect-punct p #\()
                   (let ((cols (parse-ident-list p)))
                     (expect-punct p #\))
-                    (list :action :add-primary-key :columns cols
-                          :constraint-name cname)))))
-           ((match-kw p "unique")
-            (multiple-value-bind (nulls-not-distinct null-treatment-specified)
-                (parse-unique-null-treatment p)
-              (when (and null-treatment-specified (kw-p p "using"))
-                (syntax-error p))
-              (if (match-kw p "using")
-                  (progn
-                    (expect-kw p "index")
-                    (list :action :add-unique
-                          :using-index (strip-schema (pident p))
+                    (list :action :add-unique :columns cols
                           :constraint-name cname
-                          :nulls-not-distinct nulls-not-distinct))
-                  (progn
-                    (expect-punct p #\()
-                    (let ((cols (parse-ident-list p)))
-                      (expect-punct p #\))
-                      (list :action :add-unique :columns cols
-                            :constraint-name cname
-                            :nulls-not-distinct nulls-not-distinct))))))
-           (t
-            (ereport "0A000" "unsupported ALTER TABLE action")))))
-      (t
-       (ereport "0A000" "unsupported ALTER TABLE action"))))
+                          :nulls-not-distinct nulls-not-distinct))))))
+         (t
+          (ereport "0A000" "unsupported ALTER TABLE action")))))
+    (t
+     (ereport "0A000" "unsupported ALTER TABLE action"))))
 
 ;;; ---- SET / SHOW / RESET ----
 

@@ -115,13 +115,13 @@ INTERRUPT-THREAD, so it needs no flag."
   "Register XID as a writer, waiting if an index build owns the relation."
   (sb-thread:with-mutex (*relation-lock-mutex*)
     (loop
-        (let* ((writers (gethash relfilenode *relation-writers*))
-               (token (gethash relfilenode *relation-builders*))
-               (group (gethash token *relation-build-groups*)))
+      (let* ((writers (gethash relfilenode *relation-writers*))
+             (token (gethash relfilenode *relation-builders*))
+             (group (gethash token *relation-build-groups*)))
         (when (or (null (gethash relfilenode *relation-builders*))
                   (member xid writers :test #'=)
-                    (relation-build-group-has-user-p
-                     token xid t (and group (second group))))
+                  (relation-build-group-has-user-p
+                   token xid t (and group (second group))))
           (pushnew xid (gethash relfilenode *relation-writers*) :test #'=)
           (return)))
       (check-for-interrupts)
@@ -132,18 +132,18 @@ INTERRUPT-THREAD, so it needs no flag."
   "Register XID as a reader, waiting if relation DDL excludes readers."
   (sb-thread:with-mutex (*relation-lock-mutex*)
     (loop
-        (let* ((readers (gethash relfilenode *relation-readers*))
-               (token (gethash relfilenode *relation-reader-blockers*)))
+      (let* ((readers (gethash relfilenode *relation-readers*))
+             (token (gethash relfilenode *relation-reader-blockers*)))
         (when (or (null (gethash relfilenode *relation-reader-blockers*))
                   (member xid readers :test #'=)
                   (member xid (gethash relfilenode *relation-writers*) :test #'=))
           (pushnew xid (gethash relfilenode *relation-readers*) :test #'=)
-            (return))
-          ;; Multi-relation DDL waits for existing users on every member. Let
-          ;; those transactions finish their work on the rest of that group.
-          (when (relation-build-group-has-user-p token xid t t)
-            (pushnew xid (gethash relfilenode *relation-readers*) :test #'=)
-            (return)))
+          (return))
+        ;; Multi-relation DDL waits for existing users on every member. Let
+        ;; those transactions finish their work on the rest of that group.
+        (when (relation-build-group-has-user-p token xid t t)
+          (pushnew xid (gethash relfilenode *relation-readers*) :test #'=)
+          (return)))
       (check-for-interrupts)
       (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*)))
   (values))
@@ -189,7 +189,7 @@ INTERRUPT-THREAD, so it needs no flag."
               (wait-for-xid user)))
           token)
       (error (e)
-          (release-relation-build-locks relfilenodes token)
+        (release-relation-build-locks relfilenodes token)
         (error e)))))
 
 (defun release-relation-build-locks (relfilenodes token)
@@ -215,8 +215,8 @@ INTERRUPT-THREAD, so it needs no flag."
         (xid (gensym "OWN-XID-"))
         (token (gensym "BUILD-TOKEN-")))
     `(let* ((,rel ,relfilenode)
-              (,xid (and *backend* (backend-xid *backend*)))
-              (,token (acquire-relation-build-lock ,rel ,xid ,wait-readers-p)))
+            (,xid (and *backend* (backend-xid *backend*)))
+            (,token (acquire-relation-build-lock ,rel ,xid ,wait-readers-p)))
        (unwind-protect
             (progn ,@body)
          (release-relation-build-lock ,rel ,token)))))
@@ -241,16 +241,16 @@ INTERRUPT-THREAD, so it needs no flag."
   (sb-thread:with-mutex (*relation-lock-mutex*)
     (sb-thread:with-mutex (*xid-lock*)
       (setf *active-xids* (delete xid *active-xids* :test #'=)))
-      (dolist (registrations (list *relation-writers* *relation-readers*))
-        (let ((empty-relations '()))
-          (maphash (lambda (relfilenode xids)
-                     (let ((remaining (delete xid xids :test #'=)))
-                       (if remaining
-                           (setf (gethash relfilenode registrations) remaining)
-                           (push relfilenode empty-relations))))
-                   registrations)
-          (dolist (relfilenode empty-relations)
-            (remhash relfilenode registrations))))
+    (dolist (registrations (list *relation-writers* *relation-readers*))
+      (let ((empty-relations '()))
+        (maphash (lambda (relfilenode xids)
+                   (let ((remaining (delete xid xids :test #'=)))
+                     (if remaining
+                         (setf (gethash relfilenode registrations) remaining)
+                         (push relfilenode empty-relations))))
+                 registrations)
+        (dolist (relfilenode empty-relations)
+          (remhash relfilenode registrations))))
     (sb-thread:condition-broadcast *relation-lock-cv*))
   (values))
 

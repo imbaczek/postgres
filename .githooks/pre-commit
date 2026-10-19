@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+mapfile -d '' staged_files < <(
+    git diff --cached --name-only -z --diff-filter=ACMR -- \
+        'src/lisp/*.lisp' 'src/lisp/**/*.lisp' \
+        'src/lisp/*.asd' 'src/lisp/**/*.asd'
+)
+
+if ((${#staged_files[@]} == 0)); then
+    exit 0
+fi
+
+temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/pg-lisp-pre-commit.XXXXXX")
+trap 'rm -rf "$temp_dir"' EXIT
+
+format_files=()
+for staged_path in "${staged_files[@]}"; do
+    temp_path="$temp_dir/$staged_path"
+    mkdir -p "$(dirname "$temp_path")"
+    git show ":$staged_path" > "$temp_path"
+    format_files+=("$temp_path")
+done
+
+if ! "$repo_root/src/lisp/t/format.sh" --check -- "${format_files[@]}"; then
+    printf '%s\n' \
+        'pre-commit: formatting check failed for staged Lisp files.' \
+        'Run the formatter on these staged paths, then stage them again:' >&2
+    printf '  %s\n' "${staged_files[@]}" >&2
+    printf '%s\n' '  src/lisp/t/format.sh <file...>' >&2
+    exit 1
+fi

@@ -70,14 +70,14 @@
 (defun page-get-lp (page offnum)
   "Return (values lp_off lp_flags lp_len) for 1-based OFFNUM."
   (let ((v (page-u32 page (+ +size-of-page-header+
-                            (* (1- offnum) +size-of-item-id+)))))
+                             (* (1- offnum) +size-of-item-id+)))))
     (values (logand v #x7FFF)
             (logand (ash v -15) #x3)
             (logand (ash v -17) #x3FFF))))
 
 (defun page-set-lp (page offnum off flags len)
   (page-set-u32 page (+ +size-of-page-header+
-                       (* (1- offnum) +size-of-item-id+))
+                        (* (1- offnum) +size-of-item-id+))
                 (logior (logand off #x7FFF)
                         (ash (logand flags #x3) 15)
                         (ash (logand len #x3FFF) 17))))
@@ -91,7 +91,7 @@
         (n (page-lp-count page)))
     (replace new page :end2 +size-of-page-header+)
     (setf (page-lower new) (+ +size-of-page-header+
-                             (* +size-of-item-id+ n)))
+                              (* +size-of-item-id+ n)))
     (setf (page-upper new) +blcksz+)
     (loop for i from 1 to n
           do (multiple-value-bind (off flags len) (page-get-lp page i)

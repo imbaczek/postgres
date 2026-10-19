@@ -233,6 +233,25 @@ It only adjusts indentation; it does not reflow long lines. The inferior Lisp
 defaults to the sibling `../sbcl/run-sbcl.sh`; select another launcher with
 `--lisp /path/to/launcher` or `PG_LISP_INFERIOR=/path/to/launcher`.
 
+Format all Common Lisp sources, including `pg.asd`, from the repository root:
+
+```sh
+git ls-files -z -- 'src/lisp/*.lisp' 'src/lisp/**/*.lisp' \
+  'src/lisp/*.asd' 'src/lisp/**/*.asd' |
+  xargs -0 src/lisp/t/format.sh
+```
+
+The tracked pre-commit hook checks the staged versions of changed `.lisp` and
+`.asd` files. Enable it in this clone from the repository root with:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The hook requires the same Emacs, SLIME, and inferior Lisp setup as the batch
+formatter. It reports files that need formatting; run the formatter and stage
+those files before committing.
+
 ## Storage and concurrency
 
 - 8 KB pages with PostgreSQL's `PageHeaderData` + `ItemIdData` layout, one file

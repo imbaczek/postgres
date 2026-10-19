@@ -3,7 +3,7 @@
 (in-package #:pg)
 
 (defstruct (snapshot (:constructor make-snapshot-struct
-                                  (&key xmin xmax xip curcid)))
+                         (&key xmin xmax xip curcid)))
   xmin
   xmax
   xip

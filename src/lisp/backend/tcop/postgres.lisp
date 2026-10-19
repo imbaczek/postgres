@@ -146,14 +146,14 @@
                  (setf backend *backend*)
                  ;; A dropped connection must not strand an open transaction.
                  (unwind-protect
-                       (progn
-                         ;; Register before waiting for StartupMessage so fast
-                         ;; shutdown can terminate stalled startup handshakes.
-                         (register-backend *backend*)
-                         (let ((body (read-startup-until-ready stream)))
-                           (when body
-                             (process-startup stream body)
-                             (backend-loop stream))))
+                      (progn
+                        ;; Register before waiting for StartupMessage so fast
+                        ;; shutdown can terminate stalled startup handshakes.
+                        (register-backend *backend*)
+                        (let ((body (read-startup-until-ready stream)))
+                          (when body
+                            (process-startup stream body)
+                            (backend-loop stream))))
                    (end-backend-session))))
            (pg-error (e)
              (when stream (ignore-errors (send-error-response stream e))))
@@ -163,7 +163,7 @@
                 (send-error-response
                  stream
                  (make-condition 'pg-error :sqlstate "XX000"
-                                 :message (princ-to-string e)))))))
+                                           :message (princ-to-string e)))))))
       ;; Send the final error and close the socket *before* unregistering:
       ;; during a fast shutdown the last connection's CONNECTION-FINISHED exits
       ;; the process, and the client must still receive its FATAL.

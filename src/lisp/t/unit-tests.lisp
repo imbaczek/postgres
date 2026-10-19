@@ -228,13 +228,13 @@
       (test-tuple-roundtrip)
       (test-key-order)
       (test-index-catalog-roundtrip)
-        (test-relation-build-own-xid)
+      (test-relation-build-own-xid)
       (test-visibility)
       (test-btree-duplicate-keys)
       (test-btree-mixed-duplicate-keys)
       (test-parse-error-aborts-transaction))
     (ignore-errors
-      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))
+     (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))
   (format t "~&unit-tests: ~a checks, ~a failures~%"
           *test-checks* *test-failures*)
   (when (plusp *test-failures*)

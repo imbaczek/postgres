@@ -37,7 +37,7 @@
 (defun encode-leaf-entry (key block off)
   (let* ((klen (length key))
          (v (make-array (+ 2 klen 6) :element-type '(unsigned-byte 8)
-                                          :initial-element 0)))
+                                     :initial-element 0)))
     (page-set-u16 v 0 klen)
     (replace v key :start1 2)
     (page-set-u32 v (+ 2 klen) block)
@@ -54,7 +54,7 @@
 (defun encode-internal-entry (key child)
   (let* ((klen (length key))
          (v (make-array (+ 2 klen 4) :element-type '(unsigned-byte 8)
-                                          :initial-element 0)))
+                                     :initial-element 0)))
     (page-set-u16 v 0 klen)
     (replace v key :start1 2)
     (page-set-u32 v (+ 2 klen) child)
@@ -238,8 +238,8 @@ to a single leaf."
             (if (not split-p)
                 (values nil nil nil)
                 (let* ((all (append (subseq entries 0 (1+ chosen-index))
-                                  (list (cons sep new-block))
-                                  (subseq entries (1+ chosen-index))))
+                                    (list (cons sep new-block))
+                                    (subseq entries (1+ chosen-index))))
                        (built (btree-page-build all t)))
                   (if built
                       (progn
@@ -284,9 +284,9 @@ the MVP types. Null sorts before any non-null value; ints are sign-flipped."
   (let ((out (make-array 0 :adjustable t :fill-pointer 0
                            :element-type '(unsigned-byte 8))))
     (labels ((push-byte (b) (vector-push-extend b out))
-           (push-int-be (v bytes)
-             (loop for shift from (* 8 (1- bytes)) downto 0 by 8
-                   do (push-byte (ldb (byte 8 shift) v)))))
+             (push-int-be (v bytes)
+               (loop for shift from (* 8 (1- bytes)) downto 0 by 8
+                     do (push-byte (ldb (byte 8 shift) v)))))
       (loop for v in values
             for ty in types
             do (cond

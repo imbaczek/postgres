@@ -211,9 +211,9 @@ are killed abruptly."
       (dolist (backend (list-backends))
         (unless (backend-executing backend)
           (ignore-errors
-            (send-notice (backend-stream backend)
-                         "terminating connection due to immediate shutdown command"
-                         "WARNING"))))
+           (send-notice (backend-stream backend)
+                        "terminating connection due to immediate shutdown command"
+                        "WARNING"))))
       (admin-log "database system is shut down")))
   (sb-ext:exit :code 0))
 

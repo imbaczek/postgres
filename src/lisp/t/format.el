@@ -20,6 +20,21 @@
     (unless (slime-connected-p)
       (error "Timed out waiting for the SLIME connection"))))
 
+(defun pg-format-wait-for-indentation (timeout)
+  (let ((deadline (+ (float-time) timeout))
+        (updated nil))
+    (let ((hook (lambda (&rest _)
+                  (setq updated t))))
+      (add-hook 'slime-indentation-update-hooks hook)
+      (unwind-protect
+          (progn
+            (slime-update-indentation)
+            (while (and (not updated) (< (float-time) deadline))
+              (accept-process-output nil 0.1))
+            (unless updated
+              (error "Timed out waiting for SLIME indentation information")))
+        (remove-hook 'slime-indentation-update-hooks hook)))))
+
 (defun pg-format--lisp-command (root program)
   (let ((registry (format "(push #p%s asdf:*central-registry*)"
                           (prin1-to-string (file-name-as-directory root)))))
@@ -76,10 +91,7 @@
         slime-default-lisp 'pg-lisp)
   (slime)
   (pg-format-wait-for-connection 60)
-  (slime-update-indentation)
-  ;; The second synchronous request waits until the async indentation scan has
-  ;; delivered the macro indentation table to Emacs.
-  (slime-eval '(cl:values) "CL-USER")
+  (pg-format-wait-for-indentation 60)
   (pg-format-files files check-only))
 
 ;;; format.el ends here

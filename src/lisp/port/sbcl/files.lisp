@@ -20,7 +20,7 @@
 (defun read-page (stream block)
   "Return the page vector for BLOCK, or NIL if the block does not exist."
   (let ((buf (make-array +blcksz+ :element-type '(unsigned-byte 8)
-                                :initial-element 0)))
+                                  :initial-element 0)))
     (file-position stream (* block +blcksz+))
     (let ((n (read-sequence buf stream)))
       (if (< n +blcksz+)
