@@ -158,7 +158,9 @@
 (defun parse-args (argv)
   (let ((port 5433)
         (host "127.0.0.1")
-        (pgdata nil))
+        (pgdata nil)
+        (control-port nil)
+        (control-socket nil))
     (loop for rest on argv
           for arg = (car rest)
           do (cond
@@ -171,8 +173,17 @@
                ((member arg '("-D" "--pgdata") :test #'string=)
                 (setf pgdata (cadr rest)))
                ((and (> (length arg) 9) (string= arg "--pgdata=" :end1 9))
-                (setf pgdata (subseq arg 9)))))
-    (values host port (or pgdata (sb-ext:posix-getenv "PGDATA") "./pgdata"))))
+                (setf pgdata (subseq arg 9)))
+               ((member arg '("-C" "--control-port") :test #'string=)
+                (setf control-port (parse-integer (cadr rest))))
+               ((and (> (length arg) 15) (string= arg "--control-port=" :end1 15))
+                (setf control-port (parse-integer arg :start 15)))
+               ((string= arg "--control-socket")
+                (setf control-socket (cadr rest)))
+               ((and (> (length arg) 17) (string= arg "--control-socket=" :end1 17))
+                (setf control-socket (subseq arg 17)))))
+    (values host port (or pgdata (sb-ext:posix-getenv "PGDATA") "./pgdata")
+            control-port control-socket)))
 
 (defun directory-pathname (path)
   "Return PATH as an absolute directory pathname (trailing slash).
@@ -202,58 +213,19 @@ CL's RENAME-FILE merges a relative target with the source's directory."
            (lambda () (handle-connection sock))
            :name "pg backend"))))))
 
-;;; ---- hot reload (SIGHUP) ----
-;;;
-;;; SIGHUP recompiles and reloads the "pg" system in the running image, the
-;;; same way PostgreSQL reloads configuration on SIGHUP.  Functions are
-;;; redefined in place, so connections and global state survive; only source
-;;; changes that alter a DEFSTRUCT layout need a real restart.  The signal
-;;; handler only wakes a helper thread, because ASDF must not run in a signal
-;;; handler.
-
-(defvar *reload-requested* nil)
-(defvar *reload-mutex* (sb-thread:make-mutex :name "pg reload mutex"))
-(defvar *reload-cv* (sb-thread:make-waitqueue :name "pg reload waitqueue"))
-
-(defun request-reload (&rest signal-info)
-  "SIGHUP handler: hand the work to the reloader thread and return."
-  (declare (ignore signal-info))
-  (sb-thread:with-mutex (*reload-mutex*)
-    (setf *reload-requested* t)
-    (sb-thread:condition-broadcast *reload-cv*)))
-
-(defun reload-loop ()
-  (loop
-    (sb-thread:with-mutex (*reload-mutex*)
-      (loop until *reload-requested*
-            do (sb-thread:condition-wait *reload-cv* *reload-mutex*))
-      (setf *reload-requested* nil))
-    (handler-case
-        (progn
-          (format t "~&pg-lisp: reloading code...~%")
-          (finish-output)
-          (asdf:load-system "pg" :force t)
-          (format t "~&pg-lisp: reload complete~%")
-          (finish-output))
-      (error (e)
-        (format *error-output* "~&pg-lisp: reload failed: ~a~%" e)
-        (finish-output *error-output*)))))
-
-(defun enable-reload ()
-  (sb-sys:enable-interrupt sb-unix:sighup #'request-reload)
-  (sb-thread:make-thread #'reload-loop :name "pg reloader")
-  (values))
+;;; ---- hot reload (SIGHUP) and control REPL live in tcop/control.lisp ----
 
 (defun main ()
-  (multiple-value-bind (host port pgdata)
+  (multiple-value-bind (host port pgdata control-port control-socket)
       (parse-args (cdr sb-ext:*posix-argv*))
     (setf *pgdata* (directory-pathname pgdata))
+    (capture-server-streams)
     (xact-init)
     (catalog-init)
     (enable-reload)
+    (start-control-plane :port control-port :socket-path control-socket)
     (format t "~&pg-lisp: minimal PostgreSQL-compatible server~%")
     (format t "pg-lisp: data directory ~a~%" *pgdata*)
     (format t "pg-lisp: listening on ~a:~a~%" host port)
-    (format t "pg-lisp: send SIGHUP to reload code~%")
     (finish-output)
     (serve host port)))

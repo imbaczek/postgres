@@ -61,4 +61,5 @@
      (:module "tcop"
       :serial t
       :components ((:file "dest")
+                   (:file "control")
                    (:file "postgres")))))))

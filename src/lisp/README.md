@@ -38,7 +38,7 @@ trusted, and `postgres` is always the effective role. Only the simple query
 protocol (`Q`) is implemented, which is all `psql` uses for the supported
 statements.
 
-## Hot reload
+## Hot reload and control REPL
 
 Send `SIGHUP` to a running server and it recompiles and reloads the `pg` system
 in place, like PostgreSQL reloading configuration:
@@ -52,6 +52,33 @@ counters, catalog, relation files) survive. Two caveats: a change to a
 `DEFSTRUCT` layout needs a real restart, and a reload whose compilation fails
 partway can leave a mixed image, so restart if the reload log shows an error.
 `t/hot-reload.sh` exercises this.
+
+For interactive work there is also an out-of-band control REPL. It is **off by
+default** because it evaluates arbitrary Lisp; enable it explicitly, and it only
+ever listens on loopback and/or a Unix socket:
+
+```sh
+./pg-lisp.sh -p 5439 --control-port 5490 --control-socket /tmp/pg.sock
+```
+
+Then connect with any line-oriented client. Over TCP:
+
+```sh
+nc 127.0.0.1 5490          # or: socat - TCP:127.0.0.1:5490
+```
+
+Over the Unix socket:
+
+```sh
+nc -U /tmp/pg.sock         # or: socat - UNIX-CONNECT:/tmp/pg.sock
+```
+
+The REPL starts in the `pg` package and prints the value of each form you type.
+Two helpers are provided: `(reload)` recompiles and reloads in place, and
+`(quit)` closes the connection. Any other Lisp can be evaluated too, e.g. to
+inspect server state. `t/control-repl.sh` exercises both transports and a reload
+through the REPL. Note that `telnet` sends terminal-negotiation bytes that the
+reader will parse as Lisp; use `nc`/`socat` instead.
 
 ## Supported SQL
 
@@ -107,6 +134,7 @@ cd src/lisp
 ./t/psql-smoke.sh         # boots a server and diffs psql output against a golden file
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
 ./t/hot-reload.sh         # SIGHUP reloads code in a running server
+./t/control-repl.sh       # control REPL over TCP + Unix socket, reload, SQL intact
 ```
 
 `t/psql-smoke.sh` is the acceptance test: it launches the server on a throwaway
