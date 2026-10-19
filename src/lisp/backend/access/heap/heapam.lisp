@@ -3,6 +3,9 @@
 
 (in-package #:pg)
 
+;; pg-column is defined by the later catalog component in pg.asd.
+(declaim (notinline pg-column-type))
+
 (defstruct htup
   block
   offnum
@@ -106,10 +109,10 @@
     (loop for i from 0 below natts
           for col = (aref columns i)
           do (let ((is-null
-                    (and (logtest infomask +heap-hasnull+)
-                         (logbitp (mod i 8)
-                                  (aref bytes (+ +size-of-heap-tuple-header+
-                                                 (floor i 8)))))))
+                     (and (logtest infomask +heap-hasnull+)
+                          (logbitp (mod i 8)
+                                   (aref bytes (+ +size-of-heap-tuple-header+
+                                                  (floor i 8)))))))
                (unless is-null
                  (let ((al (column-align col)))
                    (setf cursor (align-up cursor al))
@@ -245,6 +248,7 @@ Return the number of tuples pruned."
           (n (page-lp-count page)))
       (loop for i from 1 to n
             do (multiple-value-bind (off flags len) (page-get-lp page i)
+                 (declare (ignore len))
                  (when (= flags +lp-normal+)
                    (let* ((xmin (page-u32 page off))
                           (xmax (page-u32 page (+ off 4))))

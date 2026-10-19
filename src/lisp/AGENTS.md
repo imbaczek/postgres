@@ -10,6 +10,10 @@ Use `../sbcl/run-sbcl.sh` (absolute: `/home/imbaczek/proj/sbcl/run-sbcl.sh`) as
 the SBCL. Do not assume a system `sbcl`. The server launcher is `./pg-lisp.sh`.
 When you delegate to a reviewer or subagent, tell it the same.
 
+Run `./t/compile.sh` for a forced ASDF compile with compiler warnings treated
+as errors. It uses the sibling SBCL build by default; set `SBCL` to override it.
+`./t/format.sh` uses Emacs + SLIME and the same inferior Lisp by default.
+
 ## Work the Lisp way: reload, don't restart
 
 The server loads the `pg` system with ASDF and can recompile itself in place.

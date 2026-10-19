@@ -89,7 +89,7 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
     :columns ,(pg-index-columns i)
     :unique ,(pg-index-unique-p i)
     :primary ,(pg-index-primary-p i)
-      :constraint ,(pg-index-constraint-p i)
+    :constraint ,(pg-index-constraint-p i)
     :nulls-not-distinct ,(pg-index-nulls-not-distinct-p i)))
 
 (defun index-from-sexp (s)
@@ -100,7 +100,7 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
                  :columns (getf s :columns)
                  :unique-p (getf s :unique)
                  :primary-p (getf s :primary)
-                   :constraint-p (getf s :constraint)
+                 :constraint-p (getf s :constraint)
                  :nulls-not-distinct-p (getf s :nulls-not-distinct)))
 
 (defun database-to-sexp (db)
@@ -247,7 +247,7 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
   (loop for attnum in (pg-index-columns idx)
         collect (pg-column-type (aref (pg-class-columns class) (1- attnum)))))
 
-(defun index-values (idx class values)
+(defun index-values (idx values)
   (loop for attnum in (pg-index-columns idx)
         collect (aref values (1- attnum))))
 
@@ -280,7 +280,7 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
                    attnums))))
 
 (defun create-index* (db name table cols
-                         &key unique primary constraint nulls-not-distinct)
+                      &key unique primary constraint nulls-not-distinct)
   (check-new-relation-name db name)
   (let* ((oid (allocate-oid))
          (idx (make-pg-index :oid oid
@@ -290,7 +290,7 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
                              :columns cols
                              :unique-p unique
                              :primary-p primary
-                              :constraint-p constraint
+                             :constraint-p constraint
                              :nulls-not-distinct-p nulls-not-distinct)))
     (btree-init oid)
     (setf (gethash name (database-indexes db)) idx)
@@ -330,36 +330,36 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
                                :columns cols
                                :indexes '())))
     (setf (gethash name (database-tables db)) class)
-      (handler-case
-          (progn
-            ;; Per-column PRIMARY KEY / UNIQUE.
-            (loop for def in columns
-                  for col across cols
-                  do (cond
-                       ((getf def :primary)
-                          (setf (pg-column-notnull col) t)
-                          (create-index* db
-                                         (generate-index-name db name "pkey")
-                                         class (list (pg-column-attnum col))
-                                         :unique t :primary t :constraint t))
-                       ((getf def :unique)
-                        (create-index* db
-                                       (generate-index-name
-                                        db name
-                                        (format nil "~a_key"
-                                                (pg-column-name col)))
-                                       class (list (pg-column-attnum col))
-                                       :unique t
-                                       :constraint t
-                                       :nulls-not-distinct
-                                       (getf def :nulls-not-distinct)))))
-            class)
-        (error (e)
-          ;; A column constraint can fail after the table and earlier indexes
-          ;; have been installed.  Roll all of them back as one CREATE TABLE.
-          (when (eq class (gethash name (database-tables db)))
-            (drop-table* db name))
-          (error e)))))
+    (handler-case
+        (progn
+          ;; Per-column PRIMARY KEY / UNIQUE.
+          (loop for def in columns
+                for col across cols
+                do (cond
+                     ((getf def :primary)
+                      (setf (pg-column-notnull col) t)
+                      (create-index* db
+                                     (generate-index-name db name "pkey")
+                                     class (list (pg-column-attnum col))
+                                     :unique t :primary t :constraint t))
+                     ((getf def :unique)
+                      (create-index* db
+                                     (generate-index-name
+                                      db name
+                                      (format nil "~a_key"
+                                              (pg-column-name col)))
+                                     class (list (pg-column-attnum col))
+                                     :unique t
+                                     :constraint t
+                                     :nulls-not-distinct
+                                     (getf def :nulls-not-distinct)))))
+          class)
+      (error (e)
+        ;; A column constraint can fail after the table and earlier indexes
+        ;; have been installed.  Roll all of them back as one CREATE TABLE.
+        (when (eq class (gethash name (database-tables db)))
+          (drop-table* db name))
+        (error e)))))
 
 (defun drop-table* (db name)
   (let ((class (gethash name (database-tables db))))

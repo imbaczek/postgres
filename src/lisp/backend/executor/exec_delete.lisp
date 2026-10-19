@@ -64,8 +64,7 @@
                   (setf (aref new (1- (pg-column-attnum col)))
                         (coerce-value value
                                       (pg-column-type col)
-                                      (pg-column-typmod col)
-                                      (pg-column-name col)))))
+                                      (pg-column-typmod col)))))
               (check-not-null new columns)
               (when (heapam-delete-tid rel columns (car tid) (cdr tid)
                                        xid (backend-command-id *backend*))

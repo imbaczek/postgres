@@ -2,7 +2,7 @@
 
 (in-package #:pg)
 
-(defun coerce-value (value type typmod column-name)
+(defun coerce-value (value type typmod)
   (cond
     ((eq value +null+) +null+)
     ((eq type :int4)
@@ -54,7 +54,7 @@
                       "null value in column \"~a\" violates not-null constraint"
                       (pg-column-name col))))
 
-(defun unique-conflict-status (tuple idx my-xid)
+(defun unique-conflict-status (tuple my-xid)
   "Classify a heap tuple found in a unique index."
   (let ((xmin (htup-xmin tuple))
         (xmax (htup-xmax tuple)))
@@ -87,7 +87,7 @@ check NULL-containing keys for conflicts too."
         (my-xid (backend-xid *backend*)))
     (dolist (idx (unique-indexes table))
       (let* ((types (index-types idx table))
-             (vals (index-values idx table values)))
+             (vals (index-values idx values)))
         (unless (and (key-has-null-p vals)
                      (not (pg-index-nulls-not-distinct-p idx)))
           (let ((tids (btree-search (pg-index-relfilenode idx)
@@ -100,7 +100,7 @@ check NULL-containing keys for conflicts too."
                                                (car tid) (cdr tid)
                                                (pg-class-columns table))))
                   (when tuple
-                    (let ((status (unique-conflict-status tuple idx my-xid)))
+                    (let ((status (unique-conflict-status tuple my-xid)))
                       (cond
                         ((eq status :violation)
                          (setf violation (pg-index-name idx)))
@@ -118,7 +118,7 @@ check NULL-containing keys for conflicts too."
     (loop
       (let ((wait-xid nil))
         (with-write-lock
-            (ensure-current-table table)
+          (ensure-current-table table)
           (let ((check (check-unique-indexes table values exclude-tid)))
             (cond
               ((eq check :ok)
@@ -130,7 +130,7 @@ check NULL-containing keys for conflicts too."
                    (dolist (idx (table-indexes table))
                      (let* ((types (index-types idx table))
                             (key (encode-index-key
-                                  (index-values idx table values)
+                                  (index-values idx values)
                                   types)))
                        (btree-insert (pg-index-relfilenode idx)
                                      key block off)))
@@ -173,8 +173,7 @@ check NULL-containing keys for conflicts too."
                          (coerce-value
                           (eval-expr (analyze-expr expr nil) nil)
                           (pg-column-type col)
-                          (pg-column-typmod col)
-                          (pg-column-name col))))
+                          (pg-column-typmod col))))
           (check-not-null values columns)
           (insert-tuple-with-unique table values)
           (incf count)))

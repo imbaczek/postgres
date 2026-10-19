@@ -201,6 +201,38 @@ the case where equal index keys straddle many leaf splits.
 wait for active writers, and that `DROP TABLE` serializes with builds, readers,
 and writers.
 
+## Compilation and formatting
+
+`./t/compile.sh` force-compiles the `pg` ASDF system and fails on compiler
+warnings. It uses `../sbcl/run-sbcl.sh` beside the repository; set
+`SBCL=/path/to/launcher` to override.
+
+The batch formatter requires GNU Emacs and SLIME. Follow the
+[MELPA setup guide](https://melpa.org/#/getting-started), then install SLIME
+using its [installation instructions](https://slime.common-lisp.dev/doc/html/Installation.html).
+For a minimal Emacs setup, add MELPA to the package archives and install SLIME
+once:
+
+```elisp
+(require 'package)
+(add-to-list 'package-archives '("melpa" . "https://melpa.org/packages/") t)
+(package-initialize)
+```
+
+Then run `M-x package-refresh-contents` and `M-x package-install RET slime RET`.
+Format selected files or check them without writing:
+
+```sh
+./t/format.sh backend/executor/exec_simple.lisp
+./t/format.sh --check backend/executor/exec_simple.lisp
+```
+
+The formatter starts a separate SLIME inferior process, loads `pg` so SLIME can
+learn the system's macro indentation, and applies Emacs Lisp-mode indentation.
+It only adjusts indentation; it does not reflow long lines. The inferior Lisp
+defaults to the sibling `../sbcl/run-sbcl.sh`; select another launcher with
+`--lisp /path/to/launcher` or `PG_LISP_INFERIOR=/path/to/launcher`.
+
 ## Storage and concurrency
 
 - 8 KB pages with PostgreSQL's `PageHeaderData` + `ItemIdData` layout, one file
