@@ -58,6 +58,68 @@ control REPL prompt, but `eval` still runs parsed forms, so the REPL is arbitrar
 code execution; it stays off unless `--control-port` / `--control-socket` is
 given, and the Unix socket is `chmod`ed to `0700`.
 
+## Live SQL and SLIME debugging
+
+From `src/lisp`, start a server with a fresh PGDATA and free SQL and Swank ports.
+Swank is preloaded but its listener is off by default; the optional listener
+binds to loopback unless asked otherwise:
+
+```sh
+DEBUG_DATA=$(mktemp -d)
+./pg-lisp.sh -p 5439 -D "$DEBUG_DATA" --swank-port 4005
+```
+
+Connect from Emacs with `M-x slime-connect`, host `127.0.0.1`, port `4005`. Use
+the matching SLIME v2.32 frontend for this repository's pinned Swank; see
+[`README.md`'s SLIME debugging section](README.md#slime-debugging) for listener
+and connection details. If Emacs reports a protocol-version mismatch, check
+which frontend it loaded; evaluate `slime-protocol-version` with `M-:` and
+confirm it reports `2.32`. Run SQL from a second terminal while inspecting the
+live Lisp image in the SLIME REPL:
+
+```sh
+psql -X -h 127.0.0.1 -p 5439 -U postgres -d postgres
+```
+
+The SLIME REPL starts in `CL-USER`, so qualify internal server symbols with
+`pg::`. Use `(pg::reload)` after source edits. SQL runs in backend threads, so
+plain SBCL trace output may go to the server's output stream instead of the
+SLIME REPL. To inspect calls in SLIME, collect them with a trace report
+function:
+
+```lisp
+(pg::reload)
+(defvar pg::*debug-trace-events* nil)
+(defun pg::debug-trace-report (depth name event frame values)
+  (declare (ignore depth frame values))
+  (push (list name event) pg::*debug-trace-events*)
+  nil)
+(setf pg::*debug-trace-events* nil)
+(trace :report pg::debug-trace-report
+       pg::exec-create-index pg::build-unique-index)
+```
+
+From `psql`, create a small table and a unique index to exercise both traced
+functions; then inspect the collected events in the SLIME REPL:
+
+```sql
+CREATE TABLE slime_debug_items (id int, label text);
+INSERT INTO slime_debug_items VALUES (10, 'oak'), (20, 'elm'), (30, 'fir');
+CREATE UNIQUE INDEX slime_debug_items_id_idx ON slime_debug_items (id);
+```
+
+```lisp
+(reverse pg::*debug-trace-events*)
+```
+
+Remove the trace and its temporary helper after the demo:
+
+```lisp
+(untrace pg::exec-create-index pg::build-unique-index)
+(fmakunbound 'pg::debug-trace-report)
+(makunbound 'pg::*debug-trace-events*)
+```
+
 ## Tests
 
 ```sh
