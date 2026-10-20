@@ -218,6 +218,8 @@ cd src/lisp
 ./t/wal-crash-recovery.sh  # SIGKILL recovery at commit, page, update, split, and checkpoint boundaries
 ./t/unique-index-concurrency.sh # unique-index build/drop writer races
 ./t/update-concurrency.sh # concurrent UPDATE chain and WHERE rechecks
+./t/index-scan-regression.sh # indexed/SeqScan differential and DROP INDEX handoff
+./t/index-lock-contention.sh # report unrelated INSERT latency during duplicate-key scans
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
 ./t/hot-reload.sh         # SIGHUP reloads code in a running server
 ./t/control-repl.sh       # control REPL over TCP + Unix socket, reload, SQL intact
@@ -247,6 +249,19 @@ updates the same row. It confirms the waiter entered a transaction-ID wait,
 then checks that the waiter follows the committed `ctid` chain, recalculates
 `value + 1` against the latest version, and skips both UPDATE and DELETE when
 the refreshed row no longer satisfies `WHERE`.
+
+`t/index-scan-regression.sh` builds a non-unique index on populated data, applies
+deterministic randomized updates and deletes with duplicate keys and NULLs,
+runs VACUUM, and compares indexed results with SeqScan for equality, NULL, and
+residual-filter queries. It also pauses a SELECT between heap and index reader
+registration while DROP INDEX installs relation gates, then verifies the
+already-started reader can finish safely.
+
+`t/index-lock-contention.sh` synchronizes unrelated INSERTs with equality scans
+over many duplicate keys. It confirms each writer backend is waiting on the
+global write mutex before releasing the B-tree search, then reports the search
+duration and elapsed time through the INSERT's commit completion, including WAL
+commit work, without a timing threshold.
 
 The Lisp-level `test-vacuum-snapshot-horizon` ports the permanent-table case
 from PostgreSQL's `src/test/isolation/specs/horizons.spec`: an older registered
@@ -390,7 +405,11 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   restart; successful inserts refresh the page's free-space entry.
 - Writers take a single global write mutex; DDL also takes a catalog mutex;
   page I/O is serialized under an smgr mutex. Readers do not block one another;
-  relation DDL waits for registered readers.
+  relation DDL waits for registered readers. Index scans hold the global write
+  mutex while copying candidate TIDs from the B-tree, and populated index builds
+  hold it while visiting heap versions; either operation can delay unrelated
+  writers. Relation-scoped B-tree synchronization and a lock-safe bulk-build
+  protocol are needed to reduce this contention.
 
 ## Known gaps (documented, not hidden)
 

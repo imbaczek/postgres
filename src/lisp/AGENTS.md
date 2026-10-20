@@ -144,6 +144,8 @@ Remove the trace and its temporary helper after the demo:
 ./t/psql-smoke.sh       # psql acceptance, diffed against t/psql-smoke.out
 ./t/unique-index-concurrency.sh # unique-index and relation-DDL races
 ./t/update-concurrency.sh # concurrent UPDATE chain and WHERE rechecks
+./t/index-scan-regression.sh # indexed/SeqScan differential and DROP INDEX handoff
+./t/index-lock-contention.sh # report unrelated INSERT latency during duplicate-key scans
 ./t/index-stress.sh     # repeated same-key updates (slow)
 ./t/hot-reload.sh       # SIGHUP reloads a running server
 ./t/control-repl.sh     # control REPL over TCP + Unix socket, reload, SQL intact
@@ -151,10 +153,10 @@ Remove the trace and its temporary helper after the demo:
 ./t/shutdown.sh         # signals, shutdown modes, cancel/terminate admin functions
 ```
 
-Each test boots its own throwaway server on its own SQL port (5461–5471), so they
-are safe to run while a dev server is listening on 5433. The UPDATE concurrency
-and shutdown tests also bind their local control REPL at SQL port + 2000 to
-synchronize on active transaction-ID waits.
+Each test boots its own throwaway server on its own SQL port (5461–5473), so they
+are safe to run while a dev server is listening on 5433. The UPDATE concurrency,
+index-scan, index-contention, and shutdown tests also bind a local control REPL
+at SQL port + 2000 for synchronization.
 
 For a live debugger when a server-backed test fails, set `DEBUG_ON_FAILURE=1`:
 
