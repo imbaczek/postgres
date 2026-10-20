@@ -26,8 +26,9 @@ Two ways to trigger a reload:
 - The control REPL: start the server with a control socket, then call `(reload)`:
 
   ```sh
-  ./pg-lisp.sh -p 5433 -D /tmp/pgdata --control-socket /tmp/pg.sock &
-  nc -U /tmp/pg.sock        # then type: (reload)
+  CONTROL_DIR=$(mktemp -d)
+  ./pg-lisp.sh -p 5433 -D /tmp/pgdata --control-socket "$CONTROL_DIR/pg.sock" &
+  nc -U "$CONTROL_DIR/pg.sock"  # then type: (reload)
   ```
 
 A reload runs `(asdf:load-system "pg" :force t)` in the live image. Functions are
@@ -59,6 +60,20 @@ code execution; it stays off unless `--control-port` / `--control-socket` is
 given. The Unix socket's parent directory must be owned by the server user with
 mode `0700`, and the socket node is `chmod`ed to `0700`; failure to enforce
 those permissions aborts startup.
+
+## Agent runtime debugging
+
+When a task depends on live Lisp state, backend threads, or timing between SQL
+sessions, agents should prefer the control REPL on a local server instance they
+started for the task. Use it to inspect state, coordinate concurrent sessions,
+and reload code; keep compilation and the test scripts as the verification
+path. The control REPL evaluates arbitrary Lisp, so do not connect to an
+unsolicited or unrelated endpoint. It is off by default; enable it only for the
+debug instance. TCP control binds to loopback but has no authentication, so
+verify it belongs to the debug server you started before connecting. A Unix
+socket must use the private parent-directory permissions described above. Use
+SLIME when an interactive Emacs session or its tracing tools are useful; it is
+optional.
 
 ## Live SQL and SLIME debugging
 
