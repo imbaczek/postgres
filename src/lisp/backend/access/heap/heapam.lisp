@@ -234,17 +234,16 @@
 (defun heapam-get-tuple (relfilenode block offnum columns)
   (let ((page (buf-read relfilenode block)))
     (when page
-      (multiple-value-bind (off flags len) (page-get-lp page offnum)
-        (when (= flags +lp-normal+)
-          (let ((bytes (subseq page off (+ off len))))
-            (multiple-value-bind (values xmin xmax cid infomask
-                                  ctid-block ctid-offnum)
-                (deform-heap-tuple bytes columns)
-              (make-htup :block block :offnum offnum
-                         :ctid-block ctid-block :ctid-offnum ctid-offnum
-                         :xmin (full-xid-from-32 xmin)
-                         :xmax (full-xid-from-32 xmax) :cid cid
-                         :infomask infomask :values values))))))))
+      (with-live-page-item (page offnum off len)
+        (let ((bytes (subseq page off (+ off len))))
+          (multiple-value-bind (values xmin xmax cid infomask
+                                ctid-block ctid-offnum)
+              (deform-heap-tuple bytes columns)
+            (make-htup :block block :offnum offnum
+                       :ctid-block ctid-block :ctid-offnum ctid-offnum
+                       :xmin (full-xid-from-32 xmin)
+                       :xmax (full-xid-from-32 xmax) :cid cid
+                       :infomask infomask :values values)))))))
 
 (defun heapam-insert (relfilenode columns values xmin cid)
   "Insert a tuple; return (values block offnum)."
@@ -294,28 +293,24 @@
 (defun heapam-set-xmax (relfilenode block offnum xmax cid)
   (let ((page (buf-read relfilenode block)))
     (when page
-      (multiple-value-bind (off flags len) (page-get-lp page offnum)
-        (declare (ignore len))
-        (when (= flags +lp-normal+)
-          (page-set-u32 page (+ off +heap-tuple-xmax-off+)
-                        (xid32-of xmax))
-          (page-set-u32 page (+ off +heap-tuple-cid-off+) cid)
-          (buf-write relfilenode block page)
-          (mark-dirty relfilenode)
-          t)))))
+      (with-live-page-item (page offnum off len)
+        (page-set-u32 page (+ off +heap-tuple-xmax-off+)
+                      (xid32-of xmax))
+        (page-set-u32 page (+ off +heap-tuple-cid-off+) cid)
+        (buf-write relfilenode block page)
+        (mark-dirty relfilenode)
+        t))))
 
 (defun heapam-set-ctid (relfilenode block offnum ctid-block ctid-offnum)
   (with-write-lock
     (let ((page (buf-read relfilenode block)))
       (when page
-        (multiple-value-bind (off flags len) (page-get-lp page offnum)
-          (declare (ignore len))
-          (when (= flags +lp-normal+)
-            (page-set-u32 page (+ off +heap-tuple-ctid-block-off+) ctid-block)
-            (page-set-u16 page (+ off +heap-tuple-ctid-offnum-off+) ctid-offnum)
-            (buf-write relfilenode block page)
-            (mark-dirty relfilenode)
-            t))))))
+        (with-live-page-item (page offnum off len)
+          (page-set-u32 page (+ off +heap-tuple-ctid-block-off+) ctid-block)
+          (page-set-u16 page (+ off +heap-tuple-ctid-offnum-off+) ctid-offnum)
+          (buf-write relfilenode block page)
+          (mark-dirty relfilenode)
+          t)))))
 
 (defun fresh-delete-snapshot (fallback)
   (if *backend*

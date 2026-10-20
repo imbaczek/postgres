@@ -75,6 +75,23 @@
             (logand (ash v -15) #x3)
             (logand (ash v -17) #x3FFF))))
 
+(defmacro with-live-page-item ((page offnum off len) &body body)
+  "Run BODY when OFFNUM on PAGE has a normal line pointer.
+
+PAGE and OFFNUM are each evaluated once. OFF and LEN are bound to the line
+pointer's tuple offset and length; invalid, unused, and dead slots are skipped."
+  (let ((page-value (gensym "PAGE-"))
+        (offnum-value (gensym "OFFNUM-"))
+        (flags (gensym "FLAGS-")))
+    `(let ((,page-value ,page)
+           (,offnum-value ,offnum))
+       (when (<= 1 ,offnum-value (page-lp-count ,page-value))
+         (multiple-value-bind (,off ,flags ,len)
+             (page-get-lp ,page-value ,offnum-value)
+           (declare (ignorable ,len))
+           (when (= ,flags +lp-normal+)
+             ,@body))))))
+
 (defmacro do-live-page-items ((page offnum off len) &body body)
   "Run BODY for each normal line pointer on PAGE.
 

@@ -9,14 +9,12 @@
        (with-relation-build-lock ((pg-class-relfilenode ,table-value))
          ,(if refresh-snapshot
               `(let ((*current-snapshot* (refresh-statement-snapshot)))
-                 (with-write-lock
-                   (with-catalog-lock
-                     (ensure-current-table ,table-value)
-                     ,@body)))
-              `(with-write-lock
-                 (with-catalog-lock
+                 (with-write-catalog-locks
                    (ensure-current-table ,table-value)
-                   ,@body)))))))
+                   ,@body))
+              `(with-write-catalog-locks
+                 (ensure-current-table ,table-value)
+                 ,@body))))))
 
 (defmacro with-error-cleanup ((condition cleanup) &body body)
   "Run CLEANUP and re-signal ERROR from BODY."
@@ -277,47 +275,46 @@ rolled back immediately."
           (ereport "42P16"
                    "multiple primary keys for table \"~a\" are not allowed"
                    name)))
-      (with-write-lock
-        (with-catalog-lock
-          (let ((class (create-table* db name cols)))
-            (with-error-cleanup
-                (e (progn
-                     ;; CREATE TABLE is one statement.  A failed constraint
-                     ;; build must not leave earlier indexes published.
-                     (when (eq class (lookup-table name))
-                       (drop-table* db name))
-                     (save-catalog)))
-              (dolist (c constraints)
-                (let ((attnums (resolve-attnums class (getf c :columns))))
-                  (case (getf c :kind)
-                    (:primary
-                     (dolist (attnum attnums)
-                       (setf (pg-column-notnull
-                              (aref (pg-class-columns class) (1- attnum)))
-                             t))
-                     (let ((idx (create-index*
-                                 db
-                                 (or (getf c :name)
-                                     (generate-index-name db name "pkey"))
-                                 class attnums :unique t :primary t
-                                 :constraint t)))
-                       (build-unique-index idx class (pg-index-name idx))
-                       (fsync-index idx)))
-                    (:unique
-                     (let ((idx (create-index*
-                                 db
-                                 (or (getf c :name)
-                                     (generate-unique-index-name
-                                      db name class attnums))
-                                 class attnums :unique t
-                                 :constraint t
-                                 :nulls-not-distinct
-                                 (getf c :nulls-not-distinct))))
-                       (build-unique-index idx class (pg-index-name idx))
-                       (fsync-index idx))))))
-              (dolist (idx (table-indexes class))
-                (fsync-index idx))
-              (save-catalog)))))
+      (with-write-catalog-locks
+        (let ((class (create-table* db name cols)))
+          (with-error-cleanup
+              (e (progn
+                   ;; CREATE TABLE is one statement.  A failed constraint
+                   ;; build must not leave earlier indexes published.
+                   (when (eq class (lookup-table name))
+                     (drop-table* db name))
+                   (save-catalog)))
+            (dolist (c constraints)
+              (let ((attnums (resolve-attnums class (getf c :columns))))
+                (case (getf c :kind)
+                  (:primary
+                   (dolist (attnum attnums)
+                     (setf (pg-column-notnull
+                            (aref (pg-class-columns class) (1- attnum)))
+                           t))
+                   (let ((idx (create-index*
+                               db
+                               (or (getf c :name)
+                                   (generate-index-name db name "pkey"))
+                               class attnums :unique t :primary t
+                               :constraint t)))
+                     (build-unique-index idx class (pg-index-name idx))
+                     (fsync-index idx)))
+                  (:unique
+                   (let ((idx (create-index*
+                               db
+                               (or (getf c :name)
+                                   (generate-unique-index-name
+                                    db name class attnums))
+                               class attnums :unique t
+                               :constraint t
+                               :nulls-not-distinct
+                               (getf c :nulls-not-distinct))))
+                     (build-unique-index idx class (pg-index-name idx))
+                     (fsync-index idx))))))
+            (dolist (idx (table-indexes class))
+              (fsync-index idx))
+            (save-catalog))))
       (send-command-complete stream "CREATE TABLE"))))
 
 (defun exec-drop-table (stream ast)
@@ -336,31 +333,30 @@ rolled back immediately."
                  for class = (cdr entry)
                  when class collect (pg-class-relfilenode class))))
     (with-relation-build-locks (relfilenodes t)
-      (with-write-lock
-        (with-catalog-lock
-          ;; A concurrent DROP/CREATE may have replaced a name while we waited.
-          ;; Never delete a relation whose gate was not part of this operation.
-          (dolist (entry relations)
-            (let* ((name (car entry))
-                   (original (cdr entry))
-                   (current (gethash name (database-tables db))))
-              (when (and original
-                         (not (eq original current))
-                         (not if-exists))
-                (if current
-                    (ereport "55000" "table \"~a\" changed while waiting for lock"
-                             name)
-                    (ereport "42P01" "table \"~a\" does not exist" name)))))
-          (dolist (entry relations)
-            (let* ((name (car entry))
-                   (original (cdr entry))
-                   (current (gethash name (database-tables db))))
-              (if (and original (eq original current))
-                  (drop-table* db name)
-                  (send-notice stream
-                               (format nil "table \"~a\" does not exist, skipping"
-                                       name)))))
-          (save-catalog))))
+      (with-write-catalog-locks
+        ;; A concurrent DROP/CREATE may have replaced a name while we waited.
+        ;; Never delete a relation whose gate was not part of this operation.
+        (dolist (entry relations)
+          (let* ((name (car entry))
+                 (original (cdr entry))
+                 (current (gethash name (database-tables db))))
+            (when (and original
+                       (not (eq original current))
+                       (not if-exists))
+              (if current
+                  (ereport "55000" "table \"~a\" changed while waiting for lock"
+                           name)
+                  (ereport "42P01" "table \"~a\" does not exist" name)))))
+        (dolist (entry relations)
+          (let* ((name (car entry))
+                 (original (cdr entry))
+                 (current (gethash name (database-tables db))))
+            (if (and original (eq original current))
+                (drop-table* db name)
+                (send-notice stream
+                             (format nil "table \"~a\" does not exist, skipping"
+                                     name)))))
+        (save-catalog)))
     (send-command-complete stream "DROP TABLE")))
 
 (defun exec-create-index (stream ast)
@@ -407,42 +403,41 @@ rolled back immediately."
       (unless (or (cdr entry) if-exists)
         (ereport "42704" "index \"~a\" does not exist" (car entry))))
     (with-relation-build-locks (relfilenodes)
-      (with-write-lock
-        (with-catalog-lock
-          ;; Revalidate every captured index before making any change.  This
-          ;; keeps a concurrent drop/recreate from redirecting this statement.
-          (dolist (entry entries)
-            (let* ((name (car entry))
-                   (original (cdr entry))
-                   (current (gethash name (database-indexes db))))
-              (when (and original (not (eq original current)))
-                (cond
-                  (current
-                   (ereport "55000" "index \"~a\" changed while waiting for lock"
-                            name))
-                  ((not if-exists)
-                   (ereport "42704" "index \"~a\" does not exist" name))))))
-          ;; Check dependencies as a preflight, so a multi-index statement
-          ;; cannot drop an earlier index and then fail on a later one.
-          (dolist (entry entries)
-            (let* ((name (car entry))
-                   (idx (cdr entry)))
-              (when (and idx (eq idx (gethash name (database-indexes db)))
-                         (pg-index-constraint-owned-p idx))
-                (let ((table (find-table-by-oid (pg-index-table-oid idx))))
-                  (ereport "2BP01"
-                           "cannot drop index \"~a\" because constraint \"~a\" on table \"~a\" requires it"
-                           name name (if table (pg-class-name table) "?"))))))
-          (dolist (entry entries)
-            (let* ((name (car entry))
-                   (original (cdr entry)))
-              (if (and original
-                       (eq original (gethash name (database-indexes db))))
-                  (drop-index* db name)
-                  (send-notice stream
-                               (format nil "index \"~a\" does not exist, skipping"
-                                       name)))))
-          (save-catalog))))
+      (with-write-catalog-locks
+        ;; Revalidate every captured index before making any change.  This
+        ;; keeps a concurrent drop/recreate from redirecting this statement.
+        (dolist (entry entries)
+          (let* ((name (car entry))
+                 (original (cdr entry))
+                 (current (gethash name (database-indexes db))))
+            (when (and original (not (eq original current)))
+              (cond
+                (current
+                 (ereport "55000" "index \"~a\" changed while waiting for lock"
+                          name))
+                ((not if-exists)
+                 (ereport "42704" "index \"~a\" does not exist" name))))))
+        ;; Check dependencies as a preflight, so a multi-index statement
+        ;; cannot drop an earlier index and then fail on a later one.
+        (dolist (entry entries)
+          (let* ((name (car entry))
+                 (idx (cdr entry)))
+            (when (and idx (eq idx (gethash name (database-indexes db)))
+                       (pg-index-constraint-owned-p idx))
+              (let ((table (find-table-by-oid (pg-index-table-oid idx))))
+                (ereport "2BP01"
+                         "cannot drop index \"~a\" because constraint \"~a\" on table \"~a\" requires it"
+                         name name (if table (pg-class-name table) "?"))))))
+        (dolist (entry entries)
+          (let* ((name (car entry))
+                 (original (cdr entry)))
+            (if (and original
+                     (eq original (gethash name (database-indexes db))))
+                (drop-index* db name)
+                (send-notice stream
+                             (format nil "index \"~a\" does not exist, skipping"
+                                     name)))))
+        (save-catalog)))
     (send-command-complete stream "DROP INDEX")))
 
 (defun exec-alter-index (stream ast)
