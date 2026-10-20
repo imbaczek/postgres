@@ -143,7 +143,7 @@ exist\" messages."
             (ereport "42883" "function ~a(~a) does not exist"
                      name (call-signature args)))
           (list :func name args :type :bool :typmod -1))
-         ((string= name "pg_reload_conf")
+         ((member name '("pg_reload_conf" "pg_reload_code") :test #'string=)
           (when args
             (ereport "42883" "function ~a(~a) does not exist"
                      name (call-signature args)))
@@ -327,6 +327,8 @@ exist\" messages."
                                   0)))
     ((string= name "pg_reload_conf")
      (admin-reload-conf))
+    ((string= name "pg_reload_code")
+     (admin-reload-code))
     ((member name '("length" "char_length" "character_length")
              :test #'string=)
      (sql-strict-let ((value (first args)))

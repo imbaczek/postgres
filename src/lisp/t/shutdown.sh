@@ -3,7 +3,7 @@
 #
 # Covers:
 #   * pg_backend_pid(), pg_cancel_backend(), pg_terminate_backend(),
-#     pg_reload_conf() including their errors and warnings
+#     pg_reload_conf() no-op and pg_reload_code(), including errors/warnings
 #   * cancelling/terminating a backend blocked on a unique conflict
 #   * SIGTERM = smart shutdown (wait for clients, reject new ones)
 #   * SIGINT  = fast shutdown (terminate clients, deliver FATAL)
@@ -213,9 +213,20 @@ out=$(q 'select pg_backend_pid(1)' 2>&1 || true)
 echo "$out" | grep -q 'function pg_backend_pid(integer) does not exist' \
     || fail "arity error did not name the argument type"
 
-before=$(grep -c 'reload complete' "$LOG" 2>/dev/null || true)
+before=$(grep -c 'reloading code' "$LOG" 2>/dev/null || true)
 [ "$(q 'select pg_reload_conf()')" = "t" ] \
     || fail "pg_reload_conf did not return true"
+i=0
+while [ "$i" -lt 5 ]; do
+    now=$(grep -c 'reloading code' "$LOG" 2>/dev/null || true)
+    [ "$now" -eq "$before" ] || fail "pg_reload_conf triggered a code reload"
+    i=$((i + 1))
+    sleep 0.2
+done
+
+before=$(grep -c 'reload complete' "$LOG" 2>/dev/null || true)
+[ "$(q 'select pg_reload_code()')" = "t" ] \
+    || fail "pg_reload_code did not return true"
 i=0
 while [ "$i" -lt 100 ]; do
     now=$(grep -c 'reload complete' "$LOG" 2>/dev/null || true)
@@ -224,7 +235,7 @@ while [ "$i" -lt 100 ]; do
     sleep 0.2
 done
 now=$(grep -c 'reload complete' "$LOG" 2>/dev/null || true)
-[ "$now" -gt "$before" ] || fail "pg_reload_conf did not trigger a reload"
+[ "$now" -gt "$before" ] || fail "pg_reload_code did not trigger a reload"
 
 # ---- remote cancel and terminate -----------------------------------------
 

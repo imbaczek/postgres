@@ -59,8 +59,8 @@ implementation for the server's supported operations.
 
 ## Hot reload and control REPL
 
-Send `SIGHUP` to a running server and it recompiles and reloads the `pg` system
-in place, like PostgreSQL reloading configuration:
+Send `SIGHUP` to a running server, or call `pg_reload_code()`, to recompile and
+reload the `pg` system in place:
 
 ```sh
 kill -HUP "$(pgrep -f 'sbcl.*boot.lisp')"
@@ -70,7 +70,7 @@ Functions are redefined live, so existing connections and global state (xact
 counters, catalog, relation files) survive. Two caveats: a change to a
 `DEFSTRUCT` layout needs a real restart, and a reload whose compilation fails
 partway can leave a mixed image, so restart if the reload log shows an error.
-`t/hot-reload.sh` exercises this.
+`t/hot-reload.sh` exercises the SIGHUP path.
 
 For interactive work there is also an out-of-band control REPL. It is **off by
 default** because it evaluates arbitrary Lisp; enable it explicitly:
@@ -123,13 +123,15 @@ While shutting down, new connections are rejected with `FATAL 57P03`
 ("the database system is shutting down") before authentication, exactly like
 PostgreSQL's `canAcceptConnections()`.
 
-The SQL admin functions mirror `signalfuncs.c`:
+The SQL admin functions follow `signalfuncs.c`; `pg_reload_code()` is a local
+helper for this Lisp server:
 
 ```sql
 SELECT pg_backend_pid();
 SELECT pg_cancel_backend(pid);                 -- ERROR 57014 in the target
 SELECT pg_terminate_backend(pid [, timeout]);  -- FATAL 57P01, connection ends
-SELECT pg_reload_conf();                       -- same as SIGHUP
+SELECT pg_reload_conf();                       -- config reload (currently a no-op)
+SELECT pg_reload_code();                       -- recompile and reload the Lisp system
 ```
 
 `pg_cancel_backend` cancels the running statement at a safe point; a cancel
@@ -138,9 +140,9 @@ delivers the FATAL even to an idle backend and returns true once the signal is
 sent. With a positive millisecond `timeout` it waits for the backend to
 disappear and returns false if it does not; a negative timeout raises `22003`.
 An unknown PID produces a `WARNING` and returns false. `t/shutdown.sh`
-exercises this through SQL and the raw TCP CancelRequest packet, including
-rejection of invalid PID/key pairs, plus smart/fast/immediate shutdown and
-escalation.
+exercises backend signaling and both reload functions through SQL and the raw
+TCP CancelRequest packet, including rejection of invalid PID/key pairs, plus
+smart/fast/immediate shutdown and escalation.
 
 ## Supported SQL
 
@@ -195,7 +197,8 @@ parentheses. Scalar functions: `version()`, `pg_lisp_runtime()`,
 `current_database()`, `current_schema()`, `current_catalog()`, `current_user`,
 `session_user`, `user`, `length()`, `pg_backend_pid()`,
 `pg_cancel_backend(pid)`,
-`pg_terminate_backend(pid [, timeout])`, `pg_reload_conf()`.
+`pg_terminate_backend(pid [, timeout])`, `pg_reload_conf()`,
+`pg_reload_code()`.
 
 `SET TIME ZONE` accepts installed named TZif zones, stores the value per backend,
 and returns it from `SHOW timezone`; numeric offsets and `INTERVAL` forms are

@@ -371,7 +371,14 @@ are killed abruptly."
            t)))))
 
 (defun admin-reload-conf ()
-  "pg_reload_conf(): send SIGHUP to ourselves, like signalling the postmaster."
+  "Reload server configuration when supported; currently a successful no-op."
+  ;; The Lisp server does not load PostgreSQL configuration files yet. Keep the
+  ;; SQL function's success result, but do not use SIGHUP here: in this server
+  ;; SIGHUP requests a code reload.
+  t)
+
+(defun admin-reload-code ()
+  "pg_reload_code(): send SIGHUP to request an in-place Lisp code reload."
   (handler-case
       (progn
         (sb-posix:kill (sb-posix:getpid) sb-unix:sighup)
