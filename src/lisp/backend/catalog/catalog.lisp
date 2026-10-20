@@ -189,6 +189,21 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
       (save-catalog)))
   (values))
 
+(defun freeze-all-heap-xids (old-epoch)
+  "Freeze tuple XIDs from OLD-EPOCH in every catalogued heap relation."
+  (maphash
+   (lambda (db-name db)
+     (declare (ignore db-name))
+     (maphash
+      (lambda (table-name table)
+        (declare (ignore table-name))
+        (heapam-freeze-relation-xids (pg-class-relfilenode table)
+                                     (pg-class-columns table)
+                                     old-epoch))
+      (database-tables db)))
+   (catalog-databases *catalog*))
+  (values))
+
 (defun get-database (name)
   (or (gethash name (catalog-databases *catalog*))
       (let ((db (make-database :name name :oid (allocate-oid))))

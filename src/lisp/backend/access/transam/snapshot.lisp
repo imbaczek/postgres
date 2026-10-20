@@ -17,6 +17,10 @@
 ;;; conservative test is "only my snapshot is active".
 (defvar *snapshot-count-lock* (sb-thread:make-mutex :name "pg snapshot count"))
 (defvar *active-snapshots* 0)
+(defvar *snapshot-cv* (sb-thread:make-waitqueue :name "pg snapshot waitqueue"))
+(defvar *snapshot-cv-mutex* (sb-thread:make-mutex :name "pg snapshot cv mutex"))
+
+(declaim (ftype function xid-active-p))
 
 (defun note-snapshot-start ()
   (sb-thread:with-mutex (*snapshot-count-lock*)
@@ -24,22 +28,29 @@
 
 (defun note-snapshot-end ()
   (sb-thread:with-mutex (*snapshot-count-lock*)
-    (decf *active-snapshots*)))
+    (decf *active-snapshots*))
+  (sb-thread:with-mutex (*snapshot-cv-mutex*)
+    (sb-thread:condition-broadcast *snapshot-cv*)))
 
 (defmacro with-active-snapshot (&body body)
   `(progn
-     (note-snapshot-start)
      (unwind-protect (progn ,@body)
        (note-snapshot-end))))
 
 (defun xid-committed-p (xid)
-  (eql (clog-get xid) +clog-committed+))
+  (or (member xid (list +bootstrap-xid+ +frozen-xid+) :test #'=)
+      (eql (clog-get xid) +clog-committed+)))
 
 (defun xid-aborted-p (xid)
-  (eql (clog-get xid) +clog-aborted+))
+  (and (/= xid +bootstrap-xid+)
+       (/= xid +frozen-xid+)
+       (or (eql (clog-get xid) +clog-aborted+)
+           (and (eql (clog-get xid) +clog-in-progress+)
+                (not (xid-active-p xid))))))
 
 (defun xid-in-progress-p (xid)
-  (= (clog-get xid) +clog-in-progress+))
+  (and (= (clog-get xid) +clog-in-progress+)
+       (xid-active-p xid)))
 
 (defun heap-tuple-visible-p (xmin xmax cid snapshot my-xid)
   "HeapTupleSatisfiesMVCC for the MVP type set."

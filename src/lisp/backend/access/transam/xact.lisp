@@ -92,6 +92,11 @@ INTERRUPT-THREAD, so it needs no flag."
 (defvar *xid-lock* (sb-thread:make-mutex :name "pg xid lock"))
 (defvar *next-xid* +first-normal-xid+)
 (defvar *active-xids* '())
+(defvar *xid-wrap-lock* (sb-thread:make-mutex :name "pg xid wrap gate"))
+(defvar *xid-wrap-work-lock* (sb-thread:make-mutex :name "pg xid wrap worker"))
+(defvar *xid-wrap-cv* (sb-thread:make-waitqueue :name "pg xid wrap waitqueue"))
+(defvar *xid-wrap-pending* nil)
+(defvar *xid-wrap-completed-through* nil)
 
 (defvar *xact-cv* (sb-thread:make-waitqueue :name "pg xact waitqueue"))
 (defvar *xact-cv-mutex* (sb-thread:make-mutex :name "pg xact cv mutex"))
@@ -119,13 +124,165 @@ INTERRUPT-THREAD, so it needs no flag."
       (sb-thread:grab-mutex mutex))
     notified))
 
+(defun first-normal-xid-of-epoch-p (xid)
+  (and (>= xid +xid-cycle+)
+       (= (mod xid +xid-cycle+) +first-normal-xid+)))
+
+(defun xid-next-epoch-boundary (xid)
+  (+ (* (1+ (floor xid +xid-cycle+)) +xid-cycle+)
+     +first-normal-xid+))
+
+(defun advance-full-xid (xid)
+  "Advance a FullTransactionId, skipping the three special low XIDs."
+  (if (= xid +max-xid+)
+      +max-xid-one-past+
+      (let ((next (1+ xid)))
+        (loop while (< (mod next +xid-cycle+) +first-normal-xid+)
+              do (incf next))
+        next)))
+
+(defun full-xid-from-32 (xid &optional (reference *next-xid*))
+  "Reconstruct the current-cycle FullTransactionId for a stored XID.
+
+Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
+  (let ((xid (logand xid +xid-mask+)))
+    (if (< xid +first-normal-xid+)
+        xid
+        (let* ((epoch (floor reference +xid-cycle+))
+               (candidate (+ (* epoch +xid-cycle+) xid)))
+          (when (and (plusp epoch) (>= candidate reference))
+            (decf candidate +xid-cycle+))
+          candidate))))
+
+(defun xid-wrap-marker-path ()
+  (pgdata-path "global/pg_xid_wrap_pending"))
+
+(defun load-xid-wrap-marker ()
+  (let ((path (xid-wrap-marker-path)))
+    (when (probe-file path)
+      (with-open-file (s path :direction :input :if-does-not-exist nil)
+        (let ((line (and s (read-line s nil nil))))
+          (or (and line (parse-integer line :junk-allowed nil))
+              (error "invalid XID wrap marker ~a" path)))))))
+
+(defun save-xid-wrap-marker (boundary)
+  (let ((path (xid-wrap-marker-path))
+        (tmp (pgdata-path "global/pg_xid_wrap_pending.tmp")))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (with-open-file (s tmp
+                              :direction :output
+                              :if-exists :supersede
+                              :if-does-not-exist :create
+                              :element-type 'character)
+             (format s "~a~%" boundary)
+             (finish-output s)
+             (sb-posix:fsync (sb-sys:fd-stream-fd s)))
+           (sb-posix:rename (namestring tmp) (namestring path))
+           (fsync-directory (pgdata-path "global/")))
+      (ignore-errors (delete-file tmp))))
+  (values))
+
+(defun delete-xid-wrap-marker ()
+  (let ((path (xid-wrap-marker-path)))
+    (when (probe-file path)
+      (delete-file path)
+      (fsync-directory (pgdata-path "global/"))))
+  (values))
+
+(declaim (ftype function freeze-all-heap-xids))
+
+(defun active-xids-empty-p ()
+  (sb-thread:with-mutex (*xid-lock*)
+    (null *active-xids*)))
+
+(defun wait-for-no-active-xids ()
+  (loop until (active-xids-empty-p)
+        do (check-for-interrupts)
+           (sb-thread:with-mutex (*xact-cv-mutex*)
+             (unless (active-xids-empty-p)
+               (condition-wait-with-timeout *xact-cv* *xact-cv-mutex*))))
+  (values))
+
+(defun active-snapshots-empty-p ()
+  (sb-thread:with-mutex (*snapshot-count-lock*)
+    (zerop *active-snapshots*)))
+
+(defun wait-for-no-active-snapshots ()
+  (loop until (active-snapshots-empty-p)
+        do (check-for-interrupts)
+           (sb-thread:with-mutex (*snapshot-cv-mutex*)
+             (unless (active-snapshots-empty-p)
+               (condition-wait-with-timeout *snapshot-cv*
+                                            *snapshot-cv-mutex*))))
+  (values))
+
+(defun complete-xid-wraparound ()
+  "Freeze the previous XID cycle before reusing its 32-bit tuple IDs."
+  (sb-thread:with-mutex (*xid-wrap-work-lock*)
+    (let* ((boundary (sb-thread:with-mutex (*xid-lock*) *next-xid*))
+           (marker (load-xid-wrap-marker))
+           (needed (or marker
+                       (and (first-normal-xid-of-epoch-p boundary)
+                            (not (eql boundary *xid-wrap-completed-through*))))))
+      (unless needed
+        (return-from complete-xid-wraparound (values)))
+      (unless (first-normal-xid-of-epoch-p boundary)
+        (error "XID wrap marker does not match the next FullTransactionId"))
+      (when (and marker (/= marker boundary))
+        (error "XID wrap marker ~a does not match next XID ~a" marker boundary))
+      (sb-thread:with-mutex (*xid-wrap-lock*)
+        (setf *xid-wrap-pending* t))
+      ;; Persist the boundary before publishing the marker. No XID from the new
+      ;; epoch is handed out until the frozen heap and reset CLOG are durable.
+      (sb-thread:with-mutex (*xid-lock*)
+        (setf *xid-batch-end* boundary)
+        (save-next-xid))
+      (unless marker
+        (save-xid-wrap-marker boundary))
+      (wait-for-no-active-xids)
+      (wait-for-no-active-snapshots)
+      (with-write-lock
+        (freeze-all-heap-xids (1- (floor boundary +xid-cycle+)))
+        (clog-reset))
+      (delete-xid-wrap-marker)
+      (sb-thread:with-mutex (*xid-wrap-lock*)
+        (setf *xid-wrap-completed-through* boundary
+              *xid-wrap-pending* nil)
+        (sb-thread:condition-broadcast *xid-wrap-cv*))))
+  (values))
+
+(defun prepare-xid-wraparound-for-statement (backend)
+  (when (null (backend-xid backend))
+    (complete-xid-wraparound))
+  (sb-thread:with-mutex (*xid-wrap-lock*)
+    (loop while (and *xid-wrap-pending* (null (backend-xid backend)))
+          do (check-for-interrupts)
+             (condition-wait-with-timeout *xid-wrap-cv* *xid-wrap-lock*)))
+  (values))
+
+(defun begin-statement-snapshot (backend)
+  (sb-thread:with-mutex (*xid-wrap-lock*)
+    (loop while (and *xid-wrap-pending* (null (backend-xid backend)))
+          do (check-for-interrupts)
+             (condition-wait-with-timeout *xid-wrap-cv* *xid-wrap-lock*))
+    (note-snapshot-start))
+  (values))
+
 (defun assign-xid ()
   (sb-thread:with-mutex (*xid-lock*)
     (when (> *next-xid* +max-xid+)
       (ereport-fatal "54000" "transaction ID space exhausted"))
+    (when (and (first-normal-xid-of-epoch-p *next-xid*)
+               (not (eql *next-xid* *xid-wrap-completed-through*)))
+      (ereport "55000"
+               "transaction ID wraparound is waiting for a safe tuple freeze; retry the statement"))
     (when (>= *next-xid* *xid-batch-end*)
       (let ((old-end *xid-batch-end*)
-            (new-end (min +max-xid-one-past+ (+ *next-xid* 1000))))
+            (new-end (min +max-xid-one-past+
+                          (xid-next-epoch-boundary *next-xid*)
+                          (+ *next-xid* 1000))))
         (setf *xid-batch-end* new-end)
         (handler-case
             (save-next-xid)
@@ -134,7 +291,7 @@ INTERRUPT-THREAD, so it needs no flag."
             (setf *xid-batch-end* old-end)
             (error e)))))
     (let ((xid *next-xid*))
-      (incf *next-xid*)
+      (setf *next-xid* (advance-full-xid xid))
       (push xid *active-xids*)
       xid)))
 
@@ -341,12 +498,17 @@ INTERRUPT-THREAD, so it needs no flag."
     (when (eq (backend-state b) :aborted)
       (ereport "25P02"
                "current transaction is aborted, commands ignored until end of transaction block"))
+    (prepare-xid-wraparound-for-statement b)
     (when (eq (backend-state b) :idle)
       (setf (backend-state b) :in-progress
             (backend-explicit b) nil
             (backend-command-id b) 0))
     (incf (backend-command-id b))
-    (let ((snap (make-snapshot (backend-command-id b))))
+    (begin-statement-snapshot b)
+    (let ((snap (handler-case (make-snapshot (backend-command-id b))
+                  (error (e)
+                    (note-snapshot-end)
+                    (error e)))))
       (setf (backend-snapshot b) snap)
       snap)))
 
@@ -422,14 +584,23 @@ reclaimable."
         (finish-output s)
         (sb-posix:fsync (sb-sys:fd-stream-fd s)))))
   (let ((next-xid (load-next-xid)))
-    (when (> next-xid +max-xid+)
+    (when (> next-xid +max-xid-one-past+)
       (error "transaction ID space exhausted"))
     (setf *xid-batch-end* next-xid
-          *next-xid* next-xid)
+          *next-xid* next-xid
+          *xid-wrap-pending* nil
+          *xid-wrap-completed-through* nil)
     ;; Persist the initial control state too. A missing control file on a later
     ;; startup then cannot be mistaken for a fresh data directory.
     (unless (probe-file (control-path))
-      (save-next-xid)))
+      (save-next-xid))
+    (let ((marker (load-xid-wrap-marker)))
+      (when marker
+        (unless (and (= marker next-xid)
+                     (first-normal-xid-of-epoch-p next-xid))
+          (error "XID wrap marker ~a does not match next XID ~a"
+                 marker next-xid))
+        (setf *xid-wrap-pending* t))))
   (clog-init)
   (clog-recover *next-xid*)
   (values))

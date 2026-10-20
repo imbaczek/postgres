@@ -60,10 +60,10 @@
       (setf infomask (logior infomask +heap-hasvarwidth+)))
     (let ((bytes (make-array cursor :element-type '(unsigned-byte 8)
                                     :initial-element 0)))
-      ;; HeapTupleHeaderData. XIDs use the full 64-bit transaction counter;
-      ;; the page layout version distinguishes this header from the old format.
-      (page-set-u64 bytes +heap-tuple-xmin-off+ xmin)
-      (page-set-u64 bytes +heap-tuple-xmax-off+ xmax)
+      ;; HeapTupleHeaderData stores 32-bit TransactionIds. The allocator keeps
+      ;; full XIDs and advances the epoch when these low 32 bits wrap.
+      (page-set-u32 bytes +heap-tuple-xmin-off+ (xid32-of xmin))
+      (page-set-u32 bytes +heap-tuple-xmax-off+ (xid32-of xmax))
       (page-set-u32 bytes +heap-tuple-cid-off+ cid)
       (page-set-u32 bytes +heap-tuple-ctid-block-off+ block)
       (page-set-u16 bytes +heap-tuple-ctid-offnum-off+ off)
@@ -102,8 +102,8 @@
 (defun deform-heap-tuple (bytes columns)
   "Return values, XIDs, command ID, infomask, and successor TID."
   (let* ((natts (length columns))
-         (xmin (page-u64 bytes +heap-tuple-xmin-off+))
-         (xmax (page-u64 bytes +heap-tuple-xmax-off+))
+         (xmin (page-u32 bytes +heap-tuple-xmin-off+))
+         (xmax (page-u32 bytes +heap-tuple-xmax-off+))
          (cid (page-u32 bytes +heap-tuple-cid-off+))
          (ctid-block (page-u32 bytes +heap-tuple-ctid-block-off+))
          (ctid-offnum (page-u16 bytes +heap-tuple-ctid-offnum-off+))
@@ -160,7 +160,8 @@
                 (deform-heap-tuple bytes columns)
               (make-htup :block block :offnum offnum
                          :ctid-block ctid-block :ctid-offnum ctid-offnum
-                         :xmin xmin :xmax xmax :cid cid
+                         :xmin (full-xid-from-32 xmin)
+                         :xmax (full-xid-from-32 xmax) :cid cid
                          :infomask infomask :values values))))))))
 
 (defun heapam-insert (relfilenode columns values xmin cid)
@@ -205,7 +206,8 @@
       (multiple-value-bind (off flags len) (page-get-lp page offnum)
         (declare (ignore len))
         (when (= flags +lp-normal+)
-          (page-set-u64 page (+ off +heap-tuple-xmax-off+) xmax)
+          (page-set-u32 page (+ off +heap-tuple-xmax-off+)
+                        (xid32-of xmax))
           (page-set-u32 page (+ off +heap-tuple-cid-off+) cid)
           (buf-write relfilenode block page)
           (mark-dirty relfilenode)
@@ -240,6 +242,7 @@ whose xmax was set, and that tuple's physical block and offset."
   (let ((target-block block)
         (target-offnum offnum)
         (snapshot *current-snapshot*)
+        (expected-xmin nil)
         (visited (make-hash-table :test #'equal)))
     (loop
       (let ((key (cons target-block target-offnum)))
@@ -252,9 +255,12 @@ whose xmax was set, and that tuple's physical block and offset."
                                                target-offnum columns)))
                   (cond
                     ((null tuple) :skip)
+                    ((and expected-xmin
+                          (/= (htup-xmin tuple) expected-xmin))
+                     :skip)
                     ((= (htup-xmax tuple) xid) (list :done tuple))
                     ((and (not (zerop (htup-xmax tuple)))
-                          (xid-in-progress-p (htup-xmax tuple))
+                          (xid-active-p (htup-xmax tuple))
                           (/= (htup-xmax tuple) xid))
                      (list :wait (htup-xmax tuple)))
                     ((and (not (zerop (htup-xmax tuple)))
@@ -262,7 +268,8 @@ whose xmax was set, and that tuple's physical block and offset."
                      (if (or (/= (htup-ctid-block tuple) target-block)
                              (/= (htup-ctid-offnum tuple) target-offnum))
                          (list :follow (htup-ctid-block tuple)
-                               (htup-ctid-offnum tuple))
+                               (htup-ctid-offnum tuple)
+                               (htup-xmax tuple))
                          :skip))
                     ((not (heap-tuple-visible-p
                            (htup-xmin tuple) (htup-xmax tuple) (htup-cid tuple)
@@ -294,6 +301,7 @@ whose xmax was set, and that tuple's physical block and offset."
           (:follow
            (setf target-block (second action)
                  target-offnum (third action)
+                 expected-xmin (fourth action)
                  snapshot (fresh-delete-snapshot snapshot))
            (when *backend*
              (setf (backend-snapshot *backend*) snapshot))))))))
@@ -302,6 +310,43 @@ whose xmax was set, and that tuple's physical block and offset."
   "Keep heap TIDs stable until VACUUM can establish a removal horizon."
   (declare (ignore relfilenode block))
   0)
+
+(defun heapam-freeze-relation-xids (relfilenode columns old-epoch)
+  "Freeze old-cycle tuple XIDs after all transactions and snapshots drain."
+  (declare (ignore columns))
+  (let ((changed nil)
+        (epoch-base (* old-epoch +xid-cycle+)))
+    (dotimes (block (buf-nblocks relfilenode))
+      (let ((page (buf-read relfilenode block))
+            (page-changed nil))
+        (when page
+          (do-live-page-items (page offnum off len)
+            (let* ((xmin (page-u32 page (+ off +heap-tuple-xmin-off+)))
+                   (xmax (page-u32 page (+ off +heap-tuple-xmax-off+)))
+                   (full-xmin (and (>= xmin +first-normal-xid+)
+                                   (+ epoch-base xmin)))
+                   (full-xmax (and (>= xmax +first-normal-xid+)
+                                   (+ epoch-base xmax))))
+              (when full-xmin
+                (page-set-u32
+                 page (+ off +heap-tuple-xmin-off+)
+                 (if (= (clog-get full-xmin) +clog-committed+)
+                     +frozen-xid+
+                     +invalid-xid+))
+                (setf page-changed t))
+              (when full-xmax
+                (page-set-u32
+                 page (+ off +heap-tuple-xmax-off+)
+                 (if (= (clog-get full-xmax) +clog-committed+)
+                     +frozen-xid+
+                     +invalid-xid+))
+                (setf page-changed t))))
+          (when page-changed
+            (buf-write relfilenode block page)
+            (setf changed t)))))
+    (when changed
+      (smgr-fsync relfilenode)))
+  (values))
 
 (defun htup-visible-p (tuple snapshot)
   (heap-tuple-visible-p (htup-xmin tuple)
@@ -313,20 +358,22 @@ whose xmax was set, and that tuple's physical block and offset."
 (defun heapam-scan-page (page block columns snapshot callback)
   (do-live-page-items (page offnum off len)
     (let ((bytes (subseq page off (+ off len))))
-      (multiple-value-bind (values xmin xmax cid infomask
+      (multiple-value-bind (values raw-xmin raw-xmax cid infomask
                             ctid-block ctid-offnum)
           (deform-heap-tuple bytes columns)
-        (when (heap-tuple-visible-p
-               xmin xmax cid snapshot
-               (and *backend* (backend-xid *backend*)))
-          (let ((tuple (make-htup :block block :offnum offnum
-                                  :ctid-block ctid-block
-                                  :ctid-offnum ctid-offnum
-                                  :xmin xmin :xmax xmax
-                                  :cid cid :infomask infomask
-                                  :values values)))
-            (when (eq (funcall callback tuple) :stop)
-              (return-from heapam-scan-page :stop))))))))
+        (let ((xmin (full-xid-from-32 raw-xmin))
+              (xmax (full-xid-from-32 raw-xmax)))
+          (when (heap-tuple-visible-p
+                 xmin xmax cid snapshot
+                 (and *backend* (backend-xid *backend*)))
+            (let ((tuple (make-htup :block block :offnum offnum
+                                    :ctid-block ctid-block
+                                    :ctid-offnum ctid-offnum
+                                    :xmin xmin :xmax xmax
+                                    :cid cid :infomask infomask
+                                    :values values)))
+              (when (eq (funcall callback tuple) :stop)
+                (return-from heapam-scan-page :stop)))))))))
 
 (defun heapam-scan (relfilenode columns snapshot callback)
   "Call CALLBACK with each visible HTUP. CALLBACK may return :stop."

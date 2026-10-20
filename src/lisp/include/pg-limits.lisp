@@ -6,18 +6,19 @@
 (defconstant +maxalign+ 8)
 (defconstant +size-of-page-header+ 24)
 (defconstant +size-of-item-id+ 4)
-;;; Version 5 uses 64-bit XIDs, so its heap tuple header differs from PostgreSQL's.
-(defconstant +size-of-heap-tuple-header+ 31)
+;;; Heap tuple XIDs are 32-bit TransactionIds, as in PostgreSQL's
+;;; HeapTupleHeaderData. The page layout version distinguishes older formats.
+(defconstant +size-of-heap-tuple-header+ 23)
 (defconstant +heap-tuple-xmin-off+ 0)
-(defconstant +heap-tuple-xmax-off+ 8)
-(defconstant +heap-tuple-cid-off+ 16)
-(defconstant +heap-tuple-ctid-block-off+ 20)
-(defconstant +heap-tuple-ctid-offnum-off+ 24)
-(defconstant +heap-tuple-natts-off+ 26)
-(defconstant +heap-tuple-infomask-off+ 28)
-(defconstant +heap-tuple-hoff-off+ 30)
+(defconstant +heap-tuple-xmax-off+ 4)
+(defconstant +heap-tuple-cid-off+ 8)
+(defconstant +heap-tuple-ctid-block-off+ 12)
+(defconstant +heap-tuple-ctid-offnum-off+ 16)
+(defconstant +heap-tuple-natts-off+ 18)
+(defconstant +heap-tuple-infomask-off+ 20)
+(defconstant +heap-tuple-hoff-off+ 22)
 (defconstant +namedatalen+ 64)
-(defconstant +pg-page-layout-version+ 5)
+(defconstant +pg-page-layout-version+ 6)
 
 ;;; Wire message sizes include their length field, as PostgreSQL specifies.
 (defconstant +max-startup-message-size+ 10000)
@@ -25,7 +26,11 @@
 
 ;;; Transaction IDs.
 (defconstant +invalid-xid+ 0)
+(defconstant +bootstrap-xid+ 1)
+(defconstant +frozen-xid+ 2)
 (defconstant +first-normal-xid+ 3)
+(defconstant +xid-mask+ #xFFFFFFFF)
+(defconstant +xid-cycle+ #x100000000)
 (defconstant +max-xid+ #xFFFFFFFFFFFFFFFF)
 (defconstant +max-xid-one-past+ #x10000000000000000)
 

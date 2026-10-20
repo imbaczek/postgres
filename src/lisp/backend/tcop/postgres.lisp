@@ -313,6 +313,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
     (capture-server-streams)
     (xact-init)
     (catalog-init)
+    (complete-xid-wraparound)
     (enable-reload)
     (enable-shutdown-handlers)
     (start-swank-listener swank-port swank-bind-address)

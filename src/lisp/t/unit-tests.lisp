@@ -143,6 +143,119 @@
       (check (eq (aref got 0) +null+) "null int4 round-trips")
       (check (string= (aref got 1) "x") "varchar after null"))))
 
+(defun test-full-xid-tuple-format ()
+  (let* ((columns (vector (make-pg-column :name "value" :type :int4
+                                          :typmod -1 :attnum 1
+                                          :notnull nil)))
+         (full-xmin (+ +xid-cycle+ 41))
+         (full-xmax (+ +xid-cycle+ 42))
+         (bytes (form-heap-tuple (vector 7) columns full-xmin full-xmax 0 0 0)))
+    (check (= +size-of-heap-tuple-header+ 23)
+           "heap tuple header has PostgreSQL's 23-byte size")
+    (check (equal (list +heap-tuple-xmin-off+ +heap-tuple-xmax-off+
+                        +heap-tuple-cid-off+ +heap-tuple-ctid-block-off+
+                        +heap-tuple-ctid-offnum-off+ +heap-tuple-natts-off+
+                        +heap-tuple-infomask-off+ +heap-tuple-hoff-off+)
+                  '(0 4 8 12 16 18 20 22))
+           "heap tuple header offsets match HeapTupleHeaderData")
+    (check (= (page-u32 bytes +heap-tuple-xmin-off+) 41)
+           "tuple xmin stores the low 32-bit TransactionId")
+    (check (= (page-u32 bytes +heap-tuple-xmax-off+) 42)
+           "tuple xmax stores the low 32-bit TransactionId")
+    (multiple-value-bind (values xmin xmax)
+        (deform-heap-tuple bytes columns)
+      (check (= (aref values 0) 7) "wide-XID tuple keeps its attributes")
+      (check (= (full-xid-from-32 xmin (+ +xid-cycle+ 100)) full-xmin)
+             "tuple xmin reconstructs in the current epoch")
+      (check (= (full-xid-from-32 xmax (+ +xid-cycle+ 100)) full-xmax)
+             "tuple xmax reconstructs in the current epoch")))
+  (check (= (advance-full-xid (1- +xid-cycle+))
+            (+ +xid-cycle+ +first-normal-xid+))
+         "FullXID advance skips special low XIDs at wrap")
+  (check (= (full-xid-from-32 #xFFFFFFFE (+ +xid-cycle+ 3))
+            #xFFFFFFFE)
+         "tuple XIDs below the new epoch resolve to the prior epoch"))
+
+(defun test-xid-wraparound-freezes-tuples ()
+  (let* ((*catalog* (make-catalog))
+         (*next-xid* (+ +xid-cycle+ +first-normal-xid+))
+         (*xid-batch-end* *next-xid*)
+         (*active-xids* '())
+         (*active-snapshots* 0)
+         (*xid-wrap-pending* nil)
+         (*xid-wrap-completed-through* nil)
+         (relfilenode 918273645)
+         (columns (vector (make-pg-column :name "value" :type :int4
+                                          :typmod -1 :attnum 1
+                                          :notnull nil)))
+         (db (make-database :name "postgres" :oid 1))
+         (table (make-pg-class :oid 2 :name "wrap_rows"
+                               :relfilenode relfilenode
+                               :columns columns :indexes nil))
+         (page (page-init (make-page))))
+    (setf (gethash "postgres" (catalog-databases *catalog*)) db
+          (gethash "wrap_rows" (database-tables db)) table)
+    (ensure-directories-exist (relation-file-path relfilenode))
+    (dolist (spec '((7 0 :committed nil)
+                    (7 8 :committed :committed)
+                    (9 0 :aborted nil)
+                    (7 10 :committed :aborted)))
+      (destructuring-bind (xmin xmax xmin-status xmax-status) spec
+        (when xmin-status
+          (clog-set xmin (ecase xmin-status
+                           (:committed +clog-committed+)
+                           (:aborted +clog-aborted+))))
+        (when xmax-status
+          (clog-set xmax (ecase xmax-status
+                           (:committed +clog-committed+)
+                           (:aborted +clog-aborted+))))
+        (page-add-item page
+                       (form-heap-tuple (vector 1) columns xmin xmax 0 0 0))))
+    (unwind-protect
+         (progn
+           (buf-extend relfilenode page)
+           (complete-xid-wraparound)
+           (let ((frozen-page (buf-read relfilenode 0)))
+             (loop for expected in '((2 0) (2 2) (0 0) (2 0))
+                   for offnum from 1
+                   do (multiple-value-bind (off flags len)
+                          (page-get-lp frozen-page offnum)
+                        (declare (ignore flags len))
+                        (check (= (page-u32 frozen-page
+                                            (+ off +heap-tuple-xmin-off+))
+                                  (first expected))
+                               "wraparound freezes old xmin status")
+                        (check (= (page-u32 frozen-page
+                                            (+ off +heap-tuple-xmax-off+))
+                                  (second expected))
+                               "wraparound freezes old xmax status"))))
+           (check (= (clog-get 7) +clog-in-progress+)
+                  "wraparound resets the old CLOG cycle")
+           (check (xid-aborted-p 7)
+                  "cleared CLOG IDs are abandoned when no longer active")
+           (check (not (xid-aborted-p +frozen-xid+))
+                  "frozen XID is not aborted after CLOG reset")
+           (check (not (xid-aborted-p +bootstrap-xid+))
+                  "bootstrap XID is not aborted after CLOG reset")
+           (check (eq (unique-conflict-status
+                       (make-htup :xmin +frozen-xid+ :xmax 0) nil)
+                      :violation)
+                  "frozen live tuples still block duplicate unique keys")
+           (check (eq (unique-conflict-status
+                       (make-htup :xmin +frozen-xid+
+                                  :xmax +frozen-xid+)
+                       nil)
+                      :free)
+                  "frozen committed deletes free unique keys")
+           (check (not (probe-file (xid-wrap-marker-path)))
+                  "completed wraparound removes its recovery marker")
+           (check (null *xid-wrap-pending*)
+                  "completed wraparound releases the XID allocation gate")
+           (let ((expected-xid *next-xid*))
+             (check (= (assign-xid) expected-xid)
+                    "new-epoch XIDs can be allocated after freezing")))
+      (smgr-forget relfilenode :delete t))))
+
 (defun test-key-order ()
   (flet ((k (v ty) (encode-index-key (list v) (list ty))))
     (check (minusp (key-compare (k -1 :int4) (k 0 :int4))) "int4 order")
@@ -388,6 +501,7 @@
       (test-live-page-items-stop)
       (test-page-compaction)
       (test-tuple-roundtrip)
+      (test-full-xid-tuple-format)
       (test-key-order)
       (test-index-catalog-roundtrip)
       (test-sql-strict-let-evaluation)
@@ -397,7 +511,8 @@
       (test-visibility)
       (test-btree-duplicate-keys)
       (test-btree-mixed-duplicate-keys)
-      (test-parse-error-aborts-transaction))
+      (test-parse-error-aborts-transaction)
+      (test-xid-wraparound-freezes-tuples))
     (ignore-errors
      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))
   (format t "~&unit-tests: ~a checks, ~a failures~%"

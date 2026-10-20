@@ -21,8 +21,12 @@
               :if-does-not-exist :create))
   (values))
 
-(defun clog-byte-index (xid) (floor xid 4))
-(defun clog-bit-shift (xid) (* 2 (mod xid 4)))
+(defun xid32-of (xid)
+  "Return the TransactionId stored in a tuple or pg_xact entry."
+  (logand xid +xid-mask+))
+
+(defun clog-byte-index (xid) (floor (xid32-of xid) 4))
+(defun clog-bit-shift (xid) (* 2 (mod (xid32-of xid) 4)))
 
 (defun clog-get (xid)
   (sb-thread:with-mutex (*clog-lock*)
@@ -51,11 +55,32 @@
     (when *clog-stream*
       (fsync-stream *clog-stream*))))
 
+(defun clog-reset ()
+  "Start a new 32-bit XID cycle after every heap tuple has been frozen."
+  (sb-thread:with-mutex (*clog-lock*)
+    (when *clog-stream*
+      (close *clog-stream*)
+      (setf *clog-stream* nil))
+    (let ((path (clog-path)))
+      (with-open-file (s path
+                         :direction :output
+                         :element-type '(unsigned-byte 8)
+                         :if-exists :supersede
+                         :if-does-not-exist :create)
+        (fsync-stream s))
+      (fsync-directory *pgdata*)
+      (setf *clog-stream*
+            (open path
+                  :direction :io
+                  :element-type '(unsigned-byte 8)
+                  :if-exists :overwrite
+                  :if-does-not-exist :create))))
+  (values))
+
 (defun clog-recover (next-xid)
-  "No WAL: any IN_PROGRESS xid below NEXT-XID was interrupted, so treat it
-as ABORTED (plan section 4)."
-  (loop for xid from +first-normal-xid+ below next-xid
-        do (when (= (clog-get xid) +clog-in-progress+)
-             (clog-set xid +clog-aborted+)))
-  (clog-fsync)
+  "No WAL: the active-XID set distinguishes running from abandoned entries."
+  (declare (ignore next-xid))
+  ;; A zero CLOG status is IN_PROGRESS only while its full XID is present in
+  ;; *ACTIVE-XIDS*. After restart that set is empty, so the same entry is
+  ;; treated as ABORTED without scanning the entire transaction-ID history.
   (values))
