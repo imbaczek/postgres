@@ -166,11 +166,25 @@ CancelRequest, before the rest of that packet is read."
 (defun transaction-ending-statement-p (statement)
   (member (getf statement :type) '(:commit :rollback)))
 
-(defun simple-query-starts-with-transaction-end-p (message)
-  "Recognize a transaction-ending first command after SQL trivia."
-  (let* ((payload (frontend-message-payload message))
-         (end (or (position 0 payload) (length payload)))
-         (start 0))
+(defun frontend-frame-envelope-valid-p (length-bytes payload)
+  "Check only bounded frame shape needed to choose a reload-drain lane."
+  (and length-bytes
+       (= (length length-bytes) 4)
+       (let ((length (bytes-to-u32 length-bytes 0)))
+         (and (<= 4 length +max-query-message-size+)
+              payload
+              (= (length payload) (- length 4))))))
+
+(defun simple-query-payload-starts-with-transaction-end-p
+    (payload &optional (end (and payload
+                                 (or (position 0 payload) (length payload)))))
+  "Recognize a transaction-ending first command in raw query bytes.
+
+This bounded byte-only check selects drain admission; full validation and
+frontend-message construction happen after admission."
+  (unless payload
+    (return-from simple-query-payload-starts-with-transaction-end-p nil))
+  (let ((start 0))
     (labels ((whitespace-byte-p (byte)
                (member byte '(9 10 11 12 13 32)))
              (word-byte-p (byte)
@@ -224,9 +238,21 @@ CancelRequest, before the rest of that packet is read."
               (matches-word-p "END" word-start word-end)
               (matches-word-p "ABORT" word-start word-end)))))))
 
-(defun handle-simple-query (stream message)
+(defun simple-query-frame-needs-drain-p (length-bytes payload)
+  "Route malformed query frames through drain so their fatal error can clean up.
+
+The admitted decoder repeats these checks authoritatively."
+  (or (not (frontend-frame-envelope-valid-p length-bytes payload))
+      (let ((terminator (position 0 payload)))
+        (or (not (and terminator
+                      (= terminator (1- (length payload)))))
+            (simple-query-payload-starts-with-transaction-end-p
+             payload terminator)))))
+
+(defun handle-simple-query-frame (stream type-byte length-bytes payload)
   (let* ((backend *backend*)
-         (drain-command-p (simple-query-starts-with-transaction-end-p message))
+         (drain-command-p
+           (simple-query-frame-needs-drain-p length-bytes payload))
          (query nil)
          (suffix-start nil)
          (prefix-before-reload nil))
@@ -240,7 +266,10 @@ CancelRequest, before the rest of that packet is read."
                  ;; Only transactions and already-admitted sessions captured at
                  ;; gate closure can continue through the drain lane.
                  (with-live-operation-query-dispatch drain-command-p
-                   (setf query (query-string message))
+                   (setf query
+                         (query-string
+                          (decode-frontend-message
+                           type-byte length-bytes payload)))
                    (if (eq *live-operation-current-lane* :drain)
                        (multiple-value-bind (statements parsed-p)
                            ;; Parse the entire message before executing anything so
@@ -333,6 +362,16 @@ CancelRequest, before the rest of that packet is read."
       (with-live-operation-query-state-cleanup
         (end-backend-query-execution backend)))))
 
+(defun handle-simple-query (stream message)
+  "Dispatch an already-constructed simple-query message.
+
+This entry point is useful to in-image callers; the wire loop uses
+HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
+  (let ((payload (frontend-message-payload message)))
+    (handle-simple-query-frame
+     stream (char-code (frontend-message-type message))
+     (u32-to-bytes (+ 4 (length payload))) payload)))
+
 (defun handle-unsupported-message (stream message)
   (declare (ignore message))
   (send-error-response
@@ -342,21 +381,45 @@ CancelRequest, before the rest of that packet is read."
                    :message "extended query protocol is not supported by this server"))
   (send-ready-for-query stream (transaction-status-char)))
 
+(defun dispatch-frontend-frame (stream type-byte length-bytes payload)
+  "Admit a raw frame before protocol validation and message construction."
+  (cond
+    ;; Query dispatch needs its byte-only classifier first so an already-active
+    ;; transaction can still send COMMIT/ROLLBACK while reload drains.
+    ((= type-byte (char-code #\Q))
+     (handle-simple-query-frame stream type-byte length-bytes payload))
+    ;; A captured active session may terminate during drain so its transaction
+    ;; cleanup can complete. Idle sessions wait for ordinary admission.
+    ((= type-byte (char-code #\X))
+     (with-live-operation-query-dispatch t
+       (decode-frontend-message type-byte length-bytes payload)
+       :terminate))
+    ((not (frontend-frame-envelope-valid-p length-bytes payload))
+     ;; Bad frame shape must reach fatal validation during drain so it can
+     ;; release any transaction holding up the reload.
+     (with-live-operation-query-dispatch t
+       (decode-frontend-message type-byte length-bytes payload)
+       :continue))
+    (t
+     (with-live-operation
+       (handle-unsupported-message
+        stream (decode-frontend-message type-byte length-bytes payload))
+       :continue))))
+
 ;;; ---- backend loop ----
 
 (defun backend-loop (stream)
   (loop
-    (let ((message (read-message stream)))
-      (when (null message)
+    (multiple-value-bind (type-byte length-bytes payload)
+        (read-message-frame stream)
+      (when (null type-byte)
         (return))
-      ;; Frame reads are outside the gate. Simple-query dispatch enters its own
-      ;; lane so a transaction end can pass reload drain admission.
-      (case (frontend-message-type message)
-        (#\X (return))
-        (#\Q (handle-simple-query stream message))
-        (otherwise
-         (with-live-operation
-           (handle-unsupported-message stream message)))))))
+      ;; Reading socket bytes and selecting the query path stay outside
+      ;; admission. Validation, object construction and other dispatch enter it.
+      (when (eq (dispatch-frontend-frame
+                 stream type-byte length-bytes payload)
+                :terminate)
+        (return)))))
 
 (defun finish-backend-connection (backend sock stream)
   "Send final connection cleanup through the backend's captured cleanup lane."

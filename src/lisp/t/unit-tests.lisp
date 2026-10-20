@@ -14,7 +14,8 @@
          (incf *test-failures*)
          (format t "~&FAIL: ~a~%" (or ,label ',form)))))
 
-(defun test-wait-until (predicate &optional (timeout 2.0))
+(defun test-wait-until (predicate &optional (timeout 10.0))
+  "Poll PREDICATE for up to TIMEOUT seconds (ten seconds by default)."
   (let ((deadline (+ (get-internal-real-time)
                      (* timeout internal-time-units-per-second))))
     (loop
@@ -43,6 +44,17 @@
                               :initial-element 0)))
     (replace payload query-bytes)
     (make-frontend-message #\Q payload)))
+
+(defun test-read-frontend-message (stream)
+  (multiple-value-bind (type-byte length-bytes payload)
+      (read-message-frame stream)
+    (when type-byte
+      (decode-frontend-message type-byte length-bytes payload))))
+
+(defun test-dispatch-query-frame (stream query)
+  (let ((payload (frontend-message-payload (test-query-message query))))
+    (dispatch-frontend-frame
+     stream (char-code #\Q) (u32-to-bytes (+ 4 (length payload))) payload)))
 
 (defun test-page-roundtrip ()
   (let ((p (page-init (make-page))))
@@ -556,21 +568,24 @@
            "AST classifier finds a terminal after a nonterminal prefix")
     (check (= (length statements) 3)
            "the full simple-query message is parsed before dispatch"))
-  (check (simple-query-starts-with-transaction-end-p
-          (test-query-message "COMMIT; CHECKPOINT"))
+  (check (simple-query-payload-starts-with-transaction-end-p
+          (frontend-message-payload
+           (test-query-message "COMMIT; CHECKPOINT")))
          "a transaction-ending first command may enter drain admission")
   (dolist (query (list "/* leading comment */ COMMIT"
                        (format nil "-- leading comment~%ROLLBACK")
                        "; ; COMMIT"))
-    (check (simple-query-starts-with-transaction-end-p
-            (test-query-message query))
+    (check (simple-query-payload-starts-with-transaction-end-p
+            (frontend-message-payload (test-query-message query)))
            (format nil "SQL trivia before a transaction end is ignored: ~a"
                    query)))
-  (check (not (simple-query-starts-with-transaction-end-p
-               (test-query-message "SELECT 1; COMMIT")))
+  (check (not (simple-query-payload-starts-with-transaction-end-p
+               (frontend-message-payload
+                (test-query-message "SELECT 1; COMMIT"))))
          "work before COMMIT cannot enter drain admission")
-  (check (not (simple-query-starts-with-transaction-end-p
-               (test-query-message "SELECT 'COMMIT'")))
+  (check (not (simple-query-payload-starts-with-transaction-end-p
+               (frontend-message-payload
+                (test-query-message "SELECT 'COMMIT'"))))
          "a transaction keyword inside a string cannot enter drain admission")
   (check (handler-case
              (progn (parse-statements "COMMIT; SELECT") nil)
@@ -611,7 +626,7 @@
                  (*live-operation-drain-backends* (list backend))
                  (*live-operation-count* 0)
                  (*live-operation-backend-counts* (make-hash-table :test #'eq)))
-             (handle-simple-query nil (test-query-message query)))
+             (test-dispatch-query-frame nil query))
            (check (equal (nreverse events)
                          '((:exec (:prepare-only-p t :start-execution-p nil
                                    :finish-execution-p nil) :drain)
@@ -625,7 +640,7 @@
                  statements '((:type :commit) (:type :checkpoint)))
            (set-backend-state backend :idle)
            (let ((*backend* backend))
-             (handle-simple-query nil (test-query-message query)))
+             (test-dispatch-query-frame nil query))
            (check (equal (nreverse events)
                          '((:exec (:start-execution-p nil
                                    :finish-execution-p nil) :normal)
@@ -2181,19 +2196,173 @@
     (check (test-malformed-packet-p
             path (test-concat-octets (vector (char-code #\Q))
                                      (u32-to-bytes 3))
-            #'read-message "frontend message length is too short")
+            #'test-read-frontend-message "frontend message length is too short")
            "undersized query packets are rejected")
+    (check (test-malformed-packet-p
+            path (vector (char-code #\Q))
+            #'test-read-frontend-message "incomplete frontend message length")
+           "truncated query packet lengths are rejected after admission")
     (check (test-malformed-packet-p
             path (test-concat-octets (vector (char-code #\Q))
                                      (u32-to-bytes
                                       (1+ +max-query-message-size+)))
-            #'read-message "frontend message exceeds the size limit")
+            #'test-read-frontend-message "frontend message exceeds the size limit")
            "oversized query packets are rejected before allocation")
     (check (test-malformed-packet-p
             path (test-concat-octets (vector (char-code #\Q))
                                      (u32-to-bytes 5))
-            #'read-message "incomplete frontend message body")
+            #'test-read-frontend-message "incomplete frontend message body")
            "truncated query packet bodies are rejected")))
+
+(defun test-protocol-decoding-enters-live-operation ()
+  (let* ((backend (make-backend))
+         (test-lock (sb-thread:make-mutex :name "test protocol admission lock"))
+         (admission-waited nil)
+         (decoder-ran nil)
+         (decoder-live-count 0)
+         (decoder-lane nil)
+         (handler-ran nil)
+         (worker-error nil)
+         (worker nil)
+         (original-decoder (symbol-function 'decode-frontend-message))
+         (original-handler (symbol-function 'handle-unsupported-message)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'decode-frontend-message)
+                 (lambda (type-byte length-bytes payload)
+                   (let ((message (funcall original-decoder
+                                           type-byte length-bytes payload)))
+                     (sb-thread:with-mutex (test-lock)
+                       (setf decoder-ran t
+                             decoder-live-count *live-operation-count*
+                             decoder-lane *live-operation-current-lane*))
+                     message))
+                 (symbol-function 'handle-unsupported-message)
+                 (lambda (stream message)
+                   (declare (ignore stream message))
+                   (sb-thread:with-mutex (test-lock)
+                     (setf handler-ran t))))
+           (let ((*backend* backend))
+             (with-live-operation-quiescence
+               (setf worker
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (let ((*backend* backend)
+                              (*live-operation-admission-wait-hook*
+                                (lambda ()
+                                  (sb-thread:with-mutex (test-lock)
+                                    (setf admission-waited t)))))
+                          (handler-case
+                              (dispatch-frontend-frame
+                               nil (char-code #\D) (u32-to-bytes 5) #(0))
+                            (error (condition)
+                              (sb-thread:with-mutex (test-lock)
+                                (setf worker-error condition))))))
+                      :name "test admitted protocol decode"))
+               (check (test-wait-until
+                       (lambda ()
+                         (sb-thread:with-mutex (test-lock) admission-waited)))
+                      "protocol dispatch waits at closed reload admission")
+               (check (not (sb-thread:with-mutex (test-lock) decoder-ran))
+                      "protocol validation and object construction wait for admission")
+               (check (not (sb-thread:with-mutex (test-lock) handler-ran))
+                      "protocol handling waits for admission")))
+           (check (and worker
+                       (eq (sb-thread:join-thread worker :timeout 2) :continue))
+                  "raw protocol dispatch resumes after reload admission opens")
+           (check (and (sb-thread:with-mutex (test-lock) decoder-ran)
+                       (plusp (sb-thread:with-mutex (test-lock)
+                                decoder-live-count))
+                       (eq (sb-thread:with-mutex (test-lock) decoder-lane)
+                           :normal))
+                  "frontend validation and construction run inside an admitted operation")
+           (check (and (sb-thread:with-mutex (test-lock) handler-ran)
+                       (null worker-error))
+                  "the decoded message is dispatched after admission"))
+      (when (and worker (sb-thread:thread-alive-p worker))
+        (ignore-errors
+         (sb-thread:interrupt-thread
+          worker (lambda () (error "protocol admission test timed out"))))
+        (ignore-errors (sb-thread:join-thread worker :timeout 2)))
+      (setf (symbol-function 'decode-frontend-message) original-decoder
+            (symbol-function 'handle-unsupported-message) original-handler)
+      (test-reset-live-operation-admission))))
+
+(defun test-malformed-protocol-frames-drain-to-fatal-error ()
+  (let* ((backend (make-backend))
+         (old-state (backend-state backend)))
+    (labels ((expect-fatal-frame-error (type-byte length-bytes payload label)
+               (let ((worker
+                       (sb-thread:make-thread
+                        (lambda ()
+                          (let ((*backend* backend)
+                                (*live-operation-admission-open* nil)
+                                (*live-operation-drain-open* t)
+                                (*live-operation-drain-backends* (list backend))
+                                (*live-operation-cleanup-backends* (list backend))
+                                (*live-operation-count* 0)
+                                (*live-operation-backend-counts*
+                                  (make-hash-table :test #'eq)))
+                            (handler-case
+                                (dispatch-frontend-frame
+                                 nil type-byte length-bytes payload)
+                              (error (condition) condition))))
+                        :name "test malformed frame drain")))
+                 (let ((result (sb-thread:join-thread worker :timeout 2)))
+                   (check (and (typep result 'pg-error)
+                               (fatal-error-p result)
+                               (string= (pg-error-sqlstate result) "08P01"))
+                          label)
+                   (when (sb-thread:thread-alive-p worker)
+                     (ignore-errors
+                      (sb-thread:interrupt-thread
+                       worker (lambda () (error "malformed frame drain timed out"))))
+                     (ignore-errors (sb-thread:join-thread worker :timeout 2)))))))
+      (set-backend-state backend :in-progress)
+      (unwind-protect
+           (progn
+             (expect-fatal-frame-error
+              (char-code #\Q) (u32-to-bytes 3) nil
+              "a malformed query frame reaches fatal validation during drain")
+             (expect-fatal-frame-error
+              (char-code #\D) (u32-to-bytes 5) nil
+              "a malformed non-query frame reaches fatal validation during drain")
+             (expect-fatal-frame-error
+              (char-code #\X) (u32-to-bytes 5) #(0)
+              "a malformed Terminate frame reaches fatal validation during drain"))
+        (set-backend-state backend old-state)
+        (test-reset-live-operation-admission)))))
+
+(defun test-terminate-frame-drains-active-backend ()
+  (let* ((backend (make-backend))
+         (old-state (backend-state backend)))
+    (set-backend-state backend :in-progress)
+    (unwind-protect
+         (let ((worker
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (let ((*backend* backend)
+                          (*live-operation-admission-open* nil)
+                          (*live-operation-drain-open* t)
+                          (*live-operation-drain-backends* (list backend))
+                          (*live-operation-cleanup-backends* (list backend))
+                          (*live-operation-count* 0)
+                          (*live-operation-backend-counts*
+                            (make-hash-table :test #'eq)))
+                      (dispatch-frontend-frame
+                       nil (char-code #\X) (u32-to-bytes 4)
+                       (make-array 0 :element-type '(unsigned-byte 8)))))
+                  :name "test Terminate frame drain")))
+           (let ((result (sb-thread:join-thread worker :timeout 2)))
+             (check (eq result :terminate)
+                    "an active backend can dispatch Terminate during reload drain")
+             (when (sb-thread:thread-alive-p worker)
+               (ignore-errors
+                (sb-thread:interrupt-thread
+                 worker (lambda () (error "Terminate frame drain timed out"))))
+               (ignore-errors (sb-thread:join-thread worker :timeout 2)))))
+      (set-backend-state backend old-state)
+      (test-reset-live-operation-admission))))
 
 (defun test-live-page-items-stop ()
   (let ((page (page-init (make-page)))
@@ -2572,7 +2741,7 @@
   (with-open-file (stream path
                           :direction :input
                           :element-type '(unsigned-byte 8))
-    (loop for message = (read-message stream)
+    (loop for message = (test-read-frontend-message stream)
           while message
           when (char= (frontend-message-type message) #\D)
             collect (test-data-row-first-column
@@ -2750,12 +2919,6 @@
              (check (= (assign-xid) expected-xid)
                     "new-epoch XIDs can be allocated after freezing")))
       (smgr-forget relfilenode :delete t))))
-
-(defun test-wait-until (predicate)
-  (loop repeat 1000
-        when (funcall predicate) return t
-          do (sleep 0.01)
-        finally (return nil)))
 
 (defun test-prepare-wraparound-fixture (relfilenode)
   (smgr-forget relfilenode :delete t)
@@ -3378,7 +3541,12 @@
           (*backend* (make-backend)))
       (clog-init)
       (test-swank-arguments)
+      (check (test-wait-until (lambda () t) 0.01)
+             "test wait helper accepts an explicit timeout")
       (test-protocol-packet-limits)
+      (test-protocol-decoding-enters-live-operation)
+      (test-malformed-protocol-frames-drain-to-fatal-error)
+      (test-terminate-frame-drains-active-backend)
       (test-page-roundtrip)
       (test-atomic-output)
       (test-backend-wait-state)

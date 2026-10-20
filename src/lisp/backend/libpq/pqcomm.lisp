@@ -106,41 +106,55 @@ as a second value. Blocking reads stay outside OPERATION-WRAPPER."
               (values (concatenate '(vector (unsigned-byte 8)) code-bytes tail)
                       bypass-p))))))))
 
-(defun read-message (stream &optional (operation-wrapper #'funcall))
-  "Read and validate one frame before dispatching it to a live operation.
+(defun read-message-frame (stream)
+  "Read one bounded raw frame without validating or constructing a message.
 
-Valid messages are returned without entering the reload gate so SQL dispatch
-can choose ordinary or transaction-drain admission. Framing errors are reported
-through OPERATION-WRAPPER."
+The caller must validate the returned bytes after entering the appropriate live
+operation.  Only the length check needed to bound body allocation happens here."
+  (let ((type-byte (read-byte stream nil nil)))
+    (when (null type-byte)
+      (return-from read-message-frame (values nil nil nil)))
+    (multiple-value-bind (length-bytes got) (read-exact-bytes stream 4)
+      (declare (ignore got))
+      (unless length-bytes
+        (return-from read-message-frame (values type-byte nil nil)))
+      (let* ((length (logior (ash (aref length-bytes 0) 24)
+                             (ash (aref length-bytes 1) 16)
+                             (ash (aref length-bytes 2) 8)
+                             (aref length-bytes 3))))
+        (if (<= 4 length +max-query-message-size+)
+            (multiple-value-bind (payload body-got)
+                (read-exact-bytes stream (- length 4))
+              (declare (ignore body-got))
+              (values type-byte length-bytes payload))
+            ;; Invalid lengths are returned for admitted validation without
+            ;; allocating or attempting to consume an unbounded body.
+            (values type-byte length-bytes nil))))))
+
+(defun decode-frontend-message (type-byte length-bytes payload)
+  "Validate raw frame fields and construct a frontend message.
+
+Production callers run this inside the live-operation gate."
   (labels ((reject (message)
-             (funcall operation-wrapper
-                      (lambda () (malformed-protocol-message message)))))
-    (let ((type-byte (read-byte stream nil nil)))
-      (when (null type-byte)
-        (return-from read-message nil))
-      (multiple-value-bind (lenb got) (read-exact-bytes stream 4)
-        (declare (ignore got))
-        (unless lenb
-          (reject "incomplete frontend message length"))
-        (let ((length (bytes-to-u32 lenb 0)))
-          (when (< length 4)
-            (reject "frontend message length is too short"))
-          (when (> length +max-query-message-size+)
-            (reject "frontend message exceeds the size limit"))
-          (when (and (= type-byte (char-code #\X)) (/= length 4))
-            (reject "terminate message must not contain a payload"))
-          (multiple-value-bind (payload body-got)
-              (read-exact-bytes stream (- length 4))
-            (declare (ignore body-got))
-            (unless payload
-              (reject "incomplete frontend message body"))
-            (when (= type-byte (char-code #\Q))
-              (let ((terminator (position 0 payload)))
-                (unless (and terminator
-                             (= terminator (1- (length payload))))
-                  (reject
-                   "simple query message must contain one trailing null byte"))))
-            (make-frontend-message (code-char type-byte) payload)))))))
+             (malformed-protocol-message message)))
+    (unless length-bytes
+      (reject "incomplete frontend message length"))
+    (let ((length (bytes-to-u32 length-bytes 0)))
+      (when (< length 4)
+        (reject "frontend message length is too short"))
+      (when (> length +max-query-message-size+)
+        (reject "frontend message exceeds the size limit"))
+      (when (and (= type-byte (char-code #\X)) (/= length 4))
+        (reject "terminate message must not contain a payload"))
+      (unless (and payload (= (length payload) (- length 4)))
+        (reject "incomplete frontend message body"))
+      (when (= type-byte (char-code #\Q))
+        (let ((terminator (position 0 payload)))
+          (unless (and terminator
+                       (= terminator (1- (length payload))))
+            (reject
+             "simple query message must contain one trailing null byte"))))
+      (make-frontend-message (code-char type-byte) payload))))
 
 ;;; ---- writing ----
 
