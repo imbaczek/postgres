@@ -33,22 +33,151 @@
 ;; concurrently and interleave a half-compiled image.
 (defvar *reload-run-lock* (sb-thread:make-mutex :name "pg reload run lock"))
 
+;; A reload closes admission to SQL operations and waits for current queries to
+;; leave before redefining functions used by backend threads.
+(defvar *live-operation-lock*
+  (sb-thread:make-mutex :name "pg live operation lock"))
+(defvar *live-operation-cv*
+  (sb-thread:make-waitqueue :name "pg live operation condition"))
+(defvar *live-operation-admission-open* t)
+(defvar *live-operation-drain-open* nil)
+(defvar *live-operation-count* 0)
+(defvar *live-operation-depth* 0)
+
+(defun live-operation-admitted-p (drain-p)
+  (or *live-operation-admission-open*
+      (and drain-p *live-operation-drain-open*)))
+
+(defun wait-for-live-operation-admission (drain-p)
+  (sb-thread:with-mutex (*live-operation-lock*)
+    (loop until (live-operation-admitted-p drain-p)
+          do (sb-thread:condition-wait *live-operation-cv*
+                                       *live-operation-lock*)))
+  (values))
+
+(defun try-enter-live-operation (drain-p)
+  "Count an operation if its admission lane remains open; never wait here."
+  (sb-thread:with-mutex (*live-operation-lock*)
+    (when (live-operation-admitted-p drain-p)
+      (incf *live-operation-count*)
+      t)))
+
+(defun leave-live-operation ()
+  ;; Keep termination responsive while waiting for the lock. Once acquired,
+  ;; finish the count/broadcast transition without allowing an interrupt to
+  ;; strand reload waiters. A caught termination is re-signaled afterward.
+  (let ((finished-p nil)
+        (lock-acquired-p nil)
+        (pending-interrupt nil))
+    (loop until finished-p
+          do (progn
+               (handler-case
+                   (sb-sys:without-interrupts
+                     (when (sb-thread:grab-mutex *live-operation-lock* :waitp nil)
+                       (setf lock-acquired-p t)
+                       (unwind-protect
+                            (progn
+                              (unless (plusp *live-operation-count*)
+                                (error "live operation count underflow"))
+                              (decf *live-operation-count*)
+                              (when (zerop *live-operation-count*)
+                                (sb-thread:condition-broadcast *live-operation-cv*))
+                              (setf finished-p t))
+                         (sb-thread:release-mutex *live-operation-lock*))))
+                 (error (condition)
+                   (if lock-acquired-p
+                       (error condition)
+                       (setf pending-interrupt condition))))
+               (unless finished-p
+                 (handler-case
+                     (sb-thread:thread-yield)
+                   (error (condition)
+                     (setf pending-interrupt condition))))))
+    (when pending-interrupt
+      (error pending-interrupt)))
+  (values))
+
+(defun close-live-operation-admission ()
+  (when (plusp *live-operation-depth*)
+    (error "cannot reload from inside a live operation"))
+  (sb-thread:with-mutex (*live-operation-lock*)
+    (setf *live-operation-admission-open* nil)
+    (setf *live-operation-drain-open* t)
+    (loop while (plusp *live-operation-count*)
+          do (sb-thread:condition-wait *live-operation-cv*
+                                       *live-operation-lock*))
+    ;; Close the drain lane atomically with observing an empty operation set.
+    ;; Otherwise a new COMMIT could enter after this waiter decides reload is
+    ;; safe and overlap ASDF's function redefinitions.
+    (setf *live-operation-drain-open* nil))
+  (values))
+
+(defun open-live-operation-admission ()
+  (sb-thread:with-mutex (*live-operation-lock*)
+    (setf *live-operation-drain-open* nil
+          *live-operation-admission-open* t)
+    (sb-thread:condition-broadcast *live-operation-cv*))
+  (values))
+
+(defmacro with-live-operation-internal ((drain-p) &body body)
+  "Run BODY under the reload gate, optionally while active work drains."
+  (let ((outermost (gensym "OUTERMOST-"))
+        (admitted (gensym "ADMITTED-"))
+        (operation-block (gensym "LIVE-OPERATION-")))
+    `(let ((,outermost (zerop *live-operation-depth*)))
+       (if ,outermost
+           (block ,operation-block
+             (loop
+               (wait-for-live-operation-admission ,drain-p)
+               (let ((,admitted nil))
+                 ;; Keep asynchronous termination from landing after the count
+                 ;; increments but before its cleanup has been installed.
+                 (sb-sys:without-interrupts
+                   (setf ,admitted (try-enter-live-operation ,drain-p))
+                   (when ,admitted
+                     (return-from ,operation-block
+                       (unwind-protect
+                            (sb-sys:allow-with-interrupts
+                              (let ((*live-operation-depth*
+                                      (1+ *live-operation-depth*)))
+                                (progn ,@body)))
+                         (leave-live-operation))))))))
+           (let ((*live-operation-depth* (1+ *live-operation-depth*)))
+             (progn ,@body))))))
+
+(defmacro with-live-operation (&body body)
+  "Run BODY while protecting its function definitions from a live reload."
+  `(with-live-operation-internal (nil) ,@body))
+
+(defmacro with-live-operation-drain (&body body)
+  "Run a BODY that may help already-active operations drain."
+  `(with-live-operation-internal (t) ,@body))
+
+(defmacro with-live-operation-quiescence (&body body)
+  "Run BODY after existing live operations drain and before new ones enter."
+  `(unwind-protect
+        (progn
+          (close-live-operation-admission)
+          ,@body)
+     (open-live-operation-admission)))
+
 (defun reload ()
   "Recompile and reload the pg system in this image.  Returns T on success."
   (sb-thread:with-mutex (*reload-run-lock*)
     (format t "~&pg-lisp: reloading code...~%")
     (finish-output)
-    (let ((ok (handler-case
-                  (let ((*standard-output* (or *server-output* *standard-output*))
-                        (*error-output* (or *server-error* *error-output*))
-                        (*compile-verbose* nil)
-                        (*load-verbose* nil))
-                    (asdf:load-system "pg" :force t)
-                    t)
-                (error (e)
-                  (format *error-output* "~&pg-lisp: reload failed: ~a~%" e)
-                  (finish-output *error-output*)
-                  nil))))
+    (let ((ok (with-live-operation-quiescence
+                (handler-case
+                    (let ((*standard-output* (or *server-output* *standard-output*))
+                          (*error-output* (or *server-error* *error-output*))
+                          (*compile-verbose* nil)
+                          (*load-verbose* nil))
+                      (asdf:load-system "pg" :force t)
+                      t)
+                  (error (e)
+                    (format *error-output* "~&pg-lisp: reload failed: ~a~%" e)
+                    (finish-output *error-output*)
+                    nil)))))
       (format t "~&pg-lisp: reload ~:[failed (see server log)~;complete~]~%" ok)
       (finish-output)
       ok)))
@@ -156,7 +285,16 @@ this listener evaluates arbitrary Lisp."
 (defun control-eval (stream form)
   "Evaluate FORM, printing its values (or an error) to STREAM."
   (handler-case
-      (format stream "~&~{~s~^~%~}~%" (multiple-value-list (eval form)))
+      (format stream "~&~{~s~^~%~}~%"
+              (multiple-value-list
+               (if (and (consp form)
+                        (eq (first form) 'reload)
+                        (null (rest form)))
+                   ;; Keep the documented REPL reload entry outside the live
+                   ;; operation gate; RELOAD coordinates quiescence itself.
+                   (reload)
+                   (with-live-operation
+                     (eval form)))))
     (error (e)
       (format stream "~&;; error: ~a~%" e))))
 

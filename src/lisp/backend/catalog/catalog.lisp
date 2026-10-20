@@ -154,22 +154,14 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
          (terpri out))))))
 
 (defun write-catalog-image (bytes)
-  (ensure-directories-exist (catalog-path))
-  (let ((tmp (pgdata-path "global/pg_catalog.tmp")))
-    (with-open-file (s tmp
-                       :direction :output
-                       :if-exists :supersede
-                       :if-does-not-exist :create
+  (with-atomic-output (stream
+                       (catalog-path)
+                       (pgdata-path "global/pg_catalog.tmp")
+                       (pgdata-path "global/")
                        :element-type '(unsigned-byte 8))
-      (write-sequence bytes s)
-      (finish-output s)
-      (fsync-stream s))
-    ;; RENAME(2) atomically replaces the destination.  Deleting the old
-    ;; catalog first would open a window in which neither name exists, so a
-    ;; crash there would lose the whole catalog.
-    (sb-posix:rename (namestring tmp) (namestring (catalog-path)))
-    (fsync-directory (pgdata-path "global/")))
-  (values))
+    ;; Atomic rename keeps the old catalog present until the new image is
+    ;; durable, so a crash cannot leave the catalog name missing.
+    (write-sequence bytes stream)))
 
 (defun save-catalog ()
   (wal-commit-catalog (catalog-image-bytes) #'write-catalog-image))

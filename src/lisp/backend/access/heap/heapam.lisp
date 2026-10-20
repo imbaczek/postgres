@@ -290,27 +290,43 @@
         (heap-fsm-record-page fsm block (page-free-space page))
         (values block offnum)))))
 
+(defmacro with-heap-tuple-edit ((page offset relfilenode block offnum) &body body)
+  "Mutate one live tuple and publish its page after a complete edit."
+  (let ((relfilenode-value (gensym "RELFILENODE-"))
+        (block-value (gensym "BLOCK-"))
+        (offnum-value (gensym "OFFNUM-"))
+        (page-value (gensym "PAGE-"))
+        (tuple-offset (gensym "TUPLE-OFFSET-"))
+        (tuple-length (gensym "TUPLE-LENGTH-")))
+    `(let* ((,relfilenode-value ,relfilenode)
+            (,block-value ,block)
+            (,offnum-value ,offnum)
+            (,page-value (buf-read ,relfilenode-value ,block-value)))
+       (when ,page-value
+         (with-live-page-item (,page-value ,offnum-value
+                                           ,tuple-offset ,tuple-length)
+           (when (< ,tuple-length +size-of-heap-tuple-header+)
+             (ereport "XX001" "heap tuple header is truncated"))
+           (let ((,page ,page-value)
+                 (,offset ,tuple-offset))
+             (multiple-value-prog1
+                 (progn ,@body)
+               (buf-write ,relfilenode-value ,block-value ,page-value)
+               (mark-dirty ,relfilenode-value))))))))
+
 (defun heapam-set-xmax (relfilenode block offnum xmax cid)
-  (let ((page (buf-read relfilenode block)))
-    (when page
-      (with-live-page-item (page offnum off len)
-        (page-set-u32 page (+ off +heap-tuple-xmax-off+)
-                      (xid32-of xmax))
-        (page-set-u32 page (+ off +heap-tuple-cid-off+) cid)
-        (buf-write relfilenode block page)
-        (mark-dirty relfilenode)
-        t))))
+  (with-heap-tuple-edit (page offset relfilenode block offnum)
+    (page-set-u32 page (+ offset +heap-tuple-xmax-off+)
+                  (xid32-of xmax))
+    (page-set-u32 page (+ offset +heap-tuple-cid-off+) cid)
+    t))
 
 (defun heapam-set-ctid (relfilenode block offnum ctid-block ctid-offnum)
   (with-write-lock
-    (let ((page (buf-read relfilenode block)))
-      (when page
-        (with-live-page-item (page offnum off len)
-          (page-set-u32 page (+ off +heap-tuple-ctid-block-off+) ctid-block)
-          (page-set-u16 page (+ off +heap-tuple-ctid-offnum-off+) ctid-offnum)
-          (buf-write relfilenode block page)
-          (mark-dirty relfilenode)
-          t)))))
+    (with-heap-tuple-edit (page offset relfilenode block offnum)
+      (page-set-u32 page (+ offset +heap-tuple-ctid-block-off+) ctid-block)
+      (page-set-u16 page (+ offset +heap-tuple-ctid-offnum-off+) ctid-offnum)
+      t)))
 
 (defun fresh-delete-snapshot (fallback)
   (if *backend*

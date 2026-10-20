@@ -48,3 +48,34 @@
     (unwind-protect
          (sb-posix:fsync fd)
       (sb-posix:close fd))))
+
+(defun atomic-replace-file (target-path temporary-path directory write-function
+                            &key (element-type 'character)
+                              (fsync-function #'sb-posix:fsync)
+                              (rename-function #'sb-posix:rename)
+                              (fsync-directory-function #'fsync-directory))
+  "Write and fsync TEMPORARY-PATH, rename it to TARGET-PATH, and fsync DIRECTORY."
+  (ensure-directories-exist target-path)
+  (unwind-protect
+       (progn
+         (with-open-file (stream temporary-path
+                                 :direction :output
+                                 :if-exists :supersede
+                                 :if-does-not-exist :create
+                                 :element-type element-type)
+           (funcall write-function stream)
+           (finish-output stream)
+           (funcall fsync-function (sb-sys:fd-stream-fd stream)))
+         (funcall rename-function (namestring temporary-path)
+                  (namestring target-path))
+         (funcall fsync-directory-function directory))
+    (ignore-errors (delete-file temporary-path)))
+  (values))
+
+(defmacro with-atomic-output ((stream target-path temporary-path directory
+                               &rest options)
+                              &body body)
+  "Write BODY to a temporary file and atomically replace TARGET-PATH."
+  `(atomic-replace-file ,target-path ,temporary-path ,directory
+                        (lambda (,stream) ,@body)
+                        ,@options))

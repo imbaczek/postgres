@@ -341,6 +341,22 @@
     (error "WAL I/O previously failed; refusing further WAL operations"))
   (values))
 
+(defmacro with-wal-critical (&body body)
+  "Run BODY under the WAL lock and request fail-stop shutdown on errors."
+  `(handler-case
+       (sb-thread:with-mutex (*wal-lock*)
+         (handler-case
+             (progn
+               (wal-check-healthy)
+               ,@body)
+           (error (condition)
+             ;; Publish poison before another WAL operation can acquire the
+             ;; mutex; request shutdown after WITH-MUTEX releases it.
+             (setf *wal-poisoned* t)
+             (error condition))))
+     (error (condition)
+       (wal-fail-stop condition))))
+
 (defun wal-next-record-start (length)
   (when (> length +wal-segment-size+)
     (error "WAL record of ~a bytes exceeds the segment size" length))
@@ -477,30 +493,30 @@
   (unless *wal-ready*
     (funcall after-durable-function)
     (return-from wal-commit-transaction (values)))
-  (wal-check-healthy)
-  (handler-case
-      (sb-thread:with-mutex (*wal-lock*)
-        (let* ((split-p *wal-pending-btree-split*)
-               (images (wal-page-images)))
-          (wal-append-batch-start)
-          (wal-append-page-images images)
-          ;; This hook leaves complete page records in the file without a
-          ;; terminal record, so recovery must discard this entire batch.
-          (when *wal-output-stream* (finish-output *wal-output-stream*))
-          (wal-test-pause :after-page-images)
-          (wal-append-record +wal-record-commit+ xid
-                             (make-array 0 :element-type '(unsigned-byte 8)))
-          (wal-flush)
-          (wal-test-pause :after-wal-flush)
-          (funcall after-durable-function)
-          (wal-apply-page-images images :split-p split-p
-                                        :fault-on-first-write t)
-          (wal-clear-page-cache)
-          (setf *wal-pending-btree-split* nil)))
-    (error (condition)
-      (wal-fail-stop condition)))
+  (with-wal-critical
+    (let* ((split-p *wal-pending-btree-split*)
+           (images (wal-page-images)))
+      (wal-append-batch-start)
+      (wal-append-page-images images)
+      ;; This hook leaves complete page records in the file without a
+      ;; terminal record, so recovery must discard this entire batch.
+      (when *wal-output-stream* (finish-output *wal-output-stream*))
+      (wal-test-pause :after-page-images)
+      (wal-append-record +wal-record-commit+ xid
+                         (make-array 0 :element-type '(unsigned-byte 8)))
+      (wal-flush)
+      (wal-test-pause :after-wal-flush)
+      (funcall after-durable-function)
+      (wal-apply-page-images images :split-p split-p
+                                    :fault-on-first-write t)
+      (wal-clear-page-cache)
+      (setf *wal-pending-btree-split* nil)))
   (values))
 
+;; TODO: Stream catalog serialization into a temporary file and write bounded
+;; WAL chunks from it. Recovery should spool chunks, validate terminal metadata,
+;; then publish from the spool; this path currently holds several full-image
+;; byte arrays in memory.
 (defun wal-encode-catalog-payload (bytes deletes)
   (let* ((payload (make-array (+ 8 (* 4 (length deletes)) (length bytes))
                               :element-type '(unsigned-byte 8)
@@ -618,45 +634,41 @@
   "Durably publish a full catalog image and any deferred relation drops."
   (unless *wal-ready*
     (return-from wal-commit-catalog (funcall write-function catalog-bytes)))
-  (wal-check-healthy)
-  (handler-case
-      (sb-thread:with-mutex (*wal-lock*)
-        (let* ((deletes (sort (copy-list *wal-pending-deletes*) #'<))
-               (images (wal-page-images deletes))
-               (catalog-payload
-                 (wal-encode-catalog-payload catalog-bytes deletes))
-               (chunked-p
-                 (> (+ +wal-header-size+ (length catalog-payload))
-                    +wal-segment-size+))
-               (chunk-count (when chunked-p
-                              (wal-catalog-chunk-count catalog-payload)))
-               (commit-payload (when chunked-p
-                                 (wal-encode-catalog-commit-payload
-                                  catalog-payload chunk-count))))
-          (wal-append-batch-start)
-          (wal-append-page-images images)
-          (if chunked-p
-              (progn
-                (wal-append-catalog-chunks catalog-payload chunk-count)
-                (when *wal-output-stream*
-                  (finish-output *wal-output-stream*))
-                (wal-test-pause :after-catalog-chunks)
-                (wal-append-record +wal-record-catalog-commit+ 0
-                                   commit-payload))
-              (wal-append-record +wal-record-catalog+ 0 catalog-payload))
-          (wal-flush)
-          (wal-test-pause :after-catalog-wal-flush)
-          (wal-apply-page-images images)
-          (funcall write-function catalog-bytes)
-          (dolist (relfilenode deletes)
-            (smgr-forget relfilenode :delete t))
-          (setf *wal-pending-deletes*
-                (set-difference *wal-pending-deletes* deletes :test #'eql))
-          (when deletes (fsync-directory (merge-pathnames "base/" *pgdata*)))
-          (wal-clear-page-cache)
-          (setf *wal-pending-btree-split* nil)))
-    (error (condition)
-      (wal-fail-stop condition)))
+  (with-wal-critical
+    (let* ((deletes (sort (copy-list *wal-pending-deletes*) #'<))
+           (images (wal-page-images deletes))
+           (catalog-payload
+             (wal-encode-catalog-payload catalog-bytes deletes))
+           (chunked-p
+             (> (+ +wal-header-size+ (length catalog-payload))
+                +wal-segment-size+))
+           (chunk-count (when chunked-p
+                          (wal-catalog-chunk-count catalog-payload)))
+           (commit-payload (when chunked-p
+                             (wal-encode-catalog-commit-payload
+                              catalog-payload chunk-count))))
+      (wal-append-batch-start)
+      (wal-append-page-images images)
+      (if chunked-p
+          (progn
+            (wal-append-catalog-chunks catalog-payload chunk-count)
+            (when *wal-output-stream*
+              (finish-output *wal-output-stream*))
+            (wal-test-pause :after-catalog-chunks)
+            (wal-append-record +wal-record-catalog-commit+ 0
+                               commit-payload))
+          (wal-append-record +wal-record-catalog+ 0 catalog-payload))
+      (wal-flush)
+      (wal-test-pause :after-catalog-wal-flush)
+      (wal-apply-page-images images)
+      (funcall write-function catalog-bytes)
+      (dolist (relfilenode deletes)
+        (smgr-forget relfilenode :delete t))
+      (setf *wal-pending-deletes*
+            (set-difference *wal-pending-deletes* deletes :test #'eql))
+      (when deletes (fsync-directory (merge-pathnames "base/" *pgdata*)))
+      (wal-clear-page-cache)
+      (setf *wal-pending-btree-split* nil)))
   (values))
 
 (defun wal-discover-segments ()
@@ -955,23 +967,12 @@
   (values))
 
 (defun wal-atomic-write-bytes (path bytes)
-  (let* ((temporary (make-pathname :type "tmp" :defaults path))
-         (directory (make-pathname :name nil :type nil :defaults path)))
-    (ensure-directories-exist path)
-    (unwind-protect
-         (progn
-           (with-open-file (stream temporary
-                                   :direction :output
-                                   :element-type '(unsigned-byte 8)
-                                   :if-exists :supersede
-                                   :if-does-not-exist :create)
-             (write-sequence bytes stream)
-             (finish-output stream)
-             (fsync-stream stream))
-           (sb-posix:rename (namestring temporary) (namestring path))
-           (fsync-directory directory))
-      (ignore-errors (delete-file temporary)))
-    (values)))
+  (with-atomic-output (stream
+                       path
+                       (make-pathname :type "tmp" :defaults path)
+                       (make-pathname :name nil :type nil :defaults path)
+                       :element-type '(unsigned-byte 8))
+    (write-sequence bytes stream)))
 
 (defun wal-read-control-fields ()
   (let ((path (wal-control-path)))
@@ -1127,31 +1128,28 @@
 
 (defun wal-checkpoint ()
   "Write all cached pages, sync durable state, and advance the redo pointer."
-  (wal-check-healthy)
-  (handler-case
-      (with-write-lock
-        (sb-thread:with-mutex (*wal-lock*)
-          (let ((images (wal-page-images)))
-            (wal-append-batch-start)
-            (wal-append-page-images images)
-            (let ((checkpoint-end
-                    (wal-append-record
-                     +wal-record-checkpoint+ 0
-                     (make-array 0 :element-type '(unsigned-byte 8)))))
-              (wal-flush)
-              (wal-test-pause :after-checkpoint-wal-flush)
-              (wal-apply-page-images images)
-              (wal-clear-page-cache)
-              (smgr-fsync-all)
-              (clog-fsync)
-              (fsync-directory *pgdata*)
-              (fsync-directory (merge-pathnames "base/" *pgdata*))
-              (fsync-directory (merge-pathnames "global/" *pgdata*))
-              (wal-save-checkpoint-control checkpoint-end)
-              (wal-test-pause :after-checkpoint-control)
-              (wal-remove-checkpointed-segments checkpoint-end)))))
-    (error (condition)
-      (wal-fail-stop condition)))
+  ;; CHECKPOINT follows the global write-lock -> WAL-lock order.
+  (with-write-lock
+    (with-wal-critical
+      (let ((images (wal-page-images)))
+        (wal-append-batch-start)
+        (wal-append-page-images images)
+        (let ((checkpoint-end
+                (wal-append-record
+                 +wal-record-checkpoint+ 0
+                 (make-array 0 :element-type '(unsigned-byte 8)))))
+          (wal-flush)
+          (wal-test-pause :after-checkpoint-wal-flush)
+          (wal-apply-page-images images)
+          (wal-clear-page-cache)
+          (smgr-fsync-all)
+          (clog-fsync)
+          (fsync-directory *pgdata*)
+          (fsync-directory (merge-pathnames "base/" *pgdata*))
+          (fsync-directory (merge-pathnames "global/" *pgdata*))
+          (wal-save-checkpoint-control checkpoint-end)
+          (wal-test-pause :after-checkpoint-control)
+          (wal-remove-checkpointed-segments checkpoint-end)))))
   (values))
 
 (defun wal-remove-checkpointed-segments (checkpoint-lsn)
@@ -1177,20 +1175,16 @@
 
 (defun wal-log-clog-reset ()
   (when *wal-ready*
-    (wal-check-healthy)
-    (handler-case
-        (sb-thread:with-mutex (*wal-lock*)
-          (let* ((next-xid (symbol-value '*next-xid*))
-                 (images (wal-page-images))
-                 (payload (make-array 8 :element-type '(unsigned-byte 8)
-                                        :initial-element 0)))
-            (wal-append-batch-start)
-            (wal-append-page-images images)
-            (wal-set-u64 payload 0 next-xid)
-            (wal-append-record +wal-record-clog-reset+ next-xid payload)
-            (wal-flush)
-            (wal-apply-page-images images)
-            (wal-clear-page-cache)))
-      (error (condition)
-        (wal-fail-stop condition))))
+    (with-wal-critical
+      (let* ((next-xid (symbol-value '*next-xid*))
+             (images (wal-page-images))
+             (payload (make-array 8 :element-type '(unsigned-byte 8)
+                                    :initial-element 0)))
+        (wal-append-batch-start)
+        (wal-append-page-images images)
+        (wal-set-u64 payload 0 next-xid)
+        (wal-append-record +wal-record-clog-reset+ next-xid payload)
+        (wal-flush)
+        (wal-apply-page-images images)
+        (wal-clear-page-cache))))
   (values))

@@ -2,6 +2,10 @@
 
 (in-package #:pg)
 
+(defun call-with-live-operation-drain (function)
+  "Run one short post-read validation phase under reload drain admission."
+  (with-live-operation-drain (funcall function)))
+
 ;;; ---- startup ----
 
 (defun random-cancel-key ()
@@ -65,72 +69,77 @@
 (defun read-startup-until-ready (stream)
   "Consume SSL/GSS negotiation requests; return the StartupMessage body or NIL."
   (loop
-    (let ((body (read-startup-packet stream)))
+    (let ((body (read-startup-packet stream
+                                     #'call-with-live-operation-drain)))
       (when (null body)
         (return-from read-startup-until-ready nil))
-      (when (< (length body) 4)
-        (ereport-fatal "08P01" "startup packet is missing its request code"))
-      (let ((code (bytes-to-u32 body 0)))
-        (cond
-          ((= code +ssl-request-code+)
-           (unless (= (length body) 4)
-             (ereport-fatal "08P01" "SSL request packet has an invalid length"))
-           (write-byte (char-code #\N) stream)
-           (force-output stream))
-          ((= code +gssenc-request-code+)
-           (unless (= (length body) 4)
-             (ereport-fatal "08P01" "GSS encryption request packet has an invalid length"))
-           (write-byte (char-code #\N) stream)
-           (force-output stream))
-          ((= code +cancel-request-code+)
-           (unless (= (length body) 12)
-             (ereport-fatal "08P01" "cancel request packet has an invalid length"))
-           (process-cancel-request body)
-           (return-from read-startup-until-ready nil))
-          (t
-           (return-from read-startup-until-ready body)))))))
+      ;; Packet reads stay outside the gate; validating and processing each
+      ;; packet is short and must not overlap live function redefinition.
+      (with-live-operation-drain
+        (when (< (length body) 4)
+          (ereport-fatal "08P01" "startup packet is missing its request code"))
+        (let ((code (bytes-to-u32 body 0)))
+          (cond
+            ((= code +ssl-request-code+)
+             (unless (= (length body) 4)
+               (ereport-fatal "08P01" "SSL request packet has an invalid length"))
+             (write-byte (char-code #\N) stream)
+             (force-output stream))
+            ((= code +gssenc-request-code+)
+             (unless (= (length body) 4)
+               (ereport-fatal "08P01" "GSS encryption request packet has an invalid length"))
+             (write-byte (char-code #\N) stream)
+             (force-output stream))
+            ((= code +cancel-request-code+)
+             (unless (= (length body) 12)
+               (ereport-fatal "08P01" "cancel request packet has an invalid length"))
+             (process-cancel-request body)
+             (return-from read-startup-until-ready nil))
+            (t
+             (return-from read-startup-until-ready body))))))))
 
 (defun process-startup (stream body)
-  (let* ((code (bytes-to-u32 body 0))
-         (major (ash code -16)))
-    (unless (= major 3)
-      (ereport "0A000"
-               (format nil "unsupported frontend protocol ~a.~a"
-                       major (logand code #xFFFF))))
-    ;; Reject new clients once a shutdown is underway, before authentication,
-    ;; exactly as PostgreSQL's canAcceptConnections() does.
-    (unless (conns-allowed-p)
-      (ereport-fatal "57P03" "the database system is shutting down"))
-    (let* ((params (parse-startup-params body))
-           (app (or (cdr (assoc "application_name" params :test #'string=))
-                    ""))
-           (dbname (or (cdr (assoc "database" params :test #'string=))
-                       "postgres")))
-      (setf (backend-database *backend*) dbname)
-      (with-catalog-lock
-        (unless (gethash dbname (catalog-databases *catalog*))
-          (get-database dbname)
-          (save-catalog)))
-      (send-auth-ok stream)
-      (send-parameter-status stream "server_version" *server-version*)
-      (send-parameter-status stream "server_version_num"
-                             (princ-to-string *server-version-num*))
-      (send-parameter-status stream "server_encoding" "UTF8")
-      (send-parameter-status stream "client_encoding" "UTF8")
-      (send-parameter-status stream "DateStyle" "ISO, MDY")
-      (send-parameter-status stream "TimeZone" "UTC")
-      (send-parameter-status stream "integer_datetimes" "on")
-      (send-parameter-status stream "standard_conforming_strings" "on")
-      (send-parameter-status stream "IntervalStyle" "postgres")
-      (send-parameter-status stream "is_superuser" "on")
-      (send-parameter-status stream "session_authorization" "postgres")
-      (send-parameter-status stream "application_name" app)
-      (send-parameter-status stream "default_transaction_read_only" "off")
-      (send-parameter-status stream "in_hot_standby" "off")
-      (let ((key (random-cancel-key)))
-        (setf (backend-cancel-key *backend*) key)
-        (send-backend-key-data stream (backend-pid *backend*) key))
-      (send-ready-for-query stream #\I))))
+  (with-live-operation
+    (let* ((code (bytes-to-u32 body 0))
+           (major (ash code -16)))
+      (unless (= major 3)
+        (ereport "0A000"
+                 (format nil "unsupported frontend protocol ~a.~a"
+                         major (logand code #xFFFF))))
+      ;; Reject new clients once a shutdown is underway, before authentication,
+      ;; exactly as PostgreSQL's canAcceptConnections() does.
+      (unless (conns-allowed-p)
+        (ereport-fatal "57P03" "the database system is shutting down"))
+      (let* ((params (parse-startup-params body))
+             (app (or (cdr (assoc "application_name" params :test #'string=))
+                      ""))
+             (dbname (or (cdr (assoc "database" params :test #'string=))
+                         "postgres")))
+        (setf (backend-database *backend*) dbname)
+        (with-catalog-lock
+          (unless (gethash dbname (catalog-databases *catalog*))
+            (get-database dbname)
+            (save-catalog)))
+        (send-auth-ok stream)
+        (send-parameter-status stream "server_version" *server-version*)
+        (send-parameter-status stream "server_version_num"
+                               (princ-to-string *server-version-num*))
+        (send-parameter-status stream "server_encoding" "UTF8")
+        (send-parameter-status stream "client_encoding" "UTF8")
+        (send-parameter-status stream "DateStyle" "ISO, MDY")
+        (send-parameter-status stream "TimeZone" "UTC")
+        (send-parameter-status stream "integer_datetimes" "on")
+        (send-parameter-status stream "standard_conforming_strings" "on")
+        (send-parameter-status stream "IntervalStyle" "postgres")
+        (send-parameter-status stream "is_superuser" "on")
+        (send-parameter-status stream "session_authorization" "postgres")
+        (send-parameter-status stream "application_name" app)
+        (send-parameter-status stream "default_transaction_read_only" "off")
+        (send-parameter-status stream "in_hot_standby" "off")
+        (let ((key (random-cancel-key)))
+          (setf (backend-cancel-key *backend*) key)
+          (send-backend-key-data stream (backend-pid *backend*) key))
+        (send-ready-for-query stream #\I)))))
 
 ;;; ---- query dispatch ----
 
@@ -139,17 +148,66 @@
          (end (or (position 0 payload) (length payload))))
     (bytes->string payload :start 0 :end end)))
 
-(defun empty-query-p (query)
-  (every (lambda (ch)
-           (member ch '(#\Space #\Tab #\Newline #\Return #\;)))
-         query))
+(defun transaction-ending-statement-p (statement)
+  (member (getf statement :type) '(:commit :rollback)))
 
 (defun handle-simple-query (stream message)
-  (let ((query (query-string message)))
-    (if (empty-query-p query)
-        (send-empty-query-response stream)
-        (exec-simple-query stream query))
-    (send-ready-for-query stream (transaction-status-char))))
+  ;; The backend waits for client messages outside this gate; each SQL request
+  ;; drains before the reload coordinator replaces its implementation.
+  (let ((query nil)
+        (statements nil)
+        (parsed-p nil)
+        (normal-dispatch-p nil))
+    ;; Parse the whole message before running any statement. This lets a
+    ;; transaction-ending AST drain an active transaction without committing
+    ;; before a syntax error later in the same simple-query message is found.
+    (with-live-operation-drain
+      (setf query (query-string message))
+      (multiple-value-setq (statements parsed-p)
+        (exec-simple-query stream query
+                           :prepare-only-p t
+                           :finish-execution-p nil))
+      (cond
+        ((not parsed-p)
+         ;; The parser already sent the error response. Finish this request
+         ;; while the same drain guard still protects its query state.
+         (when *backend*
+           (setf (backend-executing *backend*) nil
+                 (backend-cancel-pending *backend*) nil))
+         (send-ready-for-query stream (transaction-status-char)))
+        ((or (null statements)
+             (not (position-if #'transaction-ending-statement-p statements)))
+         ;; Discard these ASTs before leaving the drain lane. If reload wins the
+         ;; gap, normal admission reparses QUERY with the newly loaded parser.
+         (setf normal-dispatch-p t))
+        (t
+         (let* ((ending-position
+                  (position-if #'transaction-ending-statement-p statements))
+                (prefix-end (1+ ending-position))
+                (prefix (subseq statements 0 prefix-end))
+                (suffix (nthcdr prefix-end statements)))
+           ;; Keep parsing and execution of every AST in this simple-query
+           ;; message under one gate, so no AST crosses a reload boundary.
+           (multiple-value-bind (result completed-p)
+               (exec-simple-query stream query
+                                  :start-execution-p nil
+                                  :finish-execution-p (null suffix)
+                                  :statements prefix)
+             (declare (ignore result))
+             (cond
+               ((and suffix completed-p)
+                (exec-simple-query stream query
+                                   :start-execution-p nil
+                                   :statements suffix))
+               (suffix
+                (when *backend*
+                  (setf (backend-executing *backend*) nil
+                        (backend-cancel-pending *backend*) nil))))
+             (send-ready-for-query stream (transaction-status-char)))))))
+    (when normal-dispatch-p
+      (with-live-operation
+        (exec-simple-query stream query :start-execution-p nil)
+        (send-ready-for-query stream (transaction-status-char))))))
 
 (defun handle-unsupported-message (stream message)
   (declare (ignore message))
@@ -164,13 +222,16 @@
 
 (defun backend-loop (stream)
   (loop
-    (let ((message (read-message stream)))
+    (let ((message (read-message stream #'call-with-live-operation-drain)))
       (when (null message)
         (return))
-      (case (frontend-message-type message)
+      (case (with-live-operation-drain
+              (frontend-message-type message))
         (#\X (return))
         (#\Q (handle-simple-query stream message))
-        (otherwise (handle-unsupported-message stream message))))))
+        (otherwise
+         (with-live-operation
+           (handle-unsupported-message stream message)))))))
 
 (defun handle-connection (sock)
   (let ((stream nil)
@@ -191,28 +252,33 @@
                       (progn
                         ;; Register before waiting for StartupMessage so fast
                         ;; shutdown can terminate stalled startup handshakes.
-                        (register-backend *backend*)
+                        (with-live-operation-drain
+                          (register-backend *backend*))
                         (let ((body (read-startup-until-ready stream)))
                           (when body
                             (process-startup stream body)
                             (backend-loop stream))))
-                   (end-backend-session))))
+                   (with-live-operation-drain
+                     (end-backend-session)))))
            (pg-error (e)
-             (when stream (ignore-errors (send-error-response stream e))))
+             (with-live-operation-drain
+               (when stream (ignore-errors (send-error-response stream e)))))
            (error (e)
-             (when stream
-               (ignore-errors
-                (send-error-response
-                 stream
-                 (make-condition 'pg-error :sqlstate "XX000"
-                                           :message (princ-to-string e)))))))
+             (with-live-operation-drain
+               (when stream
+                 (ignore-errors
+                  (send-error-response
+                   stream
+                   (make-condition 'pg-error :sqlstate "XX000"
+                                             :message (princ-to-string e))))))))
       ;; Send the final error and close the socket *before* unregistering:
       ;; during a fast shutdown the last connection's CONNECTION-FINISHED exits
       ;; the process, and the client must still receive its FATAL.
-      (close-connection sock stream)
-      (when backend
-        (unregister-backend backend))
-      (connection-finished))))
+      (with-live-operation-drain
+        (close-connection sock stream)
+        (when backend
+          (unregister-backend backend))
+        (connection-finished)))))
 
 ;;; ---- server main ----
 

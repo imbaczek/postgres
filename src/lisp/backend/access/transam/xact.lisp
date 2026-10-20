@@ -27,6 +27,20 @@
 
 (defvar *backend* nil)
 
+(defmacro with-backend-wait-state ((backend accessor value) &body body)
+  "Publish BACKEND's wait state for BODY and clear it on every exit."
+  (let ((backend-value (gensym "BACKEND-"))
+        (wait-value (gensym "WAIT-VALUE-")))
+    `(let ((,backend-value ,backend)
+           (,wait-value ,value))
+       (unwind-protect
+            (progn
+              (when ,backend-value
+                (setf (,accessor ,backend-value) ,wait-value))
+              ,@body)
+         (when ,backend-value
+           (setf (,accessor ,backend-value) nil))))))
+
 (defun check-for-interrupts ()
   "Port of PostgreSQL's CHECK_FOR_INTERRUPTS().
 
@@ -76,39 +90,17 @@ INTERRUPT-THREAD, so it needs no flag."
 
 (defvar *xid-batch-end* +first-normal-xid+)
 
-(defun atomic-replace-file (target-path temporary-path directory write-function
-                            &key (fsync-function #'sb-posix:fsync)
-                              (rename-function #'sb-posix:rename)
-                              (fsync-directory-function #'fsync-directory))
-  "Write and fsync TEMPORARY-PATH, rename it to TARGET-PATH, and fsync DIRECTORY."
-  (ensure-directories-exist target-path)
-  (unwind-protect
-       (progn
-         (with-open-file (stream temporary-path
-                                 :direction :output
-                                 :if-exists :supersede
-                                 :if-does-not-exist :create
-                                 :element-type 'character)
-           (funcall write-function stream)
-           (finish-output stream)
-           (funcall fsync-function (sb-sys:fd-stream-fd stream)))
-         (funcall rename-function (namestring temporary-path)
-                  (namestring target-path))
-         (funcall fsync-directory-function directory))
-    (ignore-errors (delete-file temporary-path)))
-  (values))
-
 (defun save-next-xid (&key (fsync-function #'sb-posix:fsync)
                         (rename-function #'sb-posix:rename)
                         (fsync-directory-function #'fsync-directory))
-  (atomic-replace-file
-   (control-path)
-   (pgdata-path "global/pg_control.tmp")
-   (pgdata-path "global/")
-   (lambda (stream) (format stream "~a~%" *xid-batch-end*))
-   :fsync-function fsync-function
-   :rename-function rename-function
-   :fsync-directory-function fsync-directory-function))
+  (with-atomic-output (stream
+                       (control-path)
+                       (pgdata-path "global/pg_control.tmp")
+                       (pgdata-path "global/")
+                       :fsync-function fsync-function
+                       :rename-function rename-function
+                       :fsync-directory-function fsync-directory-function)
+    (format stream "~a~%" *xid-batch-end*)))
 
 (defvar *xid-lock* (sb-thread:make-mutex :name "pg xid lock"))
 (defvar *next-xid* +first-normal-xid+)
@@ -191,14 +183,14 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
                                         (rename-function #'sb-posix:rename)
                                         (fsync-directory-function
                                          #'fsync-directory))
-  (atomic-replace-file
-   (xid-wrap-marker-path)
-   (pgdata-path "global/pg_xid_wrap_pending.tmp")
-   (pgdata-path "global/")
-   (lambda (stream) (format stream "~a~%" boundary))
-   :fsync-function fsync-function
-   :rename-function rename-function
-   :fsync-directory-function fsync-directory-function))
+  (with-atomic-output (stream
+                       (xid-wrap-marker-path)
+                       (pgdata-path "global/pg_xid_wrap_pending.tmp")
+                       (pgdata-path "global/")
+                       :fsync-function fsync-function
+                       :rename-function rename-function
+                       :fsync-directory-function fsync-directory-function)
+    (format stream "~a~%" boundary)))
 
 (defun delete-xid-wrap-marker (&key (fsync-directory-function
                                      #'fsync-directory))
@@ -327,14 +319,9 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
          (when *xid-wrap-failure*
            (xid-wraparound-failed-error))
          (if (and *xid-wrap-pending* (null (backend-xid backend)))
-             (progn
-               (setf (backend-wraparound-waiting backend) t)
-               (unwind-protect
-                    (progn
-                      (check-for-interrupts)
-                      (condition-wait-with-timeout *xid-wrap-cv*
-                                                   *xid-wrap-lock*))
-                 (setf (backend-wraparound-waiting backend) nil)))
+             (with-backend-wait-state (backend backend-wraparound-waiting t)
+               (check-for-interrupts)
+               (condition-wait-with-timeout *xid-wrap-cv* *xid-wrap-lock*))
              (return-from wait-for-xid-wraparound
                (if ready-function
                    (funcall ready-function)
@@ -545,18 +532,13 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
 
 (defun wait-for-xid (xid)
   "Block until XID ends. Called without the write lock held."
-  (let ((backend *backend*))
-    (when backend
-      (setf (backend-waiting-xid backend) xid))
-    (unwind-protect
-         (loop
-           (unless (xid-active-p xid) (return))
-           (check-for-interrupts)
-           (sb-thread:with-mutex (*xact-cv-mutex*)
-             (when (xid-active-p xid)
-               (condition-wait-with-timeout *xact-cv* *xact-cv-mutex*))))
-      (when backend
-        (setf (backend-waiting-xid backend) nil))))
+  (with-backend-wait-state (*backend* backend-waiting-xid xid)
+    (loop
+      (unless (xid-active-p xid) (return))
+      (check-for-interrupts)
+      (sb-thread:with-mutex (*xact-cv-mutex*)
+        (when (xid-active-p xid)
+          (condition-wait-with-timeout *xact-cv* *xact-cv-mutex*)))) )
   (values))
 
 (defun make-snapshot (curcid)

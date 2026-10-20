@@ -20,6 +20,28 @@ precede scanning. Registration and locking remain the caller's responsibility."
                       (check-for-interrupts)
                       ,@body)))))
 
+(defmacro with-registered-table ((table relfilenode xid mode) &body body)
+  "Register TABLE for the transaction, then revalidate it under the write lock.
+
+MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
+  (let ((registration-function
+          (ecase mode
+            (:read 'register-relation-reader)
+            (:write 'register-relation-writer)))
+        (table-value (gensym "TABLE-"))
+        (relfilenode-value (gensym "RELFILENODE-"))
+        (xid-value (gensym "XID-")))
+    `(let* ((,table-value ,table)
+            (,relfilenode-value (pg-class-relfilenode ,table-value))
+            (,xid-value (get-current-xid)))
+       (,registration-function ,relfilenode-value ,xid-value)
+       (with-write-lock
+         (ensure-current-table ,table-value))
+       (let ((,relfilenode ,relfilenode-value)
+             (,xid ,xid-value))
+         (declare (ignorable ,relfilenode ,xid))
+         ,@body))))
+
 (defun target->result-column (target)
   (let ((oid (type-oid (getf target :type))))
     (make-result-column :name (getf target :name)
@@ -67,13 +89,8 @@ precede scanning. Registration and locking remain the caller's responsibility."
            (when (or (null where) (true-p (eval-expr where nil)))
              (push (cons values nil) rows))))
         (t
-         (let ((relfilenode (pg-class-relfilenode table))
-               (xid (get-current-xid)))
-           ;; Keep DROP TABLE from removing storage during this scan or
-           ;; before the surrounding transaction releases its relation use.
-           (register-relation-reader relfilenode xid)
-           (with-write-lock
-             (ensure-current-table table))
+         ;; The transaction retains this read registration through completion.
+         (with-registered-table (table relfilenode xid :read)
            (do-table-tuples (tuple table :relfilenode relfilenode)
              (let ((env (htup-values tuple)))
                (when (or (null where) (true-p (eval-expr where env)))

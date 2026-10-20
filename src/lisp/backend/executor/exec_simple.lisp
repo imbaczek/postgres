@@ -728,38 +728,51 @@ rolled back immediately."
       (:show (exec-show stream ast))
       (otherwise (execute-in-transaction stream ast)))))
 
-(defun exec-simple-query (stream query)
+(defun exec-simple-query (stream query &key (start-execution-p t)
+                                         (finish-execution-p t)
+                                         (statements nil statements-p)
+                                         prepare-only-p)
   (let ((backend *backend*))
     ;; Mark the backend as executing a command, so pg_cancel_backend()
     ;; knows a pending cancel is meaningful (an idle cancel is ignored).
-    (when backend
+    (when (and backend start-execution-p)
       ;; Clear a stale idle cancel before publishing EXECUTING. If these stores
       ;; are reversed, a concurrent CancelRequest can set the flag after
       ;; EXECUTING becomes true and have this query-start path erase it.
       (setf (backend-cancel-pending backend) nil
             (backend-executing backend) t))
     (unwind-protect
-         (handler-case
-             (let ((stmts (parse-statements query)))
-               (if (null stmts)
-                   (send-empty-query-response stream)
-                   (dolist (ast stmts)
-                     (check-for-interrupts)
-                     (execute-statement stream ast))))
-           (pg-error (e)
-             ;; A FATAL must end the connection; let it reach handle-connection.
-             (if (fatal-error-p e)
-                 (error e)
-                 (progn
-                   (note-query-error)
-                   (send-error-response stream e))))
-           (error (e)
-             (note-query-error)
-             (send-error-response
-              stream
-              (make-condition 'pg-error
-                              :sqlstate "XX000"
-                              :message (princ-to-string e)))))
-      (when backend
+         (let ((completed-p nil)
+               (result nil))
+           (setf result
+                 (handler-case
+                     (let ((stmts (if statements-p
+                                      statements
+                                      (parse-statements query))))
+                       (prog1
+                           (if prepare-only-p
+                               stmts
+                               (if (null stmts)
+                                   (send-empty-query-response stream)
+                                   (dolist (ast stmts)
+                                     (check-for-interrupts)
+                                     (execute-statement stream ast))))
+                         (setf completed-p t)))
+                   (pg-error (e)
+                     ;; A FATAL must end the connection; let it reach handle-connection.
+                     (if (fatal-error-p e)
+                         (error e)
+                         (progn
+                           (note-query-error)
+                           (send-error-response stream e))))
+                   (error (e)
+                     (note-query-error)
+                     (send-error-response
+                      stream
+                      (make-condition 'pg-error
+                                      :sqlstate "XX000"
+                                      :message (princ-to-string e))))))
+           (values result completed-p))
+      (when (and backend finish-execution-p)
         (setf (backend-executing backend) nil
               (backend-cancel-pending backend) nil)))))
