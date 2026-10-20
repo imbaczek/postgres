@@ -46,6 +46,9 @@
 (defun shutdown-in-progress-p ()
   (> (shutdown-mode) +no-shutdown+))
 
+(defun shutdown-terminates-backends-p ()
+  (>= (shutdown-mode) +fast-shutdown+))
+
 (defun conns-allowed-p ()
   "CanAcceptConnections(): no new clients once shutdown has begun."
   (not (shutdown-in-progress-p)))
@@ -71,6 +74,11 @@
 (defvar *n-backends* 0)
 (defvar *n-connections* 0)
 
+(declaim (special *live-operation-lock* *live-operation-cv*
+                  *live-operation-backend-query-tokens*
+                  *live-operation-admission-open*
+                  *live-operation-cleanup-backends*))
+
 (defun list-backends ()
   (sb-thread:with-mutex (*backend-registry-lock*)
     (loop for backend being the hash-values of *backend-registry*
@@ -81,10 +89,16 @@
     (gethash pid *backend-registry*)))
 
 (defun register-backend (backend)
-  (sb-thread:with-mutex (*backend-registry-lock*)
-    (sb-sys:without-interrupts
-      (setf (gethash (backend-pid backend) *backend-registry*) backend)
-      (incf *n-backends*)))
+  ;; Serialize with the reload snapshot. A provisional backend registered after
+  ;; admission closes may finish teardown during drain, but must not gain SQL
+  ;; transaction-drain eligibility merely by arriving late.
+  (sb-thread:with-mutex (*live-operation-lock*)
+    (unless *live-operation-admission-open*
+      (pushnew backend *live-operation-cleanup-backends* :test #'eq))
+    (sb-thread:with-mutex (*backend-registry-lock*)
+      (sb-sys:without-interrupts
+        (setf (gethash (backend-pid backend) *backend-registry*) backend)
+        (incf *n-backends*))))
   ;; Close the race where fast shutdown snapshots the registry just before
   ;; this backend is added.  The caller is the backend thread itself.
   (when (and (eq backend *backend*)
@@ -94,6 +108,19 @@
   (values))
 
 (defun unregister-backend (backend)
+  ;; The query finalizer can itself be interrupted while it waits for reload
+  ;; admission. Remove its token here as a final guarantee that teardown cannot
+  ;; retain the backend. Acquire the live-operation lock before the registry
+  ;; lock, matching cancel-target lookup, but release it before taking the latter.
+  (sb-sys:without-interrupts
+    (sb-thread:grab-mutex *live-operation-lock*)
+    (unwind-protect
+         (progn
+           (setf (backend-executing backend) nil
+                 (backend-cancel-pending backend) nil)
+           (remhash backend *live-operation-backend-query-tokens*)
+           (sb-thread:condition-broadcast *live-operation-cv*))
+      (sb-thread:release-mutex *live-operation-lock*)))
   (sb-thread:with-mutex (*backend-registry-lock*)
     (sb-sys:without-interrupts
       (when (eq (gethash (backend-pid backend) *backend-registry*) backend)
@@ -111,8 +138,11 @@
   "A connection (registered or not) has gone.  Stop the postmaster if this
 was the last one and a smart/fast shutdown is in progress."
   (let ((last nil))
-    (sb-thread:with-mutex (*backend-registry-lock*)
-      (sb-sys:without-interrupts
+    ;; Once teardown starts accounting, an asynchronous backend termination must
+    ;; not interrupt the transition after the socket is unregistered but before
+    ;; *N-CONNECTIONS* is decremented.
+    (sb-sys:without-interrupts
+      (sb-thread:with-mutex (*backend-registry-lock*)
         (decf *n-connections*)
         (let ((mode (sb-thread:with-mutex (*shutdown-lock*) *shutdown*)))
           (setf last (and (<= +smart-shutdown+ mode +fast-shutdown+)
@@ -157,8 +187,13 @@ command (idle) is ignored; the connection and its transaction state survive."
     ((null backend) nil)
     ((eq backend *backend*)
      (ereport "57014" "canceling statement due to user request"))
-    ((backend-executing backend)
-     (setf (backend-cancel-pending backend) t)))
+    (t
+     ;; Query start/end and reload admission use this lock too. Wake a backend
+     ;; waiting on the reload gate so it can observe the cancel promptly.
+     (sb-thread:with-mutex (*live-operation-lock*)
+       (when (backend-executing backend)
+         (setf (backend-cancel-pending backend) t)
+         (sb-thread:condition-broadcast *live-operation-cv*)))))
   (values))
 
 (defun terminate-all-backends ()

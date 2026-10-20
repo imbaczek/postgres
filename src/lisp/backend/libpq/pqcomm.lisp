@@ -54,81 +54,93 @@
 (defun malformed-protocol-message (message)
   (ereport-fatal "08P01" message))
 
-(defun read-startup-packet (stream &optional (operation-wrapper #'funcall))
-  "Read an untyped startup packet, wrapping validation in OPERATION-WRAPPER.
+(defun read-startup-packet (stream &optional (operation-wrapper #'funcall)
+                            &rest options)
+  "Read an untyped startup packet and optionally classify its request code.
 
-Blocking reads stay outside the wrapper; invalid framing is reported inside it."
-  (multiple-value-bind (lenb got) (read-exact-bytes stream 4)
-    (unless lenb
-      (if (zerop got)
-          (return-from read-startup-packet nil)
-          (funcall operation-wrapper
-                   (lambda ()
-                     (malformed-protocol-message
-                      "incomplete startup packet length")))))
-    (let ((len
+BEFORE-BODY runs after the request code is read and before the rest of the
+packet. A packet whose code equals BYPASS-CODE skips BEFORE-BODY and returns T
+as a second value. Blocking reads stay outside OPERATION-WRAPPER."
+  (let ((before-body (getf options :before-body))
+        (bypass-code (getf options :bypass-code)))
+    (multiple-value-bind (lenb got) (read-exact-bytes stream 4)
+      (unless lenb
+        (if (zerop got)
+            (return-from read-startup-packet nil)
             (funcall operation-wrapper
                      (lambda ()
-                       (let ((length (bytes-to-u32 lenb 0)))
-                         (when (< length 8)
-                           (malformed-protocol-message
-                            "startup packet length is too short"))
-                         (when (> length +max-startup-message-size+)
-                           (malformed-protocol-message
-                            "startup packet exceeds the size limit"))
-                         length)))))
-      (multiple-value-bind (body body-got)
-          (read-exact-bytes stream (- len 4))
-        (funcall operation-wrapper
-                 (lambda ()
-                   (unless body
-                     (if (zerop body-got)
-                         (malformed-protocol-message
-                          "incomplete startup packet body")
-                         (malformed-protocol-message
-                          "truncated startup packet body")))
-                   body))))))
-
-(defun read-message (stream &optional (operation-wrapper #'funcall))
-  "Read one frontend message, wrapping framing validation in OPERATION-WRAPPER.
-
-Blocking reads stay outside the wrapper; invalid framing is reported inside it."
-  (let ((type-byte (read-byte stream nil nil)))
-    (when (null type-byte)
-      (return-from read-message nil))
-    (multiple-value-bind (lenb got) (read-exact-bytes stream 4)
-      (declare (ignore got))
-      (let ((len
-              (funcall operation-wrapper
-                       (lambda ()
-                         (unless lenb
-                           (malformed-protocol-message
-                            "incomplete frontend message length"))
-                         (let ((length (bytes-to-u32 lenb 0)))
-                           (when (< length 4)
-                             (malformed-protocol-message
-                              "frontend message length is too short"))
-                           (when (> length +max-query-message-size+)
-                             (malformed-protocol-message
-                              "frontend message exceeds the size limit"))
-                           (when (and (= type-byte (char-code #\X))
-                                      (/= length 4))
-                             (malformed-protocol-message
-                              "terminate message must not contain a payload"))
-                           length)))))
-        (let ((payload (read-exact-bytes stream (- len 4))))
+                       (malformed-protocol-message
+                        "incomplete startup packet length")))))
+      (let ((len (bytes-to-u32 lenb 0)))
+        (unless (<= 8 len +max-startup-message-size+)
           (funcall operation-wrapper
                    (lambda ()
-                     (unless payload
-                       (malformed-protocol-message
-                        "incomplete frontend message body"))
-                     (when (= type-byte (char-code #\Q))
-                       (let ((terminator (position 0 payload)))
-                         (unless (and terminator
-                                      (= terminator (1- (length payload))))
+                     (if (< len 8)
+                         (malformed-protocol-message
+                          "startup packet length is too short")
+                         (malformed-protocol-message
+                          "startup packet exceeds the size limit")))))
+        (multiple-value-bind (code-bytes code-got) (read-exact-bytes stream 4)
+          (unless code-bytes
+            (funcall operation-wrapper
+                     (lambda ()
+                       (if (zerop code-got)
                            (malformed-protocol-message
-                            "simple query message must contain one trailing null byte"))))
-                     (make-frontend-message (code-char type-byte) payload))))))))
+                            "incomplete startup packet body")
+                           (malformed-protocol-message
+                            "truncated startup packet body")))))
+          (let ((bypass-p (and bypass-code
+                               (= (bytes-to-u32 code-bytes 0) bypass-code))))
+            (when (and before-body (not bypass-p))
+              (funcall before-body))
+            (multiple-value-bind (tail tail-got)
+                (read-exact-bytes stream (- len 8))
+              (unless tail
+                (funcall operation-wrapper
+                         (lambda ()
+                           (if (zerop tail-got)
+                               (malformed-protocol-message
+                                "incomplete startup packet body")
+                               (malformed-protocol-message
+                                "truncated startup packet body")))))
+              (values (concatenate '(vector (unsigned-byte 8)) code-bytes tail)
+                      bypass-p))))))))
+
+(defun read-message (stream &optional (operation-wrapper #'funcall))
+  "Read and validate one frame before dispatching it to a live operation.
+
+Valid messages are returned without entering the reload gate so SQL dispatch
+can choose ordinary or transaction-drain admission. Framing errors are reported
+through OPERATION-WRAPPER."
+  (labels ((reject (message)
+             (funcall operation-wrapper
+                      (lambda () (malformed-protocol-message message)))))
+    (let ((type-byte (read-byte stream nil nil)))
+      (when (null type-byte)
+        (return-from read-message nil))
+      (multiple-value-bind (lenb got) (read-exact-bytes stream 4)
+        (declare (ignore got))
+        (unless lenb
+          (reject "incomplete frontend message length"))
+        (let ((length (bytes-to-u32 lenb 0)))
+          (when (< length 4)
+            (reject "frontend message length is too short"))
+          (when (> length +max-query-message-size+)
+            (reject "frontend message exceeds the size limit"))
+          (when (and (= type-byte (char-code #\X)) (/= length 4))
+            (reject "terminate message must not contain a payload"))
+          (multiple-value-bind (payload body-got)
+              (read-exact-bytes stream (- length 4))
+            (declare (ignore body-got))
+            (unless payload
+              (reject "incomplete frontend message body"))
+            (when (= type-byte (char-code #\Q))
+              (let ((terminator (position 0 payload)))
+                (unless (and terminator
+                             (= terminator (1- (length payload))))
+                  (reject
+                   "simple query message must contain one trailing null byte"))))
+            (make-frontend-message (code-char type-byte) payload)))))))
 
 ;;; ---- writing ----
 

@@ -19,6 +19,10 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-shutdown.XXXXXX")
 LOG="$TMP/server.log"
 SRV=
 STALLED=
+PARTIAL_STALLED=
+TX_SESSION=
+QUERY_SESSION=
+RELOAD_CLIENT=
 . "$BASE/t/test-support.sh"
 test_debug_setup shutdown "$PORT" "$TMP" "$LOG"
 
@@ -29,6 +33,16 @@ cleanup() {
         kill "$STALLED" 2>/dev/null || true
         wait "$STALLED" 2>/dev/null || true
     fi
+    if [ -n "$PARTIAL_STALLED" ]; then
+        kill "$PARTIAL_STALLED" 2>/dev/null || true
+        wait "$PARTIAL_STALLED" 2>/dev/null || true
+    fi
+    for client in "$TX_SESSION" "$QUERY_SESSION" "$RELOAD_CLIENT"; do
+        if [ -n "$client" ]; then
+            kill "$client" 2>/dev/null || true
+            wait "$client" 2>/dev/null || true
+        fi
+    done
     if [ -n "$SRV" ]; then
         kill -9 "$SRV" 2>/dev/null || true
         wait "$SRV" 2>/dev/null || true
@@ -273,11 +287,28 @@ grep -q 'received smart shutdown request' "$LOG" \
 # ---- SIGTERM: smart shutdown ---------------------------------------------
 
 start_server
-rm -f "$TMP/hold"
-mkfifo "$TMP/hold"
-psqlq < "$TMP/hold" > "$TMP/hold.log" 2>&1 &
-open_fd7 "$TMP/hold"
+q 'create table t (a int primary key)' >/dev/null
+rm -f "$TMP/smart-a-in" "$TMP/smart-b-in"
+mkfifo "$TMP/smart-a-in" "$TMP/smart-b-in"
+psqlq < "$TMP/smart-a-in" > "$TMP/smart-a-out" 2>&1 &
+TX_SESSION=$!
+psqlq < "$TMP/smart-b-in" > "$TMP/smart-b-out" 2>&1 &
+QUERY_SESSION=$!
+open_fd7 "$TMP/smart-a-in"
+open_fd8 "$TMP/smart-b-in"
+printf 'begin;\ninsert into t values (1);\n' >&7
 sleep 0.5
+printf 'select pg_backend_pid();\n' >&8
+learn_pid "$TMP/smart-b-out" || fail "smart-shutdown waiter did not become ready"
+smart_waiter_pid=$pid
+printf 'insert into t values (1);\nselect 42;\n' >&8
+wait_state=$(printf '%s\n(quit)\n' \
+    "(loop repeat 100 for backend = (lookup-backend $smart_waiter_pid) when (and backend (backend-waiting-xid backend)) return :waiting do (sleep 0.05) finally (return :timeout))" \
+    | timeout 20 "$SBCL" --script "$BASE/t/control-client.lisp" \
+        tcp "127.0.0.1:$CONTROL_PORT" 2>&1) \
+    || fail "could not inspect smart-shutdown waiter state"
+printf '%s\n' "$wait_state" | grep -q ':WAITING' \
+    || fail "smart-shutdown session did not reach its transaction-ID wait: $wait_state"
 
 kill -TERM "$SRV"
 sleep 0.6
@@ -289,6 +320,14 @@ echo "$out" | grep -q 'the database system is shutting down' \
     || fail "new connection was not rejected during smart shutdown"
 
 close_fd7
+i=0
+while [ "$i" -lt 50 ] && ! grep -q '^42$' "$TMP/smart-b-out"; do
+    i=$((i + 1))
+    sleep 0.1
+done
+grep -q '^42$' "$TMP/smart-b-out" \
+    || fail "disconnecting an open transaction did not release the smart-shutdown waiter"
+close_fd8
 wait_for_exit || fail "server did not exit after the last client left"
 set +e
 wait "$SRV" 2>/dev/null
@@ -296,40 +335,109 @@ status=$?
 set -e
 SRV=
 [ "$status" -eq 0 ] || fail "smart shutdown exited with status $status"
+wait "$TX_SESSION" 2>/dev/null || true
+wait "$QUERY_SESSION" 2>/dev/null || true
+TX_SESSION=
+QUERY_SESSION=
 grep -q 'received smart shutdown request' "$LOG" \
     || fail "missing smart shutdown log line"
 grep -q 'database system is shut down' "$LOG" \
     || fail "missing shutdown-complete log line"
 
-# ---- SIGINT: fast shutdown with a stalled startup handshake --------------
+# ---- SIGINT: fast shutdown while reload holds startup, active, and queued sessions ----
 
 start_server
+q 'create table t (a int primary key)' >/dev/null
+rm -f "$TMP/tx_in" "$TMP/query_in"
+mkfifo "$TMP/tx_in" "$TMP/query_in"
+psqlq < "$TMP/tx_in" > "$TMP/tx_out" 2>&1 &
+TX_SESSION=$!
+psqlq < "$TMP/query_in" > "$TMP/query_out" 2>&1 &
+QUERY_SESSION=$!
+open_fd7 "$TMP/tx_in"
+open_fd8 "$TMP/query_in"
+printf 'begin;\ninsert into t values (2);\nselect pg_backend_pid();\n' >&7
+learn_pid "$TMP/tx_out" || fail "transaction session did not become active"
+printf 'select pg_backend_pid();\n' >&8
+learn_pid "$TMP/query_out" || fail "query session did not become ready"
+query_pid=$pid
+
 STALLED_PORT=$PORT STALLED_READY="$TMP/stalled-ready" \
     "$SBCL" --script "$BASE/t/stalled-startup-client.lisp" &
 STALLED=$!
+STALLED_PORT=$PORT STALLED_READY="$TMP/partial-stalled-ready" \
+    STALLED_PARTIAL_HEADER=1 \
+    "$SBCL" --script "$BASE/t/stalled-startup-client.lisp" &
+PARTIAL_STALLED=$!
 i=0
-while [ "$i" -lt 50 ] && [ ! -f "$TMP/stalled-ready" ] \
+while [ "$i" -lt 50 ] && { [ ! -f "$TMP/stalled-ready" ] \
+       || [ ! -f "$TMP/partial-stalled-ready" ]; } \
       && kill -0 "$STALLED" 2>/dev/null; do
     i=$((i + 1))
     sleep 0.1
 done
 [ -f "$TMP/stalled-ready" ] || fail "startup-stalled client did not connect"
+[ -f "$TMP/partial-stalled-ready" ] \
+    || fail "partial-header client did not connect"
 kill -0 "$STALLED" 2>/dev/null \
     || fail "startup-stalled client exited before shutdown"
+kill -0 "$PARTIAL_STALLED" 2>/dev/null \
+    || fail "partial-header client exited before shutdown"
+
+# Let both clients reach a blocking startup read before closing query
+# admission. The SSL-stalled client needs an admitted SSL response first. Keep
+# one real transaction open and wait for a second session to queue at admission
+# so shutdown covers transaction and query cleanup too.
+hold_reload_form='(sb-thread:make-thread (lambda () (let ((*live-operation-depth* 0)) (with-live-operation-quiescence (with-open-file (stream (merge-pathnames "reload-gate-closed" *pgdata*) :direction :output :if-exists :supersede) (write-line "ready" stream)) (unless (loop repeat 100 thereis (some (lambda (backend) (backend-executing backend)) (list-backends)) do (sleep 0.05)) (error "query did not queue behind reload gate")) (with-open-file (stream (merge-pathnames "reload-query-queued" *pgdata*) :direction :output :if-exists :supersede) (write-line "ready" stream)) (sleep 30)))) :name "test reload gate hold")'
+printf '%s\n' "$hold_reload_form" > "$TMP/hold-reload-form"
+"$SBCL" --script "$BASE/t/control-client.lisp" \
+    tcp "127.0.0.1:$CONTROL_PORT" < "$TMP/hold-reload-form" \
+    > "$TMP/reload-control.out" 2>&1 &
+RELOAD_CLIENT=$!
+i=0
+while [ "$i" -lt 50 ] && [ ! -f "$TMP/data/reload-gate-closed" ]; do
+    i=$((i + 1))
+    sleep 0.1
+done
+[ -f "$TMP/data/reload-gate-closed" ] \
+    || fail "reload did not close admission before the shutdown test"
+
+printf 'select 1;\n' >&8
+i=0
+while [ "$i" -lt 100 ] && [ ! -f "$TMP/data/reload-query-queued" ]; do
+    i=$((i + 1))
+    sleep 0.1
+done
+[ -f "$TMP/data/reload-query-queued" ] \
+    || fail "query did not reach the closed admission gate (backend $query_pid)"
 
 kill -INT "$SRV"
-wait_for_exit || fail "fast shutdown did not terminate a stalled startup"
+wait_for_exit || fail "fast shutdown stalled behind reload cleanup admission"
 set +e
 wait "$SRV" 2>/dev/null
 status=$?
 set -e
 SRV=
 [ "$status" -eq 0 ] || fail "startup-stalled fast shutdown exited with status $status"
+close_fd7
+close_fd8
+wait "$TX_SESSION" 2>/dev/null || true
+wait "$QUERY_SESSION" 2>/dev/null || true
+wait "$RELOAD_CLIENT" 2>/dev/null || true
+TX_SESSION=
+QUERY_SESSION=
+RELOAD_CLIENT=
 kill "$STALLED" 2>/dev/null || true
 wait "$STALLED" 2>/dev/null || true
 STALLED=
+kill "$PARTIAL_STALLED" 2>/dev/null || true
+wait "$PARTIAL_STALLED" 2>/dev/null || true
+PARTIAL_STALLED=
 grep -q 'received fast shutdown request' "$LOG" \
-    || fail "missing fast shutdown log line for startup-stalled client"
+    || fail "missing fast shutdown log line for quiescence test"
+grep -q 'terminating connection due to administrator command' "$TMP/query_out" \
+    || { echo "queued query output:" >&2; cat "$TMP/query_out" >&2; \
+         fail "fast shutdown did not terminate the query queued behind admission"; }
 
 # ---- SIGINT: fast shutdown with a blocked backend ------------------------
 

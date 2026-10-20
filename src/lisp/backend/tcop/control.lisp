@@ -42,27 +42,131 @@
 (defvar *live-operation-admission-open* t)
 (defvar *live-operation-drain-open* nil)
 (defvar *live-operation-count* 0)
+(defvar *live-operation-backend-counts* (make-hash-table :test #'eq))
 (defvar *live-operation-depth* 0)
+(defvar *live-operation-current-lane* nil)
+(defvar *live-operation-check-cancel-p* nil)
+(defvar *live-operation-quiescence-owner* nil)
+(defvar *live-operation-quiescence-owner-thread* nil)
+(defvar *live-operation-drain-backends* nil)
+(defvar *live-operation-cleanup-backends* nil)
+(defvar *live-operation-admission-wait-hook* nil)
+(defvar *live-operation-pending-cancel-requests* nil)
+(defvar *live-operation-backend-query-tokens* (make-hash-table :test #'eq))
+(defvar *live-operation-cancel-request-admission-hook* nil)
+(defvar *live-operation-before-open-hook* nil)
 
-(defun live-operation-admitted-p (drain-p)
-  (or *live-operation-admission-open*
-      (and drain-p *live-operation-drain-open*)))
+(declaim (ftype function list-backends))
+(declaim (ftype function lookup-backend cancel-key-matches-p))
+(declaim (special *backend*))
 
-(defun wait-for-live-operation-admission (drain-p)
-  (sb-thread:with-mutex (*live-operation-lock*)
-    (loop until (live-operation-admitted-p drain-p)
-          do (sb-thread:condition-wait *live-operation-cv*
-                                       *live-operation-lock*)))
+(defvar *reload-requested* nil)
+
+(defun request-reload (&rest signal-info)
+  "Record a reload request and return immediately.
+
+Signal handlers run in whichever thread the OS delivered the signal to, so
+this must not take a lock (the signal may land in the reloader itself). ASDF
+must not run inside a handler either; the reloader thread polls the flag."
+  (declare (ignore signal-info))
+  (setf *reload-requested* t))
+
+(defun live-operation-lock-owned-p ()
+  (eq (sb-thread:mutex-owner *live-operation-lock*)
+      sb-thread:*current-thread*))
+
+(defun call-with-live-operation-lock (function)
+  "Call FUNCTION while owning the admission mutex, even across interrupts."
+  (let ((acquired-p nil))
+    (sb-sys:without-interrupts
+      (sb-thread:grab-mutex *live-operation-lock*)
+      (setf acquired-p t)
+      (unwind-protect
+           (sb-sys:allow-with-interrupts (funcall function))
+        (when (and acquired-p (live-operation-lock-owned-p))
+          (sb-thread:release-mutex *live-operation-lock*))))))
+
+(defun call-with-live-operation-lock-if-needed (function)
+  "Call FUNCTION with the admission mutex, preserving any existing ownership."
+  (sb-sys:without-interrupts
+    (let ((already-owned-p (live-operation-lock-owned-p)))
+      (unless already-owned-p
+        (sb-thread:grab-mutex *live-operation-lock*))
+      (unwind-protect
+           (funcall function)
+        (unless already-owned-p
+          (when (live-operation-lock-owned-p)
+            (sb-thread:release-mutex *live-operation-lock*))))))
   (values))
 
-(defun try-enter-live-operation (drain-p)
-  "Count an operation if its admission lane remains open; never wait here."
-  (sb-thread:with-mutex (*live-operation-lock*)
-    (when (live-operation-admitted-p drain-p)
-      (incf *live-operation-count*)
-      t)))
+(defun adopt-legacy-live-operation-quiescence ()
+  "Adopt a closed gate when this code is loaded by an older reload function."
+  (let ((reload-owner (sb-thread:mutex-owner *reload-run-lock*)))
+    (when reload-owner
+      (call-with-live-operation-lock
+       (lambda ()
+         (when (and (not *live-operation-admission-open*)
+                    (null *live-operation-quiescence-owner*))
+           (setf *live-operation-quiescence-owner*
+                 (gensym "LEGACY-LIVE-OPERATION-OWNER-")
+                 *live-operation-quiescence-owner-thread* reload-owner
+                 *live-operation-drain-open* nil
+                 *live-operation-drain-backends* nil
+                 *live-operation-cleanup-backends* nil))))))
+  (values))
 
-(defun leave-live-operation ()
+;; During the first in-place reload, the old RELOAD function may have closed
+;; admission before the ownership fields above existed. It still owns the
+;; reload mutex while ASDF loads this file, so attach that gate to its thread;
+;; its old no-argument OPEN call can then release it safely.
+(eval-when (:load-toplevel)
+  (adopt-legacy-live-operation-quiescence))
+
+(defun live-operation-admitted-p (drain-p)
+  "Return the lane admitted now, evaluating DRAIN-P under the gate lock."
+  (cond
+    (*live-operation-admission-open* :normal)
+    ((and *live-operation-drain-open*
+          (if (functionp drain-p) (funcall drain-p) drain-p))
+     :drain)
+    (t nil)))
+
+(defun wait-for-live-operation-admission (drain-p &optional backend)
+  (call-with-live-operation-lock
+   (lambda ()
+     (loop do (when (and *live-operation-check-cancel-p*
+                         backend
+                         (backend-cancel-pending backend))
+                (check-for-interrupts))
+           until (live-operation-admitted-p drain-p)
+           do (when *live-operation-admission-wait-hook*
+                (funcall *live-operation-admission-wait-hook*))
+              (sb-thread:condition-wait *live-operation-cv*
+                                        *live-operation-lock*))))
+  (values))
+
+(defun enter-live-operation-locked (lane backend)
+  "Publish an admitted operation while owning the live-operation lock."
+  (sb-sys:without-interrupts
+    (incf *live-operation-count*)
+    (when backend
+      (incf (gethash backend *live-operation-backend-counts* 0))))
+  lane)
+
+(defun try-enter-live-operation (drain-p &optional backend)
+  "Count an operation if its admission lane remains open; never wait here."
+  (call-with-live-operation-lock
+   (lambda ()
+     (sb-sys:without-interrupts
+       (when (and *live-operation-check-cancel-p*
+                  backend
+                  (backend-cancel-pending backend))
+         (check-for-interrupts))
+       (let ((lane (live-operation-admitted-p drain-p)))
+         (when lane
+           (enter-live-operation-locked lane backend)))))))
+
+(defun leave-live-operation (&optional backend)
   ;; Keep termination responsive while waiting for the lock. Once acquired,
   ;; finish the count/broadcast transition without allowing an interrupt to
   ;; strand reload waiters. A caught termination is re-signaled afterward.
@@ -79,6 +183,19 @@
                             (progn
                               (unless (plusp *live-operation-count*)
                                 (error "live operation count underflow"))
+                              (when backend
+                                (let ((backend-count
+                                        (gethash backend
+                                                 *live-operation-backend-counts*)))
+                                  (unless (and backend-count
+                                               (plusp backend-count))
+                                    (error "live operation backend count underflow"))
+                                  (if (= backend-count 1)
+                                      (remhash backend
+                                               *live-operation-backend-counts*)
+                                      (setf (gethash backend
+                                                     *live-operation-backend-counts*)
+                                            (1- backend-count)))))
                               (decf *live-operation-count*)
                               (when (zerop *live-operation-count*)
                                 (sb-thread:condition-broadcast *live-operation-cv*))
@@ -97,51 +214,187 @@
       (error pending-interrupt)))
   (values))
 
-(defun close-live-operation-admission ()
+(defun finish-live-operation-drain ()
+  ;; Called with *LIVE-OPERATION-LOCK* held. Drain work may finish an active
+  ;; transaction when it is already needed to release an operation in flight,
+  ;; but an idle transaction must not hold reload open while waiting for its
+  ;; client to send another query.
+  (loop while (plusp *live-operation-count*)
+        do (sb-thread:condition-wait *live-operation-cv*
+                                     *live-operation-lock*))
+  ;; Close the drain lane atomically with observing an empty operation set.
+  ;; Otherwise new drain work could overlap ASDF's function redefinitions.
+  (setf *live-operation-drain-open* nil)
+  (values))
+
+(defun snapshot-live-operation-backends ()
+  "Capture all cleanup targets and the narrower set eligible for transaction drain."
+  (let ((drain-backends (make-hash-table :test #'eq))
+        (cleanup-backends (make-hash-table :test #'eq)))
+    (when (fboundp 'list-backends)
+      (dolist (backend (list-backends))
+        (setf (gethash backend cleanup-backends) t)
+        (when (member (backend-state backend) '(:in-progress :aborted))
+          (setf (gethash backend drain-backends) t))))
+    (maphash (lambda (backend count)
+               (when (plusp count)
+                 (setf (gethash backend cleanup-backends) t
+                       (gethash backend drain-backends) t)))
+             *live-operation-backend-counts*)
+    (values (loop for backend being the hash-keys of drain-backends collect backend)
+            (loop for backend being the hash-keys of cleanup-backends collect backend))))
+
+(defun capture-live-operation-cancel-target (body)
+  "Capture the active query named by BODY while owning the admission lock."
+  (let* ((pid (bytes-to-u32 body 4))
+         (key (bytes-to-u32 body 8))
+         (backend (lookup-backend pid)))
+    (when (and backend
+               (integerp (backend-cancel-key backend))
+               (cancel-key-matches-p key (backend-cancel-key backend))
+               (backend-executing backend))
+      (let ((query-token (gethash backend *live-operation-backend-query-tokens*)))
+        (when query-token
+          (cons backend query-token))))))
+
+(defun try-enter-live-operation-cancel-request (body backend)
+  "Atomically admit or defer BODY while owning the admission lock."
+  (call-with-live-operation-lock
+   (lambda ()
+     (when *live-operation-cancel-request-admission-hook*
+       (funcall *live-operation-cancel-request-admission-hook*))
+     (let ((lane (live-operation-admitted-p t)))
+       (cond
+         (lane
+          (enter-live-operation-locked lane backend))
+         ((and (not *live-operation-admission-open*)
+               (not *live-operation-drain-open*))
+          (let ((target (capture-live-operation-cancel-target body)))
+            (when target
+              (push target *live-operation-pending-cancel-requests*))
+            (if target :queued :ignored)))
+         (t nil))))))
+
+(defun apply-pending-live-operation-cancel-requests ()
+  "Apply deferred requests only to the query active when each arrived."
+  (let ((requests (nreverse *live-operation-pending-cancel-requests*)))
+    (setf *live-operation-pending-cancel-requests* nil)
+    (dolist (target requests)
+      ;; Query start/end and request capture use this lock too. The token check
+      ;; prevents an idle cancel from leaking into a later command on this PID.
+      (ignore-errors
+       (let ((backend (car target))
+             (query-token (cdr target)))
+         (when (and (eq query-token
+                        (gethash backend *live-operation-backend-query-tokens*))
+                    (backend-executing backend))
+           (setf (backend-cancel-pending backend) t)
+           (sb-thread:condition-broadcast *live-operation-cv*))))))
+  (values))
+
+(defun restore-live-operation-admission (owner)
+  (call-with-live-operation-lock-if-needed
+   (lambda ()
+     (when (eq *live-operation-quiescence-owner* owner)
+       (apply-pending-live-operation-cancel-requests)
+       (setf *live-operation-quiescence-owner* nil
+             *live-operation-quiescence-owner-thread* nil
+             *live-operation-drain-backends* nil
+             *live-operation-cleanup-backends* nil
+             *live-operation-drain-open* nil
+             *live-operation-admission-open* t)
+       (sb-thread:condition-broadcast *live-operation-cv*)))))
+
+(defun close-live-operation-admission (&optional requested-owner)
   (when (plusp *live-operation-depth*)
     (error "cannot reload from inside a live operation"))
-  (sb-thread:with-mutex (*live-operation-lock*)
-    (setf *live-operation-admission-open* nil)
-    (setf *live-operation-drain-open* t)
-    (loop while (plusp *live-operation-count*)
-          do (sb-thread:condition-wait *live-operation-cv*
-                                       *live-operation-lock*))
-    ;; Close the drain lane atomically with observing an empty operation set.
-    ;; Otherwise a new COMMIT could enter after this waiter decides reload is
-    ;; safe and overlap ASDF's function redefinitions.
-    (setf *live-operation-drain-open* nil))
+  ;; The optional legacy call shape supports an already-running reloader whose
+  ;; compiled macro expansion predates explicit gate-owner tokens.
+  (let ((owner (or requested-owner
+                   (gensym "LIVE-OPERATION-QUIESCENCE-OWNER-"))))
+    (call-with-live-operation-lock
+     (lambda ()
+       (loop while *live-operation-quiescence-owner*
+             do (when (eq *live-operation-quiescence-owner-thread*
+                          sb-thread:*current-thread*)
+                  (error "nested live-operation quiescence is not allowed"))
+                (sb-thread:condition-wait *live-operation-cv*
+                                          *live-operation-lock*))
+       ;; Transaction-state setters and operation counters use this lock. Capture
+       ;; both open transactions and sessions already executing admitted work.
+       (multiple-value-bind (drain-backends cleanup-backends)
+           (snapshot-live-operation-backends)
+         (setf *live-operation-drain-backends* drain-backends
+               *live-operation-cleanup-backends* cleanup-backends))
+       (let ((finished-p nil))
+         ;; Do not allow an asynchronous interrupt between claiming the gate and
+         ;; installing the cleanup that releases it.
+         (sb-sys:without-interrupts
+           (setf *live-operation-quiescence-owner* owner
+                 *live-operation-quiescence-owner-thread* sb-thread:*current-thread*
+                 *live-operation-admission-open* nil
+                 *live-operation-drain-open* t)
+           (unwind-protect
+                (sb-sys:allow-with-interrupts
+                  (finish-live-operation-drain)
+                  (setf finished-p t))
+             ;; CONDITION-WAIT may unwind with the mutex held or released. Restore
+             ;; the gate only after reacquiring it and confirming our ownership.
+             (unless finished-p
+               (restore-live-operation-admission owner)))))))
+    (values)))
+
+(defun open-live-operation-admission (&optional requested-owner)
+  (when *live-operation-before-open-hook*
+    (funcall *live-operation-before-open-hook*))
+  (call-with-live-operation-lock
+   (lambda ()
+     ;; A failed nested close must not release a different invocation's gate.
+     (when (if requested-owner
+               (eq *live-operation-quiescence-owner* requested-owner)
+               (eq *live-operation-quiescence-owner-thread*
+                   sb-thread:*current-thread*))
+       (apply-pending-live-operation-cancel-requests)
+       (sb-sys:without-interrupts
+         (setf *live-operation-quiescence-owner* nil
+               *live-operation-quiescence-owner-thread* nil
+               *live-operation-drain-backends* nil
+               *live-operation-cleanup-backends* nil
+               *live-operation-drain-open* nil
+               *live-operation-admission-open* t)
+         (sb-thread:condition-broadcast *live-operation-cv*)))))
   (values))
 
-(defun open-live-operation-admission ()
-  (sb-thread:with-mutex (*live-operation-lock*)
-    (setf *live-operation-drain-open* nil
-          *live-operation-admission-open* t)
-    (sb-thread:condition-broadcast *live-operation-cv*))
-  (values))
-
-(defmacro with-live-operation-internal ((drain-p) &body body)
-  "Run BODY under the reload gate, optionally while active work drains."
+(defmacro with-live-operation-internal ((drain-p &optional check-cancel-p) &body body)
+  "Run BODY under the reload gate, optionally during drain or checking cancel."
   (let ((outermost (gensym "OUTERMOST-"))
         (admitted (gensym "ADMITTED-"))
+        (backend (gensym "BACKEND-"))
+        (drain-test (gensym "DRAIN-TEST-"))
         (operation-block (gensym "LIVE-OPERATION-")))
-    `(let ((,outermost (zerop *live-operation-depth*)))
+    `(let ((,outermost (zerop *live-operation-depth*))
+           (,backend *backend*)
+           (,drain-test ,(when drain-p `(lambda () ,drain-p)))
+           (,admitted nil)
+           (*live-operation-check-cancel-p* ,check-cancel-p))
        (if ,outermost
            (block ,operation-block
              (loop
-               (wait-for-live-operation-admission ,drain-p)
-               (let ((,admitted nil))
-                 ;; Keep asynchronous termination from landing after the count
-                 ;; increments but before its cleanup has been installed.
-                 (sb-sys:without-interrupts
-                   (setf ,admitted (try-enter-live-operation ,drain-p))
-                   (when ,admitted
-                     (return-from ,operation-block
-                       (unwind-protect
-                            (sb-sys:allow-with-interrupts
-                              (let ((*live-operation-depth*
-                                      (1+ *live-operation-depth*)))
-                                (progn ,@body)))
-                         (leave-live-operation))))))))
+               (wait-for-live-operation-admission ,drain-test ,backend)
+               ;; Keep asynchronous termination from landing after the count
+               ;; increments but before its cleanup has been installed.
+               (sb-sys:without-interrupts
+                 (setf ,admitted
+                       (try-enter-live-operation ,drain-test ,backend))
+                 (when ,admitted
+                   (return-from ,operation-block
+                     (unwind-protect
+                          (sb-sys:allow-with-interrupts
+                            (let ((*live-operation-depth*
+                                    (1+ *live-operation-depth*))
+                                  (*live-operation-current-lane* ,admitted))
+                              (progn ,@body)))
+                       (leave-live-operation ,backend)))))))
            (let ((*live-operation-depth* (1+ *live-operation-depth*)))
              (progn ,@body))))))
 
@@ -149,20 +402,112 @@
   "Run BODY while protecting its function definitions from a live reload."
   `(with-live-operation-internal (nil) ,@body))
 
-(defmacro with-live-operation-drain (&body body)
-  "Run a BODY that may help already-active operations drain."
-  `(with-live-operation-internal (t) ,@body))
+(defmacro with-live-operation-shutdown-cleanup (&body body)
+  "Run fatal connection cleanup without waiting during backend-terminating shutdown.
+
+Use only for sending a fatal response and releasing connection resources; this
+lane must not run query or storage work."
+  `(if (and (fboundp 'shutdown-terminates-backends-p)
+            (shutdown-terminates-backends-p))
+       (progn ,@body)
+       (with-live-operation-captured-backend-cleanup ,@body)))
+
+(defmacro with-live-operation-transaction-drain (&body body)
+  "Run work from a backend transaction that is already in progress."
+  `(with-live-operation-internal
+       ((and *backend*
+             (member *backend* *live-operation-drain-backends* :test #'eq)
+             (member (backend-state *backend*) '(:in-progress :aborted))))
+     ,@body))
+
+(defmacro with-live-operation-cancel-request ((request) &body body)
+  "Count CancelRequest work during drain, deferring only an active query target."
+  (let ((request-value (gensym "CANCEL-REQUEST-"))
+        (backend (gensym "BACKEND-"))
+        (decision (gensym "DECISION-"))
+        (outermost (gensym "OUTERMOST-"))
+        (block-name (gensym "CANCEL-REQUEST-BLOCK-")))
+    `(let ((,request-value ,request)
+           (,backend *backend*)
+           (,outermost (zerop *live-operation-depth*)))
+       (if (not ,outermost)
+           (let ((*live-operation-depth* (1+ *live-operation-depth*))
+                 (*live-operation-check-cancel-p* nil))
+             (progn ,@body))
+           (block ,block-name
+             (loop
+               (let ((,decision nil))
+                 ;; Admission and deferral are one locked decision. If admission
+                 ;; reopens, this request either enters first or queues its exact
+                 ;; query target before any awakened waiter can acquire the lock.
+                 (sb-sys:without-interrupts
+                   (let ((*live-operation-check-cancel-p* nil))
+                     (setf ,decision
+                           (try-enter-live-operation-cancel-request
+                            ,request-value ,backend)))
+                   (cond
+                     ((member ,decision '(:queued :ignored))
+                      (return-from ,block-name ,decision))
+                     (,decision
+                      (return-from ,block-name
+                        (unwind-protect
+                             (sb-sys:allow-with-interrupts
+                               (let ((*live-operation-depth* 1)
+                                     (*live-operation-current-lane* ,decision)
+                                     (*live-operation-check-cancel-p* nil))
+                                 (progn ,@body)))
+                          (leave-live-operation ,backend)))))))))))))
+
+(defmacro with-live-operation-captured-backend-cleanup (&body body)
+  "Run backend bookkeeping for a session connected when reload closed admission."
+  `(with-live-operation-internal
+       ((and *backend*
+             (or (member *backend* *live-operation-cleanup-backends* :test #'eq)
+                 (member *backend* *live-operation-drain-backends* :test #'eq))))
+     ,@body))
+
+(defmacro with-live-operation-backend-shutdown-cleanup ((backend) &body body)
+  "Bind BACKEND while admitting its shutdown and teardown cleanup."
+  (let ((backend-value (gensym "BACKEND-")))
+    `(let* ((,backend-value ,backend)
+            (*backend* ,backend-value))
+       (with-live-operation-shutdown-cleanup ,@body))))
+
+(defmacro with-live-operation-query-state-cleanup (&body body)
+  "Clear query admission state without waiting during backend-terminating shutdown."
+  `(if (and (fboundp 'shutdown-terminates-backends-p)
+            (shutdown-terminates-backends-p))
+       (progn ,@body)
+       (with-live-operation-captured-backend-cleanup ,@body)))
+
+(defmacro with-live-operation-query-dispatch (drain-command-p &body body)
+  "Admit transaction-ending commands from captured transactions during drain."
+  `(with-live-operation-internal
+       ((and ,drain-command-p
+             *backend*
+             (member *backend* *live-operation-drain-backends* :test #'eq)
+             (member (backend-state *backend*) '(:in-progress :aborted)))
+        t)
+     ,@body))
 
 (defmacro with-live-operation-quiescence (&body body)
   "Run BODY after existing live operations drain and before new ones enter."
-  `(unwind-protect
-        (progn
-          (close-live-operation-admission)
-          ,@body)
-     (open-live-operation-admission)))
+  (let ((owner (gensym "LIVE-OPERATION-QUIESCENCE-")))
+    `(let ((,owner (gensym "LIVE-OPERATION-QUIESCENCE-OWNER-")))
+       (unwind-protect
+            (progn
+              (close-live-operation-admission ,owner)
+              ,@body)
+         (open-live-operation-admission ,owner)))))
 
 (defun reload ()
   "Recompile and reload the pg system in this image.  Returns T on success."
+  ;; A control expression such as (PROGN (RELOAD)) already holds one live
+  ;; operation. Queue it for the coordinator instead of waiting for the reload
+  ;; lock while that coordinator waits for this operation to leave.
+  (when (plusp *live-operation-depth*)
+    (request-reload)
+    (return-from reload :queued))
   (sb-thread:with-mutex (*reload-run-lock*)
     (format t "~&pg-lisp: reloading code...~%")
     (finish-output)
@@ -181,17 +526,6 @@
       (format t "~&pg-lisp: reload ~:[failed (see server log)~;complete~]~%" ok)
       (finish-output)
       ok)))
-
-(defvar *reload-requested* nil)
-
-(defun request-reload (&rest signal-info)
-  "SIGHUP handler: record the request and return immediately.
-
-Signal handlers run in whichever thread the OS delivered the signal to, so
-this must not take a lock (the signal may land in the reloader itself).  ASDF
-must not run inside a handler either; the reloader thread polls the flag."
-  (declare (ignore signal-info))
-  (setf *reload-requested* t))
 
 (defun reload-loop ()
   (loop

@@ -27,6 +27,17 @@
 
 (defvar *backend* nil)
 
+(declaim (special *live-operation-lock*))
+(declaim (special *live-operation-cv*))
+(declaim (special *live-operation-backend-query-tokens*))
+
+(defun set-backend-state (backend state)
+  "Publish transaction state atomically with reload admission."
+  (sb-thread:with-mutex (*live-operation-lock*)
+    (setf (backend-state backend) state)
+    (sb-thread:condition-broadcast *live-operation-cv*))
+  state)
+
 (defmacro with-backend-wait-state ((backend accessor value) &body body)
   "Publish BACKEND's wait state for BODY and clear it on every exit."
   (let ((backend-value (gensym "BACKEND-"))
@@ -50,6 +61,28 @@ INTERRUPT-THREAD, so it needs no flag."
   (when (and *backend* (backend-cancel-pending *backend*))
     (setf (backend-cancel-pending *backend*) nil)
     (ereport "57014" "canceling statement due to user request")))
+
+(defun begin-backend-query-execution (backend)
+  "Mark a frontend query active before it waits for reload admission."
+  (when backend
+    (sb-thread:with-mutex (*live-operation-lock*)
+      ;; Clear an idle cancel before publishing EXECUTING. A cancel request
+      ;; arriving after this transition will be observed by admission waiters.
+      (setf (backend-cancel-pending backend) nil
+            (backend-executing backend) t
+            (gethash backend *live-operation-backend-query-tokens*)
+            (cons nil nil))))
+  (values))
+
+(defun end-backend-query-execution (backend)
+  "Clear frontend query interrupt state after dispatch and any gate wait."
+  (when backend
+    (sb-thread:with-mutex (*live-operation-lock*)
+      (setf (backend-executing backend) nil
+            (backend-cancel-pending backend) nil)
+      (remhash backend *live-operation-backend-query-tokens*)
+      (sb-thread:condition-broadcast *live-operation-cv*)))
+  (values))
 
 ;;; ---- pg_control: nextXid, fsynced write-ahead of XID allocation ----
 
@@ -572,9 +605,9 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
                "current transaction is aborted, commands ignored until end of transaction block"))
     (prepare-xid-wraparound-for-statement b)
     (when (eq (backend-state b) :idle)
-      (setf (backend-state b) :in-progress
-            (backend-explicit b) nil
-            (backend-command-id b) 0))
+      (setf (backend-explicit b) nil
+            (backend-command-id b) 0)
+      (set-backend-state b :in-progress))
     (incf (backend-command-id b))
     (begin-statement-snapshot b)
     (let ((snap (handler-case (make-snapshot (backend-command-id b))
@@ -586,11 +619,11 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
 
 (defun reset-backend-transaction (b)
   (setf (backend-xid b) nil
-        (backend-state b) :idle
         (backend-explicit b) nil
         (backend-command-id b) 0
         (backend-snapshot b) nil
         (backend-dirty-relations b) '())
+  (set-backend-state b :idle)
   (values))
 
 (defun commit-transaction ()

@@ -2,9 +2,9 @@
 
 (in-package #:pg)
 
-(defun call-with-live-operation-drain (function)
-  "Run one short post-read validation phase under reload drain admission."
-  (with-live-operation-drain (funcall function)))
+(defun call-with-live-operation (function)
+  "Run one post-read validation phase under ordinary reload admission."
+  (with-live-operation (funcall function)))
 
 ;;; ---- startup ----
 
@@ -66,16 +66,36 @@
           (setf i next2))))
     (nreverse params)))
 
-(defun read-startup-until-ready (stream)
-  "Consume SSL/GSS negotiation requests; return the StartupMessage body or NIL."
+(defun read-startup-until-ready (stream &optional before-startup)
+  "Consume SSL/GSS requests; return StartupMessage or NIL for a CancelRequest.
+
+BEFORE-STARTUP runs after the request code is known to be something other than
+CancelRequest, before the rest of that packet is read."
   (loop
-    (let ((body (read-startup-packet stream
-                                     #'call-with-live-operation-drain)))
+    (multiple-value-bind (body cancel-request-p)
+        (read-startup-packet stream #'call-with-live-operation
+                             :before-body before-startup
+                             :bypass-code +cancel-request-code+)
       (when (null body)
         (return-from read-startup-until-ready nil))
-      ;; Packet reads stay outside the gate; validating and processing each
-      ;; packet is short and must not overlap live function redefinition.
-      (with-live-operation-drain
+      ;; CancelRequest has no session state to register or modify. Its narrow
+      ;; handler can run during transaction drain, and ASDF deferral captures
+      ;; only a query that was already active when the request arrived.
+      (when cancel-request-p
+        (unless (= (length body) 12)
+          (with-live-operation
+            (ereport-fatal "08P01" "cancel request packet has an invalid length")))
+        ;; This handler calls reloadable backend lookup and cancellation code.
+        ;; Count it during drain; during ASDF, retain only a matching active
+        ;; query token so an idle request cannot affect the backend's next query.
+        (with-live-operation-cancel-request (body)
+          (when *backend*
+            (unregister-backend *backend*))
+          (process-cancel-request body))
+        (return-from read-startup-until-ready nil))
+      ;; Packet reads stay outside the gate; validation and ordinary startup
+      ;; processing are short and must not overlap live function redefinition.
+      (with-live-operation
         (when (< (length body) 4)
           (ereport-fatal "08P01" "startup packet is missing its request code"))
         (let ((code (bytes-to-u32 body 0)))
@@ -90,11 +110,6 @@
                (ereport-fatal "08P01" "GSS encryption request packet has an invalid length"))
              (write-byte (char-code #\N) stream)
              (force-output stream))
-            ((= code +cancel-request-code+)
-             (unless (= (length body) 12)
-               (ereport-fatal "08P01" "cancel request packet has an invalid length"))
-             (process-cancel-request body)
-             (return-from read-startup-until-ready nil))
             (t
              (return-from read-startup-until-ready body))))))))
 
@@ -151,63 +166,172 @@
 (defun transaction-ending-statement-p (statement)
   (member (getf statement :type) '(:commit :rollback)))
 
+(defun simple-query-starts-with-transaction-end-p (message)
+  "Recognize a transaction-ending first command after SQL trivia."
+  (let* ((payload (frontend-message-payload message))
+         (end (or (position 0 payload) (length payload)))
+         (start 0))
+    (labels ((whitespace-byte-p (byte)
+               (member byte '(9 10 11 12 13 32)))
+             (word-byte-p (byte)
+               (or (<= 65 byte 90) (<= 97 byte 122)
+                   (<= 48 byte 57) (= byte 95) (= byte 36)
+                   (>= byte 128)))
+             (skip-line-comment ()
+               (loop while (and (< start end) (/= (aref payload start) 10))
+                     do (incf start)))
+             (skip-block-comment ()
+               (incf start 2)
+               (loop while (< start end)
+                     do (if (and (< (1+ start) end)
+                                 (= (aref payload start) 42)
+                                 (= (aref payload (1+ start)) 47))
+                            (progn (incf start 2) (return))
+                            (incf start))))
+             (skip-leading-trivia ()
+               (loop
+                 (cond
+                   ((and (< start end) (whitespace-byte-p (aref payload start)))
+                    (incf start))
+                   ((and (< (1+ start) end)
+                         (= (aref payload start) 45)
+                         (= (aref payload (1+ start)) 45))
+                    (skip-line-comment))
+                   ((and (< (1+ start) end)
+                         (= (aref payload start) 47)
+                         (= (aref payload (1+ start)) 42))
+                    (skip-block-comment))
+                   ((and (< start end) (= (aref payload start) 59))
+                    (incf start))
+                   (t (return)))))
+             (matches-word-p (word from to)
+               (and (= (- to from) (length word))
+                    (loop for index from from below to
+                          for expected across word
+                          for byte = (aref payload index)
+                          for upper = (if (<= 97 byte 122) (- byte 32) byte)
+                          always (= upper (char-code expected))))))
+      (skip-leading-trivia)
+      (let ((word-start start))
+        (loop while (and (< start end) (word-byte-p (aref payload start)))
+              do (incf start))
+        (let ((word-end start))
+          ;; This byte-level check only decides whether the first command could
+          ;; be a transaction end. The AST parser remains authoritative, and a
+          ;; real statement before that command never enters the drain lane.
+          (or (matches-word-p "COMMIT" word-start word-end)
+              (matches-word-p "ROLLBACK" word-start word-end)
+              (matches-word-p "END" word-start word-end)
+              (matches-word-p "ABORT" word-start word-end)))))))
+
 (defun handle-simple-query (stream message)
-  ;; The backend waits for client messages outside this gate; each SQL request
-  ;; drains before the reload coordinator replaces its implementation.
-  (let ((query nil)
-        (statements nil)
-        (parsed-p nil)
-        (normal-dispatch-p nil))
-    ;; Parse the whole message before running any statement. This lets a
-    ;; transaction-ending AST drain an active transaction without committing
-    ;; before a syntax error later in the same simple-query message is found.
-    (with-live-operation-drain
-      (setf query (query-string message))
-      (multiple-value-setq (statements parsed-p)
-        (exec-simple-query stream query
-                           :prepare-only-p t
-                           :finish-execution-p nil))
-      (cond
-        ((not parsed-p)
-         ;; The parser already sent the error response. Finish this request
-         ;; while the same drain guard still protects its query state.
-         (when *backend*
-           (setf (backend-executing *backend*) nil
-                 (backend-cancel-pending *backend*) nil))
-         (send-ready-for-query stream (transaction-status-char)))
-        ((or (null statements)
-             (not (position-if #'transaction-ending-statement-p statements)))
-         ;; Discard these ASTs before leaving the drain lane. If reload wins the
-         ;; gap, normal admission reparses QUERY with the newly loaded parser.
-         (setf normal-dispatch-p t))
-        (t
-         (let* ((ending-position
-                  (position-if #'transaction-ending-statement-p statements))
-                (prefix-end (1+ ending-position))
-                (prefix (subseq statements 0 prefix-end))
-                (suffix (nthcdr prefix-end statements)))
-           ;; Keep parsing and execution of every AST in this simple-query
-           ;; message under one gate, so no AST crosses a reload boundary.
-           (multiple-value-bind (result completed-p)
-               (exec-simple-query stream query
-                                  :start-execution-p nil
-                                  :finish-execution-p (null suffix)
-                                  :statements prefix)
-             (declare (ignore result))
-             (cond
-               ((and suffix completed-p)
-                (exec-simple-query stream query
-                                   :start-execution-p nil
-                                   :statements suffix))
-               (suffix
-                (when *backend*
-                  (setf (backend-executing *backend*) nil
-                        (backend-cancel-pending *backend*) nil))))
-             (send-ready-for-query stream (transaction-status-char)))))))
-    (when normal-dispatch-p
-      (with-live-operation
-        (exec-simple-query stream query :start-execution-p nil)
-        (send-ready-for-query stream (transaction-status-char))))))
+  (let* ((backend *backend*)
+         (drain-command-p (simple-query-starts-with-transaction-end-p message))
+         (query nil)
+         (suffix-start nil)
+         (prefix-before-reload nil))
+    (unwind-protect
+         (progn
+           ;; Install cleanup before publishing the query token: a fatal
+           ;; interrupt at any later point must not retain this backend.
+           (begin-backend-query-execution backend)
+           (handler-case
+               (progn
+                 ;; Only transactions and already-admitted sessions captured at
+                 ;; gate closure can continue through the drain lane.
+                 (with-live-operation-query-dispatch drain-command-p
+                   (setf query (query-string message))
+                   (if (eq *live-operation-current-lane* :drain)
+                       (multiple-value-bind (statements parsed-p)
+                           ;; Parse the entire message before executing anything so
+                           ;; syntax errors after COMMIT are found before commit.
+                           (exec-simple-query
+                            stream query :prepare-only-p t
+                            :start-execution-p nil :finish-execution-p nil)
+                         (cond
+                           ((not parsed-p)
+                            (send-ready-for-query
+                             stream (transaction-status-char)))
+                           (t
+                            (let ((ending-position
+                                    (position-if
+                                     #'transaction-ending-statement-p statements)))
+                              (if ending-position
+                                  (let* ((prefix-end (1+ ending-position))
+                                         (prefix (subseq statements 0 prefix-end)))
+                                    (multiple-value-bind (result completed-p)
+                                        (exec-simple-query
+                                         stream query :statements prefix
+                                         :start-execution-p nil
+                                         :finish-execution-p nil)
+                                      (declare (ignore result))
+                                      (if (and completed-p
+                                               (< prefix-end (length statements)))
+                                          ;; Once COMMIT/ROLLBACK ends the captured
+                                          ;; transaction, unrelated suffix work must
+                                          ;; wait for normal admission.
+                                          (setf suffix-start prefix-end
+                                                prefix-before-reload prefix)
+                                          (send-ready-for-query
+                                           stream (transaction-status-char)))))
+                                  ;; A captured transaction may need another query
+                                  ;; to release an XID held by counted work.
+                                  (progn
+                                    (exec-simple-query
+                                     stream query :statements statements
+                                     :start-execution-p nil
+                                     :finish-execution-p nil)
+                                    (send-ready-for-query
+                                     stream (transaction-status-char))))))))
+                       (progn
+                         (exec-simple-query
+                          stream query
+                          :start-execution-p nil :finish-execution-p nil)
+                         (send-ready-for-query stream
+                                               (transaction-status-char)))))
+                 (when suffix-start
+                   (with-live-operation
+                     (multiple-value-bind (reparsed reparsed-p)
+                         (exec-simple-query
+                          stream query :prepare-only-p t
+                          :start-execution-p nil :finish-execution-p nil)
+                       (if reparsed-p
+                           (let* ((ending-position
+                                    (position-if
+                                     #'transaction-ending-statement-p reparsed))
+                                  (reparsed-prefix-end
+                                    (and ending-position (1+ ending-position)))
+                                  (reparsed-prefix
+                                    (and reparsed-prefix-end
+                                         (subseq reparsed 0 reparsed-prefix-end))))
+                             (if (and reparsed-prefix-end
+                                      (= reparsed-prefix-end suffix-start)
+                                      (equal reparsed-prefix prefix-before-reload)
+                                      (< reparsed-prefix-end (length reparsed)))
+                                 ;; Use ASTs from the newly loaded parser. The
+                                 ;; equality guard prevents skipping/replaying SQL.
+                                 (exec-simple-query
+                                  stream query :statements
+                                  (nthcdr reparsed-prefix-end reparsed)
+                                               :start-execution-p nil :finish-execution-p nil)
+                                 (send-error-response
+                                  stream
+                                  (make-condition
+                                   'pg-error :sqlstate "0A000"
+                                             :message
+                                             "query suffix changed during reload; retry it separately"))))
+                           ;; PREPARE-ONLY already sent the parse error.
+                           (values))
+                       (send-ready-for-query stream (transaction-status-char))))))
+             (pg-error (condition)
+               (if (fatal-error-p condition)
+                   (error condition)
+                   (with-live-operation-captured-backend-cleanup
+                     (note-query-error)
+                     (send-error-response stream condition)
+                     (send-ready-for-query stream (transaction-status-char)))))))
+      (with-live-operation-query-state-cleanup
+        (end-backend-query-execution backend)))))
 
 (defun handle-unsupported-message (stream message)
   (declare (ignore message))
@@ -222,16 +346,32 @@
 
 (defun backend-loop (stream)
   (loop
-    (let ((message (read-message stream #'call-with-live-operation-drain)))
+    (let ((message (read-message stream)))
       (when (null message)
         (return))
-      (case (with-live-operation-drain
-              (frontend-message-type message))
+      ;; Frame reads are outside the gate. Simple-query dispatch enters its own
+      ;; lane so a transaction end can pass reload drain admission.
+      (case (frontend-message-type message)
         (#\X (return))
         (#\Q (handle-simple-query stream message))
         (otherwise
          (with-live-operation
            (handle-unsupported-message stream message)))))))
+
+(defun finish-backend-connection (backend sock stream)
+  "Send final connection cleanup through the backend's captured cleanup lane."
+  (with-live-operation-backend-shutdown-cleanup (backend)
+    (unwind-protect
+         (close-connection sock stream)
+      ;; Install accounting before unregistering: a concurrent administrator may
+      ;; have retained this backend from a registry lookup and interrupt it
+      ;; immediately after removal. Keep both transitions indivisible to that
+      ;; asynchronous termination.
+      (sb-sys:without-interrupts
+        (unwind-protect
+             (when backend
+               (unregister-backend backend))
+          (connection-finished))))))
 
 (defun handle-connection (sock)
   (let ((stream nil)
@@ -247,24 +387,32 @@
                                                     sb-thread:*current-thread*)))
                      (*output-stream* stream))
                  (setf backend *backend*)
+                 ;; Track the connection before any blocking startup read so
+                 ;; fast shutdown can interrupt a client stalled in its first
+                 ;; header. CancelRequest removes this provisional backend once
+                 ;; its request code is known.
+                 (register-backend backend)
                  ;; A dropped connection must not strand an open transaction.
                  (unwind-protect
-                      (progn
-                        ;; Register before waiting for StartupMessage so fast
-                        ;; shutdown can terminate stalled startup handshakes.
-                        (with-live-operation-drain
-                          (register-backend *backend*))
-                        (let ((body (read-startup-until-ready stream)))
-                          (when body
-                            (process-startup stream body)
-                            (backend-loop stream))))
-                   (with-live-operation-drain
-                     (end-backend-session)))))
+                      (let ((body (read-startup-until-ready stream)))
+                        (when body
+                          (process-startup stream body)
+                          (backend-loop stream)))
+                   ;; Fast shutdown terminates every backend and exits the
+                   ;; process, so startup recovery can classify in-progress
+                   ;; CLOG entries as aborted. Smart shutdown still permits
+                   ;; sessions to continue and must release disconnected XIDs.
+                   (when (and (< (shutdown-mode) +fast-shutdown+)
+                              *backend*
+                              (or (backend-xid *backend*)
+                                  (not (eq (backend-state *backend*) :idle))))
+                     (with-live-operation-transaction-drain
+                       (end-backend-session))))))
            (pg-error (e)
-             (with-live-operation-drain
+             (with-live-operation-backend-shutdown-cleanup (backend)
                (when stream (ignore-errors (send-error-response stream e)))))
            (error (e)
-             (with-live-operation-drain
+             (with-live-operation-backend-shutdown-cleanup (backend)
                (when stream
                  (ignore-errors
                   (send-error-response
@@ -274,11 +422,7 @@
       ;; Send the final error and close the socket *before* unregistering:
       ;; during a fast shutdown the last connection's CONNECTION-FINISHED exits
       ;; the process, and the client must still receive its FATAL.
-      (with-live-operation-drain
-        (close-connection sock stream)
-        (when backend
-          (unregister-backend backend))
-        (connection-finished)))))
+      (finish-backend-connection backend sock stream))))
 
 ;;; ---- server main ----
 

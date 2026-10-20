@@ -2,6 +2,8 @@
 
 (let* ((port (parse-integer (sb-ext:posix-getenv "STALLED_PORT")))
        (ready-file (sb-ext:posix-getenv "STALLED_READY"))
+       (partial-header-p
+         (equal (sb-ext:posix-getenv "STALLED_PARTIAL_HEADER") "1"))
        (socket (make-instance 'sb-bsd-sockets:inet-socket
                               :type :stream
                               :protocol :tcp))
@@ -14,14 +16,20 @@
                (sb-bsd-sockets:socket-make-stream
                 socket :input t :output t
                 :element-type '(unsigned-byte 8) :buffering :none))
-         ;; Send PostgreSQL's SSLRequest and wait for the server's "N" reply.
-         ;; This confirms the Lisp backend accepted the socket and is reading
-         ;; the startup protocol before the test stalls the connection.
-         (dolist (byte '(0 0 0 8 4 210 22 47))
-           (write-byte byte stream))
-         (force-output stream)
-         (unless (= (read-byte stream) (char-code #\N))
-           (error "server did not reject SSLRequest"))
+         (if partial-header-p
+             ;; Leave the server blocked before it can classify the startup
+             ;; request. Fast shutdown must still be able to terminate it.
+             (progn
+               (write-byte 0 stream)
+               (force-output stream))
+             (progn
+               ;; Send PostgreSQL's SSLRequest and wait for the server's "N"
+               ;; reply, confirming it has classified the startup request.
+               (dolist (byte '(0 0 0 8 4 210 22 47))
+                 (write-byte byte stream))
+               (force-output stream)
+               (unless (= (read-byte stream) (char-code #\N))
+                 (error "server did not reject SSLRequest"))))
          (with-open-file (ready ready-file
                                 :direction :output
                                 :if-exists :supersede)
