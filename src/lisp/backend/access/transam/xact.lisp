@@ -660,6 +660,8 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
   (values))
 
 (defun make-snapshot (curcid &key register)
+  (when (and register (not (snapshot-registration-p register)))
+    (error "REGISTER must be a snapshot-registration token or NIL"))
   (sb-thread:with-mutex (*xid-lock*)
     (let* ((xmax *next-xid*)
            (xip (copy-list *active-xids*))

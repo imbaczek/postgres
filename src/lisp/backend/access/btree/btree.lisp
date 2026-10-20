@@ -355,6 +355,8 @@ to a single leaf."
                  ;; DML holds this coarse lock while changing B-tree structure.
                  ;; Once bounded retries are exhausted, one exclusive pass gives
                  ;; the cleanup a stable page set and guarantees completion.
+                 ;; This global lock can stall unrelated writes for the scan and
+                 ;; WAL flush; narrow it after split coordination is relation-scoped.
                  (with-write-lock
                    (btree-vacuum-scan-tids relfilenode dead
                                            (buf-nblocks relfilenode)

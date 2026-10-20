@@ -27,18 +27,21 @@
 
 (declaim (ftype function xid-active-p))
 
-(defun register-active-snapshot (snapshot &optional registration)
+(defun register-active-snapshot (snapshot registration)
   "Publish SNAPSHOT's xmin while the caller still holds the XID lock.
 
-REGISTRATION, when supplied, owns both the active count and the snapshot entry
-before asynchronous interrupts are re-enabled."
+REGISTRATION owns both the active count and the snapshot entry before
+asynchronous interrupts are re-enabled."
+  (unless (snapshot-registration-p registration)
+    (error "active snapshots require a snapshot-registration token"))
   (sb-sys:without-interrupts
     (sb-thread:with-mutex (*snapshot-count-lock*)
+      (when (snapshot-registration-active-p registration)
+        (error "snapshot-registration token is already active"))
       (incf *active-snapshots*)
-      (setf (gethash snapshot *active-snapshot-set*) t)
-      (when (snapshot-registration-p registration)
-        (setf (snapshot-registration-snapshot registration) snapshot
-              (snapshot-registration-active-p registration) t))))
+      (setf (gethash snapshot *active-snapshot-set*) t
+            (snapshot-registration-snapshot registration) snapshot
+            (snapshot-registration-active-p registration) t)))
   snapshot)
 
 (defun oldest-active-snapshot-xmin ()
