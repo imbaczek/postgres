@@ -354,8 +354,13 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   XIDs are handed out in
   batches of 1000, with `global/pg_control` atomically replaced and its
   directory fsynced before any XID in the batch is used.
-- Commit order: fsync every dirty heap/index file, then write + fsync CLog
-  COMMITTED, then let the tuple become visible.
+- Transaction commit is durable at the WAL flush: a commit batch writes any
+  currently staged page after-images (potentially including changes from other
+  active transactions) alongside the committing XID's commit record, then fsyncs
+  WAL before CLog marks that XID committed and applies the page images to
+  heap/index files. Heap and index files are fsynced at CHECKPOINT; the
+  checkpoint pointer advances only after pages, CLog, and the relevant
+  directories are synced.
 - The catalog (`pg_class`/`pg_attribute`/`pg_index` as structs) is serialized to
   `$PGDATA/global/pg_catalog.dat` and fsynced at each DDL commit. It is replaced
   atomically (write a temp file, `rename`, then fsync the directory), so a crash
