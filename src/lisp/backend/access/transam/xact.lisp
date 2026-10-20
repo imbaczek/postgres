@@ -22,6 +22,7 @@
   ;; Visible to the local control REPL so concurrency tests can synchronize on
   ;; a real lock wait instead of relying on scheduler timing.
   (waiting-xid nil)
+  (wraparound-waiting nil)
   (thread nil))
 
 (defvar *backend* nil)
@@ -102,6 +103,7 @@ INTERRUPT-THREAD, so it needs no flag."
 (defvar *xid-wrap-work-lock* (sb-thread:make-mutex :name "pg xid wrap worker"))
 (defvar *xid-wrap-cv* (sb-thread:make-waitqueue :name "pg xid wrap waitqueue"))
 (defvar *xid-wrap-pending* nil)
+(defvar *xid-wrap-failure* nil)
 (defvar *xid-wrap-completed-through* nil)
 
 (defvar *xact-cv* (sb-thread:make-waitqueue :name "pg xact waitqueue"))
@@ -171,7 +173,10 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
           (or (and line (parse-integer line :junk-allowed nil))
               (error "invalid XID wrap marker ~a" path)))))))
 
-(defun save-xid-wrap-marker (boundary)
+(defun save-xid-wrap-marker (boundary &key (fsync-function #'sb-posix:fsync)
+                                        (rename-function #'sb-posix:rename)
+                                        (fsync-directory-function
+                                         #'fsync-directory))
   (let ((path (xid-wrap-marker-path))
         (tmp (pgdata-path "global/pg_xid_wrap_pending.tmp")))
     (ensure-directories-exist path)
@@ -184,17 +189,18 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
                               :element-type 'character)
              (format s "~a~%" boundary)
              (finish-output s)
-             (sb-posix:fsync (sb-sys:fd-stream-fd s)))
-           (sb-posix:rename (namestring tmp) (namestring path))
-           (fsync-directory (pgdata-path "global/")))
+             (funcall fsync-function (sb-sys:fd-stream-fd s)))
+           (funcall rename-function (namestring tmp) (namestring path))
+           (funcall fsync-directory-function (pgdata-path "global/")))
       (ignore-errors (delete-file tmp))))
   (values))
 
-(defun delete-xid-wrap-marker ()
+(defun delete-xid-wrap-marker (&key (fsync-directory-function
+                                     #'fsync-directory))
   (let ((path (xid-wrap-marker-path)))
     (when (probe-file path)
       (delete-file path)
-      (fsync-directory (pgdata-path "global/"))))
+      (funcall fsync-directory-function (pgdata-path "global/"))))
   (values))
 
 (declaim (ftype function freeze-all-heap-xids))
@@ -224,57 +230,125 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
                                             *snapshot-cv-mutex*))))
   (values))
 
-(defun complete-xid-wraparound ()
-  "Freeze the previous XID cycle before reusing its 32-bit tuple IDs."
-  (sb-thread:with-mutex (*xid-wrap-work-lock*)
-    (let* ((boundary (sb-thread:with-mutex (*xid-lock*) *next-xid*))
-           (marker (load-xid-wrap-marker))
-           (needed (or marker
-                       (and (first-normal-xid-of-epoch-p boundary)
-                            (not (eql boundary *xid-wrap-completed-through*))))))
-      (unless needed
-        (return-from complete-xid-wraparound (values)))
-      (unless (first-normal-xid-of-epoch-p boundary)
-        (error "XID wrap marker does not match the next FullTransactionId"))
-      (when (and marker (/= marker boundary))
-        (error "XID wrap marker ~a does not match next XID ~a" marker boundary))
-      (sb-thread:with-mutex (*xid-wrap-lock*)
-        (setf *xid-wrap-pending* t))
-      ;; Persist the boundary before publishing the marker. No XID from the new
-      ;; epoch is handed out until the frozen heap and reset CLOG are durable.
-      (sb-thread:with-mutex (*xid-lock*)
-        (setf *xid-batch-end* boundary)
-        (save-next-xid))
-      (unless marker
-        (save-xid-wrap-marker boundary))
-      (wait-for-no-active-xids)
-      (wait-for-no-active-snapshots)
-      (with-write-lock
-        (freeze-all-heap-xids (1- (floor boundary +xid-cycle+)))
-        (clog-reset))
-      (delete-xid-wrap-marker)
-      (sb-thread:with-mutex (*xid-wrap-lock*)
-        (setf *xid-wrap-completed-through* boundary
-              *xid-wrap-pending* nil)
-        (sb-thread:condition-broadcast *xid-wrap-cv*))))
+(defun xid-wraparound-failed-error ()
+  (ereport-fatal "XX001"
+                 "XID wraparound failed; the server is shutting down"))
+
+(defun signal-xid-wraparound-shutdown ()
+  (when (fboundp 'request-fast-shutdown)
+    (funcall (symbol-function 'request-fast-shutdown)))
   (values))
+
+(defun fail-xid-wraparound (condition shutdown-function)
+  (let ((first-failure nil))
+    (sb-thread:with-mutex (*xid-wrap-lock*)
+      (unless *xid-wrap-failure*
+        (setf *xid-wrap-failure* condition
+              first-failure t))
+      ;; Keep the gate closed. The marker and next-XID boundary make recovery
+      ;; safe after restart, even if heap or CLOG changes were only partial.
+      (setf *xid-wrap-pending* t)
+      (sb-thread:condition-broadcast *xid-wrap-cv*))
+    (when first-failure
+      (ignore-errors (funcall shutdown-function))))
+  (values))
+
+(defun complete-xid-wraparound
+    (&key (load-marker-function #'load-xid-wrap-marker)
+       (save-next-xid-function #'save-next-xid)
+       (save-marker-function #'save-xid-wrap-marker)
+       (wait-for-xids-function #'wait-for-no-active-xids)
+       (wait-for-snapshots-function #'wait-for-no-active-snapshots)
+       (freeze-function #'freeze-all-heap-xids)
+       (reset-clog-function #'clog-reset)
+       (delete-marker-function #'delete-xid-wrap-marker)
+       (shutdown-function #'signal-xid-wraparound-shutdown))
+  "Freeze the previous XID cycle before reusing its 32-bit tuple IDs."
+  (let ((completed nil))
+    (handler-case
+        (sb-thread:with-mutex (*xid-wrap-work-lock*)
+          (sb-thread:with-mutex (*xid-wrap-lock*)
+            (when *xid-wrap-failure*
+              (xid-wraparound-failed-error)))
+          (let* ((boundary (sb-thread:with-mutex (*xid-lock*) *next-xid*))
+                 (marker (funcall load-marker-function))
+                 (needed (or marker
+                             (and (first-normal-xid-of-epoch-p boundary)
+                                  (not (eql boundary
+                                            *xid-wrap-completed-through*))))))
+            (when needed
+              (unless (first-normal-xid-of-epoch-p boundary)
+                (error "XID wrap marker does not match the next FullTransactionId"))
+              (when (and marker (/= marker boundary))
+                (error "XID wrap marker ~a does not match next XID ~a"
+                       marker boundary))
+              (sb-thread:with-mutex (*xid-wrap-lock*)
+                (setf *xid-wrap-pending* t))
+              ;; Persist the boundary before publishing the marker. No XID from
+              ;; the new epoch is handed out before recovery can finish.
+              (sb-thread:with-mutex (*xid-lock*)
+                (setf *xid-batch-end* boundary)
+                (funcall save-next-xid-function))
+              (unless marker
+                (funcall save-marker-function boundary))
+              (funcall wait-for-xids-function)
+              (funcall wait-for-snapshots-function)
+              (with-write-lock
+                (funcall freeze-function
+                         (1- (floor boundary +xid-cycle+)))
+                (check-for-interrupts)
+                (funcall reset-clog-function))
+              (check-for-interrupts)
+              (funcall delete-marker-function)
+              (check-for-interrupts)
+              (sb-thread:with-mutex (*xid-wrap-lock*)
+                (setf *xid-wrap-completed-through* boundary
+                      *xid-wrap-pending* nil)
+                (sb-thread:condition-broadcast *xid-wrap-cv*))
+              (setf completed t))))
+      (error (condition)
+        (fail-xid-wraparound condition shutdown-function)
+        (if *backend*
+            (xid-wraparound-failed-error)
+            (error condition))))
+    ;; If cancellation arrives after the durable transition, the wrap is safe;
+    ;; report it as an ordinary canceled statement after opening the gate.
+    (when completed
+      (check-for-interrupts))
+    (values)))
+
+(defun wait-for-xid-wraparound (backend &optional ready-function)
+  (loop
+    do (sb-thread:with-mutex (*xid-wrap-lock*)
+         (when *xid-wrap-failure*
+           (xid-wraparound-failed-error))
+         (if (and *xid-wrap-pending* (null (backend-xid backend)))
+             (progn
+               (setf (backend-wraparound-waiting backend) t)
+               (unwind-protect
+                    (progn
+                      (check-for-interrupts)
+                      (condition-wait-with-timeout *xid-wrap-cv*
+                                                   *xid-wrap-lock*))
+                 (setf (backend-wraparound-waiting backend) nil)))
+             (return-from wait-for-xid-wraparound
+               (if ready-function
+                   (funcall ready-function)
+                   (values)))))
+       (values)))
 
 (defun prepare-xid-wraparound-for-statement (backend)
   (when (null (backend-xid backend))
-    (complete-xid-wraparound))
-  (sb-thread:with-mutex (*xid-wrap-lock*)
-    (loop while (and *xid-wrap-pending* (null (backend-xid backend)))
-          do (check-for-interrupts)
-             (condition-wait-with-timeout *xid-wrap-cv* *xid-wrap-lock*)))
-  (values))
+    (let ((should-coordinate
+            (sb-thread:with-mutex (*xid-wrap-lock*)
+              (and (not *xid-wrap-pending*)
+                   (not *xid-wrap-failure*)))))
+      (when should-coordinate
+        (complete-xid-wraparound))))
+  (wait-for-xid-wraparound backend))
 
 (defun begin-statement-snapshot (backend)
-  (sb-thread:with-mutex (*xid-wrap-lock*)
-    (loop while (and *xid-wrap-pending* (null (backend-xid backend)))
-          do (check-for-interrupts)
-             (condition-wait-with-timeout *xid-wrap-cv* *xid-wrap-lock*))
-    (note-snapshot-start))
-  (values))
+  (wait-for-xid-wraparound backend #'note-snapshot-start))
 
 (defun assign-xid ()
   (sb-thread:with-mutex (*xid-lock*)

@@ -55,7 +55,8 @@
     (when *clog-stream*
       (fsync-stream *clog-stream*))))
 
-(defun clog-reset ()
+(defun clog-reset (&key (fsync-function #'fsync-stream)
+                     (fsync-directory-function #'fsync-directory))
   "Start a new 32-bit XID cycle after every heap tuple has been frozen."
   (sb-thread:with-mutex (*clog-lock*)
     (when *clog-stream*
@@ -67,8 +68,8 @@
                          :element-type '(unsigned-byte 8)
                          :if-exists :supersede
                          :if-does-not-exist :create)
-        (fsync-stream s))
-      (fsync-directory *pgdata*)
+        (funcall fsync-function s))
+      (funcall fsync-directory-function *pgdata*)
       (setf *clog-stream*
             (open path
                   :direction :io

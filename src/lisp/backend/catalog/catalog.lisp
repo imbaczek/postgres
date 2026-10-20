@@ -189,7 +189,9 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
       (save-catalog)))
   (values))
 
-(defun freeze-all-heap-xids (old-epoch)
+(defun freeze-all-heap-xids (old-epoch
+                             &key (fsync-function #'smgr-fsync)
+                               after-page-function)
   "Freeze tuple XIDs from OLD-EPOCH in every catalogued heap relation."
   (maphash
    (lambda (db-name db)
@@ -199,7 +201,10 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
         (declare (ignore table-name))
         (heapam-freeze-relation-xids (pg-class-relfilenode table)
                                      (pg-class-columns table)
-                                     old-epoch))
+                                     old-epoch
+                                     :fsync-function fsync-function
+                                     :after-page-function
+                                     after-page-function))
       (database-tables db)))
    (catalog-databases *catalog*))
   (values))

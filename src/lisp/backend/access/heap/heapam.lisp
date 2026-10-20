@@ -402,12 +402,15 @@ whose xmax was set, and that tuple's physical block and offset."
   (declare (ignore relfilenode block))
   0)
 
-(defun heapam-freeze-relation-xids (relfilenode columns old-epoch)
+(defun heapam-freeze-relation-xids
+    (relfilenode columns old-epoch
+     &key (fsync-function #'smgr-fsync) after-page-function)
   "Freeze old-cycle tuple XIDs after all transactions and snapshots drain."
   (declare (ignore columns))
   (let ((changed nil)
         (epoch-base (* old-epoch +xid-cycle+)))
     (dotimes (block (buf-nblocks relfilenode))
+      (check-for-interrupts)
       (let ((page (buf-read relfilenode block))
             (page-changed nil))
         (when page
@@ -434,9 +437,11 @@ whose xmax was set, and that tuple's physical block and offset."
                 (setf page-changed t))))
           (when page-changed
             (buf-write relfilenode block page)
-            (setf changed t)))))
+            (setf changed t)
+            (when after-page-function
+              (funcall after-page-function relfilenode block))))))
     (when changed
-      (smgr-fsync relfilenode)))
+      (funcall fsync-function relfilenode)))
   (values))
 
 (defun htup-visible-p (tuple snapshot)
