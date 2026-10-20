@@ -86,6 +86,7 @@
       (test-make-snapshot-rejects-unowned-registration)
       (test-register-active-snapshot-requires-token)
       (test-snapshot-registration-cannot-be-reused-while-active)
+      (test-vacuum-page-publication-is-atomic)
       (test-vacuum-reuses-tid-clears-index-and-vm)
       (test-vacuum-snapshot-horizon)
       (test-btree-duplicate-keys)

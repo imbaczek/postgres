@@ -2,6 +2,92 @@
 
 (in-package #:pg)
 
+(defun test-vacuum-page-publication-is-atomic ()
+  (let* ((*wal-ready* nil)
+         (*wal-page-cache* (make-hash-table :test #'equal))
+         (*wal-page-batch* nil)
+         (*wal-test-pause-at* nil)
+         (relfilenode 918273657)
+         (heap-block 0)
+         (heap-page (page-init (make-page)))
+         (changed-page nil)
+         (original-visibilitymap-clear
+           (symbol-function 'visibilitymap-clear))
+         (staged-heap-write-seen nil)
+         (injected-error nil))
+    (smgr-forget relfilenode :delete t)
+    (ensure-directories-exist (relation-file-path relfilenode))
+    (setf (aref heap-page 100) #x11
+          changed-page (copy-seq heap-page))
+    (unwind-protect
+         (progn
+           (smgr-write relfilenode heap-block heap-page)
+           (visibilitymap-set-status
+            relfilenode heap-block
+            (logior +vm-all-visible-bit+ +vm-all-frozen-bit+))
+           (let ((*wal-ready* t))
+             (setf (aref changed-page 100) #x22
+                   (symbol-function 'visibilitymap-clear)
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (let ((staged-page
+                             (and *wal-page-batch*
+                                  (gethash
+                                   (wal-page-key relfilenode heap-block)
+                                   *wal-page-batch*))))
+                       (setf staged-heap-write-seen
+                             (and staged-page
+                                  (= (aref staged-page 100) #x22))))
+                     (error "injected failure before visibility-map clear")))
+             (unwind-protect
+                  (progn
+                    (setf injected-error
+                          (handler-case
+                              (progn
+                                (with-vacuum-page-publication
+                                    (relfilenode heap-block)
+                                  (buf-write relfilenode heap-block changed-page))
+                                nil)
+                            (error (condition)
+                              (search "injected failure before visibility-map clear"
+                                      (princ-to-string condition)))))
+                    (check injected-error
+                           "VACUUM page publication propagates a VM-clear failure")
+                    (check staged-heap-write-seen
+                           "fault is injected after the heap page is staged")
+                    (check (not (nth-value
+                                 1 (gethash (wal-page-key relfilenode heap-block)
+                                            *wal-page-cache*)))
+                           "failed VACUUM publication exposes no staged heap page")
+                    (check (not (nth-value
+                                 1 (gethash (wal-page-key relfilenode 0 :visibility)
+                                            *wal-page-cache*)))
+                           "failed VACUUM publication exposes no staged VM page")
+                    (check (equalp (buf-read relfilenode heap-block) heap-page)
+                           "failed VACUUM publication preserves the original heap page")
+                    (check (= (visibilitymap-status relfilenode heap-block)
+                              (logior +vm-all-visible-bit+
+                                      +vm-all-frozen-bit+))
+                           "failed VACUUM publication preserves visibility bits"))
+               (setf (symbol-function 'visibilitymap-clear)
+                     original-visibilitymap-clear))
+             (with-vacuum-page-publication (relfilenode heap-block)
+               (buf-write relfilenode heap-block changed-page))
+             (check (and (nth-value
+                          1 (gethash (wal-page-key relfilenode heap-block)
+                                     *wal-page-cache*))
+                         (nth-value
+                          1 (gethash (wal-page-key relfilenode 0 :visibility)
+                                     *wal-page-cache*)))
+                    "successful VACUUM publication exposes both pages together")
+             (check (= (aref (buf-read relfilenode heap-block) 100) #x22)
+                    "successful VACUUM publication exposes the heap edit")
+             (check (zerop (visibilitymap-status relfilenode heap-block))
+                    "successful VACUUM publication clears visibility bits")))
+      (setf (symbol-function 'visibilitymap-clear)
+            original-visibilitymap-clear)
+      (smgr-forget relfilenode :delete t))))
+
 (defun test-vacuum-reuses-tid-clears-index-and-vm ()
   (let* ((*heap-fsms* (make-hash-table :test #'eql))
          (*wal-ready* nil)
