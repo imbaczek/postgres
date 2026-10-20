@@ -13,14 +13,16 @@
 (defconstant +wal-record-batch-start+ 6)
 (defconstant +wal-record-catalog-chunk+ 7)
 (defconstant +wal-record-catalog-commit+ 8)
+(defconstant +wal-record-maintenance+ 9)
 (defconstant +wal-catalog-chunk-header-size+ 8)
-(defconstant +wal-version+ 2)
+(defconstant +wal-version-v2+ 2)
+(defconstant +wal-version+ 3)
 
 (defstruct wal-record
-  type xid start end payload)
+  version type xid start end payload)
 
 (defstruct wal-page-image
-  relfilenode block page)
+  relfilenode (fork :main) block page)
 
 (defvar *wal-lock* (sb-thread:make-mutex :name "pg wal and page cache lock"))
 (defvar *wal-page-cache* (make-hash-table :test #'equal))
@@ -132,36 +134,54 @@
           do (setf crc (logxor (ash crc -8) (aref *wal-crc32-table* slot))))
     (logxor crc #xFFFFFFFF)))
 
-(defun wal-page-checksum (page relfilenode block)
+(defun wal-page-fork-id (fork)
+  (case fork
+    (:main 0)
+    (:visibility 1)
+    (otherwise (error "unknown relation fork ~a" fork))))
+
+(defun wal-page-fork-from-id (fork-id)
+  (case fork-id
+    (0 :main)
+    (1 :visibility)
+    (otherwise (error "unknown WAL relation fork id ~a" fork-id))))
+
+(defun wal-page-checksum (page relfilenode block &optional (fork :main))
   "Return a location-bound nonzero CRC16 for PAGE, reserving legacy values."
-  (let ((copy (make-array (+ 8 (length page))
-                          :element-type '(unsigned-byte 8)
-                          :initial-element 0)))
+  (let* ((main-p (eq fork :main))
+         (identity-size (if main-p 8 12))
+         (copy (make-array (+ identity-size (length page))
+                           :element-type '(unsigned-byte 8)
+                           :initial-element 0)))
     (page-set-u32 copy 0 relfilenode)
-    (page-set-u32 copy 4 block)
-    (replace copy page :start1 8)
-    (page-set-u16 copy (+ 8 +pd-checksum-off+) 0)
+    (if main-p
+        (page-set-u32 copy 4 block)
+        (progn
+          (page-set-u32 copy 4 (wal-page-fork-id fork))
+          (page-set-u32 copy 8 block)))
+    (replace copy page :start1 identity-size)
+    (page-set-u16 copy (+ identity-size +pd-checksum-off+) 0)
     (let ((checksum (logand (wal-crc32 copy) #xFFFF)))
       (if (<= checksum 3) (+ checksum 4) checksum))))
 
-(defun wal-stamp-page (page lsn relfilenode block)
+(defun wal-stamp-page (page lsn relfilenode block &optional (fork :main))
   (page-set-u64 page +pd-lsn-off+ lsn)
   (page-set-u16 page +pd-checksum-off+ 0)
   (page-set-u16 page +pd-checksum-off+
-                (wal-page-checksum page relfilenode block))
+                (wal-page-checksum page relfilenode block fork))
   page)
 
-(defun wal-verify-page (page relfilenode block)
+(defun wal-verify-page (page relfilenode block &optional (fork :main))
   (let ((lsn (page-u64 page +pd-lsn-off+))
         (checksum (page-u16 page +pd-checksum-off+)))
     (if (zerop lsn)
         ;; New pages staged in memory and legacy pages both have no WAL LSN.
         ;; Persisted WAL pages always carry a nonzero LSN and must have a CRC.
         (zerop checksum)
-        (= checksum (wal-page-checksum page relfilenode block)))))
+        (= checksum (wal-page-checksum page relfilenode block fork)))))
 
-(defun wal-page-key (relfilenode block)
-  (cons relfilenode block))
+(defun wal-page-key (relfilenode block &optional (fork :main))
+  (list relfilenode fork block))
 
 (defun wal-copy-dirty-page (page)
   "Copy PAGE without its persisted LSN/checksum until it is WAL-logged."
@@ -170,11 +190,11 @@
     (page-set-u16 copy +pd-checksum-off+ 0)
     copy))
 
-(defun wal-visible-page-under-lock (relfilenode block)
-  (let ((key (wal-page-key relfilenode block)))
+(defun wal-visible-page-under-lock (relfilenode block fork)
+  (let ((key (wal-page-key relfilenode block fork)))
     (or (and *wal-page-batch* (gethash key *wal-page-batch*))
         (gethash key *wal-page-cache*)
-        (smgr-read relfilenode block))))
+        (smgr-read relfilenode block fork))))
 
 (defmacro with-wal-page-state-lock (&body body)
   "Use the current page batch, or lock the shared WAL page state."
@@ -183,18 +203,18 @@
        (sb-thread:with-mutex (*wal-lock*)
          ,@body)))
 
-(defun wal-buffer-read (relfilenode block)
+(defun wal-buffer-read (relfilenode block &optional (fork :main))
   (if (not *wal-ready*)
-      (smgr-read relfilenode block)
+      (smgr-read relfilenode block fork)
       (let ((page
               (with-wal-page-state-lock
-                (wal-visible-page-under-lock relfilenode block))))
+                (wal-visible-page-under-lock relfilenode block fork))))
         (when page (copy-seq page)))))
 
-(defun wal-buffer-write (relfilenode block page)
+(defun wal-buffer-write (relfilenode block page &optional (fork :main))
   (unless *wal-ready*
-    (return-from wal-buffer-write (smgr-write relfilenode block page)))
-  (let ((key (wal-page-key relfilenode block))
+    (return-from wal-buffer-write (smgr-write relfilenode block page fork)))
+  (let ((key (wal-page-key relfilenode block fork))
         (copy (wal-copy-dirty-page page)))
     (with-wal-page-state-lock
       (setf (gethash key (if *wal-page-batch*
@@ -204,31 +224,32 @@
   (wal-test-pause :after-page-stage)
   (values))
 
-(defun wal-visible-nblocks-under-lock (relfilenode)
-  (let ((nblocks (smgr-nblocks relfilenode)))
+(defun wal-visible-nblocks-under-lock (relfilenode fork)
+  (let ((nblocks (smgr-nblocks relfilenode fork)))
     (flet ((count-map (map)
              (when map
                (maphash (lambda (key page)
                           (declare (ignore page))
-                          (when (eql (car key) relfilenode)
-                            (setf nblocks (max nblocks (1+ (cdr key))))))
+                          (when (and (eql (first key) relfilenode)
+                                     (eq (second key) fork))
+                            (setf nblocks (max nblocks (1+ (third key))))))
                         map))))
       (count-map *wal-page-cache*)
       (count-map *wal-page-batch*))
     nblocks))
 
-(defun wal-buffer-nblocks (relfilenode)
+(defun wal-buffer-nblocks (relfilenode &optional (fork :main))
   (if (not *wal-ready*)
-      (smgr-nblocks relfilenode)
+      (smgr-nblocks relfilenode fork)
       (with-wal-page-state-lock
-        (wal-visible-nblocks-under-lock relfilenode))))
+        (wal-visible-nblocks-under-lock relfilenode fork))))
 
-(defun wal-buffer-extend (relfilenode page)
+(defun wal-buffer-extend (relfilenode page &optional (fork :main))
   (if (not *wal-ready*)
-      (smgr-extend relfilenode page)
+      (smgr-extend relfilenode page fork)
       (with-wal-page-state-lock
-        (let ((block (wal-visible-nblocks-under-lock relfilenode)))
-          (setf (gethash (wal-page-key relfilenode block)
+        (let ((block (wal-visible-nblocks-under-lock relfilenode fork)))
+          (setf (gethash (wal-page-key relfilenode block fork)
                          (if *wal-page-batch*
                              *wal-page-batch*
                              *wal-page-cache*))
@@ -263,7 +284,7 @@
       (let ((keys '()))
         (maphash (lambda (key page)
                    (declare (ignore page))
-                   (when (eql (car key) relfilenode)
+                   (when (eql (first key) relfilenode)
                      (push key keys)))
                  *wal-page-cache*)
         (dolist (key keys) (remhash key *wal-page-cache*)))))
@@ -272,22 +293,28 @@
 (defun wal-page-images (&optional excluded-relfilenodes)
   (let ((images '()))
     (maphash (lambda (key page)
-               (unless (member (car key) excluded-relfilenodes :test #'eql)
-                 (push (make-wal-page-image :relfilenode (car key)
-                                            :block (cdr key)
+               (unless (member (first key) excluded-relfilenodes :test #'eql)
+                 (push (make-wal-page-image :relfilenode (first key)
+                                            :fork (second key)
+                                            :block (third key)
                                             :page (copy-seq page))
                        images)))
              *wal-page-cache*)
     (sort images
           (lambda (a b)
-            (if (= (wal-page-image-relfilenode a)
-                   (wal-page-image-relfilenode b))
-                (< (wal-page-image-block a) (wal-page-image-block b))
-                (< (wal-page-image-relfilenode a)
-                   (wal-page-image-relfilenode b)))))))
+            (cond ((/= (wal-page-image-relfilenode a)
+                       (wal-page-image-relfilenode b))
+                   (< (wal-page-image-relfilenode a)
+                      (wal-page-image-relfilenode b)))
+                  ((/= (wal-page-fork-id (wal-page-image-fork a))
+                       (wal-page-fork-id (wal-page-image-fork b)))
+                   (< (wal-page-fork-id (wal-page-image-fork a))
+                      (wal-page-fork-id (wal-page-image-fork b))))
+                  (t (< (wal-page-image-block a)
+                        (wal-page-image-block b))))))))
 
 (defun wal-page-payload-length (images)
-  (+ 4 (* (length images) (+ 8 +blcksz+))))
+  (+ 4 (* (length images) (+ 12 +blcksz+))))
 
 (defun wal-encode-page-images (images lsn)
   (let ((payload (make-array (wal-page-payload-length images)
@@ -298,33 +325,42 @@
     (dolist (image images)
       (wal-stamp-page (wal-page-image-page image) lsn
                       (wal-page-image-relfilenode image)
-                      (wal-page-image-block image))
+                      (wal-page-image-block image)
+                      (wal-page-image-fork image))
       (wal-set-u32 payload offset (wal-page-image-relfilenode image))
-      (wal-set-u32 payload (+ offset 4) (wal-page-image-block image))
-      (replace payload (wal-page-image-page image) :start1 (+ offset 8))
-      (incf offset (+ 8 +blcksz+)))
+      (wal-set-u32 payload (+ offset 4)
+                   (wal-page-fork-id (wal-page-image-fork image)))
+      (wal-set-u32 payload (+ offset 8) (wal-page-image-block image))
+      (replace payload (wal-page-image-page image) :start1 (+ offset 12))
+      (incf offset (+ 12 +blcksz+)))
     payload))
 
-(defun wal-decode-page-images (payload lsn)
+(defun wal-decode-page-images (payload lsn &optional (version +wal-version+))
   (when (< (length payload) 4)
     (error "WAL page-image record is too short"))
   (let* ((count (wal-u32 payload 0))
-         (expected (+ 4 (* count (+ 8 +blcksz+))))
+         (header-size (if (= version +wal-version-v2+) 8 12))
+         (expected (+ 4 (* count (+ header-size +blcksz+))))
          (offset 4)
          (images '()))
     (unless (= expected (length payload))
       (error "WAL page-image record has an invalid length"))
     (loop repeat count
           do (let* ((relfilenode (wal-u32 payload offset))
-                    (block (wal-u32 payload (+ offset 4)))
-                    (page (subseq payload (+ offset 8) (+ offset 8 +blcksz+))))
+                    (fork (if (= version +wal-version-v2+)
+                              :main
+                              (wal-page-fork-from-id
+                               (wal-u32 payload (+ offset 4)))))
+                    (block (wal-u32 payload (+ offset (if (= version +wal-version-v2+) 4 8))))
+                    (page-offset (+ offset header-size))
+                    (page (subseq payload page-offset (+ page-offset +blcksz+))))
                (unless (and (= (page-u64 page +pd-lsn-off+) lsn)
-                            (wal-verify-page page relfilenode block))
+                            (wal-verify-page page relfilenode block fork))
                  (error "WAL page image has an invalid LSN or checksum"))
                (push (make-wal-page-image :relfilenode relfilenode
-                                          :block block :page page)
+                                          :fork fork :block block :page page)
                      images)
-               (incf offset (+ 8 +blcksz+))))
+               (incf offset (+ header-size +blcksz+))))
     (nreverse images)))
 
 (defun wal-segment-and-offset (lsn)
@@ -465,7 +501,8 @@
     (loop for image in images
           do (smgr-write (wal-page-image-relfilenode image)
                          (wal-page-image-block image)
-                         (wal-page-image-page image))
+                         (wal-page-image-page image)
+                         (wal-page-image-fork image))
              (when (and (not paused)
                         fault-on-first-write split-p
                         (or (and *wal-test-pause-relfilenode*
@@ -482,7 +519,7 @@
     (maphash (lambda (key page)
                (declare (ignore page))
                (when (or (null excluded-relfilenodes)
-                         (member (car key) excluded-relfilenodes :test #'eql))
+                         (member (first key) excluded-relfilenodes :test #'eql))
                  (push key keys)))
              *wal-page-cache*)
     (dolist (key keys) (remhash key *wal-page-cache*)))
@@ -507,6 +544,25 @@
       (wal-flush)
       (wal-test-pause :after-wal-flush)
       (funcall after-durable-function)
+      (wal-apply-page-images images :split-p split-p
+                                    :fault-on-first-write t)
+      (wal-clear-page-cache)
+      (setf *wal-pending-btree-split* nil)))
+  (values))
+
+(defun wal-commit-maintenance ()
+  "Durably publish staged storage maintenance without committing a user XID."
+  (unless *wal-ready*
+    (return-from wal-commit-maintenance (values)))
+  (with-wal-critical
+    (let* ((split-p *wal-pending-btree-split*)
+           (images (wal-page-images)))
+      (wal-append-batch-start)
+      (wal-append-page-images images)
+      (wal-append-record +wal-record-maintenance+ 0
+                         (make-array 0 :element-type '(unsigned-byte 8)))
+      (wal-flush)
+      (wal-test-pause :after-wal-flush)
       (wal-apply-page-images images :split-p split-p
                                     :fault-on-first-write t)
       (wal-clear-page-cache)
@@ -683,35 +739,40 @@
            collect (parse-integer name :radix 16))
    #'<))
 
-(defun wal-valid-type-p (type)
-  (member type (list +wal-record-pages+ +wal-record-commit+
-                     +wal-record-catalog+ +wal-record-checkpoint+
-                     +wal-record-clog-reset+ +wal-record-batch-start+
-                     +wal-record-catalog-chunk+
-                     +wal-record-catalog-commit+)))
+(defun wal-valid-type-p (type version)
+  (and (member type (list +wal-record-pages+ +wal-record-commit+
+                          +wal-record-catalog+ +wal-record-checkpoint+
+                          +wal-record-clog-reset+ +wal-record-batch-start+
+                          +wal-record-catalog-chunk+
+                          +wal-record-catalog-commit+
+                          +wal-record-maintenance+))
+       (or (/= type +wal-record-maintenance+)
+           (= version +wal-version+))))
 
 (defun wal-decode-record (bytes expected-lsn)
-  (unless (and (>= (length bytes) +wal-header-size+)
-               (= (aref bytes 0) (char-code #\P))
-               (= (aref bytes 1) (char-code #\G))
-               (= (aref bytes 2) (char-code #\W))
-               (= (aref bytes 3) (char-code #\L))
-               (= (wal-u16 bytes 4) +wal-version+)
-               (= (wal-u32 bytes 8) (length bytes))
-               (= (wal-u64 bytes 12) expected-lsn)
-               (wal-valid-type-p (wal-u16 bytes 6)))
-    (error "invalid WAL record at LSN ~a" expected-lsn))
-  (let ((saved-crc (wal-u32 bytes 28))
-        (copy (copy-seq bytes)))
-    (wal-set-u32 copy 28 0)
-    (unless (= saved-crc (wal-crc32 copy))
-      (error "WAL checksum mismatch at LSN ~a" expected-lsn)))
-  (let* ((type (wal-u16 bytes 6))
-         (xid (wal-u64 bytes 20))
-         (payload (subseq bytes +wal-header-size+))
-         (end (+ expected-lsn (length bytes))))
-    (make-wal-record :type type :xid xid :start expected-lsn :end end
-                     :payload payload)))
+  (let ((version (and (>= (length bytes) +wal-header-size+)
+                      (wal-u16 bytes 4))))
+    (unless (and (>= (length bytes) +wal-header-size+)
+                 (= (aref bytes 0) (char-code #\P))
+                 (= (aref bytes 1) (char-code #\G))
+                 (= (aref bytes 2) (char-code #\W))
+                 (= (aref bytes 3) (char-code #\L))
+                 (member version (list +wal-version-v2+ +wal-version+))
+                 (= (wal-u32 bytes 8) (length bytes))
+                 (= (wal-u64 bytes 12) expected-lsn)
+                 (wal-valid-type-p (wal-u16 bytes 6) version))
+      (error "invalid WAL record at LSN ~a" expected-lsn))
+    (let ((saved-crc (wal-u32 bytes 28))
+          (copy (copy-seq bytes)))
+      (wal-set-u32 copy 28 0)
+      (unless (= saved-crc (wal-crc32 copy))
+        (error "WAL checksum mismatch at LSN ~a" expected-lsn)))
+    (let* ((type (wal-u16 bytes 6))
+           (xid (wal-u64 bytes 20))
+           (payload (subseq bytes +wal-header-size+))
+           (end (+ expected-lsn (length bytes))))
+      (make-wal-record :version version :type type :xid xid
+                       :start expected-lsn :end end :payload payload))))
 
 (defun wal-truncate-tail (path offset)
   (with-open-file (stream path :direction :io
@@ -909,7 +970,8 @@
        (setf *wal-recovery-page-images*
              (nconc (reverse
                      (wal-decode-page-images (wal-record-payload record)
-                                             (wal-record-end record)))
+                                             (wal-record-end record)
+                                             (wal-record-version record)))
                     *wal-recovery-page-images*)))
       (#.+wal-record-commit+
        (unless (zerop (length (wal-record-payload record)))
@@ -948,6 +1010,12 @@
        (unless (zerop (length (wal-record-payload record)))
          (error "WAL checkpoint record has an invalid payload"))
        (wal-replay-finish-batch (lambda () #'values)))
+      (#.+wal-record-maintenance+
+       (unless (zerop (wal-record-xid record))
+         (error "WAL maintenance record must not carry a transaction ID"))
+       (unless (zerop (length (wal-record-payload record)))
+         (error "WAL maintenance record has an invalid payload"))
+       (wal-replay-finish-batch (lambda () #'values)))
       (#.+wal-record-clog-reset+
        (wal-read-u64-payload (wal-record-payload record))
        (wal-replay-finish-batch
@@ -985,8 +1053,11 @@
                                   collect (subseq line start end)
                                   while end
                                   do (setf start (1+ end)))))
-               (checkpoint-lsn (and (= (length fields) 4)
-                                    (string= (first fields) "PGWAL3")
+               (control-version (and (= (length fields) 4)
+                                     (find (first fields)
+                                           '("PGWAL2" "PGWAL3")
+                                           :test #'string=)))
+               (checkpoint-lsn (and control-version
                                     (ignore-errors
                                      (parse-integer (second fields)))))
                (durable-lsn (and checkpoint-lsn
@@ -995,8 +1066,8 @@
                (crc (and durable-lsn
                          (ignore-errors
                           (parse-integer (fourth fields) :radix 16))))
-               (prefix (and checkpoint-lsn durable-lsn
-                            (format nil "PGWAL3 ~a ~a"
+               (prefix (and control-version checkpoint-lsn durable-lsn
+                            (format nil "~a ~a ~a" control-version
                                     checkpoint-lsn durable-lsn))))
           (unless (and checkpoint-lsn durable-lsn crc
                        (= crc (wal-crc32 (string->bytes prefix)))
@@ -1118,7 +1189,8 @@
         (removed nil))
     (dolist (path (directory (merge-pathnames "*" base)))
       (let ((relfilenode (ignore-errors
-                          (and (null (pathname-type path))
+                          (and (member (pathname-type path) '(nil "vm")
+                                       :test #'equal)
                                (parse-integer (pathname-name path))))))
         (when (and relfilenode (not (member relfilenode known :test #'eql)))
           (smgr-forget relfilenode :delete t)

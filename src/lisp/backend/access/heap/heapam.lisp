@@ -36,6 +36,17 @@
   (min (1- +heap-fsm-category-count+)
        (floor (max 0 space) +heap-fsm-category-size+)))
 
+(defun heap-page-insert-capacity (page)
+  "Return free bytes plus one line pointer when LP_UNUSED can be reused."
+  (+ (page-free-space page)
+     (if (loop for offnum from 1 to (page-lp-count page)
+                 thereis (multiple-value-bind (off flags len)
+                             (page-get-lp page offnum)
+                           (declare (ignore off len))
+                           (= flags +lp-unused+)))
+         +size-of-item-id+
+         0)))
+
 (defun heap-fsm-forget (relfilenode)
   (remhash relfilenode *heap-fsms*)
   (values))
@@ -96,7 +107,8 @@
         (dotimes (block (buf-nblocks relfilenode))
           (let ((page (buf-read relfilenode block)))
             (when page
-              (heap-fsm-record-page fsm block (page-free-space page)))))
+              (heap-fsm-record-page fsm block
+                                    (heap-page-insert-capacity page)))))
         (setf (gethash relfilenode *heap-fsms*) fsm))))
 
 (defun column-align (col)
@@ -251,7 +263,7 @@
          (fsm (heap-fsm-for-relation relfilenode))
          (required (+ +size-of-item-id+ (maxalign (length tuple)))))
     (labels ((add-to-page (page block)
-               (let ((offnum (page-add-item page tuple :allow-reuse nil)))
+               (let ((offnum (page-add-item page tuple :allow-reuse t)))
                  (when offnum
                    (multiple-value-bind (toff tflags tlen)
                        (page-get-lp page offnum)
@@ -260,9 +272,12 @@
                                    block)
                      (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+)
                                    offnum))
-                   (buf-write relfilenode block page)
+                   (with-wal-page-batch
+                     (buf-write relfilenode block page)
+                     (visibilitymap-clear relfilenode block))
                    (mark-dirty relfilenode)
-                   (heap-fsm-record-page fsm block (page-free-space page)))
+                   (heap-fsm-record-page fsm block
+                                         (heap-page-insert-capacity page)))
                  offnum)))
       (loop for block = (heap-fsm-take-page fsm required)
             while block
@@ -273,7 +288,8 @@
                        (return-from heapam-insert (values block offnum))
                        ;; FSM entries are advisory, like PostgreSQL's. Refresh
                        ;; one if an intervening page change made it stale.
-                       (heap-fsm-record-page fsm block (page-free-space page)))))
+                       (heap-fsm-record-page fsm block
+                                             (heap-page-insert-capacity page)))))
       ;; Tuple TIDs remain stable for concurrent update-chain rechecks. Without
       ;; VACUUM to establish a safe removal horizon, extend rather than prune.
       (let* ((block (buf-nblocks relfilenode))
@@ -285,9 +301,12 @@
           (declare (ignore tflags tlen))
           (page-set-u32 page (+ toff +heap-tuple-ctid-block-off+) block)
           (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+) offnum))
-        (buf-write relfilenode block page)
+        (with-wal-page-batch
+          (buf-write relfilenode block page)
+          (visibilitymap-clear relfilenode block))
         (mark-dirty relfilenode)
-        (heap-fsm-record-page fsm block (page-free-space page))
+        (heap-fsm-record-page fsm block
+                              (heap-page-insert-capacity page))
         (values block offnum)))))
 
 (defmacro with-heap-tuple-edit ((page offset relfilenode block offnum) &body body)
@@ -311,7 +330,9 @@
                  (,offset ,tuple-offset))
              (multiple-value-prog1
                  (progn ,@body)
-               (buf-write ,relfilenode-value ,block-value ,page-value)
+               (with-wal-page-batch
+                 (buf-write ,relfilenode-value ,block-value ,page-value)
+                 (visibilitymap-clear ,relfilenode-value ,block-value))
                (mark-dirty ,relfilenode-value))))))))
 
 (defun heapam-set-xmax (relfilenode block offnum xmax cid)
@@ -412,48 +433,6 @@ whose xmax was set, and that tuple's physical block and offset."
   "Keep heap TIDs stable until VACUUM can establish a removal horizon."
   (declare (ignore relfilenode block))
   0)
-
-(defun heapam-freeze-relation-xids
-    (relfilenode columns old-epoch
-     &key (fsync-function #'smgr-fsync) after-page-function)
-  "Freeze old-cycle tuple XIDs after all transactions and snapshots drain."
-  (declare (ignore columns))
-  (let ((changed nil)
-        (epoch-base (* old-epoch +xid-cycle+)))
-    (dotimes (block (buf-nblocks relfilenode))
-      (check-for-interrupts)
-      (let ((page (buf-read relfilenode block))
-            (page-changed nil))
-        (when page
-          (do-live-page-items (page offnum off len)
-            (let* ((xmin (page-u32 page (+ off +heap-tuple-xmin-off+)))
-                   (xmax (page-u32 page (+ off +heap-tuple-xmax-off+)))
-                   (full-xmin (and (>= xmin +first-normal-xid+)
-                                   (+ epoch-base xmin)))
-                   (full-xmax (and (>= xmax +first-normal-xid+)
-                                   (+ epoch-base xmax))))
-              (when full-xmin
-                (page-set-u32
-                 page (+ off +heap-tuple-xmin-off+)
-                 (if (= (clog-get full-xmin) +clog-committed+)
-                     +frozen-xid+
-                     +invalid-xid+))
-                (setf page-changed t))
-              (when full-xmax
-                (page-set-u32
-                 page (+ off +heap-tuple-xmax-off+)
-                 (if (= (clog-get full-xmax) +clog-committed+)
-                     +frozen-xid+
-                     +invalid-xid+))
-                (setf page-changed t))))
-          (when page-changed
-            (buf-write relfilenode block page)
-            (setf changed t)
-            (when after-page-function
-              (funcall after-page-function relfilenode block))))))
-    (when changed
-      (funcall fsync-function relfilenode)))
-  (values))
 
 (defun htup-visible-p (tuple snapshot)
   (heap-tuple-visible-p (htup-xmin tuple)

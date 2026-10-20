@@ -72,8 +72,11 @@
       (check (= (page-lp-count p) 2) "two line pointers")
       (page-mark-dead p 1)
       (check (= (page-lp-count p) 2) "dead slot keeps the LP")
+      (check (= (page-add-item p item :allow-reuse t) 3)
+             "dead slot is not reused before index cleanup")
+      (page-mark-unused p 1)
       (check (= (page-add-item p item :allow-reuse t) 1)
-             "dead slot is reused when ALLOW-REUSE"))))
+             "unused slot is reused when ALLOW-REUSE"))))
 
 (defun test-atomic-output ()
   (let* ((directory (merge-pathnames "atomic-output/" *pgdata*))
@@ -1858,7 +1861,7 @@
   (let* ((test-pgdata
            (merge-pathnames "wal-invalid-catalog-terminal-test/" *pgdata*))
          (*pgdata* test-pgdata)
-         (*relation-streams* (make-hash-table :test #'eql))
+         (*relation-streams* (make-hash-table :test #'equal))
          (*wal-ready* t)
          (*wal-checkpoint-lsn* 0)
          (*wal-durable-lsn* 0)
@@ -2834,30 +2837,39 @@
            (buf-extend relfilenode page)
            (complete-xid-wraparound)
            (let ((frozen-page (buf-read relfilenode 0)))
-             (loop for expected in '((2 0) (2 2) (0 0) (2 0))
+             (loop for expected-flags in (list +lp-normal+ +lp-unused+
+                                               +lp-unused+ +lp-normal+)
+                   for expected-xmin in '(2 nil nil 2)
+                   for expected-xmax in '(0 nil nil 0)
                    for offnum from 1
                    do (multiple-value-bind (off flags len)
                           (page-get-lp frozen-page offnum)
-                        (declare (ignore flags len))
-                        (check (= (page-u32 frozen-page
-                                            (+ off +heap-tuple-xmin-off+))
-                                  (first expected))
-                               "wraparound freezes old xmin status")
-                        (check (= (page-u32 frozen-page
-                                            (+ off +heap-tuple-xmax-off+))
-                                  (second expected))
-                               "wraparound freezes old xmax status"))))
+                        (declare (ignore len))
+                        (check (= flags expected-flags)
+                               "wraparound prunes old dead tuples")
+                        (when (= flags +lp-normal+)
+                          (check (= (page-u32 frozen-page
+                                              (+ off +heap-tuple-xmin-off+))
+                                    expected-xmin)
+                                 "wraparound freezes old xmin status")
+                          (check (= (page-u32 frozen-page
+                                              (+ off +heap-tuple-xmax-off+))
+                                    expected-xmax)
+                                 "wraparound clears old xmax status")))))
            (let ((snapshot (make-snapshot-struct :xmin +first-normal-xid+
                                                  :xmax *next-xid*
                                                  :xip '() :curcid 10)))
              (loop for expected-visible in '(t nil nil t)
                    for offnum from 1
                    for tuple = (heapam-get-tuple relfilenode 0 offnum columns)
-                   do (check (eql (heap-tuple-visible-p
-                                   (htup-xmin tuple) (htup-xmax tuple)
-                                   (htup-cid tuple) snapshot nil)
-                                  expected-visible)
-                             "pre-wrap tuple visibility survives freezing")))
+                   do (if expected-visible
+                          (check (and tuple
+                                      (heap-tuple-visible-p
+                                       (htup-xmin tuple) (htup-xmax tuple)
+                                       (htup-cid tuple) snapshot nil))
+                                 "pre-wrap tuple visibility survives freezing")
+                          (check (null tuple)
+                                 "wraparound removes no-longer-visible tuples"))))
            (check (= (clog-get 7) +clog-in-progress+)
                   "wraparound resets the old CLOG cycle")
            (check (xid-aborted-p 7)
@@ -3340,7 +3352,8 @@
          (sexp (class-to-sexp class))
          (copy (class-from-sexp sexp)))
     (check (equal sexp
-                  '(:oid 50 :name "codec" :relfilenode 51
+                  `(:oid 50 :name "codec" :relfilenode 51
+                    :relfrozenxid ,+first-normal-xid+
                     :columns ((:name "value" :type :int4 :typmod -1
                                :attnum 1 :notnull t))
                     :indexes (52)))

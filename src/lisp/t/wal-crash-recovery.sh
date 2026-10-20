@@ -543,6 +543,9 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.wal"))):
     while offset + 32 <= len(data):
         if data[offset:offset + 4] != b"PGWL":
             raise SystemExit("invalid WAL while inspecting checkpoint images")
+        version = struct.unpack_from("<H", data, offset + 4)[0]
+        if version not in (2, 3):
+            raise SystemExit("unsupported WAL version while inspecting checkpoint images")
         record_type = struct.unpack_from("<H", data, offset + 6)[0]
         length = struct.unpack_from("<I", data, offset + 8)[0]
         if length < 32 or offset + length > len(data):
@@ -552,17 +555,22 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.wal"))):
             group_images = {}
         elif record_type == 1 and group_images is not None:
             count = struct.unpack_from("<I", data, payload)[0]
-            expected = 32 + 4 + count * (8 + page_size)
+            image_header_size = 8 if version == 2 else 12
+            expected = 32 + 4 + count * (image_header_size + page_size)
             if length != expected:
                 raise SystemExit("invalid page-image length in checkpoint WAL")
             item = payload + 4
             for _ in range(count):
-                relfilenode, block = struct.unpack_from("<II", data, item)
-                page = item + 8
-                if relfilenode == heap_relfilenode:
+                if version == 2:
+                    relfilenode, block = struct.unpack_from("<II", data, item)
+                    fork_id = 0
+                else:
+                    relfilenode, fork_id, block = struct.unpack_from("<III", data, item)
+                page = item + image_header_size
+                if relfilenode == heap_relfilenode and fork_id == 0:
                     page_lsn = struct.unpack_from("<Q", data, page)[0]
                     group_images[block] = page_lsn
-                item += 8 + page_size
+                item += image_header_size + page_size
         elif record_type == 4 and group_images is not None:
             checkpoint_images = group_images
             group_images = None

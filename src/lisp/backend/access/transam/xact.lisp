@@ -158,6 +158,7 @@ INTERRUPT-THREAD, so it needs no flag."
 (defvar *relation-build-groups* (make-hash-table :test #'eq))
 (defvar *relation-writers* (make-hash-table :test #'eql))
 (defvar *relation-readers* (make-hash-table :test #'eql))
+(defvar *relation-maintainers* (make-hash-table :test #'eql))
 
 (defun broadcast-xact ()
   (sb-thread:with-mutex (*xact-cv-mutex*)
@@ -178,6 +179,14 @@ INTERRUPT-THREAD, so it needs no flag."
 (defun xid-next-epoch-boundary (xid)
   (+ (* (1+ (floor xid +xid-cycle+)) +xid-cycle+)
      +first-normal-xid+))
+
+(defun xid-epoch-start (xid)
+  (+ (* (floor xid +xid-cycle+) +xid-cycle+)
+     +first-normal-xid+))
+
+(defun next-full-xid ()
+  (sb-thread:with-mutex (*xid-lock*)
+    *next-xid*))
 
 (defun advance-full-xid (xid)
   "Advance a FullTransactionId, skipping the three special low XIDs."
@@ -233,7 +242,9 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
       (funcall fsync-directory-function (pgdata-path "global/"))))
   (values))
 
-(declaim (ftype function freeze-all-heap-xids))
+(defconstant +manual-vacuum-xid-stop-age+ 200000000)
+
+(declaim (ftype function catalog-oldest-relfrozenxid))
 
 (defun active-xids-empty-p ()
   (sb-thread:with-mutex (*xid-lock*)
@@ -323,11 +334,10 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
                 (funcall save-marker-function boundary))
               (funcall wait-for-xids-function)
               (funcall wait-for-snapshots-function)
-              (with-write-lock
-                (funcall freeze-function
-                         (1- (floor boundary +xid-cycle+)))
-                (check-for-interrupts)
-                (funcall reset-clog-function))
+              (funcall freeze-function
+                       (1- (floor boundary +xid-cycle+)))
+              (check-for-interrupts)
+              (funcall reset-clog-function)
               (check-for-interrupts)
               (funcall delete-marker-function)
               (sb-thread:with-mutex (*xid-wrap-lock*)
@@ -371,33 +381,46 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
         (complete-xid-wraparound))))
   (wait-for-xid-wraparound backend))
 
-(defun begin-statement-snapshot (backend)
-  (wait-for-xid-wraparound backend #'note-snapshot-start))
+(defun begin-statement-snapshot (backend curcid)
+  (wait-for-xid-wraparound
+   backend
+   (lambda ()
+     (note-snapshot-start)
+     (handler-case (make-snapshot curcid :register t)
+       (error (condition)
+         (note-snapshot-end)
+         (error condition))))))
 
 (defun assign-xid ()
-  (sb-thread:with-mutex (*xid-lock*)
-    (when (> *next-xid* +max-xid+)
-      (ereport-fatal "54000" "transaction ID space exhausted"))
-    (when (and (first-normal-xid-of-epoch-p *next-xid*)
-               (not (eql *next-xid* *xid-wrap-completed-through*)))
-      (ereport "55000"
-               "transaction ID wraparound is waiting for a safe tuple freeze; retry the statement"))
-    (when (>= *next-xid* *xid-batch-end*)
-      (let ((old-end *xid-batch-end*)
-            (new-end (min +max-xid-one-past+
-                          (xid-next-epoch-boundary *next-xid*)
-                          (+ *next-xid* 1000))))
-        (setf *xid-batch-end* new-end)
-        (handler-case
-            (save-next-xid)
-          (error (e)
-            ;; Never hand out an XID unless its whole batch boundary is durable.
-            (setf *xid-batch-end* old-end)
-            (error e)))))
-    (let ((xid *next-xid*))
-      (setf *next-xid* (advance-full-xid xid))
-      (push xid *active-xids*)
-      xid)))
+  (let ((oldest-relfrozenxid (catalog-oldest-relfrozenxid)))
+    (sb-thread:with-mutex (*xid-lock*)
+      (when (> *next-xid* +max-xid+)
+        (ereport-fatal "54000" "transaction ID space exhausted"))
+      (when (and oldest-relfrozenxid
+                 (>= (- *next-xid* oldest-relfrozenxid)
+                     +manual-vacuum-xid-stop-age+))
+        (ereport "55000"
+                 "transaction ID allocation stopped because manual VACUUM is required"))
+      (when (and (first-normal-xid-of-epoch-p *next-xid*)
+                 (not (eql *next-xid* *xid-wrap-completed-through*)))
+        (ereport "55000"
+                 "transaction ID wraparound is waiting for a safe tuple freeze; retry the statement"))
+      (when (>= *next-xid* *xid-batch-end*)
+        (let ((old-end *xid-batch-end*)
+              (new-end (min +max-xid-one-past+
+                            (xid-next-epoch-boundary *next-xid*)
+                            (+ *next-xid* 1000))))
+          (setf *xid-batch-end* new-end)
+          (handler-case
+              (save-next-xid)
+            (error (e)
+              ;; Never hand out an XID unless its whole batch boundary is durable.
+              (setf *xid-batch-end* old-end)
+              (error e)))))
+      (let ((xid *next-xid*))
+        (setf *next-xid* (advance-full-xid xid))
+        (push xid *active-xids*)
+        xid))))
 
 (defun relation-build-group-has-user-p (token xid writers-p readers-p)
   (let ((group (gethash token *relation-build-groups*)))
@@ -450,7 +473,9 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
 
 (defun relation-build-user (relfilenodes own-xid wait-readers-p)
   (some (lambda (relfilenode)
-          (or (find-if (lambda (xid)
+          (or (let ((token (gethash relfilenode *relation-maintainers*)))
+                (when token (list :maintenance token)))
+              (find-if (lambda (xid)
                          (or (null own-xid) (/= xid own-xid)))
                        (gethash relfilenode *relation-writers*))
               (when wait-readers-p
@@ -486,7 +511,11 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
                           (relation-build-user relfilenodes own-xid
                                                wait-readers-p))))
               (unless user (return))
-              (wait-for-xid user)))
+              (if (and (consp user) (eq (first user) :maintenance))
+                  (sb-thread:with-mutex (*relation-lock-mutex*)
+                    (condition-wait-with-timeout *relation-lock-cv*
+                                                 *relation-lock-mutex*))
+                  (wait-for-xid user))))
           token)
       (error (e)
         (release-relation-build-locks relfilenodes token)
@@ -534,6 +563,63 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
             (progn ,@body)
          (release-relation-build-locks ,rels ,token)))))
 
+(defun acquire-relation-maintenance-locks (relfilenodes)
+  "Serialize VACUUM on relations while allowing registered DML to proceed."
+  (let ((relfilenodes (sort (remove-duplicates (copy-list relfilenodes) :test #'=)
+                            #'<))
+        (token (gensym "RELATION-MAINTENANCE-")))
+    (when (null relfilenodes)
+      (return-from acquire-relation-maintenance-locks nil))
+    (sb-thread:with-mutex (*relation-lock-mutex*)
+      (loop
+        (unless (some (lambda (relfilenode)
+                        (or (gethash relfilenode *relation-builders*)
+                            (gethash relfilenode *relation-maintainers*)))
+                      relfilenodes)
+          (dolist (relfilenode relfilenodes)
+            (setf (gethash relfilenode *relation-maintainers*) token))
+          (return))
+        (check-for-interrupts)
+        (condition-wait-with-timeout *relation-lock-cv*
+                                     *relation-lock-mutex*)))
+    (values relfilenodes token)))
+
+(defun release-relation-maintenance-locks (relfilenodes token)
+  (sb-thread:with-mutex (*relation-lock-mutex*)
+    (dolist (relfilenode relfilenodes)
+      (when (eq (gethash relfilenode *relation-maintainers*) token)
+        (remhash relfilenode *relation-maintainers*)))
+    (sb-thread:condition-broadcast *relation-lock-cv*))
+  (values))
+
+(defun acquire-relation-maintenance-lock (relfilenode)
+  "Serialize VACUUM on one relation while allowing registered DML to proceed."
+  (multiple-value-bind (relfilenodes token)
+      (acquire-relation-maintenance-locks (list relfilenode))
+    (declare (ignore relfilenodes))
+    token))
+
+(defun release-relation-maintenance-lock (relfilenode token)
+  (release-relation-maintenance-locks (list relfilenode) token))
+
+(defmacro with-relation-maintenance-locks ((relfilenodes) &body body)
+  (let ((rels (gensym "RELATIONS-"))
+        (token (gensym "MAINTENANCE-TOKEN-")))
+    `(multiple-value-bind (,rels ,token)
+         (acquire-relation-maintenance-locks ,relfilenodes)
+       (unwind-protect
+            (progn ,@body)
+         (release-relation-maintenance-locks ,rels ,token)))))
+
+(defmacro with-relation-maintenance-lock ((relfilenode) &body body)
+  (let ((rel (gensym "RELATION-"))
+        (token (gensym "MAINTENANCE-TOKEN-")))
+    `(let* ((,rel ,relfilenode)
+            (,token (acquire-relation-maintenance-lock ,rel)))
+       (unwind-protect
+            (progn ,@body)
+         (release-relation-maintenance-lock ,rel ,token)))))
+
 (defun release-relation-writer-xid (xid)
   "Forget XID's relation accesses atomically with its removal from active XIDs."
   ;; Keep the relation gate closed until the XID is no longer in snapshots.
@@ -574,12 +660,28 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
           (condition-wait-with-timeout *xact-cv* *xact-cv-mutex*)))) )
   (values))
 
-(defun make-snapshot (curcid)
+(defun make-snapshot (curcid &key register)
   (sb-thread:with-mutex (*xid-lock*)
     (let* ((xmax *next-xid*)
            (xip (copy-list *active-xids*))
-           (xmin (if xip (reduce #'min xip) xmax)))
-      (make-snapshot-struct :xmin xmin :xmax xmax :xip xip :curcid curcid))))
+           (xmin (if xip (reduce #'min xip) xmax))
+           (snapshot (make-snapshot-struct :xmin xmin :xmax xmax
+                                           :xip xip :curcid curcid)))
+      (when register
+        (register-active-snapshot snapshot))
+      snapshot)))
+
+(defun oldest-xmin ()
+  "Capture the oldest XID protected by a snapshot or active transaction."
+  (sb-thread:with-mutex (*xid-lock*)
+    (let ((oldest *next-xid*))
+      (dolist (xid *active-xids*)
+        (when (< xid oldest)
+          (setf oldest xid)))
+      (let ((snapshot-xmin (oldest-active-snapshot-xmin)))
+        (when (and snapshot-xmin (< snapshot-xmin oldest))
+          (setf oldest snapshot-xmin)))
+      oldest)))
 
 ;;; ---- per-backend transaction state ----
 
@@ -609,11 +711,7 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
             (backend-command-id b) 0)
       (set-backend-state b :in-progress))
     (incf (backend-command-id b))
-    (begin-statement-snapshot b)
-    (let ((snap (handler-case (make-snapshot (backend-command-id b))
-                  (error (e)
-                    (note-snapshot-end)
-                    (error e)))))
+    (let ((snap (begin-statement-snapshot b (backend-command-id b))))
       (setf (backend-snapshot b) snap)
       snap)))
 

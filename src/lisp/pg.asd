@@ -40,10 +40,14 @@
                      (:file "xact")))
        (:module "heap"
         :serial t
-        :components ((:file "heapam")))
+        :components ((:file "visibilitymap")
+                     (:file "heapam")))
        (:module "btree"
         :serial t
-        :components ((:file "btree")))))
+        :components ((:file "btree")))
+       (:module "vacuum"
+        :serial t
+        :components ((:file "vacuumlazy")))))
      (:module "postmaster"
       :serial t
       :components ((:file "postmaster")))
@@ -51,6 +55,9 @@
       :serial t
       :components ((:file "catalog")
                    (:file "namespace")))
+     (:module "commands"
+      :serial t
+      :components ((:file "vacuum")))
      (:module "parser"
       :serial t
       :components ((:file "scan")
@@ -61,6 +68,7 @@
       :components ((:file "exec_scan")
                    (:file "exec_insert")
                    (:file "exec_delete")
+                   (:file "exec_vacuum")
                    (:file "exec_simple")))
      (:module "tcop"
       :serial t

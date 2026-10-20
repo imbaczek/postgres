@@ -14,6 +14,7 @@
   oid
   name
   relfilenode
+  (relfrozenxid +first-normal-xid+)
   columns           ; simple-vector of pg-column, attnum order
   indexes)          ; list of index OIDs
 
@@ -47,6 +48,7 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
 
 (defvar *catalog* nil)
 (defvar *catalog-mutex* (sb-thread:make-mutex :name "pg catalog mutex"))
+(defvar *catalog-oldest-relfrozenxid* nil)
 
 ;;; ---- serialization ----
 
@@ -93,6 +95,9 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
   (:oid pg-class-oid :oid)
   (:name pg-class-name :name)
   (:relfilenode pg-class-relfilenode :relfilenode)
+  (:relfrozenxid pg-class-relfrozenxid :relfrozenxid
+                 :decode (lambda (xid)
+                           (or xid (xid-epoch-start *next-xid*))))
   (:columns pg-class-columns :columns
             :encode (lambda (columns)
                       (loop for col across columns collect (column-to-sexp col)))
@@ -163,8 +168,34 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
     ;; durable, so a crash cannot leave the catalog name missing.
     (write-sequence bytes stream)))
 
+(defun catalog-compute-oldest-relfrozenxid ()
+  (let ((oldest nil))
+    (when *catalog*
+      (maphash
+       (lambda (database-name database)
+         (declare (ignore database-name))
+         (maphash
+          (lambda (table-name table)
+            (declare (ignore table-name))
+            (let ((relfrozenxid (pg-class-relfrozenxid table)))
+              (when (and relfrozenxid
+                         (or (null oldest) (< relfrozenxid oldest)))
+                (setf oldest relfrozenxid))))
+          (database-tables database)))
+       (catalog-databases *catalog*)))
+    oldest))
+
+(defun catalog-refresh-oldest-relfrozenxid ()
+  (setf *catalog-oldest-relfrozenxid*
+        (catalog-compute-oldest-relfrozenxid)))
+
+(defun catalog-oldest-relfrozenxid ()
+  (or *catalog-oldest-relfrozenxid*
+      (catalog-compute-oldest-relfrozenxid)))
+
 (defun save-catalog ()
-  (wal-commit-catalog (catalog-image-bytes) #'write-catalog-image))
+  (wal-commit-catalog (catalog-image-bytes) #'write-catalog-image)
+  (catalog-refresh-oldest-relfrozenxid))
 
 (defun load-catalog ()
   (let ((path (catalog-path)))
@@ -187,27 +218,21 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
     (let ((db (make-database :name "postgres" :oid (allocate-oid))))
       (setf (gethash "postgres" (catalog-databases *catalog*)) db)
       (save-catalog)))
+  (catalog-refresh-oldest-relfrozenxid)
   (values))
 
 (defun freeze-all-heap-xids (old-epoch
                              &key (fsync-function #'smgr-fsync)
                                after-page-function)
-  "Freeze tuple XIDs from OLD-EPOCH in every catalogued heap relation."
-  (maphash
-   (lambda (db-name db)
-     (declare (ignore db-name))
-     (maphash
-      (lambda (table-name table)
-        (declare (ignore table-name))
-        (heapam-freeze-relation-xids (pg-class-relfilenode table)
-                                     (pg-class-columns table)
-                                     old-epoch
-                                     :fsync-function fsync-function
-                                     :after-page-function
-                                     after-page-function))
-      (database-tables db)))
-   (catalog-databases *catalog*))
-  (values))
+  "Incrementally freeze catalog relations before reusing 32-bit XIDs.
+
+The all-frozen visibility-map bit lets prior VACUUM work skip pages that no
+longer contain transaction-status references."
+  (let ((boundary (+ (* (1+ old-epoch) +xid-cycle+)
+                     +first-normal-xid+)))
+    (vacuum-all-relations-for-xid-wraparound
+     boundary :fsync-function fsync-function
+     :after-page-function after-page-function)))
 
 (defun get-database (name)
   (or (gethash name (catalog-databases *catalog*))
@@ -343,6 +368,7 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
          (class (make-pg-class :oid oid
                                :name name
                                :relfilenode oid
+                               :relfrozenxid (next-full-xid)
                                :columns cols
                                :indexes '())))
     (setf (gethash name (database-tables db)) class)

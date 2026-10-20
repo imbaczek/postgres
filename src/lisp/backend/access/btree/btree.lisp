@@ -13,6 +13,16 @@
 (defconstant +btree-page-meta+ 1)
 (defconstant +btree-page-leaf+ 2)
 (defconstant +btree-page-internal+ 3)
+(defvar *btree-split-generations* (make-hash-table :test #'eql))
+(defvar *btree-split-lock* (sb-thread:make-mutex :name "pg btree split generation"))
+
+(defun btree-split-generation (relfilenode)
+  (sb-thread:with-mutex (*btree-split-lock*)
+    (gethash relfilenode *btree-split-generations* 0)))
+
+(defun btree-record-split (relfilenode)
+  (sb-thread:with-mutex (*btree-split-lock*)
+    (incf (gethash relfilenode *btree-split-generations* 0))))
 
 (defun btree-page-type (page) (aref page +pd-flags-off+))
 (defun set-btree-page-type (page type)
@@ -229,6 +239,8 @@ to a single leaf."
                   (buf-write relfilenode block old-page)
                   (let ((new-block (buf-nblocks relfilenode)))
                     (buf-write relfilenode new-block new-page)
+                    (btree-record-split relfilenode)
+                    (wal-mark-btree-split)
                     (mark-dirty relfilenode)
                     (values t (first (first new-entries)) new-block))))))
         (let* ((entries (btree-page-entries page t))
@@ -263,6 +275,8 @@ to a single leaf."
                           (buf-write relfilenode block old-page)
                           (let ((new-block (buf-nblocks relfilenode)))
                             (buf-write relfilenode new-block new-page)
+                            (btree-record-split relfilenode)
+                            (wal-mark-btree-split)
                             (mark-dirty relfilenode)
                             (values t (car (first new-entries)) new-block))))))))))))
 
@@ -284,6 +298,37 @@ to a single leaf."
                 (ereport "54000" "index root is too large"))
               (buf-write relfilenode root root-page)
               (btree-write-meta relfilenode (1+ level) root)))))))
+  (values))
+
+(defun btree-vacuum-delete-tids (relfilenode tids)
+  "Remove TIDS from leaf pages, retrying if a concurrent split changes pages."
+  (when tids
+    (let ((dead (make-hash-table :test #'equal)))
+      (dolist (tid tids)
+        (setf (gethash (cons (car tid) (cdr tid)) dead) t))
+      (loop
+        for generation = (btree-split-generation relfilenode)
+        for nblocks = (buf-nblocks relfilenode)
+        do (dotimes (block nblocks)
+             (check-for-interrupts)
+             (with-write-lock
+               (let ((page (buf-read relfilenode block)))
+                 (when (and page (= (btree-page-type page) +btree-page-leaf+))
+                   (let* ((entries (btree-page-entries page nil))
+                          (remaining
+                            (remove-if (lambda (entry)
+                                         (gethash (cons (second entry)
+                                                        (third entry))
+                                                  dead))
+                                       entries)))
+                     (when (< (length remaining) (length entries))
+                       (let ((new-page (btree-page-build remaining nil)))
+                         (unless new-page
+                           (ereport "XX000" "could not rebuild B-tree leaf page"))
+                         (with-wal-page-batch
+                           (buf-write relfilenode block new-page)))))))))
+        do (wal-commit-maintenance)
+        until (= generation (btree-split-generation relfilenode)))))
   (values))
 
 ;;; ---- key encoding ----

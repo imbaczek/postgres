@@ -687,7 +687,7 @@ rolled back immediately."
       (ereport "0A000"
                "DDL is not supported inside an explicit transaction block"))
     (let ((snap (statement-start)))
-      (with-active-snapshot
+      (with-active-snapshot (snap)
         (let ((*current-snapshot* snap))
           (handler-case
               (case (getf ast :type)
@@ -724,6 +724,7 @@ rolled back immediately."
       (:commit (command-commit stream))
       (:rollback (command-rollback stream))
       (:checkpoint (command-checkpoint stream))
+      (:vacuum (exec-vacuum stream ast))
       (:set (exec-set stream ast))
       (:reset (exec-reset stream ast))
       (:show (exec-show stream ast))

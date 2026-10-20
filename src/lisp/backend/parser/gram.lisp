@@ -96,6 +96,7 @@
     ((match-kw p "insert") (parse-insert p))
     ((match-kw p "update") (parse-update p))
     ((match-kw p "delete") (parse-delete p))
+    ((match-kw p "vacuum") (parse-vacuum p))
     ((match-kw p "create") (parse-create p))
     ((match-kw p "drop") (parse-drop p))
     ((match-kw p "alter") (parse-alter p))
@@ -116,6 +117,9 @@
     ((match-kw p "reset") (parse-reset p))
     (t
      (ereport "42601" "syntax error at or near \"~a\"" (pval p)))))
+
+(defun parse-vacuum (p)
+  (list :type :vacuum :table (strip-schema (pident p))))
 
 ;;; ---- SELECT ----
 

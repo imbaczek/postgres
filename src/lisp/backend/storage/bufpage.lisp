@@ -162,9 +162,9 @@ are bound for each live item; dead and unused slots are skipped."
 
 (defun page-add-item (page data &key allow-reuse)
   "Allocate DATA as a new tuple on PAGE. Return the 1-based line pointer
-number, or NIL if the page has no room. With ALLOW-REUSE, LP_UNUSED/LP_DEAD
-slots may be recycled; callers must only do this when no index entry can
-reference the slot (see plan section 5)."
+number, or NIL if the page has no room. With ALLOW-REUSE, LP_UNUSED slots may
+be recycled. LP_DEAD slots remain unavailable until VACUUM has removed every
+index entry that can reference them and changed them to LP_UNUSED."
   (let* ((len (length data))
          (aligned (maxalign len))
          (slot nil))
@@ -172,7 +172,7 @@ reference the slot (see plan section 5)."
       (loop for i from 1 to (page-lp-count page)
             do (multiple-value-bind (off flags l) (page-get-lp page i)
                  (declare (ignore off l))
-                 (when (or (= flags +lp-unused+) (= flags +lp-dead+))
+                 (when (= flags +lp-unused+)
                    (setf slot i)
                    (return)))))
     (unless (page-ensure-space page (if slot 0 +size-of-item-id+) aligned)
