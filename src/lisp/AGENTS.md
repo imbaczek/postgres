@@ -165,4 +165,8 @@ this mode.
   bug-for-bug compatibility with PostgreSQL. When in doubt, port the original
   behavior rather than inventing a simpler one. The MVP subset is a scope
   limit, not a license to diverge inside that scope.
+- **Original C source:** implementers and reviewers must always consult the
+  corresponding PostgreSQL C source and relevant C tests for backend behavior
+  changes. Compare the Lisp behavior with those references and explain any
+  deliberate differences.
 - Project workflow: review each milestone with a subagent.
