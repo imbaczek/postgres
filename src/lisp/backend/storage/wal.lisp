@@ -169,14 +169,19 @@
         (gethash key *wal-page-cache*)
         (smgr-read relfilenode block))))
 
+(defmacro with-wal-page-state-lock (&body body)
+  "Use the current page batch, or lock the shared WAL page state."
+  `(if *wal-page-batch*
+       (progn ,@body)
+       (sb-thread:with-mutex (*wal-lock*)
+         ,@body)))
+
 (defun wal-buffer-read (relfilenode block)
   (if (not *wal-ready*)
       (smgr-read relfilenode block)
       (let ((page
-              (if *wal-page-batch*
-                  (wal-visible-page-under-lock relfilenode block)
-                  (sb-thread:with-mutex (*wal-lock*)
-                    (wal-visible-page-under-lock relfilenode block)))))
+              (with-wal-page-state-lock
+                (wal-visible-page-under-lock relfilenode block))))
         (when page (copy-seq page)))))
 
 (defun wal-buffer-write (relfilenode block page)
@@ -184,10 +189,11 @@
     (return-from wal-buffer-write (smgr-write relfilenode block page)))
   (let ((key (wal-page-key relfilenode block))
         (copy (wal-copy-dirty-page page)))
-    (if *wal-page-batch*
-        (setf (gethash key *wal-page-batch*) copy)
-        (sb-thread:with-mutex (*wal-lock*)
-          (setf (gethash key *wal-page-cache*) copy))))
+    (with-wal-page-state-lock
+      (setf (gethash key (if *wal-page-batch*
+                             *wal-page-batch*
+                             *wal-page-cache*))
+            copy)))
   (wal-test-pause :after-page-stage)
   (values))
 
@@ -207,25 +213,22 @@
 (defun wal-buffer-nblocks (relfilenode)
   (if (not *wal-ready*)
       (smgr-nblocks relfilenode)
-      (if *wal-page-batch*
-          (wal-visible-nblocks-under-lock relfilenode)
-          (sb-thread:with-mutex (*wal-lock*)
-            (wal-visible-nblocks-under-lock relfilenode)))))
+      (with-wal-page-state-lock
+        (wal-visible-nblocks-under-lock relfilenode))))
 
 (defun wal-buffer-extend (relfilenode page)
   (if (not *wal-ready*)
       (smgr-extend relfilenode page)
-      (if *wal-page-batch*
-          (let ((block (wal-visible-nblocks-under-lock relfilenode)))
-            (setf (gethash (wal-page-key relfilenode block) *wal-page-batch*)
-                  (wal-copy-dirty-page page))
-            block)
-          (sb-thread:with-mutex (*wal-lock*)
-            (let ((block (wal-visible-nblocks-under-lock relfilenode)))
-              (setf (gethash (wal-page-key relfilenode block) *wal-page-cache*)
-                    (wal-copy-dirty-page page))
-              (wal-test-pause :after-page-stage)
-              block)))))
+      (with-wal-page-state-lock
+        (let ((block (wal-visible-nblocks-under-lock relfilenode)))
+          (setf (gethash (wal-page-key relfilenode block)
+                         (if *wal-page-batch*
+                             *wal-page-batch*
+                             *wal-page-cache*))
+                (wal-copy-dirty-page page))
+          (unless *wal-page-batch*
+            (wal-test-pause :after-page-stage))
+          block))))
 
 (defmacro with-wal-page-batch (&body body)
   "Stage related page edits privately and publish them together on success."
@@ -345,9 +348,13 @@
     (when *wal-output-stream*
       (finish-output *wal-output-stream*)
       ;; Rotation can happen in the middle of a commit batch. Make every
-      ;; previous segment durable before closing it; the final segment is
-      ;; flushed once the batch's commit/catalog record has been appended.
+      ;; previous segment and its directory entry durable before opening a
+      ;; later segment. The final segment is flushed once the batch's
+      ;; commit/catalog record has been appended.
       (fsync-stream *wal-output-stream*)
+      (when *wal-new-segments*
+        (fsync-directory (wal-directory))
+        (setf *wal-new-segments* '()))
       (close *wal-output-stream*)
       (setf *wal-output-stream* nil))
     (let* ((path (wal-segment-path segment))
@@ -964,8 +971,13 @@
                    (eql segment *wal-output-segment*))
           (close *wal-output-stream*)
           (setf *wal-output-stream* nil *wal-output-segment* nil))
-        (ignore-errors (delete-file (wal-segment-path segment)))
-        (setf removed t)))
+        ;; Delete only a contiguous prefix. Continuing after a failed unlink
+        ;; could leave a hole before the checkpoint segment and block startup.
+        (handler-case
+            (progn
+              (delete-file (wal-segment-path segment))
+              (setf removed t))
+          (file-error () (return)))))
     (when removed (fsync-directory (wal-directory))))
   (values))
 
