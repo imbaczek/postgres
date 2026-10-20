@@ -2,6 +2,62 @@
 
 (in-package #:pg)
 
+(defstruct select-relation
+  name
+  alias
+  table
+  (offset 0)
+  (width 0))
+
+(defstruct select-column
+  name
+  expr
+  type
+  (typmod -1)
+  (table-oid 0)
+  (attnum 0))
+
+(defstruct select-scope
+  relations
+  columns
+  (width 0))
+
+(defun select-relation-qualifier (relation)
+  (or (select-relation-alias relation)
+      (select-relation-name relation)))
+
+(defun resolve-select-column (scope qualifier name)
+  (if qualifier
+      (let* ((relation
+               (find qualifier (select-scope-relations scope)
+                     :key #'select-relation-qualifier :test #'string=))
+             (column
+               (and relation
+                    (find-column (select-relation-table relation) name))))
+        (unless relation
+          (ereport "42P01" "missing FROM-clause entry for table \"~a\""
+                   qualifier))
+        (unless column
+          (ereport "42703" "column \"~a\" does not exist" name))
+        (list :col (+ (select-relation-offset relation)
+                      (pg-column-attnum column))
+              :type (pg-column-type column)
+              :typmod (pg-column-typmod column)
+              :notnull (pg-column-notnull column)
+              :table-oid (pg-class-oid (select-relation-table relation))
+              :attnum (pg-column-attnum column)))
+      (let ((matches (remove-if-not
+                      (lambda (column)
+                        (string= name (select-column-name column)))
+                      (select-scope-columns scope))))
+        (cond
+          ((null matches)
+           (ereport "42703" "column \"~a\" does not exist" name))
+          ((rest matches)
+           (ereport "42702" "column reference \"~a\" is ambiguous" name))
+          (t
+           (select-column-expr (first matches)))))))
+
 (defmacro sql-strict-let (bindings &body body)
   "Evaluate all BINDINGS once, returning SQL NULL if any value is NULL."
   `(let* ,bindings
@@ -64,16 +120,23 @@ exist\" messages."
     (:bool
      (list :bool (second expr) :type :bool :typmod -1))
     (:column
-     (let ((name (if (third expr) (third expr) (second expr))))
-       (unless table
-         (ereport "42703" "column \"~a\" does not exist" name))
-       (let ((col (find-column table name)))
-         (unless col
-           (ereport "42703" "column \"~a\" does not exist" name))
-         (list :col (pg-column-attnum col)
-               :type (pg-column-type col)
-               :typmod (pg-column-typmod col)
-               :notnull (pg-column-notnull col)))))
+     (let ((name (if (third expr) (third expr) (second expr)))
+           (qualifier (and (third expr) (second expr))))
+       (cond
+         ((typep table 'select-scope)
+          (resolve-select-column table qualifier name))
+         (t
+          (unless table
+            (ereport "42703" "column \"~a\" does not exist" name))
+          (let ((col (find-column table name)))
+            (unless col
+              (ereport "42703" "column \"~a\" does not exist" name))
+            (list :col (pg-column-attnum col)
+                  :type (pg-column-type col)
+                  :typmod (pg-column-typmod col)
+                  :notnull (pg-column-notnull col)
+                  :table-oid (pg-class-oid table)
+                  :attnum (pg-column-attnum col)))))))
     (:binop
      (let* ((op (second expr))
             (l (analyze-expr (third expr) table))
@@ -164,29 +227,49 @@ exist\" messages."
   (let* ((ast (getf target :expr))
          (alias (getf target :alias))
          (resolved (analyze-expr ast table))
+         (direct-column (and (eq (first resolved) :col) resolved))
          (type (expr-type resolved))
          (typmod (expr-typmod resolved))
-         (direct-col-p (eq (first resolved) :col))
          (name (or alias (target-default-name ast))))
     (list :expr resolved
           :name name
           :type type
           :typmod typmod
-          :table-oid (if (and table direct-col-p) (pg-class-oid table) 0)
-          :attnum (if direct-col-p (second resolved) 0))))
+          :table-oid (if direct-column
+                         (or (getf direct-column :table-oid) 0)
+                         0)
+          :attnum (if direct-column
+                      (or (getf direct-column :attnum)
+                          (second direct-column))
+                      0))))
+
+(defun select-column-target (column)
+  (let ((expr (select-column-expr column)))
+    (list :expr expr
+          :name (select-column-name column)
+          :type (select-column-type column)
+          :typmod (select-column-typmod column)
+          :table-oid (select-column-table-oid column)
+          :attnum (select-column-attnum column))))
 
 (defun analyze-targets (targets table)
   (loop for tg in targets
         if (getf tg :star)
-          append (loop for col across (pg-class-columns table)
-                       collect (list :expr (list :col (pg-column-attnum col)
-                                                 :type (pg-column-type col)
-                                                 :typmod (pg-column-typmod col))
-                                     :name (pg-column-name col)
-                                     :type (pg-column-type col)
-                                     :typmod (pg-column-typmod col)
-                                     :table-oid (pg-class-oid table)
-                                     :attnum (pg-column-attnum col)))
+          append (if (typep table 'select-scope)
+                     (mapcar #'select-column-target
+                             (select-scope-columns table))
+                     (loop for col across (pg-class-columns table)
+                           collect (list :expr
+                                         (list :col (pg-column-attnum col)
+                                               :type (pg-column-type col)
+                                               :typmod (pg-column-typmod col)
+                                               :table-oid (pg-class-oid table)
+                                               :attnum (pg-column-attnum col))
+                                         :name (pg-column-name col)
+                                         :type (pg-column-type col)
+                                         :typmod (pg-column-typmod col)
+                                         :table-oid (pg-class-oid table)
+                                         :attnum (pg-column-attnum col))))
         else
           collect (analyze-target tg table)))
 
@@ -344,6 +427,13 @@ exist\" messages."
      (unless env
        (ereport "42703" "column does not exist in this context"))
      (aref env (1- (second expr))))
+    (:join-coalesce
+     (let ((left (eval-expr (second expr) env)))
+       (if (eq left +null+)
+           (eval-expr (third expr) env)
+           left)))
+    (:join-relabel
+     (eval-expr (second expr) env))
     (:binop
      (let ((op (second expr))
            (l (eval-expr (third expr) env))

@@ -81,6 +81,11 @@
                        :initial-element 65))
          (catalog-written nil)
          (record-types '()))
+    ;; Remove artifacts left by an interrupted prior run that reused the same
+    ;; process-local randomized test directory.
+    (ignore-errors
+     (uiop:delete-directory-tree test-pgdata :validate t
+                                             :if-does-not-exist :ignore))
     (wal-ensure-directory-durable *pgdata*)
     (wal-ensure-directory-durable (merge-pathnames "global/" *pgdata*))
     (wal-ensure-directory-durable (wal-directory))
@@ -125,7 +130,10 @@
                       (error () t))
                     "catalog chunk length mismatch fails before allocation")))
       (when *wal-output-stream*
-        (ignore-errors (close *wal-output-stream*))))))
+        (ignore-errors (close *wal-output-stream*)))
+      (ignore-errors
+       (uiop:delete-directory-tree test-pgdata :validate t
+                                               :if-does-not-exist :ignore)))))
 
 (defun test-wal-catalog-terminal-validation-precedes-page-redo ()
   (let* ((test-pgdata

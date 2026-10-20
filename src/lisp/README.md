@@ -175,12 +175,20 @@ ALTER TABLE t DROP CONSTRAINT old_name,
 DML:
 
 ```sql
-SELECT expr [AS alias], ... | * FROM t [WHERE e] [ORDER BY col [ASC|DESC] [, ...]] [LIMIT n];
-EXPLAIN SELECT ...;                     -- reports Seq Scan or Index Scan
+SELECT expr [AS alias], ... | * FROM t [AS alias]
+  [{[INNER] | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER]} JOIN t [AS alias]
+    {ON e | USING (cols)} | CROSS JOIN t [AS alias]] ...
+  [WHERE e] [ORDER BY col [ASC|DESC] [, ...]] [LIMIT n];
+EXPLAIN SELECT ...;                     -- reports scans or a Nested Loop join
 INSERT INTO t [(cols)] VALUES (...)[, (...)];
 UPDATE t SET col = expr [, ...] [WHERE e];
 DELETE FROM t [WHERE e];
 ```
+
+Joins use a nested-loop executor over sequential scans. `ON` predicates can
+reference both join operands; `USING` merges columns with a common type (equal
+types and `int4`/`int8` pairs), with FULL JOIN coalescing the merged key.
+Comma-separated FROM items and NATURAL JOIN are not supported.
 
 Transactions (READ COMMITTED only):
 
@@ -425,7 +433,8 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   after `2^64 - 1`.
 - DDL inside an explicit transaction block is rejected (`0A000`) because the
   catalog has no rollback log.
-- No joins, aggregates, subqueries, CTEs, or `DISTINCT`.
+- No aggregates, subqueries, CTEs, or `DISTINCT`. Joins are nested-loop-only;
+  NATURAL JOIN and comma-separated FROM items are not supported.
 - No `GROUP BY` / `HAVING`, no `OFFSET`/`FETCH`. `ORDER BY` accepts multiple
   keys with `ASC`/`DESC`.
 - No `DEFAULT`, `CHECK`, foreign keys, or `NOT NULL`/`UNIQUE` beyond what is

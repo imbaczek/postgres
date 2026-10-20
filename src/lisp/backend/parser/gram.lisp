@@ -68,7 +68,8 @@
   (member word
           '("from" "where" "order" "limit" "group" "having" "union"
             "intersect" "except" "offset" "fetch" "for" "join" "inner"
-            "left" "right" "full" "cross" "on" "using" "asc" "desc"
+            "left" "right" "full" "outer" "cross" "on" "using"
+            "natural" "asc" "desc"
             "and" "or")
           :test #'string=))
 
@@ -136,11 +137,12 @@
   (let ((targets (parse-target-list p))
         (from nil)
         (from-alias nil)
+        (joins nil)
         (where nil)
         (order-by nil)
         (limit nil))
     (when (match-kw p "from")
-      (multiple-value-setq (from from-alias) (parse-from p)))
+      (multiple-value-setq (from from-alias joins) (parse-from p)))
     (when (match-kw p "where")
       (setf where (parse-expr p)))
     (when (match-kw p "order")
@@ -156,6 +158,7 @@
           :targets targets
           :from from
           :from-alias from-alias
+          :joins joins
           :where where
           :order-by order-by
           :limit limit)))
@@ -177,7 +180,7 @@
        (setf alias (pident p))))
     (list :expr expr :alias alias)))
 
-(defun parse-from (p)
+(defun parse-from-relation (p)
   (let ((table (pident p))
         (alias nil))
     (when (match-kw p "as")
@@ -185,11 +188,54 @@
     (when (and (eq (pkind p) :ident)
                (not (clause-keyword-p (pval p))))
       (setf alias (pident p)))
-    (when (or (punct-p p #\,)
-              (kw-p p "join") (kw-p p "inner") (kw-p p "left")
-              (kw-p p "right") (kw-p p "full") (kw-p p "cross"))
-      (ereport "0A000" "joins are not supported"))
     (values (strip-schema table) alias)))
+
+(defun parse-join-clause (p)
+  (let ((join-type :inner)
+        (join-consumed nil))
+    (cond
+      ((match-kw p "join")
+       (setf join-consumed t))
+      ((match-kw p "inner")
+       (setf join-type :inner))
+      ((match-kw p "left")
+       (setf join-type :left))
+      ((match-kw p "right")
+       (setf join-type :right))
+      ((match-kw p "full")
+       (setf join-type :full))
+      ((match-kw p "cross")
+       (setf join-type :cross))
+      (t (syntax-error p "expected JOIN")))
+    (unless join-consumed
+      (when (member join-type '(:left :right :full))
+        (match-kw p "outer"))
+      (expect-kw p "join"))
+    (multiple-value-bind (table alias) (parse-from-relation p)
+      (let ((join (list :type join-type :table table :alias alias)))
+        (cond
+          ((eq join-type :cross)
+           (list* :condition :cross join))
+          ((match-kw p "on")
+           (list* :condition (parse-expr p) join))
+          ((match-kw p "using")
+           (list* :condition (with-parens (p) (parse-ident-list p))
+                  :using t join))
+          (t
+           (syntax-error p "expected ON or USING after JOIN")))))))
+
+(defun parse-from (p)
+  (multiple-value-bind (table alias) (parse-from-relation p)
+    (let ((joins '()))
+      (loop
+        (cond
+          ((or (kw-p p "join") (kw-p p "inner") (kw-p p "left")
+               (kw-p p "right") (kw-p p "full") (kw-p p "cross"))
+           (push (parse-join-clause p) joins))
+          ((punct-p p #\,)
+           (ereport "0A000" "comma-separated FROM items are not supported"))
+          (t (return))))
+      (values table alias (nreverse joins)))))
 
 (defun parse-order-list (p)
   (loop collect (let ((expr (parse-expr p))

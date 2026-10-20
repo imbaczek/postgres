@@ -22,7 +22,8 @@
   (setf *test-failures* 0
         *test-checks* 0)
   (let ((dir (merge-pathnames
-              (format nil "pg-unit-~a/" (random 1000000))
+              (format nil "pg-unit-~a-~a-~a/"
+                      (sb-posix:getpid) (get-universal-time) (random 1000000))
               #p"/tmp/opencode/")))
     (ensure-directories-exist dir)
     (let ((*pgdata* dir)
@@ -78,6 +79,7 @@
       (test-key-order)
       (test-index-catalog-roundtrip)
       (test-sql-strict-let-evaluation)
+      (test-using-join-output-metadata)
       (test-error-cleanup-and-fatal-rethrow)
       (test-create-table-cleanup-after-fsync-error)
       (test-relation-build-own-xid)

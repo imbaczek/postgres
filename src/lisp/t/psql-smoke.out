@@ -309,6 +309,100 @@ DROP TABLE
 CREATE TABLE
 INSERT 0 2
 CREATE INDEX
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 4
+INSERT 0 5
+INSERT 0 3
+Nested Loop Inner Join
+1|right-one
+1|right-one-dup
+3|right-three
+1|left-one|right-one
+1|left-one|right-one-dup
+2|left-only|
+3|left-three|right-three
+|left-null|
+1|left-one|1|right-one
+1|left-one|1|right-one-dup
+3|left-three|3|right-three
+||4|right-only
+|||right-null
+1|left-one|1|right-one
+1|left-one|1|right-one-dup
+2|left-only||
+3|left-three|3|right-three
+||4|right-only
+|left-null||
+|||right-null
+1|
+2|
+3|right-three
+|
+3|right-three
+1|left-one|l1|right-one
+1|left-one|l1|right-one-dup
+2|left-only|l2|
+3|left-three|l3|right-three
+4|||right-only
+|left-null|ln|
+|||right-null
+1|1|1
+1|1|1
+2|2|
+3|3|3
+4||4
+||
+||
+1|left-one|l1|right-one
+1|left-one|l1|right-one-dup
+3|left-three|l3|right-three
+1|left-one|l1|right-one
+1|left-one|l1|right-one-dup
+2|left-only|l2|
+3|left-three|l3|right-three
+|left-null|ln|
+1|left-one|l1|right-one
+1|left-one|l1|right-one-dup
+3|left-three|l3|right-three
+4|||right-only
+|||right-null
+1|1|1|1|left-one|right-one|third-one
+1|1|1|1|left-one|right-one-dup|third-one
+2|2|||left-only||
+3|3|3||left-three|right-three|
+4||4|4||right-only|third-four
+5|||5|||third-only
+||||left-null||
+|||||right-null|
+1|1
+1|4
+1|5
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 3
+1|2|left-match|right-match
+3|4|left-only|
+5|6||right-only
+|1|left-null|
+|1||right-null
+CREATE TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+long-right-only
+short
+ERROR:  column reference "id" is ambiguous
+ERROR:  missing FROM-clause entry for table "join_left"
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
 ERROR:  duplicate key value violates unique constraint "unique_nnd_restart_idx"
 ERROR:  index "unique_using_restart_idx" is already associated with a constraint
 ERROR:  cannot drop index "unique_using_restart_idx" because constraint "unique_using_restart_idx" on table "unique_using_restart" requires it

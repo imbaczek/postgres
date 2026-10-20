@@ -370,3 +370,85 @@ drop table index_scan_events;
 create table index_scan_restart (id int, category int);
 insert into index_scan_restart values (8, 7), (9, 7);
 create index index_scan_restart_category_idx on index_scan_restart (category);
+
+-- Ported from src/test/regress/sql/join.sql: inner and outer joins over
+-- duplicate and NULL keys, including USING's merged output column.
+create table join_left (id int, label text, note text);
+create table join_right (id int, label text);
+create table join_third (id int, label text);
+insert into join_left values
+  (1, 'left-one', 'l1'), (2, 'left-only', 'l2'),
+  (3, 'left-three', 'l3'), (null, 'left-null', 'ln');
+insert into join_right values
+  (1, 'right-one'), (1, 'right-one-dup'), (3, 'right-three'),
+  (4, 'right-only'), (null, 'right-null');
+insert into join_third values
+  (1, 'third-one'), (4, 'third-four'), (5, 'third-only');
+explain select l.id, r.label from join_left as l
+  inner join join_right as r on l.id = r.id;
+select l.id, r.label from join_left as l
+  inner join join_right as r on l.id = r.id order by l.id, r.label;
+select l.id, l.label, r.label from join_left l
+  left outer join join_right r on l.id = r.id
+  order by l.id, l.label, r.label;
+select l.id, l.label, r.id, r.label from join_left l
+  right join join_right r on l.id = r.id
+  order by r.id, r.label, l.id;
+select l.id, l.label, r.id, r.label from join_left l
+  full outer join join_right r on l.id = r.id
+  order by l.id, r.id, l.label, r.label;
+
+-- ON decides whether a row matched; WHERE filters after null extension.
+select l.id, r.label from join_left l left join join_right r
+  on l.id = r.id and r.label = 'right-three'
+  order by l.id, l.label;
+select l.id, r.label from join_left l left join join_right r
+  on l.id = r.id where r.label = 'right-three';
+
+-- USING emits one merged key. FULL joins coalesce both sides, including
+-- through a second join in the left-deep join tree.
+select * from join_left l full join join_right r using (id)
+  order by id, l.label, r.label;
+select id, l.id, r.id from join_left l full join join_right r using (id)
+  order by id, l.id, r.id;
+select * from join_left l inner join join_right r using (id)
+  order by id, r.label;
+select * from join_left l left join join_right r using (id)
+  order by id, l.label, r.label;
+select * from join_left l right join join_right r using (id)
+  order by id, l.label, r.label;
+select id, l.id, r.id, c.id, l.label, r.label, c.label
+  from join_left l full join join_right r using (id)
+  full join join_third c using (id)
+  order by id, l.id, r.id, c.id;
+select l.id, c.id from join_left l cross join join_third c
+  where l.id = 1 order by c.id;
+
+-- Multi-column USING resolves common integer types and keeps both NULL keys
+-- unmatched, as in ordinary SQL equality joins.
+create table join_pair_left (a int, b int, label text);
+create table join_pair_right (a bigint, b int, label text);
+insert into join_pair_left values (1, 2, 'left-match'), (3, 4, 'left-only'),
+  (null, 1, 'left-null');
+insert into join_pair_right values (1, 2, 'right-match'), (5, 6, 'right-only'),
+  (null, 1, 'right-null');
+select a, b, l.label, r.label from join_pair_left l
+  full join join_pair_right r using (a, b)
+  order by a, b, l.label, r.label;
+
+-- Common varchar typmod falls back to unconstrained when inputs differ.
+create table join_narrow (k varchar(5));
+create table join_wide (k varchar(20));
+insert into join_narrow values ('short');
+insert into join_wide values ('long-right-only');
+select k from join_narrow n full join join_wide w using (k) order by k;
+
+select id from join_left l inner join join_right r on l.id = r.id;
+select l.id from join_left as l where join_left.id = 1;
+drop table join_narrow;
+drop table join_wide;
+drop table join_pair_left;
+drop table join_pair_right;
+drop table join_left;
+drop table join_right;
+drop table join_third;
