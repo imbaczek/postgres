@@ -212,7 +212,7 @@ Meta-commands that need `pg_catalog` and regular-expression operators (`\d`,
 
 ```sh
 cd src/lisp
-./t/run-unit-tests.sh     # Lisp-level page/tuple/index/visibility tests
+./t/run-unit-tests.sh     # page/tuple/index/visibility and VACUUM horizon tests
 ./t/psql-smoke.sh         # boots a server and diffs psql output against a golden file
 ./t/wal-crash-recovery.sh  # SIGKILL recovery at commit, page, update, split, and checkpoint boundaries
 ./t/unique-index-concurrency.sh # unique-index build/drop writer races
@@ -246,6 +246,11 @@ updates the same row. It confirms the waiter entered a transaction-ID wait,
 then checks that the waiter follows the committed `ctid` chain, recalculates
 `value + 1` against the latest version, and skips both UPDATE and DELETE when
 the refreshed row no longer satisfies `WHERE`.
+
+The Lisp-level `test-vacuum-snapshot-horizon` ports the permanent-table case
+from PostgreSQL's `src/test/isolation/specs/horizons.spec`: an older registered
+snapshot keeps a deleted row and its index TID until VACUUM can safely advance
+its horizon.
 
 `t/shutdown.sh` also confirms that a raw TCP CancelRequest interrupts a blocked
 statement after the backend enters its transaction-ID wait, and that incorrect
@@ -393,10 +398,10 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
 - Heap page layout version 6 stores 32-bit tuple XIDs in the PostgreSQL header
   layout. Existing version 4 and 5 relation files are rejected and must be
   recreated before use.
-- XID wrap handling uses a global stop-the-world freeze at each 32-bit cycle
-  boundary. PostgreSQL instead freezes tuples incrementally during vacuum and
-  protects XID age with wraparound limits; this server has no VACUUM yet. XID
-  allocation stops after `2^64 - 1`.
+- XID wrap handling still uses a global stop-the-world freeze at each 32-bit
+  cycle boundary. VACUUM now freezes eligible tuples incrementally, but
+  PostgreSQL's wraparound limits are not implemented. XID allocation stops
+  after `2^64 - 1`.
 - DDL inside an explicit transaction block is rejected (`0A000`) because the
   catalog has no rollback log.
 - No joins, aggregates, subqueries, CTEs, or `DISTINCT`.
@@ -406,12 +411,11 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   listed above.
 - `SELECT` always uses a sequential heap scan; indexes exist to enforce
   uniqueness, not yet to accelerate reads.
-- No VACUUM or heap tuple pruning; old row versions and their TIDs are retained
-  so concurrent update-chain rechecks cannot follow a reused TID. Updates and
-  deletes do not reclaim heap space, and inserts always allocate new heap TIDs.
-  The volatile free-space map avoids a full relation scan on each INSERT, but
-  it does not reclaim obsolete versions and its first rebuild after restart
-  scans the existing heap once.
+- VACUUM is manual only; autovacuum and index-only scans are not implemented.
+  Manual VACUUM removes dead index TIDs before making safe dead heap slots
+  reusable, freezes eligible tuples, and updates the visibility map and volatile
+  free-space map. Its first FSM rebuild after restart scans the existing heap
+  once.
 - Byte-wise comparison only, i.e. C-like collation for ASCII. Index key
   encoding is length-first and is used internally only.
 - Numeric/float, date/time, boolean, and other types are unsupported. `text` is

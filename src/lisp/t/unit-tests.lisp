@@ -3481,6 +3481,117 @@
       (check (not (heap-tuple-visible-p 200 0 5 snap3 200))
              "own insert invisible in same command"))))
 
+(defun test-vacuum-snapshot-horizon ()
+  ;; Port the permanent-table horizon case from
+  ;; src/test/isolation/specs/horizons.spec. The Lisp executor currently keeps
+  ;; snapshots per statement, so register the older snapshot directly here.
+  (let* ((*backend* (make-backend))
+         (*next-xid* 7303)
+         (*active-xids* '())
+         (*active-snapshots* 0)
+         (*active-snapshot-set* (make-hash-table :test #'eq))
+         (*wal-ready* nil)
+         (heap-relfilenode 918273651)
+         (index-relfilenode 918273652)
+         (columns (vector (make-pg-column :name "value" :type :int4
+                                          :typmod -1 :attnum 1
+                                          :notnull nil)))
+         (key (encode-index-key '(1) '(:int4)))
+         (snapshot nil)
+         (page (page-init (make-page)))
+         (offset (page-add-item
+                  page (form-heap-tuple #(1) columns 7301 0 0 0 1)))
+         (snapshot-active nil)
+         (index-cleanup-before-heap-reuse nil))
+    ;; The snapshot starts after the insert but before the committed delete.
+    (smgr-forget heap-relfilenode :delete t)
+    (smgr-forget index-relfilenode :delete t)
+    (clog-set 7301 +clog-committed+)
+    (unwind-protect
+         (progn
+           (ensure-directories-exist (relation-file-path heap-relfilenode))
+           (check (= (buf-extend heap-relfilenode page) 0)
+                  "vacuum horizon fixture creates heap block zero")
+           (btree-init index-relfilenode)
+           (btree-insert index-relfilenode key 0 offset)
+           (note-snapshot-start)
+           (setf snapshot-active t
+                 snapshot (make-snapshot 1 :register t)
+                 *next-xid* 7304)
+           (with-write-lock
+             (let ((heap-page (buf-read heap-relfilenode 0)))
+               (multiple-value-bind (tuple-off flags len)
+                   (page-get-lp heap-page offset)
+                 (declare (ignore flags len))
+                 (page-set-u32 heap-page
+                               (+ tuple-off +heap-tuple-xmax-off+) 7303)
+                 (buf-write heap-relfilenode 0 heap-page))))
+           (clog-set 7303 +clog-committed+)
+           (check (= (snapshot-xmax snapshot) 7303)
+                  "snapshot treats the later delete XID as in the future")
+           (check (= (oldest-xmin) 7303)
+                  "registered old snapshot holds the vacuum removal horizon")
+           (heap-vacuum-relation heap-relfilenode (list index-relfilenode)
+                                 (oldest-xmin) 7300)
+           (multiple-value-bind (off flags len)
+               (page-get-lp (buf-read heap-relfilenode 0) offset)
+             (declare (ignore off len))
+             (check (= flags +lp-normal+)
+                    "vacuum preserves a deleted tuple visible to the old snapshot"))
+           (let ((tuple (heapam-get-tuple heap-relfilenode 0 offset columns)))
+             (check (and tuple
+                         (heap-tuple-visible-p
+                          (htup-xmin tuple) (htup-xmax tuple) (htup-cid tuple)
+                          snapshot nil))
+                    "old snapshot can still see the tuple after vacuum")
+             (check (equal (btree-search index-relfilenode key)
+                           (list (cons 0 offset)))
+                    "vacuum retains the tuple's index TID behind the old horizon"))
+           (note-snapshot-end snapshot)
+           (setf snapshot-active nil)
+           (check (= (oldest-xmin) 7304)
+                  "releasing the old snapshot advances the removal horizon")
+           (let ((original-btree-vacuum-delete-tids
+                   (symbol-function 'btree-vacuum-delete-tids)))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function 'btree-vacuum-delete-tids)
+                          (lambda (index-relfilenode tids)
+                            (funcall original-btree-vacuum-delete-tids
+                                     index-relfilenode tids)
+                            (multiple-value-bind (off flags len)
+                                (page-get-lp (buf-read heap-relfilenode 0) offset)
+                              (declare (ignore off len))
+                              (setf index-cleanup-before-heap-reuse
+                                    (and (null (btree-search
+                                                index-relfilenode key))
+                                         (= flags +lp-dead+))))))
+                    (heap-vacuum-relation heap-relfilenode
+                                          (list index-relfilenode)
+                                          (oldest-xmin) 7300))
+               (setf (symbol-function 'btree-vacuum-delete-tids)
+                     original-btree-vacuum-delete-tids)))
+           (check index-cleanup-before-heap-reuse
+                  "vacuum removes the index TID while its heap slot is still dead")
+           (multiple-value-bind (off flags len)
+               (page-get-lp (buf-read heap-relfilenode 0) offset)
+             (declare (ignore off len))
+             (check (= flags +lp-unused+)
+                    "vacuum makes the dead heap slot reusable after horizon advance"))
+           (check (null (btree-search index-relfilenode key))
+                  "vacuum removes dead index TIDs before heap-slot reuse")
+           (let* ((fsm (gethash heap-relfilenode *heap-fsms*))
+                  (recorded-space (and fsm
+                                       (gethash 0 (heap-fsm-page-space fsm))))
+                  (page-space
+                    (heap-page-insert-capacity (buf-read heap-relfilenode 0))))
+             (check (and recorded-space (= recorded-space page-space))
+                    "vacuum records reclaimed heap space in the FSM")))
+      (when snapshot-active
+        (note-snapshot-end snapshot))
+      (smgr-forget heap-relfilenode :delete t)
+      (smgr-forget index-relfilenode :delete t))))
+
 (defun test-btree-duplicate-keys ()
   ;; Insert many entries with one key so the leaves holding them must split.
   ;; Repeatedly updating an indexed value produces exactly this shape: a long
@@ -3607,6 +3718,7 @@
       (test-create-table-cleanup-after-fsync-error)
       (test-relation-build-own-xid)
       (test-visibility)
+      (test-vacuum-snapshot-horizon)
       (test-btree-duplicate-keys)
       (test-btree-mixed-duplicate-keys)
       (test-session-setting-rollback)
