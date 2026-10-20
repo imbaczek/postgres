@@ -686,32 +686,30 @@ rolled back immediately."
     (when (and (ddl-p ast) (backend-explicit *backend*))
       (ereport "0A000"
                "DDL is not supported inside an explicit transaction block"))
-    (let ((snap (statement-start)))
-      (with-active-snapshot (snap)
-        (let ((*current-snapshot* snap))
-          (handler-case
-              (case (getf ast :type)
-                (:select (exec-select stream ast))
-                (:insert (exec-insert stream ast))
-                (:update (exec-update stream ast))
-                (:delete (exec-delete stream ast))
-                (:create-table (exec-create-table stream ast))
-                (:drop-table (exec-drop-table stream ast))
-                (:create-index (exec-create-index stream ast))
-                (:drop-index (exec-drop-index stream ast))
-                (:alter-index (exec-alter-index stream ast))
-                (:alter-table (exec-alter-table stream ast))
-                (t (ereport "0A000" "unsupported statement")))
-            (error (e)
-              (if (fatal-error-p e)
-                  (error e)
-                  (progn
-                    (if implicit
-                        (abort-transaction)
-                        (set-backend-state *backend* :aborted))
-                    (error e)))))))
-      (when implicit
-        (commit-transaction)))))
+    (with-statement-snapshot (snap #'statement-start)
+      (handler-case
+          (case (getf ast :type)
+            (:select (exec-select stream ast))
+            (:insert (exec-insert stream ast))
+            (:update (exec-update stream ast))
+            (:delete (exec-delete stream ast))
+            (:create-table (exec-create-table stream ast))
+            (:drop-table (exec-drop-table stream ast))
+            (:create-index (exec-create-index stream ast))
+            (:drop-index (exec-drop-index stream ast))
+            (:alter-index (exec-alter-index stream ast))
+            (:alter-table (exec-alter-table stream ast))
+            (t (ereport "0A000" "unsupported statement")))
+        (error (e)
+          (if (fatal-error-p e)
+              (error e)
+              (progn
+                (if implicit
+                    (abort-transaction)
+                    (set-backend-state *backend* :aborted))
+                (error e))))))
+    (when implicit
+      (commit-transaction))))
 
 (defun execute-statement (stream ast)
   (let ((type (getf ast :type)))

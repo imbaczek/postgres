@@ -87,6 +87,8 @@
   ;; Discard it after releasing *SMGR-LOCK* to preserve lock ordering.
   (when (fboundp 'heap-fsm-forget)
     (funcall (symbol-function 'heap-fsm-forget) relfilenode))
+  (when (and delete (fboundp 'btree-forget))
+    (funcall (symbol-function 'btree-forget) relfilenode))
   (values))
 
 (defun smgr-close-all ()

@@ -40,13 +40,16 @@
 (defvar *wal-new-segments* '())
 (defvar *wal-test-pause-at* nil)
 (defvar *wal-test-pause-relfilenode* nil)
+(defvar *wal-test-pause-fired* nil)
+(defvar *wal-test-pause-lock*
+  (sb-thread:make-mutex :name "pg WAL test pause"))
 (defvar *wal-recovery-group-active* nil)
 (defvar *wal-recovery-page-images* '())
 (defvar *wal-recovery-catalog-chunks* '())
 (defvar *wal-recovery-catalog-chunk-count* nil)
 (defvar *wal-recovery-catalog-next-chunk* 0)
 
-(declaim (ftype function wal-test-pause
+(declaim (ftype function wal-test-pause wal-test-pause-once
                 wal-remove-checkpointed-segments wal-atomic-write-bytes
                 clog-set clog-reset clog-fsync))
 (declaim (notinline pg-class-relfilenode pg-index-relfilenode
@@ -1133,7 +1136,8 @@
             *wal-output-segment* nil
             *wal-new-segments* '()
             *wal-test-pause-at* nil
-            *wal-test-pause-relfilenode* nil)
+            *wal-test-pause-relfilenode* nil
+            *wal-test-pause-fired* nil)
       (unless checkpoint-lsn
         (wal-save-control-fields 0 0))
       (multiple-value-bind (end-lsn found-segments)
@@ -1159,13 +1163,33 @@
     (let ((marker (merge-pathnames
                    (format nil "test-paused-~a"
                            (string-downcase (symbol-name point)))
+                   (wal-directory)))
+          (resume (merge-pathnames
+                   (format nil "test-resume-~a"
+                           (string-downcase (symbol-name point)))
                    (wal-directory))))
       (with-open-file (stream marker :direction :output :if-exists :supersede
                                      :if-does-not-exist :create)
         (format stream "paused~%")
         (finish-output stream)
         (fsync-stream stream))
-      (loop do (sleep 1))))
+      (loop until (probe-file resume) do (sleep 0.1))
+      (ignore-errors (delete-file resume))
+      (ignore-errors (delete-file marker))))
+  (values))
+
+(defun wal-test-pause-once (point)
+  "Pause once at POINT when the test environment selected that hook."
+  (let ((pause-p
+          (sb-thread:with-mutex (*wal-test-pause-lock*)
+            (when (and *wal-test-pause-at*
+                       (not *wal-test-pause-fired*)
+                       (string= *wal-test-pause-at*
+                                (string-downcase (symbol-name point))))
+              (setf *wal-test-pause-fired* t)
+              t))))
+    (when pause-p
+      (wal-test-pause point)))
   (values))
 
 (defun wal-relation-filennodes ()

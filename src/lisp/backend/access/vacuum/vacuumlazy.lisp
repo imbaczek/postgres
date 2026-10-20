@@ -92,9 +92,17 @@
   ;; after every index's deletion WAL has reached its maintenance terminal.
   (wal-commit-maintenance)
   (when tids
-    (dolist (index-relfilenode indexes)
-      (btree-vacuum-delete-tids index-relfilenode tids))
-    (wal-commit-maintenance)
+    (wal-test-pause :after-vacuum-dead-tids))
+  (when tids
+    (loop for index-relfilenode in indexes
+          for index-number from 0
+          do (btree-vacuum-delete-tids index-relfilenode tids)
+             (wal-commit-maintenance)
+             (when (zerop index-number)
+               (wal-test-pause :after-vacuum-index-cleanup)))
+    ;; At this boundary every index deletion is durable, but heap line pointers
+    ;; are still LP_DEAD and cannot yet be reused by an INSERT.
+    (wal-test-pause :after-vacuum-indexes-before-reuse)
     (heap-vacuum-remove-dead-tids relfilenode tids fsm)
     (wal-commit-maintenance))
   (values))

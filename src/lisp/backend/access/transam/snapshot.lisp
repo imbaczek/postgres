@@ -9,6 +9,11 @@
   xip
   curcid)
 
+(defstruct (snapshot-registration
+            (:constructor make-snapshot-registration ()))
+  snapshot
+  (active-p nil))
+
 (defvar *current-snapshot* nil)
 
 ;;; Active snapshot xmin values bound the oldest tuple version a vacuum may
@@ -22,14 +27,18 @@
 
 (declaim (ftype function xid-active-p))
 
-(defun note-snapshot-start ()
-  (sb-thread:with-mutex (*snapshot-count-lock*)
-    (incf *active-snapshots*)))
+(defun register-active-snapshot (snapshot &optional registration)
+  "Publish SNAPSHOT's xmin while the caller still holds the XID lock.
 
-(defun register-active-snapshot (snapshot)
-  "Publish SNAPSHOT's xmin while the caller still holds the XID lock."
-  (sb-thread:with-mutex (*snapshot-count-lock*)
-    (setf (gethash snapshot *active-snapshot-set*) t))
+REGISTRATION, when supplied, owns both the active count and the snapshot entry
+before asynchronous interrupts are re-enabled."
+  (sb-sys:without-interrupts
+    (sb-thread:with-mutex (*snapshot-count-lock*)
+      (incf *active-snapshots*)
+      (setf (gethash snapshot *active-snapshot-set*) t)
+      (when (snapshot-registration-p registration)
+        (setf (snapshot-registration-snapshot registration) snapshot
+              (snapshot-registration-active-p registration) t))))
   snapshot)
 
 (defun oldest-active-snapshot-xmin ()
@@ -43,20 +52,34 @@
                *active-snapshot-set*)
       oldest)))
 
-(defun note-snapshot-end (&optional snapshot)
-  (sb-thread:with-mutex (*snapshot-count-lock*)
-    (when snapshot
-      (remhash snapshot *active-snapshot-set*))
-    (when (plusp *active-snapshots*)
-      (decf *active-snapshots*)))
-  (sb-thread:with-mutex (*snapshot-cv-mutex*)
-    (sb-thread:condition-broadcast *snapshot-cv*)))
+(defun release-snapshot-registration (registration)
+  "Release a snapshot and active-count entry owned by REGISTRATION, once."
+  (sb-sys:without-interrupts
+    (when (snapshot-registration-active-p registration)
+      (sb-thread:with-mutex (*snapshot-count-lock*)
+        (when (remhash (snapshot-registration-snapshot registration)
+                       *active-snapshot-set*)
+          (decf *active-snapshots*))
+        (setf (snapshot-registration-snapshot registration) nil
+              (snapshot-registration-active-p registration) nil))
+      (sb-thread:with-mutex (*snapshot-cv-mutex*)
+        (sb-thread:condition-broadcast *snapshot-cv*))))
+  (values))
 
-(defmacro with-active-snapshot ((snapshot) &body body)
-  (let ((snapshot-value (gensym "SNAPSHOT-")))
-    `(let ((,snapshot-value ,snapshot))
-       (unwind-protect (progn ,@body)
-         (note-snapshot-end ,snapshot-value)))))
+(defmacro with-statement-snapshot ((snapshot acquire-function) &body body)
+  "Acquire a registered statement snapshot inside its cleanup scope.
+
+ACQUIRE-FUNCTION is called with a registration token and must return the
+registered snapshot. The token is already protected if acquisition is
+interrupted after publication but before the function returns."
+  (let ((registration (gensym "SNAPSHOT-REGISTRATION-")))
+    `(let ((,registration (make-snapshot-registration)))
+       (unwind-protect
+            (let ((,snapshot (funcall ,acquire-function ,registration)))
+              (declare (ignorable ,snapshot))
+              (let ((*current-snapshot* ,snapshot))
+                ,@body))
+         (release-snapshot-registration ,registration)))))
 
 (defun xid-committed-p (xid)
   (or (member xid (list +bootstrap-xid+ +frozen-xid+) :test #'=)

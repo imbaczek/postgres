@@ -290,8 +290,8 @@
                        ;; one if an intervening page change made it stale.
                        (heap-fsm-record-page fsm block
                                              (heap-page-insert-capacity page)))))
-      ;; Tuple TIDs remain stable for concurrent update-chain rechecks. Without
-      ;; VACUUM to establish a safe removal horizon, extend rather than prune.
+      ;; Tuple TIDs remain stable for concurrent update-chain rechecks. If the
+      ;; FSM has no reusable page with enough space, extend the relation.
       (let* ((block (buf-nblocks relfilenode))
              (page (page-init (make-page)))
              (offnum (page-add-item page tuple :allow-reuse nil)))

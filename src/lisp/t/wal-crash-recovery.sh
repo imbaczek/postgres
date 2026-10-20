@@ -27,7 +27,8 @@ start_server() {
     pause_relation=${3:-}
     max_start=${4:-150}
     if [ -n "$pause_at" ]; then
-        rm -f "$data_dir/pg_wal/test-paused-$pause_at"
+        rm -f "$data_dir/pg_wal/test-paused-$pause_at" \
+            "$data_dir/pg_wal/test-resume-$pause_at"
         if [ -n "$pause_relation" ]; then
             PG_WAL_TEST_PAUSE_AT="$pause_at" \
                 PG_WAL_TEST_PAUSE_RELATION="$pause_relation" \
@@ -987,5 +988,125 @@ for path in glob.glob(os.path.join(sys.argv[1], "*.wal")):
 PY
 expect_bad_wal_startup "$TMP/missing-wal-segment" 'WAL checkpoint segment' \
     "$TMP/missing-wal-segment.log"
+
+# Exercise each durable boundary in VACUUM's index-before-heap cleanup order.
+# The table has two indexes so the first-index boundary leaves the second one
+# stale when the server is killed.
+run_vacuum_crash_boundary() {
+    point=$1
+    start_server
+    psql_db -c 'DROP TABLE IF EXISTS wal_vacuum_recovery'
+    psql_db -c 'CREATE TABLE wal_vacuum_recovery (id int, code int)'
+    psql_db -c 'CREATE UNIQUE INDEX wal_vacuum_recovery_id_idx ON wal_vacuum_recovery (id)'
+    psql_db -c 'CREATE UNIQUE INDEX wal_vacuum_recovery_code_idx ON wal_vacuum_recovery (code)'
+    psql_db -c 'INSERT INTO wal_vacuum_recovery VALUES (41, 941)'
+    psql_db -c 'DELETE FROM wal_vacuum_recovery WHERE id = 41'
+    stop_server
+
+    start_server "$point"
+    psql_db -c 'VACUUM wal_vacuum_recovery' > "$TMP/$point.out" 2>&1 &
+    CLIENT=$!
+    wait_for_pause "$point"
+    crash_server
+    wait "$CLIENT" 2>/dev/null || true
+
+    start_server
+    [ -z "$(psql_db -A -t -c 'SELECT id FROM wal_vacuum_recovery')" ]
+    python3 - "$PGDATA" "$point" <<'PY'
+import os
+import re
+import sys
+
+data_dir, point = sys.argv[1:]
+catalog = open(os.path.join(data_dir, "global", "pg_catalog.dat"),
+               encoding="utf-8").read()
+
+def relation_file(name):
+    match = re.search(r'"' + re.escape(name) +
+                      r'"\)?\s+:relfilenode\s+(\d+)', catalog,
+                      re.IGNORECASE)
+    if not match:
+        raise SystemExit("could not find relfilenode for " + name)
+    return os.path.join(data_dir, "base", match.group(1))
+
+def read_page(path, block=0):
+    with open(path, "rb") as relation:
+        relation.seek(block * 8192)
+        page = relation.read(8192)
+    if len(page) != 8192:
+        raise SystemExit("missing page " + str(block) + " in " + path)
+    return page
+
+def u16(page, offset):
+    return int.from_bytes(page[offset:offset + 2], "little")
+
+def u32(page, offset):
+    return int.from_bytes(page[offset:offset + 4], "little")
+
+def live_items(page):
+    count = (u16(page, 12) - 24) // 4
+    return sum(((u32(page, 24 + 4 * item) >> 15) & 3) == 1
+               for item in range(count))
+
+heap_page = read_page(relation_file("wal_vacuum_recovery"))
+heap_count = (u16(heap_page, 12) - 24) // 4
+heap_flags = [((u32(heap_page, 24 + 4 * item) >> 15) & 3)
+              for item in range(heap_count)]
+if heap_flags != [3]:
+    raise SystemExit("recovered VACUUM boundary did not retain one LP_DEAD slot: "
+                     + repr(heap_flags))
+
+index_counts = []
+for name in ("wal_vacuum_recovery_id_idx",
+             "wal_vacuum_recovery_code_idx"):
+    meta = read_page(relation_file(name))
+    root = u32(meta, 30)
+    index_counts.append(live_items(read_page(relation_file(name), root)))
+
+expected = {
+    "after-vacuum-dead-tids": [1, 1],
+    "after-vacuum-index-cleanup": [0, 1],
+    "after-vacuum-indexes-before-reuse": [0, 0],
+}[point]
+if sorted(index_counts) != expected:
+    raise SystemExit("unexpected recovered index entries at " + point + ": "
+                     + repr(index_counts))
+PY
+    psql_db -c 'VACUUM wal_vacuum_recovery'
+    psql_db -c 'INSERT INTO wal_vacuum_recovery VALUES (41, 941)'
+    [ "$(psql_db -A -t -c \
+        'SELECT id FROM wal_vacuum_recovery WHERE id = 41')" = 41 ]
+    [ "$(psql_db -A -t -c \
+        'SELECT id FROM wal_vacuum_recovery WHERE code = 941')" = 41 ]
+    stop_server
+}
+
+run_vacuum_crash_boundary after-vacuum-dead-tids
+run_vacuum_crash_boundary after-vacuum-index-cleanup
+run_vacuum_crash_boundary after-vacuum-indexes-before-reuse
+
+# Keep a real statement snapshot active while another backend deletes and
+# vacuums its row. The paused reader has already published its horizon, so the
+# row must remain visible to that reader until it releases the snapshot.
+start_server
+psql_db -c 'CREATE TABLE wal_snapshot_vacuum (id int primary key)'
+psql_db -c 'INSERT INTO wal_snapshot_vacuum VALUES (7)'
+stop_server
+
+start_server after-statement-snapshot
+psql_db -A -t -c 'SELECT id FROM wal_snapshot_vacuum' \
+    > "$TMP/snapshot-vacuum-reader.out" 2>&1 &
+CLIENT=$!
+wait_for_pause after-statement-snapshot
+psql_db -c 'DELETE FROM wal_snapshot_vacuum WHERE id = 7'
+psql_db -c 'VACUUM wal_snapshot_vacuum'
+touch "$PGDATA/pg_wal/test-resume-after-statement-snapshot"
+wait "$CLIENT"
+[ "$(tr -d '[:space:]' < "$TMP/snapshot-vacuum-reader.out")" = 7 ]
+[ -z "$(psql_db -A -t -c 'SELECT id FROM wal_snapshot_vacuum')" ]
+psql_db -c 'VACUUM wal_snapshot_vacuum'
+psql_db -c 'INSERT INTO wal_snapshot_vacuum VALUES (7)'
+[ "$(psql_db -A -t -c 'SELECT id FROM wal_snapshot_vacuum')" = 7 ]
+stop_server
 
 echo "wal-crash-recovery: PASS"

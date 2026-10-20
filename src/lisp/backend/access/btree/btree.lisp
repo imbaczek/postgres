@@ -4,8 +4,7 @@
 ;;;; Internal pages carry (separator, child) entries where the separator is
 ;;;; the smallest key in the child subtree; the first entry may have an empty
 ;;;; separator (minus infinity). Leaf pages carry (key, heap TID) entries.
-;;;; Stale entries are never removed: visibility of the heap tuple decides
-;;;; whether they still matter.
+;;;; Heap visibility guards stale entries until VACUUM removes their TIDs.
 
 (in-package #:pg)
 
@@ -13,6 +12,7 @@
 (defconstant +btree-page-meta+ 1)
 (defconstant +btree-page-leaf+ 2)
 (defconstant +btree-page-internal+ 3)
+(defconstant +btree-vacuum-max-split-retries+ 2)
 (defvar *btree-split-generations* (make-hash-table :test #'eql))
 (defvar *btree-split-lock* (sb-thread:make-mutex :name "pg btree split generation"))
 
@@ -23,6 +23,12 @@
 (defun btree-record-split (relfilenode)
   (sb-thread:with-mutex (*btree-split-lock*)
     (incf (gethash relfilenode *btree-split-generations* 0))))
+
+(defun btree-forget (relfilenode)
+  "Discard split-generation state after RELFILENODE is permanently deleted."
+  (sb-thread:with-mutex (*btree-split-lock*)
+    (remhash relfilenode *btree-split-generations*))
+  (values))
 
 (defun btree-page-type (page) (aref page +pd-flags-off+))
 (defun set-btree-page-type (page type)
@@ -300,35 +306,61 @@ to a single leaf."
               (btree-write-meta relfilenode (1+ level) root)))))))
   (values))
 
-(defun btree-vacuum-delete-tids (relfilenode tids)
-  "Remove TIDS from leaf pages, retrying if a concurrent split changes pages."
+(defun btree-vacuum-delete-page-tids (relfilenode block dead)
+  (let ((page (buf-read relfilenode block)))
+    (when (and page (= (btree-page-type page) +btree-page-leaf+))
+      (let* ((entries (btree-page-entries page nil))
+             (remaining
+               (remove-if (lambda (entry)
+                            (gethash (cons (second entry) (third entry)) dead))
+                          entries)))
+        (when (< (length remaining) (length entries))
+          (let ((new-page (btree-page-build remaining nil)))
+            (unless new-page
+              (ereport "XX000" "could not rebuild B-tree leaf page"))
+            (with-wal-page-batch
+              (buf-write relfilenode block new-page))))))))
+
+(defun btree-vacuum-scan-tids (relfilenode dead nblocks
+                               &key exclusive after-page-function)
+  (dotimes (block nblocks)
+    (check-for-interrupts)
+    (if exclusive
+        (btree-vacuum-delete-page-tids relfilenode block dead)
+        (with-write-lock
+          (btree-vacuum-delete-page-tids relfilenode block dead)))
+    ;; Tests use this hook to force splits between page visits. The final pass
+    ;; deliberately omits it while holding the split barrier.
+    (when (and after-page-function (not exclusive))
+      (funcall after-page-function relfilenode block))))
+
+(defun btree-vacuum-delete-tids (relfilenode tids &key after-page-function)
+  "Remove TIDS, retrying boundedly before a write-locked final scan."
   (when tids
-    (let ((dead (make-hash-table :test #'equal)))
+    (let ((dead (make-hash-table :test #'equal))
+          (retries 0))
       (dolist (tid tids)
         (setf (gethash (cons (car tid) (cdr tid)) dead) t))
       (loop
         for generation = (btree-split-generation relfilenode)
         for nblocks = (buf-nblocks relfilenode)
-        do (dotimes (block nblocks)
-             (check-for-interrupts)
-             (with-write-lock
-               (let ((page (buf-read relfilenode block)))
-                 (when (and page (= (btree-page-type page) +btree-page-leaf+))
-                   (let* ((entries (btree-page-entries page nil))
-                          (remaining
-                            (remove-if (lambda (entry)
-                                         (gethash (cons (second entry)
-                                                        (third entry))
-                                                  dead))
-                                       entries)))
-                     (when (< (length remaining) (length entries))
-                       (let ((new-page (btree-page-build remaining nil)))
-                         (unless new-page
-                           (ereport "XX000" "could not rebuild B-tree leaf page"))
-                         (with-wal-page-batch
-                           (buf-write relfilenode block new-page)))))))))
-        do (wal-commit-maintenance)
-        until (= generation (btree-split-generation relfilenode)))))
+        do (btree-vacuum-scan-tids relfilenode dead nblocks
+                                   :after-page-function after-page-function)
+           (wal-commit-maintenance)
+           (when (= generation (btree-split-generation relfilenode))
+             (return))
+           (if (< retries +btree-vacuum-max-split-retries+)
+               (incf retries)
+               (progn
+                 ;; DML holds this coarse lock while changing B-tree structure.
+                 ;; Once bounded retries are exhausted, one exclusive pass gives
+                 ;; the cleanup a stable page set and guarantees completion.
+                 (with-write-lock
+                   (btree-vacuum-scan-tids relfilenode dead
+                                           (buf-nblocks relfilenode)
+                                           :exclusive t)
+                   (wal-commit-maintenance))
+                 (return))))))
   (values))
 
 ;;; ---- key encoding ----

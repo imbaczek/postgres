@@ -381,15 +381,14 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
         (complete-xid-wraparound))))
   (wait-for-xid-wraparound backend))
 
-(defun begin-statement-snapshot (backend curcid)
-  (wait-for-xid-wraparound
-   backend
-   (lambda ()
-     (note-snapshot-start)
-     (handler-case (make-snapshot curcid :register t)
-       (error (condition)
-         (note-snapshot-end)
-         (error condition))))))
+(defun begin-statement-snapshot (backend curcid registration)
+  (let ((snapshot
+          (wait-for-xid-wraparound
+           backend
+           (lambda ()
+             (make-snapshot curcid :register registration)))))
+    (wal-test-pause-once :after-statement-snapshot)
+    snapshot))
 
 (defun assign-xid ()
   (let ((oldest-relfrozenxid (catalog-oldest-relfrozenxid)))
@@ -668,7 +667,7 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
            (snapshot (make-snapshot-struct :xmin xmin :xmax xmax
                                            :xip xip :curcid curcid)))
       (when register
-        (register-active-snapshot snapshot))
+        (register-active-snapshot snapshot register))
       snapshot)))
 
 (defun oldest-xmin ()
@@ -700,7 +699,7 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
     (push relfilenode (backend-dirty-relations *backend*)))
   (values))
 
-(defun statement-start ()
+(defun statement-start (registration)
   (let ((b *backend*))
     (when (eq (backend-state b) :aborted)
       (ereport "25P02"
@@ -711,7 +710,8 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
             (backend-command-id b) 0)
       (set-backend-state b :in-progress))
     (incf (backend-command-id b))
-    (let ((snap (begin-statement-snapshot b (backend-command-id b))))
+    (let ((snap (begin-statement-snapshot b (backend-command-id b)
+                                          registration)))
       (setf (backend-snapshot b) snap)
       snap)))
 

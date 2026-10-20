@@ -9,10 +9,12 @@
   ;; VACUUM has no user transaction or statement snapshot, but it must still
   ;; participate in wraparound admission and keep CLOG stable until it finishes.
   (prepare-xid-wraparound-for-statement *backend*)
-  (let ((snapshot
-          (begin-statement-snapshot *backend*
-                                    (backend-command-id *backend*))))
-    (with-active-snapshot (snapshot)
-      (let ((table (resolve-table-or-error (getf ast :table))))
-        (vacuum-table table)
-        (send-command-complete stream "VACUUM")))))
+  (with-statement-snapshot
+      (snapshot
+       (lambda (registration)
+         (begin-statement-snapshot *backend*
+                                   (backend-command-id *backend*)
+                                   registration)))
+    (let ((table (resolve-table-or-error (getf ast :table))))
+      (vacuum-table table)
+      (send-command-complete stream "VACUUM"))))
