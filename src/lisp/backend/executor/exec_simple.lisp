@@ -46,6 +46,19 @@ rolled back immediately."
 
 ;;; ---- transaction commands ----
 
+(defun copy-session-settings (settings)
+  (let ((copy (make-hash-table :test (hash-table-test settings))))
+    (maphash (lambda (key value) (setf (gethash key copy) value)) settings)
+    copy))
+
+(defun restore-session-settings (stream)
+  (let ((settings (backend-settings-transaction-start *backend*)))
+    (when settings
+      (setf (backend-settings *backend*) settings
+            (backend-settings-transaction-start *backend*) nil)
+      (send-parameter-status stream "TimeZone"
+                             (or (gethash "timezone" settings) "UTC")))))
+
 (defun command-begin (stream)
   (if (eq (backend-state *backend*) :idle)
       (setf (backend-state *backend*) :in-progress
@@ -53,7 +66,9 @@ rolled back immediately."
             (backend-command-id *backend*) 0
             (backend-xid *backend*) nil
             (backend-snapshot *backend*) nil
-            (backend-dirty-relations *backend*) '())
+            (backend-dirty-relations *backend*) '()
+            (backend-settings-transaction-start *backend*)
+            (copy-session-settings (backend-settings *backend*)))
       (send-notice stream "there is already a transaction in progress"))
   (send-command-complete stream "BEGIN"))
 
@@ -61,9 +76,11 @@ rolled back immediately."
   (case (backend-state *backend*)
     (:aborted
      (abort-transaction)
+     (restore-session-settings stream)
      (send-command-complete stream "ROLLBACK"))
     (:in-progress
      (commit-transaction)
+     (setf (backend-settings-transaction-start *backend*) nil)
      (send-command-complete stream "COMMIT"))
     (t
      (send-notice stream "there is no transaction in progress")
@@ -76,12 +93,81 @@ rolled back immediately."
         (send-command-complete stream "ROLLBACK"))
       (progn
         (abort-transaction)
+        (restore-session-settings stream)
         (send-command-complete stream "ROLLBACK"))))
 
 ;;; ---- SET / SHOW / RESET ----
 
+(defun known-show-setting-p (name)
+  (member name '("transaction_isolation" "server_version"
+                 "server_version_num" "client_encoding" "server_encoding"
+                 "timezone" "datestyle" "standard_conforming_strings"
+                 "is_superuser")
+          :test #'string=))
+
+(defun exec-set (stream ast)
+  (let* ((name (string-downcase (getf ast :name)))
+         (raw-value (getf ast :value))
+         (value (if (eq raw-value :default)
+                    (cond
+                      ((string= name "timezone") "UTC")
+                      ((string= name "transaction_isolation") "read committed")
+                      ((string= name "client_encoding") "UTF8")
+                      ((string= name "standard_conforming_strings") "on")
+                      (t :default))
+                    raw-value)))
+    (cond
+      ((string= name "timezone")
+       (if (eq raw-value :default)
+           (remhash "timezone" (backend-settings *backend*))
+           (progn
+             (when (or (zerop (length value)) (string-equal value "local"))
+               (ereport "0A000" "this TIME ZONE value is not supported"))
+             (setf (gethash "timezone" (backend-settings *backend*)) value)))
+       (send-parameter-status
+        stream "TimeZone"
+        (or (gethash "timezone" (backend-settings *backend*)) "UTC")))
+      ((string= name "transaction_isolation")
+       (unless (string-equal value "read committed")
+         (ereport "0A000" "only READ COMMITTED isolation is supported")))
+      ((string= name "client_encoding")
+       (unless (string-equal value "UTF8")
+         (ereport "0A000" "only UTF8 client encoding is supported")))
+      ((string= name "standard_conforming_strings")
+       (unless (string-equal value "on")
+         (ereport "0A000" "standard_conforming_strings can only be on")))
+      ((known-show-setting-p name)
+       (ereport "0A000" "configuration parameter \"~a\" is read-only"
+                name))
+      (t
+       (ereport "42704" "unrecognized configuration parameter \"~a\""
+                name)))
+    (send-command-complete stream "SET")))
+
+(defun exec-reset (stream ast)
+  (let ((name (string-downcase (getf ast :name))))
+    (cond
+      ((string= name "all")
+       (clrhash (backend-settings *backend*))
+       (send-parameter-status stream "TimeZone" "UTC"))
+      ((string= name "timezone")
+       (remhash "timezone" (backend-settings *backend*))
+       (send-parameter-status stream "TimeZone" "UTC"))
+      ((member name '("transaction_isolation" "client_encoding"
+                      "standard_conforming_strings")
+               :test #'string=)
+       ;; These settings have a fixed supported value in this server.
+       (values))
+      ((known-show-setting-p name)
+       (ereport "0A000" "configuration parameter \"~a\" cannot be reset"
+                name))
+      (t
+       (ereport "42704" "unrecognized configuration parameter \"~a\""
+                name)))
+    (send-command-complete stream "RESET")))
+
 (defun exec-show (stream ast)
-  (let* ((name (getf ast :name))
+  (let* ((name (string-downcase (getf ast :name)))
          (value (cond
                   ((string= name "transaction_isolation") "read committed")
                   ((string= name "server_version") *server-version*)
@@ -89,7 +175,9 @@ rolled back immediately."
                    (princ-to-string *server-version-num*))
                   ((string= name "client_encoding") "UTF8")
                   ((string= name "server_encoding") "UTF8")
-                  ((string= name "timezone") "UTC")
+                  ((string= name "timezone")
+                   (or (gethash "timezone" (backend-settings *backend*))
+                       "UTC"))
                   ((string= name "datestyle") "ISO, MDY")
                   ((string= name "standard_conforming_strings") "on")
                   ((string= name "is_superuser") "on")
@@ -610,8 +698,8 @@ rolled back immediately."
       (:begin (command-begin stream))
       (:commit (command-commit stream))
       (:rollback (command-rollback stream))
-      (:set (send-command-complete stream "SET"))
-      (:reset (send-command-complete stream "RESET"))
+      (:set (exec-set stream ast))
+      (:reset (exec-reset stream ast))
       (:show (exec-show stream ast))
       (otherwise (execute-in-transaction stream ast)))))
 

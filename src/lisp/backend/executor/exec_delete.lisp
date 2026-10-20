@@ -25,8 +25,12 @@
       (with-write-lock
         (ensure-current-table table))
       (dolist (tid (collect-matching-tids table where))
-        (when (heapam-delete-tid rel columns (car tid) (cdr tid)
-                                 xid (backend-command-id *backend*))
+        (when (heapam-delete-tid
+               rel columns (car tid) (cdr tid) xid
+               (backend-command-id *backend*)
+               (lambda (tuple)
+                 (or (null where)
+                     (true-p (eval-expr where (htup-values tuple))))))
           (incf count)))
       (send-command-complete stream (format nil "DELETE ~a" count)))))
 
@@ -47,9 +51,14 @@
         (ensure-current-table table))
       (dolist (tid (collect-matching-tids table where))
         (check-for-interrupts)
-        (let ((tuple (heapam-get-tuple rel (car tid) (cdr tid) columns)))
-          (when (and tuple
-                     (htup-visible-p tuple *current-snapshot*))
+        (multiple-value-bind (deleted tuple old-block old-offnum)
+            (heapam-delete-tid
+             rel columns (car tid) (cdr tid) xid
+             (backend-command-id *backend*)
+             (lambda (candidate)
+               (or (null where)
+                   (true-p (eval-expr where (htup-values candidate))))))
+          (when deleted
             (let* ((old (htup-values tuple))
                    (new (copy-seq old)))
               (dolist (set sets)
@@ -61,9 +70,11 @@
                                       (pg-column-type col)
                                       (pg-column-typmod col)))))
               (check-not-null new columns)
-              (when (heapam-delete-tid rel columns (car tid) (cdr tid)
-                                       xid (backend-command-id *backend*))
-                (insert-tuple-with-unique table new
-                                          :exclude-tid tid)
+              (multiple-value-bind (new-block new-offnum)
+                  (insert-tuple-with-unique
+                   table new :exclude-tid (cons old-block old-offnum))
+                (unless (heapam-set-ctid rel old-block old-offnum
+                                         new-block new-offnum)
+                  (ereport "XX000" "could not link updated heap tuple"))
                 (incf count))))))
       (send-command-complete stream (format nil "UPDATE ~a" count)))))

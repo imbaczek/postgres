@@ -46,9 +46,9 @@ A **restart** is still required when:
   stale);
 - you change code that runs only once at startup and is already executing or
   already installed: `boot.lisp`, `pg-lisp.sh`, the accept loops (`serve`,
-  `control-accept-loop`), `main`, the reload and postmaster worker threads, and
-  the handlers installed by `enable-reload` / `enable-shutdown-handlers` /
-  `enable-cleanup`;
+  `control-accept-loop`), `xact-init`, `start-control-plane`, `main`, the reload
+  and postmaster worker threads, and the handlers installed by `enable-reload` /
+  `enable-shutdown-handlers` / `enable-cleanup`;
 - you add or remove files in `pg.asd`.
 
 Caveats: a reload recompiles the whole system (about a second, not incremental),
@@ -56,7 +56,9 @@ and a reload whose compilation fails partway can leave a mixed image — restart
 the reload output reports an error. Reader evaluation (`#.`) is disabled at the
 control REPL prompt, but `eval` still runs parsed forms, so the REPL is arbitrary
 code execution; it stays off unless `--control-port` / `--control-socket` is
-given, and the Unix socket is `chmod`ed to `0700`.
+given. The Unix socket's parent directory must be owned by the server user with
+mode `0700`, and the socket node is `chmod`ed to `0700`; failure to enforce
+those permissions aborts startup.
 
 ## Live SQL and SLIME debugging
 

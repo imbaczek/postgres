@@ -7,7 +7,15 @@
 (in-package #:pg)
 
 (defun buf-read (relfilenode block)
-  (smgr-read relfilenode block))
+  (let ((page (smgr-read relfilenode block)))
+    (when page
+      (let ((version (page-u16 page +pd-pagesize-version-off+))
+            (expected (logior +blcksz+ +pg-page-layout-version+)))
+        (unless (= version expected)
+          (ereport "XX001"
+                   "unsupported page layout version ~a (expected ~a)"
+                   version expected)))
+      page)))
 
 (defun buf-write (relfilenode block page)
   (smgr-write relfilenode block page))

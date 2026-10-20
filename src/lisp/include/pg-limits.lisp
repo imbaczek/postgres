@@ -1,4 +1,4 @@
-;;;; pg-limits.lisp -- constants mirroring PostgreSQL's layout limits.
+;;;; pg-limits.lisp -- PostgreSQL limits and this server's page format.
 
 (in-package #:pg)
 
@@ -6,13 +6,28 @@
 (defconstant +maxalign+ 8)
 (defconstant +size-of-page-header+ 24)
 (defconstant +size-of-item-id+ 4)
-(defconstant +size-of-heap-tuple-header+ 23)
+;;; Version 5 uses 64-bit XIDs, so its heap tuple header differs from PostgreSQL's.
+(defconstant +size-of-heap-tuple-header+ 31)
+(defconstant +heap-tuple-xmin-off+ 0)
+(defconstant +heap-tuple-xmax-off+ 8)
+(defconstant +heap-tuple-cid-off+ 16)
+(defconstant +heap-tuple-ctid-block-off+ 20)
+(defconstant +heap-tuple-ctid-offnum-off+ 24)
+(defconstant +heap-tuple-natts-off+ 26)
+(defconstant +heap-tuple-infomask-off+ 28)
+(defconstant +heap-tuple-hoff-off+ 30)
 (defconstant +namedatalen+ 64)
-(defconstant +pg-page-layout-version+ 4)
+(defconstant +pg-page-layout-version+ 5)
+
+;;; Wire message sizes include their length field, as PostgreSQL specifies.
+(defconstant +max-startup-message-size+ 10000)
+(defconstant +max-query-message-size+ (* 16 1024 1024))
 
 ;;; Transaction IDs.
 (defconstant +invalid-xid+ 0)
 (defconstant +first-normal-xid+ 3)
+(defconstant +max-xid+ #xFFFFFFFFFFFFFFFF)
+(defconstant +max-xid-one-past+ #x10000000000000000)
 
 ;;; OIDs.
 (defconstant +invalid-oid+ 0)

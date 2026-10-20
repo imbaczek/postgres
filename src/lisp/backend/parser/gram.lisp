@@ -529,20 +529,22 @@
      (token-value (pnext p)))
     ((eq (pkind p) :ident)
      (if (kw-p p "default")
-         (progn (pnext p) "default")
+         (progn (pnext p) :default)
          (pident p)))
     (t (syntax-error p "expected setting value"))))
 
 (defun parse-set (p)
   (when (match-kw p "session") nil)
-  (when (match-kw p "local") nil)
+  (when (match-kw p "local")
+    (ereport "0A000" "SET LOCAL is not supported"))
   (cond
     ((match-kw p "transaction")
      (cond
        ((kw-p p "isolation")
         (parse-isolation-level p))
        ((match-kw p "read")
-        (cond ((match-kw p "only") nil)
+        (cond ((match-kw p "only")
+               (ereport "0A000" "SET TRANSACTION READ ONLY is not supported"))
               ((match-kw p "write") nil)
               (t (syntax-error p))))
        (t (syntax-error p)))
@@ -571,9 +573,14 @@
     (list :type :show :name name)))
 
 (defun parse-reset (p)
-  (if (match-kw p "all")
-      (list :type :reset :name "all")
-      (list :type :reset :name (pident p))))
+  (cond
+    ((match-kw p "all")
+     (list :type :reset :name "all"))
+    ((match-kw p "time")
+     (expect-kw p "zone")
+     (list :type :reset :name "timezone"))
+    (t
+     (list :type :reset :name (pident p)))))
 
 ;;; ---- expressions ----
 

@@ -123,8 +123,7 @@ check NULL-containing keys for conflicts too."
                (let ((columns (pg-class-columns table)))
                  (multiple-value-bind (block off)
                      (heapam-insert relfilenode columns values xid
-                                    (backend-command-id *backend*)
-                                    :allow-reuse (null (pg-class-indexes table)))
+                                    (backend-command-id *backend*))
                    (dolist (idx (table-indexes table))
                      (let* ((types (index-types idx table))
                             (key (encode-index-key

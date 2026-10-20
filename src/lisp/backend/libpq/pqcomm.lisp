@@ -41,36 +41,64 @@
 ;;; ---- reading ----
 
 (defun read-exact-bytes (stream n)
-  "Read exactly N bytes. Return NIL on EOF."
+  "Read exactly N bytes. Return bytes and N, or NIL and the count on EOF."
   (when (zerop n)
-    (return-from read-exact-bytes (make-array 0 :element-type '(unsigned-byte 8))))
+    (return-from read-exact-bytes
+      (values (make-array 0 :element-type '(unsigned-byte 8)) 0)))
   (let ((buf (make-array n :element-type '(unsigned-byte 8))))
     (let ((got (read-sequence buf stream)))
       (when (< got n)
-        (return-from read-exact-bytes nil))
-      buf)))
+        (return-from read-exact-bytes (values nil got)))
+      (values buf got))))
+
+(defun malformed-protocol-message (message)
+  (ereport-fatal "08P01" message))
 
 (defun read-startup-packet (stream)
   "Read one untyped startup packet body. Return NIL on EOF."
-  (let ((lenb (read-exact-bytes stream 4)))
-    (when (null lenb)
-      (return-from read-startup-packet nil))
-    (let* ((len (bytes-to-u32 lenb 0)))
-      (when (< len 4)
-        (return-from read-startup-packet nil))
-      (read-exact-bytes stream (- len 4)))))
+  (multiple-value-bind (lenb got) (read-exact-bytes stream 4)
+    (unless lenb
+      (if (zerop got)
+          (return-from read-startup-packet nil)
+          (malformed-protocol-message "incomplete startup packet length")))
+    (let ((len (bytes-to-u32 lenb 0)))
+      (when (< len 8)
+        (malformed-protocol-message "startup packet length is too short"))
+      (when (> len +max-startup-message-size+)
+        (malformed-protocol-message "startup packet exceeds the size limit"))
+      (multiple-value-bind (body body-got) (read-exact-bytes stream (- len 4))
+        (unless body
+          (if (zerop body-got)
+              (malformed-protocol-message "incomplete startup packet body")
+              (malformed-protocol-message "truncated startup packet body")))
+        body))))
 
 (defun read-message (stream)
   "Read one typed frontend message. Return NIL on EOF."
   (let ((type-byte (read-byte stream nil nil)))
     (when (null type-byte)
       (return-from read-message nil))
-    (let* ((lenb (read-exact-bytes stream 4))
-           (len (and lenb (bytes-to-u32 lenb 0)))
-           (payload (and lenb (>= len 4) (read-exact-bytes stream (- len 4)))))
-      (when (or (null lenb) (null payload))
-        (return-from read-message nil))
-      (make-frontend-message (code-char type-byte) payload))))
+    (let ((lenb (read-exact-bytes stream 4)))
+      (unless lenb
+        (malformed-protocol-message "incomplete frontend message length"))
+      (let ((len (bytes-to-u32 lenb 0)))
+        (when (< len 4)
+          (malformed-protocol-message "frontend message length is too short"))
+        (when (> len +max-query-message-size+)
+          (malformed-protocol-message "frontend message exceeds the size limit"))
+        (when (and (= type-byte (char-code #\X)) (/= len 4))
+          (malformed-protocol-message
+           "terminate message must not contain a payload"))
+        (let ((payload (read-exact-bytes stream (- len 4))))
+          (unless payload
+            (malformed-protocol-message "incomplete frontend message body"))
+          (when (= type-byte (char-code #\Q))
+            (let ((terminator (position 0 payload)))
+              (unless (and terminator
+                           (= terminator (1- (length payload))))
+                (malformed-protocol-message
+                 "simple query message must contain one trailing null byte"))))
+          (make-frontend-message (code-char type-byte) payload))))))
 
 ;;; ---- writing ----
 

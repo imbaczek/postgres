@@ -63,13 +63,16 @@ For interactive work there is also an out-of-band control REPL. It is **off by
 default** because it evaluates arbitrary Lisp; enable it explicitly:
 
 ```sh
-./pg-lisp.sh -p 5439 --control-port 5490 --control-socket /tmp/pg.sock
+CONTROL_DIR=$(mktemp -d)
+./pg-lisp.sh -p 5439 --control-port 5490 \
+  --control-socket "$CONTROL_DIR/pg.sock"
 ```
 
 `--control-port` binds a TCP listener on `127.0.0.1` only; `--control-socket`
-binds an AF_UNIX socket and `chmod`s the node to `0700`. Either or both may be
-given. A clean shutdown removes the Unix socket on the way out, and a stale
-socket is deleted at startup, so restarts are clean.
+binds an AF_UNIX socket and `chmod`s the node to `0700`. Its parent directory
+must already be owned by the server user and have mode `0700`. Either or both
+may be given. A clean shutdown removes the Unix socket. After an unclean exit,
+remove the stale socket path manually before restarting.
 
 Then connect with any line-oriented client. Over TCP:
 
@@ -80,7 +83,7 @@ nc 127.0.0.1 5490          # or: socat - TCP:127.0.0.1:5490
 Over the Unix socket:
 
 ```sh
-nc -U /tmp/pg.sock         # or: socat - UNIX-CONNECT:/tmp/pg.sock
+nc -U "$CONTROL_DIR/pg.sock"  # or: socat - UNIX-CONNECT:"$CONTROL_DIR/pg.sock"
 ```
 
 The REPL starts in the `pg` package and prints the value of each form you type.
@@ -178,7 +181,10 @@ parentheses. Scalar functions: `version()`, `pg_lisp_runtime()`,
 `pg_cancel_backend(pid)`,
 `pg_terminate_backend(pid [, timeout])`, `pg_reload_conf()`.
 
-`SET` and `SHOW` are accepted broadly and mostly remembered per session.
+`SET TIME ZONE` is stored per backend and returned by `SHOW timezone`;
+`RESET TIME ZONE` and `RESET ALL` restore UTC. The server supports only
+`READ COMMITTED`, UTF8 client encoding, and `standard_conforming_strings = on`.
+`SET LOCAL`, unsupported setting names, and unsupported values are rejected.
 Meta-commands that need `pg_catalog` and regular-expression operators (`\d`,
 `\dt`, `\l`) return an error from the server; `psql` prints it and continues.
 
@@ -300,14 +306,15 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
 
 - 8 KB pages with PostgreSQL's `PageHeaderData` + `ItemIdData` layout, one file
   per relation under `$PGDATA/base/<relfilenode>`.
-- Heap tuples use PostgreSQL's `HeapTupleHeaderData` field order (`t_xmin`,
-  `t_xmax`, `t_cid`, `t_ctid`, `t_infomask2`, `t_infomask`, `t_hoff`) followed
+- Heap tuples use a versioned `HeapTupleHeaderData`-like layout with 64-bit
+  `xmin`/`xmax`, then `cid`, `ctid`, `natts`, `infomask`, and `hoff`, followed
   by a null bitmap and attribute data. Attribute lookup is a single
   left-to-right walk (no offset table) — see `afm` notes in the code.
-- Real MVCC: 64-bit XIDs, a CLog (`pg_xact`) with 2 status bits per XID, and a
-  per-statement READ COMMITTED snapshot with `curcid`. `XIDs` are handed out in
-  batches of 1000, with `global/pg_control` fsynced before any XID in the batch
-  is used.
+- Real MVCC: 64-bit XIDs stored without truncation in tuple headers, a CLog
+  (`pg_xact`) with 2 status bits per XID, and a per-statement READ COMMITTED
+  snapshot with `curcid`. `XIDs` are handed out in
+  batches of 1000, with `global/pg_control` atomically replaced and its
+  directory fsynced before any XID in the batch is used.
 - Commit order: fsync every dirty heap/index file, then write + fsync CLog
   COMMITTED, then let the tuple become visible.
 - The catalog (`pg_class`/`pg_attribute`/`pg_index` as structs) is serialized to
@@ -323,6 +330,8 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   still written.
 - A disconnecting backend aborts any transaction it left open, so an abandoned
   XID (and the in-progress tuple it wrote) cannot block other sessions.
+- UPDATE and DELETE follow a committed update's `ctid` chain after waiting for
+  its writer, refresh the row snapshot, and recheck the WHERE condition.
 - Writers take a single global write mutex; DDL also takes a catalog mutex;
   page I/O is serialized under an smgr mutex. Readers do not block.
 
@@ -331,6 +340,9 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
 - No WAL and no crash recovery. A crash between the data fsync and the CLog
   commit loses that transaction; it is treated as aborted on restart. A
   returned `COMMIT` is therefore not power-fail safe.
+- Heap page layout version 5 stores 64-bit tuple XIDs. Existing version 4
+  relation files are rejected and must be recreated before use.
+- XID allocation stops after `2^64 - 1`; wraparound is not implemented.
 - DDL inside an explicit transaction block is rejected (`0A000`) because the
   catalog has no rollback log.
 - Catalog changes are fsynced at DDL statement time, while heap/index pages are
@@ -344,8 +356,9 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   listed above.
 - `SELECT` always uses a sequential heap scan; indexes exist to enforce
   uniqueness, not yet to accelerate reads.
-- No VACUUM; only lazy in-page pruning of dead tuples. Freed heap slots are
-  recycled only when the table has no indexes (to avoid dangling index TIDs).
+- No VACUUM or heap tuple pruning; old row versions and their TIDs are retained
+  so concurrent update-chain rechecks cannot follow a reused TID. Updates and
+  deletes do not reclaim heap space, and inserts always allocate new heap TIDs.
 - Byte-wise comparison only, i.e. C-like collation for ASCII. Index key
   encoding is length-first and is used internally only.
 - Numeric/float, date/time, boolean, and other types are unsupported. `text` is

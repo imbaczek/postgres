@@ -9,6 +9,8 @@
 (defstruct htup
   block
   offnum
+  ctid-block
+  ctid-offnum
   xmin
   xmax
   cid
@@ -58,15 +60,16 @@
       (setf infomask (logior infomask +heap-hasvarwidth+)))
     (let ((bytes (make-array cursor :element-type '(unsigned-byte 8)
                                     :initial-element 0)))
-      ;; HeapTupleHeaderData
-      (page-set-u32 bytes 0 xmin)
-      (page-set-u32 bytes 4 xmax)
-      (page-set-u32 bytes 8 cid)
-      (page-set-u32 bytes 12 block)
-      (page-set-u16 bytes 16 off)
-      (page-set-u16 bytes 18 natts)
-      (page-set-u16 bytes 20 infomask)
-      (setf (aref bytes 22) hoff)
+      ;; HeapTupleHeaderData. XIDs use the full 64-bit transaction counter;
+      ;; the page layout version distinguishes this header from the old format.
+      (page-set-u64 bytes +heap-tuple-xmin-off+ xmin)
+      (page-set-u64 bytes +heap-tuple-xmax-off+ xmax)
+      (page-set-u32 bytes +heap-tuple-cid-off+ cid)
+      (page-set-u32 bytes +heap-tuple-ctid-block-off+ block)
+      (page-set-u16 bytes +heap-tuple-ctid-offnum-off+ off)
+      (page-set-u16 bytes +heap-tuple-natts-off+ natts)
+      (page-set-u16 bytes +heap-tuple-infomask-off+ infomask)
+      (setf (aref bytes +heap-tuple-hoff-off+) hoff)
       ;; Null bitmap.
       (loop for i from 0 below natts
             when (eq (aref values i) +null+)
@@ -97,13 +100,15 @@
       bytes)))
 
 (defun deform-heap-tuple (bytes columns)
-  "Return (values values xmin xmax cid infomask)."
+  "Return values, XIDs, command ID, infomask, and successor TID."
   (let* ((natts (length columns))
-         (xmin (page-u32 bytes 0))
-         (xmax (page-u32 bytes 4))
-         (cid (page-u32 bytes 8))
-         (infomask (page-u16 bytes 20))
-         (hoff (aref bytes 22))
+         (xmin (page-u64 bytes +heap-tuple-xmin-off+))
+         (xmax (page-u64 bytes +heap-tuple-xmax-off+))
+         (cid (page-u32 bytes +heap-tuple-cid-off+))
+         (ctid-block (page-u32 bytes +heap-tuple-ctid-block-off+))
+         (ctid-offnum (page-u16 bytes +heap-tuple-ctid-offnum-off+))
+         (infomask (page-u16 bytes +heap-tuple-infomask-off+))
+         (hoff (aref bytes +heap-tuple-hoff-off+))
          (values (make-array natts :initial-element +null+))
          (cursor hoff))
     (loop for i from 0 below natts
@@ -142,7 +147,7 @@
                                              :start data-start
                                              :end (+ data-start data-len)))
                         (incf cursor total))))))))
-    (values values xmin xmax cid infomask)))
+    (values values xmin xmax cid infomask ctid-block ctid-offnum)))
 
 (defun heapam-get-tuple (relfilenode block offnum columns)
   (let ((page (buf-read relfilenode block)))
@@ -150,46 +155,46 @@
       (multiple-value-bind (off flags len) (page-get-lp page offnum)
         (when (= flags +lp-normal+)
           (let ((bytes (subseq page off (+ off len))))
-            (multiple-value-bind (values xmin xmax cid infomask)
+            (multiple-value-bind (values xmin xmax cid infomask
+                                  ctid-block ctid-offnum)
                 (deform-heap-tuple bytes columns)
               (make-htup :block block :offnum offnum
+                         :ctid-block ctid-block :ctid-offnum ctid-offnum
                          :xmin xmin :xmax xmax :cid cid
                          :infomask infomask :values values))))))))
 
-(defun heapam-insert (relfilenode columns values xmin cid &key allow-reuse)
+(defun heapam-insert (relfilenode columns values xmin cid)
   "Insert a tuple; return (values block offnum)."
   (let ((tuple (form-heap-tuple values columns xmin 0 cid 0 0))
         (nblocks (buf-nblocks relfilenode)))
     (flet ((try-page (block)
              (let ((page (buf-read relfilenode block)))
                (when page
-                 (let ((offnum (page-add-item page tuple :allow-reuse allow-reuse)))
+                 (let ((offnum (page-add-item page tuple :allow-reuse nil)))
                    (when offnum
                      (multiple-value-bind (toff tflags tlen)
                          (page-get-lp page offnum)
                        (declare (ignore tflags tlen))
-                       (page-set-u32 page (+ toff 12) block)
-                       (page-set-u16 page (+ toff 16) offnum))
+                       (page-set-u32 page (+ toff +heap-tuple-ctid-block-off+)
+                                     block)
+                       (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+)
+                                     offnum))
                      (buf-write relfilenode block page)
                      (mark-dirty relfilenode)
                      (return-from try-page (values block offnum))))))))
       (loop for block from 0 below nblocks
             do (multiple-value-bind (b o) (try-page block)
                  (when b (return-from heapam-insert (values b o)))))
-      ;; No page had space: prune and retry once.
-      (loop for block from 0 below nblocks
-            do (when (plusp (heapam-prune-page relfilenode block))
-                 (multiple-value-bind (b o) (try-page block)
-                   (when b (return-from heapam-insert (values b o))))))
-      ;; Extend.
+      ;; Tuple TIDs remain stable for concurrent update-chain rechecks. Without
+      ;; VACUUM to establish a safe removal horizon, extend rather than prune.
       (let ((page (page-init (make-page))))
         (let ((offnum (page-add-item page tuple :allow-reuse nil)))
           (unless offnum
             (ereport "54000" "row is too large for a heap page"))
           (multiple-value-bind (toff tflags tlen) (page-get-lp page offnum)
             (declare (ignore tflags tlen))
-            (page-set-u32 page (+ toff 12) nblocks)
-            (page-set-u16 page (+ toff 16) offnum))
+            (page-set-u32 page (+ toff +heap-tuple-ctid-block-off+) nblocks)
+            (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+) offnum))
           (buf-write relfilenode nblocks page)
           (mark-dirty relfilenode)
           (values nblocks offnum))))))
@@ -200,62 +205,103 @@
       (multiple-value-bind (off flags len) (page-get-lp page offnum)
         (declare (ignore len))
         (when (= flags +lp-normal+)
-          (page-set-u32 page (+ off 4) xmax)
-          (page-set-u32 page (+ off 8) cid)
+          (page-set-u64 page (+ off +heap-tuple-xmax-off+) xmax)
+          (page-set-u32 page (+ off +heap-tuple-cid-off+) cid)
           (buf-write relfilenode block page)
           (mark-dirty relfilenode)
           t)))))
 
-(defun heapam-delete-tid (relfilenode columns block offnum xid cid)
-  "Mark TID deleted by XID, waiting for a concurrent deleter if needed.
-Return T if this transaction actually deleted it."
+(defun heapam-set-ctid (relfilenode block offnum ctid-block ctid-offnum)
+  (with-write-lock
+    (let ((page (buf-read relfilenode block)))
+      (when page
+        (multiple-value-bind (off flags len) (page-get-lp page offnum)
+          (declare (ignore len))
+          (when (= flags +lp-normal+)
+            (page-set-u32 page (+ off +heap-tuple-ctid-block-off+) ctid-block)
+            (page-set-u16 page (+ off +heap-tuple-ctid-offnum-off+) ctid-offnum)
+            (buf-write relfilenode block page)
+            (mark-dirty relfilenode)
+            t))))))
+
+(defun fresh-delete-snapshot (fallback)
+  (if *backend*
+      (make-snapshot (backend-command-id *backend*))
+      fallback))
+
+(defun heapam-delete-tid (relfilenode columns block offnum xid cid
+                          &optional (matches-p (constantly t)))
+  "Delete the latest qualifying version of TID, waiting for a writer.
+
+After a conflicting update commits, follow its ctid chain and evaluate
+MATCHES-P against the refreshed row before claiming it. Return T, the tuple
+whose xmax was set, and that tuple's physical block and offset."
   (register-relation-writer relfilenode xid)
-  (loop
-    (let ((action
-            (with-write-lock
-              (let ((tuple (heapam-get-tuple relfilenode block offnum columns)))
-                (cond
-                  ((null tuple) :skip)
-                  ((= (htup-xmax tuple) xid) :done)
-                  ((and (not (zerop (htup-xmax tuple)))
-                        (xid-in-progress-p (htup-xmax tuple))
-                        (/= (htup-xmax tuple) xid))
-                   (cons :wait (htup-xmax tuple)))
-                  ((not (heap-tuple-visible-p
-                         (htup-xmin tuple) (htup-xmax tuple) (htup-cid tuple)
-                         *current-snapshot*
-                         (and *backend* (backend-xid *backend*))))
-                   :skip)
-                  ((zerop (htup-xmax tuple))
-                   (heapam-set-xmax relfilenode block offnum xid cid)
-                   :done)
-                  ((xid-aborted-p (htup-xmax tuple))
-                   (heapam-set-xmax relfilenode block offnum xid cid)
-                   :done)
-                  (t :skip))))))
-      (cond
-        ((eq action :done) (return t))
-        ((eq action :skip) (return nil))
-        (t (wait-for-xid (cdr action)))))))
+  (let ((target-block block)
+        (target-offnum offnum)
+        (snapshot *current-snapshot*)
+        (visited (make-hash-table :test #'equal)))
+    (loop
+      (let ((key (cons target-block target-offnum)))
+        (when (gethash key visited)
+          (ereport "XX001" "heap tuple update chain contains a cycle"))
+        (setf (gethash key visited) t))
+      (let ((action
+              (with-write-lock
+                (let ((tuple (heapam-get-tuple relfilenode target-block
+                                               target-offnum columns)))
+                  (cond
+                    ((null tuple) :skip)
+                    ((= (htup-xmax tuple) xid) (list :done tuple))
+                    ((and (not (zerop (htup-xmax tuple)))
+                          (xid-in-progress-p (htup-xmax tuple))
+                          (/= (htup-xmax tuple) xid))
+                     (list :wait (htup-xmax tuple)))
+                    ((and (not (zerop (htup-xmax tuple)))
+                          (xid-committed-p (htup-xmax tuple)))
+                     (if (or (/= (htup-ctid-block tuple) target-block)
+                             (/= (htup-ctid-offnum tuple) target-offnum))
+                         (list :follow (htup-ctid-block tuple)
+                               (htup-ctid-offnum tuple))
+                         :skip))
+                    ((not (heap-tuple-visible-p
+                           (htup-xmin tuple) (htup-xmax tuple) (htup-cid tuple)
+                           snapshot
+                           (and *backend* (backend-xid *backend*))))
+                     :skip)
+                    ((or (zerop (htup-xmax tuple))
+                         (xid-aborted-p (htup-xmax tuple)))
+                     (if (funcall matches-p tuple)
+                         (if (heapam-set-xmax relfilenode target-block
+                                              target-offnum xid cid)
+                             (list :done tuple)
+                             :skip)
+                         :skip))
+                    (t :skip))))))
+        (case (if (consp action) (car action) action)
+          (:done (return (values t (second action)
+                                 target-block target-offnum)))
+          (:skip (return (values nil nil nil nil)))
+          (:wait
+           (wait-for-xid (second action))
+           ;; Revisit this same TID after the writer ends; it is not a chain loop.
+           (remhash (cons target-block target-offnum) visited)
+           ;; READ COMMITTED rechecks a row after its conflicting writer ends.
+           ;; Keep the original statement snapshot for every other scanned TID.
+           (setf snapshot (fresh-delete-snapshot snapshot))
+           (when *backend*
+             (setf (backend-snapshot *backend*) snapshot)))
+          (:follow
+           (setf target-block (second action)
+                 target-offnum (third action)
+                 snapshot (fresh-delete-snapshot snapshot))
+           (when *backend*
+             (setf (backend-snapshot *backend*) snapshot))))))))
 
 (defun heapam-prune-page (relfilenode block)
-  "Mark aborted / committed-dead tuples LP_DEAD and compact the page.
-Return the number of tuples pruned."
-  (let ((page (buf-read relfilenode block)))
-    (unless page
-      (return-from heapam-prune-page 0))
-    (let ((pruned 0))
-      (do-live-page-items (page i off len)
-        (let* ((xmin (page-u32 page off))
-               (xmax (page-u32 page (+ off 4))))
-          (when (tuple-prunable-p xmin xmax)
-            (page-mark-dead page i)
-            (incf pruned))))
-      (when (plusp pruned)
-        (page-compact page)
-        (buf-write relfilenode block page)
-        (mark-dirty relfilenode))
-      pruned)))
+  "Keep heap TIDs stable until VACUUM can establish a removal horizon."
+  (declare (ignore relfilenode block))
+  0)
 
 (defun htup-visible-p (tuple snapshot)
   (heap-tuple-visible-p (htup-xmin tuple)
@@ -267,12 +313,15 @@ Return the number of tuples pruned."
 (defun heapam-scan-page (page block columns snapshot callback)
   (do-live-page-items (page offnum off len)
     (let ((bytes (subseq page off (+ off len))))
-      (multiple-value-bind (values xmin xmax cid infomask)
+      (multiple-value-bind (values xmin xmax cid infomask
+                            ctid-block ctid-offnum)
           (deform-heap-tuple bytes columns)
         (when (heap-tuple-visible-p
                xmin xmax cid snapshot
                (and *backend* (backend-xid *backend*)))
           (let ((tuple (make-htup :block block :offnum offnum
+                                  :ctid-block ctid-block
+                                  :ctid-offnum ctid-offnum
                                   :xmin xmin :xmax xmax
                                   :cid cid :infomask infomask
                                   :values values)))

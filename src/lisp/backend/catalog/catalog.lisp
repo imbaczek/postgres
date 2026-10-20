@@ -144,18 +144,6 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
 (defun catalog-path ()
   (pgdata-path "global/pg_catalog.dat"))
 
-(defun fsync-directory (dir)
-  "Fsync DIR so that a rename inside it survives a crash."
-  (let* ((name (namestring dir))
-         (trimmed (if (and (> (length name) 1)
-                           (char= (char name (1- (length name))) #\/))
-                      (subseq name 0 (1- (length name)))
-                      name))
-         (fd (sb-posix:open trimmed sb-posix:o-rdonly)))
-    (unwind-protect
-         (sb-posix:fsync fd)
-      (sb-posix:close fd))))
-
 (defun save-catalog ()
   (ensure-directories-exist (catalog-path))
   (let ((tmp (pgdata-path "global/pg_catalog.tmp")))

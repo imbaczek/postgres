@@ -12,6 +12,8 @@
   (command-id 0)
   (snapshot nil)
   (dirty-relations '())
+  (settings (make-hash-table :test #'equal))
+  (settings-transaction-start nil)
   ;; Interrupt state: the equivalents of QueryCancelPending and the
   ;; backend's own thread, used by pg_cancel_backend()/pg_terminate_backend().
   (executing nil)
@@ -38,25 +40,53 @@ INTERRUPT-THREAD, so it needs no flag."
 (defun control-path ()
   (pgdata-path "global/pg_control"))
 
+(defun xid-persistent-state-exists-p ()
+  (let ((clog (clog-path)))
+    (or (probe-file (pgdata-path "global/pg_catalog.dat"))
+        (and (probe-file clog)
+             (with-open-file (s clog :direction :input
+                                     :element-type '(unsigned-byte 8))
+               (plusp (file-length s))))
+        (not (null (directory (pgdata-path "base/*")))))))
+
 (defun load-next-xid ()
-  (with-open-file (s (control-path) :direction :input :if-does-not-exist nil)
-    (if s
-        (or (parse-integer (read-line s nil "") :junk-allowed t)
-            +first-normal-xid+)
-        +first-normal-xid+)))
+  (let ((path (control-path)))
+    (if (probe-file path)
+        (handler-case
+            (with-open-file (s path :direction :input :if-does-not-exist nil)
+              (let* ((line (read-line s nil nil))
+                     (xid (and line (parse-integer line :junk-allowed nil))))
+                (unless (and xid
+                             (<= +first-normal-xid+ xid +max-xid-one-past+)
+                             (null (read-line s nil nil)))
+                  (error "invalid next XID value"))
+                xid))
+          (error (e)
+            (error "cannot load XID control file ~a: ~a" path e)))
+        (progn
+          (when (xid-persistent-state-exists-p)
+            (error "XID control file ~a is missing while persistent database state exists"
+                   path))
+          +first-normal-xid+))))
 
 (defvar *xid-batch-end* +first-normal-xid+)
 
 (defun save-next-xid ()
   (ensure-directories-exist (control-path))
-  (with-open-file (s (control-path)
-                     :direction :output
-                     :if-exists :supersede
-                     :if-does-not-exist :create
-                     :element-type 'character)
-    (format s "~a~%" *xid-batch-end*)
-    (finish-output s)
-    (sb-posix:fsync (sb-sys:fd-stream-fd s)))
+  (let ((tmp (pgdata-path "global/pg_control.tmp")))
+    (unwind-protect
+         (progn
+           (with-open-file (s tmp
+                              :direction :output
+                              :if-exists :supersede
+                              :if-does-not-exist :create
+                              :element-type 'character)
+             (format s "~a~%" *xid-batch-end*)
+             (finish-output s)
+             (sb-posix:fsync (sb-sys:fd-stream-fd s)))
+           (sb-posix:rename (namestring tmp) (namestring (control-path)))
+           (fsync-directory (pgdata-path "global/")))
+      (ignore-errors (delete-file tmp))))
   (values))
 
 (defvar *xid-lock* (sb-thread:make-mutex :name "pg xid lock"))
@@ -91,9 +121,18 @@ INTERRUPT-THREAD, so it needs no flag."
 
 (defun assign-xid ()
   (sb-thread:with-mutex (*xid-lock*)
+    (when (> *next-xid* +max-xid+)
+      (ereport-fatal "54000" "transaction ID space exhausted"))
     (when (>= *next-xid* *xid-batch-end*)
-      (setf *xid-batch-end* (+ *next-xid* 1000))
-      (save-next-xid))
+      (let ((old-end *xid-batch-end*)
+            (new-end (min +max-xid-one-past+ (+ *next-xid* 1000))))
+        (setf *xid-batch-end* new-end)
+        (handler-case
+            (save-next-xid)
+          (error (e)
+            ;; Never hand out an XID unless its whole batch boundary is durable.
+            (setf *xid-batch-end* old-end)
+            (error e)))))
     (let ((xid *next-xid*))
       (incf *next-xid*)
       (push xid *active-xids*)
@@ -382,8 +421,15 @@ reclaimable."
         (format s "16~%")
         (finish-output s)
         (sb-posix:fsync (sb-sys:fd-stream-fd s)))))
-  (setf *xid-batch-end* (load-next-xid)
-        *next-xid* (load-next-xid))
+  (let ((next-xid (load-next-xid)))
+    (when (> next-xid +max-xid+)
+      (error "transaction ID space exhausted"))
+    (setf *xid-batch-end* next-xid
+          *next-xid* next-xid)
+    ;; Persist the initial control state too. A missing control file on a later
+    ;; startup then cannot be mistaken for a fresh data directory.
+    (unless (probe-file (control-path))
+      (save-next-xid)))
   (clog-init)
   (clog-recover *next-xid*)
   (values))

@@ -104,21 +104,46 @@ hook."
   (pushnew 'cleanup-control-socket sb-ext:*exit-hooks*)
   (values))
 
+(defun private-control-socket-path (path)
+  "Resolve PATH inside a directory owned by this user with mode 0700 or stricter."
+  (let* ((path (pathname path))
+         (directory (truename
+                     (merge-pathnames
+                      (make-pathname :name nil :type nil :defaults path)
+                      *default-pathname-defaults*)))
+         (status (sb-posix:stat (namestring directory)))
+         (mode (sb-posix:stat-mode status)))
+    (unless (and (= (logand mode sb-posix:s-ifmt) sb-posix:s-ifdir)
+                 (= (sb-posix:stat-uid status) (sb-posix:getuid))
+                 (= (logand mode #o700) #o700)
+                 (zerop (logand mode #o077)))
+      (error "control socket directory must be owned by this user and mode 0700: ~a"
+             directory))
+    (make-pathname :directory (pathname-directory directory)
+                   :name (pathname-name path)
+                   :type (pathname-type path)
+                   :version nil)))
+
 (defun make-local-listener (path)
   "Return a listening AF_UNIX stream socket bound to PATH.
 
-The socket node is chmod'ed to 0700: it evaluates arbitrary Lisp, and it is
-the node's mode (not the containing directory) that decides who may connect."
-  (ignore-errors (delete-file path))
+The socket node and its owner-only parent directory are both restricted:
+this listener evaluates arbitrary Lisp."
   (let ((s (make-instance 'sb-bsd-sockets:local-socket
-                          :type :stream :protocol 0)))
-    (sb-bsd-sockets:socket-bind s (namestring path))
-    (sb-bsd-sockets:socket-listen s 16)
-    (handler-case (sb-posix:chmod (namestring path) #o700)
+                          :type :stream :protocol 0))
+        (bound nil))
+    (handler-case
+        (progn
+          (sb-bsd-sockets:socket-bind s (namestring path))
+          (setf bound t)
+          (sb-posix:chmod (namestring path) #o700)
+          (sb-bsd-sockets:socket-listen s 16)
+          s)
       (error (e)
-        (format *error-output* "~&pg-lisp: warning: cannot chmod ~a: ~a~%"
-                path e)))
-    s))
+        (ignore-errors (sb-bsd-sockets:socket-close s))
+        (when bound
+          (ignore-errors (delete-file path)))
+        (error "cannot create protected control socket ~a: ~a" path e)))))
 
 (defun control-accept-loop (listener name)
   (loop
@@ -194,25 +219,48 @@ reload, say), which legitimately uses #. for compile-time constants."
   "Start the control REPL on loopback TCP PORT and/or Unix SOCKET-PATH.
 
 Both are optional; with neither, no control plane is started."
-  (when (or port socket-path)
-    (enable-cleanup))
-  (when port
-    (let ((listener (make-listener "127.0.0.1" port)))
-      (format t "~&pg-lisp: control REPL on 127.0.0.1:~a~%" port)
-      (finish-output)
-      (sb-thread:make-thread
-       (lambda () (control-accept-loop listener "control tcp"))
-       :name "pg control tcp")))
   (when socket-path
-    (let* ((pn (pathname socket-path))
-           (listener (make-local-listener pn)))
-      (setf *control-socket-path* (namestring pn))
-      (format t "~&pg-lisp: control REPL on ~a~%" (namestring pn))
-      (finish-output)
-      (sb-thread:make-thread
-       (lambda () (control-accept-loop listener "control unix"))
-       :name "pg control unix")))
-  (values))
+    (setf socket-path (private-control-socket-path socket-path)))
+  (let ((local-listener nil)
+        (tcp-listener nil)
+        (local-path (and socket-path (pathname socket-path)))
+        (started nil))
+    (unwind-protect
+         (progn
+           ;; Bind and secure every requested endpoint before accepting on any
+           ;; of them. A local-socket permission failure must not leave TCP REPL
+           ;; threads serving while startup unwinds.
+           (when local-path
+             (setf local-listener (make-local-listener local-path)))
+           (when port
+             (setf tcp-listener (make-listener "127.0.0.1" port)))
+           (when local-listener
+             (setf *control-socket-path* (namestring local-path)))
+           (when (or port local-path)
+             (enable-cleanup))
+           (when local-listener
+             (sb-thread:make-thread
+              (lambda () (control-accept-loop local-listener "control unix"))
+              :name "pg control unix")
+             (format t "~&pg-lisp: control REPL on ~a~%"
+                     (namestring local-path)))
+           (when tcp-listener
+             (sb-thread:make-thread
+              (lambda () (control-accept-loop tcp-listener "control tcp"))
+              :name "pg control tcp")
+             (format t "~&pg-lisp: control REPL on 127.0.0.1:~a~%" port))
+           (when (or port local-path)
+             (finish-output))
+           (setf started t)
+           (values))
+      (unless started
+        (setf *control-socket-path* nil)
+        (when local-listener
+          (ignore-errors (sb-bsd-sockets:socket-close local-listener)))
+        (when local-listener
+          (ignore-errors (delete-file local-path)))
+        (when tcp-listener
+          (ignore-errors (sb-bsd-sockets:socket-close tcp-listener)))))))
 
 (defun start-swank-listener (port bind-address)
   "Start the optional Swank listener on BIND-ADDRESS and PORT."
