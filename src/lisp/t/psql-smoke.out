@@ -284,6 +284,31 @@ DROP TABLE
 CREATE TABLE
 ALTER TABLE
 1
+CREATE TABLE
+INSERT 0 5
+Seq Scan on index_scan_events
+1
+2
+5
+CREATE INDEX
+Index Scan using index_scan_events_category_idx on index_scan_events
+1
+2
+5
+5
+Seq Scan on index_scan_events
+UPDATE 1
+DELETE 1
+VACUUM
+1
+2
+DROP INDEX
+Seq Scan on index_scan_events
+2
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+CREATE INDEX
 ERROR:  duplicate key value violates unique constraint "unique_nnd_restart_idx"
 ERROR:  index "unique_using_restart_idx" is already associated with a constraint
 ERROR:  cannot drop index "unique_using_restart_idx" because constraint "unique_using_restart_idx" on table "unique_using_restart" requires it
@@ -293,4 +318,12 @@ ALTER TABLE
 ERROR:  null value in column "i" violates not-null constraint
 DROP TABLE
 DROP TABLE
+DROP TABLE
+Index Scan using index_scan_restart_category_idx on index_scan_restart
+8
+9
+DROP INDEX
+Seq Scan on index_scan_restart
+8
+9
 DROP TABLE

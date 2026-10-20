@@ -21,18 +21,20 @@
   (let* ((idx (make-pg-index :oid 42 :name "nnd" :relfilenode 42
                              :table-oid 41 :columns '(1) :unique-p t
                              :constraint-p t
-                             :nulls-not-distinct-p t))
+                             :nulls-not-distinct-p t :valid-p t))
          (sexp (index-to-sexp idx))
          (copy (index-from-sexp sexp)))
     (check (equal sexp
                   '(:oid 42 :name "nnd" :relfilenode 42 :table-oid 41
                     :columns (1) :unique t :primary nil :constraint t
-                    :nulls-not-distinct t))
+                    :nulls-not-distinct t :valid t))
            "index catalog encoding is the compatible flat plist")
     (check (pg-index-nulls-not-distinct-p copy)
            "NULLS NOT DISTINCT survives catalog serialization")
     (check (pg-index-constraint-p copy)
-           "constraint ownership survives catalog serialization"))
+           "constraint ownership survives catalog serialization")
+    (check (pg-index-valid-p copy)
+           "index validity survives catalog serialization"))
   (let* ((class (make-pg-class
                  :oid 50 :name "codec" :relfilenode 51
                  :columns (vector (make-pg-column :name "value" :type :int4
@@ -55,5 +57,7 @@
   (let ((legacy-pk (index-from-sexp '(:primary t))))
     (check (not (pg-index-constraint-p legacy-pk))
            "legacy catalog has no constraint ownership flag")
+    (check (not (pg-index-valid-p legacy-pk))
+           "legacy indexes without a validity flag are not trusted")
     (check (pg-index-constraint-owned-p legacy-pk)
            "legacy primary index remains constraint-owned")))

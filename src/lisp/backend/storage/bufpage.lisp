@@ -118,7 +118,7 @@ are bound for each live item; dead and unused slots are skipped."
        (loop for ,offnum from 1 to ,line-pointer-count
              do (multiple-value-bind (,off ,flags ,len)
                     (page-get-lp ,page-value ,offnum)
-                  (declare (ignorable ,len))
+                  (declare (ignorable ,off ,len))
                   (when (= ,flags +lp-normal+)
                     ,@body))))))
 

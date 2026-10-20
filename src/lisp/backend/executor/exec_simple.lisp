@@ -2,11 +2,18 @@
 
 (in-package #:pg)
 
-(defmacro with-table-ddl ((table &key refresh-snapshot) &body body)
-  "Lock and revalidate TABLE before running its catalog change BODY."
-  (let ((table-value (gensym "TABLE-")))
-    `(let ((,table-value ,table))
-       (with-relation-build-lock ((pg-class-relfilenode ,table-value))
+(defmacro with-table-ddl ((table &key refresh-snapshot indexes wait-readers)
+                          &body body)
+  "Lock and revalidate TABLE and INDEXES before running catalog change BODY."
+  (let ((table-value (gensym "TABLE-"))
+        (index-values (gensym "INDEXES-"))
+        (relfilenodes (gensym "RELFILENODES-")))
+    `(let* ((,table-value ,table)
+            (,index-values ,indexes)
+            (,relfilenodes
+              (cons (pg-class-relfilenode ,table-value)
+                    (mapcar #'pg-index-relfilenode ,index-values))))
+       (with-relation-build-locks (,relfilenodes ,wait-readers)
          ,(if refresh-snapshot
               `(let ((*current-snapshot* (refresh-statement-snapshot)))
                  (with-write-catalog-locks
@@ -232,20 +239,57 @@ rolled back immediately."
 (defun fsync-index (idx)
   (smgr-fsync (pg-index-relfilenode idx)))
 
+(defun build-index-entries (idx table &key unique name)
+  "Populate IDX from every heap version that an active snapshot may need.
+
+UNIQUE checks only tuples visible to the fresh statement snapshot.  The caller
+holds the table DDL gate, which has drained other writers and maintenance
+before this removal horizon is captured."
+  (let* ((heap-relfilenode (pg-class-relfilenode table))
+         (index-relfilenode (pg-index-relfilenode idx))
+         (columns (pg-class-columns table))
+         (types (index-types idx table))
+         (snapshot *current-snapshot*)
+         (removal-horizon (oldest-xmin)))
+    (loop for block below (buf-nblocks heap-relfilenode)
+          for page = (buf-read heap-relfilenode block)
+          when page
+            do (do-live-page-items (page offnum off len)
+                 (let ((tuple (heapam-get-tuple heap-relfilenode block offnum
+                                                columns)))
+                   (when (and tuple
+                              (not (tuple-prunable-p (htup-xmin tuple)
+                                                     (htup-xmax tuple)
+                                                     removal-horizon)))
+                     (let* ((vals (index-values idx (htup-values tuple)))
+                            (key (encode-index-key vals types)))
+                       ;; Retain recently dead versions for old snapshots, but
+                       ;; don't let those versions create unique violations.
+                       (when (and unique
+                                  (htup-visible-p tuple snapshot)
+                                  (not (and (key-has-null-p vals)
+                                            (not (pg-index-nulls-not-distinct-p
+                                                  idx)))))
+                         (dolist (tid (btree-search index-relfilenode key))
+                           (let ((candidate
+                                   (heapam-get-tuple heap-relfilenode
+                                                     (car tid) (cdr tid)
+                                                     columns)))
+                             (when (and candidate
+                                        (htup-visible-p candidate snapshot))
+                               (ereport "23505"
+                                        "could not create unique index \"~a\""
+                                        name)))))
+                       (btree-insert index-relfilenode key
+                                     (htup-block tuple)
+                                     (htup-offnum tuple)))))))
+    ;; A missing :VALID field in an older catalog decodes as NIL.  Publish
+    ;; the index only after every candidate TID has been inserted.
+    (setf (pg-index-valid-p idx) t))
+  (values))
+
 (defun build-unique-index (idx table name)
-  (do-table-tuples (tuple table)
-    (let* ((types (index-types idx table))
-           (vals (index-values idx (htup-values tuple)))
-           (key (encode-index-key vals types)))
-      ;; By default NULLs are distinct.  A NULLS NOT DISTINCT index compares
-      ;; null-containing keys like any other key.
-      (unless (and (key-has-null-p vals)
-                   (not (pg-index-nulls-not-distinct-p idx)))
-        (when (btree-search (pg-index-relfilenode idx) key)
-          (ereport "23505"
-                   "could not create unique index \"~a\"" name)))
-      (btree-insert (pg-index-relfilenode idx)
-                    key (htup-block tuple) (htup-offnum tuple)))))
+  (build-index-entries idx table :unique t :name name))
 
 (defun check-not-null-existing (table attnums constraint-name)
   (do-table-tuples (tuple table)
@@ -259,9 +303,15 @@ rolled back immediately."
                      (or constraint-name (pg-class-name table)))))))))
 
 (defun exec-create-table (stream ast)
-  (let ((db (current-database))
-        (name (getf ast :name)))
-    (when (lookup-table name)
+  (let* ((name (getf ast :name))
+         (db nil)
+         (existing nil))
+    ;; Catalog hash tables are mutated by DDL under the write lock.  Capture a
+    ;; consistent existence check before doing any work outside that lock.
+    (with-write-lock
+      (setf db (current-database)
+            existing (lookup-table name)))
+    (when existing
       (if (getf ast :if-not-exists)
           (progn
             (send-notice stream
@@ -320,25 +370,32 @@ rolled back immediately."
                      (build-unique-index idx class (pg-index-name idx))
                      (fsync-index idx))))))
             (dolist (idx (table-indexes class))
+              ;; CREATE TABLE starts with an empty heap; table-level indexes
+              ;; have been built above and inline indexes are empty here.
+              (setf (pg-index-valid-p idx) t)
               (fsync-index idx))
             (save-catalog))))
       (send-command-complete stream "CREATE TABLE"))))
 
 (defun exec-drop-table (stream ast)
-  (let* ((db (current-database))
-         (names (getf ast :names))
+  (let* ((names (getf ast :names))
          (if-exists (getf ast :if-exists))
-         (relations
-           (mapcar (lambda (name)
-                     (let ((class (gethash name (database-tables db))))
-                       (unless (or class if-exists)
-                         (ereport "42P01" "table \"~a\" does not exist" name))
-                       (cons name class)))
-                   names))
-         (relfilenodes
-           (loop for entry in relations
-                 for class = (cdr entry)
-                 when class collect (pg-class-relfilenode class))))
+         (db nil)
+         (relations nil)
+         (relfilenodes nil))
+    (with-write-lock
+      (setf db (current-database)
+            relations
+            (mapcar (lambda (name)
+                      (let ((class (gethash name (database-tables db))))
+                        (unless (or class if-exists)
+                          (ereport "42P01" "table \"~a\" does not exist" name))
+                        (cons name class)))
+                    names)
+            relfilenodes
+            (loop for entry in relations
+                  for class = (cdr entry)
+                  when class collect (pg-class-relfilenode class))))
     (with-relation-build-locks (relfilenodes t)
       (with-write-catalog-locks
         ;; A concurrent DROP/CREATE may have replaced a name while we waited.
@@ -367,12 +424,17 @@ rolled back immediately."
     (send-command-complete stream "DROP TABLE")))
 
 (defun exec-create-index (stream ast)
-  (let* ((db (current-database))
-         (table (resolve-table-or-error (getf ast :table)))
-         (name (getf ast :name))
+  (let* ((name (getf ast :name))
          (unique (getf ast :unique))
-         (if-not-exists (getf ast :if-not-exists)))
-    (when (lookup-index name)
+         (if-not-exists (getf ast :if-not-exists))
+         (db nil)
+         (table nil)
+         (existing nil))
+    (with-write-lock
+      (setf db (current-database)
+            table (resolve-table-or-error (getf ast :table))
+            existing (lookup-index name)))
+    (when existing
       (if if-not-exists
           (progn
             (send-notice stream
@@ -387,29 +449,36 @@ rolled back immediately."
                                   :nulls-not-distinct
                                   (getf ast :nulls-not-distinct))))
           (with-error-cleanup (e (drop-index* db name))
-            (when unique
-              (build-unique-index idx table name))
+            (build-index-entries idx table :unique unique :name name)
             (fsync-index idx)
             (save-catalog)))))
     (send-command-complete stream "CREATE INDEX")))
 
 (defun exec-drop-index (stream ast)
-  (let* ((db (current-database))
-         (names (getf ast :names))
+  (let* ((names (getf ast :names))
          (if-exists (getf ast :if-exists))
-         (entries (mapcar (lambda (name)
-                            (cons name (gethash name (database-indexes db))))
-                          names))
-         (relfilenodes
-           (loop for entry in entries
-                 for idx = (cdr entry)
-                 for table = (when idx
-                               (find-table-by-oid (pg-index-table-oid idx)))
-                 when table collect (pg-class-relfilenode table))))
+         (db nil)
+         (entries nil)
+         (relfilenodes nil))
+    (with-write-lock
+      (setf db (current-database)
+            entries
+            (mapcar (lambda (name)
+                      (cons name (gethash name (database-indexes db))))
+                    names)
+            relfilenodes
+            (loop for entry in entries
+                  for idx = (cdr entry)
+                  for table = (when idx
+                                (find-table-by-oid (pg-index-table-oid idx)))
+                  when idx
+                    append (cons (pg-index-relfilenode idx)
+                                 (when table
+                                   (list (pg-class-relfilenode table)))))))
     (dolist (entry entries)
       (unless (or (cdr entry) if-exists)
         (ereport "42704" "index \"~a\" does not exist" (car entry))))
-    (with-relation-build-locks (relfilenodes)
+    (with-relation-build-locks (relfilenodes t)
       (with-write-catalog-locks
         ;; Revalidate every captured index before making any change.  This
         ;; keeps a concurrent drop/recreate from redirecting this statement.
@@ -448,16 +517,20 @@ rolled back immediately."
     (send-command-complete stream "DROP INDEX")))
 
 (defun exec-alter-index (stream ast)
-  (let* ((db (current-database))
-         (name (getf ast :name))
+  (let* ((name (getf ast :name))
          (new-name (getf ast :new-name))
-         (idx (lookup-index name))
-         (table (when idx (find-table-by-oid (pg-index-table-oid idx)))))
+         (db nil)
+         (idx nil)
+         (table nil))
+    (with-write-lock
+      (setf db (current-database)
+            idx (lookup-index name)
+            table (when idx (find-table-by-oid (pg-index-table-oid idx)))))
     (unless idx
       (ereport "42704" "index \"~a\" does not exist" name))
     (unless table
       (ereport "42P01" "table for index \"~a\" does not exist" name))
-    (with-table-ddl (table)
+    (with-table-ddl (table :indexes (list idx) :wait-readers t)
       (let ((current (lookup-index name)))
         (unless (eq idx current)
           (if current
@@ -470,14 +543,19 @@ rolled back immediately."
 
 (defun exec-alter-table-using-index (db table ast primary)
   (let* ((index-name (getf ast :using-index))
-         (idx (lookup-index index-name)))
+         (idx (with-write-lock (lookup-index index-name))))
     (unless idx
       (ereport "42704" "index \"~a\" does not exist" index-name))
-    (with-table-ddl (table :refresh-snapshot t)
-      ;; Recheck after waiting for the relation gate.
-      (setf idx (lookup-index index-name))
-      (unless idx
-        (ereport "42704" "index \"~a\" does not exist" index-name))
+    (with-table-ddl (table :refresh-snapshot t
+                           :indexes (list idx)
+                           :wait-readers t)
+      ;; Recheck after waiting for both the heap and index readers.
+      (let ((current (lookup-index index-name)))
+        (unless (eq idx current)
+          (if current
+              (ereport "55000" "index \"~a\" changed while waiting for lock"
+                       index-name)
+              (ereport "42704" "index \"~a\" does not exist" index-name))))
       (when (pg-index-constraint-owned-p idx)
         (ereport "55000"
                  "index \"~a\" is already associated with a constraint"
@@ -515,13 +593,19 @@ rolled back immediately."
 (defun exec-alter-table-constraint (stream db table ast)
   (let* ((name (getf ast :constraint-name))
          (action (getf ast :action))
-         (if-exists (getf ast :constraint-if-exists)))
-    (with-table-ddl (table)
+         (if-exists (getf ast :constraint-if-exists))
+         (original (with-write-lock
+                     (gethash name (database-indexes db)))))
+    (with-table-ddl (table :indexes (when original (list original))
+                           :wait-readers t)
       (let* ((idx (gethash name (database-indexes db)))
              (belongs-to-table
                (and idx
                     (= (pg-index-table-oid idx) (pg-class-oid table))
                     (pg-index-constraint-owned-p idx))))
+        (unless (eq original idx)
+          (ereport "55000" "constraint \"~a\" changed while waiting for lock"
+                   name))
         (unless belongs-to-table
           (if (and (eq action :drop-constraint) if-exists)
               (progn
@@ -551,8 +635,17 @@ rolled back immediately."
          (add-action (second actions))
          (old-name (getf drop-action :constraint-name))
          (old-if-exists (getf drop-action :constraint-if-exists))
-         (index-name (getf add-action :using-index)))
-    (with-table-ddl (table :refresh-snapshot t)
+         (index-name (getf add-action :using-index))
+         (original-old-idx nil)
+         (original-new-idx nil))
+    (with-write-lock
+      (setf original-old-idx (gethash old-name (database-indexes db))
+            original-new-idx (gethash index-name (database-indexes db))))
+    (with-table-ddl (table :refresh-snapshot t
+                           :indexes (remove nil
+                                            (list original-old-idx
+                                                  original-new-idx))
+                           :wait-readers t)
       (let* ((old-idx (gethash old-name (database-indexes db)))
              (old-constraint
                (and old-idx
@@ -562,6 +655,9 @@ rolled back immediately."
              (new-idx (gethash index-name (database-indexes db)))
              (new-name (or (getf add-action :constraint-name)
                            index-name)))
+        (unless (and (eq original-old-idx old-idx)
+                     (eq original-new-idx new-idx))
+          (ereport "55000" "index metadata changed while waiting for lock"))
         (unless old-constraint
           (if old-if-exists
               (send-notice stream
@@ -611,10 +707,13 @@ rolled back immediately."
           (save-catalog))))))
 
 (defun exec-alter-table (stream ast)
-  (let ((db (current-database))
-        (name (getf ast :table))
-        (table (lookup-table (getf ast :table)))
-        (primary (eq (getf ast :action) :add-primary-key)))
+  (let* ((name (getf ast :table))
+         (primary (eq (getf ast :action) :add-primary-key))
+         (db nil)
+         (table nil))
+    (with-write-lock
+      (setf db (current-database)
+            table (lookup-table name)))
     (unless table
       (if (getf ast :if-exists)
           (progn
@@ -690,6 +789,7 @@ rolled back immediately."
       (handler-case
           (case (getf ast :type)
             (:select (exec-select stream ast))
+            (:explain (exec-explain stream (getf ast :statement)))
             (:insert (exec-insert stream ast))
             (:update (exec-update stream ast))
             (:delete (exec-delete stream ast))

@@ -27,7 +27,8 @@
   unique-p
   primary-p
   constraint-p      ; a table constraint depends on this index
-  nulls-not-distinct-p)
+  nulls-not-distinct-p
+  valid-p)           ; false for legacy indexes that may be incomplete
 
 (defun pg-index-constraint-owned-p (index)
   "Return whether a table constraint depends on INDEX.
@@ -114,7 +115,8 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
   (:unique pg-index-unique-p :unique-p)
   (:primary pg-index-primary-p :primary-p)
   (:constraint pg-index-constraint-p :constraint-p)
-  (:nulls-not-distinct pg-index-nulls-not-distinct-p :nulls-not-distinct-p))
+  (:nulls-not-distinct pg-index-nulls-not-distinct-p :nulls-not-distinct-p)
+  (:valid pg-index-valid-p :valid-p))
 
 (defun database-to-sexp (db)
   `(:name ,(database-name db)

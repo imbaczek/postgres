@@ -159,7 +159,7 @@ CREATE TABLE t (a int UNIQUE, b varchar(20));
 DROP TABLE [IF EXISTS] t;
 CREATE UNIQUE INDEX name ON t (cols);
 CREATE UNIQUE INDEX name ON t (cols) NULLS NOT DISTINCT;
-CREATE INDEX name ON t (cols);          -- accepted; no scan path uses it
+CREATE INDEX name ON t (cols);
 DROP INDEX [IF EXISTS] name;
 ALTER INDEX name RENAME TO new_name;
 ALTER TABLE t ADD PRIMARY KEY (cols);
@@ -176,6 +176,7 @@ DML:
 
 ```sql
 SELECT expr [AS alias], ... | * FROM t [WHERE e] [ORDER BY col [ASC|DESC] [, ...]] [LIMIT n];
+EXPLAIN SELECT ...;                     -- reports Seq Scan or Index Scan
 INSERT INTO t [(cols)] VALUES (...)[, (...)];
 UPDATE t SET col = expr [, ...] [WHERE e];
 DELETE FROM t [WHERE e];
@@ -388,7 +389,8 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   relfilenode. It is rebuilt from heap pages once on the first insert after a
   restart; successful inserts refresh the page's free-space entry.
 - Writers take a single global write mutex; DDL also takes a catalog mutex;
-  page I/O is serialized under an smgr mutex. Readers do not block.
+  page I/O is serialized under an smgr mutex. Readers do not block one another;
+  relation DDL waits for registered readers.
 
 ## Known gaps (documented, not hidden)
 
@@ -409,15 +411,18 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   keys with `ASC`/`DESC`.
 - No `DEFAULT`, `CHECK`, foreign keys, or `NOT NULL`/`UNIQUE` beyond what is
   listed above.
-- `SELECT` always uses a sequential heap scan; indexes exist to enforce
-  uniqueness, not yet to accelerate reads.
+- `SELECT` uses a B-tree for single-column indexed equality predicates and
+  falls back to SeqScan otherwise. Index scans fetch candidate heap TIDs,
+  enforce MVCC visibility, and recheck the full predicate. Composite equality,
+  range scans, and cost-based selection are not implemented.
 - VACUUM is manual only; autovacuum and index-only scans are not implemented.
   Manual VACUUM removes dead index TIDs before making safe dead heap slots
   reusable, freezes eligible tuples, and updates the visibility map and volatile
   free-space map. Its first FSM rebuild after restart scans the existing heap
   once.
 - Byte-wise comparison only, i.e. C-like collation for ASCII. Index key
-  encoding is length-first and is used internally only.
+  encoding is length-first and is safe for equality lookups; text range ordering
+  and ordered index iteration are not implemented.
 - Numeric/float, date/time, boolean, and other types are unsupported. `text` is
   temporarily treated as `varchar(126)`; full text/varchar semantics remain a
   TODO.

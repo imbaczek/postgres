@@ -3,7 +3,9 @@
 set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
+SBCL=${SBCL:-sbcl}
 PORT=${PORT:-5467}
+CONTROL_PORT=${CONTROL_PORT:-$((PORT + 2000))}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-unique-lock.XXXXXX")
 LOG="$TMP/server.log"
 SRV=
@@ -12,6 +14,7 @@ BUILDER=
 DROPPER=
 STALE_INSERT=
 READER=
+SNAPSHOT_CHECK=
 . "$BASE/t/test-support.sh"
 test_debug_setup unique-index-concurrency "$PORT" "$TMP" "$LOG"
 
@@ -22,17 +25,20 @@ cleanup() {
     [ -z "$DROPPER" ] || kill "$DROPPER" 2>/dev/null || true
     [ -z "$STALE_INSERT" ] || kill "$STALE_INSERT" 2>/dev/null || true
     [ -z "$READER" ] || kill "$READER" 2>/dev/null || true
+    [ -z "$SNAPSHOT_CHECK" ] || kill "$SNAPSHOT_CHECK" 2>/dev/null || true
     [ -z "$BUILDER" ] || wait "$BUILDER" 2>/dev/null || true
     [ -z "$WRITER" ] || wait "$WRITER" 2>/dev/null || true
     [ -z "$DROPPER" ] || wait "$DROPPER" 2>/dev/null || true
     [ -z "$STALE_INSERT" ] || wait "$STALE_INSERT" 2>/dev/null || true
     [ -z "$READER" ] || wait "$READER" 2>/dev/null || true
+    [ -z "$SNAPSHOT_CHECK" ] || wait "$SNAPSHOT_CHECK" 2>/dev/null || true
     [ -z "$SRV" ] || wait "$SRV" 2>/dev/null || true
     rm -rf "$TMP"
 }
 test_debug_install_traps cleanup
 
-test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" \
+    --control-port "$CONTROL_PORT"
 
 i=0
 while [ "$i" -lt 150 ]; do
@@ -499,6 +505,62 @@ for table in multi_index_a multi_index_b; do
     fi
 done
 
+run -c "create table drop_index_reader (i int)" >/dev/null
+run -c "insert into drop_index_reader values (1)" >/dev/null
+run -c "create index drop_index_reader_idx on drop_index_reader (i)" >/dev/null
+{
+    printf "begin; explain select i from drop_index_reader where i = 1; select i from drop_index_reader where i = 1; select 'index-reader-ready';\n"
+    sleep 2
+    printf 'commit;\n'
+} | run > "$TMP/drop-index-reader.out" 2>&1 &
+READER=$!
+
+i=0
+while [ "$i" -lt 50 ]; do
+    if [ -f "$TMP/drop-index-reader.out" ] \
+            && grep -q index-reader-ready "$TMP/drop-index-reader.out"; then
+        break
+    fi
+    i=$((i + 1))
+    sleep 0.1
+done
+if [ "$i" -ge 50 ]; then
+    echo "unique-index-concurrency: index reader did not reach ready state" >&2
+    cat "$TMP/drop-index-reader.out" >&2
+    cat "$LOG" >&2
+    exit 1
+fi
+grep -q 'Index Scan using drop_index_reader_idx on drop_index_reader' \
+    "$TMP/drop-index-reader.out" \
+    || {
+        echo "unique-index-concurrency: reader did not use the index" >&2
+        cat "$TMP/drop-index-reader.out" >&2
+        cat "$LOG" >&2
+        exit 1
+    }
+
+run -c "drop index drop_index_reader_idx" > "$TMP/drop-index-reader-ddl.out" 2>&1 &
+DROPPER=$!
+assert_blocked "$DROPPER" "DROP INDEX behind an index reader" \
+    "$TMP/drop-index-reader-ddl.out"
+wait "$READER"
+READER=
+if ! wait "$DROPPER"; then
+    echo "unique-index-concurrency: DROP INDEX failed after the reader committed" >&2
+    cat "$TMP/drop-index-reader-ddl.out" >&2
+    cat "$LOG" >&2
+    exit 1
+fi
+DROPPER=
+plan=$(run -c "explain select i from drop_index_reader where i = 1")
+[ "$plan" = "Seq Scan on drop_index_reader" ] \
+    || {
+        echo "unique-index-concurrency: dropped index remained in the SELECT path: $plan" >&2
+        cat "$LOG" >&2
+        exit 1
+    }
+run -c "drop table drop_index_reader" >/dev/null
+
 run -c "create table drop_reader_race (i int)" >/dev/null
 run -c "insert into drop_reader_race values (1)" >/dev/null
 {
@@ -626,5 +688,103 @@ case "$dup" in
         exit 1
         ;;
 esac
+
+# Pin a pre-UPDATE snapshot while a populated non-unique index is built. The
+# old version must remain a candidate for that snapshot; the new version must
+# remain invisible to it.
+run -c "create table index_snapshot (id int, value int)" >/dev/null
+run -c "insert into index_snapshot values (1, 10)" >/dev/null
+{
+    cat <<EOF
+(let* ((registration (make-snapshot-registration))
+       (snapshot (make-snapshot 0 :register registration)))
+  (unwind-protect
+       (progn
+         (with-open-file (out "$TMP/snapshot.ready"
+                             :direction :output
+                             :if-exists :supersede)
+           (write-string "ready" out))
+         (loop repeat 3000
+               until (probe-file "$TMP/snapshot.done")
+               do (sleep 0.01))
+         (let* ((db (gethash "postgres" (catalog-databases *catalog*)))
+                (index (gethash "index_snapshot_value_idx"
+                                (database-indexes db)))
+                (table (and index
+                            (loop for candidate being the hash-values of
+                                  (database-tables db)
+                                  when (= (pg-class-oid candidate)
+                                         (pg-index-table-oid index))
+                                    return candidate)))
+                (types (and index table (index-types index table))))
+           (unless (and index table)
+             (error "index snapshot test index was not built"))
+           (labels ((visible-id-p (value expected-id)
+                      (some (lambda (tid)
+                              (let ((tuple
+                                      (heapam-get-tuple
+                                       (pg-class-relfilenode table)
+                                       (car tid) (cdr tid)
+                                       (pg-class-columns table))))
+                                (and tuple
+                                     (htup-visible-p tuple snapshot)
+                                     (= expected-id
+                                        (aref (htup-values tuple) 0)))))
+                            (btree-search
+                             (pg-index-relfilenode index)
+                             (encode-index-key (list value) types)))))
+             (list (visible-id-p 10 1)
+                   (not (visible-id-p 20 2))))))
+    (release-snapshot-registration registration)))
+(quit)
+EOF
+} | timeout 40 "$SBCL" --script "$BASE/t/control-client.lisp" \
+    tcp "127.0.0.1:$CONTROL_PORT" > "$TMP/snapshot-check.out" 2>&1 &
+SNAPSHOT_CHECK=$!
+
+i=0
+while [ "$i" -lt 50 ]; do
+    if [ -f "$TMP/snapshot.ready" ]; then
+        break
+    fi
+    i=$((i + 1))
+    sleep 0.1
+done
+if [ "$i" -ge 50 ]; then
+    echo "unique-index-concurrency: old snapshot did not register" >&2
+    cat "$TMP/snapshot-check.out" >&2
+    cat "$LOG" >&2
+    exit 1
+fi
+
+run -c "update index_snapshot set id = 2, value = 20 where id = 1" >/dev/null
+run -c "create index index_snapshot_value_idx on index_snapshot (value)" >/dev/null
+: > "$TMP/snapshot.done"
+if ! wait "$SNAPSHOT_CHECK"; then
+    echo "unique-index-concurrency: old-snapshot index check failed" >&2
+    cat "$TMP/snapshot-check.out" >&2
+    cat "$LOG" >&2
+    exit 1
+fi
+SNAPSHOT_CHECK=
+grep -q '(T T)' "$TMP/snapshot-check.out" || {
+    echo "unique-index-concurrency: index build lost an old visible tuple or exposed a new one" >&2
+    cat "$TMP/snapshot-check.out" >&2
+    cat "$LOG" >&2
+    exit 1
+}
+indexed=$(run -c "select id from index_snapshot where value = 20")
+[ "$indexed" = 2 ] || {
+    echo "unique-index-concurrency: current snapshot missed the updated indexed row: $indexed" >&2
+    cat "$LOG" >&2
+    exit 1
+}
+run -c "drop index index_snapshot_value_idx" >/dev/null
+sequential=$(run -c "select id from index_snapshot where value = 20")
+[ "$indexed" = "$sequential" ] || {
+    echo "unique-index-concurrency: old-snapshot test differs between index and SeqScan" >&2
+    cat "$LOG" >&2
+    exit 1
+}
 
 echo "unique-index-concurrency: PASS"

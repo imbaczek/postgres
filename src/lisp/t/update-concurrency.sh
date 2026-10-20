@@ -127,6 +127,7 @@ fi
 # value that makes the predicate false; B must follow the chain and return 0.
 run -c "create table update_predicate (id int, value int)" >/dev/null
 run -c "insert into update_predicate values (1, 1)" >/dev/null
+run -c "create index update_predicate_value_idx on update_predicate (value)" >/dev/null
 start_writer "$TMP/predicate.sql" "$TMP/predicate-writer.out" \
     74102 \
     "update update_predicate set value = 2 where id = 1"
@@ -141,10 +142,23 @@ grep -q '^UPDATE 0$' "$TMP/predicate-waiter.out" \
     || fail "waiter failed to recheck the now-false WHERE clause"
 [ "$(scalar -c 'select value from update_predicate where id = 1')" = 2 ] \
     || fail "predicate recheck changed a row that no longer matched"
+plan=$(scalar -c 'explain select id from update_predicate where value = 2')
+[ "$plan" = "Index Scan using update_predicate_value_idx on update_predicate" ] \
+    || fail "equality lookup after concurrent UPDATE did not use the index: $plan"
+indexed_rows=$(scalar -c 'select id from update_predicate where value = 2')
+[ "$indexed_rows" = 1 ] \
+    || fail "IndexScan missed the version produced by concurrent UPDATE"
+[ -z "$(scalar -c 'select id from update_predicate where value = 1')" ] \
+    || fail "IndexScan exposed the old version after concurrent UPDATE"
+run -c "drop index update_predicate_value_idx" >/dev/null
+sequential_rows=$(scalar -c 'select id from update_predicate where value = 2')
+[ "$indexed_rows" = "$sequential_rows" ] \
+    || fail "indexed and sequential results differed after concurrent UPDATE"
 
 # DELETE must use the same READ COMMITTED recheck after a conflicting UPDATE.
 run -c "create table delete_predicate (id int, value int)" >/dev/null
 run -c "insert into delete_predicate values (1, 1)" >/dev/null
+run -c "create index delete_predicate_value_idx on delete_predicate (value)" >/dev/null
 start_writer "$TMP/delete.sql" "$TMP/delete-writer.out" \
     74103 \
     "update delete_predicate set value = 2 where id = 1"
@@ -159,5 +173,17 @@ grep -q '^DELETE 0$' "$TMP/delete-waiter.out" \
     || fail "DELETE did not recheck the now-false WHERE clause"
 [ "$(scalar -c 'select value from delete_predicate where id = 1')" = 2 ] \
     || fail "DELETE removed a row that no longer matched"
+plan=$(scalar -c 'explain select id from delete_predicate where value = 2')
+[ "$plan" = "Index Scan using delete_predicate_value_idx on delete_predicate" ] \
+    || fail "equality lookup after concurrent DELETE recheck did not use the index: $plan"
+[ "$(scalar -c 'select id from delete_predicate where value = 2')" = 1 ] \
+    || fail "IndexScan missed the surviving version after concurrent DELETE recheck"
+run -c "delete from delete_predicate where value = 2" >/dev/null
+run -c "vacuum delete_predicate" >/dev/null
+indexed_rows=$(scalar -c 'select id from delete_predicate where value = 2')
+run -c "drop index delete_predicate_value_idx" >/dev/null
+sequential_rows=$(scalar -c 'select id from delete_predicate where value = 2')
+[ "$indexed_rows" = "$sequential_rows" ] \
+    || fail "indexed and sequential results differed after DELETE and VACUUM"
 
 echo "update-concurrency: PASS"

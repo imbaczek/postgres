@@ -339,3 +339,34 @@ drop table vc;
 create table primary_restart (i int);
 alter table primary_restart add constraint primary_restart_pk primary key (i);
 select 1 as ok;
+
+-- Ported from the filled-table equality case in btree_index.sql and the
+-- populated-index builds in create_index.sql.
+create table index_scan_events (id int, category int);
+insert into index_scan_events values
+  (1, 10), (2, 10), (3, 20), (4, null), (5, 10);
+explain select id from index_scan_events where category = 10;
+select id from index_scan_events where category = 10 order by id;
+create index index_scan_events_category_idx on index_scan_events (category);
+explain select id from index_scan_events where category = 10;
+select id from index_scan_events where category = 10 order by id;
+select id from index_scan_events
+  where category = 10 and id >= 2 order by id desc limit 1;
+explain select id from index_scan_events where category = 10 or id = 3;
+
+-- The index keeps old versions as candidates; visibility and the complete
+-- predicate still determine which rows survive UPDATE, DELETE, and VACUUM.
+update index_scan_events set category = 30 where id = 2;
+delete from index_scan_events where id = 5;
+vacuum index_scan_events;
+select id from index_scan_events where category = 10 order by id;
+select id from index_scan_events where category = 30 order by id;
+drop index index_scan_events_category_idx;
+explain select id from index_scan_events where category = 30;
+select id from index_scan_events where category = 30 order by id;
+drop table index_scan_events;
+
+-- Keep a populated non-unique index through the clean restart below.
+create table index_scan_restart (id int, category int);
+insert into index_scan_restart values (8, 7), (9, 7);
+create index index_scan_restart_category_idx on index_scan_restart (category);

@@ -92,6 +92,7 @@
 
 (defun parse-statement (p)
   (cond
+    ((match-kw p "explain") (parse-explain p))
     ((match-kw p "select") (parse-select p))
     ((match-kw p "insert") (parse-insert p))
     ((match-kw p "update") (parse-update p))
@@ -120,6 +121,11 @@
 
 (defun parse-vacuum (p)
   (list :type :vacuum :table (strip-schema (pident p))))
+
+(defun parse-explain (p)
+  (if (match-kw p "select")
+      (list :type :explain :statement (parse-select p))
+      (ereport "0A000" "EXPLAIN currently supports SELECT only")))
 
 ;;; ---- SELECT ----
 
