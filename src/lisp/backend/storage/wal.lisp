@@ -46,7 +46,6 @@
 
 (declaim (ftype function wal-test-pause
                 wal-remove-checkpointed-segments wal-atomic-write-bytes
-                wal-apply-catalog-record
                 clog-set clog-reset clog-fsync))
 (declaim (notinline pg-class-relfilenode pg-index-relfilenode
                     database-tables database-indexes catalog-databases))
@@ -609,10 +608,6 @@
         (incf offset (length chunk)))
       payload)))
 
-(defun wal-apply-chunked-catalog-record (count length)
-  (wal-apply-catalog-record
-   (wal-reassemble-catalog-chunks count length)))
-
 (defun wal-defer-relation-delete (relfilenode)
   (when *wal-ready*
     (sb-thread:with-mutex (*wal-lock*)
@@ -643,6 +638,9 @@
           (if chunked-p
               (progn
                 (wal-append-catalog-chunks catalog-payload chunk-count)
+                (when *wal-output-stream*
+                  (finish-output *wal-output-stream*))
+                (wal-test-pause :after-catalog-chunks)
                 (wal-append-record +wal-record-catalog-commit+ 0
                                    commit-payload))
               (wal-append-record +wal-record-catalog+ 0 catalog-payload))
@@ -847,23 +845,32 @@
     (error "WAL XID reset record has an invalid length"))
   (wal-u64 payload 0))
 
-(defun wal-apply-catalog-record (payload)
+(defun wal-apply-catalog-image (deletes catalog-bytes)
+  (wal-atomic-write-bytes (merge-pathnames "global/pg_catalog.dat" *pgdata*)
+                          catalog-bytes)
+  (dolist (relfilenode deletes)
+    (smgr-forget relfilenode :delete t))
+  (when deletes (fsync-directory (merge-pathnames "base/" *pgdata*))))
+
+(defun wal-prepare-catalog-record (payload)
+  "Validate a catalog payload and return the operation that publishes it."
   (multiple-value-bind (deletes catalog-bytes)
       (wal-decode-catalog-payload payload)
-    (wal-atomic-write-bytes (merge-pathnames "global/pg_catalog.dat" *pgdata*)
-                            catalog-bytes)
-    (dolist (relfilenode deletes)
-      (smgr-forget relfilenode :delete t))
-    (when deletes (fsync-directory (merge-pathnames "base/" *pgdata*)))))
+    (lambda () (wal-apply-catalog-image deletes catalog-bytes))))
 
-(defun wal-replay-finish-batch (terminal-function &optional catalog-chunks-p)
+(defun wal-replay-finish-batch (terminal-preparer &optional catalog-chunks-p)
   (unless *wal-recovery-group-active*
     (error "WAL terminal record appears outside a batch"))
   (when (and *wal-recovery-catalog-chunk-count*
              (not catalog-chunks-p))
     (error "WAL catalog chunks lack a catalog commit record"))
-  (wal-apply-page-images (nreverse *wal-recovery-page-images*))
-  (funcall terminal-function)
+  ;; Decode and validate the terminal operation before touching any relation
+  ;; pages. Chunked catalog metadata must be reassembled and decoded first.
+  (let ((terminal-function (funcall terminal-preparer)))
+    (unless (functionp terminal-function)
+      (error "WAL terminal validation did not produce an apply operation"))
+    (wal-apply-page-images (nreverse *wal-recovery-page-images*))
+    (funcall terminal-function))
   (setf *wal-recovery-group-active* nil
         *wal-recovery-page-images* '()
         *wal-recovery-catalog-chunks* '()
@@ -896,10 +903,13 @@
        (unless (zerop (length (wal-record-payload record)))
          (error "WAL commit record has an invalid payload"))
        (wal-replay-finish-batch
-        (lambda () (clog-set (wal-record-xid record) 1))))
+        (lambda ()
+          (lambda ()
+            (clog-set (wal-record-xid record) 1)))))
       (#.+wal-record-catalog+
        (wal-replay-finish-batch
-        (lambda () (wal-apply-catalog-record (wal-record-payload record)))))
+        (lambda ()
+          (wal-prepare-catalog-record (wal-record-payload record)))))
       (#.+wal-record-catalog-chunk+
        (unless *wal-recovery-group-active*
          (error "WAL catalog chunks appear outside a batch"))
@@ -919,16 +929,17 @@
            (wal-decode-catalog-commit-payload (wal-record-payload record))
          (wal-replay-finish-batch
           (lambda ()
-            (wal-apply-chunked-catalog-record count length))
+            (wal-prepare-catalog-record
+             (wal-reassemble-catalog-chunks count length)))
           t)))
       (#.+wal-record-checkpoint+
        (unless (zerop (length (wal-record-payload record)))
          (error "WAL checkpoint record has an invalid payload"))
-       (wal-replay-finish-batch #'values))
+       (wal-replay-finish-batch (lambda () #'values)))
       (#.+wal-record-clog-reset+
        (wal-read-u64-payload (wal-record-payload record))
        (wal-replay-finish-batch
-        (lambda () (clog-reset :wal-reset-p nil)))))))
+        (lambda () (lambda () (clog-reset :wal-reset-p nil))))))))
 
 (defun wal-recover ()
   "Redo durable records after the checkpoint before loading the catalog."

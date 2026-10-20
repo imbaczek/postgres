@@ -194,6 +194,69 @@ psql_db -f "$TMP/large-catalog-drop.sql" \
     > "$TMP/large-catalog-drop.out"
 stop_server
 
+# Leave a complete, multi-segment catalog chunk sequence without its terminal
+# record. Recovery must discard it, then replay a later successful WAL batch.
+start_server after-catalog-chunks
+psql_db -f "$TMP/large-catalog-create.sql" \
+    > "$TMP/large-catalog-incomplete-create.out" 2>&1 &
+CLIENT=$!
+wait_for_pause after-catalog-chunks 1800
+crash_server
+wait "$CLIENT" 2>/dev/null || true
+python3 - "$PGDATA/pg_wal" <<'PY'
+import glob
+import os
+import struct
+import sys
+
+segment_size = 16 * 1024 * 1024
+records = []
+for path in sorted(glob.glob(sys.argv[1] + "/*.wal")):
+    segment = int(os.path.basename(path).split(".")[0], 16)
+    data = open(path, "rb").read()
+    offset = 0
+    while offset < len(data):
+        if offset + 32 > len(data) or data[offset:offset + 4] != b"PGWL":
+            raise SystemExit("invalid WAL while checking incomplete catalog batch")
+        length = struct.unpack_from("<I", data, offset + 8)[0]
+        if length < 32 or offset + length > len(data):
+            raise SystemExit("incomplete WAL record before catalog crash point")
+        lsn = struct.unpack_from("<Q", data, offset + 12)[0]
+        if lsn // segment_size != segment:
+            raise SystemExit("catalog record is stored in the wrong WAL segment")
+        record_type = struct.unpack_from("<H", data, offset + 6)[0]
+        records.append((lsn, record_type))
+        offset += length
+
+batch_start = max(i for i, (_, record_type) in enumerate(records)
+                  if record_type == 6)
+tail = records[batch_start:]
+chunks = [lsn for lsn, record_type in tail if record_type == 7]
+if len(chunks) != 2 or len({lsn // segment_size for lsn in chunks}) != 2:
+    raise SystemExit("incomplete catalog batch did not span two WAL segments")
+if any(record_type == 8 for _, record_type in tail):
+    raise SystemExit("catalog terminal was written before the crash point")
+PY
+
+start_server after-catalog-wal-flush
+if psql_db -f "$TMP/large-catalog-insert.sql" \
+        > "$TMP/large-catalog-incomplete-insert.out" 2>&1; then
+    echo "wal-crash-recovery: incomplete catalog create survived recovery" >&2
+    exit 1
+fi
+
+psql_db -c 'CREATE TABLE wal_catalog_after_incomplete (id int primary key)' \
+    > "$TMP/catalog-after-incomplete-create.out" 2>&1 &
+CLIENT=$!
+wait_for_pause after-catalog-wal-flush
+crash_server
+wait "$CLIENT" 2>/dev/null || true
+start_server
+psql_db -c 'INSERT INTO wal_catalog_after_incomplete VALUES (91)'
+[ "$(psql_db -A -t -c \
+    'SELECT id FROM wal_catalog_after_incomplete WHERE id = 91')" = 91 ]
+stop_server
+
 # A DDL catalog record must restore both metadata and index pages if the server
 # exits after the WAL flush and before the catalog image is written.
 start_server after-catalog-wal-flush

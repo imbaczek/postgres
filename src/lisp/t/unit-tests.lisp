@@ -158,6 +158,85 @@
       (when *wal-output-stream*
         (ignore-errors (close *wal-output-stream*))))))
 
+(defun test-wal-catalog-terminal-validation-precedes-page-redo ()
+  (let* ((test-pgdata
+           (merge-pathnames "wal-invalid-catalog-terminal-test/" *pgdata*))
+         (*pgdata* test-pgdata)
+         (*relation-streams* (make-hash-table :test #'eql))
+         (*wal-ready* t)
+         (*wal-checkpoint-lsn* 0)
+         (*wal-durable-lsn* 0)
+         (relfilenode 424242)
+         (page-before (page-init (make-page)))
+         (page-after (let ((page (page-init (make-page))))
+                       (setf (aref page 100) #x5A)
+                       page))
+         (images (list (make-wal-page-image :relfilenode relfilenode
+                                            :block 0 :page page-after)))
+         (catalog-chunk
+           (make-array 1 :element-type '(unsigned-byte 8) :initial-element 65))
+         (batch-bytes
+           (wal-encode-record +wal-record-batch-start+ 0 0 #()))
+         (batch-record (wal-decode-record batch-bytes 0))
+         (pages-start (wal-record-end batch-record))
+         (pages-end (+ pages-start +wal-header-size+
+                       (wal-page-payload-length images)))
+         (pages-payload (wal-encode-page-images images pages-end))
+         (pages-bytes
+           (wal-encode-record +wal-record-pages+ 0 pages-start pages-payload))
+         (pages-record (wal-decode-record pages-bytes pages-start))
+         (chunk-start (wal-record-end pages-record))
+         (chunk-payload (wal-encode-catalog-chunk-payload
+                         catalog-chunk 0 1))
+         (chunk-bytes
+           (wal-encode-record +wal-record-catalog-chunk+ 0 chunk-start
+                              chunk-payload))
+         (chunk-record (wal-decode-record chunk-bytes chunk-start))
+         (terminal-start (wal-record-end chunk-record))
+         (terminal-payload
+           (wal-encode-catalog-commit-payload
+            (make-array 2 :element-type '(unsigned-byte 8) :initial-element 65)
+            1))
+         (terminal-bytes
+           (wal-encode-record +wal-record-catalog-commit+ 0 terminal-start
+                              terminal-payload))
+         (terminal-record (wal-decode-record terminal-bytes terminal-start))
+         (end-lsn (wal-record-end terminal-record)))
+    (wal-ensure-directory-durable *pgdata*)
+    (wal-ensure-directory-durable (merge-pathnames "global/" *pgdata*))
+    (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
+    (wal-ensure-directory-durable (wal-directory))
+    (ensure-directories-exist (relation-file-path relfilenode))
+    (smgr-write relfilenode 0 page-before)
+    (with-open-file (stream (wal-segment-path 0)
+                            :direction :output
+                            :element-type '(unsigned-byte 8)
+                            :if-exists :supersede
+                            :if-does-not-exist :create)
+      (dolist (bytes (list batch-bytes pages-bytes chunk-bytes terminal-bytes))
+        (write-sequence bytes stream)))
+    (setf *wal-durable-lsn* end-lsn)
+    (wal-save-control-fields 0 end-lsn)
+    (unwind-protect
+         (progn
+           ;; Each record was decoded after encoding, so its CRC is valid. The
+           ;; terminal declares two catalog bytes although its only chunk has
+           ;; one; recovery must reject it before writing the staged page.
+           (let ((error-message
+                   (handler-case
+                       (progn (wal-recover) nil)
+                     (error (condition) (princ-to-string condition)))))
+             (check (and error-message
+                         (search "catalog chunks do not match their declared length"
+                                 error-message))
+                    "malformed chunked catalog terminal fails recovery")
+             (check (equalp (smgr-read relfilenode 0) page-before)
+                    "invalid catalog terminal leaves relation pages unchanged")))
+      (smgr-close-all)
+      (ignore-errors
+       (uiop:delete-directory-tree test-pgdata :validate t
+                                               :if-does-not-exist :ignore)))))
+
 (defun test-wal-segment-rotation ()
   (let* ((test-pgdata (merge-pathnames "wal-segment-test/" *pgdata*))
          (*pgdata* test-pgdata)
@@ -1623,6 +1702,7 @@
       (test-wal-catalog-codec-and-page-checksums)
       (test-wal-record-codec)
       (test-wal-chunked-catalog-record)
+      (test-wal-catalog-terminal-validation-precedes-page-redo)
       (test-wal-segment-rotation)
       (test-wal-checkpoint-skips-obsolete-prefix)
       (test-wal-missing-interior-segment)
