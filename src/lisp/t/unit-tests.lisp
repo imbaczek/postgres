@@ -71,6 +71,85 @@
            (error () t))
          "missing Swank bind address is rejected"))
 
+(defun test-malformed-packet-p (path bytes reader &optional expected-message)
+  (with-open-file (stream path
+                          :direction :output
+                          :if-exists :supersede
+                          :if-does-not-exist :create
+                          :element-type '(unsigned-byte 8))
+    (write-sequence bytes stream))
+  (handler-case
+      (with-open-file (stream path
+                              :direction :input
+                              :element-type '(unsigned-byte 8))
+        (funcall reader stream)
+        nil)
+    (pg-error (condition)
+      (and expected-message
+           (string= (pg-error-sqlstate condition) "08P01")
+           (string= (pg-error-message condition) expected-message)))
+    (error () (null expected-message))))
+
+(defun test-concat-octets (&rest parts)
+  (let* ((size (reduce #'+ parts :key #'length :initial-value 0))
+         (bytes (make-array size :element-type '(unsigned-byte 8)))
+         (offset 0))
+    (dolist (part parts)
+      (replace bytes part :start1 offset)
+      (incf offset (length part)))
+    bytes))
+
+(defun test-startup-packet-size (path packet-length)
+  (with-open-file (stream path
+                          :direction :output
+                          :if-exists :supersede
+                          :if-does-not-exist :create
+                          :element-type '(unsigned-byte 8))
+    (write-sequence (u32-to-bytes packet-length) stream)
+    (write-sequence
+     (make-array (- packet-length 4)
+                 :element-type '(unsigned-byte 8)
+                 :initial-element 0)
+     stream))
+  (with-open-file (stream path
+                          :direction :input
+                          :element-type '(unsigned-byte 8))
+    (let ((body (read-startup-packet stream)))
+      (and body (= (length body) +max-startup-packet-length+)))))
+
+(defun test-protocol-packet-limits ()
+  (let ((path (merge-pathnames "malformed-packet.out" *pgdata*)))
+    (check (test-startup-packet-size path +max-startup-message-size+)
+           "startup packets accept PostgreSQL's maximum body length")
+    (check (test-malformed-packet-p
+            path (u32-to-bytes 7) #'read-startup-packet
+            "startup packet length is too short")
+           "undersized startup packets are rejected")
+    (check (test-malformed-packet-p
+            path (u32-to-bytes (1+ +max-startup-message-size+))
+            #'read-startup-packet "startup packet exceeds the size limit")
+           "oversized startup packets are rejected before allocation")
+    (check (test-malformed-packet-p
+            path (u32-to-bytes 8) #'read-startup-packet
+            "incomplete startup packet body")
+           "truncated startup packet bodies are rejected")
+    (check (test-malformed-packet-p
+            path (test-concat-octets (vector (char-code #\Q))
+                                     (u32-to-bytes 3))
+            #'read-message "frontend message length is too short")
+           "undersized query packets are rejected")
+    (check (test-malformed-packet-p
+            path (test-concat-octets (vector (char-code #\Q))
+                                     (u32-to-bytes
+                                      (1+ +max-query-message-size+)))
+            #'read-message "frontend message exceeds the size limit")
+           "oversized query packets are rejected before allocation")
+    (check (test-malformed-packet-p
+            path (test-concat-octets (vector (char-code #\Q))
+                                     (u32-to-bytes 5))
+            #'read-message "incomplete frontend message body")
+           "truncated query packet bodies are rejected")))
+
 (defun test-live-page-items-stop ()
   (let ((page (page-init (make-page)))
         (page-evaluations 0)
@@ -213,6 +292,93 @@
                       "new row has an invalid xmax"))))
       (smgr-forget relfilenode :delete t))))
 
+(defun test-heap-update-chain-follow ()
+  ;; PostgreSQL's heap_delete reports TM_Updated and ExecDelete runs
+  ;; EvalPlanQual. Model the ctid walk and row-predicate recheck at heap level.
+  (let* ((*next-xid* 7205)
+         (*active-xids* '(7204))
+         (*backend* (make-backend))
+         (*current-snapshot* (make-snapshot-struct :xmin 7200 :xmax 7205
+                                                   :xip '() :curcid 10))
+         (relfilenode 918273647)
+         (columns (vector (make-pg-column :name "value" :type :int4
+                                          :typmod -1 :attnum 1
+                                          :notnull nil)))
+         (tids '()))
+    (dolist (xid '(7200 7201 7202 7203))
+      (clog-set xid +clog-committed+))
+    (clog-set 7204 +clog-in-progress+)
+    (ensure-directories-exist (relation-file-path relfilenode))
+    (unwind-protect
+         (progn
+           (let ((previous nil))
+             (dolist (spec '((7200 10) (7201 20) (7202 30) (7203 40)))
+               (destructuring-bind (xmin value) spec
+                 (multiple-value-bind (block offnum)
+                     (heapam-insert relfilenode columns (vector value) xmin 0)
+                   (when previous
+                     (heapam-set-xmax relfilenode (first previous)
+                                      (second previous) xmin 0)
+                     (heapam-set-ctid relfilenode (first previous)
+                                      (second previous) block offnum))
+                   (push (cons block offnum) tids)
+                   (setf previous (list block offnum))))))
+           (setf tids (nreverse tids))
+           (multiple-value-bind (deleted tuple block offnum)
+               (heapam-delete-tid relfilenode columns
+                                  (caar tids) (cdar tids) 7204 1
+                                  (lambda (candidate)
+                                    (= (aref (htup-values candidate) 0) 40)))
+             (check deleted "update chain reaches and matches latest tuple")
+             (check (= (aref (htup-values tuple) 0) 40)
+                    "update-chain recheck returns the latest row values")
+             (check (equal (cons block offnum) (car (last tids)))
+                    "update-chain delete marks the latest tuple TID")
+             (check (= (htup-xmin tuple) 7203)
+                    "update chain can span several committed XIDs")
+             (check (= (htup-xmax (heapam-get-tuple
+                                   relfilenode block offnum columns))
+                       7204)
+                    "only the latest tuple receives the new xmax")))
+      (release-xid 7204)
+      (smgr-forget relfilenode :delete t))))
+
+(defun test-heap-free-space-map ()
+  (let ((fsm (make-heap-fsm)))
+    (heap-fsm-record-page fsm 4 300)
+    (heap-fsm-record-page fsm 6 160)
+    (check (= (heap-fsm-take-page fsm 150) 6)
+           "heap FSM selects the smallest fitting space category")
+    (heap-fsm-record-page fsm 6 64)
+    (check (= (heap-fsm-take-page fsm 250) 4)
+           "heap FSM refreshes a page's space category")
+    (check (null (heap-fsm-take-page fsm 250))
+           "heap FSM skips pages below the requested space")
+    (check (not (gethash 4 (heap-fsm-page-space fsm)))
+           "taking a page removes its old category entry")
+    (heap-fsm-record-page fsm 8 200)
+    (check (= (heap-fsm-take-page fsm 200) 8)
+           "heap FSM preserves exact-fit pages at category boundaries"))
+  ;; The heap path should reuse the current page rather than extending a page
+  ;; for every INSERT.
+  (let* ((relfilenode 918273648)
+         (columns (vector (make-pg-column :name "value" :type :int4
+                                          :typmod -1 :attnum 1
+                                          :notnull nil)))
+         (*backend* (make-backend)))
+    (ensure-directories-exist (relation-file-path relfilenode))
+    (unwind-protect
+         (progn
+           (dotimes (i 100)
+             (heapam-insert relfilenode columns (vector i) 7200 0))
+           (check (= (buf-nblocks relfilenode) 1)
+                  "heap inserts reuse a page found through the FSM")
+           (heap-fsm-forget relfilenode)
+           (heapam-insert relfilenode columns #(100) 7200 0)
+           (check (= (buf-nblocks relfilenode) 1)
+                  "first insert rebuilds the FSM from existing heap pages"))
+      (smgr-forget relfilenode :delete t))))
+
 (defun test-postgres-special-xid-statuses ()
   ;; Port the status cases from src/test/regress/sql/xid.sql. PostgreSQL's
   ;; TransactionLogFetch treats bootstrap/frozen as committed and invalid as
@@ -241,6 +407,141 @@
            "frozen XID is never aborted")
     (check (xid-aborted-p +invalid-xid+)
            "invalid XID is treated as aborted")))
+
+(defun test-xid-control-state ()
+  (let* ((*pgdata* (merge-pathnames "xid-state/" *pgdata*))
+         (control (control-path))
+         (temporary (pgdata-path "global/pg_control.tmp"))
+         (clog (clog-path)))
+    (check (= (load-next-xid) +first-normal-xid+)
+           "missing XID control state initializes an empty cluster")
+    (ensure-directories-exist clog)
+    (with-open-file (stream clog
+                            :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create
+                            :element-type '(unsigned-byte 8))
+      (write-byte 0 stream))
+    (check (handler-case (progn (load-next-xid) nil) (error () t))
+           "missing XID control state is rejected when persistent state exists")
+    (ensure-directories-exist control)
+    ;; An empty file models a crash that truncated pg_control in place.
+    (with-open-file (stream control
+                            :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create)
+      (write-string "" stream))
+    (check (handler-case (progn (load-next-xid) nil) (error () t))
+           "truncated XID control state is rejected")
+    (with-open-file (stream control
+                            :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create)
+      (format stream "not-an-xid~%"))
+    (check (handler-case (progn (load-next-xid) nil) (error () t))
+           "invalid XID control state is rejected")
+    (with-open-file (stream control
+                            :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create)
+      (format stream "~a~%" (+ +first-normal-xid+ 100)))
+    (check (= (load-next-xid) (+ +first-normal-xid+ 100))
+           "valid XID control state loads exactly")
+    (let ((fsync-count 0)
+          (*xid-batch-end* (+ +first-normal-xid+ 200)))
+      (save-next-xid
+       :fsync-function
+       (lambda (fd)
+         (incf fsync-count)
+         (sb-posix:fsync fd))
+       :fsync-directory-function
+       (lambda (directory)
+         (incf fsync-count)
+         (fsync-directory directory)))
+      (check (= (load-next-xid) *xid-batch-end*)
+             "XID control save installs the new boundary")
+      (check (= fsync-count 2)
+             "XID control save fsyncs its file and parent directory")
+      (check (not (probe-file temporary))
+             "successful XID control save removes its temporary file")
+      (let ((*xid-batch-end* (+ +first-normal-xid+ 300)))
+        (check (handler-case
+                   (progn
+                     (save-next-xid
+                      :rename-function
+                      (lambda (from to)
+                        (declare (ignore from to))
+                        (error "injected XID control rename failure")))
+                     nil)
+                 (error () t))
+               "XID control rename errors are reported")
+        (check (= (load-next-xid) (+ +first-normal-xid+ 200))
+               "failed XID control replacement preserves prior state")
+        (check (not (probe-file temporary))
+               "failed XID control save removes its temporary file")))))
+
+(defun test-data-row-first-column (payload)
+  (when (and (>= (length payload) 6)
+             (plusp (bytes-to-u16 payload 0)))
+    (let ((length (bytes-to-u32 payload 2)))
+      (unless (= length #xFFFFFFFF)
+        (when (<= (+ 6 length) (length payload))
+          (bytes->string payload :start 6 :end (+ 6 length)))))))
+
+(defun test-show-timezone-values (path)
+  (with-open-file (stream path
+                          :direction :input
+                          :element-type '(unsigned-byte 8))
+    (loop for message = (read-message stream)
+          while message
+          when (char= (frontend-message-type message) #\D)
+            collect (test-data-row-first-column
+                     (frontend-message-payload message)))))
+
+(defun test-session-setting-rollback ()
+  (let ((*backend* (make-backend))
+        (path (merge-pathnames "session-settings.out" *pgdata*)))
+    (with-open-file (stream path
+                            :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create
+                            :element-type '(unsigned-byte 8))
+      (exec-simple-query stream
+                         (concatenate 'string
+                                      "SET TIME ZONE 'Europe/Warsaw'; "
+                                      "SHOW timezone; "
+                                      "BEGIN; "
+                                      "SET TIME ZONE 'America/New_York'; "
+                                      "SHOW timezone; "
+                                      "ROLLBACK; "
+                                      "SHOW timezone; "
+                                      "RESET timezone; "
+                                      "SHOW timezone;")))
+    (check (equal (test-show-timezone-values path)
+                  '("Europe/Warsaw" "America/New_York" "Europe/Warsaw" "UTC"))
+           "SHOW reports SET values and the value restored by ROLLBACK")
+    (check (not (nth-value 1 (gethash "timezone"
+                                      (backend-settings *backend*))))
+           "RESET TIME ZONE returns the backend to its default")
+    (check (eq (backend-state *backend*) :idle)
+           "ROLLBACK leaves the backend outside a transaction")
+    (with-open-file (stream path
+                            :direction :output
+                            :if-exists :append
+                            :if-does-not-exist :create
+                            :element-type '(unsigned-byte 8))
+      (exec-simple-query stream "SET TIME ZONE 'Europe/Warsaw';"))
+    (let ((caught nil))
+      (handler-case
+          (exec-set nil '(:name "timezone" :value "Invalid/NoSuchZone"))
+        (pg-error (condition)
+          (setf caught condition)))
+      (check (and caught
+                  (string= (pg-error-sqlstate caught) "22023"))
+             "SET TIME ZONE rejects missing zoneinfo names")
+      (check (string= (gethash "timezone" (backend-settings *backend*))
+                      "Europe/Warsaw")
+             "rejected time zone preserves the previous session setting"))))
 
 (defun test-xid-wraparound-freezes-tuples ()
   ;; Deterministic one-cycle counterpart to xid_wraparound/t/003_wraparounds.pl.
@@ -583,13 +884,17 @@
           (*backend* (make-backend)))
       (clog-init)
       (test-swank-arguments)
+      (test-protocol-packet-limits)
       (test-page-roundtrip)
       (test-live-page-items-stop)
       (test-page-compaction)
       (test-tuple-roundtrip)
       (test-full-xid-tuple-format)
       (test-xid-tuple-update-roundtrip)
+      (test-heap-update-chain-follow)
+      (test-heap-free-space-map)
       (test-postgres-special-xid-statuses)
+      (test-xid-control-state)
       (test-key-order)
       (test-index-catalog-roundtrip)
       (test-sql-strict-let-evaluation)
@@ -599,6 +904,7 @@
       (test-visibility)
       (test-btree-duplicate-keys)
       (test-btree-mixed-duplicate-keys)
+      (test-session-setting-rollback)
       (test-parse-error-aborts-transaction)
       (test-xid-wraparound-freezes-tuples))
     (ignore-errors

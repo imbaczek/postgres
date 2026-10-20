@@ -105,6 +105,25 @@ rolled back immediately."
                  "is_superuser")
           :test #'string=))
 
+(defun valid-timezone-value-p (value)
+  (and (stringp value)
+       (plusp (length value))
+       (not (char= (char value 0) #\/))
+       (every (lambda (char)
+                (or (and (char>= char #\A) (char<= char #\Z))
+                    (and (char>= char #\a) (char<= char #\z))
+                    (and (char>= char #\0) (char<= char #\9))
+                    (find char "/_+-")))
+              value)
+       (handler-case
+           (with-open-file (stream (merge-pathnames
+                                    value #p"/usr/share/zoneinfo/")
+                                   :direction :input
+                                   :element-type '(unsigned-byte 8))
+             (and (loop for expected across #(84 90 105 102)
+                        always (= (read-byte stream) expected))))
+         (error () nil))))
+
 (defun exec-set (stream ast)
   (let* ((name (string-downcase (getf ast :name)))
          (raw-value (getf ast :value))
@@ -121,8 +140,12 @@ rolled back immediately."
        (if (eq raw-value :default)
            (remhash "timezone" (backend-settings *backend*))
            (progn
-             (when (or (zerop (length value)) (string-equal value "local"))
+             (when (string-equal value "local")
                (ereport "0A000" "this TIME ZONE value is not supported"))
+             (unless (valid-timezone-value-p value)
+               (ereport "22023"
+                        "invalid value for parameter \"TimeZone\": \"~a\""
+                        value))
              (setf (gethash "timezone" (backend-settings *backend*)) value)))
        (send-parameter-status
         stream "TimeZone"
@@ -708,8 +731,11 @@ rolled back immediately."
     ;; Mark the backend as executing a command, so pg_cancel_backend()
     ;; knows a pending cancel is meaningful (an idle cancel is ignored).
     (when backend
-      (setf (backend-executing backend) t
-            (backend-cancel-pending backend) nil))
+      ;; Clear a stale idle cancel before publishing EXECUTING. If these stores
+      ;; are reversed, a concurrent CancelRequest can set the flag after
+      ;; EXECUTING becomes true and have this query-start path erase it.
+      (setf (backend-cancel-pending backend) nil
+            (backend-executing backend) t))
     (unwind-protect
          (handler-case
              (let ((stmts (parse-statements query)))

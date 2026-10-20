@@ -20,8 +20,10 @@
 (defconstant +namedatalen+ 64)
 (defconstant +pg-page-layout-version+ 6)
 
-;;; Wire message sizes include their length field, as PostgreSQL specifies.
-(defconstant +max-startup-message-size+ 10000)
+;;; PostgreSQL compares the startup packet body (after the 4-byte length word)
+;;; with MAX_STARTUP_PACKET_LENGTH. Query message sizes include the length word.
+(defconstant +max-startup-packet-length+ 10000)
+(defconstant +max-startup-message-size+ (+ 4 +max-startup-packet-length+))
 (defconstant +max-query-message-size+ (* 16 1024 1024))
 
 ;;; Transaction IDs.

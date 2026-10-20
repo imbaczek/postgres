@@ -17,6 +17,88 @@
   infomask
   values)
 
+;;; The PostgreSQL FSM is persisted in a separate relation fork. Keep the MVP's
+;;; page-space candidates in memory and rebuild them once per relation after a
+;;; restart. Buckets are lower bounds, so a candidate is never reported as
+;;; having more space than it actually does.
+(defconstant +heap-fsm-category-count+ 256)
+(defconstant +heap-fsm-category-size+ (/ +blcksz+ +heap-fsm-category-count+))
+
+(defstruct heap-fsm
+  (buckets (make-hash-table :test #'eql))
+  (page-space (make-hash-table :test #'eql))
+  (nonempty-categories (make-array +heap-fsm-category-count+
+                                   :initial-element 0)))
+
+(defvar *heap-fsms* (make-hash-table :test #'eql))
+
+(defun heap-fsm-category (space)
+  (min (1- +heap-fsm-category-count+)
+       (floor (max 0 space) +heap-fsm-category-size+)))
+
+(defun heap-fsm-forget (relfilenode)
+  (remhash relfilenode *heap-fsms*)
+  (values))
+
+(defun heap-fsm-record-page (fsm block space)
+  "Record BLOCK's current free space, removing its previous category first."
+  (multiple-value-bind (old-space present-p)
+      (gethash block (heap-fsm-page-space fsm))
+    (when present-p
+      (let* ((pages (gethash old-space (heap-fsm-buckets fsm)))
+             (remaining (delete block pages :test #'eql)))
+        (if remaining
+            (setf (gethash old-space (heap-fsm-buckets fsm)) remaining)
+            (progn
+              (remhash old-space (heap-fsm-buckets fsm))
+              (decf (aref (heap-fsm-nonempty-categories fsm)
+                          (heap-fsm-category old-space))))))
+      (remhash block (heap-fsm-page-space fsm))))
+  (when (plusp space)
+    (multiple-value-bind (pages present-p)
+        (gethash space (heap-fsm-buckets fsm))
+      (unless present-p
+        (incf (aref (heap-fsm-nonempty-categories fsm)
+                    (heap-fsm-category space))))
+      (push block pages)
+      (setf (gethash space (heap-fsm-buckets fsm)) pages
+            (gethash block (heap-fsm-page-space fsm)) space)))
+  (values))
+
+(defun heap-fsm-take-page (fsm space-needed)
+  "Return and remove a candidate page with at least SPACE-NEEDED bytes."
+  (let* ((minimum-space (max 0 space-needed))
+         (minimum-category (floor minimum-space +heap-fsm-category-size+)))
+    (loop for category from minimum-category below +heap-fsm-category-count+
+          when (plusp (aref (heap-fsm-nonempty-categories fsm) category))
+            do (loop for space from (if (= category minimum-category)
+                                        minimum-space
+                                        (* category +heap-fsm-category-size+))
+                       to (min +blcksz+
+                               (1- (* (1+ category) +heap-fsm-category-size+)))
+                     for candidates = (gethash space (heap-fsm-buckets fsm))
+                     when candidates
+                       do (let ((block (pop candidates)))
+                            (if candidates
+                                (setf (gethash space (heap-fsm-buckets fsm))
+                                      candidates)
+                                (progn
+                                  (remhash space (heap-fsm-buckets fsm))
+                                  (decf (aref (heap-fsm-nonempty-categories fsm)
+                                              category))))
+                            (remhash block (heap-fsm-page-space fsm))
+                            (return-from heap-fsm-take-page block))))))
+
+(defun heap-fsm-for-relation (relfilenode)
+  (or (gethash relfilenode *heap-fsms*)
+      (let ((fsm (make-heap-fsm)))
+        ;; This one-time rebuild replaces heapam-insert's repeated full scan.
+        (dotimes (block (buf-nblocks relfilenode))
+          (let ((page (buf-read relfilenode block)))
+            (when page
+              (heap-fsm-record-page fsm block (page-free-space page)))))
+        (setf (gethash relfilenode *heap-fsms*) fsm))))
+
 (defun column-align (col)
   (case (pg-column-type col)
     (:int8 8)
@@ -166,39 +248,48 @@
 
 (defun heapam-insert (relfilenode columns values xmin cid)
   "Insert a tuple; return (values block offnum)."
-  (let ((tuple (form-heap-tuple values columns xmin 0 cid 0 0))
-        (nblocks (buf-nblocks relfilenode)))
-    (flet ((try-page (block)
-             (let ((page (buf-read relfilenode block)))
-               (when page
-                 (let ((offnum (page-add-item page tuple :allow-reuse nil)))
-                   (when offnum
-                     (multiple-value-bind (toff tflags tlen)
-                         (page-get-lp page offnum)
-                       (declare (ignore tflags tlen))
-                       (page-set-u32 page (+ toff +heap-tuple-ctid-block-off+)
-                                     block)
-                       (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+)
-                                     offnum))
-                     (buf-write relfilenode block page)
-                     (mark-dirty relfilenode)
-                     (return-from try-page (values block offnum))))))))
-      (loop for block from 0 below nblocks
-            do (multiple-value-bind (b o) (try-page block)
-                 (when b (return-from heapam-insert (values b o)))))
+  (let* ((tuple (form-heap-tuple values columns xmin 0 cid 0 0))
+         (fsm (heap-fsm-for-relation relfilenode))
+         (required (+ +size-of-item-id+ (maxalign (length tuple)))))
+    (labels ((add-to-page (page block)
+               (let ((offnum (page-add-item page tuple :allow-reuse nil)))
+                 (when offnum
+                   (multiple-value-bind (toff tflags tlen)
+                       (page-get-lp page offnum)
+                     (declare (ignore tflags tlen))
+                     (page-set-u32 page (+ toff +heap-tuple-ctid-block-off+)
+                                   block)
+                     (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+)
+                                   offnum))
+                   (buf-write relfilenode block page)
+                   (mark-dirty relfilenode)
+                   (heap-fsm-record-page fsm block (page-free-space page)))
+                 offnum)))
+      (loop for block = (heap-fsm-take-page fsm required)
+            while block
+            for page = (buf-read relfilenode block)
+            when page
+              do (let ((offnum (add-to-page page block)))
+                   (if offnum
+                       (return-from heapam-insert (values block offnum))
+                       ;; FSM entries are advisory, like PostgreSQL's. Refresh
+                       ;; one if an intervening page change made it stale.
+                       (heap-fsm-record-page fsm block (page-free-space page)))))
       ;; Tuple TIDs remain stable for concurrent update-chain rechecks. Without
       ;; VACUUM to establish a safe removal horizon, extend rather than prune.
-      (let ((page (page-init (make-page))))
-        (let ((offnum (page-add-item page tuple :allow-reuse nil)))
-          (unless offnum
-            (ereport "54000" "row is too large for a heap page"))
-          (multiple-value-bind (toff tflags tlen) (page-get-lp page offnum)
-            (declare (ignore tflags tlen))
-            (page-set-u32 page (+ toff +heap-tuple-ctid-block-off+) nblocks)
-            (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+) offnum))
-          (buf-write relfilenode nblocks page)
-          (mark-dirty relfilenode)
-          (values nblocks offnum))))))
+      (let* ((block (buf-nblocks relfilenode))
+             (page (page-init (make-page)))
+             (offnum (page-add-item page tuple :allow-reuse nil)))
+        (unless offnum
+          (ereport "54000" "row is too large for a heap page"))
+        (multiple-value-bind (toff tflags tlen) (page-get-lp page offnum)
+          (declare (ignore tflags tlen))
+          (page-set-u32 page (+ toff +heap-tuple-ctid-block-off+) block)
+          (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+) offnum))
+        (buf-write relfilenode block page)
+        (mark-dirty relfilenode)
+        (heap-fsm-record-page fsm block (page-free-space page))
+        (values block offnum)))))
 
 (defun heapam-set-xmax (relfilenode block offnum xmax cid)
   (let ((page (buf-read relfilenode block)))

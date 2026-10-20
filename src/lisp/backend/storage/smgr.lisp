@@ -49,7 +49,12 @@
         (remhash relfilenode *relation-streams*)))
     (when delete
       (ignore-errors (delete-file (relation-file-path relfilenode))))
-    (values)))
+    (values))
+  ;; Heap FSM state is volatile and owned by heapam, which loads after smgr.
+  ;; Discard it after releasing *SMGR-LOCK* to preserve lock ordering.
+  (when (fboundp 'heap-fsm-forget)
+    (funcall (symbol-function 'heap-fsm-forget) relfilenode))
+  (values))
 
 (defun smgr-close-all ()
   (sb-thread:with-mutex (*smgr-lock*)

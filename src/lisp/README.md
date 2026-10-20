@@ -125,7 +125,9 @@ delivers the FATAL even to an idle backend and returns true once the signal is
 sent. With a positive millisecond `timeout` it waits for the backend to
 disappear and returns false if it does not; a negative timeout raises `22003`.
 An unknown PID produces a `WARNING` and returns false. `t/shutdown.sh`
-exercises all of this, including smart/fast/immediate shutdown and escalation.
+exercises this through SQL and the raw TCP CancelRequest packet, including
+rejection of invalid PID/key pairs, plus smart/fast/immediate shutdown and
+escalation.
 
 ## Supported SQL
 
@@ -181,9 +183,10 @@ parentheses. Scalar functions: `version()`, `pg_lisp_runtime()`,
 `pg_cancel_backend(pid)`,
 `pg_terminate_backend(pid [, timeout])`, `pg_reload_conf()`.
 
-`SET TIME ZONE` is stored per backend and returned by `SHOW timezone`;
-`RESET TIME ZONE` and `RESET ALL` restore UTC. The server supports only
-`READ COMMITTED`, UTF8 client encoding, and `standard_conforming_strings = on`.
+`SET TIME ZONE` accepts installed named TZif zones, stores the value per backend,
+and returns it from `SHOW timezone`; numeric offsets and `INTERVAL` forms are
+unsupported. `RESET TIME ZONE` and `RESET ALL` restore UTC. The server supports
+only `READ COMMITTED`, UTF8 client encoding, and `standard_conforming_strings = on`.
 `SET LOCAL`, unsupported setting names, and unsupported values are rejected.
 Meta-commands that need `pg_catalog` and regular-expression operators (`\d`,
 `\dt`, `\l`) return an error from the server; `psql` prints it and continues.
@@ -195,6 +198,7 @@ cd src/lisp
 ./t/run-unit-tests.sh     # Lisp-level page/tuple/index/visibility tests
 ./t/psql-smoke.sh         # boots a server and diffs psql output against a golden file
 ./t/unique-index-concurrency.sh # unique-index build/drop writer races
+./t/update-concurrency.sh # concurrent UPDATE chain and WHERE rechecks
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
 ./t/hot-reload.sh         # SIGHUP reloads code in a running server
 ./t/control-repl.sh       # control REPL over TCP + Unix socket, reload, SQL intact
@@ -213,6 +217,17 @@ the case where equal index keys straddle many leaf splits.
 `t/unique-index-concurrency.sh` checks that unique-index builds and `DROP INDEX`
 wait for active writers, and that `DROP TABLE` serializes with builds, readers,
 and writers.
+
+`t/update-concurrency.sh` holds one transaction open while another session
+updates the same row. It confirms the waiter entered a transaction-ID wait,
+then checks that the waiter follows the committed `ctid` chain, recalculates
+`value + 1` against the latest version, and skips both UPDATE and DELETE when
+the refreshed row no longer satisfies `WHERE`.
+
+`t/shutdown.sh` also confirms that a raw TCP CancelRequest interrupts a blocked
+statement after the backend enters its transaction-ID wait, and that incorrect
+PID or secret-key pairs do not cancel it. The test uses the local control REPL
+on SQL port + 2000 as a synchronization point.
 
 For live debugging, server-backed tests accept `DEBUG_ON_FAILURE=1`. The test
 starts Swank on `SQL port + 1000`; if an assertion fails while the server is
@@ -336,6 +351,9 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   XID (and the in-progress tuple it wrote) cannot block other sessions.
 - UPDATE and DELETE follow a committed update's `ctid` chain after waiting for
   its writer, refresh the row snapshot, and recheck the WHERE condition.
+- Heap insertion consults a volatile 256-category free-space map per
+  relfilenode. It is rebuilt from heap pages once on the first insert after a
+  restart; successful inserts refresh the page's free-space entry.
 - Writers take a single global write mutex; DDL also takes a catalog mutex;
   page I/O is serialized under an smgr mutex. Readers do not block.
 
@@ -367,6 +385,9 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
 - No VACUUM or heap tuple pruning; old row versions and their TIDs are retained
   so concurrent update-chain rechecks cannot follow a reused TID. Updates and
   deletes do not reclaim heap space, and inserts always allocate new heap TIDs.
+  The volatile free-space map avoids a full relation scan on each INSERT, but
+  it does not reclaim obsolete versions and its first rebuild after restart
+  scans the existing heap once.
 - Byte-wise comparison only, i.e. C-like collation for ASCII. Index key
   encoding is length-first and is used internally only.
 - Numeric/float, date/time, boolean, and other types are unsupported. `text` is

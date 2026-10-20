@@ -2,10 +2,39 @@
 
 (in-package #:pg)
 
-;; DEFVAR so that hot reload does not reset them to zero.
-(defvar *secret-counter* 0)
-
 ;;; ---- startup ----
+
+(defun random-cancel-key ()
+  "Return a 32-bit cancel key from the operating system's entropy source."
+  (with-open-file (stream #p"/dev/urandom"
+                          :direction :input
+                          :element-type '(unsigned-byte 8))
+    (let ((bytes (make-array 4 :element-type '(unsigned-byte 8))))
+      (unless (= (read-sequence bytes stream) (length bytes))
+        (error "could not read a cancel key from /dev/urandom"))
+      (bytes-to-u32 bytes 0))))
+
+(defun cancel-key-matches-p (received expected)
+  ;; Compare every byte before testing the accumulated difference. PostgreSQL's
+  ;; procsignal.c uses timingsafe_bcmp for the same credential check.
+  (let ((difference 0))
+    (dotimes (i 4)
+      (setf difference
+            (logior difference
+                    (logxor (ldb (byte 8 (* i 8)) received)
+                            (ldb (byte 8 (* i 8)) expected)))))
+    (zerop difference)))
+
+(defun process-cancel-request (body)
+  "Cancel the named backend only when its PID and secret key both match."
+  (let* ((pid (bytes-to-u32 body 4))
+         (key (bytes-to-u32 body 8))
+         (backend (lookup-backend pid)))
+    (when (and backend
+               (integerp (backend-cancel-key backend))
+               (cancel-key-matches-p key (backend-cancel-key backend)))
+      (cancel-backend backend)))
+  (values))
 
 (defun next-cstring (bytes start)
   (let ((end (position 0 bytes :start start)))
@@ -56,6 +85,7 @@
           ((= code +cancel-request-code+)
            (unless (= (length body) 12)
              (ereport-fatal "08P01" "cancel request packet has an invalid length"))
+           (process-cancel-request body)
            (return-from read-startup-until-ready nil))
           (t
            (return-from read-startup-until-ready body)))))))
@@ -97,9 +127,9 @@
       (send-parameter-status stream "application_name" app)
       (send-parameter-status stream "default_transaction_read_only" "off")
       (send-parameter-status stream "in_hot_standby" "off")
-      (send-backend-key-data stream
-                             (backend-pid *backend*)
-                             (incf *secret-counter*))
+      (let ((key (random-cancel-key)))
+        (setf (backend-cancel-key *backend*) key)
+        (send-backend-key-data stream (backend-pid *backend*) key))
       (send-ready-for-query stream #\I))))
 
 ;;; ---- query dispatch ----

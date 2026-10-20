@@ -5,6 +5,7 @@
 (defstruct backend
   stream
   (pid 0)
+  (cancel-key nil)
   (database "postgres")
   (xid nil)
   (state :idle)                 ; :idle | :in-progress | :aborted
@@ -18,6 +19,9 @@
   ;; backend's own thread, used by pg_cancel_backend()/pg_terminate_backend().
   (executing nil)
   (cancel-pending nil)
+  ;; Visible to the local control REPL so concurrency tests can synchronize on
+  ;; a real lock wait instead of relying on scheduler timing.
+  (waiting-xid nil)
   (thread nil))
 
 (defvar *backend* nil)
@@ -71,7 +75,9 @@ INTERRUPT-THREAD, so it needs no flag."
 
 (defvar *xid-batch-end* +first-normal-xid+)
 
-(defun save-next-xid ()
+(defun save-next-xid (&key (fsync-function #'sb-posix:fsync)
+                        (rename-function #'sb-posix:rename)
+                        (fsync-directory-function #'fsync-directory))
   (ensure-directories-exist (control-path))
   (let ((tmp (pgdata-path "global/pg_control.tmp")))
     (unwind-protect
@@ -83,9 +89,9 @@ INTERRUPT-THREAD, so it needs no flag."
                               :element-type 'character)
              (format s "~a~%" *xid-batch-end*)
              (finish-output s)
-             (sb-posix:fsync (sb-sys:fd-stream-fd s)))
-           (sb-posix:rename (namestring tmp) (namestring (control-path)))
-           (fsync-directory (pgdata-path "global/")))
+             (funcall fsync-function (sb-sys:fd-stream-fd s)))
+           (funcall rename-function (namestring tmp) (namestring (control-path)))
+           (funcall fsync-directory-function (pgdata-path "global/")))
       (ignore-errors (delete-file tmp))))
   (values))
 
@@ -461,12 +467,18 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
 
 (defun wait-for-xid (xid)
   "Block until XID ends. Called without the write lock held."
-  (loop
-    (unless (xid-active-p xid) (return))
-    (check-for-interrupts)
-    (sb-thread:with-mutex (*xact-cv-mutex*)
-      (when (xid-active-p xid)
-        (condition-wait-with-timeout *xact-cv* *xact-cv-mutex*))))
+  (let ((backend *backend*))
+    (when backend
+      (setf (backend-waiting-xid backend) xid))
+    (unwind-protect
+         (loop
+           (unless (xid-active-p xid) (return))
+           (check-for-interrupts)
+           (sb-thread:with-mutex (*xact-cv-mutex*)
+             (when (xid-active-p xid)
+               (condition-wait-with-timeout *xact-cv* *xact-cv-mutex*))))
+      (when backend
+        (setf (backend-waiting-xid backend) nil))))
   (values))
 
 (defun make-snapshot (curcid)

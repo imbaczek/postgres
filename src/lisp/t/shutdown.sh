@@ -14,6 +14,7 @@ set -eu
 BASE=$(cd "$(dirname "$0")/.." && pwd)
 SBCL=${SBCL:-sbcl}
 PORT=${PORT:-5466}
+CONTROL_PORT=${CONTROL_PORT:-$((PORT + 2000))}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-shutdown.XXXXXX")
 LOG="$TMP/server.log"
 SRV=
@@ -64,7 +65,8 @@ close_fds() { close_fd7; close_fd8; }
 start_server() {
     rm -rf "$TMP/data"
     : > "$LOG"
-    test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
+    test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" \
+        --control-port "$CONTROL_PORT"
     i=0
     while [ "$i" -lt 150 ]; do
         if psqlq -c '' >/dev/null 2>&1; then
@@ -249,6 +251,16 @@ sleep 0.6
 sleep 0.5
 grep -q 'FATAL:  terminating connection due to administrator command' "$TMP/b_out" \
     || fail "blocked backend was not terminated"
+
+# Exercise the protocol-level CancelRequest, including rejection of a bad key
+# and a bad PID. A still holds the unique key, so the raw-wire client can only
+# complete after its valid request reaches the backend.
+CANCEL_TEST_PORT=$PORT CANCEL_TEST_CONTROL_PORT=$CONTROL_PORT \
+    "$SBCL" --script "$BASE/t/cancel-request-client.lisp" \
+    > "$TMP/wire-cancel.out" 2>&1 \
+    || fail "wire-protocol cancellation client failed: $(cat "$TMP/wire-cancel.out")"
+grep -q 'cancel-request-client: PASS' "$TMP/wire-cancel.out" \
+    || fail "wire-protocol cancellation was not verified"
 
 printf 'rollback;\n' >&7
 sleep 0.3
