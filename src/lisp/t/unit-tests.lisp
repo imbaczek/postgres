@@ -176,7 +176,74 @@
             #xFFFFFFFE)
          "tuple XIDs below the new epoch resolve to the prior epoch"))
 
+(defun test-xid-tuple-update-roundtrip ()
+  ;; Exercise the heap-level xmin/xmax contract behind the update system-column
+  ;; cases in src/test/regress/sql/update.sql, using a later 32-bit XID epoch.
+  (let* ((*next-xid* (+ +xid-cycle+ 52))
+         (relfilenode 918273646)
+         (columns (vector (make-pg-column :name "value" :type :int4
+                                          :typmod -1 :attnum 1
+                                          :notnull nil)))
+         (insert-xid (+ +xid-cycle+ 50))
+         (update-xid (+ +xid-cycle+ 51)))
+    (ensure-directories-exist (relation-file-path relfilenode))
+    (unwind-protect
+         (multiple-value-bind (old-block old-offnum)
+             (heapam-insert relfilenode columns (vector 10) insert-xid 0)
+           (heapam-set-xmax relfilenode old-block old-offnum update-xid 1)
+           (multiple-value-bind (new-block new-offnum)
+               (heapam-insert relfilenode columns (vector 11) update-xid 1)
+             (check (heapam-set-ctid relfilenode old-block old-offnum
+                                     new-block new-offnum)
+                    "heap update links the old tuple to its successor")
+             (let ((old-tuple (heapam-get-tuple relfilenode old-block
+                                                old-offnum columns))
+                   (new-tuple (heapam-get-tuple relfilenode new-block
+                                                new-offnum columns)))
+               (check (and (= (htup-ctid-block old-tuple) new-block)
+                           (= (htup-ctid-offnum old-tuple) new-offnum))
+                      "heap read preserves the update-chain ctid")
+               (check (= (htup-xmin old-tuple) insert-xid)
+                      "heap read reconstructs the old row's FullXID xmin")
+               (check (= (htup-xmax old-tuple) update-xid)
+                      "heap read reconstructs the updating FullXID xmax")
+               (check (= (htup-xmin new-tuple) update-xid)
+                      "heap read reconstructs the new row's FullXID xmin")
+               (check (zerop (htup-xmax new-tuple))
+                      "new row has an invalid xmax"))))
+      (smgr-forget relfilenode :delete t))))
+
+(defun test-postgres-special-xid-statuses ()
+  ;; Port the status cases from src/test/regress/sql/xid.sql. PostgreSQL's
+  ;; TransactionLogFetch treats bootstrap/frozen as committed and invalid as
+  ;; aborted. This Lisp check also uses the active-XID set to distinguish
+  ;; in-progress XIDs from abandoned zero-status entries.
+  (let* ((committed 7021)
+         (aborted 7022)
+         (active 7023)
+         (abandoned 7024)
+         (*active-xids* (list active)))
+    (clog-set committed +clog-committed+)
+    (clog-set aborted +clog-aborted+)
+    (clog-set active +clog-in-progress+)
+    (check (xid-committed-p committed) "committed XID status is preserved")
+    (check (xid-aborted-p aborted) "aborted XID status is preserved")
+    (check (xid-in-progress-p active) "active XID status is in progress")
+    (check (xid-aborted-p abandoned)
+           "inactive zero-status XID is treated as abandoned")
+    (check (xid-committed-p +bootstrap-xid+)
+           "bootstrap XID is always committed")
+    (check (xid-committed-p +frozen-xid+)
+           "frozen XID is always committed")
+    (check (not (xid-aborted-p +bootstrap-xid+))
+           "bootstrap XID is never aborted")
+    (check (not (xid-aborted-p +frozen-xid+))
+           "frozen XID is never aborted")
+    (check (xid-aborted-p +invalid-xid+)
+           "invalid XID is treated as aborted")))
+
 (defun test-xid-wraparound-freezes-tuples ()
+  ;; Deterministic one-cycle counterpart to xid_wraparound/t/003_wraparounds.pl.
   (let* ((*catalog* (make-catalog))
          (*next-xid* (+ +xid-cycle+ +first-normal-xid+))
          (*xid-batch-end* *next-xid*)
@@ -229,6 +296,17 @@
                                             (+ off +heap-tuple-xmax-off+))
                                   (second expected))
                                "wraparound freezes old xmax status"))))
+           (let ((snapshot (make-snapshot-struct :xmin +first-normal-xid+
+                                                 :xmax *next-xid*
+                                                 :xip '() :curcid 10)))
+             (loop for expected-visible in '(t nil nil t)
+                   for offnum from 1
+                   for tuple = (heapam-get-tuple relfilenode 0 offnum columns)
+                   do (check (eql (heap-tuple-visible-p
+                                   (htup-xmin tuple) (htup-xmax tuple)
+                                   (htup-cid tuple) snapshot nil)
+                                  expected-visible)
+                             "pre-wrap tuple visibility survives freezing")))
            (check (= (clog-get 7) +clog-in-progress+)
                   "wraparound resets the old CLOG cycle")
            (check (xid-aborted-p 7)
@@ -249,6 +327,14 @@
                   "frozen committed deletes free unique keys")
            (check (not (probe-file (xid-wrap-marker-path)))
                   "completed wraparound removes its recovery marker")
+           ;; Replay after a crash that left the durable marker behind even
+           ;; though freezing and the CLOG reset had already completed.
+           (save-xid-wrap-marker *next-xid*)
+           (setf *xid-wrap-pending* t
+                 *xid-wrap-completed-through* nil)
+           (complete-xid-wraparound)
+           (check (not (probe-file (xid-wrap-marker-path)))
+                  "wraparound marker replay completes idempotently")
            (check (null *xid-wrap-pending*)
                   "completed wraparound releases the XID allocation gate")
            (let ((expected-xid *next-xid*))
@@ -502,6 +588,8 @@
       (test-page-compaction)
       (test-tuple-roundtrip)
       (test-full-xid-tuple-format)
+      (test-xid-tuple-update-roundtrip)
+      (test-postgres-special-xid-statuses)
       (test-key-order)
       (test-index-catalog-roundtrip)
       (test-sql-strict-let-evaluation)
