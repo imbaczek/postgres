@@ -305,7 +305,6 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
                 (funcall reset-clog-function))
               (check-for-interrupts)
               (funcall delete-marker-function)
-              (check-for-interrupts)
               (sb-thread:with-mutex (*xid-wrap-lock*)
                 (setf *xid-wrap-completed-through* boundary
                       *xid-wrap-pending* nil)

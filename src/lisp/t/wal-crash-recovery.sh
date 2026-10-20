@@ -23,17 +23,27 @@ test_debug_install_traps cleanup
 
 start_server() {
     pause_at=${1:-}
+    data_dir=${2:-$PGDATA}
+    pause_relation=${3:-}
+    max_start=${4:-150}
     if [ -n "$pause_at" ]; then
-        rm -f "$PGDATA/pg_wal/test-paused-$pause_at"
-        PG_WAL_TEST_PAUSE_AT="$pause_at" "$BASE/pg-lisp.sh" \
-            -p "$PORT" -D "$PGDATA" >> "$LOG" 2>&1 &
+        rm -f "$data_dir/pg_wal/test-paused-$pause_at"
+        if [ -n "$pause_relation" ]; then
+            PG_WAL_TEST_PAUSE_AT="$pause_at" \
+                PG_WAL_TEST_PAUSE_RELATION="$pause_relation" \
+                "$BASE/pg-lisp.sh" -p "$PORT" -D "$data_dir" \
+                >> "$LOG" 2>&1 &
+        else
+            PG_WAL_TEST_PAUSE_AT="$pause_at" "$BASE/pg-lisp.sh" \
+                -p "$PORT" -D "$data_dir" >> "$LOG" 2>&1 &
+        fi
     else
-        "$BASE/pg-lisp.sh" -p "$PORT" -D "$PGDATA" >> "$LOG" 2>&1 &
+        "$BASE/pg-lisp.sh" -p "$PORT" -D "$data_dir" >> "$LOG" 2>&1 &
     fi
     SRV=$!
 
     i=0
-    while [ "$i" -lt 150 ]; do
+    while [ "$i" -lt "$max_start" ]; do
         if PGPASSWORD=x psql -X -h 127.0.0.1 -p "$PORT" -U postgres \
                 -d postgres -c '' >/dev/null 2>&1; then
             return 0
@@ -66,11 +76,21 @@ crash_server() {
 
 wait_for_pause() {
     point=$1
+    max_wait=${2:-300}
     marker="$PGDATA/pg_wal/test-paused-$point"
     i=0
-    while [ "$i" -lt 300 ]; do
+    while [ "$i" -lt "$max_wait" ]; do
         if [ -f "$marker" ]; then
             return 0
+        fi
+        if [ -n "${CLIENT:-}" ]; then
+            client_state=$(ps -o stat= -p "$CLIENT" 2>/dev/null || true)
+            case "$client_state" in
+                ''|Z*)
+                    echo "wal-crash-recovery: client exited before $point" >&2
+                    return 1
+                    ;;
+            esac
         fi
         if ! kill -0 "$SRV" 2>/dev/null; then
             echo "wal-crash-recovery: server exited before $point" >&2
@@ -89,12 +109,89 @@ psql_db() {
         -d postgres -v ON_ERROR_STOP=1 "$@"
 }
 
+expect_duplicate_key() {
+    statement=$1
+    output=$2
+    if psql_db -c "$statement" > "$output" 2>&1; then
+        echo "wal-crash-recovery: duplicate key was accepted: $statement" >&2
+        return 1
+    fi
+    if ! grep -Fq 'duplicate key value violates unique constraint' "$output"; then
+        echo "wal-crash-recovery: expected a unique-key error: $statement" >&2
+        cat "$output" >&2
+        return 1
+    fi
+}
+
 row_count() {
     psql_db -A -t -c 'SELECT id FROM wal_rows ORDER BY id' | wc -l | tr -d ' '
 }
 
 start_server
 psql_db -c 'CREATE TABLE wal_rows (id int primary key)'
+stop_server
+
+# A long quoted relation name makes a valid catalog image span multiple WAL
+# segments. Crash after its terminal record is durable, then verify redo
+# restores the complete catalog image before accepting DML.
+python3 - "$TMP/large-catalog-create.sql" \
+    "$TMP/large-catalog-insert.sql" "$TMP/large-catalog-select.sql" \
+    "$TMP/large-catalog-drop.sql" <<'PY'
+import sys
+
+segment_size = 16 * 1024 * 1024
+name = "n" * (segment_size - 256)
+quoted = '"' + name + '"'
+statements = (
+    "CREATE TABLE " + quoted + " (id int);\n",
+    "INSERT INTO " + quoted + " VALUES (42);\n",
+    "SELECT id FROM " + quoted + " WHERE id = 42;\n",
+    "DROP TABLE " + quoted + ";\n",
+)
+for path, statement in zip(sys.argv[1:], statements):
+    if len(statement.encode("ascii")) + 5 > 16 * 1024 * 1024:
+        raise SystemExit("large catalog test query exceeds protocol limit")
+    with open(path, "w", encoding="ascii") as stream:
+        stream.write(statement)
+PY
+start_server after-catalog-wal-flush
+psql_db -f "$TMP/large-catalog-create.sql" \
+    > "$TMP/large-catalog-create.out" 2>&1 &
+CLIENT=$!
+wait_for_pause after-catalog-wal-flush 1800
+crash_server
+wait "$CLIENT" 2>/dev/null || true
+python3 - "$PGDATA/pg_wal" <<'PY'
+import glob
+import os
+import struct
+import sys
+
+chunk_count = 0
+commit_count = 0
+for path in sorted(glob.glob(sys.argv[1] + "/*.wal")):
+    data = open(path, "rb").read()
+    offset = 0
+    while offset + 32 <= len(data):
+        if data[offset:offset + 4] != b"PGWL":
+            raise SystemExit("invalid WAL while checking catalog chunks")
+        length = struct.unpack_from("<I", data, offset + 8)[0]
+        if length < 32 or offset + length > len(data):
+            raise SystemExit("incomplete WAL while checking catalog chunks")
+        record_type = struct.unpack_from("<H", data, offset + 6)[0]
+        chunk_count += record_type == 7
+        commit_count += record_type == 8
+        offset += length
+if chunk_count != 2 or commit_count != 1:
+    raise SystemExit("large catalog commit did not use two chunks and a terminal")
+PY
+
+start_server "" "$PGDATA" "" 600
+psql_db -f "$TMP/large-catalog-insert.sql" \
+    > "$TMP/large-catalog-insert.out"
+[ "$(psql_db -A -t -f "$TMP/large-catalog-select.sql")" = 42 ]
+psql_db -f "$TMP/large-catalog-drop.sql" \
+    > "$TMP/large-catalog-drop.out"
 stop_server
 
 # A DDL catalog record must restore both metadata and index pages if the server
@@ -441,6 +538,101 @@ PY
 [ -z "$(psql_db -A -t -c 'SELECT id FROM wal_rows WHERE id = 14')" ]
 stop_server
 
+# An open transaction may have its pages written and removed from the shared
+# cache by a completed checkpoint. Its later commit still has to recover from
+# a commit record with no page images of its own.
+start_server after-wal-flush
+mkfifo "$TMP/post-checkpoint-commit.sql"
+psql_db < "$TMP/post-checkpoint-commit.sql" \
+    > "$TMP/post-checkpoint-commit.out" 2>&1 &
+CLIENT=$!
+exec 3> "$TMP/post-checkpoint-commit.sql"
+printf 'BEGIN;\nINSERT INTO wal_rows VALUES (15);\n\\! touch %s\n' \
+    "$TMP/post-checkpoint-staged" >&3
+i=0
+while [ ! -f "$TMP/post-checkpoint-staged" ]; do
+    if ! kill -0 "$CLIENT" 2>/dev/null; then
+        echo "wal-crash-recovery: transaction exited before checkpoint staging" >&2
+        cat "$TMP/post-checkpoint-commit.out" >&2
+        exit 1
+    fi
+    i=$((i + 1))
+    if [ "$i" -ge 100 ]; then
+        echo "wal-crash-recovery: timed out waiting for post-checkpoint transaction" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+psql_db -c 'CHECKPOINT'
+printf 'COMMIT;\n' >&3
+wait_for_pause after-wal-flush
+crash_server
+exec 3>&-
+wait "$CLIENT" 2>/dev/null || true
+
+start_server
+[ "$(psql_db -A -t -c 'SELECT id FROM wal_rows WHERE id = 15')" = 15 ]
+[ "$(row_count)" -eq 5 ]
+stop_server
+
+# A commit may publish page images containing another backend's staged tuple.
+# Exercise that coupling with separate aborting, committing, and checking
+# sessions, then repeat the visibility and unique-key checks after hard crashes.
+start_server
+psql_db -c 'CREATE TABLE wal_race_rows (id int primary key)'
+stop_server
+race=1
+while [ "$race" -le 3 ]; do
+    start_server
+    aborted_id=$((100 + race))
+    committed_id=$((200 + race))
+    mkfifo "$TMP/race-$race.sql"
+    psql_db < "$TMP/race-$race.sql" > "$TMP/race-$race.out" 2>&1 &
+    ABORT_CLIENT=$!
+    exec 3> "$TMP/race-$race.sql"
+    printf 'BEGIN;\nINSERT INTO wal_race_rows VALUES (%s);\n\\! touch %s\n' \
+        "$aborted_id" "$TMP/race-$race-staged" >&3
+    i=0
+    while [ ! -f "$TMP/race-$race-staged" ]; do
+        if ! kill -0 "$ABORT_CLIENT" 2>/dev/null; then
+            echo "wal-crash-recovery: aborting transaction exited before staging" >&2
+            cat "$TMP/race-$race.out" >&2
+            exit 1
+        fi
+        i=$((i + 1))
+        if [ "$i" -ge 100 ]; then
+            echo "wal-crash-recovery: timed out waiting for aborting transaction" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+    psql_db -c "INSERT INTO wal_race_rows VALUES ($committed_id)"
+    [ -z "$(psql_db -A -t -c \
+        "SELECT id FROM wal_race_rows WHERE id = $aborted_id")" ]
+    [ "$(psql_db -A -t -c \
+        "SELECT id FROM wal_race_rows WHERE id = $committed_id")" = "$committed_id" ]
+    expect_duplicate_key \
+        "INSERT INTO wal_race_rows VALUES ($committed_id)" \
+        "$TMP/race-$race-duplicate.out"
+
+    # Leave the first backend's transaction open across the hard crash. Its
+    # staged tuple was included in the other backend's durable page image.
+    crash_server
+    exec 3>&-
+    wait "$ABORT_CLIENT" 2>/dev/null || true
+    start_server
+    [ -z "$(psql_db -A -t -c \
+        "SELECT id FROM wal_race_rows WHERE id = $aborted_id")" ]
+    [ "$(psql_db -A -t -c \
+        "SELECT id FROM wal_race_rows WHERE id = $committed_id")" = "$committed_id" ]
+    psql_db -c "INSERT INTO wal_race_rows VALUES ($aborted_id)"
+    expect_duplicate_key \
+        "INSERT INTO wal_race_rows VALUES ($committed_id)" \
+        "$TMP/race-$race-restarted-duplicate.out"
+    stop_server
+    race=$((race + 1))
+done
+
 # The one-transaction batch crosses a leaf split. Kill after the first data
 # page write; replay must restore the whole split and every committed key.
 python3 - "$TMP/split.sql" <<'PY'
@@ -466,7 +658,7 @@ if not match:
 print(match.group(1))
 PY
 )
-start_server after-btree-split-page-write
+start_server after-btree-split-page-write "" "$INDEX_REL"
 psql_db -f "$TMP/split.sql" > "$TMP/split.out" 2>&1 &
 CLIENT=$!
 wait_for_pause after-btree-split-page-write
@@ -488,13 +680,82 @@ with open(sys.argv[1], "r+b") as stream:
 PY
 
 start_server
-[ "$(row_count)" -eq 1004 ]
+[ "$(row_count)" -eq 1005 ]
 [ "$(psql_db -A -t -c 'SELECT id FROM wal_rows WHERE id = 1099')" = 1099 ]
-if psql_db -c 'INSERT INTO wal_rows VALUES (1099)' > /dev/null 2>&1; then
-    echo "wal-crash-recovery: recovered B-tree split lost a unique key" >&2
-    exit 1
-fi
+expect_duplicate_key 'INSERT INTO wal_rows VALUES (1099)' \
+    "$TMP/split-duplicate.out"
 psql_db -c 'INSERT INTO wal_rows VALUES (1200)'
+stop_server
+
+# Use a wide key so a small index can fill an internal root. The first commit
+# leaves a level-1 root; the second grows past its capacity and must split that
+# internal page. Crash after the split index's first data-page write.
+python3 - "$TMP/internal-preload.sql" "$TMP/internal-split.sql" <<'PY'
+import sys
+
+def rows(first, stop):
+    padding = "x" * 118
+    return ",".join("('%08d%s')" % (value, padding)
+                    for value in range(first, stop))
+
+with open(sys.argv[1], "w", encoding="ascii") as stream:
+    stream.write("INSERT INTO wal_internal_rows VALUES ")
+    stream.write(rows(1, 501))
+    stream.write(";\n")
+with open(sys.argv[2], "w", encoding="ascii") as stream:
+    stream.write("INSERT INTO wal_internal_rows VALUES ")
+    stream.write(rows(501, 4501))
+    stream.write(";\n")
+PY
+start_server
+psql_db -c 'CREATE TABLE wal_internal_rows (id varchar(126) primary key)'
+psql_db -f "$TMP/internal-preload.sql" > "$TMP/internal-preload.out"
+stop_server
+
+INDEX_REL=$(python3 - "$PGDATA/global/pg_catalog.dat" <<'PY'
+import re
+import sys
+
+catalog = open(sys.argv[1], encoding="utf-8").read()
+match = re.search(
+    r'wal_internal_rows_pkey"\)?\s+:relfilenode\s+(\d+)',
+    catalog,
+    re.IGNORECASE,
+)
+if not match:
+    raise SystemExit("could not find wal_internal_rows_pkey in the catalog")
+print(match.group(1))
+PY
+)
+read_btree_level() {
+    python3 - "$PGDATA/base/$INDEX_REL" <<'PY'
+import sys
+
+with open(sys.argv[1], "rb") as index:
+    page = index.read(8192)
+if len(page) != 8192:
+    raise SystemExit("B-tree meta page is missing")
+print(int.from_bytes(page[28:30], "little"))
+PY
+}
+[ "$(read_btree_level)" -eq 1 ]
+
+start_server after-btree-split-page-write "" "$INDEX_REL"
+psql_db -f "$TMP/internal-split.sql" \
+    > "$TMP/internal-split.out" 2>&1 &
+CLIENT=$!
+wait_for_pause after-btree-split-page-write 1800
+crash_server
+wait "$CLIENT" 2>/dev/null || true
+
+start_server "" "$PGDATA" "" 600
+[ "$(psql_db -A -t -c \
+    'SELECT id FROM wal_internal_rows' | wc -l | tr -d ' ')" -eq 4500 ]
+[ "$(read_btree_level)" -eq 2 ]
+duplicate_value=$(python3 -c 'print("00004500" + "x" * 118)')
+expect_duplicate_key \
+    "INSERT INTO wal_internal_rows VALUES ('$duplicate_value')" \
+    "$TMP/internal-duplicate.out"
 stop_server
 
 # Crash once before checkpoint data writes and once after the checkpoint
@@ -507,7 +768,7 @@ crash_server
 wait "$CLIENT" 2>/dev/null || true
 
 start_server
-[ "$(row_count)" -eq 1005 ]
+[ "$(row_count)" -eq 1006 ]
 stop_server
 
 start_server after-checkpoint-control
@@ -518,7 +779,7 @@ crash_server
 wait "$CLIENT" 2>/dev/null || true
 
 start_server
-[ "$(row_count)" -eq 1005 ]
+[ "$(row_count)" -eq 1006 ]
 psql_db -c 'INSERT INTO wal_rows VALUES (1100)'
 stop_server
 
@@ -549,6 +810,7 @@ import sys
 segments = sorted(glob.glob(sys.argv[1] + "/*.wal"))
 records = []
 for path in segments:
+    segment = int(os.path.basename(path)[:16], 16)
     data = bytearray(open(path, "rb").read())
     offset = 0
     while offset + 32 <= len(data):
@@ -557,16 +819,24 @@ for path in segments:
         length = struct.unpack_from("<I", data, offset + 8)[0]
         if length < 32 or offset + length > len(data):
             break
-        records.append((path, offset, length, data))
+        records.append((path, segment, offset, length, data))
         offset += length
 
 mode = sys.argv[2]
-if mode == "interior-length":
-    path, offset, _, data = records[0]
+if mode == "obsolete-length":
+    control = os.path.join(os.path.dirname(sys.argv[1]),
+                           "global", "pg_wal_control")
+    checkpoint_lsn = int(open(control, encoding="ascii").read().split()[1])
+    obsolete = [record for record in records
+                if record[1] * 16 * 1024 * 1024 + record[2] + record[3]
+                < checkpoint_lsn]
+    if not obsolete:
+        raise SystemExit("no retained record exists before the checkpoint")
+    path, _, offset, _, data = obsolete[0]
     struct.pack_into("<I", data, offset + 8, 0)
 elif mode in ("final-length", "final-inflated", "final-checksum",
               "final-magic", "final-version", "final-lsn", "final-type"):
-    path, offset, length, data = records[-1]
+    path, _, offset, length, data = records[-1]
     record_type = struct.unpack_from("<H", data, offset + 6)[0]
     if length != 32 or record_type not in (2, 3, 4, 5):
         raise SystemExit("last durable record is not a terminal record")
@@ -592,10 +862,14 @@ with open(path, "wb") as stream:
 PY
 }
 
-# Corruption in the durable prefix must never be mistaken for a torn tail.
+# Corruption before the durable checkpoint is obsolete and need not block
+# startup; the checkpoint record and its redo suffix remain fully validated.
 cp -a "$PGDATA" "$TMP/bad-interior"
-corrupt_wal_record "$TMP/bad-interior/pg_wal" interior-length
-expect_bad_wal_startup "$TMP/bad-interior" 'invalid WAL record length' "$TMP/bad-interior.log"
+corrupt_wal_record "$TMP/bad-interior/pg_wal" obsolete-length
+start_server "" "$TMP/bad-interior"
+[ "$(row_count)" -eq 1007 ]
+[ "$(psql_db -A -t -c 'SELECT id FROM wal_rows WHERE id = 1100')" = 1100 ]
+stop_server
 
 cp -a "$PGDATA" "$TMP/bad-final-length"
 corrupt_wal_record "$TMP/bad-final-length/pg_wal" final-length
@@ -640,7 +914,7 @@ import sys
 for path in glob.glob(os.path.join(sys.argv[1], "*.wal")):
     os.unlink(path)
 PY
-expect_bad_wal_startup "$TMP/missing-wal-segment" 'WAL checkpoint LSN' \
+expect_bad_wal_startup "$TMP/missing-wal-segment" 'WAL checkpoint segment' \
     "$TMP/missing-wal-segment.log"
 
 echo "wal-crash-recovery: PASS"

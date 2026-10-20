@@ -11,6 +11,9 @@
 (defconstant +wal-record-checkpoint+ 4)
 (defconstant +wal-record-clog-reset+ 5)
 (defconstant +wal-record-batch-start+ 6)
+(defconstant +wal-record-catalog-chunk+ 7)
+(defconstant +wal-record-catalog-commit+ 8)
+(defconstant +wal-catalog-chunk-header-size+ 8)
 (defconstant +wal-version+ 2)
 
 (defstruct wal-record
@@ -34,11 +37,16 @@
 (defvar *wal-output-segment* nil)
 (defvar *wal-new-segments* '())
 (defvar *wal-test-pause-at* nil)
+(defvar *wal-test-pause-relfilenode* nil)
 (defvar *wal-recovery-group-active* nil)
 (defvar *wal-recovery-page-images* '())
+(defvar *wal-recovery-catalog-chunks* '())
+(defvar *wal-recovery-catalog-chunk-count* nil)
+(defvar *wal-recovery-catalog-next-chunk* 0)
 
 (declaim (ftype function wal-test-pause
                 wal-remove-checkpointed-segments wal-atomic-write-bytes
+                wal-apply-catalog-record
                 clog-set clog-reset clog-fsync))
 (declaim (notinline pg-class-relfilenode pg-index-relfilenode
                     database-tables database-indexes catalog-databases))
@@ -438,13 +446,20 @@
                      (make-array 0 :element-type '(unsigned-byte 8))))
 
 (defun wal-apply-page-images (images &key split-p fault-on-first-write)
-  (loop for image in images
-        for first = t then nil
-        do (smgr-write (wal-page-image-relfilenode image)
-                       (wal-page-image-block image)
-                       (wal-page-image-page image))
-           (when (and first fault-on-first-write split-p)
-             (wal-test-pause :after-btree-split-page-write)))
+  (let ((paused nil))
+    (loop for image in images
+          do (smgr-write (wal-page-image-relfilenode image)
+                         (wal-page-image-block image)
+                         (wal-page-image-page image))
+             (when (and (not paused)
+                        fault-on-first-write split-p
+                        (or (and *wal-test-pause-relfilenode*
+                                 (eql *wal-test-pause-relfilenode*
+                                      (wal-page-image-relfilenode image))
+                                 (plusp (wal-page-image-block image)))
+                            (null *wal-test-pause-relfilenode*)))
+               (setf paused t)
+               (wal-test-pause :after-btree-split-page-write))))
   (values))
 
 (defun wal-clear-page-cache (&optional excluded-relfilenodes)
@@ -521,6 +536,83 @@
                  offset catalog-length (length payload)))
         (values deletes (subseq payload offset))))))
 
+(defun wal-encode-catalog-chunk-payload (bytes index count)
+  (let ((payload (make-array (+ +wal-catalog-chunk-header-size+
+                                (length bytes))
+                             :element-type '(unsigned-byte 8)
+                             :initial-element 0)))
+    (wal-set-u32 payload 0 index)
+    (wal-set-u32 payload 4 count)
+    (replace payload bytes :start1 +wal-catalog-chunk-header-size+)
+    payload))
+
+(defun wal-decode-catalog-chunk-payload (payload)
+  (when (< (length payload) (1+ +wal-catalog-chunk-header-size+))
+    (error "WAL catalog chunk is too short"))
+  (let ((index (wal-u32 payload 0))
+        (count (wal-u32 payload 4)))
+    (unless (and (plusp count) (< index count))
+      (error "WAL catalog chunk has an invalid index or count"))
+    (values index count
+            (subseq payload +wal-catalog-chunk-header-size+))))
+
+(defun wal-catalog-chunk-count (payload)
+  (let* ((chunk-size (- +wal-segment-size+ +wal-header-size+
+                        +wal-catalog-chunk-header-size+))
+         (count (ceiling (length payload) chunk-size)))
+    (unless (<= count #xFFFFFFFF)
+      (error "WAL catalog image requires too many chunks"))
+    count))
+
+(defun wal-encode-catalog-commit-payload (payload chunk-count)
+  (let ((commit (make-array 12 :element-type '(unsigned-byte 8)
+                               :initial-element 0)))
+    (wal-set-u32 commit 0 chunk-count)
+    (wal-set-u64 commit 4 (length payload))
+    commit))
+
+(defun wal-decode-catalog-commit-payload (payload)
+  (unless (= (length payload) 12)
+    (error "WAL catalog commit record has an invalid length"))
+  (let ((count (wal-u32 payload 0))
+        (length (wal-u64 payload 4)))
+    (unless (plusp count)
+      (error "WAL catalog commit record has an invalid chunk count"))
+    (values count length)))
+
+(defun wal-append-catalog-chunks (payload count)
+  (let ((chunk-size (- +wal-segment-size+ +wal-header-size+
+                       +wal-catalog-chunk-header-size+)))
+    (loop for index from 0 below count
+          for start = (* index chunk-size)
+          for stop = (min (length payload) (+ start chunk-size))
+          for chunk = (subseq payload start stop)
+          do (wal-append-record
+              +wal-record-catalog-chunk+ 0
+              (wal-encode-catalog-chunk-payload chunk index count))))
+  (values))
+
+(defun wal-reassemble-catalog-chunks (expected-count expected-length)
+  (unless (and (eql expected-count *wal-recovery-catalog-chunk-count*)
+               (= expected-count *wal-recovery-catalog-next-chunk*)
+               (= expected-count (length *wal-recovery-catalog-chunks*)))
+    (error "WAL catalog chunk sequence is incomplete"))
+  (let* ((chunks (nreverse *wal-recovery-catalog-chunks*))
+         (actual-length (reduce #'+ chunks :key #'length :initial-value 0)))
+    (unless (= actual-length expected-length)
+      (error "WAL catalog chunks do not match their declared length"))
+    (let ((payload (make-array actual-length
+                               :element-type '(unsigned-byte 8)))
+          (offset 0))
+      (dolist (chunk chunks)
+        (replace payload chunk :start1 offset)
+        (incf offset (length chunk)))
+      payload)))
+
+(defun wal-apply-chunked-catalog-record (count length)
+  (wal-apply-catalog-record
+   (wal-reassemble-catalog-chunks count length)))
+
 (defun wal-defer-relation-delete (relfilenode)
   (when *wal-ready*
     (sb-thread:with-mutex (*wal-lock*)
@@ -535,12 +627,25 @@
   (handler-case
       (sb-thread:with-mutex (*wal-lock*)
         (let* ((deletes (sort (copy-list *wal-pending-deletes*) #'<))
-               (images (wal-page-images deletes)))
+               (images (wal-page-images deletes))
+               (catalog-payload
+                 (wal-encode-catalog-payload catalog-bytes deletes))
+               (chunked-p
+                 (> (+ +wal-header-size+ (length catalog-payload))
+                    +wal-segment-size+))
+               (chunk-count (when chunked-p
+                              (wal-catalog-chunk-count catalog-payload)))
+               (commit-payload (when chunked-p
+                                 (wal-encode-catalog-commit-payload
+                                  catalog-payload chunk-count))))
           (wal-append-batch-start)
           (wal-append-page-images images)
-          (wal-append-record
-           +wal-record-catalog+ 0
-           (wal-encode-catalog-payload catalog-bytes deletes))
+          (if chunked-p
+              (progn
+                (wal-append-catalog-chunks catalog-payload chunk-count)
+                (wal-append-record +wal-record-catalog-commit+ 0
+                                   commit-payload))
+              (wal-append-record +wal-record-catalog+ 0 catalog-payload))
           (wal-flush)
           (wal-test-pause :after-catalog-wal-flush)
           (wal-apply-page-images images)
@@ -571,7 +676,9 @@
 (defun wal-valid-type-p (type)
   (member type (list +wal-record-pages+ +wal-record-commit+
                      +wal-record-catalog+ +wal-record-checkpoint+
-                     +wal-record-clog-reset+ +wal-record-batch-start+)))
+                     +wal-record-clog-reset+ +wal-record-batch-start+
+                     +wal-record-catalog-chunk+
+                     +wal-record-catalog-commit+)))
 
 (defun wal-decode-record (bytes expected-lsn)
   (unless (and (>= (length bytes) +wal-header-size+)
@@ -615,21 +722,44 @@
   "Visit durable records; truncate only tail data beyond the durable LSN."
   (let* ((segments (wal-discover-segments))
          (last-segment (car (last segments)))
-         (end-lsn 0)
+         (checkpoint-record-start
+           (if (zerop *wal-checkpoint-lsn*)
+               0
+               (- *wal-checkpoint-lsn* +wal-header-size+)))
+         (checkpoint-segment (floor checkpoint-record-start
+                                    +wal-segment-size+))
+         (checkpoint-offset (mod checkpoint-record-start +wal-segment-size+))
+         (scan-segments
+           (if (zerop *wal-checkpoint-lsn*)
+               segments
+               (member checkpoint-segment segments)))
+         (end-lsn *wal-checkpoint-lsn*)
          (checkpoint-found (zerop *wal-checkpoint-lsn*)))
+    (when (and (plusp *wal-checkpoint-lsn*)
+               (< *wal-checkpoint-lsn* +wal-header-size+))
+      (error "WAL checkpoint LSN ~a is invalid" *wal-checkpoint-lsn*))
     (when (and (zerop *wal-checkpoint-lsn*) segments
                (not (zerop (first segments))))
       (error "WAL segment 0 is missing before the first checkpoint"))
-    (loop for (left right) on segments
+    (when (and (plusp *wal-checkpoint-lsn*)
+               (null scan-segments))
+      (error "WAL checkpoint segment ~a is missing"
+             checkpoint-segment))
+    ;; Once the checkpoint control file is durable, WAL before this segment and
+    ;; before the checkpoint record within it is no longer needed for redo.
+    (loop for (left right) on scan-segments
           while right
           unless (= right (1+ left))
             do (error "missing WAL segment between ~a and ~a" left right))
-    (loop for segment in segments
+    (loop for segment in scan-segments
           do (with-open-file (stream (wal-segment-path segment)
                                      :direction :input
                                      :element-type '(unsigned-byte 8))
                (let ((size (file-length stream))
-                     (offset 0))
+                     (offset (if (and (plusp *wal-checkpoint-lsn*)
+                                      (= segment checkpoint-segment))
+                                 checkpoint-offset
+                                 0)))
                  (loop while (< offset size)
                        do (let* ((record-lsn (+ (* segment +wal-segment-size+)
                                                 offset))
@@ -678,6 +808,19 @@
                                                     nil)
                                                   (error condition))))))
                                     (unless record (return))
+                                    (when (and (plusp *wal-checkpoint-lsn*)
+                                               (= record-lsn
+                                                  checkpoint-record-start))
+                                      (unless (and (= (wal-record-end record)
+                                                      *wal-checkpoint-lsn*)
+                                                   (= (wal-record-type record)
+                                                      +wal-record-checkpoint+)
+                                                   (zerop (length
+                                                           (wal-record-payload
+                                                            record))))
+                                        (error "WAL checkpoint LSN ~a does not point to a valid checkpoint record"
+                                               *wal-checkpoint-lsn*))
+                                      (setf checkpoint-found t))
                                     (when (= (wal-record-end record)
                                              *wal-checkpoint-lsn*)
                                       (unless (= (wal-record-type record)
@@ -697,7 +840,7 @@
     (when (> *wal-durable-lsn* end-lsn)
       (error "WAL durable LSN ~a is past the end of WAL ~a"
              *wal-durable-lsn* end-lsn))
-    (values end-lsn segments)))
+    (values end-lsn scan-segments)))
 
 (defun wal-read-u64-payload (payload)
   (unless (= (length payload) 8)
@@ -713,13 +856,19 @@
       (smgr-forget relfilenode :delete t))
     (when deletes (fsync-directory (merge-pathnames "base/" *pgdata*)))))
 
-(defun wal-replay-finish-batch (terminal-function)
+(defun wal-replay-finish-batch (terminal-function &optional catalog-chunks-p)
   (unless *wal-recovery-group-active*
     (error "WAL terminal record appears outside a batch"))
+  (when (and *wal-recovery-catalog-chunk-count*
+             (not catalog-chunks-p))
+    (error "WAL catalog chunks lack a catalog commit record"))
   (wal-apply-page-images (nreverse *wal-recovery-page-images*))
   (funcall terminal-function)
   (setf *wal-recovery-group-active* nil
-        *wal-recovery-page-images* '())
+        *wal-recovery-page-images* '()
+        *wal-recovery-catalog-chunks* '()
+        *wal-recovery-catalog-chunk-count* nil
+        *wal-recovery-catalog-next-chunk* 0)
   (values))
 
 (defun wal-replay-record (record)
@@ -729,10 +878,15 @@
        ;; A prior group without a terminal record is a crash tail. Ignore its
        ;; accumulated images and begin staging the next post-restart batch.
        (setf *wal-recovery-group-active* t
-             *wal-recovery-page-images* '()))
+             *wal-recovery-page-images* '()
+             *wal-recovery-catalog-chunks* '()
+             *wal-recovery-catalog-chunk-count* nil
+             *wal-recovery-catalog-next-chunk* 0))
       (#.+wal-record-pages+
        (unless *wal-recovery-group-active*
          (error "WAL page images appear outside a batch"))
+       (when *wal-recovery-catalog-chunk-count*
+         (error "WAL page images follow catalog chunks in a batch"))
        (setf *wal-recovery-page-images*
              (nconc (reverse
                      (wal-decode-page-images (wal-record-payload record)
@@ -746,6 +900,27 @@
       (#.+wal-record-catalog+
        (wal-replay-finish-batch
         (lambda () (wal-apply-catalog-record (wal-record-payload record)))))
+      (#.+wal-record-catalog-chunk+
+       (unless *wal-recovery-group-active*
+         (error "WAL catalog chunks appear outside a batch"))
+       (multiple-value-bind (index count bytes)
+           (wal-decode-catalog-chunk-payload (wal-record-payload record))
+         (unless (= index *wal-recovery-catalog-next-chunk*)
+           (error "WAL catalog chunk index ~a follows chunk ~a"
+                  index *wal-recovery-catalog-next-chunk*))
+         (when (and *wal-recovery-catalog-chunk-count*
+                    (/= count *wal-recovery-catalog-chunk-count*))
+           (error "WAL catalog chunk count changes within a batch"))
+         (setf *wal-recovery-catalog-chunk-count* count)
+         (push bytes *wal-recovery-catalog-chunks*)
+         (incf *wal-recovery-catalog-next-chunk*)))
+      (#.+wal-record-catalog-commit+
+       (multiple-value-bind (count length)
+           (wal-decode-catalog-commit-payload (wal-record-payload record))
+         (wal-replay-finish-batch
+          (lambda ()
+            (wal-apply-chunked-catalog-record count length))
+          t)))
       (#.+wal-record-checkpoint+
        (unless (zerop (length (wal-record-payload record)))
          (error "WAL checkpoint record has an invalid payload"))
@@ -760,7 +935,10 @@
   (unless *wal-ready*
     (return-from wal-recover (values)))
   (let ((*wal-recovery-group-active* nil)
-        (*wal-recovery-page-images* '()))
+        (*wal-recovery-page-images* '())
+        (*wal-recovery-catalog-chunks* '())
+        (*wal-recovery-catalog-chunk-count* nil)
+        (*wal-recovery-catalog-next-chunk* 0))
     (wal-scan #'wal-replay-record))
   (clog-fsync)
   (values))
@@ -871,7 +1049,8 @@
             *wal-output-stream* nil
             *wal-output-segment* nil
             *wal-new-segments* '()
-            *wal-test-pause-at* nil)
+            *wal-test-pause-at* nil
+            *wal-test-pause-relfilenode* nil)
       (unless checkpoint-lsn
         (wal-save-control-fields 0 0))
       (multiple-value-bind (end-lsn found-segments)
@@ -884,8 +1063,12 @@
           (wal-save-durable-lsn end-lsn)))
       (setf *wal-test-pause-at*
             (let ((value (sb-ext:posix-getenv "PG_WAL_TEST_PAUSE_AT")))
-              (and value (string-downcase value))))))
-  (values))
+              (and value (string-downcase value)))
+            *wal-test-pause-relfilenode*
+            (let ((value (sb-ext:posix-getenv
+                          "PG_WAL_TEST_PAUSE_RELATION")))
+              (and value (parse-integer value :junk-allowed t)))))
+    (values)))
 
 (defun wal-test-pause (point)
   (when (and *wal-test-pause-at*
