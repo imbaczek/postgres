@@ -76,25 +76,39 @@ INTERRUPT-THREAD, so it needs no flag."
 
 (defvar *xid-batch-end* +first-normal-xid+)
 
+(defun atomic-replace-file (target-path temporary-path directory write-function
+                            &key (fsync-function #'sb-posix:fsync)
+                              (rename-function #'sb-posix:rename)
+                              (fsync-directory-function #'fsync-directory))
+  "Write and fsync TEMPORARY-PATH, rename it to TARGET-PATH, and fsync DIRECTORY."
+  (ensure-directories-exist target-path)
+  (unwind-protect
+       (progn
+         (with-open-file (stream temporary-path
+                                 :direction :output
+                                 :if-exists :supersede
+                                 :if-does-not-exist :create
+                                 :element-type 'character)
+           (funcall write-function stream)
+           (finish-output stream)
+           (funcall fsync-function (sb-sys:fd-stream-fd stream)))
+         (funcall rename-function (namestring temporary-path)
+                  (namestring target-path))
+         (funcall fsync-directory-function directory))
+    (ignore-errors (delete-file temporary-path)))
+  (values))
+
 (defun save-next-xid (&key (fsync-function #'sb-posix:fsync)
                         (rename-function #'sb-posix:rename)
                         (fsync-directory-function #'fsync-directory))
-  (ensure-directories-exist (control-path))
-  (let ((tmp (pgdata-path "global/pg_control.tmp")))
-    (unwind-protect
-         (progn
-           (with-open-file (s tmp
-                              :direction :output
-                              :if-exists :supersede
-                              :if-does-not-exist :create
-                              :element-type 'character)
-             (format s "~a~%" *xid-batch-end*)
-             (finish-output s)
-             (funcall fsync-function (sb-sys:fd-stream-fd s)))
-           (funcall rename-function (namestring tmp) (namestring (control-path)))
-           (funcall fsync-directory-function (pgdata-path "global/")))
-      (ignore-errors (delete-file tmp))))
-  (values))
+  (atomic-replace-file
+   (control-path)
+   (pgdata-path "global/pg_control.tmp")
+   (pgdata-path "global/")
+   (lambda (stream) (format stream "~a~%" *xid-batch-end*))
+   :fsync-function fsync-function
+   :rename-function rename-function
+   :fsync-directory-function fsync-directory-function))
 
 (defvar *xid-lock* (sb-thread:make-mutex :name "pg xid lock"))
 (defvar *next-xid* +first-normal-xid+)
@@ -177,23 +191,14 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
                                         (rename-function #'sb-posix:rename)
                                         (fsync-directory-function
                                          #'fsync-directory))
-  (let ((path (xid-wrap-marker-path))
-        (tmp (pgdata-path "global/pg_xid_wrap_pending.tmp")))
-    (ensure-directories-exist path)
-    (unwind-protect
-         (progn
-           (with-open-file (s tmp
-                              :direction :output
-                              :if-exists :supersede
-                              :if-does-not-exist :create
-                              :element-type 'character)
-             (format s "~a~%" boundary)
-             (finish-output s)
-             (funcall fsync-function (sb-sys:fd-stream-fd s)))
-           (funcall rename-function (namestring tmp) (namestring path))
-           (funcall fsync-directory-function (pgdata-path "global/")))
-      (ignore-errors (delete-file tmp))))
-  (values))
+  (atomic-replace-file
+   (xid-wrap-marker-path)
+   (pgdata-path "global/pg_xid_wrap_pending.tmp")
+   (pgdata-path "global/")
+   (lambda (stream) (format stream "~a~%" boundary))
+   :fsync-function fsync-function
+   :rename-function rename-function
+   :fsync-directory-function fsync-directory-function))
 
 (defun delete-xid-wrap-marker (&key (fsync-directory-function
                                      #'fsync-directory))
