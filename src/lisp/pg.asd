@@ -28,6 +28,7 @@
       :serial t
       :components ((:file "bufpage")
                    (:file "smgr")
+                   (:file "wal")
                    (:file "bufmgr")))
      (:module "access"
       :serial t

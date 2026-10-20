@@ -59,6 +59,19 @@
   (page-set-u32 page +pd-prune-xid-off+ 0)
   page)
 
+(defun page-migrate-legacy-btree-header (page)
+  "Move the old B-tree type byte out of the checksum field in PAGE.
+
+The early Lisp page format stored the B-tree type at byte 8, where PostgreSQL
+reserves the page checksum. Values 1..3 identify those legacy pages; new B-tree
+pages store the type in the otherwise-unused low byte of pd_flags."
+  (let ((legacy-type (page-u16 page +pd-checksum-off+)))
+    (when (and (<= 1 legacy-type 3)
+               (zerop (page-u16 page +pd-flags-off+)))
+      (setf (aref page +pd-flags-off+) legacy-type)
+      (page-set-u16 page +pd-checksum-off+ 0)
+      t)))
+
 (defun page-lower (page) (page-u16 page +pd-lower-off+))
 (defun page-upper (page) (page-u16 page +pd-upper-off+))
 (defun (setf page-lower) (v page) (page-set-u16 page +pd-lower-off+ v))

@@ -94,6 +94,12 @@ rolled back immediately."
         (restore-session-settings stream)
         (send-command-complete stream "ROLLBACK"))))
 
+(defun command-checkpoint (stream)
+  (unless (eq (backend-state *backend*) :idle)
+    (ereport "25001" "CHECKPOINT cannot run inside a transaction block"))
+  (wal-checkpoint)
+  (send-command-complete stream "CHECKPOINT"))
+
 ;;; ---- SET / SHOW / RESET ----
 
 (defun known-show-setting-p (name)
@@ -716,6 +722,7 @@ rolled back immediately."
       (:begin (command-begin stream))
       (:commit (command-commit stream))
       (:rollback (command-rollback stream))
+      (:checkpoint (command-checkpoint stream))
       (:set (exec-set stream ast))
       (:reset (exec-reset stream ast))
       (:show (exec-show stream ast))

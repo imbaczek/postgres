@@ -44,6 +44,19 @@ trusted, and `postgres` is always the effective role. Only the simple query
 protocol (`Q`) is implemented, which is all `psql` uses for the supported
 statements.
 
+## Write-ahead logging
+
+The server keeps append-only WAL segments under `PGDATA/pg_wal`. Each transaction
+flushes full-page after-images and a commit record before applying modified heap
+and B-tree pages. Recovery replays only complete batches after the saved
+checkpoint. Page checksums include the relation and block number. A short final
+header, invalid-length record, or incomplete record can be truncated only when
+it starts beyond the durable LSN in the control file. Damage at or before that
+boundary stops startup. The WAL bytes are synced before the control file
+advances the durable LSN. Run `CHECKPOINT` to flush staged pages and catalog/CLOG
+state before advancing the recovery pointer. This is a small physical WAL
+implementation for the server's supported operations.
+
 ## Hot reload and control REPL
 
 Send `SIGHUP` to a running server and it recompiles and reloads the `pg` system
@@ -173,6 +186,7 @@ BEGIN | START TRANSACTION;
 COMMIT | END;
 ROLLBACK | ABORT;
 SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+CHECKPOINT;
 ```
 
 Expressions: column references, integer and string literals, `+ - * / %`,
@@ -197,6 +211,7 @@ Meta-commands that need `pg_catalog` and regular-expression operators (`\d`,
 cd src/lisp
 ./t/run-unit-tests.sh     # Lisp-level page/tuple/index/visibility tests
 ./t/psql-smoke.sh         # boots a server and diffs psql output against a golden file
+./t/wal-crash-recovery.sh  # SIGKILL recovery at commit, page, update, split, and checkpoint boundaries
 ./t/unique-index-concurrency.sh # unique-index build/drop writer races
 ./t/update-concurrency.sh # concurrent UPDATE chain and WHERE rechecks
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
@@ -209,6 +224,11 @@ cd src/lisp
 `t/psql-smoke.sh` is the acceptance test: it launches the server on a throwaway
 PGDATA, runs `t/psql-smoke.sql` through a real `psql`, and compares the
 transcript with `t/psql-smoke.out`.
+
+`t/wal-crash-recovery.sh` reuses one PGDATA across forced exits. It checks commit
+redo, incomplete batch and UPDATE visibility, unique-index recovery after a
+B-tree split, incomplete WAL tail truncation, rejection of malformed and
+checksummed record corruption, and crashes around checkpoints.
 
 `t/index-stress.sh` updates a single unique value a thousand times, then checks
 that a fresh transaction still sees the live tuple as a duplicate.  It exercises
@@ -359,9 +379,9 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
 
 ## Known gaps (documented, not hidden)
 
-- No WAL and no crash recovery. A crash between the data fsync and the CLog
-  commit loses that transaction; it is treated as aborted on restart. A
-  returned `COMMIT` is therefore not power-fail safe.
+- No WAL archiving, replication, or point-in-time recovery. A complete WAL record
+  with a bad checksum stops startup; this implementation detects that damage but
+  does not reconstruct the record.
 - Heap page layout version 6 stores 32-bit tuple XIDs in the PostgreSQL header
   layout. Existing version 4 and 5 relation files are rejected and must be
   recreated before use.
@@ -371,10 +391,6 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   allocation stops after `2^64 - 1`.
 - DDL inside an explicit transaction block is rejected (`0A000`) because the
   catalog has no rollback log.
-- Catalog changes are fsynced at DDL statement time, while heap/index pages are
-  fsynced at commit time. A crash in between can leave a durable catalog entry
-  for a relation whose heap pages did not make it to disk; this is bounded by
-  the same no-WAL commit hole as above.
 - No joins, aggregates, subqueries, CTEs, or `DISTINCT`.
 - No `GROUP BY` / `HAVING`, no `OFFSET`/`FETCH`. `ORDER BY` accepts multiple
   keys with `ASC`/`DESC`.
@@ -397,9 +413,8 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   implemented; `psql` is unaffected, other drivers are.
 - `pg_terminate_backend` (and fast/immediate shutdown) unwinds the target with
   an SBCL thread interrupt at an arbitrary point instead of PostgreSQL's
-  deferred safe-point check. A terminate in the middle of a page write can
-  leave a torn page; the no-WAL crash model already tolerates that, but it is a
-  real divergence from the original signal handling.
+  deferred safe-point check. An interrupt during WAL I/O forces server shutdown;
+  this remains a divergence from PostgreSQL's signal handling.
 - `\d`, `\dt`, `\l` fail because the catalog SQL uses constructs beyond this
   subset (regex operators, `pg_catalog` functions); `psql` prints an error and
   shows no listing.

@@ -616,17 +616,18 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
   (let ((b *backend*))
     (if (backend-xid b)
         (progn
-          ;; Step 1: make heap and index pages durable.
-          (dolist (rel (backend-dirty-relations b))
-            (smgr-fsync rel))
-          ;; Step 2: log the commit.  The CLog write and the reset of the
-          ;; backend's xid must not be split by a terminate/FATAL interrupt:
-          ;; otherwise END-BACKEND-SESSION could still see the xid and abort an
-          ;; already-durable commit.
+          ;; WAL page images and the commit record reach stable storage
+          ;; before CLOG can make the transaction visible. The callback and
+          ;; transaction reset are kept in the same interrupt-free section
+          ;; so a FATAL interrupt cannot abort a durable commit.
           (sb-sys:without-interrupts
-            (clog-set (backend-xid b) +clog-committed+ :fsync t)
-            (release-xid (backend-xid b))
-            (reset-backend-transaction b)))
+            (wal-commit-transaction
+             (backend-xid b)
+             (lambda ()
+               (clog-set (backend-xid b) +clog-committed+
+                         :fsync (not *wal-ready*))
+               (release-xid (backend-xid b))
+               (reset-backend-transaction b)))))
         (reset-backend-transaction b)))
   (values))
 

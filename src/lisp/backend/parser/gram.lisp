@@ -110,6 +110,7 @@
                              (list :type :rollback))
     ((match-kw p "abort") (match-kw p "work") (match-kw p "transaction")
                           (list :type :rollback))
+    ((match-kw p "checkpoint") (list :type :checkpoint))
     ((match-kw p "set") (parse-set p))
     ((match-kw p "show") (parse-show p))
     ((match-kw p "reset") (parse-reset p))

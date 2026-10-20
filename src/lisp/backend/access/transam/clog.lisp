@@ -13,12 +13,18 @@
   (merge-pathnames "pg_xact" *pgdata*))
 
 (defun clog-init ()
-  (setf *clog-stream*
-        (open (clog-path)
-              :direction :io
-              :element-type '(unsigned-byte 8)
-              :if-exists :overwrite
-              :if-does-not-exist :create))
+  (let* ((path (clog-path))
+         (existed (probe-file path)))
+    (setf *clog-stream*
+          (open path
+                :direction :io
+                :element-type '(unsigned-byte 8)
+                :if-exists :overwrite
+                :if-does-not-exist :create))
+    (unless existed
+      ;; The CLOG file's directory entry must survive before a checkpoint can
+      ;; make older commit records unnecessary.
+      (fsync-directory *pgdata*)))
   (values))
 
 (defun xid32-of (xid)
@@ -56,8 +62,13 @@
       (fsync-stream *clog-stream*))))
 
 (defun clog-reset (&key (fsync-function #'fsync-stream)
-                     (fsync-directory-function #'fsync-directory))
+                     (fsync-directory-function #'fsync-directory)
+                     (wal-reset-p t))
   "Start a new 32-bit XID cycle after every heap tuple has been frozen."
+  (when (and wal-reset-p *wal-ready*)
+    ;; The reset record follows the freeze-page images in WAL. Recovery can
+    ;; repeat the transition if the process dies before this file replacement.
+    (wal-log-clog-reset))
   (sb-thread:with-mutex (*clog-lock*)
     (when *clog-stream*
       (close *clog-stream*)
@@ -79,7 +90,7 @@
   (values))
 
 (defun clog-recover (next-xid)
-  "No WAL: the active-XID set distinguishes running from abandoned entries."
+  "Leave commit replay to startup recovery after the CLOG file is open."
   (declare (ignore next-xid))
   ;; A zero CLOG status is IN_PROGRESS only while its full XID is present in
   ;; *ACTIVE-XIDS*. After restart that set is empty, so the same entry is

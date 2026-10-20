@@ -40,6 +40,14 @@
       (when stream
         (fsync-stream stream)))))
 
+(defun smgr-fsync-all ()
+  (sb-thread:with-mutex (*smgr-lock*)
+    (maphash (lambda (relfilenode stream)
+               (declare (ignore relfilenode))
+               (fsync-stream stream))
+             *relation-streams*))
+  (values))
+
 (defun smgr-forget (relfilenode &key delete)
   "Close the cached stream for RELFILENODE, optionally deleting the file."
   (sb-thread:with-mutex (*smgr-lock*)
@@ -48,7 +56,9 @@
         (ignore-errors (close stream))
         (remhash relfilenode *relation-streams*)))
     (when delete
-      (ignore-errors (delete-file (relation-file-path relfilenode))))
+      (let ((path (relation-file-path relfilenode)))
+        (when (probe-file path)
+          (delete-file path))))
     (values))
   ;; Heap FSM state is volatile and owned by heapam, which loads after smgr.
   ;; Discard it after releasing *SMGR-LOCK* to preserve lock ordering.

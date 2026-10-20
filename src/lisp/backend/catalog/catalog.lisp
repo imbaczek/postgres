@@ -144,27 +144,35 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
 (defun catalog-path ()
   (pgdata-path "global/pg_catalog.dat"))
 
-(defun save-catalog ()
+(defun catalog-image-bytes ()
+  (string->bytes
+   (with-output-to-string (out)
+     (with-standard-io-syntax
+       (let ((*print-readably* t)
+             (*print-pretty* t))
+         (prin1 (catalog-to-sexp *catalog*) out)
+         (terpri out))))))
+
+(defun write-catalog-image (bytes)
   (ensure-directories-exist (catalog-path))
   (let ((tmp (pgdata-path "global/pg_catalog.tmp")))
     (with-open-file (s tmp
                        :direction :output
                        :if-exists :supersede
                        :if-does-not-exist :create
-                       :element-type 'character)
-      (with-standard-io-syntax
-        (let ((*print-readably* t)
-              (*print-pretty* t))
-          (prin1 (catalog-to-sexp *catalog*) s)
-          (terpri s)))
+                       :element-type '(unsigned-byte 8))
+      (write-sequence bytes s)
       (finish-output s)
-      (sb-posix:fsync (sb-sys:fd-stream-fd s)))
+      (fsync-stream s))
     ;; RENAME(2) atomically replaces the destination.  Deleting the old
     ;; catalog first would open a window in which neither name exists, so a
     ;; crash there would lose the whole catalog.
     (sb-posix:rename (namestring tmp) (namestring (catalog-path)))
     (fsync-directory (pgdata-path "global/")))
   (values))
+
+(defun save-catalog ()
+  (wal-commit-catalog (catalog-image-bytes) #'write-catalog-image))
 
 (defun load-catalog ()
   (let ((path (catalog-path)))
@@ -385,9 +393,9 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
       (let ((idx (find-index-by-oid oid)))
         (when idx
           (remhash (pg-index-name idx) (database-indexes db))
-          (smgr-forget (pg-index-relfilenode idx) :delete t))))
+          (wal-defer-relation-delete (pg-index-relfilenode idx)))))
     (remhash name (database-tables db))
-    (smgr-forget (pg-class-relfilenode class) :delete t)
+    (wal-defer-relation-delete (pg-class-relfilenode class))
     (values)))
 
 (defun drop-index* (db name)
@@ -401,5 +409,5 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
       (when class
         (setf (pg-class-indexes class)
               (delete (pg-index-oid idx) (pg-class-indexes class)))))
-    (smgr-forget (pg-index-relfilenode idx) :delete t)
+    (wal-defer-relation-delete (pg-index-relfilenode idx))
     (values)))

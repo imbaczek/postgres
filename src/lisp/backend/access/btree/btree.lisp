@@ -14,8 +14,11 @@
 (defconstant +btree-page-leaf+ 2)
 (defconstant +btree-page-internal+ 3)
 
-(defun btree-page-type (page) (aref page 8))
-(defun set-btree-page-type (page type) (setf (aref page 8) type) page)
+(defun btree-page-type (page) (aref page +pd-flags-off+))
+(defun set-btree-page-type (page type)
+  (setf (aref page +pd-flags-off+) type)
+  (page-set-u16 page +pd-checksum-off+ 0)
+  page)
 
 (defun empty-key ()
   (make-array 0 :element-type '(unsigned-byte 8)))
@@ -105,18 +108,23 @@
 ;;; ---- meta ----
 
 (defun btree-init (relfilenode)
-  (let ((meta (make-page)))
-    (page-init meta)
-    (set-btree-page-type meta +btree-page-meta+)
-    (page-set-u32 meta 24 +btree-meta-magic+)
-    (page-set-u16 meta 28 0)
-    (page-set-u32 meta 30 1)
-    (buf-write relfilenode 0 meta)
-    (let ((leaf (make-page)))
-      (page-init leaf)
-      (set-btree-page-type leaf +btree-page-leaf+)
-      (buf-write relfilenode 1 leaf)))
-  (mark-dirty relfilenode)
+  (with-wal-page-batch
+    ;; Recheck while holding the page-batch lock: two initializers can both
+    ;; observe an empty relation before either enters this batch.
+    (unless (zerop (buf-nblocks relfilenode))
+      (return-from btree-init (values)))
+    (let ((meta (make-page)))
+      (page-init meta)
+      (set-btree-page-type meta +btree-page-meta+)
+      (page-set-u32 meta 24 +btree-meta-magic+)
+      (page-set-u16 meta 28 0)
+      (page-set-u32 meta 30 1)
+      (buf-write relfilenode 0 meta)
+      (let ((leaf (make-page)))
+        (page-init leaf)
+        (set-btree-page-type leaf +btree-page-leaf+)
+        (buf-write relfilenode 1 leaf)))
+    (mark-dirty relfilenode))
   (values))
 
 (defun btree-ensure-init (relfilenode)
@@ -259,21 +267,23 @@ to a single leaf."
                             (values t (car (first new-entries)) new-block))))))))))))
 
 (defun btree-insert (relfilenode key tid-block tid-off)
-  (btree-ensure-init relfilenode)
-  (multiple-value-bind (level root) (btree-read-meta relfilenode)
-    (multiple-value-bind (split-p sep new-block)
-        (btree-insert-rec relfilenode level root key tid-block tid-off)
-      (when split-p
-        (let ((old-root root))
-          (setf root (buf-nblocks relfilenode))
-          (let ((root-page (btree-page-build
-                            (list (cons (empty-key) old-root)
-                                  (cons sep new-block))
-                            t)))
-            (unless root-page
-              (ereport "54000" "index root is too large"))
-            (buf-write relfilenode root root-page)
-            (btree-write-meta relfilenode (1+ level) root))))))
+  (with-wal-page-batch
+    (btree-ensure-init relfilenode)
+    (multiple-value-bind (level root) (btree-read-meta relfilenode)
+      (multiple-value-bind (split-p sep new-block)
+          (btree-insert-rec relfilenode level root key tid-block tid-off)
+        (when split-p
+          (wal-mark-btree-split)
+          (let ((old-root root))
+            (setf root (buf-nblocks relfilenode))
+            (let ((root-page (btree-page-build
+                              (list (cons (empty-key) old-root)
+                                    (cons sep new-block))
+                              t)))
+              (unless root-page
+                (ereport "54000" "index root is too large"))
+              (buf-write relfilenode root root-page)
+              (btree-write-meta relfilenode (1+ level) root)))))))
   (values))
 
 ;;; ---- key encoding ----
