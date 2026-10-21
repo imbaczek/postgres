@@ -226,6 +226,7 @@ cd src/lisp
 ./t/wal-crash-recovery.sh  # SIGKILL recovery at commit, page, update, split, and checkpoint boundaries
 ./t/unique-index-concurrency.sh # unique-index build/drop writer races
 ./t/update-concurrency.sh # concurrent UPDATE chain and WHERE rechecks
+./t/vacuum-update-concurrency.sh # ordinary VACUUM with same-page concurrent writers
 ./t/index-scan-regression.sh # indexed/SeqScan differential and DROP INDEX handoff
 ./t/index-lock-contention.sh # unrelated INSERT progress during duplicate-key scans
 ./t/index-build-contention.sh # detached build, relation gate, publication name race
@@ -260,6 +261,11 @@ updates the same row. It confirms the waiter entered a transaction-ID wait,
 then checks that the waiter follows the committed `ctid` chain, recalculates
 `value + 1` against the latest version, and skips both UPDATE and DELETE when
 the refreshed row no longer satisfies `WHERE`.
+
+`t/vacuum-update-concurrency.sh` pauses ordinary VACUUM before publishing a
+heap-page proposal while two writer sessions repeatedly update rows on that
+page. It verifies VACUUM retries after the page changes, then compares indexed
+results for old and current keys with SeqScan after VACUUM completes.
 
 `t/index-scan-regression.sh` builds a non-unique index on populated data, applies
 deterministic randomized updates and deletes with duplicate keys and NULLs,

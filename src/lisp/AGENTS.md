@@ -144,6 +144,7 @@ Remove the trace and its temporary helper after the demo:
 ./t/psql-smoke.sh       # psql acceptance, diffed against t/psql-smoke.out
 ./t/unique-index-concurrency.sh # unique-index and relation-DDL races
 ./t/update-concurrency.sh # concurrent UPDATE chain and WHERE rechecks
+./t/vacuum-update-concurrency.sh # ordinary VACUUM with same-page concurrent writers
 ./t/index-scan-regression.sh # indexed/SeqScan differential and DROP INDEX handoff
 ./t/index-lock-contention.sh # unrelated INSERT progress during duplicate-key scans
 ./t/index-build-contention.sh # detached build, relation gate, publication name race
