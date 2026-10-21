@@ -14,6 +14,141 @@
 (defun query-spill-test-directory-empty-p (directory)
   (null (directory (merge-pathnames "*.*" directory))))
 
+(defun test-query-temp-startup-removes-abandoned-namespaces ()
+  (let* ((pid (sb-posix:getpid))
+         (start-token (query-temp-process-start-token pid))
+         (pid-namespace-token (query-temp-pid-namespace-token))
+         (pgdata (make-query-spill-test-directory))
+         (root (merge-pathnames "pgsql_tmp/" pgdata))
+         (abandoned (merge-pathnames
+                     (format nil "pgsql_tmp-99999999-1-~d/session-9-query-1/"
+                             pid-namespace-token)
+                     root))
+         (live (merge-pathnames
+                (format nil "pgsql_tmp-~d-~d-~d/session-9-query-1/"
+                        pid start-token pid-namespace-token)
+                root))
+         (reused-pid (merge-pathnames
+                      (format nil "pgsql_tmp-~d-~d-~d/session-9-query-2/"
+                              pid (1+ start-token) pid-namespace-token)
+                      root))
+         (unknown-owner (merge-pathnames
+                         (format nil "pgsql_tmp-~d-~d-0/session-9-query-3/"
+                                 pid start-token)
+                         root))
+         (legacy (merge-pathnames
+                  (format nil "pgsql_tmp-~d/session-9-query-4/" pid) root))
+         (malformed-pid (merge-pathnames
+                         (format nil
+                                 "pgsql_tmp-999999999999999999999-1-~d/session-9-query-5/"
+                                 pid-namespace-token)
+                         root))
+         (preserved (merge-pathnames "keep/" root))
+         (instance nil)
+         (pathname nil)
+         (*query-temp-directory* nil)
+         (*query-temp-root-directory* nil)
+         (*query-temp-instance-directory* nil)
+         (*query-temp-session-id* 41))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist (merge-pathnames "spill.tmp" abandoned))
+           (ensure-directories-exist (merge-pathnames "spill.tmp" live))
+           (ensure-directories-exist (merge-pathnames "spill.tmp" reused-pid))
+           (ensure-directories-exist (merge-pathnames "spill.tmp" unknown-owner))
+           (ensure-directories-exist (merge-pathnames "spill.tmp" legacy))
+           (ensure-directories-exist (merge-pathnames "spill.tmp" malformed-pid))
+           (ensure-directories-exist (merge-pathnames "keep.tmp" preserved))
+           (remove-abandoned-query-temp-namespaces
+            root (1+ pid))
+           (check (probe-file live)
+                  "startup cleanup preserves spill namespaces owned by live servers")
+           (check (not (probe-file reused-pid))
+                  "startup cleanup detects a reused PID from its process start token")
+           (check (probe-file unknown-owner)
+                  "startup cleanup preserves namespaces from an unknown PID namespace")
+           (check (probe-file legacy)
+                  "startup cleanup preserves legacy namespaces with unknown ownership")
+           (check (probe-file malformed-pid)
+                  "startup cleanup preserves namespaces with an out-of-range PID")
+           (setf instance (initialize-query-temp-storage pgdata))
+           (check (not (probe-file abandoned))
+                  "startup cleanup removes abandoned server spill namespaces")
+           (check (not (probe-file live))
+                  "startup cleanup removes this process's prior spill namespace")
+           (check (probe-file legacy)
+                  "startup cleanup keeps legacy namespaces with unverifiable owners")
+           (check (probe-file malformed-pid)
+                  "startup cleanup keeps malformed owner identities without failing")
+           (check (probe-file preserved)
+                  "startup cleanup preserves directories outside its namespace")
+           (let ((*query-temp-instance-directory* instance))
+             (with-query-temp-files ()
+                                    (multiple-value-bind (path stream)
+                                        (open-query-temp-output)
+                                      (setf pathname path)
+                                      (query-spill-write-record stream "recovered")
+                                      (close stream))
+                                    (check (search "session-41-query-"
+                                                   (namestring pathname))
+                                           "spill paths include a session query namespace"))
+             (check (not (probe-file pathname))
+                    "completed spill scopes remove their namespaced directory")))
+      (ignore-errors
+       (uiop:delete-directory-tree pgdata :validate t
+                                          :if-does-not-exist :ignore)))))
+
+(defun test-query-temp-file-limit-is-enforced ()
+  (let* ((directory (make-query-spill-test-directory))
+         (pathname nil)
+         (sqlstate nil))
+    (unwind-protect
+         (let ((*query-temp-directory* directory)
+               (*query-temp-file-limit-bytes* 0))
+           (handler-case
+               (with-query-temp-files ()
+                                      (multiple-value-bind (path stream)
+                                          (open-query-temp-output)
+                                        (setf pathname path)
+                                        (query-spill-write-record stream "over limit")
+                                        (close stream)))
+             (pg-error (condition)
+               (setf sqlstate (pg-error-sqlstate condition))))
+           (check (equal sqlstate "53400")
+                  "temporary spill bytes honor the configured query disk limit")
+           (check (and pathname (not (probe-file pathname)))
+                  "temporary spill limit errors still clean up the partial file")
+           (check (query-spill-test-directory-empty-p directory)
+                  "temporary spill limit errors leave no artifacts"))
+      (ignore-errors
+       (uiop:delete-directory-tree directory :validate t
+                                             :if-does-not-exist :ignore)))))
+
+(defun test-query-spill-macros-use-default-memory-limit ()
+  (let ((*query-work-memory-bytes* 37))
+    (with-query-row-spool (spool)
+      (check (= (query-row-spool-memory-limit spool) 37)
+             "row-spool macro defaults to the configured work-memory limit"))
+    (with-query-match-map (match-map)
+      (check (= (query-match-map-memory-limit match-map) 37)
+             "match-map macro defaults to the configured work-memory limit"))))
+
+(defun test-query-temp-file-limit-option-parsing ()
+  (multiple-value-bind (host port pgdata control-port control-socket
+                        swank-port swank-address limit)
+      (parse-args '("--temp-file-limit-bytes" "4096"))
+    (declare (ignore host port pgdata control-port control-socket
+                     swank-port swank-address))
+    (check (= limit 4096)
+           "server option parses a finite temporary file limit"))
+  (multiple-value-bind (host port pgdata control-port control-socket
+                        swank-port swank-address limit)
+      (parse-args '("--temp-file-limit-bytes=-1"))
+    (declare (ignore host port pgdata control-port control-socket
+                     swank-port swank-address))
+    (check (null limit)
+           "server option accepts -1 for unlimited temporary disk space")))
+
 (defun test-query-temp-file-macro-cleans-up-after-error ()
   (let* ((directory (make-query-spill-test-directory))
          (pathname nil))

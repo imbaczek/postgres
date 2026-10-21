@@ -501,6 +501,15 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
       (error "option ~a expects a port in 1..65535, got ~s" arg value))
     n))
 
+(defun parse-query-temp-file-limit-bytes (value)
+  "Parse a nonnegative byte cap, or -1 for PostgreSQL-style unlimited space."
+  (let ((limit (ignore-errors (parse-integer value))))
+    (unless (and limit (>= limit -1))
+      (error "--temp-file-limit-bytes expects a nonnegative integer or -1, got ~s"
+             value))
+    (unless (= limit -1)
+      limit)))
+
 (defun parse-bind-address-arg (arg value)
   "Parse a non-empty listener address for option ARG."
   (unless (and (stringp value) (plusp (length value)))
@@ -514,7 +523,8 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
         (control-port nil)
         (control-socket nil)
         (swank-port nil)
-        (swank-bind-address "127.0.0.1"))
+        (swank-bind-address "127.0.0.1")
+        (temp-file-limit-argument nil))
     (loop for rest on argv
           for arg = (car rest)
           do (cond
@@ -548,9 +558,23 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                      (string= arg "--swank-bind-address=" :end1 21))
                 (setf swank-bind-address
                       (parse-bind-address-arg
-                       "--swank-bind-address" (subseq arg 21))))))
+                       "--swank-bind-address" (subseq arg 21))))
+               ((string= arg "--temp-file-limit-bytes")
+                (setf temp-file-limit-argument (arg-value rest arg)))
+               ((and (>= (length arg)
+                         (length "--temp-file-limit-bytes="))
+                     (string= "--temp-file-limit-bytes=" arg
+                              :end2 (length "--temp-file-limit-bytes=")))
+                (setf temp-file-limit-argument
+                      (subseq arg (length "--temp-file-limit-bytes="))))))
     (values host port (or pgdata (sb-ext:posix-getenv "PGDATA") "./pgdata")
-            control-port control-socket swank-port swank-bind-address)))
+            control-port control-socket swank-port swank-bind-address
+            (let ((value (or temp-file-limit-argument
+                             (sb-ext:posix-getenv
+                              "PG_QUERY_TEMP_FILE_LIMIT_BYTES"))))
+              (if value
+                  (parse-query-temp-file-limit-bytes value)
+                  *query-temp-file-limit-bytes*)))))
 
 (defun directory-pathname (path)
   "Return PATH as an absolute directory pathname (trailing slash).
@@ -599,7 +623,10 @@ CL's RENAME-FILE merges a relative target with the source's directory."
         (when sock
           (handler-case
               (sb-thread:make-thread
-               (lambda () (handle-connection sock))
+               (lambda ()
+                 (let ((*query-temp-session-id*
+                         (next-query-temp-session-id)))
+                   (handle-connection sock)))
                :name "pg backend")
             (error (e)
               (format *error-output* "~&pg-lisp: backend: ~a~%" e)
@@ -610,9 +637,11 @@ CL's RENAME-FILE merges a relative target with the source's directory."
 
 (defun main ()
   (multiple-value-bind (host port pgdata control-port control-socket
-                        swank-port swank-bind-address)
+                        swank-port swank-bind-address temp-file-limit-bytes)
       (parse-args (cdr sb-ext:*posix-argv*))
-    (setf *pgdata* (directory-pathname pgdata))
+    (setf *pgdata* (directory-pathname pgdata)
+          *query-temp-file-limit-bytes* temp-file-limit-bytes)
+    (initialize-query-temp-storage)
     (capture-server-streams)
     (wal-init)
     (xact-init)

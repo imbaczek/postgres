@@ -5,34 +5,269 @@
 (defparameter *query-work-memory-bytes* (* 4 1024 1024)
   "Approximate memory budget shared by one executor spool or sort operation.")
 
+;; As in PostgreSQL's temp_file_limit, NIL means unlimited. The command line
+;; can set a per-query cap; nested spill scopes share one quota.
+(defparameter *query-temp-file-limit-bytes* nil
+  "Maximum live temporary-file bytes per query, or NIL for no limit.")
+
+;; *QUERY-TEMP-DIRECTORY* is a test override that names the exact directory for
+;; spill files. Normal operation uses PGDATA/pgsql_tmp/<pid>-<start>-<pidns>/.
 (defvar *query-temp-directory* nil)
+(defvar *query-temp-root-directory* nil)
+(defvar *query-temp-instance-directory* nil)
+(defvar *query-temp-session-id* 0)
+(defvar *query-temp-scope-directory* nil)
 (defvar *query-temp-files* nil)
 (defvar *query-temp-file-scope-active-p* nil)
 (defvar *query-temp-file-sequence* 0)
+(defvar *query-temp-session-sequence* 0)
 (defvar *query-temp-file-lock*
   (sb-thread:make-mutex :name "pg query temporary file names"))
+(defvar *query-temp-quota* nil)
+(defvar *query-temp-test-pause-initialized-p* nil)
+(defvar *query-temp-test-pause-done-p* nil)
+(defvar *query-temp-test-ready-file* nil)
+(defvar *query-temp-test-release-file* nil)
 (defparameter +query-spill-eof+ (gensym "QUERY-SPILL-EOF-"))
+
+(defstruct (query-temp-quota (:constructor make-query-temp-quota (limit)))
+  limit
+  (used-bytes 0)
+  (file-sizes (make-hash-table :test #'equal))
+  (stream-paths (make-hash-table :test #'eq)))
+
+(defun next-query-temp-sequence ()
+  (sb-thread:with-mutex (*query-temp-file-lock*)
+    (incf *query-temp-file-sequence*)))
+
+(defun next-query-temp-session-id ()
+  "Allocate a unique spill namespace identifier for a client session."
+  (sb-thread:with-mutex (*query-temp-file-lock*)
+    (incf *query-temp-session-sequence*)))
+
+(defun query-temp-directory-name (directory)
+  (car (last (pathname-directory
+              (uiop:ensure-directory-pathname directory)))))
+
+(defun query-temp-private-directory (directory)
+  (let ((directory (uiop:ensure-directory-pathname directory)))
+    (ensure-directories-exist (merge-pathnames "placeholder" directory))
+    (sb-posix:chmod (namestring directory) #o700)
+    directory))
+
+(defun query-temp-owner-identity (name)
+  (let ((prefix-length (length "pgsql_tmp-")))
+    (when (and (>= (length name) prefix-length)
+               (string= "pgsql_tmp-" name :end2 prefix-length))
+      (let* ((separator (position #\- name :start prefix-length))
+             (namespace-separator
+               (and separator (position #\- name :start (1+ separator))))
+             (pid (ignore-errors
+                   (parse-integer name :start prefix-length :end separator)))
+             (start-token (and separator namespace-separator
+                               (subseq name (1+ separator)
+                                       namespace-separator)))
+             (pid-namespace-token (and namespace-separator
+                                       (subseq name
+                                               (1+ namespace-separator)))))
+        (values pid start-token pid-namespace-token)))))
+
+(defun query-temp-whitespace-p (character)
+  (find character '(#\Space #\Tab #\Newline #\Return)))
+
+(defun query-temp-whitespace-token (string token-index)
+  (let ((cursor 0)
+        (length (length string)))
+    (dotimes (index (1+ token-index))
+      (setf cursor (position-if-not #'query-temp-whitespace-p
+                                    string :start cursor))
+      (unless cursor
+        (return-from query-temp-whitespace-token nil))
+      (let ((end (position-if #'query-temp-whitespace-p string :start cursor)))
+        (when (= index token-index)
+          (return-from query-temp-whitespace-token
+            (subseq string cursor end)))
+        (setf cursor (or end length))))))
+
+(defun query-temp-process-start-token (pid)
+  "Return Linux /proc's process start-time ticks for PID."
+  (ignore-errors
+   (with-open-file (stream (format nil "/proc/~d/stat" pid))
+     (let* ((stat (read-line stream nil))
+            ;; The command name is parenthesized and may itself contain spaces
+            ;; and parentheses, so fields after it start at the final ')'.
+            (command-end (and stat (position #\) stat :from-end t)))
+            (fields (and command-end (subseq stat (1+ command-end))))
+            ;; starttime is field 22; fields starts at field 3.
+            (starttime (and fields (query-temp-whitespace-token fields 19))))
+       (and starttime (parse-integer starttime))))))
+
+(defun query-temp-pid-namespace-token ()
+  (ignore-errors
+   (let* ((target (sb-posix:readlink "/proc/self/ns/pid"))
+          (start (position #\[ target))
+          (end (and start (position #\] target :start (1+ start)))))
+     (and start end (parse-integer target :start (1+ start) :end end)))))
+
+(defun query-temp-valid-pid-p (pid)
+  (and (integerp pid) (<= 1 pid #x7fffffff)))
+
+(defun query-temp-process-state (pid)
+  (unless (query-temp-valid-pid-p pid)
+    (return-from query-temp-process-state :unknown))
+  (handler-case
+      (progn
+        (sb-posix:kill pid 0)
+        :live)
+    (sb-posix:syscall-error (condition)
+      (let ((errno (sb-posix:syscall-errno condition)))
+        (cond ((= errno sb-posix:esrch) :dead)
+              ((= errno sb-posix:eperm) :live)
+              (t :unknown))))
+    (error () :unknown)))
+
+(defun query-temp-owner-state (pid start-token pid-namespace-token)
+  "Classify an owner without treating missing process visibility as death."
+  (let ((current-namespace-token (query-temp-pid-namespace-token))
+        (expected-namespace-token
+          (and pid-namespace-token
+               (ignore-errors (parse-integer pid-namespace-token))))
+        (expected-start-token
+          (and start-token (ignore-errors (parse-integer start-token)))))
+    (cond
+      ;; PID-only, malformed, and cross-namespace entries cannot be associated
+      ;; with a visible process safely. Preserve them until ownership is clear.
+      ((or (null current-namespace-token)
+           (null expected-namespace-token)
+           (/= expected-namespace-token current-namespace-token)
+           (not (query-temp-valid-pid-p pid))
+           (null expected-start-token))
+       :unknown)
+      (t
+       (case (query-temp-process-state pid)
+         (:dead :dead)
+         (:unknown :unknown)
+         (:live
+          (let ((actual-start-token (query-temp-process-start-token pid)))
+            (cond ((null actual-start-token) :unknown)
+                  ((= actual-start-token expected-start-token) :live)
+                  (t :reused)))))))))
+
+(defun remove-abandoned-query-temp-namespaces
+    (root &optional (current-pid (sb-posix:getpid)))
+  "Remove only server-owned namespaces below ROOT, preserving other entries."
+  (when (probe-file root)
+    (dolist (directory (uiop:subdirectories root))
+      (let ((name (query-temp-directory-name directory)))
+        (multiple-value-bind (owner-pid start-token pid-namespace-token)
+            (if name
+                (query-temp-owner-identity name)
+                (values nil nil nil))
+          (let ((owner-state (and owner-pid
+                                  (query-temp-owner-state
+                                   owner-pid start-token
+                                   pid-namespace-token)))
+                (same-current-namespace-p
+                  (and owner-pid (= owner-pid current-pid)
+                       pid-namespace-token
+                       (ignore-errors
+                        (= (parse-integer pid-namespace-token)
+                           (query-temp-pid-namespace-token))))))
+            ;; A current-PID namespace is stale at startup only when its PID
+            ;; namespace also matches. Unknown ownership is preserved.
+            (when (or same-current-namespace-p
+                      (member owner-state '(:dead :reused)))
+              (uiop:delete-directory-tree directory
+                                          :validate t
+                                          :if-does-not-exist :ignore)))))))
+  (values))
+
+(defun initialize-query-temp-storage (&optional (pgdata *pgdata*))
+  "Prepare PGDATA's spill root and discard namespaces left by a prior server."
+  (unless pgdata
+    (error "Cannot initialize query spill storage without PGDATA"))
+  (let* ((root (merge-pathnames "pgsql_tmp/"
+                                (uiop:ensure-directory-pathname
+                                 (pathname pgdata))))
+         (pid (sb-posix:getpid))
+         (start-token (query-temp-process-start-token pid))
+         (pid-namespace-token (query-temp-pid-namespace-token))
+         (instance nil))
+    (unless (and start-token pid-namespace-token)
+      (error "Cannot determine query spill owner identity for process ~d" pid))
+    (setf instance
+          (merge-pathnames
+           (format nil "pgsql_tmp-~d-~d-~d/"
+                   pid start-token pid-namespace-token)
+           root))
+    (query-temp-private-directory root)
+    ;; PostgreSQL does this in postmaster startup, when no other server using
+    ;; the data directory can be running. This server has one process and
+    ;; thread-per-session backends, so each child namespace is session-local.
+    (remove-abandoned-query-temp-namespaces root)
+    (setf *query-temp-root-directory* root
+          *query-temp-instance-directory* instance)
+    instance))
+
+(defun query-temp-scope-directory ()
+  (or *query-temp-scope-directory*
+      (setf *query-temp-scope-directory*
+            (if *query-temp-directory*
+                (uiop:ensure-directory-pathname
+                 (pathname *query-temp-directory*))
+                (let* ((instance (or *query-temp-instance-directory*
+                                     (initialize-query-temp-storage)))
+                       (scope (merge-pathnames
+                               (format nil "session-~d-query-~d/"
+                                       *query-temp-session-id*
+                                       (next-query-temp-sequence))
+                               instance)))
+                  (query-temp-private-directory instance)
+                  (query-temp-private-directory scope))))))
 
 (defun unlink-query-temp-file (pathname)
   (delete-file pathname))
 
+(defun forget-query-temp-file-space (pathname)
+  (when *query-temp-quota*
+    (let* ((quota *query-temp-quota*)
+           (size (gethash pathname (query-temp-quota-file-sizes quota) 0)))
+      (decf (query-temp-quota-used-bytes quota) size)
+      (remhash pathname (query-temp-quota-file-sizes quota))
+      (let ((streams nil))
+        (maphash (lambda (stream path)
+                   (when (equal path pathname)
+                     (push stream streams)))
+                 (query-temp-quota-stream-paths quota))
+        (dolist (stream streams)
+          (remhash stream (query-temp-quota-stream-paths quota))))))
+  (values))
+
 (defmacro with-query-temp-files (&body body)
   "Delete every query-local spill file, including files from failed execution."
-  `(let ((*query-temp-files* nil)
-         (*query-temp-file-scope-active-p* t))
+  `(let* ((*query-temp-files* nil)
+          (*query-temp-file-scope-active-p* t)
+          (*query-temp-scope-directory* nil)
+          (*query-temp-quota* (or *query-temp-quota*
+                                  (make-query-temp-quota
+                                   *query-temp-file-limit-bytes*))))
      (unwind-protect
           (progn ,@body)
        (dolist (pathname *query-temp-files*)
-         (ignore-errors (unlink-query-temp-file pathname))))))
+         (multiple-value-bind (deleted-p condition)
+             (ignore-errors (unlink-query-temp-file pathname))
+           (declare (ignore condition))
+           (when deleted-p
+             (forget-query-temp-file-space pathname))))
+       (when (and *query-temp-scope-directory* (null *query-temp-directory*))
+         (ignore-errors
+          (uiop:delete-directory-tree *query-temp-scope-directory*
+                                      :validate t
+                                      :if-does-not-exist :ignore))))))
 
 (defun query-temp-file-pathname ()
-  (let* ((sequence
-           (sb-thread:with-mutex (*query-temp-file-lock*)
-             (incf *query-temp-file-sequence*)))
-         (directory
-           (uiop:ensure-directory-pathname
-            (pathname (or *query-temp-directory*
-                          (uiop:temporary-directory)))))
+  (let* ((sequence (next-query-temp-sequence))
+         (directory (query-temp-scope-directory))
          (name (format nil "pg-query-~36r-~36r-~36r.tmp"
                        (get-universal-time) (sb-posix:getpid) sequence)))
     (merge-pathnames name directory)))
@@ -41,6 +276,8 @@
   (unless *query-temp-file-scope-active-p*
     (error "Query spill files must be created inside WITH-QUERY-TEMP-FILES"))
   (push pathname *query-temp-files*)
+  (when *query-temp-quota*
+    (setf (gethash pathname (query-temp-quota-file-sizes *query-temp-quota*)) 0))
   pathname)
 
 (defun open-and-register-query-temp-file (pathname open-arguments)
@@ -52,6 +289,9 @@
            (setf stream (apply #'open pathname open-arguments))
            (when stream
              (register-query-temp-file pathname)
+             (setf (gethash stream
+                            (query-temp-quota-stream-paths *query-temp-quota*))
+                   pathname)
              (setf registered-p t))
            stream)
       (when (and stream (not registered-p))
@@ -214,17 +454,110 @@
                                   #'read-query-spill-byte-vector readtable)
     readtable))
 
+(defun query-temp-path-for-stream (stream)
+  (and *query-temp-quota*
+       (gethash stream (query-temp-quota-stream-paths *query-temp-quota*))))
+
+(defun query-temp-character-utf8-size (character)
+  (let ((code (char-code character)))
+    (cond
+      ((<= code #x7f) 1)
+      ((<= code #x7ff) 2)
+      ((<= code #xffff) 3)
+      (t 4))))
+
+(defun query-temp-string-utf8-size (string start end)
+  (loop for index from start below end
+        sum (query-temp-character-utf8-size (char string index))))
+
+(defun query-temp-check-space (pathname bytes)
+  (when (and pathname *query-temp-quota*)
+    (let* ((quota *query-temp-quota*)
+           (limit (query-temp-quota-limit quota))
+           (used (query-temp-quota-used-bytes quota)))
+      (when (and limit (> (+ used bytes) limit))
+        (ereport "53400"
+                 "temporary file size exceeds temp_file_limit (~d bytes)"
+                 limit))))
+  (values))
+
+(defun query-temp-account-space (pathname bytes &optional stream)
+  (when (and pathname *query-temp-quota*)
+    (incf (query-temp-quota-used-bytes *query-temp-quota*) bytes)
+    (incf (gethash pathname
+                   (query-temp-quota-file-sizes *query-temp-quota*)
+                   0)
+          bytes)
+    (query-temp-test-pause-after-write stream))
+  (values))
+
+(defun query-temp-test-pause-after-write (&optional stream)
+  "Test hook used to SIGKILL the server after it has written a spill record."
+  (unless *query-temp-test-pause-initialized-p*
+    (setf *query-temp-test-ready-file*
+          (sb-ext:posix-getenv "PG_QUERY_TEMP_TEST_READY_FILE")
+          *query-temp-test-release-file*
+          (sb-ext:posix-getenv "PG_QUERY_TEMP_TEST_RELEASE_FILE")
+          *query-temp-test-pause-initialized-p* t))
+  (when (and *query-temp-test-ready-file*
+             *query-temp-test-release-file*
+             (not *query-temp-test-pause-done-p*))
+    (setf *query-temp-test-pause-done-p* t)
+    (when stream
+      (finish-output stream))
+    (with-open-file (stream *query-temp-test-ready-file*
+                            :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create)
+      (write-line "spill-written" stream))
+    (loop until (probe-file *query-temp-test-release-file*)
+          do (sleep 0.01)))
+  (values))
+
+(defclass query-temp-limited-character-stream
+    (sb-gray:fundamental-character-output-stream)
+  ((stream :initarg :stream :reader query-temp-limited-underlying-stream)
+   (pathname :initarg :pathname :reader query-temp-limited-pathname)))
+
+(defmethod sb-gray:stream-write-char
+    ((stream query-temp-limited-character-stream) character)
+  (let* ((pathname (query-temp-limited-pathname stream))
+         (bytes (query-temp-character-utf8-size character)))
+    (query-temp-check-space pathname bytes)
+    (write-char character (query-temp-limited-underlying-stream stream))
+    (query-temp-account-space
+     pathname bytes (query-temp-limited-underlying-stream stream)))
+  character)
+
+(defmethod sb-gray:stream-write-string
+    ((stream query-temp-limited-character-stream) string
+     &optional (start 0) end)
+  (let* ((end (or end (length string)))
+         (pathname (query-temp-limited-pathname stream))
+         (bytes (query-temp-string-utf8-size string start end)))
+    (query-temp-check-space pathname bytes)
+    (write-string string (query-temp-limited-underlying-stream stream)
+                  :start start :end end)
+    (query-temp-account-space
+     pathname bytes (query-temp-limited-underlying-stream stream)))
+  string)
+
 (defun query-spill-write-record (stream value)
-  (let ((*print-pretty* nil)
-        (*print-readably* t)
-        (*print-circle* t)
-        (*print-length* nil)
-        (*print-level* nil)
-        (*print-base* 10)
-        (*print-radix* nil)
-        (*package* (find-package '#:pg)))
-    (query-spill-write-value stream value)
-    (terpri stream)))
+  (let* ((pathname (query-temp-path-for-stream stream))
+         (output (if pathname
+                     (make-instance 'query-temp-limited-character-stream
+                                    :stream stream :pathname pathname)
+                     stream)))
+    (let ((*print-pretty* nil)
+          (*print-readably* t)
+          (*print-circle* t)
+          (*print-length* nil)
+          (*print-level* nil)
+          (*print-base* 10)
+          (*print-radix* nil)
+          (*package* (find-package '#:pg)))
+      (query-spill-write-value output value)
+      (terpri output))))
 
 (defun query-spill-read-record (stream)
   (let ((*read-eval* nil)
@@ -288,11 +621,15 @@
     (setf (query-row-spool-output-stream spool) nil))
   (values))
 
-(defmacro with-query-row-spool ((spool &optional memory-limit) &body body)
-  `(let ((,spool (make-query-row-spool ,memory-limit)))
-     (unwind-protect
-          (progn ,@body)
-       (close-query-row-spool ,spool))))
+(defmacro with-query-row-spool
+    ((spool &optional (memory-limit nil memory-limit-p)) &body body)
+  (let ((constructor (if memory-limit-p
+                         `(make-query-row-spool ,memory-limit)
+                         '(make-query-row-spool))))
+    `(let ((,spool ,constructor))
+       (unwind-protect
+            (progn ,@body)
+         (close-query-row-spool ,spool)))))
 
 (defun map-query-row-spool (spool callback)
   (unless (query-row-spool-sealed-p spool)
@@ -329,8 +666,11 @@
     (multiple-value-bind (pathname stream) (open-query-temp-io)
       (setf (query-match-map-pathname match-map) pathname
             (query-match-map-io-stream match-map) stream)
-      (loop for byte across (query-match-map-bytes match-map)
-            do (write-byte byte stream))
+      (let* ((bytes (query-match-map-bytes match-map))
+             (byte-count (length bytes)))
+        (query-temp-check-space pathname byte-count)
+        (loop for byte across bytes do (write-byte byte stream))
+        (query-temp-account-space pathname byte-count stream))
       (setf (query-match-map-bytes match-map)
             (make-array 0 :element-type '(unsigned-byte 8)
                           :adjustable t :fill-pointer 0))))
@@ -344,10 +684,12 @@
                  (query-match-map-memory-limit match-map)))
     (query-match-map-spill match-map))
   (if (query-match-map-io-stream match-map)
-      (progn
-        (file-position (query-match-map-io-stream match-map)
-                       (query-match-map-count match-map))
-        (write-byte 0 (query-match-map-io-stream match-map)))
+      (let* ((stream (query-match-map-io-stream match-map))
+             (pathname (query-temp-path-for-stream stream)))
+        (query-temp-check-space pathname 1)
+        (file-position stream (query-match-map-count match-map))
+        (write-byte 0 stream)
+        (query-temp-account-space pathname 1 stream))
       (vector-push-extend 0 (query-match-map-bytes match-map)))
   (prog1 (query-match-map-count match-map)
     (incf (query-match-map-count match-map))))
@@ -386,8 +728,12 @@
     (setf (query-match-map-io-stream match-map) nil))
   (values))
 
-(defmacro with-query-match-map ((match-map &optional memory-limit) &body body)
-  `(let ((,match-map (make-query-match-map ,memory-limit)))
-     (unwind-protect
-          (progn ,@body)
-       (close-query-match-map ,match-map))))
+(defmacro with-query-match-map
+    ((match-map &optional (memory-limit nil memory-limit-p)) &body body)
+  (let ((constructor (if memory-limit-p
+                         `(make-query-match-map ,memory-limit)
+                         '(make-query-match-map))))
+    `(let ((,match-map ,constructor))
+       (unwind-protect
+            (progn ,@body)
+         (close-query-match-map ,match-map)))))

@@ -33,6 +33,11 @@ Options: `-p PORT` (default 5433), `-h HOST` (default 127.0.0.1), `-D PGDATA`
 (default `./pgdata`). PGDATA is created on first boot with `PG_VERSION`,
 `global/`, `base/`, `pg_xact`, and `pg_catalog.dat`. Ports are validated at
 startup (1..65535) and a missing option value is a clean error, not a crash.
+`--temp-file-limit-bytes BYTES` caps the live spill files used by one query;
+`-1` (the default) means unlimited. `PG_QUERY_TEMP_FILE_LIMIT_BYTES` sets the
+same value when the command-line option is omitted. Spill files live in private
+`PGDATA/pgsql_tmp` namespaces keyed by process identity and session/query; startup
+removes namespaces it can verify are abandoned and preserves unknown owners.
 `--swank-port PORT` optionally opens the Swank listener on `127.0.0.1`; the
 Swank code is loaded in the image by default, but the listener stays off unless
 this option is supplied. `--swank-bind-address ADDR` selects another interface
@@ -232,6 +237,7 @@ cd src/lisp
 ./t/index-build-contention.sh # detached build, relation gate, publication name race
 ./t/join-streaming.sh    # outer-join results and unordered LIMIT early stop
 ./t/join-ddl-concurrency.sh # atomic JOIN admission against concurrent DROP TABLE
+./t/spill-crash-recovery.sh # crash cleanup, restart recovery, and temp-file limit
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
 ./t/hot-reload.sh         # SIGHUP reloads code in a running server
 ./t/control-repl.sh       # control REPL over TCP + Unix socket, reload, SQL intact
@@ -291,6 +297,12 @@ the join, and that an unordered `LIMIT 1` evaluates only its first joined pair.
 `t/join-ddl-concurrency.sh` coordinates JOINs that each have one admissible heap
 and one gated heap with two `DROP TABLE` sessions. It confirms reader admission is
 all-or-none, then checks the stale plans fail safely after the tables are dropped.
+
+`t/spill-crash-recovery.sh` forces an external sort spill, SIGKILLs the server
+after its first record reaches disk, then restarts on the same PGDATA and checks
+that startup removes the abandoned query namespace while committed rows remain.
+It also verifies that the configured temporary-file limit rejects a later spill,
+cleans partial files, and leaves the server able to serve another query.
 
 The Lisp-level `test-vacuum-snapshot-horizon` ports the permanent-table case
 from PostgreSQL's `src/test/isolation/specs/horizons.spec`: an older registered
@@ -418,6 +430,10 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   `$PGDATA/global/pg_catalog.dat` and fsynced at each DDL commit. It is replaced
   atomically (write a temp file, `rename`, then fsync the directory), so a crash
   never leaves the catalog missing.
+- Executor spill files live below `$PGDATA/pgsql_tmp` in per-instance and
+  per-session query namespaces. Normal query cleanup removes them, startup
+  removes namespaces left by a crashed server, and `--temp-file-limit-bytes`
+  can cap the live spill bytes for a query.
 - Unique b-trees are real file-backed B+trees. Because duplicate keys can
   straddle a leaf split, a lookup visits every leaf that can hold the key. A
   uniqueness probe that lands on an in-progress conflicting tuple blocks until

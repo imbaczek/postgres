@@ -279,7 +279,8 @@ ROW-CALLBACK."
     (declare (ignore condition))
     (when deleted-p
       (setf *query-temp-files*
-            (delete pathname *query-temp-files* :test #'equal))))
+            (delete pathname *query-temp-files* :test #'equal))
+      (forget-query-temp-file-space pathname)))
   (values))
 
 (defun merge-query-sort-runs (left-path right-path order)
