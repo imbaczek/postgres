@@ -125,13 +125,59 @@
                                              :if-does-not-exist :ignore)))))
 
 (defun test-query-spill-macros-use-default-memory-limit ()
-  (let ((*query-work-memory-bytes* 37))
+  (let ((*query-work-memory-bytes* 37)
+        (row-limit-evaluations 0)
+        (match-limit-evaluations 0))
     (with-query-row-spool (spool)
       (check (= (query-row-spool-memory-limit spool) 37)
              "row-spool macro defaults to the configured work-memory limit"))
     (with-query-match-map (match-map)
       (check (= (query-match-map-memory-limit match-map) 37)
-             "match-map macro defaults to the configured work-memory limit"))))
+             "match-map macro defaults to the configured work-memory limit"))
+    (with-query-row-spool (spool (incf row-limit-evaluations))
+      (check (= (query-row-spool-memory-limit spool) 1)
+             "row-spool macro passes an explicit memory limit"))
+    (with-query-match-map (match-map (incf match-limit-evaluations))
+      (check (= (query-match-map-memory-limit match-map) 1)
+             "match-map macro passes an explicit memory limit"))
+    (check (= row-limit-evaluations 1)
+           "row-spool macro evaluates its memory limit once")
+    (check (= match-limit-evaluations 1)
+           "match-map macro evaluates its memory limit once")))
+
+(defun test-query-spill-resource-macros-clean-up-after-error ()
+  (let ((original-row-closer (symbol-function 'close-query-row-spool))
+        (original-match-closer (symbol-function 'close-query-match-map))
+        (row-closed-p nil)
+        (match-map-closed-p nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'close-query-row-spool)
+                 (lambda (spool)
+                   (declare (ignore spool))
+                   (setf row-closed-p t))
+                 (symbol-function 'close-query-match-map)
+                 (lambda (match-map)
+                   (declare (ignore match-map))
+                   (setf match-map-closed-p t)))
+           (handler-case
+               (with-query-row-spool (spool)
+                 (check (plusp (query-row-spool-memory-limit spool))
+                        "row-spool body runs before an exceptional exit")
+                 (error "forced row-spool body error"))
+             (error () nil))
+           (handler-case
+               (with-query-match-map (match-map)
+                 (check (plusp (query-match-map-memory-limit match-map))
+                        "match-map body runs before an exceptional exit")
+                 (error "forced match-map body error"))
+             (error () nil))
+           (check row-closed-p
+                  "row-spool resource closes after an exceptional body exit")
+           (check match-map-closed-p
+                  "match-map resource closes after an exceptional body exit"))
+      (setf (symbol-function 'close-query-row-spool) original-row-closer
+            (symbol-function 'close-query-match-map) original-match-closer))))
 
 (defun test-query-temp-file-limit-option-parsing ()
   (multiple-value-bind (host port pgdata control-port control-socket

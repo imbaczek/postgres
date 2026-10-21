@@ -621,15 +621,24 @@
     (setf (query-row-spool-output-stream spool) nil))
   (values))
 
-(defmacro with-query-row-spool
-    ((spool &optional (memory-limit nil memory-limit-p)) &body body)
-  (let ((constructor (if memory-limit-p
-                         `(make-query-row-spool ,memory-limit)
-                         '(make-query-row-spool))))
-    `(let ((,spool ,constructor))
+(defmacro with-query-spill-resource
+    ((resource constructor closer &optional (memory-limit nil memory-limit-p))
+     &body body)
+  "Bind a spill resource and always call CLOSER, including on nonlocal exit."
+  (let ((constructor-form (if memory-limit-p
+                              `(,constructor ,memory-limit)
+                              `(,constructor))))
+    `(let ((,resource ,constructor-form))
        (unwind-protect
             (progn ,@body)
-         (close-query-row-spool ,spool)))))
+         (,closer ,resource)))))
+
+(defmacro with-query-row-spool
+    ((spool &optional (memory-limit nil memory-limit-p)) &body body)
+  `(with-query-spill-resource
+       (,spool make-query-row-spool close-query-row-spool
+               ,@(when memory-limit-p (list memory-limit)))
+     ,@body))
 
 (defun map-query-row-spool (spool callback)
   (unless (query-row-spool-sealed-p spool)
@@ -730,10 +739,7 @@
 
 (defmacro with-query-match-map
     ((match-map &optional (memory-limit nil memory-limit-p)) &body body)
-  (let ((constructor (if memory-limit-p
-                         `(make-query-match-map ,memory-limit)
-                         '(make-query-match-map))))
-    `(let ((,match-map ,constructor))
-       (unwind-protect
-            (progn ,@body)
-         (close-query-match-map ,match-map)))))
+  `(with-query-spill-resource
+       (,match-map make-query-match-map close-query-match-map
+                   ,@(when memory-limit-p (list memory-limit)))
+     ,@body))

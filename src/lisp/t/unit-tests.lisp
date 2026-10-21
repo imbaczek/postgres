@@ -47,6 +47,7 @@
       (test-query-temp-startup-removes-abandoned-namespaces)
       (test-query-temp-file-limit-is-enforced)
       (test-query-spill-macros-use-default-memory-limit)
+      (test-query-spill-resource-macros-clean-up-after-error)
       (test-query-temp-file-limit-option-parsing)
       (test-query-temp-file-macro-cleans-up-after-error)
       (test-query-temp-open-registration-failure-cleans-up)
