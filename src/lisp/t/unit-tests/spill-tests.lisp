@@ -98,6 +98,167 @@
        (uiop:delete-directory-tree pgdata :validate t
                                           :if-does-not-exist :ignore)))))
 
+(defun test-query-temp-retained-namespace-observability ()
+  (let* ((pgdata (make-query-spill-test-directory))
+         (root (merge-pathnames "pgsql_tmp/" pgdata))
+         (namespace (merge-pathnames "pgsql_tmp-99999999-1-0/" root))
+         (session (merge-pathnames "session-7-query-1/" namespace))
+         (outside (merge-pathnames "outside/" pgdata))
+         (text-file (merge-pathnames "spill-a.tmp" session))
+         (binary-file (merge-pathnames "spill-b.tmp" session))
+         (outside-file (merge-pathnames "keep.tmp" outside))
+         (link (merge-pathnames "outside-link" namespace))
+         (reports nil)
+         (now nil)
+         (instance nil)
+         (startup-log nil))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist text-file)
+           (ensure-directories-exist outside-file)
+           (with-open-file (stream text-file :direction :output
+                                             :if-exists :supersede)
+             (write-string "abc" stream))
+           (with-open-file (stream binary-file :direction :output
+                                               :element-type '(unsigned-byte 8)
+                                               :if-exists :supersede)
+             (map nil (lambda (byte) (write-byte byte stream)) '(1 2 3 4 5)))
+           (with-open-file (stream outside-file :direction :output
+                                                :if-exists :supersede)
+             (write-string "outside namespace" stream))
+           (sb-posix:symlink (namestring outside) (namestring link))
+           (let* ((text-mtime
+                    (sb-posix:stat-mtime (sb-posix:lstat (namestring text-file))))
+                  (binary-mtime
+                    (sb-posix:stat-mtime (sb-posix:lstat (namestring binary-file))))
+                  (oldest-mtime (min text-mtime binary-mtime)))
+             (setf now (+ oldest-mtime 60)
+                   reports
+                   (collect-retained-query-temp-stats
+                    root now (lambda (directory)
+                               (declare (ignore directory))
+                               :unknown)))
+             (check (= (length reports) 1)
+                    "spill diagnostics report retained server namespaces only")
+             (let ((report (first reports)))
+               (check (eq (query-temp-namespace-report-owner-state report)
+                          :unknown)
+                      "spill diagnostics preserve the unknown-owner classification")
+               (check (and (= (query-temp-namespace-report-file-count report) 2)
+                           (= (query-temp-namespace-report-size-bytes report) 8))
+                      "spill diagnostics count regular files without following symlinks")
+               (check (= (query-temp-namespace-report-oldest-file-age-seconds report)
+                         (- now oldest-mtime))
+                      "spill diagnostics report age from the oldest file modification")))
+           (setf startup-log
+                 (with-output-to-string (log)
+                   (let ((*error-output* log))
+                     (setf instance (initialize-query-temp-storage pgdata)))))
+           (check (and instance (search "pgsql_tmp-" (namestring instance)))
+                  "spill startup computes its new instance namespace")
+           (check (and (probe-file namespace)
+                       (probe-file outside-file)
+                       (probe-file link))
+                  "spill startup retains unknown namespaces and does not follow links")
+           (check (and (search "owner=unknown" startup-log)
+                       (search "files=2" startup-log)
+                       (search "bytes=8" startup-log)
+                       (search "oldest-file-age=" startup-log))
+                  "startup logs retained spill namespace size and age"))
+      (ignore-errors
+       (uiop:delete-directory-tree pgdata :validate t
+                                          :if-does-not-exist :ignore)))))
+
+(defun test-query-temp-retained-scan-refuses-symlink-swap ()
+  (let* ((pgdata (make-query-spill-test-directory))
+         (root (merge-pathnames "pgsql_tmp/" pgdata))
+         (namespace-link (merge-pathnames "pgsql_tmp-race" root))
+         (namespace (uiop:ensure-directory-pathname namespace-link))
+         (outside (merge-pathnames "outside/" pgdata))
+         (outside-file (merge-pathnames "keep.tmp" outside))
+         (original-open (symbol-function 'query-temp-open-child-directory))
+         (swapped-p nil)
+         (reports nil))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist (merge-pathnames "spill.tmp" namespace))
+           (ensure-directories-exist outside-file)
+           (with-open-file (stream outside-file :direction :output
+                                                :if-exists :supersede)
+             (write-string "outside namespace" stream))
+           (setf (symbol-function 'query-temp-open-child-directory)
+                 (lambda (fd name)
+                   (when (and (not swapped-p)
+                              (string= name "pgsql_tmp-race"))
+                     (setf swapped-p t)
+                     (uiop:delete-directory-tree namespace :validate t)
+                     (sb-posix:symlink (namestring outside)
+                                       (namestring namespace-link)))
+                   (funcall original-open fd name)))
+           (setf reports
+                 (collect-retained-query-temp-stats
+                  root (- (get-universal-time) 2208988800)
+                  #'query-temp-directory-owner-state))
+           (check swapped-p
+                  "retained namespace scan test replaced the directory after enumeration")
+           (check (and (= (length reports) 1)
+                       (not (query-temp-namespace-report-scan-complete-p
+                             (first reports)))
+                       (zerop (query-temp-namespace-report-size-bytes
+                               (first reports))))
+                  "retained namespace scan rejects a directory swapped to a symlink")
+           (check (and (probe-file namespace-link) (probe-file outside-file))
+                  "retained namespace scan does not traverse the symlink target"))
+      (setf (symbol-function 'query-temp-open-child-directory) original-open)
+      (ignore-errors
+       (uiop:delete-directory-tree pgdata :validate t
+                                          :if-does-not-exist :ignore)))))
+
+(defun test-query-temp-retained-scan-reports-file-type-race ()
+  (let* ((pgdata (make-query-spill-test-directory))
+         (root (merge-pathnames "pgsql_tmp/" pgdata))
+         (namespace (merge-pathnames "pgsql_tmp-race-file/" root))
+         (session (merge-pathnames "session-7-query-1/" namespace))
+         (spill-file (merge-pathnames "spill.tmp" session))
+         (original-open (symbol-function 'query-temp-open-child-file))
+         (replaced-p nil)
+         (reports nil))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist spill-file)
+           (with-open-file (stream spill-file :direction :output
+                                              :if-exists :supersede)
+             (write-string "spill" stream))
+           (setf (symbol-function 'query-temp-open-child-file)
+                 (lambda (fd name)
+                   (when (and (not replaced-p) (string= name "spill.tmp"))
+                     (setf replaced-p t)
+                     (delete-file spill-file)
+                     (ensure-directories-exist
+                      (merge-pathnames "marker"
+                                       (uiop:ensure-directory-pathname spill-file))))
+                   (funcall original-open fd name)))
+           (setf reports
+                 (collect-retained-query-temp-stats
+                  root (- (get-universal-time) 2208988800)
+                  (lambda (name)
+                    (declare (ignore name))
+                    :unknown)))
+           (check replaced-p
+                  "retained namespace scan test replaced a file after lstat")
+           (check (and (= (length reports) 1)
+                       (not (query-temp-namespace-report-scan-complete-p
+                             (first reports)))
+                       (zerop (query-temp-namespace-report-file-count
+                               (first reports)))
+                       (zerop (query-temp-namespace-report-size-bytes
+                               (first reports))))
+                  "retained namespace scan marks a raced file type as incomplete"))
+      (setf (symbol-function 'query-temp-open-child-file) original-open)
+      (ignore-errors
+       (uiop:delete-directory-tree pgdata :validate t
+                                          :if-does-not-exist :ignore)))))
+
 (defun test-query-temp-file-limit-is-enforced ()
   (let* ((directory (make-query-spill-test-directory))
          (pathname nil)
