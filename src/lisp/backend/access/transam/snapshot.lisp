@@ -12,6 +12,8 @@
 (defstruct (snapshot-registration
             (:constructor make-snapshot-registration ()))
   snapshot
+  wal-retention-lsn
+  (releasing-p nil)
   (active-p nil))
 
 (defvar *current-snapshot* nil)
@@ -24,6 +26,7 @@
 (defvar *active-snapshot-set* (make-hash-table :test #'eq))
 (defvar *snapshot-cv* (sb-thread:make-waitqueue :name "pg snapshot waitqueue"))
 (defvar *snapshot-cv-mutex* (sb-thread:make-mutex :name "pg snapshot cv mutex"))
+(defvar *wal-test-after-snapshot-release-mark-hook* nil)
 
 (declaim (ftype function xid-active-p))
 
@@ -36,8 +39,9 @@ asynchronous interrupts are re-enabled."
     (error "active snapshots require a snapshot-registration token"))
   (sb-sys:without-interrupts
     (sb-thread:with-mutex (*snapshot-count-lock*)
-      (when (snapshot-registration-active-p registration)
-        (error "snapshot-registration token is already active"))
+      (when (or (snapshot-registration-active-p registration)
+                (snapshot-registration-releasing-p registration))
+        (error "snapshot-registration token is active or being released"))
       (incf *active-snapshots*)
       (setf (gethash snapshot *active-snapshot-set*) t
             (snapshot-registration-snapshot registration) snapshot
@@ -56,18 +60,42 @@ asynchronous interrupts are re-enabled."
       oldest)))
 
 (defun release-snapshot-registration (registration)
-  "Release a snapshot and active-count entry owned by REGISTRATION, once."
-  (sb-sys:without-interrupts
-    (when (snapshot-registration-active-p registration)
+  "Release the snapshot, WAL retention pin, and active-count entry once."
+  (let ((pinned nil)
+        (active nil))
+    (sb-sys:without-interrupts
+      ;; Boundary capture publishes the pin while holding the snapshot-count
+      ;; lock. This first transition makes a concurrent capture either publish
+      ;; before us, so we remove its pin, or observe an inactive token and fail.
       (sb-thread:with-mutex (*snapshot-count-lock*)
-        (when (remhash (snapshot-registration-snapshot registration)
-                       *active-snapshot-set*)
-          (decf *active-snapshots*))
-        (setf (snapshot-registration-snapshot registration) nil
-              (snapshot-registration-active-p registration) nil))
-      (sb-thread:with-mutex (*snapshot-cv-mutex*)
-        (sb-thread:condition-broadcast *snapshot-cv*))))
-  (values))
+        (when (and (snapshot-registration-active-p registration)
+                   (not (snapshot-registration-releasing-p registration)))
+          (setf active t
+                pinned (snapshot-registration-wal-retention-lsn registration))
+          (when (remhash (snapshot-registration-snapshot registration)
+                         *active-snapshot-set*)
+            (decf *active-snapshots*))
+          (setf (snapshot-registration-snapshot registration) nil
+                (snapshot-registration-active-p registration) nil
+                (snapshot-registration-releasing-p registration)
+                (not (null pinned)))))
+      ;; Do not let another capture reuse this token while its old pin is
+      ;; waiting to be removed under the WAL lock.
+      (when (and active pinned *wal-test-after-snapshot-release-mark-hook*)
+        (funcall *wal-test-after-snapshot-release-mark-hook* registration))
+      ;; Never take WAL while holding the snapshot-count lock: capture takes
+      ;; WAL->XID->snapshot-count. The still-published map entry conservatively
+      ;; protects WAL until this serialized removal completes.
+      (when pinned
+        (sb-thread:with-mutex (*wal-lock*)
+          (remhash registration *wal-snapshot-retention-pins*)
+          (sb-thread:with-mutex (*snapshot-count-lock*)
+            (setf (snapshot-registration-wal-retention-lsn registration) nil
+                  (snapshot-registration-releasing-p registration) nil))))
+      (when active
+        (sb-thread:with-mutex (*snapshot-cv-mutex*)
+          (sb-thread:condition-broadcast *snapshot-cv*))))
+    (values)))
 
 (defmacro with-statement-snapshot ((snapshot acquire-function) &body body)
   "Acquire a registered statement snapshot inside its cleanup scope.

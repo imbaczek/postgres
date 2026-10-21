@@ -60,6 +60,213 @@
                  (error () t))
                (car case))))))
 
+(defun test-wal-snapshot-boundary-retains-active-xid-pages ()
+  (let* ((*backend* (make-backend :xid 4101))
+         (*next-xid* 5000)
+         (*active-xids* '(4101 4102))
+         (*active-snapshots* 0)
+         (*active-snapshot-set* (make-hash-table :test #'eq))
+         (*wal-ready* t)
+         (*wal-poisoned* nil)
+         (*wal-end-lsn* 900)
+         (*wal-durable-lsn* 900)
+         (*wal-page-cache-xids* (make-hash-table :test #'equal))
+         (*wal-xid-first-lsn* (make-hash-table :test #'eql))
+         (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+         (registration (make-snapshot-registration)))
+    ;; A page batch can contain writes by several transactions. Keep each
+    ;; active contributor's first batch start, even if later batches include it
+    ;; again. This parallels the transaction state retained by PostgreSQL's
+    ;; SnapBuild machinery until a commit record closes that XID.
+    (wal-record-page-xids-at-batch-start
+     (list (make-wal-page-image :xids '(4101 4999))) 250)
+    (wal-record-page-xids-at-batch-start
+     (list (make-wal-page-image :xids '(4101 4102))) 350)
+    (check (= (gethash 4101 *wal-xid-first-lsn*) 250)
+           "WAL retention keeps the first batch containing an active XID")
+    (check (= (gethash 4102 *wal-xid-first-lsn*) 350)
+           "WAL retention records each active page contributor")
+    (check (not (gethash 4999 *wal-xid-first-lsn*))
+           "WAL retention ignores contributors that have already left the active set")
+    (multiple-value-bind (snapshot boundary-lsn restart-lsn)
+        (with-write-lock
+          (wal-capture-snapshot-boundary-under-writer-lock 7 registration))
+      (check (and (= boundary-lsn 900) (= restart-lsn 250))
+             "snapshot export pairs the durable boundary with its oldest active-XID WAL")
+      (check (= (gethash registration *wal-snapshot-retention-pins*) 250)
+             "registered snapshot pins its returned WAL restart position")
+      (check (and (= (snapshot-xmax snapshot) 5000)
+                  (equal (snapshot-xip snapshot) '(4101 4102)))
+             "snapshot boundary captures the active XID horizon under the WAL lock"))
+    (release-xid 4101)
+    (check (not (gethash 4101 *wal-xid-first-lsn*))
+           "ending an XID releases its retained WAL position")
+    (check (= (gethash registration *wal-snapshot-retention-pins*) 250)
+           "snapshot restart WAL remains pinned after an XID ends")
+    (release-snapshot-registration registration)
+    (check (and (zerop *active-snapshots*)
+                (not (gethash registration *wal-snapshot-retention-pins*)))
+           "releasing the snapshot also releases its WAL retention pin")))
+
+(defun test-wal-snapshot-release-race-before-pin-publication ()
+  (let* ((test-lock (sb-thread:make-mutex :name "snapshot boundary race test"))
+         (test-cv (sb-thread:make-waitqueue :name "snapshot boundary race test"))
+         (hook-entered nil)
+         (resume-capture nil)
+         (release-marked nil)
+         (resume-release nil)
+         (capture-error nil)
+         (capture-result nil)
+         (release-error nil)
+         (reuse-error nil)
+         (registration (make-snapshot-registration))
+         (worker nil)
+         (release-worker nil)
+         (saved-active-snapshots *active-snapshots*)
+         (saved-active-snapshot-set *active-snapshot-set*)
+         (saved-active-xids *active-xids*)
+         (saved-next-xid *next-xid*)
+         (saved-wal-ready *wal-ready*)
+         (saved-wal-poisoned *wal-poisoned*)
+         (saved-wal-end-lsn *wal-end-lsn*)
+         (saved-wal-durable-lsn *wal-durable-lsn*)
+         (saved-wal-xid-first-lsn *wal-xid-first-lsn*)
+         (saved-wal-snapshot-retention-pins *wal-snapshot-retention-pins*)
+         (saved-hook *wal-test-after-snapshot-boundary-registration-hook*)
+         (saved-release-hook *wal-test-after-snapshot-release-mark-hook*))
+    ;; These bindings are shared by both threads. The normal transaction state
+    ;; is process-global, so dynamically binding it in only the test thread
+    ;; would make the release side update a different active-snapshot count.
+    (setf *active-snapshots* 0
+          *active-snapshot-set* (make-hash-table :test #'eq)
+          *active-xids* nil
+          *next-xid* 9000
+          *wal-ready* t
+          *wal-poisoned* nil
+          *wal-end-lsn* 800
+          *wal-durable-lsn* 800
+          *wal-xid-first-lsn* (make-hash-table :test #'eql)
+          *wal-snapshot-retention-pins* (make-hash-table :test #'eq)
+          *wal-test-after-snapshot-release-mark-hook* nil
+          *wal-test-after-snapshot-boundary-registration-hook*
+          (lambda (token)
+            (declare (ignore token))
+            (sb-thread:with-mutex (test-lock)
+              (setf hook-entered t)
+              (sb-thread:condition-broadcast test-cv)
+              (loop until resume-capture
+                    do (sb-thread:condition-wait test-cv test-lock)))))
+    (unwind-protect
+         (progn
+           (setf worker
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (handler-case
+                        (progn
+                          (with-write-lock
+                            (wal-capture-snapshot-boundary-under-writer-lock
+                             0 registration))
+                          (setf capture-result :returned))
+                      (error (condition)
+                        (setf capture-error (princ-to-string condition)))))
+                  :name "snapshot boundary release race"))
+           (let ((entered
+                   (test-wait-until
+                    (lambda ()
+                      (sb-thread:with-mutex (test-lock) hook-entered))
+                    2.0)))
+             (check entered
+                    "snapshot boundary test pauses after registration")
+             (when entered
+               (release-snapshot-registration registration)
+               (check (and (zerop *active-snapshots*)
+                           (not (snapshot-registration-active-p registration)))
+                      "concurrent release clears the registered snapshot before pin publication"))
+             (sb-thread:with-mutex (test-lock)
+               (setf resume-capture t)
+               (sb-thread:condition-broadcast test-cv)))
+           (sb-thread:join-thread worker)
+           (setf worker nil)
+           (check (and (null capture-result)
+                       capture-error
+                       (search "snapshot registration was released"
+                               capture-error))
+                  "boundary capture rejects a registration released before pin publication")
+           (check (not (gethash registration *wal-snapshot-retention-pins*))
+                  "a released registration cannot leave a WAL retention pin")
+           (check (zerop *active-snapshots*)
+                  "snapshot release racing boundary capture keeps the active count balanced")
+           ;; Reuse is allowed after a completed release. Pause the second
+           ;; release after it marks the token unavailable but before it gets
+           ;; the WAL lock, then prove a new snapshot cannot steal its pin.
+           (setf *wal-test-after-snapshot-boundary-registration-hook* nil)
+           (with-write-lock
+             (wal-capture-snapshot-boundary-under-writer-lock 0 registration))
+           (setf *wal-test-after-snapshot-release-mark-hook*
+                 (lambda (token)
+                   (declare (ignore token))
+                   (sb-thread:with-mutex (test-lock)
+                     (setf release-marked t)
+                     (sb-thread:condition-broadcast test-cv)
+                     (loop until resume-release
+                           do (sb-thread:condition-wait test-cv test-lock))))
+                 release-worker
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (handler-case
+                        (release-snapshot-registration registration)
+                      (error (condition)
+                        (setf release-error (princ-to-string condition)))))
+                  :name "snapshot pin release"))
+           (let ((marked
+                   (test-wait-until
+                    (lambda ()
+                      (sb-thread:with-mutex (test-lock) release-marked))
+                    2.0)))
+             (check marked "pinned snapshot release pauses after token retirement")
+             (when marked
+               (setf reuse-error
+                     (handler-case
+                         (progn (make-snapshot 1 :register registration) nil)
+                       (error (condition) (princ-to-string condition))))
+               (check (and reuse-error (search "being released" reuse-error))
+                      "registration reuse waits until the old WAL pin is removed")
+               (check (zerop *active-snapshots*)
+                      "rejected registration reuse does not publish another snapshot"))
+             (sb-thread:with-mutex (test-lock)
+               (setf resume-release t)
+               (sb-thread:condition-broadcast test-cv)))
+           (sb-thread:join-thread release-worker)
+           (setf release-worker nil)
+           (check (null release-error) "pinned snapshot release completes")
+           (check (and (not (gethash registration *wal-snapshot-retention-pins*))
+                       (not (snapshot-registration-releasing-p registration))
+                       (zerop *active-snapshots*))
+                  "completed release clears the pin and makes the token reusable"))
+      (sb-thread:with-mutex (test-lock)
+        (setf resume-capture t)
+        (setf resume-release t)
+        (sb-thread:condition-broadcast test-cv))
+      (when worker
+        (sb-thread:join-thread worker))
+      (when release-worker
+        (sb-thread:join-thread release-worker))
+      (setf *wal-test-after-snapshot-boundary-registration-hook* nil
+            *wal-test-after-snapshot-release-mark-hook* nil)
+      (release-snapshot-registration registration)
+      (setf *active-snapshots* saved-active-snapshots
+            *active-snapshot-set* saved-active-snapshot-set
+            *active-xids* saved-active-xids
+            *next-xid* saved-next-xid
+            *wal-ready* saved-wal-ready
+            *wal-poisoned* saved-wal-poisoned
+            *wal-end-lsn* saved-wal-end-lsn
+            *wal-durable-lsn* saved-wal-durable-lsn
+            *wal-xid-first-lsn* saved-wal-xid-first-lsn
+            *wal-snapshot-retention-pins* saved-wal-snapshot-retention-pins
+            *wal-test-after-snapshot-boundary-registration-hook* saved-hook
+            *wal-test-after-snapshot-release-mark-hook* saved-release-hook))))
+
 (defun test-wal-chunked-catalog-record ()
   (let* ((test-pgdata (merge-pathnames "wal-catalog-chunks-test/" *pgdata*))
          (*pgdata* test-pgdata)
@@ -268,6 +475,65 @@
            (setf (symbol-function 'fsync-directory) original-fsync-directory)
            (when *wal-output-stream*
              (ignore-errors (close *wal-output-stream*)))))))
+
+(defun test-wal-checkpoint-retains-active-xid-segments ()
+  (let* ((test-pgdata (merge-pathnames "wal-active-xid-retention-test/" *pgdata*))
+         (*pgdata* test-pgdata)
+         (*active-xids* '(6401 6402))
+         (*next-xid* 6403)
+         (*active-snapshots* 0)
+         (*active-snapshot-set* (make-hash-table :test #'eq))
+         (*wal-ready* t)
+         (*wal-durable-lsn* (+ (* 2 +wal-segment-size+) 100))
+         (*wal-xid-first-lsn* (make-hash-table :test #'eql))
+         (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+         (*wal-poisoned* nil)
+         (*wal-output-stream* nil)
+         (*wal-output-segment* nil)
+         (checkpoint-lsn (+ (* 2 +wal-segment-size+) 100))
+         (registration (make-snapshot-registration)))
+    (wal-ensure-directory-durable *pgdata*)
+    (wal-ensure-directory-durable (wal-directory))
+    (unwind-protect
+         (progn
+           (dolist (segment '(0 1 2))
+             (with-open-file (stream (wal-segment-path segment)
+                                     :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede
+                                     :if-does-not-exist :create)
+               (write-byte 0 stream)))
+           (wal-record-page-xids-at-batch-start
+            (list (make-wal-page-image :xids '(6401)))
+            (+ +wal-segment-size+ +wal-header-size+))
+           (wal-record-page-xids-at-batch-start
+            (list (make-wal-page-image :xids '(6402))) +wal-header-size+)
+           (with-write-lock
+             (wal-capture-snapshot-boundary-under-writer-lock 0 registration))
+           (release-xid 6402)
+           (check (not (gethash 6402 *wal-xid-first-lsn*))
+                  "completed XID no longer owns the active-WAL pin")
+           (wal-remove-checkpointed-segments checkpoint-lsn)
+           (check (every (lambda (segment)
+                           (probe-file (wal-segment-path segment)))
+                         '(0 1 2))
+                  "checkpoint retains snapshot WAL after its XID ends")
+           (release-snapshot-registration registration)
+           (wal-remove-checkpointed-segments checkpoint-lsn)
+           (check (and (not (probe-file (wal-segment-path 0)))
+                       (probe-file (wal-segment-path 1))
+                       (probe-file (wal-segment-path 2)))
+                  "checkpoint advances after the snapshot releases its WAL pin")
+           (release-xid 6401)
+           (wal-remove-checkpointed-segments checkpoint-lsn)
+           (check (and (not (probe-file (wal-segment-path 1)))
+                       (probe-file (wal-segment-path 2)))
+                  "checkpoint retains the checkpoint segment after XID WAL is released"))
+      (when *wal-output-stream*
+        (ignore-errors (close *wal-output-stream*)))
+      (ignore-errors
+       (uiop:delete-directory-tree test-pgdata :validate t
+                                               :if-does-not-exist :ignore)))))
 
 (defun test-wal-checkpoint-skips-obsolete-prefix ()
   (let* ((test-pgdata (merge-pathnames "wal-checkpoint-scan-test/" *pgdata*))

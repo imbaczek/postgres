@@ -638,7 +638,10 @@ another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
   ;; No path takes these two locks in the opposite order.
   (sb-thread:with-mutex (*relation-lock-mutex*)
     (sb-thread:with-mutex (*xid-lock*)
-      (setf *active-xids* (delete xid *active-xids* :test #'=)))
+      (setf *active-xids* (delete xid *active-xids* :test #'=))
+      ;; WAL snapshot-boundary state shares the XID lock so removal from the
+      ;; active set and removal of its retained LSN remain one atomic change.
+      (wal-forget-xid-under-xid-lock xid))
     (dolist (registrations (list *relation-writers* *relation-readers*))
       (let ((empty-relations '()))
         (maphash (lambda (relfilenode xids)
@@ -672,18 +675,64 @@ another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
           (condition-wait-with-timeout *xact-cv* *xact-cv-mutex*)))) )
   (values))
 
-(defun make-snapshot (curcid &key register)
+(defun make-snapshot-under-xid-lock (curcid &key register)
+  "Build a snapshot while the caller holds *XID-LOCK*."
   (when (and register (not (snapshot-registration-p register)))
     (error "REGISTER must be a snapshot-registration token or NIL"))
+  (let* ((xmax *next-xid*)
+         (xip (copy-list *active-xids*))
+         (xmin (if xip (reduce #'min xip) xmax))
+         (snapshot (make-snapshot-struct :xmin xmin :xmax xmax
+                                         :xip xip :curcid curcid)))
+    (when register
+      (register-active-snapshot snapshot register))
+    snapshot))
+
+(defun make-snapshot (curcid &key register)
   (sb-thread:with-mutex (*xid-lock*)
-    (let* ((xmax *next-xid*)
-           (xip (copy-list *active-xids*))
-           (xmin (if xip (reduce #'min xip) xmax))
-           (snapshot (make-snapshot-struct :xmin xmin :xmax xmax
-                                           :xip xip :curcid curcid)))
-      (when register
-        (register-active-snapshot snapshot register))
-      snapshot)))
+    (make-snapshot-under-xid-lock curcid :register register)))
+
+(defvar *wal-test-after-snapshot-boundary-registration-hook* nil)
+
+(defun wal-capture-snapshot-boundary-under-writer-lock (curcid register)
+  "Capture a registered MVCC snapshot and its matching WAL position.
+
+The caller holds *WRITE-LOCK*. This establishes the same brief writer barrier
+used by logical slot startpoint selection in PostgreSQL; holding WAL before XID
+publication makes the snapshot and durable WAL end one boundary. The returned
+restart LSN reaches back to the earliest page batch that contains an XID still
+active in the snapshot. Its registration pins that WAL position until release."
+  (unless (snapshot-registration-p register)
+    (error "WAL snapshot boundaries require a snapshot-registration token"))
+  (unless *wal-ready*
+    (ereport "55000" "cannot capture a replication snapshot before WAL startup"))
+  (sb-thread:with-mutex (*wal-lock*)
+    (wal-check-healthy)
+    (sb-thread:with-mutex (*xid-lock*)
+      (let* ((snapshot (make-snapshot-under-xid-lock curcid
+                                                     :register register))
+             (boundary-lsn *wal-durable-lsn*)
+             (restart-lsn boundary-lsn))
+        (when *wal-test-after-snapshot-boundary-registration-hook*
+          (funcall *wal-test-after-snapshot-boundary-registration-hook*
+                   register))
+        (dolist (xid (snapshot-xip snapshot))
+          (let ((first-lsn (gethash xid *wal-xid-first-lsn*)))
+            (when (and first-lsn (< first-lsn restart-lsn))
+              (setf restart-lsn first-lsn))))
+        ;; Keep the returned restart point alive after active XIDs finish.
+        ;; The registered snapshot owns this pin until its caller releases
+        ;; the registration or a durable replication slot takes over.
+        (sb-thread:with-mutex (*snapshot-count-lock*)
+          (unless (and (snapshot-registration-active-p register)
+                       (eq snapshot
+                           (snapshot-registration-snapshot register)))
+            (error "snapshot registration was released during WAL boundary capture"))
+          (sb-sys:without-interrupts
+            (setf (gethash register *wal-snapshot-retention-pins*) restart-lsn
+                  (snapshot-registration-wal-retention-lsn register)
+                  restart-lsn)))
+        (values snapshot boundary-lsn restart-lsn)))))
 
 (defun oldest-xmin (&optional exclude-snapshot)
   "Capture the oldest XID protected by a snapshot or active transaction."

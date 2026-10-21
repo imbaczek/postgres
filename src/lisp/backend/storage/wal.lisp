@@ -22,12 +22,16 @@
   version type xid start end payload)
 
 (defstruct wal-page-image
-  relfilenode (fork :main) block page)
+  relfilenode (fork :main) block page (xids '()))
 
 (defvar *wal-lock* (sb-thread:make-mutex :name "pg wal and page cache lock"))
 (defvar *wal-page-cache* (make-hash-table :test #'equal))
+(defvar *wal-page-cache-xids* (make-hash-table :test #'equal))
 (defvar *wal-page-batch* nil)
+(defvar *wal-page-batch-xids* nil)
 (defvar *wal-page-batch-split* nil)
+(defvar *wal-xid-first-lsn* (make-hash-table :test #'eql))
+(defvar *wal-snapshot-retention-pins* (make-hash-table :test #'eq))
 (defvar *wal-pending-btree-split* nil)
 (defvar *wal-pending-deletes* '())
 (defvar *wal-catalog-flush-generation* 0)
@@ -48,6 +52,11 @@
 (defvar *wal-test-after-vacuum-full-catalog-flush-hook* nil)
 (defvar *wal-test-pause-lock*
   (sb-thread:make-mutex :name "pg WAL test pause"))
+
+;; BACKEND is defined later in the ASDF component order; its accessor cannot be
+;; inlined safely into this earlier storage component.
+(declaim (special *backend* *xid-lock* *active-xids*)
+         (notinline backend-xid))
 (defvar *wal-recovery-group-active* nil)
 (defvar *wal-recovery-page-images* '())
 (defvar *wal-recovery-catalog-chunks* '())
@@ -55,7 +64,9 @@
 (defvar *wal-recovery-catalog-next-chunk* 0)
 
 (declaim (ftype function wal-test-pause wal-test-pause-once
-                wal-remove-checkpointed-segments wal-atomic-write-bytes
+                wal-remove-checkpointed-segments
+                wal-remove-checkpointed-segments-under-wal-lock
+                wal-atomic-write-bytes
                 clog-set clog-reset clog-fsync))
 (declaim (notinline pg-class-relfilenode pg-index-relfilenode
                     database-tables database-indexes catalog-databases))
@@ -204,6 +215,27 @@
         (gethash key *wal-page-cache*)
         (smgr-read relfilenode block fork))))
 
+(defun wal-note-page-xid-under-lock (key)
+  "Record the current transaction as a contributor to KEY's staged page."
+  (let ((xid (and *backend* (backend-xid *backend*))))
+    (when xid
+      (let* ((contributors
+               (if *wal-page-batch*
+                   *wal-page-batch-xids*
+                   *wal-page-cache-xids*))
+             (xids (gethash key contributors)))
+        (unless (member xid xids :test #'eql)
+          (setf (gethash key contributors) (cons xid xids))))))
+  (values))
+
+(defun wal-merge-page-xids (source destination)
+  (when source
+    (maphash (lambda (key xids)
+               (dolist (xid xids)
+                 (pushnew xid (gethash key destination) :test #'eql)))
+             source))
+  (values))
+
 (defmacro with-wal-page-state-lock (&body body)
   "Use the current page batch, or lock the shared WAL page state."
   `(if *wal-page-batch*
@@ -228,7 +260,8 @@
       (setf (gethash key (if *wal-page-batch*
                              *wal-page-batch*
                              *wal-page-cache*))
-            copy)))
+            copy)
+      (wal-note-page-xid-under-lock key)))
   (wal-test-pause :after-page-stage)
   (values))
 
@@ -262,6 +295,7 @@
                              *wal-page-batch*
                              *wal-page-cache*))
                 (wal-copy-dirty-page page))
+          (wal-note-page-xid-under-lock (wal-page-key relfilenode block fork))
           (unless *wal-page-batch*
             (wal-test-pause :after-page-stage))
           block))))
@@ -272,12 +306,15 @@
        (progn ,@body)
        (sb-thread:with-mutex (*wal-lock*)
          (let ((*wal-page-batch* (make-hash-table :test #'equal))
+               (*wal-page-batch-xids* (make-hash-table :test #'equal))
                (*wal-page-batch-split* nil))
            (multiple-value-prog1
                (progn ,@body)
              (maphash (lambda (key page)
                         (setf (gethash key *wal-page-cache*) page))
                       *wal-page-batch*)
+             (wal-merge-page-xids *wal-page-batch-xids*
+                                  *wal-page-cache-xids*)
              (when *wal-page-batch-split*
                (setf *wal-pending-btree-split* t)))))))
 
@@ -295,7 +332,9 @@
                    (when (eql (first key) relfilenode)
                      (push key keys)))
                  *wal-page-cache*)
-        (dolist (key keys) (remhash key *wal-page-cache*)))))
+        (dolist (key keys)
+          (remhash key *wal-page-cache*)
+          (remhash key *wal-page-cache-xids*)))))
   (values))
 
 (defun wal-page-images (&optional excluded-relfilenodes)
@@ -305,7 +344,10 @@
                  (push (make-wal-page-image :relfilenode (first key)
                                             :fork (second key)
                                             :block (third key)
-                                            :page (copy-seq page))
+                                            :page (copy-seq page)
+                                            :xids (copy-list
+                                                   (gethash key
+                                                            *wal-page-cache-xids*)))
                        images)))
              *wal-page-cache*)
     (sort images
@@ -501,8 +543,37 @@
   images)
 
 (defun wal-append-batch-start ()
-  (wal-append-record +wal-record-batch-start+ 0
-                     (make-array 0 :element-type '(unsigned-byte 8))))
+  (let ((start (wal-next-record-start +wal-header-size+)))
+    (wal-append-record +wal-record-batch-start+ 0
+                       (make-array 0 :element-type '(unsigned-byte 8)))
+    start))
+
+(defun wal-forget-xid-under-xid-lock (xid)
+  "Remove XID's retained WAL position while the caller holds *XID-LOCK*."
+  (remhash xid *wal-xid-first-lsn*)
+  (values))
+
+(defun wal-record-page-xids-at-batch-start (images batch-start-lsn)
+  "Retain the first batch position for each active page contributor in IMAGES.
+
+Call with *WAL-LOCK* held. The WAL->XID order matches commit publication and
+the snapshot boundary capture path. PostgreSQL's logical decoding similarly
+keeps transaction state until commit records establish which changes belong to
+the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
+  (let ((xids (remove-duplicates
+               (loop for image in images
+                     append (wal-page-image-xids image))
+               :test #'eql)))
+    (when xids
+      (sb-thread:with-mutex (*xid-lock*)
+        (dolist (xid xids)
+          (when (member xid *active-xids* :test #'eql)
+            (multiple-value-bind (first-lsn present-p)
+                (gethash xid *wal-xid-first-lsn*)
+              (declare (ignore first-lsn))
+              (unless present-p
+                (setf (gethash xid *wal-xid-first-lsn*) batch-start-lsn)))))))
+    (values)))
 
 (defun wal-apply-page-images (images &key split-p fault-on-first-write)
   (let ((paused nil))
@@ -530,22 +601,29 @@
                          (member (first key) excluded-relfilenodes :test #'eql))
                  (push key keys)))
              *wal-page-cache*)
-    (dolist (key keys) (remhash key *wal-page-cache*)))
+    (dolist (key keys)
+      (remhash key *wal-page-cache*)
+      (remhash key *wal-page-cache-xids*)))
   (values))
 
 (defun wal-discard-relation-pages (relfilenodes)
   "Forget staged images for unpublished detached relations in RELFILENODES."
   (sb-thread:with-mutex (*wal-lock*)
-    (dolist (table (list *wal-page-cache* *wal-page-batch*))
-      (when (hash-table-p table)
-        (let ((keys '()))
-          (maphash (lambda (key image)
-                     (declare (ignore image))
-                     (when (member (first key) relfilenodes :test #'eql)
-                       (push key keys)))
-                   table)
-          (dolist (key keys)
-            (remhash key table))))))
+    (dolist (pair (list (cons *wal-page-cache* *wal-page-cache-xids*)
+                        (cons *wal-page-batch* *wal-page-batch-xids*)))
+      (let ((pages (car pair))
+            (contributors (cdr pair)))
+        (when (hash-table-p pages)
+          (let ((keys '()))
+            (maphash (lambda (key image)
+                       (declare (ignore image))
+                       (when (member (first key) relfilenodes :test #'eql)
+                         (push key keys)))
+                     pages)
+            (dolist (key keys)
+              (remhash key pages)
+              (when (hash-table-p contributors)
+                (remhash key contributors))))))))
   (values))
 
 (defun wal-commit-transaction (xid after-durable-function)
@@ -556,7 +634,8 @@
   (with-wal-critical
     (let* ((split-p *wal-pending-btree-split*)
            (images (wal-page-images)))
-      (wal-append-batch-start)
+      (wal-record-page-xids-at-batch-start
+       images (wal-append-batch-start))
       (wal-append-page-images images)
       ;; This hook leaves complete page records in the file without a
       ;; terminal record, so recovery must discard this entire batch.
@@ -580,7 +659,8 @@
   (with-wal-critical
     (let* ((split-p *wal-pending-btree-split*)
            (images (wal-page-images)))
-      (wal-append-batch-start)
+      (wal-record-page-xids-at-batch-start
+       images (wal-append-batch-start))
       (wal-append-page-images images)
       (wal-append-record +wal-record-maintenance+ 0
                          (make-array 0 :element-type '(unsigned-byte 8)))
@@ -739,7 +819,8 @@
            (commit-payload (when chunked-p
                              (wal-encode-catalog-commit-payload
                               catalog-payload chunk-count))))
-      (wal-append-batch-start)
+      (wal-record-page-xids-at-batch-start
+       images (wal-append-batch-start))
       (wal-append-page-images images)
       (when chunked-p
         (wal-append-catalog-chunks catalog-payload chunk-count)
@@ -1191,6 +1272,9 @@
             *wal-ready* t
             *wal-poisoned* nil
             *wal-page-cache* (make-hash-table :test #'equal)
+            *wal-page-cache-xids* (make-hash-table :test #'equal)
+            *wal-xid-first-lsn* (make-hash-table :test #'eql)
+            *wal-snapshot-retention-pins* (make-hash-table :test #'eq)
             *wal-pending-deletes* '()
             *wal-pending-btree-split* nil
             *wal-output-stream* nil
@@ -1289,7 +1373,8 @@
   (with-write-lock
     (with-wal-critical
       (let ((images (wal-page-images)))
-        (wal-append-batch-start)
+        (wal-record-page-xids-at-batch-start
+         images (wal-append-batch-start))
         (wal-append-page-images images)
         (let ((checkpoint-end
                 (wal-append-record
@@ -1306,13 +1391,46 @@
           (fsync-directory (merge-pathnames "global/" *pgdata*))
           (wal-save-checkpoint-control checkpoint-end)
           (wal-test-pause :after-checkpoint-control)
-          (wal-remove-checkpointed-segments checkpoint-end)))))
+          (wal-remove-checkpointed-segments-under-wal-lock
+           checkpoint-end)))))
   (values))
 
 (defun wal-remove-checkpointed-segments (checkpoint-lsn)
-  (let* ((keep-segment (if (zerop checkpoint-lsn)
-                           0
-                           (floor (1- checkpoint-lsn) +wal-segment-size+)))
+  (with-wal-critical
+    (wal-remove-checkpointed-segments-under-wal-lock checkpoint-lsn))
+  (values))
+
+(defun wal-remove-checkpointed-segments-under-wal-lock (checkpoint-lsn)
+  "Recycle WAL while preserving active XID and checkpoint restart positions.
+
+The caller holds *WAL-LOCK*. The checkpoint path also holds *WRITE-LOCK*, so a
+snapshot boundary cannot capture an active XID while its required segment is
+being removed. XID completion can race with recycling; reading the retention
+map under *XID-LOCK* makes that race conservative and safe."
+  (let* ((checkpoint-segment (if (zerop checkpoint-lsn)
+                                 0
+                                 (floor (1- checkpoint-lsn)
+                                        +wal-segment-size+)))
+         (oldest-active-first-lsn
+           (sb-thread:with-mutex (*xid-lock*)
+             (when (plusp (hash-table-count *wal-xid-first-lsn*))
+               (loop for lsn being the hash-values of *wal-xid-first-lsn*
+                     minimize lsn))))
+         (oldest-snapshot-pin-lsn
+           (when (plusp (hash-table-count *wal-snapshot-retention-pins*))
+             (loop for lsn being the hash-values
+                     of *wal-snapshot-retention-pins*
+                   minimize lsn)))
+         (oldest-retained-lsn
+           (cond ((and oldest-active-first-lsn oldest-snapshot-pin-lsn)
+                  (min oldest-active-first-lsn oldest-snapshot-pin-lsn))
+                 (oldest-active-first-lsn oldest-active-first-lsn)
+                 (oldest-snapshot-pin-lsn oldest-snapshot-pin-lsn)))
+         (xid-retention-segment
+           (if oldest-retained-lsn
+               (floor oldest-retained-lsn +wal-segment-size+)
+               checkpoint-segment))
+         (keep-segment (min checkpoint-segment xid-retention-segment))
          (removed nil))
     (dolist (segment (wal-discover-segments))
       (when (< segment keep-segment)
@@ -1321,7 +1439,7 @@
           (close *wal-output-stream*)
           (setf *wal-output-stream* nil *wal-output-segment* nil))
         ;; Delete only a contiguous prefix. Continuing after a failed unlink
-        ;; could leave a hole before the checkpoint segment and block startup.
+        ;; could leave a hole before a retained segment and block startup.
         (handler-case
             (progn
               (delete-file (wal-segment-path segment))
@@ -1337,7 +1455,8 @@
              (images (wal-page-images))
              (payload (make-array 8 :element-type '(unsigned-byte 8)
                                     :initial-element 0)))
-        (wal-append-batch-start)
+        (wal-record-page-xids-at-batch-start
+         images (wal-append-batch-start))
         (wal-append-page-images images)
         (wal-set-u64 payload 0 next-xid)
         (wal-append-record +wal-record-clog-reset+ next-xid payload)
