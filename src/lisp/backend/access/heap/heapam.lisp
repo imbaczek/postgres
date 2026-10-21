@@ -367,13 +367,24 @@
       (make-snapshot (backend-command-id *backend*))
       fallback))
 
+(defun repeatable-read-conflict-p (xid)
+  "Whether XID committed after the current transaction snapshot was taken."
+  (let ((snapshot (and *backend*
+                       (eq (backend-isolation-level *backend*) :repeatable-read)
+                       (backend-transaction-snapshot *backend*))))
+    (and snapshot
+         (or (>= xid (snapshot-xmax snapshot))
+             (member xid (snapshot-xip snapshot) :test #'=)))))
+
 (defun heapam-delete-tid (relfilenode columns block offnum xid cid
                           &optional (matches-p (constantly t)))
   "Delete the latest qualifying version of TID, waiting for a writer.
 
-After a conflicting update commits, follow its ctid chain and evaluate
-MATCHES-P against the refreshed row before claiming it. Return T, the tuple
-whose xmax was set, and that tuple's physical block and offset."
+Under READ COMMITTED, follow a committed update's ctid chain and evaluate
+MATCHES-P against the refreshed row before claiming it. Under REPEATABLE READ,
+return a serialization-conflict status when the row changed after the retained
+snapshot. Return T, the tuple whose xmax was set, its physical location, and a
+status keyword."
   (register-relation-writer relfilenode xid)
   (let ((target-block block)
         (target-offnum offnum)
@@ -401,12 +412,24 @@ whose xmax was set, and that tuple's physical block and offset."
                      (list :wait (htup-xmax tuple)))
                     ((and (not (zerop (htup-xmax tuple)))
                           (xid-committed-p (htup-xmax tuple)))
-                     (if (or (/= (htup-ctid-block tuple) target-block)
-                             (/= (htup-ctid-offnum tuple) target-offnum))
-                         (list :follow (htup-ctid-block tuple)
-                               (htup-ctid-offnum tuple)
-                               (htup-xmax tuple))
-                         :skip))
+                     (let ((updated-p
+                             (or (/= (htup-ctid-block tuple) target-block)
+                                 (/= (htup-ctid-offnum tuple) target-offnum))))
+                       (cond
+                         ((repeatable-read-conflict-p (htup-xmax tuple))
+                          (list (if updated-p
+                                    :serialization-update-conflict
+                                    :serialization-delete-conflict)
+                                (htup-xmax tuple)))
+                         (updated-p
+                          (if (and *backend*
+                                   (eq (backend-isolation-level *backend*)
+                                       :repeatable-read))
+                              :skip
+                              (list :follow (htup-ctid-block tuple)
+                                    (htup-ctid-offnum tuple)
+                                    (htup-xmax tuple))))
+                         (t :skip))))
                     ((not (heap-tuple-visible-p
                            (htup-xmin tuple) (htup-xmax tuple) (htup-cid tuple)
                            snapshot
@@ -423,17 +446,24 @@ whose xmax was set, and that tuple's physical block and offset."
                     (t :skip))))))
         (case (if (consp action) (car action) action)
           (:done (return (values t (second action)
-                                 target-block target-offnum)))
-          (:skip (return (values nil nil nil nil)))
+                                 target-block target-offnum :ok)))
+          (:skip (return (values nil nil nil nil :skip)))
+          (:serialization-update-conflict
+           (return (values nil nil nil nil :serialization-update-conflict)))
+          (:serialization-delete-conflict
+           (return (values nil nil nil nil :serialization-delete-conflict)))
           (:wait
            (wait-for-xid (second action))
            ;; Revisit this same TID after the writer ends; it is not a chain loop.
            (remhash (cons target-block target-offnum) visited)
            ;; READ COMMITTED rechecks a row after its conflicting writer ends.
-           ;; Keep the original statement snapshot for every other scanned TID.
-           (setf snapshot (fresh-delete-snapshot snapshot))
-           (when *backend*
-             (setf (backend-snapshot *backend*) snapshot)))
+           ;; REPEATABLE READ retains its original horizon and reports a write
+           ;; conflict if the waited-for transaction committed the row.
+           (when (or (null *backend*)
+                     (eq (backend-isolation-level *backend*) :read-committed))
+             (setf snapshot (fresh-delete-snapshot snapshot))
+             (when *backend*
+               (setf (backend-snapshot *backend*) snapshot))))
           (:follow
            (setf target-block (second action)
                  target-offnum (third action)

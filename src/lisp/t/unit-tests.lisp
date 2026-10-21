@@ -121,6 +121,7 @@
       (test-session-setting-rollback)
       (test-transaction-snapshot-lifecycle)
       (test-transaction-isolation-controls)
+      (test-repeatable-read-write-conflict-horizon)
       (test-parse-error-aborts-transaction)
       (test-xid-wraparound-freezes-tuples)
       (test-xid-wraparound-fault-recovery)

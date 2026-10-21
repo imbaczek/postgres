@@ -1,5 +1,5 @@
 #!/bin/sh
-# t/update-concurrency.sh -- READ COMMITTED UPDATE conflict rechecks.
+# t/update-concurrency.sh -- READ COMMITTED rechecks and REPEATABLE READ conflicts.
 set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
@@ -90,6 +90,55 @@ finish_writer() {
     exec 3>&-
     wait "$WRITER" || fail "writer transaction failed"
     WRITER=
+}
+
+start_repeatable_reader() {
+    fifo=$1
+    output=$2
+    marker=$3
+    query=$4
+    mkfifo "$fifo"
+    PGPASSWORD=x psql -X -q -h 127.0.0.1 -p "$PORT" -U postgres -d postgres \
+        -A -t > "$output" 2>&1 < "$fifo" &
+    WAITER=$!
+    exec 4> "$fifo"
+    printf '\\set VERBOSITY verbose\nbegin isolation level repeatable read;\n%s;\nselect %s;\n' \
+        "$query" "$marker" >&4
+    wait_for_marker "$output" "$marker"
+}
+
+finish_repeatable_reader() {
+    printf 'rollback;\n\\q\n' >&4
+    exec 4>&-
+    wait "$WAITER" || fail "repeatable-read reader session failed"
+    WAITER=
+}
+
+check_repeatable_read_conflict() {
+    name=$1
+    reader_select=$2
+    writer_statement=$3
+    reader_statement=$4
+    expected_error=$5
+    verification_query=$6
+    expected_value=$7
+    reader_marker=$8
+    writer_marker=$9
+
+    start_repeatable_reader "$TMP/$name-reader.sql" "$TMP/$name-reader.out" \
+        "$reader_marker" "$reader_select"
+    start_writer "$TMP/$name-writer.sql" "$TMP/$name-writer.out" \
+        "$writer_marker" "$writer_statement"
+    printf '%s;\n' "$reader_statement" >&4
+    await_xid_wait
+    finish_writer
+    wait_for_marker "$TMP/$name-reader.out" "40001"
+    grep -q "$expected_error" "$TMP/$name-reader.out" \
+        || fail "$name returned the wrong serialization failure"
+    finish_repeatable_reader
+    actual=$(scalar -c "$verification_query")
+    [ "$actual" = "$expected_value" ] \
+        || fail "$name left unexpected row state: $actual"
 }
 
 test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" \
@@ -185,5 +234,38 @@ run -c "drop index delete_predicate_value_idx" >/dev/null
 sequential_rows=$(scalar -c 'select id from delete_predicate where value = 2')
 [ "$indexed_rows" = "$sequential_rows" ] \
     || fail "indexed and sequential results differed after DELETE and VACUUM"
+
+# A transaction-level snapshot that predates another writer's commit must fail
+# when it tries to update the row version that writer replaced.
+run -c "create table rr_update_conflict (id int, value int)" >/dev/null
+run -c "insert into rr_update_conflict values (1, 1)" >/dev/null
+check_repeatable_read_conflict rr-update \
+    "select value from rr_update_conflict where id = 1" \
+    "update rr_update_conflict set value = 2 where id = 1" \
+    "update rr_update_conflict set value = 3 where id = 1" \
+    "could not serialize access due to concurrent update" \
+    "select value from rr_update_conflict where id = 1" 2 74104 74105
+
+# DELETE uses the same heap update-chain result and must also abort on a
+# post-snapshot UPDATE instead of following the new version.
+run -c "create table rr_delete_conflict (id int, value int)" >/dev/null
+run -c "insert into rr_delete_conflict values (1, 1)" >/dev/null
+check_repeatable_read_conflict rr-delete-update \
+    "select value from rr_delete_conflict where id = 1" \
+    "update rr_delete_conflict set value = 2 where id = 1" \
+    "delete from rr_delete_conflict where id = 1" \
+    "could not serialize access due to concurrent update" \
+    "select value from rr_delete_conflict where id = 1" 2 74106 74107
+
+# A concurrent DELETE keeps ctid on the old tuple, but it still conflicts with
+# an UPDATE based on the retained snapshot.
+run -c "create table rr_delete_row_conflict (id int, value int)" >/dev/null
+run -c "insert into rr_delete_row_conflict values (1, 1)" >/dev/null
+check_repeatable_read_conflict rr-delete-row \
+    "select value from rr_delete_row_conflict where id = 1" \
+    "delete from rr_delete_row_conflict where id = 1" \
+    "update rr_delete_row_conflict set value = 3 where id = 1" \
+    "could not serialize access due to concurrent delete" \
+    "select value from rr_delete_row_conflict where id = 1" "" 74108 74109
 
 echo "update-concurrency: PASS"

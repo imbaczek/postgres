@@ -917,11 +917,6 @@ before this removal horizon is captured."
                        '(:insert :update :delete :create-table :drop-table
                          :create-index :drop-index :alter-index :alter-table)))
       (ereport "25006" "cannot execute write statement in a read-only transaction"))
-    ;; The first REPEATABLE READ milestone is read-only. Writable transactions
-    ;; are enabled once heap update-chain conflicts return serialization errors.
-    (when (and (eq (backend-isolation-level *backend*) :repeatable-read)
-               (member (getf ast :type) '(:insert :update :delete)))
-      (ereport "0A000" "writable REPEATABLE READ transactions are not supported yet"))
     (when (and (ddl-p ast) (backend-explicit *backend*))
       (ereport "0A000"
                "DDL is not supported inside an explicit transaction block"))

@@ -298,11 +298,6 @@
                                       "BEGIN ISOLATION LEVEL REPEATABLE READ; "
                                       "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED; "
                                       "SHOW transaction_isolation; ROLLBACK;"))
-      (exec-simple-query stream
-                         "BEGIN ISOLATION LEVEL REPEATABLE READ; INSERT INTO missing VALUES (1);")
-      (check (eq (backend-state *backend*) :aborted)
-             "writable REPEATABLE READ is rejected until conflict handling is available")
-      (exec-simple-query stream "ROLLBACK")
       (check (eq (backend-state *backend*) :idle)
              "transaction controls leave the backend idle after rollback")
       (check (eq (backend-isolation-level *backend*) :read-committed)
@@ -343,6 +338,22 @@
                    (test-show-timezone-values path)))
     (check (zerop *active-snapshots*)
            "isolation control and rollback paths release transaction snapshots")))
+
+(defun test-repeatable-read-write-conflict-horizon ()
+  (let* ((*backend* (make-backend))
+         (backend *backend*))
+    (setf (backend-isolation-level backend) :repeatable-read
+          (backend-transaction-snapshot backend)
+          (make-snapshot-struct :xmin 100 :xmax 120 :xip '(115) :curcid 1))
+    (check (repeatable-read-conflict-p 120)
+           "a committed XID at the snapshot xmax is a write conflict")
+    (check (repeatable-read-conflict-p 115)
+           "an XID active when the repeatable-read snapshot was taken is a write conflict")
+    (check (not (repeatable-read-conflict-p 119))
+           "a committed XID below xmax and outside xip predates the snapshot")
+    (setf (backend-isolation-level backend) :read-committed)
+    (check (not (repeatable-read-conflict-p 120))
+           "READ COMMITTED does not use the retained-snapshot conflict rule")))
 
 (defun test-xid-wraparound-freezes-tuples ()
   ;; Deterministic one-cycle counterpart to xid_wraparound/t/003_wraparounds.pl.
