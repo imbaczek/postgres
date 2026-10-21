@@ -289,6 +289,10 @@ INSERT 0 5
 Project
   Filter
     Seq Scan on index_scan_events
+Project (actual time=<timing> rows=3.00 loops=1)
+  Filter (actual time=<timing> rows=3.00 loops=1)
+    Seq Scan on index_scan_events (actual time=<timing> rows=5.00 loops=1)
+Execution Time: <timing> ms
 1
 2
 5
@@ -296,6 +300,10 @@ CREATE INDEX
 Project
   Filter
     Index Scan using index_scan_events_category_idx on index_scan_events
+Project (actual time=<timing> rows=3.00 loops=1)
+  Filter (actual time=<timing> rows=3.00 loops=1)
+    Index Scan using index_scan_events_category_idx on index_scan_events (actual time=<timing> rows=3.00 loops=1)
+Execution Time: <timing> ms
 1
 2
 5
@@ -347,18 +355,35 @@ Project
 ||4|right-only
 |left-null||
 |||right-null
+Project (actual time=<timing> rows=1.00 loops=1)
+  HashAggregate (actual time=<timing> rows=1.00 loops=1)
+    Nested Loop Left Join (actual time=<timing> rows=5.00 loops=1)
+      Seq Scan on join_left (actual time=<timing> rows=4.00 loops=1)
+      Seq Scan on join_right (actual time=<timing> rows=5.00 loops=1)
+Execution Time: <timing> ms
+5
+7
 CREATE TABLE
 INSERT 0 4
-Sort
-  Project
-    HashAggregate
-      Nested Loop Inner Join
-        Seq Scan on tenk1
-        Seq Scan on tenk1
+Sort (actual time=<timing> rows=4.00 loops=1)
+  Project (actual time=<timing> rows=4.00 loops=1)
+    HashAggregate (actual time=<timing> rows=4.00 loops=1)
+      Nested Loop Inner Join (actual time=<timing> rows=8.00 loops=1)
+        Seq Scan on tenk1 (actual time=<timing> rows=4.00 loops=1)
+        Seq Scan on tenk1 (actual time=<timing> rows=4.00 loops=1)
+Execution Time: <timing> ms
 20|100|2
 20|200|2
 10|100|2
 10|200|2
+Project (actual time=<timing> rows=1.00 loops=1)
+  HashAggregate (actual time=<timing> rows=1.00 loops=1)
+    Filter (actual time=<timing> rows=8.00 loops=1)
+      Nested Loop Cross Join (actual time=<timing> rows=16.00 loops=1)
+        Seq Scan on tenk1 (actual time=<timing> rows=4.00 loops=1)
+        Seq Scan on tenk1 (actual time=<timing> rows=4.00 loops=1)
+Execution Time: <timing> ms
+8
 DROP TABLE
 1|
 2|
@@ -450,6 +475,9 @@ Project
 Project
   HashAggregate
     Seq Scan on aggregate_events
+Project (actual time=<timing> rows=1.00 loops=1)
+  Result (actual time=<timing> rows=1.00 loops=1)
+Execution Time: <timing> ms
 10
 10|2
 10|first|1

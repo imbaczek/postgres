@@ -134,9 +134,16 @@
           :table (strip-schema (pident p)))))
 
 (defun parse-explain (p)
-  (if (match-kw p "select")
-      (list :type :explain :statement (parse-select p))
-      (ereport "0A000" "EXPLAIN currently supports SELECT only")))
+  (let ((analyze-p (match-kw p "analyze")))
+    (when (match-punct p #\()
+      (unless (match-kw p "analyze")
+        (ereport "0A000" "EXPLAIN currently supports only the ANALYZE option"))
+      (expect-punct p #\))
+      (setf analyze-p t))
+    (if (match-kw p "select")
+        (list :type :explain :analyze-p analyze-p
+              :statement (parse-select p))
+        (ereport "0A000" "EXPLAIN currently supports SELECT only"))))
 
 ;;; ---- SELECT ----
 

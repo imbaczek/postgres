@@ -54,6 +54,14 @@ start_server
 PGPASSWORD=x psql -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres \
     -v ON_ERROR_STOP=0 -A -t -F'|' < "$BASE/t/psql-smoke-persist.sql" >> "$OUT" 2>&1 || true
 
+# EXPLAIN ANALYZE reports measured timings; normalize only those volatile
+# numbers so the regression transcript remains deterministic.
+sed -E \
+    -e 's/actual time=[0-9]+\.[0-9]+\.\.[0-9]+\.[0-9]+ rows=/actual time=<timing> rows=/' \
+    -e 's/Execution Time: [0-9]+\.[0-9]+ ms/Execution Time: <timing> ms/' \
+    "$OUT" > "$TMP/normalized-out"
+mv "$TMP/normalized-out" "$OUT"
+
 if [ "${UPDATE_EXPECTED:-0}" = "1" ]; then
     cp "$OUT" "$GOLDEN"
     echo "psql-smoke: updated expected output"

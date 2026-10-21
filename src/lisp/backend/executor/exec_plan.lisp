@@ -6,6 +6,10 @@
   estimated-rows
   estimated-cost
   actual-rows
+  (actual-row-count 0)
+  (actual-loops 0)
+  (actual-startup-time-ticks 0)
+  (actual-total-time-ticks 0)
   selection-rule)
 
 (defstruct (query-plan (:constructor %make-query-plan))
@@ -20,8 +24,12 @@
   compiler)
 
 (defvar *query-plan-backends* (make-hash-table :test #'eq))
+(defvar *query-plan-instrumentation-p* nil)
 (defvar *query-plan-backend-lock*
   (sb-thread:make-mutex :name "pg query-plan backend registry"))
+
+(defun internal-time-ticks->milliseconds (ticks)
+  (* 1000.0d0 (/ ticks internal-time-units-per-second)))
 
 (defun query-plan-backend-entry (name)
   (sb-thread:with-mutex (*query-plan-backend-lock*)
@@ -245,13 +253,51 @@ ROW-CALLBACK."
 (defun interpret-query-plan (plan registered-relations row-callback)
   "Reference interpreter for physical S-expression plans."
   (let ((metadata-map (query-plan-metadata plan)))
+    (when *query-plan-instrumentation-p*
+      (maphash (lambda (node metadata)
+                 (declare (ignore node))
+                 (setf (plan-node-metadata-actual-rows metadata) nil
+                       (plan-node-metadata-actual-row-count metadata) 0
+                       (plan-node-metadata-actual-loops metadata) 0
+                       (plan-node-metadata-actual-startup-time-ticks metadata) 0
+                       (plan-node-metadata-actual-total-time-ticks metadata) 0))
+               metadata-map))
     (labels
         ((run-node (node callback)
            (let ((metadata (gethash node metadata-map))
-                 (emitted 0))
+                 (emitted 0)
+                 (started (when *query-plan-instrumentation-p*
+                            (get-internal-real-time)))
+                 (startup-time nil)
+                 (callback-time 0)
+                 (child-total-time 0))
              (labels ((emit (row)
                         (incf emitted)
-                        (funcall callback row)))
+                        (when (and started (null startup-time))
+                          (setf startup-time
+                                (- (get-internal-real-time) started)))
+                        (if started
+                            (let ((callback-start (get-internal-real-time)))
+                              (unwind-protect
+                                   (funcall callback row)
+                                (incf callback-time
+                                      (- (get-internal-real-time)
+                                         callback-start))))
+                            (funcall callback row)))
+                      (run-child (child child-callback)
+                        (let* ((child-metadata (gethash child metadata-map))
+                               (old-total-time
+                                 (if child-metadata
+                                     (plan-node-metadata-actual-total-time-ticks
+                                      child-metadata)
+                                     0)))
+                          (unwind-protect
+                               (run-node child child-callback)
+                            (when (and started child-metadata)
+                              (incf child-total-time
+                                    (- (plan-node-metadata-actual-total-time-ticks
+                                        child-metadata)
+                                       old-total-time)))))))
                (unwind-protect
                     (case (first node)
                       (:result (emit #()))
@@ -268,7 +314,7 @@ ROW-CALLBACK."
                             (emit (htup-values tuple))))))
                       (:filter
                        (let ((qual (second node)))
-                         (run-node
+                         (run-child
                           (third node)
                           (lambda (environment)
                             (when (true-p (eval-expr qual environment))
@@ -278,16 +324,16 @@ ROW-CALLBACK."
                               (left (third node))
                               (right (fourth node))
                               (right-rows '()))
-                         (run-node right
-                                   (lambda (row) (push row right-rows)))
+                         (run-child right
+                                    (lambda (row) (push row right-rows)))
                          (setf right-rows (nreverse right-rows))
                          (stream-select-join-environments
                           (lambda (left-callback)
-                            (run-node left left-callback))
+                            (run-child left left-callback))
                           right-rows join #'emit)))
                       (:project
                        (let ((targets (second node)))
-                         (run-node
+                         (run-child
                           (third node)
                           (lambda (environment)
                             (let ((row (make-select-result-row
@@ -296,8 +342,8 @@ ROW-CALLBACK."
                       (:sort
                        (let ((rows '())
                              (order (second node)))
-                         (run-node (third node)
-                                   (lambda (row) (push row rows)))
+                         (run-child (third node)
+                                    (lambda (row) (push row rows)))
                          (dolist (row
                                   (stable-sort
                                    (nreverse rows)
@@ -311,7 +357,7 @@ ROW-CALLBACK."
                               (rows
                                 (collect-select-top-n
                                  (lambda (callback)
-                                   (run-node input callback))
+                                   (run-child input callback))
                                  order limit)))
                          (dolist (row rows)
                            (when (eq (emit row) :stop)
@@ -320,7 +366,7 @@ ROW-CALLBACK."
                        (let ((limit (second node))
                              (count 0))
                          (unless (zerop limit)
-                           (run-node
+                           (run-child
                             (third node)
                             (lambda (row)
                               (incf count)
@@ -342,7 +388,7 @@ ROW-CALLBACK."
                            ;; A plain aggregate has one group even on empty input.
                            (unless group-keys
                              (setf (gethash nil groups) (make-state nil)))
-                           (run-node
+                           (run-child
                             (fourth node)
                             (lambda (environment)
                               (check-for-interrupts)
@@ -371,8 +417,19 @@ ROW-CALLBACK."
                                (return-from run-node :stop))))))
                       (t
                        (error "Unknown physical query-plan node ~s" node)))
-                 (when metadata
-                   (setf (plan-node-metadata-actual-rows metadata) emitted)))))))
+                 (when (and started metadata)
+                   (incf (plan-node-metadata-actual-loops metadata))
+                   (incf (plan-node-metadata-actual-row-count metadata) emitted)
+                   (setf (plan-node-metadata-actual-rows metadata)
+                         (/ (plan-node-metadata-actual-row-count metadata)
+                            (plan-node-metadata-actual-loops metadata)))
+                   (let* ((elapsed (- (get-internal-real-time) started))
+                          (self-time
+                            (max 0 (- elapsed callback-time child-total-time))))
+                     (incf (plan-node-metadata-actual-startup-time-ticks metadata)
+                           (or startup-time elapsed))
+                     (incf (plan-node-metadata-actual-total-time-ticks metadata)
+                           (+ self-time child-total-time)))))))))
       (run-node (query-plan-physical plan) row-callback))))
 
 (register-query-plan-backend :interpreter :executor #'interpret-query-plan)
@@ -442,8 +499,12 @@ ROW-CALLBACK."
                (otherwise ""))))
     (otherwise (string-downcase (symbol-name (first node))))))
 
-(defun format-query-plan (plan &optional registered-relations)
-  "Format the selected physical tree for EXPLAIN."
+(defun plan-node-average-time-ms (ticks loops)
+  (internal-time-ticks->milliseconds (/ ticks loops)))
+
+(defun format-query-plan (plan &optional registered-relations analyze-p
+                                 execution-time)
+  "Format the selected physical tree for EXPLAIN, with run stats if requested."
   (let ((relations (or registered-relations
                        (getf (query-plan-prepared plan) :relations))))
     (with-output-to-string (stream)
@@ -451,10 +512,34 @@ ROW-CALLBACK."
                  (format stream "~a~a"
                          (make-string (* depth 2) :initial-element #\Space)
                          (physical-plan-node-label node relations))
+                 (when analyze-p
+                   (let* ((metadata (gethash node
+                                             (query-plan-metadata plan)))
+                          (loops (and metadata
+                                      (plan-node-metadata-actual-loops metadata))))
+                     (if (and loops (plusp loops))
+                         (format stream
+                                 " (actual time=~,3f..~,3f rows=~,2f loops=~d)"
+                                 (plan-node-average-time-ms
+                                  (plan-node-metadata-actual-startup-time-ticks
+                                   metadata)
+                                  loops)
+                                 (plan-node-average-time-ms
+                                  (plan-node-metadata-actual-total-time-ticks
+                                   metadata)
+                                  loops)
+                                 (float
+                                  (plan-node-metadata-actual-rows metadata)
+                                  1.0d0)
+                                 loops)
+                         (write-string " (never executed)" stream))))
                  (dolist (child (physical-plan-node-children node))
                    (terpri stream)
                    (print-node child (1+ depth)))))
-        (print-node (query-plan-physical plan) 0)))))
+        (print-node (query-plan-physical plan) 0)
+        (when analyze-p
+          (terpri stream)
+          (format stream "Execution Time: ~,3f ms" (or execution-time 0.0d0)))))))
 
 (defun exec-select (stream ast)
   (let* ((plan (plan-select-query ast))
@@ -478,15 +563,32 @@ ROW-CALLBACK."
       (send-command-complete stream (format nil "SELECT ~a" row-count)))))
 
 (defun exec-explain (stream ast)
-  (let* ((plan (plan-select-query ast))
+  (let* ((plan (plan-select-query (getf ast :statement)))
          (prepared (query-plan-prepared plan))
          (relations (getf prepared :relations))
-         (description nil))
-    (if relations
-        (with-registered-select-relations (registered relations)
-          (reconcile-query-plan-access-paths plan registered)
-          (setf description (format-query-plan plan registered)))
-        (setf description (format-query-plan plan)))
+         (analyze-p (getf ast :analyze-p))
+         (description nil)
+         (execution-time 0.0d0))
+    (labels ((prepare-explain (registered)
+               (reconcile-query-plan-access-paths plan registered)
+               (when analyze-p
+                 (let ((started (get-internal-real-time)))
+                   (let ((*query-plan-instrumentation-p* t))
+                     (execute-query-plan
+                      plan registered
+                      (lambda (row)
+                        (declare (ignore row))
+                        nil)))
+                   (setf execution-time
+                         (internal-time-ticks->milliseconds
+                          (- (get-internal-real-time) started)))))
+               (setf description
+                     (format-query-plan plan registered analyze-p
+                                        execution-time))))
+      (if relations
+          (with-registered-select-relations (registered relations)
+            (prepare-explain registered))
+          (prepare-explain nil)))
     (send-row-description
      stream
      (list (make-result-column :name "QUERY PLAN"

@@ -849,7 +849,7 @@ before this removal horizon is captured."
       (handler-case
           (case (getf ast :type)
             (:select (exec-select stream ast))
-            (:explain (exec-explain stream (getf ast :statement)))
+            (:explain (exec-explain stream ast))
             (:insert (exec-insert stream ast))
             (:update (exec-update stream ast))
             (:delete (exec-delete stream ast))

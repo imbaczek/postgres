@@ -346,9 +346,11 @@ create table index_scan_events (id int, category int);
 insert into index_scan_events values
   (1, 10), (2, 10), (3, 20), (4, null), (5, 10);
 explain select id from index_scan_events where category = 10;
+explain analyze select id from index_scan_events where category = 10;
 select id from index_scan_events where category = 10 order by id;
 create index index_scan_events_category_idx on index_scan_events (category);
 explain select id from index_scan_events where category = 10;
+explain (analyze) select id from index_scan_events where category = 10;
 select id from index_scan_events where category = 10 order by id;
 select id from index_scan_events
   where category = 10 and id >= 2 order by id desc limit 1;
@@ -397,13 +399,19 @@ select l.id, l.label, r.id, r.label from join_left l
 select l.id, l.label, r.id, r.label from join_left l
   full outer join join_right r on l.id = r.id
   order by l.id, r.id, l.label, r.label;
+-- Exercise COUNT(*) over outer-join rows, including duplicate and NULL keys.
+explain analyze select count(*) from join_left l
+  left join join_right r on l.id = r.id;
+select count(*) from join_left l left join join_right r on l.id = r.id;
+select count(*) from join_left l full join join_right r using (id);
 
 -- Restore the grouped COUNT(*) join case from PostgreSQL join.sql with a
 -- compact tenk1 fixture.
-create table tenk1 (thousand int, twothousand int);
+create table tenk1 (thousand int, twothousand int, hundred int, fivethous int);
 insert into tenk1 values
-  (10, 100), (10, 200), (20, 100), (20, 200);
-explain select x.thousand, x.twothousand, count(*)
+  (10, 100, 10, 3), (10, 200, 10, 5),
+  (20, 100, 20, 7), (20, 200, 20, 10);
+explain analyze select x.thousand, x.twothousand, count(*)
   from tenk1 x inner join tenk1 y on x.thousand = y.thousand
   group by x.thousand, x.twothousand
   order by x.thousand desc, x.twothousand;
@@ -411,6 +419,12 @@ select x.thousand, x.twothousand, count(*)
   from tenk1 x inner join tenk1 y on x.thousand = y.thousand
   group by x.thousand, x.twothousand
   order by x.thousand desc, x.twothousand;
+-- Port join.sql's COUNT(*) and filter from its skew-join test. The current
+-- planner uses nested loops here, so this checks SQL semantics, not hash join.
+explain analyze select count(*) from tenk1 a cross join tenk1 b
+  where a.hundred = b.thousand and (b.fivethous % 10) < 10;
+select count(*) from tenk1 a cross join tenk1 b
+  where a.hundred = b.thousand and (b.fivethous % 10) < 10;
 drop table tenk1;
 
 -- ON decides whether a row matched; WHERE filters after null extension.
@@ -486,6 +500,7 @@ select category, category, count(*) from aggregate_events
 create index aggregate_events_category_idx on aggregate_events (category);
 explain select category from aggregate_events where category = 10;
 explain select category, count(*) from aggregate_events group by category;
+explain analyze select 1;
 select category from aggregate_events where category = 10 limit 1;
 select category, count(*) as n from aggregate_events
   where category = 10 group by category order by n;
