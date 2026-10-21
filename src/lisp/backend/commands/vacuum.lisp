@@ -5,29 +5,47 @@
 (defun current-table-index-relfilenodes (table)
   (mapcar #'pg-index-relfilenode (table-indexes table)))
 
+(defun call-with-revalidated-relation-locks
+    (state-provider requested-relations acquire-lock release-lock
+     valid-state-p function)
+  "Retry FUNCTION until its captured relation state is protected by locks.
+
+STATE-PROVIDER returns catalog state before and after locking.
+REQUESTED-RELATIONS derives the initial lock set; VALID-STATE-P verifies that
+the current state is covered. Acquired locks are always released, including
+when revalidation or FUNCTION signals an error."
+  (loop
+    for captured = (funcall state-provider)
+    for requested = (funcall requested-relations captured)
+    do (multiple-value-bind (locked-relations token)
+           (funcall acquire-lock requested)
+         (unwind-protect
+              (let ((current (funcall state-provider)))
+                (when (funcall valid-state-p
+                               captured current locked-relations)
+                  (return-from call-with-revalidated-relation-locks
+                    (funcall function current))))
+           (funcall release-lock locked-relations token)))))
+
 (defun call-with-table-maintenance-locks
     (table index-provider verify-function function)
   "Hold the heap and current index maintenance locks around FUNCTION."
-  (let ((heap-relfilenode (pg-class-relfilenode table)))
-    (loop
-      for indexes = (with-write-lock (funcall index-provider))
-      for requested = (cons heap-relfilenode indexes)
-      do (multiple-value-bind (locked-relations token)
-             (acquire-relation-maintenance-locks requested)
-           (let ((current-indexes
-                   (with-write-lock (funcall index-provider))))
-             (if (every (lambda (relfilenode)
-                          (member relfilenode locked-relations :test #'=))
-                        current-indexes)
-                 (return-from call-with-table-maintenance-locks
-                   (unwind-protect
-                        (progn
-                          (when verify-function
-                            (with-write-lock (funcall verify-function)))
-                          (funcall function current-indexes))
-                     (release-relation-maintenance-locks
-                      locked-relations token)))
-                 (release-relation-maintenance-locks locked-relations token)))))))
+  (call-with-revalidated-relation-locks
+   (lambda ()
+     (with-write-lock
+       (list (pg-class-relfilenode table) (funcall index-provider))))
+   (lambda (state) (cons (first state) (second state)))
+   #'acquire-relation-maintenance-locks
+   #'release-relation-maintenance-locks
+   (lambda (captured current locked-relations)
+     (and (= (first captured) (first current))
+          (every (lambda (relfilenode)
+                   (member relfilenode locked-relations :test #'=))
+                 (cons (first current) (second current)))))
+   (lambda (current)
+     (when verify-function
+       (with-write-lock (funcall verify-function)))
+     (funcall function (second current)))))
 
 (defun vacuum-catalog-relation
     (table index-provider verify-function
@@ -76,57 +94,47 @@
 (defun same-index-object-set-p (left right)
   "Compare index membership and metadata identity without depending on order."
   (and (= (length left) (length right))
+       (= (length left) (length (remove-duplicates left :test #'eq)))
+       (= (length right) (length (remove-duplicates right :test #'eq)))
        (every (lambda (index)
                 (member index right :test #'eq))
               left)))
 
 (defun call-with-table-rewrite-locks (table function)
   "Hold exclusive build gates for TABLE and its exact current index set."
-  (loop
-    for captured =
-                 (with-write-lock
-                   (ensure-current-table table)
-                   (let ((indexes (table-indexes table)))
-                     (list (pg-class-relfilenode table)
-                           indexes
-                           (mapcar #'pg-index-relfilenode indexes))))
-    for heap-relfilenode = (first captured)
-    for indexes = (second captured)
-    for index-relfilenodes = (third captured)
-    for requested = (cons heap-relfilenode
-                          index-relfilenodes)
-    do (let* ((locked-relations
-                (sort (remove-duplicates (copy-list requested) :test #'=)
-                      #'<))
-              (token
-                (acquire-relation-build-locks
-                 locked-relations
-                 (and *backend* (backend-xid *backend*))
-                 t)))
-         (unwind-protect
-              (let* ((current-state
-                       (with-write-lock
-                         (ensure-current-table table)
-                         (let ((current-indexes (table-indexes table)))
-                           (list (pg-class-relfilenode table)
-                                 current-indexes
-                                 (mapcar #'pg-index-relfilenode
-                                         current-indexes)))))
-                     (current-indexes (second current-state))
-                     (current-relfilenodes (third current-state)))
-                (when (and (= heap-relfilenode (first current-state))
-                           (= (length indexes) (length current-indexes))
-                           (same-index-object-set-p indexes current-indexes)
-                           (= (length index-relfilenodes)
-                              (length current-relfilenodes))
-                           (every (lambda (relfilenode)
-                                    (member relfilenode locked-relations
-                                            :test #'=))
-                                  (cons heap-relfilenode
-                                        current-relfilenodes)))
-                  (return-from call-with-table-rewrite-locks
-                    (funcall function current-indexes))))
-           (release-relation-build-locks locked-relations token)))))
+  (call-with-revalidated-relation-locks
+   (lambda ()
+     (with-write-lock
+       (ensure-current-table table)
+       (let ((indexes (table-indexes table)))
+         (list (pg-class-relfilenode table)
+               indexes
+               (mapcar #'pg-index-relfilenode indexes)))))
+   (lambda (state) (cons (first state) (third state)))
+   (lambda (requested)
+     (let ((locked-relations
+             (sort (remove-duplicates (copy-list requested) :test #'=) #'<)))
+       (values locked-relations
+               (acquire-relation-build-locks
+                locked-relations
+                (and *backend* (backend-xid *backend*))
+                t))))
+   #'release-relation-build-locks
+   (lambda (captured current locked-relations)
+     (let ((indexes (second captured))
+           (index-relfilenodes (third captured))
+           (current-indexes (second current))
+           (current-relfilenodes (third current)))
+       (and (= (first captured) (first current))
+            (= (length indexes) (length current-indexes))
+            (same-index-object-set-p indexes current-indexes)
+            (= (length index-relfilenodes)
+               (length current-relfilenodes))
+            (every (lambda (relfilenode)
+                     (member relfilenode locked-relations :test #'=))
+                   (cons (first current) current-relfilenodes)))))
+   (lambda (current)
+     (funcall function (second current)))))
 
 (defun vacuum-full-copy-tuple (source-table source-relfilenode
                                target-relfilenode block offnum oldest-xmin

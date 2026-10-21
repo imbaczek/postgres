@@ -61,6 +61,173 @@
       (setf (symbol-function 'condition-wait-with-timeout) original-wait)
       (release-relation-writer-xid xid))))
 
+(defun test-select-index-reader-blocks-drop-after-registration ()
+  (let* ((xid 987784)
+         (heap-relfilenode 987785)
+         (index-relfilenode 987786)
+         (index-oid 987787)
+         (table (make-pg-class :oid 987788 :name "reader_gate"
+                               :relfilenode heap-relfilenode
+                               :columns #() :indexes (list index-oid)))
+         (index (make-pg-index :oid index-oid :name "reader_gate_idx"
+                               :relfilenode index-relfilenode
+                               :table-oid (pg-class-oid table)
+                               :columns '(1) :valid-p t))
+         (drop-lock-relfilenodes
+           (sort
+            (remove-duplicates
+             (drop-index-relation-lock-set
+              (list (cons (pg-index-name index) index))
+              (lambda (table-oid)
+                (when (= table-oid (pg-class-oid table)) table)))
+             :test #'=)
+            #'<))
+         (path (make-select-scan-path :kind :index-scan :index index))
+         (relation (list :table table :columns (pg-class-columns table)
+                         :path path))
+         (test-lock (sb-thread:make-mutex :name "test SELECT index DDL lock"))
+         (test-cv (sb-thread:make-waitqueue :name "test SELECT index DDL cv"))
+         (query-paused nil)
+         (resume-query nil)
+         (query-body-ran nil)
+         (query-done nil)
+         (drop-done nil)
+         (query-error nil)
+         (drop-error nil)
+         (reader-registrations-complete nil)
+         (xid-wait-entered nil)
+         (original-xid-active
+           (sb-thread:with-mutex (*xid-lock*)
+             (member xid *active-xids* :test #'=)))
+         (original-wait-for-xid (symbol-function 'wait-for-xid))
+         (threads '()))
+    (labels ((start-thread (function name)
+               (push (sb-thread:make-thread function :name name) threads))
+             (wait-for-flag (reader)
+               (test-wait-until
+                (lambda ()
+                  (sb-thread:with-mutex (test-lock)
+                    (funcall reader))))))
+      (unwind-protect
+           (progn
+             (sb-thread:with-mutex (*xid-lock*)
+               (setf *active-xids* (adjoin xid *active-xids* :test #'=)))
+             (setf (symbol-function 'wait-for-xid)
+                   (lambda (waiting-xid)
+                     (when (= waiting-xid xid)
+                       (sb-thread:with-mutex (test-lock)
+                         (setf xid-wait-entered t)
+                         (sb-thread:condition-broadcast test-cv)))
+                     (funcall original-wait-for-xid waiting-xid)))
+             (start-thread
+              (lambda ()
+                (unwind-protect
+                     (handler-case
+                         (flet ((get-current-xid () xid)
+                                (ensure-current-table (current-table)
+                                  (unless (eq current-table table)
+                                    (error "SELECT table changed")))
+                                (select-index-current-p (current-table current-index)
+                                  (declare (ignore current-table current-index))
+                                  ;; Pause after the atomic heap+index reader
+                                  ;; registration, before catalog revalidation.
+                                  (sb-thread:with-mutex (test-lock)
+                                    (setf query-paused t)
+                                    (sb-thread:condition-broadcast test-cv)
+                                    (loop until resume-query
+                                          do (sb-thread:condition-wait
+                                              test-cv test-lock)))
+                                  t))
+                           (with-registered-select-relations
+                               (registered (list relation))
+                             (declare (ignore registered))
+                             (sb-thread:with-mutex (test-lock)
+                               (setf query-body-ran t))))
+                       (error (condition) (setf query-error condition)))
+                  (release-xid xid)
+                  (sb-thread:with-mutex (test-lock)
+                    (setf query-done t)
+                    (sb-thread:condition-broadcast test-cv))))
+              "SELECT holding heap and index readers")
+             (check (wait-for-flag (lambda () query-paused))
+                    "indexed SELECT reaches revalidation after registering readers")
+             (start-thread
+              (lambda ()
+                (let ((locked-relations
+                        (sort (list heap-relfilenode index-relfilenode) #'<))
+                      (token nil))
+                  (unwind-protect
+                       (handler-case
+                           (progn
+                             (setf token
+                                   (acquire-relation-build-locks
+                                    locked-relations nil t))
+                             (sb-thread:with-mutex (test-lock)
+                               (setf drop-done :acquired)
+                               (sb-thread:condition-broadcast test-cv)))
+                         (error (condition) (setf drop-error condition)))
+                    (when token
+                      (release-relation-build-locks locked-relations token))
+                    (sb-thread:with-mutex (test-lock)
+                      (setf drop-done t)
+                      (sb-thread:condition-broadcast test-cv)))))
+              "DROP INDEX waiting for SELECT")
+             (check (equal drop-lock-relfilenodes
+                           (sort (list heap-relfilenode index-relfilenode) #'<))
+                    "DROP INDEX lock selection includes its index and owning heap")
+             (check (test-wait-until
+                     (lambda ()
+                       (sb-thread:with-mutex (*relation-lock-mutex*)
+                         (let ((token (gethash heap-relfilenode
+                                               *relation-builders*)))
+                           (and token
+                                (eq token (gethash index-relfilenode
+                                                   *relation-builders*)))))))
+                    "DROP INDEX gates the heap and index as one relation group")
+             (sb-thread:with-mutex (*relation-lock-mutex*)
+               (setf reader-registrations-complete
+                     (and (member xid (gethash heap-relfilenode
+                                               *relation-readers*)
+                                  :test #'=)
+                          (member xid (gethash index-relfilenode
+                                               *relation-readers*)
+                                  :test #'=))))
+             (check reader-registrations-complete
+                    "indexed SELECT registers heap and index readers atomically")
+             (check (wait-for-flag (lambda () xid-wait-entered))
+                    "DROP INDEX reaches the active-reader XID wait")
+             (check (not (sb-thread:with-mutex (test-lock) drop-done))
+                    "DROP INDEX waits while the registered SELECT is active")
+             (sb-thread:with-mutex (test-lock)
+               (setf resume-query t)
+               (sb-thread:condition-broadcast test-cv))
+             (check (wait-for-flag (lambda () query-done))
+                    "indexed SELECT exits and releases its transaction readers")
+             (check (wait-for-flag (lambda () (eq drop-done t)))
+                    "DROP INDEX proceeds after the SELECT transaction ends")
+             (check (and query-body-ran (null query-error) (null drop-error))
+                    (format nil "reader/DDL handoff completes cleanly (~a, ~a)"
+                            query-error drop-error)))
+        (sb-thread:with-mutex (test-lock)
+          (setf resume-query t)
+          (sb-thread:condition-broadcast test-cv))
+        (release-xid xid)
+        (let ((worker-timed-out nil))
+          (dolist (thread threads)
+            (ignore-errors (sb-thread:join-thread thread :timeout 2))
+            (when (sb-thread:thread-alive-p thread)
+              (setf worker-timed-out t)
+              (sb-thread:terminate-thread thread)
+              (ignore-errors (sb-thread:join-thread thread))))
+          (setf (symbol-function 'wait-for-xid) original-wait-for-xid)
+          (sb-thread:with-mutex (*xid-lock*)
+            (setf *active-xids*
+                  (if original-xid-active
+                      (adjoin xid *active-xids* :test #'=)
+                      (remove xid *active-xids* :test #'=))))
+          (check (not worker-timed-out)
+                 "SELECT and DROP INDEX test workers stop before fixture cleanup"))))))
+
 (defun test-live-operation-gate ()
   (test-reset-live-operation-admission)
   (let ((test-lock (sb-thread:make-mutex :name "test live-operation lock"))

@@ -423,6 +423,16 @@ before this removal horizon is captured."
         (save-catalog)))
     (send-command-complete stream "DROP TABLE")))
 
+(defun drop-index-relation-lock-set (entries table-lookup)
+  "Return each index and owning heap relfilenode from captured ENTRIES."
+  (loop for entry in entries
+        for index = (cdr entry)
+        for table = (when index
+                      (funcall table-lookup (pg-index-table-oid index)))
+        when index
+          append (cons (pg-index-relfilenode index)
+                       (when table (list (pg-class-relfilenode table))))))
+
 (defun exec-create-index (stream ast)
   (let* ((name (getf ast :name))
          (unique (getf ast :unique))
@@ -532,14 +542,7 @@ before this removal horizon is captured."
                       (cons name (gethash name (database-indexes db))))
                     names)
             relfilenodes
-            (loop for entry in entries
-                  for idx = (cdr entry)
-                  for table = (when idx
-                                (find-table-by-oid (pg-index-table-oid idx)))
-                  when idx
-                    append (cons (pg-index-relfilenode idx)
-                                 (when table
-                                   (list (pg-class-relfilenode table)))))))
+            (drop-index-relation-lock-set entries #'find-table-by-oid)))
     (dolist (entry entries)
       (unless (or (cdr entry) if-exists)
         (ereport "42704" "index \"~a\" does not exist" (car entry))))
