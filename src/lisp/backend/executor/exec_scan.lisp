@@ -489,9 +489,6 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
                          (getf ast :order-by) scope targets group-keys)
                         (analyze-order (getf ast :order-by) scope targets)))
              (limit (getf ast :limit)))
-        (when (and aggregate-p joins)
-          (ereport "0A000"
-                   "GROUP BY and COUNT(*) currently support one table only"))
         (list :table first-table
               :relations relations
               :scope scope

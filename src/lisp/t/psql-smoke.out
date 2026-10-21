@@ -347,6 +347,19 @@ Project
 ||4|right-only
 |left-null||
 |||right-null
+CREATE TABLE
+INSERT 0 4
+Sort
+  Project
+    HashAggregate
+      Nested Loop Inner Join
+        Seq Scan on tenk1
+        Seq Scan on tenk1
+20|100|2
+20|200|2
+10|100|2
+10|200|2
+DROP TABLE
 1|
 2|
 3|right-three

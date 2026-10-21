@@ -398,6 +398,21 @@ select l.id, l.label, r.id, r.label from join_left l
   full outer join join_right r on l.id = r.id
   order by l.id, r.id, l.label, r.label;
 
+-- Restore the grouped COUNT(*) join case from PostgreSQL join.sql with a
+-- compact tenk1 fixture.
+create table tenk1 (thousand int, twothousand int);
+insert into tenk1 values
+  (10, 100), (10, 200), (20, 100), (20, 200);
+explain select x.thousand, x.twothousand, count(*)
+  from tenk1 x inner join tenk1 y on x.thousand = y.thousand
+  group by x.thousand, x.twothousand
+  order by x.thousand desc, x.twothousand;
+select x.thousand, x.twothousand, count(*)
+  from tenk1 x inner join tenk1 y on x.thousand = y.thousand
+  group by x.thousand, x.twothousand
+  order by x.thousand desc, x.twothousand;
+drop table tenk1;
+
 -- ON decides whether a row matched; WHERE filters after null extension.
 select l.id, r.label from join_left l left join join_right r
   on l.id = r.id and r.label = 'right-three'
