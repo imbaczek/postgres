@@ -24,6 +24,34 @@ The RELFILENODE and BLOCK variables are captured once for BODY."
                  (,block ,block-value))
              ,@body))))))
 
+(defmacro with-vacuum-page-retry ((page source-page relfilenode block)
+                                  &body body)
+  "Re-read and recompute page proposals until BODY publishes or accepts one.
+
+BODY runs with a private PAGE and SOURCE-PAGE baseline. Return non-NIL only
+when its proposal is accepted; NIL discards all local work and retries. This
+server uses copied pages and compare/publish; PostgreSQL C instead coordinates
+page cleanup with buffer cleanup locks."
+  (let ((relfilenode-value (gensym "RELFILENODE-"))
+        (block-value (gensym "BLOCK-"))
+        (page-found (gensym "PAGE-FOUND-"))
+        (accepted (gensym "ACCEPTED-")))
+    `(let* ((,relfilenode-value ,relfilenode)
+            (,block-value ,block))
+       (let ((,relfilenode ,relfilenode-value)
+             (,block ,block-value))
+         (loop
+           (check-for-interrupts)
+           (let ((,page-found nil)
+                 (,accepted nil))
+             (with-vacuum-heap-page (,page ,source-page ,relfilenode ,block)
+               (setf ,page-found t
+                     ,accepted (progn ,@body)))
+             (unless ,page-found
+               (ereport "XX001" "heap page ~a disappeared during VACUUM"
+                        ,block))
+             (when ,accepted (return))))))))
+
 (defun try-vacuum-page-publication
     (relfilenode block source-page &key page write-page-p
                                      (visibility-status nil
@@ -89,43 +117,41 @@ All arguments are lexical variables; CHANGED-P is set on an update."
   "Mark removable tuples LP_DEAD and freeze old surviving tuple XIDs.
 
 If a concurrent writer changes the page, discard every proposal and rescan."
-  (loop
-    (check-for-interrupts)
-    (let ((published-result nil))
-      (with-vacuum-heap-page (page source-page relfilenode block)
-        (let ((dead-tids '())
-              (changed nil))
-          (loop for offnum from 1 to (page-lp-count page)
-                do (multiple-value-bind (off flags len)
-                       (page-get-lp page offnum)
-                     (case flags
-                       (#.+lp-dead+
-                        (push (cons block offnum) dead-tids))
-                       (#.+lp-normal+
-                        (when (< len +size-of-heap-tuple-header+)
-                          (ereport "XX001" "heap tuple header is truncated"))
-                        (let* ((raw-xmin
-                                 (page-u32 page (+ off +heap-tuple-xmin-off+)))
-                               (raw-xmax
-                                 (page-u32 page (+ off +heap-tuple-xmax-off+)))
-                               (xmin (full-xid-from-32 raw-xmin))
-                               (xmax (full-xid-from-32 raw-xmax)))
-                          (if (tuple-prunable-p xmin xmax oldest-xmin)
-                              (progn
-                                (page-mark-dead page offnum)
-                                (setf changed t)
-                                (push (cons block offnum) dead-tids))
-                              (vacuum-normalize-tuple-xids
-                               page off raw-xmin xmin raw-xmax xmax freeze-cutoff
-                               changed)))))))
-          (when (or (not changed)
-                    (try-vacuum-page-publication
-                     relfilenode block source-page
-                     :page page :write-page-p t))
-            (setf published-result
-                  (list (nreverse dead-tids) changed)))))
-      (when published-result
-        (return (values-list published-result))))))
+  (let ((published-result nil))
+    (with-vacuum-page-retry (page source-page relfilenode block)
+      (let ((dead-tids '())
+            (changed nil))
+        (loop for offnum from 1 to (page-lp-count page)
+              do (multiple-value-bind (off flags len)
+                     (page-get-lp page offnum)
+                   (case flags
+                     (#.+lp-dead+
+                      (push (cons block offnum) dead-tids))
+                     (#.+lp-normal+
+                      (when (< len +size-of-heap-tuple-header+)
+                        (ereport "XX001" "heap tuple header is truncated"))
+                      (let* ((raw-xmin
+                               (page-u32 page (+ off +heap-tuple-xmin-off+)))
+                             (raw-xmax
+                               (page-u32 page (+ off +heap-tuple-xmax-off+)))
+                             (xmin (full-xid-from-32 raw-xmin))
+                             (xmax (full-xid-from-32 raw-xmax)))
+                        (if (tuple-prunable-p xmin xmax oldest-xmin)
+                            (progn
+                              (page-mark-dead page offnum)
+                              (setf changed t)
+                              (push (cons block offnum) dead-tids))
+                            (vacuum-normalize-tuple-xids
+                             page off raw-xmin xmin raw-xmax xmax freeze-cutoff
+                             changed)))))))
+        (when (or (not changed)
+                  (try-vacuum-page-publication
+                   relfilenode block source-page
+                   :page page :write-page-p t))
+          ;; The unchanged page path accepts dead TIDs without writing.
+          (setf published-result (list (nreverse dead-tids) changed))
+          t)))
+    (values-list published-result)))
 
 (defun heap-vacuum-remove-dead-tids (relfilenode tids fsm)
   "Make LP_DEAD slots reusable only after every index has removed their TIDs."
@@ -134,36 +160,30 @@ If a concurrent writer changes the page, discard every proposal and rescan."
       (push (cdr tid) (gethash (car tid) by-block)))
     (maphash
      (lambda (block offsets)
-       (check-for-interrupts)
-       (loop
-         (check-for-interrupts)
-         (let ((finished nil)
-               (free-space nil))
-           (with-vacuum-heap-page (page source-page relfilenode block)
-             (let ((changed nil))
-               (dolist (offnum offsets)
-                 (when (and (<= 1 offnum (page-lp-count page))
-                            (multiple-value-bind (off flags len)
-                                (page-get-lp page offnum)
-                              (declare (ignore off len))
-                              (= flags +lp-dead+)))
-                   (page-mark-unused page offnum)
-                   (setf changed t)))
-               (if changed
-                   (progn
-                     (page-compact page)
-                     (when (try-vacuum-page-publication
-                            relfilenode block source-page
-                            :page page :write-page-p t)
-                       (setf free-space (heap-page-insert-capacity page)
-                             finished t)))
-                   (setf finished t))))
-           (when finished
-             ;; Keep FSM synchronization outside WAL/page locks.  A stale FSM
-             ;; entry is advisory and heapam-insert rechecks the page.
-             (when free-space
-               (heap-fsm-record-page fsm block free-space))
-             (return)))))
+       (let ((free-space nil))
+         (with-vacuum-page-retry (page source-page relfilenode block)
+           (let ((changed nil))
+             (dolist (offnum offsets)
+               (when (and (<= 1 offnum (page-lp-count page))
+                          (multiple-value-bind (off flags len)
+                              (page-get-lp page offnum)
+                            (declare (ignore off len))
+                            (= flags +lp-dead+)))
+                 (page-mark-unused page offnum)
+                 (setf changed t)))
+             (if changed
+                 (progn
+                   (page-compact page)
+                   (when (try-vacuum-page-publication
+                          relfilenode block source-page
+                          :page page :write-page-p t)
+                     (setf free-space (heap-page-insert-capacity page))
+                     t))
+                 t)))
+         ;; Keep FSM synchronization outside WAL/page locks. A stale FSM
+         ;; entry is advisory and heapam-insert rechecks the page.
+         (when free-space
+           (heap-fsm-record-page fsm block free-space))))
      by-block))
   (values))
 
@@ -196,64 +216,60 @@ If a concurrent writer changes the page, discard every proposal and rescan."
       (check-for-interrupts)
       (unless (= (visibilitymap-status relfilenode block)
                  (logior +vm-all-visible-bit+ +vm-all-frozen-bit+))
-        (loop
-          with published = nil
-          until published
-          do (check-for-interrupts)
-             (with-vacuum-heap-page (page source-page relfilenode block)
-               (let ((visible t)
-                     (all-frozen t)
-                     (tuple-changed nil))
-                 (loop for offnum from 1 to (page-lp-count page)
-                       do (multiple-value-bind (off flags len)
-                              (page-get-lp page offnum)
-                            (case flags
-                              (#.+lp-dead+
-                               (setf visible nil all-frozen nil))
-                              (#.+lp-normal+
-                               (when (< len +size-of-heap-tuple-header+)
-                                 (ereport "XX001" "heap tuple header is truncated"))
-                               (let* ((raw-xmin
-                                        (page-u32
-                                         page (+ off +heap-tuple-xmin-off+)))
-                                      (raw-xmax
-                                        (page-u32
-                                         page (+ off +heap-tuple-xmax-off+)))
-                                      (xmin (full-xid-from-32 raw-xmin))
-                                      (xmax (full-xid-from-32 raw-xmax)))
-                                 (vacuum-normalize-tuple-xids
-                                  page off raw-xmin xmin raw-xmax xmax
-                                  freeze-cutoff tuple-changed)
-                                 (unless (and (or (= xmin +bootstrap-xid+)
-                                                  (= xmin +frozen-xid+)
-                                                  (and (>= raw-xmin
-                                                           +first-normal-xid+)
-                                                       (< xmin oldest-xmin)
-                                                       (xid-committed-p xmin)))
-                                              (or (zerop raw-xmax)
-                                                  (xid-aborted-p xmax)))
-                                   (setf visible nil))
-                                 (unless (or (= xmin +bootstrap-xid+)
-                                             (= xmin +frozen-xid+))
-                                   (setf all-frozen nil))
-                                 (unless (zerop raw-xmax)
-                                   (setf all-frozen nil)))))))
-                 (let* ((status (if visible
-                                    (if all-frozen
-                                        (logior +vm-all-visible-bit+
-                                                +vm-all-frozen-bit+)
-                                        +vm-all-visible-bit+)
-                                    0))
-                        (old-status (visibilitymap-status relfilenode block)))
-                   (cond
-                     ((and (not tuple-changed) (= old-status status))
-                      (setf published t))
-                     ((try-vacuum-page-publication
-                       relfilenode block source-page
-                       :page page :write-page-p tuple-changed
-                       :visibility-status status)
-                      (setf batch-dirty t
-                            published t))))))))
+        (with-vacuum-page-retry (page source-page relfilenode block)
+          (let ((visible t)
+                (all-frozen t)
+                (tuple-changed nil))
+            (loop for offnum from 1 to (page-lp-count page)
+                  do (multiple-value-bind (off flags len)
+                         (page-get-lp page offnum)
+                       (case flags
+                         (#.+lp-dead+
+                          (setf visible nil all-frozen nil))
+                         (#.+lp-normal+
+                          (when (< len +size-of-heap-tuple-header+)
+                            (ereport "XX001" "heap tuple header is truncated"))
+                          (let* ((raw-xmin
+                                   (page-u32
+                                    page (+ off +heap-tuple-xmin-off+)))
+                                 (raw-xmax
+                                   (page-u32
+                                    page (+ off +heap-tuple-xmax-off+)))
+                                 (xmin (full-xid-from-32 raw-xmin))
+                                 (xmax (full-xid-from-32 raw-xmax)))
+                            (vacuum-normalize-tuple-xids
+                             page off raw-xmin xmin raw-xmax xmax
+                             freeze-cutoff tuple-changed)
+                            (unless (and (or (= xmin +bootstrap-xid+)
+                                             (= xmin +frozen-xid+)
+                                             (and (>= raw-xmin
+                                                      +first-normal-xid+)
+                                                  (< xmin oldest-xmin)
+                                                  (xid-committed-p xmin)))
+                                         (or (zerop raw-xmax)
+                                             (xid-aborted-p xmax)))
+                              (setf visible nil))
+                            (unless (or (= xmin +bootstrap-xid+)
+                                        (= xmin +frozen-xid+))
+                              (setf all-frozen nil))
+                            (unless (zerop raw-xmax)
+                              (setf all-frozen nil)))))))
+            (let* ((status (if visible
+                               (if all-frozen
+                                   (logior +vm-all-visible-bit+
+                                           +vm-all-frozen-bit+)
+                                   +vm-all-visible-bit+)
+                               0))
+                   (old-status (visibilitymap-status relfilenode block)))
+              (cond
+                ((and (not tuple-changed) (= old-status status)) t)
+                ((try-vacuum-page-publication
+                  relfilenode block source-page
+                  :page page :write-page-p tuple-changed
+                  :visibility-status status)
+                 (setf batch-dirty t)
+                 t)
+                (t nil))))))
       (incf pages-in-batch)
       (when (>= pages-in-batch +vacuum-max-pages-per-batch+)
         (when batch-dirty

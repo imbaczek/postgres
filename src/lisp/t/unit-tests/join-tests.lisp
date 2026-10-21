@@ -107,3 +107,47 @@
                        (eq (aref (first emitted) 1) +null+))
                   "stopping after one LEFT JOIN miss skips later left rows"))
       (setf (symbol-function 'eval-expr) original-eval))))
+
+(defun test-select-row-qualification-before-projection ()
+  (let ((original-eval (symbol-function 'eval-expr))
+        (projection-count 0)
+        (environment (vector 7))
+        (targets (list (list :expr :project))))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'eval-expr)
+                 (lambda (expr env)
+                   (case expr
+                     (:accept t)
+                     (:reject nil)
+                     (:project
+                      (incf projection-count)
+                      (aref env 0))
+                     (t (funcall original-eval expr env)))))
+           (check (null (make-select-result-row environment :reject targets))
+                  "SELECT row builder discards rows rejected by WHERE")
+           (check (zerop projection-count)
+                  "SELECT row builder does not project rejected rows")
+           (check (null (collect-select-no-from-rows :reject targets))
+                  "FROM-less SELECT discards rows rejected by WHERE")
+           (check (zerop projection-count)
+                  "FROM-less SELECT checks WHERE before projecting targets")
+           (let ((row (make-select-result-row environment :accept targets)))
+             (check (and row (equalp (car row) #(7)))
+                    "SELECT row builder projects qualifying rows")
+             (check (eq (cdr row) environment)
+                    "SELECT row builder retains the source environment")
+             (check (= projection-count 1)
+                    "SELECT row builder evaluates projection once"))
+           (let ((status
+                   (let ((row
+                           (make-select-result-row
+                            environment :accept targets)))
+                     (when row
+                       (funcall (lambda (projected-row)
+                                  (declare (ignore projected-row))
+                                  :stop)
+                                row)))))
+             (check (eq status :stop)
+                    "shared SELECT projection preserves join stop signals")))
+      (setf (symbol-function 'eval-expr) original-eval))))

@@ -20,27 +20,47 @@ precede scanning. Registration and locking remain the caller's responsibility."
                       (check-for-interrupts)
                       ,@body)))))
 
+(defmacro with-registered-relation-access
+    ((relfilenodes xid mode) relation-expression validation-form &body body)
+  "Register relation users before validating catalog state under *WRITE-LOCK*.
+
+MODE is the literal :READ or :WRITE. Readers register the complete set
+atomically; writers must register exactly one relation."
+  (let* ((captured-relfilenodes (gensym "CAPTURED-RELFILENODES-"))
+         (register-form
+           (ecase mode
+             (:read
+              `(register-relation-readers ,captured-relfilenodes ,xid))
+             (:write
+              `(progn
+                 (unless (= (length ,captured-relfilenodes) 1)
+                   (error "write registration requires exactly one relation"))
+                 (register-relation-writer
+                  (first ,captured-relfilenodes) ,xid))))))
+    `(let* ((,captured-relfilenodes
+              (remove-duplicates (copy-list ,relation-expression) :test #'=))
+            (,relfilenodes ,captured-relfilenodes)
+            (,xid (get-current-xid)))
+       (declare (ignorable ,relfilenodes ,xid))
+       ,register-form
+       (with-write-lock ,validation-form)
+       ,@body)))
+
 (defmacro with-registered-table ((table relfilenode xid mode) &body body)
   "Register TABLE for the transaction, then revalidate it under the write lock.
 
 MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
-  (let ((registration-function
-          (ecase mode
-            (:read 'register-relation-reader)
-            (:write 'register-relation-writer)))
-        (table-value (gensym "TABLE-"))
+  (let ((table-value (gensym "TABLE-"))
         (relfilenode-value (gensym "RELFILENODE-"))
-        (xid-value (gensym "XID-")))
+        (registered-relfilenodes (gensym "REGISTERED-RELFILENODES-")))
     `(let* ((,table-value ,table)
-            (,relfilenode-value (pg-class-relfilenode ,table-value))
-            (,xid-value (get-current-xid)))
-       (,registration-function ,relfilenode-value ,xid-value)
-       (with-write-lock
-         (ensure-current-table ,table-value))
-       (let ((,relfilenode ,relfilenode-value)
-             (,xid ,xid-value))
-         (declare (ignorable ,relfilenode ,xid))
-         ,@body))))
+            (,relfilenode-value (pg-class-relfilenode ,table-value)))
+       (with-registered-relation-access
+           (,registered-relfilenodes ,xid ,mode)
+           (list ,relfilenode-value)
+           (ensure-current-table ,table-value)
+         (let ((,relfilenode ,relfilenode-value))
+           ,@body)))))
 
 (defun target->result-column (target)
   (let ((oid (type-oid (getf target :type))))
@@ -488,36 +508,35 @@ registration-to-DDL handoff free of a lock-order inversion."
         (spec (gensym "SPEC-"))
         (table (gensym "TABLE-"))
         (path (gensym "PATH-"))
-        (index (gensym "INDEX-")))
-    `(let* ((,relation-list (mapcar #'copy-list ,relations))
-            (,xid (get-current-xid)))
-       (register-relation-readers
-        (loop for ,spec in ,relation-list
-              for ,table = (getf ,spec :table)
-              for ,path = (getf ,spec :path)
-              for ,index = (and (eq (select-scan-path-kind ,path) :index-scan)
-                                (select-scan-path-index ,path))
-              append (cons (pg-class-relfilenode ,table)
-                           (when ,index
-                             (list (pg-index-relfilenode ,index)))))
-        ,xid)
-       (with-write-lock
-         (dolist (,spec ,relation-list)
-           (let* ((,table (getf ,spec :table))
-                  (,path (getf ,spec :path))
-                  (,index (and (eq (select-scan-path-kind ,path) :index-scan)
-                               (select-scan-path-index ,path))))
-             (ensure-current-table ,table)
-             (unless (eq (getf ,spec :columns) (pg-class-columns ,table))
-               (ereport "0A000"
-                        "table definition changed during query planning"))
-             (when (and ,index (not (select-index-current-p ,table ,index)))
-               ;; DDL completed after planning.  The old index reader remains
-               ;; registered until transaction end; use SeqScan for this query.
-               (setf (getf ,spec :path)
-                     (make-select-scan-path :kind :seq-scan))))))
-       (let ((,registered-relations ,relation-list))
-         ,@body))))
+        (index (gensym "INDEX-"))
+        (registered-relfilenodes (gensym "REGISTERED-RELFILENODES-")))
+    `(let ((,relation-list (mapcar #'copy-list ,relations)))
+       (with-registered-relation-access
+           (,registered-relfilenodes ,xid :read)
+           (loop for ,spec in ,relation-list
+                 for ,table = (getf ,spec :table)
+                 for ,path = (getf ,spec :path)
+                 for ,index = (and (eq (select-scan-path-kind ,path) :index-scan)
+                                   (select-scan-path-index ,path))
+                 append (cons (pg-class-relfilenode ,table)
+                              (when ,index
+                                (list (pg-index-relfilenode ,index)))))
+           (dolist (,spec ,relation-list)
+             (let* ((,table (getf ,spec :table))
+                    (,path (getf ,spec :path))
+                    (,index (and (eq (select-scan-path-kind ,path) :index-scan)
+                                 (select-scan-path-index ,path))))
+               (ensure-current-table ,table)
+               (unless (eq (getf ,spec :columns) (pg-class-columns ,table))
+                 (ereport "0A000"
+                          "table definition changed during query planning"))
+               (when (and ,index (not (select-index-current-p ,table ,index)))
+                 ;; DDL completed after planning.  The old index reader remains
+                 ;; registered until transaction end; use SeqScan for this query.
+                 (setf (getf ,spec :path)
+                       (make-select-scan-path :kind :seq-scan)))))
+         (let ((,registered-relations ,relation-list))
+           ,@body)))))
 
 (defun scan-select-index (table path snapshot callback)
   (let* ((idx (select-scan-path-index path))
@@ -540,6 +559,19 @@ registration-to-DDL handoff free of a lock-order inversion."
     (:index-scan
      (scan-select-index table path snapshot callback))))
 
+(defun make-select-result-row (environment where targets)
+  "Apply WHERE before projecting ENVIRONMENT, retaining it for ORDER BY."
+  (when (or (null where) (true-p (eval-expr where environment)))
+    (cons (map 'vector
+               (lambda (target)
+                 (eval-expr (getf target :expr) environment))
+               targets)
+          environment)))
+
+(defun collect-select-no-from-rows (where targets)
+  (let ((row (make-select-result-row nil where targets)))
+    (if row (list row) nil)))
+
 (defun collect-select-table-rows (table relfilenode path where targets)
   (let ((rows '()))
     (labels ((consider (tuple)
@@ -547,13 +579,8 @@ registration-to-DDL handoff free of a lock-order inversion."
                (let ((env (htup-values tuple)))
                  ;; Index quals only produce candidates.  Recheck the complete
                  ;; WHERE expression before projection just like SeqScan.
-                 (when (or (null where) (true-p (eval-expr where env)))
-                   (push (cons (map 'vector
-                                    (lambda (tg)
-                                      (eval-expr (getf tg :expr) env))
-                                    targets)
-                               env)
-                         rows)))))
+                 (let ((row (make-select-result-row env where targets)))
+                   (when row (push row rows))))))
       (scan-select-path table relfilenode path *current-snapshot* #'consider))
     (nreverse rows)))
 
@@ -643,13 +670,8 @@ registration-to-DDL handoff free of a lock-order inversion."
    relations joins
    (lambda (environment)
      (check-for-interrupts)
-     (when (or (null where) (true-p (eval-expr where environment)))
-       (funcall callback
-                (cons (map 'vector
-                           (lambda (target)
-                             (eval-expr (getf target :expr) environment))
-                           targets)
-                      environment))))))
+     (let ((row (make-select-result-row environment where targets)))
+       (when row (funcall callback row))))))
 
 (defun collect-select-joined-rows (relations joins where targets)
   (let ((rows '()))
@@ -710,13 +732,7 @@ registration-to-DDL handoff free of a lock-order inversion."
                         table (pg-class-relfilenode table)
                         (getf relation :path) where targets))))
                   (t
-                   (let ((values (map 'vector
-                                      (lambda (tg)
-                                        (eval-expr (getf tg :expr) nil))
-                                      targets)))
-                     (if (or (null where) (true-p (eval-expr where nil)))
-                         (list (cons values nil))
-                         nil))))))
+                   (collect-select-no-from-rows where targets)))))
           (unless (and relations joins order limit)
             (when order
               (setf rows (stable-sort rows

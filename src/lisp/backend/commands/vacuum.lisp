@@ -5,6 +5,19 @@
 (defun current-table-index-relfilenodes (table)
   (mapcar #'pg-index-relfilenode (table-indexes table)))
 
+(defun vacuum-compute-freeze-cutoff
+    (old-relfrozenxid oldest-xmin next-xid &key forced-freeze-cutoff)
+  "Choose the freeze cutoff from the caller's horizon and age policy."
+  (let* ((old-relfrozenxid (or old-relfrozenxid +first-normal-xid+))
+         (age (max 0 (- next-xid old-relfrozenxid)))
+         (freeze-target
+           (or forced-freeze-cutoff
+               (if (>= age +vacuum-aggressive-freeze-age+)
+                   next-xid
+                   (max +first-normal-xid+
+                        (- next-xid +vacuum-freeze-min-age+))))))
+    (min oldest-xmin freeze-target)))
+
 (defun call-with-revalidated-relation-locks
     (state-provider requested-relations acquire-lock release-lock
      valid-state-p function)
@@ -62,15 +75,10 @@ when revalidation or FUNCTION signals an error."
                              (oldest-xmin *current-snapshot*)))
             (old-relfrozenxid (or (pg-class-relfrozenxid table)
                                   +first-normal-xid+))
-            (age (max 0 (- next-xid old-relfrozenxid)))
-            (freeze-target
-              (if forced-freeze-cutoff
-                  forced-freeze-cutoff
-                  (if (>= age +vacuum-aggressive-freeze-age+)
-                      next-xid
-                      (max +first-normal-xid+
-                           (- next-xid +vacuum-freeze-min-age+)))))
-            (freeze-cutoff (min oldest-xmin freeze-target)))
+            (freeze-cutoff
+              (vacuum-compute-freeze-cutoff
+               old-relfrozenxid oldest-xmin next-xid
+               :forced-freeze-cutoff forced-freeze-cutoff)))
        (heap-vacuum-relation-locked
         (pg-class-relfilenode table) index-relfilenodes
         oldest-xmin freeze-cutoff
@@ -187,14 +195,8 @@ when revalidation or FUNCTION signals an error."
     (buf-nblocks target-relfilenode)))
 
 (defun vacuum-full-freeze-cutoff (table oldest-xmin next-xid)
-  (let* ((old-relfrozenxid (or (pg-class-relfrozenxid table)
-                               +first-normal-xid+))
-         (age (max 0 (- next-xid old-relfrozenxid)))
-         (freeze-target (if (>= age +vacuum-aggressive-freeze-age+)
-                            next-xid
-                            (max +first-normal-xid+
-                                 (- next-xid +vacuum-freeze-min-age+)))))
-    (min oldest-xmin freeze-target)))
+  (vacuum-compute-freeze-cutoff
+   (pg-class-relfrozenxid table) oldest-xmin next-xid))
 
 (defun vacuum-full-reserve-storage (table indexes new-table new-indexes)
   "Reserve detached relfilenodes durably while the relation gates are held."

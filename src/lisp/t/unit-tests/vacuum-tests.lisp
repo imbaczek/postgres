@@ -130,6 +130,38 @@
     (check (= (vacuum-normalized-xmax 0 0) 0)
            "normalization preserves tuples without a deleting XID")))
 
+(defun test-vacuum-freeze-cutoff-invariant ()
+  (let* ((next-xid 300000000)
+         (oldest-xmin (- next-xid 10000000))
+         (normal-old-xid
+           (- next-xid (1- +vacuum-aggressive-freeze-age+)))
+         (aggressive-old-xid
+           (- next-xid +vacuum-aggressive-freeze-age+))
+         (table (make-pg-class :oid 992021 :name "freeze_cutoff")))
+    (setf (pg-class-relfrozenxid table) aggressive-old-xid)
+    (check (= (vacuum-compute-freeze-cutoff
+               normal-old-xid next-xid next-xid)
+              (- next-xid +vacuum-freeze-min-age+))
+           "VACUUM uses the normal minimum-age target below aggressive age")
+    (check (= (vacuum-compute-freeze-cutoff
+               aggressive-old-xid oldest-xmin next-xid)
+              oldest-xmin)
+           "VACUUM switches at aggressive age and clamps to oldest xmin")
+    (check (= (vacuum-full-freeze-cutoff table oldest-xmin next-xid)
+              (vacuum-compute-freeze-cutoff
+               aggressive-old-xid oldest-xmin next-xid))
+           "plain and FULL VACUUM share freeze-target arithmetic")
+    (check (= (vacuum-compute-freeze-cutoff
+               normal-old-xid oldest-xmin next-xid
+               :forced-freeze-cutoff (- oldest-xmin 500))
+              (- oldest-xmin 500))
+           "forced wraparound cutoff remains below the snapshot horizon")
+    (check (= (vacuum-compute-freeze-cutoff
+               normal-old-xid oldest-xmin next-xid
+               :forced-freeze-cutoff (+ oldest-xmin 500))
+              oldest-xmin)
+           "forced wraparound cutoff is clamped by oldest xmin")))
+
 (defun vacuum-full-test-read-file (path)
   (with-open-file (stream path :direction :input
                                :element-type '(unsigned-byte 8))
@@ -445,6 +477,85 @@
   (run-vacuum-full-publish-fault-test :before-flush)
   (run-vacuum-full-publish-fault-test :after-flush)
   (run-vacuum-full-publish-fault-test :rename))
+
+(defun test-vacuum-page-retry-rebuilds-proposal ()
+  (let ((*wal-ready* nil)
+        (*wal-page-cache* (make-hash-table :test #'equal))
+        (*wal-page-batch* nil)
+        (*wal-test-pause-at* nil)
+        (read-count 0)
+        (proposal-count 0)
+        (publication-results '())
+        (page-values '())
+        (baseline-values '())
+        (relation-evaluations 0)
+        (block-evaluations 0)
+        (accepted-value nil)
+        (original-buf-read (symbol-function 'buf-read)))
+    (unwind-protect
+         (progn
+           (smgr-forget 992022 :delete t)
+           (setf (symbol-function 'buf-read)
+                 (lambda (relfilenode block &optional fork)
+                   (declare (ignore fork))
+                   (check (= relfilenode 992022)
+                          "VACUUM page retry captures its relation")
+                   (check (= block 3)
+                          "VACUUM page retry captures its block")
+                   (incf read-count)
+                   (case read-count
+                     (1 (vector :page 1))
+                     (2 (vector :page 2))
+                     ((3 4) (vector :page 2))
+                     (otherwise
+                      (error "unexpected VACUUM page read ~a" read-count)))))
+           (let* ((relfilenode (progn
+                                 (incf relation-evaluations)
+                                 992022))
+                  (block (progn (incf block-evaluations) 3)))
+             (with-vacuum-page-retry (page source-page relfilenode block)
+               (check (and (= relfilenode 992022) (= block 3))
+                      "VACUUM page retry exposes its captured page address")
+               (push (aref page 1) page-values)
+               (push (aref source-page 1) baseline-values)
+               (incf proposal-count)
+               (setf (aref page 1) (1+ (aref page 1)))
+               (let ((published
+                       (try-vacuum-page-publication
+                        relfilenode block source-page
+                        :page page :write-page-p nil)))
+                 (push published publication-results)
+                 (when published
+                   (setf accepted-value (aref page 1))
+                   t))))
+           (check (equal (reverse page-values) '(1 2))
+                  "a failed page compare recomputes from a fresh page")
+           (check (equal (reverse baseline-values) '(1 2))
+                  "each VACUUM retry captures a fresh unchanged baseline")
+           (check (equal (reverse publication-results) '(nil t))
+                  "VACUUM retry discards a proposal after a failed page compare")
+           (check (and (= read-count 4) (= proposal-count 2)
+                       (= relation-evaluations 1) (= block-evaluations 1)
+                       (= accepted-value 3))
+                  "VACUUM page retry reevaluates its proposal, not its relation")
+           (setf (symbol-function 'buf-read)
+                 (lambda (&rest arguments)
+                   (declare (ignore arguments))
+                   nil))
+           (let ((relfilenode 992022)
+                 (block 3))
+             (check (handler-case
+                        (progn
+                          (with-vacuum-page-retry
+                              (page source-page relfilenode block)
+                            (values page source-page relfilenode block))
+                          nil)
+                      (error (condition)
+                        (search "disappeared during VACUUM"
+                                (princ-to-string condition))))
+                    "VACUUM page retry errors when its page disappears")))
+      (setf (symbol-function 'buf-read) original-buf-read)
+      (smgr-forget 992022 :delete t))))
 
 (defun test-vacuum-page-publication-is-atomic ()
   (let* ((*wal-ready* nil)

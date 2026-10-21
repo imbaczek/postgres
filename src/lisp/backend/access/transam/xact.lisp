@@ -551,15 +551,8 @@ another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
   (release-relation-build-locks (list relfilenode) token))
 
 (defmacro with-relation-build-lock ((relfilenode &optional wait-readers-p) &body body)
-  (let ((rel (gensym "RELATION-"))
-        (xid (gensym "OWN-XID-"))
-        (token (gensym "BUILD-TOKEN-")))
-    `(let* ((,rel ,relfilenode)
-            (,xid (and *backend* (backend-xid *backend*)))
-            (,token (acquire-relation-build-lock ,rel ,xid ,wait-readers-p)))
-       (unwind-protect
-            (progn ,@body)
-         (release-relation-build-lock ,rel ,token)))))
+  `(with-relation-build-locks ((list ,relfilenode) ,wait-readers-p)
+     ,@body))
 
 (defmacro with-relation-build-locks ((relfilenodes &optional wait-readers-p) &body body)
   "Acquire relation build gates as one group and release them on exit."
@@ -623,13 +616,8 @@ another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
          (release-relation-maintenance-locks ,rels ,token)))))
 
 (defmacro with-relation-maintenance-lock ((relfilenode) &body body)
-  (let ((rel (gensym "RELATION-"))
-        (token (gensym "MAINTENANCE-TOKEN-")))
-    `(let* ((,rel ,relfilenode)
-            (,token (acquire-relation-maintenance-lock ,rel)))
-       (unwind-protect
-            (progn ,@body)
-         (release-relation-maintenance-lock ,rel ,token)))))
+  `(with-relation-maintenance-locks ((list ,relfilenode))
+     ,@body))
 
 (defun release-relation-writer-xid (xid)
   "Forget XID's relation accesses atomically with its removal from active XIDs."
