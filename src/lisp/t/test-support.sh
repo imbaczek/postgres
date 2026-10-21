@@ -1,5 +1,19 @@
 # Shared helpers for server-backed shell tests.
 
+# EXPLAIN emits a tree, so check for a node as an indented exact line instead
+# of comparing the full plan output to a single scan node.
+plan_contains_indented_node() {
+    printf '%s\n' "$1" |
+        awk -v expected="$2" '
+            /^[[:space:]]/ {
+                node = $0
+                sub(/^[[:space:]]+/, "", node)
+                if (node == expected)
+                    found = 1
+            }
+            END { exit !found }'
+}
+
 test_debug_setup() {
     TEST_DEBUG_NAME=$1
     TEST_DEBUG_SQL_PORT=$2

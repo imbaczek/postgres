@@ -143,7 +143,7 @@ grep -q '^UPDATE 0$' "$TMP/predicate-waiter.out" \
 [ "$(scalar -c 'select value from update_predicate where id = 1')" = 2 ] \
     || fail "predicate recheck changed a row that no longer matched"
 plan=$(scalar -c 'explain select id from update_predicate where value = 2')
-[ "$plan" = "Index Scan using update_predicate_value_idx on update_predicate" ] \
+plan_contains_indented_node "$plan" "Index Scan using update_predicate_value_idx on update_predicate" \
     || fail "equality lookup after concurrent UPDATE did not use the index: $plan"
 indexed_rows=$(scalar -c 'select id from update_predicate where value = 2')
 [ "$indexed_rows" = 1 ] \
@@ -174,7 +174,7 @@ grep -q '^DELETE 0$' "$TMP/delete-waiter.out" \
 [ "$(scalar -c 'select value from delete_predicate where id = 1')" = 2 ] \
     || fail "DELETE removed a row that no longer matched"
 plan=$(scalar -c 'explain select id from delete_predicate where value = 2')
-[ "$plan" = "Index Scan using delete_predicate_value_idx on delete_predicate" ] \
+plan_contains_indented_node "$plan" "Index Scan using delete_predicate_value_idx on delete_predicate" \
     || fail "equality lookup after concurrent DELETE recheck did not use the index: $plan"
 [ "$(scalar -c 'select id from delete_predicate where value = 2')" = 1 ] \
     || fail "IndexScan missed the surviving version after concurrent DELETE recheck"

@@ -128,7 +128,7 @@ run -c "vacuum index_diff" > "$TMP/vacuum.out" 2>&1 \
     || fail "VACUUM after mutations failed"
 
 plan=$(run -c 'explain select id from index_diff where category = 3')
-[ "$plan" = "Index Scan using index_diff_category_idx on index_diff" ] \
+plan_contains_indented_node "$plan" "Index Scan using index_diff_category_idx on index_diff" \
     || fail "equality query did not use the populated index: $plan"
 
 capture_results() {
@@ -271,7 +271,7 @@ READER=
 wait "$DROPPER" || fail "DROP INDEX failed after reader commit"
 DROPPER=
 plan=$(run -c 'explain select id from drop_handoff where id = 7')
-[ "$plan" = "Seq Scan on drop_handoff" ] \
+plan_contains_indented_node "$plan" "Seq Scan on drop_handoff" \
     || fail "dropped index remained in the SELECT path: $plan"
 
 restore_output=$(control <<'EOF'

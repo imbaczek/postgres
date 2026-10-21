@@ -530,8 +530,9 @@ if [ "$i" -ge 50 ]; then
     cat "$LOG" >&2
     exit 1
 fi
-grep -q 'Index Scan using drop_index_reader_idx on drop_index_reader' \
-    "$TMP/drop-index-reader.out" \
+drop_reader_output=$(cat "$TMP/drop-index-reader.out")
+plan_contains_indented_node "$drop_reader_output" \
+    "Index Scan using drop_index_reader_idx on drop_index_reader" \
     || {
         echo "unique-index-concurrency: reader did not use the index" >&2
         cat "$TMP/drop-index-reader.out" >&2
@@ -553,7 +554,7 @@ if ! wait "$DROPPER"; then
 fi
 DROPPER=
 plan=$(run -c "explain select i from drop_index_reader where i = 1")
-[ "$plan" = "Seq Scan on drop_index_reader" ] \
+plan_contains_indented_node "$plan" "Seq Scan on drop_index_reader" \
     || {
         echo "unique-index-concurrency: dropped index remained in the SELECT path: $plan" >&2
         cat "$LOG" >&2

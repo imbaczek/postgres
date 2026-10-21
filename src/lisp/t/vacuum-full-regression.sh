@@ -118,7 +118,7 @@ run -c "vacuum vacfull" > "$TMP/vacuum.out" 2>&1 \
 [ "$(row_count 'select id from vacfull')" = 32 ] \
     || fail "ordinary VACUUM changed visible rows"
 plan=$(run -c 'explain select id from vacfull where category = 3')
-[ "$plan" = "Index Scan using vacfull_category_idx on vacfull" ] \
+plan_contains_indented_node "$plan" "Index Scan using vacfull_category_idx on vacfull" \
     || fail "indexed equality scan was unavailable before rewrite: $plan"
 run -c 'select id from vacfull where category = 3 order by id' \
     > "$TMP/before-full.out" || fail "indexed query before rewrite failed"
@@ -170,7 +170,7 @@ run -c 'vacuum (full) vacfull' > "$TMP/full-parenthesized.out" 2>&1 \
 [ "$(row_count 'select id from vacfull')" = 33 ] \
     || fail "parenthesized FULL changed visible rows"
 plan=$(run -c 'explain select id from vacfull where category = 3')
-[ "$plan" = "Index Scan using vacfull_category_idx on vacfull" ] \
+plan_contains_indented_node "$plan" "Index Scan using vacfull_category_idx on vacfull" \
     || fail "index was unavailable after parenthesized FULL: $plan"
 
 # The command snapshot predates this DELETE, but the writer finishes before
@@ -309,7 +309,7 @@ EOF
 grep -q '(T)' "$TMP/gate-race-retry.out" \
     || fail "FULL did not retry with its newly published index in the gate set"
 plan=$(run -c 'explain select id from full_gate_race where id = 100')
-[ "$plan" = "Index Scan using full_gate_race_idx on full_gate_race" ] \
+plan_contains_indented_node "$plan" "Index Scan using full_gate_race_idx on full_gate_race" \
     || fail "gate-race index was not available after FULL: $plan"
 [ "$(run -c 'select id from full_gate_race where id = 100')" = 100 ] \
     || fail "gate-race index returned a stale heap TID after FULL"
@@ -360,7 +360,7 @@ start_server
 [ "$(row_count 'select id from vacfull')" = 33 ] \
     || fail "pre-flush crash recovery lost rows from VACUUM FULL publication"
 plan=$(run -c 'explain select id from vacfull where category = 3')
-[ "$plan" = "Index Scan using vacfull_category_idx on vacfull" ] \
+plan_contains_indented_node "$plan" "Index Scan using vacfull_category_idx on vacfull" \
     || fail "pre-flush crash recovery lost the replacement index: $plan"
 run -c 'select id from vacfull where category = 3 order by id' \
     > "$TMP/after-before-flush-crash.out" \
@@ -428,7 +428,7 @@ start_server
 [ "$(row_count 'select id from vacfull')" = 33 ] \
     || fail "crash recovery lost rows from VACUUM FULL publication"
 plan=$(run -c 'explain select id from vacfull where category = 3')
-[ "$plan" = "Index Scan using vacfull_category_idx on vacfull" ] \
+plan_contains_indented_node "$plan" "Index Scan using vacfull_category_idx on vacfull" \
     || fail "recovered VACUUM FULL index was unavailable: $plan"
 run -c 'select id from vacfull where category = 3 order by id' \
     > "$TMP/after-crash-full.out" \

@@ -160,7 +160,7 @@ BUILDER=$!
 wait_for_file "$TMP/bulk-build.ready"
 
 plan=$(run -c 'explain select id from build_gate_a where category = 3')
-[ "$plan" = "Seq Scan on build_gate_a" ] \
+plan_contains_indented_node "$plan" "Seq Scan on build_gate_a" \
     || fail "an unfinished index build became visible: $plan"
 publication_output=$(control <<'EOF'
 (let ((db (gethash "postgres" (catalog-databases *catalog*))))
@@ -201,7 +201,7 @@ SAME_WRITER=
 wait "$OTHER_WRITER" || fail "unrelated writer failed"
 OTHER_WRITER=
 plan=$(run -c 'explain select id from build_gate_a where category = 3')
-[ "$plan" = "Index Scan using build_gate_category_idx on build_gate_a" ] \
+plan_contains_indented_node "$plan" "Index Scan using build_gate_category_idx on build_gate_a" \
     || fail "published index was not selected: $plan"
 run -c 'select id from build_gate_a where category = 9 order by id' \
     > "$TMP/indexed.out" || fail "indexed query failed"
@@ -239,7 +239,7 @@ run -c "create index shared_race_idx on build_race_right (category)" \
     > "$TMP/race-second.out" 2>&1 \
     || fail "the competing index name could not be published"
 plan=$(run -c 'explain select id from build_race_right where category = 2')
-[ "$plan" = "Index Scan using shared_race_idx on build_race_right" ] \
+plan_contains_indented_node "$plan" "Index Scan using shared_race_idx on build_race_right" \
     || fail "the published same-name index belongs to the wrong table: $plan"
 : > "$TMP/name-race.release"
 if run -c "create index shared_race_idx on build_race_left (category)" \
@@ -251,7 +251,7 @@ RACE_BUILDER=
 grep -q 'already exists' "$TMP/race-first.out" \
     || fail "the first builder did not report the publication-time name conflict"
 plan=$(run -c 'explain select id from build_race_left where category = 1')
-[ "$plan" = "Seq Scan on build_race_left" ] \
+plan_contains_indented_node "$plan" "Seq Scan on build_race_left" \
     || fail "the losing builder left an index attached to its table: $plan"
 
 restore_output=$(control <<'EOF'
@@ -328,7 +328,7 @@ PUBLICATION_RELFILE=$(cat "$TMP/publication-failure.relfilenode")
 [ -e "$TMP/data/base/$PUBLICATION_RELFILE" ] \
     || fail "publication rollback removed the relfile before recovery"
 plan=$(run -c 'explain select id from build_failure_a where category = 3')
-[ "$plan" = "Seq Scan on build_failure_a" ] \
+plan_contains_indented_node "$plan" "Seq Scan on build_failure_a" \
     || fail "failed index publication remained usable by SELECT"
 restore_failure_output=$(control <<'EOF'
 (setf *index-publication-failure-name* "durable_failure_idx"
@@ -361,7 +361,7 @@ echo "$failure_output" | grep -Eq ';; (read )?error:' \
     && fail "post-durable publication inspection failed"
 DURABLE_RELFILE=$(cat "$TMP/durable-failure.relfilenode")
 plan=$(run -c 'explain select id from build_failure_b where category = 3')
-[ "$plan" = "Index Scan using durable_failure_idx on build_failure_b" ] \
+plan_contains_indented_node "$plan" "Index Scan using durable_failure_idx on build_failure_b" \
     || fail "durably published index was not usable after the reported failure: $plan"
 run -c 'insert into build_failure_b values (2, 3)' >/dev/null \
     || fail "writer failed to maintain durably published index"
@@ -426,10 +426,10 @@ done
 [ -e "$TMP/data/base/$DURABLE_RELFILE" ] \
     || fail "startup recovery removed the durable index relation file"
 plan=$(run -c 'explain select id from build_gate_a where category = 3')
-[ "$plan" = "Seq Scan on build_gate_a" ] \
+plan_contains_indented_node "$plan" "Seq Scan on build_gate_a" \
     || fail "an interrupted index build became visible: $plan"
 plan=$(run -c 'explain select id from build_failure_b where category = 3')
-[ "$plan" = "Index Scan using durable_failure_idx on build_failure_b" ] \
+plan_contains_indented_node "$plan" "Index Scan using durable_failure_idx on build_failure_b" \
     || fail "restart recovery lost the durable index: $plan"
 run -c 'select id from build_failure_b where category = 3 order by id' \
     > "$TMP/recovered-durable-query.out" \

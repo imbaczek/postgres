@@ -103,7 +103,7 @@ run -c "create index large_duplicate_scan_category_idx on large_duplicate_scan (
     >/dev/null
 run -c "create table unrelated_writes (id int)" >/dev/null
 plan=$(run -c 'explain select id from large_duplicate_scan where category = 10')
-[ "$plan" = "Index Scan using large_duplicate_scan_category_idx on large_duplicate_scan" ] \
+plan_contains_indented_node "$plan" "Index Scan using large_duplicate_scan_category_idx on large_duplicate_scan" \
     || fail "large equality lookup is not an IndexScan: $plan"
 
 # The test-only B-tree wrapper pauses inside the search after the per-index

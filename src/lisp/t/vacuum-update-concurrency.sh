@@ -207,10 +207,10 @@ echo "$retry_output" | grep -Eq ';; (read )?error:' \
     && fail "VACUUM retry inspection failed"
 
 plan=$(run -c 'explain select id from vacuum_writer_race where category = 15')
-[ "$plan" = "Index Scan using vacuum_writer_race_category_idx on vacuum_writer_race" ] \
+plan_contains_indented_node "$plan" "Index Scan using vacuum_writer_race_category_idx on vacuum_writer_race" \
     || fail "stale index entries were not checked through IndexScan: $plan"
 plan=$(run -c 'explain select id from vacuum_writer_race where category = 16')
-[ "$plan" = "Index Scan using vacuum_writer_race_category_idx on vacuum_writer_race" ] \
+plan_contains_indented_node "$plan" "Index Scan using vacuum_writer_race_category_idx on vacuum_writer_race" \
     || fail "post-VACUUM lookup did not use the index: $plan"
 
 capture_results() {
@@ -234,7 +234,7 @@ capture_results > "$TMP/indexed-results.out" \
 run -c "drop index vacuum_writer_race_category_idx" \
     > "$TMP/drop-index.out" 2>&1 || fail "could not drop index for comparison"
 plan=$(run -c 'explain select id from vacuum_writer_race where category = 15')
-[ "$plan" = "Seq Scan on vacuum_writer_race" ] \
+plan_contains_indented_node "$plan" "Seq Scan on vacuum_writer_race" \
     || fail "sequential comparison did not use SeqScan: $plan"
 capture_results > "$TMP/sequential-results.out" \
     || fail "sequential results after concurrent VACUUM failed"
