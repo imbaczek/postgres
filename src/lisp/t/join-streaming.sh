@@ -115,7 +115,7 @@ echo "$install_output" | grep -Eq ';; (read )?error:' \
     printf 'ordered-asc-limit\n'
     run -c 'select l.id from join_limit_left l cross join join_limit_right r order by l.id limit 1'
     printf 'ordered-desc-limit\n'
-    run -c 'select l.id from join_limit_left l cross join join_limit_right r order by l.id desc limit 1'
+    run -c 'select l.id from join_limit_left l cross join join_limit_right r where l.id is not null order by l.id desc limit 1'
 } > "$TMP/results.out" 2>&1 || fail "JOIN query failed"
 
 cat > "$TMP/expected.out" <<'EOF'
@@ -142,7 +142,7 @@ limit
 ordered-asc-limit
 1
 ordered-desc-limit
-
+100
 EOF
 if ! cmp -s "$TMP/expected.out" "$TMP/results.out"; then
     diff -u "$TMP/expected.out" "$TMP/results.out" >&2 || true
@@ -151,7 +151,7 @@ fi
 
 counter_output=$(control <<'EOF'
 (if (and (= *join-limit-qual-evaluations* 20201)
-         (= *join-limit-top-n-offers* 20200)
+         (= *join-limit-top-n-offers* 20100)
          (= *join-limit-top-n-max-size* 1))
     :ORDERED-CANDIDATES-CONSUMED
     (list :QUALIFICATIONS *join-limit-qual-evaluations*

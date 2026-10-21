@@ -46,25 +46,44 @@ the compare and publication from concurrent heap writers."
               (visibilitymap-clear relfilenode block)))
         t))))
 
+(defun vacuum-normalized-xmin (raw-xmin xmin freeze-cutoff)
+  "Return the frozen XMIN value when its committed XID is past the cutoff."
+  (if (and (>= raw-xmin +first-normal-xid+)
+           (< xmin freeze-cutoff)
+           (xid-committed-p xmin))
+      +frozen-xid+
+      xmin))
+
+(defun vacuum-normalized-xmax (raw-xmax xmax)
+  "Return invalid XMAX for an aborted deleting transaction."
+  (if (and (not (zerop raw-xmax))
+           (xid-aborted-p xmax))
+      +invalid-xid+
+      xmax))
+
 (defmacro vacuum-normalize-tuple-xids
     (page offset raw-xmin xmin raw-xmax xmax freeze-cutoff changed-p)
   "Normalize tuple XIDs and their local copies.
 
 All arguments are lexical variables; CHANGED-P is set on an update."
-  `(progn
-     (when (and (>= ,raw-xmin +first-normal-xid+)
-                (< ,xmin ,freeze-cutoff)
-                (xid-committed-p ,xmin))
-       (page-set-u32 ,page (+ ,offset +heap-tuple-xmin-off+) +frozen-xid+)
-       (setf ,raw-xmin +frozen-xid+
-             ,xmin +frozen-xid+
-             ,changed-p t))
-     (when (and (not (zerop ,raw-xmax))
-                (xid-aborted-p ,xmax))
-       (page-set-u32 ,page (+ ,offset +heap-tuple-xmax-off+) +invalid-xid+)
-       (setf ,raw-xmax +invalid-xid+
-             ,xmax +invalid-xid+
-             ,changed-p t))))
+  (let ((normalized-xmin (gensym "NORMALIZED-XMIN-"))
+        (normalized-xmax (gensym "NORMALIZED-XMAX-")))
+    `(let ((,normalized-xmin
+             (vacuum-normalized-xmin ,raw-xmin ,xmin ,freeze-cutoff))
+           (,normalized-xmax
+             (vacuum-normalized-xmax ,raw-xmax ,xmax)))
+       (unless (= ,normalized-xmin ,xmin)
+         (page-set-u32 ,page (+ ,offset +heap-tuple-xmin-off+)
+                       ,normalized-xmin)
+         (setf ,raw-xmin ,normalized-xmin
+               ,xmin ,normalized-xmin
+               ,changed-p t))
+       (unless (= ,normalized-xmax ,xmax)
+         (page-set-u32 ,page (+ ,offset +heap-tuple-xmax-off+)
+                       ,normalized-xmax)
+         (setf ,raw-xmax ,normalized-xmax
+               ,xmax ,normalized-xmax
+               ,changed-p t)))))
 
 (defun heap-vacuum-scan-page (relfilenode block oldest-xmin freeze-cutoff)
   "Mark removable tuples LP_DEAD and freeze old surviving tuple XIDs.

@@ -79,6 +79,373 @@
     (check (not (same-index-object-set-p (list first first) (list first second)))
            "VACUUM FULL rejects duplicate entries in an index set")))
 
+(defun test-vacuum-xid-normalization-invariant ()
+  (let* ((xmin 992001)
+         (xmax 992002)
+         (cutoff 992010)
+         (offset 64)
+         (aborted-xmin 992003)
+         (committed-xmax 992004)
+         (page (make-page))
+         (raw-xmin (xid32-of xmin))
+         (raw-xmax (xid32-of xmax))
+         (local-xmin xmin)
+         (local-xmax xmax)
+         (changed nil))
+    (clog-set xmin +clog-committed+)
+    (clog-set xmax +clog-aborted+)
+    (clog-set aborted-xmin +clog-aborted+)
+    (clog-set committed-xmax +clog-committed+)
+    (check (= (vacuum-normalized-xmin raw-xmin xmin cutoff) +frozen-xid+)
+           "plain and FULL VACUUM share the committed-XMIN freeze rule")
+    (check (= (vacuum-normalized-xmax raw-xmax xmax) +invalid-xid+)
+           "plain and FULL VACUUM share the aborted-XMAX cleanup rule")
+    (check (= (vacuum-normalized-xmin (xid32-of xmin) xmin xmin) xmin)
+           "XMIN at the freeze cutoff is not frozen")
+    (check (= (vacuum-normalized-xmin (xid32-of aborted-xmin)
+                                      aborted-xmin cutoff)
+              aborted-xmin)
+           "aborted XMIN is not frozen")
+    (check (= (vacuum-normalized-xmax (xid32-of committed-xmax)
+                                      committed-xmax)
+              committed-xmax)
+           "committed XMAX is retained for visibility")
+    (vacuum-normalize-tuple-xids
+     page offset raw-xmin local-xmin raw-xmax local-xmax cutoff changed)
+    (check (and changed
+                (= raw-xmin +frozen-xid+)
+                (= local-xmin +frozen-xid+)
+                (= raw-xmax +invalid-xid+)
+                (= local-xmax +invalid-xid+))
+           "tuple-XID macro updates page source values and local copies together")
+    (check (and (= (page-u32 page (+ offset +heap-tuple-xmin-off+))
+                   +frozen-xid+)
+                (= (page-u32 page (+ offset +heap-tuple-xmax-off+))
+                   +invalid-xid+))
+           "tuple-XID macro writes normalized XIDs to the tuple page")
+    (check (= (vacuum-normalized-xmin (xid32-of +frozen-xid+)
+                                      +frozen-xid+ cutoff)
+              +frozen-xid+)
+           "normalization preserves tuples already carrying the frozen XID")
+    (check (= (vacuum-normalized-xmax 0 0) 0)
+           "normalization preserves tuples without a deleting XID")))
+
+(defun vacuum-full-test-read-file (path)
+  (with-open-file (stream path :direction :input
+                               :element-type '(unsigned-byte 8))
+    (let ((bytes (make-array (file-length stream)
+                             :element-type '(unsigned-byte 8))))
+      (read-sequence bytes stream)
+      bytes)))
+
+(defun vacuum-full-test-write-relation-marker (relfilenode)
+  (let ((path (relation-file-path relfilenode)))
+    (ensure-directories-exist path)
+    (with-open-file (stream path :direction :output
+                                 :if-exists :supersede
+                                 :if-does-not-exist :create
+                                 :element-type '(unsigned-byte 8))
+      (write-byte #x5A stream))))
+
+(defun call-with-vacuum-full-publish-test-fixture (function)
+  (let* ((test-pgdata (merge-pathnames "vacuum-full-publish-test/" *pgdata*))
+         (*pgdata* test-pgdata)
+         (*catalog* (make-catalog))
+         (*catalog-oldest-relfrozenxid* nil)
+         (*catalog-durable-generation* 0)
+         (*backend* (make-backend))
+         (*wal-ready* nil)
+         (*wal-page-cache* (make-hash-table :test #'equal))
+         (*wal-page-batch* nil)
+         (*wal-pending-deletes* '())
+         (*wal-pending-btree-split* nil)
+         (*wal-catalog-flush-generation* 0)
+         (*wal-vacuum-full-publication* nil)
+         (*wal-test-before-vacuum-full-catalog-record-appended-hook* nil)
+         (*wal-test-before-vacuum-full-catalog-flush-hook* nil)
+         (*wal-test-after-vacuum-full-catalog-flush-hook* nil)
+         (*wal-test-pause-at* nil)
+         (*wal-test-pause-relfilenode* nil)
+         (*wal-test-pause-fired* nil)
+         (*wal-output-stream* nil)
+         (*wal-output-segment* nil)
+         (*wal-new-segments* '())
+         (*wal-end-lsn* 0)
+         (*wal-checkpoint-lsn* 0)
+         (*wal-durable-lsn* 0)
+         (*wal-poisoned* nil)
+         (*relation-streams* (make-hash-table :test #'equal))
+         (*catalog-rename-function* nil)
+         (db (make-database :name "postgres" :oid 991000))
+         (table (make-pg-class :oid 991001 :name "vac_full_fault"
+                               :relfilenode 991002
+                               :relfrozenxid +first-normal-xid+
+                               :columns #() :indexes '(991003)))
+         (index (make-pg-index :oid 991003 :name "vac_full_fault_idx"
+                               :relfilenode 991004 :table-oid 991001
+                               :columns '(1) :valid-p t))
+         (new-table nil)
+         (new-index nil)
+         (new-relfilenodes '(991005 991006))
+         (old-relfilenodes '(991002 991004))
+         (original-fast-shutdown (symbol-function 'request-fast-shutdown)))
+    (ignore-errors
+     (uiop:delete-directory-tree test-pgdata :validate t
+                                             :if-does-not-exist :ignore))
+    (setf (backend-database *backend*) "postgres"
+          (gethash "postgres" (catalog-databases *catalog*)) db
+          (gethash (pg-class-name table) (database-tables db)) table
+          (gethash (pg-index-name index) (database-indexes db)) index
+          new-table (copy-pg-class table)
+          new-index (copy-pg-index index)
+          (pg-class-relfilenode new-table) (first new-relfilenodes)
+          (pg-index-relfilenode new-index) (second new-relfilenodes))
+    (dolist (relfilenode (append old-relfilenodes new-relfilenodes))
+      (vacuum-full-test-write-relation-marker relfilenode))
+    (unwind-protect
+         (progn
+           ;; WAL failures normally request a postmaster fast shutdown. Keep the
+           ;; unit process alive so the publication state can be inspected.
+           (setf (symbol-function 'request-fast-shutdown)
+                 (lambda (&rest arguments)
+                   (declare (ignore arguments))
+                   (values)))
+           (wal-init)
+           (write-catalog-image (catalog-image-bytes))
+           (funcall function db table index new-table new-index
+                    old-relfilenodes new-relfilenodes
+                    (vacuum-full-test-read-file (catalog-path))))
+      (setf (symbol-function 'request-fast-shutdown)
+            original-fast-shutdown)
+      (when *wal-output-stream*
+        (ignore-errors (close *wal-output-stream*)))
+      (ignore-errors
+       (uiop:delete-directory-tree test-pgdata :validate t
+                                               :if-does-not-exist :ignore)))))
+
+(defun check-vacuum-full-publish-durable-state
+    (db new-table new-index new-relfilenodes old-relfilenodes old-catalog-image)
+  (check (eq (gethash (pg-class-name new-table) (database-tables db)) new-table)
+         "durable VACUUM FULL error keeps replacement heap metadata")
+  (check (eq (gethash (pg-index-name new-index) (database-indexes db)) new-index)
+         "durable VACUUM FULL error keeps replacement index metadata")
+  (check (every (lambda (relfilenode)
+                  (probe-file (relation-file-path relfilenode)))
+                new-relfilenodes)
+         "durable VACUUM FULL error preserves replacement relation files")
+  (check (every (lambda (relfilenode)
+                  (not (probe-file (relation-file-path relfilenode))))
+                old-relfilenodes)
+         "durable VACUUM FULL error retires old relation files")
+  (check (equalp (vacuum-full-test-read-file (catalog-path))
+                 old-catalog-image)
+         "failed catalog replacement leaves the previous catalog pathname intact"))
+
+(defun vacuum-full-test-recover-appended-catalog-record
+    (new-relfilenodes old-relfilenodes)
+  (when *wal-output-stream*
+    (close *wal-output-stream*)
+    (setf *wal-output-stream* nil))
+  (smgr-close-all)
+  (setf *catalog* (make-catalog)
+        *catalog-oldest-relfrozenxid* nil
+        *wal-catalog-flush-generation* 0)
+  (wal-init)
+  (wal-recover)
+  (setf *catalog* (load-catalog))
+  (let* ((db (gethash "postgres" (catalog-databases *catalog*)))
+         (table (gethash "vac_full_fault" (database-tables db)))
+         (index (gethash "vac_full_fault_idx" (database-indexes db))))
+    (check (= (pg-class-relfilenode table) (first new-relfilenodes))
+           "restart replays a complete pre-flush catalog record")
+    (check (= (pg-index-relfilenode index) (second new-relfilenodes))
+           "restart replays the pre-flush replacement index metadata")
+    (check (every (lambda (relfilenode)
+                    (probe-file (relation-file-path relfilenode)))
+                  new-relfilenodes)
+           "restart retains files referenced by the replayed catalog")
+    (check (every (lambda (relfilenode)
+                    (not (probe-file (relation-file-path relfilenode))))
+                  old-relfilenodes)
+           "restart applies deferred deletion from the replayed catalog")))
+
+(defun vacuum-full-test-recover-unappended-catalog-record
+    (new-relfilenodes old-relfilenodes old-catalog-image
+     sentinel-relfilenode sentinel-original-image)
+  (when *wal-output-stream*
+    (close *wal-output-stream*)
+    (setf *wal-output-stream* nil))
+  (smgr-close-all)
+  (setf *catalog* (make-catalog)
+        *catalog-oldest-relfrozenxid* nil
+        *wal-catalog-flush-generation* 0)
+  (wal-init)
+  (wal-recover)
+  (setf *catalog* (load-catalog))
+  (let* ((db (gethash "postgres" (catalog-databases *catalog*)))
+         (table (gethash "vac_full_fault" (database-tables db)))
+         (index (gethash "vac_full_fault_idx" (database-indexes db))))
+    (check (= (pg-class-relfilenode table) (first old-relfilenodes))
+           "restart ignores a catalog batch without its terminal record")
+    (check (= (pg-index-relfilenode index) (second old-relfilenodes))
+           "restart keeps the original index metadata without a terminal record")
+    (check (every (lambda (relfilenode)
+                    (probe-file (relation-file-path relfilenode)))
+                  old-relfilenodes)
+           "restart retains original relation files without a terminal record")
+    (check (every (lambda (relfilenode)
+                    (not (probe-file (relation-file-path relfilenode))))
+                  new-relfilenodes)
+           "restart leaves unpublished replacement files absent")
+    (check (equalp (vacuum-full-test-read-file (catalog-path))
+                   old-catalog-image)
+           "restart retains the original catalog image without a terminal record")
+    (check (equalp (vacuum-full-test-read-file
+                    (relation-file-path sentinel-relfilenode))
+                   sentinel-original-image)
+           "restart discards staged page images from an unterminated catalog batch")))
+
+(defun run-vacuum-full-publish-fault-test (fault-point)
+  (call-with-vacuum-full-publish-test-fixture
+   (lambda (db table index new-table new-index
+            old-relfilenodes new-relfilenodes old-catalog-image)
+     (let ((preserve-replacements nil)
+           (cleanup-ran nil)
+           (caught nil)
+           (injected-condition nil)
+           (sentinel-relfilenode 991007)
+           (sentinel-original-image nil))
+       (labels ((inject (message)
+                  (setf injected-condition
+                        (make-condition 'simple-error
+                                        :format-control message
+                                        :format-arguments nil))
+                  (error injected-condition)))
+         (ecase fault-point
+           (:before-record
+            ;; Make the catalog batch contain a complete page-image record as
+            ;; well as its batch-start record. Recovery must discard both when
+            ;; the terminal catalog record is absent.
+            (vacuum-full-test-write-relation-marker sentinel-relfilenode)
+            (setf sentinel-original-image
+                  (vacuum-full-test-read-file
+                   (relation-file-path sentinel-relfilenode)))
+            (let ((page (make-page)))
+              (setf (aref page 0) #xA5)
+              (buf-write sentinel-relfilenode 0 page))
+            (setf *wal-test-before-vacuum-full-catalog-record-appended-hook*
+                  (lambda ()
+                    (finish-output *wal-output-stream*)
+                    (fsync-stream *wal-output-stream*)
+                    (when *wal-new-segments*
+                      (fsync-directory (wal-directory))
+                      (setf *wal-new-segments* '()))
+                    (inject "injected before catalog WAL record"))))
+           (:before-flush
+            (setf *wal-test-before-vacuum-full-catalog-flush-hook*
+                  (lambda ()
+                    ;; Ensure restart sees the terminal record while the
+                    ;; durable-LSN control file still names the previous WAL.
+                    (finish-output *wal-output-stream*)
+                    (fsync-stream *wal-output-stream*)
+                    (when *wal-new-segments*
+                      (fsync-directory (wal-directory))
+                      (setf *wal-new-segments* '()))
+                    (inject "injected before catalog WAL flush"))))
+           (:after-flush
+            (setf *wal-test-after-vacuum-full-catalog-flush-hook*
+                  (lambda () (inject "injected after catalog WAL flush"))))
+           (:rename
+            (setf *catalog-rename-function*
+                  (lambda (&rest arguments)
+                    (declare (ignore arguments))
+                    (inject "injected during catalog-file replacement")))))
+         (handler-case
+             (with-error-cleanup
+                 (condition
+                  (unless preserve-replacements
+                    (setf cleanup-ran t)
+                    (ignore-errors
+                     (wal-discard-relation-pages new-relfilenodes))
+                    (dolist (relfilenode new-relfilenodes)
+                      (ignore-errors (smgr-forget relfilenode :delete t)))))
+               (vacuum-full-publish
+                db table (list index) new-table (list new-index)
+                :on-wal-appended
+                (lambda () (setf preserve-replacements t))))
+           (error (condition) (setf caught condition)))
+         (check (and caught (eq caught injected-condition)
+                     (search (ecase fault-point
+                               (:before-record "injected before catalog WAL record")
+                               (:before-flush "injected before catalog WAL flush")
+                               (:after-flush "injected after catalog WAL flush")
+                               (:rename "injected during catalog-file replacement"))
+                             (princ-to-string caught)))
+                (format nil "VACUUM FULL re-signals the ~a failure"
+                        fault-point))
+         (check (= *wal-catalog-flush-generation*
+                   (if (member fault-point '(:before-record :before-flush))
+                       0 1))
+                (format nil "~a fault lands on the expected side of WAL flush"
+                        fault-point))
+         (cond
+           ((eq fault-point :before-record)
+            (check (not preserve-replacements)
+                   "failure before record append leaves replacement cleanup enabled")
+            (check cleanup-ran
+                   "failure before record append cleans replacement files")
+            (check (eq (gethash (pg-class-name table) (database-tables db)) table)
+                   "failure before record append restores original heap metadata")
+            (check (eq (gethash (pg-index-name index) (database-indexes db)) index)
+                   "failure before record append restores original index metadata")
+            (check (every (lambda (relfilenode)
+                            (not (probe-file (relation-file-path relfilenode))))
+                          new-relfilenodes)
+                   "failure before record append removes detached replacement files")
+            (check (equalp (vacuum-full-test-read-file (catalog-path))
+                           old-catalog-image)
+                   "failure before record append leaves the old catalog image intact")
+            (vacuum-full-test-recover-unappended-catalog-record
+             new-relfilenodes old-relfilenodes old-catalog-image
+             sentinel-relfilenode sentinel-original-image))
+           ((eq fault-point :before-flush)
+            (check preserve-replacements
+                   "appended catalog record protects replacement files before flush")
+            (check (not cleanup-ran)
+                   "pre-flush failure skips cleanup of replayable replacement files")
+            (check (eq (gethash (pg-class-name new-table)
+                                (database-tables db))
+                       new-table)
+                   "pre-flush failure keeps replacement heap metadata in memory")
+            (check (eq (gethash (pg-index-name new-index)
+                                (database-indexes db))
+                       new-index)
+                   "pre-flush failure keeps replacement index metadata in memory")
+            (check (every (lambda (relfilenode)
+                            (probe-file (relation-file-path relfilenode)))
+                          new-relfilenodes)
+                   "pre-flush failure retains replacement files referenced by replay")
+            (check (every (lambda (relfilenode)
+                            (probe-file (relation-file-path relfilenode)))
+                          old-relfilenodes)
+                   "pre-flush failure defers old-file deletion until recovery")
+            (vacuum-full-test-recover-appended-catalog-record
+             new-relfilenodes old-relfilenodes))
+           (t
+            (check preserve-replacements
+                   "post-flush failure preserves replacement files")
+            (check (not cleanup-ran)
+                   "post-flush failure skips unpublished-file cleanup")
+            (check-vacuum-full-publish-durable-state
+             db new-table new-index new-relfilenodes old-relfilenodes
+             old-catalog-image))))))))
+
+(defun test-vacuum-full-publish-failure-boundaries ()
+  (run-vacuum-full-publish-fault-test :before-record)
+  (run-vacuum-full-publish-fault-test :before-flush)
+  (run-vacuum-full-publish-fault-test :after-flush)
+  (run-vacuum-full-publish-fault-test :rename))
+
 (defun test-vacuum-page-publication-is-atomic ()
   (let* ((*wal-ready* nil)
          (*wal-page-cache* (make-hash-table :test #'equal))

@@ -7,6 +7,14 @@
 ;;; PG_TERMINATE_BACKEND() need to emit warnings without a stream argument.
 (defvar *output-stream* nil)
 
+(defmacro with-error-cleanup ((condition cleanup) &body body)
+  "Run CLEANUP best-effort and re-signal the original ERROR from BODY."
+  `(handler-case
+       (progn ,@body)
+     (error (,condition)
+       (ignore-errors ,cleanup)
+       (error ,condition))))
+
 (define-condition pg-error (error)
   ((sqlstate :initarg :sqlstate :reader pg-error-sqlstate :initform "XX000")
    (message  :initarg :message  :reader pg-error-message  :initform "internal error")

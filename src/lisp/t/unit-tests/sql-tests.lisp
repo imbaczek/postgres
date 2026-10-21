@@ -181,6 +181,16 @@
         (setf caught condition)))
     (check (= cleanup-count 1) "error cleanup runs before rethrow")
     (check (eq caught fatal) "error cleanup re-signals the original condition"))
+  (let* ((original (make-condition 'pg-error :severity "ERROR"
+                                             :sqlstate "XX000"
+                                             :message "original error"))
+         (caught nil))
+    (handler-case
+        (with-error-cleanup (condition (error "injected cleanup failure"))
+          (error original))
+      (pg-error (condition) (setf caught condition)))
+    (check (eq caught original)
+           "cleanup failure does not replace the original condition"))
   (let* ((fatal (make-condition 'pg-error :severity "FATAL"
                                           :sqlstate "XX000" :message "test fatal"))
          (handler-ran nil)

@@ -99,6 +99,8 @@
       (test-revalidated-relation-locks-retry-and-release)
       (test-revalidated-relation-locks-release-after-revalidation-error)
       (test-vacuum-index-object-set-invariant)
+      (test-vacuum-xid-normalization-invariant)
+      (test-vacuum-full-publish-failure-boundaries)
       (test-vacuum-page-read-releases-global-write-lock)
       (test-vacuum-reuses-tid-clears-index-and-vm)
       (test-vacuum-snapshot-horizon)

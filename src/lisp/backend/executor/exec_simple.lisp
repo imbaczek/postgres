@@ -23,14 +23,6 @@
                  (ensure-current-table ,table-value)
                  ,@body))))))
 
-(defmacro with-error-cleanup ((condition cleanup) &body body)
-  "Run CLEANUP and re-signal ERROR from BODY."
-  `(handler-case
-       (progn ,@body)
-     (error (,condition)
-       ,cleanup
-       (error ,condition))))
-
 (defun ddl-p (ast)
   (member (getf ast :type)
           '(:create-table :drop-table :create-index :drop-index

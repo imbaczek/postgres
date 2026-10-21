@@ -146,16 +146,11 @@ when revalidation or FUNCTION signals an error."
                (not (tuple-prunable-p (htup-xmin tuple)
                                       (htup-xmax tuple) oldest-xmin)))
       (let* ((xmin (htup-xmin tuple))
-             (raw-xmax (htup-xmax tuple))
-             (copy-xmin (if (and (>= xmin +first-normal-xid+)
-                                 (< xmin freeze-cutoff)
-                                 (xid-committed-p xmin))
-                            +frozen-xid+
-                            xmin))
-             (copy-xmax (if (and (not (zerop raw-xmax))
-                                 (xid-aborted-p (htup-xmax tuple)))
-                            +invalid-xid+
-                            raw-xmax)))
+             (xmax (htup-xmax tuple))
+             (copy-xmin
+               (vacuum-normalized-xmin (xid32-of xmin) xmin freeze-cutoff))
+             (copy-xmax
+               (vacuum-normalized-xmax (xid32-of xmax) xmax)))
         (multiple-value-bind (target-block target-offnum)
             (heapam-insert target-relfilenode
                            (pg-class-columns source-table)
@@ -216,46 +211,55 @@ when revalidation or FUNCTION signals an error."
     (save-catalog))
   (values))
 
-(defun vacuum-full-publish (db table indexes new-table new-indexes)
-  "Atomically publish replacement metadata and defer old-file deletion."
+(defun vacuum-full-publish (db table indexes new-table new-indexes
+                            &key on-wal-appended)
+  "Publish replacement metadata, retaining files once its WAL record is complete."
   (let ((old-relfilenodes
           (cons (pg-class-relfilenode table)
-                (mapcar #'pg-index-relfilenode indexes)))
-        (published nil))
+                (mapcar #'pg-index-relfilenode indexes))))
     (with-write-catalog-locks
       (ensure-current-table table)
       (unless (same-index-object-set-p indexes (table-indexes table))
         (ereport "40001" "relation indexes changed during VACUUM FULL"))
-      (let ((old-flush-generation (wal-catalog-flush-generation)))
+      (let ((old-flush-generation (wal-catalog-flush-generation))
+            (wal-appended nil))
         (setf (gethash (pg-class-name new-table) (database-tables db))
               new-table)
         (dolist (new-index new-indexes)
           (setf (gethash (pg-index-name new-index) (database-indexes db))
                 new-index))
         (handler-case
-            (progn
-              (save-catalog :deferred-relations old-relfilenodes)
-              (setf published t))
+            (let ((*wal-vacuum-full-publication* t))
+              (save-catalog
+               :deferred-relations old-relfilenodes
+               :on-record-appended
+               (lambda ()
+                 (setf wal-appended t)
+                 (when on-wal-appended
+                   (funcall on-wal-appended)))))
           (error (condition)
-            (if (> (wal-catalog-flush-generation) old-flush-generation)
-                (progn
-                  ;; The catalog WAL record is durable.  Keep the replacement
-                  ;; metadata and storage even if applying it failed locally.
-                  (setf published t)
-                  (ignore-errors (catalog-refresh-oldest-relfrozenxid))
-                  (dolist (relfilenode old-relfilenodes)
-                    (ignore-errors (smgr-forget relfilenode :delete t)))
-                  published)
-                (progn
-                  ;; No durable catalog record owns the replacement files.
-                  (setf (gethash (pg-class-name table) (database-tables db))
-                        table)
-                  (dolist (index indexes)
-                    (setf (gethash (pg-index-name index)
-                                   (database-indexes db))
-                          index))
-                  (error condition)))))))
-    published))
+            (cond
+              ((> (wal-catalog-flush-generation) old-flush-generation)
+               ;; Recovery will replay the durable catalog. Retire the old
+               ;; files best-effort without replacing the original error.
+               (ignore-errors (catalog-refresh-oldest-relfrozenxid))
+               (dolist (relfilenode old-relfilenodes)
+                 (ignore-errors (smgr-forget relfilenode :delete t)))
+               (error condition))
+              (t
+               (unless wal-appended
+                 ;; No complete terminal catalog record can own the
+                 ;; replacement files, so restoring the old metadata is safe.
+                 (setf (gethash (pg-class-name table) (database-tables db))
+                       table)
+                 (dolist (index indexes)
+                   (setf (gethash (pg-index-name index)
+                                  (database-indexes db))
+                         index)))
+               ;; If WAL append completed, recovery may still replay it. Keep
+               ;; replacement metadata and both file sets in that case.
+               (error condition)))))))
+    (values)))
 
 (defun vacuum-full-table (table)
   "Rewrite TABLE and all its indexes under exclusive relation build gates."
@@ -275,52 +279,53 @@ when revalidation or FUNCTION signals an error."
               (new-table (copy-pg-class table))
               (new-indexes (mapcar #'copy-pg-index indexes))
               (new-relfilenodes nil)
-              (published nil))
+              (keep-replacement-files nil))
          (setf (pg-class-indexes new-table)
                (copy-list (pg-class-indexes table)))
-         (handler-case
-             (progn
-               (vacuum-full-reserve-storage
-                table indexes new-table new-indexes)
-               (setf new-relfilenodes
-                     (cons (pg-class-relfilenode new-table)
-                           (mapcar #'pg-index-relfilenode new-indexes)))
-               (let* ((new-heap-relfilenode
-                        (pg-class-relfilenode new-table))
-                      (nblocks
-                        (vacuum-full-copy-heap
-                         table new-heap-relfilenode oldest-xmin freeze-cutoff)))
-                 (heap-vacuum-update-visibility-map
-                  new-heap-relfilenode nblocks oldest-xmin freeze-cutoff)
-                 (loop for old-index in indexes
-                       for new-index in new-indexes
-                       for was-valid = (pg-index-valid-p old-index)
-                       do (btree-init (pg-index-relfilenode new-index))
-                          (build-index-entries
-                           new-index new-table
-                           :unique (and was-valid
-                                        (pg-index-unique-p old-index))
-                           :name (pg-index-name old-index))
-                          (setf (pg-index-valid-p new-index) was-valid))
-                 (wal-commit-maintenance)
-                 (dolist (new-index new-indexes)
-                   (fsync-index new-index))
-                 (smgr-fsync new-heap-relfilenode)
-                 (smgr-fsync new-heap-relfilenode :visibility)
-                 (setf (pg-class-relfrozenxid new-table)
-                       (max (or (pg-class-relfrozenxid table)
-                                +first-normal-xid+)
-                            freeze-cutoff)))
-               (setf published
-                     (vacuum-full-publish
-                      db table indexes new-table new-indexes)))
-           (error (condition)
-             (unless published
-               (when new-relfilenodes
-                 (wal-discard-relation-pages new-relfilenodes)
-                 (dolist (relfilenode new-relfilenodes)
-                   (smgr-forget relfilenode :delete t))))
-             (error condition))))))))
+         (with-error-cleanup
+             (condition
+              (unless keep-replacement-files
+                (when new-relfilenodes
+                  (ignore-errors
+                   (wal-discard-relation-pages new-relfilenodes))
+                  (dolist (relfilenode new-relfilenodes)
+                    (ignore-errors
+                     (smgr-forget relfilenode :delete t))))))
+           (vacuum-full-reserve-storage
+            table indexes new-table new-indexes)
+           (setf new-relfilenodes
+                 (cons (pg-class-relfilenode new-table)
+                       (mapcar #'pg-index-relfilenode new-indexes)))
+           (let* ((new-heap-relfilenode
+                    (pg-class-relfilenode new-table))
+                  (nblocks
+                    (vacuum-full-copy-heap
+                     table new-heap-relfilenode oldest-xmin freeze-cutoff)))
+             (heap-vacuum-update-visibility-map
+              new-heap-relfilenode nblocks oldest-xmin freeze-cutoff)
+             (loop for old-index in indexes
+                   for new-index in new-indexes
+                   for was-valid = (pg-index-valid-p old-index)
+                   do (btree-init (pg-index-relfilenode new-index))
+                      (build-index-entries
+                       new-index new-table
+                       :unique (and was-valid
+                                    (pg-index-unique-p old-index))
+                       :name (pg-index-name old-index))
+                      (setf (pg-index-valid-p new-index) was-valid))
+             (wal-commit-maintenance)
+             (dolist (new-index new-indexes)
+               (fsync-index new-index))
+             (smgr-fsync new-heap-relfilenode)
+             (smgr-fsync new-heap-relfilenode :visibility)
+             (setf (pg-class-relfrozenxid new-table)
+                   (max (or (pg-class-relfrozenxid table)
+                            +first-normal-xid+)
+                        freeze-cutoff)))
+           (vacuum-full-publish
+            db table indexes new-table new-indexes
+            :on-wal-appended
+            (lambda () (setf keep-replacement-files t)))))))))
 
 (defun vacuum-all-relations-for-xid-wraparound
     (boundary &key fsync-function after-page-function)

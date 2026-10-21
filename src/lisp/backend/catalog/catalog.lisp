@@ -162,12 +162,16 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
          (prin1 (catalog-to-sexp *catalog*) out)
          (terpri out))))))
 
+(defvar *catalog-rename-function* nil)
+
 (defun write-catalog-image (bytes)
   (with-atomic-output (stream
                        (catalog-path)
                        (pgdata-path "global/pg_catalog.tmp")
                        (pgdata-path "global/")
-                       :element-type '(unsigned-byte 8))
+                       :element-type '(unsigned-byte 8)
+                       :rename-function (or *catalog-rename-function*
+                                            #'sb-posix:rename))
     ;; Atomic rename keeps the old catalog present until the new image is
     ;; durable, so a crash cannot leave the catalog name missing.
     (write-sequence bytes stream)))
@@ -197,13 +201,14 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
   (or *catalog-oldest-relfrozenxid*
       (catalog-compute-oldest-relfrozenxid)))
 
-(defun save-catalog (&key deferred-relations)
+(defun save-catalog (&key deferred-relations on-record-appended)
   ;; Do fallible derived-state work before publication. Once WAL commits, the
   ;; generation update and cache assignment below must not signal: callers use
   ;; the generation to distinguish rollback-safe failures from durable ones.
   (let ((oldest (catalog-compute-oldest-relfrozenxid)))
     (wal-commit-catalog (catalog-image-bytes) #'write-catalog-image
-                        :relation-deletes deferred-relations)
+                        :relation-deletes deferred-relations
+                        :on-record-appended on-record-appended)
     (incf *catalog-durable-generation*)
     (setf *catalog-oldest-relfrozenxid* oldest)))
 

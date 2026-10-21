@@ -42,6 +42,10 @@
 (defvar *wal-test-pause-at* nil)
 (defvar *wal-test-pause-relfilenode* nil)
 (defvar *wal-test-pause-fired* nil)
+(defvar *wal-vacuum-full-publication* nil)
+(defvar *wal-test-before-vacuum-full-catalog-record-appended-hook* nil)
+(defvar *wal-test-before-vacuum-full-catalog-flush-hook* nil)
+(defvar *wal-test-after-vacuum-full-catalog-flush-hook* nil)
 (defvar *wal-test-pause-lock*
   (sb-thread:make-mutex :name "pg WAL test pause"))
 (defvar *wal-recovery-group-active* nil)
@@ -711,7 +715,7 @@
     *wal-catalog-flush-generation*))
 
 (defun wal-commit-catalog (catalog-bytes write-function
-                           &key relation-deletes)
+                           &key relation-deletes on-record-appended)
   "Durably publish a full catalog image and any deferred relation drops."
   (unless *wal-ready*
     (prog1 (funcall write-function catalog-bytes)
@@ -737,20 +741,45 @@
                               catalog-payload chunk-count))))
       (wal-append-batch-start)
       (wal-append-page-images images)
+      (when chunked-p
+        (wal-append-catalog-chunks catalog-payload chunk-count)
+        (when *wal-output-stream*
+          (finish-output *wal-output-stream*))
+        (wal-test-pause :after-catalog-chunks))
+      (when (and *wal-vacuum-full-publication*
+                 *wal-test-before-vacuum-full-catalog-record-appended-hook*)
+        (funcall *wal-test-before-vacuum-full-catalog-record-appended-hook*))
       (if chunked-p
-          (progn
-            (wal-append-catalog-chunks catalog-payload chunk-count)
-            (when *wal-output-stream*
-              (finish-output *wal-output-stream*))
-            (wal-test-pause :after-catalog-chunks)
-            (wal-append-record +wal-record-catalog-commit+ 0
-                               commit-payload))
+          (wal-append-record +wal-record-catalog-commit+ 0 commit-payload)
           (wal-append-record +wal-record-catalog+ 0 catalog-payload))
+      ;; Only a complete terminal record makes this catalog image replayable.
+      (when on-record-appended
+        (funcall on-record-appended))
+      (when (and *wal-vacuum-full-publication*
+                 *wal-test-pause-at*
+                 (string= *wal-test-pause-at*
+                          "after-vacuum-full-catalog-wal-append"))
+        ;; Reproduce a complete record that reached stable storage before a
+        ;; failure left the durable-LSN control file unchanged.
+        (finish-output *wal-output-stream*)
+        (fsync-stream *wal-output-stream*)
+        (when *wal-new-segments*
+          (fsync-directory (wal-directory))
+          (setf *wal-new-segments* '()))
+        (wal-test-pause :after-vacuum-full-catalog-wal-append))
+      (when (and *wal-vacuum-full-publication*
+                 *wal-test-before-vacuum-full-catalog-flush-hook*)
+        (funcall *wal-test-before-vacuum-full-catalog-flush-hook*))
       (wal-flush)
       ;; This marker advances at the durable boundary, before any fallible
       ;; page application, catalog-file replacement, or relfile deletion.
       (incf *wal-catalog-flush-generation*)
       (wal-test-pause :after-catalog-wal-flush)
+      (when *wal-vacuum-full-publication*
+        (wal-test-pause :after-vacuum-full-catalog-wal-flush))
+      (when (and *wal-vacuum-full-publication*
+                 *wal-test-after-vacuum-full-catalog-flush-hook*)
+        (funcall *wal-test-after-vacuum-full-catalog-flush-hook*))
       (wal-apply-page-images images)
       (funcall write-function catalog-bytes)
       (dolist (relfilenode deletes)

@@ -17,6 +17,10 @@ test_debug_setup vacuum-full-regression "$PORT" "$TMP" "$LOG"
 cleanup() {
     : > "$TMP/full-gate.release"
     : > "$TMP/full-horizon.release"
+    if [ -d "$PGDATA/pg_wal" ]; then
+        : > "$PGDATA/pg_wal/test-resume-after-vacuum-full-catalog-wal-append"
+        : > "$PGDATA/pg_wal/test-resume-after-vacuum-full-catalog-wal-flush"
+    fi
     [ -z "${FULL_PID:-}" ] || kill "$FULL_PID" 2>/dev/null || true
     [ -z "${FULL_PID:-}" ] || wait "$FULL_PID" 2>/dev/null || true
     if [ -n "${SRV:-}" ]; then
@@ -65,8 +69,10 @@ wait_for_file() {
 }
 
 start_server() {
-    test_debug_start_server "$LOG" -p "$PORT" -D "$PGDATA" \
-        --control-port "$CONTROL_PORT"
+    pause_at=${1:-}
+    PG_WAL_TEST_PAUSE_AT="$pause_at" \
+        test_debug_start_server "$LOG" -p "$PORT" -D "$PGDATA" \
+            --control-port "$CONTROL_PORT"
     i=0
     while [ "$i" -lt 150 ]; do
         if run -c '' >/dev/null 2>&1; then
@@ -114,7 +120,7 @@ run -c "vacuum vacfull" > "$TMP/vacuum.out" 2>&1 \
 plan=$(run -c 'explain select id from vacfull where category = 3')
 [ "$plan" = "Index Scan using vacfull_category_idx on vacfull" ] \
     || fail "indexed equality scan was unavailable before rewrite: $plan"
-run -c 'select id, category from vacfull where category = 3 order by id' \
+run -c 'select id from vacfull where category = 3 order by id' \
     > "$TMP/before-full.out" || fail "indexed query before rewrite failed"
 
 control <<'EOF' > "$TMP/old-relations.out"
@@ -148,7 +154,7 @@ control <<'EOF' > "$TMP/relation-swap.out"
 EOF
 grep -q '(T T T T T)' "$TMP/relation-swap.out" \
     || fail "FULL did not publish and clean up replacement heap/index files"
-run -c 'select id, category from vacfull where category = 3 order by id' \
+run -c 'select id from vacfull where category = 3 order by id' \
     > "$TMP/after-full.out" || fail "indexed query after rewrite failed"
 cmp -s "$TMP/before-full.out" "$TMP/after-full.out" \
     || fail "VACUUM FULL changed indexed equality results"
@@ -320,6 +326,142 @@ run -c 'select id from vacfull where category = 3 order by id' \
     > "$TMP/after-restart.out" || fail "indexed query after restart failed"
 cmp -s "$TMP/before-restart.out" "$TMP/after-restart.out" \
     || fail "restart changed indexed results after VACUUM FULL"
+
+# Crash after the terminal record is appended but before wal-flush. A complete
+# record may still be replayed, so recovery must publish the replacement heap
+# and index, then remove both old relfilenodes.
+stop_server
+python3 - "$PGDATA/global/pg_catalog.dat" > "$TMP/pre-crash-relations" <<'PY'
+import re
+import sys
+
+catalog = open(sys.argv[1], encoding="utf-8").read()
+for name in ("vacfull", "vacfull_category_idx"):
+    match = re.search(r'"' + re.escape(name) +
+                      r'"\)?\s+:relfilenode\s+(\d+)', catalog,
+                      re.IGNORECASE)
+    if not match:
+        raise SystemExit("could not find relfilenode for " + name)
+    print(match.group(1))
+PY
+old_heap=$(sed -n '1p' "$TMP/pre-crash-relations")
+old_index=$(sed -n '2p' "$TMP/pre-crash-relations")
+start_server after-vacuum-full-catalog-wal-append
+run -c 'vacuum full vacfull' > "$TMP/crash-before-flush.out" 2>&1 &
+FULL_PID=$!
+wait_for_file \
+    "$PGDATA/pg_wal/test-paused-after-vacuum-full-catalog-wal-append"
+kill -KILL "$SRV" 2>/dev/null || true
+wait "$SRV" 2>/dev/null || true
+SRV=
+wait "$FULL_PID" 2>/dev/null || true
+FULL_PID=
+start_server
+[ "$(row_count 'select id from vacfull')" = 33 ] \
+    || fail "pre-flush crash recovery lost rows from VACUUM FULL publication"
+plan=$(run -c 'explain select id from vacfull where category = 3')
+[ "$plan" = "Index Scan using vacfull_category_idx on vacfull" ] \
+    || fail "pre-flush crash recovery lost the replacement index: $plan"
+run -c 'select id from vacfull where category = 3 order by id' \
+    > "$TMP/after-before-flush-crash.out" \
+    || fail "indexed query after pre-flush recovery failed"
+cmp -s "$TMP/before-restart.out" "$TMP/after-before-flush-crash.out" \
+    || fail "pre-flush crash recovery changed indexed results"
+python3 - "$PGDATA" "$old_heap" "$old_index" <<'PY'
+import os
+import re
+import sys
+
+data_dir, old_heap, old_index = sys.argv[1:]
+catalog = open(os.path.join(data_dir, "global", "pg_catalog.dat"),
+               encoding="utf-8").read()
+
+def relation_node(name):
+    match = re.search(r'"' + re.escape(name) +
+                      r'"\)?\s+:relfilenode\s+(\d+)', catalog,
+                      re.IGNORECASE)
+    if not match:
+        raise SystemExit("could not find relfilenode for " + name)
+    return match.group(1)
+
+new_heap = relation_node("vacfull")
+new_index = relation_node("vacfull_category_idx")
+if new_heap == old_heap or new_index == old_index:
+    raise SystemExit("recovery did not publish replacement relfilenodes")
+for relfilenode in (old_heap, old_index):
+    for suffix in ("", ".vm"):
+        path = os.path.join(data_dir, "base", relfilenode + suffix)
+        if os.path.exists(path):
+            raise SystemExit("old relation fork survived recovery: " + path)
+PY
+
+# Crash after the replacement catalog WAL record is durable but before the
+# catalog file rename. Recovery must publish the replacement heap and index,
+# then remove both old relfilenodes.
+stop_server
+python3 - "$PGDATA/global/pg_catalog.dat" > "$TMP/pre-crash-relations" <<'PY'
+import re
+import sys
+
+catalog = open(sys.argv[1], encoding="utf-8").read()
+for name in ("vacfull", "vacfull_category_idx"):
+    match = re.search(r'"' + re.escape(name) +
+                      r'"\)?\s+:relfilenode\s+(\d+)', catalog,
+                      re.IGNORECASE)
+    if not match:
+        raise SystemExit("could not find relfilenode for " + name)
+    print(match.group(1))
+PY
+old_heap=$(sed -n '1p' "$TMP/pre-crash-relations")
+old_index=$(sed -n '2p' "$TMP/pre-crash-relations")
+start_server after-vacuum-full-catalog-wal-flush
+run -c 'vacuum full vacfull' > "$TMP/crash-full.out" 2>&1 &
+FULL_PID=$!
+wait_for_file \
+    "$PGDATA/pg_wal/test-paused-after-vacuum-full-catalog-wal-flush"
+kill -KILL "$SRV" 2>/dev/null || true
+wait "$SRV" 2>/dev/null || true
+SRV=
+wait "$FULL_PID" 2>/dev/null || true
+FULL_PID=
+start_server
+[ "$(row_count 'select id from vacfull')" = 33 ] \
+    || fail "crash recovery lost rows from VACUUM FULL publication"
+plan=$(run -c 'explain select id from vacfull where category = 3')
+[ "$plan" = "Index Scan using vacfull_category_idx on vacfull" ] \
+    || fail "recovered VACUUM FULL index was unavailable: $plan"
+run -c 'select id from vacfull where category = 3 order by id' \
+    > "$TMP/after-crash-full.out" \
+    || fail "indexed query after VACUUM FULL crash recovery failed"
+cmp -s "$TMP/before-restart.out" "$TMP/after-crash-full.out" \
+    || fail "crash recovery changed indexed results after VACUUM FULL"
+python3 - "$PGDATA" "$old_heap" "$old_index" <<'PY'
+import os
+import re
+import sys
+
+data_dir, old_heap, old_index = sys.argv[1:]
+catalog = open(os.path.join(data_dir, "global", "pg_catalog.dat"),
+               encoding="utf-8").read()
+
+def relation_node(name):
+    match = re.search(r'"' + re.escape(name) +
+                      r'"\)?\s+:relfilenode\s+(\d+)', catalog,
+                      re.IGNORECASE)
+    if not match:
+        raise SystemExit("could not find relfilenode for " + name)
+    return match.group(1)
+
+new_heap = relation_node("vacfull")
+new_index = relation_node("vacfull_category_idx")
+if new_heap == old_heap or new_index == old_index:
+    raise SystemExit("recovery did not publish replacement relfilenodes")
+for relfilenode in (old_heap, old_index):
+    for suffix in ("", ".vm"):
+        path = os.path.join(data_dir, "base", relfilenode + suffix)
+        if os.path.exists(path):
+            raise SystemExit("old relation fork survived recovery: " + path)
+PY
 
 run -c 'delete from vacfull' > "$TMP/delete-all.out" 2>&1 \
     || fail "DELETE ALL after restart failed"
