@@ -5,6 +5,7 @@
 (defun test-streamed-join-stop-and-outer-matches ()
   (let ((original-eval (symbol-function 'eval-expr))
         (qual-evaluations 0)
+        (right-visits 0)
         (emitted '()))
     (unwind-protect
          (progn
@@ -17,7 +18,10 @@
             (lambda (visit-left)
               (loop for value from 1 to 1000
                     until (eq (funcall visit-left (vector value)) :stop)))
-            (loop for value from 1 to 1000 collect (vector value))
+            (lambda (visit-right)
+              (loop for value from 1 to 1000
+                    do (incf right-visits)
+                    until (eq (funcall visit-right (vector value)) :stop)))
             (list :type :cross :qual '(:bool t)
                   :left-width 1 :right-width 1)
             (lambda (environment)
@@ -25,6 +29,8 @@
               :stop))
            (check (= qual-evaluations 1)
                   "streamed nested loop stops after the first accepted pair")
+           (check (= right-visits 1)
+                  "nested loop stops the inner stream at its first output")
            (check (and (= (length emitted) 1)
                        (= (aref (first emitted) 0) 1)
                        (= (aref (first emitted) 1) 1))
@@ -35,7 +41,10 @@
               (dolist (row (list (vector 1) (vector 2)))
                 (when (eq (funcall visit-left row) :stop)
                   (return :stop))))
-            (list (vector 9) (vector 10))
+            (lambda (visit-right)
+              (dolist (row (list (vector 9) (vector 10)))
+                (when (eq (funcall visit-right row) :stop)
+                  (return :stop))))
             (list :type :full :qual '(:bool nil)
                   :left-width 1 :right-width 1)
             (lambda (environment)
@@ -54,6 +63,84 @@
                        (= (aref (fourth emitted) 1) 10))
                   "FULL JOIN emits unmatched right rows after the left input"))
       (setf (symbol-function 'eval-expr) original-eval))))
+
+(defun test-lazy-join-skips-inner-for-empty-outer ()
+  (let ((right-opened 0)
+        (emitted 0))
+    (stream-select-join-environments
+     (lambda (visit-left) (declare (ignore visit-left)) (values))
+     (lambda (visit-right)
+       (incf right-opened)
+       (funcall visit-right #(9)))
+     (list :type :cross :qual '(:bool t)
+           :left-width 1 :right-width 1)
+     (lambda (row) (declare (ignore row)) (incf emitted)))
+    (check (zerop right-opened)
+           "empty outer input never opens the inner stream")
+    (check (zerop emitted)
+           "empty CROSS JOIN emits no rows")))
+
+(defun test-lazy-join-interpreter-stops-inner-scan ()
+  (let* ((left-table (make-pg-class :oid 92001 :name "left_input"
+                                    :relfilenode 92011 :columns #()))
+         (right-table (make-pg-class :oid 92002 :name "right_input"
+                                     :relfilenode 92012 :columns #()))
+         (left-path (make-select-scan-path :kind :seq-scan))
+         (right-path (make-select-scan-path :kind :seq-scan))
+         (join (list :type :cross :qual '(:bool t :type :bool)
+                     :left-width 1 :right-width 1))
+         (scan-node (lambda (index table)
+                      (list :seq-scan index (pg-class-oid table))))
+         (registered (list (list :table left-table :path left-path)
+                           (list :table right-table :path right-path)))
+         (original-scan (symbol-function 'scan-select-path))
+         (right-visits 0)
+         (left-empty-p nil)
+         (rows 0))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'scan-select-path)
+                 (lambda (table relfilenode path snapshot callback)
+                   (declare (ignore relfilenode path snapshot))
+                   (cond
+                     ((eq table left-table)
+                      (unless left-empty-p
+                        (funcall callback
+                                 (make-htup :values #(1)))))
+                     ((eq table right-table)
+                      (loop for value from 1 to 1000
+                            do (incf right-visits)
+                            until (eq (funcall callback
+                                               (make-htup
+                                                :values (vector value)))
+                                      :stop))))))
+           (interpret-query-plan
+            (%make-query-plan
+             :physical
+             (list :limit 1
+                   (list :nested-loop-join join
+                         (funcall scan-node 0 left-table)
+                         (funcall scan-node 1 right-table))))
+            registered
+            (lambda (row) (declare (ignore row)) (incf rows)))
+           (check (= rows 1)
+                  "plan interpreter returns the first joined row under LIMIT")
+           (check (= right-visits 1)
+                  "plan interpreter does not consume the full inner scan for LIMIT 1")
+           (setf right-visits 0)
+           (setf left-empty-p t)
+           (interpret-query-plan
+            (%make-query-plan
+             :physical
+             (list :nested-loop-join join
+                   (funcall scan-node 0 left-table)
+                   (funcall scan-node 1 right-table)))
+            (list (list :table left-table :path left-path)
+                  (list :table right-table :path right-path))
+            (lambda (row) (declare (ignore row)) (incf rows)))
+           (check (zerop right-visits)
+                  "plan interpreter skips the inner scan when the outer is empty"))
+      (setf (symbol-function 'scan-select-path) original-scan))))
 
 (defun test-streamed-join-on-matches-survive-where-and-stop ()
   (let ((original-eval (symbol-function 'eval-expr))
@@ -74,7 +161,10 @@
            ;; unmatched right row. Only right value 2 survives as unmatched.
            (stream-select-join-environments
             (lambda (visit-left) (funcall visit-left #(1)))
-            (list #(1) #(2))
+            (lambda (visit-right)
+              (dolist (row (list #(1) #(2)))
+                (when (eq (funcall visit-right row) :stop)
+                  (return :stop))))
             (list :type :full :qual :join-equal
                   :left-width 1 :right-width 1)
             (lambda (environment)
@@ -94,7 +184,9 @@
                       (dolist (row (list #(3) #(4)))
                         (when (eq (funcall visit-left row) :stop)
                           (return :stop))))
-                    nil
+                    (lambda (visit-right)
+                      (declare (ignore visit-right))
+                      (values))
                     (list :type :left :qual '(:bool t)
                           :left-width 1 :right-width 1)
                     (lambda (environment)

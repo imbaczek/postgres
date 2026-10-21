@@ -250,6 +250,143 @@ ROW-CALLBACK."
                               :qual (fifth node)
                               :key (sixth node))))))
 
+(defun select-sort-item-less-p (left right order)
+  (loop for entry in order
+        for position from 0
+        for comparison =
+                       (order-compare (aref (third left) position)
+                                      (aref (third right) position))
+        unless (zerop comparison)
+          return (if (cdr entry) (> comparison 0) (< comparison 0))
+        finally (return (< (second left) (second right)))))
+
+(defun write-query-sort-run (items order)
+  (multiple-value-bind (pathname output) (open-query-temp-output)
+    (unwind-protect
+         (progn
+           (dolist (item
+                    (stable-sort items
+                                 (lambda (left right)
+                                   (select-sort-item-less-p
+                                    left right order))))
+             (query-spill-write-record output item))
+           pathname)
+      (close output))))
+
+(defun delete-query-temp-file (pathname)
+  (multiple-value-bind (deleted-p condition)
+      (ignore-errors (unlink-query-temp-file pathname))
+    (declare (ignore condition))
+    (when deleted-p
+      (setf *query-temp-files*
+            (delete pathname *query-temp-files* :test #'equal))))
+  (values))
+
+(defun merge-query-sort-runs (left-path right-path order)
+  (let ((output-path nil))
+    (multiple-value-bind (pathname output) (open-query-temp-output)
+      (setf output-path pathname)
+      (unwind-protect
+           (progn
+             (with-open-file (left-input left-path
+                                         :direction :input
+                                         :external-format :utf-8)
+               (with-open-file (right-input right-path
+                                            :direction :input
+                                            :external-format :utf-8)
+                 (let ((left (query-spill-read-record left-input))
+                       (right (query-spill-read-record right-input)))
+                   (loop until (or (eq left +query-spill-eof+)
+                                   (eq right +query-spill-eof+))
+                         do (if (select-sort-item-less-p left right order)
+                                (progn
+                                  (query-spill-write-record output left)
+                                  (setf left
+                                        (query-spill-read-record left-input)))
+                                (progn
+                                  (query-spill-write-record output right)
+                                  (setf right
+                                        (query-spill-read-record right-input)))))
+                   (loop until (eq left +query-spill-eof+)
+                         do (query-spill-write-record output left)
+                            (setf left
+                                  (query-spill-read-record left-input)))
+                   (loop until (eq right +query-spill-eof+)
+                         do (query-spill-write-record output right)
+                            (setf right
+                                  (query-spill-read-record right-input))))))
+             output-path)
+        (close output)))
+    (delete-query-temp-file left-path)
+    (delete-query-temp-file right-path)
+    output-path))
+
+(defun merge-query-sort-run-pass (runs order)
+  (loop for tail on runs by #'cddr
+        collect (if (cdr tail)
+                    (merge-query-sort-runs (car tail) (cadr tail) order)
+                    (car tail))))
+
+(defun stream-select-sort (streamer order callback)
+  "Sort a stream with bounded in-memory runs and stable external merges."
+  (with-query-temp-files ()
+                         (let ((buffer '())
+                               (buffer-bytes 0)
+                               (sequence 0)
+                               (runs '())
+                               (memory-limit (max 1 *query-work-memory-bytes*)))
+                           (labels ((flush-run ()
+                                      (when buffer
+                                        (push (write-query-sort-run (nreverse buffer) order) runs)
+                                        (setf buffer nil
+                                              buffer-bytes 0)))
+                                    (make-item (row)
+                                      (let ((sequence-number sequence))
+                                        (incf sequence)
+                                        (list :query-sort-item sequence-number
+                                              (map 'vector
+                                                   (lambda (entry)
+                                                     (eval-expr (car entry) (cdr row)))
+                                                   order)
+                                              row)))
+                                    (emit-run (pathname)
+                                      (with-open-file (stream pathname
+                                                              :direction :input
+                                                              :external-format :utf-8)
+                                        (loop for item = (query-spill-read-record stream)
+                                              until (eq item +query-spill-eof+)
+                                              do (check-for-interrupts)
+                                                 (when (eq (funcall callback (fourth item)) :stop)
+                                                   (return-from stream-select-sort :stop))))))
+                             (funcall
+                              streamer
+                              (lambda (row)
+                                (check-for-interrupts)
+                                (let* ((item (make-item row))
+                                       (item-bytes (query-spill-record-size item)))
+                                  (when (and buffer
+                                             (> (+ buffer-bytes item-bytes) memory-limit))
+                                    (flush-run))
+                                  (push item buffer)
+                                  (incf buffer-bytes item-bytes)
+                                  (when (>= buffer-bytes memory-limit)
+                                    (flush-run)))))
+                             (if (null runs)
+                                 (dolist (item
+                                          (stable-sort
+                                           (nreverse buffer)
+                                           (lambda (left right)
+                                             (select-sort-item-less-p left right order))))
+                                   (check-for-interrupts)
+                                   (when (eq (funcall callback (fourth item)) :stop)
+                                     (return-from stream-select-sort :stop)))
+                                 (progn
+                                   (flush-run)
+                                   (setf runs (nreverse runs))
+                                   (loop while (cdr runs)
+                                         do (setf runs (merge-query-sort-run-pass runs order)))
+                                   (emit-run (first runs))))))))
+
 (defun interpret-query-plan (plan registered-relations row-callback)
   "Reference interpreter for physical S-expression plans."
   (let ((metadata-map (query-plan-metadata plan)))
@@ -322,15 +459,13 @@ ROW-CALLBACK."
                       (:nested-loop-join
                        (let* ((join (second node))
                               (left (third node))
-                              (right (fourth node))
-                              (right-rows '()))
-                         (run-child right
-                                    (lambda (row) (push row right-rows)))
-                         (setf right-rows (nreverse right-rows))
+                              (right (fourth node)))
                          (stream-select-join-environments
                           (lambda (left-callback)
                             (run-child left left-callback))
-                          right-rows join #'emit)))
+                          (lambda (right-callback)
+                            (run-child right right-callback))
+                          join #'emit)))
                       (:project
                        (let ((targets (second node)))
                          (run-child
@@ -340,16 +475,12 @@ ROW-CALLBACK."
                                         environment nil targets)))
                               (when row (emit row)))))))
                       (:sort
-                       (let ((rows '())
-                             (order (second node)))
-                         (run-child (third node)
-                                    (lambda (row) (push row rows)))
-                         (dolist (row
-                                  (stable-sort
-                                   (nreverse rows)
-                                   (lambda (a b) (row-less-p a b order))))
-                           (when (eq (emit row) :stop)
-                             (return-from run-node :stop)))))
+                       (when (eq (stream-select-sort
+                                  (lambda (sort-callback)
+                                    (run-child (third node) sort-callback))
+                                  (second node) #'emit)
+                                 :stop)
+                         (return-from run-node :stop)))
                       (:top-n
                        (let* ((order (second node))
                               (limit (third node))

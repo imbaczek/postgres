@@ -594,65 +594,110 @@ registration-to-DDL handoff free of a lock-order inversion."
       (scan-select-path table relfilenode path *current-snapshot* #'consider))
     (nreverse rows)))
 
-(defun collect-select-relation-rows (relation)
-  (let* ((table (getf relation :table))
-         (path (getf relation :path))
-         (rows '()))
-    ;; Joined WHERE clauses stay above the join tree.  In particular, pushing
-    ;; an outer-side filter into this scan could turn a matched row into a
-    ;; fabricated NULL-extended row, so join inputs always use SeqScan for v1.
-    (unless (eq (select-scan-path-kind path) :seq-scan)
-      (ereport "XX000" "joined relation scan must use SeqScan"))
-    (scan-select-path
-     table (pg-class-relfilenode table) path *current-snapshot*
-     (lambda (tuple)
-       (check-for-interrupts)
-       (push (htup-values tuple) rows)))
-    (nreverse rows)))
+(defun stream-select-join-environments (left-stream right-stream join callback)
+  "Run a lazy nested-loop join with a spillable, replayable inner stream.
 
-(defun stream-select-join-environments (left-stream right-rows join callback)
-  "Stream one nested-loop join, tracking ON matches independently of WHERE."
+The inner stream is opened only after the first outer row arrives. Its rows are
+cached as they are consumed, so the first joined row can be returned before the
+inner input is exhausted and later outer rows can replay the same input."
   (let* ((join-type (getf join :type))
          (qual (getf join :qual))
          (left-width (getf join :left-width))
          (right-width (getf join :right-width))
          (null-left (make-array left-width :initial-element +null+))
          (null-right (make-array right-width :initial-element +null+))
-         (matched-right (make-array (length right-rows) :initial-element nil))
-         (stopped nil))
-    (labels ((emit (environment)
-               (when (eq (funcall callback environment) :stop)
-                 (setf stopped t)))
-             (visit-left (left)
-               (unless stopped
-                 (check-for-interrupts)
-                 (let ((matched-left nil))
-                   (loop for right in right-rows
-                         for right-index from 0
-                         until stopped
-                         do (check-for-interrupts)
-                            (let ((joined (concatenate 'vector left right)))
-                              (when (true-p (eval-expr qual joined))
-                                ;; Match state comes from ON alone.  WHERE is
-                                ;; applied by the parent stream afterward.
-                                (setf matched-left t
-                                      (aref matched-right right-index) t)
-                                (emit joined))))
-                   (when (and (not stopped)
-                              (not matched-left)
-                              (member join-type '(:left :full)))
-                     (emit (concatenate 'vector left null-right))))
-                 (when stopped :stop))))
-      (funcall left-stream #'visit-left)
-      (unless stopped
-        (when (member join-type '(:right :full))
-          (loop for right in right-rows
-                for right-index from 0
-                until stopped
-                unless (aref matched-right right-index)
-                  do (check-for-interrupts)
-                     (emit (concatenate 'vector null-left right))))))
-    (when stopped :stop)))
+         (right/full-p (member join-type '(:right :full)))
+         (work-memory (max 1 *query-work-memory-bytes*))
+         (spool-memory (if right/full-p
+                           (max 1 (floor work-memory 2))
+                           work-memory))
+         (match-memory (max 1 (- work-memory spool-memory))))
+    (with-query-temp-files ()
+                           (with-query-row-spool (right-spool spool-memory)
+                             (labels ((run-join (matched-right)
+                                        (let ((right-loaded nil)
+                                              (outer-seen nil)
+                                              (stopped nil))
+                                          (labels ((emit (environment)
+                                                     (when (eq (funcall callback environment) :stop)
+                                                       (setf stopped t)
+                                                       :stop))
+                                                   (process-right (left right right-index matched-left)
+                                                     (check-for-interrupts)
+                                                     (let ((joined (concatenate 'vector left right)))
+                                                       (when (true-p (eval-expr qual joined))
+                                                         ;; Outer-join match state comes from ON
+                                                         ;; alone; WHERE remains above this node.
+                                                         (setf (car matched-left) t)
+                                                         (when matched-right
+                                                           (query-match-map-mark
+                                                            matched-right right-index))
+                                                         (emit joined))))
+                                                   (load-right-for-left (left matched-left)
+                                                     (setf right-loaded t)
+                                                     (funcall
+                                                      right-stream
+                                                      (lambda (right)
+                                                        (let ((right-index
+                                                                (query-row-spool-append
+                                                                 right-spool right)))
+                                                          (when matched-right
+                                                            (let ((map-index
+                                                                    (query-match-map-append
+                                                                     matched-right)))
+                                                              (unless (= right-index map-index)
+                                                                (error "Join spool and match map lost row alignment"))))
+                                                          (process-right left right right-index
+                                                                         matched-left))))
+                                                     (unless stopped
+                                                       (query-row-spool-seal right-spool)))
+                                                   (visit-left (left)
+                                                     (unless stopped
+                                                       (check-for-interrupts)
+                                                       (setf outer-seen t)
+                                                       (let ((matched-left (list nil)))
+                                                         (if right-loaded
+                                                             (map-query-row-spool
+                                                              right-spool
+                                                              (lambda (right right-index)
+                                                                (process-right
+                                                                 left right right-index
+                                                                 matched-left)))
+                                                             (load-right-for-left left matched-left))
+                                                         (when (and (not stopped)
+                                                                    (not (car matched-left))
+                                                                    (member join-type '(:left :full)))
+                                                           (emit (concatenate 'vector
+                                                                              left null-right))))
+                                                       (when stopped :stop)))
+                                                   (emit-unmatched-rights ()
+                                                     (if outer-seen
+                                                         (progn
+                                                           (query-match-map-finish matched-right)
+                                                           (map-query-row-spool
+                                                            right-spool
+                                                            (lambda (right right-index)
+                                                              (unless
+                                                                  (query-match-map-matched-p
+                                                                   matched-right right-index)
+                                                                (emit (concatenate 'vector
+                                                                                   null-left right))))))
+                                                         ;; RIGHT/FULL JOIN with an empty outer
+                                                         ;; input can stream the inner rows directly.
+                                                         (funcall
+                                                          right-stream
+                                                          (lambda (right)
+                                                            (emit (concatenate 'vector
+                                                                               null-left right)))))))
+                                            (funcall left-stream #'visit-left)
+                                            (unless stopped
+                                              (when right/full-p
+                                                (emit-unmatched-rights)))
+                                            (when stopped :stop)))))
+                               (if right/full-p
+                                   (with-query-match-map (matched-right match-memory)
+                                     (run-join matched-right))
+                                   (run-join nil)))))))
 
 (defun stream-select-joined-environments (relations joins callback)
   (labels ((stream-level (level level-callback)
@@ -667,11 +712,24 @@ registration-to-DDL handoff free of a lock-order inversion."
                       (funcall level-callback (htup-values tuple)))))
                  (let* ((relation (nth (1- level) relations))
                         (join (nth (- level 2) joins))
-                        (right-rows (collect-select-relation-rows relation)))
+                        (table (getf relation :table))
+                        (path (getf relation :path)))
+                   ;; Joined WHERE clauses stay above the join tree. In
+                   ;; particular, filtering the right input here could turn a
+                   ;; matched row into a fabricated NULL-extended row.
+                   (unless (eq (select-scan-path-kind path) :seq-scan)
+                     (ereport "XX000" "joined relation scan must use SeqScan"))
                    (stream-select-join-environments
                     (lambda (left-callback)
                       (stream-level (1- level) left-callback))
-                    right-rows join level-callback)))))
+                    (lambda (right-callback)
+                      (scan-select-path
+                       table (pg-class-relfilenode table) path
+                       *current-snapshot*
+                       (lambda (tuple)
+                         (check-for-interrupts)
+                         (funcall right-callback (htup-values tuple)))))
+                    join level-callback)))))
     (when relations
       (stream-level (length relations) callback))))
 

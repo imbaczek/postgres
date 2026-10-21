@@ -8,6 +8,7 @@
                     "primitives-tests.lisp"
                     "concurrency-tests.lisp"
                     "join-tests.lisp"
+                    "spill-tests.lisp"
                     "backend-lifecycle-tests.lisp"
                     "wal-tests.lisp"
                     "protocol-tests.lisp"
@@ -40,7 +41,15 @@
       (test-single-relation-lock-macros-share-set-guards)
       (test-select-index-reader-blocks-drop-after-registration)
       (test-streamed-join-stop-and-outer-matches)
+      (test-lazy-join-skips-inner-for-empty-outer)
+      (test-lazy-join-interpreter-stops-inner-scan)
       (test-streamed-join-on-matches-survive-where-and-stop)
+      (test-query-temp-file-macro-cleans-up-after-error)
+      (test-query-temp-open-registration-failure-cleans-up)
+      (test-query-temp-delete-failure-retains-cleanup-registration)
+      (test-full-join-spool-spills-typed-bytea-and-match-state)
+      (test-query-row-spool-spills-bytea-without-expanded-list)
+      (test-query-plan-external-sort-spills-stably)
       (test-select-row-qualification-before-projection)
       (test-protocol-packet-limits)
       (test-protocol-decoding-enters-live-operation)
