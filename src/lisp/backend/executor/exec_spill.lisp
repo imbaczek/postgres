@@ -44,6 +44,24 @@
   oldest-file-age-seconds
   (scan-complete-p t))
 
+(defun query-temp-close-fd (fd)
+  (sb-posix:close fd))
+
+(defmacro with-query-temp-fd ((fd open-form) &body body)
+  "Bind FD to OPEN-FORM and close it on every exit when non-nil."
+  `(let ((,fd nil))
+     ;; Keep acquisition and cleanup masked so an interrupt cannot arrive after
+     ;; OPEN-FORM returns but before its descriptor is bound. The body can
+     ;; receive normal asynchronous interrupts once FD is bound.
+     (sb-sys:without-interrupts
+       (unwind-protect
+            (progn
+              (setf ,fd ,open-form)
+              (sb-sys:with-local-interrupts
+                (progn ,@body)))
+         (when ,fd
+           (query-temp-close-fd ,fd))))))
+
 (defun next-query-temp-sequence ()
   (sb-thread:with-mutex (*query-temp-file-lock*)
     (incf *query-temp-file-sequence*)))
@@ -252,37 +270,34 @@
                         (setf complete-p nil))
                        ((sb-posix:s-islnk mode))
                        ((sb-posix:s-isdir mode)
-                        (let ((child-fd
-                                (query-temp-open-child-directory fd name)))
+                        (with-query-temp-fd
+                            (child-fd (query-temp-open-child-directory fd name))
                           (if child-fd
-                              (unwind-protect
-                                   (if (sb-posix:s-isdir
-                                        (sb-posix:stat-mode
-                                         (sb-posix:fstat child-fd)))
-                                       (visit child-fd)
-                                       (setf complete-p nil))
-                                (sb-posix:close child-fd))
+                              (if (sb-posix:s-isdir
+                                   (sb-posix:stat-mode
+                                    (sb-posix:fstat child-fd)))
+                                  (visit child-fd)
+                                  (setf complete-p nil))
                               (setf complete-p nil))))
                        ((sb-posix:s-isreg mode)
-                        (let ((file-fd (query-temp-open-child-file fd name)))
+                        (with-query-temp-fd
+                            (file-fd (query-temp-open-child-file fd name))
                           (if file-fd
-                              (unwind-protect
-                                   (let ((file-stat (sb-posix:fstat file-fd)))
-                                     (if (sb-posix:s-isreg
-                                          (sb-posix:stat-mode file-stat))
-                                         (progn
-                                           (incf file-count)
-                                           (incf size-bytes
-                                                 (sb-posix:stat-size file-stat))
-                                           (setf oldest-mtime
-                                                 (if oldest-mtime
-                                                     (min oldest-mtime
-                                                          (sb-posix:stat-mtime
-                                                           file-stat))
+                              (let ((file-stat (sb-posix:fstat file-fd)))
+                                (if (sb-posix:s-isreg
+                                     (sb-posix:stat-mode file-stat))
+                                    (progn
+                                      (incf file-count)
+                                      (incf size-bytes
+                                            (sb-posix:stat-size file-stat))
+                                      (setf oldest-mtime
+                                            (if oldest-mtime
+                                                (min oldest-mtime
                                                      (sb-posix:stat-mtime
-                                                      file-stat))))
-                                         (setf complete-p nil)))
-                                (sb-posix:close file-fd))
+                                                      file-stat))
+                                                (sb-posix:stat-mtime
+                                                 file-stat))))
+                                    (setf complete-p nil)))
                               (setf complete-p nil))))))))))
       (visit directory-fd))
     (values file-count size-bytes
@@ -298,45 +313,40 @@
 
 (defun collect-retained-query-temp-stats (root now owner-classifier)
   "Report preserved namespaces with a no-follow, descriptor-pinned file walk."
-  (let ((root-fd (query-temp-open-directory root)))
+  (with-query-temp-fd (root-fd (query-temp-open-directory root))
     (unless root-fd
       (return-from collect-retained-query-temp-stats nil))
-    (unwind-protect
-         (multiple-value-bind (names opened-p)
-             (query-temp-directory-entry-names root-fd)
-           (unless opened-p
-             (return-from collect-retained-query-temp-stats nil))
-           (sort
-            (loop for name in names
-                  for owner-state = (funcall owner-classifier name)
-                  when (member owner-state '(:unknown :live))
-                    collect
-                    (let ((directory-fd
-                            (query-temp-open-child-directory root-fd name)))
-                      (if directory-fd
-                          (unwind-protect
-                               (multiple-value-bind
-                                     (file-count size-bytes
-                                      oldest-file-age-seconds scan-complete-p)
-                                   (query-temp-directory-content-stats
-                                    directory-fd now)
-                                 (make-query-temp-namespace-report
-                                  :pathname (query-temp-child-pathname root name)
-                                  :owner-state owner-state
-                                  :file-count file-count
-                                  :size-bytes size-bytes
-                                  :oldest-file-age-seconds
-                                  oldest-file-age-seconds
-                                  :scan-complete-p scan-complete-p))
-                            (sb-posix:close directory-fd))
-                          (make-query-temp-namespace-report
-                           :pathname (query-temp-child-pathname root name)
-                           :owner-state owner-state
-                           :scan-complete-p nil))))
-            #'string< :key (lambda (report)
-                             (namestring
-                              (query-temp-namespace-report-pathname report)))))
-      (sb-posix:close root-fd))))
+    (multiple-value-bind (names opened-p)
+        (query-temp-directory-entry-names root-fd)
+      (unless opened-p
+        (return-from collect-retained-query-temp-stats nil))
+      (sort
+       (loop for name in names
+             for owner-state = (funcall owner-classifier name)
+             when (member owner-state '(:unknown :live))
+               collect
+               (with-query-temp-fd
+                   (directory-fd
+                    (query-temp-open-child-directory root-fd name))
+                 (if directory-fd
+                     (multiple-value-bind
+                           (file-count size-bytes
+                            oldest-file-age-seconds scan-complete-p)
+                         (query-temp-directory-content-stats directory-fd now)
+                       (make-query-temp-namespace-report
+                        :pathname (query-temp-child-pathname root name)
+                        :owner-state owner-state
+                        :file-count file-count
+                        :size-bytes size-bytes
+                        :oldest-file-age-seconds oldest-file-age-seconds
+                        :scan-complete-p scan-complete-p))
+                     (make-query-temp-namespace-report
+                      :pathname (query-temp-child-pathname root name)
+                      :owner-state owner-state
+                      :scan-complete-p nil))))
+       #'string< :key (lambda (report)
+                        (namestring
+                         (query-temp-namespace-report-pathname report)))))))
 
 (defun report-retained-query-temp-namespaces (root)
   "Write a startup diagnostic for preserved spill namespaces."

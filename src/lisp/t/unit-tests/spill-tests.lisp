@@ -98,6 +98,130 @@
        (uiop:delete-directory-tree pgdata :validate t
                                           :if-does-not-exist :ignore)))))
 
+(defun test-query-temp-fd-scope-closes-after-error ()
+  (let ((original-close (symbol-function 'query-temp-close-fd))
+        (opened-fd nil)
+        (closed-fd nil)
+        (caught-error-p nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'query-temp-close-fd)
+                 (lambda (fd)
+                   (setf closed-fd fd)
+                   (funcall original-close fd)))
+           (handler-case
+               (with-query-temp-fd (fd (sb-posix:open "/dev/null"
+                                                      sb-posix:o-rdonly))
+                 (setf opened-fd fd)
+                 (error "intentional spill descriptor scope test error"))
+             (error ()
+               (setf caught-error-p t)))
+           (check caught-error-p
+                  "spill descriptor scope propagates a body error")
+           (check (and opened-fd (eql opened-fd closed-fd))
+                  "spill descriptor scope closes its descriptor after an error"))
+      (unless closed-fd
+        (when opened-fd
+          (ignore-errors (funcall original-close opened-fd))))
+      (setf (symbol-function 'query-temp-close-fd) original-close))))
+
+(defun test-query-temp-fd-scope-closes-after-acquisition-interrupt ()
+  (let ((original-close (symbol-function 'query-temp-close-fd))
+        (opened-fd nil)
+        (closed-fd nil)
+        (interrupt-queued-p nil)
+        (caught-error-p nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'query-temp-close-fd)
+                 (lambda (fd)
+                   (setf closed-fd fd)
+                   (funcall original-close fd)))
+           (handler-case
+               (with-query-temp-fd
+                   (fd (let ((opened (sb-posix:open "/dev/null"
+                                                    sb-posix:o-rdonly)))
+                         (setf opened-fd opened)
+                         (sb-thread:interrupt-thread
+                          sb-thread:*current-thread*
+                          (lambda ()
+                            (error "forced spill descriptor acquisition interrupt")))
+                         (setf interrupt-queued-p t)
+                         opened))
+                 nil)
+             (error ()
+               (setf caught-error-p t)))
+           (check interrupt-queued-p
+                  "spill descriptor acquisition interrupt was injected")
+           (check caught-error-p
+                  "spill descriptor acquisition interrupt unwinds the scope")
+           (check (eql closed-fd opened-fd)
+                  "spill descriptor acquired before an interrupt is closed"))
+      (unless closed-fd
+        (when opened-fd
+          (ignore-errors (funcall original-close opened-fd))))
+      (setf (symbol-function 'query-temp-close-fd) original-close))))
+
+(defun test-query-temp-fd-scope-closes-before-cleanup-interrupt ()
+  (let ((original-close (symbol-function 'query-temp-close-fd))
+        (opened-fd nil)
+        (closed-fd nil)
+        (interrupt-queued-p nil)
+        (caught-error-p nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'query-temp-close-fd)
+                 (lambda (fd)
+                   (sb-thread:interrupt-thread
+                    sb-thread:*current-thread*
+                    (lambda ()
+                      (error "forced spill descriptor cleanup interrupt")))
+                   (setf interrupt-queued-p t)
+                   (funcall original-close fd)
+                   (setf closed-fd fd)))
+           (handler-case
+               (with-query-temp-fd (fd (sb-posix:open "/dev/null"
+                                                      sb-posix:o-rdonly))
+                 (setf opened-fd fd))
+             (error ()
+               (setf caught-error-p t)))
+           (check interrupt-queued-p
+                  "spill descriptor cleanup interrupt was injected")
+           (check caught-error-p
+                  "spill descriptor cleanup interrupt is delivered after cleanup")
+           (check (eql closed-fd opened-fd)
+                  "spill descriptor closes before a cleanup interrupt is delivered"))
+      (unless closed-fd
+        (when opened-fd
+          (ignore-errors (funcall original-close opened-fd))))
+      (setf (symbol-function 'query-temp-close-fd) original-close))))
+
+(defun test-query-temp-fd-scope-macro-expansion-protects-cleanup ()
+  (let* ((expansion (macroexpand-1 '(with-query-temp-fd (fd nil) :body)))
+         (scope-form (and (consp expansion) (third expansion)))
+         (unwind-form
+           (and (consp scope-form)
+                (eq (first scope-form) 'sb-sys:without-interrupts)
+                (second scope-form)))
+         (protected-form
+           (and (consp unwind-form)
+                (eq (first unwind-form) 'unwind-protect)
+                (second unwind-form)))
+         (cleanup-form (and (consp unwind-form) (third unwind-form))))
+    (check (and (consp expansion)
+                (eq (first expansion) 'let)
+                unwind-form)
+           "spill fd scope installs the interrupt mask around unwind-protect")
+    (check (and (consp protected-form)
+                (eq (first protected-form) 'progn)
+                (eq (first (second protected-form)) 'setf)
+                (eq (first (third protected-form)) 'sb-sys:with-local-interrupts))
+           "spill fd scope binds acquisition before enabling body interrupts")
+    (check (and (consp cleanup-form)
+                (eq (first cleanup-form) 'when)
+                (eq (first (third cleanup-form)) 'query-temp-close-fd))
+           "spill fd cleanup stays inside the interrupt-masked unwind-protect")))
+
 (defun test-query-temp-retained-namespace-observability ()
   (let* ((pgdata (make-query-spill-test-directory))
          (root (merge-pathnames "pgsql_tmp/" pgdata))
