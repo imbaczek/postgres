@@ -1,5 +1,5 @@
 #!/bin/sh
-# t/join-streaming.sh -- outer-join semantics and early LIMIT stop.
+# t/join-streaming.sh -- outer-join semantics and bounded LIMIT execution.
 set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
@@ -72,15 +72,27 @@ run < "$TMP/left.sql" > "$TMP/left.out" 2>&1 \
     || fail "large left input insert failed"
 run < "$TMP/right.sql" > "$TMP/right.out" 2>&1 \
     || fail "large right input insert failed"
+run -c "insert into join_limit_left values (NULL)" >/dev/null
 
 install_output=$(control <<'EOF'
 (defvar *join-limit-original-eval-expr* (symbol-function 'eval-expr))
+(defvar *join-limit-original-offer-row* (symbol-function 'offer-select-top-n-row))
 (defvar *join-limit-qual-evaluations* 0)
+(defvar *join-limit-top-n-offers* 0)
+(defvar *join-limit-top-n-max-size* 0)
 (setf (symbol-function 'eval-expr)
       (lambda (expr env)
         (when (equal expr '(:bool t))
           (incf *join-limit-qual-evaluations*))
-        (funcall *join-limit-original-eval-expr* expr env)))
+        (funcall *join-limit-original-eval-expr* expr env))
+      (symbol-function 'offer-select-top-n-row)
+      (lambda (collector row)
+        (let ((result (funcall *join-limit-original-offer-row* collector row)))
+          (incf *join-limit-top-n-offers*)
+          (setf *join-limit-top-n-max-size*
+                (max *join-limit-top-n-max-size*
+                     (length (select-top-n-collector-heap collector))))
+          result)))
 (quit)
 EOF
 ) || fail "could not install JOIN evaluation counter"
@@ -100,6 +112,10 @@ echo "$install_output" | grep -Eq ';; (read )?error:' \
     run -c 'select l.id from join_left l left join join_right r on l.id = r.id where r.id is null'
     printf 'limit\n'
     run -c 'select l.id from join_limit_left l cross join join_limit_right r limit 1'
+    printf 'ordered-asc-limit\n'
+    run -c 'select l.id from join_limit_left l cross join join_limit_right r order by l.id limit 1'
+    printf 'ordered-desc-limit\n'
+    run -c 'select l.id from join_limit_left l cross join join_limit_right r order by l.id desc limit 1'
 } > "$TMP/results.out" 2>&1 || fail "JOIN query failed"
 
 cat > "$TMP/expected.out" <<'EOF'
@@ -123,6 +139,10 @@ where-after-on
 1
 limit
 1
+ordered-asc-limit
+1
+ordered-desc-limit
+
 EOF
 if ! cmp -s "$TMP/expected.out" "$TMP/results.out"; then
     diff -u "$TMP/expected.out" "$TMP/results.out" >&2 || true
@@ -130,23 +150,28 @@ if ! cmp -s "$TMP/expected.out" "$TMP/results.out"; then
 fi
 
 counter_output=$(control <<'EOF'
-(if (= *join-limit-qual-evaluations* 1)
-    :ONE-QUALIFICATION
-    (list :QUALIFICATIONS *join-limit-qual-evaluations*))
+(if (and (= *join-limit-qual-evaluations* 20201)
+         (= *join-limit-top-n-offers* 20200)
+         (= *join-limit-top-n-max-size* 1))
+    :ORDERED-CANDIDATES-CONSUMED
+    (list :QUALIFICATIONS *join-limit-qual-evaluations*
+          :TOP-N-OFFERS *join-limit-top-n-offers*
+          :MAX-HEAP-SIZE *join-limit-top-n-max-size*))
 (quit)
 EOF
 ) || fail "could not inspect JOIN LIMIT counter"
-echo "$counter_output" | grep -q ':ONE-QUALIFICATION' \
-    || fail "unordered LIMIT 1 evaluated more than one joined pair: $counter_output"
+echo "$counter_output" | grep -q ':ORDERED-CANDIDATES-CONSUMED' \
+    || fail "ordered LIMIT failed to consume both join streams within its heap bound: $counter_output"
 echo "$counter_output" | grep -Eq ';; (read )?error:' \
     && fail "JOIN LIMIT counter inspection failed"
 
 restore_output=$(control <<'EOF'
 (setf (symbol-function 'eval-expr) *join-limit-original-eval-expr*)
+(setf (symbol-function 'offer-select-top-n-row) *join-limit-original-offer-row*)
 (quit)
 EOF
 ) || fail "could not restore JOIN expression evaluator"
 echo "$restore_output" | grep -Eq ';; (read )?error:' \
-    && fail "JOIN evaluator restore failed"
+    && fail "JOIN instrumentation restore failed"
 
 echo "join-streaming: PASS"

@@ -111,6 +111,12 @@ index's B-tree mutex."
           (wait (cons :wait wait))
           (t :ok))))
 
+(defun capture-insert-indexes (table)
+  "Snapshot TABLE's index metadata while protecting the shared catalog hash."
+  (with-write-lock
+    (let ((indexes (table-indexes table)))
+      (values indexes (mapcar #'pg-index-relfilenode indexes)))))
+
 (defun insert-tuple-with-unique (table values &key exclude-tid)
   (let* ((xid (get-current-xid))
          (relfilenode (pg-class-relfilenode table))
@@ -118,8 +124,11 @@ index's B-tree mutex."
          (index-relfilenodes nil))
     (register-relation-writer relfilenode xid)
     ;; The writer registration excludes index DDL until this transaction ends.
-    (setf indexes (table-indexes table)
-          index-relfilenodes (mapcar #'pg-index-relfilenode indexes))
+    ;; table-indexes walks the database-wide index hash, so snapshot it under
+    ;; the global writer lock. Release that lock before taking B-tree locks;
+    ;; the insertion below keeps the B-tree-before-writer lock order.
+    (multiple-value-setq (indexes index-relfilenodes)
+      (capture-insert-indexes table))
     (loop
       (let ((wait-xid nil))
         ;; Acquire B-tree locks before the global write mutex. A search holds

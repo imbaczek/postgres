@@ -82,6 +82,8 @@
       (test-key-order)
       (test-index-catalog-roundtrip)
       (test-sql-strict-let-evaluation)
+      (test-insert-index-catalog-snapshot-lock)
+      (test-select-top-n-collector)
       (test-using-join-output-metadata)
       (test-error-cleanup-and-fatal-rethrow)
       (test-create-table-cleanup-after-fsync-error)

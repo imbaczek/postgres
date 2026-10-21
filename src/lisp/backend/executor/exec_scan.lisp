@@ -68,6 +68,106 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
                (return (if desc (> c 0) (< c 0)))))
         finally (return nil)))
 
+(defstruct select-top-n-item
+  row
+  keys
+  sequence)
+
+(defstruct (select-top-n-collector (:constructor %make-select-top-n-collector))
+  limit
+  order
+  heap
+  next-sequence)
+
+(defun make-select-top-n-collector (limit order)
+  (%make-select-top-n-collector
+   :limit limit
+   :order order
+   :heap (make-array (min limit 32) :adjustable t :fill-pointer 0)
+   :next-sequence 0))
+
+(defun select-top-n-push (heap item limit)
+  (when (= (fill-pointer heap) (array-dimension heap 0))
+    (setf heap
+          (adjust-array heap
+                        (min limit (max 1 (* 2 (array-dimension heap 0))))
+                        :fill-pointer (fill-pointer heap))))
+  (vector-push item heap)
+  heap)
+
+(defun select-top-n-item-less-p (a b order)
+  (loop for entry in order
+        for position from 0
+        for c = (order-compare (aref (select-top-n-item-keys a) position)
+                               (aref (select-top-n-item-keys b) position))
+        unless (zerop c)
+          return (if (cdr entry) (> c 0) (< c 0))
+        finally
+           (return (< (select-top-n-item-sequence a)
+                      (select-top-n-item-sequence b)))))
+
+(defun select-top-n-sift-up (heap order index)
+  (when (plusp index)
+    (let ((parent (floor (1- index) 2)))
+      (when (select-top-n-item-less-p (aref heap parent) (aref heap index)
+                                      order)
+        (rotatef (aref heap index) (aref heap parent))
+        (select-top-n-sift-up heap order parent)))))
+
+(defun select-top-n-sift-down (heap order index)
+  (let* ((left (+ (* 2 index) 1))
+         (right (1+ left))
+         (heap-length (length heap)))
+    (when (< left heap-length)
+      (let* ((worse-child
+               (if (and (< right heap-length)
+                        (select-top-n-item-less-p (aref heap left)
+                                                  (aref heap right) order))
+                   right
+                   left)))
+        (when (select-top-n-item-less-p (aref heap index)
+                                        (aref heap worse-child) order)
+          (rotatef (aref heap index) (aref heap worse-child))
+          (select-top-n-sift-down heap order worse-child))))))
+
+(defun offer-select-top-n-row (collector row)
+  (let* ((order (select-top-n-collector-order collector))
+         (heap (select-top-n-collector-heap collector))
+         (limit (select-top-n-collector-limit collector))
+         (sequence (select-top-n-collector-next-sequence collector))
+         (item (make-select-top-n-item
+                :row row
+                :keys (map 'vector
+                           (lambda (entry)
+                             (eval-expr (car entry) (cdr row)))
+                           order)
+                :sequence sequence)))
+    (incf (select-top-n-collector-next-sequence collector))
+    (cond
+      ((< (length heap) limit)
+       (setf (select-top-n-collector-heap collector)
+             (select-top-n-push heap item limit))
+       (setf heap (select-top-n-collector-heap collector))
+       (select-top-n-sift-up heap order (1- (length heap))))
+      ((and (plusp limit)
+            (select-top-n-item-less-p item (aref heap 0) order))
+       (setf (aref heap 0) item)
+       (select-top-n-sift-down heap order 0)))))
+
+(defun select-top-n-collector-rows (collector)
+  (mapcar #'select-top-n-item-row
+          (stable-sort (coerce (select-top-n-collector-heap collector) 'list)
+                       (lambda (a b)
+                         (select-top-n-item-less-p
+                          a b (select-top-n-collector-order collector))))))
+
+(defun collect-select-top-n (streamer order limit)
+  "Consume STREAMER while retaining at most LIMIT rows in ORDER BY order."
+  (let ((collector (make-select-top-n-collector limit order)))
+    (unless (zerop limit)
+      (funcall streamer (lambda (row) (offer-select-top-n-row collector row))))
+    (select-top-n-collector-rows collector)))
+
 (defstruct select-scan-path
   (kind :seq-scan)
   index
@@ -591,6 +691,13 @@ registration-to-DDL handoff free of a lock-order inversion."
           (send-command-complete stream (format nil "SELECT ~a" count)))
         (let ((rows
                 (cond
+                  ((and relations joins order limit)
+                   (with-registered-select-relations (registered relations)
+                     (collect-select-top-n
+                      (lambda (callback)
+                        (stream-select-joined-rows
+                         registered joins where targets callback))
+                      order limit)))
                   ((and relations joins)
                    (with-registered-select-relations (registered relations)
                      (collect-select-joined-rows
@@ -610,12 +717,13 @@ registration-to-DDL handoff free of a lock-order inversion."
                      (if (or (null where) (true-p (eval-expr where nil)))
                          (list (cons values nil))
                          nil))))))
-          (when order
-            (setf rows (stable-sort rows
-                                    (lambda (a b)
-                                      (row-less-p a b order)))))
-          (when limit
-            (setf rows (subseq rows 0 (min limit (length rows)))))
+          (unless (and relations joins order limit)
+            (when order
+              (setf rows (stable-sort rows
+                                      (lambda (a b)
+                                        (row-less-p a b order)))))
+            (when limit
+              (setf rows (subseq rows 0 (min limit (length rows))))))
           (send-row-description stream
                                 (mapcar #'target->result-column targets))
           (dolist (row rows)
