@@ -119,6 +119,8 @@
       (test-btree-mixed-duplicate-keys)
       (test-btree-vacuum-bounded-split-retries)
       (test-session-setting-rollback)
+      (test-transaction-snapshot-lifecycle)
+      (test-transaction-isolation-controls)
       (test-parse-error-aborts-transaction)
       (test-xid-wraparound-freezes-tuples)
       (test-xid-wraparound-fault-recovery)

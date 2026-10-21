@@ -166,6 +166,184 @@
                       "Europe/Warsaw")
              "rejected time zone preserves the previous session setting"))))
 
+(defun test-transaction-snapshot-lifecycle ()
+  (let* ((*backend* (make-backend))
+         (*next-xid* 8400)
+         (*active-xids* '(8300))
+         (*active-snapshots* 0)
+         (*active-snapshot-set* (make-hash-table :test #'eq))
+         (*xid-wrap-pending* nil)
+         (*xid-wrap-failure* nil)
+         (*xid-wrap-completed-through* nil)
+         (backend *backend*)
+         (first nil)
+         (second nil))
+    (setf (backend-explicit backend) t
+          (backend-state backend) :in-progress
+          (backend-isolation-level backend) :repeatable-read)
+    (setf first
+          (with-statement-snapshot (snapshot #'statement-start)
+            snapshot))
+    (check (= *active-snapshots* 1)
+           "REPEATABLE READ retains a transaction snapshot after the statement")
+    (check (and (= (snapshot-xmin first) 8300)
+                (= (snapshot-xmax first) 8400)
+                (equal (snapshot-xip first) '(8300)))
+           "the first REPEATABLE READ statement captures the active XID horizon")
+    ;; Model a commit between statements. A transaction snapshot must retain
+    ;; its original xmax/xip even though a later READ COMMITTED snapshot would
+    ;; observe the changed global XID state.
+    (setf *next-xid* 8500
+          *active-xids* '(8401 8499))
+    (setf second
+          (with-statement-snapshot (snapshot #'statement-start)
+            snapshot))
+    (check (and (= (snapshot-xmin second) (snapshot-xmin first))
+                (= (snapshot-xmax second) (snapshot-xmax first))
+                (equal (snapshot-xip second) (snapshot-xip first)))
+           "subsequent REPEATABLE READ statements reuse the captured horizon")
+    (check (= (snapshot-curcid second) (1+ (snapshot-curcid first)))
+           "the statement view advances curcid within the retained horizon")
+    (check (and (not (heap-tuple-visible-p 8401 0 1 first 8401))
+                (heap-tuple-visible-p 8401 0 1 second 8401))
+           "a later command sees its own earlier insert through curcid")
+    (check (= *active-snapshots* 1)
+           "per-statement cleanup leaves only the transaction registration")
+    ;; A retained snapshot contributes to the wraparound drain horizon. Its
+    ;; owner must be able to keep reading and then end the transaction instead
+    ;; of waiting for itself as coordinator or gate waiter.
+    (setf *next-xid* (+ +xid-cycle+ +first-normal-xid+))
+    (prepare-xid-wraparound-for-statement backend)
+    (check (and (not *xid-wrap-pending*)
+                (not (backend-wraparound-waiting backend)))
+           "a retained snapshot owner does not coordinate XID wraparound")
+    (setf *xid-wrap-pending* t)
+    (wait-for-xid-wraparound backend)
+    (check (not (backend-wraparound-waiting backend))
+           "a retained snapshot owner can pass the pending wraparound gate")
+    (setf *xid-wrap-pending* nil)
+    ;; A read-only transaction need not have assigned an XID. Its retained
+    ;; snapshot still has to be released by the no-XID commit path.
+    (commit-transaction)
+    (check (and (zerop *active-snapshots*)
+                (null (oldest-active-snapshot-xmin))
+                (eq (backend-state backend) :idle)
+                (eq (backend-isolation-level backend) :read-committed)
+                (null (backend-transaction-snapshot backend)))
+           "no-XID commit releases the retained snapshot and resets isolation")
+    (setf (backend-explicit backend) t
+          (backend-state backend) :in-progress
+          (backend-isolation-level backend) :read-committed
+          *next-xid* 8600)
+    (let ((rc-first (with-statement-snapshot (snapshot #'statement-start)
+                      snapshot)))
+      (setf *next-xid* 8700)
+      (let ((rc-second (with-statement-snapshot (snapshot #'statement-start)
+                         snapshot)))
+        (check (> (snapshot-xmax rc-second) (snapshot-xmax rc-first))
+               "READ COMMITTED continues to acquire a fresh statement snapshot")))
+    (commit-transaction)
+    (setf (backend-explicit backend) t
+          (backend-state backend) :in-progress
+          (backend-isolation-level backend) :repeatable-read)
+    (with-statement-snapshot (snapshot #'statement-start)
+      snapshot)
+    (abort-transaction)
+    (check (and (zerop *active-snapshots*)
+                (null (backend-transaction-snapshot-registration backend)))
+           "rollback releases the long-lived snapshot registration")))
+
+(defun test-transaction-isolation-controls ()
+  (let* ((*backend* (make-backend))
+         (path (merge-pathnames "transaction-isolation.out" *pgdata*)))
+    (let* ((begin (first (parse-statements
+                          "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")))
+           (start (first (parse-statements
+                          "START TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")))
+           (set (first (parse-statements
+                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")))
+           (session-set (first (parse-statements
+                                "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"))))
+      (check (and (eq (getf begin :type) :begin)
+                  (eq (getf begin :isolation-level) :repeatable-read)
+                  (getf begin :read-only))
+             "BEGIN parses REPEATABLE READ and READ ONLY options")
+      (check (and (eq (getf start :type) :begin)
+                  (eq (getf start :isolation-level) :repeatable-read)
+                  (getf start :read-only))
+             "START TRANSACTION parses comma-separated characteristics")
+      (check (and (getf set :transaction-options-p)
+                  (eq (getf (getf set :transaction-options) :isolation-level)
+                      :repeatable-read)
+                  (getf (getf set :transaction-options) :read-only))
+             "SET TRANSACTION preserves requested characteristics in its AST")
+      (check (getf session-set :session-characteristics-p)
+             "SET SESSION CHARACTERISTICS has a distinct AST path"))
+    (with-open-file (stream path
+                            :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create
+                            :element-type '(unsigned-byte 8))
+      (exec-simple-query stream
+                         (concatenate 'string
+                                      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; "
+                                      "SHOW transaction_isolation; SELECT 1; ROLLBACK; "
+                                      "BEGIN; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY; "
+                                      "SHOW transaction_isolation; ROLLBACK; "
+                                      "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1; "
+                                      "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; ROLLBACK; "
+                                      "BEGIN ISOLATION LEVEL REPEATABLE READ; "
+                                      "SET transaction_isolation = 'read committed'; "
+                                      "SHOW transaction_isolation; ROLLBACK; "
+                                      "BEGIN ISOLATION LEVEL REPEATABLE READ; "
+                                      "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED; "
+                                      "SHOW transaction_isolation; ROLLBACK;"))
+      (exec-simple-query stream
+                         "BEGIN ISOLATION LEVEL REPEATABLE READ; INSERT INTO missing VALUES (1);")
+      (check (eq (backend-state *backend*) :aborted)
+             "writable REPEATABLE READ is rejected until conflict handling is available")
+      (exec-simple-query stream "ROLLBACK")
+      (check (eq (backend-state *backend*) :idle)
+             "transaction controls leave the backend idle after rollback")
+      (check (eq (backend-isolation-level *backend*) :read-committed)
+             "transaction isolation returns to READ COMMITTED after rollback")
+      (check (not (backend-read-only *backend*))
+             "transaction read-only state resets after rollback")
+      (exec-simple-query stream "BEGIN; SELECT 1; SET TRANSACTION READ ONLY;"))
+    (check (and (eq (backend-state *backend*) :in-progress)
+                (backend-read-only *backend*))
+           "a read-write transaction may become read-only after a SELECT")
+    (with-open-file (stream path
+                            :direction :output
+                            :if-exists :append
+                            :if-does-not-exist :create
+                            :element-type '(unsigned-byte 8))
+      (exec-simple-query stream "INSERT INTO missing VALUES (1);"))
+    (check (eq (backend-state *backend*) :aborted)
+           "a write in READ ONLY aborts the explicit transaction")
+    (with-open-file (stream path
+                            :direction :output
+                            :if-exists :append
+                            :if-does-not-exist :create
+                            :element-type '(unsigned-byte 8))
+      (exec-simple-query stream
+                         "ROLLBACK; BEGIN; SELECT 1; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;"))
+    (check (eq (backend-state *backend*) :aborted)
+           "a changed isolation level after a snapshot aborts the transaction")
+    (with-open-file (stream path
+                            :direction :output
+                            :if-exists :append
+                            :if-does-not-exist :create
+                            :element-type '(unsigned-byte 8))
+      (exec-simple-query stream "ROLLBACK;"))
+    (check (equal (test-show-timezone-values path)
+                  '("repeatable read" "1" "repeatable read" "1"
+                    "read committed" "repeatable read" "1" "1"))
+           (format nil "SHOW transaction_isolation returns ~s"
+                   (test-show-timezone-values path)))
+    (check (zerop *active-snapshots*)
+           "isolation control and rollback paths release transaction snapshots")))
+
 (defun test-xid-wraparound-freezes-tuples ()
   ;; Deterministic one-cycle counterpart to xid_wraparound/t/003_wraparounds.pl.
   (let* ((*backend* (make-backend))

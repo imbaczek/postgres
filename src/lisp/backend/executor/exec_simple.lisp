@@ -56,13 +56,19 @@ rolled back immediately."
       (send-parameter-status stream "TimeZone"
                              (or (gethash "timezone" settings) "UTC")))))
 
-(defun command-begin (stream)
+(defun command-begin (stream ast)
   (if (eq (backend-state *backend*) :idle)
       (progn
         (setf (backend-explicit *backend*) t
+              (backend-isolation-level *backend*)
+              (or (getf ast :isolation-level) :read-committed)
+              (backend-read-only *backend*) (getf ast :read-only)
               (backend-command-id *backend*) 0
               (backend-xid *backend*) nil
               (backend-snapshot *backend*) nil
+              (backend-transaction-snapshot *backend*) nil
+              (backend-transaction-snapshot-registration *backend*) nil
+              (backend-first-snapshot-set *backend*) nil
               (backend-dirty-relations *backend*) '()
               (backend-settings-transaction-start *backend*)
               (copy-session-settings (backend-settings *backend*)))
@@ -128,8 +134,24 @@ rolled back immediately."
                         always (= (read-byte stream) expected))))
          (error () nil))))
 
+(defun transaction-isolation-setting-value (value)
+  (cond
+    ((and (stringp value) (string-equal value "read committed"))
+     :read-committed)
+    ((and (stringp value) (string-equal value "repeatable read"))
+     :repeatable-read)
+    ((and (stringp value) (string-equal value "serializable"))
+     (ereport "0A000" "serializable is not supported"))
+    ((and (stringp value) (string-equal value "read uncommitted"))
+     (ereport "0A000" "read uncommitted is not supported"))
+    (t
+     (ereport "22023" "invalid value for parameter \"transaction_isolation\": ~s"
+              value))))
+
 (defun exec-set (stream ast)
-  (let* ((name (string-downcase (getf ast :name)))
+  (let* ((name (or (and (getf ast :name)
+                        (string-downcase (getf ast :name)))
+                   ""))
          (raw-value (getf ast :value))
          (value (if (eq raw-value :default)
                     (cond
@@ -140,6 +162,13 @@ rolled back immediately."
                       (t :default))
                     raw-value)))
     (cond
+      ((getf ast :transaction-options-p)
+       (exec-set-transaction (getf ast :transaction-options)))
+      ;; Session characteristics set defaults for future transactions. This
+      ;; server's only supported default is READ COMMITTED, so accepting it is
+      ;; a no-op even when the current transaction uses REPEATABLE READ.
+      ((getf ast :session-characteristics-p)
+       (values))
       ((string= name "timezone")
        (if (eq raw-value :default)
            (remhash "timezone" (backend-settings *backend*))
@@ -155,8 +184,13 @@ rolled back immediately."
         stream "TimeZone"
         (or (gethash "timezone" (backend-settings *backend*)) "UTC")))
       ((string= name "transaction_isolation")
-       (unless (string-equal value "read committed")
-         (ereport "0A000" "only READ COMMITTED isolation is supported")))
+       (let ((isolation-level (transaction-isolation-setting-value value)))
+         (if (and (backend-explicit *backend*)
+                  (eq (backend-state *backend*) :in-progress))
+             (exec-set-transaction (list :isolation-level isolation-level))
+             (unless (eq isolation-level :read-committed)
+               (ereport "0A000"
+                        "session transaction isolation defaults are not supported")))))
       ((string= name "client_encoding")
        (unless (string-equal value "UTF8")
          (ereport "0A000" "only UTF8 client encoding is supported")))
@@ -170,6 +204,39 @@ rolled back immediately."
        (ereport "42704" "unrecognized configuration parameter \"~a\""
                 name)))
     (send-command-complete stream "SET")))
+
+(defun exec-set-transaction (characteristics)
+  (let* ((backend *backend*)
+         (isolation-specified-p (member :isolation-level characteristics))
+         (new-isolation (getf characteristics :isolation-level))
+         (read-mode-specified-p (member :read-only characteristics))
+         (new-read-only (getf characteristics :read-only)))
+    (unless (and (backend-explicit backend)
+                 (eq (backend-state backend) :in-progress))
+      (ereport "25001" "SET TRANSACTION can only be used in transaction blocks"))
+    ;; PostgreSQL permits idempotent isolation changes after the first query.
+    ;; A real isolation change must happen before the transaction snapshot.
+    (when (and isolation-specified-p
+               (not (eq new-isolation (backend-isolation-level backend)))
+               (backend-first-snapshot-set backend))
+      (ereport "25001"
+               "SET TRANSACTION ISOLATION LEVEL must be called before any query"))
+    ;; Like PostgreSQL's transaction_read_only GUC, READ WRITE cannot be
+    ;; enabled in a read-only transaction after its first snapshot. Switching
+    ;; a read-write transaction to read-only remains legal after reads.
+    (when (and read-mode-specified-p
+               (backend-read-only backend)
+               (not new-read-only)
+               (backend-first-snapshot-set backend))
+      (ereport "25001"
+               "transaction read-write mode must be set before any query"))
+    (when isolation-specified-p
+      (setf (backend-isolation-level backend)
+            new-isolation))
+    (when read-mode-specified-p
+      (setf (backend-read-only backend)
+            new-read-only)))
+  (values))
 
 (defun exec-reset (stream ast)
   (let ((name (string-downcase (getf ast :name))))
@@ -196,7 +263,10 @@ rolled back immediately."
 (defun exec-show (stream ast)
   (let* ((name (string-downcase (getf ast :name)))
          (value (cond
-                  ((string= name "transaction_isolation") "read committed")
+                  ((string= name "transaction_isolation")
+                   (ecase (backend-isolation-level *backend*)
+                     (:read-committed "read committed")
+                     (:repeatable-read "repeatable read")))
                   ((string= name "server_version") *server-version*)
                   ((string= name "server_version_num")
                    (princ-to-string *server-version-num*))
@@ -842,6 +912,16 @@ before this removal horizon is captured."
 
 (defun execute-in-transaction (stream ast)
   (let ((implicit (not (backend-explicit *backend*))))
+    (when (and (backend-read-only *backend*)
+               (member (getf ast :type)
+                       '(:insert :update :delete :create-table :drop-table
+                         :create-index :drop-index :alter-index :alter-table)))
+      (ereport "25006" "cannot execute write statement in a read-only transaction"))
+    ;; The first REPEATABLE READ milestone is read-only. Writable transactions
+    ;; are enabled once heap update-chain conflicts return serialization errors.
+    (when (and (eq (backend-isolation-level *backend*) :repeatable-read)
+               (member (getf ast :type) '(:insert :update :delete)))
+      (ereport "0A000" "writable REPEATABLE READ transactions are not supported yet"))
     (when (and (ddl-p ast) (backend-explicit *backend*))
       (ereport "0A000"
                "DDL is not supported inside an explicit transaction block"))
@@ -878,7 +958,7 @@ before this removal horizon is captured."
       (ereport "25P02"
                "current transaction is aborted, commands ignored until end of transaction block"))
     (case type
-      (:begin (command-begin stream))
+      (:begin (command-begin stream ast))
       (:commit (command-commit stream))
       (:rollback (command-rollback stream))
       (:checkpoint (command-checkpoint stream))

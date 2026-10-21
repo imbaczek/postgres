@@ -10,8 +10,13 @@
   (xid nil)
   (state :idle)                 ; :idle | :in-progress | :aborted
   (explicit nil)
+  (isolation-level :read-committed)
+  (read-only nil)
   (command-id 0)
   (snapshot nil)
+  (transaction-snapshot nil)
+  (transaction-snapshot-registration nil)
+  (first-snapshot-set nil)
   (dirty-relations '())
   (settings (make-hash-table :test #'equal))
   (settings-transaction-start nil)
@@ -361,7 +366,12 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
     do (sb-thread:with-mutex (*xid-wrap-lock*)
          (when *xid-wrap-failure*
            (xid-wraparound-failed-error))
-         (if (and *xid-wrap-pending* (null (backend-xid backend)))
+         ;; A retained snapshot is itself one of the resources the wraparound
+         ;; coordinator waits to drain. Let its owner run read statements so it
+         ;; can end; ASSIGN-XID still refuses a new writer at the epoch edge.
+         (if (and *xid-wrap-pending*
+                  (null (backend-xid backend))
+                  (null (backend-transaction-snapshot backend)))
              (with-backend-wait-state (backend backend-wraparound-waiting t)
                (check-for-interrupts)
                (condition-wait-with-timeout *xid-wrap-cv* *xid-wrap-lock*))
@@ -372,7 +382,10 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
        (values)))
 
 (defun prepare-xid-wraparound-for-statement (backend)
-  (when (null (backend-xid backend))
+  ;; Do not make a transaction with a retained snapshot become the wraparound
+  ;; coordinator: its own registration would make the coordinator wait forever.
+  (when (and (null (backend-xid backend))
+             (null (backend-transaction-snapshot backend)))
     (let ((should-coordinate
             (sb-thread:with-mutex (*xid-wrap-lock*)
               (and (not *xid-wrap-pending*)
@@ -697,6 +710,37 @@ another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
     (setf (backend-snapshot *backend*) snapshot)
     snapshot))
 
+(defun ensure-transaction-snapshot (backend curcid)
+  "Acquire BACKEND's retained snapshot once, atomically publishing its owner."
+  (or (backend-transaction-snapshot backend)
+      (let ((registration (make-snapshot-registration))
+            (installed nil))
+        (unwind-protect
+             (sb-sys:without-interrupts
+               (let ((snapshot (make-snapshot curcid :register registration)))
+                 (setf (backend-transaction-snapshot backend) snapshot
+                       (backend-transaction-snapshot-registration backend)
+                       registration
+                       installed t)
+                 snapshot))
+          (unless installed
+            (release-snapshot-registration registration))))))
+
+(defun begin-transaction-snapshot (backend curcid statement-registration)
+  "Return a per-statement view over BACKEND's stable transaction horizon."
+  (let* ((retained (ensure-transaction-snapshot backend curcid))
+         (snapshot (make-snapshot-struct
+                    :xmin (snapshot-xmin retained)
+                    :xmax (snapshot-xmax retained)
+                    :xip (snapshot-xip retained)
+                    :curcid curcid)))
+    ;; The transaction registration protects the horizon until transaction
+    ;; cleanup; register the statement view too so its dynamic lifetime follows
+    ;; the existing WITH-STATEMENT-SNAPSHOT contract.
+    (sb-thread:with-mutex (*xid-lock*)
+      (register-active-snapshot snapshot statement-registration))
+    snapshot))
+
 (defun mark-dirty (relfilenode)
   (unless (member relfilenode (backend-dirty-relations *backend*) :test #'eql)
     (push relfilenode (backend-dirty-relations *backend*)))
@@ -713,16 +757,32 @@ another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
             (backend-command-id b) 0)
       (set-backend-state b :in-progress))
     (incf (backend-command-id b))
-    (let ((snap (begin-statement-snapshot b (backend-command-id b)
-                                          registration)))
+    (let ((snap (if (eq (backend-isolation-level b) :repeatable-read)
+                    (begin-transaction-snapshot
+                     b (backend-command-id b) registration)
+                    (begin-statement-snapshot b (backend-command-id b)
+                                              registration))))
+      (setf (backend-first-snapshot-set b) t)
       (setf (backend-snapshot b) snap)
       snap)))
 
+(defun release-backend-transaction-snapshot (backend)
+  (when (backend-transaction-snapshot-registration backend)
+    (release-snapshot-registration
+     (backend-transaction-snapshot-registration backend)))
+  (setf (backend-transaction-snapshot backend) nil
+        (backend-transaction-snapshot-registration backend) nil)
+  (values))
+
 (defun reset-backend-transaction (b)
+  (release-backend-transaction-snapshot b)
   (setf (backend-xid b) nil
         (backend-explicit b) nil
+        (backend-isolation-level b) :read-committed
+        (backend-read-only b) nil
         (backend-command-id b) 0
         (backend-snapshot b) nil
+        (backend-first-snapshot-set b) nil
         (backend-dirty-relations b) '())
   (set-backend-state b :idle)
   (values))
