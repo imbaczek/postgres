@@ -31,6 +31,8 @@
                                    :initial-element 0)))
 
 (defvar *heap-fsms* (make-hash-table :test #'eql))
+(defvar *heap-fsm-lock*
+  (sb-thread:make-mutex :name "pg heap FSM"))
 
 (defun heap-fsm-category (space)
   (min (1- +heap-fsm-category-count+)
@@ -48,11 +50,11 @@
          0)))
 
 (defun heap-fsm-forget (relfilenode)
-  (remhash relfilenode *heap-fsms*)
+  (sb-thread:with-mutex (*heap-fsm-lock*)
+    (remhash relfilenode *heap-fsms*))
   (values))
 
-(defun heap-fsm-record-page (fsm block space)
-  "Record BLOCK's current free space, removing its previous category first."
+(defun heap-fsm-record-page-unlocked (fsm block space)
   (multiple-value-bind (old-space present-p)
       (gethash block (heap-fsm-page-space fsm))
     (when present-p
@@ -76,40 +78,51 @@
             (gethash block (heap-fsm-page-space fsm)) space)))
   (values))
 
+(defun heap-fsm-record-page (fsm block space)
+  "Record BLOCK's current free space, removing its previous category first."
+  (sb-thread:with-mutex (*heap-fsm-lock*)
+    (heap-fsm-record-page-unlocked fsm block space)))
+
 (defun heap-fsm-take-page (fsm space-needed)
   "Return and remove a candidate page with at least SPACE-NEEDED bytes."
-  (let* ((minimum-space (max 0 space-needed))
-         (minimum-category (floor minimum-space +heap-fsm-category-size+)))
-    (loop for category from minimum-category below +heap-fsm-category-count+
-          when (plusp (aref (heap-fsm-nonempty-categories fsm) category))
-            do (loop for space from (if (= category minimum-category)
-                                        minimum-space
-                                        (* category +heap-fsm-category-size+))
-                       to (min +blcksz+
-                               (1- (* (1+ category) +heap-fsm-category-size+)))
-                     for candidates = (gethash space (heap-fsm-buckets fsm))
-                     when candidates
-                       do (let ((block (pop candidates)))
-                            (if candidates
-                                (setf (gethash space (heap-fsm-buckets fsm))
-                                      candidates)
-                                (progn
-                                  (remhash space (heap-fsm-buckets fsm))
-                                  (decf (aref (heap-fsm-nonempty-categories fsm)
-                                              category))))
-                            (remhash block (heap-fsm-page-space fsm))
-                            (return-from heap-fsm-take-page block))))))
+  (sb-thread:with-mutex (*heap-fsm-lock*)
+    (let* ((minimum-space (max 0 space-needed))
+           (minimum-category (floor minimum-space +heap-fsm-category-size+)))
+      (loop for category from minimum-category below +heap-fsm-category-count+
+            when (plusp (aref (heap-fsm-nonempty-categories fsm) category))
+              do (loop for space from (if (= category minimum-category)
+                                          minimum-space
+                                          (* category +heap-fsm-category-size+))
+                         to (min +blcksz+
+                                 (1- (* (1+ category) +heap-fsm-category-size+)))
+                       for candidates = (gethash space (heap-fsm-buckets fsm))
+                       when candidates
+                         do (let ((block (pop candidates)))
+                              (if candidates
+                                  (setf (gethash space (heap-fsm-buckets fsm))
+                                        candidates)
+                                  (progn
+                                    (remhash space (heap-fsm-buckets fsm))
+                                    (decf (aref (heap-fsm-nonempty-categories fsm)
+                                                category))))
+                              (remhash block (heap-fsm-page-space fsm))
+                              (return-from heap-fsm-take-page block)))))))
 
 (defun heap-fsm-for-relation (relfilenode)
-  (or (gethash relfilenode *heap-fsms*)
+  (or (sb-thread:with-mutex (*heap-fsm-lock*)
+        (gethash relfilenode *heap-fsms*))
       (let ((fsm (make-heap-fsm)))
-        ;; This one-time rebuild replaces heapam-insert's repeated full scan.
+        ;; Build a private candidate without holding either the FSM lock or the
+        ;; global write lock across relation page reads.  Concurrent builders
+        ;; install only one candidate; all other callers use that shared FSM.
         (dotimes (block (buf-nblocks relfilenode))
           (let ((page (buf-read relfilenode block)))
             (when page
-              (heap-fsm-record-page fsm block
-                                    (heap-page-insert-capacity page)))))
-        (setf (gethash relfilenode *heap-fsms*) fsm))))
+              (heap-fsm-record-page-unlocked
+               fsm block (heap-page-insert-capacity page)))))
+        (sb-thread:with-mutex (*heap-fsm-lock*)
+          (or (gethash relfilenode *heap-fsms*)
+              (setf (gethash relfilenode *heap-fsms*) fsm))))))
 
 (defun column-align (col)
   (case (pg-column-type col)

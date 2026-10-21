@@ -15,6 +15,9 @@
          (begin-statement-snapshot *backend*
                                    (backend-command-id *backend*)
                                    registration)))
-    (let ((table (resolve-table-or-error (getf ast :table))))
-      (vacuum-table table)
+    (let ((table (with-write-lock
+                   (resolve-table-or-error (getf ast :table)))))
+      (if (getf ast :full-p)
+          (vacuum-full-table table)
+          (vacuum-table table))
       (send-command-complete stream "VACUUM"))))

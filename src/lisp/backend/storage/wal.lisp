@@ -30,6 +30,7 @@
 (defvar *wal-page-batch-split* nil)
 (defvar *wal-pending-btree-split* nil)
 (defvar *wal-pending-deletes* '())
+(defvar *wal-catalog-flush-generation* 0)
 (defvar *wal-poisoned* nil)
 (defvar *wal-end-lsn* 0)
 (defvar *wal-checkpoint-lsn* 0)
@@ -528,6 +529,21 @@
     (dolist (key keys) (remhash key *wal-page-cache*)))
   (values))
 
+(defun wal-discard-relation-pages (relfilenodes)
+  "Forget staged images for unpublished detached relations in RELFILENODES."
+  (sb-thread:with-mutex (*wal-lock*)
+    (dolist (table (list *wal-page-cache* *wal-page-batch*))
+      (when (hash-table-p table)
+        (let ((keys '()))
+          (maphash (lambda (key image)
+                     (declare (ignore image))
+                     (when (member (first key) relfilenodes :test #'eql)
+                       (push key keys)))
+                   table)
+          (dolist (key keys)
+            (remhash key table))))))
+  (values))
+
 (defun wal-commit-transaction (xid after-durable-function)
   "Flush every dirty after-image and XID's commit record as one WAL boundary."
   (unless *wal-ready*
@@ -689,12 +705,25 @@
       (pushnew relfilenode *wal-pending-deletes* :test #'eql)))
   (values))
 
-(defun wal-commit-catalog (catalog-bytes write-function)
+(defun wal-catalog-flush-generation ()
+  "Return the number of catalog WAL commits known to have reached durable WAL."
+  (sb-thread:with-mutex (*wal-lock*)
+    *wal-catalog-flush-generation*))
+
+(defun wal-commit-catalog (catalog-bytes write-function
+                           &key relation-deletes)
   "Durably publish a full catalog image and any deferred relation drops."
   (unless *wal-ready*
-    (return-from wal-commit-catalog (funcall write-function catalog-bytes)))
+    (prog1 (funcall write-function catalog-bytes)
+      (sb-thread:with-mutex (*wal-lock*)
+        (incf *wal-catalog-flush-generation*)))
+    (return-from wal-commit-catalog (values)))
   (with-wal-critical
-    (let* ((deletes (sort (copy-list *wal-pending-deletes*) #'<))
+    (let* ((deletes (sort (remove-duplicates
+                           (append (copy-list *wal-pending-deletes*)
+                                   (copy-list relation-deletes))
+                           :test #'eql)
+                          #'<))
            (images (wal-page-images deletes))
            (catalog-payload
              (wal-encode-catalog-payload catalog-bytes deletes))
@@ -718,6 +747,9 @@
                                commit-payload))
           (wal-append-record +wal-record-catalog+ 0 catalog-payload))
       (wal-flush)
+      ;; This marker advances at the durable boundary, before any fallible
+      ;; page application, catalog-file replacement, or relfile deletion.
+      (incf *wal-catalog-flush-generation*)
       (wal-test-pause :after-catalog-wal-flush)
       (wal-apply-page-images images)
       (funcall write-function catalog-bytes)

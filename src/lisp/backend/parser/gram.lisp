@@ -121,7 +121,17 @@
      (ereport "42601" "syntax error at or near \"~a\"" (pval p)))))
 
 (defun parse-vacuum (p)
-  (list :type :vacuum :table (strip-schema (pident p))))
+  (let ((full-p nil))
+    (cond
+      ((match-kw p "full")
+       (setf full-p t))
+      ((match-punct p #\()
+       (unless (match-kw p "full")
+         (syntax-error p "expected \"FULL\""))
+       (expect-punct p #\))
+       (setf full-p t)))
+    (list :type :vacuum :full-p full-p
+          :table (strip-schema (pident p)))))
 
 (defun parse-explain (p)
   (if (match-kw p "select")

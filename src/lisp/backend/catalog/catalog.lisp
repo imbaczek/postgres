@@ -197,12 +197,13 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
   (or *catalog-oldest-relfrozenxid*
       (catalog-compute-oldest-relfrozenxid)))
 
-(defun save-catalog ()
+(defun save-catalog (&key deferred-relations)
   ;; Do fallible derived-state work before publication. Once WAL commits, the
   ;; generation update and cache assignment below must not signal: callers use
   ;; the generation to distinguish rollback-safe failures from durable ones.
   (let ((oldest (catalog-compute-oldest-relfrozenxid)))
-    (wal-commit-catalog (catalog-image-bytes) #'write-catalog-image)
+    (wal-commit-catalog (catalog-image-bytes) #'write-catalog-image
+                        :relation-deletes deferred-relations)
     (incf *catalog-durable-generation*)
     (setf *catalog-oldest-relfrozenxid* oldest)))
 

@@ -684,14 +684,15 @@ another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
         (register-active-snapshot snapshot register))
       snapshot)))
 
-(defun oldest-xmin ()
+(defun oldest-xmin (&optional exclude-snapshot)
   "Capture the oldest XID protected by a snapshot or active transaction."
   (sb-thread:with-mutex (*xid-lock*)
     (let ((oldest *next-xid*))
       (dolist (xid *active-xids*)
         (when (< xid oldest)
           (setf oldest xid)))
-      (let ((snapshot-xmin (oldest-active-snapshot-xmin)))
+      (let ((snapshot-xmin
+              (oldest-active-snapshot-xmin exclude-snapshot)))
         (when (and snapshot-xmin (< snapshot-xmin oldest))
           (setf oldest snapshot-xmin)))
       oldest)))

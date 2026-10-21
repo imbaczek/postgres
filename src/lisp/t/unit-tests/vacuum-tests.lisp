@@ -44,9 +44,9 @@
                     (setf injected-error
                           (handler-case
                               (progn
-                                (with-vacuum-page-publication
-                                    (relfilenode heap-block)
-                                  (buf-write relfilenode heap-block changed-page))
+                                (try-vacuum-page-publication
+                                 relfilenode heap-block heap-page
+                                 :page changed-page :write-page-p t)
                                 nil)
                             (error (condition)
                               (search "injected failure before visibility-map clear"
@@ -71,8 +71,10 @@
                            "failed VACUUM publication preserves visibility bits"))
                (setf (symbol-function 'visibilitymap-clear)
                      original-visibilitymap-clear))
-             (with-vacuum-page-publication (relfilenode heap-block)
-               (buf-write relfilenode heap-block changed-page))
+             (check (try-vacuum-page-publication
+                     relfilenode heap-block heap-page
+                     :page changed-page :write-page-p t)
+                    "stable heap page accepts a VACUUM publication")
              (check (and (nth-value
                           1 (gethash (wal-page-key relfilenode heap-block)
                                      *wal-page-cache*))
@@ -87,6 +89,114 @@
       (setf (symbol-function 'visibilitymap-clear)
             original-visibilitymap-clear)
       (smgr-forget relfilenode :delete t))))
+
+(defun test-vacuum-page-read-releases-global-write-lock ()
+  (let* ((*wal-ready* nil)
+         (*heap-fsms* (make-hash-table :test #'eql))
+         (heap-relfilenode 918273658)
+         (other-relfilenode 918273659)
+         (columns (vector (make-pg-column :name "value" :type :int4
+                                          :typmod -1 :attnum 1
+                                          :notnull nil)))
+         (test-pgdata *pgdata*)
+         (test-fsms *heap-fsms*)
+         (vacuum-backend (make-backend))
+         (writer-backend (make-backend))
+         (test-lock (sb-thread:make-mutex :name "vacuum copied-page test"))
+         (test-cv (sb-thread:make-waitqueue :name "vacuum copied-page cv"))
+         (page-read-paused nil)
+         (resume-scan nil)
+         (writer-done nil)
+         (vacuum-done nil)
+         (writer-error nil)
+         (vacuum-error nil)
+         (threads '())
+         (original-buf-read (symbol-function 'buf-read)))
+    (smgr-forget heap-relfilenode :delete t)
+    (smgr-forget other-relfilenode :delete t)
+    (clog-set 8210 +clog-committed+)
+    (clog-set 8211 +clog-committed+)
+    (unwind-protect
+         (progn
+           (heapam-insert heap-relfilenode columns #(1) 8210 0)
+           ;; Keep FSM initialization out of the paused scan read.
+           (heap-fsm-for-relation heap-relfilenode)
+           (setf (symbol-function 'buf-read)
+                 (lambda (relfilenode block &optional (fork :main))
+                   (let ((page (funcall original-buf-read relfilenode block fork)))
+                     (when (and page
+                                (eq fork :main)
+                                (= relfilenode heap-relfilenode)
+                                (zerop block)
+                                (sb-thread:with-mutex (test-lock)
+                                  (unless page-read-paused
+                                    (setf page-read-paused t)
+                                    (sb-thread:condition-broadcast test-cv)
+                                    t)))
+                       (sb-thread:with-mutex (test-lock)
+                         (loop until resume-scan
+                               do (sb-thread:condition-wait test-cv test-lock))))
+                     page)))
+           (push
+            (sb-thread:make-thread
+             (lambda ()
+               (let ((*pgdata* test-pgdata)
+                     (*heap-fsms* test-fsms)
+                     (*wal-ready* nil)
+                     (*backend* vacuum-backend))
+                 (handler-case
+                     (heap-vacuum-relation heap-relfilenode nil 8212 8100)
+                   (error (condition) (setf vacuum-error condition))))
+               (sb-thread:with-mutex (test-lock)
+                 (setf vacuum-done t)
+                 (sb-thread:condition-broadcast test-cv)))
+             :name "vacuum copied-page scan")
+            threads)
+           (check (test-wait-until
+                   (lambda ()
+                     (sb-thread:with-mutex (test-lock) page-read-paused)))
+                  "VACUUM reaches a private copied-page read")
+           (push
+            (sb-thread:make-thread
+             (lambda ()
+               (let ((*pgdata* test-pgdata)
+                     (*heap-fsms* test-fsms)
+                     (*wal-ready* nil)
+                     (*backend* writer-backend))
+                 (handler-case
+                     (with-write-lock
+                       (heapam-insert other-relfilenode columns #(2) 8211 0))
+                   (error (condition) (setf writer-error condition))))
+               (sb-thread:with-mutex (test-lock)
+                 (setf writer-done t)
+                 (sb-thread:condition-broadcast test-cv)))
+             :name "unrelated heap writer during vacuum")
+            threads)
+           (check (test-wait-until
+                   (lambda ()
+                     (sb-thread:with-mutex (test-lock) writer-done))
+                   1.0)
+                  "an unrelated heap INSERT progresses during VACUUM page work")
+           (sb-thread:with-mutex (test-lock)
+             (setf resume-scan t)
+             (sb-thread:condition-broadcast test-cv))
+           (dolist (thread threads)
+             (sb-thread:join-thread thread :timeout 3))
+           (check (null writer-error)
+                  (format nil "the unrelated heap INSERT finishes without an error: ~a"
+                          writer-error))
+           (check (null vacuum-error)
+                  (format nil "VACUUM completes after its copied page is released: ~a"
+                          vacuum-error))
+           (check vacuum-done "VACUUM worker terminates"))
+      (sb-thread:with-mutex (test-lock)
+        (setf resume-scan t)
+        (sb-thread:condition-broadcast test-cv))
+      (dolist (thread threads)
+        (ignore-errors (sb-thread:join-thread thread :timeout 3)))
+      (setf (symbol-function 'buf-read) original-buf-read)
+      (smgr-forget heap-relfilenode :delete t)
+      (smgr-forget other-relfilenode :delete t))))
 
 (defun test-vacuum-reuses-tid-clears-index-and-vm ()
   (let* ((*heap-fsms* (make-hash-table :test #'eql))
@@ -120,6 +230,9 @@
                (buf-write heap-relfilenode (first old-tid) page)))
            (heap-vacuum-relation heap-relfilenode (list index-relfilenode)
                                  8202 8100)
+           (check (= (visibilitymap-status heap-relfilenode (first old-tid))
+                     (logior +vm-all-visible-bit+ +vm-all-frozen-bit+))
+                  "VACUUM marks the reclaimed empty page all-visible and all-frozen")
            (multiple-value-bind (off flags len)
                (page-get-lp (buf-read heap-relfilenode (first old-tid))
                             (second old-tid))
