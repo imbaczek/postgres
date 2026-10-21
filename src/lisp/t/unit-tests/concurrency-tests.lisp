@@ -2,6 +2,142 @@
 
 (in-package #:pg)
 
+(defun test-exported-snapshot-schema-lock-coordination ()
+  (let* ((test-lock (sb-thread:make-mutex :name "test schema lock state"))
+         (test-cv (sb-thread:make-waitqueue :name "test schema lock state"))
+         (writer-entered nil)
+         (release-writer nil)
+         (reader-entered nil)
+         (writer nil)
+         (reader nil)
+         (worker-error nil))
+    (unwind-protect
+         (progn
+           (with-schema-read-lock
+             (setf writer
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (with-schema-write-lock
+                            (sb-thread:with-mutex (test-lock)
+                              (setf writer-entered t)
+                              (sb-thread:condition-broadcast test-cv)
+                              (loop until release-writer
+                                    do (sb-thread:condition-wait
+                                        test-cv test-lock))))
+                        (error (condition)
+                          (setf worker-error condition)))
+                      (values))
+                    :name "test schema writer"))
+             (check (test-wait-until
+                     (lambda ()
+                       (sb-thread:with-mutex (*schema-lock-mutex*)
+                         (plusp *schema-write-lock-waiters*))))
+                    "schema writer queues behind an exported snapshot reader")
+             (setf reader
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (with-schema-read-lock
+                            (sb-thread:with-mutex (test-lock)
+                              (setf reader-entered t)
+                              (sb-thread:condition-broadcast test-cv)))
+                        (error (condition)
+                          (setf worker-error condition)))
+                      (values))
+                    :name "test later schema reader"))
+             (check (not (sb-thread:with-mutex (test-lock) writer-entered))
+                    "schema writer remains blocked for the snapshot lifetime")
+             (check (not (sb-thread:with-mutex (test-lock) reader-entered))
+                    "queued schema writer prevents later readers from starving it"))
+           (check (test-wait-until
+                   (lambda ()
+                     (sb-thread:with-mutex (test-lock) writer-entered)))
+                  "schema writer proceeds when the exported snapshot releases")
+           (check (not (sb-thread:with-mutex (test-lock) reader-entered))
+                  "schema writer runs before readers queued behind it")
+           (sb-thread:with-mutex (test-lock)
+             (setf release-writer t)
+             (sb-thread:condition-broadcast test-cv))
+           (when writer
+             (sb-thread:join-thread writer)
+             (setf writer nil))
+           (when reader
+             (sb-thread:join-thread reader)
+             (setf reader nil))
+           (check (sb-thread:with-mutex (test-lock) reader-entered)
+                  "queued schema reader proceeds after the DDL writer")
+           (check (null worker-error)
+                  "schema lock waiters finish without errors"))
+      (sb-thread:with-mutex (test-lock)
+        (setf release-writer t)
+        (sb-thread:condition-broadcast test-cv))
+      (when writer (sb-thread:join-thread writer))
+      (when reader (sb-thread:join-thread reader)))))
+
+(defun test-schema-lock-nesting-and-read-upgrade-rejection ()
+  (check (with-schema-write-lock
+           (with-schema-write-lock
+             (with-schema-read-lock t)))
+         "schema write lock nests without reacquiring the gate")
+  (let ((original-check (symbol-function 'check-for-interrupts)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'check-for-interrupts)
+                 (lambda () (error "nested schema read tried to wait")))
+           (check (handler-case
+                      (progn
+                        (with-schema-read-lock
+                          (let ((*schema-write-lock-waiters* 1))
+                            (with-schema-read-lock t)))
+                        t)
+                    (error () nil))
+                  "nested schema readers do not wait behind queued writers"))
+      (setf (symbol-function 'check-for-interrupts) original-check)))
+  (check (handler-case
+             (progn
+               (with-schema-read-lock
+                 (with-schema-write-lock t))
+               nil)
+           (error () t))
+         "schema read scope rejects a same-thread write-lock upgrade")
+  (sb-thread:with-mutex (*schema-lock-mutex*)
+    (check (and (zerop *schema-read-lock-count*)
+                (null *schema-write-lock-owner*)
+                (zerop *schema-write-lock-waiters*))
+           "schema lock macros release all counters and ownership on errors")))
+
+(defun test-schema-lock-acquisition-interruption ()
+  (let ((*schema-lock-mutex* (sb-thread:make-mutex :name "test schema lock"))
+        (*schema-lock-cv* (sb-thread:make-waitqueue :name "test schema waiters"))
+        (*schema-read-lock-count* 0)
+        (*schema-write-lock-owner* nil)
+        (*schema-write-lock-waiters* 0)
+        (*schema-read-lock-held* nil)
+        (*schema-write-lock-held* nil)
+        (original-check (symbol-function 'check-for-interrupts)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'check-for-interrupts)
+                 (lambda () (error "injected schema-lock cancellation")))
+           (setf *schema-write-lock-owner* :held)
+           (check (handler-case
+                      (progn (with-schema-read-lock t) nil)
+                    (error () t))
+                  "reader cancellation interrupts while waiting behind a writer")
+           (check (zerop *schema-read-lock-count*)
+                  "cancelled schema reader never publishes an orphaned hold")
+           (setf *schema-write-lock-owner* nil
+                 *schema-read-lock-count* 1)
+           (check (handler-case
+                      (progn (with-schema-write-lock t) nil)
+                    (error () t))
+                  "writer cancellation interrupts while waiting behind a reader")
+           (check (and (zerop *schema-write-lock-waiters*)
+                       (null *schema-write-lock-owner*))
+                  "cancelled schema writer clears its waiter count"))
+      (setf (symbol-function 'check-for-interrupts) original-check))))
+
 (defun test-atomic-relation-reader-registration ()
   (let* ((xid 987781)
          (first-rel 987782)

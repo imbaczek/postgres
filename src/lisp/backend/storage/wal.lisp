@@ -24,6 +24,9 @@
 (defstruct wal-page-image
   relfilenode (fork :main) block page (xids '()))
 
+(defstruct wal-replication-slot
+  name restart-lsn consistent-lsn active-owner)
+
 (defvar *wal-lock* (sb-thread:make-mutex :name "pg wal and page cache lock"))
 (defvar *wal-page-cache* (make-hash-table :test #'equal))
 (defvar *wal-page-cache-xids* (make-hash-table :test #'equal))
@@ -32,6 +35,7 @@
 (defvar *wal-page-batch-split* nil)
 (defvar *wal-xid-first-lsn* (make-hash-table :test #'eql))
 (defvar *wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+(defvar *wal-replication-slots* (make-hash-table :test #'equal))
 (defvar *wal-pending-btree-split* nil)
 (defvar *wal-pending-deletes* '())
 (defvar *wal-catalog-flush-generation* 0)
@@ -102,6 +106,13 @@
 
 (defun wal-control-path ()
   (merge-pathnames "global/pg_wal_control" *pgdata*))
+
+(defun wal-replication-slot-directory ()
+  (merge-pathnames "pg_replslot/" *pgdata*))
+
+(defun wal-replication-slot-path (name)
+  (merge-pathnames (format nil "~a.slot" name)
+                   (wal-replication-slot-directory)))
 
 (defun wal-u16 (bytes offset)
   (logior (aref bytes offset)
@@ -1187,6 +1198,140 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
                        :element-type '(unsigned-byte 8))
     (write-sequence bytes stream)))
 
+(defun wal-valid-replication-slot-name-p (name)
+  (and (stringp name)
+       (<= 1 (length name) 63)
+       (every (lambda (char)
+                (or (and (char>= char #\a) (char<= char #\z))
+                    (and (char>= char #\0) (char<= char #\9))
+                    (char= char #\_)))
+              name)))
+
+(defun wal-encode-replication-slot (slot)
+  (let* ((name (wal-replication-slot-name slot))
+         (restart-lsn (wal-replication-slot-restart-lsn slot))
+         (consistent-lsn (wal-replication-slot-consistent-lsn slot)))
+    (unless (and (wal-valid-replication-slot-name-p name)
+                 (integerp restart-lsn) (<= 0 restart-lsn #xFFFFFFFFFFFFFFFF)
+                 (integerp consistent-lsn)
+                 (<= restart-lsn consistent-lsn #xFFFFFFFFFFFFFFFF))
+      (error "invalid WAL replication slot state ~s" slot))
+    (let* ((prefix (format nil "PGSLOT1 ~a ~a ~a"
+                           name restart-lsn consistent-lsn))
+           (crc (wal-crc32 (string->bytes prefix))))
+      (string->bytes (format nil "~a ~8,'0X~%" prefix crc)))))
+
+(defun wal-save-replication-slot (slot)
+  (unless (string= (wal-replication-slot-name slot)
+                   (pathname-name
+                    (wal-replication-slot-path
+                     (wal-replication-slot-name slot))))
+    (error "invalid replication slot filename"))
+  (wal-atomic-write-bytes (wal-replication-slot-path
+                           (wal-replication-slot-name slot))
+                          (wal-encode-replication-slot slot))
+  (values))
+
+(defun wal-delete-replication-slot-file (name)
+  (let ((path (wal-replication-slot-path name)))
+    (when (probe-file path)
+      (delete-file path))
+    ;; Also sync when the file is already absent: a prior unlink may have
+    ;; succeeded while its directory fsync failed, and retry must make that
+    ;; deletion durable before releasing the in-memory WAL pin.
+    (fsync-directory (wal-replication-slot-directory)))
+  (values))
+
+(defun wal-split-fields (line)
+  (loop with start = 0
+        for end = (position #\Space line :start start)
+        collect (subseq line start end)
+        while end
+        do (setf start (1+ end))))
+
+(defun wal-read-replication-slot (path)
+  (with-open-file (stream path :direction :input)
+    (let* ((line (read-line stream nil nil))
+           (fields (and line (wal-split-fields line))))
+      (unless (and (= (length fields) 5)
+                   (string= (first fields) "PGSLOT1")
+                   (every (lambda (field) (plusp (length field))) fields)
+                   (null (read-line stream nil nil)))
+        (error "replication slot file ~a is malformed" path))
+      (let* ((name (second fields))
+             (restart-lsn (ignore-errors (parse-integer (third fields))))
+             (consistent-lsn (ignore-errors (parse-integer (fourth fields))))
+             (crc (ignore-errors (parse-integer (fifth fields) :radix 16)))
+             (prefix (format nil "PGSLOT1 ~a ~a ~a"
+                             name (third fields) (fourth fields)))
+             (slot (make-wal-replication-slot
+                    :name name :restart-lsn restart-lsn
+                    :consistent-lsn consistent-lsn)))
+        (unless (and (wal-valid-replication-slot-name-p name)
+                     (string= name (pathname-name path))
+                     restart-lsn consistent-lsn crc
+                     (<= 0 restart-lsn consistent-lsn
+                         *wal-durable-lsn* #xFFFFFFFFFFFFFFFF)
+                     (= crc (wal-crc32 (string->bytes prefix))))
+          (error "replication slot file ~a is corrupt or outside durable WAL"
+                 path))
+        slot))))
+
+(defun wal-validate-replication-slot-wal (slot segments)
+  (let ((restart-lsn (wal-replication-slot-restart-lsn slot)))
+    ;; A slot at the current durable end does not require a segment yet. Any
+    ;; earlier restart point requires every segment through the durable tail.
+    (when (< restart-lsn *wal-durable-lsn*)
+      (let ((first (floor restart-lsn +wal-segment-size+))
+            (last (floor (1- *wal-durable-lsn*) +wal-segment-size+)))
+        (loop for segment from first to last
+              unless (member segment segments :test #'=)
+                do (error "WAL required by replication slot ~a is missing segment ~a"
+                          (wal-replication-slot-name slot) segment)))))
+  slot)
+
+(defun wal-load-replication-slots ()
+  "Load durable WAL restart points before any checkpoint can recycle WAL."
+  (let ((segments (wal-discover-segments)))
+    (clrhash *wal-replication-slots*)
+    (dolist (path (directory
+                   (merge-pathnames "*.slot"
+                                    (wal-replication-slot-directory))))
+      (let* ((slot (wal-read-replication-slot path))
+             (name (wal-replication-slot-name slot)))
+        (when (gethash name *wal-replication-slots*)
+          (error "duplicate WAL replication slot ~a" name))
+        (wal-validate-replication-slot-wal slot segments)
+        (setf (gethash name *wal-replication-slots*) slot))))
+  (values))
+
+(defun wal-drop-replication-slot (name)
+  "Durably remove NAME while serialized with checkpoint WAL recycling."
+  (unless (wal-valid-replication-slot-name-p name)
+    (error "invalid replication slot name ~s" name))
+  ;; This only mutates slot metadata, not WAL records or pages. Use the mutex
+  ;; directly so expected errors such as an absent slot do not poison WAL.
+  (sb-thread:with-mutex (*wal-lock*)
+    (unless (gethash name *wal-replication-slots*)
+      (ereport "42704" "replication slot \"~a\" does not exist" name))
+    (when (wal-replication-slot-active-owner
+           (gethash name *wal-replication-slots*))
+      ;; PostgreSQL requires a slot to be released before it can be dropped.
+      (ereport "55006" "replication slot \"~a\" is active" name))
+    ;; Remove the durable representation before releasing the in-memory pin.
+    (wal-delete-replication-slot-file name)
+    (remhash name *wal-replication-slots*))
+  (values))
+
+(defun wal-release-replication-slot-owner (name owner)
+  "Release OWNER's runtime claim without changing the durable slot."
+  (sb-sys:without-interrupts
+    (sb-thread:with-mutex (*wal-lock*)
+      (let ((slot (gethash name *wal-replication-slots*)))
+        (when (and slot (eq owner (wal-replication-slot-active-owner slot)))
+          (setf (wal-replication-slot-active-owner slot) nil)))))
+  (values))
+
 (defun wal-read-control-fields ()
   (let ((path (wal-control-path)))
     (when (probe-file path)
@@ -1258,6 +1403,7 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
   (wal-ensure-directory-durable (merge-pathnames "global/" *pgdata*))
   (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
   (wal-ensure-directory-durable (merge-pathnames "pg_wal/" *pgdata*))
+  (wal-ensure-directory-durable (wal-replication-slot-directory))
   ;; Persist segment entries left visible by a process that exited before its
   ;; first successful WAL directory sync, before reusing any existing segment.
   (fsync-directory (wal-directory))
@@ -1275,6 +1421,7 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
             *wal-page-cache-xids* (make-hash-table :test #'equal)
             *wal-xid-first-lsn* (make-hash-table :test #'eql)
             *wal-snapshot-retention-pins* (make-hash-table :test #'eq)
+            *wal-replication-slots* (make-hash-table :test #'equal)
             *wal-pending-deletes* '()
             *wal-pending-btree-split* nil
             *wal-output-stream* nil
@@ -1401,7 +1548,7 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
   (values))
 
 (defun wal-remove-checkpointed-segments-under-wal-lock (checkpoint-lsn)
-  "Recycle WAL while preserving active XID and checkpoint restart positions.
+  "Recycle WAL while preserving active XID, snapshot, and slot restart points.
 
 The caller holds *WAL-LOCK*. The checkpoint path also holds *WRITE-LOCK*, so a
 snapshot boundary cannot capture an active XID while its required segment is
@@ -1421,11 +1568,16 @@ map under *XID-LOCK* makes that race conservative and safe."
              (loop for lsn being the hash-values
                      of *wal-snapshot-retention-pins*
                    minimize lsn)))
+         (oldest-slot-restart-lsn
+           (when (plusp (hash-table-count *wal-replication-slots*))
+             (loop for slot being the hash-values of *wal-replication-slots*
+                   minimize (wal-replication-slot-restart-lsn slot))))
          (oldest-retained-lsn
-           (cond ((and oldest-active-first-lsn oldest-snapshot-pin-lsn)
-                  (min oldest-active-first-lsn oldest-snapshot-pin-lsn))
-                 (oldest-active-first-lsn oldest-active-first-lsn)
-                 (oldest-snapshot-pin-lsn oldest-snapshot-pin-lsn)))
+           (let ((positions
+                   (remove nil (list oldest-active-first-lsn
+                                     oldest-snapshot-pin-lsn
+                                     oldest-slot-restart-lsn))))
+             (and positions (reduce #'min positions))))
          (xid-retention-segment
            (if oldest-retained-lsn
                (floor oldest-retained-lsn +wal-segment-size+)

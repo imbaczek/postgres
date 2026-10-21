@@ -535,6 +535,456 @@
        (uiop:delete-directory-tree test-pgdata :validate t
                                                :if-does-not-exist :ignore)))))
 
+(defun test-wal-replication-slot-durable-retention ()
+  (let* ((test-pgdata (merge-pathnames "wal-replication-slot-test/" *pgdata*))
+         (*pgdata* test-pgdata)
+         (*active-xids* '(6401))
+         (*next-xid* 6402)
+         (*wal-ready* t)
+         (*wal-poisoned* nil)
+         (*wal-checkpoint-lsn* 0)
+         (*wal-durable-lsn* (+ (* 2 +wal-segment-size+) 100))
+         (*wal-xid-first-lsn* (make-hash-table :test #'eql))
+         (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+         (*wal-replication-slots* (make-hash-table :test #'equal))
+         (*wal-output-stream* nil)
+         (*wal-output-segment* nil)
+         (checkpoint-lsn *wal-durable-lsn*)
+         (registration (make-snapshot-registration))
+         (snapshot nil)
+         (boundary-lsn nil)
+         (restart-lsn nil)
+         (slot nil))
+    (setf (gethash 6401 *wal-xid-first-lsn*) 100)
+    (check (and (wal-valid-replication-slot-name-p "copy_slot")
+                (not (wal-valid-replication-slot-name-p "Copy_slot")))
+           "replication slot names follow PostgreSQL's lowercase name rules")
+    (wal-ensure-directory-durable *pgdata*)
+    (wal-ensure-directory-durable (wal-directory))
+    (wal-ensure-directory-durable (wal-replication-slot-directory))
+    (unwind-protect
+         (progn
+           (dolist (segment '(0 1 2))
+             (with-open-file (stream (wal-segment-path segment)
+                                     :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede
+                                     :if-does-not-exist :create)
+               (write-byte 0 stream)))
+           (with-write-lock
+             (multiple-value-setq (snapshot boundary-lsn restart-lsn slot)
+               (wal-create-replication-slot-under-writer-lock
+                "copy_slot" 7 registration)))
+           (check (and snapshot (= boundary-lsn checkpoint-lsn)
+                       (= restart-lsn 100)
+                       (= (wal-replication-slot-consistent-lsn slot)
+                          checkpoint-lsn))
+                  "slot creation pairs a snapshot boundary with the oldest active-XID WAL")
+           (check (and (probe-file (wal-replication-slot-path "copy_slot"))
+                       (eq slot (gethash "copy_slot" *wal-replication-slots*)))
+                  "slot reserves a WAL pin and finishes durable publication")
+           ;; A restart reconstructs slot pins from durable metadata before
+           ;; checkpoint recycling is allowed to run.
+           (setf *wal-replication-slots* (make-hash-table :test #'equal))
+           (wal-load-replication-slots)
+           (check (= (wal-replication-slot-restart-lsn
+                      (gethash "copy_slot" *wal-replication-slots*))
+                     100)
+                  "startup reloads the durable replication slot restart point")
+           (release-xid 6401)
+           (release-snapshot-registration registration)
+           (wal-remove-checkpointed-segments checkpoint-lsn)
+           (check (every (lambda (segment)
+                           (probe-file (wal-segment-path segment)))
+                         '(0 1 2))
+                  "checkpoint retains slot WAL after its captured XID and snapshot end")
+           (wal-drop-replication-slot "copy_slot")
+           (wal-remove-checkpointed-segments checkpoint-lsn)
+           (check (and (not (probe-file (wal-segment-path 0)))
+                       (not (probe-file (wal-segment-path 1)))
+                       (probe-file (wal-segment-path 2))
+                       (not (probe-file (wal-replication-slot-path "copy_slot"))))
+                  "dropping a slot durably releases its WAL retention point"))
+      (when (snapshot-registration-active-p registration)
+        (release-snapshot-registration registration))
+      (when *wal-output-stream*
+        (ignore-errors (close *wal-output-stream*)))
+      (ignore-errors
+       (uiop:delete-directory-tree test-pgdata :validate t
+                                               :if-does-not-exist :ignore)))))
+
+(defun test-with-exported-snapshot-scope ()
+  (let* ((test-pgdata (merge-pathnames "exported-snapshot-scope-test/" *pgdata*))
+         (*pgdata* test-pgdata)
+         (*backend* (make-backend))
+         (*active-xids* nil)
+         (*next-xid* 9000)
+         (*active-snapshots* 0)
+         (*active-snapshot-set* (make-hash-table :test #'eq))
+         (*wal-ready* t)
+         (*wal-poisoned* nil)
+         (*wal-checkpoint-lsn* 0)
+         (*wal-durable-lsn* 1000)
+         (*wal-xid-first-lsn* (make-hash-table :test #'eql))
+         (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+         (*wal-replication-slots* (make-hash-table :test #'equal))
+         (snapshot nil)
+         (start-lsn nil))
+    (wal-ensure-directory-durable *pgdata*)
+    (wal-ensure-directory-durable (wal-replication-slot-directory))
+    (unwind-protect
+         (progn
+           (multiple-value-setq (snapshot start-lsn)
+             (with-exported-snapshot (captured captured-start
+                                               :slot-name "base_copy")
+               (check (and (eq (backend-state *backend*) :in-progress)
+                           (backend-explicit *backend*)
+                           (eq (backend-isolation-level *backend*)
+                               :repeatable-read)
+                           (backend-read-only *backend*))
+                      "export scope owns a read-only repeatable-read transaction")
+               (check (and (eq captured
+                               (backend-transaction-snapshot *backend*))
+                           (eq captured
+                               (snapshot-registration-snapshot
+                                (backend-transaction-snapshot-registration
+                                 *backend*)))
+                           (eq captured *current-snapshot*))
+                      "export scope installs the registered snapshot for copy reads")
+               (check (sb-thread:with-mutex (*schema-lock-mutex*)
+                        (plusp *schema-read-lock-count*))
+                      "export scope holds the schema read gate")
+               (check (handler-case
+                          (progn (commit-transaction) nil)
+                        (error () t))
+                      "callers cannot end the retained transaction inside the scope")
+               (check (handler-case
+                          (progn
+                            (with-schema-write-lock t)
+                            nil)
+                        (error () t))
+                      "schema changes cannot upgrade the exported read gate")
+               (check (handler-case
+                          (progn (wal-drop-replication-slot "base_copy") nil)
+                        (error () t))
+                      "an active exported-copy slot cannot be dropped")
+               (check (gethash "base_copy" *wal-replication-slots*)
+                      "a rejected active-slot drop retains its WAL pin")
+               (values captured captured-start)))
+           (check (and snapshot (= start-lsn 1000)
+                       (eq (backend-state *backend*) :idle)
+                       (null (backend-transaction-snapshot *backend*))
+                       (null (wal-replication-slot-active-owner
+                              (gethash "base_copy" *wal-replication-slots*)))
+                       (zerop *active-snapshots*))
+                  "export scope releases the snapshot and slot claim after the copy")
+           (check (gethash "base_copy" *wal-replication-slots*)
+                  "successful export leaves a durable WAL slot behind")
+           (wal-drop-replication-slot "base_copy")
+           (check (null (gethash "base_copy" *wal-replication-slots*))
+                  "caller can release the completed export slot")
+           (check (handler-case
+                      (progn
+                        (with-exported-snapshot (failed-snapshot failed-start
+                                                                 :slot-name "failed_copy")
+                          (declare (ignore failed-snapshot failed-start))
+                          (error "injected initial-copy failure"))
+                        nil)
+                    (error () t))
+                  "copy errors propagate out of the export scope")
+           (check (and (eq (backend-state *backend*) :idle)
+                       (zerop *active-snapshots*)
+                       (null (wal-replication-slot-active-owner
+                              (gethash "failed_copy" *wal-replication-slots*))))
+                  "failed copies release their snapshot and active slot claim")
+           (wal-drop-replication-slot "failed_copy"))
+      (when (not (eq (backend-state *backend*) :idle))
+        (ignore-errors (abort-transaction)))
+      (when (gethash "base_copy" *wal-replication-slots*)
+        (ignore-errors (wal-drop-replication-slot "base_copy")))
+      (ignore-errors
+       (uiop:delete-directory-tree test-pgdata :validate t
+                                               :if-does-not-exist :ignore)))))
+
+(defun test-exported-snapshot-wraparound-admission ()
+  (let ((*backend* (make-backend))
+        (*xid-wrap-pending* t)
+        (*xid-wrap-failure* nil)
+        (*active-snapshots* 0)
+        (*active-snapshot-set* (make-hash-table :test #'eq))
+        (*schema-read-lock-count* 0)
+        (*schema-write-lock-owner* nil)
+        (*schema-write-lock-waiters* 0)
+        (*wal-ready* nil)
+        (*wal-replication-slots* (make-hash-table :test #'equal))
+        (original-wait (symbol-function 'condition-wait-with-timeout))
+        (wait-called nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'condition-wait-with-timeout)
+                 (lambda (waitqueue mutex)
+                   (declare (ignore waitqueue mutex))
+                   (setf wait-called t)
+                   (error "injected wraparound gate wait")))
+           (check (handler-case
+                      (progn
+                        (with-exported-snapshot (snapshot start-lsn
+                                                          :slot-name "pending_copy")
+                          (declare (ignore snapshot start-lsn)))
+                        nil)
+                    (error () t))
+                  "snapshot export waits at the pending wraparound gate")
+           (check wait-called
+                  "export checks wraparound admission before touching WAL")
+           (check (and (eq (backend-state *backend*) :idle)
+                       (not (backend-wraparound-waiting *backend*))
+                       (zerop *active-snapshots*)
+                       (zerop *schema-read-lock-count*)
+                       (zerop (hash-table-count *wal-replication-slots*)))
+                  "a blocked export publishes no snapshot, lock, or slot"))
+      (setf (symbol-function 'condition-wait-with-timeout) original-wait))))
+
+(defun test-exported-snapshot-wraparound-race ()
+  (let ((*backend* (make-backend))
+        (*xid-wrap-pending* nil)
+        (*xid-wrap-failure* nil)
+        (*active-xids* '())
+        (*next-xid* 7000)
+        (*active-snapshots* 0)
+        (*active-snapshot-set* (make-hash-table :test #'eq))
+        (*schema-read-lock-count* 0)
+        (*schema-write-lock-owner* nil)
+        (*schema-write-lock-waiters* 0)
+        (*wal-ready* t)
+        (*wal-poisoned* nil)
+        (*wal-durable-lsn* 1000)
+        (*wal-xid-first-lsn* (make-hash-table :test #'eql))
+        (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+        (*wal-replication-slots* (make-hash-table :test #'equal))
+        (*wal-test-after-snapshot-boundary-registration-hook* nil)
+        (preflight-called nil)
+        (wait-called nil)
+        (wait-held-gate nil)
+        (capture-held-gate nil)
+        (publish-held-gate nil)
+        (publish-saw-active-pin nil)
+        (original-prepare
+          (symbol-function 'prepare-xid-wraparound-for-statement))
+        (original-wait (symbol-function 'condition-wait-with-timeout))
+        (original-publish
+          (symbol-function 'wal-publish-captured-replication-slot)))
+    (unwind-protect
+         (progn
+           ;; Model a coordinator arriving immediately after the preflight
+           ;; check, before the export has registered its retained snapshot.
+           (setf (symbol-function 'prepare-xid-wraparound-for-statement)
+                 (lambda (backend)
+                   (declare (ignore backend))
+                   (setf preflight-called t
+                         *xid-wrap-pending* t)))
+           (setf (symbol-function 'condition-wait-with-timeout)
+                 (lambda (waitqueue mutex)
+                   (declare (ignorable mutex))
+                   (if (eq waitqueue *xid-wrap-cv*)
+                       (progn
+                         (setf wait-called t
+                               wait-held-gate
+                               (sb-thread:holding-mutex-p *xid-wrap-lock*)
+                               *xid-wrap-pending* nil)
+                         t)
+                       (funcall original-wait waitqueue mutex))))
+           (setf *wal-test-after-snapshot-boundary-registration-hook*
+                 (lambda (registration)
+                   (setf capture-held-gate
+                         (and (sb-thread:holding-mutex-p *xid-wrap-lock*)
+                              (snapshot-registration-active-p registration)
+                              (not *xid-wrap-pending*)))))
+           (setf (symbol-function 'wal-publish-captured-replication-slot)
+                 (lambda (name boundary-lsn restart-lsn registration
+                          &optional active-owner)
+                   (setf publish-held-gate
+                         (sb-thread:holding-mutex-p *xid-wrap-lock*)
+                         publish-saw-active-pin
+                         (and (snapshot-registration-active-p registration)
+                              (nth-value 1
+                                         (gethash registration
+                                                  *wal-snapshot-retention-pins*))))
+                   (make-wal-replication-slot
+                    :name name :consistent-lsn boundary-lsn
+                    :restart-lsn restart-lsn :active-owner active-owner)))
+           (with-exported-snapshot (snapshot start-lsn
+                                             :slot-name "race_copy")
+             (check (and (eq snapshot
+                             (backend-transaction-snapshot *backend*))
+                         (= start-lsn 1000))
+                    "export uses the snapshot and boundary captured after the gate opens"))
+           (check (and preflight-called wait-called wait-held-gate)
+                  "export rechecks a newly pending wraparound gate atomically")
+           (check capture-held-gate
+                  "snapshot registration occurs while wraparound admission is locked")
+           (check (and publish-saw-active-pin (not publish-held-gate))
+                  "slot publication follows gate release while the snapshot pins WAL")
+           (check (and (eq (backend-state *backend*) :idle)
+                       (zerop *active-snapshots*)
+                       (zerop *schema-read-lock-count*)
+                       (null (backend-transaction-snapshot *backend*)))
+                  "export cleanup releases its registered snapshot and schema gate"))
+      (setf (symbol-function 'prepare-xid-wraparound-for-statement)
+            original-prepare
+            (symbol-function 'condition-wait-with-timeout) original-wait
+            (symbol-function 'wal-publish-captured-replication-slot)
+            original-publish)
+      (when (not (eq (backend-state *backend*) :idle))
+        (ignore-errors (abort-transaction))))))
+
+(defun test-wal-replication-slot-fsync-failure-keeps-pin ()
+  (let* ((test-pgdata (merge-pathnames "wal-replication-slot-fsync-test/"
+                                       *pgdata*))
+         (*pgdata* test-pgdata)
+         (*active-xids* '(6411))
+         (*next-xid* 6412)
+         (*wal-ready* t)
+         (*wal-poisoned* nil)
+         (*wal-checkpoint-lsn* 0)
+         (*wal-durable-lsn* (+ (* 2 +wal-segment-size+) 100))
+         (*wal-xid-first-lsn* (make-hash-table :test #'eql))
+         (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+         (*wal-replication-slots* (make-hash-table :test #'equal))
+         (*wal-output-stream* nil)
+         (*wal-output-segment* nil)
+         (checkpoint-lsn *wal-durable-lsn*)
+         (registration (make-snapshot-registration))
+         (original-fsync-directory (symbol-function 'fsync-directory))
+         (failed nil))
+    (setf (gethash 6411 *wal-xid-first-lsn*) 100)
+    (wal-ensure-directory-durable *pgdata*)
+    (wal-ensure-directory-durable (wal-directory))
+    (wal-ensure-directory-durable (wal-replication-slot-directory))
+    (dolist (segment '(0 1 2))
+      (with-open-file (stream (wal-segment-path segment)
+                              :direction :output
+                              :element-type '(unsigned-byte 8)
+                              :if-exists :supersede
+                              :if-does-not-exist :create)
+        (write-byte 0 stream)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'fsync-directory)
+                 (lambda (directory)
+                   (if (equal directory (wal-replication-slot-directory))
+                       (error "injected slot directory fsync failure")
+                       (funcall original-fsync-directory directory))))
+           (setf failed
+                 (handler-case
+                     (progn
+                       (with-write-lock
+                         (wal-create-replication-slot-under-writer-lock
+                          "fsync_slot" 7 registration))
+                       nil)
+                   (error () t)))
+           (setf (symbol-function 'fsync-directory) original-fsync-directory)
+           (check (and failed
+                       (probe-file (wal-replication-slot-path "fsync_slot")))
+                  "directory fsync failure occurs after the slot file rename")
+           (check (gethash "fsync_slot" *wal-replication-slots*)
+                  "a slot file that may survive restart keeps its WAL pin")
+           (release-xid 6411)
+           (release-snapshot-registration registration)
+           (wal-remove-checkpointed-segments checkpoint-lsn)
+           (check (every (lambda (segment)
+                           (probe-file (wal-segment-path segment)))
+                         '(0 1 2))
+                  "checkpoint retains WAL after slot directory fsync failure"))
+      (setf (symbol-function 'fsync-directory) original-fsync-directory)
+      (when (snapshot-registration-active-p registration)
+        (release-snapshot-registration registration))
+      (when *wal-output-stream*
+        (ignore-errors (close *wal-output-stream*)))
+      (ignore-errors
+       (uiop:delete-directory-tree test-pgdata :validate t
+                                               :if-does-not-exist :ignore)))))
+
+(defun test-wal-drop-missing-slot-does-not-poison-wal ()
+  (let ((*wal-ready* t)
+        (*wal-poisoned* nil)
+        (*wal-replication-slots* (make-hash-table :test #'equal)))
+    (check (handler-case
+               (progn (wal-drop-replication-slot "missing_slot") nil)
+             (error () t))
+           "dropping a missing slot reports an error")
+    (check (not *wal-poisoned*)
+           "a missing slot does not poison WAL or request fail-stop shutdown")))
+
+(defun test-wal-drop-fsync-retry-keeps-pin ()
+  (let* ((test-pgdata (merge-pathnames "wal-replication-slot-drop-test/"
+                                       *pgdata*))
+         (*pgdata* test-pgdata)
+         (*wal-durable-lsn* 1000)
+         (*wal-replication-slots* (make-hash-table :test #'equal))
+         (*wal-poisoned* nil)
+         (slot (make-wal-replication-slot
+                :name "drop_slot" :restart-lsn 500 :consistent-lsn 1000))
+         (original-fsync-directory (symbol-function 'fsync-directory)))
+    (wal-ensure-directory-durable *pgdata*)
+    (wal-ensure-directory-durable (wal-replication-slot-directory))
+    (wal-save-replication-slot slot)
+    (setf (gethash "drop_slot" *wal-replication-slots*) slot)
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'fsync-directory)
+                 (lambda (directory)
+                   (if (equal directory (wal-replication-slot-directory))
+                       (error "injected slot directory fsync failure")
+                       (funcall original-fsync-directory directory))))
+           (check (handler-case
+                      (progn (wal-drop-replication-slot "drop_slot") nil)
+                    (error () t))
+                  "slot drop surfaces a directory fsync failure")
+           (setf (symbol-function 'fsync-directory) original-fsync-directory)
+           (check (and (gethash "drop_slot" *wal-replication-slots*)
+                       (not (probe-file (wal-replication-slot-path "drop_slot"))))
+                  "failed directory fsync retains the in-memory WAL pin")
+           (wal-drop-replication-slot "drop_slot")
+           (check (null (gethash "drop_slot" *wal-replication-slots*))
+                  "retry syncs an earlier unlink before releasing its WAL pin")
+           (check (not *wal-poisoned*)
+                  "slot metadata fsync failures do not poison WAL records"))
+      (setf (symbol-function 'fsync-directory) original-fsync-directory)
+      (ignore-errors
+       (uiop:delete-directory-tree test-pgdata :validate t
+                                               :if-does-not-exist :ignore)))))
+
+(defun test-wal-replication-slot-load-rejects-missing-wal ()
+  (let* ((test-pgdata (merge-pathnames "wal-replication-slot-missing-wal-test/"
+                                       *pgdata*))
+         (*pgdata* test-pgdata)
+         (*wal-checkpoint-lsn* 0)
+         (*wal-durable-lsn* (+ (* 2 +wal-segment-size+) 100))
+         (*wal-replication-slots* (make-hash-table :test #'equal))
+         (slot (make-wal-replication-slot
+                :name "missing_wal" :restart-lsn 100
+                :consistent-lsn *wal-durable-lsn*)))
+    (wal-ensure-directory-durable *pgdata*)
+    (wal-ensure-directory-durable (wal-directory))
+    (wal-ensure-directory-durable (wal-replication-slot-directory))
+    (unwind-protect
+         (progn
+           (wal-save-replication-slot slot)
+           (dolist (segment '(0 2))
+             (with-open-file (stream (wal-segment-path segment)
+                                     :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede
+                                     :if-does-not-exist :create)
+               (write-byte 0 stream)))
+           (check (handler-case
+                      (progn (wal-load-replication-slots) nil)
+                    (error () t))
+                  "startup refuses a slot whose required WAL segment is missing"))
+      (ignore-errors
+       (uiop:delete-directory-tree test-pgdata :validate t
+                                               :if-does-not-exist :ignore)))))
+
 (defun test-wal-checkpoint-skips-obsolete-prefix ()
   (let* ((test-pgdata (merge-pathnames "wal-checkpoint-scan-test/" *pgdata*))
          (*pgdata* test-pgdata)

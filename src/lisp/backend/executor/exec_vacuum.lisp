@@ -18,6 +18,7 @@
     (let ((table (with-write-lock
                    (resolve-table-or-error (getf ast :table)))))
       (if (getf ast :full-p)
-          (vacuum-full-table table)
+          (with-schema-write-lock
+            (vacuum-full-table table))
           (vacuum-table table))
       (send-command-complete stream "VACUUM"))))

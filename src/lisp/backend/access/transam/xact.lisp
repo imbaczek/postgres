@@ -165,6 +165,22 @@ INTERRUPT-THREAD, so it needs no flag."
 (defvar *relation-readers* (make-hash-table :test #'eql))
 (defvar *relation-maintainers* (make-hash-table :test #'eql))
 
+;; Exported initial-copy snapshots pin a schema view across multiple relation
+;; reads. PostgreSQL holds relation locks for DDL and AccessExclusiveLock for
+;; VACUUM FULL; this global RW gate is the initial substitute until this server
+;; has relation-scoped DDL locks. Ordinary VACUUM stays outside because its
+;; pruning horizon already honors the registered MVCC snapshot.
+(defvar *schema-lock-mutex* (sb-thread:make-mutex :name "pg schema lock"))
+(defvar *schema-lock-cv* (sb-thread:make-waitqueue :name "pg schema waitqueue"))
+(defvar *schema-read-lock-count* 0)
+(defvar *schema-write-lock-owner* nil)
+(defvar *schema-write-lock-waiters* 0)
+(defvar *schema-read-lock-held* nil)
+(defvar *schema-write-lock-held* nil)
+
+(defvar *exported-snapshot-backend* nil)
+(defvar *exported-snapshot-cleanup* nil)
+
 (defun broadcast-xact ()
   (sb-thread:with-mutex (*xact-cv-mutex*)
     (sb-thread:condition-broadcast *xact-cv*)))
@@ -176,6 +192,109 @@ INTERRUPT-THREAD, so it needs no flag."
     (unless notified
       (sb-thread:grab-mutex mutex))
     notified))
+
+(defun acquire-schema-read-lock (on-acquired)
+  "Acquire the schema read side and publish ownership before interrupts resume."
+  (sb-thread:with-mutex (*schema-lock-mutex*)
+    (loop while (or *schema-write-lock-owner*
+                    (plusp *schema-write-lock-waiters*))
+          do (check-for-interrupts)
+             (condition-wait-with-timeout *schema-lock-cv*
+                                          *schema-lock-mutex*))
+    (sb-sys:without-interrupts
+      (incf *schema-read-lock-count*)
+      (funcall on-acquired)))
+  (values))
+
+(defun release-schema-read-lock ()
+  (sb-sys:without-interrupts
+    (sb-thread:with-mutex (*schema-lock-mutex*)
+      (unless (plusp *schema-read-lock-count*)
+        (error "schema read lock released without an owner"))
+      (decf *schema-read-lock-count*)
+      (when (zerop *schema-read-lock-count*)
+        (sb-thread:condition-broadcast *schema-lock-cv*))))
+  (values))
+
+(defun acquire-schema-write-lock (on-acquired)
+  "Acquire the schema write side; ON-ACQUIRED publishes cleanup ownership.
+
+The wait remains interruptible. Waiter accounting and the successful ownership
+handoff are interrupt-free so cancellation cannot strand either state."
+  (let ((token (gensym "SCHEMA-WRITER-"))
+        (queued nil))
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex (*schema-lock-mutex*)
+             (sb-sys:without-interrupts
+               (incf *schema-write-lock-waiters*)
+               (setf queued t))
+             (loop while (or *schema-write-lock-owner*
+                             (plusp *schema-read-lock-count*))
+                   do (check-for-interrupts)
+                      (condition-wait-with-timeout *schema-lock-cv*
+                                                   *schema-lock-mutex*))
+             (sb-sys:without-interrupts
+               (setf *schema-write-lock-owner* token)
+               (decf *schema-write-lock-waiters*)
+               (setf queued nil)
+               (funcall on-acquired token)
+               (sb-thread:condition-broadcast *schema-lock-cv*)))
+           token)
+      (sb-sys:without-interrupts
+        (when queued
+          (sb-thread:with-mutex (*schema-lock-mutex*)
+            (decf *schema-write-lock-waiters*)
+            (sb-thread:condition-broadcast *schema-lock-cv*)))))))
+
+(defun release-schema-write-lock (token)
+  (sb-sys:without-interrupts
+    (sb-thread:with-mutex (*schema-lock-mutex*)
+      (unless (eq token *schema-write-lock-owner*)
+        (error "schema write lock released by a non-owner"))
+      (setf *schema-write-lock-owner* nil)
+      (sb-thread:condition-broadcast *schema-lock-cv*)))
+  (values))
+
+(defmacro with-schema-read-lock (&body body)
+  "Hold a schema-stable view through BODY, blocking incompatible DDL."
+  (let ((acquired (gensym "SCHEMA-READ-ACQUIRED-")))
+    `(if (or *schema-write-lock-held* *schema-read-lock-held*)
+         (progn ,@body)
+         (let ((,acquired nil))
+           (unwind-protect
+                (progn
+                  (acquire-schema-read-lock
+                   (lambda () (setf ,acquired t)))
+                  (let ((*schema-read-lock-held* t))
+                    ,@body))
+             (sb-sys:without-interrupts
+               (when ,acquired
+                 (release-schema-read-lock))))))))
+
+(defmacro with-schema-write-lock (&body body)
+  "Serialize schema changes with exported snapshot scopes."
+  (let ((token (gensym "SCHEMA-WRITE-TOKEN-"))
+        (acquired (gensym "SCHEMA-WRITE-ACQUIRED-")))
+    `(cond
+       (*schema-write-lock-held* (progn ,@body))
+       (*schema-read-lock-held*
+        (ereport "25001"
+                 "schema changes cannot run inside an exported snapshot scope"))
+       (t
+        (let ((,token nil)
+              (,acquired nil))
+          (unwind-protect
+               (progn
+                 (acquire-schema-write-lock
+                  (lambda (owner)
+                    (setf ,token owner
+                          ,acquired t)))
+                 (let ((*schema-write-lock-held* t))
+                   ,@body))
+            (sb-sys:without-interrupts
+              (when ,acquired
+                (release-schema-write-lock ,token)))))))))
 
 (defun first-normal-xid-of-epoch-p (xid)
   (and (>= xid +xid-cycle+)
@@ -694,45 +813,224 @@ another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
 
 (defvar *wal-test-after-snapshot-boundary-registration-hook* nil)
 
-(defun wal-capture-snapshot-boundary-under-writer-lock (curcid register)
+(defun wal-capture-snapshot-boundary-under-writer-lock
+    (curcid register &key after-capture)
   "Capture a registered MVCC snapshot and its matching WAL position.
 
 The caller holds *WRITE-LOCK*. This establishes the same brief writer barrier
 used by logical slot startpoint selection in PostgreSQL; holding WAL before XID
 publication makes the snapshot and durable WAL end one boundary. The returned
 restart LSN reaches back to the earliest page batch that contains an XID still
-active in the snapshot. Its registration pins that WAL position until release."
+active in the snapshot. Its registration pins that WAL position until release.
+AFTER-CAPTURE runs under *WAL-LOCK* but after *XID-LOCK* is released."
   (unless (snapshot-registration-p register)
     (error "WAL snapshot boundaries require a snapshot-registration token"))
   (unless *wal-ready*
     (ereport "55000" "cannot capture a replication snapshot before WAL startup"))
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
-    (sb-thread:with-mutex (*xid-lock*)
-      (let* ((snapshot (make-snapshot-under-xid-lock curcid
-                                                     :register register))
-             (boundary-lsn *wal-durable-lsn*)
-             (restart-lsn boundary-lsn))
-        (when *wal-test-after-snapshot-boundary-registration-hook*
-          (funcall *wal-test-after-snapshot-boundary-registration-hook*
-                   register))
-        (dolist (xid (snapshot-xip snapshot))
-          (let ((first-lsn (gethash xid *wal-xid-first-lsn*)))
-            (when (and first-lsn (< first-lsn restart-lsn))
-              (setf restart-lsn first-lsn))))
-        ;; Keep the returned restart point alive after active XIDs finish.
-        ;; The registered snapshot owns this pin until its caller releases
-        ;; the registration or a durable replication slot takes over.
-        (sb-thread:with-mutex (*snapshot-count-lock*)
-          (unless (and (snapshot-registration-active-p register)
-                       (eq snapshot
-                           (snapshot-registration-snapshot register)))
-            (error "snapshot registration was released during WAL boundary capture"))
-          (sb-sys:without-interrupts
-            (setf (gethash register *wal-snapshot-retention-pins*) restart-lsn
-                  (snapshot-registration-wal-retention-lsn register)
-                  restart-lsn)))
-        (values snapshot boundary-lsn restart-lsn)))))
+    (multiple-value-bind (snapshot boundary-lsn restart-lsn)
+        (sb-thread:with-mutex (*xid-lock*)
+          (let* ((snapshot (make-snapshot-under-xid-lock
+                            curcid :register register))
+                 (boundary-lsn *wal-durable-lsn*)
+                 (restart-lsn boundary-lsn))
+            (when *wal-test-after-snapshot-boundary-registration-hook*
+              (funcall *wal-test-after-snapshot-boundary-registration-hook*
+                       register))
+            (dolist (xid (snapshot-xip snapshot))
+              (let ((first-lsn (gethash xid *wal-xid-first-lsn*)))
+                (when (and first-lsn (< first-lsn restart-lsn))
+                  (setf restart-lsn first-lsn))))
+            ;; Keep the returned restart point alive after active XIDs finish.
+            ;; The registered snapshot owns this pin until its caller releases
+            ;; the registration or a durable replication slot takes over.
+            (sb-thread:with-mutex (*snapshot-count-lock*)
+              (unless (and (snapshot-registration-active-p register)
+                           (eq snapshot
+                               (snapshot-registration-snapshot register)))
+                (error "snapshot registration was released during WAL boundary capture"))
+              (sb-sys:without-interrupts
+                (setf (gethash register *wal-snapshot-retention-pins*)
+                      restart-lsn
+                      (snapshot-registration-wal-retention-lsn register)
+                      restart-lsn)))
+            (values snapshot boundary-lsn restart-lsn)))
+      ;; Checkpoint recycling sees the temporary snapshot pin until durable
+      ;; slot publication completes, because WAL remains locked throughout.
+      (when after-capture
+        (funcall after-capture snapshot boundary-lsn restart-lsn))
+      (values snapshot boundary-lsn restart-lsn))))
+
+(defun wal-publish-replication-slot-under-wal-lock
+    (name boundary-lsn restart-lsn register active-owner)
+  "Persist and publish a slot while *WAL-LOCK* protects its retention point."
+  (unless (wal-valid-replication-slot-name-p name)
+    (ereport "42602" "invalid replication slot name \"~a\"" name))
+  (unless (and (snapshot-registration-p register)
+               (snapshot-registration-active-p register)
+               (nth-value 1 (gethash register *wal-snapshot-retention-pins*)))
+    (error "a replication slot must inherit an active snapshot WAL pin"))
+  (when (gethash name *wal-replication-slots*)
+    (ereport "42710" "replication slot \"~a\" already exists" name))
+  (let ((slot (make-wal-replication-slot
+               :name name :restart-lsn restart-lsn
+               :consistent-lsn boundary-lsn
+               :active-owner active-owner)))
+    ;; Reserve the in-memory pin before slot-file I/O. If atomic replace has
+    ;; renamed the file but directory fsync fails, retain the pin: startup may
+    ;; still observe that file and will require its WAL.
+    (unwind-protect
+         (progn
+           (setf (gethash name *wal-replication-slots*) slot)
+           (wal-save-replication-slot slot))
+      (unless (handler-case
+                  (probe-file (wal-replication-slot-path name))
+                (error () t))
+        (remhash name *wal-replication-slots*)))
+    slot))
+
+(defun wal-create-replication-slot-under-writer-lock
+    (name curcid register &optional active-owner)
+  "Persist a named restart point before exposing its captured snapshot."
+  (unless (wal-valid-replication-slot-name-p name)
+    (ereport "42602" "invalid replication slot name \"~a\"" name))
+  (let ((slot nil))
+    (multiple-value-bind (snapshot boundary-lsn restart-lsn)
+        (wal-capture-snapshot-boundary-under-writer-lock
+         curcid register
+         :after-capture
+         (lambda (captured boundary restart)
+           (declare (ignore captured))
+           ;; AFTER-CAPTURE runs under *WAL-LOCK*: persist first, then publish
+           ;; the in-memory retention entry seen by future checkpoints.
+           (setf slot
+                 (wal-publish-replication-slot-under-wal-lock
+                  name boundary restart register active-owner))))
+      (values snapshot boundary-lsn restart-lsn slot))))
+
+(defun wal-publish-captured-replication-slot
+    (name boundary-lsn restart-lsn register &optional active-owner)
+  "Publish a captured slot after the wraparound gate has been released.
+
+The active snapshot registration keeps RESTART-LSN pinned if a checkpoint runs
+between snapshot capture and this durable publication."
+  (sb-thread:with-mutex (*wal-lock*)
+    (wal-check-healthy)
+    (wal-publish-replication-slot-under-wal-lock
+     name boundary-lsn restart-lsn register active-owner)))
+
+(defun ensure-exported-snapshot-scope-can-end (backend)
+  (when (and (eq backend *exported-snapshot-backend*)
+             (not *exported-snapshot-cleanup*))
+    (ereport "25001"
+             "cannot end the transaction inside an exported snapshot scope")))
+
+(defun call-with-exported-snapshot (slot-name function)
+  "Run FUNCTION against a read-only RR snapshot and retain SLOT-NAME's WAL.
+
+Like PostgreSQL's logical snapbuild path, this owns a read-only REPEATABLE READ
+snapshot for the initial copy. The named slot survives the dynamic scope and
+must be dropped after logical consumption. Schema-changing commands and
+VACUUM FULL wait for this scope."
+  (unless *backend*
+    (ereport "55000" "exported snapshots require an active backend"))
+  (unless (eq (backend-state *backend*) :idle)
+    (ereport "25001"
+             "cannot export a snapshot from inside a transaction"))
+  ;; Match statement-start admission before this transaction can publish the
+  ;; long-lived snapshot that wraparound coordination must drain.
+  (prepare-xid-wraparound-for-statement *backend*)
+  (let ((backend *backend*))
+    (with-schema-read-lock
+      (let ((registration (make-snapshot-registration))
+            (slot-owner (gensym "EXPORTED-SNAPSHOT-SLOT-"))
+            (started nil)
+            (body-completed nil)
+            (snapshot nil)
+            (boundary-lsn nil))
+        (let ((*exported-snapshot-backend* backend))
+          (unwind-protect
+               (progn
+                 (sb-sys:without-interrupts
+                   ;; Mark cleanup ownership before touching backend state. A
+                   ;; cancel can then never strand a partially initialized
+                   ;; transaction in a reusable backend.
+                   (setf started t
+                         (backend-explicit backend) t
+                         (backend-isolation-level backend) :repeatable-read
+                         (backend-read-only backend) t
+                         (backend-command-id backend) 0
+                         (backend-xid backend) nil
+                         (backend-snapshot backend) nil
+                         (backend-transaction-snapshot backend) nil
+                         (backend-transaction-snapshot-registration backend) nil
+                         (backend-first-snapshot-set backend) nil
+                         (backend-dirty-relations backend) '()))
+                 (set-backend-state backend :in-progress)
+                 (multiple-value-bind (captured-snapshot captured-boundary
+                                       restart-lsn)
+                     ;; Ordinary statement startup holds *XID-WRAP-LOCK* while
+                     ;; registering its snapshot. Keep the same admission
+                     ;; handshake here; the registration's temporary WAL pin
+                     ;; protects the captured boundary after the gate opens.
+                     (wait-for-xid-wraparound
+                      backend
+                      (lambda ()
+                        (with-write-lock
+                          (wal-capture-snapshot-boundary-under-writer-lock
+                           (backend-command-id backend) registration))))
+                   (setf snapshot captured-snapshot
+                         boundary-lsn captured-boundary)
+                   ;; Slot fsync can take longer than snapshot capture. Publish
+                   ;; after releasing *XID-WRAP-LOCK* while the registered
+                   ;; snapshot continues to pin the required WAL.
+                   (wal-publish-captured-replication-slot
+                    slot-name captured-boundary restart-lsn registration
+                    slot-owner)
+                   ;; Publish the retained RR snapshot before user code can run.
+                   (sb-sys:without-interrupts
+                     (setf (backend-transaction-snapshot backend) snapshot
+                           (backend-transaction-snapshot-registration backend)
+                           registration
+                           (backend-first-snapshot-set backend) t
+                           (backend-snapshot backend) snapshot))
+                   (let ((*current-snapshot* snapshot))
+                     (multiple-value-prog1
+                         (funcall function snapshot boundary-lsn)
+                       (setf body-completed t)))))
+            (unwind-protect
+                 (when started
+                   (let ((*exported-snapshot-cleanup* t))
+                     (if (and body-completed
+                              (not (eq (backend-state backend) :aborted)))
+                         (handler-case
+                             (commit-transaction)
+                           (error (condition)
+                             (ignore-errors (abort-transaction))
+                             (error condition)))
+                         (abort-transaction))))
+              ;; Capture can fail after registering but before ownership moves
+              ;; into BACKEND. Release that token here; release is idempotent if
+              ;; commit or abort already retired it.
+              (unwind-protect
+                   (when (snapshot-registration-active-p registration)
+                     (release-snapshot-registration registration))
+                (sb-sys:without-interrupts
+                  (wal-release-replication-slot-owner slot-name slot-owner))))))))))
+
+(defmacro with-exported-snapshot
+    ((snapshot-var start-lsn-var &key slot-name) &body body)
+  "Bind SNAPSHOT-VAR and START-LSN-VAR during a pinned initial-copy scope.
+
+SLOT-NAME is a required lowercase replication-slot name. The durable slot
+remains after BODY and should be dropped when its WAL is no longer needed."
+  (unless slot-name
+    (error "WITH-EXPORTED-SNAPSHOT requires :SLOT-NAME"))
+  `(call-with-exported-snapshot
+    ,slot-name
+    (lambda (,snapshot-var ,start-lsn-var)
+      ,@body)))
 
 (defun oldest-xmin (&optional exclude-snapshot)
   "Capture the oldest XID protected by a snapshot or active transaction."
@@ -837,6 +1135,7 @@ active in the snapshot. Its registration pins that WAL position until release."
   (values))
 
 (defun commit-transaction ()
+  (ensure-exported-snapshot-scope-can-end *backend*)
   (let ((b *backend*))
     (if (backend-xid b)
         (progn
@@ -856,6 +1155,7 @@ active in the snapshot. Its registration pins that WAL position until release."
   (values))
 
 (defun abort-transaction ()
+  (ensure-exported-snapshot-scope-can-end *backend*)
   (let ((b *backend*))
     (sb-sys:without-interrupts
       (when (backend-xid b)

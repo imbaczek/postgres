@@ -617,6 +617,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
     (wal-init)
     (xact-init)
     (wal-recover)
+    (wal-load-replication-slots)
     (catalog-init)
     (wal-remove-orphan-relations)
     (complete-xid-wraparound)
