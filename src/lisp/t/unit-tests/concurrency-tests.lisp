@@ -2,6 +2,65 @@
 
 (in-package #:pg)
 
+(defun test-atomic-relation-reader-registration ()
+  (let* ((xid 987781)
+         (first-rel 987782)
+         (blocked-rel 987783)
+         (gate (acquire-relation-build-lock blocked-rel nil t))
+         (test-lock (sb-thread:make-mutex :name "test atomic reader lock"))
+         (wait-entered nil)
+         (done nil)
+         (worker-error nil)
+         (worker nil)
+         (original-wait (symbol-function 'condition-wait-with-timeout)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'condition-wait-with-timeout)
+                 (lambda (waitqueue mutex)
+                   (sb-thread:with-mutex (test-lock)
+                     (setf wait-entered t))
+                   (funcall original-wait waitqueue mutex)))
+           (setf worker
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (handler-case
+                        (register-relation-readers
+                         (list first-rel blocked-rel) xid)
+                      (error (condition)
+                        (setf worker-error condition)))
+                    (sb-thread:with-mutex (test-lock)
+                      (setf done t)))
+                  :name "test atomic relation reader"))
+           (check (test-wait-until
+                   (lambda ()
+                     (sb-thread:with-mutex (test-lock) wait-entered)))
+                  "multi-relation reader waits after checking the blocked set")
+           (sb-thread:with-mutex (*relation-lock-mutex*)
+             (check (null (gethash first-rel *relation-readers*))
+                    "blocked atomic reader did not register its first relation")
+             (check (null (gethash blocked-rel *relation-readers*))
+                    "blocked atomic reader registered no partial relation set"))
+           (release-relation-build-lock blocked-rel gate)
+           (setf gate nil)
+           (check (test-wait-until
+                   (lambda ()
+                     (sb-thread:with-mutex (test-lock) done)))
+                  "multi-relation reader proceeds after the DDL gate opens")
+           (check (null worker-error)
+                  "multi-relation reader completes without an error")
+           (sb-thread:with-mutex (*relation-lock-mutex*)
+             (check (and (member xid (gethash first-rel *relation-readers*)
+                                 :test #'=)
+                         (member xid (gethash blocked-rel *relation-readers*)
+                                 :test #'=))
+                    "multi-relation reader publishes every registration together")))
+      (when gate
+        (release-relation-build-lock blocked-rel gate))
+      (when worker
+        (ignore-errors (sb-thread:join-thread worker :timeout 2)))
+      (setf (symbol-function 'condition-wait-with-timeout) original-wait)
+      (release-relation-writer-xid xid))))
+
 (defun test-live-operation-gate ()
   (test-reset-live-operation-admission)
   (let ((test-lock (sb-thread:make-mutex :name "test live-operation lock"))

@@ -15,6 +15,39 @@
 (defconstant +btree-vacuum-max-split-retries+ 2)
 (defvar *btree-split-generations* (make-hash-table :test #'eql))
 (defvar *btree-split-lock* (sb-thread:make-mutex :name "pg btree split generation"))
+(defvar *btree-relation-locks* (make-hash-table :test #'eql))
+(defvar *btree-relation-lock-map-lock*
+  (sb-thread:make-mutex :name "pg btree relation lock map"))
+
+(defun btree-relation-lock (relfilenode)
+  (sb-thread:with-mutex (*btree-relation-lock-map-lock*)
+    (or (gethash relfilenode *btree-relation-locks*)
+        (setf (gethash relfilenode *btree-relation-locks*)
+              (sb-thread:make-mutex
+               :name (format nil "pg btree relation ~a" relfilenode))))))
+
+(defmacro with-btree-relation-lock ((relfilenode) &body body)
+  (let ((relation (gensym "BTREE-RELATION-"))
+        (lock (gensym "BTREE-LOCK-")))
+    `(let* ((,relation ,relfilenode)
+            (,lock (btree-relation-lock ,relation)))
+       (sb-thread:with-mutex (,lock)
+         ,@body))))
+
+(defun call-with-btree-relation-locks (relfilenodes function)
+  (let ((relfilenodes (sort (remove-duplicates (copy-list relfilenodes)
+                                               :test #'eql)
+                            #'<)))
+    (labels ((lock-next (remaining)
+               (if (null remaining)
+                   (funcall function)
+                   (let ((lock (btree-relation-lock (car remaining))))
+                     (sb-thread:with-mutex (lock)
+                       (lock-next (cdr remaining)))))))
+      (lock-next relfilenodes))))
+
+(defmacro with-btree-relation-locks ((relfilenodes) &body body)
+  `(call-with-btree-relation-locks ,relfilenodes (lambda () ,@body)))
 
 (defun btree-split-generation (relfilenode)
   (sb-thread:with-mutex (*btree-split-lock*)
@@ -26,8 +59,15 @@
 
 (defun btree-forget (relfilenode)
   "Discard split-generation state after RELFILENODE is permanently deleted."
-  (sb-thread:with-mutex (*btree-split-lock*)
-    (remhash relfilenode *btree-split-generations*))
+  (let ((relation-lock (btree-relation-lock relfilenode)))
+    (sb-thread:with-mutex (relation-lock)
+      ;; Callers hold the relation DDL gate, so no operation can have fetched
+      ;; this mutex and still be waiting to enter it.
+      (sb-thread:with-mutex (*btree-relation-lock-map-lock*)
+        (when (eq (gethash relfilenode *btree-relation-locks*) relation-lock)
+          (remhash relfilenode *btree-relation-locks*)))
+      (sb-thread:with-mutex (*btree-split-lock*)
+        (remhash relfilenode *btree-split-generations*))))
   (values))
 
 (defun btree-page-type (page) (aref page +pd-flags-off+))
@@ -123,12 +163,12 @@
 
 ;;; ---- meta ----
 
-(defun btree-init (relfilenode)
+(defun btree-init-unlocked (relfilenode)
   (with-wal-page-batch
     ;; Recheck while holding the page-batch lock: two initializers can both
     ;; observe an empty relation before either enters this batch.
     (unless (zerop (buf-nblocks relfilenode))
-      (return-from btree-init (values)))
+      (return-from btree-init-unlocked (values)))
     (let ((meta (make-page)))
       (page-init meta)
       (set-btree-page-type meta +btree-page-meta+)
@@ -143,9 +183,13 @@
     (mark-dirty relfilenode))
   (values))
 
+(defun btree-init (relfilenode)
+  (with-btree-relation-lock (relfilenode)
+    (btree-init-unlocked relfilenode)))
+
 (defun btree-ensure-init (relfilenode)
   (when (zerop (buf-nblocks relfilenode))
-    (btree-init relfilenode)))
+    (btree-init-unlocked relfilenode)))
 
 (defun btree-read-meta (relfilenode)
   (btree-ensure-init relfilenode)
@@ -206,11 +250,16 @@ to a single leaf."
                               key acc))))
             acc)))))
 
-(defun btree-search (relfilenode key)
+(defun btree-search-unlocked (relfilenode key)
   "Return a list of (block . off) heap TIDs for entries whose key equals KEY."
   (btree-ensure-init relfilenode)
   (multiple-value-bind (level root) (btree-read-meta relfilenode)
     (nreverse (btree-collect-equal relfilenode level root key '()))))
+
+(defun btree-search (relfilenode key)
+  "Search one index while excluding its own concurrent page rewrites."
+  (with-btree-relation-lock (relfilenode)
+    (btree-search-unlocked relfilenode key)))
 
 ;;; ---- insert ----
 
@@ -286,7 +335,7 @@ to a single leaf."
                             (mark-dirty relfilenode)
                             (values t (car (first new-entries)) new-block))))))))))))
 
-(defun btree-insert (relfilenode key tid-block tid-off)
+(defun btree-insert-unlocked (relfilenode key tid-block tid-off)
   (with-wal-page-batch
     (btree-ensure-init relfilenode)
     (multiple-value-bind (level root) (btree-read-meta relfilenode)
@@ -305,6 +354,10 @@ to a single leaf."
               (buf-write relfilenode root root-page)
               (btree-write-meta relfilenode (1+ level) root)))))))
   (values))
+
+(defun btree-insert (relfilenode key tid-block tid-off)
+  (with-btree-relation-lock (relfilenode)
+    (btree-insert-unlocked relfilenode key tid-block tid-off)))
 
 (defun btree-vacuum-delete-page-tids (relfilenode block dead)
   (let ((page (buf-read relfilenode block)))
@@ -327,7 +380,7 @@ to a single leaf."
     (check-for-interrupts)
     (if exclusive
         (btree-vacuum-delete-page-tids relfilenode block dead)
-        (with-write-lock
+        (with-btree-relation-lock (relfilenode)
           (btree-vacuum-delete-page-tids relfilenode block dead)))
     ;; Tests use this hook to force splits between page visits. The final pass
     ;; deliberately omits it while holding the split barrier.
@@ -352,12 +405,10 @@ to a single leaf."
            (if (< retries +btree-vacuum-max-split-retries+)
                (incf retries)
                (progn
-                 ;; DML holds this coarse lock while changing B-tree structure.
-                 ;; Once bounded retries are exhausted, one exclusive pass gives
-                 ;; the cleanup a stable page set and guarantees completion.
-                 ;; This global lock can stall unrelated writes for the scan and
-                 ;; WAL flush; narrow it after split coordination is relation-scoped.
-                 (with-write-lock
+                 ;; Once bounded retries are exhausted, one relation-exclusive
+                 ;; pass gives cleanup a stable page set without stalling writes
+                 ;; to unrelated indexes.
+                 (with-btree-relation-lock (relfilenode)
                    (btree-vacuum-scan-tids relfilenode dead
                                            (buf-nblocks relfilenode)
                                            :exclusive t)

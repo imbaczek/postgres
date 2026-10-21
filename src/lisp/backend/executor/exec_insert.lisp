@@ -79,7 +79,8 @@
   "Return :ok, (:violation . index-name), or (:wait . xid).
 
 Default unique indexes treat NULLs as distinct; NULLS NOT DISTINCT indexes
-check NULL-containing keys for conflicts too."
+check NULL-containing keys for conflicts too. The caller holds every table
+index's B-tree mutex."
   (let ((wait nil)
         (violation nil)
         (my-xid (backend-xid *backend*)))
@@ -88,8 +89,9 @@ check NULL-containing keys for conflicts too."
              (vals (index-values idx values)))
         (unless (and (key-has-null-p vals)
                      (not (pg-index-nulls-not-distinct-p idx)))
-          (let ((tids (btree-search (pg-index-relfilenode idx)
-                                    (encode-index-key vals types))))
+          (let ((tids (btree-search-unlocked
+                       (pg-index-relfilenode idx)
+                       (encode-index-key vals types))))
             (dolist (tid tids)
               (unless (and exclude-tid
                            (= (car tid) (car exclude-tid))
@@ -111,34 +113,43 @@ check NULL-containing keys for conflicts too."
 
 (defun insert-tuple-with-unique (table values &key exclude-tid)
   (let* ((xid (get-current-xid))
-         (relfilenode (pg-class-relfilenode table)))
+         (relfilenode (pg-class-relfilenode table))
+         (indexes nil)
+         (index-relfilenodes nil))
     (register-relation-writer relfilenode xid)
+    ;; The writer registration excludes index DDL until this transaction ends.
+    (setf indexes (table-indexes table)
+          index-relfilenodes (mapcar #'pg-index-relfilenode indexes))
     (loop
       (let ((wait-xid nil))
-        (with-write-lock
-          (ensure-current-table table)
-          (let ((check (check-unique-indexes table values exclude-tid)))
-            (cond
-              ((eq check :ok)
-               (let ((columns (pg-class-columns table)))
-                 (multiple-value-bind (block off)
-                     (heapam-insert relfilenode columns values xid
-                                    (backend-command-id *backend*))
-                   (dolist (idx (table-indexes table))
-                     (let* ((types (index-types idx table))
-                            (key (encode-index-key
-                                  (index-values idx values)
-                                  types)))
-                       (btree-insert (pg-index-relfilenode idx)
-                                     key block off)))
-                   (return-from insert-tuple-with-unique
-                     (values block off)))))
-              ((eq (car check) :violation)
-               (ereport "23505"
-                        "duplicate key value violates unique constraint \"~a\""
-                        (cdr check)))
-              (t
-               (setf wait-xid (cdr check))))))
+        ;; Acquire B-tree locks before the global write mutex. A search holds
+        ;; only one B-tree lock, so a writer on another relation can continue
+        ;; while this writer waits for a scan of its own index to finish.
+        (with-btree-relation-locks (index-relfilenodes)
+          (with-write-lock
+            (ensure-current-table table)
+            (let ((check (check-unique-indexes table values exclude-tid)))
+              (cond
+                ((eq check :ok)
+                 (let ((columns (pg-class-columns table)))
+                   (multiple-value-bind (block off)
+                       (heapam-insert relfilenode columns values xid
+                                      (backend-command-id *backend*))
+                     (dolist (idx indexes)
+                       (let* ((types (index-types idx table))
+                              (key (encode-index-key
+                                    (index-values idx values)
+                                    types)))
+                         (btree-insert-unlocked (pg-index-relfilenode idx)
+                                                key block off)))
+                     (return-from insert-tuple-with-unique
+                       (values block off)))))
+                ((eq (car check) :violation)
+                 (ereport "23505"
+                          "duplicate key value violates unique constraint \"~a\""
+                          (cdr check)))
+                (t
+                 (setf wait-xid (cdr check)))))))
         (when wait-xid
           (wait-for-xid wait-xid))))))
 

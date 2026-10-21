@@ -429,7 +429,8 @@ before this removal horizon is captured."
          (if-not-exists (getf ast :if-not-exists))
          (db nil)
          (table nil)
-         (existing nil))
+         (existing nil)
+         (skipped nil))
     (with-write-lock
       (setf db (current-database)
             table (resolve-table-or-error (getf ast :table))
@@ -442,16 +443,80 @@ before this removal horizon is captured."
             (send-command-complete stream "CREATE INDEX")
             (return-from exec-create-index nil))
           (ereport "42P07" "relation \"~a\" already exists" name)))
-    (let ((attnums (resolve-attnums table (getf ast :columns))))
-      (with-table-ddl (table :refresh-snapshot t)
-        (let ((idx (create-index* db name table attnums
-                                  :unique unique
-                                  :nulls-not-distinct
-                                  (getf ast :nulls-not-distinct))))
-          (with-error-cleanup (e (drop-index* db name))
-            (build-index-entries idx table :unique unique :name name)
-            (fsync-index idx)
-            (save-catalog)))))
+    (with-relation-build-lock ((pg-class-relfilenode table))
+      (let ((*current-snapshot* (refresh-statement-snapshot))
+            (idx nil)
+            (preserve-relfile nil))
+        ;; The table gate prevents schema changes and writers while the build
+        ;; runs. Resolve the columns and reserve the OID only after the gate is
+        ;; acquired, then persist the reservation before creating the relfile.
+        (with-write-catalog-locks
+          (ensure-current-table table)
+          (setf existing (gethash name (database-indexes db)))
+          (when existing
+            (if if-not-exists
+                (setf skipped t)
+                (ereport "42P07" "relation \"~a\" already exists" name)))
+          (unless skipped
+            (check-new-relation-name db name)
+            (setf idx
+                  (make-index-object
+                   (allocate-oid) name table
+                   (resolve-attnums table (getf ast :columns))
+                   :unique unique
+                   :nulls-not-distinct (getf ast :nulls-not-distinct)))
+            (save-catalog)))
+        (unless skipped
+          (handler-case
+              (progn
+                (btree-init (pg-index-relfilenode idx))
+                (build-index-entries idx table :unique unique :name name)
+                (fsync-index idx)
+                (with-write-catalog-locks
+                  (ensure-current-table table)
+                  (setf existing (gethash name (database-indexes db)))
+                  (when existing
+                    (if if-not-exists
+                        (setf skipped t)
+                        (ereport "42P07" "relation \"~a\" already exists" name)))
+                  (let ((durable-generation *catalog-durable-generation*))
+                    (handler-case
+                        (progn
+                          (unless skipped
+                            (publish-index* db idx table))
+                          (when skipped
+                            (wal-defer-relation-delete
+                             (pg-index-relfilenode idx)))
+                          (save-catalog))
+                      (error (publish-condition)
+                        ;; Do not roll back memory if WAL has published this
+                        ;; catalog image: later writes must keep maintaining
+                        ;; any index that restart recovery will restore.
+                        (if (> *catalog-durable-generation* durable-generation)
+                            (setf preserve-relfile t)
+                            ;; Keep catalog readers behind *write-lock* while
+                            ;; undoing a publication that was not durable.
+                            (when (eq idx (gethash name (database-indexes db)))
+                              (remhash name (database-indexes db))
+                              (setf (pg-class-indexes table)
+                                    (delete (pg-index-oid idx)
+                                            (pg-class-indexes table)))
+                              (setf preserve-relfile t)))
+                        (error publish-condition))))))
+            (error (condition)
+              ;; Before publication, no reader can know this relfilenode, so
+              ;; discard its pages together with a catalog save.
+              (unless preserve-relfile
+                (handler-case
+                    (with-write-catalog-locks
+                      (wal-defer-relation-delete (pg-index-relfilenode idx))
+                      (save-catalog))
+                  (error (cleanup-condition)
+                    (declare (ignore cleanup-condition)))))
+              (error condition))))))
+    (when skipped
+      (send-notice stream
+                   (format nil "relation \"~a\" already exists, skipping" name)))
     (send-command-complete stream "CREATE INDEX")))
 
 (defun exec-drop-index (stream ast)

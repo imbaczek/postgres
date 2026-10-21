@@ -7,6 +7,7 @@
   (dolist (module '("support.lisp"
                     "primitives-tests.lisp"
                     "concurrency-tests.lisp"
+                    "join-tests.lisp"
                     "backend-lifecycle-tests.lisp"
                     "wal-tests.lisp"
                     "protocol-tests.lisp"
@@ -32,6 +33,8 @@
       (test-swank-arguments)
       (check (test-wait-until (lambda () t) 0.01)
              "test wait helper accepts an explicit timeout")
+      (test-atomic-relation-reader-registration)
+      (test-streamed-join-stop-and-outer-matches)
       (test-protocol-packet-limits)
       (test-protocol-decoding-enters-live-operation)
       (test-malformed-protocol-frames-drain-to-fatal-error)

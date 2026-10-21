@@ -50,6 +50,8 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
 (defvar *catalog* nil)
 (defvar *catalog-mutex* (sb-thread:make-mutex :name "pg catalog mutex"))
 (defvar *catalog-oldest-relfrozenxid* nil)
+;; Incremented only after a catalog image has been durably committed.
+(defvar *catalog-durable-generation* 0)
 
 ;;; ---- serialization ----
 
@@ -196,8 +198,13 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
       (catalog-compute-oldest-relfrozenxid)))
 
 (defun save-catalog ()
-  (wal-commit-catalog (catalog-image-bytes) #'write-catalog-image)
-  (catalog-refresh-oldest-relfrozenxid))
+  ;; Do fallible derived-state work before publication. Once WAL commits, the
+  ;; generation update and cache assignment below must not signal: callers use
+  ;; the generation to distinguish rollback-safe failures from durable ones.
+  (let ((oldest (catalog-compute-oldest-relfrozenxid)))
+    (wal-commit-catalog (catalog-image-bytes) #'write-catalog-image)
+    (incf *catalog-durable-generation*)
+    (setf *catalog-oldest-relfrozenxid* oldest)))
 
 (defun load-catalog ()
   (let ((path (catalog-path)))
@@ -322,23 +329,40 @@ longer contain transaction-status references."
                       (aref (pg-class-columns table) (1- attnum))))
                    attnums))))
 
+(defun make-index-object (oid name table cols
+                          &key unique primary constraint nulls-not-distinct)
+  "Create detached INDEX metadata with a previously reserved object ID."
+  (make-pg-index :oid oid
+                 :name name
+                 :relfilenode oid
+                 :table-oid (pg-class-oid table)
+                 :columns cols
+                 :unique-p unique
+                 :primary-p primary
+                 :constraint-p constraint
+                 :nulls-not-distinct-p nulls-not-distinct))
+
+(defun publish-index* (db index table)
+  "Install a fully built INDEX in the database and its owning table."
+  (check-new-relation-name db (pg-index-name index))
+  (unless (= (pg-index-table-oid index) (pg-class-oid table))
+    (ereport "XX000" "index \"~a\" belongs to another table"
+             (pg-index-name index)))
+  (setf (gethash (pg-index-name index) (database-indexes db)) index)
+  (pushnew (pg-index-oid index) (pg-class-indexes table) :test #'=)
+  index)
+
 (defun create-index* (db name table cols
                       &key unique primary constraint nulls-not-distinct)
   (check-new-relation-name db name)
   (let* ((oid (allocate-oid))
-         (idx (make-pg-index :oid oid
-                             :name name
-                             :relfilenode oid
-                             :table-oid (pg-class-oid table)
-                             :columns cols
-                             :unique-p unique
-                             :primary-p primary
-                             :constraint-p constraint
-                             :nulls-not-distinct-p nulls-not-distinct)))
+         (idx (make-index-object oid name table cols
+                                 :unique unique
+                                 :primary primary
+                                 :constraint constraint
+                                 :nulls-not-distinct nulls-not-distinct)))
     (btree-init oid)
-    (setf (gethash name (database-indexes db)) idx)
-    (push oid (pg-class-indexes table))
-    idx))
+    (publish-index* db idx table)))
 
 (defun rename-index* (db old-name new-name)
   "Rename an index relation, retaining its OID and physical index file."
@@ -382,21 +406,27 @@ longer contain transaction-status references."
                 do (cond
                      ((getf def :primary)
                       (setf (pg-column-notnull col) t)
-                      (create-index* db
-                                     (generate-index-name db name "pkey")
-                                     class (list (pg-column-attnum col))
-                                     :unique t :primary t :constraint t))
+                      (setf (pg-index-valid-p
+                             (create-index*
+                              db
+                              (generate-index-name db name "pkey")
+                              class (list (pg-column-attnum col))
+                              :unique t :primary t :constraint t))
+                            t))
                      ((getf def :unique)
-                      (create-index* db
-                                     (generate-index-name
-                                      db name
-                                      (format nil "~a_key"
-                                              (pg-column-name col)))
-                                     class (list (pg-column-attnum col))
-                                     :unique t
-                                     :constraint t
-                                     :nulls-not-distinct
-                                     (getf def :nulls-not-distinct)))))
+                      (setf (pg-index-valid-p
+                             (create-index*
+                              db
+                              (generate-index-name
+                               db name
+                               (format nil "~a_key"
+                                       (pg-column-name col)))
+                              class (list (pg-column-attnum col))
+                              :unique t
+                              :constraint t
+                              :nulls-not-distinct
+                              (getf def :nulls-not-distinct)))
+                            t))))
           class)
       (error (e)
         ;; A column constraint can fail after the table and earlier indexes

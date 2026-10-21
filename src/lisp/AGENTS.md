@@ -145,7 +145,10 @@ Remove the trace and its temporary helper after the demo:
 ./t/unique-index-concurrency.sh # unique-index and relation-DDL races
 ./t/update-concurrency.sh # concurrent UPDATE chain and WHERE rechecks
 ./t/index-scan-regression.sh # indexed/SeqScan differential and DROP INDEX handoff
-./t/index-lock-contention.sh # report unrelated INSERT latency during duplicate-key scans
+./t/index-lock-contention.sh # unrelated INSERT progress during duplicate-key scans
+./t/index-build-contention.sh # detached build, relation gate, publication name race
+./t/join-streaming.sh   # outer-join results and unordered LIMIT early stop
+./t/join-ddl-concurrency.sh # atomic JOIN admission against concurrent DROP TABLE
 ./t/index-stress.sh     # repeated same-key updates (slow)
 ./t/hot-reload.sh       # SIGHUP reloads a running server
 ./t/control-repl.sh     # control REPL over TCP + Unix socket, reload, SQL intact
@@ -153,9 +156,9 @@ Remove the trace and its temporary helper after the demo:
 ./t/shutdown.sh         # signals, shutdown modes, cancel/terminate admin functions
 ```
 
-Each test boots its own throwaway server on its own SQL port (5461–5473), so they
-are safe to run while a dev server is listening on 5433. The UPDATE concurrency,
-index-scan, index-contention, and shutdown tests also bind a local control REPL
+Each test boots its own throwaway server on its own SQL port, so they are safe to
+run while a dev server is listening on 5433. The UPDATE concurrency, index scan,
+index contention/build, JOIN, and shutdown tests also bind a local control REPL
 at SQL port + 2000 for synchronization.
 
 For a live debugger when a server-backed test fails, set `DEBUG_ON_FAILURE=1`:
@@ -180,7 +183,9 @@ this mode.
   subset rather than growing scope.
 - Wire-protocol integers are big-endian; on-disk page integers are little-endian.
   Do not mix them.
-- Lock order is write-lock → smgr/catalog, never the reverse.
+- Lock order: acquire B-tree relation mutexes before the global write lock when
+  an operation needs both; never wait for a B-tree mutex while holding the global
+  write lock. The global write lock still precedes smgr/catalog locks.
 - **Compatibility target:** the eventual, far-away goal is byte-for-byte,
   bug-for-bug compatibility with PostgreSQL. When in doubt, port the original
   behavior rather than inventing a simpler one. The MVP subset is a scope

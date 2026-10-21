@@ -450,25 +450,37 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
       (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*)))
   (values))
 
-(defun register-relation-reader (relfilenode xid)
-  "Register XID as a reader, waiting if relation DDL excludes readers."
-  (sb-thread:with-mutex (*relation-lock-mutex*)
-    (loop
-      (let* ((readers (gethash relfilenode *relation-readers*))
-             (token (gethash relfilenode *relation-reader-blockers*)))
-        (when (or (null (gethash relfilenode *relation-reader-blockers*))
-                  (member xid readers :test #'=)
-                  (member xid (gethash relfilenode *relation-writers*) :test #'=))
-          (pushnew xid (gethash relfilenode *relation-readers*) :test #'=)
-          (return))
+(defun relation-reader-admissible-p (relfilenode xid)
+  (let ((readers (gethash relfilenode *relation-readers*))
+        (token (gethash relfilenode *relation-reader-blockers*)))
+    (or (null token)
+        (member xid readers :test #'=)
+        (member xid (gethash relfilenode *relation-writers*) :test #'=)
         ;; Multi-relation DDL waits for existing users on every member. Let
         ;; those transactions finish their work on the rest of that group.
-        (when (relation-build-group-has-user-p token xid t t)
-          (pushnew xid (gethash relfilenode *relation-readers*) :test #'=)
-          (return)))
-      (check-for-interrupts)
-      (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*)))
+        (relation-build-group-has-user-p token xid t t))))
+
+(defun register-relation-readers (relfilenodes xid)
+  "Atomically register XID on every relation, waiting without partial state.
+
+Multi-table readers must not hold one relation registration while waiting for
+another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
+  (let ((relfilenodes (remove-duplicates (copy-list relfilenodes) :test #'=)))
+    (sb-thread:with-mutex (*relation-lock-mutex*)
+      (loop
+        (when (every (lambda (relfilenode)
+                       (relation-reader-admissible-p relfilenode xid))
+                     relfilenodes)
+          (dolist (relfilenode relfilenodes)
+            (pushnew xid (gethash relfilenode *relation-readers*) :test #'=))
+          (return))
+        (check-for-interrupts)
+        (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*))))
   (values))
+
+(defun register-relation-reader (relfilenode xid)
+  "Register XID as a reader, waiting if relation DDL excludes readers."
+  (register-relation-readers (list relfilenode) xid))
 
 (defun relation-build-user (relfilenodes own-xid wait-readers-p)
   (some (lambda (relfilenode)

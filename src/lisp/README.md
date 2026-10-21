@@ -227,7 +227,10 @@ cd src/lisp
 ./t/unique-index-concurrency.sh # unique-index build/drop writer races
 ./t/update-concurrency.sh # concurrent UPDATE chain and WHERE rechecks
 ./t/index-scan-regression.sh # indexed/SeqScan differential and DROP INDEX handoff
-./t/index-lock-contention.sh # report unrelated INSERT latency during duplicate-key scans
+./t/index-lock-contention.sh # unrelated INSERT progress during duplicate-key scans
+./t/index-build-contention.sh # detached build, relation gate, publication name race
+./t/join-streaming.sh    # outer-join results and unordered LIMIT early stop
+./t/join-ddl-concurrency.sh # atomic JOIN admission against concurrent DROP TABLE
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
 ./t/hot-reload.sh         # SIGHUP reloads code in a running server
 ./t/control-repl.sh       # control REPL over TCP + Unix socket, reload, SQL intact
@@ -261,15 +264,27 @@ the refreshed row no longer satisfies `WHERE`.
 `t/index-scan-regression.sh` builds a non-unique index on populated data, applies
 deterministic randomized updates and deletes with duplicate keys and NULLs,
 runs VACUUM, and compares indexed results with SeqScan for equality, NULL, and
-residual-filter queries. It also pauses a SELECT between heap and index reader
-registration while DROP INDEX installs relation gates, then verifies the
-already-started reader can finish safely.
+residual-filter queries. It also pauses an explicit-transaction SELECT before
+atomic heap/index reader admission while DROP INDEX installs relation gates,
+then checks for partial registrations and verifies the SELECT revalidates to
+SeqScan after the index is dropped.
 
-`t/index-lock-contention.sh` synchronizes unrelated INSERTs with equality scans
-over many duplicate keys. It confirms each writer backend is waiting on the
-global write mutex before releasing the B-tree search, then reports the search
-duration and elapsed time through the INSERT's commit completion, including WAL
-commit work, without a timing threshold.
+`t/index-lock-contention.sh` pauses equality searches over many duplicate keys
+while unrelated INSERTs run. Each INSERT must commit before the search is
+released; the test also reports search duration and INSERT completion time.
+
+`t/index-build-contention.sh` pauses a populated non-unique index build. It checks
+that the unfinished index is absent from the catalog, a writer on another table
+commits, and a writer on the indexed table waits for the relation gate. It then
+races two builds for one index name, checks failures before and after durable
+catalog publication, and crashes during a detached build. Startup must discard
+both unpublished index files and retain the durably published index.
+
+`t/join-streaming.sh` checks INNER/LEFT/RIGHT/FULL results, WHERE evaluation above
+the join, and that an unordered `LIMIT 1` evaluates only its first joined pair.
+`t/join-ddl-concurrency.sh` coordinates JOINs that each have one admissible heap
+and one gated heap with two `DROP TABLE` sessions. It confirms reader admission is
+all-or-none, then checks the stale plans fail safely after the tables are dropped.
 
 The Lisp-level `test-vacuum-snapshot-horizon` ports the permanent-table case
 from PostgreSQL's `src/test/isolation/specs/horizons.spec`: an older registered

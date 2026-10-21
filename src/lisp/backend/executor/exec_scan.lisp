@@ -391,14 +391,16 @@ registration-to-DDL handoff free of a lock-order inversion."
         (index (gensym "INDEX-")))
     `(let* ((,relation-list (mapcar #'copy-list ,relations))
             (,xid (get-current-xid)))
-       (dolist (,spec ,relation-list)
-         (let* ((,table (getf ,spec :table))
-                (,path (getf ,spec :path))
-                (,index (and (eq (select-scan-path-kind ,path) :index-scan)
-                             (select-scan-path-index ,path))))
-           (register-relation-reader (pg-class-relfilenode ,table) ,xid)
-           (when ,index
-             (register-relation-reader (pg-index-relfilenode ,index) ,xid))))
+       (register-relation-readers
+        (loop for ,spec in ,relation-list
+              for ,table = (getf ,spec :table)
+              for ,path = (getf ,spec :path)
+              for ,index = (and (eq (select-scan-path-kind ,path) :index-scan)
+                                (select-scan-path-index ,path))
+              append (cons (pg-class-relfilenode ,table)
+                           (when ,index
+                             (list (pg-index-relfilenode ,index)))))
+        ,xid)
        (with-write-lock
          (dolist (,spec ,relation-list)
            (let* ((,table (getf ,spec :table))
@@ -420,11 +422,10 @@ registration-to-DDL handoff free of a lock-order inversion."
 (defun scan-select-index (table path snapshot callback)
   (let* ((idx (select-scan-path-index path))
          (relfilenode (pg-class-relfilenode table))
-         ;; B-tree page cleanup and splits use the write lock.  Copy all
-         ;; candidate TIDs while holding it, then fetch heap tuples unlocked.
-         (tids (with-write-lock
-                 (btree-search (pg-index-relfilenode idx)
-                               (select-scan-path-key path)))))
+         ;; B-tree synchronization is scoped to this index; candidate TIDs
+         ;; remain subject to heap visibility and the full WHERE recheck.
+         (tids (btree-search (pg-index-relfilenode idx)
+                             (select-scan-path-key path))))
     (dolist (tid (remove-duplicates tids :test #'equal))
       (check-for-interrupts)
       (let ((tuple (heapam-get-tuple relfilenode (car tid) (cdr tid)
@@ -472,8 +473,8 @@ registration-to-DDL handoff free of a lock-order inversion."
        (push (htup-values tuple) rows)))
     (nreverse rows)))
 
-(defun join-select-environments (left-rows right-rows join)
-  "Execute one nested-loop join, tracking ON matches independently of WHERE."
+(defun stream-select-join-environments (left-stream right-rows join callback)
+  "Stream one nested-loop join, tracking ON matches independently of WHERE."
   (let* ((join-type (getf join :type))
          (qual (getf join :qual))
          (left-width (getf join :left-width))
@@ -481,45 +482,89 @@ registration-to-DDL handoff free of a lock-order inversion."
          (null-left (make-array left-width :initial-element +null+))
          (null-right (make-array right-width :initial-element +null+))
          (matched-right (make-array (length right-rows) :initial-element nil))
-         (rows '()))
-    (dolist (left left-rows)
-      (check-for-interrupts)
-      (let ((matched-left nil))
-        (loop for right in right-rows
-              for right-index from 0
-              for joined = (concatenate 'vector left right)
-              do (check-for-interrupts)
-                 (when (true-p (eval-expr qual joined))
-                   ;; Match state comes from ON alone.  WHERE is applied after
-                   ;; all joins, matching PostgreSQL's joinqual/otherqual split.
-                   (setf matched-left t
-                         (aref matched-right right-index) t)
-                   (push joined rows)))
-        (when (and (not matched-left)
-                   (member join-type '(:left :full)))
-          (push (concatenate 'vector left null-right) rows))))
-    (when (member join-type '(:right :full))
-      (loop for right in right-rows
-            for right-index from 0
-            unless (aref matched-right right-index)
-              do (push (concatenate 'vector null-left right) rows)))
-    (nreverse rows)))
+         (stopped nil))
+    (labels ((emit (environment)
+               (when (eq (funcall callback environment) :stop)
+                 (setf stopped t)))
+             (visit-left (left)
+               (unless stopped
+                 (check-for-interrupts)
+                 (let ((matched-left nil))
+                   (loop for right in right-rows
+                         for right-index from 0
+                         until stopped
+                         do (check-for-interrupts)
+                            (let ((joined (concatenate 'vector left right)))
+                              (when (true-p (eval-expr qual joined))
+                                ;; Match state comes from ON alone.  WHERE is
+                                ;; applied by the parent stream afterward.
+                                (setf matched-left t
+                                      (aref matched-right right-index) t)
+                                (emit joined))))
+                   (when (and (not stopped)
+                              (not matched-left)
+                              (member join-type '(:left :full)))
+                     (emit (concatenate 'vector left null-right))))
+                 (when stopped :stop))))
+      (funcall left-stream #'visit-left)
+      (unless stopped
+        (when (member join-type '(:right :full))
+          (loop for right in right-rows
+                for right-index from 0
+                until stopped
+                unless (aref matched-right right-index)
+                  do (check-for-interrupts)
+                     (emit (concatenate 'vector null-left right))))))
+    (when stopped :stop)))
+
+(defun stream-select-joined-environments (relations joins callback)
+  (labels ((stream-level (level level-callback)
+             (if (= level 1)
+                 (let* ((relation (first relations))
+                        (table (getf relation :table)))
+                   (scan-select-path
+                    table (pg-class-relfilenode table) (getf relation :path)
+                    *current-snapshot*
+                    (lambda (tuple)
+                      (check-for-interrupts)
+                      (funcall level-callback (htup-values tuple)))))
+                 (let* ((relation (nth (1- level) relations))
+                        (join (nth (- level 2) joins))
+                        (right-rows (collect-select-relation-rows relation)))
+                   (stream-select-join-environments
+                    (lambda (left-callback)
+                      (stream-level (1- level) left-callback))
+                    right-rows join level-callback)))))
+    (when relations
+      (stream-level (length relations) callback))))
+
+(defun stream-select-joined-rows (relations joins where targets callback)
+  (stream-select-joined-environments
+   relations joins
+   (lambda (environment)
+     (check-for-interrupts)
+     (when (or (null where) (true-p (eval-expr where environment)))
+       (funcall callback
+                (cons (map 'vector
+                           (lambda (target)
+                             (eval-expr (getf target :expr) environment))
+                           targets)
+                      environment))))))
 
 (defun collect-select-joined-rows (relations joins where targets)
-  (let ((rows (collect-select-relation-rows (first relations))))
-    (loop for relation in (rest relations)
-          for join in joins
-          do (setf rows
-                   (join-select-environments
-                    rows (collect-select-relation-rows relation) join)))
-    (loop for env in rows
-          when (or (null where) (true-p (eval-expr where env)))
-            collect
-            (cons (map 'vector
-                       (lambda (target)
-                         (eval-expr (getf target :expr) env))
-                       targets)
-                  env))))
+  (let ((rows '()))
+    (stream-select-joined-rows
+     relations joins where targets
+     (lambda (row)
+       (push row rows)))
+    (nreverse rows)))
+
+(defun send-select-row (stream row targets)
+  (send-data-row-text
+   stream
+   (loop for value across (car row)
+         for target in targets
+         collect (value->text value (getf target :type)))))
 
 (defun exec-select (stream ast)
   (let* ((prepared (prepare-select ast))
@@ -528,40 +573,55 @@ registration-to-DDL handoff free of a lock-order inversion."
          (targets (getf prepared :targets))
          (where (getf prepared :where))
          (order (getf prepared :order))
-         (limit (getf prepared :limit))
-         (rows
-           (cond
-             ((and relations joins)
-              (with-registered-select-relations (registered relations)
-                (collect-select-joined-rows registered joins where targets)))
-             (relations
-              (with-registered-select-relations (registered relations)
-                (let* ((relation (first registered))
-                       (table (getf relation :table)))
-                  (collect-select-table-rows
-                   table (pg-class-relfilenode table) (getf relation :path)
-                   where targets))))
-             (t
-              (let ((values (map 'vector
-                                 (lambda (tg)
-                                   (eval-expr (getf tg :expr) nil))
-                                 targets)))
-                (if (or (null where) (true-p (eval-expr where nil)))
-                    (list (cons values nil))
-                    nil))))))
-    (when order
-      (setf rows (stable-sort rows
-                              (lambda (a b) (row-less-p a b order)))))
-    (when limit
-      (setf rows (subseq rows 0 (min limit (length rows)))))
-    (send-row-description stream (mapcar #'target->result-column targets))
-    (dolist (row rows)
-      (send-data-row-text
-       stream
-       (loop for v across (car row)
-             for tg in targets
-             collect (value->text v (getf tg :type)))))
-    (send-command-complete stream (format nil "SELECT ~a" (length rows)))))
+         (limit (getf prepared :limit)))
+    (if (and joins (null order))
+        ;; With no sort requirement, send each qualifying row as soon as it is
+        ;; produced. The stop signal unwinds the nested-loop streams at LIMIT.
+        (let ((count 0))
+          (send-row-description stream
+                                (mapcar #'target->result-column targets))
+          (with-registered-select-relations (registered relations)
+            (unless (eql limit 0)
+              (stream-select-joined-rows
+               registered joins where targets
+               (lambda (row)
+                 (send-select-row stream row targets)
+                 (incf count)
+                 (when (and limit (>= count limit)) :stop)))))
+          (send-command-complete stream (format nil "SELECT ~a" count)))
+        (let ((rows
+                (cond
+                  ((and relations joins)
+                   (with-registered-select-relations (registered relations)
+                     (collect-select-joined-rows
+                      registered joins where targets)))
+                  (relations
+                   (with-registered-select-relations (registered relations)
+                     (let* ((relation (first registered))
+                            (table (getf relation :table)))
+                       (collect-select-table-rows
+                        table (pg-class-relfilenode table)
+                        (getf relation :path) where targets))))
+                  (t
+                   (let ((values (map 'vector
+                                      (lambda (tg)
+                                        (eval-expr (getf tg :expr) nil))
+                                      targets)))
+                     (if (or (null where) (true-p (eval-expr where nil)))
+                         (list (cons values nil))
+                         nil))))))
+          (when order
+            (setf rows (stable-sort rows
+                                    (lambda (a b)
+                                      (row-less-p a b order)))))
+          (when limit
+            (setf rows (subseq rows 0 (min limit (length rows)))))
+          (send-row-description stream
+                                (mapcar #'target->result-column targets))
+          (dolist (row rows)
+            (send-select-row stream row targets))
+          (send-command-complete stream
+                                 (format nil "SELECT ~a" (length rows)))))))
 
 (defun select-path-description (table path)
   (case (select-scan-path-kind path)

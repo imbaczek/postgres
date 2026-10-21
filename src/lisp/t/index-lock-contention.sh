@@ -106,14 +106,13 @@ plan=$(run -c 'explain select id from large_duplicate_scan where category = 10')
 [ "$plan" = "Index Scan using large_duplicate_scan_category_idx on large_duplicate_scan" ] \
     || fail "large equality lookup is not an IndexScan: $plan"
 
-# The test-only B-tree wrapper pauses after the scan has acquired the global
-# write mutex. It releases the real btree-search only after the unrelated
-# writer backend is confirmed waiting on that exact mutex. The wrapper records
-# the real search duration and the INSERT's commit completion time from search start.
+# The test-only B-tree wrapper pauses inside the search after the per-index
+# mutex has been acquired. The unrelated INSERT must commit before the search
+# is released, and its completion time from search start is recorded.
 install_output=$(control <<EOF
 (defvar *contention-target-index* nil)
 (defvar *contention-target-writer-heap* nil)
-(defvar *contention-original-btree-search* nil)
+(defvar *contention-original-btree-collect-equal* nil)
 (defvar *contention-original-register-writer* nil)
 (defvar *contention-original-commit-transaction* nil)
 (defvar *contention-original-exec-select* nil)
@@ -129,27 +128,29 @@ install_output=$(control <<EOF
   (unless (and index table) (error "contention test catalog entries are missing"))
   (setf *contention-target-index* (pg-index-relfilenode index)
         *contention-target-writer-heap* (pg-class-relfilenode table)))
-(setf *contention-original-btree-search* (symbol-function 'btree-search)
+(setf *contention-original-btree-collect-equal*
+      (symbol-function 'btree-collect-equal)
       *contention-original-register-writer* (symbol-function 'register-relation-writer)
       *contention-original-commit-transaction* (symbol-function 'commit-transaction)
       *contention-original-exec-select* (symbol-function 'exec-select))
-(setf (symbol-function 'btree-search)
-      (lambda (relfilenode key)
-        (if (/= relfilenode *contention-target-index*)
-            (funcall *contention-original-btree-search* relfilenode key)
+(setf (symbol-function 'btree-collect-equal)
+      (lambda (relfilenode level block key acc)
+        (if (or (/= relfilenode *contention-target-index*)
+                *contention-active-search*)
+            (funcall *contention-original-btree-collect-equal*
+                     relfilenode level block key acc)
             (let* ((n (incf *contention-search-count*))
                    (entered (format nil "$TMP/search-~d.entered" n))
-                   (release (format nil "$TMP/search-~d.release" n)))
+                   (release (format nil "$TMP/search-~d.release" n))
+                   (start (get-internal-real-time)))
+              (setf *contention-active-search* n
+                    (gethash n *contention-search-starts*) start)
               (with-open-file (out entered :direction :output :if-exists :supersede)
                 (write-string "entered" out))
               (loop repeat 3000 until (probe-file release) do (sleep 0.01))
               (unless (probe-file release) (error "contention search gate timed out"))
-              (let* ((start (get-internal-real-time))
-                     (result (progn
-                               (setf *contention-active-search* n
-                                     (gethash n *contention-search-starts*) start)
-                               (funcall *contention-original-btree-search*
-                                        relfilenode key)))
+              (let* ((result (funcall *contention-original-btree-collect-equal*
+                                      relfilenode level block key acc))
                      (elapsed (/ (* 1000.0 (- (get-internal-real-time) start))
                                  internal-time-units-per-second)))
                 (with-open-file (out (format nil "$TMP/search-~d.done" n)
@@ -186,7 +187,8 @@ install_output=$(control <<EOF
             (when n
               (with-open-file (out (format nil "$TMP/scan-~d.done" n)
                                    :direction :output :if-exists :supersede)
-                  (write-string "done" out)))))))
+                  (write-string "done" out))
+              (setf *contention-active-search* nil))))))
 (quit)
 EOF
 ) || { printf '%s\n' "$install_output" >&2; fail "could not install contention instrumentation"; }
@@ -210,17 +212,12 @@ while [ "$n" -le "$SCANS" ]; do
     printf 'insert into unrelated_writes values (%d);\n' "$n" >&3
     wait_for_file "$TMP/writer-$n.registered"
 
-    wait_output=$(printf '%s\n(quit)\n' \
-        '(loop repeat 1000 for waiting = (some (lambda (backend) (let ((thread (backend-thread backend))) (and thread (eq (sb-thread::thread-waiting-for thread) *write-lock*)))) (list-backends)) when waiting return :waiting do (sleep 0.002) finally (return :timeout))' \
-        | control) || fail "could not inspect global write mutex wait"
-    echo "$wait_output" | grep -Eq ';; (read )?error:' \
-        && fail "global write mutex inspection failed"
-    echo "$wait_output" | grep -q ':WAITING' \
-        || fail "unrelated writer did not wait on the global write mutex"
+    # A regression that holds *write-lock* while searching or while waiting for
+    # this B-tree mutex cannot produce this marker until the scan is released.
+    wait_for_file "$TMP/insert-$n.done"
 
     : > "$TMP/search-$n.release"
     wait_for_file "$TMP/search-$n.done"
-    wait_for_file "$TMP/insert-$n.done"
     wait_for_file "$TMP/scan-$n.done"
     n=$((n + 1))
 done
@@ -242,7 +239,8 @@ written_rows=$(run -c 'select id from unrelated_writes' | wc -l | tr -d '[:space
     || fail "some unrelated INSERTs were lost"
 
 restore_output=$(control <<'EOF'
-(setf (symbol-function 'btree-search) *contention-original-btree-search*
+(setf (symbol-function 'btree-collect-equal)
+      *contention-original-btree-collect-equal*
       (symbol-function 'register-relation-writer) *contention-original-register-writer*
       (symbol-function 'commit-transaction) *contention-original-commit-transaction*
       (symbol-function 'exec-select) *contention-original-exec-select*)

@@ -16,6 +16,7 @@ test_debug_setup index-scan-regression "$PORT" "$TMP" "$LOG"
 
 cleanup() {
     : > "$TMP/drop-handoff.release"
+    : > "$TMP/drop-handoff.ddl-release"
     [ -z "$DROPPER" ] || kill "$DROPPER" 2>/dev/null || true
     [ -z "$READER" ] || kill "$READER" 2>/dev/null || true
     [ -z "$SRV" ] || kill "$SRV" 2>/dev/null || true
@@ -159,9 +160,9 @@ if ! cmp -s "$TMP/indexed-results.out" "$TMP/sequential-results.out"; then
     fail "randomized differential results differed"
 fi
 
-# Pause SELECT after it registers the heap reader but before it registers the
-# index reader. DROP INDEX must install both relation gates, then allow this
-# already-started reader to register the index and finish before publication.
+# Pause SELECT immediately before atomic heap/index reader admission. DROP INDEX
+# must finish while SELECT is waiting to register, after which SELECT revalidates
+# and falls back to SeqScan.
 run -c "create table drop_handoff (id int)" >/dev/null
 run -c "insert into drop_handoff values (7)" >/dev/null
 run -c "create index drop_handoff_idx on drop_handoff (id)" >/dev/null
@@ -169,26 +170,57 @@ run -c "create index drop_handoff_idx on drop_handoff (id)" >/dev/null
 install_output=$(control <<EOF
 (defvar *index-drop-handoff-heap* nil)
 (defvar *index-drop-handoff-index* nil)
-(defvar *index-drop-handoff-original-reader* nil)
+(defvar *index-drop-handoff-xid* nil)
+(defvar *index-drop-handoff-original-readers* nil)
+(defvar *index-drop-handoff-original-build-locks* nil)
+(defvar *index-drop-handoff-original-wait* nil)
 (let* ((db (gethash "postgres" (catalog-databases *catalog*)))
        (table (gethash "drop_handoff" (database-tables db)))
        (index (gethash "drop_handoff_idx" (database-indexes db))))
   (unless (and table index) (error "handoff test catalog entries are missing"))
   (setf *index-drop-handoff-heap* (pg-class-relfilenode table)
         *index-drop-handoff-index* (pg-index-relfilenode index)))
-(setf *index-drop-handoff-original-reader*
-      (symbol-function 'register-relation-reader))
-(setf (symbol-function 'register-relation-reader)
-      (lambda (relfilenode xid)
-        (funcall *index-drop-handoff-original-reader* relfilenode xid)
-        (when (= relfilenode *index-drop-handoff-heap*)
+(setf *index-drop-handoff-original-readers*
+      (symbol-function 'register-relation-readers)
+      *index-drop-handoff-original-build-locks*
+      (symbol-function 'acquire-relation-build-locks)
+      *index-drop-handoff-original-wait*
+      (symbol-function 'condition-wait-with-timeout))
+(setf (symbol-function 'register-relation-readers)
+      (lambda (relfilenodes xid)
+        (when (member *index-drop-handoff-heap* relfilenodes :test #'=)
+          (setf *index-drop-handoff-xid* xid)
           (with-open-file (out "$TMP/drop-handoff.ready"
                                :direction :output :if-exists :supersede)
             (write-string "ready" out))
           (loop repeat 3000
                 until (probe-file "$TMP/drop-handoff.release")
                 do (sleep 0.01)))
-        (values)))
+        (funcall *index-drop-handoff-original-readers* relfilenodes xid)))
+(setf (symbol-function 'acquire-relation-build-locks)
+      (lambda (relfilenodes &optional own-xid wait-readers-p)
+        (let ((token (funcall *index-drop-handoff-original-build-locks*
+                              relfilenodes own-xid wait-readers-p)))
+          (when (and (member *index-drop-handoff-heap* relfilenodes :test #'=)
+                     (member *index-drop-handoff-index* relfilenodes :test #'=))
+            (with-open-file (out "$TMP/drop-handoff.gates"
+                                 :direction :output :if-exists :supersede)
+              (write-string "gated" out))
+            (loop repeat 3000
+                  until (probe-file "$TMP/drop-handoff.ddl-release")
+                  do (sleep 0.01)))
+          token)))
+(setf (symbol-function 'condition-wait-with-timeout)
+      (lambda (waitqueue mutex)
+        (when (and *backend*
+                   *index-drop-handoff-xid*
+                   (eql mutex *relation-lock-mutex*)
+                   (= (or (backend-xid *backend*) 0)
+                      *index-drop-handoff-xid*))
+          (with-open-file (out "$TMP/drop-handoff.reader-waiting"
+                               :direction :output :if-exists :supersede)
+            (write-string "waiting" out)))
+        (funcall *index-drop-handoff-original-wait* waitqueue mutex)))
 (quit)
 EOF
 ) || fail "could not install handoff scheduler"
@@ -203,24 +235,35 @@ exec 3> "$TMP/drop-reader.sql"
 printf "begin;\nselect id from drop_handoff where id = 7;\nselect 'handoff-reader-ready';\n" >&3
 wait_for_file "$TMP/drop-handoff.ready"
 
-run -c "drop index drop_handoff_idx" > "$TMP/drop-handoff-ddl.out" 2>&1 &
+(
+    run -c "drop index drop_handoff_idx" > "$TMP/drop-handoff-ddl.out" 2>&1 \
+        || exit $?
+    : > "$TMP/drop-handoff.ddl-done"
+) &
 DROPPER=$!
-gate_output=$(printf '%s\n(quit)\n' \
-    '(loop repeat 300 for gated = (sb-thread:with-mutex (*relation-lock-mutex*) (and (gethash *index-drop-handoff-heap* *relation-builders*) (gethash *index-drop-handoff-index* *relation-builders*))) when gated return :gated do (sleep 0.01) finally (return :timeout))' \
-    | control) || fail "could not inspect DROP INDEX gates"
-echo "$gate_output" | grep -q ':GATED' \
-    || fail "DROP INDEX did not gate both relations during the handoff"
-echo "$gate_output" | grep -Eq ';; (read )?error:' \
-    && fail "could not inspect DROP INDEX gates"
+wait_for_file "$TMP/drop-handoff.gates"
 : > "$TMP/drop-handoff.release"
+wait_for_file "$TMP/drop-handoff.reader-waiting"
+state_output=$(control <<'EOF'
+(sb-thread:with-mutex (*relation-lock-mutex*)
+  (and (not (member *index-drop-handoff-xid*
+                    (gethash *index-drop-handoff-heap* *relation-readers*)
+                    :test #'=))
+       (not (member *index-drop-handoff-xid*
+                    (gethash *index-drop-handoff-index* *relation-readers*)
+                    :test #'=))))
+(quit)
+EOF
+) || fail "could not inspect blocked batch admission"
+echo "$state_output" | grep -q 'T' \
+    || fail "blocked SELECT left a partial relation-reader registration"
+echo "$state_output" | grep -Eq ';; (read )?error:' \
+    && fail "could not inspect blocked batch admission"
+: > "$TMP/drop-handoff.ddl-release"
+wait_for_file "$TMP/drop-handoff.ddl-done"
 wait_for_marker "$TMP/drop-reader.out" handoff-reader-ready
 grep -q '^7$' "$TMP/drop-reader.out" \
-    || fail "query failed to finish through the registered index reader"
-sleep 0.2
-drop_state=$(ps -o stat= -p "$DROPPER" 2>/dev/null || true)
-case "$drop_state" in
-    ''|Z*|X*) fail "DROP INDEX did not wait for the handed-off reader" ;;
-esac
+    || fail "SELECT failed after revalidating to a sequential scan"
 printf 'commit;\n' >&3
 exec 3>&-
 wait "$READER" || fail "reader failed after the handoff"
@@ -232,8 +275,12 @@ plan=$(run -c 'explain select id from drop_handoff where id = 7')
     || fail "dropped index remained in the SELECT path: $plan"
 
 restore_output=$(control <<'EOF'
-(setf (symbol-function 'register-relation-reader)
-      *index-drop-handoff-original-reader*)
+(setf (symbol-function 'register-relation-readers)
+      *index-drop-handoff-original-readers*
+      (symbol-function 'acquire-relation-build-locks)
+      *index-drop-handoff-original-build-locks*
+      (symbol-function 'condition-wait-with-timeout)
+      *index-drop-handoff-original-wait*)
 (quit)
 EOF
 ) || fail "could not restore relation reader function"
