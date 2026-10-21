@@ -108,6 +108,24 @@ when revalidation or FUNCTION signals an error."
                 (member index right :test #'eq))
               left)))
 
+(defmacro with-current-table-index-set ((table indexes) &body body)
+  "Run BODY under catalog locks after validating TABLE and its index objects.
+
+The caller holds the table rewrite gates while the current catalog entry and
+its exact index object set are checked and updated. PostgreSQL's C VACUUM FULL
+holds an AccessExclusiveLock across the rewrite; this catalog guard keeps this
+implementation's replacement metadata transition atomic as well."
+  (let ((table-value (gensym "TABLE-"))
+        (indexes-value (gensym "INDEXES-")))
+    `(let* ((,table-value ,table)
+            (,indexes-value ,indexes))
+       (with-write-catalog-locks
+         (ensure-current-table ,table-value)
+         (unless (same-index-object-set-p
+                  ,indexes-value (table-indexes ,table-value))
+           (ereport "40001" "relation indexes changed during VACUUM FULL"))
+         ,@body))))
+
 (defun call-with-table-rewrite-locks (table function)
   "Hold exclusive build gates for TABLE and its exact current index set."
   (call-with-revalidated-relation-locks
@@ -200,10 +218,7 @@ when revalidation or FUNCTION signals an error."
 
 (defun vacuum-full-reserve-storage (table indexes new-table new-indexes)
   "Reserve detached relfilenodes durably while the relation gates are held."
-  (with-write-catalog-locks
-    (ensure-current-table table)
-    (unless (same-index-object-set-p indexes (table-indexes table))
-      (ereport "40001" "relation indexes changed during VACUUM FULL"))
+  (with-current-table-index-set (table indexes)
     (setf (pg-class-relfilenode new-table) (allocate-oid))
     (setf (pg-class-indexes new-table)
           (copy-list (pg-class-indexes table)))
@@ -219,10 +234,7 @@ when revalidation or FUNCTION signals an error."
   (let ((old-relfilenodes
           (cons (pg-class-relfilenode table)
                 (mapcar #'pg-index-relfilenode indexes))))
-    (with-write-catalog-locks
-      (ensure-current-table table)
-      (unless (same-index-object-set-p indexes (table-indexes table))
-        (ereport "40001" "relation indexes changed during VACUUM FULL"))
+    (with-current-table-index-set (table indexes)
       (let ((old-flush-generation (wal-catalog-flush-generation))
             (wal-appended nil))
         (setf (gethash (pg-class-name new-table) (database-tables db))

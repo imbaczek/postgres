@@ -107,6 +107,7 @@
       (test-revalidated-relation-locks-retry-and-release)
       (test-revalidated-relation-locks-release-after-revalidation-error)
       (test-vacuum-index-object-set-invariant)
+      (test-vacuum-current-table-index-set-lock-guard)
       (test-vacuum-xid-normalization-invariant)
       (test-vacuum-freeze-cutoff-invariant)
       (test-vacuum-full-publish-failure-boundaries)

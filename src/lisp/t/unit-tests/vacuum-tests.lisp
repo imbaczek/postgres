@@ -79,6 +79,84 @@
     (check (not (same-index-object-set-p (list first first) (list first second)))
            "VACUUM FULL rejects duplicate entries in an index set")))
 
+(defun test-vacuum-current-table-index-set-lock-guard ()
+  (let* ((*catalog* (make-catalog))
+         (*backend* (make-backend))
+         (db (make-database :name "postgres" :oid 992030))
+         (table (make-pg-class :oid 992031 :name "vac_guard"
+                               :relfilenode 992032 :indexes '(992033)))
+         (index (make-pg-index :oid 992033 :name "vac_guard_idx"
+                               :relfilenode 992034 :table-oid 992031))
+         (replacement-index (make-pg-index :oid 992033 :name "vac_guard_idx"
+                                           :relfilenode 992035
+                                           :table-oid 992031))
+         (replacement-table (copy-pg-class table))
+         (table-evaluations 0)
+         (index-set-evaluations 0)
+         (table-check-locked-p nil)
+         (index-check-locked-p nil)
+         (body-ran nil)
+         (original-ensure (symbol-function 'ensure-current-table))
+         (original-same-set (symbol-function 'same-index-object-set-p)))
+    (setf (backend-database *backend*) "postgres"
+          (gethash "postgres" (catalog-databases *catalog*)) db
+          (gethash (pg-class-name table) (database-tables db)) table
+          (gethash (pg-index-name index) (database-indexes db)) index)
+    (flet ((ensure-current-table (candidate)
+             (setf table-check-locked-p
+                   (and (sb-thread:holding-mutex-p *write-lock*)
+                        (sb-thread:holding-mutex-p *catalog-lock*)))
+             (funcall original-ensure candidate))
+           (same-index-object-set-p (left right)
+             (setf index-check-locked-p
+                   (and (sb-thread:holding-mutex-p *write-lock*)
+                        (sb-thread:holding-mutex-p *catalog-lock*)))
+             (funcall original-same-set left right)))
+      (check (eq (with-current-table-index-set
+                     ((progn (incf table-evaluations) table)
+                      (progn (incf index-set-evaluations) (list index)))
+                   (setf body-ran t)
+                   (check (and (sb-thread:holding-mutex-p *write-lock*)
+                               (sb-thread:holding-mutex-p *catalog-lock*))
+                          "VACUUM FULL catalog body runs under ordered catalog locks")
+                   :guarded)
+                 :guarded)
+             "VACUUM FULL current-index guard preserves the body result")
+      (check (and (= table-evaluations 1)
+                  (= index-set-evaluations 1)
+                  table-check-locked-p
+                  index-check-locked-p
+                  body-ran)
+             "VACUUM FULL captures inputs once and validates under catalog locks")
+      (let ((body-ran nil)
+            (caught nil))
+        (handler-case
+            (with-current-table-index-set (table (list replacement-index))
+              (setf body-ran t))
+          (pg-error (condition) (setf caught condition)))
+        (check (and caught (string= (pg-error-sqlstate caught) "40001"))
+               "VACUUM FULL rejects replacement index metadata with serialization failure")
+        (check (not body-ran)
+               "VACUUM FULL does not mutate catalogs after index-set validation fails")
+        (check (and (not (sb-thread:holding-mutex-p *write-lock*))
+                    (not (sb-thread:holding-mutex-p *catalog-lock*)))
+               "VACUUM FULL releases catalog locks after index-set validation fails"))
+      (setf (gethash (pg-class-name table) (database-tables db))
+            replacement-table)
+      (let ((body-ran nil)
+            (caught nil))
+        (handler-case
+            (with-current-table-index-set (table (list index))
+              (setf body-ran t))
+          (pg-error (condition) (setf caught condition)))
+        (check (and caught (string= (pg-error-sqlstate caught) "42P01"))
+               "VACUUM FULL rejects a stale table object under the catalog lock")
+        (check (not body-ran)
+               "VACUUM FULL does not mutate catalogs after table revalidation fails")
+        (check (and (not (sb-thread:holding-mutex-p *write-lock*))
+                    (not (sb-thread:holding-mutex-p *catalog-lock*)))
+               "VACUUM FULL releases catalog locks after table validation fails")))))
+
 (defun test-vacuum-xid-normalization-invariant ()
   (let* ((xmin 992001)
          (xmax 992002)
