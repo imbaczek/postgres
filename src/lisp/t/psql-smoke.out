@@ -286,24 +286,32 @@ ALTER TABLE
 1
 CREATE TABLE
 INSERT 0 5
-Seq Scan on index_scan_events
+Project
+  Filter
+    Seq Scan on index_scan_events
 1
 2
 5
 CREATE INDEX
-Index Scan using index_scan_events_category_idx on index_scan_events
+Project
+  Filter
+    Index Scan using index_scan_events_category_idx on index_scan_events
 1
 2
 5
 5
-Seq Scan on index_scan_events
+Project
+  Filter
+    Seq Scan on index_scan_events
 UPDATE 1
 DELETE 1
 VACUUM
 1
 2
 DROP INDEX
-Seq Scan on index_scan_events
+Project
+  Filter
+    Seq Scan on index_scan_events
 2
 DROP TABLE
 CREATE TABLE
@@ -315,7 +323,10 @@ CREATE TABLE
 INSERT 0 4
 INSERT 0 5
 INSERT 0 3
-Nested Loop Inner Join
+Project
+  Nested Loop Inner Join
+    Seq Scan on join_left
+    Seq Scan on join_right
 1|right-one
 1|right-one-dup
 3|right-three
@@ -403,6 +414,44 @@ DROP TABLE
 DROP TABLE
 DROP TABLE
 DROP TABLE
+CREATE TABLE
+INSERT 0 5
+10|2
+20|1
+|2
+5
+7|5
+t|5
+2
+0
+10|2
+|2
+10
+10|10|2
+20|20|1
+||2
+CREATE INDEX
+Project
+  Filter
+    Index Scan using aggregate_events_category_idx on aggregate_events
+Project
+  HashAggregate
+    Seq Scan on aggregate_events
+10
+10|2
+10|first|1
+10||1
+20|other|1
+|null-a|1
+|null-b|1
+10|1
+|1
+|1
+20|1
+10|1
+ERROR:  column "label" must appear in the GROUP BY clause or be used in an aggregate function
+ERROR:  HAVING is not supported
+DROP TABLE
 ERROR:  duplicate key value violates unique constraint "unique_nnd_restart_idx"
 ERROR:  index "unique_using_restart_idx" is already associated with a constraint
 ERROR:  cannot drop index "unique_using_restart_idx" because constraint "unique_using_restart_idx" on table "unique_using_restart" requires it
@@ -413,11 +462,15 @@ ERROR:  null value in column "i" violates not-null constraint
 DROP TABLE
 DROP TABLE
 DROP TABLE
-Index Scan using index_scan_restart_category_idx on index_scan_restart
+Project
+  Filter
+    Index Scan using index_scan_restart_category_idx on index_scan_restart
 8
 9
 DROP INDEX
-Seq Scan on index_scan_restart
+Project
+  Filter
+    Seq Scan on index_scan_restart
 8
 9
 DROP TABLE

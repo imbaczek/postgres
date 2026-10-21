@@ -425,9 +425,7 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
            (relations (when scope
                         (list (list :name from-name :alias from-alias
                                     :table first-table
-                                    :columns (pg-class-columns first-table)
-                                    :path (make-select-scan-path
-                                           :kind :seq-scan)))))
+                                    :columns (pg-class-columns first-table)))))
            (joins '()))
       (dolist (join-ast (getf ast :joins))
         (let* ((name (getf join-ast :table))
@@ -465,32 +463,45 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
           (setf relations
                 (append relations
                         (list (list :name name :alias alias :table table
-                                    :columns (pg-class-columns table)
-                                    :path (make-select-scan-path
-                                           :kind :seq-scan)))))))
+                                    :columns (pg-class-columns table)))))))
       (setf joins (nreverse joins))
       (let* ((where (when (getf ast :where)
                       (analyze-expr (getf ast :where) scope)))
-             (single-table-p (and (= (length relations) 1)
-                                  (null joins)))
-             (path (if single-table-p
-                       (choose-select-scan-path first-table where)
-                       (if relations
-                           (make-select-scan-path :kind :seq-scan)
-                           (make-select-scan-path :kind :result))))
-             (targets (analyze-targets (getf ast :targets) scope))
-             (order (analyze-order (getf ast :order-by) scope targets))
+             (aggregate-p
+               (or (getf ast :group-by)
+                   (some (lambda (target)
+                           (eq (first (getf target :expr)) :count-star))
+                         (getf ast :targets))))
+             (group-keys (when (getf ast :group-by)
+                           (analyze-group-keys (getf ast :group-by) scope)))
+             (targets (if aggregate-p
+                          (analyze-aggregate-targets
+                           (getf ast :targets) scope group-keys)
+                          (analyze-targets (getf ast :targets) scope)))
+             (aggregate-count
+               (if aggregate-p
+                   (count-if (lambda (target)
+                               (getf target :aggregate-index))
+                             targets)
+                   0))
+             (order (if aggregate-p
+                        (analyze-aggregate-order
+                         (getf ast :order-by) scope targets group-keys)
+                        (analyze-order (getf ast :order-by) scope targets)))
              (limit (getf ast :limit)))
-        (when single-table-p
-          (setf (getf (first relations) :path) path))
+        (when (and aggregate-p joins)
+          (ereport "0A000"
+                   "GROUP BY and COUNT(*) currently support one table only"))
         (list :table first-table
               :relations relations
               :scope scope
               :targets targets
               :where where
+              :group-keys group-keys
+              :aggregate-p aggregate-p
+              :aggregate-count aggregate-count
               :order order
               :limit limit
-              :path path
               :joins joins)))))
 (defun select-index-current-p (table idx)
   (and (= (pg-index-table-oid idx) (pg-class-oid table))
@@ -549,8 +560,10 @@ registration-to-DDL handoff free of a lock-order inversion."
       (check-for-interrupts)
       (let ((tuple (heapam-get-tuple relfilenode (car tid) (cdr tid)
                                      (pg-class-columns table))))
-        (when (and tuple (htup-visible-p tuple snapshot))
-          (funcall callback tuple))))))
+        (when (and tuple (htup-visible-p tuple snapshot)
+                   (eq (funcall callback tuple) :stop))
+          (return-from scan-select-index :stop))))
+    (values)))
 
 (defun scan-select-path (table relfilenode path snapshot callback)
   (ecase (select-scan-path-kind path)
@@ -688,65 +701,6 @@ registration-to-DDL handoff free of a lock-order inversion."
          for target in targets
          collect (value->text value (getf target :type)))))
 
-(defun exec-select (stream ast)
-  (let* ((prepared (prepare-select ast))
-         (relations (getf prepared :relations))
-         (joins (getf prepared :joins))
-         (targets (getf prepared :targets))
-         (where (getf prepared :where))
-         (order (getf prepared :order))
-         (limit (getf prepared :limit)))
-    (if (and joins (null order))
-        ;; With no sort requirement, send each qualifying row as soon as it is
-        ;; produced. The stop signal unwinds the nested-loop streams at LIMIT.
-        (let ((count 0))
-          (send-row-description stream
-                                (mapcar #'target->result-column targets))
-          (with-registered-select-relations (registered relations)
-            (unless (eql limit 0)
-              (stream-select-joined-rows
-               registered joins where targets
-               (lambda (row)
-                 (send-select-row stream row targets)
-                 (incf count)
-                 (when (and limit (>= count limit)) :stop)))))
-          (send-command-complete stream (format nil "SELECT ~a" count)))
-        (let ((rows
-                (cond
-                  ((and relations joins order limit)
-                   (with-registered-select-relations (registered relations)
-                     (collect-select-top-n
-                      (lambda (callback)
-                        (stream-select-joined-rows
-                         registered joins where targets callback))
-                      order limit)))
-                  ((and relations joins)
-                   (with-registered-select-relations (registered relations)
-                     (collect-select-joined-rows
-                      registered joins where targets)))
-                  (relations
-                   (with-registered-select-relations (registered relations)
-                     (let* ((relation (first registered))
-                            (table (getf relation :table)))
-                       (collect-select-table-rows
-                        table (pg-class-relfilenode table)
-                        (getf relation :path) where targets))))
-                  (t
-                   (collect-select-no-from-rows where targets)))))
-          (unless (and relations joins order limit)
-            (when order
-              (setf rows (stable-sort rows
-                                      (lambda (a b)
-                                        (row-less-p a b order)))))
-            (when limit
-              (setf rows (subseq rows 0 (min limit (length rows))))))
-          (send-row-description stream
-                                (mapcar #'target->result-column targets))
-          (dolist (row rows)
-            (send-select-row stream row targets))
-          (send-command-complete stream
-                                 (format nil "SELECT ~a" (length rows)))))))
-
 (defun select-path-description (table path)
   (case (select-scan-path-kind path)
     (:index-scan
@@ -756,44 +710,3 @@ registration-to-DDL handoff free of a lock-order inversion."
     (:seq-scan
      (format nil "Seq Scan on ~a" (pg-class-name table)))
     (:result "Result")))
-
-(defun select-join-plan-description (joins)
-  (let ((names (mapcar (lambda (join)
-                         (case (getf join :type)
-                           (:inner "Inner Join")
-                           (:left "Left Join")
-                           (:right "Right Join")
-                           (:full "Full Join")
-                           (:cross "Cross Join")))
-                       joins)))
-    (if (null (rest names))
-        (format nil "Nested Loop ~a" (first names))
-        (format nil "Nested Loop (~{~a~^, ~})" names))))
-
-(defun exec-explain (stream ast)
-  (let* ((prepared (prepare-select ast))
-         (relations (getf prepared :relations))
-         (joins (getf prepared :joins))
-         (path (getf prepared :path))
-         (description
-           (cond
-             (joins (select-join-plan-description joins))
-             (relations
-              (with-registered-select-relations (registered relations)
-                (select-path-description
-                 (getf (first registered) :table)
-                 (getf (first registered) :path))))
-             (t "Result"))))
-    (when (and joins relations)
-      (with-registered-select-relations (registered relations)
-        (declare (ignore registered))))
-    (when (and (null joins) (null relations))
-      (setf description (select-path-description nil path)))
-    (send-row-description
-     stream
-     (list (make-result-column :name "QUERY PLAN"
-                               :type-oid +textoid+
-                               :typlen -1
-                               :typmod -1)))
-    (send-data-row-text stream (list description))
-    (send-command-complete stream "EXPLAIN")))

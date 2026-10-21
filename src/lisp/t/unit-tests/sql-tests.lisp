@@ -238,6 +238,295 @@
                   "CREATE TABLE cleanup removes table after final fsync failure"))
       (setf (symbol-function 'fsync-index) original-fsync-index))))
 
+(defun test-query-plan-ir-and-count-aggregate ()
+  (let* ((ast (first (parse-statements
+                      "select category, count(*) as n from events group by category order by n desc limit 2")))
+         (targets (getf ast :targets)))
+    (check (string= (second (first (getf ast :group-by))) "category")
+           "SELECT parser retains GROUP BY expressions")
+    (check (eq (first (getf (second targets) :expr)) :count-star)
+           "SELECT parser represents COUNT(*) as an aggregate node")
+    (check (= (length (parse-statements "select *, count(*) from events")) 1)
+           "SELECT parser accepts a star mixed with other targets")
+    (let ((caught nil))
+      (handler-case
+          (parse-statements "select count(*) from events having count(*) > 1")
+        (pg-error (condition) (setf caught condition)))
+      (check (and caught (string= (pg-error-sqlstate caught) "0A000"))
+             "HAVING remains explicitly unsupported")))
+  (let* ((plan (plan-select-query
+                (first (parse-statements "select count(*)"))))
+         (logical (query-plan-logical plan))
+         (physical (query-plan-physical plan))
+         (rows '())
+         (aggregate-node
+           (find :hash-aggregate (collect-query-plan-nodes physical)
+                 :key #'first)))
+    (check (eq (first (third logical)) :aggregate)
+           "logical plan uses an abstract aggregate operator")
+    (check (eq (first (third physical)) :hash-aggregate)
+           "physical plan selects HashAggregate")
+    (execute-query-plan plan nil (lambda (row) (push (aref (car row) 0) rows)))
+    (check (equal (nreverse rows) '(1))
+           "interpreter executes a plain COUNT(*) over its input")
+    (check (= (plan-node-metadata-actual-rows
+               (gethash aggregate-node (query-plan-metadata plan)))
+              1)
+           "operator sidecar records actual aggregate output rows"))
+  (let* ((plan (plan-select-query
+                (first (parse-statements "select 7, count(*) where 1 = 0"))))
+         (rows '()))
+    (execute-query-plan plan nil (lambda (row) (push (car row) rows)))
+    (check (equalp (nreverse rows) (list #(7 0)))
+           "global COUNT(*) emits one zero row for empty input and permits constants"))
+  (let* ((plan (plan-select-query
+                (first (parse-statements "select true, count(*) where 1 = 0"))))
+         (rows '()))
+    (execute-query-plan plan nil (lambda (row) (push (car row) rows)))
+    (check (equalp (nreverse rows) (list #(t 0)))
+           "global COUNT(*) permits row-independent boolean projections"))
+  (let* ((group-ref (aggregate-output-ref 1 :int4))
+         (targets (list (list :name "category" :expr group-ref)
+                        (list :name "category" :expr (copy-tree group-ref))))
+         (order (analyze-aggregate-order
+                 (list (list :expr '(:column "category") :desc nil))
+                 nil targets nil)))
+    (check (equal (caar order) group-ref)
+           "ORDER BY accepts duplicate output names for the same expression")))
+
+(defun test-index-scan-limit-stops-duplicate-candidates ()
+  (let* ((table (make-pg-class :oid 91011 :name "limit_index_test"
+                               :relfilenode 91012 :columns #()))
+         (index (make-pg-index :oid 91013 :relfilenode 91014
+                               :table-oid 91011 :columns '(1)))
+         (path (make-select-scan-path :kind :index-scan :index index
+                                      :qual '(:bool t :type :bool)
+                                      :key #(10)))
+         (scan-node (list :index-scan 0 91011 91013
+                          '(:bool t :type :bool) #(10)))
+         (target (list :expr '(:col 1 :type :int4 :typmod -1)
+                       :name "k" :type :int4 :typmod -1
+                       :table-oid 0 :attnum 0))
+         (plan (%make-query-plan
+                :physical (list :limit 1
+                                (list :project (list target)
+                                      (list :filter '(:bool t :type :bool)
+                                            scan-node)))))
+         (registered (list (list :table table :path path)))
+         (original-search (symbol-function 'btree-search))
+         (original-get-tuple (symbol-function 'heapam-get-tuple))
+         (original-visible (symbol-function 'htup-visible-p))
+         (seen 0))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'btree-search)
+                 (lambda (relfilenode key)
+                   (declare (ignore relfilenode key))
+                   '((0 . 1) (0 . 2) (0 . 3)))
+                 (symbol-function 'heapam-get-tuple)
+                 (lambda (relfilenode block offnum columns)
+                   (declare (ignore relfilenode block columns))
+                   (make-htup :values (vector offnum)))
+                 (symbol-function 'htup-visible-p)
+                 (lambda (tuple snapshot)
+                   (declare (ignore tuple snapshot))
+                   t))
+           (interpret-query-plan
+            plan registered
+            (lambda (row) (declare (ignore row)) (incf seen)))
+           (check (= seen 1)
+                  "LIMIT stops an index scan after its first duplicate-key candidate"))
+      (setf (symbol-function 'btree-search) original-search
+            (symbol-function 'heapam-get-tuple) original-get-tuple
+            (symbol-function 'htup-visible-p) original-visible))
+    (let* ((logical-scan
+             (select-scan-plan-form 0 (list :table table) path nil))
+           (physical-scan
+             (select-scan-plan-form 0 (list :table table) path t))
+           (metadata (make-plan-node-metadata
+                      :selection-rule :equality-index))
+           (plan (%make-query-plan
+                  :physical (list :project nil
+                                  (list :filter '(:bool t :type :bool)
+                                        physical-scan)))))
+      (setf (gethash physical-scan (query-plan-metadata plan)) metadata)
+      (check (eq (first logical-scan) :scan)
+             "logical plans keep the access method abstract")
+      (check (eq (first physical-scan) :index-scan)
+             "physical plans expose the selected IndexScan")
+      (let* ((wrong-table (make-pg-class :oid 91015 :name "other_table"
+                                         :relfilenode 91016 :columns #()))
+             (caught nil))
+        (handler-case
+            (physical-scan-relation
+             physical-scan (list (list :table wrong-table)))
+          (error (condition) (setf caught condition)))
+        (check caught
+               "physical scans reject a registered table with a mismatched OID"))
+      (let* ((wrong-index (make-pg-index :oid 91013 :relfilenode 91017
+                                         :table-oid 91015 :columns '(1)))
+             (wrong-path (make-select-scan-path
+                          :kind :index-scan :index wrong-index
+                          :qual '(:bool t :type :bool) :key #(10)))
+             (index-node (select-scan-plan-form
+                          0 (list :table table) path t))
+             (caught nil))
+        (handler-case
+            (physical-scan-path
+             index-node (list :table table :path wrong-path))
+          (error (condition) (setf caught condition)))
+        (check caught
+               "physical IndexScan rejects an index owned by another table")
+        (setf caught nil)
+        (handler-case
+            (format-query-plan
+             (%make-query-plan :physical index-node)
+             (list (list :table table :path wrong-path)))
+          (error (condition) (setf caught condition)))
+        (check caught
+               "EXPLAIN formatting rejects an index path inconsistent with its node"))
+      (reconcile-query-plan-access-paths
+       plan (list (list :table table
+                        :path (make-select-scan-path :kind :seq-scan))))
+      (check (eq (first physical-scan) :seq-scan)
+             "index replacement rewrites the executable plan to SeqScan")
+      (check (eq (plan-node-metadata-selection-rule metadata)
+                 :sequential-fallback)
+             "plan metadata records a stale-index fallback"))))
+
+(defun test-query-plan-compiler-backend-hook ()
+  (let ((original (query-plan-backend-entry :unit-test-compiler))
+        (compiled 0)
+        (rows '())
+        (plan (plan-select-query
+               (first (parse-statements "select 42")))))
+    (unwind-protect
+         (progn
+           (register-query-plan-backend
+            :unit-test-compiler
+            :compiler (lambda (received-plan)
+                        (check (eq received-plan plan)
+                               "compiler receives the physical query plan")
+                        (incf compiled)
+                        (lambda (relations callback)
+                          (declare (ignore relations))
+                          (interpret-query-plan received-plan nil callback))))
+           (execute-query-plan
+            plan nil (lambda (row) (push (aref (car row) 0) rows))
+            :backend :unit-test-compiler)
+           (check (= compiled 1) "compiler backend hook is invoked once")
+           (check (equal rows '(42))
+                  "compiled backend can route execution through an alternate function"))
+      (sb-thread:with-mutex (*query-plan-backend-lock*)
+        (if original
+            (setf (gethash :unit-test-compiler *query-plan-backends*) original)
+            (remhash :unit-test-compiler *query-plan-backends*))))))
+
+(defun test-query-plan-compiler-dispatch-uses-registry-snapshot ()
+  (let* ((name :unit-test-compiler-snapshot)
+         (original (query-plan-backend-entry name))
+         (original-entry-reader (symbol-function 'query-plan-backend-entry))
+         (plan (plan-select-query
+                (first (parse-statements "select 42"))))
+         (rows '())
+         (lookups 0)
+         (caught nil)
+         (replacement
+           (lambda (received-plan relations callback)
+             (declare (ignore received-plan relations))
+             (funcall callback (cons #(99) nil)))))
+    (unwind-protect
+         (progn
+           (register-query-plan-backend
+            name
+            :compiler (lambda (received-plan)
+                        (declare (ignore received-plan))
+                        (lambda (relations callback)
+                          (declare (ignore relations))
+                          (funcall callback (cons #(42) nil)))))
+           (setf (symbol-function 'query-plan-backend-entry)
+                 (lambda (backend)
+                   (if (eq backend name)
+                       (progn
+                         (incf lookups)
+                         (if (= lookups 1)
+                             (prog1 (funcall original-entry-reader backend)
+                               ;; Model replacement after dispatch captured the
+                               ;; compiler entry but before a second lookup.
+                               (register-query-plan-backend
+                                name :executor replacement))
+                             (funcall original-entry-reader backend)))
+                       (funcall original-entry-reader backend))))
+           (handler-case
+               (execute-query-plan
+                plan nil (lambda (row) (push (aref (car row) 0) rows))
+                :backend name)
+             (error (condition) (setf caught condition)))
+           (check (null caught)
+                  "compiler dispatch keeps the backend entry captured at lookup")
+           (check (= lookups 1)
+                  "compiler dispatch reads the backend registry only once")
+           (check (equal rows '(42))
+                  "a concurrent backend replacement does not change active dispatch"))
+      (setf (symbol-function 'query-plan-backend-entry) original-entry-reader)
+      (sb-thread:with-mutex (*query-plan-backend-lock*)
+        (if original
+            (setf (gethash name *query-plan-backends*) original)
+            (remhash name *query-plan-backends*))))))
+
+(defun test-query-plan-backend-registry-synchronization ()
+  (let* ((name :unit-test-backend-registry)
+         (original (query-plan-backend-entry name))
+         (plan (plan-select-query
+                (first (parse-statements "select 42"))))
+         (failures '())
+         (failure-lock (sb-thread:make-mutex :name "backend registry test")))
+    (labels ((executor-for (value)
+               (lambda (received-plan relations callback)
+                 (declare (ignore received-plan relations))
+                 (funcall callback
+                          (cons (vector value
+                                        (sb-thread:holding-mutex-p
+                                         *query-plan-backend-lock*))
+                                nil))))
+             (record-failure (failure)
+               (sb-thread:with-mutex (failure-lock)
+                 (push failure failures))))
+      (unwind-protect
+           (progn
+             (register-query-plan-backend name :executor (executor-for 1))
+             (let ((writer
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (dotimes (iteration 300)
+                          (register-query-plan-backend
+                           name :executor (executor-for
+                                           (if (evenp iteration) 1 2)))))))
+                   (reader
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (loop repeat 300
+                              do
+                                 (handler-case
+                                     (let ((row nil))
+                                       (execute-query-plan
+                                        plan nil (lambda (result) (setf row result))
+                                        :backend name)
+                                       (unless (and row
+                                                    (member (aref (car row) 0) '(1 2))
+                                                    (not (aref (car row) 1)))
+                                         (record-failure row)))
+                                   (error (condition)
+                                     (record-failure condition))))))))
+               (sb-thread:join-thread writer)
+               (sb-thread:join-thread reader))
+             (check (null failures)
+                    "concurrent backend registration and dispatch use synchronized snapshots"))
+        (sb-thread:with-mutex (*query-plan-backend-lock*)
+          (if original
+              (setf (gethash name *query-plan-backends*) original)
+              (remhash name *query-plan-backends*)))))))
+
 (defun test-relation-build-own-xid ()
   (let ((relfilenode 987653)
         (xid 987654))

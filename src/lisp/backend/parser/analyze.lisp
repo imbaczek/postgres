@@ -214,6 +214,8 @@ exist\" messages."
          (t
           (ereport "42883" "function ~a(~a) does not exist"
                    name (call-signature args))))))
+    (:count-star
+     (ereport "42803" "aggregate functions are not allowed in this expression"))
     (t
      (ereport "XX000" "cannot analyze expression ~a" expr))))
 
@@ -221,6 +223,7 @@ exist\" messages."
   (case (first ast)
     (:column
      (if (third ast) (third ast) (second ast)))
+    (:count-star "count")
     (t "?column?")))
 
 (defun analyze-target (target table)
@@ -272,6 +275,146 @@ exist\" messages."
                                          :attnum (pg-column-attnum col))))
         else
           collect (analyze-target tg table)))
+
+(defun same-group-column-p (left right)
+  "Compare resolved columns by identity, ignoring incidental nullability."
+  (and (eq (first left) :col)
+       (eq (first right) :col)
+       (= (second left) (second right))
+       (eq (expr-type left) (expr-type right))
+       (= (expr-typmod left) (expr-typmod right))
+       (= (or (getf left :table-oid) 0)
+          (or (getf right :table-oid) 0))
+       (= (or (getf left :attnum) 0)
+          (or (getf right :attnum) 0))))
+
+(defun group-column-position (expr group-keys)
+  (position expr group-keys :test #'same-group-column-p))
+
+(defun analyze-group-keys (group-asts scope)
+  "Resolve a GROUP BY list and keep its first occurrence of each column."
+  (let ((keys '()))
+    (dolist (ast group-asts)
+      (let ((expr (analyze-expr ast scope)))
+        (unless (eq (first expr) :col)
+          (ereport "0A000" "GROUP BY currently supports column references only"))
+        (unless (group-column-position expr keys)
+          (push expr keys))))
+    (nreverse keys)))
+
+(defun aggregate-output-ref (position type)
+  "Reference the internal row produced by HashAggregate."
+  (list :col position :type type :typmod -1
+        :table-oid 0 :attnum position))
+
+(defun aggregate-row-independent-expression-p (expr)
+  "True when an analyzed expression does not depend on an input row."
+  (labels ((contains-column-p (form)
+             (and (consp form)
+                  (or (eq (first form) :col)
+                      (some #'contains-column-p form)))))
+    (not (contains-column-p expr))))
+
+(defun analyze-aggregate-targets (raw-targets scope group-keys)
+  "Analyze the restricted GROUP BY / COUNT(*) projection."
+  (let ((expanded
+          (loop for target in raw-targets
+                if (getf target :star)
+                  append (progn
+                           (unless (typep scope 'select-scope)
+                             (ereport "42601" "SELECT * requires a FROM clause"))
+                           (mapcar #'select-column-target
+                                   (select-scope-columns scope)))
+                else collect target))
+        (count-index 0)
+        (result '()))
+    (dolist (target expanded)
+      (let ((ast (getf target :expr)))
+        (if (eq (first ast) :count-star)
+            (let ((index count-index))
+              (incf count-index)
+              (push (list :expr
+                          (aggregate-output-ref
+                           (+ (length group-keys) index 1) :int8)
+                          :name (or (getf target :alias) "count")
+                          :type :int8 :typmod -1
+                          :table-oid 0 :attnum 0
+                          :aggregate-index index)
+                    result))
+            (let* ((analyzed (if (and (getf target :name)
+                                      (eq (first ast) :col))
+                                 target
+                                 (analyze-target target scope)))
+                   (expr (getf analyzed :expr))
+                   (group-index (group-column-position expr group-keys)))
+              (cond
+                (group-index
+                 (setf (getf analyzed :expr)
+                       (aggregate-output-ref
+                        (1+ group-index) (expr-type expr))))
+                ((aggregate-row-independent-expression-p expr))
+                (t
+                 (ereport "42803"
+                          "column \"~a\" must appear in the GROUP BY clause or be used in an aggregate function"
+                          (getf analyzed :name))))
+              (push analyzed result)))))
+    (nreverse result)))
+
+(defun analyze-aggregate-order (order scope targets group-keys)
+  "Resolve ORDER BY against aggregate outputs and grouping keys."
+  (loop for item in order
+        collect (let ((expr (getf item :expr)))
+                  (cons
+                   (cond
+                     ((and (eq (first expr) :const)
+                           (integerp (second expr))
+                           (<= 1 (second expr) (length targets)))
+                      (getf (nth (1- (second expr)) targets) :expr))
+                     ((eq (first expr) :count-star)
+                      (let ((target (find-if
+                                     (lambda (target)
+                                       (getf target :aggregate-index))
+                                     targets)))
+                        (unless target
+                          (ereport "42803"
+                                   "aggregate is not present in the SELECT list"))
+                        (getf target :expr)))
+                     ((eq (first expr) :column)
+                      (let* ((name (if (third expr)
+                                       (third expr) (second expr)))
+                             (matches (unless (third expr)
+                                        (remove-if-not
+                                         (lambda (target)
+                                           (string= name (getf target :name)))
+                                         targets))))
+                        (cond
+                          ((rest matches)
+                           (let ((first-expr (getf (first matches) :expr)))
+                             (if (every (lambda (target)
+                                          (equal first-expr
+                                                 (getf target :expr)))
+                                        (rest matches))
+                                 first-expr
+                                 (ereport "42702"
+                                          "ORDER BY \"~a\" is ambiguous"
+                                          name))))
+                          (matches (getf (first matches) :expr))
+                          (t
+                           (let* ((resolved (analyze-expr expr scope))
+                                  (position
+                                    (group-column-position
+                                     resolved group-keys)))
+                             (unless position
+                               (ereport
+                                "42803"
+                                "ORDER BY expression must be a grouped or selected aggregate output"))
+                             (aggregate-output-ref
+                              (1+ position) (expr-type resolved)))))))
+                     (t
+                      (ereport
+                       "0A000"
+                       "ORDER BY currently supports grouped or selected aggregate outputs")))
+                   (getf item :desc)))))
 
 (defun analyze-order (order table targets)
   (loop for item in order

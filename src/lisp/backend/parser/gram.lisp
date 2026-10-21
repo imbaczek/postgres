@@ -149,35 +149,38 @@
         (from-alias nil)
         (joins nil)
         (where nil)
+        (group-by nil)
         (order-by nil)
         (limit nil))
     (when (match-kw p "from")
       (multiple-value-setq (from from-alias joins) (parse-from p)))
     (when (match-kw p "where")
       (setf where (parse-expr p)))
+    (when (match-kw p "group")
+      (expect-kw p "by")
+      (setf group-by (parse-expr-list p)))
+    (when (kw-p p "having")
+      (ereport "0A000" "HAVING is not supported"))
     (when (match-kw p "order")
       (expect-kw p "by")
       (setf order-by (parse-order-list p)))
     (when (match-kw p "limit")
       (setf limit (parse-integer-literal p)))
-    (when (kw-p p "group")
-      (ereport "0A000" "GROUP BY is not supported"))
-    (when (kw-p p "having")
-      (ereport "0A000" "HAVING is not supported"))
     (list :type :select
           :targets targets
           :from from
           :from-alias from-alias
           :joins joins
           :where where
+          :group-by group-by
           :order-by order-by
           :limit limit)))
 
 (defun parse-target-list (p)
-  (if (match-op p "*")
-      (list (list :star t))
-      (loop collect (parse-target p)
-            while (match-punct p #\,))))
+  (loop collect (if (match-op p "*")
+                    (list :star t)
+                    (parse-target p))
+        while (match-punct p #\,)))
 
 (defun parse-target (p)
   (let ((expr (parse-expr p))
@@ -731,11 +734,16 @@
           (let ((col (pident p)))
             (list :column name col)))
          ((match-punct p #\()
-          (let ((args (if (match-punct p #\))
-                          '()
-                          (with-parens (p :opening-consumed t)
-                            (parse-expr-list p)))))
-            (list :func name args)))
+          (if (and (string= name "count")
+                   (match-op p "*"))
+              (progn
+                (expect-punct p #\))
+                (list :count-star))
+              (let ((args (if (match-punct p #\))
+                              '()
+                              (with-parens (p :opening-consumed t)
+                                (parse-expr-list p)))))
+                (list :func name args))))
          ((member name '("current_user" "session_user" "user"
                          "current_database" "current_schema" "current_catalog")
                   :test #'string=)

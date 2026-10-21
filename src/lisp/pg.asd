@@ -66,6 +66,7 @@
      (:module "executor"
       :serial t
       :components ((:file "exec_scan")
+                   (:file "exec_plan")
                    (:file "exec_insert")
                    (:file "exec_delete")
                    (:file "exec_vacuum")

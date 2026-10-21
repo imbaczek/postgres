@@ -452,3 +452,31 @@ drop table join_pair_right;
 drop table join_left;
 drop table join_right;
 drop table join_third;
+
+-- Adapted from PostgreSQL aggregates.sql: simple grouped and plain counts.
+create table aggregate_events (category int, label text);
+insert into aggregate_events values
+  (10, 'first'), (10, null), (20, 'other'), (null, 'null-a'), (null, 'null-b');
+select category, count(*) from aggregate_events group by category order by category;
+select count(*) from aggregate_events;
+select 7, count(*) from aggregate_events;
+select true, count(*) from aggregate_events;
+select count(*) as n from aggregate_events where category = 10;
+select count(*) from aggregate_events where category = 99;
+select category, count(*) as n from aggregate_events
+  group by category order by n desc, category limit 2;
+select category from aggregate_events where category = 10 group by category;
+select category, category, count(*) from aggregate_events
+  group by category order by category;
+create index aggregate_events_category_idx on aggregate_events (category);
+explain select category from aggregate_events where category = 10;
+explain select category, count(*) from aggregate_events group by category;
+select category from aggregate_events where category = 10 limit 1;
+select category, count(*) as n from aggregate_events
+  where category = 10 group by category order by n;
+select *, count(*) from aggregate_events group by category, label;
+select category as label, count(*) from aggregate_events
+  group by category, label order by aggregate_events.label;
+select label, count(*) from aggregate_events group by category;
+select category, count(*) from aggregate_events group by category having count(*) > 1;
+drop table aggregate_events;
