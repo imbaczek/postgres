@@ -972,42 +972,37 @@ before this removal horizon is captured."
                                          (finish-execution-p t)
                                          (statements nil statements-p)
                                          prepare-only-p)
-  (let ((backend *backend*))
-    (unwind-protect
-         (progn
-           ;; Install cleanup before publishing query execution state.
-           (when (and backend start-execution-p)
-             (begin-backend-query-execution backend))
-           (let ((completed-p nil)
-                 (result nil))
-             (setf result
-                   (handler-case
-                       (let ((stmts (if statements-p
-                                        statements
-                                        (parse-statements query))))
-                         (prog1
-                             (if prepare-only-p
-                                 stmts
-                                 (if (null stmts)
-                                     (send-empty-query-response stream)
-                                     (dolist (ast stmts)
-                                       (check-for-interrupts)
-                                       (execute-statement stream ast))))
-                           (setf completed-p t)))
-                     (pg-error (e)
-                       ;; A FATAL must end the connection; let it reach handle-connection.
-                       (if (fatal-error-p e)
-                           (error e)
-                           (progn
-                             (note-query-error)
-                             (send-error-response stream e))))
-                     (error (e)
-                       (note-query-error)
-                       (send-error-response
-                        stream
-                        (make-condition 'pg-error
-                                        :sqlstate "XX000"
-                                        :message (princ-to-string e))))))
-             (values result completed-p)))
-      (when (and backend finish-execution-p)
-        (end-backend-query-execution backend)))))
+  (with-backend-query-execution (:start start-execution-p :finish finish-execution-p)
+    (progn
+      (let ((completed-p nil)
+            (result nil))
+        (setf result
+              (handler-case
+                  (let ((stmts (if statements-p
+                                   statements
+                                   (parse-statements query))))
+                    (prog1
+                        (if prepare-only-p
+                            stmts
+                            (if (null stmts)
+                                (send-empty-query-response stream)
+                                (dolist (ast stmts)
+                                  (check-for-interrupts)
+                                  (execute-statement stream ast))))
+                      (setf completed-p t)))
+                (pg-error (e)
+                  ;; A FATAL must end the connection; let it reach handle-connection.
+                  (if (fatal-error-p e)
+                      (error e)
+                      (progn
+                        (note-query-error)
+                        (send-error-response stream e))))
+                (error (e)
+                  (note-query-error)
+                  (send-error-response
+                   stream
+                   (make-condition 'pg-error
+                                   :sqlstate "XX000"
+                                   :message (princ-to-string e))))))
+        (values result completed-p)))
+    ))

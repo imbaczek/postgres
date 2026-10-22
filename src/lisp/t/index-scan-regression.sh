@@ -198,9 +198,9 @@ install_output=$(control <<EOF
                 do (sleep 0.01)))
         (funcall *index-drop-handoff-original-readers* relfilenodes xid)))
 (setf (symbol-function 'acquire-relation-build-locks)
-      (lambda (relfilenodes &optional own-xid wait-readers-p)
+      (lambda (relfilenodes &optional own-xid wait-readers-p on-acquired)
         (let ((token (funcall *index-drop-handoff-original-build-locks*
-                              relfilenodes own-xid wait-readers-p)))
+                              relfilenodes own-xid wait-readers-p on-acquired)))
           (when (and (member *index-drop-handoff-heap* relfilenodes :test #'=)
                      (member *index-drop-handoff-index* relfilenodes :test #'=))
             (with-open-file (out "$TMP/drop-handoff.gates"

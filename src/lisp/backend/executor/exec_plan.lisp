@@ -261,17 +261,13 @@ ROW-CALLBACK."
         finally (return (< (second left) (second right)))))
 
 (defun write-query-sort-run (items order)
-  (multiple-value-bind (pathname output) (open-query-temp-output)
-    (unwind-protect
-         (progn
-           (dolist (item
-                    (stable-sort items
-                                 (lambda (left right)
-                                   (select-sort-item-less-p
-                                    left right order))))
-             (query-spill-write-record output item))
-           pathname)
-      (close output))))
+  (with-query-temp-output (pathname output)
+    (dolist (item
+             (stable-sort items
+                          (lambda (left right)
+                            (select-sort-item-less-p left right order))))
+      (query-spill-write-record output item))
+    pathname))
 
 (defun delete-query-temp-file (pathname)
   (multiple-value-bind (deleted-p condition)
@@ -285,39 +281,37 @@ ROW-CALLBACK."
 
 (defun merge-query-sort-runs (left-path right-path order)
   (let ((output-path nil))
-    (multiple-value-bind (pathname output) (open-query-temp-output)
+    (with-query-temp-output (pathname output)
       (setf output-path pathname)
-      (unwind-protect
-           (progn
-             (with-open-file (left-input left-path
-                                         :direction :input
-                                         :external-format :utf-8)
-               (with-open-file (right-input right-path
-                                            :direction :input
-                                            :external-format :utf-8)
-                 (let ((left (query-spill-read-record left-input))
-                       (right (query-spill-read-record right-input)))
-                   (loop until (or (eq left +query-spill-eof+)
-                                   (eq right +query-spill-eof+))
-                         do (if (select-sort-item-less-p left right order)
-                                (progn
-                                  (query-spill-write-record output left)
-                                  (setf left
-                                        (query-spill-read-record left-input)))
-                                (progn
-                                  (query-spill-write-record output right)
-                                  (setf right
-                                        (query-spill-read-record right-input)))))
-                   (loop until (eq left +query-spill-eof+)
-                         do (query-spill-write-record output left)
-                            (setf left
-                                  (query-spill-read-record left-input)))
-                   (loop until (eq right +query-spill-eof+)
-                         do (query-spill-write-record output right)
-                            (setf right
-                                  (query-spill-read-record right-input))))))
-             output-path)
-        (close output)))
+      (progn
+        (with-open-file (left-input left-path
+                                    :direction :input
+                                    :external-format :utf-8)
+          (with-open-file (right-input right-path
+                                       :direction :input
+                                       :external-format :utf-8)
+            (let ((left (query-spill-read-record left-input))
+                  (right (query-spill-read-record right-input)))
+              (loop until (or (eq left +query-spill-eof+)
+                              (eq right +query-spill-eof+))
+                    do (if (select-sort-item-less-p left right order)
+                           (progn
+                             (query-spill-write-record output left)
+                             (setf left
+                                   (query-spill-read-record left-input)))
+                           (progn
+                             (query-spill-write-record output right)
+                             (setf right
+                                   (query-spill-read-record right-input)))))
+              (loop until (eq left +query-spill-eof+)
+                    do (query-spill-write-record output left)
+                       (setf left
+                             (query-spill-read-record left-input)))
+              (loop until (eq right +query-spill-eof+)
+                    do (query-spill-write-record output right)
+                       (setf right
+                             (query-spill-read-record right-input))))))
+        output-path))
     (delete-query-temp-file left-path)
     (delete-query-temp-file right-path)
     output-path))

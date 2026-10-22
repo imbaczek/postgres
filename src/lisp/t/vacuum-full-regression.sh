@@ -190,7 +190,7 @@ control <<EOF > "$TMP/horizon-scheduler.out"
       (symbol-function 'acquire-relation-build-locks)
       *vac-full-horizon-paused* nil
       (symbol-function 'acquire-relation-build-locks)
-      (lambda (relfilenodes &optional own-xid wait-readers-p)
+      (lambda (relfilenodes &optional own-xid wait-readers-p on-acquired)
         (when (and (not *vac-full-horizon-paused*)
                    (member *vac-full-horizon-heap* relfilenodes :test #'=))
           (setf *vac-full-horizon-paused* t)
@@ -201,7 +201,7 @@ control <<EOF > "$TMP/horizon-scheduler.out"
                 until (probe-file "$TMP/full-horizon.release")
                 do (sleep 0.01)))
         (funcall *vac-full-horizon-original-build-locks*
-                 relfilenodes own-xid wait-readers-p)))
+                 relfilenodes own-xid wait-readers-p on-acquired)))
 (quit)
 EOF
 grep -q 'bye' "$TMP/horizon-scheduler.out" \
@@ -267,7 +267,7 @@ control <<EOF > "$TMP/gate-race-scheduler.out"
       *vac-full-race-build-sets* nil
       *vac-full-race-armed* t
       (symbol-function 'acquire-relation-build-locks)
-      (lambda (relfilenodes &optional own-xid wait-readers-p)
+      (lambda (relfilenodes &optional own-xid wait-readers-p on-acquired)
         (push (copy-list relfilenodes) *vac-full-race-build-sets*)
         (when (and *vac-full-race-armed*
                    (not *vac-full-race-paused*)
@@ -280,7 +280,7 @@ control <<EOF > "$TMP/gate-race-scheduler.out"
                 until (probe-file "$TMP/full-gate.release")
                 do (sleep 0.01)))
         (funcall *vac-full-race-original-build-locks*
-                 relfilenodes own-xid wait-readers-p)))
+                 relfilenodes own-xid wait-readers-p on-acquired)))
 (quit)
 EOF
 grep -q 'bye' "$TMP/gate-race-scheduler.out" \

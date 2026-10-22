@@ -538,6 +538,18 @@
           do (return-from open-query-temp-io (values pathname stream)))
   (error "Could not create a unique query spill file"))
 
+(defmacro with-query-temp-output ((pathname stream) &body body)
+  "Own an output stream before opening it; the surrounding file scope owns PATHNAME."
+  `(let ((,pathname nil)
+         (,stream nil))
+     (declare (ignorable ,pathname))
+     (sb-sys:without-interrupts
+       (unwind-protect
+            (progn
+              (multiple-value-setq (,pathname ,stream) (open-query-temp-output))
+              (sb-sys:with-local-interrupts (progn ,@body)))
+         (when ,stream (close ,stream))))))
+
 (defun query-spill-value-size (value)
   "Estimate retained row memory without building its printed representation."
   (cond

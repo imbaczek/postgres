@@ -89,6 +89,30 @@ INTERRUPT-THREAD, so it needs no flag."
       (sb-thread:condition-broadcast *live-operation-cv*)))
   (values))
 
+(defmacro with-backend-query-execution
+    ((&key (backend '*backend*) (start t) (finish t) (cleanup :direct)) &body body)
+  "Capture query lifecycle controls once and guard cleanup before publication.
+START and FINISH are independent. CLEANUP selects :DIRECT for in-image callers
+or :QUERY-STATE for the wire dispatch's existing reload/shutdown cleanup lane."
+  (let ((captured (gensym "BACKEND-"))
+        (start-p (gensym "START-"))
+        (finish-p (gensym "FINISH-")))
+    `(let ((,captured ,backend)
+           (,start-p ,start)
+           (,finish-p ,finish))
+       (unwind-protect
+            (progn
+              (when (and ,captured ,start-p)
+                (begin-backend-query-execution ,captured))
+              ,@body)
+         (when (and ,captured ,finish-p)
+           ,(ecase cleanup
+              (:direct `(end-backend-query-execution ,captured))
+              (:query-state
+               `(let ((*backend* ,captured))
+                  (with-live-operation-query-state-cleanup
+                    (end-backend-query-execution ,captured))))))))))
+
 ;;; ---- pg_control: nextXid, fsynced write-ahead of XID allocation ----
 
 (defun pgdata-path (relative)
@@ -629,42 +653,85 @@ another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
                          (gethash relfilenode *relation-readers*)))))
         relfilenodes))
 
-(defun acquire-relation-build-locks (relfilenodes &optional own-xid wait-readers-p)
-  "Block new users as one group, then wait for all active users to finish."
+(defmacro with-acquired-relation-locks
+    ((relations token acquire-function release-function) &body body)
+  "Protect ownership before ACQUIRE-FUNCTION can publish any relation gates.
+ACQUIRE-FUNCTION receives a callback accepting the owned relation set and token.
+It must call that callback with interrupts disabled as part of publication. Waiting
+and BODY remain interruptible; RELEASE-FUNCTION runs after every exit."
+  (let ((acquire (gensym "ACQUIRE-"))
+        (release (gensym "RELEASE-"))
+        (owned (gensym "OWNED-"))
+        (published-relations (gensym "PUBLISHED-RELATIONS-"))
+        (published-token (gensym "PUBLISHED-TOKEN-")))
+    `(let ((,relations nil)
+           (,token nil)
+           (,owned nil)
+           (,acquire ,acquire-function)
+           (,release ,release-function))
+       (declare (ignorable ,relations ,token))
+       (unwind-protect
+            (progn
+              (funcall ,acquire
+                       (lambda (,published-relations ,published-token)
+                         (setf ,relations ,published-relations
+                               ,token ,published-token
+                               ,owned t)))
+              ,@body)
+         (sb-sys:without-interrupts
+           (when ,owned
+             (funcall ,release ,relations ,token)))))))
+
+(defun acquire-relation-build-locks
+    (relfilenodes &optional own-xid wait-readers-p on-acquired)
+  "Block new users as one group, then wait for all active users to finish.
+ON-ACQUIRED publishes cleanup ownership as gates become visible. It is
+called under the relation mutex with interrupts disabled. Raw callers retain
+responsibility for release after successful return. Without ON-ACQUIRED they
+must protect the return-to-owner handoff from interrupts; prefer the scoped macros."
   (let ((relfilenodes (sort (remove-duplicates (copy-list relfilenodes) :test #'=)
                             #'<))
-        (token (gensym "RELATION-BUILD-")))
+        (token (gensym "RELATION-BUILD-"))
+        (published nil)
+        (completed nil))
     (when (null relfilenodes)
       (return-from acquire-relation-build-locks nil))
-    (sb-thread:with-mutex (*relation-lock-mutex*)
-      (loop while (some (lambda (relfilenode)
-                          (gethash relfilenode *relation-builders*))
-                        relfilenodes)
-            do (check-for-interrupts)
-               (condition-wait-with-timeout *relation-lock-cv*
-                                            *relation-lock-mutex*))
-      (setf (gethash token *relation-build-groups*)
-            (list relfilenodes wait-readers-p))
-      (dolist (relfilenode relfilenodes)
-        (setf (gethash relfilenode *relation-builders*) token)
-        (when wait-readers-p
-          (setf (gethash relfilenode *relation-reader-blockers*) token))))
-    (handler-case
-        (progn
-          (loop
-            (let ((user (sb-thread:with-mutex (*relation-lock-mutex*)
-                          (relation-build-user relfilenodes own-xid
-                                               wait-readers-p))))
-              (unless user (return))
-              (if (and (consp user) (eq (first user) :maintenance))
-                  (sb-thread:with-mutex (*relation-lock-mutex*)
-                    (condition-wait-with-timeout *relation-lock-cv*
-                                                 *relation-lock-mutex*))
-                  (wait-for-xid user))))
-          token)
-      (error (e)
-        (release-relation-build-locks relfilenodes token)
-        (error e)))))
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex (*relation-lock-mutex*)
+             (loop while (some (lambda (relfilenode)
+                                 (gethash relfilenode *relation-builders*))
+                               relfilenodes)
+                   do (check-for-interrupts)
+                      (condition-wait-with-timeout *relation-lock-cv*
+                                                   *relation-lock-mutex*))
+             (sb-sys:without-interrupts
+               ;; Own the complete set before any partial map update can fail.
+               (setf published t)
+               (setf (gethash token *relation-build-groups*)
+                     (list relfilenodes wait-readers-p))
+               (dolist (relfilenode relfilenodes)
+                 (setf (gethash relfilenode *relation-builders*) token)
+                 (when wait-readers-p
+                   (setf (gethash relfilenode *relation-reader-blockers*) token)))
+               (when on-acquired (funcall on-acquired relfilenodes token))))
+           (loop
+             (let ((user (sb-thread:with-mutex (*relation-lock-mutex*)
+                           (relation-build-user relfilenodes own-xid
+                                                wait-readers-p))))
+               (unless user (return))
+               (if (and (consp user) (eq (first user) :maintenance))
+                   (sb-thread:with-mutex (*relation-lock-mutex*)
+                     (condition-wait-with-timeout *relation-lock-cv*
+                                                  *relation-lock-mutex*))
+                   (wait-for-xid user))))
+           (setf completed t)
+           token)
+      ;; Also protect unscoped callers and non-error exits during acquisition.
+      ;; Release is token-checked and idempotent if the outer scope also owns it.
+      (when (and published (not completed))
+        (sb-sys:without-interrupts
+          (release-relation-build-locks relfilenodes token))))))
 
 (defun release-relation-build-locks (relfilenodes token)
   (sb-thread:with-mutex (*relation-lock-mutex*)
@@ -678,8 +745,9 @@ another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
     (sb-thread:condition-broadcast *relation-lock-cv*))
   (values))
 
-(defun acquire-relation-build-lock (relfilenode &optional own-xid wait-readers-p)
-  (acquire-relation-build-locks (list relfilenode) own-xid wait-readers-p))
+(defun acquire-relation-build-lock
+    (relfilenode &optional own-xid wait-readers-p on-acquired)
+  (acquire-relation-build-locks (list relfilenode) own-xid wait-readers-p on-acquired))
 
 (defun release-relation-build-lock (relfilenode token)
   (release-relation-build-locks (list relfilenode) token))
@@ -690,37 +758,55 @@ another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
 
 (defmacro with-relation-build-locks ((relfilenodes &optional wait-readers-p) &body body)
   "Acquire relation build gates as one group and release them on exit."
-  (let ((rels (gensym "RELATIONS-"))
+  (let ((requested (gensym "REQUESTED-"))
+        (rels (gensym "RELATIONS-"))
         (xid (gensym "OWN-XID-"))
-        (token (gensym "BUILD-TOKEN-")))
-    `(let* ((,rels (sort (remove-duplicates (copy-list ,relfilenodes) :test #'=)
-                         #'<))
+        (token (gensym "BUILD-TOKEN-"))
+        (wait (gensym "WAIT-READERS-")))
+    `(let* ((,requested ,relfilenodes)
             (,xid (and *backend* (backend-xid *backend*)))
-            (,token (acquire-relation-build-locks ,rels ,xid ,wait-readers-p)))
-       (unwind-protect
-            (progn ,@body)
-         (release-relation-build-locks ,rels ,token)))))
+            (,wait ,wait-readers-p))
+       (with-acquired-relation-locks
+           (,rels ,token
+                  (lambda (publish)
+                    (acquire-relation-build-locks ,requested ,xid ,wait publish))
+                  #'release-relation-build-locks)
+         ,@body))))
 
-(defun acquire-relation-maintenance-locks (relfilenodes)
-  "Serialize VACUUM on relations while allowing registered DML to proceed."
+(defun acquire-relation-maintenance-locks (relfilenodes &optional on-acquired)
+  "Serialize VACUUM on relations while allowing registered DML to proceed.
+ON-ACQUIRED publishes cleanup ownership atomically with the maintenance gates.
+Without it raw callers must protect the return-to-owner handoff from interrupts;
+prefer WITH-RELATION-MAINTENANCE-LOCKS."
   (let ((relfilenodes (sort (remove-duplicates (copy-list relfilenodes) :test #'=)
                             #'<))
-        (token (gensym "RELATION-MAINTENANCE-")))
+        (token (gensym "RELATION-MAINTENANCE-"))
+        (published nil)
+        (completed nil))
     (when (null relfilenodes)
       (return-from acquire-relation-maintenance-locks nil))
-    (sb-thread:with-mutex (*relation-lock-mutex*)
-      (loop
-        (unless (some (lambda (relfilenode)
-                        (or (gethash relfilenode *relation-builders*)
-                            (gethash relfilenode *relation-maintainers*)))
-                      relfilenodes)
-          (dolist (relfilenode relfilenodes)
-            (setf (gethash relfilenode *relation-maintainers*) token))
-          (return))
-        (check-for-interrupts)
-        (condition-wait-with-timeout *relation-lock-cv*
-                                     *relation-lock-mutex*)))
-    (values relfilenodes token)))
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex (*relation-lock-mutex*)
+             (loop
+               (unless (some (lambda (relfilenode)
+                               (or (gethash relfilenode *relation-builders*)
+                                   (gethash relfilenode *relation-maintainers*)))
+                             relfilenodes)
+                 (sb-sys:without-interrupts
+                   (setf published t)
+                   (dolist (relfilenode relfilenodes)
+                     (setf (gethash relfilenode *relation-maintainers*) token))
+                   (when on-acquired (funcall on-acquired relfilenodes token)))
+                 (return))
+               (check-for-interrupts)
+               (condition-wait-with-timeout *relation-lock-cv*
+                                            *relation-lock-mutex*)))
+           (setf completed t)
+           (values relfilenodes token))
+      (when (and published (not completed))
+        (sb-sys:without-interrupts
+          (release-relation-maintenance-locks relfilenodes token))))))
 
 (defun release-relation-maintenance-locks (relfilenodes token)
   (sb-thread:with-mutex (*relation-lock-mutex*)
@@ -730,10 +816,10 @@ another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
     (sb-thread:condition-broadcast *relation-lock-cv*))
   (values))
 
-(defun acquire-relation-maintenance-lock (relfilenode)
+(defun acquire-relation-maintenance-lock (relfilenode &optional on-acquired)
   "Serialize VACUUM on one relation while allowing registered DML to proceed."
   (multiple-value-bind (relfilenodes token)
-      (acquire-relation-maintenance-locks (list relfilenode))
+      (acquire-relation-maintenance-locks (list relfilenode) on-acquired)
     (declare (ignore relfilenodes))
     token))
 
@@ -741,13 +827,16 @@ another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
   (release-relation-maintenance-locks (list relfilenode) token))
 
 (defmacro with-relation-maintenance-locks ((relfilenodes) &body body)
-  (let ((rels (gensym "RELATIONS-"))
+  (let ((requested (gensym "REQUESTED-"))
+        (rels (gensym "RELATIONS-"))
         (token (gensym "MAINTENANCE-TOKEN-")))
-    `(multiple-value-bind (,rels ,token)
-         (acquire-relation-maintenance-locks ,relfilenodes)
-       (unwind-protect
-            (progn ,@body)
-         (release-relation-maintenance-locks ,rels ,token)))))
+    `(let ((,requested ,relfilenodes))
+       (with-acquired-relation-locks
+           (,rels ,token
+                  (lambda (publish)
+                    (acquire-relation-maintenance-locks ,requested publish))
+                  #'release-relation-maintenance-locks)
+         ,@body))))
 
 (defmacro with-relation-maintenance-lock ((relfilenode) &body body)
   `(with-relation-maintenance-locks ((list ,relfilenode))

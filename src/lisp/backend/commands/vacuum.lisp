@@ -26,19 +26,19 @@
 STATE-PROVIDER returns catalog state before and after locking.
 REQUESTED-RELATIONS derives the initial lock set; VALID-STATE-P verifies that
 the current state is covered. Acquired locks are always released, including
-when revalidation or FUNCTION signals an error."
+when revalidation or FUNCTION signals an error. ACQUIRE-LOCK accepts the
+requested relations and an ownership callback, published atomically with gates."
   (loop
     for captured = (funcall state-provider)
     for requested = (funcall requested-relations captured)
-    do (multiple-value-bind (locked-relations token)
-           (funcall acquire-lock requested)
-         (unwind-protect
-              (let ((current (funcall state-provider)))
-                (when (funcall valid-state-p
-                               captured current locked-relations)
-                  (return-from call-with-revalidated-relation-locks
-                    (funcall function current))))
-           (funcall release-lock locked-relations token)))))
+    do (with-acquired-relation-locks
+           (locked-relations token
+                             (lambda (publish) (funcall acquire-lock requested publish))
+                             release-lock)
+         (let ((current (funcall state-provider)))
+           (when (funcall valid-state-p captured current locked-relations)
+             (return-from call-with-revalidated-relation-locks
+               (funcall function current)))))))
 
 (defun call-with-table-maintenance-locks
     (table index-provider verify-function function)
@@ -137,14 +137,9 @@ implementation's replacement metadata transition atomic as well."
                indexes
                (mapcar #'pg-index-relfilenode indexes)))))
    (lambda (state) (cons (first state) (third state)))
-   (lambda (requested)
-     (let ((locked-relations
-             (sort (remove-duplicates (copy-list requested) :test #'=) #'<)))
-       (values locked-relations
-               (acquire-relation-build-locks
-                locked-relations
-                (and *backend* (backend-xid *backend*))
-                t))))
+   (lambda (requested publish)
+     (acquire-relation-build-locks
+      requested (and *backend* (backend-xid *backend*)) t publish))
    #'release-relation-build-locks
    (lambda (captured current locked-relations)
      (let ((indexes (second captured))

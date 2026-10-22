@@ -136,9 +136,9 @@ install_output=$(control <<EOF
                 (write-string "waiting" out)))))
         (funcall *join-ddl-original-wait* waitqueue mutex)))
 (setf (symbol-function 'acquire-relation-build-locks)
-      (lambda (relfilenodes &optional own-xid wait-readers-p)
+      (lambda (relfilenodes &optional own-xid wait-readers-p on-acquired)
         (let ((token (funcall *join-ddl-original-build-locks*
-                              relfilenodes own-xid wait-readers-p)))
+                              relfilenodes own-xid wait-readers-p on-acquired)))
           (let ((label (cond ((member *join-ddl-heap-b* relfilenodes :test #'=) "b")
                              ((member *join-ddl-heap-c* relfilenodes :test #'=) "c"))))
             (when label

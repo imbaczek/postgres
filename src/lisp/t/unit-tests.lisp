@@ -10,6 +10,7 @@
                     "join-tests.lisp"
                     "spill-tests.lisp"
                     "arena-tests.lisp"
+                    "ownership-tests.lisp"
                     "backend-lifecycle-tests.lisp"
                     "wal-tests.lisp"
                     "protocol-tests.lisp"
@@ -42,6 +43,12 @@
       (test-schema-lock-acquisition-interruption)
       (test-atomic-relation-reader-registration)
       (test-single-relation-lock-macros-share-set-guards)
+      (test-relation-scope-publication-and-return-interrupts)
+      (test-relation-scope-waits-and-cleanup)
+      (test-relation-scope-empty-and-unscoped-failure)
+      (test-backend-query-scope-controls-and-values)
+      (test-backend-query-scope-captures-owner)
+      (test-backend-query-scope-cleanup-lanes)
       (test-select-index-reader-blocks-drop-after-registration)
       (test-streamed-join-stop-and-outer-matches)
       (test-lazy-join-skips-inner-for-empty-outer)
@@ -52,6 +59,8 @@
       (test-query-temp-fd-scope-closes-after-acquisition-interrupt)
       (test-query-temp-fd-scope-closes-before-cleanup-interrupt)
       (test-query-temp-fd-scope-macro-expansion-protects-cleanup)
+      (test-query-temp-output-acquisition-interrupts)
+      (test-query-temp-output-values-and-quota-error)
       (test-query-temp-retained-namespace-observability)
       (test-query-temp-retained-scan-refuses-symlink-swap)
       (test-query-temp-retained-scan-reports-file-type-race)

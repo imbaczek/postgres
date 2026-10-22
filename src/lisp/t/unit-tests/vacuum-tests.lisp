@@ -14,10 +14,11 @@
              (incf state-count)
              (if (= state-count 1) 10 20))
            #'list
-           (lambda (requested)
+           (lambda (requested publish)
              (let ((locked (copy-list requested))
                    (token (gensym "TEST-LOCK-")))
                (push (list locked token) acquisitions)
+               (funcall publish locked token)
                (values locked token)))
            (lambda (locked token)
              (push (list locked token) releases))
@@ -49,7 +50,9 @@
                        10
                        (error "injected relation-state failure")))
                  #'list
-                 (lambda (requested) (values requested :test-token))
+                 (lambda (requested publish)
+                   (funcall publish requested :test-token)
+                   (values requested :test-token))
                  (lambda (locked token)
                    (setf released
                          (and (equal locked '(10)) (eq token :test-token))))

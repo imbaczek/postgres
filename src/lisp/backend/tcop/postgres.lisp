@@ -256,111 +256,107 @@ The admitted decoder repeats these checks authoritatively."
          (query nil)
          (suffix-start nil)
          (prefix-before-reload nil))
-    (unwind-protect
-         (progn
-           ;; Install cleanup before publishing the query token: a fatal
-           ;; interrupt at any later point must not retain this backend.
-           (begin-backend-query-execution backend)
-           (handler-case
-               (progn
-                 ;; Only transactions and already-admitted sessions captured at
-                 ;; gate closure can continue through the drain lane.
-                 (with-live-operation-query-dispatch drain-command-p
-                   (setf query
-                         (query-string
-                          (decode-frontend-message
-                           type-byte length-bytes payload)))
-                   (if (eq *live-operation-current-lane* :drain)
-                       (multiple-value-bind (statements parsed-p)
-                           ;; Parse the entire message before executing anything so
-                           ;; syntax errors after COMMIT are found before commit.
-                           (exec-simple-query
-                            stream query :prepare-only-p t
-                            :start-execution-p nil :finish-execution-p nil)
-                         (cond
-                           ((not parsed-p)
-                            (send-ready-for-query
-                             stream (transaction-status-char)))
-                           (t
-                            (let ((ending-position
-                                    (position-if
-                                     #'transaction-ending-statement-p statements)))
-                              (if ending-position
-                                  (let* ((prefix-end (1+ ending-position))
-                                         (prefix (subseq statements 0 prefix-end)))
-                                    (multiple-value-bind (result completed-p)
-                                        (exec-simple-query
-                                         stream query :statements prefix
-                                         :start-execution-p nil
-                                         :finish-execution-p nil)
-                                      (declare (ignore result))
-                                      (if (and completed-p
-                                               (< prefix-end (length statements)))
-                                          ;; Once COMMIT/ROLLBACK ends the captured
-                                          ;; transaction, unrelated suffix work must
-                                          ;; wait for normal admission.
-                                          (setf suffix-start prefix-end
-                                                prefix-before-reload prefix)
-                                          (send-ready-for-query
-                                           stream (transaction-status-char)))))
-                                  ;; A captured transaction may need another query
-                                  ;; to release an XID held by counted work.
-                                  (progn
-                                    (exec-simple-query
-                                     stream query :statements statements
-                                     :start-execution-p nil
-                                     :finish-execution-p nil)
-                                    (send-ready-for-query
-                                     stream (transaction-status-char))))))))
-                       (progn
-                         (exec-simple-query
-                          stream query
-                          :start-execution-p nil :finish-execution-p nil)
-                         (send-ready-for-query stream
-                                               (transaction-status-char)))))
-                 (when suffix-start
-                   (with-live-operation
-                     (multiple-value-bind (reparsed reparsed-p)
-                         (exec-simple-query
-                          stream query :prepare-only-p t
-                          :start-execution-p nil :finish-execution-p nil)
-                       (if reparsed-p
-                           (let* ((ending-position
-                                    (position-if
-                                     #'transaction-ending-statement-p reparsed))
-                                  (reparsed-prefix-end
-                                    (and ending-position (1+ ending-position)))
-                                  (reparsed-prefix
-                                    (and reparsed-prefix-end
-                                         (subseq reparsed 0 reparsed-prefix-end))))
-                             (if (and reparsed-prefix-end
-                                      (= reparsed-prefix-end suffix-start)
-                                      (equal reparsed-prefix prefix-before-reload)
-                                      (< reparsed-prefix-end (length reparsed)))
-                                 ;; Use ASTs from the newly loaded parser. The
-                                 ;; equality guard prevents skipping/replaying SQL.
+    (with-backend-query-execution (:backend backend :cleanup :query-state)
+      (progn
+        (handler-case
+            (progn
+              ;; Only transactions and already-admitted sessions captured at
+              ;; gate closure can continue through the drain lane.
+              (with-live-operation-query-dispatch drain-command-p
+                (setf query
+                      (query-string
+                       (decode-frontend-message
+                        type-byte length-bytes payload)))
+                (if (eq *live-operation-current-lane* :drain)
+                    (multiple-value-bind (statements parsed-p)
+                        ;; Parse the entire message before executing anything so
+                        ;; syntax errors after COMMIT are found before commit.
+                        (exec-simple-query
+                         stream query :prepare-only-p t
+                         :start-execution-p nil :finish-execution-p nil)
+                      (cond
+                        ((not parsed-p)
+                         (send-ready-for-query
+                          stream (transaction-status-char)))
+                        (t
+                         (let ((ending-position
+                                 (position-if
+                                  #'transaction-ending-statement-p statements)))
+                           (if ending-position
+                               (let* ((prefix-end (1+ ending-position))
+                                      (prefix (subseq statements 0 prefix-end)))
+                                 (multiple-value-bind (result completed-p)
+                                     (exec-simple-query
+                                      stream query :statements prefix
+                                      :start-execution-p nil
+                                      :finish-execution-p nil)
+                                   (declare (ignore result))
+                                   (if (and completed-p
+                                            (< prefix-end (length statements)))
+                                       ;; Once COMMIT/ROLLBACK ends the captured
+                                       ;; transaction, unrelated suffix work must
+                                       ;; wait for normal admission.
+                                       (setf suffix-start prefix-end
+                                             prefix-before-reload prefix)
+                                       (send-ready-for-query
+                                        stream (transaction-status-char)))))
+                               ;; A captured transaction may need another query
+                               ;; to release an XID held by counted work.
+                               (progn
                                  (exec-simple-query
-                                  stream query :statements
-                                  (nthcdr reparsed-prefix-end reparsed)
-                                               :start-execution-p nil :finish-execution-p nil)
-                                 (send-error-response
-                                  stream
-                                  (make-condition
-                                   'pg-error :sqlstate "0A000"
-                                             :message
-                                             "query suffix changed during reload; retry it separately"))))
-                           ;; PREPARE-ONLY already sent the parse error.
-                           (values))
-                       (send-ready-for-query stream (transaction-status-char))))))
-             (pg-error (condition)
-               (if (fatal-error-p condition)
-                   (error condition)
-                   (with-live-operation-captured-backend-cleanup
-                     (note-query-error)
-                     (send-error-response stream condition)
-                     (send-ready-for-query stream (transaction-status-char)))))))
-      (with-live-operation-query-state-cleanup
-        (end-backend-query-execution backend)))))
+                                  stream query :statements statements
+                                  :start-execution-p nil
+                                  :finish-execution-p nil)
+                                 (send-ready-for-query
+                                  stream (transaction-status-char))))))))
+                    (progn
+                      (exec-simple-query
+                       stream query
+                       :start-execution-p nil :finish-execution-p nil)
+                      (send-ready-for-query stream
+                                            (transaction-status-char)))))
+              (when suffix-start
+                (with-live-operation
+                  (multiple-value-bind (reparsed reparsed-p)
+                      (exec-simple-query
+                       stream query :prepare-only-p t
+                       :start-execution-p nil :finish-execution-p nil)
+                    (if reparsed-p
+                        (let* ((ending-position
+                                 (position-if
+                                  #'transaction-ending-statement-p reparsed))
+                               (reparsed-prefix-end
+                                 (and ending-position (1+ ending-position)))
+                               (reparsed-prefix
+                                 (and reparsed-prefix-end
+                                      (subseq reparsed 0 reparsed-prefix-end))))
+                          (if (and reparsed-prefix-end
+                                   (= reparsed-prefix-end suffix-start)
+                                   (equal reparsed-prefix prefix-before-reload)
+                                   (< reparsed-prefix-end (length reparsed)))
+                              ;; Use ASTs from the newly loaded parser. The
+                              ;; equality guard prevents skipping/replaying SQL.
+                              (exec-simple-query
+                               stream query :statements
+                               (nthcdr reparsed-prefix-end reparsed)
+                                            :start-execution-p nil :finish-execution-p nil)
+                              (send-error-response
+                               stream
+                               (make-condition
+                                'pg-error :sqlstate "0A000"
+                                          :message
+                                          "query suffix changed during reload; retry it separately"))))
+                        ;; PREPARE-ONLY already sent the parse error.
+                        (values))
+                    (send-ready-for-query stream (transaction-status-char))))))
+          (pg-error (condition)
+            (if (fatal-error-p condition)
+                (error condition)
+                (with-live-operation-captured-backend-cleanup
+                  (note-query-error)
+                  (send-error-response stream condition)
+                  (send-ready-for-query stream (transaction-status-char)))))))
+      )))
 
 (defun handle-simple-query (stream message)
   "Dispatch an already-constructed simple-query message.
