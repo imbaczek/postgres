@@ -103,15 +103,83 @@
          "schema read scope rejects a same-thread write-lock upgrade")
   (sb-thread:with-mutex (*schema-lock-mutex*)
     (check (and (zerop *schema-read-lock-count*)
-                (null *schema-write-lock-owner*)
+                (null *schema-write-lock-owners*)
                 (zerop *schema-write-lock-waiters*))
            "schema lock macros release all counters and ownership on errors")))
+
+(defun test-schema-gate-allows-independent-writers ()
+  (let ((lock (sb-thread:make-mutex :name "test schema cohorts"))
+        (cv (sb-thread:make-waitqueue :name "test schema cohorts"))
+        (other-entered nil)
+        (release-other nil)
+        (reader-waiting nil)
+        (reader-entered nil)
+        (worker-error nil)
+        (other nil)
+        (reader nil)
+        (original-wait (symbol-function 'condition-wait-with-timeout)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'condition-wait-with-timeout)
+                 (lambda (waitqueue mutex)
+                   (when (eq waitqueue *schema-lock-cv*)
+                     (sb-thread:with-mutex (lock) (setf reader-waiting t)))
+                   (funcall original-wait waitqueue mutex)))
+           (with-schema-write-lock
+             (setf other
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (with-schema-write-lock
+                            (sb-thread:with-mutex (lock)
+                              (setf other-entered t)
+                              (loop until release-other
+                                    do (sb-thread:condition-wait cv lock))))
+                        (error (condition)
+                          (sb-thread:with-mutex (lock)
+                            (setf worker-error condition)))))))
+             (check (test-wait-until
+                     (lambda () (sb-thread:with-mutex (lock) other-entered)))
+                    "independent DDL can enter while another schema changer is active")
+             (setf reader
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (with-schema-read-lock
+                            (sb-thread:with-mutex (lock) (setf reader-entered t)))
+                        (error (condition)
+                          (sb-thread:with-mutex (lock)
+                            (setf worker-error condition)))))))
+             (check (test-wait-until
+                     (lambda () (sb-thread:with-mutex (lock) reader-waiting)))
+                    "exported snapshot waits behind active schema changers"))
+           (check (sb-thread:with-mutex (*schema-lock-mutex*)
+                    (= (length *schema-write-lock-owners*) 1))
+                  "releasing one DDL token retains the other schema hold")
+           (check (not (sb-thread:with-mutex (lock) reader-entered))
+                  "exported snapshot cannot enter before every schema changer exits")
+           (sb-thread:with-mutex (lock)
+             (setf release-other t)
+             (sb-thread:condition-broadcast cv))
+           (sb-thread:join-thread other)
+           (setf other nil)
+           (sb-thread:join-thread reader)
+           (setf reader nil)
+           (check (and (sb-thread:with-mutex (lock) reader-entered)
+                       (null worker-error))
+                  "exported snapshot proceeds after the final schema changer exits"))
+      (sb-thread:with-mutex (lock)
+        (setf release-other t)
+        (sb-thread:condition-broadcast cv))
+      (when other (sb-thread:join-thread other))
+      (when reader (sb-thread:join-thread reader))
+      (setf (symbol-function 'condition-wait-with-timeout) original-wait))))
 
 (defun test-schema-lock-acquisition-interruption ()
   (let ((*schema-lock-mutex* (sb-thread:make-mutex :name "test schema lock"))
         (*schema-lock-cv* (sb-thread:make-waitqueue :name "test schema waiters"))
         (*schema-read-lock-count* 0)
-        (*schema-write-lock-owner* nil)
+        (*schema-write-lock-owners* nil)
         (*schema-write-lock-waiters* 0)
         (*schema-read-lock-held* nil)
         (*schema-write-lock-held* nil)
@@ -120,23 +188,56 @@
          (progn
            (setf (symbol-function 'check-for-interrupts)
                  (lambda () (error "injected schema-lock cancellation")))
-           (setf *schema-write-lock-owner* :held)
+           (setf *schema-write-lock-owners* (list :held))
            (check (handler-case
                       (progn (with-schema-read-lock t) nil)
                     (error () t))
                   "reader cancellation interrupts while waiting behind a writer")
            (check (zerop *schema-read-lock-count*)
                   "cancelled schema reader never publishes an orphaned hold")
-           (setf *schema-write-lock-owner* nil
+           (setf *schema-write-lock-owners* nil
                  *schema-read-lock-count* 1)
            (check (handler-case
                       (progn (with-schema-write-lock t) nil)
                     (error () t))
                   "writer cancellation interrupts while waiting behind a reader")
            (check (and (zerop *schema-write-lock-waiters*)
-                       (null *schema-write-lock-owner*))
+                       (null *schema-write-lock-owners*))
                   "cancelled schema writer clears its waiter count"))
       (setf (symbol-function 'check-for-interrupts) original-check))))
+
+(defun test-schema-gate-queued-writers-enter-together ()
+  (let ((lock (sb-thread:make-mutex :name "test queued schema changers"))
+        (cv (sb-thread:make-waitqueue :name "test queued schema changers"))
+        (entered 0)
+        (release nil)
+        (workers nil))
+    (unwind-protect
+         (progn
+           (with-schema-read-lock
+             (dotimes (index 2)
+               (push (sb-thread:make-thread
+                      (lambda ()
+                        (with-schema-write-lock
+                          (sb-thread:with-mutex (lock)
+                            (incf entered)
+                            (loop until release
+                                  do (sb-thread:condition-wait cv lock))))))
+                     workers))
+             (check (test-wait-until
+                     (lambda ()
+                       (sb-thread:with-mutex (*schema-lock-mutex*)
+                         (= *schema-write-lock-waiters* 2))))
+                    "both DDL operations queue behind an exported snapshot")
+             (check (zerop (sb-thread:with-mutex (lock) entered))
+                    "queued schema changers respect the active snapshot"))
+           (check (test-wait-until
+                   (lambda () (sb-thread:with-mutex (lock) (= entered 2))))
+                  "both queued schema changers enter after the snapshot drains"))
+      (sb-thread:with-mutex (lock)
+        (setf release t)
+        (sb-thread:condition-broadcast cv))
+      (dolist (worker workers) (sb-thread:join-thread worker)))))
 
 (defun test-atomic-relation-reader-registration ()
   (let* ((xid 987781)

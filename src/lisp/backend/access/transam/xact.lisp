@@ -167,13 +167,14 @@ INTERRUPT-THREAD, so it needs no flag."
 
 ;; Exported initial-copy snapshots pin a schema view across multiple relation
 ;; reads. PostgreSQL holds relation locks for DDL and AccessExclusiveLock for
-;; VACUUM FULL; this global RW gate is the initial substitute until this server
-;; has relation-scoped DDL locks. Ordinary VACUUM stays outside because its
-;; pruning horizon already honors the registered MVCC snapshot.
+;; VACUUM FULL. This global gate excludes exported snapshot scopes from schema
+;; changers, while allowing independent DDL operations to overlap. Conflicting
+;; DDL still uses the relation gates and catalog locks below. Ordinary VACUUM
+;; stays outside because its pruning horizon honors the MVCC snapshot.
 (defvar *schema-lock-mutex* (sb-thread:make-mutex :name "pg schema lock"))
 (defvar *schema-lock-cv* (sb-thread:make-waitqueue :name "pg schema waitqueue"))
 (defvar *schema-read-lock-count* 0)
-(defvar *schema-write-lock-owner* nil)
+(defvar *schema-write-lock-owners* nil)
 (defvar *schema-write-lock-waiters* 0)
 (defvar *schema-read-lock-held* nil)
 (defvar *schema-write-lock-held* nil)
@@ -196,7 +197,7 @@ INTERRUPT-THREAD, so it needs no flag."
 (defun acquire-schema-read-lock (on-acquired)
   "Acquire the schema read side and publish ownership before interrupts resume."
   (sb-thread:with-mutex (*schema-lock-mutex*)
-    (loop while (or *schema-write-lock-owner*
+    (loop while (or *schema-write-lock-owners*
                     (plusp *schema-write-lock-waiters*))
           do (check-for-interrupts)
              (condition-wait-with-timeout *schema-lock-cv*
@@ -217,7 +218,7 @@ INTERRUPT-THREAD, so it needs no flag."
   (values))
 
 (defun acquire-schema-write-lock (on-acquired)
-  "Acquire the schema write side; ON-ACQUIRED publishes cleanup ownership.
+  "Join the schema changer cohort; ON-ACQUIRED publishes cleanup ownership.
 
 The wait remains interruptible. Waiter accounting and the successful ownership
 handoff are interrupt-free so cancellation cannot strand either state."
@@ -229,13 +230,12 @@ handoff are interrupt-free so cancellation cannot strand either state."
              (sb-sys:without-interrupts
                (incf *schema-write-lock-waiters*)
                (setf queued t))
-             (loop while (or *schema-write-lock-owner*
-                             (plusp *schema-read-lock-count*))
+             (loop while (plusp *schema-read-lock-count*)
                    do (check-for-interrupts)
                       (condition-wait-with-timeout *schema-lock-cv*
                                                    *schema-lock-mutex*))
              (sb-sys:without-interrupts
-               (setf *schema-write-lock-owner* token)
+               (push token *schema-write-lock-owners*)
                (decf *schema-write-lock-waiters*)
                (setf queued nil)
                (funcall on-acquired token)
@@ -250,9 +250,10 @@ handoff are interrupt-free so cancellation cannot strand either state."
 (defun release-schema-write-lock (token)
   (sb-sys:without-interrupts
     (sb-thread:with-mutex (*schema-lock-mutex*)
-      (unless (eq token *schema-write-lock-owner*)
+      (unless (member token *schema-write-lock-owners* :test #'eq)
         (error "schema write lock released by a non-owner"))
-      (setf *schema-write-lock-owner* nil)
+      (setf *schema-write-lock-owners*
+            (delete token *schema-write-lock-owners* :test #'eq))
       (sb-thread:condition-broadcast *schema-lock-cv*)))
   (values))
 
@@ -273,7 +274,8 @@ handoff are interrupt-free so cancellation cannot strand either state."
                  (release-schema-read-lock))))))))
 
 (defmacro with-schema-write-lock (&body body)
-  "Serialize schema changes with exported snapshot scopes."
+  "Exclude exported snapshots while BODY changes schema.
+Independent schema changers may overlap; relation/catalog locks order DDL."
   (let ((token (gensym "SCHEMA-WRITE-TOKEN-"))
         (acquired (gensym "SCHEMA-WRITE-ACQUIRED-")))
     `(cond

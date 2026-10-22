@@ -35,6 +35,8 @@
       (check (test-wait-until (lambda () t) 0.01)
              "test wait helper accepts an explicit timeout")
       (test-exported-snapshot-schema-lock-coordination)
+      (test-schema-gate-allows-independent-writers)
+      (test-schema-gate-queued-writers-enter-together)
       (test-schema-lock-nesting-and-read-upgrade-rejection)
       (test-schema-lock-acquisition-interruption)
       (test-atomic-relation-reader-registration)
