@@ -150,6 +150,7 @@ Remove the trace and its temporary helper after the demo:
 ./t/index-build-contention.sh # detached build, relation gate, publication name race
 ./t/join-streaming.sh   # outer-join results and unordered LIMIT early stop
 ./t/join-ddl-concurrency.sh # atomic JOIN admission against concurrent DROP TABLE
+./t/sort-arena.sh       # opt-in SBCL sort arenas, capacity errors, transaction recovery
 ./t/index-stress.sh     # repeated same-key updates (slow)
 ./t/hot-reload.sh       # SIGHUP reloads a running server
 ./t/control-repl.sh     # control REPL over TCP + Unix socket, reload, SQL intact

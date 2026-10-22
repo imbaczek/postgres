@@ -510,6 +510,15 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
     (unless (= limit -1)
       limit)))
 
+(defun parse-query-sort-arena-limit-bytes (value)
+  "Parse an optional experimental sort arena capacity (-1 disables it)."
+  (let ((limit (ignore-errors (parse-integer value))))
+    (unless (and limit
+                 (or (= limit -1) (<= 65536 limit most-positive-fixnum)))
+      (error "--sort-arena-limit-bytes expects -1 or an integer in 65536..~d, got ~s"
+             most-positive-fixnum value))
+    (unless (= limit -1) limit)))
+
 (defun parse-bind-address-arg (arg value)
   "Parse a non-empty listener address for option ARG."
   (unless (and (stringp value) (plusp (length value)))
@@ -524,7 +533,8 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
         (control-socket nil)
         (swank-port nil)
         (swank-bind-address "127.0.0.1")
-        (temp-file-limit-argument nil))
+        (temp-file-limit-argument nil)
+        (sort-arena-limit-argument nil))
     (loop for rest on argv
           for arg = (car rest)
           do (cond
@@ -566,7 +576,14 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                      (string= "--temp-file-limit-bytes=" arg
                               :end2 (length "--temp-file-limit-bytes=")))
                 (setf temp-file-limit-argument
-                      (subseq arg (length "--temp-file-limit-bytes="))))))
+                      (subseq arg (length "--temp-file-limit-bytes="))))
+               ((string= arg "--sort-arena-limit-bytes")
+                (setf sort-arena-limit-argument (arg-value rest arg)))
+               ((and (>= (length arg) (length "--sort-arena-limit-bytes="))
+                     (string= "--sort-arena-limit-bytes=" arg
+                              :end2 (length "--sort-arena-limit-bytes=")))
+                (setf sort-arena-limit-argument
+                      (subseq arg (length "--sort-arena-limit-bytes="))))))
     (values host port (or pgdata (sb-ext:posix-getenv "PGDATA") "./pgdata")
             control-port control-socket swank-port swank-bind-address
             (let ((value (or temp-file-limit-argument
@@ -574,7 +591,13 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                               "PG_QUERY_TEMP_FILE_LIMIT_BYTES"))))
               (if value
                   (parse-query-temp-file-limit-bytes value)
-                  *query-temp-file-limit-bytes*)))))
+                  *query-temp-file-limit-bytes*))
+            (let ((value (or sort-arena-limit-argument
+                             (sb-ext:posix-getenv
+                              "PG_QUERY_SORT_ARENA_LIMIT_BYTES"))))
+              (if value
+                  (parse-query-sort-arena-limit-bytes value)
+                  *query-sort-arena-limit-bytes*)))))
 
 (defun directory-pathname (path)
   "Return PATH as an absolute directory pathname (trailing slash).
@@ -637,10 +660,14 @@ CL's RENAME-FILE merges a relative target with the source's directory."
 
 (defun main ()
   (multiple-value-bind (host port pgdata control-port control-socket
-                        swank-port swank-bind-address temp-file-limit-bytes)
+                        swank-port swank-bind-address temp-file-limit-bytes
+                        sort-arena-limit-bytes)
       (parse-args (cdr sb-ext:*posix-argv*))
     (setf *pgdata* (directory-pathname pgdata)
-          *query-temp-file-limit-bytes* temp-file-limit-bytes)
+          *query-temp-file-limit-bytes* temp-file-limit-bytes
+          *query-sort-arena-limit-bytes* sort-arena-limit-bytes)
+    ;; Reject an unsupported SBCL before opening storage or accepting clients.
+    (call-with-query-sort-arena (lambda (arena) (declare (ignore arena))))
     (initialize-query-temp-storage)
     (capture-server-streams)
     (wal-init)

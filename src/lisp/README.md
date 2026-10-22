@@ -38,6 +38,13 @@ startup (1..65535) and a missing option value is a clean error, not a crash.
 same value when the command-line option is omitted. Spill files live in private
 `PGDATA/pgsql_tmp` namespaces keyed by process identity and session/query; startup
 removes namespaces it can verify are abandoned and preserves unknown owners.
+`--sort-arena-limit-bytes BYTES` enables an experimental SBCL arena for each
+`ORDER BY` sort run. The default `-1` disables it; enabled capacities must be at
+least 65536 bytes. `PG_QUERY_SORT_ARENA_LIMIT_BYTES` supplies the value when the
+option is omitted. This requires an SBCL build with recoverable arena exhaustion
+and its default arena extension predicate; unsupported builds reject the option
+at startup. Capacity exhaustion reports SQLSTATE `53200` and follows ordinary
+statement/transaction error handling.
 `--swank-port PORT` optionally opens the Swank listener on `127.0.0.1`; the
 Swank code is loaded in the image by default, but the listener stays off unless
 this option is supplied. `--swank-bind-address ADDR` selects another interface
@@ -238,6 +245,7 @@ cd src/lisp
 ./t/join-streaming.sh    # outer-join results and unordered LIMIT early stop
 ./t/join-ddl-concurrency.sh # atomic JOIN admission against concurrent DROP TABLE
 ./t/spill-crash-recovery.sh # crash cleanup, restart recovery, and temp-file limit
+./t/sort-arena.sh        # bounded sort arenas, transaction recovery, concurrent sorts
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
 ./t/hot-reload.sh         # SIGHUP reloads code in a running server
 ./t/control-repl.sh       # control REPL over TCP + Unix socket, reload, SQL intact
@@ -303,6 +311,25 @@ after its first record reaches disk, then restarts on the same PGDATA and checks
 that startup removes the abandoned query namespace while committed rows remain.
 It also verifies that the configured temporary-file limit rejects a later spill,
 cleans partial files, and leaves the server able to serve another query.
+
+`t/sort-arena.sh` requires arena support and provokes actual arena exhaustion,
+then checks SQLSTATE `53200`, an aborted transaction (`25P02`), rollback, and
+continued use of the same connection. It also runs concurrent external sorts
+whose many runs reuse their own arenas. Unit tests cover owned VARCHAR/BYTEA
+output after arena release and full GC, scalar GC roots, cancellation during
+the allocation-region switch, and cleanup after errors and exhaustion.
+
+Sort arenas currently cover only owned copies of completed `ORDER BY` run
+buffers. Input scanning, expression evaluation, spill/merge I/O, output
+callbacks, top-N sorts, joins, and aggregation use the ordinary GC heap. A run
+is staged under the existing approximate work-memory budget before a single
+batch copy enters its arena; both copies briefly coexist. The arena is reset
+after each spilled run, and in-memory output is copied back onto the heap before
+delivery. Arena storage includes allocator overhead and is capped independently
+of the spill threshold. PostgreSQL C's `tuplesort_begin_batch` likewise uses a
+dedicated tuple memory context; this prototype imposes an additional capacity
+error rather than replacing `work_mem` spilling. It does not provide independent
+backend heaps, a global process memory limit, or recovery from a kernel OOM kill.
 
 `t/spill-oom-cgroup.sh` repeats spill recovery after a real cgroup OOM kill.
 On a systemd host with cgroup v2 memory delegation, run it in a private scope

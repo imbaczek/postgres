@@ -9,6 +9,7 @@
                     "concurrency-tests.lisp"
                     "join-tests.lisp"
                     "spill-tests.lisp"
+                    "arena-tests.lisp"
                     "backend-lifecycle-tests.lisp"
                     "wal-tests.lisp"
                     "protocol-tests.lisp"
@@ -64,6 +65,14 @@
       (test-full-join-spool-spills-typed-bytea-and-match-state)
       (test-query-row-spool-spills-bytea-without-expanded-list)
       (test-query-plan-external-sort-spills-stably)
+      (test-sort-arena-option-parsing)
+      (when (sort-arena-test-supported-p)
+        (test-sort-arena-output-survives-release)
+        (test-sort-arena-is-only-scalar-root)
+        (test-sort-arena-exhaustion-cleans-spills)
+        (test-sort-arena-errors-own-diagnostics)
+        (test-sort-arena-concurrent-capacities)
+        (test-sort-arena-interrupt-after-switch))
       (test-select-row-qualification-before-projection)
       (test-protocol-packet-limits)
       (test-protocol-decoding-enters-live-operation)

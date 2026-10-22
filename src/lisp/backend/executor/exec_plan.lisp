@@ -330,63 +330,86 @@ ROW-CALLBACK."
 
 (defun stream-select-sort (streamer order callback)
   "Sort a stream with bounded in-memory runs and stable external merges."
+  (call-with-query-sort-arena
+   (lambda (arena)
+     (stream-select-sort-with-arena streamer order callback arena))))
+
+(defun stream-select-sort-with-arena (streamer order callback arena)
   (with-query-temp-files ()
                          (let ((buffer '())
                                (buffer-bytes 0)
                                (sequence 0)
                                (runs '())
                                (memory-limit (max 1 *query-work-memory-bytes*)))
-                           (labels ((flush-run ()
+                           (labels ((own-run ()
+                                      ;; Batch region switches: SBCL discards unused TLAB space on
+                                      ;; every exit. Staging and the arena copy briefly coexist.
+                                      (when arena
+                                        (setf buffer
+                                              (call-in-query-sort-arena
+                                               arena (lambda () (copy-query-sort-value buffer))))))
+                                    (flush-run ()
                                       (when buffer
+                                        (own-run)
                                         (push (write-query-sort-run (nreverse buffer) order) runs)
-                                        (setf buffer nil
-                                              buffer-bytes 0)))
+                                        (setf buffer nil buffer-bytes 0)
+                                        (reset-query-sort-arena arena)))
                                     (make-item (row)
                                       (let ((sequence-number sequence))
                                         (incf sequence)
                                         (list :query-sort-item sequence-number
                                               (map 'vector
-                                                   (lambda (entry)
-                                                     (eval-expr (car entry) (cdr row)))
+                                                   (lambda (entry) (eval-expr (car entry) (cdr row)))
                                                    order)
                                               row)))
                                     (emit-run (pathname)
-                                      (with-open-file (stream pathname
-                                                              :direction :input
-                                                              :external-format :utf-8)
+                                      (with-open-file (stream pathname :direction :input
+                                                                       :external-format :utf-8)
                                         (loop for item = (query-spill-read-record stream)
                                               until (eq item +query-spill-eof+)
                                               do (check-for-interrupts)
                                                  (when (eq (funcall callback (fourth item)) :stop)
-                                                   (return-from stream-select-sort :stop))))))
-                             (funcall
-                              streamer
-                              (lambda (row)
-                                (check-for-interrupts)
-                                (let* ((item (make-item row))
-                                       (item-bytes (query-spill-record-size item)))
-                                  (when (and buffer
-                                             (> (+ buffer-bytes item-bytes) memory-limit))
-                                    (flush-run))
-                                  (push item buffer)
-                                  (incf buffer-bytes item-bytes)
-                                  (when (>= buffer-bytes memory-limit)
-                                    (flush-run)))))
-                             (if (null runs)
-                                 (dolist (item
-                                          (stable-sort
-                                           (nreverse buffer)
-                                           (lambda (left right)
-                                             (select-sort-item-less-p left right order))))
-                                   (check-for-interrupts)
-                                   (when (eq (funcall callback (fourth item)) :stop)
-                                     (return-from stream-select-sort :stop)))
-                                 (progn
-                                   (flush-run)
-                                   (setf runs (nreverse runs))
-                                   (loop while (cdr runs)
-                                         do (setf runs (merge-query-sort-run-pass runs order)))
-                                   (emit-run (first runs))))))))
+                                                   (return-from stream-select-sort-with-arena :stop))))))
+                             (unwind-protect
+                                  (progn
+                                    (funcall
+                                     streamer
+                                     (lambda (row)
+                                       (check-for-interrupts)
+                                       (let* ((item (make-item row))
+                                              (item-bytes (query-spill-record-size item)))
+                                         (when (and buffer
+                                                    (> (+ buffer-bytes item-bytes) memory-limit))
+                                           (flush-run))
+                                         (push item buffer)
+                                         (incf buffer-bytes item-bytes)
+                                         (when (>= buffer-bytes memory-limit)
+                                           (flush-run)))))
+                                    (if (null runs)
+                                        (progn
+                                          (own-run)
+                                          (dolist (item
+                                                   (stable-sort
+                                                    (nreverse buffer)
+                                                    (lambda (left right)
+                                                      (select-sort-item-less-p left right order))))
+                                            (check-for-interrupts)
+                                            ;; Consumers, including instrumentation, can retain rows.
+                                            (when (eq (funcall callback
+                                                               (if arena
+                                                                   (copy-query-sort-value (fourth item))
+                                                                   (fourth item)))
+                                                      :stop)
+                                              (return-from stream-select-sort-with-arena :stop))))
+                                        (progn
+                                          (flush-run)
+                                          (setf runs (nreverse runs))
+                                          (loop while (cdr runs)
+                                                do (setf runs (merge-query-sort-run-pass runs order)))
+                                          (emit-run (first runs)))))
+                               ;; This captured cell lives on the heap. Clear it before arena reset
+                               ;; or destruction, including cancellation and downstream errors.
+                               (setf buffer nil))))))
 
 (defun interpret-query-plan (plan registered-relations row-callback)
   "Reference interpreter for physical S-expression plans."
