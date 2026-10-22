@@ -17,6 +17,8 @@ QUERY=
 OOM_CLIENT=
 CGROUP=
 CGROUP_PARENT=
+CGROUP_SUPERVISOR=
+SUPERVISOR_MOVED=0
 ENABLED_MEMORY=0
 CGROUP_CREATED=0
 ANCESTOR_EVENTS="$TMP/ancestor-oom-events"
@@ -47,6 +49,12 @@ cleanup() {
     fi
     if [ "$ENABLED_MEMORY" = 1 ] && [ -n "$CGROUP_PARENT" ]; then
         printf '%s\n' '-memory' > "$CGROUP_PARENT/cgroup.subtree_control" 2>/dev/null || true
+    fi
+    if [ "$SUPERVISOR_MOVED" = 1 ]; then
+        printf '%s\n' "$$" > "$CGROUP_PARENT/cgroup.procs" 2>/dev/null || true
+    fi
+    if [ -n "$CGROUP_SUPERVISOR" ]; then
+        rmdir "$CGROUP_SUPERVISOR" 2>/dev/null || true
     fi
     rm -rf "$TMP"
 }
@@ -95,7 +103,7 @@ else
         *) skip "the current cgroup is outside the mounted cgroup subtree" ;;
     esac
 fi
-CGROUP_PARENT="${CGROUP_MOUNT%/}$CGROUP_RELATIVE"
+CGROUP_PARENT="${CGROUP_MOUNT%/}${CGROUP_RELATIVE%/}"
 [ -r "$CGROUP_PARENT/cgroup.controllers" ] \
     || skip "the current cgroup controller files are not readable"
 grep -qw memory "$CGROUP_PARENT/cgroup.controllers" \
@@ -103,6 +111,20 @@ grep -qw memory "$CGROUP_PARENT/cgroup.controllers" \
 [ -w "$CGROUP_PARENT/cgroup.subtree_control" ] \
     || skip "the current cgroup does not delegate subtree control"
 if ! grep -qw memory "$CGROUP_PARENT/cgroup.subtree_control"; then
+    # Domain controllers require an empty parent. Only move this harness;
+    # never rearrange unrelated processes in a shared scope such as tmux.
+    while IFS= read -r pid; do
+        [ "$pid" = "$$" ] \
+            || skip "the current cgroup is shared; run with systemd-run --user --scope -p Delegate=memory $BASE/t/spill-oom-cgroup.sh"
+    done < "$CGROUP_PARENT/cgroup.procs"
+    CGROUP_SUPERVISOR="$CGROUP_PARENT/pg-lisp-spill-supervisor-$$"
+    if ! mkdir "$CGROUP_SUPERVISOR" 2>/dev/null; then
+        CGROUP_SUPERVISOR=
+        skip "cannot create a delegated supervisor cgroup"
+    fi
+    printf '%s\n' "$$" > "$CGROUP_SUPERVISOR/cgroup.procs" \
+        || skip "cannot move the harness into its supervisor cgroup"
+    SUPERVISOR_MOVED=1
     if printf '%s\n' '+memory' > "$CGROUP_PARENT/cgroup.subtree_control" 2>/dev/null; then
         ENABLED_MEMORY=1
     else
@@ -127,6 +149,12 @@ host_required_kb=$(((MEMORY_MAX + MEMORY_RESERVE + 1023) / 1024))
 : > "$ANCESTOR_EVENTS"
 ancestor=$CGROUP_PARENT
 while :; do
+    # The actual hierarchy root has no memory limit or local event files.
+    # A mounted subtree root still has controls and must be checked below.
+    if [ "$ancestor" = "$CGROUP_MOUNT" ] && [ "$MOUNT_ROOT" = / ] \
+        && [ ! -e "$ancestor/memory.max" ]; then
+        break
+    fi
     [ -r "$ancestor/memory.max" ] \
         && [ -r "$ancestor/memory.current" ] \
         && [ -r "$ancestor/memory.events.local" ] \

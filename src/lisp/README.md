@@ -304,6 +304,24 @@ that startup removes the abandoned query namespace while committed rows remain.
 It also verifies that the configured temporary-file limit rejects a later spill,
 cleans partial files, and leaves the server able to serve another query.
 
+`t/spill-oom-cgroup.sh` repeats spill recovery after a real cgroup OOM kill.
+On a systemd host with cgroup v2 memory delegation, run it in a private scope
+(from `src/lisp`):
+
+```sh
+systemd-run --user --scope -p Delegate=memory ./t/spill-oom-cgroup.sh
+```
+
+The harness moves itself into a supervisor child, enables memory control on
+the empty scope, and places the server in a sibling with a 768 MiB limit,
+swap disabled, and whole-group OOM killing enabled. It verifies OOM counters,
+spill cleanup, and committed rows after restart. It skips when delegation,
+memory controls, or memory headroom are unavailable; a shared scope such as
+tmux must be replaced with the private scope above. `MEMORY_MAX` and
+`MEMORY_RESERVE` override the limit and required spare memory in bytes
+(defaults: 805306368 and 268435456). The host and each visible limited ancestor
+must have at least their sum available.
+
 The Lisp-level `test-vacuum-snapshot-horizon` ports the permanent-table case
 from PostgreSQL's `src/test/isolation/specs/horizons.spec`: an older registered
 snapshot keeps a deleted row and its index TID until VACUUM can safely advance
