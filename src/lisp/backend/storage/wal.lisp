@@ -16,7 +16,11 @@
 (defconstant +wal-record-maintenance+ 9)
 (defconstant +wal-catalog-chunk-header-size+ 8)
 (defconstant +wal-version-v2+ 2)
-(defconstant +wal-version+ 3)
+(defconstant +wal-version-v3+ 3)
+(defconstant +wal-version+ 4)
+
+(defparameter *max-slot-wal-keep-bytes* (* 1024 1024 1024)
+  "Maximum WAL retained by one replication slot at checkpoint; NIL disables the cap.")
 
 (defstruct wal-record
   version type xid start end payload)
@@ -25,7 +29,9 @@
   relfilenode (fork :main) block page (xids '()))
 
 (defstruct wal-replication-slot
-  name restart-lsn consistent-lsn active-owner)
+  name restart-lsn consistent-lsn confirmed-flush-lsn active-owner
+  (pending-xids (make-hash-table :test #'eql))
+  (wal-status :reserved))
 
 (defvar *wal-lock* (sb-thread:make-mutex :name "pg wal and page cache lock"))
 (defvar *wal-page-cache* (make-hash-table :test #'equal))
@@ -71,7 +77,7 @@
                 wal-remove-checkpointed-segments
                 wal-remove-checkpointed-segments-under-wal-lock
                 wal-atomic-write-bytes
-                clog-set clog-reset clog-fsync))
+                clog-get clog-set clog-reset clog-fsync))
 (declaim (notinline pg-class-relfilenode pg-index-relfilenode
                     database-tables database-indexes catalog-databases))
 
@@ -374,8 +380,11 @@
                   (t (< (wal-page-image-block a)
                         (wal-page-image-block b))))))))
 
+(defun wal-page-image-encoded-size (image)
+  (+ 12 +blcksz+ 4 (* 8 (length (wal-page-image-xids image)))))
+
 (defun wal-page-payload-length (images)
-  (+ 4 (* (length images) (+ 12 +blcksz+))))
+  (+ 4 (loop for image in images sum (wal-page-image-encoded-size image))))
 
 (defun wal-encode-page-images (images lsn)
   (let ((payload (make-array (wal-page-payload-length images)
@@ -393,7 +402,14 @@
                    (wal-page-fork-id (wal-page-image-fork image)))
       (wal-set-u32 payload (+ offset 8) (wal-page-image-block image))
       (replace payload (wal-page-image-page image) :start1 (+ offset 12))
-      (incf offset (+ 12 +blcksz+)))
+      (let* ((xids (wal-page-image-xids image))
+             (xid-count-offset (+ offset 12 +blcksz+))
+             (xid-offset (+ xid-count-offset 4)))
+        (wal-set-u32 payload xid-count-offset (length xids))
+        (loop for xid in xids
+              do (wal-set-u64 payload xid-offset xid)
+                 (incf xid-offset 8))
+        (setf offset xid-offset)))
     payload))
 
 (defun wal-decode-page-images (payload lsn &optional (version +wal-version+))
@@ -401,11 +417,8 @@
     (error "WAL page-image record is too short"))
   (let* ((count (wal-u32 payload 0))
          (header-size (if (= version +wal-version-v2+) 8 12))
-         (expected (+ 4 (* count (+ header-size +blcksz+))))
          (offset 4)
          (images '()))
-    (unless (= expected (length payload))
-      (error "WAL page-image record has an invalid length"))
     (loop repeat count
           do (let* ((relfilenode (wal-u32 payload offset))
                     (fork (if (= version +wal-version-v2+)
@@ -414,14 +427,34 @@
                                (wal-u32 payload (+ offset 4)))))
                     (block (wal-u32 payload (+ offset (if (= version +wal-version-v2+) 4 8))))
                     (page-offset (+ offset header-size))
-                    (page (subseq payload page-offset (+ page-offset +blcksz+))))
-               (unless (and (= (page-u64 page +pd-lsn-off+) lsn)
-                            (wal-verify-page page relfilenode block fork))
-                 (error "WAL page image has an invalid LSN or checksum"))
-               (push (make-wal-page-image :relfilenode relfilenode
-                                          :fork fork :block block :page page)
-                     images)
-               (incf offset (+ header-size +blcksz+))))
+                    (page-end (+ page-offset +blcksz+)))
+               (unless (<= page-end (length payload))
+                 (error "WAL page-image record has a truncated page"))
+               (let* ((page (subseq payload page-offset page-end))
+                      (xids nil)
+                      (next-offset page-end))
+                 (when (= version +wal-version+)
+                   (unless (<= (+ next-offset 4) (length payload))
+                     (error "WAL page-image record has a truncated contributor count"))
+                   (let* ((xid-count (wal-u32 payload next-offset))
+                          (xids-start (+ next-offset 4))
+                          (xids-end (+ xids-start (* xid-count 8))))
+                     (unless (<= xids-end (length payload))
+                       (error "WAL page-image record has truncated contributors"))
+                     (setf xids
+                           (loop for xid-offset from xids-start below xids-end by 8
+                                 collect (wal-u64 payload xid-offset))
+                           next-offset xids-end)))
+                 (unless (and (= (page-u64 page +pd-lsn-off+) lsn)
+                              (wal-verify-page page relfilenode block fork))
+                   (error "WAL page image has an invalid LSN or checksum"))
+                 (push (make-wal-page-image :relfilenode relfilenode
+                                            :fork fork :block block :page page
+                                            :xids xids)
+                       images)
+                 (setf offset next-offset))))
+    (unless (= offset (length payload))
+      (error "WAL page-image record has an invalid length"))
     (nreverse images)))
 
 (defun wal-segment-and-offset (lsn)
@@ -541,16 +574,30 @@
       (wal-fail-stop condition))))
 
 (defun wal-append-page-images (images)
-  (loop for start from 0 below (length images)
-        by +wal-max-page-images-per-record+
-        for stop = (min (length images)
-                        (+ start +wal-max-page-images-per-record+))
-        for chunk = (subseq images start stop)
-        for length = (+ +wal-header-size+ (wal-page-payload-length chunk))
-        for lsn = (+ (wal-next-record-start length) length)
-        for payload = (wal-encode-page-images chunk lsn)
-        do (unless (= lsn (wal-append-record +wal-record-pages+ 0 payload))
-             (error "WAL page-image LSN changed while appending")))
+  (labels ((append-chunk (chunk)
+             (let* ((length (+ +wal-header-size+ (wal-page-payload-length chunk)))
+                    (lsn (+ (wal-next-record-start length) length))
+                    (payload (wal-encode-page-images chunk lsn)))
+               (unless (= lsn (wal-append-record +wal-record-pages+ 0 payload))
+                 (error "WAL page-image LSN changed while appending")))))
+    (let ((chunk nil)
+          (chunk-count 0)
+          (chunk-bytes (+ +wal-header-size+ 4)))
+      (dolist (image images)
+        (let ((image-size (wal-page-image-encoded-size image)))
+          (when (> (+ +wal-header-size+ 4 image-size) +wal-segment-size+)
+            (error "WAL page image has too many transaction contributors"))
+          (when (and chunk
+                     (or (>= chunk-count +wal-max-page-images-per-record+)
+                         (> (+ chunk-bytes image-size) +wal-segment-size+)))
+            (append-chunk (nreverse chunk))
+            (setf chunk nil chunk-count 0
+                  chunk-bytes (+ +wal-header-size+ 4)))
+          (push image chunk)
+          (incf chunk-count)
+          (incf chunk-bytes image-size)))
+      (when chunk
+        (append-chunk (nreverse chunk)))))
   images)
 
 (defun wal-append-batch-start ()
@@ -562,6 +609,35 @@
 (defun wal-forget-xid-under-xid-lock (xid)
   "Remove XID's retained WAL position while the caller holds *XID-LOCK*."
   (remhash xid *wal-xid-first-lsn*)
+  (values))
+
+(defun wal-slot-record-xid-batch-under-wal-lock (xid first-lsn)
+  (maphash (lambda (name slot)
+             (declare (ignore name))
+             (unless (eq (wal-replication-slot-wal-status slot) :lost)
+               (let ((pending (wal-replication-slot-pending-xids slot)))
+                 (unless (gethash xid pending)
+                   (setf (gethash xid pending) (cons first-lsn nil))))))
+           *wal-replication-slots*)
+  (values))
+
+(defun wal-slot-seed-active-xids-under-wal-lock (slot active-xids)
+  (sb-thread:with-mutex (*xid-lock*)
+    (dolist (xid active-xids)
+      (let ((first-lsn (gethash xid *wal-xid-first-lsn*)))
+        (when first-lsn
+          (setf (gethash xid (wal-replication-slot-pending-xids slot))
+                (cons first-lsn nil))))))
+  (values))
+
+(defun wal-slot-record-xid-commit-under-wal-lock (xid commit-lsn)
+  (maphash (lambda (name slot)
+             (declare (ignore name))
+             (let ((entry (gethash xid
+                                   (wal-replication-slot-pending-xids slot))))
+               (when entry
+                 (setf (cdr entry) commit-lsn))))
+           *wal-replication-slots*)
   (values))
 
 (defun wal-record-page-xids-at-batch-start (images batch-start-lsn)
@@ -581,9 +657,10 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
           (when (member xid *active-xids* :test #'eql)
             (multiple-value-bind (first-lsn present-p)
                 (gethash xid *wal-xid-first-lsn*)
-              (declare (ignore first-lsn))
               (unless present-p
-                (setf (gethash xid *wal-xid-first-lsn*) batch-start-lsn)))))))
+                (setf first-lsn batch-start-lsn
+                      (gethash xid *wal-xid-first-lsn*) first-lsn))
+              (wal-slot-record-xid-batch-under-wal-lock xid first-lsn))))))
     (values)))
 
 (defun wal-apply-page-images (images &key split-p fault-on-first-write)
@@ -652,9 +729,11 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
       ;; terminal record, so recovery must discard this entire batch.
       (when *wal-output-stream* (finish-output *wal-output-stream*))
       (wal-test-pause :after-page-images)
-      (wal-append-record +wal-record-commit+ xid
-                         (make-array 0 :element-type '(unsigned-byte 8)))
-      (wal-flush)
+      (let ((commit-lsn
+              (wal-append-record +wal-record-commit+ xid
+                                 (make-array 0 :element-type '(unsigned-byte 8)))))
+        (wal-flush)
+        (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn))
       (wal-test-pause :after-wal-flush)
       (funcall after-durable-function)
       (wal-apply-page-images images :split-p split-p
@@ -903,7 +982,10 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
                           +wal-record-catalog-commit+
                           +wal-record-maintenance+))
        (or (/= type +wal-record-maintenance+)
-           (= version +wal-version+))))
+           ;; Maintenance terminals were already emitted by v3. Keep them
+           ;; readable after the v4 page-image extension, as PostgreSQL's
+           ;; version-aware xlogreader must decode WAL written by older servers.
+           (member version (list +wal-version-v3+ +wal-version+)))))
 
 (defun wal-decode-record (bytes expected-lsn)
   (let ((version (and (>= (length bytes) +wal-header-size+)
@@ -913,7 +995,9 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
                  (= (aref bytes 1) (char-code #\G))
                  (= (aref bytes 2) (char-code #\W))
                  (= (aref bytes 3) (char-code #\L))
-                 (member version (list +wal-version-v2+ +wal-version+))
+                 (member version (list +wal-version-v2+
+                                       +wal-version-v3+
+                                       +wal-version+))
                  (= (wal-u32 bytes 8) (length bytes))
                  (= (wal-u64 bytes 12) expected-lsn)
                  (wal-valid-type-p (wal-u16 bytes 6) version))
@@ -945,126 +1029,145 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
   (wal-truncate-tail (wal-segment-path segment) offset)
   (values))
 
-(defun wal-scan (function)
-  "Visit durable records; truncate only tail data beyond the durable LSN."
+(defun wal-read-scan-record (stream segment last-segment offset size)
+  "Read and decode the record at OFFSET, truncating only an unflushed tail."
+  (let* ((record-lsn (+ (* segment +wal-segment-size+) offset))
+         (remaining (- size offset)))
+    (when (< remaining +wal-header-size+)
+      (wal-truncate-unflushed-tail segment last-segment offset record-lsn
+                                   "incomplete WAL header")
+      (return-from wal-read-scan-record (values nil nil)))
+    (file-position stream offset)
+    (let ((header (make-array +wal-header-size+
+                              :element-type '(unsigned-byte 8))))
+      (unless (= (read-sequence header stream) +wal-header-size+)
+        (error "could not read WAL record header"))
+      (let ((record-length (wal-u32 header 8)))
+        (unless (and (>= record-length +wal-header-size+)
+                     (<= record-length +wal-segment-size+)
+                     (<= (+ offset record-length) +wal-segment-size+))
+          (wal-truncate-unflushed-tail segment last-segment offset record-lsn
+                                       "invalid WAL record length")
+          (return-from wal-read-scan-record (values nil nil)))
+        (when (> record-length remaining)
+          (wal-truncate-unflushed-tail segment last-segment offset record-lsn
+                                       "incomplete durable WAL record")
+          (return-from wal-read-scan-record (values nil nil)))
+        (let ((bytes (make-array record-length
+                                 :element-type '(unsigned-byte 8))))
+          (file-position stream offset)
+          (unless (= (read-sequence bytes stream) record-length)
+            (error "could not read WAL record at LSN ~a" record-lsn))
+          (values
+           (handler-case
+               (wal-decode-record bytes record-lsn)
+             (error (condition)
+               (if (and (eql segment last-segment)
+                        (>= record-lsn *wal-durable-lsn*))
+                   (progn
+                     (wal-truncate-tail (wal-segment-path segment) offset)
+                     nil)
+                   (error condition))))
+           record-length))))))
+
+(defun wal-scan-checkpoint-record (record record-lsn scan-from-lsn
+                                   checkpoint-record-start)
+  "Validate checkpoint pointers encountered while scanning from the WAL head."
+  (let ((checkpoint-found nil))
+    (when (and (not scan-from-lsn)
+               (plusp *wal-checkpoint-lsn*)
+               (= record-lsn checkpoint-record-start))
+      (unless (and (= (wal-record-end record) *wal-checkpoint-lsn*)
+                   (= (wal-record-type record) +wal-record-checkpoint+)
+                   (zerop (length (wal-record-payload record))))
+        (error "WAL checkpoint LSN ~a does not point to a valid checkpoint record"
+               *wal-checkpoint-lsn*))
+      (setf checkpoint-found t))
+    (when (and (not scan-from-lsn)
+               (= (wal-record-end record) *wal-checkpoint-lsn*))
+      (unless (= (wal-record-type record) +wal-record-checkpoint+)
+        (error "WAL checkpoint LSN ~a points to a non-checkpoint record"
+               *wal-checkpoint-lsn*))
+      (setf checkpoint-found t))
+    checkpoint-found))
+
+(defun wal-scan-segment (function segment last-segment scan-start-offset end-lsn
+                         scan-from-lsn checkpoint-record-start checkpoint-found)
+  "Visit one segment, preserving WAL tail-truncation and checkpoint checks."
+  (let ((stop-p nil)
+        (checkpoint-found checkpoint-found))
+    (with-open-file (stream (wal-segment-path segment)
+                            :direction :input
+                            :element-type '(unsigned-byte 8))
+      (let ((size (file-length stream))
+            (offset scan-start-offset))
+        (loop while (and (< offset size) (not stop-p))
+              do (multiple-value-bind (record record-length)
+                     (wal-read-scan-record stream segment last-segment offset size)
+                   (unless record (return))
+                   (when (wal-scan-checkpoint-record
+                          record (wal-record-start record) scan-from-lsn
+                          checkpoint-record-start)
+                     (setf checkpoint-found t))
+                   (setf end-lsn (wal-record-end record))
+                   (if (eq (funcall function record) :stop)
+                       (setf stop-p t)
+                       (incf offset record-length))))))
+    (values end-lsn stop-p checkpoint-found)))
+
+(defun wal-scan (function &optional scan-from-lsn)
+  "Visit durable records from the checkpoint or an exact retained LSN.
+FUNCTION may return :STOP to end the scan after the current record.
+
+Stopping at each decoded record mirrors the XLogReadRecord() consumer loop in
+src/backend/access/transam/xlogreader.c."
   (let* ((segments (wal-discover-segments))
          (last-segment (car (last segments)))
          (checkpoint-record-start
            (if (zerop *wal-checkpoint-lsn*)
                0
                (- *wal-checkpoint-lsn* +wal-header-size+)))
-         (checkpoint-segment (floor checkpoint-record-start
-                                    +wal-segment-size+))
-         (checkpoint-offset (mod checkpoint-record-start +wal-segment-size+))
+         (scan-start-lsn (or scan-from-lsn checkpoint-record-start))
+         (scan-start-segment (floor scan-start-lsn +wal-segment-size+))
+         (scan-start-offset (mod scan-start-lsn +wal-segment-size+))
          (scan-segments
-           (if (zerop *wal-checkpoint-lsn*)
+           (if (zerop scan-start-lsn)
                segments
-               (member checkpoint-segment segments)))
-         (end-lsn *wal-checkpoint-lsn*)
-         (checkpoint-found (zerop *wal-checkpoint-lsn*)))
-    (when (and (plusp *wal-checkpoint-lsn*)
+               (member scan-start-segment segments)))
+         (end-lsn scan-start-lsn)
+         (checkpoint-found (or scan-from-lsn (zerop *wal-checkpoint-lsn*)))
+         (stop-p nil))
+    (when (and scan-from-lsn (> scan-from-lsn *wal-durable-lsn*))
+      (error "WAL scan start ~a is past durable WAL ~a"
+             scan-from-lsn *wal-durable-lsn*))
+    (when (and (not scan-from-lsn) (plusp *wal-checkpoint-lsn*)
                (< *wal-checkpoint-lsn* +wal-header-size+))
       (error "WAL checkpoint LSN ~a is invalid" *wal-checkpoint-lsn*))
-    (when (and (zerop *wal-checkpoint-lsn*) segments
+    (when (and (not scan-from-lsn) (zerop *wal-checkpoint-lsn*) segments
                (not (zerop (first segments))))
       (error "WAL segment 0 is missing before the first checkpoint"))
-    (when (and (plusp *wal-checkpoint-lsn*)
+    (when (and (< scan-start-lsn *wal-durable-lsn*)
                (null scan-segments))
-      (error "WAL checkpoint segment ~a is missing"
-             checkpoint-segment))
-    ;; Once the checkpoint control file is durable, WAL before this segment and
-    ;; before the checkpoint record within it is no longer needed for redo.
+      (error "WAL scan start segment ~a is missing" scan-start-segment))
     (loop for (left right) on scan-segments
           while right
           unless (= right (1+ left))
             do (error "missing WAL segment between ~a and ~a" left right))
     (loop for segment in scan-segments
-          do (with-open-file (stream (wal-segment-path segment)
-                                     :direction :input
-                                     :element-type '(unsigned-byte 8))
-               (let ((size (file-length stream))
-                     (offset (if (and (plusp *wal-checkpoint-lsn*)
-                                      (= segment checkpoint-segment))
-                                 checkpoint-offset
-                                 0)))
-                 (loop while (< offset size)
-                       do (let* ((record-lsn (+ (* segment +wal-segment-size+)
-                                                offset))
-                                 (remaining (- size offset)))
-                            (when (< remaining +wal-header-size+)
-                              (wal-truncate-unflushed-tail
-                               segment last-segment offset record-lsn
-                               "incomplete WAL header")
-                              (return))
-                            (file-position stream offset)
-                            (let ((header (make-array +wal-header-size+
-                                                      :element-type '(unsigned-byte 8))))
-                              (unless (= (read-sequence header stream) +wal-header-size+)
-                                (error "could not read WAL record header"))
-                              (let ((record-length (wal-u32 header 8)))
-                                (unless (and (>= record-length +wal-header-size+)
-                                             (<= record-length +wal-segment-size+)
-                                             (<= (+ offset record-length)
-                                                 +wal-segment-size+))
-                                  (wal-truncate-unflushed-tail
-                                   segment last-segment offset record-lsn
-                                   "invalid WAL record length")
-                                  (return))
-                                (when (> record-length remaining)
-                                  (wal-truncate-unflushed-tail
-                                   segment last-segment offset record-lsn
-                                   "incomplete durable WAL record")
-                                  (return))
-                                (let ((bytes (make-array record-length
-                                                         :element-type '(unsigned-byte 8))))
-                                  (file-position stream offset)
-                                  (unless (= (read-sequence bytes stream) record-length)
-                                    (error "could not read WAL record at LSN ~a"
-                                           record-lsn))
-                                  (let ((record
-                                          (handler-case
-                                              (wal-decode-record bytes record-lsn)
-                                            (error (condition)
-                                              (if (and (eql segment last-segment)
-                                                       (>= record-lsn
-                                                           *wal-durable-lsn*))
-                                                  (progn
-                                                    (wal-truncate-tail
-                                                     (wal-segment-path segment)
-                                                     offset)
-                                                    nil)
-                                                  (error condition))))))
-                                    (unless record (return))
-                                    (when (and (plusp *wal-checkpoint-lsn*)
-                                               (= record-lsn
-                                                  checkpoint-record-start))
-                                      (unless (and (= (wal-record-end record)
-                                                      *wal-checkpoint-lsn*)
-                                                   (= (wal-record-type record)
-                                                      +wal-record-checkpoint+)
-                                                   (zerop (length
-                                                           (wal-record-payload
-                                                            record))))
-                                        (error "WAL checkpoint LSN ~a does not point to a valid checkpoint record"
-                                               *wal-checkpoint-lsn*))
-                                      (setf checkpoint-found t))
-                                    (when (= (wal-record-end record)
-                                             *wal-checkpoint-lsn*)
-                                      (unless (= (wal-record-type record)
-                                                 +wal-record-checkpoint+)
-                                        (error "WAL checkpoint LSN ~a points to a non-checkpoint record"
-                                               *wal-checkpoint-lsn*))
-                                      (setf checkpoint-found t))
-                                    (funcall function record)
-                                    (setf end-lsn (wal-record-end record))
-                                    (incf offset record-length))))))))))
-    (unless checkpoint-found
+          while (not stop-p)
+          do (multiple-value-setq (end-lsn stop-p checkpoint-found)
+               (wal-scan-segment
+                function segment last-segment
+                (if (= segment scan-start-segment) scan-start-offset 0)
+                end-lsn scan-from-lsn checkpoint-record-start checkpoint-found)))
+    (unless (or stop-p checkpoint-found)
       (error "WAL checkpoint LSN ~a is not present in retained WAL"
              *wal-checkpoint-lsn*))
-    (when (> *wal-checkpoint-lsn* end-lsn)
+    (when (and (not stop-p) (not scan-from-lsn)
+               (> *wal-checkpoint-lsn* end-lsn))
       (error "WAL checkpoint LSN ~a is past the end of WAL ~a"
              *wal-checkpoint-lsn* end-lsn))
-    (when (> *wal-durable-lsn* end-lsn)
+    (when (and (not stop-p) (> *wal-durable-lsn* end-lsn))
       (error "WAL durable LSN ~a is past the end of WAL ~a"
              *wal-durable-lsn* end-lsn))
     (values end-lsn scan-segments)))
@@ -1210,14 +1313,26 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
 (defun wal-encode-replication-slot (slot)
   (let* ((name (wal-replication-slot-name slot))
          (restart-lsn (wal-replication-slot-restart-lsn slot))
-         (consistent-lsn (wal-replication-slot-consistent-lsn slot)))
+         (consistent-lsn (wal-replication-slot-consistent-lsn slot))
+         (confirmed-flush-lsn
+           (wal-replication-slot-confirmed-flush-lsn slot))
+         (wal-status (wal-replication-slot-wal-status slot)))
     (unless (and (wal-valid-replication-slot-name-p name)
                  (integerp restart-lsn) (<= 0 restart-lsn #xFFFFFFFFFFFFFFFF)
                  (integerp consistent-lsn)
-                 (<= restart-lsn consistent-lsn #xFFFFFFFFFFFFFFFF))
+                 (<= 0 consistent-lsn #xFFFFFFFFFFFFFFFF)
+                 (or (null confirmed-flush-lsn)
+                     (and (integerp confirmed-flush-lsn)
+                          (<= consistent-lsn confirmed-flush-lsn
+                              #xFFFFFFFFFFFFFFFF)
+                          (<= restart-lsn confirmed-flush-lsn)))
+                 (or confirmed-flush-lsn (<= restart-lsn consistent-lsn))
+                 (member wal-status '(:reserved :lost)))
       (error "invalid WAL replication slot state ~s" slot))
-    (let* ((prefix (format nil "PGSLOT1 ~a ~a ~a"
-                           name restart-lsn consistent-lsn))
+    (let* ((prefix (format nil "PGSLOT2 ~a ~a ~a ~a ~a"
+                           name restart-lsn consistent-lsn
+                           (or confirmed-flush-lsn "-")
+                           (string-downcase (symbol-name wal-status))))
            (crc (wal-crc32 (string->bytes prefix))))
       (string->bytes (format nil "~a ~8,'0X~%" prefix crc)))))
 
@@ -1252,26 +1367,55 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
 (defun wal-read-replication-slot (path)
   (with-open-file (stream path :direction :input)
     (let* ((line (read-line stream nil nil))
-           (fields (and line (wal-split-fields line))))
-      (unless (and (= (length fields) 5)
-                   (string= (first fields) "PGSLOT1")
+           (fields (and line (wal-split-fields line)))
+           (legacy-p (and fields (string= (first fields) "PGSLOT1")))
+           (version-ok-p (or legacy-p
+                             (and fields (string= (first fields) "PGSLOT2"))))
+           (expected-count (if legacy-p 5 7)))
+      (unless (and version-ok-p (= (length fields) expected-count)
                    (every (lambda (field) (plusp (length field))) fields)
                    (null (read-line stream nil nil)))
         (error "replication slot file ~a is malformed" path))
       (let* ((name (second fields))
              (restart-lsn (ignore-errors (parse-integer (third fields))))
              (consistent-lsn (ignore-errors (parse-integer (fourth fields))))
-             (crc (ignore-errors (parse-integer (fifth fields) :radix 16)))
-             (prefix (format nil "PGSLOT1 ~a ~a ~a"
-                             name (third fields) (fourth fields)))
+             (confirmed-text (unless legacy-p (fifth fields)))
+             (confirmed-flush-lsn
+               (and confirmed-text (not (string= confirmed-text "-"))
+                    (ignore-errors (parse-integer confirmed-text))))
+             (wal-status (if legacy-p :reserved
+                             (cond ((string= (sixth fields) "reserved") :reserved)
+                                   ((string= (sixth fields) "lost") :lost)
+                                   (t nil))))
+             (crc-field (if legacy-p (fifth fields) (seventh fields)))
+             (crc (ignore-errors (parse-integer crc-field :radix 16)))
+             (prefix (if legacy-p
+                         (format nil "PGSLOT1 ~a ~a ~a"
+                                 name (third fields) (fourth fields))
+                         (format nil "PGSLOT2 ~a ~a ~a ~a ~a"
+                                 name (third fields) (fourth fields)
+                                 confirmed-text (sixth fields))))
              (slot (make-wal-replication-slot
                     :name name :restart-lsn restart-lsn
-                    :consistent-lsn consistent-lsn)))
+                    :consistent-lsn consistent-lsn
+                    :confirmed-flush-lsn confirmed-flush-lsn
+                    :wal-status wal-status)))
         (unless (and (wal-valid-replication-slot-name-p name)
                      (string= name (pathname-name path))
                      restart-lsn consistent-lsn crc
-                     (<= 0 restart-lsn consistent-lsn
-                         *wal-durable-lsn* #xFFFFFFFFFFFFFFFF)
+                     wal-status
+                     (or legacy-p (string= confirmed-text "-")
+                         confirmed-flush-lsn)
+                     (<= 0 restart-lsn *wal-durable-lsn* #xFFFFFFFFFFFFFFFF)
+                     (<= 0 consistent-lsn *wal-durable-lsn*
+                         #xFFFFFFFFFFFFFFFF)
+                     (or (null confirmed-flush-lsn)
+                         (<= consistent-lsn confirmed-flush-lsn
+                             *wal-durable-lsn*))
+                     (or (null confirmed-flush-lsn)
+                         (<= restart-lsn confirmed-flush-lsn))
+                     (or confirmed-flush-lsn
+                         (<= restart-lsn consistent-lsn))
                      (= crc (wal-crc32 (string->bytes prefix))))
           (error "replication slot file ~a is corrupt or outside durable WAL"
                  path))
@@ -1281,7 +1425,8 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
   (let ((restart-lsn (wal-replication-slot-restart-lsn slot)))
     ;; A slot at the current durable end does not require a segment yet. Any
     ;; earlier restart point requires every segment through the durable tail.
-    (when (< restart-lsn *wal-durable-lsn*)
+    (when (and (eq (wal-replication-slot-wal-status slot) :reserved)
+               (< restart-lsn *wal-durable-lsn*))
       (let ((first (floor restart-lsn +wal-segment-size+))
             (last (floor (1- *wal-durable-lsn*) +wal-segment-size+)))
         (loop for segment from first to last
@@ -1289,6 +1434,167 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
                 do (error "WAL required by replication slot ~a is missing segment ~a"
                           (wal-replication-slot-name slot) segment)))))
   slot)
+
+(defun wal-terminal-record-type-p (type)
+  (member type (list +wal-record-commit+ +wal-record-catalog+
+                     +wal-record-catalog-commit+ +wal-record-checkpoint+
+                     +wal-record-maintenance+ +wal-record-clog-reset+)
+          :test #'=))
+
+(defun wal-slot-terminal-ack-p (slot target-lsn)
+  (let ((batch-open nil)
+        (found nil)
+        (scan-from-lsn (or (wal-replication-slot-confirmed-flush-lsn slot)
+                           (wal-replication-slot-consistent-lsn slot)
+                           (wal-replication-slot-restart-lsn slot))))
+    (wal-scan
+     (lambda (record)
+       (case (wal-record-type record)
+         (#.+wal-record-batch-start+
+          (setf batch-open t))
+         (otherwise
+          (when (and batch-open
+                     (wal-terminal-record-type-p (wal-record-type record)))
+            (when (= (wal-record-end record) target-lsn)
+              (setf found t))
+            (setf batch-open nil))))
+       (when (or found (>= (wal-record-end record) target-lsn))
+         :stop))
+     ;; LogicalConfirmReceivedLocation() in src/backend/replication/logical/logical.c
+     ;; advances confirmed_flush monotonically. Validate forward from that point,
+     ;; even when an older in-flight XID keeps restart_lsn behind it.
+     scan-from-lsn)
+    found))
+
+(defun wal-slot-rebuild-progress (slot)
+  "Rebuild pending transaction WAL from retained records after restart."
+  (let ((first-lsns (make-hash-table :test #'eql))
+        (committed (make-hash-table :test #'eql))
+        (legacy-first-lsn nil)
+        (batch-start-lsn nil)
+        (pending (make-hash-table :test #'eql)))
+    (unless (or (eq (wal-replication-slot-wal-status slot) :lost)
+                (and (wal-replication-slot-confirmed-flush-lsn slot)
+                     (>= (wal-replication-slot-confirmed-flush-lsn slot)
+                         *wal-durable-lsn*)))
+      (wal-scan
+       (lambda (record)
+         (case (wal-record-type record)
+           (#.+wal-record-batch-start+
+            (setf batch-start-lsn (wal-record-start record)))
+           (#.+wal-record-pages+
+            (let ((images (wal-decode-page-images
+                           (wal-record-payload record) (wal-record-end record)
+                           (wal-record-version record))))
+              (if (= (wal-record-version record) +wal-version+)
+                  (dolist (image images)
+                    (dolist (xid (wal-page-image-xids image))
+                      (unless (gethash xid first-lsns)
+                        (setf (gethash xid first-lsns) batch-start-lsn))))
+                  (when (and batch-start-lsn
+                             (null legacy-first-lsn))
+                    (setf legacy-first-lsn batch-start-lsn)))))
+           (#.+wal-record-commit+
+            (let* ((xid (wal-record-xid record))
+                   (first-lsn (or (gethash xid first-lsns)
+                                  legacy-first-lsn)))
+              (when (and (plusp xid) first-lsn)
+                (setf (gethash xid committed)
+                      (cons first-lsn (wal-record-end record))))))))
+       (wal-replication-slot-restart-lsn slot))
+      (maphash
+       (lambda (xid entry)
+         (let ((confirmed (wal-replication-slot-confirmed-flush-lsn slot)))
+           (when (or (null confirmed) (> (cdr entry) confirmed))
+             (setf (gethash xid pending) entry))))
+       committed)
+      (setf (wal-replication-slot-pending-xids slot) pending))
+    slot))
+
+(defun wal-slot-pending-after-ack (slot acknowledged-lsn)
+  (let ((pending (make-hash-table :test #'eql)))
+    (maphash (lambda (xid entry)
+               (let ((commit-lsn (cdr entry)))
+                 (unless (or (and commit-lsn (<= commit-lsn acknowledged-lsn))
+                             ;; CLOG stores the aborted state as the two-bit
+                             ;; value 2 (see access/transam/clog.lisp).
+                             (= (clog-get xid) 2))
+                   (setf (gethash xid pending) (cons (car entry) commit-lsn)))))
+             (wal-replication-slot-pending-xids slot))
+    pending))
+
+(defun wal-slot-restart-for-ack (acknowledged-lsn pending)
+  (let ((restart-lsn acknowledged-lsn))
+    (maphash (lambda (xid entry)
+               (declare (ignore xid))
+               (setf restart-lsn (min restart-lsn (car entry))))
+             pending)
+    restart-lsn))
+
+(defun wal-acknowledge-replication-slot (name acknowledged-lsn)
+  "Durably advance a slot after a consumer completes a terminal WAL batch."
+  (unless (and (integerp acknowledged-lsn)
+               (<= 0 acknowledged-lsn #xFFFFFFFFFFFFFFFF))
+    (ereport "22023" "invalid replication slot acknowledgment LSN"))
+  (sb-thread:with-mutex (*wal-lock*)
+    (wal-check-healthy)
+    (let* ((slot (gethash name *wal-replication-slots*))
+           (confirmed (and slot
+                           (wal-replication-slot-confirmed-flush-lsn slot))))
+      (unless slot
+        (ereport "42704" "replication slot \"~a\" does not exist" name))
+      (when (eq (wal-replication-slot-wal-status slot) :lost)
+        (ereport "55000" "replication slot \"~a\" has lost its WAL" name))
+      (when (and (null confirmed)
+                 (wal-replication-slot-active-owner slot))
+        (ereport "55000" "initial replication slot acknowledgment waits for snapshot copy"))
+      (when (and confirmed (< acknowledged-lsn confirmed))
+        (ereport "22023" "replication slot acknowledgment cannot move backwards"))
+      (when (> acknowledged-lsn *wal-durable-lsn*)
+        (ereport "22023" "replication slot acknowledgment is past durable WAL"))
+      (when (= (or confirmed -1) acknowledged-lsn)
+        (return-from wal-acknowledge-replication-slot slot))
+      (unless (or (and (null confirmed)
+                       (= acknowledged-lsn
+                          (wal-replication-slot-consistent-lsn slot)))
+                  (wal-slot-terminal-ack-p slot acknowledged-lsn))
+        (ereport "22023"
+                 "replication slot acknowledgment must name a terminal WAL batch LSN"))
+      (let* ((pending (wal-slot-pending-after-ack slot acknowledged-lsn))
+             (restart-lsn (wal-slot-restart-for-ack acknowledged-lsn pending))
+             (candidate (copy-wal-replication-slot slot)))
+        (setf (wal-replication-slot-confirmed-flush-lsn candidate)
+              acknowledged-lsn
+              (wal-replication-slot-restart-lsn candidate) restart-lsn
+              (wal-replication-slot-pending-xids candidate) pending)
+        ;; Persist first: checkpoint recycling cannot observe the new horizon
+        ;; until the durable slot file records the consumer's acknowledgment.
+        (wal-save-replication-slot candidate)
+        (setf (wal-replication-slot-confirmed-flush-lsn slot) acknowledged-lsn
+              (wal-replication-slot-restart-lsn slot) restart-lsn
+              (wal-replication-slot-pending-xids slot) pending)
+        slot))))
+
+(defun wal-format-lsn (lsn)
+  (format nil "~X/~8,'0X" (ash lsn -32) (logand lsn #xFFFFFFFF)))
+
+(defun wal-replication-slot-rows ()
+  (sb-thread:with-mutex (*wal-lock*)
+    (loop for slot being the hash-values of *wal-replication-slots*
+          collect
+          (vector (wal-replication-slot-name slot)
+                  (if (wal-replication-slot-active-owner slot) t nil)
+                  (wal-format-lsn (wal-replication-slot-restart-lsn slot))
+                  (if (wal-replication-slot-confirmed-flush-lsn slot)
+                      (wal-format-lsn
+                       (wal-replication-slot-confirmed-flush-lsn slot))
+                      +null+)
+                  (if (eq (wal-replication-slot-wal-status slot) :lost)
+                      0
+                      (max 0 (- *wal-durable-lsn*
+                                (wal-replication-slot-restart-lsn slot))))
+                  (string-downcase
+                   (symbol-name (wal-replication-slot-wal-status slot)))))))
 
 (defun wal-load-replication-slots ()
   "Load durable WAL restart points before any checkpoint can recycle WAL."
@@ -1302,7 +1608,11 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
         (when (gethash name *wal-replication-slots*)
           (error "duplicate WAL replication slot ~a" name))
         (wal-validate-replication-slot-wal slot segments)
-        (setf (gethash name *wal-replication-slots*) slot))))
+        (setf (gethash name *wal-replication-slots*) slot)))
+    (maphash (lambda (name slot)
+               (declare (ignore name))
+               (wal-slot-rebuild-progress slot))
+             *wal-replication-slots*))
   (values))
 
 (defun wal-drop-replication-slot (name)
@@ -1547,13 +1857,38 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
     (wal-remove-checkpointed-segments-under-wal-lock checkpoint-lsn))
   (values))
 
+(defun wal-invalidate-lagging-replication-slots-under-wal-lock ()
+  "Persistently invalidate over-limit slots before removing their WAL pin."
+  (when (integerp *max-slot-wal-keep-bytes*)
+    (maphash
+     (lambda (name slot)
+       (declare (ignore name))
+       (when (and (eq (wal-replication-slot-wal-status slot) :reserved)
+                  (> (- *wal-durable-lsn*
+                        (wal-replication-slot-restart-lsn slot))
+                     *max-slot-wal-keep-bytes*))
+         (let ((candidate (copy-wal-replication-slot slot)))
+           (setf (wal-replication-slot-wal-status candidate) :lost
+                 (wal-replication-slot-pending-xids candidate)
+                 (make-hash-table :test #'eql))
+           ;; Save before clearing the live pin. A failure aborts recycling.
+           (wal-save-replication-slot candidate)
+           (setf (wal-replication-slot-wal-status slot) :lost
+                 (wal-replication-slot-pending-xids slot)
+                 (wal-replication-slot-pending-xids candidate)))))
+     *wal-replication-slots*))
+  (values))
+
 (defun wal-remove-checkpointed-segments-under-wal-lock (checkpoint-lsn)
   "Recycle WAL while preserving active XID, snapshot, and slot restart points.
 
 The caller holds *WAL-LOCK*. The checkpoint path also holds *WRITE-LOCK*, so a
 snapshot boundary cannot capture an active XID while its required segment is
 being removed. XID completion can race with recycling; reading the retention
-map under *XID-LOCK* makes that race conservative and safe."
+map under *XID-LOCK* makes that race conservative and safe. Lagging slots are
+durably invalidated here when they exceed max-slot-wal-keep-bytes, matching
+PostgreSQL's checkpoint-time invalidation policy."
+  (wal-invalidate-lagging-replication-slots-under-wal-lock)
   (let* ((checkpoint-segment (if (zerop checkpoint-lsn)
                                  0
                                  (floor (1- checkpoint-lsn)
@@ -1569,9 +1904,12 @@ map under *XID-LOCK* makes that race conservative and safe."
                      of *wal-snapshot-retention-pins*
                    minimize lsn)))
          (oldest-slot-restart-lsn
-           (when (plusp (hash-table-count *wal-replication-slots*))
-             (loop for slot being the hash-values of *wal-replication-slots*
-                   minimize (wal-replication-slot-restart-lsn slot))))
+           (let ((positions
+                   (loop for slot being the hash-values of *wal-replication-slots*
+                         when (eq (wal-replication-slot-wal-status slot) :reserved)
+                           collect
+                           (wal-replication-slot-restart-lsn slot))))
+             (and positions (reduce #'min positions))))
          (oldest-retained-lsn
            (let ((positions
                    (remove nil (list oldest-active-first-lsn

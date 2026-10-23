@@ -60,6 +60,238 @@
                  (error () t))
                (car case))))))
 
+(defun wal-test-encode-versioned-record (type xid start payload version)
+  (let ((record (wal-encode-record type xid start payload)))
+    (wal-set-u16 record 4 version)
+    (wal-set-u32 record 28 0)
+    (wal-set-u32 record 28 (wal-crc32 record))
+    record))
+
+(defun test-wal-v3-maintenance-record-replay ()
+  ;; WAL v3 already used maintenance terminals; v4 only extends page images.
+  ;; Exercise complete headers, checksums, decoding, and terminal replay, like
+  ;; PostgreSQL's xlogreader/recovery path must do across a format upgrade.
+  (let* ((*wal-checkpoint-lsn* 0)
+         (*wal-recovery-group-active* nil)
+         (*wal-recovery-page-images* '())
+         (*wal-recovery-catalog-chunks* '())
+         (*wal-recovery-catalog-chunk-count* nil)
+         (*wal-recovery-catalog-next-chunk* 0)
+         (empty (make-array 0 :element-type '(unsigned-byte 8)))
+         (batch-bytes
+           (wal-test-encode-versioned-record
+            +wal-record-batch-start+ 0 0 empty +wal-version-v3+))
+         (terminal-bytes
+           (wal-test-encode-versioned-record
+            +wal-record-maintenance+ 0 +wal-header-size+ empty +wal-version-v3+))
+         (batch (wal-decode-record batch-bytes 0))
+         (terminal
+           (wal-decode-record terminal-bytes +wal-header-size+)))
+    (wal-replay-record batch)
+    (wal-replay-record terminal)
+    (check (and (= (wal-record-version terminal) +wal-version-v3+)
+                (= (wal-record-type terminal) +wal-record-maintenance+)
+                (not *wal-recovery-group-active*))
+           "recovery decodes and replays a complete v3 maintenance terminal")))
+
+(defun test-wal-page-image-xid-codec-compatibility ()
+  (let* ((lsn 4096)
+         (page (page-init (make-page)))
+         (image (make-wal-page-image :relfilenode 7310 :block 3 :page page
+                                     :xids '(7201 7202)))
+         (payload (wal-encode-page-images (list image) lsn))
+         (decoded (first (wal-decode-page-images payload lsn +wal-version+)))
+         (no-xid-image (make-wal-page-image
+                        :relfilenode 7311 :block 4 :page (page-init (make-page))))
+         (one-xid-image (make-wal-page-image
+                         :relfilenode 7312 :block 5 :page (page-init (make-page))
+                         :xids '(7203)))
+         (multi-payload
+           (wal-encode-page-images (list image no-xid-image one-xid-image) lsn))
+         (multi-decoded
+           (wal-decode-page-images multi-payload lsn +wal-version+))
+         (legacy-v3 (make-array (+ 4 12 +blcksz+)
+                                :element-type '(unsigned-byte 8)
+                                :initial-element 0))
+         (legacy-v2 (make-array (+ 4 8 +blcksz+)
+                                :element-type '(unsigned-byte 8)
+                                :initial-element 0)))
+    (check (equal (wal-page-image-xids decoded) '(7201 7202))
+           "WAL v4 page images retain transaction contributors")
+    (check (= (length payload) (+ 4 12 +blcksz+ 4 (* 8 2)))
+           "WAL v4 page-image length includes variable contributor data")
+    (check (equal (mapcar #'wal-page-image-xids multi-decoded)
+                  '((7201 7202) nil (7203)))
+           "WAL v4 multi-page records retain each image's contributor list")
+    (wal-set-u32 legacy-v3 0 1)
+    (wal-set-u32 legacy-v3 4 7310)
+    (wal-set-u32 legacy-v3 8 0)
+    (wal-set-u32 legacy-v3 12 3)
+    (replace legacy-v3 page :start1 16)
+    (wal-set-u32 legacy-v2 0 1)
+    (wal-set-u32 legacy-v2 4 7310)
+    (wal-set-u32 legacy-v2 8 3)
+    (replace legacy-v2 page :start1 12)
+    (check (null (wal-page-image-xids
+                  (first (wal-decode-page-images legacy-v3 lsn +wal-version-v3+))))
+           "WAL v3 page images remain readable without contributor metadata")
+    (check (null (wal-page-image-xids
+                  (first (wal-decode-page-images legacy-v2 lsn +wal-version-v2+))))
+           "WAL v2 page images remain readable without fork metadata")))
+
+(defun wal-test-append-committed-xid-batch (xid &optional (contributors (list xid)))
+  (let* ((batch-start (wal-append-batch-start))
+         (page (page-init (make-page)))
+         (image (make-wal-page-image :relfilenode (+ 7400 xid) :block 0
+                                     :page page :xids contributors)))
+    (dolist (contributor contributors)
+      (wal-slot-record-xid-batch-under-wal-lock contributor batch-start))
+    (wal-append-page-images (list image))
+    (let ((commit-end
+            (wal-append-record +wal-record-commit+ xid
+                               (make-array 0 :element-type '(unsigned-byte 8)))))
+      (wal-slot-record-xid-commit-under-wal-lock xid commit-end)
+      (values batch-start commit-end))))
+
+(defun test-wal-replication-slot-acknowledgment-progress ()
+  (let* ((test-pgdata (merge-pathnames "wal-slot-ack-test/" *pgdata*))
+         (*pgdata* test-pgdata)
+         (*wal-end-lsn* 0)
+         (*wal-checkpoint-lsn* 0)
+         (*wal-durable-lsn* 0)
+         (*wal-output-stream* nil)
+         (*wal-output-segment* nil)
+         (*wal-new-segments* '())
+         (*wal-poisoned* nil)
+         (*wal-ready* t)
+         (*max-slot-wal-keep-bytes* nil)
+         (*clog-stream* nil)
+         (*active-xids* '(7201 7202))
+         (*wal-replication-slots* (make-hash-table :test #'equal))
+         (original-scan (symbol-function 'wal-scan))
+         (scan-starts '())
+         (slot (make-wal-replication-slot :name "ack_slot"
+                                          :restart-lsn 0 :consistent-lsn 0))
+         (first-start nil)
+         (first-end nil)
+         (second-end nil))
+    (wal-ensure-directory-durable *pgdata*)
+    (wal-ensure-directory-durable (merge-pathnames "global/" *pgdata*))
+    (wal-ensure-directory-durable (wal-directory))
+    (wal-ensure-directory-durable (wal-replication-slot-directory))
+    (setf (gethash "ack_slot" *wal-replication-slots*) slot)
+    (wal-save-replication-slot slot)
+    (setf (symbol-function 'wal-scan)
+          (lambda (function &optional scan-from-lsn)
+            (push scan-from-lsn scan-starts)
+            (funcall original-scan function scan-from-lsn)))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (start end)
+               (wal-test-append-committed-xid-batch 7201 '(7201 7202))
+             (check (zerop start) "first transaction starts at retained WAL origin")
+             (setf first-start start first-end end))
+           (wal-flush)
+           (check (handler-case
+                      (progn
+                        (wal-acknowledge-replication-slot "ack_slot"
+                                                          (1- first-end))
+                        nil)
+                    (error () t))
+                  "slot acknowledgment rejects an LSN inside a WAL record")
+           (wal-acknowledge-replication-slot "ack_slot" first-end)
+           (check (and (= (wal-replication-slot-confirmed-flush-lsn slot) first-end)
+                       (= (wal-replication-slot-restart-lsn slot) first-start))
+                  "slot acknowledgment advances while an older transaction pins WAL")
+           (multiple-value-bind (start end)
+               (wal-test-append-committed-xid-batch 7202)
+             (declare (ignore start))
+             (setf second-end end))
+           (wal-flush)
+           (let ((record-ends '())
+                 (scanned-end nil))
+             (setf scanned-end
+                   (wal-scan (lambda (record)
+                               (push (wal-record-end record) record-ends)
+                               (when (= (wal-record-end record) first-end)
+                                 :stop))
+                             first-start)
+                   record-ends (nreverse record-ends))
+             (check (= scanned-end first-end)
+                    "WAL scan returns the target LSN after an early stop")
+             (check (= (car (last record-ends)) first-end)
+                    "WAL scan does not visit records after its stop boundary"))
+           (setf *wal-replication-slots* (make-hash-table :test #'equal))
+           (wal-load-replication-slots)
+           (setf slot (gethash "ack_slot" *wal-replication-slots*))
+           (check (and (= (wal-replication-slot-confirmed-flush-lsn slot) first-end)
+                       (equal (gethash 7202
+                                       (wal-replication-slot-pending-xids slot))
+                              (cons first-start second-end)))
+                  "startup rebuilds unacknowledged transaction progress from v4 WAL")
+           (check (and (= (wal-replication-slot-confirmed-flush-lsn slot) first-end)
+                       (= (wal-replication-slot-restart-lsn slot) first-start))
+                  "an older active transaction pins restart WAL behind confirmed progress")
+           (check (handler-case
+                      (progn
+                        (wal-acknowledge-replication-slot "ack_slot"
+                                                          (1- first-end))
+                        nil)
+                    (error () t))
+                  "slot acknowledgment cannot move backwards")
+           (setf scan-starts '())
+           (wal-acknowledge-replication-slot "ack_slot" second-end)
+           (check (and (= (wal-replication-slot-confirmed-flush-lsn slot) second-end)
+                       (= (wal-replication-slot-restart-lsn slot) second-end)
+                       (zerop (hash-table-count
+                               (wal-replication-slot-pending-xids slot))))
+                  "acknowledging the next batch releases its transaction WAL pin")
+           (check (equal scan-starts (list first-end))
+                  "slot acknowledgment scans forward from confirmed progress"))
+      (when *wal-output-stream*
+        (ignore-errors (close *wal-output-stream*)))
+      (setf (symbol-function 'wal-scan) original-scan)
+      (ignore-errors
+       (uiop:delete-directory-tree test-pgdata :validate t
+                                               :if-does-not-exist :ignore)))))
+
+(defun test-wal-replication-slot-retention-cap-invalidates-pin ()
+  (let* ((test-pgdata (merge-pathnames "wal-slot-retention-cap-test/" *pgdata*))
+         (*pgdata* test-pgdata)
+         (*wal-durable-lsn* (+ (* 2 +wal-segment-size+) 100))
+         (*wal-poisoned* nil)
+         (*max-slot-wal-keep-bytes* 32)
+         (*wal-replication-slots* (make-hash-table :test #'equal))
+         (slot (make-wal-replication-slot :name "lag_slot" :restart-lsn 0
+                                          :consistent-lsn *wal-durable-lsn*)))
+    (wal-ensure-directory-durable *pgdata*)
+    (wal-ensure-directory-durable (wal-directory))
+    (wal-ensure-directory-durable (wal-replication-slot-directory))
+    (unwind-protect
+         (progn
+           (dolist (segment '(0 1 2))
+             (with-open-file (stream (wal-segment-path segment)
+                                     :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede
+                                     :if-does-not-exist :create)
+               (write-byte 0 stream)))
+           (setf (gethash "lag_slot" *wal-replication-slots*) slot)
+           (wal-save-replication-slot slot)
+           (wal-remove-checkpointed-segments *wal-durable-lsn*)
+           (let ((row (first (wal-replication-slot-rows))))
+             (check (and (eq (wal-replication-slot-wal-status slot) :lost)
+                         (equal (aref row 5) "lost")
+                         (zerop (aref row 4)))
+                    "over-limit slot is invalidated and reports released retention"))
+           (check (and (not (probe-file (wal-segment-path 0)))
+                       (not (probe-file (wal-segment-path 1)))
+                       (probe-file (wal-segment-path 2)))
+                  "checkpoint releases old WAL after persisting slot invalidation"))
+      (ignore-errors
+       (uiop:delete-directory-tree test-pgdata :validate t
+                                               :if-does-not-exist :ignore)))))
+
 (defun test-wal-snapshot-boundary-retains-active-xid-pages ()
   (let* ((*backend* (make-backend :xid 4101))
          (*next-xid* 5000)
@@ -583,6 +815,9 @@
            (check (and (probe-file (wal-replication-slot-path "copy_slot"))
                        (eq slot (gethash "copy_slot" *wal-replication-slots*)))
                   "slot reserves a WAL pin and finishes durable publication")
+           ;; This fixture has no transaction records, so acknowledge its
+           ;; consistent point before exercising startup metadata loading.
+           (wal-acknowledge-replication-slot "copy_slot" boundary-lsn)
            ;; A restart reconstructs slot pins from durable metadata before
            ;; checkpoint recycling is allowed to run.
            (setf *wal-replication-slots* (make-hash-table :test #'equal))
@@ -768,11 +1003,14 @@
         (capture-held-gate nil)
         (publish-held-gate nil)
         (publish-saw-active-pin nil)
+        (ack-called nil)
+        (ack-after-snapshot-release nil)
         (original-prepare
           (symbol-function 'prepare-xid-wraparound-for-statement))
         (original-wait (symbol-function 'condition-wait-with-timeout))
         (original-publish
-          (symbol-function 'wal-publish-captured-replication-slot)))
+          (symbol-function 'wal-publish-captured-replication-slot))
+        (original-ack (symbol-function 'wal-acknowledge-replication-slot)))
     (unwind-protect
          (progn
            ;; Model a coordinator arriving immediately after the preflight
@@ -801,7 +1039,8 @@
                               (not *xid-wrap-pending*)))))
            (setf (symbol-function 'wal-publish-captured-replication-slot)
                  (lambda (name boundary-lsn restart-lsn registration
-                          &optional active-owner)
+                          &optional active-owner active-xids)
+                   (declare (ignore active-xids))
                    (setf publish-held-gate
                          (sb-thread:holding-mutex-p *xid-wrap-lock*)
                          publish-saw-active-pin
@@ -812,6 +1051,14 @@
                    (make-wal-replication-slot
                     :name name :consistent-lsn boundary-lsn
                     :restart-lsn restart-lsn :active-owner active-owner)))
+           (setf (symbol-function 'wal-acknowledge-replication-slot)
+                 (lambda (name acknowledged-lsn)
+                   (declare (ignore name))
+                   (setf ack-called t
+                         ack-after-snapshot-release
+                         (and (= acknowledged-lsn 1000)
+                              (eq (backend-state *backend*) :idle)
+                              (zerop *active-snapshots*)))))
            (with-exported-snapshot (snapshot start-lsn
                                              :slot-name "race_copy")
              (check (and (eq snapshot
@@ -824,6 +1071,8 @@
                   "snapshot registration occurs while wraparound admission is locked")
            (check (and publish-saw-active-pin (not publish-held-gate))
                   "slot publication follows gate release while the snapshot pins WAL")
+           (check (and ack-called ack-after-snapshot-release)
+                  "initial-copy acknowledgment follows commit and snapshot release")
            (check (and (eq (backend-state *backend*) :idle)
                        (zerop *active-snapshots*)
                        (zerop *schema-read-lock-count*)
@@ -833,7 +1082,8 @@
             original-prepare
             (symbol-function 'condition-wait-with-timeout) original-wait
             (symbol-function 'wal-publish-captured-replication-slot)
-            original-publish)
+            original-publish
+            (symbol-function 'wal-acknowledge-replication-slot) original-ack)
       (when (not (eq (backend-state *backend*) :idle))
         (ignore-errors (abort-transaction))))))
 

@@ -101,6 +101,41 @@
                   '(:null))
            "ordered LIMIT follows DESC NULL ordering")))
 
+(defun test-replication-slots-catalog-view ()
+  (let* ((*backend* (make-backend))
+         (*wal-replication-slots* (make-hash-table :test #'equal))
+         (*wal-durable-lsn* 4096)
+         (slot (make-wal-replication-slot
+                :name "view_slot" :restart-lsn 1024 :consistent-lsn 2048
+                :confirmed-flush-lsn 3072 :active-owner (gensym "OWNER-")
+                :wal-status :reserved))
+         (ast (first (parse-statements
+                      "SELECT * FROM pg_catalog.pg_replication_slots")))
+         (plan (plan-select-query ast))
+         (relations (getf (query-plan-prepared plan) :relations))
+         (rows '()))
+    (setf (gethash "view_slot" *wal-replication-slots*) slot)
+    (with-registered-select-relations (registered relations)
+      (execute-query-plan plan registered
+                          (lambda (row) (push row rows))))
+    (setf rows (nreverse rows))
+    (check (= (length rows) 1)
+           "pg_catalog.pg_replication_slots returns live slot rows")
+    (when rows
+      (let ((values (caar rows)))
+        (check (equal (aref values 0) "view_slot")
+               "replication-slot view exposes the slot name")
+        (check (eq (aref values 1) t)
+               "replication-slot view exposes active state")
+        (check (equal (aref values 2) "0/00000400")
+               "replication-slot view formats restart LSN")
+        (check (equal (aref values 3) "0/00000C00")
+               "replication-slot view formats confirmed flush LSN")
+        (check (= (aref values 4) 3072)
+               "replication-slot view reports retained WAL bytes")
+        (check (equal (aref values 5) "reserved")
+               "replication-slot view reports WAL status")))))
+
 (defun test-using-join-output-metadata ()
   (let* ((left (make-select-column
                 :name "k" :expr '(:col 1 :type :varchar :typmod 9
@@ -342,6 +377,158 @@
     (check (equal (caar order) group-ref)
            "ORDER BY accepts duplicate output names for the same expression")))
 
+(defun test-analyze-parser-and-costed-join-order ()
+  (check (equal (first (parse-statements "ANALYZE events"))
+                '(:type :analyze :table "events"))
+         "ANALYZE parses as a table statistics command")
+  (check (and (catalog-change-p (first (parse-statements "ANALYZE events")))
+              (not (ddl-p (first (parse-statements "ANALYZE events")))))
+         "ANALYZE is non-transactional catalog work, not schema DDL")
+  (let* ((column-a (make-pg-column :name "id" :type :int4 :typmod -1
+                                   :attnum 1 :notnull nil))
+         (column-b (make-pg-column :name "id" :type :int4 :typmod -1
+                                   :attnum 1 :notnull nil))
+         (table-a (make-pg-class
+                   :oid 93001 :name "a" :relfilenode 93011
+                   :columns (vector column-a) :indexes '(93021)
+                   :statistics
+                   (make-pg-table-statistics
+                    :row-count 100000 :sample-count 1
+                    :columns (vector (make-pg-column-statistics
+                                      :null-fraction 0.0d0
+                                      :distinct-count 100000
+                                      :most-common-values nil)))))
+         (table-b (make-pg-class
+                   :oid 93002 :name "b" :relfilenode 93012
+                   :columns (vector column-b) :indexes nil
+                   :statistics
+                   (make-pg-table-statistics
+                    :row-count 100 :sample-count 1
+                    :columns (vector (make-pg-column-statistics
+                                      :null-fraction 0.0d0
+                                      :distinct-count 100
+                                      :most-common-values nil)))))
+         (index-a (make-pg-index :oid 93021 :name "a_id_idx"
+                                 :relfilenode 93031 :table-oid 93001
+                                 :columns '(1) :valid-p t))
+         (original-resolver (symbol-function 'select-table-or-error))
+         (original-indexes (symbol-function 'table-indexes))
+         (original-buf-nblocks (symbol-function 'buf-nblocks)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'select-table-or-error)
+                 (lambda (name)
+                   (cond ((string= name "a") table-a)
+                         ((string= name "b") table-b)
+                         (t (error "unexpected test relation ~a" name))))
+                 (symbol-function 'table-indexes)
+                 (lambda (table)
+                   (if (eq table table-a) (list index-a) nil))
+                 (symbol-function 'buf-nblocks)
+                 (lambda (relfilenode)
+                   (case relfilenode
+                     (93011 1000) (93012 10) (93031 2) (t 1))))
+           (let* ((plan (plan-select-query
+                         (first (parse-statements
+                                 "SELECT a.id FROM a JOIN b ON a.id = b.id"))))
+                  (prepared (query-plan-prepared plan))
+                  (relations (getf prepared :relations))
+                  (path-a (getf (first relations) :path))
+                  (path-b (getf (second relations) :path)))
+             (check (equal (getf prepared :join-order) '(1 0))
+                    "greedy INNER join planning starts with the smaller relation")
+             (check (eq (select-scan-path-kind path-b) :seq-scan)
+                    "cheapest base input uses a sequential scan")
+             (check (and (eq (select-scan-path-kind path-a) :index-scan)
+                         (equal (select-scan-path-parameter-expr path-a)
+                                '(:col 2 :type :int4 :typmod -1 :notnull nil
+                                  :table-oid 93002 :attnum 1)))
+                    "join planner chooses an indexed inner path keyed by outer Var")
+             (check (find-if (lambda (node)
+                               (and (eq (first node) :index-scan)
+                                    (= (second node) 0)
+                                    (seventh node)))
+                             (collect-query-plan-nodes
+                              (query-plan-physical plan)))
+                    "physical plan retains the parameter expression for execution")))
+      (setf (symbol-function 'select-table-or-error) original-resolver
+            (symbol-function 'table-indexes) original-indexes
+            (symbol-function 'buf-nblocks) original-buf-nblocks))))
+
+(defun test-parameterized-join-streaming-and-reordered-slots ()
+  (let ((rows '()))
+    (stream-select-indexed-join-environments
+     (lambda (callback)
+       (dolist (left (list #(10) #(20)))
+         (funcall callback left)))
+     (lambda (outer callback)
+       (when (= (aref outer 0) 10)
+         (funcall callback #(100))))
+     (list :type :left :qual '(:bool t) :left-width 1 :right-width 1)
+     (lambda (environment) (push environment rows)))
+    (check (equalp (nreverse rows) (list #(10 100) (vector 20 +null+)))
+           "parameterized LEFT join emits matches and null-extends misses"))
+  (check (equalp
+          (combine-select-join-environment
+           #(10 +null+ 30) #(20)
+           (list :reordered t :right-offset 1))
+          #(10 20 30))
+         "greedy join execution writes rows into source-order Var slots"))
+
+(defun test-query-plan-index-lock-order ()
+  (let* ((table-high (make-pg-class :oid 93011 :name "high" :relfilenode 93011
+                                    :columns #()))
+         (table-low (make-pg-class :oid 93012 :name "low" :relfilenode 93012
+                                   :columns #()))
+         (index-high (make-pg-index :oid 93021 :relfilenode 202
+                                    :table-oid 93011 :columns '(1)))
+         (index-low (make-pg-index :oid 93022 :relfilenode 101
+                                   :table-oid 93012 :columns '(1)))
+         (relations
+           (list (list :table table-high
+                       :path (make-select-scan-path :kind :index-scan
+                                                    :index index-high))
+                 (list :table table-low
+                       :path (make-select-scan-path :kind :index-scan
+                                                    :index index-low))))
+         (plan
+           (%make-query-plan
+            :physical
+            (list :nested-loop-join
+                  (list :type :inner)
+                  (list :index-scan 0 93011 93021 '(:bool t :type :bool) #(1))
+                  (list :index-scan 1 93012 93022 '(:bool t :type :bool) #(1)))))
+         (original-ensure (symbol-function 'btree-ensure-init-before-read))
+         (original-locks (symbol-function 'call-with-btree-relation-read-locks))
+         (original-backend-entry (symbol-function 'query-plan-backend-entry))
+         (locked-relfilenodes nil)
+         (executor-ran-under-locks-p nil))
+    (unwind-protect
+         (progn
+           (check (equal (query-plan-index-relfilenodes plan relations) '(101 202))
+                  "nested IndexScans resolve to sorted, deduplicated relation IDs")
+           (setf (symbol-function 'btree-ensure-init-before-read)
+                 (lambda (relfilenode) (declare (ignore relfilenode)) (values))
+                 (symbol-function 'call-with-btree-relation-read-locks)
+                 (lambda (relfilenodes function)
+                   (setf locked-relfilenodes relfilenodes)
+                   (funcall function))
+                 (symbol-function 'query-plan-backend-entry)
+                 (lambda (backend)
+                   (declare (ignore backend))
+                   (make-query-plan-backend
+                    :executor
+                    (lambda (query registered callback)
+                      (declare (ignore query registered callback))
+                      (setf executor-ran-under-locks-p
+                            (equal locked-relfilenodes '(101 202)))))))
+           (execute-query-plan plan relations nil :backend :lock-order-test)
+           (check executor-ran-under-locks-p
+                  "executor starts only after the full sorted index read-lock set"))
+      (setf (symbol-function 'btree-ensure-init-before-read) original-ensure
+            (symbol-function 'call-with-btree-relation-read-locks) original-locks
+            (symbol-function 'query-plan-backend-entry) original-backend-entry))))
+
 (defun test-index-scan-limit-stops-duplicate-candidates ()
   (let* ((table (make-pg-class :oid 91011 :name "limit_index_test"
                                :relfilenode 91012 :columns #()))
@@ -361,19 +548,27 @@
                                       (list :filter '(:bool t :type :bool)
                                             scan-node)))))
          (registered (list (list :table table :path path)))
-         (original-search (symbol-function 'btree-search))
+         (original-btree-scan (symbol-function 'btree-scan-equal))
          (original-get-tuple (symbol-function 'heapam-get-tuple))
          (original-visible (symbol-function 'htup-visible-p))
+         (scan-calls 0)
+         (candidate-visits 0)
+         (heap-visits 0)
          (seen 0))
     (unwind-protect
          (progn
-           (setf (symbol-function 'btree-search)
-                 (lambda (relfilenode key)
+           (setf (symbol-function 'btree-scan-equal)
+                 (lambda (relfilenode key callback)
                    (declare (ignore relfilenode key))
-                   '((0 . 1) (0 . 2) (0 . 3)))
+                   (incf scan-calls)
+                   (loop for tid in '((0 . 1) (0 . 2) (0 . 3))
+                         do (incf candidate-visits)
+                            (when (eq (funcall callback tid) :stop)
+                              (return :stop))))
                  (symbol-function 'heapam-get-tuple)
                  (lambda (relfilenode block offnum columns)
                    (declare (ignore relfilenode block columns))
+                   (incf heap-visits)
                    (make-htup :values (vector offnum)))
                  (symbol-function 'htup-visible-p)
                  (lambda (tuple snapshot)
@@ -382,9 +577,10 @@
            (interpret-query-plan
             plan registered
             (lambda (row) (declare (ignore row)) (incf seen)))
-           (check (= seen 1)
-                  "LIMIT stops an index scan after its first duplicate-key candidate"))
-      (setf (symbol-function 'btree-search) original-search
+           (check (and (= seen 1) (= heap-visits 1)
+                       (= candidate-visits 1) (= scan-calls 1))
+                  "LIMIT stops a duplicate-key cursor after its first candidate"))
+      (setf (symbol-function 'btree-scan-equal) original-btree-scan
             (symbol-function 'heapam-get-tuple) original-get-tuple
             (symbol-function 'htup-visible-p) original-visible))
     (let* ((logical-scan

@@ -150,7 +150,7 @@ if ! cmp -s "$TMP/expected.out" "$TMP/results.out"; then
 fi
 
 counter_output=$(control <<'EOF'
-(if (and (= *join-limit-qual-evaluations* 20201)
+  (if (and (= *join-limit-qual-evaluations* 20210)
          (= *join-limit-top-n-offers* 20100)
          (= *join-limit-top-n-max-size* 1))
     :ORDERED-CANDIDATES-CONSUMED

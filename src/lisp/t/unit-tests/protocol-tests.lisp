@@ -40,6 +40,26 @@
            (error () t))
          "missing Swank bind address is rejected"))
 
+(defun test-replication-slot-retention-option-parsing ()
+  (multiple-value-bind (host port pgdata control-port control-socket
+                        swank-port bind-address temp-limit arena-limit slot-limit)
+      (parse-args '("--max-slot-wal-keep-bytes=4096"))
+    (declare (ignore host port pgdata control-port control-socket swank-port
+                     bind-address temp-limit arena-limit))
+    (check (= slot-limit 4096)
+           "slot retention option accepts a finite byte cap"))
+  (multiple-value-bind (host port pgdata control-port control-socket
+                        swank-port bind-address temp-limit arena-limit slot-limit)
+      (parse-args '("--max-slot-wal-keep-bytes" "-1"))
+    (declare (ignore host port pgdata control-port control-socket swank-port
+                     bind-address temp-limit arena-limit))
+    (check (null slot-limit)
+           "slot retention option uses -1 to disable the cap"))
+  (check (handler-case
+             (progn (parse-args '("--max-slot-wal-keep-bytes" "-2")) nil)
+           (error () t))
+         "slot retention option rejects negative values other than -1"))
+
 (defun test-malformed-packet-p (path bytes reader &optional expected-message)
   (with-open-file (stream path
                           :direction :output

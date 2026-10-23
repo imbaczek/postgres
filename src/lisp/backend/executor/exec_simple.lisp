@@ -29,6 +29,10 @@
           '(:create-table :drop-table :create-index :drop-index
             :alter-index :alter-table)))
 
+(defun catalog-change-p (ast)
+  "Return whether AST changes durable catalog state, including ANALYZE."
+  (or (ddl-p ast) (eq (getf ast :type) :analyze)))
+
 (defun note-query-error ()
   "Record that the current statement failed, matching PostgreSQL.
 
@@ -916,17 +920,19 @@ before this removal horizon is captured."
     (when (and (backend-read-only *backend*)
                (member (getf ast :type)
                        '(:insert :update :delete :create-table :drop-table
-                         :create-index :drop-index :alter-index :alter-table)))
+                         :create-index :drop-index :alter-index :alter-table
+                         :analyze)))
       (ereport "25006" "cannot execute write statement in a read-only transaction"))
-    (when (and (ddl-p ast) (backend-explicit *backend*))
+    (when (and (catalog-change-p ast) (backend-explicit *backend*))
       (ereport "0A000"
-               "DDL is not supported inside an explicit transaction block"))
+               "catalog changes are not supported inside an explicit transaction block"))
     (with-statement-snapshot (snap #'statement-start)
       (handler-case
           (flet ((execute-body ()
                    (case (getf ast :type)
                      (:select (exec-select stream ast))
                      (:explain (exec-explain stream ast))
+                     (:analyze (exec-analyze stream ast))
                      (:insert (exec-insert stream ast))
                      (:update (exec-update stream ast))
                      (:delete (exec-delete stream ast))

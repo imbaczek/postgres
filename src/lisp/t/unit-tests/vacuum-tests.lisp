@@ -418,6 +418,113 @@
                    sentinel-original-image)
            "restart discards staged page images from an unterminated catalog batch")))
 
+(defun vacuum-full-publish-fault-message (fault-point)
+  (ecase fault-point
+    (:before-record "injected before catalog WAL record")
+    (:before-flush "injected before catalog WAL flush")
+    (:after-flush "injected after catalog WAL flush")
+    (:rename "injected during catalog-file replacement")))
+
+(defun install-vacuum-full-publish-fault (fault-point sentinel-relfilenode inject)
+  (ecase fault-point
+    (:before-record
+     ;; Include a complete page-image record in the unterminated catalog batch.
+     (vacuum-full-test-write-relation-marker sentinel-relfilenode)
+     (let ((original-image
+             (vacuum-full-test-read-file
+              (relation-file-path sentinel-relfilenode))))
+       (let ((page (make-page)))
+         (setf (aref page 0) #xA5)
+         (buf-write sentinel-relfilenode 0 page))
+       (setf *wal-test-before-vacuum-full-catalog-record-appended-hook*
+             (lambda ()
+               (finish-output *wal-output-stream*)
+               (fsync-stream *wal-output-stream*)
+               (when *wal-new-segments*
+                 (fsync-directory (wal-directory))
+                 (setf *wal-new-segments* '()))
+               (funcall inject "injected before catalog WAL record")))
+       original-image))
+    (:before-flush
+     (setf *wal-test-before-vacuum-full-catalog-flush-hook*
+           (lambda ()
+             ;; Leave the terminal record visible while durable-LSN still points
+             ;; to the prior WAL boundary, as restart must do after a crash here.
+             (finish-output *wal-output-stream*)
+             (fsync-stream *wal-output-stream*)
+             (when *wal-new-segments*
+               (fsync-directory (wal-directory))
+               (setf *wal-new-segments* '()))
+             (funcall inject "injected before catalog WAL flush"))))
+    (:after-flush
+     (setf *wal-test-after-vacuum-full-catalog-flush-hook*
+           (lambda () (funcall inject "injected after catalog WAL flush"))))
+    (:rename
+     (setf *catalog-rename-function*
+           (lambda (&rest arguments)
+             (declare (ignore arguments))
+             (funcall inject "injected during catalog-file replacement"))))))
+
+(defun check-vacuum-full-publish-fault-result
+    (fault-point caught injected-condition preserve-replacements cleanup-ran
+     db table index new-table new-index new-relfilenodes old-relfilenodes
+     old-catalog-image sentinel-relfilenode sentinel-original-image)
+  (check (and caught
+              (eq caught injected-condition)
+              (search (vacuum-full-publish-fault-message fault-point)
+                      (princ-to-string caught)))
+         (format nil "VACUUM FULL re-signals the ~a failure" fault-point))
+  (check (= *wal-catalog-flush-generation*
+            (if (member fault-point '(:before-record :before-flush)) 0 1))
+         (format nil "~a fault lands on the expected side of WAL flush" fault-point))
+  (cond
+    ((eq fault-point :before-record)
+     (check (not preserve-replacements)
+            "failure before record append leaves replacement cleanup enabled")
+     (check cleanup-ran
+            "failure before record append cleans replacement files")
+     (check (eq (gethash (pg-class-name table) (database-tables db)) table)
+            "failure before record append restores original heap metadata")
+     (check (eq (gethash (pg-index-name index) (database-indexes db)) index)
+            "failure before record append restores original index metadata")
+     (check (every (lambda (relfilenode)
+                     (not (probe-file (relation-file-path relfilenode))))
+                   new-relfilenodes)
+            "failure before record append removes detached replacement files")
+     (check (equalp (vacuum-full-test-read-file (catalog-path)) old-catalog-image)
+            "failure before record append leaves the old catalog image intact")
+     (vacuum-full-test-recover-unappended-catalog-record
+      new-relfilenodes old-relfilenodes old-catalog-image
+      sentinel-relfilenode sentinel-original-image))
+    ((eq fault-point :before-flush)
+     (check preserve-replacements
+            "appended catalog record protects replacement files before flush")
+     (check (not cleanup-ran)
+            "pre-flush failure skips cleanup of replayable replacement files")
+     (check (eq (gethash (pg-class-name new-table) (database-tables db)) new-table)
+            "pre-flush failure keeps replacement heap metadata in memory")
+     (check (eq (gethash (pg-index-name new-index)
+                         (database-indexes db)) new-index)
+            "pre-flush failure keeps replacement index metadata in memory")
+     (check (every (lambda (relfilenode)
+                     (probe-file (relation-file-path relfilenode)))
+                   new-relfilenodes)
+            "pre-flush failure retains replacement files referenced by replay")
+     (check (every (lambda (relfilenode)
+                     (probe-file (relation-file-path relfilenode)))
+                   old-relfilenodes)
+            "pre-flush failure defers old-file deletion until recovery")
+     (vacuum-full-test-recover-appended-catalog-record
+      new-relfilenodes old-relfilenodes))
+    (t
+     (check preserve-replacements
+            "post-flush failure preserves replacement files")
+     (check (not cleanup-ran)
+            "post-flush failure skips unpublished-file cleanup")
+     (check-vacuum-full-publish-durable-state
+      db new-table new-index new-relfilenodes old-relfilenodes
+      old-catalog-image))))
+
 (defun run-vacuum-full-publish-fault-test (fault-point)
   (call-with-vacuum-full-publish-test-fixture
    (lambda (db table index new-table new-index
@@ -428,51 +535,17 @@
            (injected-condition nil)
            (sentinel-relfilenode 991007)
            (sentinel-original-image nil))
-       (labels ((inject (message)
-                  (setf injected-condition
-                        (make-condition 'simple-error
-                                        :format-control message
-                                        :format-arguments nil))
-                  (error injected-condition)))
-         (ecase fault-point
-           (:before-record
-            ;; Make the catalog batch contain a complete page-image record as
-            ;; well as its batch-start record. Recovery must discard both when
-            ;; the terminal catalog record is absent.
-            (vacuum-full-test-write-relation-marker sentinel-relfilenode)
-            (setf sentinel-original-image
-                  (vacuum-full-test-read-file
-                   (relation-file-path sentinel-relfilenode)))
-            (let ((page (make-page)))
-              (setf (aref page 0) #xA5)
-              (buf-write sentinel-relfilenode 0 page))
-            (setf *wal-test-before-vacuum-full-catalog-record-appended-hook*
-                  (lambda ()
-                    (finish-output *wal-output-stream*)
-                    (fsync-stream *wal-output-stream*)
-                    (when *wal-new-segments*
-                      (fsync-directory (wal-directory))
-                      (setf *wal-new-segments* '()))
-                    (inject "injected before catalog WAL record"))))
-           (:before-flush
-            (setf *wal-test-before-vacuum-full-catalog-flush-hook*
-                  (lambda ()
-                    ;; Ensure restart sees the terminal record while the
-                    ;; durable-LSN control file still names the previous WAL.
-                    (finish-output *wal-output-stream*)
-                    (fsync-stream *wal-output-stream*)
-                    (when *wal-new-segments*
-                      (fsync-directory (wal-directory))
-                      (setf *wal-new-segments* '()))
-                    (inject "injected before catalog WAL flush"))))
-           (:after-flush
-            (setf *wal-test-after-vacuum-full-catalog-flush-hook*
-                  (lambda () (inject "injected after catalog WAL flush"))))
-           (:rename
-            (setf *catalog-rename-function*
-                  (lambda (&rest arguments)
-                    (declare (ignore arguments))
-                    (inject "injected during catalog-file replacement")))))
+       (flet ((inject (message)
+                (setf injected-condition
+                      (make-condition 'simple-error
+                                      :format-control message
+                                      :format-arguments nil))
+                (error injected-condition)))
+         (let ((original-image
+                 (install-vacuum-full-publish-fault
+                  fault-point sentinel-relfilenode #'inject)))
+           (when (eq fault-point :before-record)
+             (setf sentinel-original-image original-image)))
          (handler-case
              (with-error-cleanup
                  (condition
@@ -487,71 +560,10 @@
                 :on-wal-appended
                 (lambda () (setf preserve-replacements t))))
            (error (condition) (setf caught condition)))
-         (check (and caught (eq caught injected-condition)
-                     (search (ecase fault-point
-                               (:before-record "injected before catalog WAL record")
-                               (:before-flush "injected before catalog WAL flush")
-                               (:after-flush "injected after catalog WAL flush")
-                               (:rename "injected during catalog-file replacement"))
-                             (princ-to-string caught)))
-                (format nil "VACUUM FULL re-signals the ~a failure"
-                        fault-point))
-         (check (= *wal-catalog-flush-generation*
-                   (if (member fault-point '(:before-record :before-flush))
-                       0 1))
-                (format nil "~a fault lands on the expected side of WAL flush"
-                        fault-point))
-         (cond
-           ((eq fault-point :before-record)
-            (check (not preserve-replacements)
-                   "failure before record append leaves replacement cleanup enabled")
-            (check cleanup-ran
-                   "failure before record append cleans replacement files")
-            (check (eq (gethash (pg-class-name table) (database-tables db)) table)
-                   "failure before record append restores original heap metadata")
-            (check (eq (gethash (pg-index-name index) (database-indexes db)) index)
-                   "failure before record append restores original index metadata")
-            (check (every (lambda (relfilenode)
-                            (not (probe-file (relation-file-path relfilenode))))
-                          new-relfilenodes)
-                   "failure before record append removes detached replacement files")
-            (check (equalp (vacuum-full-test-read-file (catalog-path))
-                           old-catalog-image)
-                   "failure before record append leaves the old catalog image intact")
-            (vacuum-full-test-recover-unappended-catalog-record
-             new-relfilenodes old-relfilenodes old-catalog-image
-             sentinel-relfilenode sentinel-original-image))
-           ((eq fault-point :before-flush)
-            (check preserve-replacements
-                   "appended catalog record protects replacement files before flush")
-            (check (not cleanup-ran)
-                   "pre-flush failure skips cleanup of replayable replacement files")
-            (check (eq (gethash (pg-class-name new-table)
-                                (database-tables db))
-                       new-table)
-                   "pre-flush failure keeps replacement heap metadata in memory")
-            (check (eq (gethash (pg-index-name new-index)
-                                (database-indexes db))
-                       new-index)
-                   "pre-flush failure keeps replacement index metadata in memory")
-            (check (every (lambda (relfilenode)
-                            (probe-file (relation-file-path relfilenode)))
-                          new-relfilenodes)
-                   "pre-flush failure retains replacement files referenced by replay")
-            (check (every (lambda (relfilenode)
-                            (probe-file (relation-file-path relfilenode)))
-                          old-relfilenodes)
-                   "pre-flush failure defers old-file deletion until recovery")
-            (vacuum-full-test-recover-appended-catalog-record
-             new-relfilenodes old-relfilenodes))
-           (t
-            (check preserve-replacements
-                   "post-flush failure preserves replacement files")
-            (check (not cleanup-ran)
-                   "post-flush failure skips unpublished-file cleanup")
-            (check-vacuum-full-publish-durable-state
-             db new-table new-index new-relfilenodes old-relfilenodes
-             old-catalog-image))))))))
+         (check-vacuum-full-publish-fault-result
+          fault-point caught injected-condition preserve-replacements cleanup-ran
+          db table index new-table new-index new-relfilenodes old-relfilenodes
+          old-catalog-image sentinel-relfilenode sentinel-original-image))))))
 
 (defun test-vacuum-full-publish-failure-boundaries ()
   (run-vacuum-full-publish-fault-test :before-record)
@@ -1017,20 +1029,161 @@
     (btree-init rel)
     (dotimes (i n)
       (btree-insert rel key 0 i))
+    ;; Internal separators do not include heap TIDs, so an equal key with a
+    ;; lower TID can land in a later leaf. PostgreSQL's heapkeyspace routing
+    ;; in nbtinsert.c keeps this ordering global; our cursor must preserve the
+    ;; tree's own physical traversal instead of using TID as a global anchor.
+    (btree-insert rel key 1 1)
     (let ((found (btree-search rel key)))
-      (check (= (length found) n)
+      (check (= (length found) (1+ n))
              "duplicate keys are found across leaf splits")
-      (check (= (length (remove-duplicates found :test #'equal)) n)
+      (check (= (length (remove-duplicates found :test #'equal)) (1+ n))
              "every duplicate-key TID is distinct")
+      (let ((cursor-tids '())
+            (visited 0))
+        (btree-scan-equal rel key (lambda (tid) (push tid cursor-tids)))
+        (check (equal (nreverse cursor-tids) found)
+               "duplicate-key cursor streams every leaf TID in index order")
+        (check (eq (btree-scan-equal
+                    rel key
+                    (lambda (tid)
+                      (declare (ignore tid))
+                      (check (= (length (btree-search rel key)) (1+ n))
+                             "a cursor callback may re-enter the same index as a reader")
+                      :stop))
+                   :stop)
+               "nested index reads do not deadlock the duplicate-key cursor")
+        (check (eq (btree-scan-equal rel key
+                                     (lambda (tid)
+                                       (declare (ignore tid))
+                                       (incf visited)
+                                       :stop))
+                   :stop)
+               "duplicate-key cursor reports early termination")
+        (check (= visited 1)
+               "duplicate-key cursor reads no candidate after early stop"))
       (check (null (btree-search rel (encode-index-key (list 43) (list :int4))))
              "an absent key is not found")
       (btree-vacuum-delete-tids
-       rel (loop for i below (/ n 2) collect (cons 0 i)))
+       rel (append (loop for i below (/ n 2) collect (cons 0 i))
+                   '((1 . 1))))
       (let ((remaining (btree-search rel key)))
         (check (= (length remaining) (/ n 2))
                "B-tree VACUUM removes dead TIDs across duplicate-key leaves")
         (check (every (lambda (tid) (>= (cdr tid) (/ n 2))) remaining)
                "B-tree VACUUM preserves every remaining duplicate-key TID")))))
+
+(defun test-btree-relation-lock-macro ()
+  (let* ((relfilenode 987657)
+         (state (btree-relation-lock relfilenode))
+         (evaluations 0)
+         (writer-owned-p nil)
+         (nested-reader-p nil))
+    (with-btree-relation-lock ((progn (incf evaluations) relfilenode))
+      (setf writer-owned-p
+            (eq sb-thread:*current-thread*
+                (btree-relation-lock-state-writer-owner state))
+            nested-reader-p
+            (eq (call-with-btree-relation-read-lock relfilenode
+                                                    (lambda () :read))
+                :read)))
+    (check (and (= evaluations 1) writer-owned-p nested-reader-p)
+           "B-tree relation-lock macro evaluates once and permits a nested read")
+    (check (and (null (btree-relation-lock-state-writer-owner state))
+                (zerop (btree-relation-lock-state-reader-count state)))
+           "B-tree relation-lock macro releases ownership after its body")
+    (btree-forget relfilenode)))
+
+(defun test-btree-relation-lock-set-macro ()
+  (let* ((low-relfilenode 987661)
+         (high-relfilenode 987662)
+         (low-state (btree-relation-lock low-relfilenode))
+         (high-state (btree-relation-lock high-relfilenode))
+         (evaluations 0)
+         (inside-p nil))
+    (with-btree-relation-locks
+        ((progn
+           (incf evaluations)
+           (list high-relfilenode low-relfilenode high-relfilenode)))
+      (setf inside-p
+            (and (eq (btree-relation-lock-state-writer-owner low-state)
+                     sb-thread:*current-thread*)
+                 (eq (btree-relation-lock-state-writer-owner high-state)
+                     sb-thread:*current-thread*)
+                 (= (btree-relation-lock-state-writer-depth low-state) 1)
+                 (= (btree-relation-lock-state-writer-depth high-state) 1))))
+    (check (and (= evaluations 1) inside-p)
+           "B-tree writer-lock set evaluates once and deduplicates relations")
+    (check (and (null (btree-relation-lock-state-writer-owner low-state))
+                (null (btree-relation-lock-state-writer-owner high-state)))
+           "B-tree writer-lock set releases each relation after its body")
+    (btree-forget low-relfilenode)
+    (btree-forget high-relfilenode)))
+
+(defun test-btree-writer-interrupt-cleans-waiter ()
+  (let* ((relfilenode 987660)
+         (state (btree-relation-lock relfilenode))
+         (original-wait (symbol-function 'btree-relation-condition-wait))
+         (writer-interrupted-p nil))
+    (unwind-protect
+         (progn
+           ;; Keep a read lease while the writer reaches its wait, then force
+           ;; that wait to unwind so waiter cleanup is exercised.
+           (setf (symbol-function 'btree-relation-condition-wait)
+                 (lambda (state)
+                   (declare (ignore state))
+                   (error "forced B-tree writer wait interrupt")))
+           (call-with-btree-relation-read-lock
+            relfilenode
+            (lambda ()
+              (let ((writer
+                      (sb-thread:make-thread
+                       (lambda ()
+                         (handler-case
+                             (call-with-btree-relation-write-lock relfilenode
+                                                                  (lambda () :writer))
+                           (error ()
+                             (setf writer-interrupted-p t)))))))
+                (sb-thread:join-thread writer))))
+           (check writer-interrupted-p
+                  "an interrupted B-tree writer exits its condition wait")
+           (check (zerop (btree-relation-lock-state-waiting-writers state))
+                  "an interrupted B-tree writer unregisters its waiter")
+           (check (eq (call-with-btree-relation-read-lock
+                       relfilenode (lambda () :reader))
+                      :reader)
+                  "readers proceed after an interrupted writer releases its waiter"))
+      (setf (symbol-function 'btree-relation-condition-wait) original-wait)
+      (btree-forget relfilenode))))
+
+(defun test-btree-read-lock-set-macro ()
+  (let* ((low-relfilenode 987658)
+         (high-relfilenode 987659)
+         (low-state (btree-relation-lock low-relfilenode))
+         (high-state (btree-relation-lock high-relfilenode))
+         (inside-p nil))
+    (with-btree-relation-read-locks
+        ((list high-relfilenode low-relfilenode high-relfilenode))
+      (setf inside-p
+            (and (= (btree-relation-lock-state-reader-count low-state) 1)
+                 (= (btree-relation-lock-state-reader-count high-state) 1)
+                 (= (gethash sb-thread:*current-thread*
+                             (btree-relation-lock-state-reader-owners low-state))
+                    1)
+                 (= (gethash sb-thread:*current-thread*
+                             (btree-relation-lock-state-reader-owners high-state))
+                    1)))
+      (check inside-p
+             "B-tree read-lock set deduplicates and holds every requested lease")
+      (check (eq (call-with-btree-relation-read-lock
+                  low-relfilenode (lambda () :nested-read))
+                 :nested-read)
+             "B-tree read-lock sets permit nested same-relation scans"))
+    (check (and (zerop (btree-relation-lock-state-reader-count low-state))
+                (zerop (btree-relation-lock-state-reader-count high-state)))
+           "B-tree read-lock set releases every lease after its body")
+    (btree-forget low-relfilenode)
+    (btree-forget high-relfilenode)))
 
 (defun test-btree-mixed-duplicate-keys ()
   ;; Interleave two keys so splits produce equal separators for both, which

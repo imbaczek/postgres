@@ -493,19 +493,24 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
 - Heap insertion consults a volatile 256-category free-space map per
   relfilenode. It is rebuilt from heap pages once on the first insert after a
   restart; successful inserts refresh the page's free-space entry.
-- Writers take a single global write mutex; DDL also takes a catalog mutex;
-  page I/O is serialized under an smgr mutex. Readers do not block one another;
-  relation DDL waits for registered readers. Index scans hold the global write
-  mutex while copying candidate TIDs from the B-tree, and populated index builds
-  hold it while visiting heap versions; either operation can delay unrelated
-  writers. Relation-scoped B-tree synchronization and a lock-safe bulk-build
-  protocol are needed to reduce this contention.
+- Heap/catalog writes still use a global write mutex, and page I/O is serialized
+  under an smgr mutex. B-tree reads and mutations use relation-scoped leases;
+  relation DDL waits for registered readers. A query acquires all selected index
+  read leases in relfilenode order before execution and holds them through row
+  callbacks so nested scans cannot deadlock with multi-index inserts. A slow
+  scan or output consumer can therefore delay writes and VACUUM on each selected
+  index. Populated index builds use detached files and publish under relation
+  gates.
 
 ## Known gaps (documented, not hidden)
 
-- No WAL archiving, replication, or point-in-time recovery. A complete WAL record
-  with a bad checksum stops startup; this implementation detects that damage but
-  does not reconstruct the record.
+- No WAL archiving, complete replication protocol, or point-in-time recovery. The
+  WAL layer supports persistent replication slots with restart/consistent LSNs,
+  confirmed-flush acknowledgments, and `pg_catalog.pg_replication_slots`
+  diagnostics. Slots that exceed the configured per-slot WAL-retention cap are
+  durably marked lost at checkpoint so recycling can proceed. A complete WAL
+  record with a bad checksum stops startup; this implementation detects that
+  damage but does not reconstruct the record.
 - Heap page layout version 6 stores 32-bit tuple XIDs in the PostgreSQL header
   layout. Existing version 4 and 5 relation files are rejected and must be
   recreated before use.
@@ -513,18 +518,28 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   cycle boundary. VACUUM now freezes eligible tuples incrementally, but
   PostgreSQL's wraparound limits are not implemented. XID allocation stops
   after `2^64 - 1`.
-- DDL inside an explicit transaction block is rejected (`0A000`) because the
-  catalog has no rollback log.
-- No aggregates, subqueries, CTEs, or `DISTINCT`. Joins are nested-loop-only;
-  NATURAL JOIN and comma-separated FROM items are not supported.
-- No `GROUP BY` / `HAVING`, no `OFFSET`/`FETCH`. `ORDER BY` accepts multiple
-  keys with `ASC`/`DESC`.
+- DDL and `ANALYZE` inside an explicit transaction block are rejected (`0A000`)
+  because catalog changes and statistics have no rollback log.
+- `COUNT(*)` and `GROUP BY` are supported. Hash aggregation is bounded by query
+  work memory and spills through recursive hash partitions, with external sort
+  as the skew/depth fallback. Subqueries, CTEs, `DISTINCT`, and `HAVING` are not
+  implemented. Joins use nested loops; INNER/CROSS join order uses a greedy
+  statistics-based choice, while outer joins retain source order. NATURAL JOIN
+  and comma-separated FROM items are not supported.
+- No `OFFSET`/`FETCH`. `ORDER BY` accepts multiple keys with `ASC`/`DESC` and
+  uses bounded in-memory runs with external merge when needed.
 - No `DEFAULT`, `CHECK`, foreign keys, or `NOT NULL`/`UNIQUE` beyond what is
   listed above.
-- `SELECT` uses a B-tree for single-column indexed equality predicates and
-  falls back to SeqScan otherwise. Index scans fetch candidate heap TIDs,
-  enforce MVCC visibility, and recheck the full predicate. Composite equality,
-  range scans, and cost-based selection are not implemented.
+- `ANALYZE table` scans visible heap rows to count them exactly and keeps a
+  transient reservoir capped at 300 rows and about 4 MiB. It persists row count,
+  NULL fraction, distinct-count estimate, and up to ten most-common values per
+  column; raw sample rows are not stored. These estimates feed a small cost
+  model for SeqScan, single-column equality IndexScan, parameterized INNER/LEFT
+  nested-loop inputs, and greedy
+  INNER/CROSS join order. Statistics are explicit and can become stale between
+  ANALYZE commands. Index scans stream duplicate-key TIDs, enforce MVCC
+  visibility, and recheck the full predicate. Composite equality, range scans,
+  bitmap scans, and index-only scans are not implemented.
 - VACUUM is manual only; autovacuum and index-only scans are not implemented.
   Manual VACUUM removes dead index TIDs before making safe dead heap slots
   reusable, freezes eligible tuples, and updates the visibility map and volatile

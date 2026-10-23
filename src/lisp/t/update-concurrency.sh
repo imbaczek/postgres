@@ -46,6 +46,18 @@ scalar() {
         -A -t -v ON_ERROR_STOP=1 "$@"
 }
 
+populate_index_selectivity_fixture() {
+    table=$1
+    awk -v table="$table" 'BEGIN {
+        printf "insert into %s values ", table
+        for (id = 2; id <= 2001; id++)
+            printf "%s(%d, %d)", id == 2 ? "" : ", ", id, id + 100
+        print ";"
+    }' > "$TMP/index-fixture.sql"
+    run < "$TMP/index-fixture.sql" > "$TMP/index-fixture.out" 2>&1 \
+        || fail "could not populate selective index fixture for $table"
+}
+
 wait_for_marker() {
     file=$1
     marker=$2
@@ -176,6 +188,7 @@ fi
 # value that makes the predicate false; B must follow the chain and return 0.
 run -c "create table update_predicate (id int, value int)" >/dev/null
 run -c "insert into update_predicate values (1, 1)" >/dev/null
+populate_index_selectivity_fixture update_predicate
 run -c "create index update_predicate_value_idx on update_predicate (value)" >/dev/null
 start_writer "$TMP/predicate.sql" "$TMP/predicate-writer.out" \
     74102 \
@@ -191,6 +204,7 @@ grep -q '^UPDATE 0$' "$TMP/predicate-waiter.out" \
     || fail "waiter failed to recheck the now-false WHERE clause"
 [ "$(scalar -c 'select value from update_predicate where id = 1')" = 2 ] \
     || fail "predicate recheck changed a row that no longer matched"
+scalar -c "analyze update_predicate" >/dev/null
 plan=$(scalar -c 'explain select id from update_predicate where value = 2')
 plan_contains_indented_node "$plan" "Index Scan using update_predicate_value_idx on update_predicate" \
     || fail "equality lookup after concurrent UPDATE did not use the index: $plan"
@@ -207,6 +221,7 @@ sequential_rows=$(scalar -c 'select id from update_predicate where value = 2')
 # DELETE must use the same READ COMMITTED recheck after a conflicting UPDATE.
 run -c "create table delete_predicate (id int, value int)" >/dev/null
 run -c "insert into delete_predicate values (1, 1)" >/dev/null
+populate_index_selectivity_fixture delete_predicate
 run -c "create index delete_predicate_value_idx on delete_predicate (value)" >/dev/null
 start_writer "$TMP/delete.sql" "$TMP/delete-writer.out" \
     74103 \
@@ -222,6 +237,7 @@ grep -q '^DELETE 0$' "$TMP/delete-waiter.out" \
     || fail "DELETE did not recheck the now-false WHERE clause"
 [ "$(scalar -c 'select value from delete_predicate where id = 1')" = 2 ] \
     || fail "DELETE removed a row that no longer matched"
+scalar -c "analyze delete_predicate" >/dev/null
 plan=$(scalar -c 'explain select id from delete_predicate where value = 2')
 plan_contains_indented_node "$plan" "Index Scan using delete_predicate_value_idx on delete_predicate" \
     || fail "equality lookup after concurrent DELETE recheck did not use the index: $plan"

@@ -102,6 +102,14 @@ awk 'BEGIN {
     print ";"
 }' > "$TMP/initial.sql"
 run < "$TMP/initial.sql" > "$TMP/initial.out" 2>&1 || fail "initial insert failed"
+awk 'BEGIN {
+    printf "insert into index_diff values (1001, 8, 0)"
+    for (id = 1002; id <= 3001; id++)
+        printf ", (%d, %d, 0)", id, id + 10000
+    print ";"
+}' > "$TMP/selectivity-fixture.sql"
+run < "$TMP/selectivity-fixture.sql" > "$TMP/selectivity-fixture.out" 2>&1 \
+    || fail "selectivity fixture insert failed"
 run -c "create index index_diff_category_idx on index_diff (category)" \
     > "$TMP/build.out" 2>&1 || fail "populated non-unique index build failed"
 
@@ -126,13 +134,14 @@ run < "$TMP/mutations.sql" > "$TMP/mutations.out" 2>&1 \
     || fail "randomized updates/deletes failed"
 run -c "vacuum index_diff" > "$TMP/vacuum.out" 2>&1 \
     || fail "VACUUM after mutations failed"
+run -c "analyze index_diff" >/dev/null
 
-plan=$(run -c 'explain select id from index_diff where category = 3')
+plan=$(run -c 'explain select id from index_diff where category = 8')
 plan_contains_indented_node "$plan" "Index Scan using index_diff_category_idx on index_diff" \
     || fail "equality query did not use the populated index: $plan"
 
 capture_results() {
-    for category in 0 1 2 3 4 5 6 7; do
+    for category in 0 1 2 3 4 5 6 7 8; do
         printf 'category=%s\n' "$category"
         run -c "select id from index_diff where category = $category order by id" \
             || return 1

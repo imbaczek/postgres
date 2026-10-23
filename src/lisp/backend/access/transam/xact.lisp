@@ -954,7 +954,7 @@ AFTER-CAPTURE runs under *WAL-LOCK* but after *XID-LOCK* is released."
       (values snapshot boundary-lsn restart-lsn))))
 
 (defun wal-publish-replication-slot-under-wal-lock
-    (name boundary-lsn restart-lsn register active-owner)
+    (name boundary-lsn restart-lsn register active-owner &optional active-xids)
   "Persist and publish a slot while *WAL-LOCK* protects its retention point."
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid replication slot name \"~a\"" name))
@@ -974,6 +974,7 @@ AFTER-CAPTURE runs under *WAL-LOCK* but after *XID-LOCK* is released."
     (unwind-protect
          (progn
            (setf (gethash name *wal-replication-slots*) slot)
+           (wal-slot-seed-active-xids-under-wal-lock slot active-xids)
            (wal-save-replication-slot slot))
       (unless (handler-case
                   (probe-file (wal-replication-slot-path name))
@@ -992,16 +993,16 @@ AFTER-CAPTURE runs under *WAL-LOCK* but after *XID-LOCK* is released."
          curcid register
          :after-capture
          (lambda (captured boundary restart)
-           (declare (ignore captured))
            ;; AFTER-CAPTURE runs under *WAL-LOCK*: persist first, then publish
            ;; the in-memory retention entry seen by future checkpoints.
            (setf slot
                  (wal-publish-replication-slot-under-wal-lock
-                  name boundary restart register active-owner))))
+                  name boundary restart register active-owner
+                  (snapshot-xip captured)))))
       (values snapshot boundary-lsn restart-lsn slot))))
 
 (defun wal-publish-captured-replication-slot
-    (name boundary-lsn restart-lsn register &optional active-owner)
+    (name boundary-lsn restart-lsn register &optional active-owner active-xids)
   "Publish a captured slot after the wraparound gate has been released.
 
 The active snapshot registration keeps RESTART-LSN pinned if a checkpoint runs
@@ -1009,7 +1010,7 @@ between snapshot capture and this durable publication."
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
     (wal-publish-replication-slot-under-wal-lock
-     name boundary-lsn restart-lsn register active-owner)))
+     name boundary-lsn restart-lsn register active-owner active-xids)))
 
 (defun ensure-exported-snapshot-scope-can-end (backend)
   (when (and (eq backend *exported-snapshot-backend*)
@@ -1038,77 +1039,85 @@ VACUUM FULL wait for this scope."
             (slot-owner (gensym "EXPORTED-SNAPSHOT-SLOT-"))
             (started nil)
             (body-completed nil)
+            (initial-copy-committed-p nil)
             (snapshot nil)
             (boundary-lsn nil))
         (let ((*exported-snapshot-backend* backend))
-          (unwind-protect
-               (progn
-                 (sb-sys:without-interrupts
-                   ;; Mark cleanup ownership before touching backend state. A
-                   ;; cancel can then never strand a partially initialized
-                   ;; transaction in a reusable backend.
-                   (setf started t
-                         (backend-explicit backend) t
-                         (backend-isolation-level backend) :repeatable-read
-                         (backend-read-only backend) t
-                         (backend-command-id backend) 0
-                         (backend-xid backend) nil
-                         (backend-snapshot backend) nil
-                         (backend-transaction-snapshot backend) nil
-                         (backend-transaction-snapshot-registration backend) nil
-                         (backend-first-snapshot-set backend) nil
-                         (backend-dirty-relations backend) '()))
-                 (set-backend-state backend :in-progress)
-                 (multiple-value-bind (captured-snapshot captured-boundary
-                                       restart-lsn)
-                     ;; Ordinary statement startup holds *XID-WRAP-LOCK* while
-                     ;; registering its snapshot. Keep the same admission
-                     ;; handshake here; the registration's temporary WAL pin
-                     ;; protects the captured boundary after the gate opens.
-                     (wait-for-xid-wraparound
-                      backend
-                      (lambda ()
-                        (with-write-lock
-                          (wal-capture-snapshot-boundary-under-writer-lock
-                           (backend-command-id backend) registration))))
-                   (setf snapshot captured-snapshot
-                         boundary-lsn captured-boundary)
-                   ;; Slot fsync can take longer than snapshot capture. Publish
-                   ;; after releasing *XID-WRAP-LOCK* while the registered
-                   ;; snapshot continues to pin the required WAL.
-                   (wal-publish-captured-replication-slot
-                    slot-name captured-boundary restart-lsn registration
-                    slot-owner)
-                   ;; Publish the retained RR snapshot before user code can run.
-                   (sb-sys:without-interrupts
-                     (setf (backend-transaction-snapshot backend) snapshot
-                           (backend-transaction-snapshot-registration backend)
-                           registration
-                           (backend-first-snapshot-set backend) t
-                           (backend-snapshot backend) snapshot))
-                   (let ((*current-snapshot* snapshot))
-                     (multiple-value-prog1
-                         (funcall function snapshot boundary-lsn)
-                       (setf body-completed t)))))
-            (unwind-protect
-                 (when started
-                   (let ((*exported-snapshot-cleanup* t))
-                     (if (and body-completed
-                              (not (eq (backend-state backend) :aborted)))
-                         (handler-case
-                             (commit-transaction)
-                           (error (condition)
-                             (ignore-errors (abort-transaction))
-                             (error condition)))
-                         (abort-transaction))))
-              ;; Capture can fail after registering but before ownership moves
-              ;; into BACKEND. Release that token here; release is idempotent if
-              ;; commit or abort already retired it.
+          (multiple-value-prog1
               (unwind-protect
-                   (when (snapshot-registration-active-p registration)
-                     (release-snapshot-registration registration))
-                (sb-sys:without-interrupts
-                  (wal-release-replication-slot-owner slot-name slot-owner))))))))))
+                   (progn
+                     (sb-sys:without-interrupts
+                       ;; Mark cleanup ownership before touching backend state. A
+                       ;; cancel can then never strand a partially initialized
+                       ;; transaction in a reusable backend.
+                       (setf started t
+                             (backend-explicit backend) t
+                             (backend-isolation-level backend) :repeatable-read
+                             (backend-read-only backend) t
+                             (backend-command-id backend) 0
+                             (backend-xid backend) nil
+                             (backend-snapshot backend) nil
+                             (backend-transaction-snapshot backend) nil
+                             (backend-transaction-snapshot-registration backend) nil
+                             (backend-first-snapshot-set backend) nil
+                             (backend-dirty-relations backend) '()))
+                     (set-backend-state backend :in-progress)
+                     (multiple-value-bind (captured-snapshot captured-boundary
+                                           restart-lsn)
+                         ;; Ordinary statement startup holds *XID-WRAP-LOCK* while
+                         ;; registering its snapshot. Keep the same admission
+                         ;; handshake here; the registration's temporary WAL pin
+                         ;; protects the captured boundary after the gate opens.
+                         (wait-for-xid-wraparound
+                          backend
+                          (lambda ()
+                            (with-write-lock
+                              (wal-capture-snapshot-boundary-under-writer-lock
+                               (backend-command-id backend) registration))))
+                       (setf snapshot captured-snapshot
+                             boundary-lsn captured-boundary)
+                       ;; Slot fsync can take longer than snapshot capture. Publish
+                       ;; after releasing *XID-WRAP-LOCK* while the registered
+                       ;; snapshot continues to pin the required WAL.
+                       (wal-publish-captured-replication-slot
+                        slot-name captured-boundary restart-lsn registration
+                        slot-owner (snapshot-xip captured-snapshot))
+                       ;; Publish the retained RR snapshot before user code can run.
+                       (sb-sys:without-interrupts
+                         (setf (backend-transaction-snapshot backend) snapshot
+                               (backend-transaction-snapshot-registration backend)
+                               registration
+                               (backend-first-snapshot-set backend) t
+                               (backend-snapshot backend) snapshot))
+                       (let ((*current-snapshot* snapshot))
+                         (multiple-value-prog1
+                             (funcall function snapshot boundary-lsn)
+                           (setf body-completed t)))))
+                (unwind-protect
+                     (when started
+                       (let ((*exported-snapshot-cleanup* t))
+                         (if (and body-completed
+                                  (not (eq (backend-state backend) :aborted)))
+                             (handler-case
+                                 (progn
+                                   (commit-transaction)
+                                   (setf initial-copy-committed-p t))
+                               (error (condition)
+                                 (ignore-errors (abort-transaction))
+                                 (error condition)))
+                             (abort-transaction))))
+                  ;; Capture can fail after registering but before ownership moves
+                  ;; into BACKEND. Release that token here; release is idempotent if
+                  ;; commit or abort already retired it.
+                  (unwind-protect
+                       (when (snapshot-registration-active-p registration)
+                         (release-snapshot-registration registration))
+                    (sb-sys:without-interrupts
+                      (wal-release-replication-slot-owner slot-name slot-owner))))
+                (when initial-copy-committed-p
+                  ;; Like SnapBuild's consistent point, initial-copy completion is
+                  ;; an acknowledgment only after the exported snapshot is released.
+                  (wal-acknowledge-replication-slot slot-name boundary-lsn)))))))))
 
 (defmacro with-exported-snapshot
     ((snapshot-var start-lsn-var &key slot-name) &body body)

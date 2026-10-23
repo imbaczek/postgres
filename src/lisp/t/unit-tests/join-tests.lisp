@@ -100,8 +100,9 @@
     (unwind-protect
          (progn
            (setf (symbol-function 'scan-select-path)
-                 (lambda (table relfilenode path snapshot callback)
-                   (declare (ignore relfilenode path snapshot))
+                 (lambda (table relfilenode path snapshot callback
+                          &optional environment)
+                   (declare (ignore relfilenode path snapshot environment))
                    (cond
                      ((eq table left-table)
                       (unless left-empty-p

@@ -99,6 +99,7 @@
     ((match-kw p "update") (parse-update p))
     ((match-kw p "delete") (parse-delete p))
     ((match-kw p "vacuum") (parse-vacuum p))
+    ((match-kw p "analyze") (parse-analyze p))
     ((match-kw p "create") (parse-create p))
     ((match-kw p "drop") (parse-drop p))
     ((match-kw p "alter") (parse-alter p))
@@ -136,6 +137,9 @@
        (setf full-p t)))
     (list :type :vacuum :full-p full-p
           :table (strip-schema (pident p)))))
+
+(defun parse-analyze (p)
+  (list :type :analyze :table (strip-schema (pident p))))
 
 (defun parse-explain (p)
   (let ((analyze-p (match-kw p "analyze")))
@@ -205,14 +209,16 @@
     (list :expr expr :alias alias)))
 
 (defun parse-from-relation (p)
-  (let ((table (pident p))
-        (alias nil))
+  (let* ((first-name (pident p))
+         (table (strip-schema
+                 (if (match-punct p #\.) (pident p) first-name)))
+         (alias nil))
     (when (match-kw p "as")
       (setf alias (pident p)))
     (when (and (eq (pkind p) :ident)
                (not (clause-keyword-p (pval p))))
       (setf alias (pident p)))
-    (values (strip-schema table) alias)))
+    (values table alias)))
 
 (defun parse-join-clause (p)
   (let ((join-type :inner)

@@ -106,21 +106,30 @@ awk 'BEGIN {
 }' > "$TMP/initial.sql"
 run < "$TMP/initial.sql" > "$TMP/initial.out" 2>&1 \
     || fail "initial populated-table insert failed"
+awk 'BEGIN {
+    printf "insert into vacfull values "
+    for (id = 1000; id < 3000; id++)
+        printf "%s(%d, %d)", id == 1000 ? "" : ", ", id, id + 10000
+    print ";"
+}' > "$TMP/selectivity-fixture.sql"
+run < "$TMP/selectivity-fixture.sql" > "$TMP/selectivity-fixture.out" 2>&1 \
+    || fail "selectivity fixture insert failed"
 run -c "create index vacfull_category_idx on vacfull (category)" \
     > "$TMP/index-build.out" 2>&1 || fail "populated index build failed"
 run -c "update vacfull set category = category + 10 where id <= 8" \
     > "$TMP/update.out" 2>&1 || fail "UPDATE before rewrite failed"
-run -c "delete from vacfull where id > 32" \
+run -c "delete from vacfull where id > 32 and id <= 128" \
     > "$TMP/delete.out" 2>&1 || fail "DELETE before rewrite failed"
 run -c "vacuum vacfull" > "$TMP/vacuum.out" 2>&1 \
     || fail "ordinary VACUUM before rewrite failed"
 
-[ "$(row_count 'select id from vacfull')" = 32 ] \
+[ "$(row_count 'select id from vacfull')" = 2032 ] \
     || fail "ordinary VACUUM changed visible rows"
-plan=$(run -c 'explain select id from vacfull where category = 3')
+run -c "analyze vacfull" >/dev/null
+plan=$(run -c 'explain select id from vacfull where category = 11000')
 plan_contains_indented_node "$plan" "Index Scan using vacfull_category_idx on vacfull" \
     || fail "indexed equality scan was unavailable before rewrite: $plan"
-run -c 'select id from vacfull where category = 3 order by id' \
+run -c 'select id from vacfull where category = 11000 order by id' \
     > "$TMP/before-full.out" || fail "indexed query before rewrite failed"
 
 control <<'EOF' > "$TMP/old-relations.out"
@@ -141,6 +150,7 @@ grep -q 'bye' "$TMP/old-relations.out" \
 
 run -c 'vacuum full vacfull' > "$TMP/full.out" 2>&1 \
     || fail "VACUUM FULL rewrite failed"
+run -c "analyze vacfull" >/dev/null
 control <<'EOF' > "$TMP/relation-swap.out"
 (let* ((db (gethash "postgres" (catalog-databases *catalog*)))
        (table (gethash "vacfull" (database-tables db)))
@@ -154,7 +164,7 @@ control <<'EOF' > "$TMP/relation-swap.out"
 EOF
 grep -q '(T T T T T)' "$TMP/relation-swap.out" \
     || fail "FULL did not publish and clean up replacement heap/index files"
-run -c 'select id from vacfull where category = 3 order by id' \
+run -c 'select id from vacfull where category = 11000 order by id' \
     > "$TMP/after-full.out" || fail "indexed query after rewrite failed"
 cmp -s "$TMP/before-full.out" "$TMP/after-full.out" \
     || fail "VACUUM FULL changed indexed equality results"
@@ -167,9 +177,10 @@ run -c "insert into vacfull values (129, 3)" >/dev/null \
     || fail "INSERT after rewrite failed"
 run -c 'vacuum (full) vacfull' > "$TMP/full-parenthesized.out" 2>&1 \
     || fail "VACUUM (FULL) rewrite failed"
-[ "$(row_count 'select id from vacfull')" = 33 ] \
+run -c "analyze vacfull" >/dev/null
+[ "$(row_count 'select id from vacfull')" = 2033 ] \
     || fail "parenthesized FULL changed visible rows"
-plan=$(run -c 'explain select id from vacfull where category = 3')
+plan=$(run -c 'explain select id from vacfull where category = 11000')
 plan_contains_indented_node "$plan" "Index Scan using vacfull_category_idx on vacfull" \
     || fail "index was unavailable after parenthesized FULL: $plan"
 
@@ -251,6 +262,14 @@ run < "$TMP/gate-race-initial.sql" > "$TMP/gate-race-initial.out" 2>&1 \
     || fail "gate-race fixture insert failed"
 run -c "delete from full_gate_race where id <= 64" >/dev/null \
     || fail "gate-race fixture delete failed"
+awk 'BEGIN {
+    printf "insert into full_gate_race values "
+    for (id = 1000; id < 3000; id++)
+        printf "%s(%d)", id == 1000 ? "" : ", ", id
+    print ";"
+}' > "$TMP/gate-race-selectivity.sql"
+run < "$TMP/gate-race-selectivity.sql" >/dev/null
+run -c "analyze full_gate_race" >/dev/null
 control <<EOF > "$TMP/gate-race-scheduler.out"
 (defvar *vac-full-race-heap* nil)
 (defvar *vac-full-race-original-build-locks* nil)
@@ -316,13 +335,14 @@ plan_contains_indented_node "$plan" "Index Scan using full_gate_race_idx on full
 
 # PostgreSQL's original regression removes all rows after a FULL rewrite; keep
 # rows across a restart first to verify the published catalog and rebuilt index.
-run -c 'select id from vacfull where category = 3 order by id' \
+run -c 'select id from vacfull where category = 11000 order by id' \
     > "$TMP/before-restart.out" || fail "indexed query before restart failed"
 stop_server
 start_server
-[ "$(row_count 'select id from vacfull')" = 33 ] \
+[ "$(row_count 'select id from vacfull')" = 2033 ] \
     || fail "restart lost rows published by VACUUM FULL"
-run -c 'select id from vacfull where category = 3 order by id' \
+run -c "analyze vacfull" >/dev/null
+run -c 'select id from vacfull where category = 11000 order by id' \
     > "$TMP/after-restart.out" || fail "indexed query after restart failed"
 cmp -s "$TMP/before-restart.out" "$TMP/after-restart.out" \
     || fail "restart changed indexed results after VACUUM FULL"
@@ -357,12 +377,13 @@ SRV=
 wait "$FULL_PID" 2>/dev/null || true
 FULL_PID=
 start_server
-[ "$(row_count 'select id from vacfull')" = 33 ] \
+[ "$(row_count 'select id from vacfull')" = 2033 ] \
     || fail "pre-flush crash recovery lost rows from VACUUM FULL publication"
-plan=$(run -c 'explain select id from vacfull where category = 3')
+run -c "analyze vacfull" >/dev/null
+plan=$(run -c 'explain select id from vacfull where category = 11000')
 plan_contains_indented_node "$plan" "Index Scan using vacfull_category_idx on vacfull" \
     || fail "pre-flush crash recovery lost the replacement index: $plan"
-run -c 'select id from vacfull where category = 3 order by id' \
+run -c 'select id from vacfull where category = 11000 order by id' \
     > "$TMP/after-before-flush-crash.out" \
     || fail "indexed query after pre-flush recovery failed"
 cmp -s "$TMP/before-restart.out" "$TMP/after-before-flush-crash.out" \
@@ -425,12 +446,13 @@ SRV=
 wait "$FULL_PID" 2>/dev/null || true
 FULL_PID=
 start_server
-[ "$(row_count 'select id from vacfull')" = 33 ] \
+[ "$(row_count 'select id from vacfull')" = 2033 ] \
     || fail "crash recovery lost rows from VACUUM FULL publication"
-plan=$(run -c 'explain select id from vacfull where category = 3')
+run -c "analyze vacfull" >/dev/null
+plan=$(run -c 'explain select id from vacfull where category = 11000')
 plan_contains_indented_node "$plan" "Index Scan using vacfull_category_idx on vacfull" \
     || fail "recovered VACUUM FULL index was unavailable: $plan"
-run -c 'select id from vacfull where category = 3 order by id' \
+run -c 'select id from vacfull where category = 11000 order by id' \
     > "$TMP/after-crash-full.out" \
     || fail "indexed query after VACUUM FULL crash recovery failed"
 cmp -s "$TMP/before-restart.out" "$TMP/after-crash-full.out" \

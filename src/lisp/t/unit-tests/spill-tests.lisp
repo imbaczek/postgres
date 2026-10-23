@@ -2,6 +2,81 @@
 
 (in-package #:pg)
 
+(declaim (ftype function make-query-spill-test-directory
+                query-spill-test-directory-empty-p))
+
+(defun test-hash-aggregate-partitioned-spill ()
+  (let* ((directory (make-query-spill-test-directory))
+         (rows (loop for index below 120
+                     collect (vector (if (zerop (mod index 17)) +null+
+                                         (mod index 23)))))
+         (expected (make-hash-table :test #'equal))
+         (actual (make-hash-table :test #'equal))
+         (group-key '(:col 1 :type :int4)))
+    (dolist (row rows)
+      (incf (gethash (sql-group-value-key (aref row 0) :int4) expected 0)))
+    (unwind-protect
+         (let ((*query-temp-directory* directory)
+               (*query-work-memory-bytes* 180))
+           (stream-hash-aggregate
+            (lambda (callback) (dolist (row rows) (funcall callback row)))
+            (list group-key) 1
+            (lambda (row)
+              (setf (gethash (sql-group-value-key (aref row 0) :int4) actual)
+                    (aref row 1))))
+           (check (and (= (hash-table-count actual) (hash-table-count expected))
+                       (loop for key being the hash-keys of expected
+                             always (= (gethash key actual -1)
+                                       (gethash key expected))))
+                  "partitioned hash aggregation preserves duplicate and NULL groups")
+           (check (query-spill-test-directory-empty-p directory)
+                  "partitioned hash aggregation removes all spill files"))
+      (ignore-errors
+       (uiop:delete-directory-tree directory :validate t
+                                             :if-does-not-exist :ignore)))))
+
+(defun test-hash-aggregate-sort-fallback-and-scalar-empty-input ()
+  (let* ((directory (make-query-spill-test-directory))
+         (rows (loop for value below 24 collect (vector value)))
+         (actual (make-hash-table :test #'equal))
+         (group-key '(:col 1 :type :int4)))
+    (unwind-protect
+         (let ((*query-temp-directory* directory)
+               (*query-work-memory-bytes* 1)
+               (+hash-aggregate-partition-count+ 1))
+           (stream-hash-aggregate
+            (lambda (callback) (dolist (row rows) (funcall callback row)))
+            (list group-key) 1
+            (lambda (row)
+              (setf (gethash (aref row 0) actual) (aref row 1))))
+           (check (and (= (hash-table-count actual) (length rows))
+                       (loop for value below (length rows)
+                             always (= (gethash value actual -1) 1)))
+                  "external-sort fallback emits each spilled group exactly once")
+           (check (query-spill-test-directory-empty-p directory)
+                  "sort fallback removes spill and merge files")
+           (let ((scalar-rows nil))
+             (stream-hash-aggregate (lambda (callback)
+                                      (declare (ignore callback)))
+                                    nil 1
+                                    (lambda (row) (push (aref row 0) scalar-rows)))
+             (check (equal scalar-rows '(0))
+                    "empty scalar COUNT(*) emits one zero-count row")))
+      (ignore-errors
+       (uiop:delete-directory-tree directory :validate t
+                                             :if-does-not-exist :ignore)))))
+
+(defun test-hash-aggregate-skew-does-not-spill-unnecessarily ()
+  (let ((actual nil))
+    (let ((*query-work-memory-bytes* 1))
+      (stream-hash-aggregate
+       (lambda (callback)
+         (dotimes (index 100) (funcall callback #(7))))
+       '((:col 1 :type :int4)) 1
+       (lambda (row) (push (list (aref row 0) (aref row 1)) actual))))
+    (check (equal actual '((7 100)))
+           "a single heavily skewed group stays in one bounded hash state")))
+
 (defun make-query-spill-test-directory ()
   (let ((directory
           (merge-pathnames
@@ -660,8 +735,9 @@
          (let ((*query-work-memory-bytes* 1)
                (*query-temp-directory* directory))
            (setf (symbol-function 'scan-select-path)
-                 (lambda (received-table relfilenode received-path snapshot callback)
-                   (declare (ignore relfilenode received-path snapshot))
+                 (lambda (received-table relfilenode received-path snapshot callback
+                          &optional environment)
+                   (declare (ignore relfilenode received-path snapshot environment))
                    (check (eq received-table table)
                           "external sort reads its registered scan relation")
                    (dolist (values input)

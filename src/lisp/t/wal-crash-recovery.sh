@@ -545,7 +545,7 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.wal"))):
         if data[offset:offset + 4] != b"PGWL":
             raise SystemExit("invalid WAL while inspecting checkpoint images")
         version = struct.unpack_from("<H", data, offset + 4)[0]
-        if version not in (2, 3):
+        if version not in (2, 3, 4):
             raise SystemExit("unsupported WAL version while inspecting checkpoint images")
         record_type = struct.unpack_from("<H", data, offset + 6)[0]
         length = struct.unpack_from("<I", data, offset + 8)[0]
@@ -557,9 +557,6 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.wal"))):
         elif record_type == 1 and group_images is not None:
             count = struct.unpack_from("<I", data, payload)[0]
             image_header_size = 8 if version == 2 else 12
-            expected = 32 + 4 + count * (image_header_size + page_size)
-            if length != expected:
-                raise SystemExit("invalid page-image length in checkpoint WAL")
             item = payload + 4
             for _ in range(count):
                 if version == 2:
@@ -572,6 +569,15 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.wal"))):
                     page_lsn = struct.unpack_from("<Q", data, page)[0]
                     group_images[block] = page_lsn
                 item += image_header_size + page_size
+                if version == 4:
+                    if item + 4 > offset + length:
+                        raise SystemExit("truncated contributor count in checkpoint WAL")
+                    xid_count = struct.unpack_from("<I", data, item)[0]
+                    item += 4 + xid_count * 8
+                    if item > offset + length:
+                        raise SystemExit("truncated contributors in checkpoint WAL")
+            if item != offset + length:
+                raise SystemExit("invalid page-image length in checkpoint WAL")
         elif record_type == 4 and group_images is not None:
             checkpoint_images = group_images
             group_images = None
@@ -866,6 +872,10 @@ expect_bad_wal_startup() {
     if ! grep -Fq "$expected_message" "$error_log"; then
         echo "wal-crash-recovery: startup failed for the wrong reason" >&2
         cat "$error_log" >&2
+        echo "WAL control file:" >&2
+        cat "$bad_data/global/pg_wal_control" >&2
+        echo "Retained WAL segments:" >&2
+        ls -1 "$bad_data/pg_wal"/*.wal >&2 2>/dev/null || true
         exit 1
     fi
 }
@@ -986,7 +996,7 @@ import sys
 for path in glob.glob(os.path.join(sys.argv[1], "*.wal")):
     os.unlink(path)
 PY
-expect_bad_wal_startup "$TMP/missing-wal-segment" 'WAL checkpoint segment' \
+expect_bad_wal_startup "$TMP/missing-wal-segment" 'WAL scan start segment' \
     "$TMP/missing-wal-segment.log"
 
 # Exercise each durable boundary in VACUUM's index-before-heap cleanup order.

@@ -86,11 +86,12 @@ run -c "create table build_gate_other (id int)" >/dev/null
 awk 'BEGIN {
     printf "insert into build_gate_a values "
     for (i = 1; i <= 2000; i++)
-        printf "%s(%d, %d)", i == 1 ? "" : ", ", i, i % 10
+      printf "%s(%d, %d)", i == 1 ? "" : ", ", i, i
     print ";"
 }' > "$TMP/populate.sql"
 run < "$TMP/populate.sql" > "$TMP/populate.out" 2>&1 \
     || fail "could not populate build table"
+run -c "analyze build_gate_a" >/dev/null
 
 install_output=$(control <<EOF
 (defvar *index-build-test-original-entries* nil)
@@ -218,6 +219,14 @@ run -c "create table build_race_left (id int, category int)" >/dev/null
 run -c "create table build_race_right (id int, category int)" >/dev/null
 run -c "insert into build_race_left values (1, 1)" >/dev/null
 run -c "insert into build_race_right values (2, 2)" >/dev/null
+awk 'BEGIN {
+    printf "insert into build_race_right values "
+    for (id = 1000; id < 3000; id++)
+        printf "%s(%d, %d)", id == 1000 ? "" : ", ", id, id + 10000
+    print ";"
+}' > "$TMP/race-selectivity.sql"
+run < "$TMP/race-selectivity.sql" >/dev/null
+run -c "analyze build_race_right" >/dev/null
 race_setup=$(control <<EOF
 (let* ((db (gethash "postgres" (catalog-databases *catalog*)))
        (table (gethash "build_race_left" (database-tables db))))
@@ -270,6 +279,14 @@ run -c "create table build_failure_a (id int, category int)" >/dev/null
 run -c "insert into build_failure_a values (1, 3)" >/dev/null
 run -c "create table build_failure_b (id int, category int)" >/dev/null
 run -c "insert into build_failure_b values (1, 3)" >/dev/null
+awk 'BEGIN {
+    printf "insert into build_failure_b values "
+    for (id = 1000; id < 11000; id++)
+        printf "%s(%d, %d)", id == 1000 ? "" : ", ", id, id + 10000
+    print ";"
+}' > "$TMP/failure-selectivity.sql"
+run < "$TMP/failure-selectivity.sql" >/dev/null
+run -c "analyze build_failure_b" >/dev/null
 failure_setup=$(control <<EOF
 (defvar *index-publication-failure-original-save* nil)
 (defvar *index-publication-failure-name* "publication_failure_idx")

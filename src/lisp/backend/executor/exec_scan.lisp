@@ -192,7 +192,9 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
   (kind :seq-scan)
   index
   qual
-  key)
+  key
+  parameter-expr
+  selectivity)
 
 (defun where-conjuncts (where)
   "Return WHERE's top-level AND terms in source order."
@@ -234,31 +236,262 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
          (:varchar (stringp value))
          (t nil))))
 
-(defun index-path-for-equality (table qual)
+(defun table-statistics-column (table attnum)
+  (let* ((statistics (pg-class-statistics table))
+         (columns (and statistics (pg-table-statistics-columns statistics))))
+    (when (and columns (<= 1 attnum (length columns)))
+      (aref columns (1- attnum)))))
+
+(defun table-row-estimate (table)
+  (let ((statistics (pg-class-statistics table)))
+    (if statistics
+        (pg-table-statistics-row-count statistics)
+        (* 100 (buf-nblocks (pg-class-relfilenode table))))))
+
+(defun table-page-estimate (table)
+  (max 1 (buf-nblocks (pg-class-relfilenode table))))
+
+(defun planner-equality-selectivity (table attnum value)
+  "Use ANALYZE's MCV frequencies, then its residual ndistinct estimate."
+  (let ((statistics (table-statistics-column table attnum)))
+    (if (null statistics)
+        0.1d0
+        (let* ((mcv (pg-column-statistics-most-common-values statistics))
+               (common (and value
+                            (assoc value mcv :test #'equal)))
+               (common-fraction (reduce #'+ mcv :key #'cdr :initial-value 0.0d0))
+               (remaining-values
+                 (max 1 (- (pg-column-statistics-distinct-count statistics)
+                           (length mcv))))
+               (residual (max 0.0d0
+                              (- 1.0d0
+                                 (pg-column-statistics-null-fraction statistics)
+                                 common-fraction))))
+          (min 1.0d0
+               (max 0.0d0
+                    (or (cdr common)
+                        (/ residual remaining-values))))))))
+
+(defun index-paths-for-column (table attnum qual &key value parameter-expr)
+  (when (<= 1 attnum (length (pg-class-columns table)))
+    (loop for index in (table-indexes table)
+          when (and (pg-index-valid-p index)
+                    (= (length (pg-index-columns index)) 1)
+                    (= (first (pg-index-columns index)) attnum))
+            append
+            (let* ((types (index-types index table))
+                   (type (first types))
+                   (constant-p (null parameter-expr)))
+              (when (or (not constant-p)
+                        (indexable-equality-value-p value type))
+                (list
+                 (make-select-scan-path
+                  :kind :index-scan
+                  :index index
+                  :qual qual
+                  :key (when constant-p
+                         (encode-index-key (list value) types))
+                  :parameter-expr parameter-expr
+                  :selectivity
+                  (let ((selectivity
+                          (if constant-p
+                              (planner-equality-selectivity table attnum value)
+                              (let ((statistics
+                                      (table-statistics-column table attnum)))
+                                (if statistics
+                                    (/ 1.0d0
+                                       (max 1 (pg-column-statistics-distinct-count
+                                               statistics)))
+                                    0.1d0)))))
+                    (if (pg-index-unique-p index)
+                        (min selectivity
+                             (/ 1.0d0 (max 1 (table-row-estimate table))))
+                        selectivity)))))))))
+
+(defun index-paths-for-equality (table qual &optional (column-offset 0))
   (multiple-value-bind (attnum value found-p)
       (equality-column-constant qual)
-    (when found-p
-      (dolist (idx (table-indexes table))
-        (when (and (pg-index-valid-p idx)
-                   (= (length (pg-index-columns idx)) 1)
-                   (= (first (pg-index-columns idx)) attnum))
-          (let* ((types (index-types idx table))
-                 (type (first types)))
-            (when (indexable-equality-value-p value type)
-              (return-from index-path-for-equality
-                (make-select-scan-path
-                 :kind :index-scan
-                 :index idx
-                 :qual qual
-                 :key (encode-index-key (list value) types))))))))
-    nil))
+    (when (and found-p
+               (< column-offset attnum)
+               (<= attnum (+ column-offset
+                             (length (pg-class-columns table)))))
+      (index-paths-for-column table (- attnum column-offset) qual
+                              :value value))))
 
-(defun choose-select-scan-path (table where)
-  "Choose the first single-column equality index usable by a top-level AND."
-  (or (loop for qual in (where-conjuncts where)
-            for path = (index-path-for-equality table qual)
-            when path return path)
-      (make-select-scan-path :kind :seq-scan)))
+(defun index-path-for-equality (table qual &optional (column-offset 0))
+  (first (index-paths-for-equality table qual column-offset)))
+
+(defun planner-random-heap-page-estimate (pages matching-rows)
+  "Approximate random heap-page visits under uniform row placement.
+
+costsize.c uses index_pages_fetched's cache-aware Mackert-Lohman estimate;
+this Poisson approximation stays monotone and bounded for the small planner."
+  (if (zerop matching-rows)
+      0
+      (min pages
+           (ceiling (* pages
+                       (- 1.0d0
+                          (exp (- (/ matching-rows (float pages 1.0d0))))))))))
+
+(defun select-scan-path-cost (table path)
+  "Estimate SeqScan and IndexScan using costsize.c's page/tuple model.
+
+The constants intentionally follow costsize.c's default sequential page,
+random page, and tuple CPU costs; this is a stable first choice model rather
+than a configurable cost GUC surface."
+  (let* ((rows (table-row-estimate table))
+         (pages (table-page-estimate table)))
+    (if (eq (select-scan-path-kind path) :seq-scan)
+        (+ pages (* rows 0.01d0))
+        (let* ((index (select-scan-path-index path))
+               (index-pages (max 1 (buf-nblocks (pg-index-relfilenode index))))
+               (levels (max 1 (ceiling (log index-pages 100))))
+               (selectivity (or (select-scan-path-selectivity path) 0.1d0))
+               (index-rows (* rows selectivity))
+               (heap-pages (planner-random-heap-page-estimate
+                            pages index-rows)))
+          (+ (* 4.0d0 levels)
+             (* 4.0d0 heap-pages)
+             (* 0.01d0 index-rows))))))
+
+(defun select-scan-path-row-estimate (table path)
+  (* (table-row-estimate table)
+     (if (eq (select-scan-path-kind path) :index-scan)
+         (or (select-scan-path-selectivity path) 0.1d0)
+         1.0d0)))
+
+(defun select-path-spool-spill-page-cost (table path)
+  "Estimate sequential I/O pages for a materialized inner that spills.
+
+Like costsize.c:cost_material, this charges a sequential page write at
+materialization and a page read per replay. PostgreSQL BLCKSZ (8192 bytes)
+approximates tuple spool size from relation pages and path selectivity."
+  (let* ((selectivity (if (eq (select-scan-path-kind path) :index-scan)
+                          (or (select-scan-path-selectivity path) 0.1d0)
+                          1.0d0))
+         (spool-bytes (* 8192 (table-page-estimate table) selectivity))
+         (memory-limit (max 1 *query-work-memory-bytes*)))
+    (if (> spool-bytes memory-limit)
+        (/ spool-bytes 8192.0d0)
+        0.0d0)))
+
+(defun nested-loop-inner-path-cost (table path outer-rows)
+  "Estimate an inner path using its parameterization and replay strategy.
+
+Unparameterized SeqScan and IndexScan inputs are cached by
+stream-select-join-environments, like nodeMaterial.c, so their access cost is
+paid once and later passes pay tuple replay plus possible spill reads. A
+parameterized IndexScan is rescanned per outer row, as in nodeIndexscan.c."
+  (let* ((scan-cost (select-scan-path-cost table path))
+         (loops (max 1.0d0 outer-rows))
+         (spill-pages (select-path-spool-spill-page-cost table path)))
+    (if (select-scan-path-parameter-expr path)
+        (* loops scan-cost)
+        (+ scan-cost
+           ;; The first inner pass writes spilled tuples; each later pass reads
+           ;; the same spool sequentially, matching nodeMaterial.c's rescan cost.
+           spill-pages
+           (* (max 0.0d0 (1- loops))
+              (+ (* (select-scan-path-row-estimate table path) 0.01d0)
+                 spill-pages))))))
+
+(defun select-path-before-p (table left right &optional outer-rows)
+  (if outer-rows
+      (< (nested-loop-inner-path-cost table left outer-rows)
+         (nested-loop-inner-path-cost table right outer-rows))
+      (< (select-scan-path-cost table left)
+         (select-scan-path-cost table right))))
+
+(defun equality-column-references (qual)
+  "Return the two column expressions in a simple equality qual."
+  (when (and (eq (first qual) :binop)
+             (string= (second qual) "=")
+             (eq (first (third qual)) :col)
+             (eq (first (fourth qual)) :col))
+    (values (third qual) (fourth qual) t)))
+
+(defun index-paths-for-join-equality (table qual outer-width right-offset)
+  "Find parameterized indexes for right-side Vars equated to outer Vars.
+
+Like indxpath.c's parameterized IndexPath discovery, only a simple equality
+whose other operand belongs to the already-built outer relation is considered."
+  (multiple-value-bind (left right found-p)
+      (equality-column-references qual)
+    (when found-p
+      (loop for (right-var outer-var) in (list (list right left) (list left right))
+            for global-attnum = (second right-var)
+            for local-attnum = (- global-attnum right-offset)
+            when (and (<= 1 local-attnum (length (pg-class-columns table)))
+                      (<= 1 (second outer-var) outer-width))
+              append (index-paths-for-column
+                      table local-attnum qual
+                      :parameter-expr outer-var)))))
+
+(defun select-relation-index-for-attnum (attnum relations)
+  (position-if
+   (lambda (relation)
+     (let ((offset (getf relation :offset))
+           (width (getf relation :width)))
+       (and (< offset attnum) (<= attnum (+ offset width)))))
+   relations))
+
+(defun index-paths-for-reordered-join-equality
+    (table qual relation-index relations joined-indices)
+  "Find a parameterized path from this relation to any already joined Var."
+  (multiple-value-bind (left right found-p)
+      (equality-column-references qual)
+    (when found-p
+      (loop for (right-var outer-var) in (list (list right left) (list left right))
+            for local-attnum =
+                             (- (second right-var)
+                                (getf (nth relation-index relations) :offset))
+            for outer-index =
+                            (select-relation-index-for-attnum (second outer-var) relations)
+            when (and (<= 1 local-attnum (length (pg-class-columns table)))
+                      (member outer-index joined-indices))
+              append (index-paths-for-column
+                      table local-attnum qual
+                      :parameter-expr outer-var)))))
+
+(defun index-paths-for-relation-joins
+    (table relation-index relations joined-indices joins)
+  (loop for join in joins
+        append (index-paths-for-reordered-join-equality
+                table (getf join :qual) relation-index relations
+                joined-indices)))
+
+(defun choose-cheapest-select-path (table candidates &optional outer-rows)
+  (reduce (lambda (best path)
+            (if (select-path-before-p table path best outer-rows) path best))
+          (rest candidates) :initial-value (first candidates)))
+
+(defun choose-join-inner-path (table join outer-rows right-offset)
+  (let* ((type (getf join :type))
+         (paths (if (member type '(:inner :left))
+                    (index-paths-for-join-equality
+                     table (getf join :qual) (getf join :left-width)
+                     right-offset)
+                    nil))
+         (seq (make-select-scan-path :kind :seq-scan)))
+    (if (null paths)
+        seq
+        (let* ((best-index
+                 (choose-cheapest-select-path table paths outer-rows))
+               (index-cost (nested-loop-inner-path-cost
+                            table best-index outer-rows))
+               (seq-cost (nested-loop-inner-path-cost table seq outer-rows)))
+          (if (< index-cost seq-cost) best-index seq)))))
+
+(defun choose-select-scan-path (table where &optional (column-offset 0))
+  "Choose the lowest-cost SeqScan or equality IndexScan.
+
+COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
+  (let ((candidates
+          (cons (make-select-scan-path :kind :seq-scan)
+                (loop for qual in (where-conjuncts where)
+                      append (index-paths-for-equality
+                              table qual column-offset)))))
+    (choose-cheapest-select-path table candidates)))
 
 (defun select-relation-columns (relation)
   (loop for column across (pg-class-columns (select-relation-table relation))
@@ -408,10 +641,44 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
               right-columns)))
 
 (defun select-table-or-error (name)
-  (let ((table (lookup-table name)))
+  (let ((table (or (when (member name '("pg_replication_slots"
+                                        "pg_catalog.pg_replication_slots")
+                                 :test #'string=)
+                     (make-pg-class
+                      :oid #x7FFFFFFE :name "pg_replication_slots"
+                      :relfilenode #x7FFFFFFD
+                      :columns
+                      (vector (make-pg-column :name "slot_name" :type :varchar
+                                              :typmod -1 :attnum 1 :notnull t)
+                              (make-pg-column :name "active" :type :bool
+                                              :typmod -1 :attnum 2 :notnull t)
+                              (make-pg-column :name "restart_lsn" :type :varchar
+                                              :typmod -1 :attnum 3 :notnull t)
+                              (make-pg-column :name "confirmed_flush_lsn"
+                                              :type :varchar :typmod -1
+                                              :attnum 4 :notnull nil)
+                              (make-pg-column :name "retained_wal_bytes"
+                                              :type :int8 :typmod -1
+                                              :attnum 5 :notnull t)
+                              (make-pg-column :name "wal_status" :type :varchar
+                                              :typmod -1 :attnum 6 :notnull t))))
+                   (lookup-table name))))
     (unless table
       (ereport "42P01" "relation \"~a\" does not exist" name))
     table))
+
+(defun select-virtual-row-source (table)
+  (when (string= (pg-class-name table) "pg_replication_slots")
+    #'wal-replication-slot-rows))
+
+(defun make-select-relation-spec (name alias table offset)
+  (let ((row-source (select-virtual-row-source table)))
+    (list :name name :alias alias :table table
+          :columns (pg-class-columns table)
+          :offset offset
+          :width (length (pg-class-columns table))
+          :virtual-p (not (null row-source))
+          :row-source row-source)))
 
 (defun prepare-select (ast)
   ;; Resolve all names on one catalog view. Reader registration below protects
@@ -423,9 +690,8 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
            (scope (when first-table
                     (make-base-select-scope from-name from-alias first-table)))
            (relations (when scope
-                        (list (list :name from-name :alias from-alias
-                                    :table first-table
-                                    :columns (pg-class-columns first-table)))))
+                        (list (make-select-relation-spec
+                               from-name from-alias first-table 0))))
            (joins '()))
       (dolist (join-ast (getf ast :joins))
         (let* ((name (getf join-ast :table))
@@ -462,8 +728,8 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
                 joins)
           (setf relations
                 (append relations
-                        (list (list :name name :alias alias :table table
-                                    :columns (pg-class-columns table)))))))
+                        (list (make-select-relation-spec
+                               name alias table offset))))))
       (setf joins (nreverse joins))
       (let* ((where (when (getf ast :where)
                       (analyze-expr (getf ast :where) scope)))
@@ -499,10 +765,23 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
               :aggregate-count aggregate-count
               :order order
               :limit limit
+              :join-order nil
               :joins joins)))))
 (defun select-index-current-p (table idx)
   (and (= (pg-index-table-oid idx) (pg-class-oid table))
        (member idx (table-indexes table) :test #'eq)))
+
+(defun select-relation-reader-relfilenodes (relations)
+  (mapcan (lambda (spec)
+            (when (not (getf spec :virtual-p))
+              (let* ((table (getf spec :table))
+                     (path (getf spec :path))
+                     (index (and (eq (select-scan-path-kind path) :index-scan)
+                                 (select-scan-path-index path))))
+                (cons (pg-class-relfilenode table)
+                      (when index
+                        (list (pg-index-relfilenode index)))))))
+          relations))
 
 (defmacro with-registered-select-relations ((registered-relations relations)
                                             &body body)
@@ -521,53 +800,80 @@ registration-to-DDL handoff free of a lock-order inversion."
     `(let ((,relation-list (mapcar #'copy-list ,relations)))
        (with-registered-relation-access
            (,registered-relfilenodes ,xid :read)
-           (loop for ,spec in ,relation-list
-                 for ,table = (getf ,spec :table)
-                 for ,path = (getf ,spec :path)
-                 for ,index = (and (eq (select-scan-path-kind ,path) :index-scan)
-                                   (select-scan-path-index ,path))
-                 append (cons (pg-class-relfilenode ,table)
-                              (when ,index
-                                (list (pg-index-relfilenode ,index)))))
+           (select-relation-reader-relfilenodes ,relation-list)
            (dolist (,spec ,relation-list)
-             (let* ((,table (getf ,spec :table))
-                    (,path (getf ,spec :path))
-                    (,index (and (eq (select-scan-path-kind ,path) :index-scan)
-                                 (select-scan-path-index ,path))))
-               (ensure-current-table ,table)
-               (unless (eq (getf ,spec :columns) (pg-class-columns ,table))
-                 (ereport "0A000"
-                          "table definition changed during query planning"))
-               (when (and ,index (not (select-index-current-p ,table ,index)))
-                 ;; DDL completed after planning.  The old index reader remains
-                 ;; registered until transaction end; use SeqScan for this query.
-                 (setf (getf ,spec :path)
-                       (make-select-scan-path :kind :seq-scan)))))
+             (unless (getf ,spec :virtual-p)
+               (let* ((,table (getf ,spec :table))
+                      (,path (getf ,spec :path))
+                      (,index (and (eq (select-scan-path-kind ,path) :index-scan)
+                                   (select-scan-path-index ,path))))
+                 (ensure-current-table ,table)
+                 (unless (eq (getf ,spec :columns) (pg-class-columns ,table))
+                   (ereport "0A000"
+                            "table definition changed during query planning"))
+                 (when (and ,index (not (select-index-current-p ,table ,index)))
+                   ;; DDL completed after planning. The old index reader remains
+                   ;; registered until transaction end; use SeqScan for this query.
+                   (setf (getf ,spec :path)
+                         (make-select-scan-path :kind :seq-scan))))))
          (let ((,registered-relations ,relation-list))
            ,@body)))))
 
-(defun scan-select-index (table path snapshot callback)
+(defun select-scan-index-key (table path environment)
+  (let ((parameter (select-scan-path-parameter-expr path)))
+    (if (null parameter)
+        (select-scan-path-key path)
+        (let* ((value (eval-expr parameter environment))
+               (types (index-types (select-scan-path-index path) table)))
+          (when (indexable-equality-value-p value (first types))
+            (encode-index-key (list value) types))))))
+
+(defun scan-select-index (table path snapshot callback &optional environment)
   (let* ((idx (select-scan-path-index path))
          (relfilenode (pg-class-relfilenode table))
-         ;; B-tree synchronization is scoped to this index; candidate TIDs
-         ;; remain subject to heap visibility and the full WHERE recheck.
-         (tids (btree-search (pg-index-relfilenode idx)
-                             (select-scan-path-key path))))
-    (dolist (tid (remove-duplicates tids :test #'equal))
-      (check-for-interrupts)
-      (let ((tuple (heapam-get-tuple relfilenode (car tid) (cdr tid)
-                                     (pg-class-columns table))))
-        (when (and tuple (htup-visible-p tuple snapshot)
-                   (eq (funcall callback tuple) :stop))
-          (return-from scan-select-index :stop))))
-    (values)))
+         (key (select-scan-index-key table path environment)))
+    (when key
+      ;; B-tree synchronization stays scoped to this index. The cursor streams
+      ;; one TID to the executor, so LIMIT can stop before later duplicates.
+      ;; Parameter values are evaluated for each nested-loop outer row, matching
+      ;; PostgreSQL's ExecIndexScan/ScanKey setup in nodeIndexscan.c.
+      (btree-scan-equal
+       (pg-index-relfilenode idx) key
+       (lambda (tid)
+         (check-for-interrupts)
+         (let ((tuple (heapam-get-tuple relfilenode (car tid) (cdr tid)
+                                        (pg-class-columns table))))
+           (when (and tuple (htup-visible-p tuple snapshot))
+             (funcall callback tuple))))))))
 
-(defun scan-select-path (table relfilenode path snapshot callback)
+(defun scan-select-path (table relfilenode path snapshot callback
+                         &optional environment)
   (ecase (select-scan-path-kind path)
     (:seq-scan
      (heapam-scan relfilenode (pg-class-columns table) snapshot callback))
     (:index-scan
-     (scan-select-index table path snapshot callback))))
+     (scan-select-index table path snapshot callback environment))))
+
+(defun scan-select-relation (relation path snapshot callback
+                             &optional environment)
+  "Scan a registered relation, including executor-backed virtual catalogs."
+  (let ((row-source (getf relation :row-source))
+        (table (getf relation :table)))
+    (if row-source
+        (dolist (row (funcall row-source))
+          (check-for-interrupts)
+          (when (eq (funcall callback row) :stop)
+            (return-from scan-select-relation :stop)))
+        (scan-select-path table (pg-class-relfilenode table) path snapshot
+                          callback environment))))
+
+(defun make-select-relation-environment (relations relation row)
+  "Place ROW in its source-order slots after a greedy join-order scan."
+  (let* ((width (reduce #'+ relations :key (lambda (spec) (getf spec :width))
+                                      :initial-value 0))
+         (environment (make-array width :initial-element +null+)))
+    (replace environment row :start1 (getf relation :offset))
+    environment))
 
 (defun make-select-result-row (environment where targets)
   "Apply WHERE before projecting ENVIRONMENT, retaining it for ORDER BY."
@@ -593,6 +899,14 @@ registration-to-DDL handoff free of a lock-order inversion."
                    (when row (push row rows))))))
       (scan-select-path table relfilenode path *current-snapshot* #'consider))
     (nreverse rows)))
+
+(defun combine-select-join-environment (left right join)
+  (if (getf join :reordered)
+      (let* ((offset (getf join :right-offset))
+             (environment (copy-seq left)))
+        (replace environment right :start1 offset)
+        environment)
+      (concatenate 'vector left right)))
 
 (defun stream-select-join-environments (left-stream right-stream join callback)
   "Run a lazy nested-loop join with a spillable, replayable inner stream.
@@ -624,7 +938,9 @@ inner input is exhausted and later outer rows can replay the same input."
                                                        :stop))
                                                    (process-right (left right right-index matched-left)
                                                      (check-for-interrupts)
-                                                     (let ((joined (concatenate 'vector left right)))
+                                                     (let ((joined
+                                                             (combine-select-join-environment
+                                                              left right join)))
                                                        (when (true-p (eval-expr qual joined))
                                                          ;; Outer-join match state comes from ON
                                                          ;; alone; WHERE remains above this node.
@@ -698,6 +1014,42 @@ inner input is exhausted and later outer rows can replay the same input."
                                    (with-query-match-map (matched-right match-memory)
                                      (run-join matched-right))
                                    (run-join nil)))))))
+
+(defun stream-select-indexed-join-environments
+    (left-stream parameterized-right-stream join callback)
+  "Run an INNER/LEFT nested loop with an index scan keyed by each outer row.
+
+Unlike the replayable SeqScan inner used by stream-select-join-environments,
+the right input changes with every outer row and must not be spooled once."
+  (let* ((join-type (getf join :type))
+         (qual (getf join :qual))
+         (right-width (getf join :right-width))
+         (null-right (make-array right-width :initial-element +null+))
+         (stopped nil))
+    (unless (member join-type '(:inner :left))
+      (error "Parameterized index join does not support ~a joins" join-type))
+    (labels ((emit (environment)
+               (when (eq (funcall callback environment) :stop)
+                 (setf stopped t)
+                 :stop))
+             (visit-left (left)
+               (unless stopped
+                 (check-for-interrupts)
+                 (let ((matched nil))
+                   (funcall
+                    parameterized-right-stream left
+                    (lambda (right)
+                      (let ((joined
+                              (combine-select-join-environment left right join)))
+                        (when (true-p (eval-expr qual joined))
+                          (setf matched t)
+                          (emit joined)))))
+                   (when (and (not stopped) (not matched)
+                              (eq join-type :left))
+                     (emit (concatenate 'vector left null-right))))
+                 (when stopped :stop))))
+      (funcall left-stream #'visit-left)
+      (if stopped :stop (values)))))
 
 (defun stream-select-joined-environments (relations joins callback)
   (labels ((stream-level (level level-callback)

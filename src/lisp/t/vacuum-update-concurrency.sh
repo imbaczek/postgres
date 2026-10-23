@@ -76,20 +76,28 @@ while [ "$i" -lt 150 ]; do
 done
 [ "$i" -lt 150 ] || fail "server did not start"
 
-# Keep the fixture on one page. Two rows per writer leave enough space for
-# repeated non-HOT updates while still making page conflicts deterministic.
+# Keep the race rows on block zero while extra unique values give the cost model
+# enough relation pages to choose the category index for the post-VACUUM probes.
 run -c "create table vacuum_writer_race (id int, category int)" >/dev/null
 awk 'BEGIN {
     printf "insert into vacuum_writer_race values "
     for (id = 1; id <= 64; id++)
-        printf "%s(%d, 0)", id == 1 ? "" : ", ", id
+        printf "%s(%d, %d)", id == 1 ? "" : ", ", id, id <= 4 ? id : id + 100
     print ";"
 }' > "$TMP/initial.sql"
 run < "$TMP/initial.sql" > "$TMP/initial.out" 2>&1 \
     || fail "initial insert failed"
+awk 'BEGIN {
+    printf "insert into vacuum_writer_race values "
+    for (id = 1000; id < 3000; id++)
+        printf "%s(%d, %d)", id == 1000 ? "" : ", ", id, id + 10000
+    print ";"
+}' > "$TMP/selectivity-fixture.sql"
+run < "$TMP/selectivity-fixture.sql" > "$TMP/selectivity-fixture.out" 2>&1 \
+    || fail "selectivity fixture insert failed"
 run -c "create index vacuum_writer_race_category_idx on vacuum_writer_race (category)" \
     > "$TMP/index.out" 2>&1 || fail "populated index build failed"
-run -c "delete from vacuum_writer_race where id > 62" \
+run -c "delete from vacuum_writer_race where id > 62 and id < 65" \
     > "$TMP/delete.out" 2>&1 || fail "dead-TID fixture delete failed"
 
 install_output=$(control <<EOF
@@ -177,8 +185,8 @@ page_count=$(control <<'EOF'
 (quit)
 EOF
 ) || fail "could not inspect the writer heap page count"
-echo "$page_count" | grep -q '(1)' \
-    || fail "writers extended the heap beyond their shared page: $page_count"
+echo "$page_count" | grep -Eq '\(([2-9]|[1-9][0-9]+)\)' \
+    || fail "writers did not retain a shared first page in the enlarged heap: $page_count"
 
 if [ -f "$TMP/page-retry.timeout" ]; then
     fail "same-page writers did not finish before the page-retry watchdog"
@@ -191,6 +199,7 @@ if [ -f "$TMP/page-retry.timeout" ]; then
 fi
 wait "$VACUUM_PID" || fail "ordinary VACUUM failed after page conflict"
 VACUUM_PID=
+run -c "analyze vacuum_writer_race" >/dev/null
 
 retry_output=$(control <<'EOF'
 (list (and (> (length *vacuum-writer-race-results*) 1)
@@ -209,12 +218,12 @@ echo "$retry_output" | grep -Eq ';; (read )?error:' \
 plan=$(run -c 'explain select id from vacuum_writer_race where category = 15')
 plan_contains_indented_node "$plan" "Index Scan using vacuum_writer_race_category_idx on vacuum_writer_race" \
     || fail "stale index entries were not checked through IndexScan: $plan"
-plan=$(run -c 'explain select id from vacuum_writer_race where category = 16')
+plan=$(run -c 'explain select id from vacuum_writer_race where category = 17')
 plan_contains_indented_node "$plan" "Index Scan using vacuum_writer_race_category_idx on vacuum_writer_race" \
     || fail "post-VACUUM lookup did not use the index: $plan"
 
 capture_results() {
-    for category in 0 1 8 15 16; do
+    for category in 0 1 8 15 17 18 19 20; do
         printf 'category=%s\n' "$category"
         run -c "select id from vacuum_writer_race where category = $category order by id" \
             || return 1
@@ -223,11 +232,14 @@ capture_results() {
 
 capture_results > "$TMP/indexed-results.out" \
     || fail "indexed results after concurrent VACUUM failed"
-[ "$(run -c 'select id from vacuum_writer_race where category = 16 order by id')" = "1
-2
-3
-4" ] \
-    || fail "indexed scan did not find all latest writer versions"
+[ "$(run -c 'select id from vacuum_writer_race where category = 17 order by id')" = 1 ] \
+    || fail "indexed scan missed the latest first-writer version"
+[ "$(run -c 'select id from vacuum_writer_race where category = 18 order by id')" = 2 ] \
+    || fail "indexed scan missed the latest second-writer version"
+[ "$(run -c 'select id from vacuum_writer_race where category = 19 order by id')" = 3 ] \
+    || fail "indexed scan missed the latest third-writer version"
+[ "$(run -c 'select id from vacuum_writer_race where category = 20 order by id')" = 4 ] \
+    || fail "indexed scan missed the latest fourth-writer version"
 [ -z "$(run -c 'select id from vacuum_writer_race where category = 15')" ] \
     || fail "indexed scan exposed obsolete versions from before VACUUM"
 

@@ -19,20 +19,125 @@
 (defvar *btree-relation-lock-map-lock*
   (sb-thread:make-mutex :name "pg btree relation lock map"))
 
+(defstruct btree-relation-lock-state
+  mutex
+  waitqueue
+  (reader-count 0)
+  (reader-owners (make-hash-table :test #'eq))
+  (waiting-writers 0)
+  writer-owner
+  (writer-depth 0))
+
 (defun btree-relation-lock (relfilenode)
   (sb-thread:with-mutex (*btree-relation-lock-map-lock*)
     (or (gethash relfilenode *btree-relation-locks*)
         (setf (gethash relfilenode *btree-relation-locks*)
-              (sb-thread:make-mutex
-               :name (format nil "pg btree relation ~a" relfilenode))))))
+              (make-btree-relation-lock-state
+               :mutex (sb-thread:make-mutex
+                       :name (format nil "pg btree relation ~a" relfilenode))
+               :waitqueue (sb-thread:make-waitqueue
+                           :name (format nil "pg btree relation ~a waiters"
+                                         relfilenode)))))))
 
 (defmacro with-btree-relation-lock ((relfilenode) &body body)
-  (let ((relation (gensym "BTREE-RELATION-"))
-        (lock (gensym "BTREE-LOCK-")))
-    `(let* ((,relation ,relfilenode)
-            (,lock (btree-relation-lock ,relation)))
-       (sb-thread:with-mutex (,lock)
-         ,@body))))
+  (let ((relation (gensym "BTREE-RELATION-")))
+    `(let ((,relation ,relfilenode))
+       (call-with-btree-relation-write-lock
+        ,relation (lambda () ,@body)))))
+
+(declaim (notinline btree-relation-condition-wait))
+
+(defun btree-relation-condition-wait (state)
+  (sb-thread:condition-wait (btree-relation-lock-state-waitqueue state)
+                            (btree-relation-lock-state-mutex state)))
+
+(defun call-with-btree-relation-read-lock (relfilenode function)
+  (let* ((state (btree-relation-lock relfilenode))
+         (thread sb-thread:*current-thread*)
+         (writer-reentrant nil)
+         (registered nil))
+    (sb-thread:with-mutex ((btree-relation-lock-state-mutex state))
+      (when (eq (btree-relation-lock-state-writer-owner state) thread)
+        (setf writer-reentrant t))
+      (unless writer-reentrant
+        (loop while (or (btree-relation-lock-state-writer-owner state)
+                        (and (zerop (gethash thread
+                                             (btree-relation-lock-state-reader-owners
+                                              state)
+                                             0))
+                             (plusp
+                              (btree-relation-lock-state-waiting-writers state))))
+              do (btree-relation-condition-wait state))
+        (incf (btree-relation-lock-state-reader-count state))
+        (incf (gethash thread
+                       (btree-relation-lock-state-reader-owners state)
+                       0))
+        (setf registered t)))
+    (unwind-protect
+         (funcall function)
+      (when registered
+        (sb-thread:with-mutex ((btree-relation-lock-state-mutex state))
+          (decf (btree-relation-lock-state-reader-count state))
+          (let ((depth (gethash thread
+                                (btree-relation-lock-state-reader-owners state))))
+            (if (= depth 1)
+                (remhash thread (btree-relation-lock-state-reader-owners state))
+                (decf (gethash thread
+                               (btree-relation-lock-state-reader-owners state)))))
+          (when (zerop (btree-relation-lock-state-reader-count state))
+            (sb-thread:condition-broadcast
+             (btree-relation-lock-state-waitqueue state))))))))
+
+(defun call-with-btree-relation-write-lock (relfilenode function)
+  (let* ((state (btree-relation-lock relfilenode))
+         (thread sb-thread:*current-thread*)
+         (registered-waiter nil)
+         (writer-held nil))
+    ;; Install release cleanup before acquiring ownership, so an interrupt at
+    ;; the acquisition boundary cannot strand the relation lock.
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex ((btree-relation-lock-state-mutex state))
+             (if (eq (btree-relation-lock-state-writer-owner state) thread)
+                 (sb-sys:without-interrupts
+                   (incf (btree-relation-lock-state-writer-depth state))
+                   (setf writer-held t))
+                 (progn
+                   (when (plusp (gethash thread
+                                         (btree-relation-lock-state-reader-owners state)
+                                         0))
+                     (error "cannot upgrade a B-tree scan lock to a writer lock"))
+                   (unwind-protect
+                        (progn
+                          ;; Like LWLockDequeueSelf() in
+                          ;; src/backend/storage/lmgr/lwlock.c, every interrupted
+                          ;; wait must remove its waiter registration.
+                          (sb-sys:without-interrupts
+                            (incf (btree-relation-lock-state-waiting-writers state))
+                            (setf registered-waiter t))
+                          (loop while (or (btree-relation-lock-state-writer-owner state)
+                                          (plusp (btree-relation-lock-state-reader-count state)))
+                                do (btree-relation-condition-wait state))
+                          (sb-sys:without-interrupts
+                            (decf (btree-relation-lock-state-waiting-writers state))
+                            (setf registered-waiter nil
+                                  (btree-relation-lock-state-writer-owner state) thread
+                                  (btree-relation-lock-state-writer-depth state) 1
+                                  writer-held t)))
+                     (when registered-waiter
+                       (sb-sys:without-interrupts
+                         (decf (btree-relation-lock-state-waiting-writers state))
+                         (setf registered-waiter nil)
+                         (sb-thread:condition-broadcast
+                          (btree-relation-lock-state-waitqueue state))))))))
+           (funcall function))
+      (when writer-held
+        (sb-thread:with-mutex ((btree-relation-lock-state-mutex state))
+          (decf (btree-relation-lock-state-writer-depth state))
+          (when (zerop (btree-relation-lock-state-writer-depth state))
+            (setf (btree-relation-lock-state-writer-owner state) nil)
+            (sb-thread:condition-broadcast
+             (btree-relation-lock-state-waitqueue state))))))))
 
 (defun call-with-btree-relation-locks (relfilenodes function)
   (let ((relfilenodes (sort (remove-duplicates (copy-list relfilenodes)
@@ -41,33 +146,62 @@
     (labels ((lock-next (remaining)
                (if (null remaining)
                    (funcall function)
-                   (let ((lock (btree-relation-lock (car remaining))))
-                     (sb-thread:with-mutex (lock)
-                       (lock-next (cdr remaining)))))))
+                   (call-with-btree-relation-write-lock
+                    (car remaining)
+                    (lambda () (lock-next (cdr remaining)))))))
       (lock-next relfilenodes))))
 
 (defmacro with-btree-relation-locks ((relfilenodes) &body body)
   `(call-with-btree-relation-locks ,relfilenodes (lambda () ,@body)))
+
+(defun call-with-btree-relation-read-locks (relfilenodes function)
+  "Hold a shared lease on each relation in writer-compatible lock order."
+  (let ((relfilenodes (sort (remove-duplicates (copy-list relfilenodes)
+                                               :test #'eql)
+                            #'<)))
+    (labels ((lock-next (remaining)
+               (if (null remaining)
+                   (funcall function)
+                   (call-with-btree-relation-read-lock
+                    (car remaining)
+                    (lambda () (lock-next (cdr remaining)))))))
+      (lock-next relfilenodes))))
+
+(defmacro with-btree-relation-read-locks ((relfilenodes) &body body)
+  `(call-with-btree-relation-read-locks ,relfilenodes (lambda () ,@body)))
+
+(defun btree-ensure-init-before-read (relfilenode)
+  "Initialize an empty index before entering any shared read-lease set."
+  (unless (plusp (buf-nblocks relfilenode))
+    (with-btree-relation-lock (relfilenode)
+      (btree-ensure-init relfilenode)))
+  (values))
 
 (defun btree-split-generation (relfilenode)
   (sb-thread:with-mutex (*btree-split-lock*)
     (gethash relfilenode *btree-split-generations* 0)))
 
 (defun btree-record-split (relfilenode)
+  "Compatibility name for the per-relation mutation generation bump."
+  (btree-record-mutation relfilenode))
+
+(defun btree-record-mutation (relfilenode)
   (sb-thread:with-mutex (*btree-split-lock*)
     (incf (gethash relfilenode *btree-split-generations* 0))))
 
 (defun btree-forget (relfilenode)
   "Discard split-generation state after RELFILENODE is permanently deleted."
-  (let ((relation-lock (btree-relation-lock relfilenode)))
-    (sb-thread:with-mutex (relation-lock)
-      ;; Callers hold the relation DDL gate, so no operation can have fetched
-      ;; this mutex and still be waiting to enter it.
-      (sb-thread:with-mutex (*btree-relation-lock-map-lock*)
-        (when (eq (gethash relfilenode *btree-relation-locks*) relation-lock)
-          (remhash relfilenode *btree-relation-locks*)))
-      (sb-thread:with-mutex (*btree-split-lock*)
-        (remhash relfilenode *btree-split-generations*))))
+  (let ((lock-state (btree-relation-lock relfilenode)))
+    (call-with-btree-relation-write-lock
+     relfilenode
+     (lambda ()
+       ;; Callers hold the relation DDL gate, so no operation can have fetched
+       ;; this state and still be waiting to enter it.
+       (sb-thread:with-mutex (*btree-relation-lock-map-lock*)
+         (when (eq (gethash relfilenode *btree-relation-locks*) lock-state)
+           (remhash relfilenode *btree-relation-locks*)))
+       (sb-thread:with-mutex (*btree-split-lock*)
+         (remhash relfilenode *btree-split-generations*)))))
   (values))
 
 (defun btree-page-type (page) (aref page +pd-flags-off+))
@@ -179,7 +313,8 @@
       (let ((leaf (make-page)))
         (page-init leaf)
         (set-btree-page-type leaf +btree-page-leaf+)
-        (buf-write relfilenode 1 leaf)))
+        (buf-write relfilenode 1 leaf))
+      (btree-record-mutation relfilenode))
     (mark-dirty relfilenode))
   (values))
 
@@ -258,8 +393,95 @@ to a single leaf."
 
 (defun btree-search (relfilenode key)
   "Search one index while excluding its own concurrent page rewrites."
-  (with-btree-relation-lock (relfilenode)
-    (btree-search-unlocked relfilenode key)))
+  (btree-ensure-init-before-read relfilenode)
+  (call-with-btree-relation-read-lock
+   relfilenode (lambda () (btree-search-unlocked relfilenode key))))
+
+(defstruct btree-equal-cursor
+  relfilenode key stack)
+
+(defstruct btree-equal-cursor-frame
+  level entries (next 0) (end -1))
+
+(defun btree-equal-child-range (entries key)
+  "Return the first and last child that can contain KEY."
+  (let ((last-lower-bound 0))
+    (loop for entry in entries
+          for index from 0
+          when (key<= (car entry) key)
+            do (setf last-lower-bound index))
+    (let ((first-candidate last-lower-bound))
+      (when (key= (car (nth last-lower-bound entries)) key)
+        (loop while (and (> first-candidate 0)
+                         (key= (car (nth (1- first-candidate) entries)) key))
+              do (decf first-candidate))
+        (when (plusp first-candidate)
+          (decf first-candidate)))
+      (values first-candidate last-lower-bound))))
+
+(defun btree-cursor-push-node (cursor level block)
+  (let ((page (buf-read (btree-equal-cursor-relfilenode cursor) block)))
+    (unless page
+      (ereport "XX000" "index page ~a is missing" block))
+    (if (zerop level)
+        (let ((entries (btree-page-entries page nil)))
+          (push (make-btree-equal-cursor-frame
+                 :level 0 :entries entries :next 0 :end (1- (length entries)))
+                (btree-equal-cursor-stack cursor)))
+        (let ((entries (btree-page-entries page t)))
+          (unless (null entries)
+            (multiple-value-bind (first last)
+                (btree-equal-child-range entries (btree-equal-cursor-key cursor))
+              (push (make-btree-equal-cursor-frame
+                     :level level :entries entries :next first :end last)
+                    (btree-equal-cursor-stack cursor))))))))
+
+(defun btree-cursor-next-tid (cursor)
+  (loop while (btree-equal-cursor-stack cursor)
+        for frame = (first (btree-equal-cursor-stack cursor))
+        for next = (btree-equal-cursor-frame-next frame)
+        do (if (> next (btree-equal-cursor-frame-end frame))
+               (pop (btree-equal-cursor-stack cursor))
+               (if (zerop (btree-equal-cursor-frame-level frame))
+                   (let* ((entry (nth next
+                                      (btree-equal-cursor-frame-entries frame)))
+                          (key-order
+                            (key-compare (first entry)
+                                         (btree-equal-cursor-key cursor)))
+                          (tid (cons (second entry) (third entry))))
+                     (incf (btree-equal-cursor-frame-next frame))
+                     (cond
+                       ((minusp key-order))
+                       ((plusp key-order)
+                        (pop (btree-equal-cursor-stack cursor)))
+                       (t (return tid))))
+                   (let* ((entries (btree-equal-cursor-frame-entries frame))
+                          (index next)
+                          (child (cdr (nth index entries)))
+                          (child-level (1- (btree-equal-cursor-frame-level frame))))
+                     (incf (btree-equal-cursor-frame-next frame))
+                     (btree-cursor-push-node cursor child-level child))))))
+
+(defun btree-scan-equal (relfilenode key callback)
+  "Stream matching TIDs to CALLBACK until it returns :STOP.
+
+Like PostgreSQL's nbtree.c:btgettuple loop over _bt_first/_bt_next in
+nbtsearch.c, this retains only a scan position and one TID at a time. PostgreSQL
+uses page pins, page locks, and sibling links to survive concurrent splits; this
+tree has key-only separators and no sibling links, so hold its relation-scoped
+read lease for the scan to preserve the actual leaf traversal order. Readers can
+nest and share this lease; relation writers wait until all scans finish."
+  (btree-ensure-init-before-read relfilenode)
+  (call-with-btree-relation-read-lock
+   relfilenode
+   (lambda ()
+     (multiple-value-bind (level root) (btree-read-meta relfilenode)
+       (let ((cursor (make-btree-equal-cursor :relfilenode relfilenode :key key)))
+         (btree-cursor-push-node cursor level root)
+         (loop for tid = (btree-cursor-next-tid cursor)
+               while tid
+               do (when (eq (funcall callback tid) :stop)
+                    (return-from btree-scan-equal :stop))))))))
 
 ;;; ---- insert ----
 
@@ -337,7 +559,6 @@ to a single leaf."
 
 (defun btree-insert-unlocked (relfilenode key tid-block tid-off)
   (with-wal-page-batch
-    (btree-ensure-init relfilenode)
     (multiple-value-bind (level root) (btree-read-meta relfilenode)
       (multiple-value-bind (split-p sep new-block)
           (btree-insert-rec relfilenode level root key tid-block tid-off)
@@ -352,7 +573,10 @@ to a single leaf."
               (unless root-page
                 (ereport "54000" "index root is too large"))
               (buf-write relfilenode root root-page)
-              (btree-write-meta relfilenode (1+ level) root)))))))
+              (btree-write-meta relfilenode (1+ level) root))))))
+    ;; Track non-splitting inserts too, like PostgreSQL's scan-position checks
+    ;; around concurrent leaf changes in nbtsearch.c.
+    (btree-record-mutation relfilenode))
   (values))
 
 (defun btree-insert (relfilenode key tid-block tid-off)
@@ -372,7 +596,8 @@ to a single leaf."
             (unless new-page
               (ereport "XX000" "could not rebuild B-tree leaf page"))
             (with-wal-page-batch
-              (buf-write relfilenode block new-page))))))))
+              (buf-write relfilenode block new-page)
+              (btree-record-mutation relfilenode))))))))
 
 (defun btree-vacuum-scan-tids (relfilenode dead nblocks
                                &key exclusive after-page-function)

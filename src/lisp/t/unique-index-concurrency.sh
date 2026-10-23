@@ -507,7 +507,15 @@ done
 
 run -c "create table drop_index_reader (i int)" >/dev/null
 run -c "insert into drop_index_reader values (1)" >/dev/null
+values='(2)'
+i=3
+while [ "$i" -le 2000 ]; do
+    values="$values, ($i)"
+    i=$((i + 1))
+done
+run -c "insert into drop_index_reader values $values" >/dev/null
 run -c "create index drop_index_reader_idx on drop_index_reader (i)" >/dev/null
+run -c "analyze drop_index_reader" >/dev/null
 {
     printf "begin; explain select i from drop_index_reader where i = 1; select i from drop_index_reader where i = 1; select 'index-reader-ready';\n"
     sleep 2

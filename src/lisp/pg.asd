@@ -57,7 +57,8 @@
                    (:file "namespace")))
      (:module "commands"
       :serial t
-      :components ((:file "vacuum")))
+      :components ((:file "vacuum")
+                   (:file "analyze")))
      (:module "parser"
       :serial t
       :components ((:file "scan")
@@ -69,6 +70,7 @@
                    (:file "exec_spill")
                    (:file "exec_scan")
                    (:file "exec_plan")
+                   (:file "exec_analyze")
                    (:file "exec_insert")
                    (:file "exec_delete")
                    (:file "exec_vacuum")

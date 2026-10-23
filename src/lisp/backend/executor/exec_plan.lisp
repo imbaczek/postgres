@@ -59,17 +59,25 @@ ROW-CALLBACK."
 
 (defun execute-query-plan (plan registered-relations row-callback
                            &key (backend :interpreter))
-  "Execute PLAN through BACKEND. The interpreter is the reference backend."
-  (let* ((entry (query-plan-backend-entry backend))
-         (executor (and entry (query-plan-backend-executor entry))))
-    (cond
-      (executor
-       (funcall executor plan registered-relations row-callback))
-      ((and entry (query-plan-backend-compiler entry))
-       (funcall (funcall (query-plan-backend-compiler entry) plan)
-                registered-relations row-callback))
-      (t
-       (ereport "0A000" "query-plan backend ~a is not installed" backend)))))
+  "Execute PLAN under sorted read leases for all selected B-tree indexes.
+
+This matches insert's ordered multi-index write leases and prevents a nested
+IndexScan from requesting a lower relfilenode while retaining a higher one."
+  (let ((index-relfilenodes
+          (query-plan-index-relfilenodes plan registered-relations)))
+    (dolist (relfilenode index-relfilenodes)
+      (btree-ensure-init-before-read relfilenode))
+    (with-btree-relation-read-locks (index-relfilenodes)
+      (let* ((entry (query-plan-backend-entry backend))
+             (executor (and entry (query-plan-backend-executor entry))))
+        (cond
+          (executor
+           (funcall executor plan registered-relations row-callback))
+          ((and entry (query-plan-backend-compiler entry))
+           (funcall (funcall (query-plan-backend-compiler entry) plan)
+                    registered-relations row-callback))
+          (t
+           (ereport "0A000" "query-plan backend ~a is not installed" backend)))))))
 
 (defun query-plan-sexp (plan)
   "Return the inspectable logical/physical plan artifact."
@@ -77,26 +85,129 @@ ROW-CALLBACK."
         :physical (query-plan-physical plan)
         :alternatives (query-plan-alternatives plan)))
 
-(defun select-plan-path-candidates (prepared)
-  "Build v1 path alternatives: an applicable equality index, then SeqScan."
+(defun reorderable-inner-query-p (relations joins)
+  (and (> (length relations) 1)
+       (every (lambda (relation) (not (getf relation :virtual-p))) relations)
+       (every (lambda (join)
+                (member (getf join :type) '(:inner :cross)))
+              joins)))
+
+(defun relation-path-candidates (prepared relation-index joined-indices)
+  (let* ((relations (getf prepared :relations))
+         (relation (nth relation-index relations))
+         (table (getf relation :table))
+         (offset (getf relation :offset))
+         (where-paths
+           (loop for qual in (where-conjuncts (getf prepared :where))
+                 append (index-paths-for-equality table qual offset)))
+         (join-paths
+           (when joined-indices
+             (index-paths-for-relation-joins
+              table relation-index relations joined-indices
+              (getf prepared :joins)))))
+    (cons (make-select-scan-path :kind :seq-scan)
+          (append where-paths join-paths))))
+
+(defun choose-greedy-select-paths (prepared)
+  "Greedily add the cheapest INNER/CROSS relation, preserving source Var slots.
+
+The bounded search follows joinrels.c's level-by-level idea without building
+PostgreSQL's full join-relation graph. Join quals are applied above the
+reordered tree, and each parameterized path can reference only joined Vars."
+  (let* ((relations (getf prepared :relations))
+         (paths (make-array (length relations)))
+         (remaining (loop for index below (length relations) collect index))
+         (order '())
+         (joined '())
+         (outer-rows 1.0d0))
+    (with-write-lock
+      (loop while remaining
+            do (let ((best-index nil)
+                     (best-path nil)
+                     (best-cost nil))
+                 (dolist (index remaining)
+                   (let* ((table (getf (nth index relations) :table))
+                          (candidates
+                            (relation-path-candidates prepared index joined))
+                          (path (choose-cheapest-select-path
+                                 table candidates outer-rows))
+                          (cost (nested-loop-inner-path-cost
+                                 table path outer-rows)))
+                     (when (or (null best-cost) (< cost best-cost))
+                       (setf best-index index
+                             best-path path
+                             best-cost cost))))
+                 (setf (aref paths best-index) best-path
+                       remaining (remove best-index remaining)
+                       order (append order (list best-index))
+                       joined (append joined (list best-index)))
+                 (let ((table (getf (nth best-index relations) :table)))
+                   (setf outer-rows
+                         (min 1.0d12
+                              (max 1.0d0
+                                   (* outer-rows
+                                      (max 1.0d-6
+                                           (select-scan-path-row-estimate
+                                            table best-path))))))))))
+    (setf (getf prepared :join-order) order)
+    (values (coerce paths 'list) order)))
+
+(defun choose-source-order-select-paths (prepared)
   (let* ((relations (getf prepared :relations))
          (joins (getf prepared :joins))
-         (table (getf prepared :table)))
-    (cond
-      ((null relations)
-       (values nil (list nil)))
-      ((and (= (length relations) 1) (null joins))
-       (let* ((best (with-write-lock
-                      (choose-select-scan-path table (getf prepared :where))))
-              (seq (make-select-scan-path :kind :seq-scan)))
-         (if (eq (select-scan-path-kind best) :index-scan)
-             (values (list best) (list (list best) (list seq)))
-             (values (list seq) (list (list seq))))))
-      (t
-       (let ((seq-paths (loop repeat (length relations)
-                              collect (make-select-scan-path
-                                       :kind :seq-scan))))
-         (values seq-paths (list seq-paths)))))))
+         (paths '())
+         (outer-rows 1.0d0))
+    (with-write-lock
+      (loop for relation in relations
+            for index from 0
+            for table = (getf relation :table)
+            for offset = (getf relation :offset)
+            for path =
+                     (cond
+                       ((getf relation :virtual-p)
+                        (make-select-scan-path :kind :seq-scan))
+                       ((zerop index)
+                        (choose-select-scan-path table (getf prepared :where) offset))
+                       (t
+                        (choose-join-inner-path table (nth (1- index) joins)
+                                                outer-rows offset)))
+            do (push path paths)
+               (setf outer-rows
+                     (min 1.0d12
+                          (max 1.0d0
+                               (* outer-rows
+                                  (max 1.0d-6
+                                       (if (getf relation :virtual-p)
+                                           100.0d0
+                                           (select-scan-path-row-estimate
+                                            table path)))))))))
+    (nreverse paths)))
+
+(defun select-plan-path-candidates (prepared)
+  "Cost scan paths and retain a SeqScan-only fallback alternative."
+  (let* ((relations (getf prepared :relations))
+         (table (getf prepared :table))
+         (selected
+           (cond
+             ((null relations) nil)
+             ((reorderable-inner-query-p relations (getf prepared :joins))
+              (first (multiple-value-list
+                      (choose-greedy-select-paths prepared))))
+             ((and (null (getf prepared :joins))
+                   (getf (first relations) :virtual-p))
+              (list (make-select-scan-path :kind :seq-scan)))
+             ((null (getf prepared :joins))
+              (list (with-write-lock
+                      (choose-select-scan-path table (getf prepared :where)))))
+             (t (choose-source-order-select-paths prepared))))
+         (seq-paths (loop repeat (length relations)
+                          collect (make-select-scan-path :kind :seq-scan)))
+         (alternatives
+           (if (some (lambda (path)
+                       (eq (select-scan-path-kind path) :index-scan)) selected)
+               (list selected seq-paths)
+               (list seq-paths))))
+    (values selected alternatives)))
 
 (defun select-scan-plan-form (relation-index relation path physical-p)
   (let ((table (getf relation :table)))
@@ -106,35 +217,71 @@ ROW-CALLBACK."
             (list :index-scan relation-index (pg-class-oid table)
                   (pg-index-oid (select-scan-path-index path))
                   (select-scan-path-qual path)
-                  (select-scan-path-key path))
+                  (select-scan-path-key path)
+                  (select-scan-path-parameter-expr path))
             (list :seq-scan relation-index (pg-class-oid table))))))
 
 (defun select-plan-input-form (prepared physical-p paths)
   (let* ((relations (getf prepared :relations))
-         (joins (getf prepared :joins)))
+         (joins (getf prepared :joins))
+         (join-order (getf prepared :join-order)))
     (if (null relations)
         '(:result)
-        (let ((input
-                (select-scan-plan-form
-                 0 (first relations) (or (first paths)
-                                         (make-select-scan-path
-                                          :kind :seq-scan)) physical-p)))
-          (loop for join in joins
-                for relation-index from 1
-                for relation = (nth relation-index relations)
-                for path = (or (nth relation-index paths)
-                               (make-select-scan-path :kind :seq-scan))
-                for right = (select-scan-plan-form
-                             relation-index relation path physical-p)
-                do (setf input
-                         (list (if physical-p :nested-loop-join :join)
-                               join input right)))
-          input))))
+        (if join-order
+            (let ((input nil)
+                  (left-width 0))
+              (dolist (relation-index join-order)
+                (let* ((relation (nth relation-index relations))
+                       (path (or (nth relation-index paths)
+                                 (make-select-scan-path :kind :seq-scan)))
+                       (right (select-scan-plan-form
+                               relation-index relation path physical-p)))
+                  (if input
+                      (let ((join (list :type :inner :qual '(:bool t)
+                                        :left-width left-width
+                                        :right-width (getf relation :width)
+                                        :right-offset (getf relation :offset)
+                                        :reordered t)))
+                        (setf input
+                              (list (if physical-p :nested-loop-join :join)
+                                    join input right)))
+                      (setf input right))
+                  (incf left-width (getf relation :width))))
+              input)
+            (let ((input
+                    (select-scan-plan-form
+                     0 (first relations) (or (first paths)
+                                             (make-select-scan-path
+                                              :kind :seq-scan)) physical-p)))
+              (loop for join in joins
+                    for relation-index from 1
+                    for relation = (nth relation-index relations)
+                    for path = (or (nth relation-index paths)
+                                   (make-select-scan-path :kind :seq-scan))
+                    for right = (select-scan-plan-form
+                                 relation-index relation path physical-p)
+                    do (setf input
+                             (list (if physical-p :nested-loop-join :join)
+                                   join input right)))
+              input)))))
+
+(defun select-reordered-join-qual (prepared)
+  (let ((quals (remove '(:bool t) (mapcar (lambda (join) (getf join :qual))
+                                          (getf prepared :joins))
+                       :test #'equal)))
+    (when quals
+      (reduce (lambda (left right)
+                (list :and left right :type :bool :typmod -1))
+              (rest quals) :initial-value (first quals)))))
 
 (defun build-select-plan-tree (prepared physical-p paths)
   (let* ((input (select-plan-input-form prepared physical-p paths))
          (where (getf prepared :where))
          (aggregate-p (getf prepared :aggregate-p)))
+    (when (getf prepared :join-order)
+      (let ((join-qual (select-reordered-join-qual prepared)))
+        (when join-qual
+          (setf input (list :filter join-qual input)))))
     (when where
       (setf input (list :filter where input)))
     (when aggregate-p
@@ -181,8 +328,13 @@ ROW-CALLBACK."
       (setf (getf prepared :relations)
             (loop for relation in (getf prepared :relations)
                   for path in selected-paths
+                  for relation-index from 0
                   collect (let ((copy (copy-list relation)))
                             (setf (getf copy :path) path)
+                            (when (and (getf prepared :join-order)
+                                       (= relation-index
+                                          (first (getf prepared :join-order))))
+                              (setf (getf copy :join-order-base) t))
                             copy)))
       (let* ((logical (build-select-plan-tree prepared nil selected-paths))
              (physical (build-select-plan-tree prepared t selected-paths))
@@ -203,7 +355,9 @@ ROW-CALLBACK."
                      (path (getf relation :path)))
                 (setf (plan-node-metadata-selection-rule metadata)
                       (if (eq (select-scan-path-kind path) :index-scan)
-                          :equality-index
+                          (if (select-scan-path-parameter-expr path)
+                              :parameterized-equality-index
+                              :equality-index)
                           :sequential-fallback))))
             (setf (gethash node (query-plan-metadata plan)) metadata)))
         plan))))
@@ -248,7 +402,23 @@ ROW-CALLBACK."
        (make-select-scan-path :kind :index-scan
                               :index index
                               :qual (fifth node)
-                              :key (sixth node))))))
+                              :key (sixth node)
+                              :parameter-expr (seventh node)
+                              :selectivity
+                              (select-scan-path-selectivity path))))))
+
+(defun query-plan-index-relfilenodes (plan registered-relations)
+  "Validate and return the selected IndexScan relations in global lock order."
+  (sort
+   (remove-duplicates
+    (loop for node in (collect-query-plan-nodes (query-plan-physical plan))
+          when (eq (first node) :index-scan)
+            collect
+            (let* ((relation (physical-scan-relation node registered-relations))
+                   (path (physical-scan-path node relation)))
+              (pg-index-relfilenode (select-scan-path-index path))))
+    :test #'eql)
+   #'<))
 
 (defun select-sort-item-less-p (left right order)
   (loop for entry in order
@@ -405,180 +575,369 @@ ROW-CALLBACK."
                                ;; or destruction, including cancellation and downstream errors.
                                (setf buffer nil))))))
 
+(defparameter +hash-aggregate-partition-count+ 16)
+(defparameter +hash-aggregate-entry-overhead-bytes+ 128)
+(defparameter +hash-aggregate-max-partition-depth+ 8)
+
+(defun hash-aggregate-group (group-keys environment)
+  (let* ((values (mapcar (lambda (expr) (eval-expr expr environment)) group-keys))
+         (key (loop for expr in group-keys
+                    for value in values
+                    collect (sql-group-value-key value (expr-type expr)))))
+    (values values key)))
+
+(defun hash-aggregate-state-row (state)
+  (concatenate 'vector (car state) (cdr state)))
+
+(defun hash-aggregate-spill-file (pathname callback)
+  (with-open-file (stream pathname :direction :input :external-format :utf-8)
+    (loop for row = (query-spill-read-record stream)
+          until (eq row +query-spill-eof+)
+          do (check-for-interrupts)
+             (when (eq (funcall callback row) :stop)
+               (return-from hash-aggregate-spill-file :stop))))
+  (values))
+
+(defun hash-aggregate-partition-index (key depth)
+  (mod (sxhash (cons depth key)) +hash-aggregate-partition-count+))
+
+(defun hash-aggregate-partition-spill (pathname group-keys depth)
+  (let ((paths (make-array +hash-aggregate-partition-count+ :initial-element nil))
+        (streams (make-array +hash-aggregate-partition-count+ :initial-element nil))
+        (counts (make-array +hash-aggregate-partition-count+ :initial-element 0)))
+    (unwind-protect
+         (hash-aggregate-spill-file
+          pathname
+          (lambda (environment)
+            (multiple-value-bind (values key)
+                (hash-aggregate-group group-keys environment)
+              (declare (ignore values))
+              (let* ((partition (hash-aggregate-partition-index key depth))
+                     (stream (or (aref streams partition)
+                                 (multiple-value-bind (path output)
+                                     (open-query-temp-output)
+                                   (setf (aref paths partition) path
+                                         (aref streams partition) output)
+                                   output))))
+                (query-spill-write-record stream environment)
+                (incf (aref counts partition))))))
+      (dotimes (index (length streams))
+        (when (aref streams index)
+          (close (aref streams index)))))
+    (loop for index below (length paths)
+          for path = (aref paths index)
+          when path collect (cons (aref counts index) path))))
+
+(defun hash-aggregate-delete-partitions (partitions)
+  (dolist (partition partitions)
+    (delete-query-temp-file (cdr partition)))
+  (values))
+
+(defun hash-aggregate-sort-spill (pathname group-keys aggregate-count callback)
+  "Sort one non-shrinking spill batch and reduce adjacent equal groups."
+  (let ((order (mapcar (lambda (expr) (cons expr nil)) group-keys))
+        (current-key nil)
+        (current-state nil)
+        (saw-row nil))
+    (labels ((emit-current ()
+               (when current-state
+                 (prog1 (funcall callback (hash-aggregate-state-row current-state))
+                   (setf current-state nil))))
+             (consume (environment)
+               (multiple-value-bind (values key)
+                   (hash-aggregate-group group-keys (cdr environment))
+                 (cond
+                   ((and saw-row (not (equal key current-key)))
+                    (when (eq (emit-current) :stop)
+                      (return-from consume :stop))
+                    (setf current-state
+                          (cons (coerce values 'vector)
+                                (make-array aggregate-count :initial-element 0))))
+                   ((not saw-row)
+                    (setf current-state
+                          (cons (coerce values 'vector)
+                                (make-array aggregate-count :initial-element 0)))))
+                 (setf saw-row t current-key key)
+                 (dotimes (index aggregate-count)
+                   (incf (aref (cdr current-state) index)))))
+             (source (row-callback)
+               (hash-aggregate-spill-file
+                pathname (lambda (row) (funcall row-callback (cons nil row))))))
+      (let ((result (stream-select-sort #'source order #'consume)))
+        (when (eq result :stop)
+          (return-from hash-aggregate-sort-spill :stop)))
+      (when (and (not saw-row) (null group-keys))
+        (setf current-state
+              (cons #() (make-array aggregate-count :initial-element 0))))
+      (emit-current))))
+
+(defun hash-aggregate-process-rows
+    (source group-keys aggregate-count callback memory-limit depth)
+  "Aggregate one row stream, spilling unseen groups and recursively partitioning them."
+  (let ((groups (make-hash-table :test #'equal))
+        (group-order nil)
+        (memory-used 0)
+        (spill-path nil)
+        (spill-stream nil)
+        (spill-count 0))
+    (labels ((make-state (values)
+               (let ((state (cons (coerce values 'vector)
+                                  (make-array aggregate-count :initial-element 0))))
+                 (push state group-order)
+                 state))
+             (start-spill ()
+               (multiple-value-setq (spill-path spill-stream)
+                 (open-query-temp-output)))
+             (consume (environment)
+               (check-for-interrupts)
+               (multiple-value-bind (values key)
+                   (hash-aggregate-group group-keys environment)
+                 (let ((state (gethash key groups)))
+                   (cond
+                     (state
+                      (dotimes (index aggregate-count)
+                        (incf (aref (cdr state) index))))
+                     ((and spill-stream group-keys)
+                      (query-spill-write-record spill-stream environment)
+                      (incf spill-count))
+                     (t
+                      (let ((entry-size
+                              (+ +hash-aggregate-entry-overhead-bytes+
+                                 (query-spill-record-size (list key values)))))
+                        (when (and group-keys group-order
+                                   (> (+ memory-used entry-size) memory-limit))
+                          (start-spill))
+                        (if spill-stream
+                            (progn
+                              (query-spill-write-record spill-stream environment)
+                              (incf spill-count))
+                            (let ((new-state (make-state values)))
+                              (setf (gethash key groups) new-state)
+                              (incf memory-used entry-size)
+                              (dotimes (index aggregate-count)
+                                (incf (aref (cdr new-state) index))))))))))))
+      ;; COUNT(*) without GROUP BY has one state even when the child is empty.
+      (unless group-keys
+        (setf (gethash nil groups) (make-state nil)))
+      (unwind-protect
+           (funcall source #'consume)
+        (when spill-stream
+          (close spill-stream)))
+      (dolist (state (nreverse group-order))
+        (when (eq (funcall callback (hash-aggregate-state-row state)) :stop)
+          (return-from hash-aggregate-process-rows :stop)))
+      (when spill-path
+        ;; Drop this batch's keys and states before processing child batches.
+        ;; PostgreSQL resets its hash table between batches for the same reason.
+        (setf groups (make-hash-table :test #'equal)
+              group-order nil
+              memory-used 0)
+        (when (and (> spill-count 0)
+                   (>= depth +hash-aggregate-max-partition-depth+))
+          (unwind-protect
+               (return-from hash-aggregate-process-rows
+                 (hash-aggregate-sort-spill spill-path group-keys
+                                            aggregate-count callback))
+            (delete-query-temp-file spill-path)))
+        (let ((partitions
+                (hash-aggregate-partition-spill spill-path group-keys (1+ depth))))
+          (when (and (> spill-count 0)
+                     (some (lambda (partition)
+                             (>= (car partition) spill-count))
+                           partitions))
+            (hash-aggregate-delete-partitions partitions)
+            (unwind-protect
+                 (return-from hash-aggregate-process-rows
+                   (hash-aggregate-sort-spill spill-path group-keys
+                                              aggregate-count callback))
+              (delete-query-temp-file spill-path)))
+          (delete-query-temp-file spill-path)
+          (dolist (partition partitions)
+            (let* ((path (cdr partition))
+                   (result
+                     (hash-aggregate-process-rows
+                      (lambda (row-callback)
+                        (hash-aggregate-spill-file path row-callback))
+                      group-keys aggregate-count callback memory-limit
+                      (1+ depth))))
+              (delete-query-temp-file path)
+              (when (eq result :stop)
+                (return-from hash-aggregate-process-rows :stop))))))
+      (values))))
+
+(defun stream-hash-aggregate (source group-keys aggregate-count callback)
+  "Run bounded hash aggregation with partitioned spill and sort fallback."
+  (with-query-temp-files ()
+                         (hash-aggregate-process-rows source group-keys aggregate-count callback
+                                                      (max 1 *query-work-memory-bytes*) 0)))
+
+(defun execute-physical-plan-node (node registered-relations outer-environment
+                                   emit run-child run-node)
+  "Execute one physical node using the instrumented callbacks from RUN-NODE."
+  (case (first node)
+    (:result
+     (funcall emit #()))
+    ((:seq-scan :index-scan)
+     (let* ((relation (physical-scan-relation node registered-relations))
+            (path (physical-scan-path node relation)))
+       (scan-select-relation
+        relation path *current-snapshot*
+        (lambda (row)
+          (check-for-interrupts)
+          (let ((environment (if (getf relation :row-source)
+                                 row
+                                 (htup-values row))))
+            (funcall emit
+                     (if (getf relation :join-order-base)
+                         (make-select-relation-environment
+                          registered-relations relation environment)
+                         environment))))
+        outer-environment)))
+    (:filter
+     (let ((qual (second node)))
+       (funcall run-child
+                (third node)
+                (lambda (environment)
+                  (when (true-p (eval-expr qual environment))
+                    (funcall emit environment))))))
+    (:nested-loop-join
+     (let* ((join (second node))
+            (left (third node))
+            (right (fourth node))
+            (right-relation
+              (and (member (first right) '(:seq-scan :index-scan) :test #'eq)
+                   (physical-scan-relation right registered-relations)))
+            (right-path
+              (and right-relation
+                   (physical-scan-path right right-relation))))
+       (if (and right-path (select-scan-path-parameter-expr right-path))
+           (stream-select-indexed-join-environments
+            (lambda (left-callback)
+              (funcall run-child left left-callback))
+            (lambda (outer-environment right-callback)
+              (funcall run-node right right-callback outer-environment))
+            join emit)
+           (stream-select-join-environments
+            (lambda (left-callback)
+              (funcall run-child left left-callback))
+            (lambda (right-callback)
+              (funcall run-child right right-callback))
+            join emit))))
+    (:project
+     (let ((targets (second node)))
+       (funcall run-child
+                (third node)
+                (lambda (environment)
+                  (let ((row (make-select-result-row environment nil targets)))
+                    (when row (funcall emit row)))))))
+    (:sort
+     (stream-select-sort
+      (lambda (sort-callback)
+        (funcall run-child (third node) sort-callback))
+      (second node) emit))
+    (:top-n
+     (let* ((order (second node))
+            (limit (third node))
+            (input (fourth node))
+            (rows (collect-select-top-n
+                   (lambda (callback)
+                     (funcall run-child input callback))
+                   order limit)))
+       (loop for row in rows
+             when (eq (funcall emit row) :stop)
+               do (return :stop))))
+    (:limit
+     (let ((limit (second node))
+           (count 0))
+       (unless (zerop limit)
+         (funcall run-child
+                  (third node)
+                  (lambda (row)
+                    (incf count)
+                    (funcall emit row)
+                    (when (>= count limit) :stop))))))
+    (:hash-aggregate
+     (stream-hash-aggregate
+      (lambda (aggregate-callback)
+        (funcall run-child (fourth node) aggregate-callback))
+      (second node) (third node) emit))
+    (otherwise
+     (error "Unknown physical query-plan node ~s" node))))
+
+(defun reset-query-plan-instrumentation (metadata-map)
+  (maphash (lambda (node metadata)
+             (declare (ignore node))
+             (setf (plan-node-metadata-actual-rows metadata) nil
+                   (plan-node-metadata-actual-row-count metadata) 0
+                   (plan-node-metadata-actual-loops metadata) 0
+                   (plan-node-metadata-actual-startup-time-ticks metadata) 0
+                   (plan-node-metadata-actual-total-time-ticks metadata) 0))
+           metadata-map)
+  (values))
+
+(defun record-query-plan-node-instrumentation (metadata started emitted startup-time
+                                               callback-time child-total-time)
+  (when (and started metadata)
+    (incf (plan-node-metadata-actual-loops metadata))
+    (incf (plan-node-metadata-actual-row-count metadata) emitted)
+    (setf (plan-node-metadata-actual-rows metadata)
+          (/ (plan-node-metadata-actual-row-count metadata)
+             (plan-node-metadata-actual-loops metadata)))
+    (let* ((elapsed (- (get-internal-real-time) started))
+           (self-time (max 0 (- elapsed callback-time child-total-time))))
+      (incf (plan-node-metadata-actual-startup-time-ticks metadata)
+            (or startup-time elapsed))
+      (incf (plan-node-metadata-actual-total-time-ticks metadata)
+            (+ self-time child-total-time))))
+  (values))
+
 (defun interpret-query-plan (plan registered-relations row-callback)
   "Reference interpreter for physical S-expression plans."
   (let ((metadata-map (query-plan-metadata plan)))
     (when *query-plan-instrumentation-p*
-      (maphash (lambda (node metadata)
-                 (declare (ignore node))
-                 (setf (plan-node-metadata-actual-rows metadata) nil
-                       (plan-node-metadata-actual-row-count metadata) 0
-                       (plan-node-metadata-actual-loops metadata) 0
-                       (plan-node-metadata-actual-startup-time-ticks metadata) 0
-                       (plan-node-metadata-actual-total-time-ticks metadata) 0))
-               metadata-map))
-    (labels
-        ((run-node (node callback)
-           (let ((metadata (gethash node metadata-map))
-                 (emitted 0)
-                 (started (when *query-plan-instrumentation-p*
-                            (get-internal-real-time)))
-                 (startup-time nil)
-                 (callback-time 0)
-                 (child-total-time 0))
-             (labels ((emit (row)
-                        (incf emitted)
-                        (when (and started (null startup-time))
-                          (setf startup-time
-                                (- (get-internal-real-time) started)))
-                        (if started
-                            (let ((callback-start (get-internal-real-time)))
+      (reset-query-plan-instrumentation metadata-map))
+    (labels ((run-node (node callback &optional outer-environment)
+               (let ((metadata (gethash node metadata-map))
+                     (emitted 0)
+                     (started (when *query-plan-instrumentation-p*
+                                (get-internal-real-time)))
+                     (startup-time nil)
+                     (callback-time 0)
+                     (child-total-time 0))
+                 (labels ((emit (row)
+                            (incf emitted)
+                            (when (and started (null startup-time))
+                              (setf startup-time
+                                    (- (get-internal-real-time) started)))
+                            (if started
+                                (let ((callback-start (get-internal-real-time)))
+                                  (unwind-protect
+                                       (funcall callback row)
+                                    (incf callback-time
+                                          (- (get-internal-real-time)
+                                             callback-start))))
+                                (funcall callback row)))
+                          (run-child (child child-callback &optional environment)
+                            (let* ((child-metadata (gethash child metadata-map))
+                                   (old-total-time
+                                     (if child-metadata
+                                         (plan-node-metadata-actual-total-time-ticks
+                                          child-metadata)
+                                         0)))
                               (unwind-protect
-                                   (funcall callback row)
-                                (incf callback-time
-                                      (- (get-internal-real-time)
-                                         callback-start))))
-                            (funcall callback row)))
-                      (run-child (child child-callback)
-                        (let* ((child-metadata (gethash child metadata-map))
-                               (old-total-time
-                                 (if child-metadata
-                                     (plan-node-metadata-actual-total-time-ticks
-                                      child-metadata)
-                                     0)))
-                          (unwind-protect
-                               (run-node child child-callback)
-                            (when (and started child-metadata)
-                              (incf child-total-time
-                                    (- (plan-node-metadata-actual-total-time-ticks
-                                        child-metadata)
-                                       old-total-time)))))))
-               (unwind-protect
-                    (case (first node)
-                      (:result (emit #()))
-                      ((:seq-scan :index-scan)
-                       (let* ((relation (physical-scan-relation
-                                         node registered-relations))
-                              (table (getf relation :table))
-                              (path (physical-scan-path node relation)))
-                         (scan-select-path
-                          table (pg-class-relfilenode table) path
-                          *current-snapshot*
-                          (lambda (tuple)
-                            (check-for-interrupts)
-                            (emit (htup-values tuple))))))
-                      (:filter
-                       (let ((qual (second node)))
-                         (run-child
-                          (third node)
-                          (lambda (environment)
-                            (when (true-p (eval-expr qual environment))
-                              (emit environment))))))
-                      (:nested-loop-join
-                       (let* ((join (second node))
-                              (left (third node))
-                              (right (fourth node)))
-                         (stream-select-join-environments
-                          (lambda (left-callback)
-                            (run-child left left-callback))
-                          (lambda (right-callback)
-                            (run-child right right-callback))
-                          join #'emit)))
-                      (:project
-                       (let ((targets (second node)))
-                         (run-child
-                          (third node)
-                          (lambda (environment)
-                            (let ((row (make-select-result-row
-                                        environment nil targets)))
-                              (when row (emit row)))))))
-                      (:sort
-                       (when (eq (stream-select-sort
-                                  (lambda (sort-callback)
-                                    (run-child (third node) sort-callback))
-                                  (second node) #'emit)
-                                 :stop)
-                         (return-from run-node :stop)))
-                      (:top-n
-                       (let* ((order (second node))
-                              (limit (third node))
-                              (input (fourth node))
-                              (rows
-                                (collect-select-top-n
-                                 (lambda (callback)
-                                   (run-child input callback))
-                                 order limit)))
-                         (dolist (row rows)
-                           (when (eq (emit row) :stop)
-                             (return-from run-node :stop)))))
-                      (:limit
-                       (let ((limit (second node))
-                             (count 0))
-                         (unless (zerop limit)
-                           (run-child
-                            (third node)
-                            (lambda (row)
-                              (incf count)
-                              (emit row)
-                              (when (>= count limit) :stop))))))
-                      (:hash-aggregate
-                       (let* ((group-keys (second node))
-                              (aggregate-count (third node))
-                              (groups (make-hash-table :test #'equal))
-                              (group-order '()))
-                         (labels ((make-state (values)
-                                    (let ((state
-                                            (cons (coerce values 'vector)
-                                                  (make-array
-                                                   aggregate-count
-                                                   :initial-element 0))))
-                                      (push state group-order)
-                                      state)))
-                           ;; A plain aggregate has one group even on empty input.
-                           (unless group-keys
-                             (setf (gethash nil groups) (make-state nil)))
-                           (run-child
-                            (fourth node)
-                            (lambda (environment)
-                              (check-for-interrupts)
-                              (let* ((values
-                                       (mapcar
-                                        (lambda (expr)
-                                          (eval-expr expr environment))
-                                        group-keys))
-                                     (key
-                                       (loop for expr in group-keys
-                                             for value in values
-                                             collect
-                                             (sql-group-value-key
-                                              value (expr-type expr))))
-                                     (state (gethash key groups)))
-                                (unless state
-                                  (setf state (make-state values)
-                                        (gethash key groups) state))
-                                (dotimes (index aggregate-count)
-                                  (incf (aref (cdr state) index))))))
-                           (dolist (state (nreverse group-order))
-                             (when (eq (emit (concatenate 'vector
-                                                          (car state)
-                                                          (cdr state)))
-                                       :stop)
-                               (return-from run-node :stop))))))
-                      (t
-                       (error "Unknown physical query-plan node ~s" node)))
-                 (when (and started metadata)
-                   (incf (plan-node-metadata-actual-loops metadata))
-                   (incf (plan-node-metadata-actual-row-count metadata) emitted)
-                   (setf (plan-node-metadata-actual-rows metadata)
-                         (/ (plan-node-metadata-actual-row-count metadata)
-                            (plan-node-metadata-actual-loops metadata)))
-                   (let* ((elapsed (- (get-internal-real-time) started))
-                          (self-time
-                            (max 0 (- elapsed callback-time child-total-time))))
-                     (incf (plan-node-metadata-actual-startup-time-ticks metadata)
-                           (or startup-time elapsed))
-                     (incf (plan-node-metadata-actual-total-time-ticks metadata)
-                           (+ self-time child-total-time)))))))))
+                                   (run-node child child-callback environment)
+                                (when (and started child-metadata)
+                                  (incf child-total-time
+                                        (- (plan-node-metadata-actual-total-time-ticks
+                                            child-metadata)
+                                           old-total-time)))))))
+                   (unwind-protect
+                        (execute-physical-plan-node
+                         node registered-relations outer-environment
+                         #'emit #'run-child #'run-node)
+                     (record-query-plan-node-instrumentation
+                      metadata started emitted startup-time callback-time
+                      child-total-time))))))
       (run-node (query-plan-physical plan) row-callback))))
 
 (register-query-plan-backend :interpreter :executor #'interpret-query-plan)

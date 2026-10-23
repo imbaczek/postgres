@@ -515,6 +515,14 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
              most-positive-fixnum value))
     (unless (= limit -1) limit)))
 
+(defun parse-slot-wal-keep-bytes (value)
+  "Parse the per-slot WAL retention cap; -1 explicitly disables it."
+  (let ((limit (ignore-errors (parse-integer value))))
+    (unless (and limit (>= limit -1))
+      (error "--max-slot-wal-keep-bytes expects a nonnegative integer or -1, got ~s"
+             value))
+    (unless (= limit -1) limit)))
+
 (defun parse-bind-address-arg (arg value)
   "Parse a non-empty listener address for option ARG."
   (unless (and (stringp value) (plusp (length value)))
@@ -530,7 +538,8 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
         (swank-port nil)
         (swank-bind-address "127.0.0.1")
         (temp-file-limit-argument nil)
-        (sort-arena-limit-argument nil))
+        (sort-arena-limit-argument nil)
+        (slot-wal-keep-argument nil))
     (loop for rest on argv
           for arg = (car rest)
           do (cond
@@ -579,7 +588,14 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                      (string= "--sort-arena-limit-bytes=" arg
                               :end2 (length "--sort-arena-limit-bytes=")))
                 (setf sort-arena-limit-argument
-                      (subseq arg (length "--sort-arena-limit-bytes="))))))
+                      (subseq arg (length "--sort-arena-limit-bytes="))))
+               ((string= arg "--max-slot-wal-keep-bytes")
+                (setf slot-wal-keep-argument (arg-value rest arg)))
+               ((and (>= (length arg) (length "--max-slot-wal-keep-bytes="))
+                     (string= "--max-slot-wal-keep-bytes=" arg
+                              :end2 (length "--max-slot-wal-keep-bytes=")))
+                (setf slot-wal-keep-argument
+                      (subseq arg (length "--max-slot-wal-keep-bytes="))))))
     (values host port (or pgdata (sb-ext:posix-getenv "PGDATA") "./pgdata")
             control-port control-socket swank-port swank-bind-address
             (let ((value (or temp-file-limit-argument
@@ -593,7 +609,13 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                               "PG_QUERY_SORT_ARENA_LIMIT_BYTES"))))
               (if value
                   (parse-query-sort-arena-limit-bytes value)
-                  *query-sort-arena-limit-bytes*)))))
+                  *query-sort-arena-limit-bytes*))
+            (let ((value (or slot-wal-keep-argument
+                             (sb-ext:posix-getenv
+                              "PG_MAX_SLOT_WAL_KEEP_BYTES"))))
+              (if value
+                  (parse-slot-wal-keep-bytes value)
+                  *max-slot-wal-keep-bytes*)))))
 
 (defun directory-pathname (path)
   "Return PATH as an absolute directory pathname (trailing slash).
@@ -657,11 +679,12 @@ CL's RENAME-FILE merges a relative target with the source's directory."
 (defun main ()
   (multiple-value-bind (host port pgdata control-port control-socket
                         swank-port swank-bind-address temp-file-limit-bytes
-                        sort-arena-limit-bytes)
+                        sort-arena-limit-bytes max-slot-wal-keep-bytes)
       (parse-args (cdr sb-ext:*posix-argv*))
     (setf *pgdata* (directory-pathname pgdata)
           *query-temp-file-limit-bytes* temp-file-limit-bytes
-          *query-sort-arena-limit-bytes* sort-arena-limit-bytes)
+          *query-sort-arena-limit-bytes* sort-arena-limit-bytes
+          *max-slot-wal-keep-bytes* max-slot-wal-keep-bytes)
     ;; Reject an unsupported SBCL before opening storage or accepting clients.
     (call-with-query-sort-arena (lambda (arena) (declare (ignore arena))))
     (initialize-query-temp-storage)

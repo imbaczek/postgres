@@ -16,7 +16,8 @@
   relfilenode
   (relfrozenxid +first-normal-xid+)
   columns           ; simple-vector of pg-column, attnum order
-  indexes)          ; list of index OIDs
+  indexes           ; list of index OIDs
+  statistics)       ; derived ANALYZE estimates; raw samples remain transient
 
 (defstruct pg-index
   oid
@@ -29,6 +30,16 @@
   constraint-p      ; a table constraint depends on this index
   nulls-not-distinct-p
   valid-p)           ; false for legacy indexes that may be incomplete
+
+(defstruct pg-column-statistics
+  null-fraction
+  distinct-count
+  most-common-values)
+
+(defstruct pg-table-statistics
+  row-count
+  sample-count
+  columns)
 
 (defun pg-index-constraint-owned-p (index)
   "Return whether a table constraint depends on INDEX.
@@ -94,6 +105,21 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
   (:attnum pg-column-attnum :attnum)
   (:notnull pg-column-notnull :notnull))
 
+(define-catalog-codec column-statistics make-pg-column-statistics
+  (:null-fraction pg-column-statistics-null-fraction :null-fraction)
+  (:distinct-count pg-column-statistics-distinct-count :distinct-count)
+  (:most-common-values pg-column-statistics-most-common-values
+   :most-common-values))
+
+(define-catalog-codec table-statistics make-pg-table-statistics
+  (:row-count pg-table-statistics-row-count :row-count)
+  (:sample-count pg-table-statistics-sample-count :sample-count)
+  (:columns pg-table-statistics-columns :columns
+            :encode (lambda (columns)
+                      (map 'list #'column-statistics-to-sexp columns))
+            :decode (lambda (columns)
+                      (map 'vector #'column-statistics-from-sexp columns))))
+
 (define-catalog-codec class make-pg-class
   (:oid pg-class-oid :oid)
   (:name pg-class-name :name)
@@ -106,7 +132,13 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
                       (loop for col across columns collect (column-to-sexp col)))
             :decode (lambda (columns)
                       (coerce (mapcar #'column-from-sexp columns) 'vector)))
-  (:indexes pg-class-indexes :indexes))
+  (:indexes pg-class-indexes :indexes)
+  (:statistics pg-class-statistics :statistics
+               :encode (lambda (statistics)
+                         (and statistics (table-statistics-to-sexp statistics)))
+               :decode (lambda (statistics)
+                         (and statistics
+                              (table-statistics-from-sexp statistics)))))
 
 (define-catalog-codec index make-pg-index
   (:oid pg-index-oid :oid)
