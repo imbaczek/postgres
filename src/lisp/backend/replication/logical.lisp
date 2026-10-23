@@ -15,7 +15,7 @@
 
 (defstruct logical-change
   kind database-oid relation-oid relation-name columns key-attnums
-  old-values new-values)
+  old-values new-values event-payload)
 
 (defstruct logical-transaction
   xid commit-lsn changes)
@@ -46,6 +46,9 @@
     (:insert 1)
     (:update 2)
     (:delete 3)
+    (:truncate 4)
+    (:ddl 5)
+    (:sequence-state 6)
     (otherwise (error "invalid logical row change kind ~a" kind))))
 
 (defun logical-kind-from-code (code)
@@ -53,6 +56,9 @@
     (1 :insert)
     (2 :update)
     (3 :delete)
+    (4 :truncate)
+    (5 :ddl)
+    (6 :sequence-state)
     (otherwise (error "invalid logical row change code ~a" code))))
 
 (defun logical-write-u8 (buffer value)
@@ -150,6 +156,14 @@
                               :adjustable t :fill-pointer 0))
         (columns (logical-change-columns change))
         (key-attnums (logical-change-key-attnums change)))
+    (when (member (logical-change-kind change)
+                  '(:truncate :ddl :sequence-state))
+      (logical-write-u8 buffer 0)
+      (logical-write-u8 buffer 2)
+      (logical-write-u8 buffer (logical-kind-code (logical-change-kind change)))
+      (logical-write-u32 buffer (logical-change-database-oid change))
+      (logical-write-string-u32 buffer (logical-change-event-payload change))
+      (return-from logical-encode-change buffer))
     ;; Event format 1 adds immutable replica-identity attnums. The zero marker
     ;; cannot collide with the legacy 1/2/3 kind tags, so existing WAL remains
     ;; decodable without a physical WAL format bump.
@@ -253,63 +267,167 @@
          (event-version (if (zerop marker) (logical-read-u8 cursor) 0))
          (kind (logical-kind-from-code
                 (if (zerop marker) (logical-read-u8 cursor) marker)))
-         (database-oid (logical-read-u32 cursor))
-         (relation-oid (logical-read-u32 cursor))
-         (relation-name (logical-read-string-u32 cursor))
-         (column-count (logical-read-u16 cursor))
-         (columns
-           (loop repeat column-count
-                 collect (list :attnum (logical-read-u16 cursor)
-                               :name (logical-read-string-u32 cursor)
-                               :type (logical-type-from-code
-                                      (logical-read-u8 cursor))
-                               :typmod (logical-u32-signed
-                                        (logical-read-u32 cursor))
-                               :notnull (case (logical-read-u8 cursor)
-                                          (0 nil)
-                                          (1 t)
-                                          (otherwise
-                                           (error "invalid logical column flags"))))))
-         (key-attnums (if (= event-version 1)
-                          (loop repeat (logical-read-u16 cursor)
-                                collect (logical-read-u16 cursor))
-                          (progn
-                            (unless (zerop event-version)
-                              (error "unsupported logical row-change event version"))
-                            nil)))
-         (rows
-           (loop repeat 2
-                 collect (case (logical-read-u8 cursor)
-                           (0 nil)
-                           (1 (logical-read-row cursor columns))
-                           (otherwise (error "invalid logical row-image flag")))))
-         (change (make-logical-change :kind kind
-                                      :database-oid database-oid
-                                      :relation-oid relation-oid
-                                      :relation-name relation-name
-                                      :columns columns
-                                      :key-attnums key-attnums
-                                      :old-values (first rows)
-                                      :new-values (second rows))))
-    (unless (= (logical-cursor-offset cursor) (length bytes))
-      (error "logical row-change payload has trailing bytes"))
-    (unless (and (<= (length key-attnums) (length columns))
-                 (= (length key-attnums) (length (remove-duplicates key-attnums)))
-                 (every (lambda (attnum)
-                          (find attnum columns :key (lambda (column)
-                                                      (getf column :attnum))
-                                               :test #'=))
-                        key-attnums))
-      (error "logical row change has invalid replica-identity columns"))
-    (unless (case kind
-              (:insert (and (null (logical-change-old-values change))
-                            (logical-change-new-values change)))
-              (:update (and (logical-change-old-values change)
-                            (logical-change-new-values change)))
-              (:delete (and (logical-change-old-values change)
-                            (null (logical-change-new-values change)))))
-      (error "logical row change has inconsistent old/new images"))
-    change))
+         (database-oid (logical-read-u32 cursor)))
+    (when (= event-version 2)
+      (unless (member kind '(:truncate :ddl :sequence-state))
+        (error "invalid logical catalog-event kind ~a" kind))
+      (let ((payload (logical-read-string-u32 cursor)))
+        (unless (= (logical-cursor-offset cursor) (length bytes))
+          (error "logical event payload has trailing bytes"))
+        (return-from logical-decode-change
+          (make-logical-change :kind kind :database-oid database-oid
+                               :event-payload payload))))
+    (unless (member event-version '(0 1))
+      (error "unsupported logical row-change event version"))
+    (let* ((relation-oid (logical-read-u32 cursor))
+           (relation-name (logical-read-string-u32 cursor))
+           (column-count (logical-read-u16 cursor))
+           (columns
+             (loop repeat column-count
+                   collect (list :attnum (logical-read-u16 cursor)
+                                 :name (logical-read-string-u32 cursor)
+                                 :type (logical-type-from-code
+                                        (logical-read-u8 cursor))
+                                 :typmod (logical-u32-signed
+                                          (logical-read-u32 cursor))
+                                 :notnull (case (logical-read-u8 cursor)
+                                            (0 nil)
+                                            (1 t)
+                                            (otherwise
+                                             (error "invalid logical column flags"))))))
+           (key-attnums (if (= event-version 1)
+                            (loop repeat (logical-read-u16 cursor)
+                                  collect (logical-read-u16 cursor))
+                            (progn
+                              nil)))
+           (rows
+             (loop repeat 2
+                   collect (case (logical-read-u8 cursor)
+                             (0 nil)
+                             (1 (logical-read-row cursor columns))
+                             (otherwise (error "invalid logical row-image flag")))))
+           (change (make-logical-change :kind kind
+                                        :database-oid database-oid
+                                        :relation-oid relation-oid
+                                        :relation-name relation-name
+                                        :columns columns
+                                        :key-attnums key-attnums
+                                        :old-values (first rows)
+                                        :new-values (second rows))))
+      (unless (= (logical-cursor-offset cursor) (length bytes))
+        (error "logical row-change payload has trailing bytes"))
+      (unless (and (<= (length key-attnums) (length columns))
+                   (= (length key-attnums) (length (remove-duplicates key-attnums)))
+                   (every (lambda (attnum)
+                            (find attnum columns :key (lambda (column)
+                                                        (getf column :attnum))
+                                                 :test #'=))
+                          key-attnums))
+        (error "logical row change has invalid replica-identity columns"))
+      (unless (case kind
+                (:insert (and (null (logical-change-old-values change))
+                              (logical-change-new-values change)))
+                (:update (and (logical-change-old-values change)
+                              (logical-change-new-values change)))
+                (:delete (and (logical-change-old-values change)
+                              (null (logical-change-new-values change)))))
+        (error "logical row change has inconsistent old/new images"))
+      change)))
+
+(defun logical-encode-catalog-event (database-oid ast)
+  (let* ((text (catalog-readable-data-string
+                (list :database-oid database-oid :ast ast)))
+         (change (make-logical-change
+                  :kind :ddl :database-oid database-oid
+                  :event-payload text)))
+    (logical-wrap-catalog-event database-oid
+                                (logical-encode-change change))))
+
+(defun logical-wrap-catalog-event (database-oid event-bytes)
+  "Prefix an event with the database and byte length required by wal.lisp."
+  (let ((buffer (make-array 0 :element-type '(unsigned-byte 8)
+                              :adjustable t :fill-pointer 0)))
+    (logical-write-u32 buffer database-oid)
+    (logical-write-u32 buffer (length event-bytes))
+    (logical-write-octets buffer event-bytes)))
+
+(defun logical-catalog-event-for-ast (ast)
+  ;; CREATE/ALTER/DROP PUBLICATION changes publisher-side selection policy;
+  ;; like pgoutput's publication metadata, these are not subscriber schema DDL.
+  (unless (member (getf ast :type)
+                  '(:create-publication :alter-publication :drop-publication))
+    (logical-encode-catalog-event
+     (database-oid (current-database)) ast)))
+
+(defun logical-read-data-string (text)
+  "Read one data-only S-expression, rejecting evaluation and trailing forms."
+  (let ((eof (gensym "LOGICAL-EVENT-EOF-")))
+    (with-input-from-string (stream text)
+      (with-standard-io-syntax
+        (let* ((*read-eval* nil)
+               (value (read stream nil eof)))
+          (when (eq value eof)
+            (error "logical event payload is empty"))
+          (unless (eq (read stream nil eof) eof)
+            (error "logical event payload has trailing data"))
+          value)))))
+
+(defun logical-decode-catalog-event (bytes)
+  (let ((cursor (make-logical-cursor :bytes bytes)))
+    (let* ((database-oid (logical-read-u32 cursor))
+           (event-bytes (logical-read-octets cursor (logical-read-u32 cursor))))
+      (unless (= (logical-cursor-offset cursor) (length bytes))
+        (error "WAL logical catalog event has trailing bytes"))
+      (let ((change (logical-decode-change event-bytes)))
+        (unless (= database-oid (logical-change-database-oid change))
+          (error "WAL logical catalog event database does not match its payload"))
+        (unless (member (logical-change-kind change) '(:ddl :sequence-state))
+          (error "WAL catalog event has invalid kind ~a"
+                 (logical-change-kind change)))
+        change))))
+
+(defun logical-sequence-state-event (name)
+  "Encode the durable state update emitted by sequence.c-style operations."
+  (let ((sequence (lookup-sequence name)))
+    (unless sequence
+      (ereport "42P01" "sequence \"~a\" does not exist" name))
+    (logical-wrap-catalog-event
+     (database-oid (current-database))
+     (logical-encode-change
+      (make-logical-change
+       :kind :sequence-state :database-oid (database-oid (current-database))
+       :event-payload
+       (catalog-readable-data-string
+        (list :database-oid (database-oid (current-database))
+              :name name :oid (pg-sequence-oid sequence)
+              :start (pg-sequence-start-value sequence)
+              :increment (pg-sequence-increment sequence)
+              :min (pg-sequence-min-value sequence)
+              :max (pg-sequence-max-value sequence)
+              :last (pg-sequence-last-value sequence)
+              :called (pg-sequence-called-p sequence))))))))
+
+(defun logical-note-transaction-event (kind payload)
+  "Capture a transactional utility event such as TRUNCATE before XID commit."
+  (when (and *backend* (backend-xid *backend*))
+    (unless (eq kind :truncate)
+      (error "unsupported logical transaction event ~a" kind))
+    (let* ((text (with-output-to-string (stream)
+                   (with-standard-io-syntax
+                     (let ((*print-readably* t) (*print-pretty* nil))
+                       (prin1 payload stream)))))
+           (change (make-logical-change
+                    :kind kind
+                    :database-oid (database-oid (current-database))
+                    :event-payload text))
+           (encoded (logical-encode-change change))
+           (total (+ (backend-logical-change-bytes *backend*)
+                     (length encoded))))
+      (when (> total +max-logical-transaction-bytes+)
+        (ereport "54000" "logical transaction exceeds the 64 MiB change limit"))
+      (push encoded (backend-logical-changes *backend*))
+      (setf (backend-logical-change-bytes *backend*) total)
+      change)))
 
 (defun logical-note-row-change (kind table &key old-values new-values)
   "Capture a successful executor row operation for its current transaction.
@@ -489,6 +607,10 @@ executor, so capture the same operation before transaction commit."
 (defun wal-logical-reader-add-chunk (state record)
   (unless (logical-reader-state-batch-open-p state)
     (error "logical WAL changes appear outside a batch"))
+  (when (some (lambda (change)
+                (member (logical-change-kind change) '(:ddl :sequence-state)))
+              (logical-reader-state-changes state))
+    (error "row changes follow a logical catalog event in the same WAL batch"))
   (multiple-value-bind (xid count next-index change-bytes changes)
       (wal-advance-logical-change-chunk
        record (logical-reader-state-xid state)
@@ -500,34 +622,85 @@ executor, so capture the same operation before transaction commit."
           (logical-reader-state-next-chunk state) next-index
           (logical-reader-state-change-bytes state) change-bytes
           (logical-reader-state-changes state)
-          (nconc (logical-reader-state-changes state) changes)))
+          (nconc (logical-reader-state-changes state) changes))
+    (unless (every (lambda (change)
+                     (member (logical-change-kind change)
+                             '(:insert :update :delete :truncate)))
+                   changes)
+      (error "catalog event appears in a transactional row-change record")))
+  (values))
+
+(defun wal-logical-reader-add-catalog-event (state record)
+  (unless (logical-reader-state-batch-open-p state)
+    (error "logical catalog event appears outside a WAL batch"))
+  (when (or (logical-reader-state-chunk-count state)
+            (logical-reader-state-changes state))
+    (error "logical catalog event is mixed with other changes in a WAL batch"))
+  (unless (zerop (wal-record-xid record))
+    (error "logical catalog event must not carry a transaction ID"))
+  (let* ((bytes (wal-record-payload record))
+         (change (logical-decode-catalog-event bytes)))
+    (when (= (logical-change-database-oid change)
+             (logical-reader-state-database-oid state))
+      (let ((next-bytes (+ (logical-reader-state-change-bytes state)
+                           (length bytes))))
+        (when (> next-bytes +max-logical-wal-transaction-bytes+)
+          (error "logical catalog event exceeds the 65 MiB transaction limit"))
+        (setf (logical-reader-state-change-bytes state) next-bytes)
+        (setf (logical-reader-state-changes state)
+              (nconc (logical-reader-state-changes state) (list change))))))
   (values))
 
 (defun wal-logical-reader-finish-batch (state record)
   (unless (logical-reader-state-batch-open-p state)
     (error "logical WAL terminal appears outside a batch"))
-  (if (= (wal-record-type record) +wal-record-commit+)
-      (progn
-        (when (logical-reader-state-chunk-count state)
-          (unless (and (= (wal-record-xid record)
-                          (logical-reader-state-xid state))
-                       (= (logical-reader-state-next-chunk state)
-                          (logical-reader-state-chunk-count state)))
-            (error "logical WAL chunks do not match their commit record")))
-        (let ((changes
-                (remove-if-not
-                 (lambda (change)
-                   (= (logical-change-database-oid change)
-                      (logical-reader-state-database-oid state)))
-                 (logical-reader-state-changes state))))
-          (when changes
-            (push (make-logical-transaction :xid (wal-record-xid record)
-                                            :commit-lsn (wal-record-end record)
-                                            :changes changes)
-                  (logical-reader-state-transactions state)))))
-      (when (logical-reader-state-chunk-count state)
-        (error "logical row changes are attached to a non-commit WAL batch")))
-  (wal-logical-reader-reset-batch state nil))
+  (let* ((record-type (wal-record-type record))
+         (catalog-terminal-p
+           (member record-type (list +wal-record-catalog+
+                                     +wal-record-catalog-commit+)))
+         (changes
+           (remove-if-not
+            (lambda (change)
+              (= (logical-change-database-oid change)
+                 (logical-reader-state-database-oid state)))
+            (logical-reader-state-changes state)))
+         (catalog-event-p
+           (some (lambda (change)
+                   (member (logical-change-kind change)
+                           '(:ddl :sequence-state)))
+                 changes))
+         (row-change-p
+           (some (lambda (change)
+                   (member (logical-change-kind change)
+                           '(:insert :update :delete :truncate)))
+                 changes)))
+    (cond
+      ((= record-type +wal-record-commit+)
+       (when catalog-event-p
+         (error "logical catalog events are attached to a row commit"))
+       (when (logical-reader-state-chunk-count state)
+         (unless (and (= (wal-record-xid record)
+                         (logical-reader-state-xid state))
+                      (= (logical-reader-state-next-chunk state)
+                         (logical-reader-state-chunk-count state)))
+           (error "logical WAL chunks do not match their commit record")))
+       (when changes
+         (push (make-logical-transaction :xid (wal-record-xid record)
+                                         :commit-lsn (wal-record-end record)
+                                         :changes changes)
+               (logical-reader-state-transactions state))))
+      (catalog-terminal-p
+       (when (or (logical-reader-state-chunk-count state) row-change-p)
+         (error "logical row changes are attached to a catalog WAL batch"))
+       (when changes
+         (push (make-logical-transaction :xid 0
+                                         :commit-lsn (wal-record-end record)
+                                         :changes changes)
+               (logical-reader-state-transactions state))))
+      ((or (logical-reader-state-chunk-count state)
+           (logical-reader-state-changes state))
+       (error "logical changes are attached to an unsupported WAL terminal")))
+    (wal-logical-reader-reset-batch state nil)))
 
 (defun wal-logical-reader-has-database-changes-p (state)
   (some (lambda (change)
@@ -695,10 +868,14 @@ scanned, or the slot's starting position when no scan was needed."
                 (wal-logical-reader-start-batch state))
                (#.+wal-record-logical-changes+
                 (wal-logical-reader-add-chunk state record))
+               (#.+wal-record-logical-catalog-event+
+                (wal-logical-reader-add-catalog-event state record))
                (otherwise
                 (when (wal-terminal-record-type-p record-type)
                   (let* ((has-changes
-                           (and (= record-type +wal-record-commit+)
+                           (and (or (= record-type +wal-record-commit+)
+                                    (= record-type +wal-record-catalog+)
+                                    (= record-type +wal-record-catalog-commit+))
                                 (wal-logical-reader-has-database-changes-p
                                  state)))
                          (batch-bytes

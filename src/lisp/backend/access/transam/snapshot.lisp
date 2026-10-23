@@ -3,11 +3,15 @@
 (in-package #:pg)
 
 (defstruct (snapshot (:constructor make-snapshot-struct
-                         (&key xmin xmax xip curcid)))
+                         (&key xmin xmax xip curcid sequence-database-oid
+                            sequence-state-captured-p sequence-states)))
   xmin
   xmax
   xip
-  curcid)
+  curcid
+  sequence-database-oid
+  sequence-state-captured-p
+  sequence-states)
 
 (defstruct (snapshot-registration
             (:constructor make-snapshot-registration ()))
@@ -25,6 +29,7 @@
 (defvar *logical-slot-lifecycle-lock*
   (sb-thread:make-mutex :name "pg logical slot lifecycle"))
 (defvar *logical-test-after-snapshot-token-lookup-hook* nil)
+(defvar *logical-test-after-snapshot-capture-hook* nil)
 (defvar *exported-logical-snapshots* (make-hash-table :test #'equal))
 (defvar *exported-logical-snapshot-counter* 0)
 

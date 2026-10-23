@@ -15,6 +15,7 @@
 (defconstant +wal-record-catalog-commit+ 8)
 (defconstant +wal-record-maintenance+ 9)
 (defconstant +wal-record-logical-changes+ 10)
+(defconstant +wal-record-logical-catalog-event+ 11)
 (defconstant +wal-catalog-chunk-header-size+ 8)
 (defconstant +wal-version-v2+ 2)
 (defconstant +wal-version-v3+ 3)
@@ -44,6 +45,7 @@
 (defvar *wal-xid-first-lsn* (make-hash-table :test #'eql))
 (defvar *wal-snapshot-retention-pins* (make-hash-table :test #'eq))
 (defvar *wal-replication-slots* (make-hash-table :test #'equal))
+(defvar *wal-logical-catalog-event-interests* (make-hash-table :test #'eq))
 (defvar *wal-logical-slot-owner* nil)
 (defvar *wal-pending-btree-split* nil)
 (defvar *wal-pending-deletes* '())
@@ -79,6 +81,7 @@
 (defvar *wal-recovery-logical-chunk-count* nil)
 (defvar *wal-recovery-logical-next-chunk* 0)
 (defvar *wal-recovery-logical-bytes* 0)
+(defvar *wal-recovery-logical-catalog-event-p* nil)
 
 (declaim (ftype function wal-test-pause wal-test-pause-once
                 wal-remove-checkpointed-segments
@@ -900,8 +903,45 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
   (sb-thread:with-mutex (*wal-lock*)
     *wal-catalog-flush-generation*))
 
+(defun wal-logical-catalog-event-needed-under-lock-p (database-oid)
+  "Whether a live slot or in-flight snapshot needs DATABASE-OID catalog events.
+
+Call while holding *WAL-LOCK*. Provisional interests close the gap between
+snapshot capture under *WRITE-LOCK* and durable slot publication."
+  (or (loop for interested-database being the hash-values of
+            *wal-logical-catalog-event-interests*
+              thereis (= database-oid interested-database))
+      (loop for slot being the hash-values of *wal-replication-slots*
+              thereis (and (= database-oid
+                              (or (wal-replication-slot-database-oid slot) -1))
+                           (not (eq (wal-replication-slot-wal-status slot)
+                                    :lost))))))
+
+(defun wal-register-logical-catalog-event-interest-under-writer-lock
+    (registration database-oid)
+  "Protect sequence/DDL events after a snapshot boundary until slot publish."
+  ;; WAL loads before the snapshot structure is defined, so keep validation
+  ;; independent of its generated predicates. Callers pass the active
+  ;; registration created by snapshot capture.
+  (unless (and registration
+               (integerp database-oid) (<= 1 database-oid #xFFFFFFFF))
+    (error "logical catalog event interest requires a snapshot and database"))
+  ;; The capture caller still holds *WRITE-LOCK*: taking *WAL-LOCK* here follows
+  ;; the write -> WAL order and makes the interest visible before writers resume.
+  (sb-thread:with-mutex (*wal-lock*)
+    (setf (gethash registration *wal-logical-catalog-event-interests*)
+          database-oid))
+  registration)
+
+(defun wal-release-logical-catalog-event-interest (registration)
+  (when registration
+    (sb-thread:with-mutex (*wal-lock*)
+      (remhash registration *wal-logical-catalog-event-interests*)))
+  (values))
+
 (defun wal-commit-catalog (catalog-bytes write-function
-                           &key relation-deletes on-record-appended)
+                           &key relation-deletes logical-event
+                             on-record-appended)
   "Durably publish a full catalog image and any deferred relation drops."
   (unless *wal-ready*
     (prog1 (funcall write-function catalog-bytes)
@@ -909,7 +949,14 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
         (incf *wal-catalog-flush-generation*)))
     (return-from wal-commit-catalog (values)))
   (with-wal-critical
-    (let* ((deletes (sort (remove-duplicates
+    (when (and logical-event (< (length logical-event) 8))
+      (error "invalid WAL logical catalog event envelope"))
+    (let* ((logical-event
+             (when (and logical-event
+                        (wal-logical-catalog-event-needed-under-lock-p
+                         (wal-u32 logical-event 0)))
+               logical-event))
+           (deletes (sort (remove-duplicates
                            (append (copy-list *wal-pending-deletes*)
                                    (copy-list relation-deletes))
                            :test #'eql)
@@ -925,6 +972,10 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
            (commit-payload (when chunked-p
                              (wal-encode-catalog-commit-payload
                               catalog-payload chunk-count))))
+      (when (and logical-event
+                 (> (+ +wal-header-size+ (length logical-event))
+                    +wal-segment-size+))
+        (error "WAL logical catalog event exceeds the segment size"))
       (wal-record-page-xids-at-batch-start
        images (wal-append-batch-start))
       (wal-append-page-images images)
@@ -933,6 +984,10 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
         (when *wal-output-stream*
           (finish-output *wal-output-stream*))
         (wal-test-pause :after-catalog-chunks))
+      (when logical-event
+        ;; A reader exposes this event only when the following catalog terminal
+        ;; is complete. This mirrors pgoutput's commit callback boundary.
+        (wal-append-record +wal-record-logical-catalog-event+ 0 logical-event))
       (when (and *wal-vacuum-full-publication*
                  *wal-test-before-vacuum-full-catalog-record-appended-hook*)
         (funcall *wal-test-before-vacuum-full-catalog-record-appended-hook*))
@@ -998,6 +1053,8 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
                               +wal-record-catalog-commit+
                               +wal-record-maintenance+))
            (and (= type +wal-record-logical-changes+)
+                (>= version +wal-version+))
+           (and (= type +wal-record-logical-catalog-event+)
                 (>= version +wal-version+)))
        (or (/= type +wal-record-maintenance+)
            ;; Maintenance terminals were already emitted by v3. Keep them
@@ -1253,6 +1310,22 @@ src/backend/access/transam/xlogreader.c."
         *wal-recovery-catalog-chunk-count* nil
         *wal-recovery-catalog-next-chunk* 0)
   (wal-recovery-reset-logical-change-batch)
+  (setf *wal-recovery-logical-catalog-event-p* nil)
+  (values))
+
+(defun wal-recovery-validate-logical-terminal (kind &optional xid)
+  (ecase kind
+    (:commit
+     (when *wal-recovery-logical-catalog-event-p*
+       (error "logical catalog events are attached to a row commit"))
+     (wal-recovery-finish-logical-change-batch xid))
+    (:catalog
+     (when *wal-recovery-logical-chunk-count*
+       (error "logical row changes are attached to a catalog WAL batch")))
+    (:other
+     (when (or *wal-recovery-logical-catalog-event-p*
+               *wal-recovery-logical-chunk-count*)
+       (error "logical changes are attached to an unsupported WAL terminal"))))
   (values))
 
 (defun wal-replay-record (record)
@@ -1266,7 +1339,8 @@ src/backend/access/transam/xlogreader.c."
              *wal-recovery-catalog-chunks* '()
              *wal-recovery-catalog-chunk-count* nil
              *wal-recovery-catalog-next-chunk* 0)
-       (wal-recovery-reset-logical-change-batch))
+       (wal-recovery-reset-logical-change-batch)
+       (setf *wal-recovery-logical-catalog-event-p* nil))
       (#.+wal-record-pages+
        (unless *wal-recovery-group-active*
          (error "WAL page images appear outside a batch"))
@@ -1279,25 +1353,45 @@ src/backend/access/transam/xlogreader.c."
                                              (wal-record-version record)))
                     *wal-recovery-page-images*)))
       (#.+wal-record-logical-changes+
+       (when *wal-recovery-logical-catalog-event-p*
+         (error "logical row changes follow a catalog event in the same batch"))
        (when *wal-recovery-catalog-chunk-count*
          (error "logical WAL changes follow catalog chunks in a batch"))
        (wal-recovery-accept-logical-change-chunk record))
+      (#.+wal-record-logical-catalog-event+
+       (unless *wal-recovery-group-active*
+         (error "logical catalog event appears outside a WAL batch"))
+       (when (/= (wal-record-xid record) 0)
+         (error "logical catalog event must not carry a transaction ID"))
+       (when (or *wal-recovery-logical-catalog-event-p*
+                 *wal-recovery-logical-chunk-count*)
+         (error "logical catalog event is mixed with other changes in a WAL batch"))
+       (setf *wal-recovery-logical-catalog-event-p* t)
+       (let ((payload (wal-record-payload record)))
+         (unless (and (>= (length payload) 8)
+                      (plusp (wal-u32 payload 0))
+                      (= (+ 8 (wal-u32 payload 4)) (length payload)))
+           (error "logical catalog event has an invalid payload"))))
       (#.+wal-record-commit+
        (unless (zerop (length (wal-record-payload record)))
          (error "WAL commit record has an invalid payload"))
-       (wal-recovery-finish-logical-change-batch
-        (wal-record-xid record))
+       (wal-recovery-validate-logical-terminal
+        :commit (wal-record-xid record))
        (wal-replay-finish-batch
         (lambda ()
           (lambda ()
             (clog-set (wal-record-xid record) 1)))))
       (#.+wal-record-catalog+
+       (wal-recovery-validate-logical-terminal :catalog)
        (wal-replay-finish-batch
         (lambda ()
           (wal-prepare-catalog-record (wal-record-payload record)))))
       (#.+wal-record-catalog-chunk+
        (unless *wal-recovery-group-active*
          (error "WAL catalog chunks appear outside a batch"))
+       (when (or *wal-recovery-logical-catalog-event-p*
+                 *wal-recovery-logical-chunk-count*)
+         (error "WAL catalog chunks are mixed with row or catalog events"))
        (multiple-value-bind (index count bytes)
            (wal-decode-catalog-chunk-payload (wal-record-payload record))
          (unless (= index *wal-recovery-catalog-next-chunk*)
@@ -1310,6 +1404,7 @@ src/backend/access/transam/xlogreader.c."
          (push bytes *wal-recovery-catalog-chunks*)
          (incf *wal-recovery-catalog-next-chunk*)))
       (#.+wal-record-catalog-commit+
+       (wal-recovery-validate-logical-terminal :catalog)
        (multiple-value-bind (count length)
            (wal-decode-catalog-commit-payload (wal-record-payload record))
          (wal-replay-finish-batch
@@ -1318,16 +1413,19 @@ src/backend/access/transam/xlogreader.c."
              (wal-reassemble-catalog-chunks count length)))
           t)))
       (#.+wal-record-checkpoint+
+       (wal-recovery-validate-logical-terminal :other)
        (unless (zerop (length (wal-record-payload record)))
          (error "WAL checkpoint record has an invalid payload"))
        (wal-replay-finish-batch (lambda () #'values)))
       (#.+wal-record-maintenance+
+       (wal-recovery-validate-logical-terminal :other)
        (unless (zerop (wal-record-xid record))
          (error "WAL maintenance record must not carry a transaction ID"))
        (unless (zerop (length (wal-record-payload record)))
          (error "WAL maintenance record has an invalid payload"))
        (wal-replay-finish-batch (lambda () #'values)))
       (#.+wal-record-clog-reset+
+       (wal-recovery-validate-logical-terminal :other)
        (wal-read-u64-payload (wal-record-payload record))
        (wal-replay-finish-batch
         (lambda () (lambda () (clog-reset :wal-reset-p nil))))))))
@@ -1344,7 +1442,8 @@ src/backend/access/transam/xlogreader.c."
         (*wal-recovery-logical-xid* nil)
         (*wal-recovery-logical-chunk-count* nil)
         (*wal-recovery-logical-next-chunk* 0)
-        (*wal-recovery-logical-bytes* 0))
+        (*wal-recovery-logical-bytes* 0)
+        (*wal-recovery-logical-catalog-event-p* nil))
     (wal-scan #'wal-replay-record))
   (clog-fsync)
   (values))

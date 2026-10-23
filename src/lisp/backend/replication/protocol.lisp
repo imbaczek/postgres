@@ -3,7 +3,7 @@
 (in-package #:pg)
 
 (defstruct logical-replication-command
-  type slot-name plugin export-snapshot-p requested-lsn)
+  type slot-name plugin export-snapshot-p requested-lsn protocol-version)
 
 (defparameter +logical-replication-type-oids+
   '((:int4 . 23) (:int8 . 20) (:varchar . 1043)))
@@ -91,14 +91,16 @@
                     (string-equal (fourth words) "LOGICAL"))
          (ereport "0A000"
                   "supported syntax is START_REPLICATION SLOT name LOGICAL lsn"))
-       (when (and (> (length words) 5)
-                  (not (equal words
-                              (append (subseq words 0 5)
-                                      '("(" "proto_version" "'1'" ")")))))
-         (ereport "0A000" "only pgoutput protocol version 1 is supported"))
-       (make-logical-replication-command
-        :type :start :slot-name (third words)
-        :requested-lsn (parse-replication-lsn (fifth words))))
+       (let ((protocol-version 2))
+         (when (> (length words) 5)
+           (unless (equal words
+                          (append (subseq words 0 5)
+                                  '("(" "proto_version" "'2'" ")")))
+             (ereport "0A000" "only pgoutput protocol version 2 is supported")))
+         (make-logical-replication-command
+          :type :start :slot-name (third words)
+          :requested-lsn (parse-replication-lsn (fifth words))
+          :protocol-version protocol-version)))
       (t
        (ereport "42601" "unsupported replication command")))))
 
@@ -282,22 +284,62 @@
       (otherwise (error "unsupported logical change kind")))
     payload))
 
+(defun pgoutput-message-prefix (change)
+  (case (logical-change-kind change)
+    (:truncate "pg_lisp/truncate")
+    (:ddl "pg_lisp/ddl")
+    (:sequence-state "pg_lisp/sequence-state")
+    (otherwise (error "logical change kind has no Message prefix"))))
+
+(defun pgoutput-build-message (change transaction)
+  ;; logicalrep_write_message() in src/backend/replication/logical/proto.c
+  ;; includes XID only for transactional messages, then flags, LSN, prefix,
+  ;; and sized content. Version 2 enables that XID field for this worker.
+  (let* ((payload (make-payload))
+         (transactional-p (plusp (logical-transaction-xid transaction)))
+         (content (string->bytes (logical-change-event-payload change)))
+         (prefix (pgoutput-message-prefix change)))
+    (payload-push-byte payload (char-code #\M))
+    (when transactional-p
+      (payload-push-u32 payload (logical-transaction-xid transaction)))
+    (payload-push-byte payload (if transactional-p 1 0))
+    (replication-push-u64 payload (logical-transaction-commit-lsn transaction))
+    (payload-push-cstring payload prefix)
+    (payload-push-u32 payload (length content))
+    (payload-push payload content)))
+
 (defun send-logical-transaction (stream transaction wal-end)
   ;; Use one XLogData frame per pgoutput message like the C logical output
   ;; plugin's prepare/write callback path.
-  (send-logical-xlog-data
-   stream (logical-transaction-commit-lsn transaction) wal-end
-   (pgoutput-build-begin transaction))
-  (dolist (change (logical-transaction-changes transaction))
-    (send-logical-xlog-data
-     stream (logical-transaction-commit-lsn transaction) wal-end
-     (pgoutput-build-relation change))
-    (send-logical-xlog-data
-     stream (logical-transaction-commit-lsn transaction) wal-end
-     (pgoutput-build-row-change change)))
-  (send-logical-xlog-data
-   stream (logical-transaction-commit-lsn transaction) wal-end
-   (pgoutput-build-commit transaction)))
+  (let ((changes (logical-transaction-changes transaction)))
+    (if (zerop (logical-transaction-xid transaction))
+        (progn
+          (unless (and (= (length changes) 1)
+                       (member (logical-change-kind (first changes))
+                               '(:ddl :sequence-state)))
+            (error "catalog logical transaction must contain one standalone event"))
+          (send-logical-xlog-data
+           stream (logical-transaction-commit-lsn transaction) wal-end
+           (pgoutput-build-message (first changes) transaction)))
+        (progn
+          (send-logical-xlog-data
+           stream (logical-transaction-commit-lsn transaction) wal-end
+           (pgoutput-build-begin transaction))
+          (dolist (change changes)
+            (if (eq (logical-change-kind change) :truncate)
+                (send-logical-xlog-data
+                 stream (logical-transaction-commit-lsn transaction) wal-end
+                 (pgoutput-build-message change transaction))
+                (progn
+                  (send-logical-xlog-data
+                   stream (logical-transaction-commit-lsn transaction) wal-end
+                   (pgoutput-build-relation change))
+                  (send-logical-xlog-data
+                   stream (logical-transaction-commit-lsn transaction) wal-end
+                   (pgoutput-build-row-change change)))))
+          (send-logical-xlog-data
+           stream (logical-transaction-commit-lsn transaction) wal-end
+           (pgoutput-build-commit transaction))))))
 
 (defun replication-status-position (status)
   (let ((write-lsn (getf status :write))

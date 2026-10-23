@@ -22,6 +22,7 @@
   (dirty-relations '())
   (logical-changes '())
   (logical-change-bytes 0)
+  (sequence-currvals (make-hash-table :test #'eql))
   (settings (make-hash-table :test #'equal))
   (settings-transaction-start nil)
   ;; Interrupt state: the equivalents of QueryCancelPending and the
@@ -958,6 +959,30 @@ AFTER-CAPTURE runs under *WAL-LOCK* but after *XID-LOCK* is released."
         (funcall after-capture snapshot boundary-lsn restart-lsn))
       (values snapshot boundary-lsn restart-lsn))))
 
+(declaim (ftype function catalog-sequence-bootstrap-snapshot))
+
+(defun wal-capture-logical-snapshot-boundary-under-writer-lock
+    (backend registration database-oid)
+  "Capture sequence state under the same writer barrier as the slot boundary.
+
+Sequence state is not MVCC. Copying it beside the boundary prevents a value
+advanced during table copy from being installed before the older WAL events
+that describe that advance, matching pg_dump's separate sequence-state phase.
+Register the logical event interest before returning, while writers are still
+excluded, so a sequence advance before slot publication remains streamable."
+  (multiple-value-bind (snapshot boundary-lsn restart-lsn)
+      (wal-capture-snapshot-boundary-under-writer-lock
+       (backend-command-id backend) registration)
+    (setf (snapshot-sequence-database-oid snapshot)
+          (database-oid (get-database (backend-database backend)))
+          (snapshot-sequence-states snapshot)
+          (catalog-sequence-bootstrap-snapshot
+           (get-database (backend-database backend)))
+          (snapshot-sequence-state-captured-p snapshot) t)
+    (wal-register-logical-catalog-event-interest-under-writer-lock
+     registration database-oid)
+    (values snapshot boundary-lsn restart-lsn)))
+
 (defun wal-publish-replication-slot-under-wal-lock
     (name boundary-lsn restart-lsn register active-owner
      &optional active-xids database-oid)
@@ -1017,9 +1042,14 @@ The active snapshot registration keeps RESTART-LSN pinned if a checkpoint runs
 between snapshot capture and this durable publication."
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
-    (wal-publish-replication-slot-under-wal-lock
-     name boundary-lsn restart-lsn register active-owner active-xids
-     database-oid)))
+    (let ((slot
+            (wal-publish-replication-slot-under-wal-lock
+             name boundary-lsn restart-lsn register active-owner active-xids
+             database-oid)))
+      ;; Switch atomically from the provisional snapshot interest to the durable
+      ;; slot visible to catalog-event writers under this same WAL lock.
+      (remhash register *wal-logical-catalog-event-interests*)
+      slot)))
 
 (defun new-exported-logical-snapshot-token ()
   (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
@@ -1092,10 +1122,13 @@ snapshot lifecycle."
                 backend
                 (lambda ()
                   (with-write-lock
-                    (wal-capture-snapshot-boundary-under-writer-lock
-                     (backend-command-id backend) registration))))
+                    (wal-capture-logical-snapshot-boundary-under-writer-lock
+                     backend registration database-id))))
              (setf snapshot captured
                    boundary-lsn captured-boundary)
+             (when *logical-test-after-snapshot-capture-hook*
+               (funcall *logical-test-after-snapshot-capture-hook*
+                        slot-name boundary-lsn))
              ;; Match SnapBuild's ordering: publish the slot after the writer
              ;; gate opens while the registered snapshot still pins WAL.
              (wal-publish-captured-replication-slot
@@ -1121,7 +1154,9 @@ snapshot lifecycle."
         (when (snapshot-registration-active-p registration)
           (ignore-errors (release-snapshot-registration registration)))
         (when schema-lock-held
-          (ignore-errors (release-schema-read-lock)))))))
+          (ignore-errors (release-schema-read-lock))))
+      (ignore-errors
+       (wal-release-logical-catalog-event-interest registration)))))
 
 (defun import-exported-logical-snapshot (token)
   "Import TOKEN into the current read-only RR transaction as an independent pin."
@@ -1159,7 +1194,13 @@ snapshot lifecycle."
                        :xmin (snapshot-xmin source-snapshot)
                        :xmax (snapshot-xmax source-snapshot)
                        :xip (copy-list (snapshot-xip source-snapshot))
-                       :curcid (snapshot-curcid source-snapshot))))
+                       :curcid (snapshot-curcid source-snapshot)
+                       :sequence-database-oid
+                       (snapshot-sequence-database-oid source-snapshot)
+                       :sequence-state-captured-p
+                       (snapshot-sequence-state-captured-p source-snapshot)
+                       :sequence-states
+                       (copy-tree (snapshot-sequence-states source-snapshot)))))
                (setf registration (make-snapshot-registration))
                (sb-sys:without-interrupts
                  (sb-thread:with-mutex (*xid-lock*)
@@ -1237,10 +1278,13 @@ VACUUM FULL wait for this scope."
                           backend
                           (lambda ()
                             (with-write-lock
-                              (wal-capture-snapshot-boundary-under-writer-lock
-                               (backend-command-id backend) registration))))
+                              (wal-capture-logical-snapshot-boundary-under-writer-lock
+                               backend registration database-id))))
                        (setf snapshot captured-snapshot
                              boundary-lsn captured-boundary)
+                       (when *logical-test-after-snapshot-capture-hook*
+                         (funcall *logical-test-after-snapshot-capture-hook*
+                                  slot-name boundary-lsn))
                        ;; Slot fsync can take longer than snapshot capture. Publish
                        ;; after releasing *XID-WRAP-LOCK* while the registered
                        ;; snapshot continues to pin the required WAL.
@@ -1284,8 +1328,11 @@ VACUUM FULL wait for this scope."
                   (unwind-protect
                        (when (snapshot-registration-active-p registration)
                          (release-snapshot-registration registration))
-                    (sb-sys:without-interrupts
-                      (wal-release-replication-slot-owner slot-name slot-owner)))))))))))
+                    (unwind-protect
+                         (wal-release-logical-catalog-event-interest registration)
+                      (sb-sys:without-interrupts
+                        (wal-release-replication-slot-owner
+                         slot-name slot-owner))))))))))))
 
 (defmacro with-exported-snapshot
     ((snapshot-var start-lsn-var &key slot-name) &body body)

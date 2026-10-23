@@ -13,6 +13,7 @@ REPLICA_ONE_PID=
 REPLICA_TWO_PID=
 WORKER_ONE_PID=
 WORKER_TWO_PID=
+SOURCE_DDL_PID=
 
 sql() {
     SQL_PORT=$1
@@ -84,6 +85,20 @@ replicated_rows() {
 
 nullable_rows() {
     sql "$1" "SELECT nullable_key, label FROM nullable_rows ORDER BY nullable_key"
+}
+
+sequence_state() {
+    sql "$1" "SELECT pg_lisp_sequence_state('$2')"
+}
+
+sequence_definition_state() {
+    sequence_state "$1" "$2" \
+        | sed -n 's/.*:start \([-0-9][0-9]*\) :increment \([-0-9][0-9]*\) :min \([-0-9][0-9]*\) :max \([-0-9][0-9]*\).*/\1|\2|\3|\4/p'
+}
+
+sequence_state_position() {
+    sequence_state "$1" "$2" \
+        | sed -n 's/.*:last \([-0-9][0-9]*\).*:called \([^)]*\).*/\1|\2/p'
 }
 
 wait_for_rows() {
@@ -172,13 +187,13 @@ wait_for_lsn_barrier() {
 }
 
 cleanup() {
-    for pid in "$WORKER_ONE_PID" "$WORKER_TWO_PID" \
+    for pid in "$WORKER_ONE_PID" "$WORKER_TWO_PID" "$SOURCE_DDL_PID" \
                "$SOURCE_PID" "$REPLICA_ONE_PID" "$REPLICA_TWO_PID"; do
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
         fi
     done
-    for pid in "$WORKER_ONE_PID" "$WORKER_TWO_PID" \
+    for pid in "$WORKER_ONE_PID" "$WORKER_TWO_PID" "$SOURCE_DDL_PID" \
                "$SOURCE_PID" "$REPLICA_ONE_PID" "$REPLICA_TWO_PID"; do
         if [ -n "$pid" ]; then
             wait "$pid" 2>/dev/null || true
@@ -216,16 +231,14 @@ REPLICA_ONE_PID=$SERVER_PID
 start_server "$REPLICA_TWO_PORT" "$TMP/replica-two-data" "$TMP/replica-two.log"
 REPLICA_TWO_PID=$SERVER_PID
 
-sql "$SOURCE_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label varchar(64)); CREATE TABLE nullable_rows (nullable_key integer, label varchar(64)); CREATE UNIQUE INDEX nullable_rows_key_idx ON nullable_rows (nullable_key) NULLS NOT DISTINCT; CREATE TABLE ignored_rows (id integer PRIMARY KEY, label varchar(64)); INSERT INTO replicated_rows VALUES (1, 10, 'initial'), (9, 90, 'remove'); INSERT INTO nullable_rows VALUES (NULL, 'initial-null'), (2, 'two'); INSERT INTO ignored_rows VALUES (1, 'before')"
-sql "$REPLICA_ONE_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label varchar(64)); CREATE TABLE nullable_rows (nullable_key integer, label varchar(64)); CREATE UNIQUE INDEX nullable_rows_key_idx ON nullable_rows (nullable_key) NULLS NOT DISTINCT; CREATE TABLE ignored_rows (id integer PRIMARY KEY, label varchar(64))"
-sql "$REPLICA_TWO_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label varchar(64)); CREATE TABLE nullable_rows (nullable_key integer, label varchar(64)); CREATE UNIQUE INDEX nullable_rows_key_idx ON nullable_rows (nullable_key) NULLS NOT DISTINCT; CREATE TABLE ignored_rows (id integer PRIMARY KEY, label varchar(64))"
+sql "$SOURCE_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label varchar(64)); CREATE TABLE nullable_rows (nullable_key integer, label varchar(64)); CREATE UNIQUE INDEX nullable_rows_key_idx ON nullable_rows (nullable_key) NULLS NOT DISTINCT; CREATE TABLE ignored_rows (id integer PRIMARY KEY, label varchar(64)); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; ALTER SEQUENCE bootstrap_counter INCREMENT BY -2; SELECT setval('bootstrap_counter', 100, true); INSERT INTO replicated_rows VALUES (1, 10, 'initial'), (9, 90, 'remove'); INSERT INTO nullable_rows VALUES (NULL, 'initial-null'), (2, 'two'); INSERT INTO ignored_rows VALUES (1, 'before')"
 
-PG_LISP_SUBSCRIBE_COPY_DELAY_MS=2000 \
+PG_LISP_SUBSCRIBE_COPY_DELAY_MS=5000 \
     "$BASE/pg-lisp-subscribe" --slot logical_replica_one \
     --source-port "$SOURCE_PORT" --target-port "$REPLICA_ONE_PORT" \
     --table replicated_rows --table nullable_rows > "$TMP/worker-one.log" 2>&1 &
 WORKER_ONE_PID=$!
-PG_LISP_SUBSCRIBE_COPY_DELAY_MS=2000 \
+PG_LISP_SUBSCRIBE_COPY_DELAY_MS=5000 \
 PG_LISP_SUBSCRIBE_DROP_FEEDBACK_ONCE=1 \
     "$BASE/pg-lisp-subscribe" --slot logical_replica_two \
     --source-port "$SOURCE_PORT" --target-port "$REPLICA_TWO_PORT" \
@@ -234,15 +247,21 @@ WORKER_TWO_PID=$!
 
 wait_for_log "$TMP/worker-one.log" "snapshot imported at"
 wait_for_log "$TMP/worker-two.log" "snapshot imported at"
+wait_for_log "$TMP/worker-one.log" "snapshot imported; copy pause"
+wait_for_log "$TMP/worker-two.log" "snapshot imported; copy pause"
 wait_for_state "$REPLICA_ONE_PORT" logical_replica_one copying
 wait_for_state "$REPLICA_TWO_PORT" logical_replica_two copying
 copy_boundary_two=$(sql "$REPLICA_TWO_PORT" \
     "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = 'logical_replica_two'")
 
-# Both exported snapshots already exist. The source commit must therefore appear
-# in the stream after snapshot copy, following snapbuild.c's copy/stream handoff.
+# Both exported snapshots already exist. Commit row and sequence changes while
+# the copy is paused; they must appear after the snapshot boundary, following
+# snapbuild.c's consistent-point and copy/stream handoff.
+sql "$SOURCE_PORT" "SELECT nextval('bootstrap_counter')" >/dev/null
 sql "$SOURCE_PORT" "BEGIN; INSERT INTO replicated_rows VALUES (2, 20, 'inserted'), (3, 30, 'temporary'); UPDATE replicated_rows SET amount = 11, label = NULL WHERE id = 1; DELETE FROM replicated_rows WHERE id = 9; DELETE FROM replicated_rows WHERE id = 3; UPDATE nullable_rows SET label = 'updated-null' WHERE nullable_key IS NULL; COMMIT"
-sql "$SOURCE_PORT" "BEGIN; INSERT INTO replicated_rows VALUES (77, 770, 'aborted'); ROLLBACK"
+sql "$SOURCE_PORT" "CREATE TABLE logical_copy_race (id integer PRIMARY KEY)" \
+    > "$TMP/source-ddl.log" 2>&1 &
+SOURCE_DDL_PID=$!
 
 wait_for_log "$TMP/worker-two.log" "dropping feedback after durable target commit"
 wait "$WORKER_TWO_PID"
@@ -290,9 +309,31 @@ expected_nullable_first=$(nullable_rows "$SOURCE_PORT")
 wait_for_nullable_rows "$REPLICA_ONE_PORT" "$expected_nullable_first"
 wait_for_nullable_rows "$REPLICA_TWO_PORT" "$expected_nullable_first"
 
+# The exported slot boundary includes schema and sequence state. A later
+# nextval is delivered as a standalone pgoutput Message and durably applied on
+# both subscribers, like sequence.c's nontransactional sequence WAL update.
+if [ "$(sequence_state_position "$SOURCE_PORT" bootstrap_counter)" != \
+     "$(sequence_state_position "$REPLICA_ONE_PORT" bootstrap_counter)" ] \
+        || [ "$(sequence_state_position "$SOURCE_PORT" bootstrap_counter)" != \
+             "$(sequence_state_position "$REPLICA_TWO_PORT" bootstrap_counter)" ]; then
+    echo "logical-replication: sequence state did not reach both subscribers" >&2
+    exit 1
+fi
+if [ "$(sequence_definition_state "$SOURCE_PORT" bootstrap_counter)" != \
+     "$(sequence_definition_state "$REPLICA_ONE_PORT" bootstrap_counter)" ] \
+        || [ "$(sequence_definition_state "$SOURCE_PORT" bootstrap_counter)" != \
+             "$(sequence_definition_state "$REPLICA_TWO_PORT" bootstrap_counter)" ]; then
+    echo "logical-replication: bootstrap changed sequence start, increment, or bounds" >&2
+    exit 1
+fi
+wait "$SOURCE_DDL_PID"
+SOURCE_DDL_PID=
+sql "$SOURCE_PORT" "BEGIN; INSERT INTO replicated_rows VALUES (77, 770, 'aborted'); ROLLBACK"
+
 # Commit additional work while replica two is disconnected. It must restart from
 # its target's durable marker without duplicating the transaction applied above.
 sql "$SOURCE_PORT" "BEGIN; UPDATE replicated_rows SET amount = 22, label = 'resumed' WHERE id = 2; INSERT INTO replicated_rows VALUES (4, 40, 'later'); DELETE FROM nullable_rows WHERE nullable_key IS NULL; COMMIT"
+sql "$SOURCE_PORT" "ALTER TABLE replicated_rows ADD CONSTRAINT replicated_rows_amount_key UNIQUE (amount); CREATE INDEX replicated_rows_id_amount_idx ON replicated_rows (id, amount); CREATE SEQUENCE streaming_counter START WITH 10 INCREMENT BY 5; SELECT nextval('streaming_counter'); ALTER SEQUENCE streaming_counter INCREMENT BY -3; SELECT nextval('streaming_counter')"
 disconnected_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
 expected_final=$(sql "$SOURCE_PORT" "SELECT id, amount, label FROM replicated_rows ORDER BY id")
 "$BASE/pg-lisp-subscribe" --slot logical_replica_two \
@@ -315,6 +356,27 @@ if [ "$(nullable_rows "$REPLICA_ONE_PORT")" != "$expected_nullable_final" ] \
     echo "replica two: $(nullable_rows "$REPLICA_TWO_PORT")" >&2
     exit 1
 fi
+if [ "$(sequence_state_position "$SOURCE_PORT" streaming_counter)" != \
+     "$(sequence_state_position "$REPLICA_ONE_PORT" streaming_counter)" ] \
+        || [ "$(sequence_state_position "$SOURCE_PORT" streaming_counter)" != \
+             "$(sequence_state_position "$REPLICA_TWO_PORT" streaming_counter)" ]; then
+    echo "logical-replication: streamed sequence DDL or state diverged" >&2
+    exit 1
+fi
+if [ "$(sequence_definition_state "$SOURCE_PORT" streaming_counter)" != \
+     "$(sequence_definition_state "$REPLICA_ONE_PORT" streaming_counter)" ] \
+        || [ "$(sequence_definition_state "$SOURCE_PORT" streaming_counter)" != \
+             "$(sequence_definition_state "$REPLICA_TWO_PORT" streaming_counter)" ]; then
+    echo "logical-replication: streamed sequence bounds or definition diverged" >&2
+    exit 1
+fi
+if sql "$REPLICA_ONE_PORT" "CREATE INDEX replicated_rows_id_amount_idx ON replicated_rows (id, amount)" \
+        >/dev/null 2>&1 \
+        || sql "$REPLICA_TWO_PORT" "CREATE INDEX replicated_rows_id_amount_idx ON replicated_rows (id, amount)" \
+            >/dev/null 2>&1; then
+    echo "logical-replication: streamed index DDL did not reach both subscribers" >&2
+    exit 1
+fi
 
 # A source transaction for an excluded table has no target row operation. Its
 # commit still advances per-slot durable progress, just as no-row WAL intervals
@@ -327,8 +389,7 @@ sql "$SOURCE_PORT" "UPDATE ignored_rows SET label = 'filtered' WHERE id = 1"
 wait_for_progress_change "$REPLICA_ONE_PORT" logical_replica_one "$progress_one_before"
 wait_for_progress_change "$REPLICA_TWO_PORT" logical_replica_two "$progress_two_before"
 
-# This DDL commits source WAL but emits no row change. The logical reader must
-# still advance via keepalive feedback after it scans the terminal record.
+# Standalone DDL is applied before the worker acknowledges its terminal LSN.
 progress_one_before=$(sql "$REPLICA_ONE_PORT" \
     "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = 'logical_replica_one' AND state = 'ready'")
 progress_two_before=$(sql "$REPLICA_TWO_PORT" \
@@ -336,6 +397,16 @@ progress_two_before=$(sql "$REPLICA_TWO_PORT" \
 sql "$SOURCE_PORT" "CREATE TABLE logical_progress_only (id integer)"
 wait_for_progress_change "$REPLICA_ONE_PORT" logical_replica_one "$progress_one_before"
 wait_for_progress_change "$REPLICA_TWO_PORT" logical_replica_two "$progress_two_before"
+if [ "$(sql "$REPLICA_ONE_PORT" "SELECT count(*) FROM logical_copy_race")" != 0 ] \
+        || [ "$(sql "$REPLICA_TWO_PORT" "SELECT count(*) FROM logical_copy_race")" != 0 ]; then
+    echo "logical-replication: DDL held by initial copy did not reach both subscribers" >&2
+    exit 1
+fi
+if [ "$(sql "$REPLICA_ONE_PORT" "SELECT count(*) FROM logical_progress_only")" != 0 ] \
+        || [ "$(sql "$REPLICA_TWO_PORT" "SELECT count(*) FROM logical_progress_only")" != 0 ]; then
+    echo "logical-replication: CREATE TABLE did not reach both subscribers" >&2
+    exit 1
+fi
 source_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
 wait_for_lsn_barrier "$REPLICA_ONE_PORT" logical_replica_one "$source_barrier"
 wait_for_lsn_barrier "$REPLICA_TWO_PORT" logical_replica_two "$source_barrier"

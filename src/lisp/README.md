@@ -168,12 +168,18 @@ DDL:
 ```sql
 CREATE TABLE t (a int, b varchar(20), PRIMARY KEY (a));
 CREATE TABLE t (a int UNIQUE, b varchar(20));
+CREATE TABLE t (id bigint DEFAULT nextval('t_id_seq'));
 DROP TABLE [IF EXISTS] t;
+TRUNCATE TABLE t [, ...];
 CREATE UNIQUE INDEX name ON t (cols);
 CREATE UNIQUE INDEX name ON t (cols) NULLS NOT DISTINCT;
 CREATE INDEX name ON t (cols);
 DROP INDEX [IF EXISTS] name;
 ALTER INDEX name RENAME TO new_name;
+CREATE [IF NOT EXISTS] SEQUENCE name [START [WITH] n] [INCREMENT [BY] n]
+  [MINVALUE n] [MAXVALUE n];
+ALTER SEQUENCE name INCREMENT [BY] n | RESTART [WITH] n;
+DROP SEQUENCE [IF EXISTS] name [, ...];
 ALTER TABLE t ADD PRIMARY KEY (cols);
 ALTER TABLE t ADD PRIMARY KEY USING INDEX name;
 ALTER TABLE t ADD UNIQUE [NULLS NOT DISTINCT] (cols);
@@ -196,6 +202,11 @@ INSERT INTO t [(cols)] VALUES (...)[, (...)];
 UPDATE t SET col = expr [, ...] [WHERE e];
 DELETE FROM t [WHERE e];
 ```
+
+Sequence expressions support `nextval('sequence')`, `currval('sequence')`, and
+`setval('sequence', value [, is_called])`. The only supported column default is
+`DEFAULT nextval('sequence')`. Sequence values use the implemented signed `int8`
+range and are persisted separately from transaction rollback, as in PostgreSQL.
 
 Joins use a nested-loop executor over sequential scans. `ON` predicates can
 reference both join operands; `USING` merges columns with a common type (equal
@@ -229,6 +240,29 @@ only `READ COMMITTED`, UTF8 client encoding, and `standard_conforming_strings = 
 Meta-commands that need `pg_catalog` and regular-expression operators (`\d`,
 `\dt`, `\l`) return an error from the server; `psql` prints it and continues.
 
+## Logical replication
+
+`./pg-lisp-subscribe` streams from one `pg-lisp` server to another. It creates a
+logical slot with an exported snapshot, initializes supported table/index/sequence
+definitions on the target, copies rows from an explicit `--table` allowlist, then
+applies committed row transactions and supported DDL/sequence events. Each target
+stores a durable source-LSN marker in the same catalog commit as an applied event;
+the worker sends replication feedback only after that commit. `t/logical-replication.sh`
+exercises initial copy, DDL and sequence changes, two independent replicas, and
+restart after a lost feedback message.
+
+This is a `pg-lisp` to `pg-lisp` subset, not a general PostgreSQL subscription
+implementation. Table definitions and supported DDL cover the SQL subset listed
+above. Initial bootstrap mirrors supported schema objects in `public`; `--table`
+selects which tables have rows copied and whose row changes are applied. DDL and
+sequence events are database-wide and are applied independently of that table
+allowlist. Publication objects, publication row filters, replication origins,
+cascading-loop prevention, arbitrary DDL, and unsupported types or storage
+features are not implemented. The wire stream uses pgoutput row messages plus
+the v2 `Message` form for the worker's DDL and sequence events; those custom
+events require the bundled subscriber. A single catalog event must fit within
+one WAL segment.
+
 ## Testing
 
 ```sh
@@ -246,6 +280,7 @@ cd src/lisp
 ./t/join-ddl-concurrency.sh # atomic JOIN admission against concurrent DROP TABLE
 ./t/spill-crash-recovery.sh # crash cleanup, restart recovery, and temp-file limit
 ./t/sort-arena.sh        # bounded sort arenas, transaction recovery, concurrent sorts
+./t/logical-replication.sh # exported snapshot, row/DDL/sequence stream, restart recovery
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
 ./t/hot-reload.sh         # SIGHUP reloads code in a running server
 ./t/control-repl.sh       # control REPL over TCP + Unix socket, reload, SQL intact
@@ -504,13 +539,16 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
 
 ## Known gaps (documented, not hidden)
 
-- No WAL archiving, complete replication protocol, or point-in-time recovery. The
-  WAL layer supports persistent replication slots with restart/consistent LSNs,
-  confirmed-flush acknowledgments, and `pg_catalog.pg_replication_slots`
-  diagnostics. Slots that exceed the configured per-slot WAL-retention cap are
-  durably marked lost at checkpoint so recycling can proceed. A complete WAL
-  record with a bad checksum stops startup; this implementation detects that
-  damage but does not reconstruct the record.
+- No WAL archiving, complete PostgreSQL replication protocol, or point-in-time
+  recovery. The `pg-lisp` logical subscriber supports only the documented SQL
+  subset, source-side supported DDL and sequence state, and an explicit table
+  allowlist; it does not implement publication selection or filters, replication
+  origins, or conflict handling. The WAL layer supports persistent replication
+  slots with restart/consistent LSNs, confirmed-flush acknowledgments, and
+  `pg_catalog.pg_replication_slots` diagnostics. Slots that exceed the configured
+  per-slot WAL-retention cap are durably marked lost at checkpoint so recycling
+  can proceed. A complete WAL record with a bad checksum stops startup; this
+  implementation detects that damage but does not reconstruct the record.
 - Heap page layout version 6 stores 32-bit tuple XIDs in the PostgreSQL header
   layout. Existing version 4 and 5 relation files are rejected and must be
   recreated before use.
@@ -528,8 +566,8 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   and comma-separated FROM items are not supported.
 - No `OFFSET`/`FETCH`. `ORDER BY` accepts multiple keys with `ASC`/`DESC` and
   uses bounded in-memory runs with external merge when needed.
-- No `DEFAULT`, `CHECK`, foreign keys, or `NOT NULL`/`UNIQUE` beyond what is
-  listed above.
+- No general `DEFAULT` expressions (only `DEFAULT nextval('sequence')`), `CHECK`,
+  foreign keys, or `NOT NULL`/`UNIQUE` beyond what is listed above.
 - `ANALYZE table` scans visible heap rows to count them exactly and keeps a
   transient reservoir capped at 300 rows and about 4 MiB. It persists row count,
   NULL fraction, distinct-count estimate, and up to ten most-common values per

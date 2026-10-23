@@ -18,6 +18,12 @@
            "varchar key encoding is length-first")))
 
 (defun test-index-catalog-roundtrip ()
+  (let* ((catalog (make-catalog))
+         (identity (catalog-cluster-identity catalog))
+         (copy (catalog-from-sexp (catalog-to-sexp catalog))))
+    (check (and (stringp identity)
+                (string= identity (catalog-cluster-identity copy)))
+           "catalog incarnation survives durable catalog serialization"))
   (let* ((idx (make-pg-index :oid 42 :name "nnd" :relfilenode 42
                              :table-oid 41 :columns '(1) :unique-p t
                              :constraint-p t
@@ -47,7 +53,7 @@
                   `(:oid 50 :name "codec" :relfilenode 51
                     :relfrozenxid ,+first-normal-xid+
                     :columns ((:name "value" :type :int4 :typmod -1
-                               :attnum 1 :notnull t))
+                               :attnum 1 :notnull t :default-sequence nil))
                     :indexes (52)
                     :statistics nil))
            "class and column codecs use compatible flat plists")

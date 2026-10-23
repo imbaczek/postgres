@@ -27,7 +27,10 @@
 (defun ddl-p (ast)
   (member (getf ast :type)
           '(:create-table :drop-table :create-index :drop-index
-            :alter-index :alter-table)))
+            :alter-index :alter-table :create-sequence :alter-sequence
+            :drop-sequence :apply-sequence-state
+            :create-publication :alter-publication
+            :drop-publication)))
 
 (defun catalog-change-p (ast)
   "Return whether AST changes durable catalog state, including ANALYZE."
@@ -38,6 +41,9 @@
   ;; relation truncation path. This subset marks every live tuple deleted in the
   ;; current transaction so rollback preserves MVCC visibility; it deliberately
   ;; avoids queuing one logical DELETE event per row.
+  ;; A table may be empty, but TRUNCATE still needs a commit-ordered logical
+  ;; event just as PostgreSQL's heap_truncate_one_rel() is WAL-visible.
+  (get-current-xid)
   (dolist (name (getf ast :tables))
     (let ((table (resolve-table-or-error name)))
       (with-registered-table (table rel xid :write)
@@ -53,7 +59,403 @@
               (unless deleted
                 (ereport "40001"
                          "could not truncate relation after concurrent update"))))))))
+  (logical-note-transaction-event :truncate
+                                  (list :tables (getf ast :tables)))
   (send-command-complete stream "TRUNCATE TABLE"))
+
+(defun exec-apply-sequence-state (stream ast)
+  (let* ((state (getf ast :state))
+         (name (getf state :name))
+         (oid (getf state :oid))
+         (start (getf state :start))
+         (increment (getf state :increment))
+         (minimum (getf state :min))
+         (maximum (getf state :max))
+         (last (getf state :last))
+         (called (getf state :called))
+         (db (current-database))
+         (previous nil))
+    (unless (and (stringp name)
+                 (and (integerp oid) (<= 1 oid #xFFFFFFFF))
+                 (sequence-value-range-p start)
+                 (sequence-value-range-p increment) (not (zerop increment))
+                 (sequence-value-range-p minimum)
+                 (sequence-value-range-p maximum)
+                 (<= minimum start maximum)
+                 (<= minimum last maximum)
+                 (member called '(t nil)))
+      (ereport "08P01" "invalid replicated sequence state"))
+    (call-with-catalog-durability-rollback
+     (lambda ()
+       (when previous
+         (setf (gethash name (database-sequences db)) previous)))
+     (lambda ()
+       (let ((sequence (gethash name (database-sequences db))))
+         (unless sequence
+           (ereport "42P01" "replicated sequence \"~a\" does not exist" name))
+         (setf previous (copy-pg-sequence sequence)
+               (pg-sequence-start-value sequence) start
+               (pg-sequence-increment sequence) increment
+               (pg-sequence-min-value sequence) minimum
+               (pg-sequence-max-value sequence) maximum
+               (pg-sequence-last-value sequence) last
+               (pg-sequence-called-p sequence) called)
+         (save-catalog :logical-event (logical-sequence-state-event name)))))
+    (send-command-complete stream "APPLY LOGICAL EVENT")))
+
+(defun logical-event-ddl-ast (payload)
+  (let* ((envelope (logical-read-data-string payload))
+         (source-database-oid (getf envelope :database-oid))
+         (ast (getf envelope :ast)))
+    (unless (and (integerp source-database-oid)
+                 (<= 1 source-database-oid #xFFFFFFFF)
+                 (listp ast)
+                 (member (getf ast :type)
+                         '(:create-table :drop-table :create-index :drop-index
+                           :alter-index :alter-table :create-sequence
+                           :alter-sequence :drop-sequence)))
+      (ereport "08P01" "invalid or unsupported replicated DDL event"))
+    ast))
+
+(defun logical-event-sequence-state-ast (payload)
+  (let* ((state (logical-read-data-string payload))
+         (source-database-oid (getf state :database-oid)))
+    (unless (and (integerp source-database-oid)
+                 (<= 1 source-database-oid #xFFFFFFFF))
+      (ereport "08P01" "invalid replicated sequence event database"))
+    (list :type :apply-sequence-state :state state)))
+
+(defun exec-apply-logical-event (stream command)
+  (unless (and *backend*
+               (string= (or (backend-application-name *backend*) "")
+                        "pg-lisp-subscribe-apply"))
+    (ereport "42501" "APPLY LOGICAL EVENT is restricted to the replication worker"))
+  (when (or (backend-explicit *backend*)
+            (not (eq (backend-state *backend*) :idle)))
+    (ereport "25001" "APPLY LOGICAL EVENT cannot run inside a transaction block"))
+  (let ((key (getf command :event-key))
+        (lsn (getf command :event-lsn))
+        (payload (getf command :payload)))
+    (unless (and (stringp key) (<= 1 (length key) 1024)
+                 (integerp lsn) (<= 1 lsn #xFFFFFFFFFFFFFFFF)
+                 (stringp payload))
+      (ereport "08P01" "invalid logical replication event envelope"))
+    (sb-thread:with-mutex (*logical-event-apply-lock*)
+      (let* ((db (current-database))
+             (last-lsn (with-write-lock
+                         (gethash key
+                                  (database-applied-logical-event-ids db)))))
+        (when (and last-lsn (>= last-lsn lsn))
+          (send-command-complete stream "APPLY LOGICAL EVENT")
+          (return-from exec-apply-logical-event nil)))
+      (let* ((kind (let ((data (logical-read-data-string payload)))
+                     (if (getf data :ast) :ddl :sequence-state)))
+             (event-ast (ecase kind
+                          (:ddl
+                           (logical-event-ddl-ast payload))
+                          (:sequence-state
+                           (logical-event-sequence-state-ast payload))))
+             (*logical-event-apply-id* (cons key lsn)))
+        ;; Execute one committed DDL/state change using the same statement
+        ;; snapshot and schema locking path as ordinary commands. The incoming
+        ;; source position is stored by save-catalog in that durable image,
+        ;; mirroring ReorderBufferCommit()'s commit boundary in PostgreSQL.
+        (execute-in-transaction (make-broadcast-stream) event-ast)))
+    (send-command-complete stream "APPLY LOGICAL EVENT")))
+
+(defun exec-create-sequence (stream ast)
+  (let* ((db (current-database))
+         (name (getf ast :name))
+         (increment (getf ast :increment))
+         (start (getf ast :start))
+         (minimum (getf ast :min))
+         (maximum (getf ast :max))
+         (created nil))
+    (call-with-catalog-durability-rollback
+     (lambda ()
+       (when created
+         (remhash name (database-sequences db))))
+     (lambda ()
+       (when (gethash name (database-sequences db))
+         (if (getf ast :if-not-exists)
+             (progn
+               (send-notice stream
+                            (format nil "sequence \"~a\" already exists, skipping" name))
+               (send-command-complete stream "CREATE SEQUENCE")
+               (return-from exec-create-sequence nil))
+             (ereport "42P07" "sequence \"~a\" already exists" name)))
+       (check-new-relation-name db name)
+       (multiple-value-bind (default-min default-max)
+           (sequence-default-limits increment)
+         (setf minimum (or minimum default-min)
+               maximum (or maximum default-max))
+         (unless (and (sequence-value-range-p minimum)
+                      (sequence-value-range-p maximum)
+                      (<= minimum start maximum))
+           (ereport "22023" "sequence start value is out of bounds (~a..~a)"
+                    minimum maximum))
+         (setf (gethash name (database-sequences db))
+               (make-pg-sequence :oid (allocate-oid) :name name
+                                 :increment increment :start-value start
+                                 :min-value minimum :max-value maximum
+                                 :last-value start :called-p nil)
+               created t))
+       (save-catalog :logical-event
+                     (logical-catalog-event-for-ast ast))))
+    (send-command-complete stream "CREATE SEQUENCE")))
+
+(defun exec-alter-sequence (stream ast)
+  (let* ((db (current-database))
+         (name (getf ast :name))
+         (previous nil))
+    (call-with-catalog-durability-rollback
+     (lambda ()
+       (when previous (setf (gethash name (database-sequences db)) previous)))
+     (lambda ()
+       (let ((sequence (gethash name (database-sequences db))))
+         (unless sequence
+           (ereport "42P01" "sequence \"~a\" does not exist" name))
+         (setf previous (copy-pg-sequence sequence))
+         (when (getf ast :increment)
+           (let ((increment (getf ast :increment)))
+             (unless (and (sequence-value-range-p increment) (not (zerop increment)))
+               (ereport "22023" "sequence increment must be a nonzero int8"))
+             ;; AlterSequence() in src/backend/commands/sequence.c retains
+             ;; current bounds and state when only INCREMENT changes. Defaults
+             ;; are selected by init_params() for CREATE or explicit bound edits.
+             (setf (pg-sequence-increment sequence) increment)
+             (unless (<= (pg-sequence-min-value sequence)
+                         (pg-sequence-start-value sequence)
+                         (pg-sequence-max-value sequence))
+               (ereport "22023" "sequence start value is out of bounds"))))
+         (when (getf ast :restart)
+           (let ((restart (getf ast :restart)))
+             (unless (and (sequence-value-range-p restart)
+                          (<= (pg-sequence-min-value sequence) restart
+                              (pg-sequence-max-value sequence)))
+               (ereport "22003" "sequence restart value is out of bounds"))
+             (setf (pg-sequence-last-value sequence) restart
+                   (pg-sequence-called-p sequence) nil)))
+         (save-catalog :logical-event
+                       (logical-catalog-event-for-ast ast)))))
+    (send-command-complete stream "ALTER SEQUENCE")))
+
+(defun sequence-default-references (db sequence-name)
+  (loop for table being the hash-values of (database-tables db)
+        append (loop for column across (pg-class-columns table)
+                     when (equal (pg-column-default-sequence-name column)
+                                 sequence-name)
+                       collect (list (pg-class-name table)
+                                     (pg-column-name column)))))
+
+(defun exec-drop-sequence (stream ast)
+  (let ((db (current-database))
+        (names (getf ast :names))
+        (if-exists (getf ast :if-exists))
+        (removed '())
+        (publication-state '()))
+    (call-with-catalog-durability-rollback
+     (lambda ()
+       (dolist (entry removed)
+         (setf (gethash (car entry) (database-sequences db)) (cdr entry)))
+       (dolist (entry publication-state)
+         (setf (pg-publication-sequences (first entry)) (second entry)
+               (pg-publication-generation (first entry)) (third entry))))
+     (lambda ()
+       (dolist (name names)
+         (let ((sequence (gethash name (database-sequences db))))
+           (unless (or sequence if-exists)
+             (ereport "42P01" "sequence \"~a\" does not exist" name))
+           (when (and sequence (sequence-default-references db name))
+             (ereport "2BP01" "cannot drop sequence \"~a\" because a column default depends on it"
+                      name))))
+       (dolist (name names)
+         (let ((sequence (gethash name (database-sequences db))))
+           (if sequence
+               (progn
+                 (push (cons name sequence) removed)
+                 (maphash
+                  (lambda (publication-name publication)
+                    (declare (ignore publication-name))
+                    (let ((published (pg-publication-sequences publication)))
+                      (when (and (not (eq published :all))
+                                 (member name published :test #'string=))
+                        (pushnew
+                         (list publication published
+                               (pg-publication-generation publication))
+                         publication-state :key #'first)
+                        (setf (pg-publication-sequences publication)
+                              (remove name published :test #'string=))
+                        (incf (pg-publication-generation publication)))))
+                  (database-publications db))
+                 (remhash name (database-sequences db)))
+               (when if-exists
+                 (send-notice stream
+                              (format nil "sequence \"~a\" does not exist, skipping" name))))))
+       (save-catalog :logical-event
+                     (logical-catalog-event-for-ast ast))))
+    (send-command-complete stream "DROP SEQUENCE")))
+
+(defun validate-publication-table-entry (entry db)
+  (let* ((name (getf entry :name))
+         (table (gethash name (database-tables db)))
+         (filter (getf entry :filter)))
+    (unless table
+      (ereport "42P01" "publication table \"~a\" does not exist" name))
+    (setf (getf entry :table-oid) (pg-class-oid table))
+    (when filter
+      (unless (eq (expr-type (analyze-expr filter table)) :bool)
+        (ereport "42804" "publication row filter must return boolean")))
+    entry))
+
+(defun validate-publication-definition (publication db)
+  (unless (pg-publication-all-tables-p publication)
+    (let ((names (mapcar (lambda (entry) (getf entry :name))
+                         (pg-publication-tables publication))))
+      (when (/= (length names)
+                (length (remove-duplicates names :test #'string=)))
+        (ereport "42710" "publication lists a table more than once"))
+      (dolist (entry (pg-publication-tables publication))
+        (validate-publication-table-entry entry db))))
+  (unless (eq (pg-publication-sequences publication) :all)
+    (when (/= (length (pg-publication-sequences publication))
+              (length (remove-duplicates
+                       (pg-publication-sequences publication)
+                       :test #'string=)))
+      (ereport "42710" "publication lists a sequence more than once"))
+    (dolist (name (pg-publication-sequences publication))
+      (unless (gethash name (database-sequences db))
+        (ereport "42P01" "publication sequence \"~a\" does not exist" name))))
+  publication)
+
+(defun exec-create-publication (stream ast)
+  (let* ((db (current-database))
+         (name (getf ast :name))
+         (publication
+           (make-pg-publication :name name
+                                :all-tables-p (getf ast :all-tables-p)
+                                :tables (copy-tree (getf ast :tables))
+                                :sequences (copy-tree (getf ast :sequences))
+                                :generation 1))
+         (created nil))
+    (call-with-catalog-durability-rollback
+     (lambda ()
+       (when created
+         (remhash name (database-publications db))))
+     (lambda ()
+       (when (gethash name (database-publications db))
+         (ereport "42710" "publication \"~a\" already exists" name))
+       (validate-publication-definition publication db)
+       (setf (gethash name (database-publications db)) publication
+             created t)
+       (save-catalog :logical-event
+                     (logical-catalog-event-for-ast ast))))
+    (send-command-complete stream "CREATE PUBLICATION")))
+
+(defun alter-publication-tables (publication ast)
+  (let ((entries (copy-tree (pg-publication-tables publication))))
+    (when (and (pg-publication-all-tables-p publication)
+               (not (eq (getf ast :action) :set-table)))
+      (ereport "0A000" "use ALTER PUBLICATION SET TABLE before editing an all-tables publication"))
+    (case (getf ast :action)
+      (:add-table
+       (dolist (entry (getf ast :tables))
+         (when (find (getf entry :name) entries
+                     :key (lambda (current) (getf current :name))
+                     :test #'string=)
+           (ereport "42710" "publication table \"~a\" is already present"
+                    (getf entry :name)))
+         (push (copy-tree entry) entries)))
+      (:drop-table
+       (dolist (entry (getf ast :tables))
+         (let ((name (getf entry :name)))
+           (unless (find name entries :key (lambda (current)
+                                             (getf current :name))
+                                      :test #'string=)
+             (ereport "42704" "publication table \"~a\" is not present" name))
+           (setf entries
+                 (remove name entries :key (lambda (current)
+                                             (getf current :name))
+                                      :test #'string=)))))
+      (:set-table (setf entries (copy-tree (getf ast :tables)))))
+    (setf (pg-publication-tables publication) (nreverse entries)
+          (pg-publication-all-tables-p publication) nil)))
+
+(defun alter-publication-sequences (publication ast)
+  (let ((sequences (pg-publication-sequences publication)))
+    (case (getf ast :action)
+      (:add-sequence
+       (when (eq sequences :all)
+         (ereport "42710" "publication already includes all sequences"))
+       (setf sequences (copy-list sequences))
+       (dolist (name (getf ast :sequences))
+         (when (member name sequences :test #'string=)
+           (ereport "42710" "publication sequence \"~a\" is already present" name))
+         (push name sequences)))
+      (:drop-sequence
+       (when (eq sequences :all)
+         (ereport "0A000" "use ALTER PUBLICATION SET SEQUENCES before dropping a sequence"))
+       (setf sequences (copy-list sequences))
+       (dolist (name (getf ast :sequences))
+         (unless (member name sequences :test #'string=)
+           (ereport "42704" "publication sequence \"~a\" is not explicitly present" name))
+         (setf sequences (remove name sequences :test #'string=))))
+      (:set-sequences
+       (setf sequences (copy-tree (getf ast :sequences)))))
+    (setf (pg-publication-sequences publication) sequences)))
+
+(defun exec-alter-publication (stream ast)
+  (let* ((db (current-database))
+         (name (getf ast :name))
+         (previous nil))
+    (call-with-catalog-durability-rollback
+     (lambda ()
+       (when previous
+         (setf (gethash name (database-publications db)) previous)))
+     (lambda ()
+       (let ((current (gethash name (database-publications db))))
+         (unless current
+           (ereport "42704" "publication \"~a\" does not exist" name))
+         (setf previous current)
+         (let ((candidate (copy-pg-publication current)))
+           (setf (pg-publication-tables candidate)
+                 (copy-tree (pg-publication-tables current))
+                 (pg-publication-sequences candidate)
+                 (copy-tree (pg-publication-sequences current)))
+           (if (member (getf ast :action) '(:add-table :drop-table :set-table))
+               (alter-publication-tables candidate ast)
+               (alter-publication-sequences candidate ast))
+           (incf (pg-publication-generation candidate))
+           (validate-publication-definition candidate db)
+           (setf (gethash name (database-publications db)) candidate)
+           (save-catalog :logical-event
+                         (logical-catalog-event-for-ast ast))))))
+    (send-command-complete stream "ALTER PUBLICATION")))
+
+(defun exec-drop-publication (stream ast)
+  (let ((db (current-database))
+        (if-exists (getf ast :if-exists))
+        (removed '()))
+    (call-with-catalog-durability-rollback
+     (lambda ()
+       (dolist (entry removed)
+         (setf (gethash (car entry) (database-publications db)) (cdr entry))))
+     (lambda ()
+       (dolist (name (getf ast :names))
+         (unless (or (gethash name (database-publications db)) if-exists)
+           (ereport "42704" "publication \"~a\" does not exist" name)))
+       (dolist (name (getf ast :names))
+         (let ((publication (gethash name (database-publications db))))
+           (if publication
+               (progn (push (cons name publication) removed)
+                      (remhash name (database-publications db)))
+               (when if-exists
+                 (send-notice stream
+                              (format nil "publication \"~a\" does not exist, skipping"
+                                      name))))))
+       (save-catalog :logical-event
+                     (logical-catalog-event-for-ast ast))))
+    (send-command-complete stream "DROP PUBLICATION")))
 
 (defun note-query-error ()
   "Record that the current statement failed, matching PostgreSQL.
@@ -433,7 +835,7 @@ before this removal horizon is captured."
                    ;; build must not leave earlier indexes published.
                    (when (eq class (lookup-table name))
                      (drop-table* db name))
-                   (save-catalog)))
+                   (save-catalog :applied-logical-event-id nil)))
             (dolist (c constraints)
               (let ((attnums (resolve-attnums class (getf c :columns))))
                 (case (getf c :kind)
@@ -467,7 +869,8 @@ before this removal horizon is captured."
               ;; have been built above and inline indexes are empty here.
               (setf (pg-index-valid-p idx) t)
               (fsync-index idx))
-            (save-catalog))))
+            (save-catalog :logical-event
+                          (logical-catalog-event-for-ast ast)))))
       (send-command-complete stream "CREATE TABLE"))))
 
 (defun exec-drop-table (stream ast)
@@ -513,7 +916,8 @@ before this removal horizon is captured."
                 (send-notice stream
                              (format nil "table \"~a\" does not exist, skipping"
                                      name)))))
-        (save-catalog)))
+        (save-catalog :logical-event
+                      (logical-catalog-event-for-ast ast))))
     (send-command-complete stream "DROP TABLE")))
 
 (defun drop-index-relation-lock-set (entries table-lookup)
@@ -568,7 +972,7 @@ before this removal horizon is captured."
                    (resolve-attnums table (getf ast :columns))
                    :unique unique
                    :nulls-not-distinct (getf ast :nulls-not-distinct)))
-            (save-catalog)))
+            (save-catalog :applied-logical-event-id nil)))
         (unless skipped
           (handler-case
               (progn
@@ -590,7 +994,8 @@ before this removal horizon is captured."
                           (when skipped
                             (wal-defer-relation-delete
                              (pg-index-relfilenode idx)))
-                          (save-catalog))
+                          (save-catalog :logical-event
+                                        (logical-catalog-event-for-ast ast)))
                       (error (publish-condition)
                         ;; Do not roll back memory if WAL has published this
                         ;; catalog image: later writes must keep maintaining
@@ -613,7 +1018,7 @@ before this removal horizon is captured."
                 (handler-case
                     (with-write-catalog-locks
                       (wal-defer-relation-delete (pg-index-relfilenode idx))
-                      (save-catalog))
+                      (save-catalog :applied-logical-event-id nil))
                   (error (cleanup-condition)
                     (declare (ignore cleanup-condition)))))
               (error condition))))))
@@ -674,7 +1079,8 @@ before this removal horizon is captured."
                 (send-notice stream
                              (format nil "index \"~a\" does not exist, skipping"
                                      name)))))
-        (save-catalog)))
+        (save-catalog :logical-event
+                      (logical-catalog-event-for-ast ast))))
     (send-command-complete stream "DROP INDEX")))
 
 (defun exec-alter-index (stream ast)
@@ -699,7 +1105,8 @@ before this removal horizon is captured."
                        name)
               (ereport "42704" "index \"~a\" does not exist" name)))
         (rename-index* db name new-name)
-        (save-catalog)))
+        (save-catalog :logical-event
+                      (logical-catalog-event-for-ast ast))))
     (send-command-complete stream "ALTER INDEX")))
 
 (defun exec-alter-table-using-index (db table ast primary)
@@ -749,7 +1156,8 @@ before this removal horizon is captured."
         (setf (pg-index-constraint-p idx) t)
         (unless (string= new-name (pg-index-name idx))
           (rename-index* db (pg-index-name idx) new-name))
-        (save-catalog)))))
+        (save-catalog :logical-event
+                      (logical-catalog-event-for-ast ast))))))
 
 (defun exec-alter-table-constraint (stream db table ast)
   (let* ((name (getf ast :constraint-name))
@@ -782,10 +1190,11 @@ before this removal horizon is captured."
            (rename-index* db name (getf ast :new-name)))
           (:drop-constraint
            (drop-index* db name)))
-        (save-catalog)))
+        (save-catalog :logical-event
+                      (logical-catalog-event-for-ast ast))))
     t))
 
-(defun exec-alter-table-replace-primary (stream db table actions)
+(defun exec-alter-table-replace-primary (stream db table actions ast)
   (unless (and (= (length actions) 2)
                (eq (getf (first actions) :action) :drop-constraint)
                (eq (getf (second actions) :action) :add-primary-key)
@@ -865,7 +1274,8 @@ before this removal horizon is captured."
                   t))
           (unless (string= new-name (pg-index-name new-idx))
             (rename-index* db (pg-index-name new-idx) new-name))
-          (save-catalog))))))
+          (save-catalog :logical-event
+                        (logical-catalog-event-for-ast ast)))))))
 
 (defun exec-alter-table (stream ast)
   (let* ((name (getf ast :table))
@@ -886,7 +1296,8 @@ before this removal horizon is captured."
           (ereport "42P01" "relation \"~a\" does not exist" name)))
     (cond
       ((getf ast :actions)
-       (exec-alter-table-replace-primary stream db table (getf ast :actions)))
+       (exec-alter-table-replace-primary
+        stream db table (getf ast :actions) ast))
       ((getf ast :using-index)
        (exec-alter-table-using-index db table ast primary))
       ((member (getf ast :action) '(:rename-constraint :drop-constraint))
@@ -936,7 +1347,8 @@ before this removal horizon is captured."
                                 (1- attnum)))
                          t)))
                (fsync-index idx)
-               (save-catalog)))))))
+               (save-catalog :logical-event
+                             (logical-catalog-event-for-ast ast))))))))
     (send-command-complete stream "ALTER TABLE")))
 
 ;;; ---- simple-query execution ----
@@ -947,7 +1359,7 @@ before this removal horizon is captured."
                (member (getf ast :type)
                        '(:insert :update :delete :truncate :create-table :drop-table
                          :create-index :drop-index :alter-index :alter-table
-                         :analyze)))
+                         :apply-sequence-state :analyze)))
       (ereport "25006" "cannot execute write statement in a read-only transaction"))
     (when (and (catalog-change-p ast) (backend-explicit *backend*))
       (ereport "0A000"
@@ -965,6 +1377,14 @@ before this removal horizon is captured."
                      (:truncate (exec-truncate stream ast))
                      (:create-table (exec-create-table stream ast))
                      (:drop-table (exec-drop-table stream ast))
+                     (:create-sequence (exec-create-sequence stream ast))
+                     (:alter-sequence (exec-alter-sequence stream ast))
+                     (:apply-sequence-state
+                      (exec-apply-sequence-state stream ast))
+                     (:drop-sequence (exec-drop-sequence stream ast))
+                     (:create-publication (exec-create-publication stream ast))
+                     (:alter-publication (exec-alter-publication stream ast))
+                     (:drop-publication (exec-drop-publication stream ast))
                      (:create-index (exec-create-index stream ast))
                      (:drop-index (exec-drop-index stream ast))
                      (:alter-index (exec-alter-index stream ast))
@@ -1001,6 +1421,7 @@ before this removal horizon is captured."
        (exec-set-transaction-snapshot stream ast))
       (:reset (exec-reset stream ast))
       (:show (exec-show stream ast))
+      (:apply-logical-event (exec-apply-logical-event stream ast))
       (otherwise (execute-in-transaction stream ast)))))
 
 (defun exec-simple-query (stream query &key (start-execution-p t)

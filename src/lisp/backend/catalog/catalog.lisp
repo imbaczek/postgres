@@ -8,7 +8,8 @@
   type              ; :int4 | :int8 | :varchar
   typmod            ; n+4 for varchar(n), else -1
   attnum
-  notnull)
+  notnull
+  default-sequence-name)
 
 (defstruct pg-class
   oid
@@ -41,6 +42,12 @@
   sample-count
   columns)
 
+(defstruct pg-sequence
+  oid name increment start-value min-value max-value last-value called-p)
+
+(defstruct pg-publication
+  name all-tables-p tables sequences generation)
+
 (defun pg-index-constraint-owned-p (index)
   "Return whether a table constraint depends on INDEX.
 
@@ -52,17 +59,31 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
   name
   oid
   (tables (make-hash-table :test #'equal))
-  (indexes (make-hash-table :test #'equal)))
+  (indexes (make-hash-table :test #'equal))
+  (sequences (make-hash-table :test #'equal))
+  (publications (make-hash-table :test #'equal))
+  (applied-logical-event-ids (make-hash-table :test #'equal)))
+
+(defun new-catalog-cluster-identity ()
+  (format nil "~36r-~X"
+          (get-universal-time) (random (ash 1 128))))
 
 (defstruct catalog
+  (cluster-identity (new-catalog-cluster-identity))
   (next-oid +first-normal-object-id+)
   (databases (make-hash-table :test #'equal)))
 
 (defvar *catalog* nil)
+(defvar *catalog-identity-needs-persist-p* nil)
 (defvar *catalog-mutex* (sb-thread:make-mutex :name "pg catalog mutex"))
 (defvar *catalog-oldest-relfrozenxid* nil)
 ;; Incremented only after a catalog image has been durably committed.
 (defvar *catalog-durable-generation* 0)
+(defvar *catalog-save-error-after-durable-p* nil)
+(defvar *logical-event-apply-id* nil)
+(defvar *logical-event-apply-lock*
+  (sb-thread:make-mutex :name "logical event apply mutex"))
+(declaim (ftype function logical-sequence-state-event))
 
 ;;; ---- serialization ----
 
@@ -103,7 +124,25 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
   (:type pg-column-type :type)
   (:typmod pg-column-typmod :typmod)
   (:attnum pg-column-attnum :attnum)
-  (:notnull pg-column-notnull :notnull))
+  (:notnull pg-column-notnull :notnull)
+  (:default-sequence pg-column-default-sequence-name :default-sequence-name))
+
+(define-catalog-codec sequence make-pg-sequence
+  (:oid pg-sequence-oid :oid)
+  (:name pg-sequence-name :name)
+  (:increment pg-sequence-increment :increment)
+  (:start pg-sequence-start-value :start-value)
+  (:min pg-sequence-min-value :min-value)
+  (:max pg-sequence-max-value :max-value)
+  (:last pg-sequence-last-value :last-value)
+  (:called pg-sequence-called-p :called-p))
+
+(define-catalog-codec publication make-pg-publication
+  (:name pg-publication-name :name)
+  (:all-tables pg-publication-all-tables-p :all-tables-p)
+  (:tables pg-publication-tables :tables)
+  (:sequences pg-publication-sequences :sequences)
+  (:generation pg-publication-generation :generation))
 
 (define-catalog-codec column-statistics make-pg-column-statistics
   (:null-fraction pg-column-statistics-null-fraction :null-fraction)
@@ -158,7 +197,16 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
     :tables ,(loop for c being the hash-values of (database-tables db)
                    collect (class-to-sexp c))
     :indexes ,(loop for i being the hash-values of (database-indexes db)
-                    collect (index-to-sexp i))))
+                    collect (index-to-sexp i))
+    :sequences ,(loop for s being the hash-values of (database-sequences db)
+                      collect (sequence-to-sexp s))
+    :publications ,(loop for p being the hash-values of (database-publications db)
+                         collect (publication-to-sexp p))
+    :applied-logical-event-ids
+    ,(loop for key being the hash-keys of
+                                       (database-applied-logical-event-ids db)
+             using (hash-value lsn)
+           collect (cons key lsn))))
 
 (defun database-from-sexp (s)
   (let ((db (make-database :name (getf s :name) :oid (getf s :oid))))
@@ -168,15 +216,47 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
     (dolist (is (getf s :indexes))
       (let ((i (index-from-sexp is)))
         (setf (gethash (pg-index-name i) (database-indexes db)) i)))
+    (dolist (ss (getf s :sequences))
+      (let ((sequence (sequence-from-sexp ss)))
+        ;; Catalogs written before sequence limits were stored only increment
+        ;; and start. Match sequence.c:init_params()' direction-sensitive
+        ;; int8 defaults when such a catalog is loaded.
+        (unless (pg-sequence-min-value sequence)
+          (setf (pg-sequence-min-value sequence)
+                (if (minusp (pg-sequence-increment sequence))
+                    +int8-min+ 1)))
+        (unless (pg-sequence-max-value sequence)
+          (setf (pg-sequence-max-value sequence)
+                (if (minusp (pg-sequence-increment sequence))
+                    -1 +int8-max+)))
+        (setf (gethash (pg-sequence-name sequence)
+                       (database-sequences db)) sequence)))
+    (dolist (ps (getf s :publications))
+      (let ((publication (publication-from-sexp ps)))
+        (setf (gethash (pg-publication-name publication)
+                       (database-publications db)) publication)))
+    (dolist (entry (getf s :applied-logical-event-ids))
+      (if (consp entry)
+          (setf (gethash (car entry) (database-applied-logical-event-ids db))
+                (cdr entry))
+          ;; Accept the short-lived exact-ID list format written during the
+          ;; initial logical-event implementation.
+          (setf (gethash entry (database-applied-logical-event-ids db)) 0)))
     db))
 
 (defun catalog-to-sexp (cat)
-  `(:next-oid ,(catalog-next-oid cat)
+  `(:cluster-identity ,(catalog-cluster-identity cat)
+    :next-oid ,(catalog-next-oid cat)
     :databases ,(loop for db being the hash-values of (catalog-databases cat)
                       collect (database-to-sexp db))))
 
 (defun catalog-from-sexp (s)
-  (let ((cat (make-catalog :next-oid (getf s :next-oid))))
+  (unless (getf s :cluster-identity)
+    (setf *catalog-identity-needs-persist-p* t))
+  (let ((cat (make-catalog :cluster-identity
+                           (or (getf s :cluster-identity)
+                               (new-catalog-cluster-identity))
+                           :next-oid (getf s :next-oid))))
     (dolist (ds (getf s :databases))
       (let ((db (database-from-sexp ds)))
         (setf (gethash (database-name db) (catalog-databases cat)) db)))
@@ -233,16 +313,47 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
   (or *catalog-oldest-relfrozenxid*
       (catalog-compute-oldest-relfrozenxid)))
 
-(defun save-catalog (&key deferred-relations on-record-appended)
+(defun save-catalog (&key deferred-relations logical-event on-record-appended
+                       (applied-logical-event-id *logical-event-apply-id*))
   ;; Do fallible derived-state work before publication. Once WAL commits, the
   ;; generation update and cache assignment below must not signal: callers use
   ;; the generation to distinguish rollback-safe failures from durable ones.
-  (let ((oldest (catalog-compute-oldest-relfrozenxid)))
-    (wal-commit-catalog (catalog-image-bytes) #'write-catalog-image
-                        :relation-deletes deferred-relations
-                        :on-record-appended on-record-appended)
-    (incf *catalog-durable-generation*)
-    (setf *catalog-oldest-relfrozenxid* oldest)))
+  (let* ((event-key (car applied-logical-event-id))
+         (event-lsn (cdr applied-logical-event-id))
+         (database (and event-key *backend* (current-database)))
+         (previous-event-lsn (and database
+                                  (gethash event-key
+                                           (database-applied-logical-event-ids
+                                            database))))
+         (previous-event-present-p
+           (and database
+                (nth-value 1
+                           (gethash event-key
+                                    (database-applied-logical-event-ids database)))))
+         (wal-generation (wal-catalog-flush-generation)))
+    (when database
+      (setf (gethash event-key (database-applied-logical-event-ids database))
+            event-lsn))
+    (handler-case
+        (let ((oldest (catalog-compute-oldest-relfrozenxid)))
+          (wal-commit-catalog
+           (catalog-image-bytes) #'write-catalog-image
+           :relation-deletes deferred-relations
+           :logical-event logical-event
+           :on-record-appended on-record-appended)
+          (incf *catalog-durable-generation*)
+          (setf *catalog-oldest-relfrozenxid* oldest))
+      (error (condition)
+        (if (> (wal-catalog-flush-generation) wal-generation)
+            (setf *catalog-save-error-after-durable-p* t)
+            (when database
+              (if previous-event-present-p
+                  (setf (gethash event-key
+                                 (database-applied-logical-event-ids database))
+                        previous-event-lsn)
+                  (remhash event-key
+                           (database-applied-logical-event-ids database)))))
+        (error condition)))))
 
 (defun load-catalog ()
   (let ((path (catalog-path)))
@@ -260,7 +371,13 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
     (incf (catalog-next-oid *catalog*))))
 
 (defun catalog-init ()
-  (setf *catalog* (or (load-catalog) (make-catalog)))
+  (setf *catalog-identity-needs-persist-p* nil
+        *catalog* (or (load-catalog) (make-catalog)))
+  (when *catalog-identity-needs-persist-p*
+    ;; Persist the generated identity before a subscriber can save it as the
+    ;; publisher incarnation, so a restart never looks like a new publisher.
+    (save-catalog)
+    (setf *catalog-identity-needs-persist-p* nil))
   (unless (gethash "postgres" (catalog-databases *catalog*))
     (let ((db (make-database :name "postgres" :oid (allocate-oid))))
       (setf (gethash "postgres" (catalog-databases *catalog*)) db)
@@ -308,6 +425,335 @@ longer contain transaction-status references."
 (defun lookup-index (name)
   (gethash (strip-schema name) (database-indexes (current-database))))
 
+(defun lookup-sequence (name)
+  (gethash (strip-schema name) (database-sequences (current-database))))
+
+(defun lookup-publication (name)
+  (gethash name (database-publications (current-database))))
+
+(defun sequence-value-range-p (value)
+  (and (integerp value) (<= +int8-min+ value +int8-max+)))
+
+(defun sequence-default-limits (increment)
+  "Return direction-sensitive int8 bounds as sequence.c:init_params() does."
+  (if (minusp increment)
+      (values +int8-min+ -1)
+      (values 1 +int8-max+)))
+
+(defun call-with-catalog-durability-rollback (rollback function)
+  "Run a catalog mutation and undo pre-durable failures under the catalog locks.
+
+Holding both locks through the failure decision prevents another catalog writer
+from advancing the shared WAL generation between a failed save and rollback."
+  (with-write-catalog-locks
+    (let ((*catalog-save-error-after-durable-p* nil))
+      (handler-case
+          (funcall function)
+        (error (condition)
+          (unless *catalog-save-error-after-durable-p*
+            (funcall rollback))
+          (error condition))))))
+
+(defun sequence-nextval (name)
+  "Advance and durably save NAME before returning its next value."
+  (when (and *backend* (backend-read-only *backend*))
+    (ereport "25006" "cannot execute nextval in a read-only transaction"))
+  (with-write-lock
+    (let* ((sequence (lookup-sequence name))
+           (old-value (and sequence (pg-sequence-last-value sequence)))
+           (old-called (and sequence (pg-sequence-called-p sequence))))
+      (unless sequence
+        (ereport "42P01" "sequence \"~a\" does not exist" name))
+      (let ((value (if old-called
+                       (+ old-value (pg-sequence-increment sequence))
+                       old-value)))
+        (unless (<= (pg-sequence-min-value sequence) value
+                    (pg-sequence-max-value sequence))
+          (ereport "2200H" "sequence \"~a\" has run out" name))
+        (setf (pg-sequence-last-value sequence) value
+              (pg-sequence-called-p sequence) t)
+        (let ((generation (wal-catalog-flush-generation)))
+          (handler-case
+              (save-catalog :logical-event
+                            (logical-sequence-state-event name))
+            (error (condition)
+              (unless (> (wal-catalog-flush-generation) generation)
+                (setf (pg-sequence-last-value sequence) old-value
+                      (pg-sequence-called-p sequence) old-called))
+              (error condition))))
+        (setf (gethash (pg-sequence-oid sequence)
+                       (backend-sequence-currvals *backend*)) value)
+        value))))
+
+(defun sequence-currval (name)
+  (let* ((sequence (lookup-sequence name))
+         (value (and sequence
+                     (gethash (pg-sequence-oid sequence)
+                              (backend-sequence-currvals *backend*)))))
+    (unless sequence
+      (ereport "42P01" "sequence \"~a\" does not exist" name))
+    (unless value
+      (ereport "55000"
+               "currval of sequence \"~a\" is not yet defined in this session"
+               name))
+    value))
+
+(defun sequence-setval (name value &optional (called-p t))
+  "Set and durably save a sequence value; this operation is not transactional."
+  (when (and *backend* (backend-read-only *backend*))
+    (ereport "25006" "cannot execute setval in a read-only transaction"))
+  (unless (sequence-value-range-p value)
+    (ereport "22003" "sequence value is out of range"))
+  (with-write-lock
+    (let* ((sequence (lookup-sequence name))
+           (old-value (and sequence (pg-sequence-last-value sequence)))
+           (old-called (and sequence (pg-sequence-called-p sequence))))
+      (unless sequence
+        (ereport "42P01" "sequence \"~a\" does not exist" name))
+      (unless (<= (pg-sequence-min-value sequence) value
+                  (pg-sequence-max-value sequence))
+        (ereport "22003"
+                 "setval: value ~a is out of bounds for sequence \"~a\" (~a..~a)"
+                 value name (pg-sequence-min-value sequence)
+                 (pg-sequence-max-value sequence)))
+      (setf (pg-sequence-last-value sequence) value
+            (pg-sequence-called-p sequence) (not (null called-p)))
+      (let ((generation (wal-catalog-flush-generation)))
+        (handler-case
+            (save-catalog :logical-event
+                          (logical-sequence-state-event name))
+          (error (condition)
+            (unless (> (wal-catalog-flush-generation) generation)
+              (setf (pg-sequence-last-value sequence) old-value
+                    (pg-sequence-called-p sequence) old-called))
+            (error condition))))
+      (when called-p
+        ;; SetSequence() in src/backend/commands/sequence.c updates the current
+        ;; backend's currval cache only for iscalled=true.
+        (setf (gethash (pg-sequence-oid sequence)
+                       (backend-sequence-currvals *backend*)) value))
+      value)))
+
+(defun publication-table-entry (publication table-name)
+  (when (pg-publication-all-tables-p publication)
+    (return-from publication-table-entry
+      (when (gethash table-name (database-tables (current-database)))
+        (list :name table-name :filter nil))))
+  (let* ((entry (find table-name (pg-publication-tables publication)
+                      :key (lambda (candidate) (getf candidate :name))
+                      :test #'string=))
+         (table (gethash table-name (database-tables (current-database))))
+         (entry-oid (and entry (getf entry :table-oid))))
+    (when (and entry table
+               (or (null entry-oid) (= entry-oid (pg-class-oid table))))
+      entry)))
+
+(defun publication-selects-table-p (publication table-name)
+  (or (pg-publication-all-tables-p publication)
+      (not (null (publication-table-entry publication table-name)))))
+
+(defun publication-selected-table-names (publication db)
+  (if (pg-publication-all-tables-p publication)
+      (sort (loop for name being the hash-keys of (database-tables db)
+                  collect name)
+            #'string<)
+      (mapcar (lambda (entry) (getf entry :name))
+              (remove-if-not
+               (lambda (entry)
+                 (let* ((table (gethash (getf entry :name)
+                                        (database-tables db)))
+                        (oid (getf entry :table-oid)))
+                   (and table (or (null oid) (= oid (pg-class-oid table))))))
+               (pg-publication-tables publication)))))
+
+(defun publication-sequence-names (publication db)
+  (let ((selected
+          (if (eq (pg-publication-sequences publication) :all)
+              (loop for name being the hash-keys of (database-sequences db)
+                    collect name)
+              (copy-list (pg-publication-sequences publication)))))
+    (dolist (table-name (publication-selected-table-names publication db))
+      (let ((table (gethash table-name (database-tables db))))
+        (when table
+          (loop for column across (pg-class-columns table)
+                for sequence-name = (pg-column-default-sequence-name column)
+                when sequence-name
+                  do (pushnew sequence-name selected :test #'string=)))))
+    (sort selected #'string<)))
+
+(defun catalog-sql-quote-ident (name)
+  (with-output-to-string (stream)
+    (write-char #\" stream)
+    (loop for char across name
+          do (when (char= char #\") (write-char #\" stream))
+             (write-char char stream))
+    (write-char #\" stream)))
+
+(defun catalog-sql-literal (value)
+  (with-output-to-string (stream)
+    (write-char #\' stream)
+    (loop for char across value
+          do (when (char= char #\') (write-char #\' stream))
+             (write-char char stream))
+    (write-char #\' stream)))
+
+(defun catalog-column-definition-sql (column)
+  (with-output-to-string (stream)
+    (format stream "~a ~a"
+            (catalog-sql-quote-ident (pg-column-name column))
+            (case (pg-column-type column)
+              (:int4 "integer")
+              (:int8 "bigint")
+              (:varchar
+               (format nil "varchar(~a)"
+                       (- (pg-column-typmod column) 4)))
+              (otherwise
+               (error "cannot publish unsupported type ~a"
+                      (pg-column-type column)))))
+    (when (pg-column-notnull column)
+      (write-string " NOT NULL" stream))
+    (when (pg-column-default-sequence-name column)
+      (format stream " DEFAULT nextval(~a)"
+              (catalog-sql-literal
+               (pg-column-default-sequence-name column))))))
+
+(defun catalog-table-constraint-sql (index table)
+  (let ((columns (mapcar (lambda (attnum)
+                           (catalog-sql-quote-ident
+                            (pg-column-name
+                             (aref (pg-class-columns table) (1- attnum)))))
+                         (pg-index-columns index))))
+    (format nil "CONSTRAINT ~a ~a~a (~{~a~^, ~})"
+            (catalog-sql-quote-ident (pg-index-name index))
+            (if (pg-index-primary-p index) "PRIMARY KEY" "UNIQUE")
+            (if (and (pg-index-nulls-not-distinct-p index)
+                     (not (pg-index-primary-p index)))
+                " NULLS NOT DISTINCT" "")
+            columns)))
+
+(defun catalog-table-definition-sql (table)
+  (let* ((indexes (table-indexes table))
+         (constraints (mapcar (lambda (index)
+                                (catalog-table-constraint-sql index table))
+                              (remove-if-not #'pg-index-constraint-owned-p indexes)))
+         (definitions
+           (append (loop for column across (pg-class-columns table)
+                         collect (catalog-column-definition-sql column))
+                   constraints)))
+    (format nil "CREATE TABLE ~a (~{~a~^, ~})"
+            (catalog-sql-quote-ident (pg-class-name table)) definitions)))
+
+(defun catalog-standalone-index-definition-sql (index table)
+  (format nil "CREATE ~aINDEX IF NOT EXISTS ~a ON ~a (~{~a~^, ~})~a"
+          (if (pg-index-unique-p index) "UNIQUE " "")
+          (catalog-sql-quote-ident (pg-index-name index))
+          (catalog-sql-quote-ident (pg-class-name table))
+          (mapcar (lambda (attnum)
+                    (catalog-sql-quote-ident
+                     (pg-column-name
+                      (aref (pg-class-columns table) (1- attnum)))))
+                  (pg-index-columns index))
+          (if (and (pg-index-unique-p index)
+                   (pg-index-nulls-not-distinct-p index))
+              " NULLS NOT DISTINCT" "")))
+
+(defun catalog-sequence-definition-sql (sequence)
+  (format nil "CREATE SEQUENCE IF NOT EXISTS ~a INCREMENT BY ~d MINVALUE ~d MAXVALUE ~d START WITH ~d"
+          (catalog-sql-quote-ident (pg-sequence-name sequence))
+          (pg-sequence-increment sequence)
+          (pg-sequence-min-value sequence)
+          (pg-sequence-max-value sequence)
+          (pg-sequence-start-value sequence)))
+
+(defun catalog-sequence-state-data (sequence)
+  (list :name (pg-sequence-name sequence)
+        :oid (pg-sequence-oid sequence)
+        :start (pg-sequence-start-value sequence)
+        :increment (pg-sequence-increment sequence)
+        :min (pg-sequence-min-value sequence)
+        :max (pg-sequence-max-value sequence)
+        :last (pg-sequence-last-value sequence)
+        :called (pg-sequence-called-p sequence)))
+
+(defun catalog-sequence-bootstrap-entry (sequence)
+  (list :definition (catalog-sequence-definition-sql sequence)
+        :state (catalog-sequence-state-data sequence)))
+
+(defun catalog-sequence-bootstrap-snapshot (db)
+  "Copy sequence definitions and state while the caller holds *WRITE-LOCK*."
+  (sort (loop for sequence being the hash-values of (database-sequences db)
+              collect (catalog-sequence-bootstrap-entry sequence))
+        #'string< :key (lambda (entry) (getf (getf entry :state) :name))))
+
+(defun catalog-replication-bootstrap-data (db &optional snapshot)
+  "Return supported schema and sequence state for the imported base snapshot.
+
+Only table columns backed by the implemented int4/int8/varchar types, btree
+indexes, and integer sequences are serialized, matching catalog SQL helpers and
+the feature boundary in pg_dump.c's schema/data phases."
+  (let ((tables (sort (loop for table being the hash-values of
+                                                            (database-tables db)
+                            collect table)
+                      #'string< :key #'pg-class-name))
+        (sequences
+          (if (and snapshot
+                   (snapshot-sequence-state-captured-p snapshot)
+                   (= (snapshot-sequence-database-oid snapshot)
+                      (database-oid db)))
+              (snapshot-sequence-states snapshot)
+              (catalog-sequence-bootstrap-snapshot db))))
+    (list :database-oid (database-oid db)
+          :tables
+          (mapcar (lambda (table)
+                    (list :name (pg-class-name table)
+                          :sql (concatenate
+                                'string "CREATE TABLE IF NOT EXISTS "
+                                (subseq (catalog-table-definition-sql table)
+                                        (length "CREATE TABLE ")))))
+                  tables)
+          :indexes
+          (loop for table in tables
+                append (loop for index in (sort (table-indexes table)
+                                                #'string<
+                                                :key #'pg-index-name)
+                             unless (pg-index-constraint-owned-p index)
+                               collect (list :name (pg-index-name index)
+                                             :sql
+                                             (catalog-standalone-index-definition-sql
+                                              index table))))
+          :sequences sequences)))
+
+(defun publication-definition-data (publication db)
+  (list :database-oid (database-oid db)
+        :name (pg-publication-name publication)
+        :all-tables (pg-publication-all-tables-p publication)
+        :generation (pg-publication-generation publication)
+        :tables (if (pg-publication-all-tables-p publication)
+                    (mapcar (lambda (name)
+                              (list :name name
+                                    :table-oid
+                                    (pg-class-oid (gethash name
+                                                           (database-tables db)))
+                                    :filter nil))
+                            (publication-selected-table-names publication db))
+                    (copy-tree (pg-publication-tables publication)))
+        :sequences
+        (loop for name in (publication-sequence-names publication db)
+              for sequence = (gethash name (database-sequences db))
+              when sequence
+                collect (list :name name
+                              :oid (pg-sequence-oid sequence)
+                              :start (pg-sequence-start-value sequence)
+                              :increment (pg-sequence-increment sequence)
+                              :last (pg-sequence-last-value sequence)
+                              :called (pg-sequence-called-p sequence)))))
+
+(defun catalog-readable-data-string (data)
+  (with-output-to-string (stream)
+    (with-standard-io-syntax
+      (let ((*print-readably* t) (*print-pretty* nil))
+        (prin1 data stream)))))
+
 (defun find-column (class name)
   (loop for col across (pg-class-columns class)
         when (string= (pg-column-name col) name)
@@ -343,7 +789,8 @@ longer contain transaction-status references."
 
 (defun check-new-relation-name (db name)
   (when (or (gethash name (database-tables db))
-            (gethash name (database-indexes db)))
+            (gethash name (database-indexes db))
+            (gethash name (database-sequences db)))
     (ereport "42P07" "relation \"~a\" already exists" name)))
 
 (defun generate-index-name (db table-name suffix)
@@ -418,6 +865,13 @@ longer contain transaction-status references."
   "COLUMNS is a list of plists with :name :type :typmod :notnull :primary,
 :unique, and :nulls-not-distinct. Returns the new pg-class."
   (check-new-relation-name db name)
+  (dolist (def columns)
+    (let ((sequence-name (getf def :default-sequence-name)))
+      (when sequence-name
+        (unless (gethash sequence-name (database-sequences db))
+          (ereport "42P01" "sequence \"~a\" does not exist" sequence-name))
+        (unless (member (getf def :type) '(:int4 :int8))
+          (ereport "42804" "sequence default requires an integer column")))))
   (let* ((oid (allocate-oid))
          (cols (coerce
                 (loop for def in columns
@@ -427,7 +881,9 @@ longer contain transaction-status references."
                                :type (getf def :type)
                                :typmod (getf def :typmod)
                                :attnum i
-                               :notnull (getf def :notnull)))
+                               :notnull (getf def :notnull)
+                               :default-sequence-name
+                               (getf def :default-sequence-name)))
                 'vector))
          (class (make-pg-class :oid oid
                                :name name
@@ -482,6 +938,19 @@ longer contain transaction-status references."
         (when idx
           (remhash (pg-index-name idx) (database-indexes db))
           (wal-defer-relation-delete (pg-index-relfilenode idx)))))
+    (maphash
+     (lambda (publication-name publication)
+       (declare (ignore publication-name))
+       (unless (pg-publication-all-tables-p publication)
+         (let ((remaining
+                 (remove name (pg-publication-tables publication)
+                         :key (lambda (entry) (getf entry :name))
+                         :test #'string=)))
+           (unless (= (length remaining)
+                      (length (pg-publication-tables publication)))
+             (setf (pg-publication-tables publication) remaining)
+             (incf (pg-publication-generation publication))))))
+     (database-publications db))
     (remhash name (database-tables db))
     (wal-defer-relation-delete (pg-class-relfilenode class))
     (values)))

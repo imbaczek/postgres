@@ -110,6 +110,7 @@ exist\" messages."
          (args (mapcar (lambda (arg) (analyze-expr arg table)) (third expr))))
     (cond
       ((member name '("version" "pg_lisp_runtime" "pg_current_wal_lsn"
+                      "pg_lisp_cluster_identity"
                       "current_database" "current_schema"
                       "current_catalog" "current_user" "session_user" "user")
                :test #'string=)
@@ -117,13 +118,44 @@ exist\" messages."
          (ereport "42883" "function ~a(~a) does not exist"
                   name (call-signature args)))
        (list :func name args
-             :type (if (string= name "pg_current_wal_lsn") :varchar :text)
+             :type (if (member name '("pg_current_wal_lsn"
+                                      "pg_lisp_cluster_identity")
+                               :test #'string=)
+                       :varchar :text)
              :typmod -1))
       ((string= name "pg_lisp_replica_identity_columns")
        (unless (= (length args) 1)
          (ereport "42883" "function ~a(~a) does not exist"
                   name (call-signature args)))
        (list :func name args :type :varchar :typmod -1))
+      ((member name '("pg_lisp_publication_definition"
+                      "pg_lisp_table_definition"
+                      "pg_lisp_sequence_state")
+               :test #'string=)
+       (unless (= (length args) 1)
+         (ereport "42883" "function ~a(~a) does not exist"
+                  name (call-signature args)))
+       (list :func name args :type :varchar :typmod -1))
+      ((string= name "pg_lisp_replication_bootstrap")
+       (unless (null args)
+         (ereport "42883" "function ~a(~a) does not exist"
+                  name (call-signature args)))
+       (list :func name args :type :varchar :typmod -1))
+      ((member name '("nextval" "currval") :test #'string=)
+       (unless (and (= (length args) 1)
+                    (eq (expr-type (first args)) :text))
+         (ereport "42883" "function ~a(~a) does not exist"
+                  name (call-signature args)))
+       (list :func name args :type :int8 :typmod -1))
+      ((string= name "setval")
+       (unless (and (member (length args) '(2 3))
+                    (eq (expr-type (first args)) :text)
+                    (member (expr-type (second args)) '(:int4 :int8))
+                    (or (= (length args) 2)
+                        (eq (expr-type (third args)) :bool)))
+         (ereport "42883" "function ~a(~a) does not exist"
+                  name (call-signature args)))
+       (list :func name args :type :int8 :typmod -1))
       ((member name '("length" "char_length" "character_length")
                :test #'string=)
        (unless (= (length args) 1)
@@ -549,6 +581,26 @@ exist\" messages."
     ;; location. This compact engine formats its durable WAL end the same way.
     ((string= name "pg_current_wal_lsn")
      (wal-format-lsn *wal-end-lsn*))
+    ((string= name "pg_lisp_cluster_identity")
+     (catalog-cluster-identity *catalog*))
+    ((string= name "nextval")
+     (unless (and (= (length args) 1) (stringp (first args)))
+       (ereport "42883" "nextval expects one sequence name string"))
+     (sequence-nextval (first args)))
+    ((string= name "currval")
+     (unless (and (= (length args) 1) (stringp (first args)))
+       (ereport "42883" "currval expects one sequence name string"))
+     (sequence-currval (first args)))
+    ((string= name "setval")
+     (unless (and (member (length args) '(2 3))
+                  (stringp (first args))
+                  (integerp (second args))
+                  (or (= (length args) 2)
+                      (member (third args) '(t nil))))
+       (ereport "42883"
+                "setval expects a sequence name, int8 value, and optional boolean"))
+     (sequence-setval (first args) (second args)
+                      (if (= (length args) 3) (third args) t)))
     ((string= name "pg_lisp_replica_identity_columns")
      (with-write-lock
        (let* ((table-name (first args))
@@ -557,6 +609,39 @@ exist\" messages."
            (ereport "42P01" "relation \"~a\" does not exist" table-name))
          (format nil "~{~d~^,~}"
                  (sort (copy-list (logical-table-replica-identity table)) #'<)))))
+    ((string= name "pg_lisp_publication_definition")
+     (with-write-lock
+       (let* ((publication (lookup-publication (first args)))
+              (db (current-database)))
+         (unless publication
+           (ereport "42704" "publication \"~a\" does not exist" (first args)))
+         (catalog-readable-data-string
+          (publication-definition-data publication db)))))
+    ((string= name "pg_lisp_table_definition")
+     (with-write-lock
+       (let ((table (lookup-table (first args))))
+         (unless table
+           (ereport "42P01" "table \"~a\" does not exist" (first args)))
+         (catalog-table-definition-sql table))))
+    ((string= name "pg_lisp_sequence_state")
+     (with-write-lock
+       (let ((sequence (lookup-sequence (first args))))
+         (unless sequence
+           (ereport "42P01" "sequence \"~a\" does not exist" (first args)))
+         (catalog-readable-data-string
+          (list :name (pg-sequence-name sequence)
+                :oid (pg-sequence-oid sequence)
+                :start (pg-sequence-start-value sequence)
+                :increment (pg-sequence-increment sequence)
+                :min (pg-sequence-min-value sequence)
+                :max (pg-sequence-max-value sequence)
+                :last (pg-sequence-last-value sequence)
+                :called (pg-sequence-called-p sequence))))))
+    ((string= name "pg_lisp_replication_bootstrap")
+     (with-write-lock
+       (catalog-readable-data-string
+        (catalog-replication-bootstrap-data
+         (current-database) *current-snapshot*))))
     ((string= name "current_database")
      (backend-database *backend*))
     ((string= name "current_schema") "public")

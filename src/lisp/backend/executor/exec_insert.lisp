@@ -52,6 +52,12 @@
                       "null value in column \"~a\" violates not-null constraint"
                       (pg-column-name col))))
 
+(defun insert-column-default (column)
+  (let ((sequence-name (pg-column-default-sequence-name column)))
+    (if sequence-name
+        (sequence-nextval sequence-name)
+        +null+)))
+
 (defun unique-conflict-status (tuple my-xid)
   "Classify a heap tuple found in a unique index."
   (let ((xmin (htup-xmin tuple))
@@ -188,9 +194,18 @@ index's B-tree mutex."
                 for col = (aref columns (1- attnum))
                 do (setf (aref values (1- attnum))
                          (coerce-value
-                          (eval-expr (analyze-expr expr nil) nil)
+                          (if (eq (first expr) :default)
+                              (insert-column-default col)
+                              (eval-expr (analyze-expr expr nil) nil))
                           (pg-column-type col)
                           (pg-column-typmod col))))
+          (loop for col across columns
+                for index from 0
+                unless (member (1+ index) attnums :test #'=)
+                  do (setf (aref values index)
+                           (coerce-value (insert-column-default col)
+                                         (pg-column-type col)
+                                         (pg-column-typmod col))))
           (check-not-null values columns)
           (insert-tuple-with-unique table values)
           (logical-note-row-change :insert table :new-values values)

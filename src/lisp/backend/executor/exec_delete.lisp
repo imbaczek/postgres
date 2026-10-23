@@ -50,7 +50,11 @@
          (sets (loop for s in (getf ast :sets)
                      for col = (resolve-column-or-error
                                 table (getf s :column))
-                     collect (cons col (analyze-expr (getf s :expr) table))))
+                     for expr = (getf s :expr)
+                     collect (cons col
+                                   (if (eq (first expr) :default)
+                                       :default
+                                       (analyze-expr expr table)))))
          (where (when (getf ast :where)
                   (analyze-expr (getf ast :where) table))))
     (with-registered-table (table rel xid :write)
@@ -72,7 +76,9 @@
                 (dolist (set sets)
                   (let* ((col (car set))
                          (expr (cdr set))
-                         (value (eval-expr expr old)))
+                         (value (if (eq expr :default)
+                                    (insert-column-default col)
+                                    (eval-expr expr old))))
                     (setf (aref new (1- (pg-column-attnum col)))
                           (coerce-value value
                                         (pg-column-type col)

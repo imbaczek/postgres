@@ -57,8 +57,8 @@
                        (logical-decode-change (logical-encode-change event))))
              "logical schema names use lengths large enough for valid identifiers"))))
 
-(defun test-logical-pgoutput-v1-codec ()
-  ;; Compare the v1 message shapes with pgoutput.c's Relation/Begin/Commit and
+(defun test-logical-pgoutput-v2-codec ()
+  ;; Compare the v2 message shapes with pgoutput.c's Relation/Begin/Commit and
   ;; logicalrep_write_insert/update/delete in src/backend/replication/.
   (let* ((lsn #x0102030405060708)
          (insert (logical-test-change :insert 7 701 :new-values #(10 20 "oak")))
@@ -110,7 +110,43 @@
                 (= (aref commit 0) (char-code #\C))
                 (= (pg-client-u64 commit 2) lsn)
                 (= (pg-client-u64 commit 10) lsn))
-           "pgoutput Begin and Commit use v1 field order and LSNs")
+           "pgoutput Begin and Commit retain their C wire field order and LSNs")
+    (let* ((catalog-change
+             (make-logical-change :kind :ddl :database-oid 7
+                                  :event-payload "(:database-oid 7 :ast (:type :create-table))"))
+           (standalone
+             (pgoutput-build-message
+              catalog-change
+              (make-logical-transaction :xid 0 :commit-lsn lsn
+                                        :changes (list catalog-change))))
+           (truncate
+             (make-logical-change :kind :truncate :database-oid 7
+                                  :event-payload "(:tables (\"logical_rows\"))"))
+           (transactional
+             (pgoutput-build-message truncate transaction)))
+      (check (and (= (aref standalone 0) (char-code #\M))
+                  (= (aref standalone 1) 0)
+                  (= (pg-client-u64 standalone 2) lsn))
+             "pgoutput v2 emits standalone DDL Message without an XID")
+      (check (and (= (aref transactional 0) (char-code #\M))
+                  (= (bytes-to-u32 transactional 1) 91)
+                  (= (aref transactional 5) 1)
+                  (= (pg-client-u64 transactional 6) lsn))
+             "pgoutput v2 emits transactional TRUNCATE Message with its XID")
+      (multiple-value-bind (prefix event-lsn content)
+          (logical-pgoutput-read-message
+           (make-logical-subscription-runtime) standalone)
+        (check (and (string= prefix "pg_lisp/ddl") (= event-lsn lsn)
+                    (string= content (logical-change-event-payload catalog-change)))
+               "subscriber decodes standalone v2 Message fields"))
+      (multiple-value-bind (prefix event-lsn content)
+          (logical-pgoutput-read-message
+           (make-logical-subscription-runtime
+            :transaction-open-p t :source-xid 91)
+           transactional)
+        (check (and (string= prefix "pg_lisp/truncate") (= event-lsn lsn)
+                    (string= content (logical-change-event-payload truncate)))
+               "subscriber validates transactional v2 Message XID and content")))
     (check (eq :create
                (logical-replication-command-type
                 (parse-replication-command
@@ -119,15 +155,259 @@
     (check (eq :start
                (logical-replication-command-type
                 (parse-replication-command
-                 "START_REPLICATION SLOT unit_slot LOGICAL 0/0 (proto_version '1')")))
-           "logical slot command parser accepts the worker's pgoutput v1 start command")
+                 "START_REPLICATION SLOT unit_slot LOGICAL 0/0 (proto_version '2')")))
+           "logical slot command parser accepts the worker's pgoutput v2 start command")
     (check (handler-case
                (progn
                  (parse-replication-command
-                  "START_REPLICATION SLOT unit_slot LOGICAL 0/0 (proto_version '2')")
+                  "START_REPLICATION SLOT unit_slot LOGICAL 0/0 (proto_version '1')")
                  nil)
              (error () t))
-           "logical slot command parser rejects unsupported pgoutput versions")))
+           "logical slot command parser rejects pgoutput v1 for v2 Message support")))
+
+(defun test-logical-catalog-event-codec-and-parser ()
+  (let* ((ast (list :type :alter-sequence :name "counter" :restart 19))
+         (bytes (logical-encode-catalog-event 7 ast))
+         (change (logical-decode-catalog-event bytes))
+         (envelope (logical-read-data-string
+                    (logical-change-event-payload change)))
+         (sql (format nil "APPLY LOGICAL EVENT ~a 12345 ~a"
+                      (logical-sql-literal "source:7:slot")
+                      (logical-sql-literal
+                       (catalog-readable-data-string envelope))))
+         (apply-ast (first (parse-statements sql))))
+    (check (and (eq (logical-change-kind change) :ddl)
+                (= (logical-change-database-oid change) 7)
+                (= (getf envelope :database-oid) 7)
+                (equal (getf envelope :ast) ast))
+           "catalog event preserves its source database and supported DDL AST")
+    (check (and (eq (getf apply-ast :type) :apply-logical-event)
+                (string= (getf apply-ast :event-key) "source:7:slot")
+                (= (getf apply-ast :event-lsn) 12345)
+                (string= (getf apply-ast :payload)
+                         (catalog-readable-data-string envelope)))
+           "private APPLY LOGICAL EVENT SQL parses the idempotent event envelope")
+    (check (handler-case
+               (progn (logical-read-data-string "(:type :ddl) (:type :drop-table)") nil)
+             (error () t))
+           "logical event parser rejects trailing S-expression payloads")
+    (check (handler-case
+               (progn (logical-read-data-string "#.(error \"unsafe\")") nil)
+             (error () t))
+           "logical event parser disables reader evaluation")))
+
+(defun test-logical-catalog-terminal-validation ()
+  (let ((catalog-event (make-logical-change :kind :ddl :database-oid 7))
+        (row-change (logical-test-change :insert 7 701 :new-values #(1 2 "a")))
+        (commit (make-wal-record :type +wal-record-commit+ :xid 9 :end 100))
+        (catalog-terminal
+          (make-wal-record :type +wal-record-catalog+ :xid 0 :end 100)))
+    (check (handler-case
+               (progn
+                 (wal-logical-reader-finish-batch
+                  (make-logical-reader-state :database-oid 7 :batch-open-p t
+                                             :changes (list catalog-event))
+                  commit)
+                 nil)
+             (error () t))
+           "catalog events cannot become visible at a row commit terminal")
+    (check (handler-case
+               (progn
+                 (wal-logical-reader-finish-batch
+                  (make-logical-reader-state :database-oid 7 :batch-open-p t
+                                             :changes (list row-change))
+                  catalog-terminal)
+                 nil)
+             (error () t))
+           "row changes cannot become visible at a catalog terminal")
+    (check (handler-case
+               (progn
+                 (let ((*wal-recovery-logical-catalog-event-p* t)
+                       (*wal-recovery-logical-chunk-count* nil))
+                   (wal-recovery-validate-logical-terminal :commit 9))
+                 nil)
+             (error () t))
+           "WAL recovery rejects a catalog event followed by a row commit")
+    (check (handler-case
+               (progn
+                 (let ((*wal-recovery-logical-catalog-event-p* nil)
+                       (*wal-recovery-logical-chunk-count* 1))
+                   (wal-recovery-validate-logical-terminal :catalog))
+                 nil)
+             (error () t))
+           "WAL recovery rejects row changes followed by a catalog terminal")))
+
+(defun test-logical-replication-bootstrap-definitions ()
+  (let* ((*catalog* (make-catalog))
+         (*backend* (make-backend :database "postgres"))
+         (db (make-database :name "postgres" :oid 7))
+         (table
+           (make-pg-class
+            :oid 301 :name "bootstrap_rows" :relfilenode 1301
+            :columns
+            (vector (make-pg-column :name "id" :type :int4 :typmod -1
+                                    :attnum 1 :notnull t)
+                    (make-pg-column :name "amount" :type :int8 :typmod -1
+                                    :attnum 2 :notnull nil
+                                    :default-sequence-name "bootstrap_seq"))
+            :indexes '(401 402)))
+         (primary
+           (make-pg-index :oid 401 :name "bootstrap_rows_pkey"
+                          :relfilenode 1401 :table-oid 301 :columns '(1)
+                          :unique-p t :primary-p t :constraint-p t :valid-p t))
+         (standalone
+           (make-pg-index :oid 402 :name "bootstrap_rows_amount_idx"
+                          :relfilenode 1402 :table-oid 301 :columns '(2)
+                          :unique-p t :nulls-not-distinct-p t :valid-p t))
+         (sequence
+           (make-pg-sequence :oid 501 :name "bootstrap_seq" :increment -2
+                             :start-value -1 :min-value +int8-min+
+                             :max-value -1 :last-value -9 :called-p t)))
+    (setf (gethash "postgres" (catalog-databases *catalog*)) db
+          (gethash "bootstrap_rows" (database-tables db)) table
+          (gethash "bootstrap_rows_pkey" (database-indexes db)) primary
+          (gethash "bootstrap_rows_amount_idx" (database-indexes db)) standalone
+          (gethash "bootstrap_seq" (database-sequences db)) sequence)
+    (let* ((bootstrap (catalog-replication-bootstrap-data db))
+           (sequence-snapshot
+             (make-snapshot-struct
+              :sequence-database-oid 7 :sequence-state-captured-p t
+              :sequence-states (getf bootstrap :sequences)))
+           (table-sql (getf (first (getf bootstrap :tables)) :sql))
+           (index-entry (first (getf bootstrap :indexes)))
+           (sequence-entry (first (getf bootstrap :sequences))))
+      (check (and (search "CREATE TABLE IF NOT EXISTS" table-sql)
+                  (search "DEFAULT nextval('bootstrap_seq')" table-sql)
+                  (search "CONSTRAINT \"bootstrap_rows_pkey\" PRIMARY KEY" table-sql)
+                  (not (search "bootstrap_rows_amount_idx" table-sql)))
+             "bootstrap table definition retains defaults and only constraint indexes")
+      (check (and (string= (getf index-entry :name) "bootstrap_rows_amount_idx")
+                  (search "CREATE UNIQUE INDEX IF NOT EXISTS" (getf index-entry :sql))
+                  (search "NULLS NOT DISTINCT" (getf index-entry :sql)))
+             "bootstrap emits standalone btree indexes as separate SQL")
+      (check (and (search (format nil "INCREMENT BY -2 MINVALUE ~d MAXVALUE -1 START WITH -1"
+                                  +int8-min+)
+                          (getf sequence-entry :definition))
+                  (= (getf (getf sequence-entry :state) :last) -9)
+                  (getf (getf sequence-entry :state) :called))
+             "bootstrap preserves sequence increment, bounds, start, and state")
+      ;; The exported snapshot keeps its sequence state from the slot boundary,
+      ;; even though PostgreSQL sequences are not MVCC-visible.
+      (setf (pg-sequence-last-value sequence) -11)
+      (let* ((captured-bootstrap
+               (catalog-replication-bootstrap-data db sequence-snapshot))
+             (captured-sequence
+               (first (getf captured-bootstrap :sequences))))
+        (check (= (getf (getf captured-sequence :state) :last) -9)
+               "bootstrap uses the sequence state captured with the slot boundary")))))
+
+(defun test-wal-logical-catalog-event-slot-gating ()
+  (let* ((*wal-replication-slots* (make-hash-table :test #'equal))
+         (*wal-logical-catalog-event-interests* (make-hash-table :test #'eq))
+         (slot (make-wal-replication-slot :name "catalog_event_slot"
+                                          :database-oid 7)))
+    (sb-thread:with-mutex (*wal-lock*)
+      (check (not (wal-logical-catalog-event-needed-under-lock-p 7))
+             "catalog state before logical slot creation needs no stream event")
+      (setf (gethash "catalog_event_slot" *wal-replication-slots*) slot)
+      (check (wal-logical-catalog-event-needed-under-lock-p 7)
+             "catalog changes are recorded for a live database slot")
+      (check (not (wal-logical-catalog-event-needed-under-lock-p 8))
+             "catalog events are scoped to the slot database")
+      (setf (wal-replication-slot-wal-status slot) :lost)
+      (check (not (wal-logical-catalog-event-needed-under-lock-p 7))
+             "a lost slot no longer requires catalog stream events"))))
+
+(declaim (ftype (function (function) *) logical-test-with-wal-storage))
+
+(defun test-logical-snapshot-capture-to-slot-publication-interest ()
+  (logical-test-with-wal-storage
+   (lambda ()
+     (let* ((*catalog* (make-catalog))
+            (*backend* (make-backend :database "postgres"))
+            (*active-xids* nil)
+            (*next-xid* 3)
+            (*active-snapshots* 0)
+            (*active-snapshot-set* (make-hash-table :test #'eq))
+            (*wal-xid-first-lsn* (make-hash-table :test #'eql))
+            (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+            (*wal-page-cache* (make-hash-table :test #'equal))
+            (*wal-page-cache-xids* (make-hash-table :test #'equal))
+            (database (make-database :name "postgres" :oid 7))
+            (sequence
+              (make-pg-sequence :oid 701 :name "gap_counter" :start-value 10
+                                :increment 1 :min-value 1 :max-value +int8-max+
+                                :last-value 10 :called-p t))
+            (boundary-lsn nil)
+            (token nil)
+            (event-p nil)
+            (*logical-test-after-snapshot-capture-hook*
+              (lambda (slot-name captured-lsn)
+                (declare (ignore slot-name))
+                (setf boundary-lsn captured-lsn)
+                (sb-thread:with-mutex (*wal-lock*)
+                  (check (wal-logical-catalog-event-needed-under-lock-p 7)
+                         "captured snapshot reserves catalog events before slot publish"))
+                ;; This is the concurrent sequence.c operation that can run
+                ;; after snapshot capture releases *WRITE-LOCK* but before slot
+                ;; publication makes the durable slot visible.
+                (sequence-nextval "gap_counter"))))
+       (setf (gethash "postgres" (catalog-databases *catalog*)) database
+             (gethash "gap_counter" (database-sequences database)) sequence)
+       (unwind-protect
+            (progn
+              (multiple-value-setq (boundary-lsn token)
+                (create-exported-logical-snapshot-slot "gap_slot"))
+              (let* ((exported (gethash token *exported-logical-snapshots*))
+                     (captured-state
+                       (getf (first
+                              (snapshot-sequence-states
+                               (exported-logical-snapshot-snapshot exported)))
+                             :state)))
+                (check (and (= (getf captured-state :last) 10)
+                            (getf captured-state :called)
+                            (= (pg-sequence-last-value sequence) 11))
+                       "copy retains boundary sequence state before an interleaved nextval")
+                (wal-scan
+                 (lambda (record)
+                   (when (= (wal-record-type record)
+                            +wal-record-logical-catalog-event+)
+                     (let ((change
+                             (logical-decode-catalog-event
+                              (wal-record-payload record))))
+                       (when (and (> (wal-record-end record) boundary-lsn)
+                                  (eq (logical-change-kind change) :sequence-state))
+                         (setf event-p t)))))
+                 boundary-lsn)
+                (check event-p
+                       "sequence advance between capture and publication is streamable")))
+         (when token
+           (remove-exported-logical-snapshot-token token))
+         (ignore-errors (wal-drop-replication-slot "gap_slot")))))))
+
+(defun test-create-sequence-parser-bounds ()
+  (let* ((explicit
+           (first (parse-statements
+                   "CREATE SEQUENCE bounded_counter INCREMENT BY -2 MINVALUE -90 MAXVALUE 5 START WITH 4")))
+         (default-descending
+           (first (parse-statements
+                   "CREATE SEQUENCE descending_counter INCREMENT BY -2"))))
+    (check (and (= (getf explicit :increment) -2)
+                (= (getf explicit :min) -90)
+                (= (getf explicit :max) 5)
+                (= (getf explicit :start) 4))
+           "CREATE SEQUENCE parses explicit int8 minimum and maximum bounds")
+    (check (and (= (getf default-descending :min) +int8-min+)
+                (= (getf default-descending :max) -1)
+                (= (getf default-descending :start) -1))
+           "descending sequence defaults follow sequence.c init_params")
+    (check (handler-case
+               (progn
+                 (parse-statements
+                  "CREATE SEQUENCE invalid_counter MINVALUE 20 MAXVALUE 10")
+                 nil)
+             (error () t))
+           "CREATE SEQUENCE rejects bounds that do not contain its start")))
 
 (defun test-logical-subscription-argument-parser ()
   (let ((options
@@ -152,8 +432,10 @@
   (let* ((options (make-logical-subscription-options
                    :source-host "publisher.example" :source-port 5440
                    :source-database "publisher_db"
+                   :source-identity "cluster-a"
                    :tables '("z_rows" "a_rows")))
          (config (list :source-host "publisher.example"
+                       :source-identity "cluster-a"
                        :source-port 5440
                        :source-database "publisher_db"
                        :table-allowlist "a_rows,z_rows")))
@@ -187,7 +469,19 @@
                  (logical-validate-resume-config options '(:state "ready") nil)
                  nil)
              (error () t))
-           "legacy progress without a saved config cannot resume unsafely")))
+           "legacy progress without a saved config cannot resume unsafely")
+    (check (handler-case
+               (progn
+                 (logical-validate-resume-config
+                  (make-logical-subscription-options
+                   :source-host "publisher.example" :source-port 5440
+                   :source-database "publisher_db"
+                   :source-identity "replacement-cluster"
+                   :tables '("z_rows" "a_rows"))
+                  '(:state "ready") config)
+                 nil)
+             (error () t))
+           "a replacement publisher incarnation cannot reuse the old event marker")))
 
 (defun logical-test-append-batch (xid changes &optional commit-p)
   ;; Like reorderbuffer.c, the reader must not expose queued changes until a
@@ -263,6 +557,7 @@
          (*wal-poisoned* nil)
          (*clog-stream* nil)
          (*wal-replication-slots* (make-hash-table :test #'equal))
+         (*wal-logical-catalog-event-interests* (make-hash-table :test #'eq))
          (*max-slot-wal-keep-bytes* nil))
     (ignore-errors
      (uiop:delete-directory-tree test-pgdata :validate t

@@ -31,14 +31,21 @@ the new restart horizon before publishing it in memory.
 The implemented path captures row changes at the executor boundary because
 this backend writes page after-images rather than PostgreSQL heap WAL records.
 `backend/replication/logical.lisp` stores those changes with their transaction,
-validates their commit batches, and reads them in commit order under an owned
-slot. `backend/replication/protocol.lisp` handles database-scoped replication
-startup, slot commands, CopyBoth, pgoutput v1, keepalives, and standby status.
-`backend/replication/worker.lisp` imports the exported snapshot, copies
-allowlisted tables, applies committed row changes, and persists each target
-marker with its row transaction. `backend/replication/client.lisp` is the small
-wire frontend used by the worker. Run `t/logical-replication.sh` to boot one
-source and two independent replicas and exercise this path.
+validates commit batches, and reads them in commit order under an owned slot.
+While a live logical slot exists or a captured snapshot is being handed off to
+its slot, catalog DDL is stored in its catalog commit record and
+nontransactional sequence state is stored in a standalone catalog event.
+Earlier catalog state comes from the slot's exported snapshot.
+`backend/replication/protocol.lisp`
+handles database-scoped replication startup, slot commands, CopyBoth, pgoutput
+row messages, v2 `Message` events, keepalives, and standby status.
+`backend/replication/worker.lisp` imports the exported snapshot, bootstraps
+supported table/index/sequence definitions, copies allowlisted table rows,
+applies committed row changes and supported DDL/sequence events, and persists
+target markers with the corresponding durable catalog update.
+`backend/replication/client.lisp` is the small wire frontend used by the worker.
+Run `t/logical-replication.sh` to boot one source and two independent replicas
+and exercise this path.
 
 PostgreSQL's C implementation remains the behavioral reference. In particular,
 `decode.c` and `reorderbuffer.c` show how heap changes are decoded and grouped by
@@ -49,6 +56,10 @@ moving the restart horizon; `walsender.c`, `pgoutput.c`, and
 protocol; and `logical/tablesync.c` plus `logical/worker.c` show the initial-copy
 and apply-worker lifecycles. The executor-boundary record format and this
 worker's limits are deliberate adaptations, not PostgreSQL heap-WAL decoding.
+Sequence setup and advancement follow `commands/sequence.c` (`init_params`,
+`AlterSequence`, `nextval_internal`, and `SetSequence`). Schema/data bootstrap is
+scoped like the schema and data phases in `bin/pg_dump/pg_dump.c`, but only
+serializes objects represented by this server's catalog.
 
 The three milestones below are complete for the stated subset. Their numbered
 items record the design and its compatibility references; the final section
@@ -141,12 +152,15 @@ upgrades.
    The token is process-local: if the source restarts before copy completion,
    reject the expired token and require the worker to discard its partial copy,
    drop the still-unconfirmed slot, and create a new slot and snapshot.
-3. Enter PostgreSQL `CopyBoth` mode for `START_REPLICATION`. Encode the
-   supported logical subset as `pgoutput` v1 `Begin`, `Relation`, `Insert`,
-   `Update`, `Delete`, and `Commit` messages carried by `XLogData`. Relation
+3. Enter PostgreSQL `CopyBoth` mode for `START_REPLICATION`. Encode row changes
+   as pgoutput `Begin`, `Relation`, `Insert`, `Update`, `Delete`, and `Commit`
+   messages carried by `XLogData`. Encode supported transactional DDL and
+   standalone sequence-state changes as pgoutput v2 `Message` records. Relation
    metadata marks unique replica-identity columns; UPDATE/DELETE use a `K` key
    tuple when present and an `O` full old tuple otherwise. The worker requires
-   `K` identity for its configured tables. Send keepalives for safe progress
+   `K` identity for its configured tables. The v2 message payload is a private
+   pg-lisp event envelope, so only the bundled subscriber can apply it. Send
+   keepalives for safe progress
    across batches with no rows for this database.
    For the initial connection, wait for the client's first standby status update
    at exactly the consistent LSN. This is the explicit copy-complete handshake:
@@ -172,27 +186,22 @@ upgrades.
    source SQL, source replication, and target SQL connections without an
    external driver. Add a foreground `pg-lisp-subscribe` worker with an explicit
    table allowlist. It opens an ordinary source connection to import the
-   exported snapshot,
-   copies those compatible tables to an already-created target schema in
-   chunks capped at 8 MiB of logical row changes. Keep the imported snapshot
-   transaction open on the source for the entire copy, while committing bounded
-   chunks independently on the target. Before copying, persist a `copying`
-   state and the pending snapshot token in an internal target progress table
-   keyed by source slot. Partial target chunks are never treated as complete.
-   After every table is copied,
-   commit the consistent LSN and `ready` state in the target progress table.
-    Persist the source endpoint/database and canonical table allowlist beside
-    the progress row, and reject a resumed worker whose configuration differs.
-   On retry with a live token, reset the allowlisted tables using supported
-   `TRUNCATE TABLE` and repeat the copy from the same snapshot. Add the needed
-   parser and executor support for `TRUNCATE`; clearing with row-by-row DELETE
-   can exceed the logical transaction size bound. If the worker crashes before
-   its `copying` row is durable, it drops and recreates the unconfirmed slot.
-   If the token expired after a source restart, it resets the target tables,
-   drops the still-unconfirmed slot, and creates a new slot and copy. Keep
-    source DDL and target table creation outside this milestone; require
-    matching columns, types, typmods, and replica-identity columns, and validate
-    relation metadata again before applying rows.
+   exported snapshot and holds the imported transaction for the copy. A schema
+   read lease keeps source DDL beyond the slot boundary out of the live catalog
+   bootstrap; those DDL commits stream after the copy. The worker creates the
+   supported source table, standalone btree index, and sequence definitions on
+   the target, validates matching definitions, and copies selected table rows
+   in chunks capped at 8 MiB of logical row changes. Sequence state is captured
+   alongside the slot boundary because it is not MVCC-versioned. Target chunks
+   commit independently, while a `copying` state and pending snapshot token in
+   the target progress table prevent partial copies from being treated as ready.
+   After every selected table is copied, commit the consistent LSN and `ready`
+   state. Persist the source endpoint, publisher incarnation, database, and
+   canonical table allowlist beside progress, and reject a resume whose source
+   or allowlist differs. On retry with a live token, reset selected tables with
+   `TRUNCATE TABLE` and repeat the copy from the same snapshot. If the token
+   expired after a source restart, reset selected tables, drop the unconfirmed
+   slot, and start a new snapshot and copy.
 2. Apply each `pgoutput` transaction to the target inside one target
    transaction. Persist its source commit LSN in the same target transaction
    as its row changes, and send feedback only after that commit succeeds. Also
@@ -220,12 +229,17 @@ upgrades.
    one row.
   3. `t/logical-replication.sh` boots three isolated `pg-lisp` servers and starts
      an independent slot and worker for each replica. It waits until both
-     exported snapshots have been imported, commits writes during the copy, and
-     checks the copied state plus later stream results. Its workload covers a
+     exported snapshots have been imported, commits row and sequence changes
+     during the paused copy, and launches source DDL while the schema lease is
+     held. It checks the copied state plus later stream results. Its workload covers a
      multi-row insert, several changes in one transaction, nullable values,
      `NULLS NOT DISTINCT` key update/delete, ordinary update/delete, and an
-     aborted transaction. It checks a filtered-table transaction and a source
-     DDL commit with no logical row event advance each target's durable marker.
+     aborted transaction, DDL during initial copy, supported ALTER TABLE/index
+     changes, and sequence bootstrap and stream state with direction changes.
+     It checks that a transaction for an excluded table advances each target's
+     durable marker and that supported source DDL is applied. DDL and sequence
+     events are database-wide; the `--table` allowlist filters row copy and row
+     changes only.
      It then disconnects one worker after the target commit but before feedback,
      writes more source data while that worker is stopped, restarts it from its
      target marker, and compares both replicas with the source. The other worker
@@ -248,18 +262,30 @@ upgrades.
 - The initial copy and stream share one boundary. If an XID is active at that
   boundary, its snapshot-invisible changes are emitted in the later commit
   batch, after the copy boundary.
-- The supported row model is limited to the current scalar types (`int4`,
-  `int8`, `varchar`) and complete rows. The end-to-end worker copies an
-  explicit table allowlist from the `public` schema into a pre-created target
-  schema with matching columns, types, typmods, and identity columns. It
-  applies source changes from all relations and filters rows at the subscriber;
-  it does not implement publications or row filters. Target `TRUNCATE` resets
-  an initial copy; source `TRUNCATE` is not emitted as a logical change. It
-  also does not track replication origins or prevent loops in cascaded
-  replication. It does not replicate arbitrary DDL, sequence state, large
-  objects/TOAST values, partition routing, two-phase transactions, or
-  conflicts. These remain follow-on work before claiming general-purpose
-  blue-green upgrade support.
+- The supported row model is limited to complete rows with the current scalar
+  types (`int4`, `int8`, and `varchar`; `text` is the current varchar alias).
+  Initial bootstrap creates and validates supported `public` schema tables,
+  standalone btree indexes, and integer sequences. The explicit `--table`
+  allowlist controls which table rows are copied and which row changes are
+  applied. Supported DDL events (`CREATE`/`DROP TABLE`, supported btree index
+  and table-constraint changes, `CREATE`/`ALTER`/`DROP SEQUENCE`) and sequence
+  state are applied database-wide, independent of that allowlist. `TRUNCATE`
+  changes are carried transactionally for selected tables. Each catalog event
+  must fit within one WAL segment. DDL in explicit
+  transaction blocks is rejected by the SQL server. Sequence support covers
+  int8 increment/start/min/max bounds, restart, and `nextval`/`currval`/`setval`;
+  sequence values remain nontransactional as in `sequence.c`.
+- The worker does not implement PostgreSQL publication selection or row filters;
+  publication catalog objects do not control this stream. It does not track
+  replication origins or prevent loops in cascaded replication. Arbitrary DDL,
+  unsupported types/storage, large objects/TOAST values, partition routing,
+  two-phase transactions, and conflict resolution are outside the implemented
+  subset. These remain follow-on work before claiming general-purpose blue-green
+  upgrade support.
+- Initial-copy reset uses target `TRUNCATE TABLE`; source `TRUNCATE` is emitted
+  transactionally for the selected tables. The source and target must be
+  `pg-lisp` servers using this worker's private v2 `Message` payload for DDL and
+  sequence events; PostgreSQL's stock subscriber cannot apply those messages.
 - Each logical read returns a bounded batch rather than materializing all WAL
   retained by a lagging slot. PostgreSQL's `reorderbuffer.c` can serialize
   pending transactions to disk; this milestone instead reads already durable
@@ -274,23 +300,24 @@ upgrades.
 
 ## Follow-on milestone
 
-Add blue-green cutover guidance: prepare matching tables/indexes, copy under
-the exported snapshot, wait for replay to reach a source commit barrier, fence
-old-primary writes, validate, then promote the subscriber. Sequence state and
-DDL need explicit support before claiming general-purpose upgrade safety.
+Add blue-green cutover guidance: prepare matching supported tables/indexes,
+copy under the exported snapshot, wait for replay to reach a source commit
+barrier, fence old-primary writes, validate, then promote the subscriber.
+General-purpose upgrade safety still requires publication semantics, broader
+schema/type/storage coverage, conflict handling, and loop prevention.
 
 ## Validation
 
 Validation completed:
 
-- `./t/format.sh --check` for the changed Lisp files
+- `./t/format.sh --check` for all changed Lisp files
 - `./t/compile.sh`
-- `./t/run-unit-tests.sh` — 1,333 checks, 0 failures
-- Server-backed shell regressions: 19 passed, including
+- `./t/run-unit-tests.sh` — 1,361 checks, 0 failures
+- All documented shell regressions passed, including
   `./t/logical-replication.sh` — source plus two independent subscribers,
-  lost-feedback restart, config mismatch rejection, and source-LSN barrier
-  checks. `spill-oom-cgroup.sh` skipped because this environment uses a shared
-  cgroup.
+  copy-time DML and DDL, sequence state and bounds, lost-feedback restart,
+  config mismatch rejection, and source-LSN barrier checks. The cgroup OOM test
+  skipped because this environment uses a shared cgroup.
 
 The tests compare transaction visibility, snapshot handoff, pgoutput framing,
 and acknowledgment ordering with the PostgreSQL C references above.

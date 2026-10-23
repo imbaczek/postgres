@@ -44,6 +44,8 @@
   :normalize string)
 (define-token-matchers :op op-p match-op expect-op op)
 
+(declaim (ftype function parse-apply-logical-event))
+
 (defmacro with-parens ((parser &key opening-consumed) &body body)
   "Evaluate BODY between required parentheses and return all its values."
   (let ((parser-value (gensym "PARSER-")))
@@ -63,6 +65,15 @@
   (if (eq (pkind p) :integer)
       (token-value (pnext p))
       (syntax-error p "expected integer literal")))
+
+(defun parse-string-literal (p)
+  (if (eq (pkind p) :string)
+      (token-value (pnext p))
+      (syntax-error p "expected string literal")))
+
+(defun parse-signed-integer-literal (p)
+  (let ((negative-p (match-op p "-")))
+    (* (if negative-p -1 1) (parse-integer-literal p))))
 
 (defun clause-keyword-p (word)
   (member word
@@ -104,6 +115,7 @@
     ((match-kw p "create") (parse-create p))
     ((match-kw p "drop") (parse-drop p))
     ((match-kw p "alter") (parse-alter p))
+    ((match-kw p "apply") (parse-apply-logical-event p))
     ((match-kw p "begin")
      (match-kw p "work")
      (match-kw p "transaction")
@@ -125,6 +137,17 @@
     ((match-kw p "reset") (parse-reset p))
     (t
      (ereport "42601" "syntax error at or near \"~a\"" (pval p)))))
+
+(defun parse-apply-logical-event (p)
+  ;; Private worker command; exec-apply-logical-event checks the connection's
+  ;; application name before accepting this trusted replication payload.
+  (expect-kw p "logical")
+  (expect-kw p "event")
+  (let ((event-key (parse-string-literal p))
+        (event-lsn (parse-integer-literal p))
+        (payload (parse-string-literal p)))
+    (list :type :apply-logical-event :event-key event-key
+          :event-lsn event-lsn :payload payload)))
 
 (defun parse-vacuum (p)
   (let ((full-p nil))
@@ -331,6 +354,8 @@
 
 (defun parse-create (p)
   (cond
+    ((match-kw p "sequence") (parse-create-sequence p))
+    ((match-kw p "publication") (parse-create-publication p))
     ((match-kw p "table") (parse-create-table p))
     ((match-kw p "unique")
      (expect-kw p "index")
@@ -338,6 +363,78 @@
     ((match-kw p "index") (parse-create-index p nil))
     (t
      (ereport "0A000" "unsupported CREATE statement"))))
+
+(defun parse-create-sequence (p)
+  (let ((if-not-exists
+          (when (match-kw p "if")
+            (expect-kw p "not")
+            (expect-kw p "exists")
+            t))
+        (name (strip-schema (pident p)))
+        (increment 1)
+        (start nil)
+        (minimum nil)
+        (maximum nil))
+    (loop while (and (not (at-eof-p p)) (not (punct-p p #\;)))
+          do (cond
+               ((match-kw p "increment")
+                (match-kw p "by")
+                (setf increment (parse-signed-integer-literal p)))
+               ((match-kw p "start")
+                (match-kw p "with")
+                (setf start (parse-signed-integer-literal p)))
+               ((match-kw p "minvalue")
+                (setf minimum (parse-signed-integer-literal p)))
+               ((match-kw p "maxvalue")
+                (setf maximum (parse-signed-integer-literal p)))
+               (t (ereport "0A000" "unsupported CREATE SEQUENCE option"))))
+    (unless (and (/= increment 0)
+                 (<= +int8-min+ increment +int8-max+))
+      (ereport "22023" "sequence increment must be a nonzero int8"))
+    (multiple-value-bind (default-minimum default-maximum)
+        (sequence-default-limits increment)
+      (setf minimum (or minimum default-minimum)
+            maximum (or maximum default-maximum)
+            start (or start (if (plusp increment) minimum maximum)))
+      (unless (and (sequence-value-range-p minimum)
+                   (sequence-value-range-p maximum)
+                   (sequence-value-range-p start)
+                   (<= minimum start maximum))
+        (ereport "22023" "sequence start and bounds must be valid int8 values")))
+    (list :type :create-sequence :name name :if-not-exists if-not-exists
+          :start start :increment increment :min minimum :max maximum)))
+
+(defun parse-create-publication (p)
+  (let ((name (pident p))
+        (all-tables-p nil)
+        (tables '())
+        (sequences nil))
+    (expect-kw p "for")
+    (if (match-kw p "all")
+        (progn (expect-kw p "tables") (setf all-tables-p t))
+        (progn
+          (expect-kw p "table")
+          (setf tables (parse-publication-table-list p))))
+    (when (match-kw p "sequences")
+      (setf sequences (parse-publication-sequence-list p)))
+    (list :type :create-publication :name name :all-tables-p all-tables-p
+          :tables tables :sequences sequences)))
+
+(defun parse-publication-table-list (p)
+  (loop collect
+        (let ((table (strip-schema (pident p)))
+              (filter nil))
+          (when (match-kw p "where")
+            (setf filter (with-parens (p) (parse-expr p))))
+          (list :name table :filter filter))
+        while (match-punct p #\,)))
+
+(defun parse-publication-sequence-list (p)
+  (if (match-kw p "all")
+      :all
+      (with-parens (p)
+        (loop collect (strip-schema (pident p))
+              while (match-punct p #\,)))))
 
 (defun parse-create-table (p)
   (let ((if-not-exists
@@ -370,7 +467,8 @@
     (let ((notnull nil)
           (primary nil)
           (unique nil)
-          (nulls-not-distinct nil))
+          (nulls-not-distinct nil)
+          (default-sequence nil))
       (loop
         (cond
           ((match-kw p "not")
@@ -384,7 +482,16 @@
            (setf unique t
                  nulls-not-distinct (parse-unique-null-treatment p)))
           ((match-kw p "default")
-           (ereport "0A000" "DEFAULT is not supported"))
+           (let ((expression (parse-expr p)))
+             (unless (and (eq (first expression) :func)
+                          (string= (second expression) "nextval")
+                          (= (length (third expression)) 1)
+                          (eq (first (first (third expression))) :const)
+                          (stringp (second (first (third expression)))))
+               (ereport "0A000"
+                        "only DEFAULT nextval('sequence') is supported"))
+             (setf default-sequence
+                   (strip-schema (second (first (third expression)))))))
           ((match-kw p "check")
            (ereport "0A000" "CHECK is not supported"))
           ((match-kw p "references")
@@ -392,7 +499,8 @@
           (t (return))))
       (list :name name :type type :typmod typmod
             :notnull notnull :primary primary :unique unique
-            :nulls-not-distinct nulls-not-distinct))))
+            :nulls-not-distinct nulls-not-distinct
+            :default-sequence-name default-sequence))))
 
 (defun parse-type (p)
   (cond
@@ -491,6 +599,22 @@
 
 (defun parse-drop (p)
   (cond
+    ((match-kw p "publication")
+     (let ((if-exists (when (match-kw p "if")
+                        (expect-kw p "exists")
+                        t)))
+       (list :type :drop-publication
+             :names (loop collect (pident p)
+                          while (match-punct p #\,))
+             :if-exists if-exists)))
+    ((match-kw p "sequence")
+     (let ((if-exists (when (match-kw p "if")
+                        (expect-kw p "exists")
+                        t)))
+       (list :type :drop-sequence :names
+             (loop collect (strip-schema (pident p))
+                   while (match-punct p #\,))
+             :if-exists if-exists)))
     ((match-kw p "table")
      (let ((if-exists (when (match-kw p "if")
                         (expect-kw p "exists")
@@ -514,6 +638,20 @@
 
 (defun parse-alter (p)
   (cond
+    ((match-kw p "publication")
+     (parse-alter-publication p))
+    ((match-kw p "sequence")
+     (let ((name (strip-schema (pident p))))
+       (cond
+         ((match-kw p "increment")
+          (match-kw p "by")
+          (list :type :alter-sequence :name name
+                :increment (parse-signed-integer-literal p)))
+         ((match-kw p "restart")
+          (match-kw p "with")
+          (list :type :alter-sequence :name name
+                :restart (parse-signed-integer-literal p)))
+         (t (ereport "0A000" "unsupported ALTER SEQUENCE option")))))
     ((match-kw p "index")
      (let ((name (strip-schema (pident p))))
        (expect-kw p "rename")
@@ -523,6 +661,41 @@
      (parse-alter-table p))
     (t
      (syntax-error p "expected TABLE or INDEX after ALTER"))))
+
+(defun parse-alter-publication (p)
+  (let ((name (pident p)))
+    (cond
+      ((match-kw p "add")
+       (cond
+         ((match-kw p "table")
+          (list :type :alter-publication :name name :action :add-table
+                :tables (parse-publication-table-list p)))
+         ((match-kw p "sequence")
+          (list :type :alter-publication :name name :action :add-sequence
+                :sequences (loop collect (strip-schema (pident p))
+                                 while (match-punct p #\,))))
+         (t (ereport "0A000" "ALTER PUBLICATION ADD supports TABLE or SEQUENCE"))))
+      ((match-kw p "drop")
+       (cond
+         ((match-kw p "table")
+          (list :type :alter-publication :name name :action :drop-table
+                :tables (loop collect (list :name (strip-schema (pident p)))
+                              while (match-punct p #\,))))
+         ((match-kw p "sequence")
+          (list :type :alter-publication :name name :action :drop-sequence
+                :sequences (loop collect (strip-schema (pident p))
+                                 while (match-punct p #\,))))
+         (t (ereport "0A000" "ALTER PUBLICATION DROP supports TABLE or SEQUENCE"))))
+      ((match-kw p "set")
+       (cond
+         ((match-kw p "table")
+          (list :type :alter-publication :name name :action :set-table
+                :tables (parse-publication-table-list p)))
+         ((match-kw p "sequences")
+          (list :type :alter-publication :name name :action :set-sequences
+                :sequences (parse-publication-sequence-list p)))
+         (t (ereport "0A000" "ALTER PUBLICATION SET supports TABLE or SEQUENCES"))))
+      (t (ereport "0A000" "unsupported ALTER PUBLICATION action")))))
 
 (defun parse-alter-table (p)
   (let ((if-exists (when (match-kw p "if")
@@ -782,6 +955,7 @@
      (with-parens (p :opening-consumed t)
        (parse-expr p)))
     ((match-kw p "null") (list :const +null+))
+    ((match-kw p "default") (list :default))
     ((match-kw p "true") (list :bool t))
     ((match-kw p "false") (list :bool nil))
     ((eq (pkind p) :ident)
