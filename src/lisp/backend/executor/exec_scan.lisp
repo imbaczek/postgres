@@ -252,13 +252,18 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
   (max 1 (buf-nblocks (pg-class-relfilenode table))))
 
 (defun planner-equality-selectivity (table attnum value)
-  "Use ANALYZE's MCV frequencies, then its residual ndistinct estimate."
+  "Use ANALYZE's type-consistent MCV frequencies and residual estimate.
+
+PostgreSQL's selfuncs.c equality estimator applies the query operator when it
+compares a constant with MCV values. Reuse ANALYZE's equality helper so fresh
+BYTEA vectors match the byte-content values stored in the MCV list."
   (let ((statistics (table-statistics-column table attnum)))
     (if (null statistics)
         0.1d0
         (let* ((mcv (pg-column-statistics-most-common-values statistics))
                (common (and value
-                            (assoc value mcv :test #'equal)))
+                            (assoc value mcv
+                                   :test #'analyze-statistics-value-equal-p)))
                (common-fraction (reduce #'+ mcv :key #'cdr :initial-value 0.0d0))
                (remaining-values
                  (max 1 (- (pg-column-statistics-distinct-count statistics)

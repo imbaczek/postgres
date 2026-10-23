@@ -119,6 +119,255 @@
                   "cost model chooses a selective index scan over SeqScan"))
       (setf (symbol-function 'buf-nblocks) original-buf-nblocks))))
 
+(defun test-analyze-catalog-class-image-roundtrip (table)
+  "Round-trip TABLE through the same readable catalog image used on disk."
+  (let* ((*catalog* (make-catalog))
+         (database (make-database :name "postgres" :oid 1)))
+    (setf (gethash "postgres" (catalog-databases *catalog*)) database
+          (gethash (pg-class-name table) (database-tables database)) table)
+    (let* ((image (bytes->string (catalog-image-bytes)))
+           (restored
+             (with-standard-io-syntax
+               (let ((*read-eval* nil))
+                 (catalog-from-sexp (read-from-string image)))))
+           (restored-database
+             (gethash "postgres" (catalog-databases restored))))
+      (gethash (pg-class-name table) (database-tables restored-database)))))
+
+(defun test-analyze-byte-vector-statistics-and-planner ()
+  (let* ((first (make-array 3 :element-type '(unsigned-byte 8)
+                              :initial-contents '(0 255 1)))
+         (first-copy (copy-seq first))
+         (other (make-array 4 :element-type '(unsigned-byte 8)
+                              :initial-contents '(0 255 1 2)))
+         (other-copy (copy-seq other))
+         (empty (make-array 0 :element-type '(unsigned-byte 8)))
+         (empty-copy (copy-seq empty))
+         (sample (vector (vector first) (vector first-copy) (vector (copy-seq first))
+                         (vector other) (vector other-copy) (vector empty)
+                         (vector empty-copy) (vector +null+)))
+         (column (analyze-column-statistics sample 0 8))
+         (table (make-pg-class
+                 :oid 5703 :name "byte_statistics" :relfilenode 5703
+                 :columns #()
+                 :statistics
+                 (make-pg-table-statistics
+                  :row-count 8 :sample-count 8 :columns (vector column))))
+         (restored (test-analyze-catalog-class-image-roundtrip table))
+         (restored-column
+           (aref (pg-table-statistics-columns
+                  (pg-class-statistics restored))
+                 0))
+         (mcv (pg-column-statistics-most-common-values restored-column)))
+    (check (= (pg-column-statistics-distinct-count column) 3)
+           "ANALYZE counts separately allocated equal byte vectors once")
+    (check (= (pg-column-statistics-null-fraction column) (/ 1.0d0 8))
+           "ANALYZE keeps NULL separate from byte-vector values")
+    (check (= (cdr (assoc first-copy mcv
+                          :test #'analyze-statistics-value-equal-p))
+              (/ 3.0d0 8))
+           "ANALYZE records the byte-vector MCV frequency over all sample rows")
+    (check (= (cdr (assoc other-copy mcv
+                          :test #'analyze-statistics-value-equal-p))
+              (/ 2.0d0 8))
+           "ANALYZE distinguishes byte vectors with different lengths")
+    (check (= (cdr (assoc empty-copy mcv
+                          :test #'analyze-statistics-value-equal-p))
+              (/ 2.0d0 8))
+           "ANALYZE matches separately allocated empty byte vectors")
+    (check (typep (car (first mcv)) '(vector (unsigned-byte 8)))
+           "catalog image restores byte-vector element type")
+    (check (= (planner-equality-selectivity
+               restored 1 (copy-seq first))
+              (/ 3.0d0 8))
+           "planner matches a fresh byte vector against the persisted MCV")
+    (check (= (planner-equality-selectivity
+               restored 1 (copy-seq other))
+              (/ 2.0d0 8))
+           "planner preserves byte-vector MCV frequency after catalog reload")))
+
+(defun test-analyze-byte-vector-hash-collisions-and-text-equality ()
+  (let* ((first (make-array 2 :element-type '(unsigned-byte 8)
+                              :initial-contents '(1 2)))
+         (sample (vector (vector first) (vector (copy-seq first))
+                         (vector (make-array 2 :element-type '(unsigned-byte 8)
+                                               :initial-contents '(2 1)))
+                         (vector (make-array 0 :element-type '(unsigned-byte 8)))
+                         (vector +null+)))
+         (collided
+           (analyze-column-statistics
+            sample 0 5 :value-hash (lambda (value) (declare (ignore value)) 0)))
+         (text-column
+           (analyze-column-statistics (vector #("A") #("a") #("A")) 0 3)))
+    (check (= (pg-column-statistics-distinct-count collided) 3)
+           "byte-vector collisions are resolved with content equality")
+    (check (= (cdr (assoc first
+                          (pg-column-statistics-most-common-values collided)
+                          :test #'analyze-statistics-value-equal-p))
+              (/ 2.0d0 5))
+           "colliding byte-vector buckets retain the correct repeated count")
+    (check (= (pg-column-statistics-distinct-count text-column) 2)
+           "ANALYZE preserves case-sensitive EQUAL semantics for strings")))
+
+(defun test-analyze-retained-byte-vector-payload (sample)
+  "Count payload bytes in the simple byte vectors reachable from SAMPLE."
+  (loop for row across sample
+        for value = (aref row 0)
+        when (analyze-byte-vector-p value)
+          sum (array-total-size value)))
+
+(defun test-analyze-value-estimate-counts-backing-storage ()
+  (let* ((adjustable-bytes
+           (make-array 1024 :element-type '(unsigned-byte 8)
+                            :initial-element 0 :adjustable t :fill-pointer 4))
+         (byte-backing
+           (make-array 4096 :element-type '(unsigned-byte 8)
+                            :initial-element 0))
+         (displaced-bytes
+           (make-array 8 :element-type '(unsigned-byte 8)
+                         :displaced-to byte-backing :displaced-index-offset 512))
+         (adjustable-string
+           (make-array 1024 :element-type 'character :initial-element #\x
+                            :adjustable t :fill-pointer 4))
+         (string-backing (make-string 1000 :initial-element #\x))
+         (displaced-string
+           (make-array 10 :element-type 'character
+                          :displaced-to string-backing :displaced-index-offset 20)))
+    (check (>= (analyze-value-memory-estimate adjustable-bytes) (+ 64 1024))
+           "ANALYZE charges adjustable byte-vector capacity beyond its fill pointer")
+    (check (>= (analyze-value-memory-estimate adjustable-string) (+ 64 4096))
+           "ANALYZE charges adjustable string capacity beyond its fill pointer")
+    (check (>= (analyze-value-memory-estimate displaced-bytes) (+ 64 64 4096))
+           "ANALYZE charges a displaced byte vector's full backing array")
+    (check (>= (analyze-value-memory-estimate displaced-string) (+ 64 64 4000))
+           "ANALYZE charges a displaced string's full backing array")))
+
+(defun test-analyze-byte-vector-sample-retention ()
+  (let* ((table (make-pg-class :oid 5902 :name "byte_sample"
+                               :relfilenode 5902 :columns #()))
+         (original-heapam-scan (symbol-function 'heapam-scan))
+         (payload-size (* 128 1024)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'heapam-scan)
+                 (lambda (relfilenode columns snapshot callback)
+                   (declare (ignore relfilenode columns snapshot))
+                   (dotimes (index 300)
+                     (funcall callback
+                              (make-htup
+                               :values
+                               (vector (make-array
+                                        payload-size
+                                        :element-type '(unsigned-byte 8)
+                                        :initial-element (mod index 256))))))))
+           (let ((*analyze-random-function*
+                   (lambda (limit) (declare (ignore limit)) 0)))
+             (multiple-value-bind (row-count sample)
+                 (analyze-sample-visible-rows table 5902 nil)
+               (let ((retained-bytes
+                       (test-analyze-retained-byte-vector-payload sample)))
+                 (check (= row-count 300)
+                        "ANALYZE counts all rows containing large byte vectors")
+                 (check (< (length sample) 300)
+                        "ANALYZE reduces the sample for large byte-vector rows")
+                 (check (= retained-bytes (* (length sample) payload-size))
+                        "sample payload measurement reads retained vector storage")
+                 (check (<= retained-bytes +analyze-sample-memory-bytes+)
+                        "retained byte-vector payload stays within the 4 MiB budget")))))
+      (setf (symbol-function 'heapam-scan) original-heapam-scan))))
+
+(defun test-analyze-byte-vector-reservoir-shrink-and-oversize ()
+  (let* ((table (make-pg-class :oid 5903 :name "byte_sample_edges"
+                               :relfilenode 5903 :columns #()))
+         (original-heapam-scan (symbol-function 'heapam-scan))
+         (small-size 16)
+         (large-size (* 64 1024)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'heapam-scan)
+                 (lambda (relfilenode columns snapshot callback)
+                   (declare (ignore relfilenode columns snapshot))
+                   (dotimes (index 600)
+                     (funcall callback
+                              (make-htup
+                               :values
+                               (vector
+                                (make-array
+                                 (if (< index 300) small-size large-size)
+                                 :element-type '(unsigned-byte 8)
+                                 :initial-element (mod index 256))))))))
+           (let ((*analyze-random-function*
+                   (lambda (limit) (declare (ignore limit)) 0)))
+             (multiple-value-bind (row-count sample)
+                 (analyze-sample-visible-rows table 5903 nil)
+               (check (= row-count 600)
+                      "ANALYZE continues sampling after a large byte value shrinks capacity")
+               (check (and (< (length sample) 300)
+                           (some (lambda (row)
+                                   (> (array-total-size (aref row 0)) small-size))
+                                 sample))
+                      "shrunk byte-vector reservoir considers later large values")
+               (check (<= (test-analyze-retained-byte-vector-payload sample)
+                          +analyze-sample-memory-bytes+)
+                      "mixed-size retained byte payload stays within budget")))
+           (setf (symbol-function 'heapam-scan)
+                 (lambda (relfilenode columns snapshot callback)
+                   (declare (ignore relfilenode columns snapshot))
+                   (funcall callback
+                            (make-htup
+                             :values
+                             (vector (make-array
+                                      (1+ +analyze-sample-memory-bytes+)
+                                      :element-type '(unsigned-byte 8)
+                                      :initial-element 1))))
+                   (funcall callback
+                            (make-htup :values (vector (make-array
+                                                        3
+                                                        :element-type
+                                                        '(unsigned-byte 8)
+                                                        :initial-contents '(4 5 6)))))))
+           (multiple-value-bind (row-count sample)
+               (analyze-sample-visible-rows table 5903 nil)
+             (check (= row-count 2)
+                    "ANALYZE counts an oversized byte row before a small row")
+             (check (and (= (length sample) 1)
+                         (= (test-analyze-retained-byte-vector-payload sample) 3))
+                    "ANALYZE skips an individually oversized byte row"))
+           (setf (symbol-function 'heapam-scan)
+                 (lambda (relfilenode columns snapshot callback)
+                   (declare (ignore relfilenode columns snapshot))
+                   (dotimes (index 2)
+                     (funcall callback
+                              (make-htup
+                               :values
+                               (vector (make-array
+                                        (1+ +analyze-sample-memory-bytes+)
+                                        :element-type '(unsigned-byte 8)
+                                        :initial-element index)))))))
+           (multiple-value-bind (row-count sample)
+               (analyze-sample-visible-rows table 5903 nil)
+             (check (and (= row-count 2) (zerop (length sample)))
+                    "ANALYZE returns an empty sample when every byte row is oversized"))
+           (setf (symbol-function 'heapam-scan)
+                 (lambda (relfilenode columns snapshot callback)
+                   (declare (ignore relfilenode columns snapshot callback))))
+           (multiple-value-bind (row-count sample)
+               (analyze-sample-visible-rows table 5903 nil)
+             (check (and (zerop row-count) (zerop (length sample)))
+                    "ANALYZE handles a relation with no visible rows")))
+      (setf (symbol-function 'heapam-scan) original-heapam-scan))))
+
+(defun test-analyze-reservoir-shrink-clears-evicted-values ()
+  (let* ((*analyze-random-function*
+           (lambda (limit) (declare (ignore limit)) 0))
+         (sample (make-array 4 :adjustable t :fill-pointer 4
+                               :initial-contents (vector :a :b :c :d))))
+    (analyze-shrink-reservoir sample 2)
+    (check (= (fill-pointer sample) 2)
+           "ANALYZE shrink updates the reservoir fill pointer")
+    (check (and (null (aref sample 2)) (null (aref sample 3)))
+           "ANALYZE shrink clears references beyond the fill pointer")))
+
 (defun test-analyze-reservoir-sample-is-bounded ()
   (let* ((table (make-pg-class
                  :oid 59 :name "sampled" :relfilenode 5901
