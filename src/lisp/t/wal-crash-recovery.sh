@@ -545,7 +545,7 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.wal"))):
         if data[offset:offset + 4] != b"PGWL":
             raise SystemExit("invalid WAL while inspecting checkpoint images")
         version = struct.unpack_from("<H", data, offset + 4)[0]
-        if version not in (2, 3, 4):
+        if version not in (2, 3, 4, 5):
             raise SystemExit("unsupported WAL version while inspecting checkpoint images")
         record_type = struct.unpack_from("<H", data, offset + 6)[0]
         length = struct.unpack_from("<I", data, offset + 8)[0]
@@ -569,7 +569,7 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.wal"))):
                     page_lsn = struct.unpack_from("<Q", data, page)[0]
                     group_images[block] = page_lsn
                 item += image_header_size + page_size
-                if version == 4:
+                if version >= 4:
                     if item + 4 > offset + length:
                         raise SystemExit("truncated contributor count in checkpoint WAL")
                     xid_count = struct.unpack_from("<I", data, item)[0]

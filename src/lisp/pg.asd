@@ -55,6 +55,9 @@
       :serial t
       :components ((:file "catalog")
                    (:file "namespace")))
+     (:module "replication"
+      :serial t
+      :components ((:file "logical")))
      (:module "commands"
       :serial t
       :components ((:file "vacuum")

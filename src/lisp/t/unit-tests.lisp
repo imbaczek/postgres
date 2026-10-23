@@ -13,6 +13,7 @@
                     "ownership-tests.lisp"
                     "backend-lifecycle-tests.lisp"
                     "wal-tests.lisp"
+                    "logical-tests.lisp"
                     "protocol-tests.lisp"
                     "storage-tests.lisp"
                     "transaction-tests.lisp"
@@ -120,6 +121,10 @@
       (test-wal-record-codec)
       (test-wal-v3-maintenance-record-replay)
       (test-wal-page-image-xid-codec-compatibility)
+      (test-logical-row-change-codec)
+      (test-logical-wal-reader-commit-order-and-slot-ack)
+      (test-logical-snapshot-handoff-active-xid)
+      (test-wal-pgslot3-database-field-validation)
       (test-wal-snapshot-boundary-retains-active-xid-pages)
       (test-wal-snapshot-release-race-before-pin-publication)
       (test-wal-chunked-catalog-record)

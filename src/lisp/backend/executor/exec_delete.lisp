@@ -37,9 +37,11 @@
                (lambda (tuple)
                  (or (null where)
                      (true-p (eval-expr where (htup-values tuple))))))
-            (declare (ignore tuple block offnum))
+            (declare (ignore block offnum))
             (check-heapam-write-status status)
             (when deleted
+              (logical-note-row-change :delete table
+                                       :old-values (htup-values tuple))
               (incf count))))
         (send-command-complete stream (format nil "DELETE ~a" count))))))
 
@@ -82,5 +84,8 @@
                   (unless (heapam-set-ctid rel old-block old-offnum
                                            new-block new-offnum)
                     (ereport "XX000" "could not link updated heap tuple"))
+                  (logical-note-row-change :update table
+                                           :old-values old
+                                           :new-values new)
                   (incf count))))))
         (send-command-complete stream (format nil "UPDATE ~a" count))))))

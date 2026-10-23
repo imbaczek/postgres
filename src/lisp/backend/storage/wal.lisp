@@ -14,10 +14,12 @@
 (defconstant +wal-record-catalog-chunk+ 7)
 (defconstant +wal-record-catalog-commit+ 8)
 (defconstant +wal-record-maintenance+ 9)
+(defconstant +wal-record-logical-changes+ 10)
 (defconstant +wal-catalog-chunk-header-size+ 8)
 (defconstant +wal-version-v2+ 2)
 (defconstant +wal-version-v3+ 3)
-(defconstant +wal-version+ 4)
+(defconstant +wal-version-v4+ 4)
+(defconstant +wal-version+ 5)
 
 (defparameter *max-slot-wal-keep-bytes* (* 1024 1024 1024)
   "Maximum WAL retained by one replication slot at checkpoint; NIL disables the cap.")
@@ -29,7 +31,7 @@
   relfilenode (fork :main) block page (xids '()))
 
 (defstruct wal-replication-slot
-  name restart-lsn consistent-lsn confirmed-flush-lsn active-owner
+  name database-oid restart-lsn consistent-lsn confirmed-flush-lsn active-owner
   (pending-xids (make-hash-table :test #'eql))
   (wal-status :reserved))
 
@@ -42,6 +44,7 @@
 (defvar *wal-xid-first-lsn* (make-hash-table :test #'eql))
 (defvar *wal-snapshot-retention-pins* (make-hash-table :test #'eq))
 (defvar *wal-replication-slots* (make-hash-table :test #'equal))
+(defvar *wal-logical-slot-owner* nil)
 (defvar *wal-pending-btree-split* nil)
 (defvar *wal-pending-deletes* '())
 (defvar *wal-catalog-flush-generation* 0)
@@ -72,11 +75,19 @@
 (defvar *wal-recovery-catalog-chunks* '())
 (defvar *wal-recovery-catalog-chunk-count* nil)
 (defvar *wal-recovery-catalog-next-chunk* 0)
+(defvar *wal-recovery-logical-xid* nil)
+(defvar *wal-recovery-logical-chunk-count* nil)
+(defvar *wal-recovery-logical-next-chunk* 0)
+(defvar *wal-recovery-logical-bytes* 0)
 
 (declaim (ftype function wal-test-pause wal-test-pause-once
                 wal-remove-checkpointed-segments
                 wal-remove-checkpointed-segments-under-wal-lock
                 wal-atomic-write-bytes
+                wal-append-logical-changes
+                wal-recovery-accept-logical-change-chunk
+                wal-recovery-finish-logical-change-batch
+                wal-recovery-reset-logical-change-batch
                 clog-get clog-set clog-reset clog-fsync))
 (declaim (notinline pg-class-relfilenode pg-index-relfilenode
                     database-tables database-indexes catalog-databases))
@@ -433,7 +444,7 @@
                (let* ((page (subseq payload page-offset page-end))
                       (xids nil)
                       (next-offset page-end))
-                 (when (= version +wal-version+)
+                 (when (>= version +wal-version-v4+)
                    (unless (<= (+ next-offset 4) (length payload))
                      (error "WAL page-image record has a truncated contributor count"))
                    (let* ((xid-count (wal-u32 payload next-offset))
@@ -714,8 +725,8 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
                 (remhash key contributors))))))))
   (values))
 
-(defun wal-commit-transaction (xid after-durable-function)
-  "Flush every dirty after-image and XID's commit record as one WAL boundary."
+(defun wal-commit-transaction (xid after-durable-function &optional logical-changes)
+  "Flush page images, LOGICAL-CHANGES, and XID's commit as one WAL boundary."
   (unless *wal-ready*
     (funcall after-durable-function)
     (return-from wal-commit-transaction (values)))
@@ -725,6 +736,11 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
       (wal-record-page-xids-at-batch-start
        images (wal-append-batch-start))
       (wal-append-page-images images)
+      ;; PostgreSQL's decode.c queues heap changes by XID and reorderbuffer.c
+      ;; emits them at ReorderBufferCommit(). These executor-captured rows use
+      ;; the same visibility boundary: append them before this batch's commit.
+      (when logical-changes
+        (wal-append-logical-changes xid logical-changes))
       ;; This hook leaves complete page records in the file without a
       ;; terminal record, so recovery must discard this entire batch.
       (when *wal-output-stream* (finish-output *wal-output-stream*))
@@ -975,17 +991,19 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
    #'<))
 
 (defun wal-valid-type-p (type version)
-  (and (member type (list +wal-record-pages+ +wal-record-commit+
-                          +wal-record-catalog+ +wal-record-checkpoint+
-                          +wal-record-clog-reset+ +wal-record-batch-start+
-                          +wal-record-catalog-chunk+
-                          +wal-record-catalog-commit+
-                          +wal-record-maintenance+))
+  (and (or (member type (list +wal-record-pages+ +wal-record-commit+
+                              +wal-record-catalog+ +wal-record-checkpoint+
+                              +wal-record-clog-reset+ +wal-record-batch-start+
+                              +wal-record-catalog-chunk+
+                              +wal-record-catalog-commit+
+                              +wal-record-maintenance+))
+           (and (= type +wal-record-logical-changes+)
+                (>= version +wal-version+)))
        (or (/= type +wal-record-maintenance+)
            ;; Maintenance terminals were already emitted by v3. Keep them
-           ;; readable after the v4 page-image extension, as PostgreSQL's
+           ;; readable after the v4/v5 page-image extensions, as PostgreSQL's
            ;; version-aware xlogreader must decode WAL written by older servers.
-           (member version (list +wal-version-v3+ +wal-version+)))))
+           (>= version +wal-version-v3+))))
 
 (defun wal-decode-record (bytes expected-lsn)
   (let ((version (and (>= (length bytes) +wal-header-size+)
@@ -997,6 +1015,7 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
                  (= (aref bytes 3) (char-code #\L))
                  (member version (list +wal-version-v2+
                                        +wal-version-v3+
+                                       +wal-version-v4+
                                        +wal-version+))
                  (= (wal-u32 bytes 8) (length bytes))
                  (= (wal-u64 bytes 12) expected-lsn)
@@ -1091,8 +1110,9 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
       (setf checkpoint-found t))
     checkpoint-found))
 
-(defun wal-scan-segment (function segment last-segment scan-start-offset end-lsn
-                         scan-from-lsn checkpoint-record-start checkpoint-found)
+(defun wal-scan-segment (function segment last-segment scan-start-offset
+                         scan-end-lsn scanned-end-lsn scan-from-lsn
+                         checkpoint-record-start checkpoint-found)
   "Visit one segment, preserving WAL tail-truncation and checkpoint checks."
   (let ((stop-p nil)
         (checkpoint-found checkpoint-found))
@@ -1101,21 +1121,30 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
                             :element-type '(unsigned-byte 8))
       (let ((size (file-length stream))
             (offset scan-start-offset))
-        (loop while (and (< offset size) (not stop-p))
+        (loop while (and (< offset size) (not stop-p)
+                         (or (null scan-end-lsn)
+                             (< (+ (* segment +wal-segment-size+) offset)
+                                scan-end-lsn)))
               do (multiple-value-bind (record record-length)
                      (wal-read-scan-record stream segment last-segment offset size)
                    (unless record (return))
+                   (when (and scan-end-lsn
+                              (> (wal-record-end record) scan-end-lsn))
+                     (error "WAL scan end ~a is not a record boundary"
+                            scan-end-lsn))
                    (when (wal-scan-checkpoint-record
                           record (wal-record-start record) scan-from-lsn
                           checkpoint-record-start)
                      (setf checkpoint-found t))
-                   (setf end-lsn (wal-record-end record))
-                   (if (eq (funcall function record) :stop)
+                   (setf scanned-end-lsn (wal-record-end record))
+                   (if (or (eq (funcall function record) :stop)
+                           (and scan-end-lsn
+                                (= scanned-end-lsn scan-end-lsn)))
                        (setf stop-p t)
                        (incf offset record-length))))))
-    (values end-lsn stop-p checkpoint-found)))
+    (values scanned-end-lsn stop-p checkpoint-found)))
 
-(defun wal-scan (function &optional scan-from-lsn)
+(defun wal-scan (function &optional scan-from-lsn &rest options)
   "Visit durable records from the checkpoint or an exact retained LSN.
 FUNCTION may return :STOP to end the scan after the current record.
 
@@ -1134,12 +1163,19 @@ src/backend/access/transam/xlogreader.c."
            (if (zerop scan-start-lsn)
                segments
                (member scan-start-segment segments)))
-         (end-lsn scan-start-lsn)
+         (scan-end-lsn (getf options :end-lsn))
+         (scanned-end-lsn scan-start-lsn)
          (checkpoint-found (or scan-from-lsn (zerop *wal-checkpoint-lsn*)))
          (stop-p nil))
     (when (and scan-from-lsn (> scan-from-lsn *wal-durable-lsn*))
       (error "WAL scan start ~a is past durable WAL ~a"
              scan-from-lsn *wal-durable-lsn*))
+    (when (and scan-end-lsn
+               (not (and (integerp scan-end-lsn)
+                         (<= scan-start-lsn scan-end-lsn
+                             *wal-durable-lsn*))))
+      (error "WAL scan end ~a is outside the durable scan range"
+             scan-end-lsn))
     (when (and (not scan-from-lsn) (plusp *wal-checkpoint-lsn*)
                (< *wal-checkpoint-lsn* +wal-header-size+))
       (error "WAL checkpoint LSN ~a is invalid" *wal-checkpoint-lsn*))
@@ -1155,22 +1191,28 @@ src/backend/access/transam/xlogreader.c."
             do (error "missing WAL segment between ~a and ~a" left right))
     (loop for segment in scan-segments
           while (not stop-p)
-          do (multiple-value-setq (end-lsn stop-p checkpoint-found)
+          do (multiple-value-setq (scanned-end-lsn stop-p checkpoint-found)
                (wal-scan-segment
                 function segment last-segment
                 (if (= segment scan-start-segment) scan-start-offset 0)
-                end-lsn scan-from-lsn checkpoint-record-start checkpoint-found)))
+                scan-end-lsn scanned-end-lsn scan-from-lsn
+                checkpoint-record-start checkpoint-found)))
+    (when (and scan-end-lsn (not stop-p)
+               (/= scanned-end-lsn scan-end-lsn))
+      (error "WAL scan stopped at ~a before requested end ~a"
+             scanned-end-lsn scan-end-lsn))
     (unless (or stop-p checkpoint-found)
       (error "WAL checkpoint LSN ~a is not present in retained WAL"
              *wal-checkpoint-lsn*))
     (when (and (not stop-p) (not scan-from-lsn)
-               (> *wal-checkpoint-lsn* end-lsn))
+               (> *wal-checkpoint-lsn* scanned-end-lsn))
       (error "WAL checkpoint LSN ~a is past the end of WAL ~a"
-             *wal-checkpoint-lsn* end-lsn))
-    (when (and (not stop-p) (> *wal-durable-lsn* end-lsn))
+             *wal-checkpoint-lsn* scanned-end-lsn))
+    (when (and (not stop-p) (not scan-end-lsn)
+               (> *wal-durable-lsn* scanned-end-lsn))
       (error "WAL durable LSN ~a is past the end of WAL ~a"
-             *wal-durable-lsn* end-lsn))
-    (values end-lsn scan-segments)))
+             *wal-durable-lsn* scanned-end-lsn))
+    (values scanned-end-lsn scan-segments)))
 
 (defun wal-read-u64-payload (payload)
   (unless (= (length payload) 8)
@@ -1193,6 +1235,8 @@ src/backend/access/transam/xlogreader.c."
 (defun wal-replay-finish-batch (terminal-preparer &optional catalog-chunks-p)
   (unless *wal-recovery-group-active*
     (error "WAL terminal record appears outside a batch"))
+  (when *wal-recovery-logical-chunk-count*
+    (error "logical WAL chunks appear before a non-commit terminal"))
   (when (and *wal-recovery-catalog-chunk-count*
              (not catalog-chunks-p))
     (error "WAL catalog chunks lack a catalog commit record"))
@@ -1208,6 +1252,7 @@ src/backend/access/transam/xlogreader.c."
         *wal-recovery-catalog-chunks* '()
         *wal-recovery-catalog-chunk-count* nil
         *wal-recovery-catalog-next-chunk* 0)
+  (wal-recovery-reset-logical-change-batch)
   (values))
 
 (defun wal-replay-record (record)
@@ -1220,7 +1265,8 @@ src/backend/access/transam/xlogreader.c."
              *wal-recovery-page-images* '()
              *wal-recovery-catalog-chunks* '()
              *wal-recovery-catalog-chunk-count* nil
-             *wal-recovery-catalog-next-chunk* 0))
+             *wal-recovery-catalog-next-chunk* 0)
+       (wal-recovery-reset-logical-change-batch))
       (#.+wal-record-pages+
        (unless *wal-recovery-group-active*
          (error "WAL page images appear outside a batch"))
@@ -1232,9 +1278,15 @@ src/backend/access/transam/xlogreader.c."
                                              (wal-record-end record)
                                              (wal-record-version record)))
                     *wal-recovery-page-images*)))
+      (#.+wal-record-logical-changes+
+       (when *wal-recovery-catalog-chunk-count*
+         (error "logical WAL changes follow catalog chunks in a batch"))
+       (wal-recovery-accept-logical-change-chunk record))
       (#.+wal-record-commit+
        (unless (zerop (length (wal-record-payload record)))
          (error "WAL commit record has an invalid payload"))
+       (wal-recovery-finish-logical-change-batch
+        (wal-record-xid record))
        (wal-replay-finish-batch
         (lambda ()
           (lambda ()
@@ -1288,7 +1340,11 @@ src/backend/access/transam/xlogreader.c."
         (*wal-recovery-page-images* '())
         (*wal-recovery-catalog-chunks* '())
         (*wal-recovery-catalog-chunk-count* nil)
-        (*wal-recovery-catalog-next-chunk* 0))
+        (*wal-recovery-catalog-next-chunk* 0)
+        (*wal-recovery-logical-xid* nil)
+        (*wal-recovery-logical-chunk-count* nil)
+        (*wal-recovery-logical-next-chunk* 0)
+        (*wal-recovery-logical-bytes* 0))
     (wal-scan #'wal-replay-record))
   (clog-fsync)
   (values))
@@ -1312,12 +1368,16 @@ src/backend/access/transam/xlogreader.c."
 
 (defun wal-encode-replication-slot (slot)
   (let* ((name (wal-replication-slot-name slot))
+         (database-oid (wal-replication-slot-database-oid slot))
          (restart-lsn (wal-replication-slot-restart-lsn slot))
          (consistent-lsn (wal-replication-slot-consistent-lsn slot))
          (confirmed-flush-lsn
            (wal-replication-slot-confirmed-flush-lsn slot))
          (wal-status (wal-replication-slot-wal-status slot)))
     (unless (and (wal-valid-replication-slot-name-p name)
+                 (or (null database-oid)
+                     (and (integerp database-oid)
+                          (<= 1 database-oid #xFFFFFFFF)))
                  (integerp restart-lsn) (<= 0 restart-lsn #xFFFFFFFFFFFFFFFF)
                  (integerp consistent-lsn)
                  (<= 0 consistent-lsn #xFFFFFFFFFFFFFFFF)
@@ -1329,8 +1389,9 @@ src/backend/access/transam/xlogreader.c."
                  (or confirmed-flush-lsn (<= restart-lsn consistent-lsn))
                  (member wal-status '(:reserved :lost)))
       (error "invalid WAL replication slot state ~s" slot))
-    (let* ((prefix (format nil "PGSLOT2 ~a ~a ~a ~a ~a"
-                           name restart-lsn consistent-lsn
+    (let* ((prefix (format nil "PGSLOT3 ~a ~a ~a ~a ~a ~a"
+                           name (or database-oid "-")
+                           restart-lsn consistent-lsn
                            (or confirmed-flush-lsn "-")
                            (string-downcase (symbol-name wal-status))))
            (crc (wal-crc32 (string->bytes prefix))))
@@ -1368,35 +1429,62 @@ src/backend/access/transam/xlogreader.c."
   (with-open-file (stream path :direction :input)
     (let* ((line (read-line stream nil nil))
            (fields (and line (wal-split-fields line)))
-           (legacy-p (and fields (string= (first fields) "PGSLOT1")))
-           (version-ok-p (or legacy-p
-                             (and fields (string= (first fields) "PGSLOT2"))))
-           (expected-count (if legacy-p 5 7)))
+           (version (and fields (first fields)))
+           (legacy-v1-p (and version (string= version "PGSLOT1")))
+           (legacy-v2-p (and version (string= version "PGSLOT2")))
+           (version-ok-p (or legacy-v1-p legacy-v2-p
+                             (and version (string= version "PGSLOT3"))))
+           (expected-count (cond (legacy-v1-p 5)
+                                 (legacy-v2-p 7)
+                                 (t 8)))
+           (database-index (if (string= (or version "") "PGSLOT3") 2 nil))
+           (restart-index (if database-index 3 2))
+           (consistent-index (1+ restart-index))
+           (confirmed-index (and (not legacy-v1-p) (+ restart-index 2)))
+           (status-index (and (not legacy-v1-p) (+ restart-index 3)))
+           (crc-index (if legacy-v1-p 4 (+ restart-index 4))))
       (unless (and version-ok-p (= (length fields) expected-count)
                    (every (lambda (field) (plusp (length field))) fields)
                    (null (read-line stream nil nil)))
         (error "replication slot file ~a is malformed" path))
       (let* ((name (second fields))
-             (restart-lsn (ignore-errors (parse-integer (third fields))))
-             (consistent-lsn (ignore-errors (parse-integer (fourth fields))))
-             (confirmed-text (unless legacy-p (fifth fields)))
+             (database-text (and database-index (nth database-index fields)))
+             (database-oid (and database-text (not (string= database-text "-"))
+                                (ignore-errors (parse-integer database-text))))
+             (database-field-valid-p
+               (or (null database-index)
+                   (string= database-text "-")
+                   (and database-oid
+                        (<= 1 database-oid #xFFFFFFFF))))
+             (restart-text (nth restart-index fields))
+             (consistent-text (nth consistent-index fields))
+             (confirmed-text (and confirmed-index (nth confirmed-index fields)))
+             (restart-lsn (ignore-errors (parse-integer restart-text)))
+             (consistent-lsn (ignore-errors (parse-integer consistent-text)))
              (confirmed-flush-lsn
                (and confirmed-text (not (string= confirmed-text "-"))
                     (ignore-errors (parse-integer confirmed-text))))
-             (wal-status (if legacy-p :reserved
-                             (cond ((string= (sixth fields) "reserved") :reserved)
-                                   ((string= (sixth fields) "lost") :lost)
+             (wal-status (if legacy-v1-p :reserved
+                             (cond ((string= (nth status-index fields) "reserved") :reserved)
+                                   ((string= (nth status-index fields) "lost") :lost)
                                    (t nil))))
-             (crc-field (if legacy-p (fifth fields) (seventh fields)))
+             (crc-field (nth crc-index fields))
              (crc (ignore-errors (parse-integer crc-field :radix 16)))
-             (prefix (if legacy-p
-                         (format nil "PGSLOT1 ~a ~a ~a"
-                                 name (third fields) (fourth fields))
-                         (format nil "PGSLOT2 ~a ~a ~a ~a ~a"
-                                 name (third fields) (fourth fields)
-                                 confirmed-text (sixth fields))))
+             (prefix (cond
+                       (legacy-v1-p
+                        (format nil "PGSLOT1 ~a ~a ~a"
+                                name restart-text consistent-text))
+                       (legacy-v2-p
+                        (format nil "PGSLOT2 ~a ~a ~a ~a ~a"
+                                name restart-text consistent-text
+                                confirmed-text (nth status-index fields)))
+                       (t
+                        (format nil "PGSLOT3 ~a ~a ~a ~a ~a ~a"
+                                name database-text restart-text consistent-text
+                                confirmed-text (nth status-index fields)))))
              (slot (make-wal-replication-slot
-                    :name name :restart-lsn restart-lsn
+                    :name name :database-oid database-oid
+                    :restart-lsn restart-lsn
                     :consistent-lsn consistent-lsn
                     :confirmed-flush-lsn confirmed-flush-lsn
                     :wal-status wal-status)))
@@ -1404,8 +1492,11 @@ src/backend/access/transam/xlogreader.c."
                      (string= name (pathname-name path))
                      restart-lsn consistent-lsn crc
                      wal-status
-                     (or legacy-p (string= confirmed-text "-")
+                     database-field-valid-p
+                     (or legacy-v1-p (string= confirmed-text "-")
                          confirmed-flush-lsn)
+                     (or (null database-oid)
+                         (<= 1 database-oid #xFFFFFFFF))
                      (<= 0 restart-lsn *wal-durable-lsn* #xFFFFFFFFFFFFFFFF)
                      (<= 0 consistent-lsn *wal-durable-lsn*
                          #xFFFFFFFFFFFFFFFF)
@@ -1486,7 +1577,7 @@ src/backend/access/transam/xlogreader.c."
             (let ((images (wal-decode-page-images
                            (wal-record-payload record) (wal-record-end record)
                            (wal-record-version record))))
-              (if (= (wal-record-version record) +wal-version+)
+              (if (>= (wal-record-version record) +wal-version-v4+)
                   (dolist (image images)
                     (dolist (xid (wal-page-image-xids image))
                       (unless (gethash xid first-lsns)
@@ -1531,7 +1622,8 @@ src/backend/access/transam/xlogreader.c."
              pending)
     restart-lsn))
 
-(defun wal-acknowledge-replication-slot (name acknowledged-lsn)
+(defun wal-acknowledge-replication-slot
+    (name acknowledged-lsn &optional expected-owner)
   "Durably advance a slot after a consumer completes a terminal WAL batch."
   (unless (and (integerp acknowledged-lsn)
                (<= 0 acknowledged-lsn #xFFFFFFFFFFFFFFFF))
@@ -1543,6 +1635,15 @@ src/backend/access/transam/xlogreader.c."
                            (wal-replication-slot-confirmed-flush-lsn slot))))
       (unless slot
         (ereport "42704" "replication slot \"~a\" does not exist" name))
+      (when (and expected-owner
+                 (not (eq (wal-replication-slot-active-owner slot)
+                          expected-owner)))
+        (ereport "55006" "replication slot \"~a\" is not owned by this reader"
+                 name))
+      (when (and (wal-replication-slot-active-owner slot)
+                 (not (eq (wal-replication-slot-active-owner slot)
+                          *wal-logical-slot-owner*)))
+        (ereport "55006" "replication slot \"~a\" is active" name))
       (when (eq (wal-replication-slot-wal-status slot) :lost)
         (ereport "55000" "replication slot \"~a\" has lost its WAL" name))
       (when (and (null confirmed)

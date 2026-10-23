@@ -193,5 +193,6 @@ index's B-tree mutex."
                           (pg-column-typmod col))))
           (check-not-null values columns)
           (insert-tuple-with-unique table values)
+          (logical-note-row-change :insert table :new-values values)
           (incf count)))
       (send-command-complete stream (format nil "INSERT 0 ~a" count)))))

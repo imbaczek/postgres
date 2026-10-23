@@ -18,6 +18,8 @@
   (transaction-snapshot-registration nil)
   (first-snapshot-set nil)
   (dirty-relations '())
+  (logical-changes '())
+  (logical-change-bytes 0)
   (settings (make-hash-table :test #'equal))
   (settings-transaction-start nil)
   ;; Interrupt state: the equivalents of QueryCancelPending and the
@@ -35,6 +37,7 @@
 (declaim (special *live-operation-lock*))
 (declaim (special *live-operation-cv*))
 (declaim (special *live-operation-backend-query-tokens*))
+(declaim (notinline get-database database-oid))
 
 (defun set-backend-state (backend state)
   "Publish transaction state atomically with reload admission."
@@ -954,7 +957,8 @@ AFTER-CAPTURE runs under *WAL-LOCK* but after *XID-LOCK* is released."
       (values snapshot boundary-lsn restart-lsn))))
 
 (defun wal-publish-replication-slot-under-wal-lock
-    (name boundary-lsn restart-lsn register active-owner &optional active-xids)
+    (name boundary-lsn restart-lsn register active-owner
+     &optional active-xids database-oid)
   "Persist and publish a slot while *WAL-LOCK* protects its retention point."
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid replication slot name \"~a\"" name))
@@ -967,6 +971,7 @@ AFTER-CAPTURE runs under *WAL-LOCK* but after *XID-LOCK* is released."
   (let ((slot (make-wal-replication-slot
                :name name :restart-lsn restart-lsn
                :consistent-lsn boundary-lsn
+               :database-oid database-oid
                :active-owner active-owner)))
     ;; Reserve the in-memory pin before slot-file I/O. If atomic replace has
     ;; renamed the file but directory fsync fails, retain the pin: startup may
@@ -983,7 +988,7 @@ AFTER-CAPTURE runs under *WAL-LOCK* but after *XID-LOCK* is released."
     slot))
 
 (defun wal-create-replication-slot-under-writer-lock
-    (name curcid register &optional active-owner)
+    (name curcid register &optional active-owner database-oid)
   "Persist a named restart point before exposing its captured snapshot."
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid replication slot name \"~a\"" name))
@@ -998,11 +1003,12 @@ AFTER-CAPTURE runs under *WAL-LOCK* but after *XID-LOCK* is released."
            (setf slot
                  (wal-publish-replication-slot-under-wal-lock
                   name boundary restart register active-owner
-                  (snapshot-xip captured)))))
+                  (snapshot-xip captured) database-oid))))
       (values snapshot boundary-lsn restart-lsn slot))))
 
 (defun wal-publish-captured-replication-slot
-    (name boundary-lsn restart-lsn register &optional active-owner active-xids)
+    (name boundary-lsn restart-lsn register
+     &optional active-owner active-xids database-oid)
   "Publish a captured slot after the wraparound gate has been released.
 
 The active snapshot registration keeps RESTART-LSN pinned if a checkpoint runs
@@ -1010,7 +1016,8 @@ between snapshot capture and this durable publication."
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
     (wal-publish-replication-slot-under-wal-lock
-     name boundary-lsn restart-lsn register active-owner active-xids)))
+     name boundary-lsn restart-lsn register active-owner active-xids
+     database-oid)))
 
 (defun ensure-exported-snapshot-scope-can-end (backend)
   (when (and (eq backend *exported-snapshot-backend*)
@@ -1037,6 +1044,8 @@ VACUUM FULL wait for this scope."
     (with-schema-read-lock
       (let ((registration (make-snapshot-registration))
             (slot-owner (gensym "EXPORTED-SNAPSHOT-SLOT-"))
+            (database-id
+              (database-oid (get-database (backend-database backend))))
             (started nil)
             (body-completed nil)
             (initial-copy-committed-p nil)
@@ -1060,7 +1069,9 @@ VACUUM FULL wait for this scope."
                              (backend-transaction-snapshot backend) nil
                              (backend-transaction-snapshot-registration backend) nil
                              (backend-first-snapshot-set backend) nil
-                             (backend-dirty-relations backend) '()))
+                             (backend-dirty-relations backend) '()
+                             (backend-logical-changes backend) '()
+                             (backend-logical-change-bytes backend) 0))
                      (set-backend-state backend :in-progress)
                      (multiple-value-bind (captured-snapshot captured-boundary
                                            restart-lsn)
@@ -1081,7 +1092,8 @@ VACUUM FULL wait for this scope."
                        ;; snapshot continues to pin the required WAL.
                        (wal-publish-captured-replication-slot
                         slot-name captured-boundary restart-lsn registration
-                        slot-owner (snapshot-xip captured-snapshot))
+                        slot-owner (snapshot-xip captured-snapshot)
+                        database-id)
                        ;; Publish the retained RR snapshot before user code can run.
                        (sb-sys:without-interrupts
                          (setf (backend-transaction-snapshot backend) snapshot
@@ -1230,7 +1242,9 @@ remains after BODY and should be dropped when its WAL is no longer needed."
         (backend-command-id b) 0
         (backend-snapshot b) nil
         (backend-first-snapshot-set b) nil
-        (backend-dirty-relations b) '())
+        (backend-dirty-relations b) '()
+        (backend-logical-changes b) '()
+        (backend-logical-change-bytes b) 0)
   (set-backend-state b :idle)
   (values))
 
@@ -1250,7 +1264,8 @@ remains after BODY and should be dropped when its WAL is no longer needed."
                (clog-set (backend-xid b) +clog-committed+
                          :fsync (not *wal-ready*))
                (release-xid (backend-xid b))
-               (reset-backend-transaction b)))))
+               (reset-backend-transaction b))
+             (reverse (backend-logical-changes b)))))
         (reset-backend-transaction b)))
   (values))
 
