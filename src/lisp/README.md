@@ -374,6 +374,23 @@ On a systemd host with cgroup v2 memory delegation, run it in a private scope
 systemd-run --user --scope -p Delegate=memory ./t/spill-oom-cgroup.sh
 ```
 
+From tmux or a noninteractive agent harness, use a transient service to give
+the test its own delegated cgroup, stream its output, and wait for its exit:
+
+```sh
+cd src/lisp  # from the repository root
+systemd-run --user --wait --pipe --collect -p Delegate=memory \
+  --working-directory="$PWD" --setenv=SBCL="${SBCL:-$(command -v sbcl)}" \
+  "$PWD/t/spill-oom-cgroup.sh"
+```
+
+This needs a running systemd user manager and access to its bus. If the harness
+lacks the session environment, run `export XDG_RUNTIME_DIR=/run/user/$(id -u)`
+then `export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus` (the bus
+must already exist). Use an absolute path for a custom `SBCL`; pass other
+overrides with `--setenv=NAME=value`. Look for `spill-oom-cgroup: PASS`: `SKIP` also exits zero
+and means the OOM checks did not run.
+
 The harness moves itself into a supervisor child, enables memory control on
 the empty scope, and places the server in a sibling with a 768 MiB limit,
 swap disabled, and whole-group OOM killing enabled. It verifies OOM counters,

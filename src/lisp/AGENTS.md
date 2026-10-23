@@ -163,6 +163,21 @@ run while a dev server is listening on 5433. The UPDATE concurrency, index scan,
 index contention/build, JOIN, and shutdown tests also bind a local control REPL
 at SQL port + 2000 for synchronization.
 
+For the kernel OOM recovery test, agents and tmux sessions should use a private
+delegated systemd service. From `src/lisp`:
+
+```sh
+systemd-run --user --wait --pipe --collect -p Delegate=memory \
+  --working-directory="$PWD" --setenv=SBCL="${SBCL:-$(command -v sbcl)}" \
+  "$PWD/t/spill-oom-cgroup.sh"
+```
+
+Require `spill-oom-cgroup: PASS` in the output; `SKIP` also exits zero and does
+not verify recovery. Do not move unrelated processes out of a shared tmux or
+agent cgroup to enable memory control. See the README's
+[OOM test instructions](README.md#testing) for user-bus setup, memory headroom,
+and overrides (pass these through `systemd-run --setenv=NAME=value`).
+
 For a live debugger when a server-backed test fails, set `DEBUG_ON_FAILURE=1`:
 
 ```sh
