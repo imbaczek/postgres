@@ -8,10 +8,11 @@
         (list :attnum 3 :name "label" :type :varchar :typmod 64 :notnull nil)))
 
 (defun logical-test-change (kind database-oid relation-oid
-                            &key old-values new-values)
+                            &key old-values new-values (key-attnums '(1)))
   (make-logical-change :kind kind :database-oid database-oid
                        :relation-oid relation-oid :relation-name "logical_rows"
                        :columns (logical-test-columns)
+                       :key-attnums key-attnums
                        :old-values old-values :new-values new-values))
 
 (defun test-logical-row-change-codec ()
@@ -31,6 +32,8 @@
                         (logical-change-kind event))
                     (= (logical-change-database-oid decoded) 7)
                     (= (logical-change-relation-oid decoded) 701)
+                    (equal (logical-change-key-attnums decoded)
+                           (logical-change-key-attnums event))
                     (equal (logical-change-columns decoded)
                            (logical-change-columns event))
                     (equalp (logical-change-old-values decoded)
@@ -54,6 +57,138 @@
                        (logical-decode-change (logical-encode-change event))))
              "logical schema names use lengths large enough for valid identifiers"))))
 
+(defun test-logical-pgoutput-v1-codec ()
+  ;; Compare the v1 message shapes with pgoutput.c's Relation/Begin/Commit and
+  ;; logicalrep_write_insert/update/delete in src/backend/replication/.
+  (let* ((lsn #x0102030405060708)
+         (insert (logical-test-change :insert 7 701 :new-values #(10 20 "oak")))
+         (update (logical-test-change :update 7 701
+                                      :old-values #(10 20 "oak")
+                                      :new-values #(10 30 "elm")))
+         (delete (logical-test-change :delete 7 701
+                                      :old-values #(10 30 "elm")))
+         (transaction (make-logical-transaction
+                       :xid 91 :commit-lsn lsn
+                       :changes (list insert update delete)))
+         (relation (pgoutput-build-relation insert))
+         (insert-payload (pgoutput-build-row-change insert))
+         (update-payload (pgoutput-build-row-change update))
+         (delete-payload (pgoutput-build-row-change delete))
+         (begin (pgoutput-build-begin transaction))
+         (commit (pgoutput-build-commit transaction)))
+    (check (and (= (aref relation 0) (char-code #\R))
+                (= (bytes-to-u32 relation 1) 701)
+                (= (aref insert-payload 0) (char-code #\I))
+                (= (bytes-to-u32 insert-payload 1) 701))
+           "pgoutput Relation and INSERT carry the source relation OID")
+    (multiple-value-bind (tuple end)
+        (logical-pgoutput-read-tuple insert-payload 6)
+      (check (and (= (aref insert-payload 5) (char-code #\N))
+                  (= end (length insert-payload))
+                  (equalp tuple #("10" "20" "oak")))
+             "pgoutput INSERT encodes a complete text-format tuple"))
+    (multiple-value-bind (key end)
+        (logical-pgoutput-read-tuple update-payload 6)
+      (check (and (= (aref update-payload 5) (char-code #\K))
+                  (= (aref update-payload end) (char-code #\N))
+                  (equalp key #("10")))
+             "pgoutput UPDATE sends the replica identity before the new tuple"))
+    (multiple-value-bind (key end)
+        (logical-pgoutput-read-tuple delete-payload 6)
+      (check (and (= (aref delete-payload 5) (char-code #\K))
+                  (= end (length delete-payload))
+                  (equalp key #("10")))
+             "pgoutput DELETE sends only its key tuple"))
+    (check (string= (logical-row-key-predicate
+                     #(nil) (list (make-pgoutput-column :name "id" :type-oid 23)))
+                    "id IS NULL")
+           "nullable NULLS NOT DISTINCT replica keys generate NULL-safe predicates")
+    (check (and (= (aref begin 0) (char-code #\B))
+                (= (pg-client-u64 begin 1) lsn)
+                (= (bytes-to-u32 begin 17) 91)
+                (= (length commit) 26)
+                (= (aref commit 0) (char-code #\C))
+                (= (pg-client-u64 commit 2) lsn)
+                (= (pg-client-u64 commit 10) lsn))
+           "pgoutput Begin and Commit use v1 field order and LSNs")
+    (check (eq :create
+               (logical-replication-command-type
+                (parse-replication-command
+                 "CREATE_REPLICATION_SLOT unit_slot LOGICAL pgoutput EXPORT_SNAPSHOT")))
+           "logical slot command parser accepts the supported pgoutput syntax")
+    (check (eq :start
+               (logical-replication-command-type
+                (parse-replication-command
+                 "START_REPLICATION SLOT unit_slot LOGICAL 0/0 (proto_version '1')")))
+           "logical slot command parser accepts the worker's pgoutput v1 start command")
+    (check (handler-case
+               (progn
+                 (parse-replication-command
+                  "START_REPLICATION SLOT unit_slot LOGICAL 0/0 (proto_version '2')")
+                 nil)
+             (error () t))
+           "logical slot command parser rejects unsupported pgoutput versions")))
+
+(defun test-logical-subscription-argument-parser ()
+  (let ((options
+          (parse-logical-subscription-args
+           '("--slot" "test_slot" "--source-port" "5434"
+             "--target-port" "5435" "--table" "first_rows"
+             "--table" "second_rows"))))
+    (check (and (= (logical-subscription-options-source-port options) 5434)
+                (= (logical-subscription-options-target-port options) 5435)
+                (equal (logical-subscription-options-tables options)
+                       '("first_rows" "second_rows")))
+           "subscriber CLI consumes option values and retains repeated tables")
+    (check (handler-case
+               (progn
+                 (parse-logical-subscription-args
+                  '("--slot" "test_slot" "--table"))
+                 nil)
+             (error () t))
+           "subscriber CLI rejects an option with no value")))
+
+(defun test-logical-subscription-resume-config ()
+  (let* ((options (make-logical-subscription-options
+                   :source-host "publisher.example" :source-port 5440
+                   :source-database "publisher_db"
+                   :tables '("z_rows" "a_rows")))
+         (config (list :source-host "publisher.example"
+                       :source-port 5440
+                       :source-database "publisher_db"
+                       :table-allowlist "a_rows,z_rows")))
+    (check (string= (fourth (logical-subscription-config-values options))
+                    "a_rows,z_rows")
+           "subscriber config canonicalizes allowlist ordering")
+    (check (null (logical-validate-resume-config options '(:state "ready") config))
+           "matching source and allowlist permit a safe resume")
+    (check (handler-case
+               (progn
+                 (logical-validate-resume-config
+                  (make-logical-subscription-options
+                   :source-host "other.example" :source-port 5440
+                   :source-database "publisher_db" :tables '("z_rows" "a_rows"))
+                  '(:state "ready") config)
+                 nil)
+             (error () t))
+           "subscriber config rejects changing the source endpoint")
+    (check (handler-case
+               (progn
+                 (logical-validate-resume-config
+                  (make-logical-subscription-options
+                   :source-host "publisher.example" :source-port 5440
+                   :source-database "publisher_db" :tables '("a_rows"))
+                  '(:state "ready") config)
+                 nil)
+             (error () t))
+           "subscriber config rejects changing the table allowlist")
+    (check (handler-case
+               (progn
+                 (logical-validate-resume-config options '(:state "ready") nil)
+                 nil)
+             (error () t))
+           "legacy progress without a saved config cannot resume unsafely")))
+
 (defun logical-test-append-batch (xid changes &optional commit-p)
   ;; Like reorderbuffer.c, the reader must not expose queued changes until a
   ;; transaction's commit record closes the WAL batch.
@@ -62,6 +197,55 @@
     (wal-append-logical-changes xid (mapcar #'logical-encode-change changes)))
   (when commit-p
     (wal-append-record +wal-record-commit+ xid #())))
+
+(defun logical-test-chunk-record (xid index count)
+  (let ((event
+          (logical-encode-change
+           (logical-test-change :insert 7 701 :new-values #(1 2 "chunk")))))
+    (make-wal-record :type +wal-record-logical-changes+ :xid xid
+                     :payload (logical-encode-chunk index count (list event)))))
+
+(defun test-logical-change-chunk-validation ()
+  (let* ((event
+           (logical-encode-change
+            (logical-test-change :insert 7 701 :new-values #(1 2 "chunk"))))
+         (change-bytes (length event))
+         (first-chunk
+           (make-wal-record :type +wal-record-logical-changes+ :xid 88
+                            :payload (logical-encode-chunk 0 2 (list event)))))
+    (labels ((rejects (record xid count index bytes)
+               (handler-case
+                   (progn
+                     (wal-advance-logical-change-chunk
+                      record xid count index bytes)
+                     nil)
+                 (error () t))))
+      (multiple-value-bind (xid count next-index bytes changes)
+          (wal-advance-logical-change-chunk first-chunk nil nil 0 0)
+        (check (and (= xid 88) (= count 2) (= next-index 1)
+                    (= bytes change-bytes) (= (length changes) 1))
+               "logical chunk progress records the first complete chunk"))
+      (check (rejects (logical-test-chunk-record 88 1 2) nil nil 0 0)
+             "logical chunks must start at index zero")
+      (check (rejects (logical-test-chunk-record 0 0 2) nil nil 0 0)
+             "logical chunks require a positive transaction ID")
+      (check (rejects (logical-test-chunk-record 89 1 2) 88 2 1 change-bytes)
+             "logical chunks cannot change transaction ID")
+      (check (rejects (logical-test-chunk-record 88 0 2) 88 2 1 change-bytes)
+             "logical chunks must be sequential")
+      (check (rejects (logical-test-chunk-record 88 1 3) 88 2 1 change-bytes)
+             "logical chunk count cannot change within a transaction")
+      (check (rejects (logical-test-chunk-record 88 1 2) 88 2 1
+                      +max-logical-wal-transaction-bytes+)
+             "logical chunk progress enforces the 65 MiB transaction cap")
+      (let ((state (make-logical-reader-state :database-oid 7 :batch-open-p t
+                                              :next-chunk 0))
+            (commit (make-wal-record :type +wal-record-commit+ :xid 88 :end 100)))
+        (wal-logical-reader-add-chunk state first-chunk)
+        (check (handler-case
+                   (progn (wal-logical-reader-finish-batch state commit) nil)
+                 (error () t))
+               "logical commit terminals require every declared chunk")))))
 
 (defun logical-test-with-wal-storage (function)
   (let* ((test-pgdata
@@ -95,6 +279,71 @@
       (ignore-errors
        (uiop:delete-directory-tree test-pgdata :validate t
                                                :if-does-not-exist :ignore)))))
+
+(defun logical-test-assert-owned-reader-progress (slot first-end later-end)
+  (call-with-logical-replication-slot
+   "logical_slot"
+   (lambda (owned-slot)
+     (declare (ignore owned-slot))
+     (let ((bounded-transactions
+             (wal-logical-slot-read-transactions
+              "logical_slot" :max-transactions 1)))
+       (check (equal (mapcar #'logical-transaction-xid bounded-transactions)
+                     '(901))
+              "logical reader stops at its transaction-count boundary"))
+     (let ((bounded-transactions
+             (wal-logical-slot-read-transactions
+              "logical_slot" :max-transactions 8 :max-bytes 1)))
+       (check (equal (mapcar #'logical-transaction-xid bounded-transactions)
+                     '(901))
+              "byte budget returns one complete oversized transaction"))
+     (check (handler-case
+                (progn
+                  (wal-logical-slot-acknowledge "logical_slot" later-end)
+                  nil)
+              (error () t))
+            "slot cannot acknowledge a transaction beyond read progress")
+     (check (handler-case
+                (progn
+                  (wal-logical-slot-acknowledge "logical_slot" "invalid")
+                  nil)
+              (error () t))
+            "logical acknowledgment rejects non-integer LSNs")
+     (let ((transactions (wal-logical-slot-read-transactions "logical_slot")))
+       (check (equal (mapcar #'logical-transaction-xid transactions) '(901 903))
+              "reader drops crash tails and filters other databases")
+       (check (< (logical-transaction-commit-lsn (first transactions))
+                 (logical-transaction-commit-lsn (second transactions)))
+              "logical transactions are emitted in durable commit order")
+       (check (equal (mapcar #'logical-change-kind
+                             (logical-transaction-changes (first transactions)))
+                     '(:insert :update))
+              "row changes retain executor order within a transaction")
+       (check (handler-case
+                  (progn
+                    (wal-logical-slot-acknowledge
+                     "other_slot"
+                     (logical-transaction-commit-lsn (first transactions)))
+                    nil)
+                (error () t))
+              "a reader cannot acknowledge a different slot")
+       (wal-logical-slot-acknowledge
+        "logical_slot"
+        (logical-transaction-commit-lsn (first transactions)))
+       (check (= (wal-replication-slot-confirmed-flush-lsn slot) first-end)
+              "slot acknowledgment persists the applied commit boundary")
+       (multiple-value-bind (transactions progress-lsn)
+           (wal-logical-slot-read-transactions
+            "logical_slot" :max-scan-bytes 1)
+         (check (null transactions)
+                "bounded scan can make progress without row transactions")
+         (check (> progress-lsn first-end)
+                "empty read returns its last complete terminal LSN")
+         (wal-logical-slot-acknowledge "logical_slot" progress-lsn))
+       (check (equal (mapcar #'logical-transaction-xid
+                             (wal-logical-slot-read-transactions "logical_slot"))
+                     '(903))
+              "a second read resumes after the durable acknowledgment")))))
 
 (defun test-logical-wal-reader-commit-order-and-slot-ack ()
   (logical-test-with-wal-storage
@@ -159,74 +408,101 @@
                          nil)
                 (error () t))
               "logical acknowledgment requires ownership of its slot")
+       (logical-test-assert-owned-reader-progress slot first-end later-end)))))
+
+(defun logical-test-large-change (id payload)
+  (make-logical-change
+   :kind :insert :database-oid 7 :relation-oid 702
+   :relation-name "wide_logical_rows"
+   :columns (list (list :attnum 1 :name "id" :type :int4
+                        :typmod -1 :notnull t)
+                  (list :attnum 2 :name "payload" :type :varchar
+                        :typmod -1 :notnull nil))
+   :key-attnums '(1) :new-values (vector id payload)))
+
+(defun logical-test-capture-row-change (catalog table application-name byte-count)
+  (let* ((*catalog* catalog)
+         (*backend* (make-backend :xid 9902
+                                  :application-name application-name
+                                  :database "postgres")))
+    (setf (backend-logical-change-bytes *backend*) byte-count)
+    (handler-case
+        (progn
+          (logical-note-row-change :insert table :new-values #(1 "small"))
+          (values t (backend-logical-change-bytes *backend*)))
+      (error () (values nil (backend-logical-change-bytes *backend*))))))
+
+(defun test-logical-capture-application-headroom ()
+  (let* ((catalog (make-catalog))
+         (database (make-database :name "postgres" :oid 7))
+         (table
+           (make-pg-class
+            :oid 702 :name "logical_rows"
+            :columns (vector (make-pg-column :name "id" :type :int4
+                                             :typmod -1 :attnum 1 :notnull t)
+                             (make-pg-column :name "label" :type :varchar
+                                             :typmod -1 :attnum 2 :notnull nil)))))
+    (setf (gethash "postgres" (catalog-databases catalog)) database
+          (gethash "logical_rows" (database-tables database)) table)
+    (multiple-value-bind (accepted bytes)
+        (logical-test-capture-row-change
+         catalog table "postgres" +max-logical-transaction-bytes+)
+      (declare (ignore bytes))
+      (check (not accepted)
+             "ordinary source transactions remain capped at 64 MiB"))
+    (multiple-value-bind (accepted bytes)
+        (logical-test-capture-row-change
+         catalog table "pg-lisp-subscribe-apply"
+         +max-logical-transaction-bytes+)
+      (check (and accepted (> bytes +max-logical-transaction-bytes+)
+                  (<= bytes +max-logical-wal-transaction-bytes+))
+             "subscriber apply capture may use only its reserved headroom"))
+    (multiple-value-bind (accepted bytes)
+        (logical-test-capture-row-change
+         catalog table "pg-lisp-subscribe-apply"
+         +max-logical-wal-transaction-bytes+)
+      (declare (ignore bytes))
+      (check (not accepted)
+             "subscriber apply capture still rejects changes beyond 65 MiB"))))
+
+(defun test-logical-wal-apply-headroom-recovery ()
+  ;; The subscriber's own progress row is committed alongside each source
+  ;; transaction. Leave 1 MiB of headroom above the source's 64 MiB event cap.
+  ;; Keep individual records below the WAL segment record-size limit.
+  (logical-test-with-wal-storage
+   (lambda ()
+     (let* ((payload-size (+ (* 10 1024 1024) (* 768 1024)))
+            (payload (make-string payload-size :initial-element #\x))
+            (changes (loop for id from 1 to 6
+                           collect (logical-test-large-change id payload)))
+            (encoded (mapcar #'logical-encode-change changes))
+            (change-bytes (reduce #'+ encoded :key #'length :initial-value 0))
+            (slot (make-wal-replication-slot
+                   :name "headroom_slot" :database-oid 7 :restart-lsn 0
+                   :consistent-lsn 0 :confirmed-flush-lsn 0)))
+       (check (and (> change-bytes +max-logical-transaction-bytes+)
+                   (<= change-bytes +max-logical-wal-transaction-bytes+))
+              "target apply metadata fits the WAL transaction headroom")
+       (setf (gethash "headroom_slot" *wal-replication-slots*) slot)
+       (logical-test-append-batch 9901 changes t)
+       (wal-flush)
+       (wal-recover)
        (call-with-logical-replication-slot
-        "logical_slot"
+        "headroom_slot"
         (lambda (owned-slot)
           (declare (ignore owned-slot))
-          (let ((bounded-transactions
-                  (wal-logical-slot-read-transactions
-                   "logical_slot" :max-transactions 1)))
-            (check (equal (mapcar #'logical-transaction-xid
-                                  bounded-transactions)
-                          '(901))
-                   "logical reader stops at its transaction-count boundary"))
-          (let ((bounded-transactions
-                  (wal-logical-slot-read-transactions
-                   "logical_slot" :max-transactions 8 :max-bytes 1)))
-            (check (equal (mapcar #'logical-transaction-xid
-                                  bounded-transactions)
-                          '(901))
-                   "byte budget returns one complete oversized transaction"))
-          (check (handler-case
-                     (progn
-                       (wal-logical-slot-acknowledge "logical_slot" later-end)
-                       nil)
-                   (error () t))
-                 "slot cannot acknowledge a transaction beyond read progress")
-          (check (handler-case
-                     (progn
-                       (wal-logical-slot-acknowledge "logical_slot" "invalid")
-                       nil)
-                   (error () t))
-                 "logical acknowledgment rejects non-integer LSNs")
-          (let ((transactions (wal-logical-slot-read-transactions "logical_slot")))
-            (check (equal (mapcar #'logical-transaction-xid transactions)
-                          '(901 903))
-                   "reader drops crash tails and filters other databases")
-            (check (< (logical-transaction-commit-lsn (first transactions))
-                      (logical-transaction-commit-lsn (second transactions)))
-                   "logical transactions are emitted in durable commit order")
-            (check (equal (mapcar #'logical-change-kind
-                                  (logical-transaction-changes
-                                   (first transactions)))
-                          '(:insert :update))
-                   "row changes retain executor order within a transaction")
-            (check (handler-case
-                       (progn
-                         (wal-logical-slot-acknowledge
-                          "other_slot"
-                          (logical-transaction-commit-lsn (first transactions)))
-                         nil)
-                     (error () t))
-                   "a reader cannot acknowledge a different slot")
-            (wal-logical-slot-acknowledge
-             "logical_slot"
-             (logical-transaction-commit-lsn (first transactions)))
-            (check (= (wal-replication-slot-confirmed-flush-lsn slot) first-end)
-                   "slot acknowledgment persists the applied commit boundary")
-            (multiple-value-bind (transactions progress-lsn)
-                (wal-logical-slot-read-transactions
-                 "logical_slot" :max-scan-bytes 1)
-              (check (null transactions)
-                     "bounded scan can make progress without row transactions")
-              (check (> progress-lsn first-end)
-                     "empty read returns its last complete terminal LSN")
-              (wal-logical-slot-acknowledge "logical_slot" progress-lsn))
-            (check (equal (mapcar #'logical-transaction-xid
-                                  (wal-logical-slot-read-transactions
-                                   "logical_slot"))
-                          '(903))
-                   "a second read resumes after the durable acknowledgment"))))))))
+          (let* ((transactions
+                   (wal-logical-slot-read-transactions
+                    "headroom_slot" :max-bytes (* 8 1024 1024)))
+                 (transaction (first transactions)))
+            (check (and (= (length transactions) 1)
+                        (= (length (logical-transaction-changes transaction)) 6)
+                        (= (length (aref
+                                    (logical-change-new-values
+                                     (first (logical-transaction-changes transaction)))
+                                    1))
+                           payload-size))
+                   "near-limit logical transaction recovers and reads as one commit"))))))))
 
 (defun logical-test-commit-boundary-batch (xid)
   (with-wal-critical
@@ -322,8 +598,8 @@
        ;; its XID even though it runs after the snapshot boundary.
        (logical-note-row-change :insert table :new-values #(57 6 "second statement"))
        (release-snapshot-registration registration)
+       (wal-finalize-replication-slot-copy "handoff_slot" boundary-lsn owner)
        (wal-release-replication-slot-owner "handoff_slot" owner)
-       (wal-acknowledge-replication-slot "handoff_slot" boundary-lsn)
        (commit-transaction)
        (check (and (null (backend-logical-changes *backend*))
                    (not (member xid *active-xids* :test #'=)))
@@ -371,6 +647,108 @@
           (declare (ignore owned-slot))
           (check (null (wal-logical-slot-read-transactions "handoff_slot"))
                  "restart does not replay acknowledged transactions")))))))
+
+(defun test-logical-snapshot-import-locks-token-through-pin ()
+  (let* ((catalog (make-catalog))
+         (database (make-database :name "postgres" :oid 7))
+         (token (new-exported-logical-snapshot-token))
+         (source-snapshot
+           (make-snapshot-struct :xmin 10 :xmax 20 :xip '() :curcid 1))
+         (source-registration (make-snapshot-registration))
+         (state (make-exported-logical-snapshot
+                 :slot-name "snapshot_race" :token token :database-oid 7
+                 :snapshot source-snapshot :registration source-registration))
+         (import-backend
+           (make-backend :database "postgres" :state :in-progress :explicit t
+                         :isolation-level :repeatable-read :read-only t))
+         (gate-lock (sb-thread:make-mutex :name "logical snapshot import test"))
+         (gate-cv (sb-thread:make-waitqueue :name "logical snapshot import test"))
+         (lookup-seen nil)
+         (finalizer-started nil)
+         (finalizer-done nil)
+         (allow-import nil)
+         (import-error nil)
+         (finalizer-error nil)
+         (importer nil)
+         (finalizer nil)
+         (baseline-snapshots *active-snapshots*))
+    (setf (gethash "postgres" (catalog-databases catalog)) database)
+    (sb-thread:with-mutex (*xid-lock*)
+      (register-active-snapshot source-snapshot source-registration))
+    (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
+      (setf (gethash token *exported-logical-snapshots*) state))
+    (unwind-protect
+         (progn
+           (setf importer
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (let ((*catalog* catalog)
+                          (*backend* import-backend)
+                          (*logical-test-after-snapshot-token-lookup-hook*
+                            (lambda (ignored-state)
+                              (declare (ignore ignored-state))
+                              (sb-thread:with-mutex (gate-lock)
+                                (setf lookup-seen t)
+                                (sb-thread:condition-broadcast gate-cv)
+                                (loop until allow-import
+                                      do (sb-thread:condition-wait
+                                          gate-cv gate-lock))))))
+                      (handler-case
+                          (import-exported-logical-snapshot token)
+                        (error (condition)
+                          (setf import-error condition)))))))
+           (sb-thread:with-mutex (gate-lock)
+             (loop until lookup-seen
+                   do (sb-thread:condition-wait gate-cv gate-lock)))
+           (setf finalizer
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (sb-thread:with-mutex (gate-lock)
+                      (setf finalizer-started t)
+                      (sb-thread:condition-broadcast gate-cv))
+                    (handler-case
+                        (remove-exported-logical-snapshot-token token)
+                      (error (condition)
+                        (setf finalizer-error condition)))
+                    (sb-thread:with-mutex (gate-lock)
+                      (setf finalizer-done t)
+                      (sb-thread:condition-broadcast gate-cv)))))
+           (sb-thread:with-mutex (gate-lock)
+             (loop until finalizer-started
+                   do (sb-thread:condition-wait gate-cv gate-lock)))
+           (sleep 0.02)
+           (sb-thread:with-mutex (gate-lock)
+             (check (not finalizer-done)
+                    "snapshot finalizer waits while import publishes its pin")
+             (setf allow-import t)
+             (sb-thread:condition-broadcast gate-cv))
+           (sb-thread:join-thread importer)
+           (sb-thread:join-thread finalizer)
+           (check (null import-error) "snapshot import completes during finalization")
+           (check (null finalizer-error) "snapshot finalization completes after import")
+           (check (null (gethash token *exported-logical-snapshots*))
+                  "copy completion removes the exact imported snapshot token")
+           (check (snapshot-registration-active-p
+                   (backend-transaction-snapshot-registration import-backend))
+                  "imported transaction retains an independent snapshot pin")
+           (check (= *active-snapshots* (1+ baseline-snapshots))
+                  "finalization releases only the exported snapshot registration"))
+      (sb-thread:with-mutex (gate-lock)
+        (setf allow-import t)
+        (sb-thread:condition-broadcast gate-cv))
+      (when (and importer (sb-thread:thread-alive-p importer))
+        (sb-thread:join-thread importer))
+      (when (and finalizer (sb-thread:thread-alive-p finalizer))
+        (sb-thread:join-thread finalizer))
+      (when (gethash token *exported-logical-snapshots*)
+        (ignore-errors (remove-exported-logical-snapshot-token token)))
+      (when (snapshot-registration-active-p source-registration)
+        (release-snapshot-registration source-registration))
+      (let ((import-registration
+              (backend-transaction-snapshot-registration import-backend)))
+        (when (and import-registration
+                   (snapshot-registration-active-p import-registration))
+          (release-snapshot-registration import-registration))))))
 
 (defun test-wal-pgslot3-database-field-validation ()
   (let* ((test-directory

@@ -171,7 +171,8 @@
          (original-scan (symbol-function 'wal-scan))
          (scan-starts '())
          (slot (make-wal-replication-slot :name "ack_slot"
-                                          :restart-lsn 0 :consistent-lsn 0))
+                                          :restart-lsn 0 :consistent-lsn 0
+                                          :confirmed-flush-lsn 0))
          (first-start nil)
          (first-end nil)
          (second-end nil))
@@ -340,20 +341,10 @@
                 (not (gethash registration *wal-snapshot-retention-pins*)))
            "releasing the snapshot also releases its WAL retention pin")))
 
-(defun test-wal-snapshot-release-race-before-pin-publication ()
+(defun call-with-wal-snapshot-release-race-state (function)
   (let* ((test-lock (sb-thread:make-mutex :name "snapshot boundary race test"))
          (test-cv (sb-thread:make-waitqueue :name "snapshot boundary race test"))
-         (hook-entered nil)
-         (resume-capture nil)
-         (release-marked nil)
-         (resume-release nil)
-         (capture-error nil)
-         (capture-result nil)
-         (release-error nil)
-         (reuse-error nil)
          (registration (make-snapshot-registration))
-         (worker nil)
-         (release-worker nil)
          (saved-active-snapshots *active-snapshots*)
          (saved-active-snapshot-set *active-snapshot-set*)
          (saved-active-xids *active-xids*)
@@ -366,9 +357,7 @@
          (saved-wal-snapshot-retention-pins *wal-snapshot-retention-pins*)
          (saved-hook *wal-test-after-snapshot-boundary-registration-hook*)
          (saved-release-hook *wal-test-after-snapshot-release-mark-hook*))
-    ;; These bindings are shared by both threads. The normal transaction state
-    ;; is process-global, so dynamically binding it in only the test thread
-    ;; would make the release side update a different active-snapshot count.
+    ;; The capture and release workers share process-global snapshot state.
     (setf *active-snapshots* 0
           *active-snapshot-set* (make-hash-table :test #'eq)
           *active-xids* nil
@@ -379,110 +368,10 @@
           *wal-durable-lsn* 800
           *wal-xid-first-lsn* (make-hash-table :test #'eql)
           *wal-snapshot-retention-pins* (make-hash-table :test #'eq)
-          *wal-test-after-snapshot-release-mark-hook* nil
-          *wal-test-after-snapshot-boundary-registration-hook*
-          (lambda (token)
-            (declare (ignore token))
-            (sb-thread:with-mutex (test-lock)
-              (setf hook-entered t)
-              (sb-thread:condition-broadcast test-cv)
-              (loop until resume-capture
-                    do (sb-thread:condition-wait test-cv test-lock)))))
+          *wal-test-after-snapshot-boundary-registration-hook* nil
+          *wal-test-after-snapshot-release-mark-hook* nil)
     (unwind-protect
-         (progn
-           (setf worker
-                 (sb-thread:make-thread
-                  (lambda ()
-                    (handler-case
-                        (progn
-                          (with-write-lock
-                            (wal-capture-snapshot-boundary-under-writer-lock
-                             0 registration))
-                          (setf capture-result :returned))
-                      (error (condition)
-                        (setf capture-error (princ-to-string condition)))))
-                  :name "snapshot boundary release race"))
-           (let ((entered
-                   (test-wait-until
-                    (lambda ()
-                      (sb-thread:with-mutex (test-lock) hook-entered))
-                    2.0)))
-             (check entered
-                    "snapshot boundary test pauses after registration")
-             (when entered
-               (release-snapshot-registration registration)
-               (check (and (zerop *active-snapshots*)
-                           (not (snapshot-registration-active-p registration)))
-                      "concurrent release clears the registered snapshot before pin publication"))
-             (sb-thread:with-mutex (test-lock)
-               (setf resume-capture t)
-               (sb-thread:condition-broadcast test-cv)))
-           (sb-thread:join-thread worker)
-           (setf worker nil)
-           (check (and (null capture-result)
-                       capture-error
-                       (search "snapshot registration was released"
-                               capture-error))
-                  "boundary capture rejects a registration released before pin publication")
-           (check (not (gethash registration *wal-snapshot-retention-pins*))
-                  "a released registration cannot leave a WAL retention pin")
-           (check (zerop *active-snapshots*)
-                  "snapshot release racing boundary capture keeps the active count balanced")
-           ;; Reuse is allowed after a completed release. Pause the second
-           ;; release after it marks the token unavailable but before it gets
-           ;; the WAL lock, then prove a new snapshot cannot steal its pin.
-           (setf *wal-test-after-snapshot-boundary-registration-hook* nil)
-           (with-write-lock
-             (wal-capture-snapshot-boundary-under-writer-lock 0 registration))
-           (setf *wal-test-after-snapshot-release-mark-hook*
-                 (lambda (token)
-                   (declare (ignore token))
-                   (sb-thread:with-mutex (test-lock)
-                     (setf release-marked t)
-                     (sb-thread:condition-broadcast test-cv)
-                     (loop until resume-release
-                           do (sb-thread:condition-wait test-cv test-lock))))
-                 release-worker
-                 (sb-thread:make-thread
-                  (lambda ()
-                    (handler-case
-                        (release-snapshot-registration registration)
-                      (error (condition)
-                        (setf release-error (princ-to-string condition)))))
-                  :name "snapshot pin release"))
-           (let ((marked
-                   (test-wait-until
-                    (lambda ()
-                      (sb-thread:with-mutex (test-lock) release-marked))
-                    2.0)))
-             (check marked "pinned snapshot release pauses after token retirement")
-             (when marked
-               (setf reuse-error
-                     (handler-case
-                         (progn (make-snapshot 1 :register registration) nil)
-                       (error (condition) (princ-to-string condition))))
-               (check (and reuse-error (search "being released" reuse-error))
-                      "registration reuse waits until the old WAL pin is removed")
-               (check (zerop *active-snapshots*)
-                      "rejected registration reuse does not publish another snapshot"))
-             (sb-thread:with-mutex (test-lock)
-               (setf resume-release t)
-               (sb-thread:condition-broadcast test-cv)))
-           (sb-thread:join-thread release-worker)
-           (setf release-worker nil)
-           (check (null release-error) "pinned snapshot release completes")
-           (check (and (not (gethash registration *wal-snapshot-retention-pins*))
-                       (not (snapshot-registration-releasing-p registration))
-                       (zerop *active-snapshots*))
-                  "completed release clears the pin and makes the token reusable"))
-      (sb-thread:with-mutex (test-lock)
-        (setf resume-capture t)
-        (setf resume-release t)
-        (sb-thread:condition-broadcast test-cv))
-      (when worker
-        (sb-thread:join-thread worker))
-      (when release-worker
-        (sb-thread:join-thread release-worker))
+         (funcall function test-lock test-cv registration)
       (setf *wal-test-after-snapshot-boundary-registration-hook* nil
             *wal-test-after-snapshot-release-mark-hook* nil)
       (release-snapshot-registration registration)
@@ -498,6 +387,124 @@
             *wal-snapshot-retention-pins* saved-wal-snapshot-retention-pins
             *wal-test-after-snapshot-boundary-registration-hook* saved-hook
             *wal-test-after-snapshot-release-mark-hook* saved-release-hook))))
+
+(defun test-wal-snapshot-release-race-before-pin-publication ()
+  (call-with-wal-snapshot-release-race-state
+   (lambda (test-lock test-cv registration)
+     (let ((hook-entered nil)
+           (resume-capture nil)
+           (capture-error nil)
+           (capture-result nil)
+           (worker nil))
+       (setf *wal-test-after-snapshot-boundary-registration-hook*
+             (lambda (token)
+               (declare (ignore token))
+               (sb-thread:with-mutex (test-lock)
+                 (setf hook-entered t)
+                 (sb-thread:condition-broadcast test-cv)
+                 (loop until resume-capture
+                       do (sb-thread:condition-wait test-cv test-lock)))))
+       (unwind-protect
+            (progn
+              (setf worker
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (handler-case
+                           (progn
+                             (with-write-lock
+                               (wal-capture-snapshot-boundary-under-writer-lock
+                                0 registration))
+                             (setf capture-result :returned))
+                         (error (condition)
+                           (setf capture-error (princ-to-string condition)))))
+                     :name "snapshot boundary release race"))
+              (let ((entered
+                      (test-wait-until
+                       (lambda ()
+                         (sb-thread:with-mutex (test-lock) hook-entered))
+                       2.0)))
+                (check entered "snapshot boundary test pauses after registration")
+                (when entered
+                  (release-snapshot-registration registration)
+                  (check (and (zerop *active-snapshots*)
+                              (not (snapshot-registration-active-p registration)))
+                         "concurrent release clears the registered snapshot before pin publication"))
+                (sb-thread:with-mutex (test-lock)
+                  (setf resume-capture t)
+                  (sb-thread:condition-broadcast test-cv)))
+              (sb-thread:join-thread worker)
+              (setf worker nil)
+              (check (and (null capture-result)
+                          capture-error
+                          (search "snapshot registration was released" capture-error))
+                     "boundary capture rejects a registration released before pin publication")
+              (check (not (gethash registration *wal-snapshot-retention-pins*))
+                     "a released registration cannot leave a WAL retention pin")
+              (check (zerop *active-snapshots*)
+                     "snapshot release racing boundary capture keeps the active count balanced"))
+         (sb-thread:with-mutex (test-lock)
+           (setf resume-capture t)
+           (sb-thread:condition-broadcast test-cv))
+         (when worker (sb-thread:join-thread worker)))))))
+
+(defun test-wal-snapshot-release-race-before-reuse ()
+  (call-with-wal-snapshot-release-race-state
+   (lambda (test-lock test-cv registration)
+     (let ((release-marked nil)
+           (resume-release nil)
+           (release-error nil)
+           (reuse-error nil)
+           (release-worker nil))
+       ;; Reuse after completed release is valid. Pause another release after
+       ;; it retires the token but before it removes the WAL pin.
+       (with-write-lock
+         (wal-capture-snapshot-boundary-under-writer-lock 0 registration))
+       (setf *wal-test-after-snapshot-release-mark-hook*
+             (lambda (token)
+               (declare (ignore token))
+               (sb-thread:with-mutex (test-lock)
+                 (setf release-marked t)
+                 (sb-thread:condition-broadcast test-cv)
+                 (loop until resume-release
+                       do (sb-thread:condition-wait test-cv test-lock))))
+             release-worker
+             (sb-thread:make-thread
+              (lambda ()
+                (handler-case
+                    (release-snapshot-registration registration)
+                  (error (condition)
+                    (setf release-error (princ-to-string condition)))))
+              :name "snapshot pin release"))
+       (unwind-protect
+            (let ((marked
+                    (test-wait-until
+                     (lambda ()
+                       (sb-thread:with-mutex (test-lock) release-marked))
+                     2.0)))
+              (check marked "pinned snapshot release pauses after token retirement")
+              (when marked
+                (setf reuse-error
+                      (handler-case
+                          (progn (make-snapshot 1 :register registration) nil)
+                        (error (condition) (princ-to-string condition))))
+                (check (and reuse-error (search "being released" reuse-error))
+                       "registration reuse waits until the old WAL pin is removed")
+                (check (zerop *active-snapshots*)
+                       "rejected registration reuse does not publish another snapshot"))
+              (sb-thread:with-mutex (test-lock)
+                (setf resume-release t)
+                (sb-thread:condition-broadcast test-cv))
+              (sb-thread:join-thread release-worker)
+              (setf release-worker nil)
+              (check (null release-error) "pinned snapshot release completes")
+              (check (and (not (gethash registration *wal-snapshot-retention-pins*))
+                          (not (snapshot-registration-releasing-p registration))
+                          (zerop *active-snapshots*))
+                     "completed release clears the pin and makes the token reusable"))
+         (sb-thread:with-mutex (test-lock)
+           (setf resume-release t)
+           (sb-thread:condition-broadcast test-cv))
+         (when release-worker (sb-thread:join-thread release-worker)))))))
 
 (defun test-wal-chunked-catalog-record ()
   (let* ((test-pgdata (merge-pathnames "wal-catalog-chunks-test/" *pgdata*))
@@ -783,6 +790,7 @@
          (*wal-output-segment* nil)
          (checkpoint-lsn *wal-durable-lsn*)
          (registration (make-snapshot-registration))
+         (slot-owner (gensym "COPY-SLOT-"))
          (snapshot nil)
          (boundary-lsn nil)
          (restart-lsn nil)
@@ -806,7 +814,7 @@
            (with-write-lock
              (multiple-value-setq (snapshot boundary-lsn restart-lsn slot)
                (wal-create-replication-slot-under-writer-lock
-                "copy_slot" 7 registration)))
+                "copy_slot" 7 registration slot-owner)))
            (check (and snapshot (= boundary-lsn checkpoint-lsn)
                        (= restart-lsn 100)
                        (= (wal-replication-slot-consistent-lsn slot)
@@ -815,9 +823,38 @@
            (check (and (probe-file (wal-replication-slot-path "copy_slot"))
                        (eq slot (gethash "copy_slot" *wal-replication-slots*)))
                   "slot reserves a WAL pin and finishes durable publication")
-           ;; This fixture has no transaction records, so acknowledge its
+           ;; This fixture has no transaction records, so finalize its
            ;; consistent point before exercising startup metadata loading.
-           (wal-acknowledge-replication-slot "copy_slot" boundary-lsn)
+           (check (handler-case
+                      (progn
+                        (wal-acknowledge-replication-slot
+                         "copy_slot" boundary-lsn)
+                        nil)
+                    (error () t))
+                  "an unconfirmed slot rejects unowned low-level acknowledgment")
+           (check (handler-case
+                      (progn
+                        (wal-finalize-replication-slot-copy
+                         "copy_slot" boundary-lsn (gensym "WRONG-OWNER-"))
+                        nil)
+                    (error () t))
+                  "initial finalization rejects a different slot owner")
+           (check (null (wal-replication-slot-confirmed-flush-lsn slot))
+                  "a rejected owner cannot publish the initial boundary")
+           (setf (wal-replication-slot-wal-status slot) :lost)
+           (check (handler-case
+                      (progn
+                        (wal-finalize-replication-slot-copy
+                         "copy_slot" boundary-lsn slot-owner)
+                        nil)
+                    (error () t))
+                  "initial finalization rejects a slot whose WAL was lost")
+           (check (null (wal-replication-slot-confirmed-flush-lsn slot))
+                  "lost-WAL finalization leaves the slot unconfirmed")
+           (setf (wal-replication-slot-wal-status slot) :reserved)
+           (wal-finalize-replication-slot-copy
+            "copy_slot" boundary-lsn slot-owner)
+           (wal-release-replication-slot-owner "copy_slot" slot-owner)
            ;; A restart reconstructs slot pins from durable metadata before
            ;; checkpoint recycling is allowed to run.
            (setf *wal-replication-slots* (make-hash-table :test #'equal))
@@ -1015,12 +1052,14 @@
          (publish-saw-active-pin nil)
          (ack-called nil)
          (ack-after-snapshot-release nil)
+         (finalizer-owner-held nil)
          (original-prepare
            (symbol-function 'prepare-xid-wraparound-for-statement))
          (original-wait (symbol-function 'condition-wait-with-timeout))
          (original-publish
            (symbol-function 'wal-publish-captured-replication-slot))
-         (original-ack (symbol-function 'wal-acknowledge-replication-slot)))
+         (original-finalize
+           (symbol-function 'wal-finalize-replication-slot-copy)))
     (setf (backend-database *backend*) "postgres"
           (gethash "postgres" (catalog-databases *catalog*)) database)
     (unwind-protect
@@ -1060,17 +1099,22 @@
                               (nth-value 1
                                          (gethash registration
                                                   *wal-snapshot-retention-pins*))))
-                   (make-wal-replication-slot
-                    :name name :consistent-lsn boundary-lsn
-                    :restart-lsn restart-lsn :active-owner active-owner)))
-           (setf (symbol-function 'wal-acknowledge-replication-slot)
-                 (lambda (name acknowledged-lsn)
-                   (declare (ignore name))
-                   (setf ack-called t
-                         ack-after-snapshot-release
-                         (and (= acknowledged-lsn 1000)
-                              (eq (backend-state *backend*) :idle)
-                              (zerop *active-snapshots*)))))
+                   (let ((slot
+                           (make-wal-replication-slot
+                            :name name :consistent-lsn boundary-lsn
+                            :restart-lsn restart-lsn :active-owner active-owner)))
+                     (setf (gethash name *wal-replication-slots*) slot)
+                     slot)))
+           (setf (symbol-function 'wal-finalize-replication-slot-copy)
+                 (lambda (name acknowledged-lsn owner)
+                   (let ((slot (gethash name *wal-replication-slots*)))
+                     (setf ack-called t
+                           finalizer-owner-held
+                           (eq owner (wal-replication-slot-active-owner slot))
+                           ack-after-snapshot-release
+                           (and (= acknowledged-lsn 1000)
+                                (eq (backend-state *backend*) :idle)
+                                (zerop *active-snapshots*))))))
            (with-exported-snapshot (snapshot start-lsn
                                              :slot-name "race_copy")
              (check (and (eq snapshot
@@ -1083,8 +1127,9 @@
                   "snapshot registration occurs while wraparound admission is locked")
            (check (and publish-saw-active-pin (not publish-held-gate))
                   "slot publication follows gate release while the snapshot pins WAL")
-           (check (and ack-called ack-after-snapshot-release)
-                  "initial-copy acknowledgment follows commit and snapshot release")
+           (check (and ack-called ack-after-snapshot-release
+                       finalizer-owner-held)
+                  "initial-copy finalization follows the copy and retains its slot owner")
            (check (and (eq (backend-state *backend*) :idle)
                        (zerop *active-snapshots*)
                        (zerop *schema-read-lock-count*)
@@ -1095,7 +1140,8 @@
             (symbol-function 'condition-wait-with-timeout) original-wait
             (symbol-function 'wal-publish-captured-replication-slot)
             original-publish
-            (symbol-function 'wal-acknowledge-replication-slot) original-ack)
+            (symbol-function 'wal-finalize-replication-slot-copy)
+            original-finalize)
       (when (not (eq (backend-state *backend*) :idle))
         (ignore-errors (abort-transaction))))))
 

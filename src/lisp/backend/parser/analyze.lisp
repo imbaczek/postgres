@@ -104,6 +104,60 @@ exist\" messages."
         (:int4 (eq (expr-type expr) :int4))
         (:int8 (member (expr-type expr) '(:int4 :int8))))))
 
+(defun analyze-function-expression (expr table)
+  "Resolve a supported scalar or administrative function call."
+  (let* ((name (second expr))
+         (args (mapcar (lambda (arg) (analyze-expr arg table)) (third expr))))
+    (cond
+      ((member name '("version" "pg_lisp_runtime" "pg_current_wal_lsn"
+                      "current_database" "current_schema"
+                      "current_catalog" "current_user" "session_user" "user")
+               :test #'string=)
+       (when args
+         (ereport "42883" "function ~a(~a) does not exist"
+                  name (call-signature args)))
+       (list :func name args
+             :type (if (string= name "pg_current_wal_lsn") :varchar :text)
+             :typmod -1))
+      ((string= name "pg_lisp_replica_identity_columns")
+       (unless (= (length args) 1)
+         (ereport "42883" "function ~a(~a) does not exist"
+                  name (call-signature args)))
+       (list :func name args :type :varchar :typmod -1))
+      ((member name '("length" "char_length" "character_length")
+               :test #'string=)
+       (unless (= (length args) 1)
+         (ereport "42883" "function ~a(~a) does not exist"
+                  name (call-signature args)))
+       (list :func name args :type :int4 :typmod -1))
+      ((string= name "pg_backend_pid")
+       (when args
+         (ereport "42883" "function ~a(~a) does not exist"
+                  name (call-signature args)))
+       (list :func name args :type :int4 :typmod -1))
+      ((string= name "pg_cancel_backend")
+       (unless (and (= (length args) 1)
+                    (admin-arg-coercible-p (first args) :int4))
+         (ereport "42883" "function ~a(~a) does not exist"
+                  name (call-signature args)))
+       (list :func name args :type :bool :typmod -1))
+      ((string= name "pg_terminate_backend")
+       (unless (and (<= 1 (length args) 2)
+                    (admin-arg-coercible-p (first args) :int4)
+                    (or (= (length args) 1)
+                        (admin-arg-coercible-p (second args) :int8)))
+         (ereport "42883" "function ~a(~a) does not exist"
+                  name (call-signature args)))
+       (list :func name args :type :bool :typmod -1))
+      ((member name '("pg_reload_conf" "pg_reload_code") :test #'string=)
+       (when args
+         (ereport "42883" "function ~a(~a) does not exist"
+                  name (call-signature args)))
+       (list :func name args :type :bool :typmod -1))
+      (t
+       (ereport "42883" "function ~a(~a) does not exist"
+                name (call-signature args))))))
+
 (defun analyze-expr (expr table)
   "Resolve column references and annotate expression types."
   (case (first expr)
@@ -169,51 +223,7 @@ exist\" messages."
     (:is-bool
      (list :is-bool (analyze-expr (second expr) table) (third expr)
            (fourth expr) :type :bool :typmod -1))
-    (:func
-     (let* ((name (second expr))
-            (args (mapcar (lambda (a) (analyze-expr a table)) (third expr))))
-       (cond
-         ((member name '("version" "pg_lisp_runtime"
-                         "current_database" "current_schema"
-                         "current_catalog" "current_user" "session_user" "user")
-                  :test #'string=)
-          (when args
-            (ereport "42883" "function ~a(~a) does not exist"
-                     name (call-signature args)))
-          (list :func name args :type :text :typmod -1))
-         ((member name '("length" "char_length" "character_length")
-                  :test #'string=)
-          (unless (= (length args) 1)
-            (ereport "42883" "function ~a(~a) does not exist"
-                     name (call-signature args)))
-          (list :func name args :type :int4 :typmod -1))
-         ((string= name "pg_backend_pid")
-          (when args
-            (ereport "42883" "function ~a(~a) does not exist"
-                     name (call-signature args)))
-          (list :func name args :type :int4 :typmod -1))
-         ((string= name "pg_cancel_backend")
-          (unless (and (= (length args) 1)
-                       (admin-arg-coercible-p (first args) :int4))
-            (ereport "42883" "function ~a(~a) does not exist"
-                     name (call-signature args)))
-          (list :func name args :type :bool :typmod -1))
-         ((string= name "pg_terminate_backend")
-          (unless (and (<= 1 (length args) 2)
-                       (admin-arg-coercible-p (first args) :int4)
-                       (or (= (length args) 1)
-                           (admin-arg-coercible-p (second args) :int8)))
-            (ereport "42883" "function ~a(~a) does not exist"
-                     name (call-signature args)))
-          (list :func name args :type :bool :typmod -1))
-         ((member name '("pg_reload_conf" "pg_reload_code") :test #'string=)
-          (when args
-            (ereport "42883" "function ~a(~a) does not exist"
-                     name (call-signature args)))
-          (list :func name args :type :bool :typmod -1))
-         (t
-          (ereport "42883" "function ~a(~a) does not exist"
-                   name (call-signature args))))))
+    (:func (analyze-function-expression expr table))
     (:count-star
      (ereport "42803" "aggregate functions are not allowed in this expression"))
     (t
@@ -535,6 +545,18 @@ exist\" messages."
     ((string= name "pg_lisp_runtime")
      (format nil "~a ~a" (lisp-implementation-type)
              (lisp-implementation-version)))
+    ;; xlogfuncs.c exposes pg_current_wal_lsn() as the current WAL insert
+    ;; location. This compact engine formats its durable WAL end the same way.
+    ((string= name "pg_current_wal_lsn")
+     (wal-format-lsn *wal-end-lsn*))
+    ((string= name "pg_lisp_replica_identity_columns")
+     (with-write-lock
+       (let* ((table-name (first args))
+              (table (and (stringp table-name) (lookup-table table-name))))
+         (unless table
+           (ereport "42P01" "relation \"~a\" does not exist" table-name))
+         (format nil "~{~d~^,~}"
+                 (sort (copy-list (logical-table-replica-identity table)) #'<)))))
     ((string= name "current_database")
      (backend-database *backend*))
     ((string= name "current_schema") "public")

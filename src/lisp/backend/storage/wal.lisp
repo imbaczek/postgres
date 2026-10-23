@@ -1622,6 +1622,22 @@ src/backend/access/transam/xlogreader.c."
              pending)
     restart-lsn))
 
+(defun wal-persist-replication-slot-ack-under-lock (slot acknowledged-lsn)
+  "Persist an already-validated slot acknowledgment while *WAL-LOCK* is held."
+  (let* ((pending (wal-slot-pending-after-ack slot acknowledged-lsn))
+         (restart-lsn (wal-slot-restart-for-ack acknowledged-lsn pending))
+         (candidate (copy-wal-replication-slot slot)))
+    (setf (wal-replication-slot-confirmed-flush-lsn candidate) acknowledged-lsn
+          (wal-replication-slot-restart-lsn candidate) restart-lsn
+          (wal-replication-slot-pending-xids candidate) pending)
+    ;; Persist first: checkpoint recycling cannot observe the new horizon until
+    ;; the durable slot file records the consumer's acknowledgment.
+    (wal-save-replication-slot candidate)
+    (setf (wal-replication-slot-confirmed-flush-lsn slot) acknowledged-lsn
+          (wal-replication-slot-restart-lsn slot) restart-lsn
+          (wal-replication-slot-pending-xids slot) pending)
+    slot))
+
 (defun wal-acknowledge-replication-slot
     (name acknowledged-lsn &optional expected-owner)
   "Durably advance a slot after a consumer completes a terminal WAL batch."
@@ -1646,35 +1662,47 @@ src/backend/access/transam/xlogreader.c."
         (ereport "55006" "replication slot \"~a\" is active" name))
       (when (eq (wal-replication-slot-wal-status slot) :lost)
         (ereport "55000" "replication slot \"~a\" has lost its WAL" name))
-      (when (and (null confirmed)
-                 (wal-replication-slot-active-owner slot))
-        (ereport "55000" "initial replication slot acknowledgment waits for snapshot copy"))
+      ;; Initial copy completion has a separate owner-checked finalizer below.
+      ;; Keeping it out of this general path prevents an unowned client from
+      ;; advancing a snapshot slot after its runtime owner was released.
+      (unless confirmed
+        (ereport "55000" "initial replication slot acknowledgment requires its owner"))
       (when (and confirmed (< acknowledged-lsn confirmed))
         (ereport "22023" "replication slot acknowledgment cannot move backwards"))
       (when (> acknowledged-lsn *wal-durable-lsn*)
         (ereport "22023" "replication slot acknowledgment is past durable WAL"))
       (when (= (or confirmed -1) acknowledged-lsn)
         (return-from wal-acknowledge-replication-slot slot))
-      (unless (or (and (null confirmed)
-                       (= acknowledged-lsn
-                          (wal-replication-slot-consistent-lsn slot)))
-                  (wal-slot-terminal-ack-p slot acknowledged-lsn))
+      (unless (wal-slot-terminal-ack-p slot acknowledged-lsn)
         (ereport "22023"
                  "replication slot acknowledgment must name a terminal WAL batch LSN"))
-      (let* ((pending (wal-slot-pending-after-ack slot acknowledged-lsn))
-             (restart-lsn (wal-slot-restart-for-ack acknowledged-lsn pending))
-             (candidate (copy-wal-replication-slot slot)))
-        (setf (wal-replication-slot-confirmed-flush-lsn candidate)
-              acknowledged-lsn
-              (wal-replication-slot-restart-lsn candidate) restart-lsn
-              (wal-replication-slot-pending-xids candidate) pending)
-        ;; Persist first: checkpoint recycling cannot observe the new horizon
-        ;; until the durable slot file records the consumer's acknowledgment.
-        (wal-save-replication-slot candidate)
-        (setf (wal-replication-slot-confirmed-flush-lsn slot) acknowledged-lsn
-              (wal-replication-slot-restart-lsn slot) restart-lsn
-              (wal-replication-slot-pending-xids slot) pending)
-        slot))))
+      (wal-persist-replication-slot-ack-under-lock slot acknowledged-lsn))))
+
+(defun wal-finalize-replication-slot-copy (name boundary-lsn expected-owner)
+  "Confirm an initial snapshot boundary for its exact active slot owner."
+  (unless (and (integerp boundary-lsn)
+               (<= 0 boundary-lsn #xFFFFFFFFFFFFFFFF))
+    (ereport "22023" "invalid initial replication slot boundary LSN"))
+  (sb-thread:with-mutex (*wal-lock*)
+    (wal-check-healthy)
+    (let ((slot (gethash name *wal-replication-slots*)))
+      (unless slot
+        (ereport "42704" "replication slot \"~a\" does not exist" name))
+      (unless (and expected-owner
+                   (eq (wal-replication-slot-active-owner slot) expected-owner))
+        (ereport "55006" "initial replication slot finalization requires its active owner"))
+      (when (eq (wal-replication-slot-wal-status slot) :lost)
+        (ereport "55000" "replication slot \"~a\" has lost its WAL" name))
+      (when (wal-replication-slot-confirmed-flush-lsn slot)
+        (ereport "55000" "replication slot initial copy is already finalized"))
+      (unless (= boundary-lsn (wal-replication-slot-consistent-lsn slot))
+        (ereport "22023" "initial replication acknowledgment must name the consistent LSN"))
+      (when (> boundary-lsn *wal-durable-lsn*)
+        (ereport "22023" "initial replication acknowledgment is past durable WAL"))
+      ;; A snapshot boundary is captured under the writer gate and need not be
+      ;; rediscovered by scanning a terminal record. Match SnapBuild's one-time
+      ;; consistent-point confirmation while retaining exact owner validation.
+      (wal-persist-replication-slot-ack-under-lock slot boundary-lsn))))
 
 (defun wal-format-lsn (lsn)
   (format nil "~X/~8,'0X" (ash lsn -32) (logand lsn #xFFFFFFFF)))

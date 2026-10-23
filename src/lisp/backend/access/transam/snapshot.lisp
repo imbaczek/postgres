@@ -16,7 +16,17 @@
   (releasing-p nil)
   (active-p nil))
 
+(defstruct exported-logical-snapshot
+  slot-name token database-oid snapshot registration schema-read-lock-held-p)
+
 (defvar *current-snapshot* nil)
+(defvar *exported-logical-snapshot-lock*
+  (sb-thread:make-mutex :name "pg exported logical snapshots"))
+(defvar *logical-slot-lifecycle-lock*
+  (sb-thread:make-mutex :name "pg logical slot lifecycle"))
+(defvar *logical-test-after-snapshot-token-lookup-hook* nil)
+(defvar *exported-logical-snapshots* (make-hash-table :test #'equal))
+(defvar *exported-logical-snapshot-counter* 0)
 
 ;;; Active snapshot xmin values bound the oldest tuple version a vacuum may
 ;;; remove. The count remains separate because XID wraparound waits for every

@@ -33,6 +33,28 @@
   "Return whether AST changes durable catalog state, including ANALYZE."
   (or (ddl-p ast) (eq (getf ast :type) :analyze)))
 
+(defun exec-truncate (stream ast)
+  ;; PostgreSQL's standard_ProcessUtility routes TRUNCATE through its dedicated
+  ;; relation truncation path. This subset marks every live tuple deleted in the
+  ;; current transaction so rollback preserves MVCC visibility; it deliberately
+  ;; avoids queuing one logical DELETE event per row.
+  (dolist (name (getf ast :tables))
+    (let ((table (resolve-table-or-error name)))
+      (with-registered-table (table rel xid :write)
+        (let ((columns (pg-class-columns table)))
+          (dolist (tid (collect-matching-tids table nil))
+            (check-for-interrupts)
+            (multiple-value-bind (deleted tuple block offnum status)
+                (heapam-delete-tid
+                 rel columns (car tid) (cdr tid) xid
+                 (backend-command-id *backend*))
+              (declare (ignore tuple block offnum))
+              (check-heapam-write-status status)
+              (unless deleted
+                (ereport "40001"
+                         "could not truncate relation after concurrent update"))))))))
+  (send-command-complete stream "TRUNCATE TABLE"))
+
 (defun note-query-error ()
   "Record that the current statement failed, matching PostgreSQL.
 
@@ -209,6 +231,10 @@ rolled back immediately."
        (ereport "42704" "unrecognized configuration parameter \"~a\""
                 name)))
     (send-command-complete stream "SET")))
+
+(defun exec-set-transaction-snapshot (stream ast)
+  (import-exported-logical-snapshot (getf ast :token))
+  (send-command-complete stream "SET"))
 
 (defun exec-set-transaction (characteristics)
   (let* ((backend *backend*)
@@ -919,7 +945,7 @@ before this removal horizon is captured."
   (let ((implicit (not (backend-explicit *backend*))))
     (when (and (backend-read-only *backend*)
                (member (getf ast :type)
-                       '(:insert :update :delete :create-table :drop-table
+                       '(:insert :update :delete :truncate :create-table :drop-table
                          :create-index :drop-index :alter-index :alter-table
                          :analyze)))
       (ereport "25006" "cannot execute write statement in a read-only transaction"))
@@ -936,6 +962,7 @@ before this removal horizon is captured."
                      (:insert (exec-insert stream ast))
                      (:update (exec-update stream ast))
                      (:delete (exec-delete stream ast))
+                     (:truncate (exec-truncate stream ast))
                      (:create-table (exec-create-table stream ast))
                      (:drop-table (exec-drop-table stream ast))
                      (:create-index (exec-create-index stream ast))
@@ -970,6 +997,8 @@ before this removal horizon is captured."
       (:checkpoint (command-checkpoint stream))
       (:vacuum (exec-vacuum stream ast))
       (:set (exec-set stream ast))
+      (:set-transaction-snapshot
+       (exec-set-transaction-snapshot stream ast))
       (:reset (exec-reset stream ast))
       (:show (exec-show stream ast))
       (otherwise (execute-in-transaction stream ast)))))

@@ -3,6 +3,9 @@
 (in-package #:pg)
 
 (defconstant +max-logical-transaction-bytes+ (* 64 1024 1024))
+(defconstant +max-logical-apply-headroom-bytes+ (* 1024 1024))
+(defconstant +max-logical-wal-transaction-bytes+
+  (+ +max-logical-transaction-bytes+ +max-logical-apply-headroom-bytes+))
 (defconstant +max-logical-read-transactions+ 128)
 (defconstant +max-logical-read-bytes+ (* 8 1024 1024))
 (defconstant +max-logical-read-scan-bytes+ (* 16 1024 1024))
@@ -11,7 +14,8 @@
 (defvar *wal-logical-slot-read-progress* nil)
 
 (defstruct logical-change
-  kind database-oid relation-oid relation-name columns old-values new-values)
+  kind database-oid relation-oid relation-name columns key-attnums
+  old-values new-values)
 
 (defstruct logical-transaction
   xid commit-lsn changes)
@@ -113,10 +117,44 @@
         for value across values
         do (logical-write-value buffer (getf column :type) value)))
 
+(defun logical-identity-index-usable-p (index table)
+  (let ((attnums (pg-index-columns index)))
+    (and (pg-index-valid-p index)
+         (pg-index-unique-p index)
+         attnums
+         (every (lambda (attnum)
+                  (<= 1 attnum (length (pg-class-columns table))))
+                attnums)
+         (or (pg-index-primary-p index)
+             (pg-index-nulls-not-distinct-p index)
+             (every (lambda (attnum)
+                      (pg-column-notnull
+                       (aref (pg-class-columns table) (1- attnum))))
+                    attnums)))))
+
+(defun logical-table-replica-identity (table)
+  "Choose the primary or otherwise unambiguous unique index for pgoutput K."
+  (let* ((indexes (table-indexes table))
+         (primary (find-if (lambda (index)
+                             (and (pg-index-primary-p index)
+                                  (logical-identity-index-usable-p index table)))
+                           indexes))
+         (index (or primary
+                    (find-if (lambda (candidate)
+                               (logical-identity-index-usable-p candidate table))
+                             indexes))))
+    (and index (copy-list (pg-index-columns index)))))
+
 (defun logical-encode-change (change)
   (let ((buffer (make-array 0 :element-type '(unsigned-byte 8)
                               :adjustable t :fill-pointer 0))
-        (columns (logical-change-columns change)))
+        (columns (logical-change-columns change))
+        (key-attnums (logical-change-key-attnums change)))
+    ;; Event format 1 adds immutable replica-identity attnums. The zero marker
+    ;; cannot collide with the legacy 1/2/3 kind tags, so existing WAL remains
+    ;; decodable without a physical WAL format bump.
+    (logical-write-u8 buffer 0)
+    (logical-write-u8 buffer 1)
     (logical-write-u8 buffer (logical-kind-code (logical-change-kind change)))
     (logical-write-u32 buffer (logical-change-database-oid change))
     (logical-write-u32 buffer (logical-change-relation-oid change))
@@ -128,6 +166,9 @@
       (logical-write-u8 buffer (logical-type-code (getf column :type)))
       (logical-write-u32 buffer (logand (getf column :typmod) #xFFFFFFFF))
       (logical-write-u8 buffer (if (getf column :notnull) 1 0)))
+    (logical-write-u16 buffer (length key-attnums))
+    (dolist (attnum key-attnums)
+      (logical-write-u16 buffer attnum))
     (dolist (values (list (logical-change-old-values change)
                           (logical-change-new-values change)))
       (logical-write-u8 buffer (if values 1 0))
@@ -208,7 +249,10 @@
 
 (defun logical-decode-change (bytes)
   (let* ((cursor (make-logical-cursor :bytes bytes))
-         (kind (logical-kind-from-code (logical-read-u8 cursor)))
+         (marker (logical-read-u8 cursor))
+         (event-version (if (zerop marker) (logical-read-u8 cursor) 0))
+         (kind (logical-kind-from-code
+                (if (zerop marker) (logical-read-u8 cursor) marker)))
          (database-oid (logical-read-u32 cursor))
          (relation-oid (logical-read-u32 cursor))
          (relation-name (logical-read-string-u32 cursor))
@@ -226,6 +270,13 @@
                                           (1 t)
                                           (otherwise
                                            (error "invalid logical column flags"))))))
+         (key-attnums (if (= event-version 1)
+                          (loop repeat (logical-read-u16 cursor)
+                                collect (logical-read-u16 cursor))
+                          (progn
+                            (unless (zerop event-version)
+                              (error "unsupported logical row-change event version"))
+                            nil)))
          (rows
            (loop repeat 2
                  collect (case (logical-read-u8 cursor)
@@ -237,10 +288,19 @@
                                       :relation-oid relation-oid
                                       :relation-name relation-name
                                       :columns columns
+                                      :key-attnums key-attnums
                                       :old-values (first rows)
                                       :new-values (second rows))))
     (unless (= (logical-cursor-offset cursor) (length bytes))
       (error "logical row-change payload has trailing bytes"))
+    (unless (and (<= (length key-attnums) (length columns))
+                 (= (length key-attnums) (length (remove-duplicates key-attnums)))
+                 (every (lambda (attnum)
+                          (find attnum columns :key (lambda (column)
+                                                      (getf column :attnum))
+                                               :test #'=))
+                        key-attnums))
+      (error "logical row change has invalid replica-identity columns"))
     (unless (case kind
               (:insert (and (null (logical-change-old-values change))
                             (logical-change-new-values change)))
@@ -265,18 +325,25 @@ executor, so capture the same operation before transaction commit."
                                  :type (pg-column-type column)
                                  :typmod (pg-column-typmod column)
                                  :notnull (pg-column-notnull column))))
+           (key-attnums (logical-table-replica-identity table))
            (change (make-logical-change
                     :kind kind
                     :database-oid (database-oid (current-database))
                     :relation-oid (pg-class-oid table)
                     :relation-name (copy-seq (pg-class-name table))
                     :columns columns
+                    :key-attnums key-attnums
                     :old-values (and old-values (copy-seq old-values))
                     :new-values (and new-values (copy-seq new-values))))
            (encoded (logical-encode-change change))
            (total (+ (backend-logical-change-bytes *backend*)
-                     (length encoded))))
-      (when (> total +max-logical-transaction-bytes+)
+                     (length encoded)))
+           (limit (+ +max-logical-transaction-bytes+
+                     (if (string= (or (backend-application-name *backend*) "")
+                                  "pg-lisp-subscribe-apply")
+                         +max-logical-apply-headroom-bytes+
+                         0))))
+      (when (> total limit)
         (ereport "54000"
                  "logical change stream transaction exceeds the 64 MiB limit"))
       (setf (backend-logical-changes *backend*)
@@ -320,8 +387,8 @@ executor, so capture the same operation before transaction commit."
       (error "logical row changes require a transaction ID"))
     (let* ((events encoded-changes)
            (event-bytes (reduce #'+ events :key #'length :initial-value 0)))
-      (when (> event-bytes +max-logical-transaction-bytes+)
-        (error "logical transaction exceeds its configured change limit"))
+      (when (> event-bytes +max-logical-wal-transaction-bytes+)
+        (error "logical transaction exceeds its WAL change limit"))
       (let* ((chunks (logical-split-encoded-changes events))
              (chunk-count (length chunks)))
         (loop for chunk in chunks
@@ -355,27 +422,45 @@ executor, so capture the same operation before transaction commit."
         *wal-recovery-logical-bytes* 0)
   (values))
 
+(defun wal-advance-logical-change-chunk
+    (record expected-xid expected-count expected-index change-bytes)
+  "Validate one chunk and return its updated transaction progress."
+  (multiple-value-bind (index count changes event-bytes)
+      (wal-decode-logical-change-chunk (wal-record-payload record))
+    (let ((xid (wal-record-xid record)))
+      (unless (plusp xid)
+        (error "logical row-change record has no transaction ID"))
+      (unless expected-count
+        (unless (and (null expected-xid)
+                     (zerop expected-index)
+                     (zerop change-bytes)
+                     (zerop index))
+          (error "logical WAL chunks do not start at index zero"))
+        (setf expected-xid xid
+              expected-count count))
+      (unless (and (= xid expected-xid)
+                   (= count expected-count)
+                   (= index expected-index))
+        (error "logical WAL chunks are out of order or change transaction"))
+      (let ((next-index (1+ expected-index))
+            (next-bytes (+ change-bytes event-bytes)))
+        (when (> next-bytes +max-logical-wal-transaction-bytes+)
+          (error "logical WAL transaction exceeds the 65 MiB limit"))
+        (values expected-xid expected-count next-index next-bytes changes)))))
+
 (defun wal-recovery-accept-logical-change-chunk (record)
   (unless *wal-recovery-group-active*
     (error "logical row changes appear outside a WAL batch"))
-  (multiple-value-bind (index count changes event-bytes)
-      (wal-decode-logical-change-chunk (wal-record-payload record))
-    (declare (ignore changes))
-    (unless (plusp (wal-record-xid record))
-      (error "logical row-change record has no transaction ID"))
-    (unless *wal-recovery-logical-chunk-count*
-      (unless (zerop index)
-        (error "logical WAL chunks do not start at index zero"))
-      (setf *wal-recovery-logical-xid* (wal-record-xid record)
-            *wal-recovery-logical-chunk-count* count))
-    (unless (and (= (wal-record-xid record) *wal-recovery-logical-xid*)
-                 (= count *wal-recovery-logical-chunk-count*)
-                 (= index *wal-recovery-logical-next-chunk*))
-      (error "logical WAL chunks are out of order or change transaction"))
-    (incf *wal-recovery-logical-next-chunk*)
-    (incf *wal-recovery-logical-bytes* event-bytes)
-    (when (> *wal-recovery-logical-bytes* +max-logical-transaction-bytes+)
-      (error "logical WAL transaction exceeds the 64 MiB limit")))
+  (multiple-value-bind (xid count next-index change-bytes)
+      (wal-advance-logical-change-chunk
+       record *wal-recovery-logical-xid*
+       *wal-recovery-logical-chunk-count*
+       *wal-recovery-logical-next-chunk*
+       *wal-recovery-logical-bytes*)
+    (setf *wal-recovery-logical-xid* xid
+          *wal-recovery-logical-chunk-count* count
+          *wal-recovery-logical-next-chunk* next-index
+          *wal-recovery-logical-bytes* change-bytes))
   (values))
 
 (defun wal-recovery-finish-logical-change-batch (xid)
@@ -404,25 +489,17 @@ executor, so capture the same operation before transaction commit."
 (defun wal-logical-reader-add-chunk (state record)
   (unless (logical-reader-state-batch-open-p state)
     (error "logical WAL changes appear outside a batch"))
-  (multiple-value-bind (index count changes event-bytes)
-      (wal-decode-logical-change-chunk (wal-record-payload record))
-    (unless (plusp (wal-record-xid record))
-      (error "logical row-change record has no transaction ID"))
-    (unless (logical-reader-state-chunk-count state)
-      (unless (zerop index)
-        (error "logical WAL chunks do not start at index zero"))
-      (setf (logical-reader-state-xid state) (wal-record-xid record)
-            (logical-reader-state-chunk-count state) count))
-    (unless (and (= (wal-record-xid record) (logical-reader-state-xid state))
-                 (= count (logical-reader-state-chunk-count state))
-                 (= index (logical-reader-state-next-chunk state)))
-      (error "logical WAL chunks are out of order or change transaction"))
-    (incf (logical-reader-state-next-chunk state))
-    (incf (logical-reader-state-change-bytes state) event-bytes)
-    (when (> (logical-reader-state-change-bytes state)
-             +max-logical-transaction-bytes+)
-      (error "logical WAL transaction exceeds the 64 MiB limit"))
-    (setf (logical-reader-state-changes state)
+  (multiple-value-bind (xid count next-index change-bytes changes)
+      (wal-advance-logical-change-chunk
+       record (logical-reader-state-xid state)
+       (logical-reader-state-chunk-count state)
+       (logical-reader-state-next-chunk state)
+       (logical-reader-state-change-bytes state))
+    (setf (logical-reader-state-xid state) xid
+          (logical-reader-state-chunk-count state) count
+          (logical-reader-state-next-chunk state) next-index
+          (logical-reader-state-change-bytes state) change-bytes
+          (logical-reader-state-changes state)
           (nconc (logical-reader-state-changes state) changes)))
   (values))
 
@@ -476,7 +553,7 @@ executor, so capture the same operation before transaction commit."
                progress-lsn)))
   (values transactions progress-lsn))
 
-(defun call-with-logical-replication-slot (name function)
+(defun call-with-logical-replication-slot (name function &key allow-initial-copy)
   "Hold an exclusive runtime claim across the reader's apply/ack callback.
 
 PostgreSQL's ReplicationSlotAcquire() keeps a slot from being dropped or read
@@ -492,7 +569,8 @@ session boundary until the wire-protocol replication command is added."
         (ereport "55000" "replication slot has no database binding"))
       (when (eq (wal-replication-slot-wal-status slot) :lost)
         (ereport "55000" "replication slot \"~a\" has lost its WAL" name))
-      (unless (wal-replication-slot-confirmed-flush-lsn slot)
+      (unless (or (wal-replication-slot-confirmed-flush-lsn slot)
+                  allow-initial-copy)
         (ereport "55000" "replication slot initial copy is not acknowledged"))
       (when (wal-replication-slot-active-owner slot)
         (ereport "55006" "replication slot \"~a\" is active" name))
@@ -504,9 +582,65 @@ session boundary until the wire-protocol replication command is added."
     (unwind-protect
          (let ((*wal-logical-slot-owner* owner)
                (*wal-logical-slot-read-progress*
-                 (wal-replication-slot-confirmed-flush-lsn slot)))
+                 (or (wal-replication-slot-confirmed-flush-lsn slot)
+                     (wal-replication-slot-consistent-lsn slot))))
            (funcall function slot))
       (wal-release-replication-slot-owner name owner))))
+
+(defun wal-logical-slot-validate-start-position (name requested-lsn)
+  "Validate the requested initial or resumed stream boundary for NAME."
+  (unless (and (integerp requested-lsn)
+               (<= 0 requested-lsn #xFFFFFFFFFFFFFFFF))
+    (ereport "22023" "invalid logical replication start LSN"))
+  (sb-thread:with-mutex (*wal-lock*)
+    (wal-check-healthy)
+    (let ((slot (gethash name *wal-replication-slots*)))
+      (unless slot
+        (ereport "42704" "replication slot \"~a\" does not exist" name))
+      (when (eq (wal-replication-slot-wal-status slot) :lost)
+        (ereport "55000" "replication slot \"~a\" has lost its WAL" name))
+      (unless (wal-replication-slot-database-oid slot)
+        (ereport "55000" "logical replication slot has no database binding"))
+      (if (null (wal-replication-slot-confirmed-flush-lsn slot))
+          (unless (= requested-lsn (wal-replication-slot-consistent-lsn slot))
+            (ereport "22023"
+                     "initial logical replication must start at the consistent LSN"))
+          (let ((confirmed
+                  (wal-replication-slot-confirmed-flush-lsn slot)))
+            (unless (<= confirmed requested-lsn *wal-durable-lsn*)
+              (ereport "22023"
+                       "logical replication start LSN is outside retained durable WAL"))
+            (when (and (> requested-lsn confirmed)
+                       (not (wal-slot-terminal-ack-p slot requested-lsn)))
+              (ereport "22023"
+                       "logical replication start LSN must be a terminal WAL batch")))))
+    (values)))
+
+(defun wal-logical-slot-accept-resume-position (name requested-lsn)
+  "Confirm a target's durable marker as the first status on a resumed stream."
+  (unless *wal-logical-slot-owner*
+    (ereport "55000" "logical replication slot is not owned by this reader"))
+  (sb-thread:with-mutex (*wal-lock*)
+    (wal-check-healthy)
+    (let* ((slot (gethash name *wal-replication-slots*))
+           (confirmed (and slot
+                           (wal-replication-slot-confirmed-flush-lsn slot))))
+      (unless slot
+        (ereport "42704" "replication slot \"~a\" does not exist" name))
+      (unless (eq (wal-replication-slot-active-owner slot)
+                  *wal-logical-slot-owner*)
+        (ereport "55006" "logical replication slot is not owned by this reader"))
+      (unless confirmed
+        (ereport "55000" "initial copy requires its consistent-point handshake"))
+      (unless (and (integerp requested-lsn)
+                   (<= confirmed requested-lsn *wal-durable-lsn*))
+        (ereport "22023" "resume status is outside confirmed durable WAL"))
+      (when (> requested-lsn confirmed)
+        (unless (wal-slot-terminal-ack-p slot requested-lsn)
+          (ereport "22023" "resume status must name a terminal WAL batch"))
+        (wal-persist-replication-slot-ack-under-lock slot requested-lsn))
+      (setf *wal-logical-slot-read-progress* requested-lsn)
+      requested-lsn)))
 
 (defun wal-logical-slot-read-transactions
     (name &key upto-lsn

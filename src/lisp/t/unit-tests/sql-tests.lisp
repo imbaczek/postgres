@@ -19,6 +19,22 @@
            "strict let returns body result for non-NULL bindings")
     (check (= evaluations 2) "strict let bindings run once each")))
 
+(defun test-sql-current-wal-lsn ()
+  (let* ((*wal-end-lsn* #x123456789)
+         (statement (first (parse-statements "SELECT pg_current_wal_lsn()")))
+         (target (first (getf statement :targets)))
+         (expression (analyze-expr (getf target :expr) nil)))
+    (check (and (eq (expr-type expression) :varchar)
+                (string= (eval-expr expression nil) "1/23456789"))
+           "pg_current_wal_lsn exposes a stable SQL commit barrier")))
+
+(defun test-truncate-parser ()
+  (let ((statement (first (parse-statements "TRUNCATE TABLE first_rows, second_rows"))))
+    (check (and (eq (getf statement :type) :truncate)
+                (equal (getf statement :tables)
+                       '("first_rows" "second_rows")))
+           "TRUNCATE parses an explicit table list")))
+
 (defun test-insert-index-catalog-snapshot-lock ()
   (let ((original-table-indexes (symbol-function 'table-indexes))
         (first-index (make-pg-index :relfilenode 91001))

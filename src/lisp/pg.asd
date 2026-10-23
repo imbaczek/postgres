@@ -57,7 +57,8 @@
                    (:file "namespace")))
      (:module "replication"
       :serial t
-      :components ((:file "logical")))
+      :components ((:file "logical")
+                   (:file "client")))
      (:module "commands"
       :serial t
       :components ((:file "vacuum")
@@ -82,4 +83,6 @@
       :serial t
       :components ((:file "dest")
                    (:file "control")
+                   (:file "../replication/protocol")
+                   (:file "../replication/worker")
                    (:file "postgres")))))))

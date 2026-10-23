@@ -126,11 +126,18 @@ CancelRequest, before the rest of that packet is read."
       (unless (conns-allowed-p)
         (ereport-fatal "57P03" "the database system is shutting down"))
       (let* ((params (parse-startup-params body))
+             (replication
+               (cdr (assoc "replication" params :test #'string=)))
              (app (or (cdr (assoc "application_name" params :test #'string=))
                       ""))
              (dbname (or (cdr (assoc "database" params :test #'string=))
                          "postgres")))
         (setf (backend-database *backend*) dbname)
+        (setf (backend-application-name *backend*) app)
+        (when replication
+          (unless (string-equal replication "database")
+            (ereport "0A000" "only database-scoped logical replication is supported"))
+          (setf (backend-replication-mode *backend*) :database))
         (with-catalog-lock
           (unless (gethash dbname (catalog-databases *catalog*))
             (get-database dbname)
@@ -382,6 +389,10 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
   (cond
     ;; Query dispatch needs its byte-only classifier first so an already-active
     ;; transaction can still send COMMIT/ROLLBACK while reload drains.
+    ((and (= type-byte (char-code #\Q))
+          (eq (backend-replication-mode *backend*) :database))
+     (handle-replication-query-frame stream type-byte length-bytes payload)
+     :continue)
     ((= type-byte (char-code #\Q))
      (handle-simple-query-frame stream type-byte length-bytes payload))
     ;; A captured active session may terminate during drain so its transaction

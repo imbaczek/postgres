@@ -7,6 +7,8 @@
   (pid 0)
   (cancel-key nil)
   (database "postgres")
+  (replication-mode nil)
+  (application-name nil)
   (xid nil)
   (state :idle)                 ; :idle | :in-progress | :aborted
   (explicit nil)
@@ -1019,6 +1021,158 @@ between snapshot capture and this durable publication."
      name boundary-lsn restart-lsn register active-owner active-xids
      database-oid)))
 
+(defun new-exported-logical-snapshot-token ()
+  (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
+    (incf *exported-logical-snapshot-counter*)
+    (format nil "pg_lisp_~X_~X"
+            (get-internal-real-time) *exported-logical-snapshot-counter*)))
+
+(defun register-exported-logical-snapshot (state)
+  (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
+    (let ((token (exported-logical-snapshot-token state)))
+      (when (gethash token *exported-logical-snapshots*)
+        (error "duplicate exported logical snapshot token"))
+      (setf (gethash token *exported-logical-snapshots*) state)))
+  state)
+
+(defun remove-exported-logical-snapshot-token (token)
+  (let ((state nil))
+    (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
+      (setf state (gethash token *exported-logical-snapshots*))
+      (remhash token *exported-logical-snapshots*))
+    (when state
+      (when (snapshot-registration-active-p
+             (exported-logical-snapshot-registration state))
+        (release-snapshot-registration
+         (exported-logical-snapshot-registration state)))
+      (when (exported-logical-snapshot-schema-read-lock-held-p state)
+        (release-schema-read-lock)
+        (setf (exported-logical-snapshot-schema-read-lock-held-p state) nil)))
+    state))
+
+(defun release-exported-logical-snapshot-for-slot (slot-name)
+  (let ((token nil))
+    (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
+      (maphash (lambda (candidate state)
+                 (when (string= slot-name
+                                (exported-logical-snapshot-slot-name state))
+                   (setf token candidate)))
+               *exported-logical-snapshots*))
+    (when token (remove-exported-logical-snapshot-token token))))
+
+(defun create-exported-logical-snapshot-slot (slot-name)
+  "Create an unconfirmed logical slot and return its copy boundary and token.
+
+Unlike the in-process WITH-EXPORTED-SNAPSHOT helper, this keeps the snapshot
+registration and schema read lease in a process registry until the wire
+copy-complete handshake. This follows snapbuild.c's exported consistent
+snapshot lifecycle."
+  (unless *backend*
+    (ereport "55000" "logical snapshot export requires an active backend"))
+  (unless (eq (backend-state *backend*) :idle)
+    (ereport "25001" "cannot export a replication snapshot inside a transaction"))
+  (prepare-xid-wraparound-for-statement *backend*)
+  (let* ((backend *backend*)
+         (registration (make-snapshot-registration))
+         (owner (gensym "LOGICAL-SNAPSHOT-SLOT-"))
+         (database-id
+           (database-oid (get-database (backend-database backend))))
+         (schema-lock-held nil)
+         (published nil)
+         (registered nil)
+         (snapshot nil)
+         (boundary-lsn nil)
+         (token (new-exported-logical-snapshot-token)))
+    (unwind-protect
+         (progn
+           (acquire-schema-read-lock
+            (lambda () (setf schema-lock-held t)))
+           (multiple-value-bind (captured captured-boundary restart-lsn)
+               (wait-for-xid-wraparound
+                backend
+                (lambda ()
+                  (with-write-lock
+                    (wal-capture-snapshot-boundary-under-writer-lock
+                     (backend-command-id backend) registration))))
+             (setf snapshot captured
+                   boundary-lsn captured-boundary)
+             ;; Match SnapBuild's ordering: publish the slot after the writer
+             ;; gate opens while the registered snapshot still pins WAL.
+             (wal-publish-captured-replication-slot
+              slot-name captured-boundary restart-lsn registration owner
+              (snapshot-xip captured) database-id)
+             (setf published t)
+             (register-exported-logical-snapshot
+              (make-exported-logical-snapshot
+               :slot-name slot-name :token token :database-oid database-id
+               :snapshot snapshot :registration registration
+               :schema-read-lock-held-p schema-lock-held))
+             (setf registered t schema-lock-held nil)
+             ;; As with ExportSnapshot, release slot runtime ownership before
+             ;; the token is returned so the importer can connect independently.
+             (wal-release-replication-slot-owner slot-name owner)
+             (setf owner nil)
+             (values boundary-lsn token)))
+      (when owner
+        (ignore-errors (wal-release-replication-slot-owner slot-name owner)))
+      (when (and published (not registered))
+        (ignore-errors (wal-drop-replication-slot slot-name)))
+      (unless registered
+        (when (snapshot-registration-active-p registration)
+          (ignore-errors (release-snapshot-registration registration)))
+        (when schema-lock-held
+          (ignore-errors (release-schema-read-lock)))))))
+
+(defun import-exported-logical-snapshot (token)
+  "Import TOKEN into the current read-only RR transaction as an independent pin."
+  (unless (and *backend*
+               (eq (backend-state *backend*) :in-progress)
+               (backend-explicit *backend*)
+               (eq (backend-isolation-level *backend*) :repeatable-read)
+               (backend-read-only *backend*)
+               (null (backend-xid *backend*))
+               (null (backend-transaction-snapshot *backend*))
+               (not (backend-first-snapshot-set *backend*)))
+    (ereport "25001"
+             "SET TRANSACTION SNAPSHOT requires an unused read-only REPEATABLE READ transaction"))
+  (let ((registration nil)
+        (installed nil)
+        (database-id (database-oid (current-database))))
+    (unwind-protect
+         ;; Keep the source lease lookup and this transaction's independent pin
+         ;; in one registry critical section. Copy completion can remove the
+         ;; exported pin only after the importer has published its own pin.
+         (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
+           (let ((state (gethash token *exported-logical-snapshots*)))
+             (unless (and state
+                          (snapshot-registration-active-p
+                           (exported-logical-snapshot-registration state)))
+               (ereport "22023" "exported logical snapshot token is invalid or expired"))
+             (unless (= database-id
+                        (exported-logical-snapshot-database-oid state))
+               (ereport "22023" "exported logical snapshot belongs to another database"))
+             (when *logical-test-after-snapshot-token-lookup-hook*
+               (funcall *logical-test-after-snapshot-token-lookup-hook* state))
+             (let* ((source-snapshot (exported-logical-snapshot-snapshot state))
+                    (snapshot
+                      (make-snapshot-struct
+                       :xmin (snapshot-xmin source-snapshot)
+                       :xmax (snapshot-xmax source-snapshot)
+                       :xip (copy-list (snapshot-xip source-snapshot))
+                       :curcid (snapshot-curcid source-snapshot))))
+               (setf registration (make-snapshot-registration))
+               (sb-sys:without-interrupts
+                 (sb-thread:with-mutex (*xid-lock*)
+                   (register-active-snapshot snapshot registration))
+                 (setf (backend-transaction-snapshot *backend*) snapshot
+                       (backend-transaction-snapshot-registration *backend*)
+                       registration
+                       (backend-first-snapshot-set *backend*) t
+                       (backend-snapshot *backend*) snapshot
+                       installed t)))))
+      (when (and registration (not installed))
+        (release-snapshot-registration registration)))))
+
 (defun ensure-exported-snapshot-scope-can-end (backend)
   (when (and (eq backend *exported-snapshot-backend*)
              (not *exported-snapshot-cleanup*))
@@ -1106,18 +1260,24 @@ VACUUM FULL wait for this scope."
                              (funcall function snapshot boundary-lsn)
                            (setf body-completed t)))))
                 (unwind-protect
-                     (when started
-                       (let ((*exported-snapshot-cleanup* t))
-                         (if (and body-completed
-                                  (not (eq (backend-state backend) :aborted)))
-                             (handler-case
-                                 (progn
-                                   (commit-transaction)
-                                   (setf initial-copy-committed-p t))
-                               (error (condition)
-                                 (ignore-errors (abort-transaction))
-                                 (error condition)))
-                             (abort-transaction))))
+                     (unwind-protect
+                          (when started
+                            (let ((*exported-snapshot-cleanup* t))
+                              (if (and body-completed
+                                       (not (eq (backend-state backend) :aborted)))
+                                  (handler-case
+                                      (progn
+                                        (commit-transaction)
+                                        (setf initial-copy-committed-p t))
+                                    (error (condition)
+                                      (ignore-errors (abort-transaction))
+                                      (error condition)))
+                                  (abort-transaction))))
+                       (when initial-copy-committed-p
+                         ;; SnapBuild confirms its consistent point after the
+                         ;; copy consumer ends, while its exact slot owner is held.
+                         (wal-finalize-replication-slot-copy
+                          slot-name boundary-lsn slot-owner)))
                   ;; Capture can fail after registering but before ownership moves
                   ;; into BACKEND. Release that token here; release is idempotent if
                   ;; commit or abort already retired it.
@@ -1125,11 +1285,7 @@ VACUUM FULL wait for this scope."
                        (when (snapshot-registration-active-p registration)
                          (release-snapshot-registration registration))
                     (sb-sys:without-interrupts
-                      (wal-release-replication-slot-owner slot-name slot-owner))))
-                (when initial-copy-committed-p
-                  ;; Like SnapBuild's consistent point, initial-copy completion is
-                  ;; an acknowledgment only after the exported snapshot is released.
-                  (wal-acknowledge-replication-slot slot-name boundary-lsn)))))))))
+                      (wal-release-replication-slot-owner slot-name slot-owner)))))))))))
 
 (defmacro with-exported-snapshot
     ((snapshot-var start-lsn-var &key slot-name) &body body)

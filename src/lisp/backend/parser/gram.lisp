@@ -98,6 +98,7 @@
     ((match-kw p "insert") (parse-insert p))
     ((match-kw p "update") (parse-update p))
     ((match-kw p "delete") (parse-delete p))
+    ((match-kw p "truncate") (parse-truncate p))
     ((match-kw p "vacuum") (parse-vacuum p))
     ((match-kw p "analyze") (parse-analyze p))
     ((match-kw p "create") (parse-create p))
@@ -319,6 +320,12 @@
     (when (match-kw p "where")
       (setf where (parse-expr p)))
     (list :type :delete :table table :where where)))
+
+(defun parse-truncate (p)
+  (match-kw p "table")
+  (list :type :truncate
+        :tables (loop collect (strip-schema (pident p))
+                      while (match-punct p #\,))))
 
 ;;; ---- CREATE / DROP / ALTER ----
 
@@ -658,11 +665,14 @@
       ((match-kw p "transaction")
        (when session-p
          (ereport "0A000" "session transaction characteristics are not supported"))
-       (let ((characteristics (parse-transaction-characteristics p)))
-         (unless characteristics
-           (syntax-error p "expected transaction characteristic"))
-         (list :type :set :transaction-options-p t
-               :transaction-options characteristics)))
+       (if (match-kw p "snapshot")
+           (list :type :set-transaction-snapshot
+                 :token (parse-set-value p))
+           (let ((characteristics (parse-transaction-characteristics p)))
+             (unless characteristics
+               (syntax-error p "expected transaction characteristic"))
+             (list :type :set :transaction-options-p t
+                   :transaction-options characteristics))))
       ((match-kw p "time")
        (expect-kw p "zone")
        (list :type :set :name "timezone" :value (parse-set-value p)))
