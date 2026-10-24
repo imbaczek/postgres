@@ -363,24 +363,22 @@
          (row (first rows)))
     (unless (and row (stringp (aref row 0)))
       (error "replication bootstrap query returned no schema description"))
-    (let ((data (logical-read-data-string (aref row 0))))
-      (unless (and (integerp (getf data :database-oid))
-                   (listp (getf data :tables))
-                   (listp (getf data :indexes))
-                   (listp (getf data :sequences)))
-        (error "replication bootstrap schema description is malformed"))
-      data)))
+    ;; The projection validates all raw entries and owners before filtering,
+    ;; so malformed metadata cannot reach target schema creation.
+    (logical-replication-bootstrap-view
+     (logical-read-data-string (aref row 0)))))
 
 (defun logical-find-bootstrap-object (name objects key-function)
   (find name objects :key key-function :test #'string=))
 
-(defun logical-bootstrap-create-schema (target bootstrap)
+(defun logical-bootstrap-create-schema (target bootstrap-view)
+  "Apply schema definitions from the validated subscriber-visible bootstrap."
   ;; Sequences precede tables because supported DEFAULT expressions call nextval.
-  (dolist (entry (getf bootstrap :sequences))
+  (dolist (entry (getf bootstrap-view :sequences))
     (logical-target-query target (getf entry :definition)))
-  (dolist (entry (getf bootstrap :tables))
+  (dolist (entry (getf bootstrap-view :tables))
     (logical-target-query target (getf entry :sql)))
-  (dolist (entry (getf bootstrap :indexes))
+  (dolist (entry (getf bootstrap-view :indexes))
     (logical-target-query target (getf entry :sql))))
 
 (defun logical-bootstrap-set-sequence-state (target bootstrap)

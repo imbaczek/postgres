@@ -121,6 +121,7 @@
   (test-logical-catalog-event-codec-and-parser)
   (test-logical-catalog-terminal-validation)
   (test-logical-replication-bootstrap-definitions)
+  (test-logical-bootstrap-private-index-projection)
   (test-logical-bootstrap-constraint-order-stable)
   (test-logical-schema-contract-strictness)
   (test-logical-private-metadata-ddl-targets)

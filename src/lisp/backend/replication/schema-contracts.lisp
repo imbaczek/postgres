@@ -5,32 +5,90 @@
 (defparameter +logical-private-schema-table-names+
   '("pg_lisp_subscription_progress" "pg_lisp_subscription_config"))
 
-(defun logical-schema-contract-object-list (bootstrap key)
-  (remove-if
-   (lambda (object)
-     (and (eq key :tables)
-          (member (getf object :name) +logical-private-schema-table-names+
-                  :test #'string=)))
-   (mapcar
-    (lambda (object)
-      (if (eq key :sequences)
-          (list :name (getf (getf object :state) :name)
-                :definition (getf object :definition))
-          (list :name (getf object :name) :sql (getf object :sql))))
-    (getf bootstrap key))))
+(defun logical-private-metadata-table-name-p (name)
+  (and (stringp name)
+       (member name +logical-private-schema-table-names+ :test #'string=)))
 
-(defun logical-bootstrap-schema-contract (bootstrap)
+(defun logical-plist-has-exact-keys-p (plist keys)
+  (and (listp plist)
+       (integerp (list-length plist))
+       (evenp (length plist))
+       (= (length plist) (* 2 (length keys)))
+       (let ((found (loop for (key value) on plist by #'cddr collect key)))
+         (and (= (length found) (length (remove-duplicates found :test #'eq)))
+              (every (lambda (key) (member key keys :test #'eq)) found)
+              (every (lambda (key) (member key found :test #'eq)) keys)))))
+
+(defun logical-bootstrap-table-entry-valid-p (entry)
+  (and (logical-plist-has-exact-keys-p entry '(:name :sql))
+       (stringp (getf entry :name))
+       (stringp (getf entry :sql))))
+
+(defun logical-bootstrap-index-entry-valid-p (entry table-names)
+  (and (logical-plist-has-exact-keys-p
+        entry '(:table-name :name :sql))
+       (stringp (getf entry :table-name))
+       (stringp (getf entry :name))
+       (stringp (getf entry :sql))
+       (member (getf entry :table-name) table-names :test #'string=)))
+
+(defun logical-bootstrap-object-names-unique-p (objects)
+  (let ((names (mapcar (lambda (object) (getf object :name)) objects)))
+    (= (length names) (length (remove-duplicates names :test #'string=)))))
+
+(defun logical-replication-bootstrap-view (bootstrap)
+  "Validate publisher metadata, then omit subscriber-private tables and indexes.
+The trusted catalog emitter derives each index owner and SQL from the same table
+object, matching PostgreSQL's pg_index.indrelid ownership field. Older
+bootstrap payloads without index owners are rejected before schema changes."
+  (let ((tables (getf bootstrap :tables))
+        (indexes (getf bootstrap :indexes))
+        (sequences (getf bootstrap :sequences)))
+    (unless (and (integerp (getf bootstrap :database-oid))
+                 (listp tables) (integerp (list-length tables))
+                 (listp indexes) (integerp (list-length indexes))
+                 (listp sequences) (integerp (list-length sequences))
+                 (every #'logical-bootstrap-table-entry-valid-p tables)
+                 (logical-bootstrap-object-names-unique-p tables))
+      (error "replication bootstrap schema description is malformed"))
+    (let ((table-names (mapcar (lambda (entry) (getf entry :name)) tables)))
+      (unless (and (every (lambda (entry)
+                            (logical-bootstrap-index-entry-valid-p
+                             entry table-names))
+                          indexes)
+                   (logical-bootstrap-object-names-unique-p indexes))
+        (error "replication bootstrap index ownership metadata is malformed"))
+      (list :database-oid (getf bootstrap :database-oid)
+            :tables (remove-if
+                     (lambda (entry)
+                       (logical-private-metadata-table-name-p
+                        (getf entry :name)))
+                     tables)
+            :indexes (remove-if
+                      (lambda (entry)
+                        (logical-private-metadata-table-name-p
+                         (getf entry :table-name)))
+                      indexes)
+            :sequences sequences))))
+
+(defun logical-schema-contract-object-list (bootstrap-view key)
+  (mapcar
+   (lambda (object)
+     (if (eq key :sequences)
+         (list :name (getf (getf object :state) :name)
+               :definition (getf object :definition))
+         (list :name (getf object :name) :sql (getf object :sql))))
+   (getf bootstrap-view key)))
+
+(defun logical-bootstrap-schema-contract (bootstrap-view)
   "Return definitions only; sequence values are deliberately not schema."
-  (list :tables (logical-schema-contract-object-list bootstrap :tables)
-        :indexes (logical-schema-contract-object-list bootstrap :indexes)
-        :sequences (logical-schema-contract-object-list bootstrap :sequences)))
+  (list :tables (logical-schema-contract-object-list bootstrap-view :tables)
+        :indexes (logical-schema-contract-object-list bootstrap-view :indexes)
+        :sequences (logical-schema-contract-object-list bootstrap-view :sequences)))
 
 ;; The private event envelope lets DDL use the normal executor, unlike PostgreSQL's
 ;; pgoutput tuple stream. Protect subscriber-owned relations before the custom
 ;; event reaches utility.c:ExecDropStmt's equivalent apply path.
-(defun logical-private-metadata-table-name-p (name)
-  (and (stringp name)
-       (member name +logical-private-schema-table-names+ :test #'string=)))
 
 (defun logical-private-metadata-resolved-table-name (database name)
   ;; PostgreSQL resolves RangeVar names in catalog/namespace.c before
@@ -98,22 +156,13 @@
 
 (defun logical-current-schema-contract-under-write-lock ()
   (logical-bootstrap-schema-contract
-   (catalog-replication-bootstrap-data (current-database))))
+   (logical-replication-bootstrap-view
+    (catalog-replication-bootstrap-data (current-database)))))
 
 (defun logical-current-schema-contract ()
   "Capture the supported catalog shape atomically, excluding sequence state."
   (with-write-lock
     (logical-current-schema-contract-under-write-lock)))
-
-(defun logical-plist-has-exact-keys-p (plist keys)
-  (and (listp plist)
-       (integerp (list-length plist))
-       (evenp (length plist))
-       (= (length plist) (* 2 (length keys)))
-       (let ((found (loop for (key value) on plist by #'cddr collect key)))
-         (and (= (length found) (length (remove-duplicates found :test #'eq)))
-              (every (lambda (key) (member key keys :test #'eq)) found)
-              (every (lambda (key) (member key found :test #'eq)) keys)))))
 
 (defun logical-schema-object-list-valid-p (objects definition-key)
   (and (listp objects)

@@ -271,4 +271,33 @@ assert_rejected_ddl logical_qualified_alter_config pg_lisp_subscription_config \
 assert_rejected_ddl logical_drop_config pg_lisp_subscription_config \
     "DROP TABLE pg_lisp_subscription_config"
 
+# Initial schema bootstrap must also respect index ownership. PostgreSQL stores
+# that owner in pg_index.indrelid; pg_dump's schema phase recreates indexes only
+# after their owning tables exist. These publisher tables intentionally use the
+# subscriber's private names but remain outside the subscriber's metadata.
+sql "$SOURCE_PORT" \
+    "CREATE TABLE pg_lisp_subscription_progress (source_slot varchar PRIMARY KEY, source_lsn varchar, state varchar NOT NULL, snapshot_token varchar); CREATE INDEX publisher_progress_source_lsn_idx ON pg_lisp_subscription_progress (source_lsn); CREATE TABLE pg_lisp_subscription_config (source_slot varchar PRIMARY KEY, source_host varchar NOT NULL, source_port integer NOT NULL, source_database varchar NOT NULL, table_allowlist varchar NOT NULL); CREATE INDEX publisher_config_source_port_idx ON pg_lisp_subscription_config (source_port); CREATE INDEX logical_guard_rows_label_idx ON logical_guard_rows (label)" \
+    >/dev/null
+start_worker logical_bootstrap_private_indexes \
+    "$TMP/bootstrap-private-indexes.log"
+
+if ! sql "$TARGET_PORT" \
+        "CREATE INDEX publisher_progress_source_lsn_idx ON pg_lisp_subscription_progress (source_lsn)" \
+        >/dev/null 2>&1; then
+    echo "logical-private-metadata-ddl: bootstrap installed a publisher index on subscriber progress" >&2
+    exit 1
+fi
+if ! sql "$TARGET_PORT" \
+        "CREATE INDEX publisher_config_source_port_idx ON pg_lisp_subscription_config (source_port)" \
+        >/dev/null 2>&1; then
+    echo "logical-private-metadata-ddl: bootstrap installed a publisher index on subscriber config" >&2
+    exit 1
+fi
+if sql "$TARGET_PORT" \
+        "CREATE INDEX logical_guard_rows_label_idx ON logical_guard_rows (label)" \
+        >/dev/null 2>&1; then
+    echo "logical-private-metadata-ddl: bootstrap omitted an ordinary standalone index" >&2
+    exit 1
+fi
+
 echo "logical-private-metadata-ddl: PASS"

@@ -884,7 +884,8 @@ from advancing the shared WAL generation between a failed save and rollback."
 
 Only table columns backed by the implemented int4/int8/varchar types, btree
 indexes, and integer sequences are serialized, matching catalog SQL helpers and
-the feature boundary in pg_dump.c's schema/data phases."
+the feature boundary in pg_dump.c's schema/data phases. Standalone index entries
+carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
   (let ((tables (sort (loop for table being the hash-values of
                                                             (database-tables db)
                             collect table)
@@ -911,10 +912,14 @@ the feature boundary in pg_dump.c's schema/data phases."
                                                 #'string<
                                                 :key #'pg-index-name)
                              unless (pg-index-constraint-owned-p index)
-                               collect (list :name (pg-index-name index)
-                                             :sql
-                                             (catalog-standalone-index-definition-sql
-                                              index table))))
+                               collect
+                             ;; pg_index.indrelid records index ownership;
+                             ;; preserve that relation before schema filtering.
+                               (list :table-name (pg-class-name table)
+                                     :name (pg-index-name index)
+                                     :sql
+                                     (catalog-standalone-index-definition-sql
+                                      index table))))
           :sequences sequences)))
 
 (defun publication-definition-data (publication db)

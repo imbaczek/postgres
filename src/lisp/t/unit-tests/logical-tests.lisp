@@ -300,6 +300,7 @@
                   (not (search "bootstrap_rows_amount_idx" table-sql)))
              "bootstrap table definition retains defaults and only constraint indexes")
       (check (and (string= (getf index-entry :name) "bootstrap_rows_amount_idx")
+                  (string= (getf index-entry :table-name) "bootstrap_rows")
                   (search "CREATE UNIQUE INDEX IF NOT EXISTS" (getf index-entry :sql))
                   (search "NULLS NOT DISTINCT" (getf index-entry :sql)))
              "bootstrap emits standalone btree indexes as separate SQL")
@@ -318,6 +319,113 @@
                (first (getf captured-bootstrap :sequences))))
         (check (= (getf (getf captured-sequence :state) :last) -9)
                "bootstrap uses the sequence state captured with the slot boundary")))))
+
+(defun test-logical-bootstrap-private-index-projection ()
+  (let* ((progress-name "pg_lisp_subscription_progress")
+         (config-name "pg_lisp_subscription_config")
+         (ordinary-name "logical_guard_rows")
+         (progress-source-index "publisher_progress_source_lsn_idx")
+         (config-source-index "publisher_config_source_port_idx")
+         (ordinary-index "logical_guard_rows_label_idx")
+         (ordinary-lookalike-index
+           "pg_lisp_subscription_progress_label_idx")
+         (source
+           (list :database-oid 7
+                 :tables
+                 (list (list :name progress-name
+                             :sql "CREATE TABLE pg_lisp_subscription_progress (source_lsn varchar)")
+                       (list :name config-name
+                             :sql "CREATE TABLE pg_lisp_subscription_config (source_port integer)")
+                       (list :name ordinary-name
+                             :sql "CREATE TABLE logical_guard_rows (label varchar)"))
+                 :indexes
+                 (list (list :table-name progress-name
+                             :name progress-source-index
+                             :sql "CREATE INDEX publisher_progress_source_lsn_idx ON pg_lisp_subscription_progress (source_lsn)")
+                       (list :table-name config-name
+                             :name config-source-index
+                             :sql "CREATE INDEX publisher_config_source_port_idx ON pg_lisp_subscription_config (source_port)")
+                       (list :table-name ordinary-name
+                             :name ordinary-index
+                             :sql "CREATE INDEX logical_guard_rows_label_idx ON logical_guard_rows (label)")
+                       (list :table-name ordinary-name
+                             :name ordinary-lookalike-index
+                             :sql "CREATE INDEX pg_lisp_subscription_progress_label_idx ON logical_guard_rows (label)"))
+                 :sequences nil))
+         (target
+           (list :database-oid 7
+                 :tables
+                 (list (list :name progress-name
+                             :sql "CREATE TABLE pg_lisp_subscription_progress (source_slot varchar PRIMARY KEY, source_lsn varchar, state varchar NOT NULL, snapshot_token varchar)")
+                       (list :name config-name
+                             :sql "CREATE TABLE pg_lisp_subscription_config (source_slot varchar PRIMARY KEY, source_host varchar NOT NULL, source_port integer NOT NULL, source_database varchar NOT NULL, table_allowlist varchar NOT NULL)")
+                       (list :name ordinary-name
+                             :sql "CREATE TABLE logical_guard_rows (label varchar)"))
+                 :indexes
+                 (list (list :table-name progress-name
+                             :name "pg_lisp_subscription_progress_pkey"
+                             :sql "CREATE UNIQUE INDEX pg_lisp_subscription_progress_pkey ON pg_lisp_subscription_progress (source_slot)")
+                       (list :table-name config-name
+                             :name "pg_lisp_subscription_config_pkey"
+                             :sql "CREATE UNIQUE INDEX pg_lisp_subscription_config_pkey ON pg_lisp_subscription_config (source_slot)")
+                       (list :table-name ordinary-name
+                             :name ordinary-index
+                             :sql "CREATE INDEX logical_guard_rows_label_idx ON logical_guard_rows (label)")
+                       (list :table-name ordinary-name
+                             :name ordinary-lookalike-index
+                             :sql "CREATE INDEX pg_lisp_subscription_progress_label_idx ON logical_guard_rows (label)"))
+                 :sequences nil))
+         (source-view (logical-replication-bootstrap-view source))
+         (target-view (logical-replication-bootstrap-view target))
+         (source-contract (logical-bootstrap-schema-contract source-view))
+         (target-contract (logical-bootstrap-schema-contract target-view)))
+    (check (equal (mapcar (lambda (entry) (getf entry :name))
+                          (getf source-view :tables))
+                  (list ordinary-name))
+           "bootstrap projection omits both subscriber-private tables")
+    (check (equal (mapcar (lambda (entry) (getf entry :name))
+                          (getf source-view :indexes))
+                  (list ordinary-index ordinary-lookalike-index))
+           "bootstrap projection filters private indexes by owning table")
+    (check (and (equal source-contract target-contract)
+                (logical-schema-contract-subset-compatible-p
+                 source-contract target-contract))
+           "private table and index differences are outside the schema contract")
+    (let ((private-source (copy-tree source))
+          (private-target (copy-tree target)))
+      (setf (getf private-source :tables)
+            (subseq (getf private-source :tables) 0 2)
+            (getf private-source :indexes)
+            (subseq (getf private-source :indexes) 0 2)
+            (getf private-target :tables)
+            (subseq (getf private-target :tables) 0 2)
+            (getf private-target :indexes)
+            (subseq (getf private-target :indexes) 0 2))
+      (check (handler-case
+                 (progn
+                   (logical-validate-existing-replication-bootstrap
+                    nil nil
+                    (logical-replication-bootstrap-view private-source)
+                    (logical-replication-bootstrap-view private-target)
+                    (make-logical-subscription-options))
+                   t)
+               (error () nil))
+             "private table schema differences bypass copy-schema validation"))
+    (dolist (malformed-index
+             (list '(:name "missing_owner_idx" :sql "CREATE INDEX missing_owner_idx")
+                   '(:table-name 7 :name "non_string_owner_idx"
+                     :sql "CREATE INDEX non_string_owner_idx")
+                   '(:table-name "missing_table" :name "unknown_owner_idx"
+                     :sql "CREATE INDEX unknown_owner_idx")
+                   '(:table-name "logical_guard_rows" :name "duplicate_owner_idx"
+                     :sql "CREATE INDEX duplicate_owner_idx"
+                     :table-name "pg_lisp_subscription_progress")))
+      (let ((malformed (copy-tree source)))
+        (setf (getf malformed :indexes) (list malformed-index))
+        (check (handler-case
+                   (progn (logical-replication-bootstrap-view malformed) nil)
+                 (error () t))
+               "malformed or unknown bootstrap index owners are rejected")))))
 
 (defun test-logical-bootstrap-constraint-order-stable ()
   (let* ((*catalog* (make-catalog))
