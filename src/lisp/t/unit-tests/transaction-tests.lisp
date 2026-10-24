@@ -253,6 +253,68 @@
                 (null (backend-transaction-snapshot-registration backend)))
            "rollback releases the long-lived snapshot registration")))
 
+(defun test-wal-enabled-repeatable-read-commit-releases-unpinned-snapshot ()
+  (let* ((test-pgdata (merge-pathnames "rr-commit-snapshot-test/" *pgdata*))
+         (*pgdata* test-pgdata)
+         (xid 8401)
+         (*backend* (make-backend :xid xid))
+         (*wal-ready* t)
+         (*wal-poisoned* nil)
+         (*wal-output-stream* nil)
+         (*wal-output-segment* nil)
+         (*wal-new-segments* '())
+         (*wal-end-lsn* 0)
+         (*wal-durable-lsn* 0)
+         (*wal-checkpoint-lsn* 0)
+         (*wal-page-cache* (make-hash-table :test #'equal))
+         (*wal-page-cache-xids* (make-hash-table :test #'equal))
+         (*wal-xid-first-lsn* (make-hash-table :test #'eql))
+         (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+         (*wal-replication-slots* (make-hash-table :test #'equal))
+         (*active-snapshots* 0)
+         (*active-snapshot-set* (make-hash-table :test #'eq))
+         (*active-xids* (list xid))
+         (*next-xid* (1+ xid))
+         (*xid-batch-end* (1+ xid))
+         (*clog-stream* nil)
+         (registration (make-snapshot-registration))
+         (snapshot (make-snapshot-struct :xmin xid :xmax (1+ xid)
+                                         :xip (list xid) :curcid 1)))
+    (wal-ensure-directory-durable *pgdata*)
+    (wal-ensure-directory-durable (wal-directory))
+    ;; PostgreSQL's xact.c:CommitTransaction makes WAL durable before
+    ;; transaction-end snapshot cleanup. This exercises reset from the
+    ;; after-durable callback while *WAL-LOCK* is still held.
+    (unwind-protect
+         (progn
+           (clog-init)
+           (setf (backend-state *backend*) :in-progress
+                 (backend-explicit *backend*) t
+                 (backend-isolation-level *backend*) :repeatable-read
+                 (backend-read-only *backend*) nil
+                 (backend-transaction-snapshot *backend*) snapshot
+                 (backend-transaction-snapshot-registration *backend*)
+                 registration
+                 (backend-first-snapshot-set *backend*) t)
+           (register-active-snapshot snapshot registration)
+           (commit-transaction)
+           (check (and (= *wal-end-lsn* *wal-durable-lsn*)
+                       (plusp *wal-end-lsn*)
+                       (= (clog-get xid) +clog-committed+)
+                       (eq (backend-state *backend*) :idle)
+                       (zerop *active-snapshots*)
+                       (not (snapshot-registration-releasing-p registration))
+                       (not *wal-poisoned*))
+                  "WAL-backed writable REPEATABLE READ commit releases its unpinned snapshot"))
+      (when *wal-output-stream*
+        (ignore-errors (close *wal-output-stream*)))
+      (when *clog-stream*
+        (ignore-errors (close *clog-stream*)))
+      (setf *wal-output-stream* nil *clog-stream* nil)
+      (ignore-errors
+       (uiop:delete-directory-tree test-pgdata :validate t
+                                               :if-does-not-exist :ignore)))))
+
 (defun test-transaction-isolation-controls ()
   (let* ((*backend* (make-backend))
          (path (merge-pathnames "transaction-isolation.out" *pgdata*)))

@@ -67,22 +67,15 @@
   (let* ((state (getf ast :state))
          (name (getf state :name))
          (oid (getf state :oid))
-         (start (getf state :start))
-         (increment (getf state :increment))
-         (minimum (getf state :min))
-         (maximum (getf state :max))
+         (definition (getf state :definition))
          (last (getf state :last))
          (called (getf state :called))
          (db (current-database))
          (previous nil))
     (unless (and (stringp name)
                  (and (integerp oid) (<= 1 oid #xFFFFFFFF))
-                 (sequence-value-range-p start)
-                 (sequence-value-range-p increment) (not (zerop increment))
-                 (sequence-value-range-p minimum)
-                 (sequence-value-range-p maximum)
-                 (<= minimum start maximum)
-                 (<= minimum last maximum)
+                 (stringp definition)
+                 (sequence-value-range-p last)
                  (member called '(t nil)))
       (ereport "08P01" "invalid replicated sequence state"))
     (call-with-catalog-durability-rollback
@@ -93,29 +86,22 @@
        (let ((sequence (gethash name (database-sequences db))))
          (unless sequence
            (ereport "42P01" "replicated sequence \"~a\" does not exist" name))
+         (unless (string= definition (catalog-sequence-definition-sql sequence))
+           (ereport "55000"
+                    "replicated sequence \"~a\" definition does not match publisher"
+                    name))
+         ;; Sequence state events carry values only. ALTER SEQUENCE is a
+         ;; separate ordered DDL event and must establish matching definitions.
          (setf previous (copy-pg-sequence sequence)
-               (pg-sequence-start-value sequence) start
-               (pg-sequence-increment sequence) increment
-               (pg-sequence-min-value sequence) minimum
-               (pg-sequence-max-value sequence) maximum
                (pg-sequence-last-value sequence) last
                (pg-sequence-called-p sequence) called)
          (save-catalog :logical-event (logical-sequence-state-event name)))))
     (send-command-complete stream "APPLY LOGICAL EVENT")))
 
 (defun logical-event-ddl-ast (payload)
-  (let* ((envelope (logical-read-data-string payload))
-         (source-database-oid (getf envelope :database-oid))
-         (ast (getf envelope :ast)))
-    (unless (and (integerp source-database-oid)
-                 (<= 1 source-database-oid #xFFFFFFFF)
-                 (listp ast)
-                 (member (getf ast :type)
-                         '(:create-table :drop-table :create-index :drop-index
-                           :alter-index :alter-table :create-sequence
-                           :alter-sequence :drop-sequence)))
-      (ereport "08P01" "invalid or unsupported replicated DDL event"))
-    ast))
+  (getf (logical-validate-ddl-event-envelope
+         (logical-read-data-string payload))
+        :ast))
 
 (defun logical-event-sequence-state-ast (payload)
   (let* ((state (logical-read-data-string payload))
@@ -148,18 +134,20 @@
         (when (and last-lsn (>= last-lsn lsn))
           (send-command-complete stream "APPLY LOGICAL EVENT")
           (return-from exec-apply-logical-event nil)))
-      (let* ((kind (let ((data (logical-read-data-string payload)))
-                     (if (getf data :ast) :ddl :sequence-state)))
+      (let* ((envelope (logical-read-data-string payload))
+             (kind (if (getf envelope :ast) :ddl :sequence-state))
+             (schema-contract
+               (when (eq kind :ddl)
+                 (logical-validate-ddl-event-envelope envelope)))
              (event-ast (ecase kind
-                          (:ddl
-                           (logical-event-ddl-ast payload))
+                          (:ddl (getf schema-contract :ast))
                           (:sequence-state
                            (logical-event-sequence-state-ast payload))))
-             (*logical-event-apply-id* (cons key lsn)))
-        ;; Execute one committed DDL/state change using the same statement
-        ;; snapshot and schema locking path as ordinary commands. The incoming
-        ;; source position is stored by save-catalog in that durable image,
-        ;; mirroring ReorderBufferCommit()'s commit boundary in PostgreSQL.
+             (*logical-event-apply-id* (cons key lsn))
+             (*logical-event-schema-contract* schema-contract))
+        ;; The subscriber's precondition is checked inside the schema write
+        ;; lease; save-catalog checks the expected post-shape before WAL commit.
+        ;; This follows the apply-then-feedback ordering in logical/worker.c.
         (execute-in-transaction (make-broadcast-stream) event-ast)))
     (send-command-complete stream "APPLY LOGICAL EVENT")))
 
@@ -514,6 +502,11 @@ rolled back immediately."
     (:in-progress
      (commit-transaction)
      (setf (backend-settings-transaction-start *backend*) nil)
+     ;; Commit record and target progress are durable before the worker can
+     ;; acknowledge the publisher, as logical/worker.c expects.
+     (when (string= (or (backend-application-name *backend*) "")
+                    "pg-lisp-subscribe-apply")
+       (logical-test-failpoint :after-target-commit-before-command-response))
      (send-command-complete stream "COMMIT"))
     (t
      (send-notice stream "there is no transaction in progress")
@@ -828,14 +821,18 @@ before this removal horizon is captured."
                    "multiple primary keys for table \"~a\" are not allowed"
                    name)))
       (with-write-catalog-locks
-        (let ((class (create-table* db name cols)))
+        (let* ((*catalog-save-error-after-durable-p* nil)
+               (class (create-table* db name cols))
+               (durable-generation *catalog-durable-generation*))
           (with-error-cleanup
-              (e (progn
-                   ;; CREATE TABLE is one statement.  A failed constraint
-                   ;; build must not leave earlier indexes published.
-                   (when (eq class (lookup-table name))
-                     (drop-table* db name))
-                   (save-catalog :applied-logical-event-id nil)))
+              (e (unless (or *catalog-save-error-after-durable-p*
+                             (> *catalog-durable-generation* durable-generation))
+                   (progn
+                     ;; CREATE TABLE is one statement. A failed constraint
+                     ;; build must not leave earlier indexes published.
+                     (when (eq class (lookup-table name))
+                       (drop-table* db name))
+                     (save-catalog :applied-logical-event-id nil))))
             (dolist (c constraints)
               (let ((attnums (resolve-attnums class (getf c :columns))))
                 (case (getf c :kind)
@@ -907,17 +904,18 @@ before this removal horizon is captured."
                   (ereport "55000" "table \"~a\" changed while waiting for lock"
                            name)
                   (ereport "42P01" "table \"~a\" does not exist" name)))))
-        (dolist (entry relations)
-          (let* ((name (car entry))
-                 (original (cdr entry))
-                 (current (gethash name (database-tables db))))
-            (if (and original (eq original current))
-                (drop-table* db name)
-                (send-notice stream
-                             (format nil "table \"~a\" does not exist, skipping"
-                                     name)))))
-        (save-catalog :logical-event
-                      (logical-catalog-event-for-ast ast))))
+        (with-catalog-mutation-rollback (db)
+          (dolist (entry relations)
+            (let* ((name (car entry))
+                   (original (cdr entry))
+                   (current (gethash name (database-tables db))))
+              (if (and original (eq original current))
+                  (drop-table* db name)
+                  (send-notice stream
+                               (format nil "table \"~a\" does not exist, skipping"
+                                       name)))))
+          (save-catalog :logical-event
+                        (logical-catalog-event-for-ast ast)))))
     (send-command-complete stream "DROP TABLE")))
 
 (defun drop-index-relation-lock-set (entries table-lookup)
@@ -931,7 +929,8 @@ before this removal horizon is captured."
                        (when table (list (pg-class-relfilenode table))))))
 
 (defun exec-create-index (stream ast)
-  (let* ((name (getf ast :name))
+  (let* ((*catalog-save-error-after-durable-p* nil)
+         (name (getf ast :name))
          (unique (getf ast :unique))
          (if-not-exists (getf ast :if-not-exists))
          (db nil)
@@ -1000,7 +999,8 @@ before this removal horizon is captured."
                         ;; Do not roll back memory if WAL has published this
                         ;; catalog image: later writes must keep maintaining
                         ;; any index that restart recovery will restore.
-                        (if (> *catalog-durable-generation* durable-generation)
+                        (if (or *catalog-save-error-after-durable-p*
+                                (> *catalog-durable-generation* durable-generation))
                             (setf preserve-relfile t)
                             ;; Keep catalog readers behind *write-lock* while
                             ;; undoing a publication that was not durable.
@@ -1070,17 +1070,18 @@ before this removal horizon is captured."
                 (ereport "2BP01"
                          "cannot drop index \"~a\" because constraint \"~a\" on table \"~a\" requires it"
                          name name (if table (pg-class-name table) "?"))))))
-        (dolist (entry entries)
-          (let* ((name (car entry))
-                 (original (cdr entry)))
-            (if (and original
-                     (eq original (gethash name (database-indexes db))))
-                (drop-index* db name)
-                (send-notice stream
-                             (format nil "index \"~a\" does not exist, skipping"
-                                     name)))))
-        (save-catalog :logical-event
-                      (logical-catalog-event-for-ast ast))))
+        (with-catalog-mutation-rollback (db)
+          (dolist (entry entries)
+            (let* ((name (car entry))
+                   (original (cdr entry)))
+              (if (and original
+                       (eq original (gethash name (database-indexes db))))
+                  (drop-index* db name)
+                  (send-notice stream
+                               (format nil "index \"~a\" does not exist, skipping"
+                                       name)))))
+          (save-catalog :logical-event
+                        (logical-catalog-event-for-ast ast)))))
     (send-command-complete stream "DROP INDEX")))
 
 (defun exec-alter-index (stream ast)
@@ -1104,9 +1105,10 @@ before this removal horizon is captured."
               (ereport "55000" "index \"~a\" changed while waiting for lock"
                        name)
               (ereport "42704" "index \"~a\" does not exist" name)))
-        (rename-index* db name new-name)
-        (save-catalog :logical-event
-                      (logical-catalog-event-for-ast ast))))
+        (with-catalog-mutation-rollback (db)
+          (rename-index* db name new-name)
+          (save-catalog :logical-event
+                        (logical-catalog-event-for-ast ast)))))
     (send-command-complete stream "ALTER INDEX")))
 
 (defun exec-alter-table-using-index (db table ast primary)
@@ -1147,17 +1149,18 @@ before this removal horizon is captured."
                            (pg-index-name idx))))
         (unless (string= new-name (pg-index-name idx))
           (check-new-relation-name db new-name))
-        (when primary
-          (dolist (attnum (pg-index-columns idx))
-            (setf (pg-column-notnull
-                   (aref (pg-class-columns table) (1- attnum)))
-                  t))
-          (setf (pg-index-primary-p idx) t))
-        (setf (pg-index-constraint-p idx) t)
-        (unless (string= new-name (pg-index-name idx))
-          (rename-index* db (pg-index-name idx) new-name))
-        (save-catalog :logical-event
-                      (logical-catalog-event-for-ast ast))))))
+        (with-catalog-mutation-rollback (db)
+          (when primary
+            (dolist (attnum (pg-index-columns idx))
+              (setf (pg-column-notnull
+                     (aref (pg-class-columns table) (1- attnum)))
+                    t))
+            (setf (pg-index-primary-p idx) t))
+          (setf (pg-index-constraint-p idx) t)
+          (unless (string= new-name (pg-index-name idx))
+            (rename-index* db (pg-index-name idx) new-name))
+          (save-catalog :logical-event
+                        (logical-catalog-event-for-ast ast)))))))
 
 (defun exec-alter-table-constraint (stream db table ast)
   (let* ((name (getf ast :constraint-name))
@@ -1185,13 +1188,14 @@ before this removal horizon is captured."
               (ereport "42704"
                        "constraint \"~a\" of relation \"~a\" does not exist"
                        name (pg-class-name table))))
-        (case action
-          (:rename-constraint
-           (rename-index* db name (getf ast :new-name)))
-          (:drop-constraint
-           (drop-index* db name)))
-        (save-catalog :logical-event
-                      (logical-catalog-event-for-ast ast))))
+        (with-catalog-mutation-rollback (db)
+          (case action
+            (:rename-constraint
+             (rename-index* db name (getf ast :new-name)))
+            (:drop-constraint
+             (drop-index* db name)))
+          (save-catalog :logical-event
+                        (logical-catalog-event-for-ast ast)))))
     t))
 
 (defun exec-alter-table-replace-primary (stream db table actions ast)
@@ -1263,9 +1267,9 @@ before this removal horizon is captured."
                          (not (eq named old-constraint))
                          (not (eq named new-idx)))))
           (ereport "42P07" "relation \"~a\" already exists" new-name))
-        (when old-constraint
-          (drop-index* db old-name))
-        (progn
+        (with-catalog-mutation-rollback (db)
+          (when old-constraint
+            (drop-index* db old-name))
           (setf (pg-index-primary-p new-idx) t
                 (pg-index-constraint-p new-idx) t)
           (dolist (attnum (pg-index-columns new-idx))
@@ -1312,7 +1316,9 @@ before this removal horizon is captured."
                       name))
            (when primary
              (check-not-null-existing table attnums (getf ast :constraint-name)))
-           (let* ((previous-notnull
+           (let* ((*catalog-save-error-after-durable-p* nil)
+                  (durable-generation *catalog-durable-generation*)
+                  (previous-notnull
                     (when primary
                       (mapcar (lambda (attnum)
                                 (cons attnum
@@ -1332,13 +1338,15 @@ before this removal horizon is captured."
                         :nulls-not-distinct
                         (getf ast :nulls-not-distinct))))
              (with-error-cleanup
-                 (e (progn
-                      (drop-index* db (pg-index-name idx))
-                      (dolist (entry previous-notnull)
-                        (setf (pg-column-notnull
-                               (aref (pg-class-columns table)
-                                     (1- (car entry))))
-                              (cdr entry)))))
+                 (e (unless (or *catalog-save-error-after-durable-p*
+                                (> *catalog-durable-generation* durable-generation))
+                      (progn
+                        (drop-index* db (pg-index-name idx))
+                        (dolist (entry previous-notnull)
+                          (setf (pg-column-notnull
+                                 (aref (pg-class-columns table)
+                                       (1- (car entry))))
+                                (cdr entry))))))
                (build-unique-index idx table (pg-index-name idx))
                (when primary
                  (dolist (attnum attnums)
@@ -1353,8 +1361,14 @@ before this removal horizon is captured."
 
 ;;; ---- simple-query execution ----
 
+(defun commit-ddl-and-flush-responses (responses)
+  "Commit a DDL command before sending its deferred success and notice replies."
+  (commit-transaction)
+  (flush-logical-ddl-deferred-responses responses))
+
 (defun execute-in-transaction (stream ast)
-  (let ((implicit (not (backend-explicit *backend*))))
+  (let ((implicit (not (backend-explicit *backend*)))
+        (logical-ddl-responses nil))
     (when (and (backend-read-only *backend*)
                (member (getf ast :type)
                        '(:insert :update :delete :truncate :create-table :drop-table
@@ -1391,7 +1405,28 @@ before this removal horizon is captured."
                      (:alter-table (exec-alter-table stream ast))
                      (t (ereport "0A000" "unsupported statement")))))
             (if (ddl-p ast)
-                (with-schema-write-lock (execute-body))
+                (with-schema-write-lock
+                  ;; The schema contract is database-wide, while tablecmds.c
+                  ;; relation locks permit disjoint DDL to overlap. Serialize
+                  ;; before-image capture through WAL publication so event
+                  ;; schema-before follows the preceding schema-after.
+                  (multiple-value-bind (result responses)
+                      (call-with-logical-ddl-event-order
+                       (lambda ()
+                         (let* ((*logical-source-schema-precondition*
+                                  (logical-current-schema-contract))
+                                (expected-before
+                                  (and *logical-event-schema-contract*
+                                       (getf *logical-event-schema-contract*
+                                             :schema-before))))
+                           (when (and expected-before
+                                      (not (equal expected-before
+                                                  *logical-source-schema-precondition*)))
+                             (error
+                              "subscriber schema differs from publisher schema before DDL"))
+                           (execute-body))))
+                    (setf logical-ddl-responses responses)
+                    result))
                 (execute-body)))
         (error (e)
           (if (fatal-error-p e)
@@ -1401,8 +1436,11 @@ before this removal horizon is captured."
                     (abort-transaction)
                     (set-backend-state *backend* :aborted))
                 (error e))))))
+    ;; postgres.c:exec_simple_query commits before EndCommand reports success.
     (when implicit
-      (commit-transaction))))
+      (if logical-ddl-responses
+          (commit-ddl-and-flush-responses logical-ddl-responses)
+          (commit-transaction)))))
 
 (defun execute-statement (stream ast)
   (let ((type (getf ast :type)))

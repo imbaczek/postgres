@@ -14,11 +14,11 @@
 
 (defstruct pgoutput-column name type-oid key-p (typmod -1))
 (defstruct pgoutput-relation oid namespace name columns key-columns)
+
 (defstruct logical-subscription-runtime
   options target (relations (make-hash-table :test #'eql))
   (validated-relations (make-hash-table :test #'equal))
-  source-client current-lsn transaction-open-p source-xid
-  (drop-feedback-p nil) (drop-feedback-ready-p nil))
+  source-client current-lsn transaction-open-p source-xid)
 
 (defun logical-simple-identifier-p (value)
   (and (stringp value) (plusp (length value))
@@ -153,12 +153,15 @@
 (defun logical-target-query (client query)
   (pg-client-query client query))
 
-(defun logical-target-transaction (client function)
+(defun logical-target-transaction
+    (client function &key before-commit after-commit)
   (logical-target-query client "BEGIN")
   (handler-case
       (multiple-value-prog1
           (funcall function)
-        (logical-target-query client "COMMIT"))
+        (when before-commit (funcall before-commit))
+        (logical-target-query client "COMMIT")
+        (when after-commit (funcall after-commit)))
     (error (condition)
       (ignore-errors (logical-target-query client "ROLLBACK"))
       (error condition))))
@@ -167,9 +170,13 @@
   (logical-target-query client (logical-progress-delete-query slot))
   (logical-target-query client (logical-progress-insert-query slot lsn state token)))
 
-(defun logical-persist-progress (client slot lsn state token)
+(defun logical-persist-progress
+    (client slot lsn state token &key before-commit after-commit)
   (logical-target-transaction
-   client (lambda () (logical-replace-progress-row client slot lsn state token))))
+   client
+   (lambda () (logical-replace-progress-row client slot lsn state token))
+   :before-commit before-commit
+   :after-commit after-commit))
 
 (defun logical-persist-initial-progress (client options slot lsn state token)
   (logical-target-transaction
@@ -364,9 +371,6 @@
         (error "replication bootstrap schema description is malformed"))
       data)))
 
-(defun logical-bootstrap-sequence-name (entry)
-  (getf (getf entry :state) :name))
-
 (defun logical-find-bootstrap-object (name objects key-function)
   (find name objects :key key-function :test #'string=))
 
@@ -389,42 +393,38 @@
                (logical-sql-literal name) (getf state :last)
                (if (getf state :called) "true" "false"))))))
 
-(defun logical-bootstrap-schema-matches-p (source target)
-  "Check every source bootstrap object's definition after idempotent creation."
-  (loop for source-table in (getf source :tables)
-        for name = (getf source-table :name)
-        for target-table =
-                         (logical-find-bootstrap-object name (getf target :tables)
-                                                        (lambda (entry) (getf entry :name)))
-        always (and target-table
-                    (string= (getf source-table :sql)
-                             (getf target-table :sql)))))
-
-(defun logical-bootstrap-indexes-match-p (source target)
-  (loop for source-index in (getf source :indexes)
-        for name = (getf source-index :name)
-        for target-index =
-                         (logical-find-bootstrap-object name (getf target :indexes)
-                                                        (lambda (entry) (getf entry :name)))
-        always (and target-index
-                    (string= (getf source-index :sql)
-                             (getf target-index :sql)))))
-
-(defun logical-bootstrap-sequences-match-p (source target)
-  (loop for source-sequence in (getf source :sequences)
-        for name = (logical-bootstrap-sequence-name source-sequence)
-        for target-sequence =
-                            (logical-find-bootstrap-object
-                             name (getf target :sequences) #'logical-bootstrap-sequence-name)
-        always (and target-sequence
-                    (string= (getf source-sequence :definition)
-                             (getf target-sequence :definition)))))
+(defun logical-validate-existing-replication-bootstrap
+    (source-client target-client source target options)
+  "Reject target drift before bootstrap can create or reset anything."
+  (unless (logical-schema-contract-subset-compatible-p
+           (logical-bootstrap-schema-contract source)
+           (logical-bootstrap-schema-contract target))
+    (error "target has existing schema definitions that differ from source"))
+  (let ((source-names (mapcar (lambda (entry) (getf entry :name))
+                              (getf source :tables))))
+    (dolist (table (logical-subscription-options-tables options))
+      (unless (member table source-names :test #'string=)
+        (error "allowlisted source table ~a does not exist" table)))
+    (dolist (source-table (getf source :tables))
+      (let* ((name (getf source-table :name))
+             (target-table
+               (logical-find-bootstrap-object
+                name (getf target :tables) (lambda (entry) (getf entry :name)))))
+        (when target-table
+          (logical-validate-client-schema
+           name (logical-table-schema source-client name)
+           (logical-table-schema target-client name))
+          (when (member name (logical-subscription-options-tables options)
+                        :test #'string=)
+            (logical-validate-copy-schema source-client target-client name))))))
+  (values))
 
 (defun logical-validate-replication-bootstrap
     (source-client target-client source target options)
-  (unless (and (logical-bootstrap-schema-matches-p source target)
-               (logical-bootstrap-indexes-match-p source target)
-               (logical-bootstrap-sequences-match-p source target))
+  ;; Compare the full implemented object set after creating source objects that
+  ;; were absent on an empty or compatible target. Sequence values are excluded.
+  (unless (equal (logical-bootstrap-schema-contract source)
+                 (logical-bootstrap-schema-contract target))
     (error "source and target supported schema definitions differ"))
   (let ((source-names (mapcar (lambda (entry) (getf entry :name))
                               (getf source :tables))))
@@ -449,6 +449,27 @@
 (defun logical-copy-row-size (row)
   (+ 32 (* 16 (length row))
      (loop for value across row when value sum (length (string->bytes value)))))
+
+(defun logical-copy-chunk-limit (test-limit failpoint action)
+  (if (null test-limit)
+      +logical-copy-chunk-bytes+
+      (progn
+        (unless (and (string-equal (or failpoint "")
+                                   "after-copy-chunk-commit")
+                     (string-equal (or action "") "crash"))
+          (error "test copy chunk limit requires the copy-chunk crash failpoint"))
+        (let ((limit (ignore-errors
+                      (parse-integer test-limit :junk-allowed nil))))
+          (unless (and limit (<= 1 limit +logical-copy-chunk-bytes+))
+            (error "PG_LISP_TEST_COPY_CHUNK_BYTES must be between 1 and ~d"
+                   +logical-copy-chunk-bytes+))
+          limit))))
+
+(defun logical-copy-chunk-limit-bytes ()
+  (logical-copy-chunk-limit
+   (sb-ext:posix-getenv "PG_LISP_TEST_COPY_CHUNK_BYTES")
+   (sb-ext:posix-getenv "PG_LISP_TEST_FAILPOINT")
+   (sb-ext:posix-getenv "PG_LISP_TEST_FAILPOINT_ACTION")))
 
 (defun logical-copy-insert-query (table columns row)
   (format nil "INSERT INTO ~a (~{~a~^, ~}) VALUES (~{~a~^, ~})"
@@ -479,24 +500,33 @@
      target
      (lambda ()
        (dolist (row (nreverse rows))
+         (logical-test-failpoint :before-copy-row-change table)
          (logical-target-query
-          target (logical-copy-insert-query table columns row)))))))
+          target (logical-copy-insert-query table columns row))
+         (logical-test-failpoint :after-copy-row-change table)))
+     :before-commit
+     (lambda ()
+       (logical-test-failpoint :before-copy-chunk-commit table))
+     :after-commit
+     (lambda ()
+       (logical-test-failpoint :after-copy-chunk-commit table)))))
 
 (defun logical-copy-source-table (source target table)
   (let ((columns (logical-validate-copy-schema source target table))
         (rows '())
-        (chunk-bytes 0))
+        (chunk-bytes 0)
+        (chunk-limit (logical-copy-chunk-limit-bytes)))
     (labels ((flush-chunk ()
                (logical-copy-target-chunk target table columns rows)
                (setf rows '() chunk-bytes 0))
              (consume-row (row row-columns)
                (declare (ignore row-columns))
                (let ((row-bytes (logical-copy-row-size row)))
-                 (when (> row-bytes +logical-copy-chunk-bytes+)
-                   (error "one source row exceeds the 8 MiB initial-copy chunk limit"))
+                 (when (> row-bytes chunk-limit)
+                   (error "one source row exceeds the initial-copy chunk limit (~d bytes)"
+                          chunk-limit))
                  (when (and rows
-                            (> (+ chunk-bytes row-bytes)
-                               +logical-copy-chunk-bytes+))
+                            (> (+ chunk-bytes row-bytes) chunk-limit))
                    (flush-chunk))
                  (push row rows)
                  (incf chunk-bytes row-bytes))))
@@ -514,60 +544,93 @@
       (finish-output *error-output*)
       (sleep delay))))
 
+(defun logical-import-copy-snapshot (source token)
+  (pg-client-query source "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+  (handler-case
+      (progn
+        (pg-client-query
+         source (format nil "SET TRANSACTION SNAPSHOT ~a"
+                        (logical-sql-literal token)))
+        :imported)
+    (pg-client-error (condition)
+      (if (string= (pg-client-error-sqlstate condition) "22023")
+          :expired
+          (error condition)))))
+
 (defun logical-copy-from-exported-snapshot (options target boundary token)
   (let ((source (logical-startup-source-client options))
         (slot (logical-subscription-options-slot-name options)))
     (unwind-protect
-         (progn
-           (pg-client-query source
-                            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-           (pg-client-query
-            source (format nil "SET TRANSACTION SNAPSHOT ~a"
-                           (logical-sql-literal token)))
-           (format *error-output* "pg-lisp-subscribe: snapshot imported at ~a~%" boundary)
-           (finish-output *error-output*)
-           (logical-copy-delay-if-configured)
-           (let ((source-bootstrap (logical-read-replication-bootstrap source)))
-             ;; pg_dump separates schema and data phases; create only the
-             ;; implemented sequence/table/btree definitions before COPY.
-             (logical-bootstrap-create-schema target source-bootstrap)
-             (logical-validate-replication-bootstrap
-              source target source-bootstrap
-              (logical-read-replication-bootstrap target) options)
-             ;; Sequence values are non-MVCC in PostgreSQL too. Capture their
-             ;; state at the imported snapshot before copying table rows.
-             (logical-bootstrap-set-sequence-state target source-bootstrap))
-           (dolist (table (logical-subscription-options-tables options))
-             (logical-validate-copy-schema source target table))
-           (logical-reset-target-tables
-            target (logical-subscription-options-tables options))
-           (dolist (table (logical-subscription-options-tables options))
-             (logical-copy-source-table source target table))
-           (pg-client-query source "COMMIT")
-           (logical-persist-progress target slot boundary "ready" nil)
-           (pg-client-close source)
-           (setf source nil))
+         (if (eq (logical-import-copy-snapshot source token) :expired)
+             :snapshot-expired
+             (progn
+               (format *error-output*
+                       "pg-lisp-subscribe: snapshot imported at ~a~%" boundary)
+               (finish-output *error-output*)
+               (logical-copy-delay-if-configured)
+               (let* ((source-bootstrap
+                        (logical-read-replication-bootstrap source))
+                      (target-bootstrap
+                        (logical-read-replication-bootstrap target)))
+                 ;; Validate existing target definitions before pg_dump-style
+                 ;; schema creation or any sequence/data mutation.
+                 (logical-validate-existing-replication-bootstrap
+                  source target source-bootstrap target-bootstrap options)
+                 (logical-bootstrap-create-schema target source-bootstrap)
+                 (logical-validate-replication-bootstrap
+                  source target source-bootstrap
+                  (logical-read-replication-bootstrap target) options))
+               (dolist (table (logical-subscription-options-tables options))
+                 (logical-validate-copy-schema source target table))
+               ;; Sequence values are non-MVCC; apply the boundary capture only
+               ;; after every schema and replica-identity check has succeeded.
+               (logical-bootstrap-set-sequence-state
+                target (logical-read-replication-bootstrap source))
+               (logical-test-failpoint :before-copy-reset slot boundary)
+               (logical-reset-target-tables
+                target (logical-subscription-options-tables options))
+               (logical-test-failpoint :after-copy-reset slot boundary)
+               (dolist (table (logical-subscription-options-tables options))
+                 (logical-copy-source-table source target table))
+               (pg-client-query source "COMMIT")
+               (logical-test-failpoint
+                :after-copy-snapshot-transaction-commit slot boundary)
+               (logical-persist-progress
+                target slot boundary "ready" nil
+                :before-commit
+                (lambda ()
+                  (logical-test-failpoint
+                   :before-copy-ready-commit slot boundary))
+                :after-commit
+                (lambda ()
+                  (logical-test-failpoint :after-copy-ready-commit slot boundary)))
+               (pg-client-close source)
+               (setf source nil)
+               :ready))
       (when source (pg-client-close source)))))
 
 (defun logical-copy-or-reseed (options target progress)
-  (if (and progress (string= (getf progress :state) "copying")
-           (getf progress :token) (getf progress :lsn))
-      (handler-case
-          (logical-copy-from-exported-snapshot
-           options target (getf progress :lsn) (getf progress :token))
-        (pg-client-error (condition)
-          (unless (string= (pg-client-error-sqlstate condition) "22023")
-            (error condition))
-          (format *error-output* "pg-lisp-subscribe: exported snapshot expired; reseeding~%")
-          (logical-create-copy-state options target)))
+  (if (and progress
+           (string= (getf progress :state) "copying")
+           (getf progress :token)
+           (getf progress :lsn))
+      (when (eq (logical-copy-from-exported-snapshot
+                 options target (getf progress :lsn) (getf progress :token))
+                :snapshot-expired)
+        (format *error-output*
+                "pg-lisp-subscribe: exported snapshot expired; reseeding~%")
+        (logical-create-copy-state options target))
       (logical-create-copy-state options target)))
 
 (defun logical-create-copy-state (options target)
   (multiple-value-bind (boundary token) (logical-create-source-slot options)
-    (logical-persist-initial-progress
-     target options (logical-subscription-options-slot-name options)
-     boundary "copying" token)
-    (logical-copy-from-exported-snapshot options target boundary token)))
+    (let ((slot (logical-subscription-options-slot-name options)))
+      (logical-test-failpoint
+       :after-source-slot-created-before-copying-progress slot boundary)
+      (logical-persist-initial-progress
+       target options slot boundary "copying" token)
+      (logical-test-failpoint :after-copying-progress-commit slot boundary)
+      (logical-copy-from-exported-snapshot options target boundary token))))
 
 (defun logical-relation-key-signature (relation)
   (format nil "~{~d~^,~}"
@@ -799,28 +862,48 @@
 (defun logical-progress-transaction-commit (runtime commit-lsn)
   (let* ((options (logical-subscription-runtime-options runtime))
          (slot (logical-subscription-options-slot-name options))
+         (target (logical-subscription-runtime-target runtime))
          (lsn-text (wal-format-lsn commit-lsn)))
-    (logical-replace-progress-row
-     (logical-subscription-runtime-target runtime) slot lsn-text "ready" nil)
-    (logical-target-query (logical-subscription-runtime-target runtime) "COMMIT")
+    ;; Match apply_handle_commit_internal(): the source transaction and its
+    ;; applied-origin marker commit atomically on the subscriber.
+    (logical-replace-progress-row target slot lsn-text "ready" nil)
+    (logical-test-failpoint :before-target-commit slot commit-lsn)
+    (logical-target-query target "COMMIT")
     (setf (logical-subscription-runtime-current-lsn runtime) commit-lsn
           (logical-subscription-runtime-transaction-open-p runtime) nil
-          (logical-subscription-runtime-source-xid runtime) nil
-          (logical-subscription-runtime-drop-feedback-ready-p runtime)
-          (logical-subscription-runtime-drop-feedback-p runtime))
-    (unless (logical-subscription-runtime-drop-feedback-ready-p runtime)
-      (pg-client-send-standby-status
-       (logical-subscription-runtime-source-client runtime) commit-lsn))))
+          (logical-subscription-runtime-source-xid runtime) nil)
+    ;; walsender.c only learns this position from the reply sent after local
+    ;; COMMIT; a retry starts from the durable target marker if this point dies.
+    (logical-test-failpoint
+     :after-target-commit-before-feedback slot commit-lsn)
+    (pg-client-send-standby-status
+     (logical-subscription-runtime-source-client runtime) commit-lsn)))
 
-(defun logical-progress-keepalive (runtime lsn)
-  (let ((current (logical-subscription-runtime-current-lsn runtime)))
+(defun logical-progress-keepalive (runtime wal-end)
+  "Reply to a keepalive without treating WAL-END as an applied position."
+  ;; WalSndKeepalive() in walsender.c reports the publisher's end, which may
+  ;; include events the subscriber has not applied. logical/worker.c advances
+  ;; confirmation only through LogicalConfirmReceivedLocation() after commit.
+  (declare (ignore wal-end))
+  (pg-client-send-standby-status
+   (logical-subscription-runtime-source-client runtime)
+   (logical-subscription-runtime-current-lsn runtime)))
+
+(defun logical-advance-progress-from-scan (runtime lsn)
+  "Commit and acknowledge a safe frontier returned by the WAL reader."
+  (let* ((current (logical-subscription-runtime-current-lsn runtime))
+         (options (logical-subscription-runtime-options runtime))
+         (slot (logical-subscription-options-slot-name options)))
+    (unless (and (integerp current) (integerp lsn) (>= lsn current))
+      (error "safe logical scan progress moved backwards"))
     (when (> lsn current)
+      ;; Commit the marker before feedback, as in logical/worker.c's
+      ;; LogicalConfirmReceivedLocation() ordering.
       (logical-persist-progress
        (logical-subscription-runtime-target runtime)
-       (logical-subscription-options-slot-name
-        (logical-subscription-runtime-options runtime))
-       (wal-format-lsn lsn) "ready" nil)
+       slot (wal-format-lsn lsn) "ready" nil)
       (setf (logical-subscription-runtime-current-lsn runtime) lsn))
+    (logical-test-failpoint :after-scan-progress-before-feedback slot lsn)
     (pg-client-send-standby-status
      (logical-subscription-runtime-source-client runtime)
      (logical-subscription-runtime-current-lsn runtime))))
@@ -879,33 +962,40 @@
          (slot (logical-subscription-options-slot-name options)))
     (unless (and (integerp database-oid) (<= 1 database-oid #xFFFFFFFF))
       (error "logical event has an invalid source database OID"))
+    (logical-test-failpoint :before-standalone-event-apply slot lsn)
     (logical-target-query
      target
      (format nil "APPLY LOGICAL EVENT ~a ~d ~a"
              (logical-sql-literal
               (logical-standalone-event-key options database-oid))
              lsn (logical-sql-literal payload)))
-    ;; APPLY commits both catalog state and the source LSN high-water mark before
-    ;; this progress row moves. A retry after a crash is therefore idempotent.
+    ;; APPLY commits the catalog state and event high-water before progress.
+    ;; Retries after this point deduplicate in save-catalog.
+    (logical-test-failpoint
+     :after-standalone-target-apply-before-progress slot lsn)
     (logical-persist-progress target slot (wal-format-lsn lsn) "ready" nil)
     (setf (logical-subscription-runtime-current-lsn runtime) lsn)
+    (logical-test-failpoint
+     :after-standalone-progress-before-feedback slot lsn)
     (pg-client-send-standby-status
      (logical-subscription-runtime-source-client runtime) lsn)))
 
 (defun logical-apply-truncate-message (runtime payload)
   (let* ((data (logical-read-data-string payload))
          (tables (getf data :tables))
-         (options (logical-subscription-runtime-options runtime)))
+         (options (logical-subscription-runtime-options runtime))
+         (target (logical-subscription-runtime-target runtime)))
     (unless (and (listp tables) (every #'stringp tables))
       (error "invalid pgoutput TRUNCATE message payload"))
-    ;; TRUNCATE follows the same publication filter as row changes. pgoutput.c
-    ;; emits one transactional Truncate message rather than per-row deletes.
+    ;; pgoutput.c emits one transactional Truncate message; treat each selected
+    ;; relation as a change inside the already-open target transaction.
     (dolist (name tables)
       (when (member name (logical-subscription-options-tables options)
                     :test #'string=)
+        (logical-test-failpoint :before-row-change :truncate name)
         (logical-target-query
-         (logical-subscription-runtime-target runtime)
-         (format nil "TRUNCATE TABLE ~a" (catalog-sql-quote-ident name)))))))
+         target (format nil "TRUNCATE TABLE ~a" (catalog-sql-quote-ident name)))
+        (logical-test-failpoint :after-row-change :truncate name)))))
 
 (defun logical-pgoutput-dispatch (runtime payload)
   (when (zerop (length payload)) (error "empty pgoutput message"))
@@ -933,10 +1023,14 @@
               (relation (gethash oid
                                  (logical-subscription-runtime-relations runtime))))
          (unless relation (error "pgoutput row message has no Relation metadata"))
+         (logical-test-failpoint
+          :before-row-change kind (pgoutput-relation-name relation))
          (ecase kind
            (#\I (logical-apply-insert runtime relation payload 5))
            (#\U (logical-apply-update runtime relation payload 5))
-           (#\D (logical-apply-delete runtime relation payload 5)))))
+           (#\D (logical-apply-delete runtime relation payload 5)))
+         (logical-test-failpoint
+          :after-row-change kind (pgoutput-relation-name relation))))
       (#\M
        (multiple-value-bind (prefix lsn content)
            (logical-pgoutput-read-message runtime payload)
@@ -950,6 +1044,12 @@
             (when (logical-subscription-runtime-transaction-open-p runtime)
               (error "catalog event unexpectedly appears inside a transaction"))
             (logical-apply-standalone-event runtime lsn content))
+           ((string= prefix "pg_lisp/progress")
+            (when (logical-subscription-runtime-transaction-open-p runtime)
+              (error "safe progress Message appeared inside a transaction"))
+            (unless (string= content "")
+              (error "safe progress Message must have empty content"))
+            (logical-advance-progress-from-scan runtime lsn))
            (t (error "unsupported pgoutput Message prefix ~s" prefix)))))
       (#\C
        (unless (and (logical-subscription-runtime-transaction-open-p runtime)
@@ -977,9 +1077,7 @@
   (let* ((source (logical-startup-replication-client options))
          (runtime
            (make-logical-subscription-runtime
-            :options options :target target :current-lsn marker
-            :drop-feedback-p
-            (equal (sb-ext:posix-getenv "PG_LISP_SUBSCRIBE_DROP_FEEDBACK_ONCE") "1"))))
+            :options options :target target :current-lsn marker)))
     (unwind-protect
          (progn
            (setf (logical-subscription-runtime-source-client runtime) source)
@@ -988,9 +1086,8 @@
             (format nil "START_REPLICATION SLOT ~a LOGICAL ~a (proto_version '2')"
                     (logical-subscription-options-slot-name options)
                     (wal-format-lsn marker)))
-           ;; START_REPLICATION's first feedback is the copy boundary on first
-           ;; use, or a durable target commit after reconnect. walsender.c
-           ;; validates these startup handshakes before entering its send loop.
+           ;; The first feedback is the copy boundary or the target's durable
+           ;; restart marker; walsender.c validates it before entering its loop.
            (pg-client-send-standby-status source marker)
            (format *error-output* "pg-lisp-subscribe: streaming from ~a~%"
                    (wal-format-lsn marker))
@@ -1000,15 +1097,7 @@
                  (pg-client-replication-frame source)
                (unless (char= type #\d)
                  (error "unexpected CopyBoth frontend response ~s" type))
-               (logical-stream-frame runtime payload)
-               (when (and (logical-subscription-runtime-drop-feedback-ready-p runtime)
-                          (not (logical-subscription-runtime-transaction-open-p runtime))
-                          (> (logical-subscription-runtime-current-lsn runtime) marker))
-                 ;; Regression hook for the crash window after target COMMIT but
-                 ;; before the publisher receives feedback.
-                 (format *error-output* "pg-lisp-subscribe: dropping feedback after durable target commit~%")
-                 (finish-output *error-output*)
-                 (return))))
+               (logical-stream-frame runtime payload)))
            (values))
       (pg-client-close source))))
 

@@ -450,61 +450,117 @@
 (defun test-wal-snapshot-release-race-before-reuse ()
   (call-with-wal-snapshot-release-race-state
    (lambda (test-lock test-cv registration)
-     (let ((release-marked nil)
-           (resume-release nil)
-           (release-error nil)
-           (reuse-error nil)
-           (release-worker nil))
-       ;; Reuse after completed release is valid. Pause another release after
-       ;; it retires the token but before it removes the WAL pin.
+     (let ((first-release-entered nil)
+           (second-release-entered nil)
+           (resume-first-release nil)
+           (hook-calls 0)
+           (first-error nil)
+           (second-error nil)
+           (old-generation nil)
+           (old-pin nil)
+           (old-state
+             (make-exported-logical-snapshot :importers (list :old-importer)))
+           (new-state nil)
+           (first-worker nil)
+           (second-worker nil))
        (with-write-lock
          (wal-capture-snapshot-boundary-under-writer-lock 0 registration))
-       (setf *wal-test-after-snapshot-release-mark-hook*
+       (setf old-generation
+             (snapshot-registration-lifecycle-generation registration)
+             old-pin (snapshot-registration-wal-retention-lsn registration)
+             *wal-test-after-snapshot-release-mark-hook*
              (lambda (token)
                (declare (ignore token))
                (sb-thread:with-mutex (test-lock)
-                 (setf release-marked t)
-                 (sb-thread:condition-broadcast test-cv)
-                 (loop until resume-release
-                       do (sb-thread:condition-wait test-cv test-lock))))
-             release-worker
+                 (incf hook-calls)
+                 (if (= hook-calls 1)
+                     (progn
+                       (setf first-release-entered t)
+                       (sb-thread:condition-broadcast test-cv)
+                       (loop until resume-first-release
+                             do (sb-thread:condition-wait test-cv test-lock)))
+                     (setf second-release-entered t))
+                 (sb-thread:condition-broadcast test-cv))))
+       (register-exported-logical-snapshot-importer
+        old-state registration :old-importer)
+       (setf first-worker
              (sb-thread:make-thread
               (lambda ()
                 (handler-case
                     (release-snapshot-registration registration)
                   (error (condition)
-                    (setf release-error (princ-to-string condition)))))
-              :name "snapshot pin release"))
+                    (setf first-error (princ-to-string condition)))))
+              :name "first snapshot release"))
        (unwind-protect
-            (let ((marked
-                    (test-wait-until
-                     (lambda ()
-                       (sb-thread:with-mutex (test-lock) release-marked))
-                     2.0)))
-              (check marked "pinned snapshot release pauses after token retirement")
-              (when marked
-                (setf reuse-error
-                      (handler-case
-                          (progn (make-snapshot 1 :register registration) nil)
-                        (error (condition) (princ-to-string condition))))
-                (check (and reuse-error (search "being released" reuse-error))
-                       "registration reuse waits until the old WAL pin is removed")
-                (check (zerop *active-snapshots*)
-                       "rejected registration reuse does not publish another snapshot"))
-              (sb-thread:with-mutex (test-lock)
-                (setf resume-release t)
-                (sb-thread:condition-broadcast test-cv))
-              (sb-thread:join-thread release-worker)
-              (setf release-worker nil)
-              (check (null release-error) "pinned snapshot release completes")
-              (check (and (not (gethash registration *wal-snapshot-retention-pins*))
+            (progn
+              (check (test-wait-until
+                      (lambda ()
+                        (sb-thread:with-mutex (test-lock) first-release-entered))
+                      2.0)
+                     "first releaser pauses after capturing its generation")
+              ;; Hold WAL while the retry captures the same old generation;
+              ;; then the first releaser stays paused while the retry retires it.
+              (sb-thread:with-mutex (*wal-lock*)
+                (setf second-worker
+                      (sb-thread:make-thread
+                       (lambda ()
+                         (handler-case
+                             (release-snapshot-registration registration)
+                           (error (condition)
+                             (setf second-error (princ-to-string condition)))))
+                       :name "retry snapshot release"))
+                (check (test-wait-until
+                        (lambda ()
+                          (sb-thread:with-mutex (test-lock)
+                            second-release-entered))
+                        2.0)
+                       "retry captures the old generation while waiting for WAL"))
+              (when second-worker
+                (sb-thread:join-thread second-worker)
+                (setf second-worker nil))
+              (check (null second-error) "retry completes the old release")
+              (check (and (not (gethash registration
+                                        *wal-snapshot-retention-pins*))
                           (not (snapshot-registration-releasing-p registration))
                           (zerop *active-snapshots*))
-                     "completed release clears the pin and makes the token reusable"))
+                     "retry clears the old pin before registration reuse")
+              (check (and (null (snapshot-registration-exported-state registration))
+                          (null (exported-logical-snapshot-importers old-state)))
+                     "release detaches the old importer before allowing reuse")
+              (with-write-lock
+                (wal-capture-snapshot-boundary-under-writer-lock 0 registration))
+              (setf new-state
+                    (make-exported-logical-snapshot :importers '()))
+              (register-exported-logical-snapshot-importer
+               new-state registration :new-importer)
+              (check (and (> (snapshot-registration-lifecycle-generation
+                              registration)
+                             old-generation)
+                          (= (snapshot-registration-wal-retention-lsn registration)
+                             old-pin))
+                     "reuse advances the generation even when the new pin has the same LSN")
+              (sb-thread:with-mutex (test-lock)
+                (setf resume-first-release t)
+                (sb-thread:condition-broadcast test-cv))
+              (sb-thread:join-thread first-worker)
+              (setf first-worker nil)
+              (check (null first-error) "delayed old releaser completes harmlessly")
+              (check (and (snapshot-registration-active-p registration)
+                          (= (gethash registration
+                                      *wal-snapshot-retention-pins*)
+                             old-pin)
+                          (= *active-snapshots* 1))
+                     "delayed old release preserves the new snapshot's WAL pin")
+              (check (and (eq (snapshot-registration-exported-state registration)
+                              new-state)
+                          (equal (exported-logical-snapshot-importers new-state)
+                                 '(:new-importer)))
+                     "delayed old cleanup preserves the new importer association"))
          (sb-thread:with-mutex (test-lock)
-           (setf resume-release t)
+           (setf resume-first-release t)
            (sb-thread:condition-broadcast test-cv))
-         (when release-worker (sb-thread:join-thread release-worker)))))))
+         (when first-worker (sb-thread:join-thread first-worker))
+         (when second-worker (sb-thread:join-thread second-worker)))))))
 
 (defun test-wal-chunked-catalog-record ()
   (let* ((test-pgdata (merge-pathnames "wal-catalog-chunks-test/" *pgdata*))
@@ -1222,6 +1278,21 @@
            "dropping a missing slot reports an error")
     (check (not *wal-poisoned*)
            "a missing slot does not poison WAL or request fail-stop shutdown")))
+
+(defun test-with-wal-critical-validation-errors-do-not-poison ()
+  (let ((*wal-poisoned* nil))
+    (check (handler-case
+               (progn
+                 (with-wal-critical
+                   (wal-invalid-input "invalid test input"))
+                 nil)
+             (wal-input-validation-error () t))
+           "WAL input validation errors propagate through the critical macro")
+    (check (not *wal-poisoned*)
+           "WAL input validation errors do not poison the critical section")
+    (check (eq :healthy
+               (with-wal-critical :healthy))
+           "the critical macro releases its lock after an input validation error")))
 
 (defun test-wal-drop-fsync-retry-keeps-pin ()
   (let* ((test-pgdata (merge-pathnames "wal-replication-slot-drop-test/"

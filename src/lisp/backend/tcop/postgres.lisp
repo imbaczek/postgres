@@ -451,6 +451,7 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
              (progn
                (setf stream (socket->stream sock))
                (let ((*backend* (make-backend :stream stream
+                                              :socket sock
                                               :database "postgres"
                                               :thread sb-thread:*current-thread*
                                               :pid (sb-thread:thread-os-tid

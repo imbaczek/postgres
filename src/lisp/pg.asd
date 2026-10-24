@@ -58,6 +58,7 @@
      (:module "replication"
       :serial t
       :components ((:file "logical")
+                   (:file "schema-contracts")
                    (:file "client")))
      (:module "commands"
       :serial t
@@ -85,4 +86,5 @@
                    (:file "control")
                    (:file "../replication/protocol")
                    (:file "../replication/worker")
-                   (:file "postgres")))))))
+                   (:file "postgres")))
+     (:file "replication/logical-retention")))))

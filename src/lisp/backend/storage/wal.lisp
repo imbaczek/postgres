@@ -25,6 +25,11 @@
 (defparameter *max-slot-wal-keep-bytes* (* 1024 1024 1024)
   "Maximum WAL retained by one replication slot at checkpoint; NIL disables the cap.")
 
+(defvar *wal-replication-slot-loss-collector* nil
+  "Dynamically bound list receiving durably invalidated slots during WAL maintenance.")
+
+(declaim (ftype function cleanup-invalidated-logical-replication-state))
+
 (defstruct wal-record
   version type xid start end payload)
 
@@ -33,6 +38,7 @@
 
 (defstruct wal-replication-slot
   name database-oid restart-lsn consistent-lsn confirmed-flush-lsn active-owner
+  active-owner-backend
   (pending-xids (make-hash-table :test #'eql))
   (wal-status :reserved))
 
@@ -84,6 +90,10 @@
 (defvar *wal-recovery-logical-catalog-event-p* nil)
 
 (declaim (ftype function wal-test-pause wal-test-pause-once
+                wal-checkpoint
+                wal-drop-replication-slot
+                wal-release-replication-slot-owner
+                wal-invalidate-lagging-replication-slots-under-wal-lock
                 wal-remove-checkpointed-segments
                 wal-remove-checkpointed-segments-under-wal-lock
                 wal-atomic-write-bytes
@@ -474,6 +484,13 @@
 (defun wal-segment-and-offset (lsn)
   (floor lsn +wal-segment-size+))
 
+(define-condition wal-input-validation-error (simple-error) ())
+
+(defun wal-invalid-input (control &rest arguments)
+  (error 'wal-input-validation-error
+         :format-control control
+         :format-arguments arguments))
+
 (defun wal-fail-stop (condition)
   (setf *wal-poisoned* t)
   (when (fboundp 'request-fast-shutdown)
@@ -493,11 +510,15 @@
              (progn
                (wal-check-healthy)
                ,@body)
+           (wal-input-validation-error (condition)
+             (error condition))
            (error (condition)
              ;; Publish poison before another WAL operation can acquire the
              ;; mutex; request shutdown after WITH-MUTEX releases it.
              (setf *wal-poisoned* t)
              (error condition))))
+     (wal-input-validation-error (condition)
+       (error condition))
      (error (condition)
        (wal-fail-stop condition))))
 
@@ -949,13 +970,25 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
         (incf *wal-catalog-flush-generation*)))
     (return-from wal-commit-catalog (values)))
   (with-wal-critical
-    (when (and logical-event (< (length logical-event) 8))
-      (error "invalid WAL logical catalog event envelope"))
     (let* ((logical-event
-             (when (and logical-event
-                        (wal-logical-catalog-event-needed-under-lock-p
-                         (wal-u32 logical-event 0)))
-               logical-event))
+             (when logical-event
+               ;; At least the database identifier is needed to decide whether
+               ;; a slot or snapshot lease retains this event. Malformed input
+               ;; that cannot identify its database is rejected without
+               ;; poisoning WAL.
+               (when (< (length logical-event) 4)
+                 (wal-invalid-input
+                  "invalid WAL logical catalog event envelope"))
+               (when (wal-logical-catalog-event-needed-under-lock-p
+                      (wal-u32 logical-event 0))
+                 (when (< (length logical-event) 8)
+                   (wal-invalid-input
+                    "invalid WAL logical catalog event envelope"))
+                 (when (> (+ +wal-header-size+ (length logical-event))
+                          +wal-segment-size+)
+                   (wal-invalid-input
+                    "WAL logical catalog event exceeds the segment size"))
+                 logical-event)))
            (deletes (sort (remove-duplicates
                            (append (copy-list *wal-pending-deletes*)
                                    (copy-list relation-deletes))
@@ -972,10 +1005,6 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
            (commit-payload (when chunked-p
                              (wal-encode-catalog-commit-payload
                               catalog-payload chunk-count))))
-      (when (and logical-event
-                 (> (+ +wal-header-size+ (length logical-event))
-                    +wal-segment-size+))
-        (error "WAL logical catalog event exceeds the segment size"))
       (wal-record-page-xids-at-batch-start
        images (wal-append-batch-start))
       (wal-append-page-images images)
@@ -1843,33 +1872,6 @@ src/backend/access/transam/xlogreader.c."
              *wal-replication-slots*))
   (values))
 
-(defun wal-drop-replication-slot (name)
-  "Durably remove NAME while serialized with checkpoint WAL recycling."
-  (unless (wal-valid-replication-slot-name-p name)
-    (error "invalid replication slot name ~s" name))
-  ;; This only mutates slot metadata, not WAL records or pages. Use the mutex
-  ;; directly so expected errors such as an absent slot do not poison WAL.
-  (sb-thread:with-mutex (*wal-lock*)
-    (unless (gethash name *wal-replication-slots*)
-      (ereport "42704" "replication slot \"~a\" does not exist" name))
-    (when (wal-replication-slot-active-owner
-           (gethash name *wal-replication-slots*))
-      ;; PostgreSQL requires a slot to be released before it can be dropped.
-      (ereport "55006" "replication slot \"~a\" is active" name))
-    ;; Remove the durable representation before releasing the in-memory pin.
-    (wal-delete-replication-slot-file name)
-    (remhash name *wal-replication-slots*))
-  (values))
-
-(defun wal-release-replication-slot-owner (name owner)
-  "Release OWNER's runtime claim without changing the durable slot."
-  (sb-sys:without-interrupts
-    (sb-thread:with-mutex (*wal-lock*)
-      (let ((slot (gethash name *wal-replication-slots*)))
-        (when (and slot (eq owner (wal-replication-slot-active-owner slot)))
-          (setf (wal-replication-slot-active-owner slot) nil)))))
-  (values))
-
 (defun wal-read-control-fields ()
   (let ((path (wal-control-path)))
     (when (probe-file path)
@@ -2052,7 +2054,7 @@ src/backend/access/transam/xlogreader.c."
     (when removed (fsync-directory base)))
   (values))
 
-(defun wal-checkpoint ()
+(defun wal-checkpoint-core ()
   "Write all cached pages, sync durable state, and advance the redo pointer."
   ;; CHECKPOINT follows the global write-lock -> WAL-lock order.
   (with-write-lock
@@ -2078,33 +2080,6 @@ src/backend/access/transam/xlogreader.c."
           (wal-test-pause :after-checkpoint-control)
           (wal-remove-checkpointed-segments-under-wal-lock
            checkpoint-end)))))
-  (values))
-
-(defun wal-remove-checkpointed-segments (checkpoint-lsn)
-  (with-wal-critical
-    (wal-remove-checkpointed-segments-under-wal-lock checkpoint-lsn))
-  (values))
-
-(defun wal-invalidate-lagging-replication-slots-under-wal-lock ()
-  "Persistently invalidate over-limit slots before removing their WAL pin."
-  (when (integerp *max-slot-wal-keep-bytes*)
-    (maphash
-     (lambda (name slot)
-       (declare (ignore name))
-       (when (and (eq (wal-replication-slot-wal-status slot) :reserved)
-                  (> (- *wal-durable-lsn*
-                        (wal-replication-slot-restart-lsn slot))
-                     *max-slot-wal-keep-bytes*))
-         (let ((candidate (copy-wal-replication-slot slot)))
-           (setf (wal-replication-slot-wal-status candidate) :lost
-                 (wal-replication-slot-pending-xids candidate)
-                 (make-hash-table :test #'eql))
-           ;; Save before clearing the live pin. A failure aborts recycling.
-           (wal-save-replication-slot candidate)
-           (setf (wal-replication-slot-wal-status slot) :lost
-                 (wal-replication-slot-pending-xids slot)
-                 (wal-replication-slot-pending-xids candidate)))))
-     *wal-replication-slots*))
   (values))
 
 (defun wal-remove-checkpointed-segments-under-wal-lock (checkpoint-lsn)

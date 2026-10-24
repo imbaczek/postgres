@@ -4,6 +4,7 @@
 
 (defstruct backend
   stream
+  socket
   (pid 0)
   (cancel-key nil)
   (database "postgres")
@@ -999,7 +1000,8 @@ excluded, so a sequence advance before slot publication remains streamable."
                :name name :restart-lsn restart-lsn
                :consistent-lsn boundary-lsn
                :database-oid database-oid
-               :active-owner active-owner)))
+               :active-owner active-owner
+               :active-owner-backend (and active-owner *backend*))))
     ;; Reserve the in-memory pin before slot-file I/O. If atomic replace has
     ;; renamed the file but directory fsync fails, retain the pin: startup may
     ;; still observe that file and will require its WAL.
@@ -1007,7 +1009,11 @@ excluded, so a sequence advance before slot publication remains streamable."
          (progn
            (setf (gethash name *wal-replication-slots*) slot)
            (wal-slot-seed-active-xids-under-wal-lock slot active-xids)
-           (wal-save-replication-slot slot))
+           (wal-save-replication-slot slot)
+           ;; The durable slot now owns the same restart horizon; dropping
+           ;; this temporary snapshot pin keeps one retention owner and lets
+           ;; the configured slot cap invalidate it atomically at checkpoint.
+           (release-snapshot-registration-wal-pin-under-wal-lock register))
       (unless (handler-case
                   (probe-file (wal-replication-slot-path name))
                 (error () t))
@@ -1051,44 +1057,17 @@ between snapshot capture and this durable publication."
       (remhash register *wal-logical-catalog-event-interests*)
       slot)))
 
+(declaim
+ (ftype function
+        register-exported-logical-snapshot
+        remove-exported-logical-snapshot-token
+        release-exported-logical-snapshot-for-slot))
+
 (defun new-exported-logical-snapshot-token ()
   (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
     (incf *exported-logical-snapshot-counter*)
     (format nil "pg_lisp_~X_~X"
             (get-internal-real-time) *exported-logical-snapshot-counter*)))
-
-(defun register-exported-logical-snapshot (state)
-  (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
-    (let ((token (exported-logical-snapshot-token state)))
-      (when (gethash token *exported-logical-snapshots*)
-        (error "duplicate exported logical snapshot token"))
-      (setf (gethash token *exported-logical-snapshots*) state)))
-  state)
-
-(defun remove-exported-logical-snapshot-token (token)
-  (let ((state nil))
-    (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
-      (setf state (gethash token *exported-logical-snapshots*))
-      (remhash token *exported-logical-snapshots*))
-    (when state
-      (when (snapshot-registration-active-p
-             (exported-logical-snapshot-registration state))
-        (release-snapshot-registration
-         (exported-logical-snapshot-registration state)))
-      (when (exported-logical-snapshot-schema-read-lock-held-p state)
-        (release-schema-read-lock)
-        (setf (exported-logical-snapshot-schema-read-lock-held-p state) nil)))
-    state))
-
-(defun release-exported-logical-snapshot-for-slot (slot-name)
-  (let ((token nil))
-    (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
-      (maphash (lambda (candidate state)
-                 (when (string= slot-name
-                                (exported-logical-snapshot-slot-name state))
-                   (setf token candidate)))
-               *exported-logical-snapshots*))
-    (when token (remove-exported-logical-snapshot-token token))))
 
 (defun create-exported-logical-snapshot-slot (slot-name)
   "Create an unconfirmed logical slot and return its copy boundary and token.
@@ -1110,8 +1089,11 @@ snapshot lifecycle."
          (schema-lock-held nil)
          (published nil)
          (registered nil)
+         (token-published nil)
+         (returned nil)
          (snapshot nil)
          (boundary-lsn nil)
+         (slot-object nil)
          (token (new-exported-logical-snapshot-token)))
     (unwind-protect
          (progn
@@ -1126,26 +1108,48 @@ snapshot lifecycle."
                      backend registration database-id))))
              (setf snapshot captured
                    boundary-lsn captured-boundary)
+             ;; Run the transition race after capture releases *WRITE-LOCK* but
+             ;; before slot publication, as the in-process copy helper does.
              (when *logical-test-after-snapshot-capture-hook*
                (funcall *logical-test-after-snapshot-capture-hook*
                         slot-name boundary-lsn))
-             ;; Match SnapBuild's ordering: publish the slot after the writer
-             ;; gate opens while the registered snapshot still pins WAL.
-             (wal-publish-captured-replication-slot
-              slot-name captured-boundary restart-lsn registration owner
-              (snapshot-xip captured) database-id)
-             (setf published t)
-             (register-exported-logical-snapshot
-              (make-exported-logical-snapshot
-               :slot-name slot-name :token token :database-oid database-id
-               :snapshot snapshot :registration registration
-               :schema-read-lock-held-p schema-lock-held))
-             (setf registered t schema-lock-held nil)
+             ;; snapbuild.c pins the consistent point before exposing its slot.
+             (logical-test-failpoint
+              :after-snapshot-boundary-capture slot-name boundary-lsn)
+             (logical-test-failpoint
+              :before-initial-slot-publication slot-name boundary-lsn)
+             (setf slot-object
+                   (wal-publish-captured-replication-slot
+                    slot-name captured-boundary restart-lsn registration owner
+                    (snapshot-xip captured) database-id)
+                   published t)
+             (logical-test-failpoint
+              :after-initial-slot-file-publication slot-name boundary-lsn)
+             (logical-test-failpoint
+              :before-snapshot-token-publication slot-name boundary-lsn)
+             ;; The registry owns the schema lease as soon as the token becomes
+             ;; visible. Keep that ownership transfer atomic with its local flags.
+             (sb-sys:without-interrupts
+               (register-exported-logical-snapshot
+                (make-exported-logical-snapshot
+                 :slot-name slot-name :slot-object slot-object
+                 :token token :database-oid database-id
+                 :snapshot snapshot :registration registration
+                 :schema-read-lock-held-p schema-lock-held))
+               (setf token-published t
+                     registered t
+                     schema-lock-held nil))
              ;; As with ExportSnapshot, release slot runtime ownership before
              ;; the token is returned so the importer can connect independently.
              (wal-release-replication-slot-owner slot-name owner)
              (setf owner nil)
+             (logical-test-failpoint
+              :after-snapshot-token-publication slot-name boundary-lsn)
+             (setf returned t)
              (values boundary-lsn token)))
+      (when (and token-published (not returned))
+        (ignore-errors (remove-exported-logical-snapshot-token token))
+        (setf token-published nil registered nil))
       (when owner
         (ignore-errors (wal-release-replication-slot-owner slot-name owner)))
       (when (and published (not registered))
@@ -1174,9 +1178,9 @@ snapshot lifecycle."
         (installed nil)
         (database-id (database-oid (current-database))))
     (unwind-protect
-         ;; Keep the source lease lookup and this transaction's independent pin
-         ;; in one registry critical section. Copy completion can remove the
-         ;; exported pin only after the importer has published its own pin.
+         ;; Keep token validation and publication of the independent MVCC pin
+         ;; serialized with invalidation. Importers take registry -> XID ->
+         ;; snapshot locks, matching PostgreSQL's exported snapshot handoff.
          (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
            (let ((state (gethash token *exported-logical-snapshots*)))
              (unless (and state
@@ -1210,7 +1214,10 @@ snapshot lifecycle."
                        registration
                        (backend-first-snapshot-set *backend*) t
                        (backend-snapshot *backend*) snapshot
-                       installed t)))))
+                       installed t)
+                 (register-exported-logical-snapshot-importer
+                  state registration *backend*))
+               (logical-test-failpoint :after-snapshot-import token))))
       (when (and registration (not installed))
         (release-snapshot-registration registration)))))
 

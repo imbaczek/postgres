@@ -7,10 +7,14 @@ PORT_BASE=${PORT_BASE:-5610}
 SOURCE_PORT=$PORT_BASE
 REPLICA_ONE_PORT=$((PORT_BASE + 1))
 REPLICA_TWO_PORT=$((PORT_BASE + 2))
+REPLICA_DRIFT_PORT=$((PORT_BASE + 3))
+SOURCE_DRIFT_PORT=$((PORT_BASE + 4))
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-logical.XXXXXX")
 SOURCE_PID=
+SOURCE_DRIFT_PID=
 REPLICA_ONE_PID=
 REPLICA_TWO_PID=
+REPLICA_DRIFT_PID=
 WORKER_ONE_PID=
 WORKER_TWO_PID=
 SOURCE_DDL_PID=
@@ -20,6 +24,10 @@ sql() {
     SQL_TEXT=$2
     psql -X -h 127.0.0.1 -p "$SQL_PORT" -U postgres -d postgres \
         -q -v ON_ERROR_STOP=1 -A -t -F'|' -c "$SQL_TEXT"
+}
+
+seed_copy_stress_table() {
+    sql "$SOURCE_PORT" "CREATE TABLE copy_stress (id integer PRIMARY KEY, a varchar(126), b varchar(126), c varchar(126), d varchar(126)); INSERT INTO copy_stress VALUES (1, 'copy-1a', 'copy-1b', 'copy-1c', 'copy-1d'), (2, 'copy-2a', 'copy-2b', 'copy-2c', 'copy-2d'), (3, 'copy-3a', 'copy-3b', 'copy-3c', 'copy-3d'), (4, 'copy-4a', 'copy-4b', 'copy-4c', 'copy-4d'), (5, 'copy-5a', 'copy-5b', 'copy-5c', 'copy-5d'), (6, 'copy-6a', 'copy-6b', 'copy-6c', 'copy-6d'), (7, 'copy-7a', 'copy-7b', 'copy-7c', 'copy-7d'), (8, 'copy-8a', 'copy-8b', 'copy-8c', 'copy-8d'), (9, 'copy-9a', 'copy-9b', 'copy-9c', 'copy-9d'), (10, 'copy-10a', 'copy-10b', 'copy-10c', 'copy-10d'), (11, 'copy-11a', 'copy-11b', 'copy-11c', 'copy-11d'), (12, 'copy-12a', 'copy-12b', 'copy-12c', 'copy-12d')" >/dev/null
 }
 
 start_server() {
@@ -58,6 +66,25 @@ wait_for_log() {
         sleep 0.1
     done
     echo "logical-replication: timed out waiting for '$LOG_TEXT' in $LOG_FILE" >&2
+    return 1
+}
+
+wait_for_file() {
+    wait_for_file_timeout "$1" 300
+}
+
+wait_for_file_timeout() {
+    FILE_PATH=$1
+    WAIT_ITERATIONS=$2
+    i=0
+    while [ "$i" -lt "$WAIT_ITERATIONS" ]; do
+        if [ -f "$FILE_PATH" ]; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 0.1
+    done
+    echo "logical-replication: timed out waiting for $FILE_PATH" >&2
     return 1
 }
 
@@ -168,7 +195,7 @@ wait_for_lsn_barrier() {
     SLOT_NAME=$2
     BARRIER=$(normalize_lsn "$3")
     i=0
-    while [ "$i" -lt 300 ]; do
+    while [ "$i" -lt 1800 ]; do
         current=$(sql "$SQL_PORT" \
             "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = '$SLOT_NAME' AND state = 'ready'")
         if [ -n "$current" ]; then
@@ -182,19 +209,46 @@ wait_for_lsn_barrier() {
         i=$((i + 1))
         sleep 0.1
     done
-    echo "logical-replication: slot $SLOT_NAME did not reach source LSN $BARRIER" >&2
+    echo "logical-replication: slot $SLOT_NAME did not reach source LSN $BARRIER within 180 seconds" >&2
+    return 1
+}
+
+wait_for_slot_confirmation() {
+    SQL_PORT=$1
+    SLOT_NAME=$2
+    BARRIER=$(normalize_lsn "$3")
+    i=0
+    while [ "$i" -lt 1800 ]; do
+        current=$(sql "$SQL_PORT" \
+            "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = '$SLOT_NAME'")
+        if [ -n "$current" ]; then
+            current=$(normalize_lsn "$current")
+            first_lsn=$(printf '%s\n%s\n' "$BARRIER" "$current" \
+                | LC_ALL=C sort | sed -n '1p')
+            if [ "$first_lsn" = "$BARRIER" ]; then
+                return 0
+            fi
+        fi
+        i=$((i + 1))
+        sleep 0.1
+    done
+    echo "logical-replication: slot $SLOT_NAME did not confirm source LSN $BARRIER within 180 seconds" >&2
     return 1
 }
 
 cleanup() {
     for pid in "$WORKER_ONE_PID" "$WORKER_TWO_PID" "$SOURCE_DDL_PID" \
-               "$SOURCE_PID" "$REPLICA_ONE_PID" "$REPLICA_TWO_PID"; do
+               "$SOURCE_PID" "$SOURCE_DRIFT_PID" \
+               "$REPLICA_ONE_PID" "$REPLICA_TWO_PID" \
+               "$REPLICA_DRIFT_PID"; do
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
         fi
     done
     for pid in "$WORKER_ONE_PID" "$WORKER_TWO_PID" "$SOURCE_DDL_PID" \
-               "$SOURCE_PID" "$REPLICA_ONE_PID" "$REPLICA_TWO_PID"; do
+               "$SOURCE_PID" "$SOURCE_DRIFT_PID" \
+               "$REPLICA_ONE_PID" "$REPLICA_TWO_PID" \
+               "$REPLICA_DRIFT_PID"; do
         if [ -n "$pid" ]; then
             wait "$pid" 2>/dev/null || true
         fi
@@ -207,9 +261,15 @@ on_exit() {
     trap - EXIT
     if [ "$status" -ne 0 ]; then
         echo "logical-replication: failure; server and worker logs follow" >&2
-        for log in "$TMP/source.log" "$TMP/replica-one.log" \
+          for log in "$TMP/source.log" "$TMP/source-drift.log" \
+                     "$TMP/replica-one.log" \
                    "$TMP/replica-two.log" "$TMP/worker-one.log" \
-                    "$TMP/worker-two.log" "$TMP/worker-two-restart.log"; do
+                   "$TMP/replica-drift.log" "$TMP/worker-initial-drift.log" \
+                   "$TMP/worker-two.log" "$TMP/worker-two-feedback-fault.log" \
+                   "$TMP/worker-two-restart.log" "$TMP/worker-one-row-fault.log" \
+                   "$TMP/worker-one-row-restart.log" \
+                   "$TMP/worker-one-drift-rejected.log" \
+                   "$TMP/worker-one-schema-drift.log"; do
             if [ -f "$log" ]; then
                 echo "--- $log" >&2
                 cat "$log" >&2
@@ -231,18 +291,69 @@ REPLICA_ONE_PID=$SERVER_PID
 start_server "$REPLICA_TWO_PORT" "$TMP/replica-two-data" "$TMP/replica-two.log"
 REPLICA_TWO_PID=$SERVER_PID
 
-sql "$SOURCE_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label varchar(64)); CREATE TABLE nullable_rows (nullable_key integer, label varchar(64)); CREATE UNIQUE INDEX nullable_rows_key_idx ON nullable_rows (nullable_key) NULLS NOT DISTINCT; CREATE TABLE ignored_rows (id integer PRIMARY KEY, label varchar(64)); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; ALTER SEQUENCE bootstrap_counter INCREMENT BY -2; SELECT setval('bootstrap_counter', 100, true); INSERT INTO replicated_rows VALUES (1, 10, 'initial'), (9, 90, 'remove'); INSERT INTO nullable_rows VALUES (NULL, 'initial-null'), (2, 'two'); INSERT INTO ignored_rows VALUES (1, 'before')"
+seed_copy_stress_table
+sql "$SOURCE_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label varchar(64)); CREATE TABLE bootstrap_constraint_order (a integer, b integer, c integer, CONSTRAINT bootstrap_constraint_order_pkey PRIMARY KEY (a), CONSTRAINT bootstrap_constraint_order_b_key UNIQUE (b), CONSTRAINT bootstrap_constraint_order_c_key UNIQUE (c)); CREATE TABLE nullable_rows (nullable_key integer, label varchar(64)); CREATE UNIQUE INDEX nullable_rows_key_idx ON nullable_rows (nullable_key) NULLS NOT DISTINCT; CREATE TABLE ignored_rows (id integer PRIMARY KEY, label varchar(64)); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; ALTER SEQUENCE bootstrap_counter INCREMENT BY -2; SELECT setval('bootstrap_counter', 100, true); INSERT INTO replicated_rows VALUES (1, 10, 'initial'), (9, 90, 'remove'); INSERT INTO nullable_rows VALUES (NULL, 'initial-null'), (2, 'two'); INSERT INTO ignored_rows VALUES (1, 'before')"
+
+# Isolate the failed initial-copy slot on a disposable publisher. Its exported
+# snapshot intentionally remains available for retry, so it must not hold the
+# schema lease used by the main publisher's later DDL regression.
+start_server "$SOURCE_DRIFT_PORT" "$TMP/source-drift-data" "$TMP/source-drift.log"
+SOURCE_DRIFT_PID=$SERVER_PID
+sql "$SOURCE_DRIFT_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label varchar(64)); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; SELECT setval('bootstrap_counter', 100, true)"
+
+# A fresh subscriber with a pre-existing incompatible table and sequence must
+# fail before initial-copy reset or sequence-state bootstrap changes either one.
+start_server "$REPLICA_DRIFT_PORT" "$TMP/replica-drift-data" "$TMP/replica-drift.log"
+REPLICA_DRIFT_PID=$SERVER_PID
+sql "$REPLICA_DRIFT_PORT" "CREATE TABLE replicated_rows (id varchar(12) PRIMARY KEY, amount integer NOT NULL, label varchar(64)); INSERT INTO replicated_rows VALUES ('keep', 42, 'sentinel'); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 1; SELECT setval('bootstrap_counter', 77, true)"
+drift_rows_before=$(sql "$REPLICA_DRIFT_PORT" \
+    "SELECT id, amount, label FROM replicated_rows")
+drift_sequence_before=$(sequence_state_position "$REPLICA_DRIFT_PORT" bootstrap_counter)
+drift_sequence_definition_before=$(sequence_definition_state \
+    "$REPLICA_DRIFT_PORT" bootstrap_counter)
+if "$BASE/pg-lisp-subscribe" --slot logical_initial_drift \
+        --source-port "$SOURCE_DRIFT_PORT" --target-port "$REPLICA_DRIFT_PORT" \
+        --table replicated_rows > "$TMP/worker-initial-drift.log" 2>&1; then
+    echo "logical-replication: initial copy accepted an incompatible target schema" >&2
+    exit 1
+fi
+if ! grep -F "target has existing schema definitions that differ from source" \
+        "$TMP/worker-initial-drift.log" >/dev/null; then
+    echo "logical-replication: initial schema drift failed for an unexpected reason" >&2
+    exit 1
+fi
+if [ "$(sql "$REPLICA_DRIFT_PORT" "SELECT id, amount, label FROM replicated_rows")" \
+        != "$drift_rows_before" ] || \
+        [ "$(sequence_state_position "$REPLICA_DRIFT_PORT" bootstrap_counter)" \
+        != "$drift_sequence_before" ] || \
+        [ "$(sequence_definition_state "$REPLICA_DRIFT_PORT" bootstrap_counter)" \
+        != "$drift_sequence_definition_before" ]; then
+    echo "logical-replication: initial drift rejection changed target rows or sequence state" >&2
+    exit 1
+fi
+kill "$SOURCE_DRIFT_PID" 2>/dev/null || true
+wait "$SOURCE_DRIFT_PID" 2>/dev/null || true
+SOURCE_DRIFT_PID=
+kill "$REPLICA_DRIFT_PID" 2>/dev/null || true
+wait "$REPLICA_DRIFT_PID" 2>/dev/null || true
+REPLICA_DRIFT_PID=
 
 PG_LISP_SUBSCRIBE_COPY_DELAY_MS=5000 \
     "$BASE/pg-lisp-subscribe" --slot logical_replica_one \
     --source-port "$SOURCE_PORT" --target-port "$REPLICA_ONE_PORT" \
     --table replicated_rows --table nullable_rows > "$TMP/worker-one.log" 2>&1 &
 WORKER_ONE_PID=$!
+# Exercise two durable copy chunks quickly; the production 8 MiB boundary is
+# covered separately by test-logical-copy-chunk-byte-boundaries.
+PG_LISP_TEST_FAILPOINT=after-copy-chunk-commit \
+PG_LISP_TEST_FAILPOINT_ACTION=crash \
+PG_LISP_TEST_FAILPOINT_ONCE_FILE="$TMP/worker-two-copy-crash.marker" \
+PG_LISP_TEST_FAILPOINT_HIT=2 \
+PG_LISP_TEST_COPY_CHUNK_BYTES=300 \
 PG_LISP_SUBSCRIBE_COPY_DELAY_MS=5000 \
-PG_LISP_SUBSCRIBE_DROP_FEEDBACK_ONCE=1 \
     "$BASE/pg-lisp-subscribe" --slot logical_replica_two \
     --source-port "$SOURCE_PORT" --target-port "$REPLICA_TWO_PORT" \
-    --table replicated_rows --table nullable_rows > "$TMP/worker-two.log" 2>&1 &
+    --table copy_stress --table replicated_rows --table nullable_rows > "$TMP/worker-two.log" 2>&1 &
 WORKER_TWO_PID=$!
 
 wait_for_log "$TMP/worker-one.log" "snapshot imported at"
@@ -263,8 +374,67 @@ sql "$SOURCE_PORT" "CREATE TABLE logical_copy_race (id integer PRIMARY KEY)" \
     > "$TMP/source-ddl.log" 2>&1 &
 SOURCE_DDL_PID=$!
 
-wait_for_log "$TMP/worker-two.log" "dropping feedback after durable target commit"
-wait "$WORKER_TWO_PID"
+wait_for_file_timeout "$TMP/worker-two-copy-crash.marker" 1800
+if ! grep -Fi "after-copy-chunk-commit" \
+        "$TMP/worker-two-copy-crash.marker" >/dev/null; then
+    echo "logical-replication: worker did not crash after a committed copy chunk" >&2
+    cat "$TMP/worker-two-copy-crash.marker" >&2
+    exit 1
+fi
+if wait "$WORKER_TWO_PID"; then
+    echo "logical-replication: copy-chunk failpoint returned without crashing the process" >&2
+    exit 1
+else
+    worker_status=$?
+fi
+if [ "$worker_status" -ne 137 ]; then
+    echo "logical-replication: expected copy worker SIGKILL status 137, got $worker_status" >&2
+    exit 1
+fi
+WORKER_TWO_PID=
+
+if [ "$(sql "$REPLICA_TWO_PORT" \
+        "SELECT state FROM pg_lisp_subscription_progress WHERE source_slot = 'logical_replica_two'")" != copying ]; then
+    echo "logical-replication: committed initial-copy chunk made the subscription ready" >&2
+    exit 1
+fi
+if [ "$(sql "$REPLICA_TWO_PORT" \
+        "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = 'logical_replica_two'")" != "$copy_boundary_two" ]; then
+    echo "logical-replication: initial-copy chunk advanced progress before copy completion" >&2
+    exit 1
+fi
+if [ "$(sql "$REPLICA_TWO_PORT" "SELECT count(*) FROM copy_stress")" != 4 ] \
+        || [ "$(sql "$REPLICA_TWO_PORT" "SELECT count(*) FROM replicated_rows")" != 0 ]; then
+    echo "logical-replication: second committed copy chunk or per-table copy order was not durable" >&2
+    exit 1
+fi
+
+PG_LISP_TEST_FAILPOINT=after-target-commit-before-feedback \
+PG_LISP_TEST_FAILPOINT_ACTION=crash \
+PG_LISP_TEST_FAILPOINT_ONCE_FILE="$TMP/worker-two-crash.marker" \
+    "$BASE/pg-lisp-subscribe" --slot logical_replica_two \
+    --source-port "$SOURCE_PORT" --target-port "$REPLICA_TWO_PORT" \
+      --table copy_stress --table replicated_rows --table nullable_rows \
+    > "$TMP/worker-two-feedback-fault.log" 2>&1 &
+WORKER_TWO_PID=$!
+
+wait_for_file "$TMP/worker-two-crash.marker"
+if ! grep -Fi "after-target-commit-before-feedback" \
+        "$TMP/worker-two-crash.marker" >/dev/null; then
+    echo "logical-replication: worker missed target-commit/feedback failpoint" >&2
+    cat "$TMP/worker-two-crash.marker" >&2
+    exit 1
+fi
+if wait "$WORKER_TWO_PID"; then
+    echo "logical-replication: target-commit failpoint returned without crashing" >&2
+    exit 1
+else
+    worker_status=$?
+fi
+if [ "$worker_status" -ne 137 ]; then
+    echo "logical-replication: expected target-commit SIGKILL status 137, got $worker_status" >&2
+    exit 1
+fi
 WORKER_TWO_PID=
 
 after_first_commit=$(sql "$REPLICA_TWO_PORT" \
@@ -290,7 +460,7 @@ if ! grep -F "source or table allowlist does not match saved progress" \
 fi
 if "$BASE/pg-lisp-subscribe" --slot logical_replica_two \
         --source-port "$((SOURCE_PORT + 100))" --target-port "$REPLICA_TWO_PORT" \
-        --table replicated_rows --table nullable_rows \
+        --table copy_stress --table replicated_rows --table nullable_rows \
         > "$TMP/worker-wrong-source.log" 2>&1; then
     echo "logical-replication: changed source endpoint was accepted on resume" >&2
     exit 1
@@ -308,6 +478,11 @@ wait_for_rows "$REPLICA_TWO_PORT" "$expected_first"
 expected_nullable_first=$(nullable_rows "$SOURCE_PORT")
 wait_for_nullable_rows "$REPLICA_ONE_PORT" "$expected_nullable_first"
 wait_for_nullable_rows "$REPLICA_TWO_PORT" "$expected_nullable_first"
+if [ "$(sql "$REPLICA_TWO_PORT" "SELECT count(*) FROM copy_stress")" != 12 ] \
+        || [ "$(sql "$REPLICA_ONE_PORT" "SELECT count(*) FROM copy_stress")" != 0 ]; then
+    echo "logical-replication: initial copy chunking ignored the selected-table boundary" >&2
+    exit 1
+fi
 
 # The exported slot boundary includes schema and sequence state. A later
 # nextval is delivered as a standalone pgoutput Message and durably applied on
@@ -328,23 +503,44 @@ if [ "$(sequence_definition_state "$SOURCE_PORT" bootstrap_counter)" != \
 fi
 wait "$SOURCE_DDL_PID"
 SOURCE_DDL_PID=
+
+# The strict schema contract covers the whole supported catalog. Concurrent
+# CREATE TABLE statements must therefore publish before/after shapes in one
+# total order, even though PostgreSQL's tablecmds.c relation locks allow
+# disjoint relations to change independently.
+sql "$SOURCE_PORT" "CREATE TABLE concurrent_schema_one (id integer)" \
+    > "$TMP/concurrent-ddl-one.log" 2>&1 &
+concurrent_ddl_one_pid=$!
+sql "$SOURCE_PORT" "CREATE TABLE concurrent_schema_two (id integer)" \
+    > "$TMP/concurrent-ddl-two.log" 2>&1 &
+concurrent_ddl_two_pid=$!
+wait "$concurrent_ddl_one_pid"
+wait "$concurrent_ddl_two_pid"
+
 sql "$SOURCE_PORT" "BEGIN; INSERT INTO replicated_rows VALUES (77, 770, 'aborted'); ROLLBACK"
 
 # Commit additional work while replica two is disconnected. It must restart from
 # its target's durable marker without duplicating the transaction applied above.
 sql "$SOURCE_PORT" "BEGIN; UPDATE replicated_rows SET amount = 22, label = 'resumed' WHERE id = 2; INSERT INTO replicated_rows VALUES (4, 40, 'later'); DELETE FROM nullable_rows WHERE nullable_key IS NULL; COMMIT"
-sql "$SOURCE_PORT" "ALTER TABLE replicated_rows ADD CONSTRAINT replicated_rows_amount_key UNIQUE (amount); CREATE INDEX replicated_rows_id_amount_idx ON replicated_rows (id, amount); CREATE SEQUENCE streaming_counter START WITH 10 INCREMENT BY 5; SELECT nextval('streaming_counter'); ALTER SEQUENCE streaming_counter INCREMENT BY -3; SELECT nextval('streaming_counter')"
+sql "$SOURCE_PORT" "ALTER TABLE replicated_rows ADD CONSTRAINT replicated_rows_amount_key UNIQUE (amount); CREATE INDEX replicated_rows_id_amount_idx ON replicated_rows (id, amount); CREATE INDEX ignored_rows_label_idx ON ignored_rows (label); CREATE SEQUENCE streaming_counter START WITH 10 INCREMENT BY 5; SELECT nextval('streaming_counter'); ALTER SEQUENCE streaming_counter INCREMENT BY -3; SELECT nextval('streaming_counter')"
 disconnected_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
 expected_final=$(sql "$SOURCE_PORT" "SELECT id, amount, label FROM replicated_rows ORDER BY id")
 "$BASE/pg-lisp-subscribe" --slot logical_replica_two \
     --source-port "$SOURCE_PORT" --target-port "$REPLICA_TWO_PORT" \
-    --table replicated_rows --table nullable_rows \
+      --table copy_stress --table replicated_rows --table nullable_rows \
     > "$TMP/worker-two-restart.log" 2>&1 &
 WORKER_TWO_PID=$!
 wait_for_rows "$REPLICA_ONE_PORT" "$expected_final"
 wait_for_rows "$REPLICA_TWO_PORT" "$expected_final"
 wait_for_lsn_barrier "$REPLICA_ONE_PORT" logical_replica_one "$disconnected_barrier"
 wait_for_lsn_barrier "$REPLICA_TWO_PORT" logical_replica_two "$disconnected_barrier"
+if [ "$(sql "$REPLICA_ONE_PORT" "SELECT count(*) FROM concurrent_schema_one")" != 0 ] \
+        || [ "$(sql "$REPLICA_TWO_PORT" "SELECT count(*) FROM concurrent_schema_one")" != 0 ] \
+        || [ "$(sql "$REPLICA_ONE_PORT" "SELECT count(*) FROM concurrent_schema_two")" != 0 ] \
+        || [ "$(sql "$REPLICA_TWO_PORT" "SELECT count(*) FROM concurrent_schema_two")" != 0 ]; then
+    echo "logical-replication: concurrent DDL schema contracts did not converge" >&2
+    exit 1
+fi
 expected_nullable_final=$(nullable_rows "$SOURCE_PORT")
 wait_for_nullable_rows "$REPLICA_ONE_PORT" "$expected_nullable_final"
 wait_for_nullable_rows "$REPLICA_TWO_PORT" "$expected_nullable_final"
@@ -390,12 +586,70 @@ wait_for_progress_change "$REPLICA_ONE_PORT" logical_replica_one "$progress_one_
 wait_for_progress_change "$REPLICA_TWO_PORT" logical_replica_two "$progress_two_before"
 
 # Standalone DDL is applied before the worker acknowledges its terminal LSN.
+# Stop the current worker and wait for its committed target marker to reach the
+# slot. This drains any feedback already in flight before checking that a later
+# schema rejection leaves confirmation at the old boundary.
+kill -KILL "$WORKER_ONE_PID"
+wait "$WORKER_ONE_PID" 2>/dev/null || true
+WORKER_ONE_PID=
 progress_one_before=$(sql "$REPLICA_ONE_PORT" \
     "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = 'logical_replica_one' AND state = 'ready'")
 progress_two_before=$(sql "$REPLICA_TWO_PORT" \
     "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = 'logical_replica_two' AND state = 'ready'")
+wait_for_slot_confirmation "$SOURCE_PORT" logical_replica_one "$progress_one_before"
+confirmed_one_before_drift=$(sql "$SOURCE_PORT" \
+    "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'logical_replica_one'")
+rows_one_before_drift=$(replicated_rows "$REPLICA_ONE_PORT")
+sql "$REPLICA_ONE_PORT" "CREATE TABLE subscriber_schema_drift (id integer)"
+"$BASE/pg-lisp-subscribe" --slot logical_replica_one \
+    --source-port "$SOURCE_PORT" --target-port "$REPLICA_ONE_PORT" \
+      --table replicated_rows --table nullable_rows \
+    > "$TMP/worker-one-drift-rejected.log" 2>&1 &
+WORKER_ONE_PID=$!
 sql "$SOURCE_PORT" "CREATE TABLE logical_progress_only (id integer)"
-wait_for_progress_change "$REPLICA_ONE_PORT" logical_replica_one "$progress_one_before"
+if ! wait_for_log "$TMP/worker-one-drift-rejected.log" \
+        "subscriber schema differs from publisher schema before DDL"; then
+    echo "logical-replication: subscriber schema drift was not rejected" >&2
+    exit 1
+fi
+if wait "$WORKER_ONE_PID"; then
+    echo "logical-replication: worker continued after incompatible DDL schema" >&2
+    exit 1
+fi
+WORKER_ONE_PID=
+confirmed_one_after_drift=$(sql "$SOURCE_PORT" \
+    "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'logical_replica_one'")
+if [ "$confirmed_one_after_drift" != "$confirmed_one_before_drift" ]; then
+    echo "logical-replication: schema rejection advanced publisher confirmation" >&2
+    exit 1
+fi
+schema_drift_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
+progress_one_after_drift=$(sql "$REPLICA_ONE_PORT" \
+    "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = 'logical_replica_one' AND state = 'ready'")
+barrier_normalized=$(normalize_lsn "$schema_drift_barrier")
+progress_normalized=$(normalize_lsn "$progress_one_after_drift")
+first_lsn=$(printf '%s\n%s\n' "$barrier_normalized" "$progress_normalized" \
+    | LC_ALL=C sort | sed -n '1p')
+if [ "$first_lsn" = "$barrier_normalized" ]; then
+    echo "logical-replication: schema drift advanced progress through unapplied DDL" >&2
+    exit 1
+fi
+if sql "$REPLICA_ONE_PORT" "SELECT count(*) FROM logical_progress_only" \
+        >/dev/null 2>&1; then
+    echo "logical-replication: incompatible DDL changed the subscriber catalog" >&2
+    exit 1
+fi
+if [ "$(replicated_rows "$REPLICA_ONE_PORT")" != "$rows_one_before_drift" ]; then
+    echo "logical-replication: incompatible DDL changed subscriber table data" >&2
+    exit 1
+fi
+sql "$REPLICA_ONE_PORT" "DROP TABLE subscriber_schema_drift"
+"$BASE/pg-lisp-subscribe" --slot logical_replica_one \
+    --source-port "$SOURCE_PORT" --target-port "$REPLICA_ONE_PORT" \
+      --table replicated_rows --table nullable_rows \
+    > "$TMP/worker-one-schema-drift.log" 2>&1 &
+WORKER_ONE_PID=$!
+wait_for_progress_change "$REPLICA_ONE_PORT" logical_replica_one "$progress_one_after_drift"
 wait_for_progress_change "$REPLICA_TWO_PORT" logical_replica_two "$progress_two_before"
 if [ "$(sql "$REPLICA_ONE_PORT" "SELECT count(*) FROM logical_copy_race")" != 0 ] \
         || [ "$(sql "$REPLICA_TWO_PORT" "SELECT count(*) FROM logical_copy_race")" != 0 ]; then
@@ -407,6 +661,24 @@ if [ "$(sql "$REPLICA_ONE_PORT" "SELECT count(*) FROM logical_progress_only")" !
     echo "logical-replication: CREATE TABLE did not reach both subscribers" >&2
     exit 1
 fi
+
+# DDL for a populated publisher table outside the row allowlist was committed
+# while replica two was disconnected. Both catalogs receive the supported index
+# definition on resume, while row changes remain excluded, following the schema
+# versus table-sync split in pgoutput.c and logical/tablesync.c.
+if [ "$(sql "$REPLICA_ONE_PORT" "SELECT count(*) FROM ignored_rows")" != 0 ] \
+        || [ "$(sql "$REPLICA_TWO_PORT" "SELECT count(*) FROM ignored_rows")" != 0 ]; then
+    echo "logical-replication: DDL for an excluded table copied its publisher rows" >&2
+    exit 1
+fi
+if sql "$REPLICA_ONE_PORT" \
+        "CREATE INDEX ignored_rows_label_idx ON ignored_rows(label)" >/dev/null 2>&1 \
+        || sql "$REPLICA_TWO_PORT" \
+            "CREATE INDEX ignored_rows_label_idx ON ignored_rows(label)" >/dev/null 2>&1; then
+    echo "logical-replication: DDL for an excluded table did not reach both subscribers" >&2
+    exit 1
+fi
+
 source_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
 wait_for_lsn_barrier "$REPLICA_ONE_PORT" logical_replica_one "$source_barrier"
 wait_for_lsn_barrier "$REPLICA_TWO_PORT" logical_replica_two "$source_barrier"
@@ -419,6 +691,212 @@ fi
 if [ "$(sql "$REPLICA_ONE_PORT" "SELECT count(*) FROM replicated_rows WHERE id = 77")" != 0 ] \
         || [ "$(sql "$REPLICA_TWO_PORT" "SELECT count(*) FROM replicated_rows WHERE id = 77")" != 0 ]; then
     echo "logical-replication: aborted source transaction became visible" >&2
+    exit 1
+fi
+
+# Interrupt a target transaction after one of several row changes. The open
+# target transaction must roll back both that row and its progress marker,
+# matching the transactional rollback in logical/worker.c.
+progress_one_before=$(sql "$REPLICA_ONE_PORT" \
+    "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = 'logical_replica_one' AND state = 'ready'")
+kill -KILL "$WORKER_ONE_PID"
+wait "$WORKER_ONE_PID" 2>/dev/null || true
+WORKER_ONE_PID=
+PG_LISP_TEST_FAILPOINT=after-row-change \
+PG_LISP_TEST_FAILPOINT_ACTION=crash \
+PG_LISP_TEST_FAILPOINT_ONCE_FILE="$TMP/worker-one-row-crash.marker" \
+  PG_LISP_TEST_FAILPOINT_HIT=2 \
+    "$BASE/pg-lisp-subscribe" --slot logical_replica_one \
+    --source-port "$SOURCE_PORT" --target-port "$REPLICA_ONE_PORT" \
+      --table replicated_rows --table nullable_rows \
+    > "$TMP/worker-one-row-fault.log" 2>&1 &
+WORKER_ONE_PID=$!
+sql "$SOURCE_PORT" "BEGIN; UPDATE replicated_rows SET label = 'row-failpoint'; COMMIT"
+wait_for_file "$TMP/worker-one-row-crash.marker"
+if ! grep -Fi "after-row-change" "$TMP/worker-one-row-crash.marker" >/dev/null; then
+    echo "logical-replication: worker missed the row-change failpoint" >&2
+    cat "$TMP/worker-one-row-crash.marker" >&2
+    exit 1
+fi
+if wait "$WORKER_ONE_PID"; then
+    echo "logical-replication: row-change failpoint returned without crashing" >&2
+    exit 1
+else
+    worker_status=$?
+fi
+if [ "$worker_status" -ne 137 ]; then
+    echo "logical-replication: expected row-change SIGKILL status 137, got $worker_status" >&2
+    exit 1
+fi
+WORKER_ONE_PID=
+if [ "$(sql "$REPLICA_ONE_PORT" \
+        "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = 'logical_replica_one' AND state = 'ready'")" != "$progress_one_before" ]; then
+    echo "logical-replication: row failpoint committed progress without its transaction" >&2
+    exit 1
+fi
+if [ "$(replicated_rows "$REPLICA_ONE_PORT")" != "$expected_final" ]; then
+    echo "logical-replication: a partial target row transaction survived worker crash" >&2
+    exit 1
+fi
+
+"$BASE/pg-lisp-subscribe" --slot logical_replica_one \
+    --source-port "$SOURCE_PORT" --target-port "$REPLICA_ONE_PORT" \
+      --table replicated_rows --table nullable_rows \
+    > "$TMP/worker-one-row-restart.log" 2>&1 &
+WORKER_ONE_PID=$!
+row_fault_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
+wait_for_lsn_barrier "$REPLICA_ONE_PORT" logical_replica_one "$row_fault_barrier"
+row_fault_expected=$(replicated_rows "$SOURCE_PORT")
+if [ "$(replicated_rows "$REPLICA_ONE_PORT")" != "$row_fault_expected" ]; then
+    echo "logical-replication: row transaction did not replay atomically after restart" >&2
+    exit 1
+fi
+wait_for_lsn_barrier "$REPLICA_TWO_PORT" logical_replica_two "$row_fault_barrier"
+
+  # Crash after all row effects are staged but before the target COMMIT. The
+  # open transaction must still roll back both rows and the durable marker.
+  kill -KILL "$WORKER_ONE_PID"
+  wait "$WORKER_ONE_PID" 2>/dev/null || true
+  WORKER_ONE_PID=
+  progress_before_commit=$(sql "$REPLICA_ONE_PORT" \
+      "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = 'logical_replica_one' AND state = 'ready'")
+  rows_before_commit=$(replicated_rows "$REPLICA_ONE_PORT")
+  PG_LISP_TEST_FAILPOINT=before-target-commit \
+  PG_LISP_TEST_FAILPOINT_ACTION=crash \
+  PG_LISP_TEST_FAILPOINT_ONCE_FILE="$TMP/worker-one-before-commit.marker" \
+      "$BASE/pg-lisp-subscribe" --slot logical_replica_one \
+      --source-port "$SOURCE_PORT" --target-port "$REPLICA_ONE_PORT" \
+      --table replicated_rows --table nullable_rows \
+      > "$TMP/worker-one-before-commit.log" 2>&1 &
+  WORKER_ONE_PID=$!
+  sql "$SOURCE_PORT" \
+      "BEGIN; UPDATE replicated_rows SET label = 'before-target-commit'; COMMIT"
+  wait_for_file "$TMP/worker-one-before-commit.marker"
+  if wait "$WORKER_ONE_PID"; then
+      echo "logical-replication: before-target-commit failpoint returned without crashing" >&2
+      exit 1
+  else
+      worker_status=$?
+  fi
+  [ "$worker_status" -eq 137 ] || {
+      echo "logical-replication: expected pre-commit SIGKILL 137, got $worker_status" >&2
+      exit 1
+  }
+  WORKER_ONE_PID=
+  if [ "$(sql "$REPLICA_ONE_PORT" \
+          "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = 'logical_replica_one' AND state = 'ready'")" != "$progress_before_commit" ] \
+          || [ "$(replicated_rows "$REPLICA_ONE_PORT")" != "$rows_before_commit" ]; then
+      echo "logical-replication: target effects or progress survived a pre-commit crash" >&2
+      exit 1
+  fi
+  "$BASE/pg-lisp-subscribe" --slot logical_replica_one \
+      --source-port "$SOURCE_PORT" --target-port "$REPLICA_ONE_PORT" \
+      --table replicated_rows --table nullable_rows \
+      > "$TMP/worker-one-before-commit-restart.log" 2>&1 &
+  WORKER_ONE_PID=$!
+  before_commit_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
+  wait_for_lsn_barrier "$REPLICA_ONE_PORT" logical_replica_one "$before_commit_barrier"
+  if [ "$(replicated_rows "$REPLICA_ONE_PORT")" != "$(replicated_rows "$SOURCE_PORT")" ]; then
+      echo "logical-replication: pre-commit transaction did not replay after restart" >&2
+      exit 1
+  fi
+
+# Hold one subscriber offline while a large transaction and concurrent writers
+# advance WAL. The slot must retain the unapplied interval until that target
+# commits it; then repeat the reconnect once more to cover repeated resumes.
+kill -KILL "$WORKER_TWO_PID"
+wait "$WORKER_TWO_PID" 2>/dev/null || true
+WORKER_TWO_PID=
+progress_two_before=$(sql "$REPLICA_TWO_PORT" \
+    "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = 'logical_replica_two' AND state = 'ready'")
+bulk_values=
+bulk_id=10000
+while [ "$bulk_id" -lt 10300 ]; do
+    if [ -n "$bulk_values" ]; then
+        bulk_values="$bulk_values,"
+    fi
+    bulk_values="$bulk_values($bulk_id,$((bulk_id * 10)),'bulk')"
+    bulk_id=$((bulk_id + 1))
+done
+sql "$SOURCE_PORT" \
+    "BEGIN; INSERT INTO replicated_rows VALUES $bulk_values; COMMIT" >/dev/null
+sql "$SOURCE_PORT" "INSERT INTO replicated_rows VALUES (20001, 200010, 'writer-one')" \
+    > "$TMP/stress-writer-one.log" 2>&1 &
+writer_one_pid=$!
+sql "$SOURCE_PORT" "INSERT INTO replicated_rows VALUES (30001, 300010, 'writer-two')" \
+    > "$TMP/stress-writer-two.log" 2>&1 &
+writer_two_pid=$!
+wait "$writer_one_pid"
+wait "$writer_two_pid"
+if [ "$(sql "$REPLICA_TWO_PORT" \
+        "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = 'logical_replica_two' AND state = 'ready'")" != "$progress_two_before" ]; then
+    echo "logical-replication: disconnected subscriber advanced its durable marker" >&2
+    exit 1
+fi
+slot_retained=$(sql "$SOURCE_PORT" \
+    "SELECT retained_wal_bytes FROM pg_replication_slots WHERE slot_name = 'logical_replica_two'")
+slot_active=$(sql "$SOURCE_PORT" \
+    "SELECT active FROM pg_replication_slots WHERE slot_name = 'logical_replica_two'")
+if [ "$slot_active" != f ] || [ -z "$slot_retained" ] || [ "$slot_retained" -le 0 ]; then
+    echo "logical-replication: lagging slot did not retain its unapplied WAL" >&2
+    exit 1
+fi
+"$BASE/pg-lisp-subscribe" --slot logical_replica_two \
+    --source-port "$SOURCE_PORT" --target-port "$REPLICA_TWO_PORT" \
+      --table copy_stress --table replicated_rows --table nullable_rows \
+    > "$TMP/worker-two-stress-restart.log" 2>&1 &
+WORKER_TWO_PID=$!
+stress_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
+wait_for_lsn_barrier "$REPLICA_ONE_PORT" logical_replica_one "$stress_barrier"
+wait_for_lsn_barrier "$REPLICA_TWO_PORT" logical_replica_two "$stress_barrier"
+source_stress_rows=$(sql "$SOURCE_PORT" \
+    "SELECT id, amount, label FROM replicated_rows WHERE id >= 10000 ORDER BY id")
+if [ "$(sql "$REPLICA_ONE_PORT" \
+        "SELECT id, amount, label FROM replicated_rows WHERE id >= 10000 ORDER BY id")" != "$source_stress_rows" ] \
+        || [ "$(sql "$REPLICA_TWO_PORT" \
+             "SELECT id, amount, label FROM replicated_rows WHERE id >= 10000 ORDER BY id")" != "$source_stress_rows" ]; then
+    echo "logical-replication: large transaction or concurrent writer changes diverged" >&2
+    exit 1
+fi
+
+kill -KILL "$WORKER_TWO_PID"
+wait "$WORKER_TWO_PID" 2>/dev/null || true
+WORKER_TWO_PID=
+sql "$SOURCE_PORT" "INSERT INTO replicated_rows VALUES (40001, 400010, 'reconnect-two')" >/dev/null
+"$BASE/pg-lisp-subscribe" --slot logical_replica_two \
+    --source-port "$SOURCE_PORT" --target-port "$REPLICA_TWO_PORT" \
+      --table copy_stress --table replicated_rows --table nullable_rows \
+    > "$TMP/worker-two-second-reconnect.log" 2>&1 &
+WORKER_TWO_PID=$!
+reconnect_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
+wait_for_lsn_barrier "$REPLICA_TWO_PORT" logical_replica_two "$reconnect_barrier"
+if [ "$(replicated_rows "$SOURCE_PORT")" != "$(replicated_rows "$REPLICA_TWO_PORT")" ]; then
+    echo "logical-replication: repeated subscriber reconnect diverged" >&2
+    exit 1
+fi
+
+# TRUNCATE is a transactional row operation. A rollback must emit no target
+# effect; a commit must clear each selected table with its source commit marker.
+rows_before_truncate=$(replicated_rows "$SOURCE_PORT")
+sql "$SOURCE_PORT" "BEGIN; TRUNCATE TABLE replicated_rows; ROLLBACK"
+truncate_rollback_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
+wait_for_lsn_barrier "$REPLICA_ONE_PORT" logical_replica_one "$truncate_rollback_barrier"
+wait_for_lsn_barrier "$REPLICA_TWO_PORT" logical_replica_two "$truncate_rollback_barrier"
+if [ "$(replicated_rows "$SOURCE_PORT")" != "$rows_before_truncate" ] \
+        || [ "$(replicated_rows "$REPLICA_ONE_PORT")" != "$rows_before_truncate" ] \
+        || [ "$(replicated_rows "$REPLICA_TWO_PORT")" != "$rows_before_truncate" ]; then
+    echo "logical-replication: rolled-back TRUNCATE changed source or subscriber rows" >&2
+    exit 1
+fi
+
+sql "$SOURCE_PORT" "TRUNCATE TABLE replicated_rows"
+truncate_commit_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
+wait_for_lsn_barrier "$REPLICA_ONE_PORT" logical_replica_one "$truncate_commit_barrier"
+wait_for_lsn_barrier "$REPLICA_TWO_PORT" logical_replica_two "$truncate_commit_barrier"
+if [ -n "$(replicated_rows "$SOURCE_PORT")" ] \
+        || [ -n "$(replicated_rows "$REPLICA_ONE_PORT")" ] \
+        || [ -n "$(replicated_rows "$REPLICA_TWO_PORT")" ]; then
+    echo "logical-replication: committed TRUNCATE did not clear selected tables" >&2
     exit 1
 fi
 

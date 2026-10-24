@@ -11,6 +11,8 @@
 (defconstant +max-logical-read-scan-bytes+ (* 16 1024 1024))
 (defconstant +logical-change-chunk-header-size+ 12)
 
+(declaim (ftype function call-with-logical-replication-slot))
+
 (defvar *wal-logical-slot-read-progress* nil)
 
 (defstruct logical-change
@@ -351,14 +353,6 @@
     (logical-write-u32 buffer (length event-bytes))
     (logical-write-octets buffer event-bytes)))
 
-(defun logical-catalog-event-for-ast (ast)
-  ;; CREATE/ALTER/DROP PUBLICATION changes publisher-side selection policy;
-  ;; like pgoutput's publication metadata, these are not subscriber schema DDL.
-  (unless (member (getf ast :type)
-                  '(:create-publication :alter-publication :drop-publication))
-    (logical-encode-catalog-event
-     (database-oid (current-database)) ast)))
-
 (defun logical-read-data-string (text)
   "Read one data-only S-expression, rejecting evaluation and trailing forms."
   (let ((eof (gensym "LOGICAL-EVENT-EOF-")))
@@ -400,6 +394,7 @@
        (catalog-readable-data-string
         (list :database-oid (database-oid (current-database))
               :name name :oid (pg-sequence-oid sequence)
+              :definition (catalog-sequence-definition-sql sequence)
               :start (pg-sequence-start-value sequence)
               :increment (pg-sequence-increment sequence)
               :min (pg-sequence-min-value sequence)
@@ -725,40 +720,6 @@ executor, so capture the same operation before transaction commit."
           (max (or *wal-logical-slot-read-progress* progress-lsn)
                progress-lsn)))
   (values transactions progress-lsn))
-
-(defun call-with-logical-replication-slot (name function &key allow-initial-copy)
-  "Hold an exclusive runtime claim across the reader's apply/ack callback.
-
-PostgreSQL's ReplicationSlotAcquire() keeps a slot from being dropped or read
-by a second walsender while it is active. This callback is the equivalent
-session boundary until the wire-protocol replication command is added."
-  (let ((owner (gensym "LOGICAL-SLOT-"))
-        (slot nil))
-    (sb-thread:with-mutex (*wal-lock*)
-      (setf slot (gethash name *wal-replication-slots*))
-      (unless slot
-        (ereport "42704" "replication slot \"~a\" does not exist" name))
-      (unless (wal-replication-slot-database-oid slot)
-        (ereport "55000" "replication slot has no database binding"))
-      (when (eq (wal-replication-slot-wal-status slot) :lost)
-        (ereport "55000" "replication slot \"~a\" has lost its WAL" name))
-      (unless (or (wal-replication-slot-confirmed-flush-lsn slot)
-                  allow-initial-copy)
-        (ereport "55000" "replication slot initial copy is not acknowledged"))
-      (when (wal-replication-slot-active-owner slot)
-        (ereport "55006" "replication slot \"~a\" is active" name))
-      (when (and *backend*
-                 (/= (database-oid (current-database))
-                     (wal-replication-slot-database-oid slot)))
-        (ereport "55000" "replication slot belongs to another database"))
-      (setf (wal-replication-slot-active-owner slot) owner))
-    (unwind-protect
-         (let ((*wal-logical-slot-owner* owner)
-               (*wal-logical-slot-read-progress*
-                 (or (wal-replication-slot-confirmed-flush-lsn slot)
-                     (wal-replication-slot-consistent-lsn slot))))
-           (funcall function slot))
-      (wal-release-replication-slot-owner name owner))))
 
 (defun wal-logical-slot-validate-start-position (name requested-lsn)
   "Validate the requested initial or resumed stream boundary for NAME."

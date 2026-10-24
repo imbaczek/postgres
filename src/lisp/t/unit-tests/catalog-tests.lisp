@@ -69,6 +69,142 @@
     (check (pg-index-constraint-owned-p legacy-pk)
            "legacy primary index remains constraint-owned")))
 
+(defun test-catalog-mutation-rollback-macro ()
+  (let* ((*catalog* (make-catalog))
+         (*backend* (make-backend :database "postgres"))
+         (database (make-database :name "postgres" :oid 7))
+         (table
+           (make-pg-class
+            :oid 701 :name "rollback_rows" :relfilenode 1701
+            :columns
+            (vector (make-pg-column :name "id" :type :int4 :typmod -1
+                                    :attnum 1 :notnull t))))
+         (original-next-oid (catalog-next-oid *catalog*)))
+    (setf (gethash "postgres" (catalog-databases *catalog*)) database
+          (gethash "rollback_rows" (database-tables database)) table)
+    (let ((failed nil))
+      (handler-case
+          (with-write-catalog-locks
+            (with-catalog-mutation-rollback (database)
+              (setf (pg-column-notnull (aref (pg-class-columns table) 0)) nil
+                    (gethash "transient" (database-tables database))
+                    (make-pg-class :oid 702 :name "transient" :columns #()))
+              (incf (catalog-next-oid *catalog*))
+              (error "injected pre-durable catalog failure")))
+        (error () (setf failed t)))
+      (check (and failed
+                  (eq table (gethash "rollback_rows" (database-tables database)))
+                  (not (gethash "transient" (database-tables database)))
+                  (pg-column-notnull (aref (pg-class-columns table) 0))
+                  (= (catalog-next-oid *catalog*) original-next-oid))
+             "catalog mutation macro restores object state, catalog maps, and OID allocation"))
+    (let ((failed nil))
+      (handler-case
+          (with-write-catalog-locks
+            (with-catalog-mutation-rollback (database)
+              (setf (pg-column-notnull (aref (pg-class-columns table) 0)) nil
+                    *catalog-save-error-after-durable-p* t)
+              (error "injected post-durable catalog failure")))
+        (error () (setf failed t)))
+      (check (and failed
+                  (not (pg-column-notnull (aref (pg-class-columns table) 0))))
+             "catalog mutation macro keeps state after the durable WAL boundary"))
+    ;; Exercise the generation path through save-catalog itself, after its
+    ;; catalog terminal has crossed the WAL boundary like RecordTransactionCommit()
+    ;; in xact.c. This guards against a rollback after a durable catalog image.
+    (logical-test-with-wal-storage
+     (lambda ()
+       (let* ((*catalog* (make-catalog))
+              (*backend* (make-backend :database "postgres"))
+              (*catalog-durable-generation* 0)
+              (*wal-catalog-flush-generation* 0)
+              (database (make-database :name "postgres" :oid 7))
+              (table
+                (make-pg-class
+                 :oid 701 :name "rollback_rows" :relfilenode 1701
+                 :columns
+                 (vector (make-pg-column :name "id" :type :int4 :typmod -1
+                                         :attnum 1 :notnull t))))
+              (event (logical-encode-catalog-event
+                      7 '(:type :create-table :name "rollback_event")))
+              (generation *catalog-durable-generation*)
+              (caught nil))
+         (setf (gethash "postgres" (catalog-databases *catalog*)) database
+               (gethash "rollback_rows" (database-tables database)) table
+               (gethash :catalog-rollback-test
+                        *wal-logical-catalog-event-interests*) 7)
+         (let ((*logical-test-failpoint-hook*
+                 (lambda (point &rest details)
+                   (declare (ignore details))
+                   (when (eq point :after-catalog-event-wal-terminal)
+                     (error "injected failure after durable catalog terminal")))))
+           (handler-case
+               (with-write-catalog-locks
+                 (with-catalog-mutation-rollback (database)
+                   ;; Rollback would restore NOT NULL, so a false result below
+                   ;; proves the post-terminal mutation stayed published.
+                   (setf (pg-column-notnull
+                          (aref (pg-class-columns table) 0)) nil)
+                   (save-catalog :logical-event event)))
+             (error () (setf caught t))))
+         (check (and caught
+                     (> *catalog-durable-generation* generation)
+                     (plusp *wal-durable-lsn*)
+                     (not (pg-column-notnull (aref (pg-class-columns table) 0))))
+                "catalog mutation macro keeps state after save-catalog advances the durable generation"))))))
+
+(defun test-with-table-ddl-evaluates-lock-inputs-once ()
+  (let* ((*catalog* (make-catalog))
+         (*backend* (make-backend :database "postgres"))
+         (*relation-builders* (make-hash-table :test #'eql))
+         (*relation-reader-blockers* (make-hash-table :test #'eql))
+         (*relation-build-groups* (make-hash-table :test #'eq))
+         (database (make-database :name "postgres" :oid 7))
+         (table (make-pg-class :oid 810 :name "macro_rows"
+                               :relfilenode 810 :columns #()))
+         (index (make-pg-index :oid 820 :name "macro_rows_idx"
+                               :relfilenode 820 :table-oid 810))
+         (table-evaluations 0)
+         (index-evaluations 0)
+         (wait-evaluations 0)
+         (locked-relations nil)
+         (reader-blocked-p nil)
+         (body-ran nil))
+    (setf (gethash "postgres" (catalog-databases *catalog*)) database
+          (gethash "macro_rows" (database-tables database)) table)
+    (let ((result
+            (with-table-ddl
+                ((progn (incf table-evaluations) table)
+                 :indexes (progn (incf index-evaluations) (list index))
+                 :wait-readers (progn (incf wait-evaluations) t))
+              (maphash
+               (lambda (token entry)
+                 (declare (ignore token))
+                 (setf locked-relations (first entry)
+                       reader-blocked-p (second entry)))
+               *relation-build-groups*)
+              (setf body-ran t)
+              table)))
+      (check (eq result table)
+             "table DDL macro returns its body result")
+      (check (and (= table-evaluations 1)
+                  (= index-evaluations 1)
+                  (= wait-evaluations 1))
+             "table DDL macro evaluates table, index, and wait forms once")
+      (check (and (equal locked-relations '(810 820))
+                  reader-blocked-p
+                  body-ran)
+             "table DDL macro locks its table and indexes before the body"))
+    (let ((rejected nil)
+          (stale-body-ran nil))
+      (handler-case
+          (with-table-ddl
+              ((progn (remhash "macro_rows" (database-tables database)) table))
+            (setf stale-body-ran t))
+        (error () (setf rejected t)))
+      (check (and rejected (not stale-body-ran))
+             "table DDL macro revalidates a stale table before catalog mutation"))))
+
 (defun test-table-statistics-catalog-roundtrip ()
   (let* ((statistics
            (make-pg-table-statistics

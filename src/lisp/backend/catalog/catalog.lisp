@@ -81,6 +81,15 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
 (defvar *catalog-durable-generation* 0)
 (defvar *catalog-save-error-after-durable-p* nil)
 (defvar *logical-event-apply-id* nil)
+
+(defvar *logical-source-schema-precondition* nil)
+
+(defvar *logical-event-schema-contract* nil)
+
+(defvar *catalog-logical-event-publication-p* nil)
+
+(declaim (ftype function logical-validate-schema-contract-under-write-lock))
+
 (defvar *logical-event-apply-lock*
   (sb-thread:make-mutex :name "logical event apply mutex"))
 (declaim (ftype function logical-sequence-state-event))
@@ -277,6 +286,8 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
 (defvar *catalog-rename-function* nil)
 
 (defun write-catalog-image (bytes)
+  (when *catalog-logical-event-publication-p*
+    (logical-test-failpoint :after-catalog-wal-flush-before-file-publication))
   (with-atomic-output (stream
                        (catalog-path)
                        (pgdata-path "global/pg_catalog.tmp")
@@ -336,11 +347,18 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
             event-lsn))
     (handler-case
         (let ((oldest (catalog-compute-oldest-relfrozenxid)))
-          (wal-commit-catalog
-           (catalog-image-bytes) #'write-catalog-image
-           :relation-deletes deferred-relations
-           :logical-event logical-event
-           :on-record-appended on-record-appended)
+          (when (and logical-event *logical-event-schema-contract*)
+            (logical-validate-schema-contract-under-write-lock
+             (getf *logical-event-schema-contract* :schema-after) :after))
+          (when logical-event
+            (logical-test-failpoint :before-catalog-event-wal-terminal))
+          (let ((*catalog-logical-event-publication-p*
+                  (not (null logical-event))))
+            (wal-commit-catalog
+             (catalog-image-bytes) #'write-catalog-image
+             :relation-deletes deferred-relations
+             :logical-event logical-event
+             :on-record-appended on-record-appended))
           (incf *catalog-durable-generation*)
           (setf *catalog-oldest-relfrozenxid* oldest))
       (error (condition)
@@ -353,7 +371,12 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
                         previous-event-lsn)
                   (remhash event-key
                            (database-applied-logical-event-ids database)))))
-        (error condition)))))
+        (error condition)))
+    (when logical-event
+      ;; The catalog terminal is now durable. Crashing here leaves a replayable
+      ;; standalone event, matching the subscriber's target-commit/feedback gap.
+      (logical-test-failpoint :after-catalog-event-wal-terminal))
+    (values)))
 
 (defun load-catalog ()
   (let ((path (catalog-path)))
@@ -440,19 +463,187 @@ longer contain transaction-status references."
       (values +int8-min+ -1)
       (values 1 +int8-max+)))
 
+(defstruct catalog-mutation-snapshot
+  database next-oid table-entries index-entries sequence-entries
+  publication-entries applied-event-entries table-states index-states
+  sequence-states publication-states pending-relation-deletes)
+
+(defun catalog-mutation-hash-entries (table)
+  (loop for key being the hash-keys of table using (hash-value value)
+        collect (cons key value)))
+
+(defun catalog-mutation-copy-class (class)
+  (let ((copy (copy-pg-class class)))
+    (setf (pg-class-columns copy)
+          (map 'vector #'copy-pg-column (pg-class-columns class))
+          (pg-class-indexes copy) (copy-list (pg-class-indexes class)))
+    copy))
+
+(defun catalog-mutation-copy-index (index)
+  (let ((copy (copy-pg-index index)))
+    (setf (pg-index-columns copy) (copy-list (pg-index-columns index)))
+    copy))
+
+(defun catalog-mutation-copy-publication (publication)
+  (let ((copy (copy-pg-publication publication)))
+    (setf (pg-publication-tables copy)
+          (copy-tree (pg-publication-tables publication))
+          (pg-publication-sequences copy)
+          (copy-list (pg-publication-sequences publication)))
+    copy))
+
+(defun catalog-capture-mutation-snapshot (database)
+  (let ((tables (catalog-mutation-hash-entries (database-tables database)))
+        (indexes (catalog-mutation-hash-entries (database-indexes database)))
+        (sequences (catalog-mutation-hash-entries
+                    (database-sequences database)))
+        (publications (catalog-mutation-hash-entries
+                       (database-publications database))))
+    (make-catalog-mutation-snapshot
+     :database database
+     :next-oid (catalog-next-oid *catalog*)
+     :table-entries tables
+     :index-entries indexes
+     :sequence-entries sequences
+     :publication-entries publications
+     :applied-event-entries
+     (catalog-mutation-hash-entries
+      (database-applied-logical-event-ids database))
+     :table-states
+     (mapcar (lambda (entry)
+               (cons (cdr entry) (catalog-mutation-copy-class (cdr entry))))
+             tables)
+     :index-states
+     (mapcar (lambda (entry)
+               (cons (cdr entry) (catalog-mutation-copy-index (cdr entry))))
+             indexes)
+     :sequence-states
+     (mapcar (lambda (entry)
+               (cons (cdr entry) (copy-pg-sequence (cdr entry))))
+             sequences)
+     :publication-states
+     (mapcar (lambda (entry)
+               (cons (cdr entry)
+                     (catalog-mutation-copy-publication (cdr entry))))
+             publications)
+     :pending-relation-deletes
+     (sb-thread:with-mutex (*wal-lock*)
+       (copy-list *wal-pending-deletes*)))))
+
+(defun catalog-mutation-restore-hash (table entries)
+  (clrhash table)
+  (dolist (entry entries)
+    (setf (gethash (car entry) table) (cdr entry))))
+
+(defun catalog-mutation-restore-class (class saved)
+  (setf (pg-class-oid class) (pg-class-oid saved)
+        (pg-class-name class) (pg-class-name saved)
+        (pg-class-relfilenode class) (pg-class-relfilenode saved)
+        (pg-class-relfrozenxid class) (pg-class-relfrozenxid saved)
+        (pg-class-columns class) (pg-class-columns saved)
+        (pg-class-indexes class) (pg-class-indexes saved)
+        (pg-class-statistics class) (pg-class-statistics saved)))
+
+(defun catalog-mutation-restore-index (index saved)
+  (setf (pg-index-oid index) (pg-index-oid saved)
+        (pg-index-name index) (pg-index-name saved)
+        (pg-index-relfilenode index) (pg-index-relfilenode saved)
+        (pg-index-table-oid index) (pg-index-table-oid saved)
+        (pg-index-columns index) (pg-index-columns saved)
+        (pg-index-unique-p index) (pg-index-unique-p saved)
+        (pg-index-primary-p index) (pg-index-primary-p saved)
+        (pg-index-constraint-p index) (pg-index-constraint-p saved)
+        (pg-index-nulls-not-distinct-p index)
+        (pg-index-nulls-not-distinct-p saved)
+        (pg-index-valid-p index) (pg-index-valid-p saved)))
+
+(defun catalog-mutation-restore-sequence (sequence saved)
+  (setf (pg-sequence-oid sequence) (pg-sequence-oid saved)
+        (pg-sequence-name sequence) (pg-sequence-name saved)
+        (pg-sequence-increment sequence) (pg-sequence-increment saved)
+        (pg-sequence-start-value sequence) (pg-sequence-start-value saved)
+        (pg-sequence-min-value sequence) (pg-sequence-min-value saved)
+        (pg-sequence-max-value sequence) (pg-sequence-max-value saved)
+        (pg-sequence-last-value sequence) (pg-sequence-last-value saved)
+        (pg-sequence-called-p sequence) (pg-sequence-called-p saved)))
+
+(defun catalog-mutation-restore-publication (publication saved)
+  (setf (pg-publication-name publication) (pg-publication-name saved)
+        (pg-publication-all-tables-p publication)
+        (pg-publication-all-tables-p saved)
+        (pg-publication-tables publication) (pg-publication-tables saved)
+        (pg-publication-sequences publication)
+        (pg-publication-sequences saved)
+        (pg-publication-generation publication)
+        (pg-publication-generation saved)))
+
+(defun catalog-restore-mutation-snapshot (snapshot)
+  (let ((database (catalog-mutation-snapshot-database snapshot)))
+    (catalog-mutation-restore-hash
+     (database-tables database)
+     (catalog-mutation-snapshot-table-entries snapshot))
+    (catalog-mutation-restore-hash
+     (database-indexes database)
+     (catalog-mutation-snapshot-index-entries snapshot))
+    (catalog-mutation-restore-hash
+     (database-sequences database)
+     (catalog-mutation-snapshot-sequence-entries snapshot))
+    (catalog-mutation-restore-hash
+     (database-publications database)
+     (catalog-mutation-snapshot-publication-entries snapshot))
+    (catalog-mutation-restore-hash
+     (database-applied-logical-event-ids database)
+     (catalog-mutation-snapshot-applied-event-entries snapshot))
+    (dolist (state (catalog-mutation-snapshot-table-states snapshot))
+      (catalog-mutation-restore-class (car state) (cdr state)))
+    (dolist (state (catalog-mutation-snapshot-index-states snapshot))
+      (catalog-mutation-restore-index (car state) (cdr state)))
+    (dolist (state (catalog-mutation-snapshot-sequence-states snapshot))
+      (catalog-mutation-restore-sequence (car state) (cdr state)))
+    (dolist (state (catalog-mutation-snapshot-publication-states snapshot))
+      (catalog-mutation-restore-publication (car state) (cdr state)))
+    (setf (catalog-next-oid *catalog*)
+          (catalog-mutation-snapshot-next-oid snapshot))
+    (sb-thread:with-mutex (*wal-lock*)
+      (setf *wal-pending-deletes*
+            (copy-list
+             (catalog-mutation-snapshot-pending-relation-deletes snapshot)))))
+  (values))
+
+(defun call-with-catalog-durability-rollback-under-lock (rollback function)
+  (let ((*catalog-save-error-after-durable-p* nil)
+        (durable-generation *catalog-durable-generation*))
+    (handler-case
+        (funcall function)
+      (error (condition)
+        (unless (or *catalog-save-error-after-durable-p*
+                    (> *catalog-durable-generation* durable-generation))
+          (funcall rollback))
+        (error condition)))))
+
+(defun call-with-catalog-mutation-rollback-under-lock (database function)
+  ;; tablecmds.c rolls catalog changes back with the surrounding transaction.
+  ;; This project has no catalog transaction manager, so snapshot the supported
+  ;; catalog maps and pending relfile deletes through the same WAL boundary.
+  (let ((snapshot (catalog-capture-mutation-snapshot database)))
+    (call-with-catalog-durability-rollback-under-lock
+     (lambda () (catalog-restore-mutation-snapshot snapshot))
+     function)))
+
+(defmacro with-catalog-mutation-rollback ((database) &body body)
+  `(call-with-catalog-mutation-rollback-under-lock
+    ,database
+    (lambda () ,@body)))
+
+                                        ; errors after the WAL terminal leave its state published.
+
 (defun call-with-catalog-durability-rollback (rollback function)
   "Run a catalog mutation and undo pre-durable failures under the catalog locks.
 
 Holding both locks through the failure decision prevents another catalog writer
 from advancing the shared WAL generation between a failed save and rollback."
   (with-write-catalog-locks
-    (let ((*catalog-save-error-after-durable-p* nil))
-      (handler-case
-          (funcall function)
-        (error (condition)
-          (unless *catalog-save-error-after-durable-p*
-            (funcall rollback))
-          (error condition))))))
+    (call-with-catalog-durability-rollback-under-lock rollback function)))
 
 (defun sequence-nextval (name)
   "Advance and durably save NAME before returning its next value."
@@ -633,9 +824,12 @@ from advancing the shared WAL generation between a failed save and rollback."
 
 (defun catalog-table-definition-sql (table)
   (let* ((indexes (table-indexes table))
+         ;; Constraint-owned indexes are push-built; sort by name so the
+         ;; pg_dump-style schema representation is independent of insertion order.
          (constraints (mapcar (lambda (index)
                                 (catalog-table-constraint-sql index table))
-                              (remove-if-not #'pg-index-constraint-owned-p indexes)))
+                              (sort (remove-if-not #'pg-index-constraint-owned-p indexes)
+                                    #'string< :key #'pg-index-name)))
          (definitions
            (append (loop for column across (pg-class-columns table)
                          collect (catalog-column-definition-sql column))

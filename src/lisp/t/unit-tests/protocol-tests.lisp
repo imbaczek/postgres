@@ -106,6 +106,72 @@
     (let ((body (read-startup-packet stream)))
       (and body (= (length body) +max-startup-packet-length+)))))
 
+(defun test-logical-ddl-response-deferral ()
+  ;; postgres.c:exec_simple_query completes the transaction before EndCommand.
+  (let ((original-write-message (symbol-function 'write-message))
+        (original-commit-transaction (symbol-function 'commit-transaction))
+        (write-count 0)
+        (write-types '())
+        (commit-failed-p t)
+        (commit-complete-p nil)
+        (all-writes-after-commit-and-unlock-p t)
+        (responses nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'write-message)
+                 (lambda (stream type payload)
+                   (declare (ignore stream payload))
+                   (let ((acquired
+                           (sb-thread:grab-mutex
+                            *logical-ddl-event-order-lock* :waitp nil)))
+                     (setf all-writes-after-commit-and-unlock-p
+                           (and all-writes-after-commit-and-unlock-p
+                                (not *logical-ddl-event-order-active-p*)
+                                commit-complete-p
+                                acquired))
+                     (when acquired
+                       (sb-thread:release-mutex
+                        *logical-ddl-event-order-lock*))
+                     (incf write-count)
+                     (push type write-types)
+                     (values)))
+                 (symbol-function 'commit-transaction)
+                 (lambda ()
+                   (when commit-failed-p
+                     (error "injected DDL commit failure"))
+                   (setf commit-complete-p t)))
+           (multiple-value-bind (result queued)
+               (call-with-logical-ddl-event-order
+                (lambda ()
+                  (send-notice nil "queued DDL notice")
+                  (send-command-complete nil "CREATE TABLE")
+                  (check (zerop write-count)
+                         "DDL responses remain queued while schema events are ordered")
+                  :ddl-result))
+             (check (eq result :ddl-result)
+                    "DDL ordering returns the body result")
+             (setf responses queued))
+           (check (equal (mapcar #'first responses)
+                         '(:notice :command-complete))
+                  "DDL response queue preserves notice and completion order")
+           (check (zerop write-count)
+                  "responses stay deferred after unlocking until COMMIT succeeds")
+           (handler-case
+               (commit-ddl-and-flush-responses responses)
+             (error () nil))
+           (check (zerop write-count)
+                  "failed DDL COMMIT sends no success or deferred notice response")
+           (setf commit-failed-p nil)
+           (commit-ddl-and-flush-responses responses)
+           (check (and (= write-count 2)
+                       (equal (mapcar #'char-code (nreverse write-types))
+                              '(78 67))
+                       all-writes-after-commit-and-unlock-p)
+                  "successful DDL COMMIT flushes replies outside the event-order lock"))
+      (setf (symbol-function 'write-message) original-write-message
+            (symbol-function 'commit-transaction)
+            original-commit-transaction))))
+
 (defun test-protocol-packet-limits ()
   (let ((path (merge-pathnames "malformed-packet.out" *pgdata*)))
     (check (test-startup-packet-size path +max-startup-message-size+)

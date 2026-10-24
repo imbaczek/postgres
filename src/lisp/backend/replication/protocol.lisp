@@ -289,6 +289,7 @@
     (:truncate "pg_lisp/truncate")
     (:ddl "pg_lisp/ddl")
     (:sequence-state "pg_lisp/sequence-state")
+    (:progress "pg_lisp/progress")
     (otherwise (error "logical change kind has no Message prefix"))))
 
 (defun pgoutput-build-message (change transaction)
@@ -307,6 +308,20 @@
     (payload-push-cstring payload prefix)
     (payload-push-u32 payload (length content))
     (payload-push payload content)))
+
+(defun pgoutput-build-safe-progress-message (lsn)
+  "Encode a publisher-verified scan frontier as a nontransactional Message.
+
+This private prefix distinguishes scanned-safe progress from the standard
+keepalive's WAL-end field, which may include changes not yet applied."
+  (pgoutput-build-message
+   (make-logical-change :kind :progress :event-payload "")
+   (make-logical-transaction :xid 0 :commit-lsn lsn)))
+
+(defun send-logical-progress (stream lsn)
+  "Send LSN only after the logical reader scanned through that safe boundary."
+  (send-logical-xlog-data
+   stream lsn lsn (pgoutput-build-safe-progress-message lsn)))
 
 (defun send-logical-transaction (stream transaction wal-end)
   ;; Use one XLogData frame per pgoutput message like the C logical output
@@ -350,17 +365,34 @@
                "subscriber write, flush, and apply LSNs must match in this worker"))
     flush-lsn))
 
-(defun finalize-initial-replication-copy (slot-name requested-lsn status)
-  (let ((position (replication-status-position status)))
+(defun finalize-initial-replication-copy (slot-name slot-object requested-lsn status)
+  (let ((position (replication-status-position status))
+        (finalized nil))
     (unless (= position requested-lsn)
       (ereport "22023"
                "initial copy-complete status must equal the consistent LSN"))
-    (wal-finalize-replication-slot-copy
-     slot-name position *wal-logical-slot-owner*)
-    ;; The imported source transaction has ended by the time the subscriber
-    ;; sends this status, so snapmgr's exported registration can now be retired.
-    (release-exported-logical-snapshot-for-slot slot-name)
-    (setf *wal-logical-slot-read-progress* position)
+    ;; Keep the exported snapshot registered on validation and pre-finalization
+    ;; failures. Once the slot terminal is durable, every exit path can retire it.
+    (unwind-protect
+         (progn
+           (logical-test-failpoint
+            :before-copy-slot-finalization slot-name position)
+           (sb-sys:without-interrupts
+             (wal-finalize-replication-slot-copy
+              slot-name position *wal-logical-slot-owner*)
+             (setf finalized t))
+           ;; This process-crash point is now inside the release scope.
+           (logical-test-failpoint
+            :after-copy-slot-finalization-before-snapshot-release
+            slot-name position))
+      (when finalized
+        ;; The imported source transaction has ended by the time the subscriber
+        ;; sends this status, so snapmgr's exported registration can be retired.
+        (release-exported-logical-snapshot-for-slot slot-name slot-object)))
+    (when finalized
+      (logical-test-failpoint
+       :after-snapshot-schema-lease-release slot-name position)
+      (setf *wal-logical-slot-read-progress* position))
     position))
 
 (defun validate-stream-status (slot-name sent-lsn status)
@@ -369,7 +401,11 @@
                  (gethash slot-name *wal-replication-slots*))
                 position sent-lsn)
       (ereport "22023" "standby status is outside sent logical replication progress"))
+    (logical-test-failpoint :before-slot-acknowledgment slot-name position)
     (wal-logical-slot-acknowledge slot-name position)
+    ;; LogicalConfirmReceivedLocation() makes the persisted consumer horizon
+    ;; visible only after the slot file is durable.
+    (logical-test-failpoint :after-slot-acknowledgment slot-name position)
     position))
 
 (defun end-logical-copy-mode (stream)
@@ -379,48 +415,72 @@
 
 (defun start-logical-replication (stream slot-name requested-lsn)
   (let ((copy-mode-p nil))
-    (handler-case
-        (progn
-          (wal-logical-slot-validate-start-position slot-name requested-lsn)
-          (call-with-logical-replication-slot
-           slot-name
-           (lambda (slot)
-             (let ((initial-copy-p
-                     (null (wal-replication-slot-confirmed-flush-lsn slot))))
-               (wal-logical-slot-validate-start-position
-                slot-name requested-lsn)
-               (send-copy-both-response stream)
-               (setf copy-mode-p t)
-               (let ((first-status (replication-standby-status stream)))
-                 (unless first-status
-                   (return-from start-logical-replication nil))
-                 (if initial-copy-p
-                     (finalize-initial-replication-copy
-                      slot-name requested-lsn first-status)
-                     (let ((position (replication-status-position first-status)))
-                       (unless (= position requested-lsn)
-                         (ereport "22023"
-                                  "first resumed standby status must equal the requested LSN"))
-                       (wal-logical-slot-accept-resume-position
-                        slot-name requested-lsn))))
-               (stream-logical-replication-loop stream slot-name requested-lsn)))
-           :allow-initial-copy t)
-          (when copy-mode-p (end-logical-copy-mode stream)))
-      (pg-error (condition)
-        (if copy-mode-p
-            (progn
-              (send-error-response stream condition)
-              (end-logical-copy-mode stream))
-            (progn
-              (send-error-response stream condition)
-              (send-ready-for-query stream #\I)))))))
+    (handler-case-nonfatal
+     (progn
+       (wal-logical-slot-validate-start-position slot-name requested-lsn)
+       (call-with-logical-replication-slot
+        slot-name
+        (lambda (slot)
+          (let ((initial-copy-p
+                  (null (wal-replication-slot-confirmed-flush-lsn slot))))
+            (wal-logical-slot-validate-start-position
+             slot-name requested-lsn)
+            (send-copy-both-response stream)
+            (setf copy-mode-p t)
+            (let ((first-status (replication-standby-status stream)))
+              (unless first-status
+                (return-from start-logical-replication nil))
+              (if initial-copy-p
+                  (finalize-initial-replication-copy
+                   slot-name slot requested-lsn first-status)
+                  (let ((position (replication-status-position first-status)))
+                    (unless (= position requested-lsn)
+                      (ereport "22023"
+                               "first resumed standby status must equal the requested LSN"))
+                    (wal-logical-slot-accept-resume-position
+                     slot-name requested-lsn))))
+            (stream-logical-replication-loop stream slot-name requested-lsn)))
+        :allow-initial-copy t)
+       (when copy-mode-p (end-logical-copy-mode stream)))
+     (condition
+      (if copy-mode-p
+          (progn
+            (send-error-response stream condition)
+            (end-logical-copy-mode stream))
+          (progn
+            (send-error-response stream condition)
+            (send-ready-for-query stream #\I)))))))
+
+(defun logical-scan-budget-limit (override failpoint action)
+  "Return the scan budget, permitting a narrow value only for crash tests."
+  (if (null override)
+      +max-logical-read-scan-bytes+
+      (progn
+        (unless (and (string-equal (or failpoint "")
+                                   "after-scan-progress-before-feedback")
+                     (string-equal (or action "") "crash"))
+          (error "test scan budget requires the safe-progress crash failpoint"))
+        (let ((limit (ignore-errors
+                      (parse-integer override :junk-allowed nil))))
+          (unless (and limit (<= 1 limit +max-logical-read-scan-bytes+))
+            (error "PG_LISP_TEST_LOGICAL_SCAN_BYTES must be between 1 and ~d"
+                   +max-logical-read-scan-bytes+))
+          limit))))
+
+(defun logical-stream-scan-budget-bytes ()
+  (logical-scan-budget-limit
+   (sb-ext:posix-getenv "PG_LISP_TEST_LOGICAL_SCAN_BYTES")
+   (sb-ext:posix-getenv "PG_LISP_TEST_FAILPOINT")
+   (sb-ext:posix-getenv "PG_LISP_TEST_FAILPOINT_ACTION")))
 
 (defun stream-logical-replication-loop (stream slot-name initial-lsn)
   (let ((sent-lsn initial-lsn))
     (loop
       (multiple-value-bind (transactions progress-lsn)
           (wal-logical-slot-read-transactions
-           slot-name :max-transactions 1)
+           slot-name
+           :max-transactions 1
+           :max-scan-bytes (logical-stream-scan-budget-bytes))
         (if transactions
             (let* ((transaction (first transactions))
                    (commit-lsn (logical-transaction-commit-lsn transaction)))
@@ -430,14 +490,22 @@
                 (unless status (return))
                 (setf sent-lsn
                       (validate-stream-status slot-name sent-lsn status))))
-            (progn
-              (when (> progress-lsn sent-lsn)
-                (setf sent-lsn progress-lsn))
-              (send-logical-keepalive stream sent-lsn)
-              (let ((status (replication-standby-status stream)))
-                (unless status (return))
-                (validate-stream-status slot-name sent-lsn status)
-                (sleep 0.05))))))))
+            (if (> progress-lsn sent-lsn)
+                (progn
+                  ;; Advance only through a bounded scan that found no
+                  ;; subscriber-visible event, never through keepalive WAL-END.
+                  (send-logical-progress stream progress-lsn)
+                  (setf sent-lsn progress-lsn)
+                  (let ((status (replication-standby-status stream)))
+                    (unless status (return))
+                    (setf sent-lsn
+                          (validate-stream-status slot-name sent-lsn status))))
+                (progn
+                  (send-logical-keepalive stream sent-lsn)
+                  (let ((status (replication-standby-status stream)))
+                    (unless status (return))
+                    (validate-stream-status slot-name sent-lsn status)
+                    (sleep 0.05)))))))))
 
 (defun create-replication-slot-command (stream command)
   (multiple-value-bind (boundary token)

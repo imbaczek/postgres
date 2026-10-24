@@ -248,8 +248,60 @@ upgrades.
      `pg_current_wal_lsn()`, and asserts both durable target markers reach it,
      including after the restarted worker resumes. It also checks that changing
      the source endpoint or table allowlist is rejected. Its C regression
-     references are `src/test/subscription/t/001_rep_changes.pl`, `004_sync.pl`,
-     and `035_conflicts.pl`.
+      references are `src/test/subscription/t/001_rep_changes.pl`, `004_sync.pl`,
+      and `035_conflicts.pl`.
+
+### Follow-up checks (complete)
+
+`t/logical-replication.sh` injects SIGKILL after a committed initial-copy
+chunk, after one target row change inside an uncommitted apply transaction, and
+after target COMMIT but before publisher feedback. It verifies that copy remains
+in `copying`, partial row changes and their marker roll back together, and a
+durable target commit resumes without applying the transaction twice. Its
+stress phase applies a 300-row transaction while one subscriber is offline,
+runs two concurrent source writers, checks that the inactive slot retains WAL,
+and exercises a second reconnect. It also runs concurrent DDL and verifies that
+the database-wide schema contract converges after the offline subscriber
+reconnects. These checks compare the target commit and feedback order in
+`logical/worker.c`, and the schema ordering with `commands/tablecmds.c`.
+
+`t/logical-replication-faults.sh` kills the publisher after copy-slot
+finalization and on both sides of exported snapshot release, then restarts the
+same PGDATA and resumes from the target marker. It also kills the publisher at
+slot-file boundaries before rename, after rename, and after directory fsync;
+restart must load a valid slot image or safely replace an abandoned temporary
+file. These are process-crash tests, not power-loss tests. The ordering follows
+`snapbuild.c`, `snapmgr.c`, `walsender.c`, and `slot.c:ReplicationSlotPersist`.
+
+`t/logical-catalog-durability-faults.sh` injects an error after the catalog WAL
+terminal for `CREATE TABLE`, `ALTER TABLE ... UNIQUE`, and `CREATE SEQUENCE`.
+The SQL call reports the injected error, while the durable catalog mutation
+remains visible. This keeps the publisher catalog aligned with the event stream
+and exercises the distinction between pre-durable rollback and post-durable
+failure in `commands/tablecmds.c`, `commands/sequence.c`, and the Lisp catalog
+WAL terminal.
+
+`t/logical-standalone-event-faults.sh` crashes sequence-state application after
+the target marker commits but before feedback. Restart verifies that the marker
+and sequence state are atomic and that the publisher is not acknowledged early,
+following `logical/worker.c`'s apply-then-feedback order.
+
+`t/logical-slot-backpressure.sh` keeps fast and slow subscribers at different
+LSNs while bounded and oversized WAL intervals accumulate. It checks that
+checkpoint retains required WAL below the cap, persists slot loss above the
+cap, terminates an importer and a publisher blocked on a small socket buffer,
+rolls back the blocked target transaction, and allows both reconnect and fresh
+slot reseed. The workload includes a 1,000-row fast apply, concurrent writers,
+and a 300-row blocked apply with eight supported `varchar(126)` payloads per
+row. It also records RSS for both worker states and exercises repeated
+connection attempts.
+
+The schema contract is deliberately strict for this implemented catalog
+subset: table, standalone-index, and sequence definitions must match exactly;
+sequence values are excluded. A drifted subscriber rejects the DDL event before
+mutating its catalog or advancing the durable source marker. No implicit type
+conversion is attempted. This is narrower than PostgreSQL's schema-sync
+compatibility rules in `src/test/subscription/t/008_diff_schema.pl`.
 
 ## Invariants and limits
 
@@ -263,11 +315,13 @@ upgrades.
   boundary, its snapshot-invisible changes are emitted in the later commit
   batch, after the copy boundary.
 - The supported row model is limited to complete rows with the current scalar
-  types (`int4`, `int8`, and `varchar`; `text` is the current varchar alias).
+  types (`int4`, `int8`, and the implemented bounded `varchar`).
   Initial bootstrap creates and validates supported `public` schema tables,
   standalone btree indexes, and integer sequences. The explicit `--table`
   allowlist controls which table rows are copied and which row changes are
-  applied. Supported DDL events (`CREATE`/`DROP TABLE`, supported btree index
+  applied; supported DDL and sequence-definition events are database-wide.
+  The allowlist is persisted in subscription configuration, so changing it
+  requires a reseed. Supported DDL events (`CREATE`/`DROP TABLE`, supported btree index
   and table-constraint changes, `CREATE`/`ALTER`/`DROP SEQUENCE`) and sequence
   state are applied database-wide, independent of that allowlist. `TRUNCATE`
   changes are carried transactionally for selected tables. Each catalog event
@@ -282,6 +336,12 @@ upgrades.
   two-phase transactions, and conflict resolution are outside the implemented
   subset. These remain follow-on work before claiming general-purpose blue-green
   upgrade support.
+- DDL compatibility uses a versioned exact schema contract for the implemented
+  table, index, and sequence definitions. Existing target objects are checked
+  before bootstrap or row reset; each streamed DDL checks the expected schema
+  before and after execution. Sequence values are not schema. Drift halts that
+  worker until the target is repaired; no implicit casts or column-order
+  changes are attempted.
 - Initial-copy reset uses target `TRUNCATE TABLE`; source `TRUNCATE` is emitted
   transactionally for the selected tables. The source and target must be
   `pg-lisp` servers using this worker's private v2 `Message` payload for DDL and
@@ -297,6 +357,81 @@ upgrades.
   must still be available when it commits. Ordinary DML transactions are
   limited to 64 MiB; subscriber apply transactions have a 1 MiB reserve for the
   target progress update, with recovery and WAL readers accepting up to 65 MiB.
+  These encoded-byte caps do not bound total process RSS: decoded Lisp objects
+  and full catalog images add overhead. A lagging subscriber can retain
+  additional WAL until its durable feedback advances the slot.
+
+## Follow-on priorities
+
+### Fault injection
+
+Keep the target `COMMIT` to publisher-acknowledgment interval as the primary
+recovery boundary. The current regressions also interrupt row application,
+initial-copy chunk commits, slot finalization, snapshot release, standalone
+event application, and slot-file publication. Add a failpoint whenever a new
+durable transition is introduced, and assert both durable progress and WAL
+retention after restart. The snapshot finalizer unit test injects an error
+after it claims ownership and verifies that the MVCC pin and schema lease are
+still released exactly once. These boundaries correspond to `snapbuild.c`,
+`snapmgr.c`, `slot.c`, and `logical/worker.c`. Cleanup regressions now also
+interrupt DROP after its slot and export ownership transfer, retry a lost-slot
+cleanup after its original collector is gone, and interrupt importer shutdown
+between two backends. Each importer receives at most one termination request,
+so retry cannot deliver a second asynchronous abort while the first cleanup is
+unwinding.
+
+### Schema compatibility
+
+The implemented policy remains strict: relation definitions, standalone index
+definitions, and sequence definitions must match exactly before and after each
+DDL event. The subscriber stops on drift; it does not guess at type conversions,
+column reordering, or missing-column defaults. A future compatibility policy
+should be explicit and versioned, validate every event before mutation, and
+define which changes are safe for the currently implemented scalar types and
+catalog objects. Until that policy and its upgrade tests exist, repair the
+target schema or reseed it.
+
+The current v1 contract compares these catalog fields:
+
+| Operation | Strict compatibility check | Replicated state |
+| --- | --- | --- |
+| `CREATE TABLE` / `DROP TABLE` | Name; ordered column names, type OIDs, typmods, and nullability; `int4`, `int8`, and implemented bounded `varchar` (typmod through 126); supported `nextval(sequence)` defaults | Table rows |
+| `ALTER TABLE` constraint changes | Supported named PRIMARY KEY and UNIQUE definitions; ordered constrained columns and `NULLS NOT DISTINCT` | Constraint/index contents and replica identity |
+| `CREATE INDEX` / `DROP INDEX` / `ALTER INDEX ... RENAME` | Name, table, ordered columns, btree method, uniqueness, and `NULLS NOT DISTINCT` | Index contents |
+| pgoutput replica identity | Ordered source key attnums and names from Relation metadata; target identity signature must match; selected UPDATE/DELETE requires the key tuple | Key values in row changes |
+| `TRUNCATE` | Transactional list of source relations; the `--table` allowlist limits which target tables are truncated; table shape follows the strict table contract | Selected table rows |
+| `CREATE SEQUENCE` / `ALTER SEQUENCE` / `DROP SEQUENCE` | Name, int8 increment, minimum, maximum, and start value | Sequence definition |
+| Sequence-state event | Source and target sequence definitions must match | Last value and `is_called`, committed with the applied-event marker |
+
+Before bootstrap or a copy retry resets target rows, every existing target
+object must have a matching publisher definition. Bootstrap then creates
+missing publisher objects and requires full schema equality. For each streamed
+DDL event, the worker checks the expected schema under the schema lock before
+execution and checks the resulting contract before committing progress.
+Sequence-state events validate the source sequence definition and update only
+its value and `is_called` flag. Any mismatch leaves the target catalog, target
+progress marker, and publisher acknowledgment at their prior durable boundary.
+
+The integration matrix covers compatible bootstrap, mismatched target table
+and sequence definitions before initial-copy reset, DDL drift after a ready
+subscription, concurrent DDL during copy, and an offline subscriber catching
+up after DDL. These cases use the supported scalar/catalog objects above; they
+do not introduce conversions or behavior for unimplemented types or storage.
+
+### Resource limits and backpressure
+
+Continue stress coverage with large transactions, concurrent writers, a slow
+subscriber, repeated reconnects, and checkpoints. Verify that each slot retains
+all WAL needed to replay through its durable target marker, while a fast slot
+can advance independently. The current tests exercise the configured retention
+cap and a blocked publisher socket; transaction payloads remain bounded by the
+64 MiB logical-change limit and the 1 MiB apply reserve. Decoded objects and
+catalog images still add process-memory overhead, so RSS and latency should be
+measured as stress sizes increase. The 300-row blocked-apply case uses eight
+`varchar(126)` payloads per row to exceed the socket's buffered window and
+samples the subscriber's RSS, failing above the configurable 256 MiB default
+(`BLOCKED_WORKER_RSS_MAX_KB`); the fast-consumer workload continues to report
+its high-water mark and concurrent-writer latency.
 
 ## Follow-on milestone
 
@@ -312,12 +447,20 @@ Validation completed:
 
 - `./t/format.sh --check` for all changed Lisp files
 - `./t/compile.sh`
-- `./t/run-unit-tests.sh` — 1,361 checks, 0 failures
-- All documented shell regressions passed, including
-  `./t/logical-replication.sh` — source plus two independent subscribers,
-  copy-time DML and DDL, sequence state and bounds, lost-feedback restart,
-  config mismatch rejection, and source-LSN barrier checks. The cgroup OOM test
-  skipped because this environment uses a shared cgroup.
+- CL-MCP unit suite — 1,554 checks, 0 failures
+- `./t/logical-replication.sh` — source plus two independent subscribers,
+  copy-time DML and DDL, concurrent DDL, sequence state and bounds,
+  lost-feedback restart, schema drift rejection, WAL retention, and repeated
+  reconnect checks.
+- `./t/logical-replication-faults.sh` — snapshot release, slot finalization,
+  slot-file crash stages, same-PGDATA restart, and resumed LSN checks.
+- `./t/logical-catalog-durability-faults.sh` — post-terminal injected errors
+  preserve durable table, constraint, and sequence DDL.
+- `./t/logical-standalone-event-faults.sh` — standalone sequence state and
+  target-progress durability before publisher feedback.
+- `./t/logical-slot-backpressure.sh` — retention caps, slow and fast consumers,
+  blocked sender termination, and slot reseeding.
+
 
 The tests compare transaction visibility, snapshot handoff, pgoutput framing,
 and acknowledgment ordering with the PostgreSQL C references above.

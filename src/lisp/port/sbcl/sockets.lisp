@@ -28,6 +28,15 @@ spinning at full speed while it retries."
       nil)))
 
 (defun socket->stream (sock)
+  ;; A small send buffer lets logical-replication fault tests exercise the
+  ;; blocking-write case without constructing multi-megabyte row transactions.
+  (let ((send-buffer-text
+          (sb-ext:posix-getenv "PG_LISP_TEST_SOCKET_SEND_BUFFER_BYTES")))
+    (when send-buffer-text
+      (let ((send-buffer-size (ignore-errors (parse-integer send-buffer-text))))
+        (unless (and send-buffer-size (plusp send-buffer-size))
+          (error "PG_LISP_TEST_SOCKET_SEND_BUFFER_BYTES must be positive"))
+        (setf (sb-bsd-sockets:sockopt-send-buffer sock) send-buffer-size))))
   (sb-bsd-sockets:socket-make-stream
    sock
    :input t :output t
