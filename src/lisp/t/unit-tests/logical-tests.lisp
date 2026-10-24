@@ -447,6 +447,68 @@
                (error () t))
              "strict schema validation rejects target drift"))))
 
+(defun test-logical-private-metadata-ddl-targets ()
+  (let* ((database (make-database :name "postgres" :oid 7))
+         (progress-name (first +logical-private-schema-table-names+))
+         (config-name (second +logical-private-schema-table-names+))
+         (ordinary-name "logical_guard_rows")
+         (progress-index-name "pg_lisp_subscription_progress_pkey")
+         (config-index-name "pg_lisp_subscription_config_pkey")
+         (ordinary-index-name "logical_guard_rows_pkey")
+         (progress-table
+           (make-pg-class :oid 701 :name progress-name :relfilenode 1701))
+         (config-table
+           (make-pg-class :oid 702 :name config-name :relfilenode 1702))
+         (ordinary-table
+           (make-pg-class :oid 703 :name ordinary-name :relfilenode 1703))
+         (cases nil))
+    (setf (gethash progress-name (database-tables database)) progress-table
+          (gethash config-name (database-tables database)) config-table
+          (gethash ordinary-name (database-tables database)) ordinary-table
+          (gethash progress-index-name (database-indexes database))
+          (make-pg-index :oid 801 :name progress-index-name
+                         :relfilenode 1801 :table-oid 701)
+          (gethash config-index-name (database-indexes database))
+          (make-pg-index :oid 802 :name config-index-name
+                         :relfilenode 1802 :table-oid 702)
+          (gethash ordinary-index-name (database-indexes database))
+          (make-pg-index :oid 803 :name ordinary-index-name
+                         :relfilenode 1803 :table-oid 703))
+    (setf cases
+          (list
+           (list (list :type :create-table :name progress-name :if-not-exists t)
+                 progress-name)
+           (list (list :type :drop-table :names (list ordinary-name config-name) :if-exists t)
+                 config-name)
+           (list (list :type :alter-table :table progress-name :actions nil)
+                 progress-name)
+           (list (list :type :create-index :table config-name
+                       :name "config_extra_idx")
+                 config-name)
+           (list (list :type :create-index :table ordinary-name
+                       :name progress-index-name)
+                 progress-name)
+           (list (list :type :drop-index
+                       :names (list ordinary-index-name config-index-name))
+                 config-name)
+           (list (list :type :alter-index :name progress-index-name
+                       :new-name "renamed_progress_idx")
+                 progress-name)
+           (list (list :type :create-table :name ordinary-name) nil)
+           (list (list :type :drop-table :names (list ordinary-name)) nil)
+           (list (list :type :alter-table :table ordinary-name :actions nil) nil)
+           (list (list :type :create-index :table ordinary-name
+                       :name "ordinary_extra_idx")
+                 nil)
+           (list (list :type :drop-index :names (list ordinary-index-name)) nil)
+           (list (list :type :alter-sequence :name "ordinary_seq" :increment 2)
+                 nil)))
+    (dolist (case cases)
+      (check (equal (logical-private-metadata-ddl-target-name
+                     database (first case))
+                    (second case))
+             "replicated DDL guard classifies protected table and index targets"))))
+
 (defun test-logical-schema-contract-column-shape-drift ()
   (let* ((*catalog* (make-catalog))
          (*backend* (make-backend :database "postgres"))
@@ -943,7 +1005,15 @@
                   '("--slot" "test_slot" "--table"))
                  nil)
              (error () t))
-           "subscriber CLI rejects an option with no value")))
+           "subscriber CLI rejects an option with no value")
+    (dolist (table +logical-private-schema-table-names+)
+      (check (handler-case
+                 (progn
+                   (parse-logical-subscription-args
+                    (list "--slot" "test_slot" "--table" table))
+                   nil)
+               (error () t))
+             "subscriber CLI rejects private metadata tables in --table"))))
 
 (defun test-logical-subscription-resume-config ()
   (let* ((options (make-logical-subscription-options
@@ -2176,6 +2246,37 @@
                 (exported-logical-snapshot-cleanup-complete-p state)
                 (null (gethash token *expired-exported-logical-snapshots*)))
            "pending-registry retry completes MVCC and schema cleanup exactly once")))
+
+(defun test-unpinned-snapshot-release-preserves-wal-pin-map ()
+  ;; Snapshot release follows snapmgr.c:AtEOXact_Snapshot for the MVCC
+  ;; registration; only a published WAL pin may be removed under *wal-lock*.
+  ;; This impossible registration/map mismatch is an adversarial sentinel that
+  ;; catches accidental pin-map mutation in the unpinned path.
+  (let* ((*active-snapshots* 0)
+         (*active-snapshot-set* (make-hash-table :test #'eq))
+         (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+         (registration (make-snapshot-registration))
+         (snapshot (make-snapshot-struct :xmin 10 :xmax 20 :xip '() :curcid 1))
+         (sentinel :test-only-unpublished-pin))
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex (*xid-lock*)
+             (register-active-snapshot snapshot registration))
+           (sb-thread:with-mutex (*wal-lock*)
+             (setf (gethash registration *wal-snapshot-retention-pins*) sentinel))
+           (check (null (snapshot-registration-wal-retention-lsn registration))
+                  "test pin-map sentinel has no published registration LSN")
+           (release-snapshot-registration registration)
+           (check (and (zerop *active-snapshots*)
+                       (not (snapshot-registration-releasing-p registration)))
+                  "unpinned release retires the active snapshot registration")
+           (check (eq sentinel
+                      (sb-thread:with-mutex (*wal-lock*)
+                        (gethash registration *wal-snapshot-retention-pins*)))
+                  "unpinned release does not mutate WAL pin state without *wal-lock*"))
+      (release-snapshot-registration registration)
+      (sb-thread:with-mutex (*wal-lock*)
+        (remhash registration *wal-snapshot-retention-pins*)))))
 
 (defun test-logical-snapshot-import-locks-token-through-pin ()
   (let* ((catalog (make-catalog))

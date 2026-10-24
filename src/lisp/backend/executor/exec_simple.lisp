@@ -1424,6 +1424,14 @@ before this removal horizon is captured."
                                                   *logical-source-schema-precondition*)))
                              (error
                               "subscriber schema differs from publisher schema before DDL"))
+                           (when *logical-event-schema-contract*
+                             (let ((target-name
+                                     (logical-private-metadata-ddl-target-name
+                                      (current-database) ast)))
+                               (when target-name
+                                 (error
+                                  "replicated DDL cannot target subscriber metadata relation ~s"
+                                  target-name))))
                            (execute-body))))
                     (setf logical-ddl-responses responses)
                     result))

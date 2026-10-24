@@ -25,6 +25,52 @@
         :indexes (logical-schema-contract-object-list bootstrap :indexes)
         :sequences (logical-schema-contract-object-list bootstrap :sequences)))
 
+;; The private event envelope lets DDL use the normal executor, unlike PostgreSQL's
+;; pgoutput tuple stream. Protect subscriber-owned relations before the custom
+;; event reaches utility.c:ExecDropStmt's equivalent apply path.
+(defun logical-private-metadata-table-name-p (name)
+  (and (stringp name)
+       (member name +logical-private-schema-table-names+ :test #'string=)))
+
+(defun logical-private-metadata-index-owner-name (database index-name)
+  (let* ((index (gethash index-name (database-indexes database)))
+         (table
+           (and index
+                (loop for candidate being the hash-values of (database-tables database)
+                      when (= (pg-class-oid candidate)
+                              (pg-index-table-oid index))
+                        return candidate)))
+         (table-name (and table (pg-class-name table))))
+    (and (logical-private-metadata-table-name-p table-name)
+         table-name)))
+
+(defun logical-private-metadata-ddl-target-name (database ast)
+  "Return the subscriber-owned table name targeted by replicated DDL AST."
+  (with-write-lock
+    (case (getf ast :type)
+      (:create-table
+       (let ((name (getf ast :name)))
+         (and (logical-private-metadata-table-name-p name) name)))
+      (:drop-table
+       (find-if #'logical-private-metadata-table-name-p (getf ast :names)))
+      (:alter-table
+       (let ((name (getf ast :table)))
+         (and (logical-private-metadata-table-name-p name) name)))
+      (:create-index
+       (let ((table-name (getf ast :table)))
+         (or (and (logical-private-metadata-table-name-p table-name)
+                  table-name)
+             (logical-private-metadata-index-owner-name
+              database (getf ast :name)))))
+      (:drop-index
+       (loop for name in (getf ast :names)
+             for owner = (logical-private-metadata-index-owner-name
+                          database name)
+             when owner return owner))
+      (:alter-index
+       (logical-private-metadata-index-owner-name database (getf ast :name)))
+      (otherwise nil))))
+
 (defun logical-current-schema-contract-under-write-lock ()
   (logical-bootstrap-schema-contract
    (catalog-replication-bootstrap-data (current-database))))
@@ -49,16 +95,7 @@
        (integerp (list-length objects))
        (every
         (lambda (object)
-          (and (listp object)
-               (integerp (list-length object))
-               (evenp (length object))
-               (= (length object) 4)
-               (let ((keys (loop for (key value) on object by #'cddr
-                                 collect key)))
-                 (and (= (length keys) 2)
-                      (= (length (remove-duplicates keys :test #'eq)) 2)
-                      (member :name keys :test #'eq)
-                      (member definition-key keys :test #'eq)))
+          (and (logical-plist-has-exact-keys-p object (list :name definition-key))
                (stringp (getf object :name))
                (stringp (getf object definition-key))))
         objects)
@@ -67,16 +104,7 @@
 
 (defun logical-schema-contract-valid-p (contract)
   (ignore-errors
-   (and (listp contract)
-        (integerp (list-length contract))
-        (evenp (length contract))
-        (= (length contract) 6)
-        (let ((keys (loop for (key value) on contract by #'cddr collect key)))
-          (and (= (length keys) 3)
-               (= (length (remove-duplicates keys :test #'eq)) 3)
-               (every (lambda (key)
-                        (member key '(:tables :indexes :sequences) :test #'eq))
-                      keys)))
+   (and (logical-plist-has-exact-keys-p contract '(:tables :indexes :sequences))
         (logical-schema-object-list-valid-p (getf contract :tables) :sql)
         (logical-schema-object-list-valid-p (getf contract :indexes) :sql)
         (logical-schema-object-list-valid-p

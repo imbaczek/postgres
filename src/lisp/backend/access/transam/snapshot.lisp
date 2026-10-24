@@ -115,7 +115,8 @@ reusable token also checks a generation before delayed cleanup."
                             (snapshot-registration-releasing-p registration)
                             (or (null current-lsn)
                                 (eql pinned current-lsn)))
-                   (remhash registration *wal-snapshot-retention-pins*)
+                   (when pinned
+                     (remhash registration *wal-snapshot-retention-pins*))
                    ;; Detach before clearing RELEASING-P. Reuse may publish a
                    ;; new importer immediately after this lock is released.
                    (sb-thread:with-mutex (*exported-logical-snapshot-importer-lock*)
@@ -141,8 +142,11 @@ reusable token also checks a generation before delayed cleanup."
             (sb-thread:with-mutex (*snapshot-count-lock*)
               (finish-under-snapshot-lock)))
           (sb-thread:with-mutex (*snapshot-count-lock*)
-            (when (null (snapshot-registration-wal-retention-lsn registration))
-              (finish-under-snapshot-lock)))))
+            (assert (null
+                     (snapshot-registration-wal-retention-lsn registration))
+                    ()
+                    "unpinned snapshot release found a published WAL retention pin")
+            (finish-under-snapshot-lock))))
     ;; Like snapmgr.c's transaction-end cleanup, release dependent state only
     ;; after shared locks are gone. The detached state is safe across reuse.
     (when (and completed imported-state)
@@ -169,9 +173,7 @@ reusable token also checks a generation before delayed cleanup."
                        (not (snapshot-registration-releasing-p registration)))
                   (setf active t
                         pinned
-                        (snapshot-registration-wal-retention-lsn registration)
-                        generation
-                        (snapshot-registration-lifecycle-generation registration))
+                        (snapshot-registration-wal-retention-lsn registration))
                   (when (remhash (snapshot-registration-snapshot registration)
                                  *active-snapshot-set*)
                     (decf *active-snapshots*))
@@ -182,8 +184,6 @@ reusable token also checks a generation before delayed cleanup."
                  ((snapshot-registration-releasing-p registration)
                   (setf pinned
                         (snapshot-registration-wal-retention-lsn registration)
-                        generation
-                        (snapshot-registration-lifecycle-generation registration)
                         release-pending t))))
              ;; This hook pauses after a caller captures the release
              ;; generation, including concurrent retry callers.
