@@ -281,6 +281,7 @@ cd src/lisp
 ./t/spill-crash-recovery.sh # crash cleanup, restart recovery, and temp-file limit
 ./t/sort-arena.sh        # bounded sort arenas, transaction recovery, concurrent sorts
 ./t/logical-replication.sh # exported snapshot, row/DDL/sequence stream, restart recovery
+./t/logical-private-metadata-ddl.sh # rejects replicated DDL targeting subscriber metadata
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
 ./t/hot-reload.sh         # SIGHUP reloads code in a running server
 ./t/control-repl.sh       # control REPL over TCP + Unix socket, reload, SQL intact

@@ -455,6 +455,10 @@
          (progress-index-name "pg_lisp_subscription_progress_pkey")
          (config-index-name "pg_lisp_subscription_config_pkey")
          (ordinary-index-name "logical_guard_rows_pkey")
+         (qualified-progress-name (concatenate 'string "public." progress-name))
+         (qualified-config-name (concatenate 'string "public." config-name))
+         (qualified-progress-index-name
+           (concatenate 'string "public." progress-index-name))
          (progress-table
            (make-pg-class :oid 701 :name progress-name :relfilenode 1701))
          (config-table
@@ -478,20 +482,44 @@
           (list
            (list (list :type :create-table :name progress-name :if-not-exists t)
                  progress-name)
-           (list (list :type :drop-table :names (list ordinary-name config-name) :if-exists t)
+           ;; The parser has already stripped one public prefix here; the
+           ;; executor's lookup-table strips another before resolving the name.
+           (list (list :type :create-table :name qualified-progress-name
+                       :if-not-exists t)
+                 progress-name)
+           (list (list :type :drop-table
+                       :names (list ordinary-name config-name) :if-exists t)
                  config-name)
+           (list (list :type :drop-table
+                       :names (list qualified-progress-name) :if-exists t)
+                 nil)
            (list (list :type :alter-table :table progress-name :actions nil)
+                 progress-name)
+           (list (list :type :alter-table :table qualified-progress-name
+                       :actions nil)
                  progress-name)
            (list (list :type :create-index :table config-name
                        :name "config_extra_idx")
                  config-name)
+           (list (list :type :create-index :table qualified-config-name
+                       :name "qualified_config_idx")
+                 config-name)
            (list (list :type :create-index :table ordinary-name
                        :name progress-index-name)
+                 progress-name)
+           (list (list :type :create-index :table ordinary-name
+                       :name qualified-progress-index-name)
                  progress-name)
            (list (list :type :drop-index
                        :names (list ordinary-index-name config-index-name))
                  config-name)
+           (list (list :type :drop-index
+                       :names (list qualified-progress-index-name))
+                 nil)
            (list (list :type :alter-index :name progress-index-name
+                       :new-name "renamed_progress_idx")
+                 progress-name)
+           (list (list :type :alter-index :name qualified-progress-index-name
                        :new-name "renamed_progress_idx")
                  progress-name)
            (list (list :type :create-table :name ordinary-name) nil)
@@ -2277,6 +2305,87 @@
       (release-snapshot-registration registration)
       (sb-thread:with-mutex (*wal-lock*)
         (remhash registration *wal-snapshot-retention-pins*)))))
+
+(defun test-unpinned-snapshot-release-ignores-stale-reuse-pin ()
+  ;; A retry may finish an unpinned release while its original caller is
+  ;; paused, after which the registration can be reused and pinned again.
+  (let* ((baseline-active-snapshots *active-snapshots*)
+         (registration (make-snapshot-registration))
+         (old-snapshot
+           (make-snapshot-struct :xmin 10 :xmax 20 :xip '() :curcid 1))
+         (new-snapshot
+           (make-snapshot-struct :xmin 20 :xmax 30 :xip '() :curcid 1))
+         (gate-lock (sb-thread:make-mutex :name "stale snapshot release test"))
+         (gate-cv (sb-thread:make-waitqueue :name "stale snapshot release test"))
+         (release-paused nil)
+         (continue-release nil)
+         (stale-release-error nil)
+         (release-thread nil)
+         (new-pin 42))
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex (*xid-lock*)
+             (register-active-snapshot old-snapshot registration))
+           (setf release-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (let ((*wal-test-after-snapshot-release-mark-hook*
+                            (lambda (ignored-registration)
+                              (declare (ignore ignored-registration))
+                              (sb-thread:with-mutex (gate-lock)
+                                (setf release-paused t)
+                                (sb-thread:condition-broadcast gate-cv)
+                                (loop until continue-release
+                                      do (sb-thread:condition-wait
+                                          gate-cv gate-lock))))))
+                      (handler-case
+                          (release-snapshot-registration registration)
+                        (error (condition)
+                          (setf stale-release-error condition)))))))
+           (sb-thread:with-mutex (gate-lock)
+             (loop until release-paused
+                   do (sb-thread:condition-wait gate-cv gate-lock)))
+           ;; A concurrent retry finishes the same unpinned generation.
+           (release-snapshot-registration registration)
+           ;; Reuse the token and publish a pin as boundary capture does.
+           (sb-thread:with-mutex (*xid-lock*)
+             (register-active-snapshot new-snapshot registration))
+           (sb-thread:with-mutex (*wal-lock*)
+             (sb-thread:with-mutex (*snapshot-count-lock*)
+               (setf (gethash registration *wal-snapshot-retention-pins*) new-pin
+                     (snapshot-registration-wal-retention-lsn registration)
+                     new-pin)))
+           (sb-thread:with-mutex (gate-lock)
+             (setf continue-release t)
+             (sb-thread:condition-broadcast gate-cv))
+           (sb-thread:join-thread release-thread)
+           (check (null stale-release-error)
+                  "stale unpinned release ignores a reused generation's WAL pin")
+           (check (snapshot-registration-active-p registration)
+                  "stale release preserves the reused registration")
+           (check (not (snapshot-registration-releasing-p registration))
+                  "stale release preserves the new release state")
+           (check (eql (snapshot-registration-wal-retention-lsn registration)
+                       new-pin)
+                  "stale release preserves the new registration's pin LSN")
+           (check (= *active-snapshots* (1+ baseline-active-snapshots))
+                  "stale release preserves the new active snapshot count")
+           (check (eq new-pin
+                      (sb-thread:with-mutex (*wal-lock*)
+                        (gethash registration *wal-snapshot-retention-pins*)))
+                  "stale release preserves the new WAL retention map entry"))
+      (when release-thread
+        (sb-thread:with-mutex (gate-lock)
+          (setf continue-release t)
+          (sb-thread:condition-broadcast gate-cv))
+        (sb-thread:join-thread release-thread))
+      (when (or (snapshot-registration-active-p registration)
+                (snapshot-registration-releasing-p registration))
+        (release-snapshot-registration registration))
+      (sb-thread:with-mutex (*wal-lock*)
+        (remhash registration *wal-snapshot-retention-pins*))
+      (check (= *active-snapshots* baseline-active-snapshots)
+             "stale-release regression restores the active snapshot count"))))
 
 (defun test-logical-snapshot-import-locks-token-through-pin ()
   (let* ((catalog (make-catalog))

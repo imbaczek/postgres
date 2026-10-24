@@ -112,28 +112,35 @@ reusable token also checks a generation before delayed cleanup."
                  (when (and (= generation
                                (snapshot-registration-lifecycle-generation
                                 registration))
-                            (snapshot-registration-releasing-p registration)
-                            (or (null current-lsn)
-                                (eql pinned current-lsn)))
-                   (when pinned
-                     (remhash registration *wal-snapshot-retention-pins*))
-                   ;; Detach before clearing RELEASING-P. Reuse may publish a
-                   ;; new importer immediately after this lock is released.
-                   (sb-thread:with-mutex (*exported-logical-snapshot-importer-lock*)
-                     (setf imported-state
-                           (snapshot-registration-exported-state registration))
-                     (when imported-state
-                       (setf (exported-logical-snapshot-importers imported-state)
-                             (delete
-                              (snapshot-registration-importer-backend registration)
-                              (exported-logical-snapshot-importers imported-state)
-                              :test #'eq))
-                       (setf (snapshot-registration-exported-state registration) nil
-                             (snapshot-registration-importer-backend registration)
-                             nil)))
-                   (setf (snapshot-registration-wal-retention-lsn registration) nil
-                         (snapshot-registration-releasing-p registration) nil
-                         completed t)))))
+                            (snapshot-registration-releasing-p registration))
+                   ;; A stale unpinned release may outlive a retry and token
+                   ;; reuse. Check its generation before asserting against a
+                   ;; newer registration's published pin.
+                   (unless pinned
+                     (assert (null current-lsn)
+                             ()
+                             "unpinned snapshot release found a published WAL retention pin"))
+                   (when (or (null current-lsn)
+                             (eql pinned current-lsn))
+                     (when pinned
+                       (remhash registration *wal-snapshot-retention-pins*))
+                     ;; Detach before clearing RELEASING-P. Reuse may publish a
+                     ;; new importer immediately after this lock is released.
+                     (sb-thread:with-mutex (*exported-logical-snapshot-importer-lock*)
+                       (setf imported-state
+                             (snapshot-registration-exported-state registration))
+                       (when imported-state
+                         (setf (exported-logical-snapshot-importers imported-state)
+                               (delete
+                                (snapshot-registration-importer-backend registration)
+                                (exported-logical-snapshot-importers imported-state)
+                                :test #'eq))
+                         (setf (snapshot-registration-exported-state registration) nil
+                               (snapshot-registration-importer-backend registration)
+                               nil)))
+                     (setf (snapshot-registration-wal-retention-lsn registration) nil
+                           (snapshot-registration-releasing-p registration) nil
+                           completed t))))))
       ;; Unpinned registrations use only the snapshot and importer locks. This
       ;; avoids recursively taking WAL from transaction-end cleanup, and lets a
       ;; release win against a capture paused before it publishes a pin.
@@ -142,10 +149,6 @@ reusable token also checks a generation before delayed cleanup."
             (sb-thread:with-mutex (*snapshot-count-lock*)
               (finish-under-snapshot-lock)))
           (sb-thread:with-mutex (*snapshot-count-lock*)
-            (assert (null
-                     (snapshot-registration-wal-retention-lsn registration))
-                    ()
-                    "unpinned snapshot release found a published WAL retention pin")
             (finish-under-snapshot-lock))))
     ;; Like snapmgr.c's transaction-end cleanup, release dependent state only
     ;; after shared locks are gone. The detached state is safe across reuse.

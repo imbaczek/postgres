@@ -155,6 +155,7 @@
   (test-logical-export-cleanup-releases-after-claim-error)
   (test-logical-export-cleanup-retries-wal-pin-release)
   (test-unpinned-snapshot-release-preserves-wal-pin-map)
+  (test-unpinned-snapshot-release-ignores-stale-reuse-pin)
   (test-logical-snapshot-import-locks-token-through-pin)
   (test-logical-lost-slot-cleans-importers-by-generation)
   (test-logical-drop-adopts-snapshot-before-cleanup)

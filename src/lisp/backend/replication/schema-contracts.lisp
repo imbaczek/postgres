@@ -32,6 +32,17 @@
   (and (stringp name)
        (member name +logical-private-schema-table-names+ :test #'string=)))
 
+(defun logical-private-metadata-resolved-table-name (database name)
+  ;; PostgreSQL resolves RangeVar names in catalog/namespace.c before
+  ;; tcop/utility.c:ExecDropStmt dispatches destructive DDL. This parser and
+  ;; lookup-table each strip the one supported public prefix, so mirror both.
+  (let* ((table (and (stringp name)
+                     (gethash (strip-schema name)
+                              (database-tables database))))
+         (resolved-name (and table (pg-class-name table))))
+    (and (logical-private-metadata-table-name-p resolved-name)
+         resolved-name)))
+
 (defun logical-private-metadata-index-owner-name (database index-name)
   (let* ((index (gethash index-name (database-indexes database)))
          (table
@@ -50,25 +61,39 @@
     (case (getf ast :type)
       (:create-table
        (let ((name (getf ast :name)))
-         (and (logical-private-metadata-table-name-p name) name)))
+         (or (and (logical-private-metadata-table-name-p name) name)
+             (logical-private-metadata-resolved-table-name database name))))
+      ;; DROP TABLE uses the parser's already-normalized catalog key directly.
       (:drop-table
        (find-if #'logical-private-metadata-table-name-p (getf ast :names)))
+      ;; ALTER TABLE resolves the AST name through lookup-table.
       (:alter-table
        (let ((name (getf ast :table)))
-         (and (logical-private-metadata-table-name-p name) name)))
+         (or (and (logical-private-metadata-table-name-p name) name)
+             (logical-private-metadata-resolved-table-name database name))))
       (:create-index
-       (let ((table-name (getf ast :table)))
+       (let ((table-name (getf ast :table))
+             (index-name (getf ast :name)))
          (or (and (logical-private-metadata-table-name-p table-name)
                   table-name)
-             (logical-private-metadata-index-owner-name
-              database (getf ast :name)))))
+             (logical-private-metadata-resolved-table-name database table-name)
+             (logical-private-metadata-index-owner-name database index-name)
+             (and (stringp index-name)
+                  (logical-private-metadata-index-owner-name
+                   database (strip-schema index-name))))))
+      ;; DROP INDEX uses the parser's already-normalized catalog key directly.
       (:drop-index
        (loop for name in (getf ast :names)
              for owner = (logical-private-metadata-index-owner-name
                           database name)
              when owner return owner))
+      ;; ALTER INDEX resolves the AST name through lookup-index.
       (:alter-index
-       (logical-private-metadata-index-owner-name database (getf ast :name)))
+       (let ((name (getf ast :name)))
+         (or (logical-private-metadata-index-owner-name database name)
+             (and (stringp name)
+                  (logical-private-metadata-index-owner-name
+                   database (strip-schema name))))))
       (otherwise nil))))
 
 (defun logical-current-schema-contract-under-write-lock ()
