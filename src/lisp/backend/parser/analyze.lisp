@@ -54,7 +54,7 @@
 
 (defparameter +sql-expression-types+
   '((:bool 16 1) (:char 18 1) (:name 19 64) (:int8 20 8)
-    (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1) (:text-array 1009 -1) (:oid 26 4) (:pg-node-tree 194 -1) (:record 2249 -1) (:void 2278 4) (:pg-lsn 3220 8) (:numeric 1700 -1)))
+    (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1) (:text-array 1009 -1) (:oid 26 4) (:pg-node-tree 194 -1) (:record 2249 -1) (:void 2278 4) (:pg-lsn 3220 8) (:numeric 1700 -1) (:bit 1560 -1)))
 
 (defun sql-expression-type-description (type)
   (or (assoc type +sql-expression-types+)
@@ -82,6 +82,7 @@ exist\" messages."
     (:int8 "bigint")
     (:pg-lsn "pg_lsn")
     (:numeric "numeric")
+    (:bit "bit")
     (:varchar "character varying")
     (:bool "boolean")
     (:text-array "text[]")
@@ -455,6 +456,8 @@ exist\" messages."
       (member source '(:text :varchar :name))
       (and (member source '(:int2 :int4 :int8 :oid))
            (member target '(:int2 :int4 :int8 :oid)))
+      (and (eq source :bit) (member target '(:int4 :int8)))
+      (and (eq target :bit) (member source '(:int4 :int8)))
       (and (eq source :numeric) (member target '(:int2 :int4 :int8)))
       (and (eq source :int4) (member target '(:bool :char)))
       (and (eq target :int4) (member source '(:bool :char)))))
@@ -665,13 +668,22 @@ exist\" messages."
 
 (defun sql-cast-value (value source target typmod)
   (when (eq value +null+) (return-from sql-cast-value +null+))
+  (when (eq target :bit)
+    (return-from sql-cast-value
+      (cond ((eq source :bit) (sql-bit-resize value typmod))
+            ((member source '(:int4 :int8)) (sql-integer-to-bit value typmod))
+            ((member source '(:text :varchar :name))
+             (sql-bit-resize (sql-bit-input value) typmod))
+            (t (ereport "42846" "cannot cast type ~a to bit" source)))))
+  (when (and (eq source :bit) (member target '(:int4 :int8)))
+    (return-from sql-cast-value (sql-bit-to-integer value (if (eq target :int4) 32 64))))
   (when (eq target :int2)
     (let ((number (sql-cast-value value source :int4 -1)))
       (unless (<= -32768 number 32767)
         (ereport "22003" "smallint out of range"))
       (return-from sql-cast-value number)))
   (when (and (eq source :numeric) (member target '(:int4 :int8)))
-    ;; Current numeric producers are exact integral LSN differences.
+    ;; Current numeric producers retain exact integral values.
     (unless (integerp value)
       (ereport "0A000" "nonintegral numeric conversion is not implemented"))
     (unless (if (eq target :int4) (<= +int4-min+ value +int4-max+)
@@ -735,7 +747,7 @@ exist\" messages."
       (unknown-literal
        (list :const (sql-cast-value (second raw) source target typmod) :explicit-cast t
              :type target :typmod typmod))
-      ((and (eq source target) (= typmod -1))
+      ((and (eq source target) (= typmod -1) (not (eq target :bit)))
        (when (and (eq (first argument) :const) (member target '(:int2 :int4 :int8)))
          (sql-cast-value (second argument) source target typmod))
        argument)
@@ -743,6 +755,8 @@ exist\" messages."
 
 (defun analyze-text-concatenation (left right)
   "Resolve textcat and text/anynonarray overloads without treating arrays as text."
+  (when (and (eq (expr-type left) :bit) (eq (expr-type right) :bit))
+    (ereport "0A000" "bit concatenation is not implemented"))
   (when (some (lambda (argument) (member (expr-type argument) '(:text-array :int2vector)))
               (list left right))
     (ereport "0A000" "array concatenation is not implemented"))
@@ -767,8 +781,8 @@ exist\" messages."
             (ereport "0A000" "numeric arithmetic is not implemented"))
           (when (or (eq (expr-type left) :pg-lsn) (eq (expr-type right) :pg-lsn))
             (ereport "0A000" "pg_lsn arithmetic is not implemented"))
-          (when (or (member (expr-type left) '(:char :int2vector :text-array :oid))
-                    (member (expr-type right) '(:char :int2vector :text-array :oid)))
+          (when (or (member (expr-type left) '(:char :int2vector :text-array :oid :bit))
+                    (member (expr-type right) '(:char :int2vector :text-array :oid :bit)))
             (ereport "42883" "operator ~a does not exist for ~a and ~a"
                      operator (expr-type left) (expr-type right)))
           (list :binop operator left right
@@ -890,10 +904,14 @@ exist\" messages."
          ((eq v +null+) (list :const v :type :text :typmod -1))
          ((integerp v)
           (list :const v
-                :type (if (<= +int4-min+ v +int4-max+) :int4 :int8)
+                :type (cond ((<= +int4-min+ v +int4-max+) :int4)
+                            ((<= +int8-min+ v +int8-max+) :int8)
+                            (t :numeric))
                 :typmod -1))
          ((stringp v) (list :const v :type :text :typmod -1))
          (t (list :const v :type :text :typmod -1)))))
+    (:bit-literal
+     (list :const (sql-bit-input (second expr)) :explicit-cast t :type :bit :typmod -1))
     (:coalesce (analyze-coalesce-expression expr table))
     (:case (analyze-case-expression expr table))
     (:array-literal (analyze-array-literal expr table))
@@ -925,7 +943,7 @@ exist\" messages."
     (:binop (analyze-binop-expression expr table))
     (:unary
      (let ((e (analyze-expr (third expr) table)))
-       (when (member (expr-type e) '(:char :int2vector :text-array :oid :pg-lsn))
+       (when (member (expr-type e) '(:char :int2vector :text-array :oid :pg-lsn :bit))
          (ereport "42883" "unary operator does not exist for ~a" (expr-type e)))
        (list :unary (second expr) e
              :type (expr-type e) :typmod (expr-typmod e))))

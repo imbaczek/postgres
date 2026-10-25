@@ -340,6 +340,10 @@ decimal numeric input, storage or arithmetic.
 Text `||` and `substr(text, start [, length])` support the string operations used
 by Patroni's status expression. Substring positions count Unicode characters,
 including SQL's adjusted zero/negative starts. Array concatenation remains unsupported.
+Fixed `bit(N)` expression casts and `B'...'`/`X'...'` literals support binary/hex
+input, explicit padding/truncation, and C-compatible integer/bigint conversion.
+Varying-bit types, bitwise operations, bit concatenation and bit table storage
+remain unfinished.
 
 See the [interop test inventory](t/interop/README.md) for refactor decisions,
 generated-check domains, replay seeds and verification limits.

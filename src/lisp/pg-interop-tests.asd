@@ -5,6 +5,7 @@
   :components ((:file "t/interop/protocol-tests")
                (:file "t/interop/sum-tests")
                (:file "t/interop/string-tests")
+               (:file "t/interop/bit-tests")
                (:file "t/interop/standard-tests")
                (:file "t/interop/copy-tests")
                (:file "t/interop/standard-subscriber-tests")

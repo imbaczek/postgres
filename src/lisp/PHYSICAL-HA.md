@@ -12,6 +12,44 @@ manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
 
+### Fixed-bit cast checkpoint
+
+Patroni's `('x' || substr(filename,1,8))::bit(32)::int` expression now uses actual
+fixed-bit casts. `bit` reports OID 1560 with variable length and C typmod metadata.
+Binary and hexadecimal input, B/X literals, explicit left-prefix truncation/right
+zero-padding, integer low-bit truncation/sign-fill, and destination-width signed
+decoding follow `varbit.c`. Short bit strings do not sign-extend when converted
+to integers. Oversized strings raise 22003 even when their numeric value is zero.
+Bit input with a supplied assignment typmod validates length before digits
+(22026); expression casts read unbounded input then resize explicitly.
+
+Bare unquoted `::bit` defaults to one bit, while quoted/qualified unmodified casts
+retain unspecified length. Declared lengths accept C's 1..83,886,080 range;
+no-op casts to unspecified bit also clear result typmods. Raw numeric type
+modifiers retain their spelling through integer input, so fractional/exponent
+modifiers raise 22P02, and unary-plus/expression modifiers raise 42601. Numeric
+tokenization follows C radix/underscore and decimal/exponent spelling rules;
+decimal SQL expressions remain unsupported outside type-modifier parsing.
+Integer literals beyond signed bigint now resolve as integral numeric values,
+preventing them from bypassing the catalog's explicit int4/int8-to-bit cast routes.
+
+Canonical binary strings preserve values through existing comparisons, grouping
+and spill. The new signed-cast property passes 200 trials with seed 42. All 154
+interop cases and 131 physical cases pass. The unchanged native/C wire fixture
+covers 100 synthetic timeline patterns, signed roundtrips, metadata, NULLs and
+error precedence; synthetic filenames never promote a server. Pinned C evidence:
+`/tmp/pg-c-bit.GHAtRT`. Native final acceptance passed in
+`/tmp/pg-patroni-start.h7eQWK`, including bit decoding after live reload. Forced
+strict compile, formatting and 1,598 legacy checks pass; final logs use
+`/tmp/pg-bit-accepted-`. Luna max's fractional-typmod finding was fixed; Sol high
+reviewed the implementation and follow-up without further findings. Sol medium
+found no useful LOC-saving refactor; all changed production functions remain
+under 120 lines.
+
+Varying-bit types, bitwise operations, bit concatenation and bit table storage
+remain unfinished. The complete Patroni status query still needs WAL filename
+and receiver/control reporting. This milestone adds no coordination.
+
 ### String status-expression checkpoint
 
 Text `||` and `substr(text,int4[,int4])` are implemented for the remaining string
@@ -123,9 +161,8 @@ Sol medium suggested the applied literal-coercion simplification.
 
 The pinned `pg_walfile_name()` uses `XLByteToSeg`, so an exact segment boundary
 names the new segment. Do not import older PostgreSQL's previous-segment rule.
-The complete Patroni TL_LSN expression additionally needs
-`bit(32)::int` (signed bit pattern), actual timeline
-filename reporting, and receiver/control statistics. These remain unfinished.
+The complete Patroni TL_LSN expression additionally needs actual timeline
+filename reporting and receiver/control statistics. These remain unfinished.
 
 ### Replay pause control checkpoint
 
@@ -162,8 +199,8 @@ An explicit barrier test for requesting pause during active redo remains a
 coverage gap; admission serialization was inspected but not raced in that test.
 
 The pinned Patroni 4.1.5 `Postgresql.TL_LSN` expression was rechecked: this closes
-its replay-pause predicate dependency, but the full query still needs WAL filename,
-bit casts, and receiver/control statistics.
+its replay-pause predicate dependency, but the full query still needs WAL filename
+and receiver/control statistics.
 Do not infer complete Patroni monitoring compatibility from the four controls.
 
 | Contract | Current evidence | Required acceptance |

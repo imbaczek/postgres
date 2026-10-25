@@ -6,6 +6,9 @@
   tokens
   (pos 0))
 
+(defvar *parse-type-modifiers-p* nil
+  "Allow raw numeric spelling in typmods without enabling decimal SQL expressions.")
+
 (defun pcur (p) (nth (sql-parser-pos p) (sql-parser-tokens p)))
 (defun pnext (p) (prog1 (pcur p) (incf (sql-parser-pos p))))
 (defun pkind (p) (token-kind (pcur p)))
@@ -63,6 +66,7 @@
       (syntax-error p "expected identifier")))
 
 (defun parse-integer-literal (p)
+  (when (eq (pkind p) :numeric) (ereport "0A000" "decimal numeric literals are not supported"))
   (if (eq (pkind p) :integer)
       (token-value (pnext p))
       (syntax-error p "expected integer literal")))
@@ -938,6 +942,7 @@
 
 (defun parse-set-value (p)
   (cond
+    ((eq (pkind p) :numeric) (ereport "0A000" "decimal numeric literals are not supported"))
     ((eq (pkind p) :integer)
      (princ-to-string (token-value (pnext p))))
     ((eq (pkind p) :string)
@@ -1091,6 +1096,28 @@
           (+ length 4)))
       -1))
 
+(defun type-modifier-input-string (expression)
+  "Match typenameTypeMod's constant/identifier validation before integer input."
+  (cond
+    ((eq (first expression) :numeric-literal) (second expression))
+    ((and (eq (first expression) :const) (integerp (second expression)))
+     (format nil "~d" (second expression)))
+    ((and (eq (first expression) :const) (stringp (second expression)))
+     (second expression))
+    ((and (eq (first expression) :column) (= (length expression) 2))
+     (second expression))
+    (t (ereport "42601" "type modifiers must be simple constants or identifiers"))))
+
+(defun parse-bit-typmod (p default)
+  (if (match-punct p #\()
+      (let* ((strings (mapcar #'type-modifier-input-string
+                              (let ((*parse-type-modifiers-p* t))
+                                (with-parens (p :opening-consumed t) (parse-expr-list p)))))
+             (lengths (mapcar (lambda (text) (sql-cast-integer-input text :int4)) strings)))
+        (unless (= (length lengths) 1) (ereport "22023" "invalid type modifier"))
+        (sql-bit-validate-typmod (first lengths)))
+      default))
+
 (defun parse-scalar-cast-type (p)
   "Resolve supported expression types independently of table storage aliases."
   (let* ((quoted (token-quoted-p (pcur p)))
@@ -1105,6 +1132,10 @@
       ((string= name "name") (values :name -1))
       ((string= name "oid") (values :oid -1))
       ((string= name "pg_lsn") (values :pg-lsn -1))
+      ((string= name "bit")
+       (when (and (not quoted) (not qualified) (match-kw p "varying"))
+         (ereport "0A000" "bit varying casts are not implemented"))
+       (values :bit (parse-bit-typmod p (if (or quoted qualified) -1 1))))
       ((or (string= name "int2")
            (and (not quoted) (not qualified) (string= name "smallint")))
        (values :int2 -1))
@@ -1151,11 +1182,19 @@
   (cond
     ((match-op p "-")
      (let ((argument (parse-unary p)))
-       ;; gram.y:doNegate folds raw integer constants before selecting their type.
-       (if (and (eq (first argument) :const) (integerp (second argument)))
-           (list :const (- (second argument)))
-           (list :unary "-" argument))))
-    ((match-op p "+") (parse-unary p))
+       ;; gram.y:doNegate folds raw constants before selecting their type.
+       (cond
+         ((and (eq (first argument) :const) (integerp (second argument)))
+          (list :const (- (second argument))))
+         ((eq (first argument) :numeric-literal)
+          (let ((text (second argument)))
+            (list :numeric-literal
+                  (if (char= (char text 0) #\-) (subseq text 1)
+                      (concatenate 'string "-" text)))))
+         (t (list :unary "-" argument)))))
+    ((match-op p "+")
+     (let ((argument (parse-unary p)))
+       (if *parse-type-modifiers-p* (list :unary "+" argument) argument)))
     (t (parse-postfix-expression p))))
 
 (defun parse-call-arguments (p)
@@ -1207,6 +1246,11 @@
 
 (defun parse-primary (p)
   (cond
+    ((eq (pkind p) :numeric)
+     (unless *parse-type-modifiers-p*
+       (ereport "0A000" "decimal numeric literals are not supported"))
+     (list :numeric-literal (token-value (pnext p))))
+    ((eq (pkind p) :bit-string) (list :bit-literal (token-value (pnext p))))
     ((eq (pkind p) :integer)
      (list :const (token-value (pnext p))))
     ((eq (pkind p) :string)

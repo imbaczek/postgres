@@ -264,6 +264,7 @@ def main():
         connection = wait_for(connect)
         subprocess.run([sys.executable, str(base / "t/interop/wal-sql.py"), str(port)], check=True)
         subprocess.run([sys.executable, str(base / "t/interop/string-sql.py"), str(port)], check=True)
+        subprocess.run([sys.executable, str(base / "t/interop/bit-sql.py"), str(port)], check=True)
         check_named_connection(connection, port)
         check_timeout_reload_gate(base, root, port)
         subprocess.run([sys.executable, str(base / "t/interop/patroni-history.py"),
@@ -399,8 +400,8 @@ def main():
         process.send_signal(signal.SIGHUP)
         wait_for(lambda: show("checkpoint_timeout") == "2min")
         with connection.cursor() as cursor:
-            cursor.execute("SELECT COALESCE(sum(1),0), 'x'||substr('ab',1,1)")
-            assert cursor.fetchone() == (1, "xa")
+            cursor.execute("SELECT COALESCE(sum(1),0), 'x'||substr('ab',1,1), ('x'||substr('FFFFFFFF0000000000000001',1,8))::bit(32)::int")
+            assert cursor.fetchone() == (1, "xa", -1)
         print("patroni-start: aggregate definitions survive live reload PASS", flush=True)
         for argument in ("--typo=1", "unexpected"):
             rejected = root / ("rejected-" + str(len(argument)))

@@ -72,6 +72,7 @@
      (:module "parser"
       :serial t
       :components ((:file "scan")
+                   (:file "../utils/adt/varbit")
                    (:file "gram")
                    (:file "analyze")))
      (:module "executor"
