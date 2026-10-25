@@ -42,6 +42,21 @@
 (defvar *physical-recovery-failed-p* nil
   "A failed replay never admits further SQL until process restart.")
 
+(defvar *physical-shutdown-state* nil
+  "Process-local native standby shutdown phase; reset only by process restart.")
+
+(defvar *physical-shutdown-lock* (sb-thread:make-mutex :name "native standby shutdown"))
+
+(defun check-physical-recovery-work ()
+  (check-recovery-available)
+  (when (member *physical-shutdown-state* '(:prepared :failed))
+    (ereport "55000" "native standby shutdown is prepared; restart is required")))
+
+(defun check-physical-recovery-worker-start ()
+  (check-recovery-available)
+  (when (or *physical-shutdown-state* (shutdown-in-progress-p))
+    (ereport "55000" "cannot start native recovery workers during shutdown")))
+
 (defun check-recovery-available ()
   (when *physical-recovery-failed-p*
     (ereport "57P03" "physical recovery failed; restart is required")))

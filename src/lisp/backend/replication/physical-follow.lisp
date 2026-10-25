@@ -300,6 +300,7 @@
 
 (defun physical-follow-launch (config)
   "Called with the command mutex held; publish only a complete worker pair."
+  (check-physical-recovery-worker-start)
   (physical-follow-check-config config)
   (sb-thread:with-mutex (*physical-follow-lock*)
     (when *physical-follow-runtime* (error "native physical follow already has a runtime; stop it first"))
@@ -327,6 +328,7 @@
   "Persist a native source endpoint and run receipt/replay; never authorize a writer."
   (when (plusp *live-operation-depth*) (error "follow start requires its own operation admission"))
   (sb-thread:with-mutex (*physical-follow-command-lock*)
+    (check-physical-recovery-worker-start)
     (let ((config (physical-follow-check-config (list 1 host port pin))))
       (when *physical-follow-runtime* (error "stop the existing native physical follow runtime first"))
       (when (eq :deferred (physical-recovery-enable-streaming))
@@ -334,37 +336,43 @@
       (with-live-operation (physical-follow-save-config config))
       (physical-follow-launch config))))
 
+(defun physical-follow-quiesce-runtime ()
+  "Caller owns the command mutex, outside admission; preserve durable follow configuration."
+  (when (plusp *live-operation-depth*) (error "follow quiescence must join outside admission"))
+  (let ((runtime *physical-follow-runtime*))
+    (when runtime
+      (setf (physical-follow-runtime-stopped-p runtime) t)
+      (let ((client (sb-thread:with-mutex (*physical-follow-lock*)
+                      (physical-follow-runtime-client runtime))))
+        (when client
+          (ignore-errors
+           (sb-bsd-sockets:socket-shutdown (pg-client-socket client) :direction :io))))
+      (let ((threads (list (physical-follow-runtime-receiver-thread runtime)
+                           (physical-follow-runtime-replay-thread runtime))))
+        (dolist (thread threads)
+          (when thread (sb-thread:join-thread thread :timeout 15 :default :timeout)))
+        (when (some (lambda (thread) (and thread (sb-thread:thread-alive-p thread))) threads)
+          (error "native physical workers have not stopped")))
+      ;; Older live stack frames may retain their pre-flush cleanup.
+      (physical-follow-flush-on-exit runtime)
+      (physical-follow-check-exit)
+      (sb-thread:with-mutex (*physical-follow-lock*) (setf *physical-follow-runtime* nil))))
+  :stopped)
+
 (defun physical-follow-stop ()
   "Disable automatic receipt durably; keep recovery role, spool and applied data."
   (when (plusp *live-operation-depth*) (error "follow stop must join outside operation admission"))
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (with-live-operation
+      (check-physical-recovery-work)
       (when (probe-file (physical-follow-config-path))
         (delete-file (physical-follow-config-path))
         (fsync-directory *pgdata*)))
-    (let ((runtime *physical-follow-runtime*))
-      (when runtime
-        (setf (physical-follow-runtime-stopped-p runtime) t)
-        (let ((client (sb-thread:with-mutex (*physical-follow-lock*)
-                        (physical-follow-runtime-client runtime))))
-          (when client
-            (ignore-errors
-             (sb-bsd-sockets:socket-shutdown (pg-client-socket client) :direction :io))))
-        (let ((threads (list (physical-follow-runtime-receiver-thread runtime)
-                             (physical-follow-runtime-replay-thread runtime))))
-          (dolist (thread threads)
-            (when thread (sb-thread:join-thread thread :timeout 15 :default :timeout)))
-          (when (some (lambda (thread) (and thread (sb-thread:thread-alive-p thread))) threads)
-            (error "native physical workers have not stopped")))
-        ;; Active frames retain their old cleanup after a live reload. Once
-        ;; workers are joined, preserve the public stop contract independently.
-        (physical-follow-flush-on-exit runtime)
-        (physical-follow-check-exit)
-        (sb-thread:with-mutex (*physical-follow-lock*) (setf *physical-follow-runtime* nil)))))
-  :stopped)
+    (physical-follow-quiesce-runtime)))
 
 (defun physical-follow-autostart ()
   (sb-thread:with-mutex (*physical-follow-command-lock*)
+    (check-physical-recovery-worker-start)
     (when (probe-file (physical-follow-config-path))
       (unless (and (recovery-in-progress-p) *physical-receive-store*)
         (error "native follow configuration requires streaming recovery"))

@@ -87,11 +87,12 @@ can be ahead after a crash and never grants a missing-file exemption."
 (defun physical-recovery-enable-streaming ()
   "Enter restartable native receive/replay, retaining all WAL from the base.
 Direct control operation; does not promote, follow a network source or coordinate."
-  (check-recovery-available)
+  (check-physical-recovery-worker-start)
   (unless (recovery-in-progress-p) (error "streaming requires a verified recovery base"))
   (when (plusp *live-operation-depth*) (error "streaming setup requires its own admission gate"))
   (sb-thread:with-mutex (*reload-run-lock*)
     (with-live-operation-quiescence
+      (check-physical-recovery-worker-start)
       (when *swank-listener-enabled-p* (error "streaming setup requires Swank to be off"))
       (when (physical-recovery-reader-conflict-p) (return-from physical-recovery-enable-streaming :deferred))
       (unless *physical-receive-store*
@@ -116,12 +117,12 @@ Direct control operation; does not promote, follow a network source or coordinat
       (getf *physical-recovery-state* :phase))))
 
 (defun physical-recovery-receive (start-lsn bytes)
-  (check-recovery-available)
+  (check-physical-recovery-work)
   (unless *physical-receive-store* (error "no native physical receiver spool"))
   (physical-store-input *physical-receive-store* start-lsn bytes))
 
 (defun physical-recovery-flush ()
-  (check-recovery-available)
+  (check-physical-recovery-work)
   (unless *physical-receive-store* (error "no native physical receiver spool"))
   (let ((flush (physical-store-flush *physical-receive-store*)))
     (setf (getf *physical-recovery-state* :receive-lsn) flush)
@@ -220,6 +221,8 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
   "Control replay under admission; native redo cannot overlap an admitted caller."
   (with-live-operation
     (check-recovery-available)
+    (when (member name '("pg_wal_replay_pause" "pg_wal_replay_resume") :test #'string=)
+      (check-physical-recovery-work))
     (unless (recovery-in-progress-p)
       (ereport "55000" "recovery is not in progress"))
     (sb-thread:with-mutex (*physical-replay-pause-lock*)
@@ -240,11 +243,12 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
 
 (defun physical-recovery-replay ()
   "Apply durable terminal batches between transactions; return :DEFERRED on conflict."
-  (check-recovery-available)
+  (check-physical-recovery-work)
   (unless *physical-receive-store* (error "no native physical receiver spool"))
   (when (plusp *live-operation-depth*) (error "replay requires its own admission gate"))
   (sb-thread:with-mutex (*reload-run-lock*)
     (with-live-operation-quiescence
+      (check-physical-recovery-work)
       (when *swank-listener-enabled-p* (error "native replay requires Swank to be off"))
       (sb-thread:with-mutex (*physical-replay-pause-lock*)
         (when *physical-replay-paused-p*

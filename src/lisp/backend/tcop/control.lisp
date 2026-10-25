@@ -633,7 +633,7 @@ this listener evaluates arbitrary Lisp."
                   ;; expressions outside live admission. The backup owns its gate.
                   (physical-base-backup (second form) (third form)))
                  ((and (consp form)
-                       (member (first form) '(physical-recovery-enable-streaming physical-recovery-replay physical-recovery-restartpoint physical-follow-stop))
+                       (member (first form) '(physical-recovery-enable-streaming physical-recovery-replay physical-recovery-restartpoint physical-recovery-prepare-shutdown physical-follow-stop))
                        (null (rest form)))
                   (funcall (first form)))
                  ((and (consp form) (eq (first form) 'physical-follow-start)

@@ -1,6 +1,8 @@
 ;;;; Local restartpoint generations and durable publication, independent of source pins.
 (in-package #:pg)
 
+(declaim (special *physical-follow-command-lock*))
+
 (defvar *physical-restartpoint-test-hook* nil)
 
 (defvar *physical-restartpoint-timeout* 300
@@ -244,7 +246,7 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
               (and (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
                    (not *live-operation-drain-open*)))
     (error "restartpoint publication requires live admission or owned quiescence"))
-  (check-recovery-available)
+  (check-physical-recovery-work)
   (unless (and (recovery-in-progress-p) *physical-receive-store*)
     (error "restartpoint requires streaming recovery"))
   (when *swank-listener-enabled-p* (error "restartpoint requires Swank to be off"))
@@ -260,7 +262,7 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
 
 (defun physical-recovery-checkpoint ()
   "CHECKPOINT in recovery is a restartpoint request, including within read transactions."
-  (check-recovery-available)
+  (check-physical-recovery-work)
   (if *physical-receive-store*
       (physical-recovery-restartpoint-core)
       ;; An immutable base has no newer replay boundary to checkpoint.
@@ -268,12 +270,13 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
 
 (defun physical-recovery-restartpoint (&key automatic)
   "Publish a local durable terminal and compact its receive spool; never promote."
-  (check-recovery-available)
+  (check-physical-recovery-work)
   (unless (and (recovery-in-progress-p) *physical-receive-store*)
     (error "restartpoint requires streaming recovery"))
   (when (plusp *live-operation-depth*) (error "restartpoint requires its own admission gate"))
   (sb-thread:with-mutex (*reload-run-lock*)
     (with-live-operation-quiescence
+      (check-physical-recovery-work)
       (when (and automatic (not (physical-restartpoint-needed-p)))
         (return-from physical-recovery-restartpoint :not-due))
       (when (physical-recovery-reader-conflict-p)
@@ -282,6 +285,12 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
 
 (defun physical-restartpoint-worker-step ()
   "Keep the running worker's iteration replaceable by a live reload."
+  ;; A previous loop frame may survive reload. Exit only this registered
+  ;; worker, synchronously before entering admission or doing storage work.
+  (when (and *physical-shutdown-state*
+             (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+               (eq sb-thread:*current-thread* *physical-restartpoint-worker*)))
+    (sb-thread:return-from-thread :stopped))
   (handler-case
       (when (with-live-operation (physical-restartpoint-needed-p))
         (physical-recovery-restartpoint :automatic t))
@@ -291,13 +300,14 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
       :failed)))
 
 (defun physical-restartpoint-worker-loop ()
-  (loop until (or (shutdown-in-progress-p) *physical-recovery-failed-p*)
+  (loop until (or *physical-shutdown-state* (shutdown-in-progress-p) *physical-recovery-failed-p*)
         for result = (physical-restartpoint-worker-step)
         do (sleep (if (eq result :deferred) 1 0.2))))
 
 (defun physical-restartpoint-start-worker ()
   "Start one local maintenance worker for streaming recovery, independent of following."
   (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+    (check-physical-recovery-worker-start)
     (when (and (recovery-in-progress-p) *physical-receive-store*
                (not (and *physical-restartpoint-worker*
                          (sb-thread:thread-alive-p *physical-restartpoint-worker*))))
@@ -306,3 +316,58 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
             (sb-thread:make-thread #'physical-restartpoint-worker-loop
                                    :name "native standby restartpoints")))
     *physical-restartpoint-worker*))
+
+(defun physical-restartpoint-join-for-shutdown ()
+  "Join outside admission and the reload lock; never interrupt publication."
+  (let ((worker (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+                  *physical-restartpoint-worker*)))
+    (when worker
+      (sb-thread:join-thread worker :timeout 15 :default :timeout)
+      (when (sb-thread:thread-alive-p worker)
+        (error "native standby restartpoint worker has not stopped"))
+      (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+        (when (eq worker *physical-restartpoint-worker*)
+          (setf *physical-restartpoint-worker* nil))))))
+
+(defun physical-recovery-prepare-shutdown ()
+  "Quiesce native recovery and publish its applied terminal; do not exit the process."
+  (when (plusp *live-operation-depth*) (error "standby shutdown requires its own admission gate"))
+  (check-recovery-available)
+  (unless (recovery-in-progress-p)
+    (ereport "55000" "standby shutdown preparation requires recovery"))
+  (when *swank-listener-enabled-p* (error "standby shutdown requires Swank to be off"))
+  (sb-thread:with-mutex (*physical-shutdown-lock*)
+    (sb-thread:with-mutex (*physical-follow-command-lock*)
+      (check-recovery-available)
+      (when (eq *physical-shutdown-state* :prepared)
+        (return-from physical-recovery-prepare-shutdown
+          (or *last-replay-lsn* (getf *physical-recovery-state* :end))))
+      (let ((finished nil) (terminal nil))
+        (unwind-protect
+             (progn
+               (with-live-operation
+                 (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+                   (setf *physical-shutdown-state* :stopping)))
+               ;; Exit flush needs admission; replay/maintenance may own reload.
+               ;; Join all of them before taking either gate.
+               (physical-follow-quiesce-runtime)
+               (physical-restartpoint-join-for-shutdown)
+               (sb-thread:with-mutex (*reload-run-lock*)
+                 (with-live-operation-quiescence
+                   (check-recovery-available)
+                   (when *physical-receive-store*
+                     (when (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
+                             (physical-store-check-live *physical-receive-store*)
+                             (< (physical-store-flushed-lsn *physical-receive-store*)
+                                (physical-store-written-lsn *physical-receive-store*)))
+                       (physical-recovery-flush)))
+                   (setf terminal (if *physical-receive-store*
+                                      (physical-recovery-restartpoint-core)
+                                      (or *last-replay-lsn* (getf *physical-recovery-state* :end)))
+                         *physical-shutdown-state* :prepared)))
+               ;; A failure while reopening admission is a failed preparation too.
+               (setf finished t)
+               terminal)
+          (unless finished
+            (setf *physical-shutdown-state* :failed
+                  *physical-recovery-failed-p* t)))))))
