@@ -1130,6 +1130,7 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
     (setf (gethash name (database-tables db)) class)
     (handler-case
         (progn
+          (smgr-create (pg-class-relfilenode class))
           ;; Per-column PRIMARY KEY / UNIQUE.
           (loop for def in columns
                 for col across cols

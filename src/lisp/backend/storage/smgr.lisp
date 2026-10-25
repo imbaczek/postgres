@@ -20,6 +20,17 @@
         (setf (gethash key *relation-streams*)
               (open-relation-file (relation-file-path relfilenode fork))))))
 
+(defun smgr-create (relfilenode &key redo)
+  "Durably create an empty main fork before publishing its catalog identity.
+REDO permits an existing file and never truncates it, matching smgrcreate redo."
+  (let ((path (relation-file-path relfilenode)))
+    (sb-thread:with-mutex (*smgr-lock*)
+      (when (and (not redo) (probe-file path))
+        (error "relation storage already exists: ~a" path))
+      (fsync-stream (smgr-open-locked relfilenode)))
+    (fsync-directory (merge-pathnames "base/" *pgdata*)))
+  (values))
+
 (defun smgr-nblocks (relfilenode &optional (fork :main))
   (sb-thread:with-mutex (*smgr-lock*)
     (let ((stream (gethash (list relfilenode fork) *relation-streams*))
