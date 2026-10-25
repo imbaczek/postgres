@@ -192,6 +192,28 @@ exist\" messages."
   (sql-strict-let ((left (first arguments)) (right (second arguments)))
     (- left right)))
 
+(defun analyze-wal-filename (name arguments)
+  "Resolve xlogfuncs.c's strict pg_walfile_name(pg_lsn) -> text."
+  (unless (and (= (length arguments) 1)
+               (or (eq (expr-type (first arguments)) :pg-lsn)
+                   (in-unknown-constant-p (first arguments))))
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+  (list :func name (list (coerce-in-constant (first arguments) :pg-lsn))
+        :type :text :typmod -1))
+
+(defun eval-wal-filename (arguments)
+  "Compute XLogFileName; native WAL storage is not C disk compatible."
+  (sql-strict-let ((location (first arguments)))
+    (when (recovery-in-progress-p)
+      (ereport "55000" "recovery is in progress"
+               :hint "pg_walfile_name() cannot be executed during recovery."))
+    ;; Native primary startup currently supports timeline 1 only. Promotion must
+    ;; replace this alongside the writer's insertion timeline before admitting writes.
+    (let* ((segment (floor location +wal-segment-size+))
+           (segments-per-id (floor (ash 1 32) +wal-segment-size+)))
+      (format nil "~8,'0X~8,'0X~8,'0X"
+              1 (floor segment segments-per-id) (mod segment segments-per-id)))))
+
 (defun cast-expression-to-text (argument)
   (if (eq (expr-type argument) :text) argument
       (list :cast argument :type :text :typmod -1)))
@@ -232,6 +254,7 @@ exist\" messages."
     (cond
       ((string= name "substr") (analyze-substr-function name args))
       ((string= name "pg_wal_lsn_diff") (analyze-wal-lsn-diff name args))
+      ((string= name "pg_walfile_name") (analyze-wal-filename name args))
       ((member name '("lower" "current_setting") :test #'string=)
        (analyze-setting-function name args))
       ((member name '("array_length" "pg_get_expr" "pg_get_replica_identity_index") :test #'string=)
@@ -1654,6 +1677,7 @@ exist\" messages."
   (cond
     ((string= name "substr") (eval-substr-function args))
     ((string= name "pg_wal_lsn_diff") (eval-wal-lsn-diff args))
+    ((string= name "pg_walfile_name") (eval-wal-filename args))
     ((member name '("lower" "current_setting") :test #'string=)
      (eval-setting-function name args))
     ((string= name "pg_get_expr")

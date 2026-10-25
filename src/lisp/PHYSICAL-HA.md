@@ -12,6 +12,28 @@ manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
 
+### WAL filename reporting checkpoint
+
+`pg_catalog.pg_walfile_name(pg_lsn)` now follows pinned `xlogfuncs.c` and
+`XLogFileName`: strict NULL propagation, unknown-input LSN coercion, text result
+OID 25, and recovery rejection with 55000. Exact segment boundaries name the
+segment starting there, including zero. The native segment size is 16 MiB and
+the only supported primary insertion timeline remains 1; promotion must update
+this reporting together with the writer before enabling child-timeline writes.
+These computed SQL names do not change native WAL filenames or establish C
+physical WAL/disk compatibility.
+
+The same wire probe passes on pinned C (`/tmp/pg-c-wal-filename.kfPk4U`) and the
+native server (`/tmp/pg-patroni-start.KJG2Ng`): 106 boundary/random locations,
+metadata, NULLs and input errors. Both new Rove tests and all 156 interop tests
+pass; the owned native server also passes actual Patroni startup/config/reload/
+shutdown smoke checks. Strict compilation passes.
+Luna's recovery message/hint finding is fixed and covered by explicit condition
+field assertions. Sol high found no other defects; Sol medium recommended no
+refactor. Formatting and 1,598 legacy checks pass. The full Patroni timeline/LSN
+fragment remains the next acceptance target: its recovery AND replay-paused
+guard also requires correct lazy Boolean evaluation on a primary.
+
 ### Fixed-bit cast checkpoint
 
 Patroni's `('x' || substr(filename,1,8))::bit(32)::int` expression now uses actual
