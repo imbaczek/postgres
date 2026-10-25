@@ -190,6 +190,36 @@
                (equal (aref (first rows) 1) "1"))
     (physical-follow-reject "source identity or timeline differs from the native recovery base")))
 
+(defun physical-follow-flush-on-exit (runtime)
+  "Flush complete writes before receiver exit; record fatal cleanup errors without masking an unwind."
+  (with-live-operation
+    (when *physical-recovery-failed-p*
+      (return-from physical-follow-flush-on-exit :failed))
+    (handler-case
+        (let ((store *physical-receive-store*))
+          (unless store (error "receiver exit lost its native receive spool"))
+          (multiple-value-bind (failed written flushed)
+              (sb-thread:with-mutex ((physical-store-mutex store))
+                (values (or (physical-store-failed-p store) (physical-store-closed-p store))
+                        (physical-store-written-lsn store) (physical-store-flushed-lsn store)))
+            (cond (failed :failed)
+                  ((= written flushed) flushed)
+                  (t (physical-recovery-flush)))))
+      (error (condition)
+        ;; C's WAL fsync failure is PANIC. Keep this native recovery image
+        ;; closed until restart, even if a stop request is pending.
+        (setf *physical-recovery-failed-p* t)
+        (physical-follow-note-error runtime condition t)
+        :failed))))
+
+(defun physical-follow-check-exit ()
+  "A joined receiver must not turn poisoned receive storage into a successful stop."
+  (with-live-operation
+    (check-recovery-available)
+    (unless *physical-receive-store* (error "receiver exit lost its native receive spool"))
+    (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
+      (physical-store-check-live *physical-receive-store*))))
+
 (defun physical-follow-session (runtime cursor)
   (let ((client nil))
     (unwind-protect
@@ -221,11 +251,13 @@
                         (#\E (error (pg-client-error-from-payload payload)))
                         (otherwise (physical-follow-reject "unexpected native replication frame"))))
                     (physical-follow-feedback client)))
-      (physical-follow-monitor-stop runtime)
-      (sb-thread:with-mutex (*physical-follow-lock*)
-        (when (eq client (physical-follow-runtime-client runtime))
-          (setf (physical-follow-runtime-client runtime) nil)))
-      (pg-client-close client))))
+      (unwind-protect
+           (physical-follow-flush-on-exit runtime)
+        (physical-follow-monitor-stop runtime)
+        (sb-thread:with-mutex (*physical-follow-lock*)
+          (when (eq client (physical-follow-runtime-client runtime))
+            (setf (physical-follow-runtime-client runtime) nil)))
+        (pg-client-close client)))))
 
 (defun physical-follow-terminal-p (condition)
   (or (typep condition 'physical-follow-terminal-error)
@@ -249,8 +281,10 @@
                                (physical-store-reset-unflushed *physical-receive-store*))))
                  (physical-follow-session runtime cursor))
              ((or error sb-ext:timeout) (condition)
-               (unless (physical-follow-runtime-stopped-p runtime)
-                 (physical-follow-note-error runtime condition (physical-follow-terminal-p condition)))))
+               (let ((terminal (physical-follow-terminal-p condition)))
+                 (when (or (not (physical-follow-runtime-stopped-p runtime))
+                           (and terminal (not *physical-recovery-failed-p*)))
+                   (physical-follow-note-error runtime condition terminal)))))
            (unless (physical-follow-runtime-stopped-p runtime) (sleep 0.2))))
 
 (defun physical-follow-replay-loop (runtime)
@@ -322,6 +356,7 @@
             (when thread (sb-thread:join-thread thread :timeout 15 :default :timeout)))
           (when (some (lambda (thread) (and thread (sb-thread:thread-alive-p thread))) threads)
             (error "native physical workers have not stopped")))
+        (physical-follow-check-exit)
         (sb-thread:with-mutex (*physical-follow-lock*) (setf *physical-follow-runtime* nil)))))
   :stopped)
 
