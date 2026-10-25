@@ -270,7 +270,7 @@
           ;; derived-relation registration domain as an explicit subquery.
           (values (make-sql-derived-relation
                    :query (list :type :select
-                                :targets (list (list :expr (list :record-expand call)))))
+                                :targets (list (list :expr (list :record-expand call :once t)))))
                   name))
         (if schema (make-sql-relation-name :schema schema :name name) name))))
 

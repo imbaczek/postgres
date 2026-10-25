@@ -964,7 +964,12 @@ reordered tree, and each parameterized path can reference only joined Vars."
 
 (defun make-sql-set-function-iterator (call environment)
   (let ((arguments (mapcar (lambda (argument) (eval-expr argument environment)) (third call))))
-    (cond ((string= (second call) "pg_get_publication_tables")
+    (cond ((eq (first call) :single-record)
+           (let ((value (eval-func (second call) arguments)) (pending t))
+             (lambda ()
+               (if pending (progn (setf pending nil) (values value t))
+                   (values nil nil)))))
+          ((string= (second call) "pg_get_publication_tables")
            (apply #'make-publication-table-result-iterator arguments))
           (t (ereport "0A000" "unsupported set-returning function ~a" (second call))))))
 

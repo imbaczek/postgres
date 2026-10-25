@@ -29,6 +29,7 @@ checked() {
 cleanup() {
     status=$?
     trap - EXIT
+    : >"$TMP/receiver-connect-release"
     if [ "$status" -ne 0 ] && [ -S "$TMP/target.sock" ]; then
         control target '(list :follow *physical-follow-runtime* :receive (getf *physical-recovery-state* :receive-lsn) :apply *last-replay-lsn* :failed *physical-recovery-failed-p*)' >"$TMP/failure-state.log" 2>&1 || :
     fi
@@ -75,16 +76,28 @@ checked source "(physical-base-backup \"$TMP/copy/\" \"network_base\")" backup
 start_target
 "$PATRONI_PYTHON" "$BASE/t/interop/patroni-tl-lsn.py" "$PORT" primary
 "$PATRONI_PYTHON" "$BASE/t/interop/patroni-tl-lsn.py" "$TARGET_PORT" standby
+"$PATRONI_PYTHON" "$BASE/t/interop/receiver-sql.py" "$TARGET_PORT" absent native
 test "$(sql "$TARGET_PORT" "SELECT pg_wal_lsn_diff(COALESCE(pg_last_wal_receive_lsn(),'0/0'),'0/0')::bigint")" = 0
+# Install a one-shot hook in the actual standby image. It restores itself before
+# waiting, holds no admission/storage lock, and has a five-second bound.
+checked target "(let ((original (symbol-function 'pg-client-connect))) (setf (symbol-function 'pg-client-connect) (lambda (&rest arguments) (setf (symbol-function 'pg-client-connect) original) (with-open-file (out \"$TMP/receiver-connecting\" :direction :output) (write-line \"connecting\" out)) (loop repeat 100 until (probe-file \"$TMP/receiver-connect-release\") do (sleep 0.05)) (unless (probe-file \"$TMP/receiver-connect-release\") (error \"receiver connect barrier timed out\")) (apply original arguments))))" connecting-hook
 checked target "(physical-follow-start \"127.0.0.1\" $PORT \"network_base\")" follow
+attempt=0
+while [ ! -f "$TMP/receiver-connecting" ]; do
+    attempt=$((attempt + 1)); test "$attempt" -lt 100; sleep 0.02
+done
+"$PATRONI_PYTHON" "$BASE/t/interop/receiver-sql.py" "$TARGET_PORT" connecting native
+: >"$TMP/receiver-connect-release"
 sql "$PORT" "INSERT INTO data VALUES (2,'network')"
 wait_target 'SELECT count(*) FROM data' 2
 test "$(sql "$TARGET_PORT" "SELECT pg_wal_lsn_diff(COALESCE(pg_last_wal_receive_lsn(),'0/0'),'0/0')::bigint > 0")" = t
 compare
+"$PATRONI_PYTHON" "$BASE/t/interop/receiver-sql.py" "$TARGET_PORT" streaming native "$PORT"
 checked source '(reload)' source-reload
 checked target '(reload)' target-reload
 test "$(sql "$TARGET_PORT" 'SELECT COALESCE(NULL,1)')" = 1
 "$PATRONI_PYTHON" "$BASE/t/interop/patroni-tl-lsn.py" "$TARGET_PORT" standby
+"$PATRONI_PYTHON" "$BASE/t/interop/receiver-sql.py" "$TARGET_PORT" streaming native "$PORT"
 # SQL pause stops only apply: durable receipt and feedback continue.
 test "$(sql "$TARGET_PORT" 'SELECT pg_get_wal_replay_pause_state()')" = 'not paused'
 test "$(sql "$TARGET_PORT" 'SELECT pg_wal_replay_pause()')" = ''
@@ -97,10 +110,12 @@ wait_target "SELECT pg_last_wal_receive_lsn() >= '$paused_flush'::pg_lsn" t
 test "$(sql "$TARGET_PORT" 'SELECT pg_last_wal_replay_lsn()')" = "$paused_replay"
 test "$(sql "$TARGET_PORT" 'SELECT label FROM data WHERE id=1')" = base
 "$PATRONI_PYTHON" "$BASE/t/interop/patroni-tl-lsn.py" "$TARGET_PORT" standby paused
+"$PATRONI_PYTHON" "$BASE/t/interop/receiver-sql.py" "$TARGET_PORT" paused native "$PORT"
 checked target '(physical-recovery-replay)' paused-direct-replay
 grep -q '^:PAUSED$' "$TMP/paused-direct-replay.log"
 checked target '(reload)' paused-reload
 test "$(sql "$TARGET_PORT" 'SELECT pg_get_wal_replay_pause_state()')" = paused
+"$PATRONI_PYTHON" "$BASE/t/interop/receiver-sql.py" "$TARGET_PORT" paused native "$PORT"
 test "$(sql "$TARGET_PORT" 'SELECT pg_wal_replay_resume()')" = ''
 wait_target "SELECT label FROM data WHERE id=1" received-while-paused
 "$PATRONI_PYTHON" "$BASE/t/interop/patroni-tl-lsn.py" "$TARGET_PORT" standby
@@ -156,6 +171,7 @@ sql "$PORT" "UPDATE data SET label='after-source-crash' WHERE id=1; INSERT INTO 
 wait_target "SELECT label FROM data WHERE id=1" after-source-crash
 wait_target 'SELECT count(*) FROM data' 1003
 compare
+"$PATRONI_PYTHON" "$BASE/t/interop/receiver-sql.py" "$TARGET_PORT" streaming native "$PORT"
 # Persisted follow configuration starts exactly one receiver/replayer after restart.
 sql "$TARGET_PORT" 'SELECT pg_wal_replay_pause()' >/dev/null
 sql "$PORT" "UPDATE data SET label='durable-paused-before-crash' WHERE id=1"
@@ -171,8 +187,10 @@ wait_target "SELECT label FROM data WHERE id=1" durable-paused-before-crash
 sql "$PORT" "DELETE FROM data WHERE id=2; INSERT INTO data VALUES (4,'target-restart')"
 wait_target "SELECT label FROM data WHERE id=4" target-restart
 compare
+"$PATRONI_PYTHON" "$BASE/t/interop/receiver-sql.py" "$TARGET_PORT" streaming native "$PORT"
 test "$(sql "$TARGET_PORT" 'SELECT pg_is_in_recovery()')" = t
 checked target '(physical-follow-stop)' stop
+"$PATRONI_PYTHON" "$BASE/t/interop/receiver-sql.py" "$TARGET_PORT" absent native
 test ! -e "$TMP/copy/physical-follow.control"
 sql "$PORT" "INSERT INTO data VALUES (5,'stopped')"
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data WHERE id=5')" = 0

@@ -53,7 +53,7 @@
          (progn ,@body))))
 
 (defparameter +sql-expression-types+
-  '((:bool 16 1) (:char 18 1) (:name 19 64) (:int8 20 8)
+  '((:bool 16 1) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
     (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1) (:text-array 1009 -1) (:oid 26 4) (:pg-node-tree 194 -1) (:record 2249 -1) (:void 2278 4) (:pg-lsn 3220 8) (:numeric 1700 -1) (:bit 1560 -1)))
 
 (defun sql-expression-type-description (type)
@@ -85,6 +85,7 @@ exist\" messages."
     (:void "void")
     (:record "record")
     (:pg-node-tree "pg_node_tree")
+    (:timestamptz "timestamp with time zone")
     (:numeric "numeric")
     (:bit "bit")
     (:varchar "character varying")
@@ -247,6 +248,11 @@ exist\" messages."
            (end (if length-p (min size (max 0 (1- (+ start length)))) size)))
       (subseq text begin (max begin end)))))
 
+(defun analyze-wal-receiver-function (name arguments)
+  (when arguments
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+  (list :func name nil :type :record :typmod -1 :fields +wal-receiver-result-fields+))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
@@ -256,6 +262,7 @@ exist\" messages."
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     (cond
+      ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
       ((string= name "substr") (analyze-substr-function name args))
       ((string= name "pg_wal_lsn_diff") (analyze-wal-lsn-diff name args))
       ((string= name "pg_walfile_name") (analyze-wal-filename name args))
@@ -808,8 +815,8 @@ exist\" messages."
             (ereport "0A000" "numeric arithmetic is not implemented"))
           (when (or (eq (expr-type left) :pg-lsn) (eq (expr-type right) :pg-lsn))
             (ereport "0A000" "pg_lsn arithmetic is not implemented"))
-          (when (or (member (expr-type left) '(:char :int2vector :text-array :oid :bit))
-                    (member (expr-type right) '(:char :int2vector :text-array :oid :bit)))
+          (when (or (member (expr-type left) '(:char :int2vector :text-array :oid :bit :timestamptz))
+                    (member (expr-type right) '(:char :int2vector :text-array :oid :bit :timestamptz)))
             (ereport "42883" "operator ~a does not exist for ~a and ~a"
                      operator (expr-type left) (expr-type right)))
           (list :binop operator left right
@@ -967,6 +974,10 @@ exist\" messages."
     ((:any :all) (analyze-any-expression expr table))
     (:cast (analyze-cast-expression expr table))
     (:record-field (analyze-record-field expr table))
+    (:single-record
+     (let ((call (analyze-expr (second expr) table)))
+       (if (eq (first call) :set-func) call
+           (cons :single-record (cdr call)))))
     (:bool
      (list :bool (second expr) :type :bool :typmod -1))
     (:column
@@ -992,7 +1003,7 @@ exist\" messages."
     (:binop (analyze-binop-expression expr table))
     (:unary
      (let ((e (analyze-expr (third expr) table)))
-       (when (member (expr-type e) '(:char :int2vector :text-array :oid :pg-lsn :bit))
+       (when (member (expr-type e) '(:char :int2vector :text-array :oid :pg-lsn :bit :timestamptz))
          (ereport "42883" "unary operator does not exist for ~a" (expr-type e)))
        (list :unary (second expr) e
              :type (expr-type e) :typmod (expr-typmod e))))
@@ -1063,11 +1074,14 @@ exist\" messages."
           :attnum (select-column-attnum column))))
 
 (defun sql-composite-call-fields (raw)
-  (unless (and (eq (first raw) :func)
-               (string= (builtin-function-name (second raw) (getf (cdddr raw) :schema))
-                        "pg_get_publication_tables"))
+  (when (eq (first raw) :single-record)
+    (return-from sql-composite-call-fields (sql-composite-call-fields (second raw))))
+  (unless (eq (first raw) :func)
     (ereport "42809" "expression is not a supported composite type"))
-  +publication-table-result-fields+)
+  (let ((name (builtin-function-name (second raw) (getf (cdddr raw) :schema))))
+    (cond ((string= name "pg_get_publication_tables") +publication-table-result-fields+)
+          ((string= name "pg_stat_get_wal_receiver") +wal-receiver-result-fields+)
+          (t (ereport "42809" "expression is not a supported composite type")))))
 
 (defun expand-select-targets (targets scope)
   "Expand records before analysis, as C ExpandRowReference does with FieldSelect."
@@ -1084,7 +1098,10 @@ exist\" messages."
                  (t (ereport "42601" "SELECT * requires a FROM clause"))))
           ((eq (first raw) :record-expand)
            (loop for (name type) in (sql-composite-call-fields (second raw))
-                 collect (list :expr (list :record-field (copy-tree (second raw)) name)
+                 collect (list :expr (list :record-field
+                                           (if (getf (cddr raw) :once)
+                                               (list :single-record (copy-tree (second raw)))
+                                               (copy-tree (second raw))) name)
                                :alias name)))
           (t (list target)))))
 
@@ -1160,9 +1177,9 @@ exist\" messages."
     (labels ((lift (form reuse-p)
                (cond
                  ((atom form) form)
-                 ((eq (first form) :set-func)
+                 ((member (first form) '(:set-func :single-record))
                   (let ((position
-                          (and (or reuse-p share-calls-p)
+                          (and (or reuse-p share-calls-p (eq (first form) :single-record))
                                (or (position form calls :test #'eq)
                                    (position form calls :test #'equal)))))
                     (unless position
@@ -1691,6 +1708,7 @@ exist\" messages."
 
 (defun eval-func (name args)
   (cond
+    ((string= name "pg_stat_get_wal_receiver") (wal-receiver-result))
     ((string= name "substr") (eval-substr-function args))
     ((string= name "pg_wal_lsn_diff") (eval-wal-lsn-diff args))
     ((string= name "pg_walfile_name") (eval-wal-filename args))
@@ -1962,12 +1980,27 @@ exist\" messages."
                    (when quote-p (write-char (code-char 34) stream)))))
     (write-char #\} stream)))
 
+(defun sql-timestamptz-output (timestamp)
+  "Format PostgreSQL epoch microseconds in the supported UTC/ISO session mode."
+  (let ((zone (if *backend* (sql-setting-value "timezone") "UTC")))
+    (unless (member zone '("UTC" "Etc/UTC" "GMT" "Etc/GMT") :test #'string-equal)
+      (ereport "0A000" "timestamp output currently supports only UTC time zones"))
+    (multiple-value-bind (seconds microseconds) (floor timestamp 1000000)
+      (multiple-value-bind (second minute hour day month year)
+          (decode-universal-time (+ seconds 3155673600) 0)
+        (format nil "~4,'0D-~2,'0D-~2,'0D ~2,'0D:~2,'0D:~2,'0D~a+00"
+                year month day hour minute second
+                (if (zerop microseconds) ""
+                    (concatenate 'string "."
+                                 (string-right-trim "0" (format nil "~6,'0D" microseconds)))))))))
+
 (defun value->text (v type)
   (cond
     ((eq v +null+) nil)
     ((eq type :void) "")
     ((eq type :bool) (if v "t" "f"))
     ((eq type :pg-lsn) (wal-format-lsn v))
+    ((eq type :timestamptz) (sql-timestamptz-output v))
     ((eq type :record) (sql-record-output v))
     ((eq type :text-array) (sql-text-array-output v))
     ((eq type :char) (sql-char-output v))

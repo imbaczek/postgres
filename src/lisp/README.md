@@ -734,12 +734,18 @@ PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/physical-follow.sh
 
 Physical follow also requires that pinned environment and checks Patroni's unchanged
 five-column timeline/LSN fragment on primary, standby and paused standby, including
-reload and resume. This does not verify the larger cluster status query.
+reload and resume. It also checks the unchanged ordinary 16-column cluster status
+query with slot queries and synchronous mode disabled, using actual receiver
+write/flush progress and message timestamps. Standby-leader control metadata,
+slot-enabled and synchronous variants remain unfinished. Receiver timestamp
+output currently supports UTC aliases only; other session time zones fail explicitly.
 These tests check process discovery, start-time validation, direct startup, fast stop,
 configuration precedence, SIGHUP and the pinned ConfigHandler's settings queries
 through real psycopg2. The configuration subset supports `port`,
-`listen_addresses`, `data_directory`, `checkpoint_timeout`, `max_wal_size` and
-`max_slot_wal_keep_size`, with includes, auto.conf and CLI overrides. SHOW,
+`listen_addresses`, `data_directory`, `checkpoint_timeout`, `max_wal_size`,
+`max_slot_wal_keep_size` and the empty `restore_command` default, with includes,
+auto.conf and CLI overrides. Nonempty restore commands are rejected until archive
+recovery exists. SHOW,
 current_setting and typed pg_settings rows expose the actual installed values.
 Unknown settings fail visibly; empty or multiple listen addresses are unsupported.
 Session startup `options` accept `statement_timeout` and dotted custom GUC

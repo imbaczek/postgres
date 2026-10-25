@@ -11,6 +11,32 @@
 (defparameter +publication-table-result-fields+
   '(("pubid" :oid) ("relid" :oid) ("attrs" :int2vector) ("qual" :pg-node-tree)))
 
+(defparameter +wal-receiver-result-fields+
+  '(("pid" :int4) ("status" :text) ("receive_start_lsn" :pg-lsn)
+    ("receive_start_tli" :int4) ("written_lsn" :pg-lsn) ("flushed_lsn" :pg-lsn)
+    ("received_tli" :int4) ("last_msg_send_time" :timestamptz)
+    ("last_msg_receipt_time" :timestamptz) ("latest_end_lsn" :pg-lsn)
+    ("latest_end_time" :timestamptz) ("slot_name" :text) ("sender_host" :text)
+    ("sender_port" :int4) ("conninfo" :text)))
+
+(defun wal-receiver-result ()
+  "Return C's nullable scalar record; the native pin is not a physical slot."
+  (let ((statistics (physical-follow-statistics)))
+    (when statistics
+      (flet ((value (key &optional zero-is-null)
+               (let ((value (getf statistics key)))
+                 (if (or (null value) (and zero-is-null (zerop value))) +null+ value))))
+        (return-from wal-receiver-result
+          (make-sql-record
+           :fields +wal-receiver-result-fields+
+           :values (vector (value :pid) (value :status)
+                           (value :receive-start-lsn t) (value :receive-start-tli)
+                           (value :written-lsn t) (value :flushed-lsn t) (value :received-tli)
+                           (value :last-send-time t) (value :last-receipt-time t)
+                           (value :latest-end-lsn t) (value :latest-end-time t)
+                           +null+ (value :host) (value :port) (value :conninfo))))))
+    +null+))
+
 (defun publication-table-result-rows (names &optional (relation-id nil relation-p))
   "Match the variadic SRF and C20's missing-publication-tolerant relation overload."
   (when (or (eq names +null+) (and relation-p (eq relation-id +null+)))

@@ -2,7 +2,7 @@
 
 Status: durable native intake/bootstrap/recovery, continuous TCP receipt/reconnect,
 advancing source retention, explicit/automatic local restartpoints and Linux
-PGDATA/PID ownership and a six-setting startup/reload configuration subset are
+PGDATA/PID ownership and a startup/reload configuration subset are
 implemented, 2026-10-25. Pinned Patroni direct startup, process discovery,
 reload and stop plus a psycopg2 driver smoke test pass. Full physical-slot SQL/control,
 promotion, synchronous durability and remaining Patroni interfaces are unfinished.
@@ -11,6 +11,73 @@ claim of physical replication support. Coordination is excluded; tests use
 manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
+
+### Receiver statistics and ordinary Patroni cluster status
+
+`pg_stat_get_wal_receiver()` now returns the 15 typed OUT fields from pinned C
+`walreceiver.c`/`pg_proc.dat`, including separate real local written/flushed LSNs,
+requested receive-start LSN, verified timeline, source WAL-end hints and message
+send/receipt/end timestamps. Source-end hints never substitute for local durability.
+The receiver thread's actual Linux TID is the PID field; native workers share a
+process rather than C's separate receiver process. Metadata is published under
+the lifecycle mutex and progress sampled under the receive-store mutex, with
+store-before-lifecycle lock order. It is monitoring data, not a commit durability
+or authority predicate.
+
+Like C, a ready connecting worker exposes `connecting` with old sender details
+cleared. The last source-end LSN survives same-process receiver reconnects,
+while startup resets message timestamps, matching C shared-memory lifetime.
+Established connections expose `streaming`, stop requests can expose
+`stopping`, and cleanup removes the exact runtime-tagged snapshot. No worker,
+bootstrap-only recovery and stopped follow return a NULL scalar composite, while
+`FROM pg_stat_get_wal_receiver()` still produces one all-NULL row. Retained spool
+files do not invent an active receiver. Native retention pins are not C physical
+slots, so `slot_name` remains NULL. `conninfo` describes the successful native TCP
+connection using escaped libpq syntax and actual startup parameters, including
+`replication=database` and `sslmode=disable`; it omits libpq-only default options
+that this custom client does not implement.
+
+Scalar composite functions in FROM now materialize once per input row before
+OUT-field expansion. This uses a single-record intermediate in the existing
+projection pipeline, preserving scalar NULL behavior and existing publication
+SRFs. A call-count test verifies one receiver snapshot for all 15 columns.
+The three temporal fields use timestamptz OID 1184/length 8, PostgreSQL epoch
+microseconds and ISO text output. Current output supports UTC aliases only;
+other session time zones fail explicitly with 0A000. General timestamp input,
+arithmetic and complete temporal/time-zone behavior are unfinished.
+
+The receiver probe exposed zero send-time placeholders in shared native sender
+helpers. XLogData and keepalive frames now use `postgres-current-timestamp`, as
+C walsender does. Signed timestamp decoding reuses `pg-client-i64`. The real
+`restore_command` SIGHUP setting has its C empty default and normal provenance;
+nonempty commands are rejected because archive recovery is not implemented.
+
+Pinned Patroni 4.1.5's ordinary 16-column `cluster_info_query` now runs unchanged
+on primary, bootstrap standby, active/paused standby and stopped follow. The
+probe uses installed query builders with synchronous mode and slot queries
+disabled, without starting an HA loop. C evidence: primary
+`/tmp/pg-c-receiver-primary.wChXzU` and active/paused streaming standby
+`/tmp/pg-c-receiver-standby.cP7OK0`. Native source/standby acceptance, including a
+bounded one-shot live control-REPL connection barrier, passed in
+`/tmp/pg-physical-follow.4olH7C`. All 167 interop and 131 physical tests pass;
+1,598 legacy checks and
+both real Lisp/C logical-replication directions pass after the sender timestamp
+fix (`/tmp/pg-receiver-logical.log`). Formatting and strict compilation pass.
+All three manual logical switchovers pass: Lisp-to-Lisp
+`/tmp/pg-switchover.I1a0jX`, Lisp-to-C `/tmp/pg-switchover.hukijp` and C-to-Lisp
+`/tmp/pg-switchover.hVenyW`. These are logical handoffs, not physical promotion.
+Sol medium's decoder refactor was applied; Sol high reviewed the final lifecycle
+and descriptor changes without a defect. Luna max's retained-end reconnect
+finding is fixed and re-reviewed.
+
+Standby-leader control-checkpoint reporting, enabled slot/JSON and synchronous
+sender-statistics variants of Patroni's query remain unfinished, as do promotion,
+follow/rejoin across child timelines, synchronous commit waits and rewind. This
+checkpoint adds no coordination and establishes no C physical WAL/disk compatibility.
+One follow-up from this C audit: `WalRcvDie` flushes complete received WAL before
+receiver exit. Native session cleanup currently drops the connection and resets
+unflushed input on retry instead; acknowledged flush remains durable, but clean
+receiver-stop/exit flushing still needs an explicit implementation and crash test.
 
 ### Boolean execution and Patroni TL_LSN checkpoint
 

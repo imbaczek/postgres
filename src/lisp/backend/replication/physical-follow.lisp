@@ -9,6 +9,82 @@
 
 (defvar *physical-follow-command-lock* (sb-thread:make-mutex :name "native physical follow commands"))
 
+(defvar *physical-follow-statistics* nil
+  "Session-tagged receiver telemetry, protected by *PHYSICAL-FOLLOW-LOCK*.")
+
+(defvar *physical-follow-last-end-lsn* 0
+  "C's latestWalEnd survives receiver exit/reconnect within a server process.")
+
+(defun physical-follow-connection-description (runtime)
+  "Describe the successful native plaintext connection, without libpq-only defaults."
+  (let ((host (with-output-to-string (stream)
+                (write-char (code-char 39) stream)
+                (loop for character across (physical-follow-runtime-host runtime)
+                      do (when (member (char-code character) '(39 92))
+                           (write-char (code-char 92) stream))
+                         (write-char character stream))
+                (write-char (code-char 39) stream))))
+    (format nil "host=~a port=~d user=postgres dbname=postgres application_name=pg_lisp_physical_receiver replication=database sslmode=disable"
+            host (physical-follow-runtime-port runtime))))
+
+(defun physical-follow-monitor-start (runtime cursor)
+  "Publish C's connecting state with stale sender details cleared."
+  (let ((now (postgres-current-timestamp)))
+    (sb-thread:with-mutex (*physical-follow-lock*)
+      (setf *physical-follow-statistics*
+            (list :runtime runtime :pid (sb-thread:thread-os-tid sb-thread:*current-thread*)
+                  :receive-start-lsn cursor :receive-start-tli 1
+                  :last-send-time now :last-receipt-time now
+                  :latest-end-lsn *physical-follow-last-end-lsn*
+                  :latest-end-time now)
+            (physical-follow-runtime-connected-p runtime) nil))))
+
+(defun physical-follow-monitor-connected (runtime)
+  "Publish sender details only after native streaming is established."
+  (sb-thread:with-mutex (*physical-follow-lock*)
+    (when (eq runtime (getf *physical-follow-statistics* :runtime))
+      (setf (getf *physical-follow-statistics* :host) (physical-follow-runtime-host runtime)
+            (getf *physical-follow-statistics* :port) (physical-follow-runtime-port runtime)
+            (getf *physical-follow-statistics* :conninfo) (physical-follow-connection-description runtime)
+            (physical-follow-runtime-connected-p runtime) t
+            (physical-follow-runtime-last-error runtime) nil))))
+
+(defun physical-follow-monitor-message (runtime end send-time)
+  "Match ProcessWalSndrMessage without using source end as local progress."
+  (let ((now (postgres-current-timestamp)))
+    (sb-thread:with-mutex (*physical-follow-lock*)
+      (when (eq runtime (getf *physical-follow-statistics* :runtime))
+        (when (< (getf *physical-follow-statistics* :latest-end-lsn) end)
+          (setf (getf *physical-follow-statistics* :latest-end-time) send-time))
+        (setf *physical-follow-last-end-lsn* end
+              (getf *physical-follow-statistics* :latest-end-lsn) end
+              (getf *physical-follow-statistics* :last-send-time) send-time
+              (getf *physical-follow-statistics* :last-receipt-time) now)))))
+
+(defun physical-follow-monitor-stop (runtime)
+  (sb-thread:with-mutex (*physical-follow-lock*)
+    (setf (physical-follow-runtime-connected-p runtime) nil)
+    (when (eq runtime (getf *physical-follow-statistics* :runtime))
+      (setf *physical-follow-statistics* nil))))
+
+(defun physical-follow-statistics ()
+  "Copy receiver metadata and real spool write/flush; never infer a live receiver from a spool."
+  (let ((store *physical-receive-store*))
+    (when store
+      ;; Do not wait for a store mutex while holding the lifecycle lock.
+      (sb-thread:with-mutex ((physical-store-mutex store))
+        (sb-thread:with-mutex (*physical-follow-lock*)
+          (let* ((runtime *physical-follow-runtime*)
+                 (statistics *physical-follow-statistics*))
+            (when (and runtime (eq runtime (getf statistics :runtime)))
+              (append (copy-list statistics)
+                      (list :status (cond ((physical-follow-runtime-stopped-p runtime) "stopping")
+                                          ((physical-follow-runtime-connected-p runtime) "streaming")
+                                          (t "connecting"))
+                            :written-lsn (physical-store-written-lsn store)
+                            :flushed-lsn (physical-store-flushed-lsn store)
+                            :received-tli (physical-store-timeline store))))))))))
+
 (defparameter *physical-receive-flush-bytes* (* 1024 1024)
   "Batch native flushes while busy; a keepalive flushes all completed records.")
 
@@ -68,7 +144,7 @@
     (sb-ext:with-timeout 10
       (write-message (pg-client-stream client) #\d payload))))
 
-(defun physical-follow-process-frame (payload)
+(defun physical-follow-process-frame (payload &optional runtime)
   (unless (and payload (plusp (length payload))) (physical-follow-reject "empty native physical frame"))
   (case (code-char (aref payload 0))
     (#\w
@@ -78,6 +154,8 @@
                                              (bytes (subseq payload 25)))
        (unless (<= (+ start (length bytes)) end #xffffffffffffffff)
          (physical-follow-reject "native XLogData exceeds durable source end"))
+       (when runtime
+         (physical-follow-monitor-message runtime end (pg-client-i64 payload 17)))
        (physical-recovery-receive start bytes)
        ;; Match walreceiver's write-then-flush cycle rather than forcing a
        ;; manifest fsync for every tiny physical record. Feedback still exposes
@@ -89,6 +167,8 @@
     (#\k
      (unless (and (= (length payload) 18) (member (aref payload 17) '(0 1)))
        (physical-follow-reject "invalid native keepalive"))
+     (when runtime
+       (physical-follow-monitor-message runtime (pg-client-u64 payload 1) (pg-client-i64 payload 9)))
      ;; Caught-up traffic must become durable even below the batching threshold.
      ;; The source WAL-end hint is never substituted for the local write cursor.
      (physical-recovery-flush))
@@ -114,6 +194,7 @@
   (let ((client nil))
     (unwind-protect
          (progn
+           (physical-follow-monitor-start runtime cursor)
            (setf client (sb-ext:with-timeout 10
                           (pg-client-connect (physical-follow-runtime-host runtime)
                                              (physical-follow-runtime-port runtime) "postgres"
@@ -131,17 +212,16 @@
              (sb-ext:with-timeout 10
                (physical-follow-check-identity (pg-client-query client "IDENTIFY_SYSTEM"))
                (pg-client-start-replication client query)))
-           (setf (physical-follow-runtime-connected-p runtime) t
-                 (physical-follow-runtime-last-error runtime) nil)
+           (physical-follow-monitor-connected runtime)
            (loop until (physical-follow-runtime-stopped-p runtime)
                  do (multiple-value-bind (type payload)
                         (sb-ext:with-timeout 10 (pg-client-replication-frame client))
                       (case type
-                        (#\d (with-live-operation (physical-follow-process-frame payload)))
+                        (#\d (with-live-operation (physical-follow-process-frame payload runtime)))
                         (#\E (error (pg-client-error-from-payload payload)))
                         (otherwise (physical-follow-reject "unexpected native replication frame"))))
                     (physical-follow-feedback client)))
-      (setf (physical-follow-runtime-connected-p runtime) nil)
+      (physical-follow-monitor-stop runtime)
       (sb-thread:with-mutex (*physical-follow-lock*)
         (when (eq client (physical-follow-runtime-client runtime))
           (setf (physical-follow-runtime-client runtime) nil)))

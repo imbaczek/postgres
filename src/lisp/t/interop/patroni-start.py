@@ -268,6 +268,7 @@ def main():
         subprocess.run([sys.executable, str(base / "t/interop/wal-filename-sql.py"), str(port)], check=True)
         subprocess.run([sys.executable, str(base / "t/interop/patroni-tl-lsn.py"), str(port), "primary"], check=True)
         subprocess.run([sys.executable, str(base / "t/interop/boolean-sql.py"), str(port)], check=True)
+        subprocess.run([sys.executable, str(base / "t/interop/receiver-sql.py"), str(port), "absent", "native"], check=True)
         check_named_connection(connection, port)
         check_timeout_reload_gate(base, root, port)
         subprocess.run([sys.executable, str(base / "t/interop/patroni-history.py"),
