@@ -54,7 +54,7 @@
 
 (defparameter +sql-expression-types+
   '((:bool 16 1) (:char 18 1) (:name 19 64) (:int8 20 8)
-    (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1) (:text-array 1009 -1) (:oid 26 4) (:pg-node-tree 194 -1) (:record 2249 -1) (:pg-lsn 3220 8)))
+    (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1) (:text-array 1009 -1) (:oid 26 4) (:pg-node-tree 194 -1) (:record 2249 -1) (:void 2278 4) (:pg-lsn 3220 8)))
 
 (defun sql-expression-type-description (type)
   (or (assoc type +sql-expression-types+)
@@ -144,6 +144,34 @@ exist\" messages."
        (list :func name (list node (coerce-catalog-oid-argument (second arguments) name))
              :type :text :typmod -1)))))
 
+(defun analyze-setting-function (name args)
+  (unless (and (if (string= name "lower") (= (length args) 1)
+                   (<= 1 (length args) 2))
+               (member (expr-type (first args)) '(:text :varchar :name :char))
+               (or (= (length args) 1)
+                   (eq (expr-type (second args)) :bool)
+                   (in-unknown-constant-p (second args))))
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+  (when (and (rest args) (in-unknown-constant-p (second args)))
+    (setf (second args) (list :cast (second args) :type :bool :typmod -1)))
+  (unless (eq (expr-type (first args)) :text)
+    (setf (first args) (list :cast (first args) :type :text :typmod -1)))
+  (list :func name args :type :text :typmod -1))
+
+(defun sql-lower-c (value)
+  "Match formatting.c:asc_tolower for the supported C/POSIX collation."
+  (map 'string (lambda (character)
+                 (let ((code (char-code character)))
+                   (if (<= 65 code 90) (code-char (+ code 32)) character)))
+       value))
+
+(defun eval-setting-function (name args)
+  (if (member +null+ args :test #'eq)
+      +null+
+      (if (string= name "lower")
+          (sql-lower-c (first args))
+          (sql-setting-value (first args) (second args)))))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
@@ -153,9 +181,15 @@ exist\" messages."
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     (cond
+      ((member name '("lower" "current_setting") :test #'string=)
+       (analyze-setting-function name args))
       ((member name '("array_length" "pg_get_expr" "pg_get_replica_identity_index") :test #'string=)
        (analyze-metadata-function name args))
       ((member name '("version" "pg_lisp_runtime" "pg_current_wal_lsn"
+                      "pg_current_wal_flush_lsn" "pg_is_in_recovery"
+                      "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn"
+                      "pg_wal_replay_pause" "pg_wal_replay_resume"
+                      "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state"
                       "pg_lisp_cluster_identity"
                       "current_database" "current_schema"
                       "current_catalog" "current_user" "session_user" "user")
@@ -164,7 +198,13 @@ exist\" messages."
          (ereport "42883" "function ~a(~a) does not exist"
                   name (call-signature args)))
        (list :func name args
-             :type (cond ((string= name "pg_current_wal_lsn") :pg-lsn)
+             :type (cond ((member name '("pg_current_wal_lsn" "pg_current_wal_flush_lsn"
+                                         "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn")
+                                  :test #'string=) :pg-lsn)
+                         ((member name '("pg_is_in_recovery" "pg_is_wal_replay_paused")
+                                  :test #'string=) :bool)
+                         ((member name '("pg_wal_replay_pause" "pg_wal_replay_resume")
+                                  :test #'string=) :void)
                          ((string= name "pg_lisp_cluster_identity") :varchar)
                          (t :text))
              :typmod -1))
@@ -510,6 +550,68 @@ exist\" messages."
           (ereport "22003" "value ~s is out of range for type oid" text))
         result))))
 
+(defun sql-array-space-p (character)
+  (and character (find (char-code character) '(9 10 11 12 13 32))))
+
+(defun sql-text-array-element (text position)
+  "ReadArrayToken's quoted/unquoted element rules, for one-dimensional text[]."
+  (let* ((length (length text))
+         (quoted (and (< position length) (char= (char text position) #\")))
+         (escaped nil) (end 0)
+         (buffer (make-array 0 :element-type 'character :adjustable t :fill-pointer 0)))
+    (when quoted (incf position))
+    (loop
+      (when (>= position length) (ereport "22P02" "malformed array literal: ~s" text))
+      (let ((character (char text position)))
+        (cond
+          ((char= character #\\)
+           (setf escaped t)
+           (incf position)
+           (when (>= position length) (ereport "22P02" "malformed array literal: ~s" text))
+           (vector-push-extend (char text position) buffer)
+           (setf end (length buffer)))
+          ((and quoted (char= character #\"))
+           (return-from sql-text-array-element (values (coerce buffer 'simple-string) (1+ position))))
+          ((and (not quoted) (find character ",}"))
+           (when (zerop end) (ereport "22P02" "malformed array literal: ~s" text))
+           (let ((value (subseq buffer 0 end)))
+             (return-from sql-text-array-element
+               (values (if (and (not escaped) (string-equal value "NULL")) +null+ value)
+                       position))))
+          ((and (not quoted) (find character "{\""))
+           (ereport "22P02" "malformed array literal: ~s" text))
+          (t
+           (vector-push-extend character buffer)
+           (unless (and (not quoted) (sql-array-space-p character)) (setf end (length buffer))))))
+      (incf position))))
+
+(defun sql-text-array-input (text)
+  "Read the supported one-dimensional array type; reject unsupported dimensions."
+  (let ((position 0) (length (length text)) (values nil))
+    (labels ((skip-space ()
+               (loop while (and (< position length) (sql-array-space-p (char text position)))
+                     do (incf position)))
+             (peek () (and (< position length) (char text position)))
+             (fail () (ereport "22P02" "malformed array literal: ~s" text)))
+      (skip-space)
+      (when (eql (peek) #\[) (ereport "0A000" "explicit array dimensions are not supported"))
+      (unless (eql (peek) #\{) (fail))
+      (incf position)
+      (skip-space)
+      (unless (eql (peek) #\})
+        (loop
+          (when (eql (peek) #\{) (ereport "0A000" "multidimensional arrays are not supported"))
+          (multiple-value-bind (value next) (sql-text-array-element text position)
+            (push value values) (setf position next))
+          (skip-space)
+          (cond ((eql (peek) #\}) (return))
+                ((eql (peek) #\,) (incf position) (skip-space))
+                (t (fail)))))
+      (incf position)
+      (skip-space)
+      (unless (= position length) (fail))
+      (coerce (nreverse values) 'vector))))
+
 (defun sql-cast-value (value source target typmod)
   (when (eq value +null+) (return-from sql-cast-value +null+))
   (when (eq target :int2)
@@ -540,6 +642,7 @@ exist\" messages."
        (:bool (sql-cast-boolean-input value))
        (:char (sql-char-input value))
        (:int2vector (sql-int2vector-input value))
+       (:text-array (sql-text-array-input value))
        (:oid (sql-oid-input value))
        (:pg-lsn (sql-pg-lsn-input value))
        (otherwise (ereport "0A000" "text input for ~a is not implemented" target))))
@@ -655,19 +758,36 @@ exist\" messages."
       (ereport "0A000" "ARRAY constructors currently support text elements"))
     (list :array items :type :text-array :typmod -1)))
 
+(defun analyze-scalar-array-argument (raw scope)
+  (let ((array (analyze-expr raw scope)))
+    (if (and (in-unknown-constant-p array) (stringp (second array)))
+        (list :const (sql-text-array-input (second array)) :type :text-array :typmod -1
+              :infer-element-type t)
+        array)))
+
 (defun analyze-any-expression (expression scope)
   (let* ((left (analyze-expr (third expression) scope))
-         (array (analyze-expr (fourth expression) scope))
+         (array (analyze-scalar-array-argument (fourth expression) scope))
          (element (case (expr-type array)
                     (:text-array :text) (:int2vector :int2))))
     (when (and (in-unknown-constant-p array) (eq (second array) +null+))
       (return-from analyze-any-expression
-        (list :any (second expression) left array :type :bool :typmod -1)))
+        (list (first expression) (second expression) left array :type :bool :typmod -1)))
     (unless element (ereport "42809" "ANY requires a supported array argument"))
     (let ((operands
             (analyze-comparison-operands
-             left (list :const +null+ :type element :typmod -1 :explicit-cast t))))
-      (list :any (second expression) (first operands) array
+             left (list :const +null+
+                        :type (if (getf (cddr array) :infer-element-type)
+                                  (expr-type left) element)
+                        :typmod -1 :explicit-cast t))))
+      (when (getf (cddr array) :infer-element-type)
+        ;; C inputs literal arrays at analysis time, including dead CASE arms.
+        (let ((target (expr-type (second operands))))
+          (setf array (list :scalar-array-const
+                            (map 'vector (lambda (value) (sql-cast-value value :text target -1))
+                                 (second array)))
+                element target)))
+      (list (first expression) (second expression) (first operands) array
             :element-source element :element-target (expr-type (second operands))
             :type :bool :typmod -1))))
 
@@ -686,7 +806,7 @@ exist\" messages."
          (t (list :const v :type :text :typmod -1)))))
     (:case (analyze-case-expression expr table))
     (:array-literal (analyze-array-literal expr table))
-    (:any (analyze-any-expression expr table))
+    ((:any :all) (analyze-any-expression expr table))
     (:cast (analyze-cast-expression expr table))
     (:record-field (analyze-record-field expr table))
     (:bool
@@ -1399,8 +1519,21 @@ exist\" messages."
       (ereport "22003" "bigint out of range"))
     n))
 
+(defun eval-recovery-wal-function (name)
+  "Report actual recovery state; a base image has no walreceiver position."
+  (cond
+    ((string= name "pg_is_in_recovery") (recovery-in-progress-p))
+    ((string= name "pg_last_wal_receive_lsn")
+     (or (getf *physical-recovery-state* :receive-lsn) +null+))
+    ((string= name "pg_last_wal_replay_lsn") (or *last-replay-lsn* +null+))
+    (t
+     (prevent-recovery-primary-operation name)
+     (if (string= name "pg_current_wal_flush_lsn") *wal-durable-lsn* *wal-end-lsn*))))
+
 (defun eval-func (name args)
   (cond
+    ((member name '("lower" "current_setting") :test #'string=)
+     (eval-setting-function name args))
     ((string= name "pg_get_expr")
      (sql-strict-let ((node (first args)) (relation (second args)))
        (ereport "0A000" "non-NULL pg_node_tree deparsing is not supported")))
@@ -1412,8 +1545,12 @@ exist\" messages."
      (format nil "~a ~a" (lisp-implementation-type)
              (lisp-implementation-version)))
     ;; xlogfuncs.c returns the current WAL write location as a pg_lsn value.
-    ((string= name "pg_current_wal_lsn")
-     *wal-end-lsn*)
+    ((member name '("pg_current_wal_lsn" "pg_current_wal_flush_lsn" "pg_is_in_recovery"
+                    "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn") :test #'string=)
+     (eval-recovery-wal-function name))
+    ((member name '("pg_wal_replay_pause" "pg_wal_replay_resume"
+                    "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state") :test #'string=)
+     (physical-replay-pause-command name))
     ((string= name "pg_lisp_cluster_identity")
      (catalog-cluster-identity *catalog*))
     ((string= name "nextval")
@@ -1532,17 +1669,24 @@ exist\" messages."
   (eval-expr (third expression) environment))
 
 (defun eval-any-expression (expression environment)
+  "Match C ScalarArrayOp's ANY/ALL identity, short circuit and NULL semantics."
   (let ((left (eval-expr (third expression) environment))
         (array (eval-expr (fourth expression) environment))
+        (all-p (eq (first expression) :all))
         (null-seen nil))
     (when (eq array +null+) (return-from eval-any-expression +null+))
-    (loop for element across array
-          for value = (sql-cast-value element (getf (nthcdr 4 expression) :element-source)
-                                      (getf (nthcdr 4 expression) :element-target) -1)
+    ;; Convert the complete array before comparison, as C's array input does:
+    ;; a decisive first element cannot hide an invalid later input value.
+    (setf array (map 'vector
+                     (lambda (element)
+                       (sql-cast-value element (getf (nthcdr 4 expression) :element-source)
+                                       (getf (nthcdr 4 expression) :element-target) -1))
+                     array))
+    (loop for value across array
           for result = (sql-compare (second expression) left value)
-          do (when (eq result t) (return-from eval-any-expression t))
+          do (when (eq result (not all-p)) (return-from eval-any-expression result))
              (when (eq result +null+) (setf null-seen t)))
-    (if null-seen +null+ nil)))
+    (if null-seen +null+ all-p)))
 
 (defun eval-array-length (expression environment)
   (sql-strict-let ((array (eval-expr (second expression) environment))
@@ -1554,9 +1698,9 @@ exist\" messages."
 
 (defun eval-expr (expr env)
   (case (first expr)
-    (:const (second expr))
+    ((:const :scalar-array-const) (second expr))
     (:case (eval-case-expression expr env))
-    (:any (eval-any-expression expr env))
+    ((:any :all) (eval-any-expression expr env))
     (:array-length (eval-array-length expr env))
     (:cast (sql-cast-value (eval-expr (second expr) env)
                            (expr-type (second expr)) (expr-type expr) (expr-typmod expr)))
@@ -1644,6 +1788,7 @@ exist\" messages."
 (defun value->text (v type)
   (cond
     ((eq v +null+) nil)
+    ((eq type :void) "")
     ((eq type :bool) (if v "t" "f"))
     ((eq type :pg-lsn) (wal-format-lsn v))
     ((eq type :record) (sql-record-output v))

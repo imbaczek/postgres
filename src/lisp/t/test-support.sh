@@ -6,9 +6,10 @@ test_wait_owned_sql_server() {
     TEST_WAIT_PID=$1
     TEST_WAIT_PORT=$2
     TEST_WAIT_PSQL=${3:-psql}
+    TEST_WAIT_LIMIT=${4:-200}
     command -v ss >/dev/null || { echo 'SQL test readiness requires ss' >&2; return 1; }
     TEST_WAIT_ATTEMPT=0
-    while [ "$TEST_WAIT_ATTEMPT" -lt 200 ]; do
+    while [ "$TEST_WAIT_ATTEMPT" -lt "$TEST_WAIT_LIMIT" ]; do
         kill -0 "$TEST_WAIT_PID" 2>/dev/null || {
             echo "SQL test server $TEST_WAIT_PID exited before owning port $TEST_WAIT_PORT" >&2
             return 1

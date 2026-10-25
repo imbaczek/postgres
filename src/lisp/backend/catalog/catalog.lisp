@@ -342,6 +342,7 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
 
 (defun save-catalog (&key deferred-relations logical-event on-record-appended
                        (applied-logical-event-id *logical-event-apply-id*))
+  (prevent-recovery-write "catalog persistence")
   ;; Do fallible derived-state work before publication. Once WAL commits, the
   ;; generation update and cache assignment below must not signal: callers use
   ;; the generation to distinguish rollback-safe failures from durable ones.
@@ -683,6 +684,7 @@ from advancing the shared WAL generation between a failed save and rollback."
 
 (defun sequence-nextval (name)
   "Advance and durably save NAME before returning its next value."
+  (prevent-recovery-write "nextval")
   (when (and *backend* (backend-read-only *backend*))
     (ereport "25006" "cannot execute nextval in a read-only transaction"))
   (with-write-lock
@@ -727,6 +729,7 @@ from advancing the shared WAL generation between a failed save and rollback."
 
 (defun sequence-setval (name value &optional (called-p t))
   "Set and durably save a sequence value; this operation is not transactional."
+  (prevent-recovery-write "setval")
   (when (and *backend* (backend-read-only *backend*))
     (ereport "25006" "cannot execute setval in a read-only transaction"))
   (unless (sequence-value-range-p value)

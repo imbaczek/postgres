@@ -48,8 +48,10 @@
 (declaim (notinline btree-relation-condition-wait))
 
 (defun btree-relation-condition-wait (state)
-  (sb-thread:condition-wait (btree-relation-lock-state-waitqueue state)
-                            (btree-relation-lock-state-mutex state)))
+  (check-for-interrupts)
+  (condition-wait-with-timeout (btree-relation-lock-state-waitqueue state)
+                               (btree-relation-lock-state-mutex state))
+  (check-for-interrupts))
 
 (defun call-with-btree-relation-read-lock (relfilenode function)
   (let* ((state (btree-relation-lock relfilenode))

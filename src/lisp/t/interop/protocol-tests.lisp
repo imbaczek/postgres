@@ -1200,14 +1200,17 @@
     (dolist (sql '("CREATE_REPLICATION_SLOT s LOGICAL pgoutput EXPORT_SNAPSHOT"
                    "START_REPLICATION SLOT s LOGICAL 0/0"
                    "DROP_REPLICATION_SLOT s"
-                   "IDENTIFY_SYSTEM"))
+                   "IDENTIFY_SYSTEM" "TIMELINE_HISTORY 2" "SHOW statement_timeout"))
       (ok (pg::replication-query-payload-p (pg::string->bytes sql))))
   (dolist (sql '("SELECT 1" "BEGIN" "COMMIT" "ROLLBACK"
                  "CREATE_REPLICATION_SLOT_extra" "START_REPLICATIONx"
                  "CREATE TABLE t (id int)" ""))
     (ok (not (pg::replication-query-payload-p (pg::string->bytes sql)))))
-  (ok (pg::replication-query-payload-p
-       (pg::string->bytes " /* comment */ identify_system")))
+  ;; C repl_scanner does not skip SQL comments; database mode uses SQL fallback.
+  (ok (not (pg::replication-query-payload-p
+            (pg::string->bytes " /* comment */ identify_system"))))
+  (ok (not (pg::replication-query-payload-p
+            (pg::string->bytes " /* comment */ SHOW statement_timeout"))))
   (ok (not (pg::replication-query-payload-p
             (pg::string->bytes " /* comment */ SELECT 1")))))
 

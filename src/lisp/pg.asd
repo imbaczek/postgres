@@ -89,6 +89,8 @@
       :serial t
       :components ((:file "dest")
                    (:file "control")
+                   (:file "../utils/startup-config")
+                   (:file "../utils/session-config")
                    (:file "../replication/physical-bootstrap")
                    (:file "../replication/physical-recovery")
                    (:file "../access/transam/timeline")

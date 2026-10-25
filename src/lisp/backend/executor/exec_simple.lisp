@@ -490,12 +490,14 @@ rolled back immediately."
         (send-parameter-status stream "search_path" (session-search-path))))))
 
 (defun command-begin (stream ast)
+  (when (and (member :read-only ast) (not (getf ast :read-only)))
+    (recovery-check-read-write))
   (if (eq (backend-state *backend*) :idle)
       (progn
         (setf (backend-explicit *backend*) t
               (backend-isolation-level *backend*)
               (or (getf ast :isolation-level) :read-committed)
-              (backend-read-only *backend*) (getf ast :read-only)
+              (backend-read-only *backend*) (or (recovery-in-progress-p) (getf ast :read-only))
               (backend-command-id *backend*) 0
               (backend-xid *backend*) nil
               (backend-snapshot *backend*) nil
@@ -539,9 +541,9 @@ rolled back immediately."
         (send-command-complete stream "ROLLBACK"))))
 
 (defun command-checkpoint (stream)
-  (unless (eq (backend-state *backend*) :idle)
-    (ereport "25001" "CHECKPOINT cannot run inside a transaction block"))
-  (wal-checkpoint)
+  (if (recovery-in-progress-p)
+      (physical-recovery-checkpoint)
+      (wal-checkpoint))
   (send-command-complete stream "CHECKPOINT"))
 
 ;;; ---- SET / SHOW / RESET ----
@@ -599,7 +601,12 @@ rolled back immediately."
                       ((string= name "standard_conforming_strings") "on")
                       (t :default))
                     raw-value)))
+    (when (and (eq raw-value :default) (not (session-extra-setting-p name))
+               (nth-value 1 (gethash name (backend-settings-reset *backend*))))
+      (setf raw-value (gethash name (backend-settings-reset *backend*)) value raw-value))
+    (startup-check-session-setting name)
     (cond
+      ((session-extra-setting-p name) (session-set-extra-setting name raw-value))
       ((string= name "search_path")
        (set-session-search-path (if (eq raw-value :default) +null+ value)))
       ((getf ast :transaction-options-p)
@@ -674,6 +681,8 @@ rolled back immediately."
                (backend-first-snapshot-set backend))
       (ereport "25001"
                "transaction read-write mode must be set before any query"))
+    (when (and read-mode-specified-p (not new-read-only))
+      (recovery-check-read-write))
     (when isolation-specified-p
       (setf (backend-isolation-level backend)
             new-isolation))
@@ -684,15 +693,23 @@ rolled back immediately."
 
 (defun exec-reset (stream ast)
   (let ((name (string-downcase (getf ast :name))))
+    (startup-check-session-setting name)
     (cond
-      ((string= name "search_path") (set-session-search-path +null+))
+      ((session-extra-setting-p name) (session-set-extra-setting name :default))
+      ((string= name "search_path")
+       (set-session-search-path (gethash name (backend-settings-reset *backend*) +null+)))
       ((string= name "all")
        (set-session-search-path +null+)
-       (clrhash (backend-settings *backend*))
-       (send-parameter-status stream "TimeZone" "UTC"))
+       (session-reset-all-settings)
+       (send-parameter-status stream "TimeZone"
+                              (or (gethash "timezone" (backend-settings *backend*)) "UTC"))
+       (send-parameter-status stream "search_path" (session-search-path)))
       ((string= name "timezone")
-       (remhash "timezone" (backend-settings *backend*))
-       (send-parameter-status stream "TimeZone" "UTC"))
+       (let ((baseline (gethash "timezone" (backend-settings-reset *backend*))))
+         (if baseline (setf (gethash "timezone" (backend-settings *backend*)) baseline)
+             (remhash "timezone" (backend-settings *backend*))))
+       (send-parameter-status stream "TimeZone"
+                              (or (gethash "timezone" (backend-settings *backend*)) "UTC")))
       ((member name '("transaction_isolation" "client_encoding"
                       "standard_conforming_strings")
                :test #'string=)
@@ -706,35 +723,38 @@ rolled back immediately."
                 name)))
     (send-command-complete stream "RESET")))
 
+(defun sql-setting-value (name &optional missing-ok)
+  "Shared SHOW/current_setting value path, using C's human unit formatting."
+  (setf name (string-downcase name))
+  (multiple-value-bind (value present-p) (session-extra-setting-value name)
+    (when present-p (return-from sql-setting-value value)))
+  (multiple-value-bind (value present-p) (startup-setting-show-value name)
+    (when present-p (return-from sql-setting-value value)))
+  (cond
+    ((string= name "transaction_isolation")
+     (ecase (backend-isolation-level *backend*)
+       (:read-committed "read committed") (:repeatable-read "repeatable read")))
+    ((string= name "transaction_read_only")
+     (if (or (recovery-in-progress-p) (backend-read-only *backend*)) "on" "off"))
+    ((string= name "in_hot_standby") (if (recovery-in-progress-p) "on" "off"))
+    ((string= name "default_transaction_read_only") "off")
+    ((string= name "server_version") *server-version*)
+    ((string= name "server_version_num") (princ-to-string *server-version-num*))
+    ((string= name "search_path") (session-search-path))
+    ((member name '("client_encoding" "server_encoding") :test #'string=) "UTF8")
+    ((string= name "timezone") (or (gethash "timezone" (backend-settings *backend*)) "UTC"))
+    ((string= name "datestyle") "ISO, MDY")
+    ((string= name "standard_conforming_strings") "on")
+    ((string= name "is_superuser") "on")
+    (missing-ok +null+)
+    (t (ereport "42704" "unrecognized configuration parameter ~s" name))))
+
 (defun exec-show (stream ast)
   (let* ((name (string-downcase (getf ast :name)))
-         (value (cond
-                  ((string= name "transaction_isolation")
-                   (ecase (backend-isolation-level *backend*)
-                     (:read-committed "read committed")
-                     (:repeatable-read "repeatable read")))
-                  ((string= name "server_version") *server-version*)
-                  ((string= name "search_path") (session-search-path))
-                  ((string= name "server_version_num")
-                   (princ-to-string *server-version-num*))
-                  ((string= name "client_encoding") "UTF8")
-                  ((string= name "server_encoding") "UTF8")
-                  ((string= name "timezone")
-                   (or (gethash "timezone" (backend-settings *backend*))
-                       "UTC"))
-                  ((string= name "datestyle") "ISO, MDY")
-                  ((string= name "standard_conforming_strings") "on")
-                  ((string= name "is_superuser") "on")
-                  (t
-                   (ereport "42704"
-                            "unrecognized configuration parameter \"~a\""
-                            name)))))
+         (value (sql-setting-value name)))
     (send-row-description
-     stream
-     (list (make-result-column :name name
-                               :type-oid +textoid+
-                               :typlen -1
-                               :typmod -1)))
+     stream (list (make-result-column :name name :type-oid +textoid+
+                                      :typlen -1 :typmod -1)))
     (send-data-row-text stream (list value))
     (send-command-complete stream "SHOW")))
 
@@ -1486,6 +1506,9 @@ before this removal horizon is captured."
                (not (member type '(:commit :rollback))))
       (ereport "25P02"
                "current transaction is aborted, commands ignored until end of transaction block"))
+    ;; Every command still passes the cluster recovery guard before dispatch.
+    ;; A failed transaction exits above without executing any command.
+    (recovery-check-statement ast)
     (case type
       (:begin (command-begin stream ast))
       (:commit (command-commit stream))
@@ -1493,48 +1516,45 @@ before this removal horizon is captured."
       (:checkpoint (command-checkpoint stream))
       (:vacuum (exec-vacuum stream ast))
       (:set (exec-set stream ast))
-      (:set-transaction-snapshot
-       (exec-set-transaction-snapshot stream ast))
+      (:set-transaction-snapshot (exec-set-transaction-snapshot stream ast))
       (:reset (exec-reset stream ast))
       (:show (exec-show stream ast))
       (:apply-logical-event (exec-apply-logical-event stream ast))
       (otherwise (execute-in-transaction stream ast)))))
 
-(defun exec-simple-query (stream query &key (start-execution-p t)
-                                         (finish-execution-p t)
-                                         (statements nil statements-p)
-                                         prepare-only-p)
+(defun exec-simple-query (stream query &key (start-execution-p t) (finish-execution-p t)
+                                         (statements nil statements-p) prepare-only-p)
   (with-backend-query-execution (:start start-execution-p :finish finish-execution-p)
-    (progn
-      (let ((completed-p nil)
-            (result nil))
-        (setf result
-              (handler-case
-                  (let ((stmts (if statements-p
-                                   statements
-                                   (parse-statements query))))
-                    (prog1
-                        (if prepare-only-p
-                            stmts
-                            (if (null stmts)
-                                (send-empty-query-response stream)
+    (let ((completed-p nil) (result nil))
+      (unwind-protect
+           (setf result
+                 (handler-case
+                     (progn
+                       (arm-statement-timeout)
+                       (let ((stmts (if statements-p statements (parse-statements query))))
+                         (check-for-interrupts)
+                         (prog1
+                             (cond
+                               (prepare-only-p stmts)
+                               ((null stmts) (send-empty-query-response stream))
+                               (t
                                 (dolist (ast stmts)
-                                  (check-for-interrupts)
-                                  (execute-statement stream ast))))
-                      (setf completed-p t)))
-                (pg-error (e)
-                  ;; A FATAL must end the connection; let it reach handle-connection.
-                  (if (fatal-error-p e)
-                      (error e)
-                      (progn
-                        (note-query-error)
-                        (send-error-response stream e))))
-                (error (e)
-                  (note-query-error)
-                  (send-error-response
-                   stream
-                   (make-condition 'pg-error
-                                   :sqlstate "XX000"
-                                   :message (princ-to-string e))))))
-        (values result completed-p)))
-    ))
+                                  (arm-statement-timeout)
+                                  (unwind-protect
+                                       (progn (check-for-interrupts) (execute-statement stream ast))
+                                    (clear-statement-timeout)))))
+                           (setf completed-p t))))
+                   (pg-error (e)
+                     (clear-statement-timeout)
+                     (if (fatal-error-p e) (error e)
+                         (progn (note-query-error) (send-error-response stream e))))
+                   (error (e)
+                     (clear-statement-timeout)
+                     (note-query-error)
+                     (send-error-response
+                      stream (make-condition 'pg-error :sqlstate "XX000"
+                                                       :message (princ-to-string e))))))
+        ;; A drain-lane parse-only pass shares the first statement's deadline
+        ;; with its immediate execution pass. The frontend lifecycle clears it too.
+        (unless (and prepare-only-p completed-p) (clear-statement-timeout)))
+      (values result completed-p))))

@@ -9,16 +9,14 @@
   '((:int4 . 23) (:int8 . 20) (:varchar . 1043)))
 
 (defun replication-command-words (query)
-  "Tokenize repl_scanner-style quoted words and command punctuation."
+  "Tokenize repl_scanner-style quoted words, C whitespace and command punctuation."
   (let ((words nil) (position 0) (length (length query)))
     (loop while (< position length)
           for character = (char query position)
           do (cond
-               ((find character '(#\Space #\Tab #\Newline #\Return #\Page))
-                (incf position))
+               ((sql-array-space-p character) (incf position))
                ((find character '(#\( #\) #\, #\;))
-                (push (string character) words)
-                (incf position))
+                (push (string character) words) (incf position))
                ((find character '(#\' #\"))
                 (let ((start position))
                   (setf position (nth-value 1 (scan-quoted-text query position character)))
@@ -26,9 +24,8 @@
                (t
                 (let ((start position))
                   (loop while (and (< position length)
-                                   (not (find (char query position)
-                                              '(#\Space #\Tab #\Newline #\Return #\Page
-                                                #\( #\) #\, #\; #\' #\"))))
+                                   (not (sql-array-space-p (char query position)))
+                                   (not (find (char query position) '(#\( #\) #\, #\; #\' #\"))))
                         do (incf position))
                   (push (subseq query start position) words)))))
     (setf words (nreverse words))
@@ -173,6 +170,17 @@
       (error ()
         (ereport "22P02" "invalid replication LSN \"~a\"" text)))))
 
+(declaim (ftype function parse-native-physical-start start-native-physical-replication))
+
+(defun parse-timeline-history-command (words)
+  (unless (and (= (length words) 2) (plusp (length (second words)))
+               (every (lambda (character) (find character "0123456789")) (second words)))
+    (ereport "42601" "expected TIMELINE_HISTORY positive_timeline"))
+  (let ((timeline (parse-integer (second words))))
+    (unless (<= 1 timeline #xffffffff) (ereport "42601" "invalid timeline ~a" timeline))
+    (make-logical-replication-command
+     :type :timeline-history :options (list (cons "timeline" timeline)))))
+
 (defun parse-replication-command (query)
   (let* ((words (replication-command-words query))
          (verb (and words (string-upcase (first words)))))
@@ -181,6 +189,11 @@
        (unless (= (length words) 1)
          (ereport "42601" "IDENTIFY_SYSTEM does not accept options"))
        (make-logical-replication-command :type :identify))
+      ((equal verb "SHOW")
+       (unless (= (length words) 2) (ereport "42601" "expected SHOW setting"))
+       (make-logical-replication-command
+        :type :show :options (list (cons "name" (replication-command-identifier (second words))))))
+      ((equal verb "TIMELINE_HISTORY") (parse-timeline-history-command words))
       ((equal verb "CREATE_REPLICATION_SLOT") (parse-create-replication-slot words))
       ((equal verb "DROP_REPLICATION_SLOT")
        (unless (or (= (length words) 2)
@@ -192,6 +205,9 @@
          (make-logical-replication-command :type :drop :slot-name name
                                            :options (when (third words)
                                                       (list (cons "wait" t))))))
+      ((and (equal verb "START_REPLICATION")
+            (not (and (>= (length words) 4) (string-equal (fourth words) "LOGICAL"))))
+       (parse-native-physical-start words))
       ((equal verb "START_REPLICATION")
        (unless (and (<= 5 (length words))
                     (string-equal (second words) "SLOT")
@@ -220,10 +236,17 @@
                 (make-result-column :name "timeline" :type-oid +int8oid+ :typlen 8)
                 (make-result-column :name "xlogpos" :type-oid +textoid+ :typlen -1)
                 (make-result-column :name "dbname" :type-oid +textoid+ :typlen -1)))
-  (let ((flushed (sb-thread:with-mutex (*wal-lock*) *wal-durable-lsn*)))
+  (let ((flushed (if (recovery-in-progress-p)
+                     ;; C GetStandbyFlushRecPtr can expose received durable WAL
+                     ;; ahead of replay when both are on the same timeline.
+                     (max (or *last-replay-lsn* 0)
+                          (or (getf *physical-recovery-state* :receive-lsn) 0))
+                     (sb-thread:with-mutex (*wal-lock*) *wal-durable-lsn*))))
     (send-data-row-text
      stream (list (format nil "~d" (catalog-system-identifier)) "1"
-                  (wal-format-lsn flushed) (backend-database *backend*))))
+                  (wal-format-lsn flushed)
+                  (unless (eq (backend-replication-mode *backend*) :physical)
+                    (backend-database *backend*)))))
   (send-command-complete stream "IDENTIFY_SYSTEM")
   (send-ready-for-query stream (transaction-status-char)))
 
@@ -687,17 +710,26 @@ keepalive's WAL-end field, which may include changes not yet applied."
     (bytes->string query-payload :start 0 :end end)))
 
 (defun validate-replication-command-context (command)
-  "Enforce C walsender transaction restrictions before touching replication state."
+  "Enforce transaction and recovery restrictions before touching replication state."
   (when (eq (backend-state *backend*) :aborted)
     (ereport "25P02"
              "current transaction is aborted, commands ignored until end of transaction block"))
+  (check-recovery-available)
+  (when (and (eq (backend-replication-mode *backend*) :physical)
+             (member (logical-replication-command-type command) '(:create :start)))
+    (ereport "55000" "logical decoding requires a database connection"))
+  ;; All non-read-only commands retain their recovery write guard.
+  (unless (member (logical-replication-command-type command) '(:identify :timeline-history :show))
+    (prevent-recovery-write "logical replication state change"))
   (when (and (eq (logical-replication-command-type command) :create)
              (eq (logical-replication-command-snapshot-action command) :export)
              (backend-explicit *backend*))
     (ereport "25001" "EXPORT_SNAPSHOT cannot run inside a transaction block"))
-  (when (and (eq (logical-replication-command-type command) :start)
+  (when (and (member (logical-replication-command-type command) '(:start :physical-start :timeline-history))
              (backend-explicit *backend*))
-    (ereport "25001" "START_REPLICATION cannot run inside a transaction block")))
+    (ereport "25001" "~a cannot run inside a transaction block"
+             (if (eq (logical-replication-command-type command) :timeline-history)
+                 "TIMELINE_HISTORY" "START_REPLICATION"))))
 
 (defun handle-replication-query-frame (stream type-byte length-bytes payload)
   (with-backend-query-execution (:backend *backend* :cleanup :query-state)
@@ -707,15 +739,30 @@ keepalive's WAL-end field, which may include changes not yet applied."
                    (replication-frame-query-string
                     type-byte length-bytes payload)))
                (command (with-live-operation
-                          (parse-replication-command query))))
+                          (progn
+                            (when (and (eq (backend-replication-mode *backend*) :physical)
+                                       (not (replication-query-payload-p payload)))
+                              (ereport "0A000" "cannot execute SQL in a physical replication connection"))
+                            (parse-replication-command query)))))
           (with-live-operation (validate-replication-command-context command))
           (case (logical-replication-command-type command)
             (:identify
              (with-live-operation (identify-replication-system stream)))
+            (:show
+             (with-live-operation
+               (exec-show stream (list :name (cdr (assoc "name" (logical-replication-command-options command)
+                                                         :test #'string=))))
+               (send-ready-for-query stream (transaction-status-char))))
+            (:timeline-history
+             (with-live-operation
+               (send-timeline-history stream
+                                      (cdr (assoc "timeline" (logical-replication-command-options command)
+                                                  :test #'string=)))))
             (:create
              (with-live-operation
                (create-replication-slot-command stream command)))
             (:drop (drop-replication-slot-command stream command))
+            (:physical-start (start-native-physical-replication stream command))
             (:start
              (start-logical-replication
               stream (logical-replication-command-slot-name command)

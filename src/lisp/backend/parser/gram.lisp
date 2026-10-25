@@ -1046,9 +1046,10 @@
             (member (pval p) '("=" "<>" "!=" "<" "<=" ">" ">=") :test #'string=))
        (let ((op (if (string= (pval p) "!=") "<>" (pval p))))
          (pnext p)
-         (if (match-kw p "any")
-             (list :any op left (with-parens (p) (parse-expr p)))
-             (list :binop op left (parse-additive p)))))
+         (cond
+           ((match-kw p "any") (list :any op left (with-parens (p) (parse-expr p))))
+           ((match-kw p "all") (list :all op left (with-parens (p) (parse-expr p))))
+           (t (list :binop op left (parse-additive p))))))
       ((or (kw-p p "in") (kw-p p "not"))
        (let ((negated (match-kw p "not")))
          (expect-kw p "in")

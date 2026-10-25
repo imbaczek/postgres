@@ -40,7 +40,9 @@ atomically; writers must register exactly one relation."
     `(let* ((,captured-relfilenodes
               (remove-duplicates (copy-list ,relation-expression) :test #'=))
             (,relfilenodes ,captured-relfilenodes)
-            (,xid (get-current-xid)))
+            (,xid ,(if (eq mode :read)
+                       `(if (recovery-in-progress-p) (get-current-reader-xid) (get-current-xid))
+                       '(get-current-xid))))
        (declare (ignorable ,relfilenodes ,xid))
        ,register-form
        (with-write-lock ,validation-form)

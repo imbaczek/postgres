@@ -69,7 +69,7 @@
       (gethash "search_path" (backend-settings *backend*) "\"$user\", public")
       "\"$user\", public"))
 
-(defun search-path-identifiers (text)
+(defun search-path-identifiers (text &optional (parameter "search_path"))
   "Follow C SplitIdentifierString: whitespace/comma delimiters and doubled quotes."
   (let ((position 0)
         (end (length text))
@@ -79,7 +79,7 @@
                (loop while (and (< position end) (space-p (char text position)))
                      do (incf position)))
              (invalid ()
-               (ereport "22023" "invalid value for parameter \"search_path\": \"~a\"" text))
+               (ereport "22023" "invalid value for parameter ~s: ~s" parameter text))
              (read-name ()
                (when (= position end) (invalid))
                (if (= (char-code (char text position)) 34)
@@ -129,6 +129,8 @@
   "Resolve existing explicit schemas without implicitly adding pg_catalog."
   (parse-sql-search-path (session-search-path)))
 
+(defvar *session-setting-reports-suppressed-p* nil)
+
 (defun set-session-search-path (value)
   "Validate, save transaction undo state, and report the new session search path."
   (let ((text (if (eq value +null+) "\"$user\", public" value)))
@@ -139,7 +141,7 @@
             (copy-session-settings (backend-settings *backend*))))
     (unless (string= text (session-search-path))
       (setf (gethash "search_path" (backend-settings *backend*)) text)
-      (when (backend-stream *backend*)
+      (when (and (backend-stream *backend*) (not *session-setting-reports-suppressed-p*))
         (send-parameter-status (backend-stream *backend*) "search_path" text)))
     text))
 
@@ -147,6 +149,11 @@
   "Implement supported set_config semantics; reject unsupported GUCs and LOCAL."
   (when (eq name +null+)
     (ereport "22004" "SET requires parameter name"))
+  (startup-check-session-setting (string-downcase name))
+  (when (session-extra-setting-p (string-downcase name))
+    (when (and local-p (not (eq local-p +null+)))
+      (ereport "0A000" "transaction-local settings are not supported"))
+    (return-from set-config-value (session-set-extra-setting (string-downcase name) value)))
   (unless (string-equal name "search_path")
     (ereport "42704" "unrecognized configuration parameter \"~a\"" name))
   (when (and local-p (not (eq local-p +null+)))
@@ -178,10 +185,18 @@
     ("pubinsert" :bool t 6) ("pubupdate" :bool t 7) ("pubdelete" :bool t 8)
     ("pubtruncate" :bool t 9) ("pubviaroot" :bool t 10) ("pubgencols" :char t 11)))
 
+(defparameter +sql-settings-fields+
+  '(("name" :text nil 1) ("setting" :text nil 2) ("unit" :text nil 3)
+    ("context" :text nil 7) ("vartype" :text nil 8) ("source" :text nil 9)
+    ("sourcefile" :text nil 15) ("sourceline" :int4 nil 16)
+    ("pending_restart" :bool nil 17)))
+
 (defparameter +sql-system-relations+
   ;; Catalog OIDs and original attribute numbers follow the pinned C tree.
   ;; The sequence view OID is from that tree's unmodified initdb catalog.
   (list
+   (list :oid 12109 :name "pg_settings" :kind #\v
+         :rows 'startup-settings-rows :fields +sql-settings-fields+)
    (list :oid 1259 :name "pg_class" :kind #\r :rows 'sql-class-rows
          :fields '(("oid" :oid t 1) ("relname" :name t 2)
                    ("relnamespace" :oid t 3) ("relkind" :char t 18)
@@ -240,7 +255,7 @@
           (rows (loop for entry in +sql-system-relations+
                       collect (vector (getf entry :oid) (getf entry :name) 11
                                       (char-code (getf entry :kind))
-                                      (length (getf entry :fields)) (char-code #\d)))))
+                                      (reduce #'max (getf entry :fields) :key #'fourth) (char-code #\d)))))
       (labels ((add-object (oid name kind columns)
                  (push (vector oid name 2200 (char-code kind) columns (char-code #\d)) rows)))
         (maphash (lambda (name table)
@@ -258,13 +273,13 @@
   (vector oid name (type-oid type) number (or typmod -1) notnull 0 nil))
 
 (defun sql-attribute-rows ()
-  "Use dense local virtual slots; outward origins retain their separate C Anums."
+  "Expose original attribute numbers; virtual executor slots remain dense internally."
   (with-write-lock
     (let ((database (current-database)) (rows nil))
       (dolist (entry +sql-system-relations+)
-        (loop for field in (getf entry :fields) for number from 1
+        (loop for field in (getf entry :fields)
               do (push (sql-attribute-row (getf entry :oid) (first field) (second field)
-                                          number -1 (third field)) rows)))
+                                          (fourth field) -1 (third field)) rows)))
       (maphash
        (lambda (name table)
          (declare (ignore name))

@@ -1,0 +1,91 @@
+;;;; Bootstrap file durability and startup admission boundaries.
+(in-package #:pg-physical-tests)
+
+(deftest physical-bootstrap-never-starts-writable
+    (with-physical-store-directory (root)
+      (let ((pg::*pgdata* root))
+        (ok (not (intake-fails-p #'pg::physical-bootstrap-check-startup)))
+        (pg::physical-bootstrap-mark-target root)
+        (ok (probe-file (merge-pathnames "recovery.required" root)))
+        (ok (intake-fails-p #'pg::physical-bootstrap-check-startup))
+        (delete-file (merge-pathnames "recovery.required" root))
+        (with-open-file (stream (merge-pathnames "physical-backup.manifest" root)
+                                :direction :output)
+          (write-line "incomplete manifest" stream))
+        (ok (intake-fails-p #'pg::physical-bootstrap-check-startup)))))
+
+(deftest physical-bootstrap-target-is-separate-and-empty
+    (with-physical-store-directory (root)
+      (let* ((source (merge-pathnames "source/" root))
+             (target (merge-pathnames "target/" root))
+             (nested (merge-pathnames "nested/" source))
+             (pg::*pgdata* source))
+        (dolist (directory (list source target nested))
+          (ensure-directories-exist (merge-pathnames "dummy" directory)))
+        (ok (equal target (pg::physical-bootstrap-target target)))
+        (ok (intake-fails-p (lambda () (pg::physical-bootstrap-target source))))
+        (ok (intake-fails-p (lambda () (pg::physical-bootstrap-target root))))
+        (ok (intake-fails-p (lambda () (pg::physical-bootstrap-target nested))))
+        (with-open-file (stream (merge-pathnames "existing" target) :direction :output)
+          (write-line "existing target" stream))
+        (ok (intake-fails-p (lambda () (pg::physical-bootstrap-target target)))))))
+
+(deftest physical-bootstrap-file-copy-preserves-bounded-chunks
+    (with-physical-store-directory (root)
+      (let* ((source (merge-pathnames "source/" root))
+             (target (merge-pathnames "target/" root))
+             (pg::*pgdata* source)
+             (bytes (make-array 131079 :element-type '(unsigned-byte 8)))
+             (path "global/example"))
+        (loop for index below (length bytes) do (setf (aref bytes index) (mod index 251)))
+        (ensure-directories-exist (merge-pathnames path source))
+        (ensure-directories-exist (merge-pathnames "dummy" target))
+        (with-open-file (stream (merge-pathnames path source)
+                                :direction :output :element-type '(unsigned-byte 8))
+          (write-sequence bytes stream))
+        (let ((entry (pg::physical-bootstrap-copy-file path target)))
+          (ok (equal path (first entry)))
+          (ok (= (length bytes) (second entry))))
+        (with-open-file (stream (merge-pathnames path target)
+                                :element-type '(unsigned-byte 8))
+          (let ((copy (make-array (length bytes) :element-type '(unsigned-byte 8))))
+            (ok (= (length bytes) (read-sequence copy stream)))
+            (ok (equalp bytes copy)))))))
+
+(deftest physical-bootstrap-copy-caps-the-durable-prefix
+    (with-physical-store-directory (root)
+      (let* ((source (merge-pathnames "source/" root))
+             (target (merge-pathnames "target/" root))
+             (pg::*pgdata* source))
+        (ensure-directories-exist (merge-pathnames "wal" source))
+        (ensure-directories-exist (merge-pathnames "dummy" target))
+        (with-open-file (stream (merge-pathnames "wal" source)
+                                :direction :output :element-type '(unsigned-byte 8))
+          (write-sequence #(1 2 3 4 5) stream))
+        (ok (= 3 (second (pg::physical-bootstrap-copy-file "wal" target :limit 3))))
+        (ok (intake-fails-p
+             (lambda () (pg::physical-bootstrap-copy-file "wal" target :limit 6))))
+        (with-open-file (stream (merge-pathnames "wal" target) :element-type '(unsigned-byte 8))
+          (ok (= 3 (file-length stream)))
+          (ok (equal '(1 2 3) (loop repeat 3 collect (read-byte stream))))))))
+
+(deftest physical-bootstrap-requires-gate-owner
+    (with-physical-store-directory (root)
+      (ok (intake-fails-p
+           (lambda () (pg::physical-bootstrap-copy-under-quiescence root "copy"))))))
+
+(deftest physical-bootstrap-refuses-unsupported-mutation-paths
+    (with-physical-store-directory (root)
+      (let ((pg::*swank-listener-enabled-p* t))
+        (ok (intake-fails-p (lambda () (pg::physical-base-backup root "copy")))))
+      (let ((pg::*swank-listener-enabled-p* t)
+            (pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
+        (ok (intake-fails-p
+             (lambda () (pg::physical-bootstrap-copy-under-quiescence root "copy")))))
+      (let ((pg::*live-operation-depth* 1))
+        (ok (intake-fails-p (lambda () (pg::physical-base-backup root "copy")))))
+      (let ((pg::*active-xids* '(42))
+            (pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
+        (ok (intake-fails-p
+             (lambda () (pg::physical-bootstrap-copy-under-quiescence root "copy")))))
+      (ok (null (uiop:directory-files root)))))

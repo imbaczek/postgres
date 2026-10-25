@@ -8,8 +8,10 @@
   (pushnew (merge-pathnames "vendor/swank/" here)
            asdf:*central-registry* :test #'equal))
 
-(asdf:load-system "pg")
-(asdf:load-system "pg-swank")
+(let ((*compile-verbose* nil) (*load-verbose* nil)
+                              (*standard-output* *error-output*))
+  (asdf:load-system "pg")
+  (asdf:load-system "pg-swank"))
 
 (handler-case
     (pg:main)

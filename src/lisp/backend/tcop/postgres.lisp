@@ -113,6 +113,15 @@ CancelRequest, before the rest of that packet is read."
             (t
              (return-from read-startup-until-ready body))))))))
 
+(defun startup-replication-mode (value)
+  (cond
+    ((null value) nil)
+    ((string= value "database") :database)
+    (t
+     (handler-case
+         (when (sql-cast-boolean-input value) :physical)
+       (pg-error () (ereport-fatal "22023" "invalid replication startup value: ~s" value))))))
+
 (defun process-startup (stream body)
   (with-live-operation
     (let* ((code (bytes-to-u32 body 0))
@@ -134,12 +143,13 @@ CancelRequest, before the rest of that packet is read."
                          "postgres")))
         (setf (backend-database *backend*) dbname)
         (setf (backend-application-name *backend*) app)
-        (when replication
-          (unless (string-equal replication "database")
-            (ereport "0A000" "only database-scoped logical replication is supported"))
-          (setf (backend-replication-mode *backend*) :database))
+        (setf (backend-replication-mode *backend*) (startup-replication-mode replication))
+        (session-apply-startup-options params)
         (with-catalog-lock
-          (unless (gethash dbname (catalog-databases *catalog*))
+          (unless (or (eq (backend-replication-mode *backend*) :physical)
+                      (gethash dbname (catalog-databases *catalog*)))
+            (when (recovery-in-progress-p)
+              (ereport-fatal "3D000" "database ~s does not exist" dbname))
             (get-database dbname)
             (save-catalog)))
         (send-auth-ok stream)
@@ -150,7 +160,8 @@ CancelRequest, before the rest of that packet is read."
         (send-parameter-status stream "server_encoding" "UTF8")
         (send-parameter-status stream "client_encoding" "UTF8")
         (send-parameter-status stream "DateStyle" "ISO, MDY")
-        (send-parameter-status stream "TimeZone" "UTC")
+        (send-parameter-status stream "TimeZone"
+                               (or (gethash "timezone" (backend-settings *backend*)) "UTC"))
         (send-parameter-status stream "integer_datetimes" "on")
         (send-parameter-status stream "standard_conforming_strings" "on")
         (send-parameter-status stream "IntervalStyle" "postgres")
@@ -158,7 +169,7 @@ CancelRequest, before the rest of that packet is read."
         (send-parameter-status stream "session_authorization" "postgres")
         (send-parameter-status stream "application_name" app)
         (send-parameter-status stream "default_transaction_read_only" "off")
-        (send-parameter-status stream "in_hot_standby" "off")
+        (send-parameter-status stream "in_hot_standby" (if (recovery-in-progress-p) "on" "off"))
         (let ((key (random-cancel-key)))
           (setf (backend-cancel-key *backend*) key)
           (send-backend-key-data stream (backend-pid *backend*) key))
@@ -185,7 +196,7 @@ CancelRequest, before the rest of that packet is read."
 
 (defun simple-query-payload-starts-with-word-p
     (payload words &optional (end (and payload
-                                       (or (position 0 payload) (length payload)))))
+                                       (or (position 0 payload) (length payload)))) (sql-trivia-p t))
   "Classify a raw query's first word before reload admission and full decoding."
   (unless payload
     (return-from simple-query-payload-starts-with-word-p nil))
@@ -213,14 +224,14 @@ CancelRequest, before the rest of that packet is read."
                    ((and (< start end) (whitespace-byte-p (aref payload start)))
                     (incf start))
                    ((and (< (1+ start) end)
-                         (= (aref payload start) 45)
+                         (and sql-trivia-p (= (aref payload start) 45))
                          (= (aref payload (1+ start)) 45))
                     (skip-line-comment))
                    ((and (< (1+ start) end)
-                         (= (aref payload start) 47)
+                         (and sql-trivia-p (= (aref payload start) 47))
                          (= (aref payload (1+ start)) 42))
                     (skip-block-comment))
-                   ((and (< start end) (= (aref payload start) 59))
+                   ((and sql-trivia-p (< start end) (= (aref payload start) 59))
                     (incf start))
                    (t (return)))))
              (matches-word-p (word from to)
@@ -244,14 +255,13 @@ CancelRequest, before the rest of that packet is read."
    payload '("COMMIT" "ROLLBACK" "END" "ABORT") end))
 
 (defun replication-query-payload-p (payload)
-  "Select the replication parser only for replication-command keywords.
-
-Like C exec_replication_command, logical walsenders otherwise execute SQL.
-This classifier does not construct or validate a frontend message."
+  "Match repl_scanner's first-token dispatch: skip whitespace, not SQL comments.
+Database walsenders fall back to SQL for a leading comment or empty statement."
   (simple-query-payload-starts-with-word-p
    payload '("IDENTIFY_SYSTEM" "CREATE_REPLICATION_SLOT" "DROP_REPLICATION_SLOT"
              "START_REPLICATION" "READ_REPLICATION_SLOT" "TIMELINE_HISTORY"
-             "BASE_BACKUP" "UPLOAD_MANIFEST" "ALTER_REPLICATION_SLOT")))
+             "BASE_BACKUP" "UPLOAD_MANIFEST" "ALTER_REPLICATION_SLOT" "SHOW")
+   (and payload (or (position 0 payload) (length payload))) nil))
 
 (defun simple-query-frame-needs-drain-p (length-bytes payload)
   "Route malformed query frames through drain so their fatal error can clean up.
@@ -398,8 +408,9 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
     ;; Query dispatch needs its byte-only classifier first so an already-active
     ;; transaction can still send COMMIT/ROLLBACK while reload drains.
     ((and (= type-byte (char-code #\Q))
-          (eq (backend-replication-mode *backend*) :database)
-          (replication-query-payload-p payload))
+          (member (backend-replication-mode *backend*) '(:database :physical))
+          (or (eq (backend-replication-mode *backend*) :physical)
+              (replication-query-payload-p payload)))
      (handle-replication-query-frame stream type-byte length-bytes payload)
      :continue)
     ((= type-byte (char-code #\Q))
@@ -552,92 +563,7 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
   value)
 
 (defun parse-args (argv)
-  (let ((port 5433)
-        (host "127.0.0.1")
-        (pgdata nil)
-        (control-port nil)
-        (control-socket nil)
-        (swank-port nil)
-        (swank-bind-address "127.0.0.1")
-        (temp-file-limit-argument nil)
-        (sort-arena-limit-argument nil)
-        (slot-wal-keep-argument nil))
-    (loop for rest on argv
-          for arg = (car rest)
-          do (cond
-               ((member arg '("-p" "--port") :test #'string=)
-                (setf port (parse-port-arg arg (arg-value rest arg))))
-               ((and (> (length arg) 7) (string= arg "--port=" :end1 7))
-                (setf port (parse-port-arg "--port" (subseq arg 7))))
-               ((member arg '("-h" "--host") :test #'string=)
-                (setf host (arg-value rest arg)))
-               ((member arg '("-D" "--pgdata") :test #'string=)
-                (setf pgdata (arg-value rest arg)))
-               ((and (> (length arg) 9) (string= arg "--pgdata=" :end1 9))
-                (setf pgdata (subseq arg 9)))
-               ((member arg '("-C" "--control-port") :test #'string=)
-                (setf control-port (parse-port-arg arg (arg-value rest arg))))
-               ((and (> (length arg) 15) (string= arg "--control-port=" :end1 15))
-                (setf control-port (parse-port-arg "--control-port" (subseq arg 15))))
-               ((string= arg "--control-socket")
-                (setf control-socket (arg-value rest arg)))
-               ((and (> (length arg) 17) (string= arg "--control-socket=" :end1 17))
-                (setf control-socket (subseq arg 17)))
-               ((string= arg "--swank-port")
-                (setf swank-port (parse-port-arg arg (arg-value rest arg))))
-               ((and (>= (length arg) 13) (string= arg "--swank-port=" :end1 13))
-                (setf swank-port (parse-port-arg "--swank-port" (subseq arg 13))))
-               ((string= arg "--swank-bind-address")
-                (setf swank-bind-address
-                      (parse-bind-address-arg
-                       arg (arg-value rest arg))))
-               ((and (>= (length arg) 21)
-                     (string= arg "--swank-bind-address=" :end1 21))
-                (setf swank-bind-address
-                      (parse-bind-address-arg
-                       "--swank-bind-address" (subseq arg 21))))
-               ((string= arg "--temp-file-limit-bytes")
-                (setf temp-file-limit-argument (arg-value rest arg)))
-               ((and (>= (length arg)
-                         (length "--temp-file-limit-bytes="))
-                     (string= "--temp-file-limit-bytes=" arg
-                              :end2 (length "--temp-file-limit-bytes=")))
-                (setf temp-file-limit-argument
-                      (subseq arg (length "--temp-file-limit-bytes="))))
-               ((string= arg "--sort-arena-limit-bytes")
-                (setf sort-arena-limit-argument (arg-value rest arg)))
-               ((and (>= (length arg) (length "--sort-arena-limit-bytes="))
-                     (string= "--sort-arena-limit-bytes=" arg
-                              :end2 (length "--sort-arena-limit-bytes=")))
-                (setf sort-arena-limit-argument
-                      (subseq arg (length "--sort-arena-limit-bytes="))))
-               ((string= arg "--max-slot-wal-keep-bytes")
-                (setf slot-wal-keep-argument (arg-value rest arg)))
-               ((and (>= (length arg) (length "--max-slot-wal-keep-bytes="))
-                     (string= "--max-slot-wal-keep-bytes=" arg
-                              :end2 (length "--max-slot-wal-keep-bytes=")))
-                (setf slot-wal-keep-argument
-                      (subseq arg (length "--max-slot-wal-keep-bytes="))))))
-    (values host port (or pgdata (sb-ext:posix-getenv "PGDATA") "./pgdata")
-            control-port control-socket swank-port swank-bind-address
-            (let ((value (or temp-file-limit-argument
-                             (sb-ext:posix-getenv
-                              "PG_QUERY_TEMP_FILE_LIMIT_BYTES"))))
-              (if value
-                  (parse-query-temp-file-limit-bytes value)
-                  *query-temp-file-limit-bytes*))
-            (let ((value (or sort-arena-limit-argument
-                             (sb-ext:posix-getenv
-                              "PG_QUERY_SORT_ARENA_LIMIT_BYTES"))))
-              (if value
-                  (parse-query-sort-arena-limit-bytes value)
-                  *query-sort-arena-limit-bytes*))
-            (let ((value (or slot-wal-keep-argument
-                             (sb-ext:posix-getenv
-                              "PG_MAX_SLOT_WAL_KEEP_BYTES"))))
-              (if value
-                  (parse-slot-wal-keep-bytes value)
-                  *max-slot-wal-keep-bytes*)))))
+  (startup-argument-values argv))
 
 (defun directory-pathname (path)
   "Return PATH as an absolute directory pathname (trailing slash).
@@ -657,6 +583,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
 
 (defun serve (host port)
   (let ((listener (make-listener host port)))
+    (postmaster-note-listener listener)
     (sb-thread:with-mutex (*accept-lock*)
       (setf *accept-stop-requested* nil))
     (loop
@@ -699,29 +626,40 @@ CL's RENAME-FILE merges a relative target with the source's directory."
 ;;; ---- hot reload (SIGHUP) and control REPL live in tcop/control.lisp ----
 
 (defun main ()
+  (startup-handle-meta-request (cdr sb-ext:*posix-argv*))
   (multiple-value-bind (host port pgdata control-port control-socket
                         swank-port swank-bind-address temp-file-limit-bytes
-                        sort-arena-limit-bytes max-slot-wal-keep-bytes)
+                        sort-arena-limit-bytes max-slot-wal-keep-bytes startup-settings startup-native startup-overrides)
       (parse-args (cdr sb-ext:*posix-argv*))
     (setf *pgdata* (directory-pathname pgdata)
           *query-temp-file-limit-bytes* temp-file-limit-bytes
           *query-sort-arena-limit-bytes* sort-arena-limit-bytes
           *max-slot-wal-keep-bytes* max-slot-wal-keep-bytes)
+    (startup-install-settings startup-settings startup-native startup-overrides)
+    (postmaster-own-data-directory host port)
+    (physical-bootstrap-check-startup)
     ;; Reject an unsupported SBCL before opening storage or accepting clients.
     (call-with-query-sort-arena (lambda (arena) (declare (ignore arena))))
     (initialize-query-temp-storage)
     (capture-server-streams)
-    (wal-init)
-    (xact-init)
-    (wal-recover)
-    (wal-load-replication-slots)
-    (catalog-init)
-    (wal-remove-orphan-relations)
-    (complete-xid-wraparound)
+    (if (recovery-in-progress-p)
+        (physical-recovery-open-storage)
+        (progn
+          (wal-init)
+          (xact-init)
+          (wal-recover)
+          (note-primary-startup-replay)
+          (wal-load-replication-slots)
+          (catalog-init)
+          (physical-source-pin-load)
+          (wal-remove-orphan-relations)
+          (complete-xid-wraparound)))
     (enable-reload)
     (enable-shutdown-handlers)
     (start-swank-listener swank-port swank-bind-address)
     (start-control-plane :port control-port :socket-path control-socket)
+    (physical-follow-autostart)
+    (physical-restartpoint-start-worker)
     (format t "~&pg-lisp: minimal PostgreSQL-compatible server~%")
     (format t "pg-lisp: data directory ~a~%" *pgdata*)
     (format t "pg-lisp: listening on ~a:~a~%" host port)

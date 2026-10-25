@@ -1,0 +1,47 @@
+;;;; Offline acceptance oracle; no SQL listener or promotion of the copied target.
+(require :asdf)
+(push (uiop:pathname-parent-directory-pathname
+       (uiop:pathname-directory-pathname *load-truename*))
+      asdf:*central-registry*)
+(asdf:load-system "pg")
+
+(let* ((args (uiop:command-line-arguments))
+       (target (uiop:ensure-directory-pathname (first args)))
+       (pg::*pgdata* target)
+       (manifest
+         (with-open-file (stream (merge-pathnames "physical-backup.manifest" target))
+           (let* ((header (read-line stream))
+                  (text (read-line stream)))
+             (assert (uiop:string-prefix-p "PGPHYSICALBACKUP1 " header))
+             (assert (= (parse-integer header :start 18 :radix 16)
+                        (pg::wal-crc32 (pg::string->bytes text))))
+             (assert (null (read-line stream nil nil)))
+             (with-standard-io-syntax
+               (let ((*read-eval* nil)) (read-from-string text))))))
+       (catalog (pg::load-catalog)))
+  (assert (= 1 (getf manifest :version)))
+  (assert (= (pg::catalog-system-identifier catalog) (getf manifest :system-id)))
+  (assert (equal (pg::catalog-cluster-identity catalog) (getf manifest :cluster-identity)))
+  (assert (probe-file (merge-pathnames "recovery.required" target)))
+  (assert (getf manifest :files))
+  (dolist (entry (getf manifest :files))
+    (destructuring-bind (relative expected-length expected-digest) entry
+      (assert (not (member relative '("pg_physical_pins" "pg_replslot") :test #'equal)))
+      (with-open-file (stream (merge-pathnames relative target) :element-type '(unsigned-byte 8))
+        (assert (= expected-length (file-length stream)))
+        (let ((digest #xCBF29CE484222325)
+              (buffer (make-array 65536 :element-type '(unsigned-byte 8))))
+          (loop for count = (read-sequence buffer stream)
+                while (plusp count)
+                do (setf digest (pg::physical-store-update-digest digest (subseq buffer 0 count))))
+          (assert (= expected-digest digest))))))
+  (multiple-value-bind (checkpoint durable) (pg::wal-read-control-fields)
+    (assert (= checkpoint (getf manifest :checkpoint)))
+    (assert (= durable (getf manifest :end)))
+    (let ((pg::*wal-durable-lsn* durable))
+      (pg::physical-source-pin-check-wal
+       (pg::make-physical-source-pin :name "copy" :system-id (getf manifest :system-id)
+                                     :consistent-lsn checkpoint
+                                     :restart-lsn (if (zerop checkpoint) 0 (- checkpoint 32))))))
+  (assert (>= (pg::load-next-xid) (getf manifest :next-xid)))
+  (format t "physical-bootstrap-verify: PASS~%"))

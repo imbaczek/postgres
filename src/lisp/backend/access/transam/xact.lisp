@@ -14,7 +14,7 @@
   (state :idle)                 ; :idle | :in-progress | :aborted
   (explicit nil)
   (isolation-level :read-committed)
-  (read-only nil)
+  (read-only (recovery-in-progress-p))
   (command-id 0)
   (snapshot nil)
   (transaction-snapshot nil)
@@ -27,6 +27,8 @@
   (sequence-currvals (make-hash-table :test #'eql))
   (settings (make-hash-table :test #'equal))
   (settings-transaction-start nil)
+  (settings-reset (make-hash-table :test #'equal))
+  (statement-deadline nil)
   ;; Interrupt state: the equivalents of QueryCancelPending and the
   ;; backend's own thread, used by pg_cancel_backend()/pg_terminate_backend().
   (executing nil)
@@ -35,7 +37,8 @@
   ;; a real lock wait instead of relying on scheduler timing.
   (waiting-xid nil)
   (wraparound-waiting nil)
-  (thread nil))
+  (thread nil)
+  (virtual-reader-xid nil))
 
 (defvar *backend* nil)
 
@@ -65,12 +68,37 @@
          (when ,backend-value
            (setf (,accessor ,backend-value) nil))))))
 
+(defun clear-statement-timeout (&optional (backend *backend*))
+  (when backend (setf (backend-statement-deadline backend) nil)))
+
+(defun arm-statement-timeout (&optional (backend *backend*))
+  "Arm once after admission; parsing and the first statement share one deadline."
+  (when (and backend (not (backend-statement-deadline backend)))
+    (let ((milliseconds (gethash "statement_timeout" (backend-settings backend) 0)))
+      (when (plusp milliseconds)
+        (setf (backend-statement-deadline backend)
+              (+ (get-internal-real-time)
+                 (ceiling (* milliseconds internal-time-units-per-second) 1000)))))))
+
+(defun backend-wait-timeout ()
+  "Bound cooperative waits by the statement deadline, with a short cancel poll."
+  (let ((deadline (and *backend* (backend-statement-deadline *backend*))))
+    (if deadline
+        (max 0.001 (min 0.1 (/ (- deadline (get-internal-real-time))
+                               (float internal-time-units-per-second 1d0))))
+        0.1)))
+
 (defun check-for-interrupts ()
   "Port of PostgreSQL's CHECK_FOR_INTERRUPTS().
 
 A pending PG_CANCEL_BACKEND() request raises 57014 here, at a safe point.
 PG_TERMINATE_BACKEND() is delivered as a FATAL condition from
 INTERRUPT-THREAD, so it needs no flag."
+  (when (and *backend* (backend-statement-deadline *backend*)
+             (>= (get-internal-real-time) (backend-statement-deadline *backend*)))
+    (clear-statement-timeout)
+    (setf (backend-cancel-pending *backend*) nil)
+    (ereport "57014" "canceling statement due to statement timeout"))
   (when (and *backend* (backend-cancel-pending *backend*))
     (setf (backend-cancel-pending *backend*) nil)
     (ereport "57014" "canceling statement due to user request")))
@@ -89,6 +117,7 @@ INTERRUPT-THREAD, so it needs no flag."
 
 (defun end-backend-query-execution (backend)
   "Clear frontend query interrupt state after dispatch and any gate wait."
+  (clear-statement-timeout backend)
   (when backend
     (sb-thread:with-mutex (*live-operation-lock*)
       (setf (backend-executing backend) nil
@@ -219,8 +248,8 @@ or :QUERY-STATE for the wire dispatch's existing reload/shutdown cleanup lane."
     (sb-thread:condition-broadcast *xact-cv*)))
 
 (defun condition-wait-with-timeout (waitqueue mutex)
-  "Wait up to one second, returning with MUTEX held even after a timeout."
-  (let ((notified (sb-thread:condition-wait waitqueue mutex :timeout 1)))
+  "Wait with bounded interrupt latency, returning with MUTEX held after timeout."
+  (let ((notified (sb-thread:condition-wait waitqueue mutex :timeout (backend-wait-timeout))))
     ;; SBCL returns NIL on timeout without reacquiring MUTEX.
     (unless notified
       (sb-thread:grab-mutex mutex))
@@ -561,6 +590,7 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
     snapshot))
 
 (defun assign-xid ()
+  (prevent-recovery-write "transaction ID assignment")
   (let ((oldest-relfrozenxid (catalog-oldest-relfrozenxid)))
     (sb-thread:with-mutex (*xid-lock*)
       (when (> *next-xid* +max-xid+)
@@ -1452,6 +1482,18 @@ remains after BODY and should be dropped when its WAL is no longer needed."
   (or (backend-xid *backend*)
       (setf (backend-xid *backend*) (assign-xid))))
 
+(defvar *recovery-reader-xid-counter* 0)
+
+(defun get-current-reader-xid ()
+  "Use a virtual relation-lock identity in recovery, never a durable transaction ID."
+  (if (not (recovery-in-progress-p))
+      (get-current-xid)
+      (or (backend-virtual-reader-xid *backend*)
+          (sb-sys:without-interrupts
+            (sb-thread:with-mutex (*relation-lock-mutex*)
+              (setf (backend-virtual-reader-xid *backend*)
+                    (- (incf *recovery-reader-xid-counter*))))))))
+
 (defun refresh-statement-snapshot ()
   "Take a fresh snapshot after DDL has waited for prior table writers."
   (let ((snapshot (make-snapshot (backend-command-id *backend*))))
@@ -1499,7 +1541,9 @@ remains after BODY and should be dropped when its WAL is no longer needed."
     (when (eq (backend-state b) :aborted)
       (ereport "25P02"
                "current transaction is aborted, commands ignored until end of transaction block"))
-    (prepare-xid-wraparound-for-statement b)
+    (unless (recovery-in-progress-p)
+      (prepare-xid-wraparound-for-statement b))
+    (when (recovery-in-progress-p) (setf (backend-read-only b) t))
     (when (eq (backend-state b) :idle)
       (setf (backend-explicit b) nil
             (backend-command-id b) 0)
@@ -1528,10 +1572,13 @@ remains after BODY and should be dropped when its WAL is no longer needed."
 
 (defun reset-backend-transaction (b)
   (release-backend-transaction-snapshot b)
+  (when (backend-virtual-reader-xid b)
+    (release-xid (backend-virtual-reader-xid b))
+    (setf (backend-virtual-reader-xid b) nil))
   (setf (backend-xid b) nil
         (backend-explicit b) nil
         (backend-isolation-level b) :read-committed
-        (backend-read-only b) nil
+        (backend-read-only b) (recovery-in-progress-p)
         (backend-command-id b) 0
         (backend-snapshot b) nil
         (backend-first-snapshot-set b) nil

@@ -518,6 +518,7 @@ lane must not run query or storage work."
                           (*compile-verbose* nil)
                           (*load-verbose* nil))
                       (asdf:load-system "pg" :force t)
+                      (startup-reload-settings)
                       t)
                   (error (e)
                     (format *error-output* "~&pg-lisp: reload failed: ~a~%" e)
@@ -616,19 +617,30 @@ this listener evaluates arbitrary Lisp."
          (lambda () (control-serve sock))
          :name "pg control connection")))))
 
+(declaim (ftype function physical-base-backup))
+
 (defun control-eval (stream form)
   "Evaluate FORM, printing its values (or an error) to STREAM."
   (handler-case
       (format stream "~&~{~s~^~%~}~%"
               (multiple-value-list
-               (if (and (consp form)
-                        (eq (first form) 'reload)
-                        (null (rest form)))
-                   ;; Keep the documented REPL reload entry outside the live
-                   ;; operation gate; RELOAD coordinates quiescence itself.
-                   (reload)
-                   (with-live-operation
-                     (eval form)))))
+               (cond
+                 ((and (consp form) (eq (first form) 'reload) (null (rest form)))
+                  (reload))
+                 ((and (consp form) (eq (first form) 'physical-base-backup)
+                       (= (length form) 3) (every #'stringp (rest form)))
+                  ;; Literal arguments only: do not evaluate arbitrary argument
+                  ;; expressions outside live admission. The backup owns its gate.
+                  (physical-base-backup (second form) (third form)))
+                 ((and (consp form)
+                       (member (first form) '(physical-recovery-enable-streaming physical-recovery-replay physical-recovery-restartpoint physical-follow-stop))
+                       (null (rest form)))
+                  (funcall (first form)))
+                 ((and (consp form) (eq (first form) 'physical-follow-start)
+                       (= (length form) 4) (stringp (second form))
+                       (integerp (third form)) (stringp (fourth form)))
+                  (physical-follow-start (second form) (third form) (fourth form)))
+                 (t (with-live-operation (eval form))))))
     (error (e)
       (format stream "~&;; error: ~a~%" e))))
 
@@ -734,6 +746,9 @@ Both are optional; with neither, no control plane is started."
         (when tcp-listener
           (ignore-errors (sb-bsd-sockets:socket-close tcp-listener)))))))
 
+(defvar *swank-listener-enabled-p* nil
+  "The optional debugger evaluates outside normal operation admission.")
+
 (defun start-swank-listener (port bind-address)
   "Start the optional Swank listener on BIND-ADDRESS and PORT."
   (when port
@@ -753,6 +768,7 @@ Both are optional; with neither, no control plane is started."
                                  :dont-close t)
         (error (e)
           (error "cannot start Swank on ~a:~a: ~a" bind-address port e)))
+      (setf *swank-listener-enabled-p* t)
       (format t "~&pg-lisp: Swank listening on ~a:~a~%" bind-address port)
       (finish-output)))
   (values))
