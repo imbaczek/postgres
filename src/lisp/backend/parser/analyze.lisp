@@ -81,6 +81,10 @@ exist\" messages."
     (:int4 "integer")
     (:int8 "bigint")
     (:pg-lsn "pg_lsn")
+    (:oid "oid")
+    (:void "void")
+    (:record "record")
+    (:pg-node-tree "pg_node_tree")
     (:numeric "numeric")
     (:bit "bit")
     (:varchar "character varying")
@@ -856,6 +860,28 @@ exist\" messages."
     (list :coalesce coerced :type type
           :typmod (common-expression-typmod coerced))))
 
+(defun coerce-boolean-expression (expression construct)
+  "Match coerce_to_boolean for supported Boolean input types and set checks."
+  (let ((coerced (coerce-in-constant expression :bool)))
+    (unless (eq (expr-type coerced) :bool)
+      (ereport "42804" "argument of ~a must be type boolean, not type ~a"
+               construct (typed-arg-name coerced)))
+    (when (analyzed-expression-contains-set-p coerced)
+      (ereport "42804" "argument of ~a must not return a set" construct))
+    coerced))
+
+(defun analyze-boolean-expression (expression scope)
+  "Analyze all Boolean operands before the executor may skip any of them."
+  (let* ((kind (first expression))
+         (construct (symbol-name kind))
+         (operands (if (eq kind :not) (list (second expression))
+                       (list (second expression) (third expression)))))
+    (append (list kind)
+            (mapcar (lambda (operand)
+                      (coerce-boolean-expression (analyze-expr operand scope) construct))
+                    operands)
+            (list :type :bool :typmod -1))))
+
 (defun analyze-case-expression (expression scope)
   (let* ((branches
            (mapcar
@@ -970,17 +996,7 @@ exist\" messages."
          (ereport "42883" "unary operator does not exist for ~a" (expr-type e)))
        (list :unary (second expr) e
              :type (expr-type e) :typmod (expr-typmod e))))
-    (:and
-     (list :and (analyze-expr (second expr) table)
-           (analyze-expr (third expr) table)
-           :type :bool :typmod -1))
-    (:or
-     (list :or (analyze-expr (second expr) table)
-           (analyze-expr (third expr) table)
-           :type :bool :typmod -1))
-    (:not
-     (list :not (analyze-expr (second expr) table)
-           :type :bool :typmod -1))
+    ((:and :or :not) (analyze-boolean-expression expr table))
     (:in (analyze-in-expression expr table))
     (:is-null
      (list :is-null (analyze-expr (second expr) table) (third expr)
@@ -1895,10 +1911,14 @@ exist\" messages."
                 (sql-cast-value result (expr-type expr) (expr-type expr) -1) result)))
          (t (ereport "42883" "unsupported unary operator ~a"
                      (second expr))))))
-    (:and (sql-3val-and (eval-expr (second expr) env)
-                        (eval-expr (third expr) env)))
-    (:or (sql-3val-or (eval-expr (second expr) env)
-                      (eval-expr (third expr) env)))
+    (:and
+     (let ((left (eval-expr (second expr) env)))
+       (if (null left) nil
+           (sql-3val-and left (eval-expr (third expr) env)))))
+    (:or
+     (let ((left (eval-expr (second expr) env)))
+       (if (eq left t) t
+           (sql-3val-or left (eval-expr (third expr) env)))))
     (:not (sql-3val-not (eval-expr (second expr) env)))
     (:in (eval-in-expression expr env))
     (:is-null
