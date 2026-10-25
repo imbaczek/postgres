@@ -19,6 +19,7 @@
     :serial t
     :components
     ((:file "utils/elog")
+     (:file "utils/recovery")
      (:file "utils/lwlock")
      (:module "libpq"
       :serial t
@@ -59,7 +60,10 @@
       :serial t
       :components ((:file "logical")
                    (:file "schema-contracts")
-                   (:file "client")))
+                   (:file "client")
+                   (:file "physical")
+                   (:file "physical-store")
+                   (:file "physical-source")))
      (:module "commands"
       :serial t
       :components ((:file "vacuum")

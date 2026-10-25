@@ -25,6 +25,7 @@
            (when *wal-replication-slot-loss-collector*
              (push slot (car *wal-replication-slot-loss-collector*))))))
      *wal-replication-slots*))
+  (physical-source-invalidate-lagging-pins-under-wal-lock)
   (values))
 
 (defun wal-lost-replication-slots ()
@@ -49,6 +50,7 @@
 
 (defun wal-checkpoint ()
   "Write cached pages and then clean up any slots lost by this checkpoint."
+  (prevent-recovery-primary-operation "CHECKPOINT")
   (call-with-invalidated-slot-cleanup #'wal-checkpoint-core)
   (values))
 
