@@ -101,6 +101,40 @@
       (ok (equal "55000" (recovery-state-of
                           (lambda () (pg::eval-recovery-wal-function "pg_current_wal_lsn")))))))
 
+(deftest wal-lsn-difference-preserves-unsigned-range-and-numeric-type
+    (let* ((expression (pg::analyze-function-expression
+                        '(:func "pg_wal_lsn_diff"
+                          ((:const "FFFFFFFF/FFFFFFFF" :type :text :typmod -1)
+                           (:const "0/0" :type :text :typmod -1))) nil))
+           (value (pg::eval-expr expression nil)))
+      (ok (eq :numeric (pg::expr-type expression)))
+      (ok (= 1700 (pg::type-oid :numeric)))
+      (ok (equal "numeric" (pg::typed-arg-name expression)))
+      (ok (equal "pg_lsn" (pg::typed-arg-name '(:const 0 :type :pg-lsn))))
+      (ok (= #xffffffffffffffff value))
+      (ok (equal "18446744073709551615" (pg::value->text value :numeric)))
+      (ok (equal "22003" (recovery-state-of
+                          (lambda () (pg::sql-cast-value value :numeric :int8 -1)))))
+      (ok (= pg::+int8-max+ (pg::sql-cast-value pg::+int8-max+ :numeric :int8 -1)))
+      (ok (= pg::+int8-min+ (pg::sql-cast-value pg::+int8-min+ :numeric :int8 -1)))
+      (ok (equal "22003" (recovery-state-of
+                          (lambda () (pg::sql-cast-value (1- pg::+int8-min+) :numeric :int8 -1)))))
+      (ok (eq pg::+null+ (pg::eval-func "pg_wal_lsn_diff" (list pg::+null+ 1))))))
+
+(cl-spec:defproperty wal-lsn-difference-is-exact-and-antisymmetric
+    ((left (range integer 0 18446744073709551615))
+     (right (range integer 0 18446744073709551615)))
+  (:about pg::eval-wal-lsn-diff)
+  (:trials (:normal 200))
+  (let ((difference (pg::eval-wal-lsn-diff (list left right))))
+    (and (= left (+ right difference))
+         (= difference (- (pg::eval-wal-lsn-diff (list right left)))))))
+
+(deftest generated-wal-lsn-difference
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'wal-lsn-difference-is-exact-and-antisymmetric :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (deftest replay-pause-controls-require-recovery
     (let ((pg::*physical-recovery-state* nil)
           (pg::*physical-recovery-failed-p* nil))

@@ -54,7 +54,7 @@
 
 (defparameter +sql-expression-types+
   '((:bool 16 1) (:char 18 1) (:name 19 64) (:int8 20 8)
-    (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1) (:text-array 1009 -1) (:oid 26 4) (:pg-node-tree 194 -1) (:record 2249 -1) (:void 2278 4) (:pg-lsn 3220 8)))
+    (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1) (:text-array 1009 -1) (:oid 26 4) (:pg-node-tree 194 -1) (:record 2249 -1) (:void 2278 4) (:pg-lsn 3220 8) (:numeric 1700 -1)))
 
 (defun sql-expression-type-description (type)
   (or (assoc type +sql-expression-types+)
@@ -80,6 +80,8 @@ exist\" messages."
     (:int2 "smallint")
     (:int4 "integer")
     (:int8 "bigint")
+    (:pg-lsn "pg_lsn")
+    (:numeric "numeric")
     (:varchar "character varying")
     (:bool "boolean")
     (:text-array "text[]")
@@ -172,6 +174,23 @@ exist\" messages."
           (sql-lower-c (first args))
           (sql-setting-value (first args) (second args)))))
 
+(defun analyze-wal-lsn-diff (name arguments)
+  "Resolve xlogfuncs.c's strict (pg_lsn, pg_lsn) -> numeric function."
+  (unless (and (= (length arguments) 2)
+               (every (lambda (argument)
+                        (or (eq (expr-type argument) :pg-lsn)
+                            (in-unknown-constant-p argument)))
+                      arguments))
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+  (list :func name
+        (mapcar (lambda (argument) (coerce-in-constant argument :pg-lsn)) arguments)
+        :type :numeric :typmod -1))
+
+(defun eval-wal-lsn-diff (arguments)
+  "Match pg_lsn_mi without signed-int64 truncation or floating point."
+  (sql-strict-let ((left (first arguments)) (right (second arguments)))
+    (- left right)))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
@@ -181,6 +200,7 @@ exist\" messages."
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     (cond
+      ((string= name "pg_wal_lsn_diff") (analyze-wal-lsn-diff name args))
       ((member name '("lower" "current_setting") :test #'string=)
        (analyze-setting-function name args))
       ((member name '("array_length" "pg_get_expr" "pg_get_replica_identity_index") :test #'string=)
@@ -377,7 +397,7 @@ exist\" messages."
         (t (ereport "42883" "operator does not exist for ~a and ~a" left-type right-type)))))
   (let ((left-type (expr-type left)) (right-type (expr-type right)))
     (unless (or (eq left-type right-type)
-                (and (member left-type '(:int2 :int4 :int8)) (member right-type '(:int2 :int4 :int8)))
+                (and (member left-type '(:int2 :int4 :int8 :numeric)) (member right-type '(:int2 :int4 :int8 :numeric)))
                 (and (member left-type '(:text :varchar :name))
                      (member right-type '(:text :varchar :name))))
       (ereport "42883" "operator does not exist for ~a and ~a" left-type right-type)))
@@ -405,6 +425,7 @@ exist\" messages."
       (member source '(:text :varchar :name))
       (and (member source '(:int2 :int4 :int8 :oid))
            (member target '(:int2 :int4 :int8 :oid)))
+      (and (eq source :numeric) (member target '(:int2 :int4 :int8)))
       (and (eq source :int4) (member target '(:bool :char)))
       (and (eq target :int4) (member source '(:bool :char)))))
 
@@ -619,6 +640,13 @@ exist\" messages."
       (unless (<= -32768 number 32767)
         (ereport "22003" "smallint out of range"))
       (return-from sql-cast-value number)))
+  (when (and (eq source :numeric) (member target '(:int4 :int8)))
+    ;; Current numeric producers are exact integral LSN differences.
+    (unless (integerp value)
+      (ereport "0A000" "nonintegral numeric conversion is not implemented"))
+    (unless (if (eq target :int4) (<= +int4-min+ value +int4-max+)
+                (<= +int8-min+ value +int8-max+))
+      (ereport "22003" "~a out of range" (if (eq target :int4) "integer" "bigint"))))
   (when (eq source :int2) (setf source :int4))
   (when (and (member target '(:int4 :int8)) (eq source target))
     (unless (if (eq target :int4) (<= +int4-min+ value +int4-max+)
@@ -691,6 +719,8 @@ exist\" messages."
         (let ((operands (analyze-comparison-operands left right)))
           (list :binop operator (first operands) (second operands) :type :bool :typmod -1))
         (progn
+          (when (or (eq (expr-type left) :numeric) (eq (expr-type right) :numeric))
+            (ereport "0A000" "numeric arithmetic is not implemented"))
           (when (or (eq (expr-type left) :pg-lsn) (eq (expr-type right) :pg-lsn))
             (ereport "0A000" "pg_lsn arithmetic is not implemented"))
           (when (or (member (expr-type left) '(:char :int2vector :text-array :oid))
@@ -1532,6 +1562,7 @@ exist\" messages."
 
 (defun eval-func (name args)
   (cond
+    ((string= name "pg_wal_lsn_diff") (eval-wal-lsn-diff args))
     ((member name '("lower" "current_setting") :test #'string=)
      (eval-setting-function name args))
     ((string= name "pg_get_expr")

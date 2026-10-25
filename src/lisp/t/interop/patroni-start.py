@@ -262,6 +262,7 @@ def main():
             return conn
 
         connection = wait_for(connect)
+        subprocess.run([sys.executable, str(base / "t/interop/wal-sql.py"), str(port)], check=True)
         check_named_connection(connection, port)
         check_timeout_reload_gate(base, root, port)
         subprocess.run([sys.executable, str(base / "t/interop/patroni-history.py"),
