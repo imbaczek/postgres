@@ -739,6 +739,11 @@ query with slot queries and synchronous mode disabled, using actual receiver
 write/flush progress and message timestamps. Standby-leader control metadata,
 slot-enabled and synchronous variants remain unfinished. Receiver timestamp
 output currently supports UTC aliases only; other session time zones fail explicitly.
+`./t/physical-exit-flush.sh` needs SBCL and psql without Patroni. It verifies
+below-threshold receive flushing on disconnect and explicit stop, target crash/
+restart, and receive-control fsync failure. Receiver session exit flushes complete
+native records before clearing status; failed flush closes recovery until restart.
+Whole-server shutdown worker ordering and shutdown restartpoints remain unfinished.
 These tests check process discovery, start-time validation, direct startup, fast stop,
 configuration precedence, SIGHUP and the pinned ConfigHandler's settings queries
 through real psycopg2. The configuration subset supports `port`,

@@ -12,6 +12,54 @@ manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
 
+### Receiver session exit flushing
+
+Native receiver session cleanup now follows C `WalRcvDie`: flush completed writes
+before clearing receiver status and closing the connection, without sending exit
+feedback. `physical-store-flush` fsyncs WAL and directory entries, atomically
+persists receive control, then publishes the flush cursor. The reload admission
+gate protects the flush; it runs outside network deadlines and without holding
+the lifecycle mutex. Manual `physical-follow-stop` joins outside admission and
+checks recovery/store health before reporting success or clearing the runtime.
+After joining, stop also performs a final flush: an already-running stack frame
+can retain its pre-reload cleanup code. This is a no-op for a current receiver
+and preserves the stop durability contract after live reload.
+
+Only whole CRC-validated native records advance written/flush positions. Decoder
+fragments remain unacknowledged, including a fragment after a completed record.
+This differs from C's raw physical byte stream, which may flush bytes belonging
+to an incomplete WAL record. An idle exit does not invent received progress.
+
+A new exit durability failure poisons the store and latches recovery failure,
+logs a terminal receiver error even during an explicit stop, and blocks SQL with
+57P03 until restart. Cleanup still clears the monitor/client and closes the
+socket; an existing transport error remains the unwinding condition. Already
+poisoned input is not flushed again. This is the native fail-closed equivalent
+of C's WAL-fsync PANIC, rather than a claim that SBCL uses C's process model.
+
+The new `t/physical-exit-flush.sh` live experiment passed in
+`/tmp/pg-physical-exit-flush.X02dae`: private control-REPL hooks pause the actual
+receiver after a below-threshold complete write, then exercise source SIGKILL,
+explicit stop, target SIGKILL/restart and continuation from the exact durable
+cursor. A receive-control-fsync failpoint leaves the prior cursor intact, makes
+stop fail visibly, closes SQL, and permits safe restart/resume. The same source
+commits four rows; all four are recovered after the tests. A self-restoring
+live-REPL helper wrapper emulates an older frame skipping session cleanup, proving
+the post-join fallback in the actual standby image. Six Rove tests cover
+complete-plus-partial input, idle exit, poisoned input, exit flush failure and
+preservation of an unwinding transport condition and stop after an older frame.
+All 137 physical and 167
+interop tests and 1,598 legacy checks pass. The full native physical-follow and
+Patroni status regression passes in `/tmp/pg-physical-follow.yU80m1`.
+Formatting and strict compilation pass; requested reviews
+found no blocking issue or useful further refactor. Production functions remain
+below 120 lines.
+
+This covers receiver session exit and explicit stop, not whole-server shutdown
+ordering. Smart/fast postmaster shutdown still needs to stop/join native workers
+and publish a shutdown restartpoint before process exit. That remains part of
+the HA roadmap, alongside promotion, child timelines and synchronous commit waits.
+
 ### Receiver statistics and ordinary Patroni cluster status
 
 `pg_stat_get_wal_receiver()` now returns the 15 typed OUT fields from pinned C
@@ -74,10 +122,8 @@ Standby-leader control-checkpoint reporting, enabled slot/JSON and synchronous
 sender-statistics variants of Patroni's query remain unfinished, as do promotion,
 follow/rejoin across child timelines, synchronous commit waits and rewind. This
 checkpoint adds no coordination and establishes no C physical WAL/disk compatibility.
-One follow-up from this C audit: `WalRcvDie` flushes complete received WAL before
-receiver exit. Native session cleanup currently drops the connection and resets
-unflushed input on retry instead; acknowledged flush remains durable, but clean
-receiver-stop/exit flushing still needs an explicit implementation and crash test.
+The exit-flushing gap identified in this audit is implemented and tested in the
+newer receiver session exit checkpoint above.
 
 ### Boolean execution and Patroni TL_LSN checkpoint
 
