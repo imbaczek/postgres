@@ -751,6 +751,12 @@ control form `(physical-recovery-prepare-shutdown)` preserves follow configurati
 and blocks further supported recovery mutations after preparation. It does not
 exit the server; automatic smart/fast shutdown integration and a durable
 clean-shutdown marker remain unfinished.
+`pg_postmaster_start_time()` reports the captured server-initialization timestamp
+as timestamptz and remains unchanged across connections and reloads. The pinned
+Patroni method is included in direct-start acceptance. An already-running image
+from before this capture was added needs a one-time process restart. The full
+20-field `pg_control_checkpoint()` interface remains unfinished; see the field
+inventory in [PHYSICAL-HA.md](PHYSICAL-HA.md).
 These tests check process discovery, start-time validation, direct startup, fast stop,
 configuration precedence, SIGHUP and the pinned ConfigHandler's settings queries
 through real psycopg2. The configuration subset supports `port`,

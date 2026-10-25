@@ -262,6 +262,8 @@ def main():
             return conn
 
         connection = wait_for(connect)
+        subprocess.run([sys.executable, str(base / "t/interop/postmaster-time-sql.py"),
+                        str(port), str(root / "start-time.baseline")], check=True)
         subprocess.run([sys.executable, str(base / "t/interop/wal-sql.py"), str(port)], check=True)
         subprocess.run([sys.executable, str(base / "t/interop/string-sql.py"), str(port)], check=True)
         subprocess.run([sys.executable, str(base / "t/interop/bit-sql.py"), str(port)], check=True)
@@ -407,6 +409,8 @@ def main():
             cursor.execute("SELECT COALESCE(sum(1),0), 'x'||substr('ab',1,1), ('x'||substr('FFFFFFFF0000000000000001',1,8))::bit(32)::int")
             assert cursor.fetchone() == (1, "xa", -1)
         print("patroni-start: aggregate definitions survive live reload PASS", flush=True)
+        subprocess.run([sys.executable, str(base / "t/interop/postmaster-time-sql.py"),
+                        str(port), str(root / "start-time.baseline")], check=True)
         subprocess.run([sys.executable, str(base / "t/interop/patroni-tl-lsn.py"), str(port), "primary"], check=True)
         for argument in ("--typo=1", "unexpected"):
             rejected = root / ("rejected-" + str(len(argument)))

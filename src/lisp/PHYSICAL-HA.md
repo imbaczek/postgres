@@ -12,6 +12,53 @@ manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
 
+### Postmaster startup timestamp and checkpoint reporting inventory
+
+`pg_catalog.pg_postmaster_start_time()` now returns a stable timestamptz
+(OID 1184, length 8), following `timestamp.c` and `PostmasterMain`'s `PgStartTime`.
+The native postmaster samples PostgreSQL-epoch wall-clock microseconds once after
+successfully locking its PGDATA, before PID/storage initialization. That datum
+is separate from the Linux process-birth seconds used by `postmaster.pid` and
+stale-owner validation. Reload preserves it; queries and new connections never
+resample the clock. Failed PID creation clears the captured datum, and access
+before initialization raises 55000 instead of fabricating a start time. The
+catalog's stable volatility classification is retained for aggregate sharing.
+
+The shared wire probe calls pinned Patroni 4.1.5's actual
+`Postgresql.postmaster_start_time` method and checks metadata, argument errors,
+multiple connections and unchanged values after reload. Pinned C evidence:
+`/tmp/pg-c-start-time.T90j9h`; native startup/reload evidence:
+`/tmp/pg-patroni-start.SHE7lj`. All 145 physical, 169 interop and 1,598 legacy
+checks pass, along with formatting and strict compilation. Luna max's failed
+PID-creation cleanup finding is fixed and re-reviewed; Sol high found no further
+defect, and the 120-line analyzer remains within the function-length limit.
+Servers already running a definition from before this capture was introduced
+need a one-time process restart; a reload cannot reconstruct an unrecorded
+initialization timestamp. Output uses the existing UTC timestamptz subset.
+
+The standby-leader query remains blocked by the full `pg_control_checkpoint()`
+contract, not by startup-time reporting. Pinned C20 has **20** OUT columns in
+`pg_proc.dat` (OID 3442); its function reads CRC-checked durable control data, not the
+current allocator state. These are required compatibility fields:
+
+| Fields | Native evidence/dependency before SQL exposure |
+| --- | --- |
+| `checkpoint_lsn`, `redo_lsn`, `redo_wal_file` | Define and persist checkpoint versus redo positions; do not substitute the WAL tail or duplicate a restartpoint LSN without matching semantics. |
+| `timeline_id`, `prev_timeline_id` | Persist checkpoint lineage alongside promotion/history; current native writer supports timeline 1 only. |
+| `full_page_writes`, `logical_decoding` | Persist the actual checkpoint policy flags; full native page images and logical events alone are not a C control snapshot. |
+| `next_xid`, `next_oid` | Snapshot counters at the checkpoint; restartpoints already save FullXID/catalog data, but the API needs C's `epoch:xid` text and C20 `oid8` type contract. |
+| `next_multixact_id`, `next_multi_offset`, `oldest_multi_xid`, `oldest_multi_dbid` | MultiXact lifecycle/control fields are not implemented. |
+| `oldest_xid`, `oldest_xid_dbid`, `oldest_active_xid` | Add durable C-compatible freeze/retention metadata rather than sampling current active sessions. |
+| `oldest_commit_ts_xid`, `newest_commit_ts_xid` | Implement truthful commit-timestamp tracking/control state; logical commit timestamps are a separate facility. |
+| `data_page_checksum_version`, `checkpoint_time` | Persist page-checksum policy and checkpoint wall-clock time; native WAL CRCs are not C data-page checksums. |
+
+SQL `xid`/`oid8` output contracts and coherent publication of all these fields
+remain necessary. No partial all-NULL record or invented constants were added
+to make Patroni's standby-leader query pass. Writer/control integration also
+depends on the still-blocked structural edits to valid `#.` source files. The
+ordinary Patroni cluster query remains verified separately; enabled slots,
+synchronous replication and standby-leader variants are not yet complete.
+
 ### Callable standby shutdown preparation
 
 `physical-recovery-prepare-shutdown` now provides the local finalization primitive
