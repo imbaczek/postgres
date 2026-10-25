@@ -5,7 +5,7 @@
   (with-physical-store-directory (root)
     (let ((pg::*pgdata* root) (pg::*postmaster-data-lock* nil)
                               (pg::*postmaster-pid-stream* nil) (pg::*postmaster-pid-directory* nil)
-                              (pg::*postmaster-start-time* nil) (pg::*postmaster-pid-host* nil)
+                              (pg::*postmaster-start-time* nil) (pg::*postmaster-start-timestamp* nil) (pg::*postmaster-pid-host* nil)
                               (pg::*postmaster-pid-port* nil) (pg::*postmaster-pid-inode* nil)
                               (saved-exit-hooks sb-ext:*exit-hooks*))
       (sb-posix:chmod (namestring root) #o700)
@@ -15,6 +15,41 @@
         (pg::postmaster-remove-pid-file)
         (setf sb-ext:*exit-hooks* saved-exit-hooks)
         (when pg::*postmaster-data-lock* (close pg::*postmaster-data-lock*))))))
+
+(deftest postmaster-sql-time-initializes-once-with-owned-data
+    (let ((before (pg::postgres-current-timestamp)))
+      (call-with-pid-owner
+       (lambda (root)
+         (declare (ignore root))
+         (let ((captured (pg::postmaster-start-timestamp)))
+           (ok (<= before captured (pg::postgres-current-timestamp)))
+           (ok (>= (+ 946684800 (floor captured 1000000)) pg::*postmaster-start-time*))
+           (pg::postmaster-update-pid-status "ready   ")
+           (ok (= captured (pg::postmaster-start-timestamp))))))))
+
+(deftest failed-pid-creation-clears-the-sql-startup-time
+    (with-physical-store-directory (root)
+      (let ((pg::*pgdata* root) (pg::*postmaster-data-lock* nil)
+                                (pg::*postmaster-pid-stream* nil) (pg::*postmaster-pid-directory* nil)
+                                (pg::*postmaster-start-time* nil) (pg::*postmaster-start-timestamp* nil)
+                                (pg::*postmaster-pid-host* nil) (pg::*postmaster-pid-port* nil)
+                                (pg::*postmaster-pid-inode* nil)
+                                (original (symbol-function 'pg::postmaster-create-pid-file))
+                                (captured nil))
+        (sb-posix:chmod (namestring root) #o700)
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'pg::postmaster-create-pid-file)
+                     (lambda ()
+                       (setf captured pg::*postmaster-start-timestamp*)
+                       (error "PID creation failpoint")))
+               (ok (handler-case (progn (pg::postmaster-own-data-directory "127.0.0.1" 5439) nil)
+                     (error () t)))
+               (ok captured)
+               (ok (null pg::*postmaster-start-timestamp*))
+               (ok (equal "55000" (handler-case (progn (pg::postmaster-start-timestamp) nil)
+                                    (pg::pg-error (condition) (pg::pg-error-sqlstate condition))))))
+          (setf (symbol-function 'pg::postmaster-create-pid-file) original)))))
 
 (deftest pid-metadata-eight-lines-and-stable-status-width
     (call-with-pid-owner

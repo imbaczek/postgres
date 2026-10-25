@@ -128,6 +128,10 @@ exist\" messages."
 
 (defun analyze-metadata-function (name arguments)
   (cond
+    ((string= name "pg_postmaster_start_time")
+     (when arguments
+       (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+     (list :func name nil :type :timestamptz :typmod -1))
     ((string= name "array_length")
      (unless (and (= 2 (length arguments))
                   (member (expr-type (first arguments)) '(:int2vector :text-array)))
@@ -268,7 +272,8 @@ exist\" messages."
       ((string= name "pg_walfile_name") (analyze-wal-filename name args))
       ((member name '("lower" "current_setting") :test #'string=)
        (analyze-setting-function name args))
-      ((member name '("array_length" "pg_get_expr" "pg_get_replica_identity_index") :test #'string=)
+      ((member name '("array_length" "pg_get_expr" "pg_get_replica_identity_index"
+                      "pg_postmaster_start_time") :test #'string=)
        (analyze-metadata-function name args))
       ((member name '("version" "pg_lisp_runtime" "pg_current_wal_lsn"
                       "pg_current_wal_flush_lsn" "pg_is_in_recovery"
@@ -1292,7 +1297,7 @@ exist\" messages."
        (or (and (eq (first form) :func)
                 (not (member (second form)
                              '("version" "pg_lisp_runtime" "current_database" "current_schema"
-                               "current_catalog" "current_user" "session_user" "user"
+                               "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
                                "substr" "length" "char_length" "character_length" "pg_backend_pid")
                              :test #'string=)))
            (analyzed-expression-volatile-p (car form))
@@ -1709,6 +1714,7 @@ exist\" messages."
 (defun eval-func (name args)
   (cond
     ((string= name "pg_stat_get_wal_receiver") (wal-receiver-result))
+    ((string= name "pg_postmaster_start_time") (postmaster-start-timestamp))
     ((string= name "substr") (eval-substr-function args))
     ((string= name "pg_wal_lsn_diff") (eval-wal-lsn-diff args))
     ((string= name "pg_walfile_name") (eval-wal-filename args))

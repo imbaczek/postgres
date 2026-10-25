@@ -12,6 +12,14 @@
 
 (defvar *postmaster-start-time* nil)
 
+(defvar *postmaster-start-timestamp* nil
+  "PostgreSQL epoch microseconds when this postmaster initializes its owned PGDATA.")
+
+(defun postmaster-start-timestamp ()
+  "Return the initialized PgStartTime analogue without sampling the query clock."
+  (or *postmaster-start-timestamp*
+      (ereport "55000" "postmaster startup timestamp is not initialized")))
+
 (defvar *postmaster-pid-host* nil)
 
 (defvar *postmaster-pid-port* nil)
@@ -189,9 +197,11 @@
                  lock (postmaster-open-data-lock))
            (unless (zerop (physical-store-flock (sb-sys:fd-stream-fd lock) 6))
              (error "data directory is already owned by another pg-lisp process"))
+           (setf *postmaster-start-timestamp* (postgres-current-timestamp))
            (postmaster-create-pid-file)
            (setf *postmaster-data-lock* lock success t)
            *postmaster-pid-directory*)
       (unless success
+        (setf *postmaster-start-timestamp* nil)
         (when *postmaster-pid-stream* (postmaster-remove-pid-file))
         (when lock (close lock))))))

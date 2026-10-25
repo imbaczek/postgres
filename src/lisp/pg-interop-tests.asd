@@ -9,6 +9,7 @@
                (:file "t/interop/wal-filename-tests")
                (:file "t/interop/boolean-tests")
                (:file "t/interop/receiver-tests")
+               (:file "t/interop/postmaster-time-tests")
                (:file "t/interop/standard-tests")
                (:file "t/interop/copy-tests")
                (:file "t/interop/standard-subscriber-tests")
