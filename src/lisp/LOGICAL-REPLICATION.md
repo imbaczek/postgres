@@ -473,6 +473,14 @@ its high-water mark and concurrent-writer latency.
 
 ## Follow-on milestone: cutover after protocol compatibility
 
+The [manual switchover rehearsal](MANUAL-SWITCHOVER.md) now exercises the happy
+path with isolated peers, one controlled application writer and a process-stop
+source fence. It is an experimental subset of the general requirements below;
+it does not supply arbitrary-client fencing or restartable authority transfer.
+Its [next-step assessment](MANUAL-SWITCHOVER.md#assessment-and-next-milestones)
+prioritizes durable write authority, restartable cutover and a manual failover/RPO
+matrix, with physical follower/Patroni integration as a parallel track.
+
 After the [C-peer compatibility milestone](REPLICATION-COMPATIBILITY.md), add
 blue-green cutover: verify complete data coverage and one apply owner, fence
 old-primary writes, drain transactions, establish a final durable barrier,

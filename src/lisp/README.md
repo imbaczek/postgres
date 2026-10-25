@@ -289,6 +289,11 @@ generated columns, TOAST, and replica identity FULL remain outside the subset.
 See [C-peer acceptance and limits](REPLICATION-COMPATIBILITY.md) for the pinned
 reference, test matrix, recovery evidence, and exact options.
 
+For a coordinator-free planned writer handoff experiment, see the
+[manual logical switchover rehearsal](MANUAL-SWITCHOVER.md). Its script exercises
+Lisp→Lisp, Lisp→C and C→Lisp with an owned writer, source shutdown as the fence,
+durable target validation, sequence alignment and post-cutover writes.
+
 ## Testing
 
 The `pg-interop-tests` ASDF system depends on Rove and `cl-spec/check-it` for
