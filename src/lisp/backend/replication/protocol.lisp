@@ -300,7 +300,7 @@
     (payload-push-byte payload (char-code #\w))
     (replication-push-u64 payload wal-start)
     (replication-push-u64 payload wal-end)
-    (replication-push-i64 payload 0)
+    (replication-push-i64 payload (postgres-current-timestamp))
     (payload-push payload plugin-data)
     (send-replication-copy-data stream payload)))
 
@@ -308,7 +308,7 @@
   (let ((payload (make-payload)))
     (payload-push-byte payload (char-code #\k))
     (replication-push-u64 payload wal-end)
-    (replication-push-i64 payload 0)
+    (replication-push-i64 payload (postgres-current-timestamp))
     (payload-push-byte payload 1)
     (send-replication-copy-data stream payload)))
 
