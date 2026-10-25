@@ -356,6 +356,9 @@
             (when thread (sb-thread:join-thread thread :timeout 15 :default :timeout)))
           (when (some (lambda (thread) (and thread (sb-thread:thread-alive-p thread))) threads)
             (error "native physical workers have not stopped")))
+        ;; Active frames retain their old cleanup after a live reload. Once
+        ;; workers are joined, preserve the public stop contract independently.
+        (physical-follow-flush-on-exit runtime)
         (physical-follow-check-exit)
         (sb-thread:with-mutex (*physical-follow-lock*) (setf *physical-follow-runtime* nil)))))
   :stopped)

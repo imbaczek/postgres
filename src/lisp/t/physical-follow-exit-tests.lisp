@@ -87,3 +87,17 @@
          (ok (typep condition 'pg::pg-client-error))
          (ok (equal "original transport failure" (pg::pg-client-error-message condition)))
          (ok pg::*physical-recovery-failed-p*)))))
+
+(deftest stop-flushes-writes-left-by-an-older-receiver-frame
+    (call-with-exit-flush-store
+     (lambda (root store runtime)
+       (let ((pg::*pgdata* root)
+             (pg::*physical-follow-runtime* runtime)
+             (record (sample-physical-record)))
+         ;; A worker from the previous live definition has already exited without
+         ;; the new session cleanup. Stop still owns the final durability contract.
+         (pg::physical-store-input store 0 record)
+         (ok (eq :stopped (pg::physical-follow-stop)))
+         (ok (= (length record) (pg::physical-store-flushed-lsn store)))
+         (ok (= (length record) (getf pg::*physical-recovery-state* :receive-lsn)))
+         (ok (null pg::*physical-follow-runtime*))))))
