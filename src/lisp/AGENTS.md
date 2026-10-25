@@ -92,6 +92,86 @@ socket must use the private parent-directory permissions described above. Use
 SLIME when an interactive Emacs session or its tracing tools are useful; it is
 optional.
 
+### Choose the image that owns the failure
+
+- The cl-mcp worker, the running SQL server, and the formatter's temporary
+  SLIME/Swank image are separate Lisp processes. Loading `pg` in cl-mcp does
+  not update the server under test. A formatter connection is not a debugger
+  attached to that server. Record the server PID, PGDATA, SQL port and control
+  socket/Swank port when starting an experiment.
+- Start a task-owned dev server with a private control socket before debugging
+  stateful SQL or replication failures. Reproduce through its SQL/replication
+  connection, then inspect and instrument that same image through control or
+  Swank. Prefer this to repeated blind restarts and inference from logs alone.
+  Keep fresh, isolated peers for acceptance and intentional crash/restart tests.
+- A control evaluation runs in its own thread, not the failing SQL backend's
+  dynamic environment. Capture the relevant backend/thread explicitly; do not
+  assume its `*backend*` binding is visible in the control REPL. Keep inspections
+  under the appropriate locks short, and do not block a failpoint while holding
+  locks needed by the session that must release it.
+
+From `src/lisp`, the existing control client can send an experiment or reload
+to the actual server and close just the control connection:
+
+```sh
+printf '(pg::reload)\n(quit)\n' |
+  "${SBCL:-sbcl}" --script t/control-client.lisp unix "$CONTROL_DIR/pg.sock"
+```
+
+Check the response and server log for reload success before repeating SQL.
+The native interop harness uses this mechanism to load
+`t/interop/native-failpoints.lisp` into the publisher and install COPY,
+publication-race, commit-end and feedback hooks. Reuse those bounded hooks when
+appropriate instead of replacing the native C peer or adding a message relay.
+
+### Redefine deliberately, then verify from saved source
+
+- A source edit is not a live redefinition. After a cl-mcp structural edit,
+  `load-system` updates the worker; `(pg::reload)` or SIGHUP separately updates
+  the dev server. Individual REPL definitions are useful experiments, but save
+  the final change and reload its system before acceptance. A function reload
+  affects subsequent calls; it does not rewind active stack frames, reconstruct
+  old closures or migrate structure instances. Reinstall changed test hooks.
+- Inspect state at the failing boundary: for replication, distinguish source
+  commit start/end, target durable progress, exact confirmed flush, retained
+  restart floor and in-flight effects. Eventual row equality or a received WAL
+  position alone cannot diagnose a durability failure. Preserve an independent
+  wire/C-peer oracle after an interactive experiment succeeds.
+- Use `unwind-protect` to restore temporary `symbol-function` replacements and
+  hooks; untrace after debugging. Release paused actors during cleanup. These
+  changes live in a persistent image and otherwise contaminate later tests.
+- Serialize forced ASDF rebuilds, FASL deletion, server startup/reload and the
+  Emacs/SLIME formatter when they share an output cache. A formatter inferior
+  exited during an overlapping rebuild in this session; a serialized retry
+  succeeded. Do not start another copy of a test merely because its output was
+  truncated or a poll timed out; check the original process/session first.
+
+### Reader and test-discovery checks
+
+- Use cl-mcp structural edits for Lisp. A rejected patch that would add an extra
+  closing parenthesis leaves the source intact; correct the patch rather than
+  bypassing that guard.
+- Distinguish `#(...)` vector literals from `#.` read-time evaluation. Empty and
+  nonempty vectors work in the current tools. Several server files legitimately
+  use `#.(char-code ...)`; a tool with `*read-eval*` disabled can reject those
+  files even when their parentheses are balanced. That is a reader restriction,
+  not proof of damaged parentheses or ignored vector data.
+- On a reader error, inspect the exact raw source with `lisp-read-file`
+  `collapsed=false` or `fs-read-file`. A documented `readtable` override changes
+  parsing behavior and is not a universal workaround for `#.`. Preserve valid
+  source and report unsupported syntax instead of rewriting wire fixtures or
+  enabling arbitrary read-time evaluation just to make a tool accept the file.
+- Balanced parentheses do not establish the intended top-level structure. After
+  inserting multiple definitions, inspect the collapsed outline and test names;
+  a misplaced close once nested a `deftest` inside another form in this session.
+  Confirm the expected tests actually execute, not just that loading succeeds.
+  Collapsed output hides bodies, and raw output may be paginated; neither means
+  the hidden forms were ignored by Lisp.
+- Rove tests do not automatically execute registered cl-spec declarations. Call
+  their runners from the test system, and check Function Specs and Properties
+  separately. Record selection, seed and actual trial counts; a declaration
+  digest does not identify the implementation or the server image being tested.
+
 ## Live SQL and SLIME debugging
 
 From `src/lisp`, start a server with a fresh PGDATA and free SQL and Swank ports.
