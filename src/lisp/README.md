@@ -744,6 +744,13 @@ below-threshold receive flushing on disconnect and explicit stop, target crash/
 restart, and receive-control fsync failure. Receiver session exit flushes complete
 native records before clearing status; failed flush closes recovery until restart.
 Whole-server shutdown worker ordering and shutdown restartpoints remain unfinished.
+`./t/physical-shutdown-prepare.sh` tests the callable preparation primitive:
+worker joins, a checkpoint at the applied terminal with received-ahead WAL
+preserved, automatic following after restart, and failed publication. The private
+control form `(physical-recovery-prepare-shutdown)` preserves follow configuration
+and blocks further supported recovery mutations after preparation. It does not
+exit the server; automatic smart/fast shutdown integration and a durable
+clean-shutdown marker remain unfinished.
 These tests check process discovery, start-time validation, direct startup, fast stop,
 configuration precedence, SIGHUP and the pinned ConfigHandler's settings queries
 through real psycopg2. The configuration subset supports `port`,

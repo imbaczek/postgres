@@ -12,6 +12,60 @@ manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
 
+### Callable standby shutdown preparation
+
+`physical-recovery-prepare-shutdown` now provides the local finalization primitive
+needed by the postmaster. Invoke it as a standalone private control-REPL form;
+it owns admission and must not be nested in an admitted expression. It does not
+exit the process. Follow/replay workers are stopped and joined without deleting
+`physical-follow.control`, then the restartpoint maintenance worker is joined.
+All joins precede the reload lock and quiescence gate, because receiver exit
+flush needs admission and replay/maintenance can own the reload lock. A running
+older maintenance loop exits itself at the replaceable step boundary; no thread
+is asynchronously interrupted during publication.
+
+The process-local `:stopping` phase rejects new worker starts but permits existing
+exit flush and admitted control work to drain. Final quiescence flushes pending
+complete receive records even without a follower, then publishes a restartpoint
+at the last applied terminal A. It neither resumes paused replay nor promotes
+received-ahead F>A data into the applied checkpoint. `:prepared` is published
+before admission reopens; supported receive/flush/replay/checkpoint/pause and
+follow mutations are then rejected. Replay, streaming setup and restartpoint
+requests recheck after acquiring their gate, closing the queued-call race. Any
+failure after preparation begins latches `:failed` and recovery failure until
+process restart. The prepared call is idempotent, and an immutable base needs no
+new spool or restartpoint. Explicit follow stop still deletes follow configuration;
+the shared runtime quiescence helper preserves it for shutdown.
+
+The live fixture `t/physical-shutdown-prepare.sh` passed in
+`/tmp/pg-physical-shutdown.mQ8RFo`: immutable recovery, paused replay with F>A,
+configuration preservation, mutation rejection, SIGKILL/restart with automatic
+following, genuine direct unflushed receipt without a follower, an incomplete
+received batch, and publication-failure restart/resume. A self-restoring wrapper
+dispatches preparation while automatic maintenance publication is paused, then
+the fixture checks completion after releasing it; this is not a deterministic
+assertion about the exact mutex-wait schedule. Unit tests additionally simulate
+publication between an outer work check and acquisition of quiescence. All 143
+physical and 167 interop tests pass. Existing following/Patroni regression passes
+in `/tmp/pg-physical-follow.enPsYC`, and receiver-exit durability regression in
+`/tmp/pg-physical-exit-flush.TmLzJ2`. All 1,598 legacy checks pass. Formatting and
+strict compilation pass.
+Luna max and Sol high found no production defect; Sol medium found no useful
+refactor beyond the shared runtime-quiescence extraction.
+
+This is necessary groundwork, not completed C `ShutdownXLOG` equivalence. The
+postmaster still exits directly from its last-backend path, which can hold live
+admission; finalization must instead run later from the postmaster worker for
+smart/fast shutdown. It must also publish the native counterpart of C's durable
+`DB_SHUTDOWNED_IN_RECOVERY` marker, including duplicate-restartpoint shutdowns.
+SIGQUIT must remain abrupt. The valid `#.` forms in `postmaster.lisp` still cause
+cl-mcp structural tools to reject that file with reader evaluation disabled;
+no shell-edit, shadow-definition or exit-hook workaround was used. Automatic
+signal integration remains unimplemented. C oracle: `ShutdownXLOG` and
+`CreateRestartPoint` in `xlog.c`, plus `016_min_consistency.pl`'s offline recovery
+point-versus-page-LSN check. No coordination or C physical disk compatibility
+is added by this primitive.
+
 ### Receiver session exit flushing
 
 Native receiver session cleanup now follows C `WalRcvDie`: flush completed writes

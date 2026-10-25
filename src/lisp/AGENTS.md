@@ -132,6 +132,15 @@ appropriate instead of replacing the native C peer or adding a message relay.
   the final change and reload its system before acceptance. A function reload
   affects subsequent calls; it does not rewind active stack frames, reconstruct
   old closures or migrate structure instances. Reinstall changed test hooks.
+- Verify strict compilation in a fresh Lisp process too. A live image can
+  already know a special variable defined by a later module and hide a missing
+  forward declaration. A fresh receiver-shutdown test exposed such a warning
+  even though loading the same saved source into cl-mcp succeeded.
+- A replaceable worker-step function can make an older loop exit safely at an
+  iteration boundary. Check that the current thread is the registered worker,
+  then use SBCL's synchronous `return-from-thread` before taking admission or
+  storage locks. Do not interrupt a checkpoint or terminate another thread to
+  make a shutdown join succeed.
 - Inspect state at the failing boundary: for replication, distinguish source
   commit start/end, target durable progress, exact confirmed flush, retained
   restart floor and in-flight effects. Eventual row equality or a received WAL
