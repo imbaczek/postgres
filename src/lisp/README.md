@@ -296,7 +296,8 @@ durable target validation, sequence alignment and post-cutover writes.
 
 ## Testing
 
-The `pg-interop-tests` ASDF system depends on Rove and `cl-spec/check-it` for
+The `pg-interop-tests` and `pg-physical-tests` ASDF systems depend on Rove and
+`cl-spec/check-it` for
 new executable contracts and property checks. These are test dependencies;
 the `pg` server system does not load them. Install
 [cl-spec](https://github.com/masatoi/cl-spec) in your Quicklisp `local-projects/`
@@ -310,7 +311,32 @@ and their dependencies. From `src/lisp/` in a Quicklisp-enabled REPL:
 (asdf:load-asd (truename "pg-interop-tests.asd"))
 (ql:quickload "pg-interop-tests")
 (asdf:test-system "pg-interop-tests")
+(asdf:load-asd (truename "pg-physical-tests.asd"))
+(ql:quickload "pg-physical-tests")
+(asdf:test-system "pg-physical-tests")
 ```
+
+The physical suite checks native WAL intake, durable receive progress, source
+retention, bootstrap, recovery write exclusion and streaming contracts. See
+[physical HA implementation and limits](PHYSICAL-HA.md) for the task-owned native
+server crash/restart scripts and remaining compatibility work. Streaming native
+standbys support explicit local restartpoints through the private control REPL:
+`(physical-recovery-restartpoint)` publishes a durable catalog/fork snapshot and
+compacts the receive spool. A local worker also requests a restartpoint after
+300 seconds or 1 GiB of applied WAL progress; received-but-unapplied WAL never
+triggers one. SQL `CHECKPOINT` requests a standby restartpoint and succeeds as a
+no-op on an unchanged static base. Orderly-shutdown restartpoints remain unfinished.
+The startup configuration subset below controls these restartpoint thresholds.
+
+Recovery SQL supports `pg_wal_replay_pause()`, `pg_wal_replay_resume()`,
+`pg_is_wal_replay_paused()` and `pg_get_wal_replay_pause_state()`. Pausing keeps
+receipt and flush running while apply and visible data stay fixed. Native pause
+waits for exclusive redo to finish and acknowledges `paused` synchronously;
+C can return earlier with `pause requested`. Pause survives reload and clears
+on process restart. These functions reject a primary with SQLSTATE `55000`.
+`pg_wal_lsn_diff()` returns an exact integral `numeric`, including differences
+outside signed int64; `::bigint` checks overflow. This does not add general
+decimal numeric input, storage or arithmetic.
 
 See the [interop test inventory](t/interop/README.md) for refactor decisions,
 generated-check domains, replay seeds and verification limits.
@@ -675,3 +701,42 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
 - `\d`, `\dt`, `\l` fail because the catalog SQL uses constructs beyond this
   subset (regex operators, `pg_catalog` functions); `psql` prints an error and
   shows no listing.
+
+
+The Linux launcher owns PGDATA before storage initialization and writes the
+standard eight-line `postmaster.pid` for process discovery. Existing PGDATA must
+belong to the server user and use mode 0700 or 0750; missing directories are
+created with mode 0700. A normal exit removes the owned PID file; SIGKILL leaves
+it for stale-owner validation on restart. The persistent `.pg_lisp.lock` is a
+local Lisp process lock and should not be removed while the server is running.
+
+The pinned Patroni process/driver smoke test starts no HA controller or DCS:
+
+```sh
+uv venv /tmp/pg-patroni-4.1.5-venv
+uv pip install --python /tmp/pg-patroni-4.1.5-venv/bin/python3 -r t/interop/patroni-requirements.txt
+PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/postmaster-pid.sh
+PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/patroni-start.sh
+```
+
+These check process discovery, start-time validation, direct startup, fast stop,
+configuration precedence, SIGHUP and the pinned ConfigHandler's settings queries
+through real psycopg2. The configuration subset supports `port`,
+`listen_addresses`, `data_directory`, `checkpoint_timeout`, `max_wal_size` and
+`max_slot_wal_keep_size`, with includes, auto.conf and CLI overrides. SHOW,
+current_setting and typed pg_settings rows expose the actual installed values.
+Unknown settings fail visibly; empty or multiple listen addresses are unsupported.
+Session startup `options` accept `statement_timeout` and dotted custom GUC
+placeholders, including Patroni's defaults. Statement deadlines apply at safe
+interrupt points and bounded lock waits, with independent budgets for statements
+in one simple-query frame. RESET restores startup values; ordinary timeout
+cancellation during blocked partial output is deferred as in C PostgreSQL.
+Native defaults remain port 5433 and a 1 GiB slot cap. Full generated Patroni
+configurations, recovery parameters, session GUC catalog coverage and control
+interfaces remain unfinished, as does C physical data compatibility; see
+[the HA ledger](PHYSICAL-HA.md).
+
+Physical replication connections support inspection with `IDENTIFY_SYSTEM`,
+`TIMELINE_HISTORY` and `SHOW`. History parsing includes native ancestry-position
+checks; it does not perform promotion or change the current timeline. Timeline
+aware writer storage, crash-safe promotion and rejoin remain unfinished.

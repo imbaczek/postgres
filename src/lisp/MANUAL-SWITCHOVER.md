@@ -117,78 +117,65 @@ were addressed before the final matrix run. No server implementation changed.
 
 Assessment date: 2026-10-25. The experiment establishes the supported handoff's
 ordering and gives us reusable cross-engine acceptance oracles. It does not
-establish database-wide write admission, a recoverable authority transfer, or an
-unplanned failover policy. The next implementation milestone should be a
-restartable, operator-run blue-green cutover for the same supported subset.
+establish physical standby recovery, promotion, synchronous durability, or an
+unplanned failover policy. The next implementation track is the missing C-backed
+HA primitives and the interfaces required by Patroni. Coordination is out of
+scope: no election, DCS/leases, routing automation, distributed cutover journal,
+or custom writer-generation service.
 
-| Rehearsal assumption | Capability needed outside the fixture |
-| --- | --- |
-| Only the script's writer exists | Enforced application write admission and drain, including existing sessions and transactions |
-| Green receives no application connections | Green rejects application mutations until explicitly granted authority, while authorized apply can continue |
-| The script can stop its own source PID | Confirmed fencing that remains effective through restart; external fencing when the source cannot be contacted |
-| `phase.state` records completed steps | Durable, idempotent recovery of an interrupted handoff, bound to source/target identity and authority generation |
-| Three tables and one cache-one sequence | Complete declared data/schema coverage, retained WAL, and a sequence allocation contract |
-| New connections select a different port | Real application connection-pool drain and routing transition; routing alone cannot revoke old write authority |
+Track verified findings and remaining call-site audits in
+[the physical HA implementation ledger](PHYSICAL-HA.md).
 
-### 1. Enforce write authority before generalizing the operator script
+### 1. Implement C-compatible standby semantics
 
-Persist a database-wide application-write mode and monotonic authority generation.
-Synchronize its transitions with write admission and COMMIT: a statement-only
-check leaves an already open transaction able to commit after the final barrier.
-Define whether admitted writers drain or abort, and finish that decision before
-creating the barrier. Test DML, TRUNCATE, DDL, sequence mutations, existing
-connections and transactions spanning the transition. Restarted retired sources
-must remain fenced before accepting application writes.
+Start with continuous Lisp→Lisp physical WAL receive, durable flush and replay,
+consistent bootstrap and shared cluster identity. Persist recovery state across
+restart and reject application writes throughout recovery, including attempts to
+turn transaction read-only off. Replay is an internal recovery capability, not a
+SQL role-name bypass. Report receive, flush and replay positions independently;
+never substitute received bytes for durable or replayed progress.
 
-Keep maintenance/barrier generation and replication apply narrowly authorized
-while application admission is closed. Current authentication is trusted and
-`backend-read-only` is transaction/session state, so neither a role name nor
-`SET TRANSACTION READ ONLY` is an authority boundary. Establish authenticated
-apply/control capabilities or another enforced isolation boundary; an ordinary
-SQL client must not be able to claim the bypass. Green needs the same separation
-before its grant, not just a convention that clients avoid its address.
+Implement promotion with timeline/history changes and restart-safe completion.
+Reject incompatible identities and divergent history on follow/rejoin. Initially
+rebuild/reseed a former primary; stage rewind explicitly. C↔Lisp physical WAL and
+disk compatibility is a separate audited requirement from the already working
+logical interop, and must not be implied by a Lisp→Lisp test.
 
-A local fence does not stop an unreachable process or a partitioned old leader.
-Require independently confirmed process/power/storage fencing, or a suitably
-enforced lease, before granting a different node authority. Reuse the eventual
-HA manager's election/lease mechanism rather than inventing a competing one.
+C references: `access/transam/xlogrecovery.c`, `access/transam/xlog.c`,
+`access/transam/xlogfuncs.c`, `replication/walreceiver.c`,
+`replication/walsender.c`, and `bin/pg_basebackup/`.
 
-**Gate:** repeated writes from old and new connections, including a transaction
-opened before fencing, cannot commit under retired authority. This remains true
-after reboot; green accepts application writes only after the explicit grant.
+**Gate:** bootstrap under concurrent writes, stream and replay, restart both
+peers, crash abruptly before and after reported durable flush, delay replay
+while receiving WAL and verify distinct truthful progress, promote manually,
+restart the promoted peer,
+reject stale/divergent follow attempts, and rebuild/rejoin. Verify SQL-visible
+state and data against independent client evidence. Recovery write exclusion
+must cover DML, DDL, TRUNCATE and sequence mutation through existing and new
+sessions.
 
-### 2. Make planned cutover recoverable and expand its data contract
+### 2. Implement the actual Patroni backend contract
 
-Replace the evidence-only phase file with a durable operator-operation journal:
-operation ID, endpoint/cluster/database identities, generations, covered objects,
-barrier, durable target progress, apply owner and authority/routing decisions.
-An operator retry must inspect actual server state and perform idempotent steps.
-Serialize operator ownership and use conditional updates against the expected
-generation; concurrent or stale operators must not grant conflicting authority.
-The journal records one selected transition; it is not a leader-election service.
+Pin Patroni and its SQL driver, inventory real call sites and classify each
+contract as implemented, partial, missing or explicitly deferred. Cover process
+start/stop/restart/reload/status/promote, configuration and recovery settings,
+PGDATA/version/PID/control metadata, system identity, timeline, recovery and WAL
+SQL functions, replication statistics and slots. Verify native behavior with
+interface smoke tests; plausible constants and cosmetic utility wrappers are
+not sufficient. Bootstrap and replica-creation hooks can initially use a native
+pg-lisp copy path while truthful steady-state recovery remains mandatory.
 
-Order application-admission closure and writer drain before the final barrier;
-verify coverage and target durability, establish the source fence, detach apply,
-grant green, and then change routing. Maintenance writes during the closed-admission
-phase need the controlled path from milestone 1. Never automatically restore old
-authority after green may have accepted writes. Rebuild/reseed the retired node
-before rejoining it; reverse replication and divergent-history reconciliation
-are separate work.
+C PostgreSQL supplies recovery write exclusion and promotion primitives. It does
+not supply a general SQL writer-authority generation or an automatic election
+service. A logical subscriber is an ordinary writable database, so the rehearsal's
+process-stop fence remains a manual prerequisite for that path. Configurable
+transaction read-only defaults do not replace physical recovery write exclusion
+or external fencing of an unreachable former primary. Custom logical cutover
+admission/journaling designs are deferred, not C compatibility prerequisites.
 
-Validate all declared application tables, publication membership/actions, schema
-and keys, supported types, slot health/retention and one apply owner. Freeze DDL
-or enforce an explicitly supported migration contract. Replace fixture row diffs
-with bounded consistent validation for larger data. Generalize sequence handling
-to every sequence, including increment direction, `is_called`, caches and IDs
-reserved outside committed rows. `MAX(id)` is insufficient. Standard mode still
-does not synchronize arbitrary DDL or sequences automatically.
-
-**Gate:** interrupt before and after every fence, barrier, detach, grant and
-routing transition; retry the operator process and reboot both databases. Every
-case either completes forward or remains safely unavailable, with at most one
-application-write authority. Include concurrent/stale operator retries, pooled
-connections, multiple writers, schema/coverage drift, exhausted retention and
-sequence caches greater than one.
+**Gate:** a real pinned Patroni control layer can inspect and control task-owned
+instances using truthful interfaces, without running DCS/election or automatic
+failover. Keep logical switchover and both C logical-interop directions passing.
 
 ### 3. Rehearse unplanned manual failover with an explicit loss policy
 
@@ -214,7 +201,7 @@ and the WAL receiver/replay paths. Availability when no eligible replica remains
 is an explicit policy decision. The current asynchronous logical tests do not
 implement this guarantee.
 
-### 4. Build the Patroni runtime contract as a parallel physical-HA track
+### 4. Future Patroni coordination integration
 
 The current parser accepts logical START_REPLICATION, the replication directory
 has logical send/apply workers, and local `wal-recover` replays custom after-image
@@ -238,7 +225,10 @@ promotion/follow controls; compatible wrappers must reflect real backend state.
 can defer C-compatible initdb/basebackup, and rebuilding can defer rewind. Those
 hooks do not supply the missing steady-state standby behavior.
 
-Once manual physical promotion and rejoin pass, use Patroni/DCS for election and
+Pre-DCS interface smoke tests belong to the current backend work and may run
+as their prerequisites become available. Future coordination work, outside this
+implementation scope: after the backend gates, including manual physical
+promotion/rejoin and explicit durability policy, pass, use Patroni/DCS for election and
 membership and test loss of its authority path. Patroni normally stops/demotes a
 primary when it cannot maintain its leader lock;
 [watchdog support](https://patroni.readthedocs.io/en/latest/watchdog.html) addresses
@@ -248,8 +238,8 @@ paused/crashed managers, delayed shutdown, old-primary return and stale routing.
 governs durability/availability and eligible candidates; configuring those flags
 cannot create synchronous replication in an engine that does not implement it.
 
-**Recommended sequence:** durable write-authority gate → restartable planned
-cutover → manual unplanned failover/RPO matrix. In parallel, develop the physical
-follower and Patroni interface contract; integrate automated elections after
-manual physical failover and fencing are proven. The experiment informs both
-tracks, but it does not make a stock Patroni cluster from logical subscribers.
+**Recommended sequence:** inventory C and Patroni contracts → physical standby
+and bootstrap → promotion/history/rejoin → synchronous durability and manual
+failover/RPO evidence → Patroni interface smoke tests. These milestones may
+advance together where dependencies permit. Patroni/DCS integration and automatic
+elections remain future work after the backend acceptance gates pass.

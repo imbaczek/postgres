@@ -146,6 +146,25 @@ appropriate instead of replacing the native C peer or adding a message relay.
   succeeded. Do not start another copy of a test merely because its output was
   truncated or a poll timed out; check the original process/session first.
 
+### Network deadlines and live socket inspection
+
+- In the current SBCL, `sb-ext:timeout` is not an ordinary `error` condition.
+  A retry loop handling only `error` allowed a receiver timeout to escape its
+  thread and terminate the server. Catch that timeout explicitly when the
+  operation is retryable. Scope network timers around socket I/O, not request
+  construction that can wait for admission, replay locks, or storage durability.
+- Use the task-owned control REPL to inspect actual socket options when network
+  progress is unexpectedly slow. In this session, enabling TCP_NODELAY on the
+  live sender/receiver exposed a Nagle/delayed-ACK stall without restarting Lisp.
+  Persist the setup change, compare C `pq_init` / libpq `connectNoDelay`, then
+  verify fresh connections: reloading a setup function does not change existing
+  socket options by itself.
+- Large full-prefix recovery can exceed the small-test startup deadline. The
+  owned-server readiness helper accepts an optional fourth attempt limit;
+  increasing it must preserve PID/listener ownership checks. Diagnose a real
+  startup failure separately from slow replay, and stop polling if the owned
+  process dies rather than connecting repeatedly to its former port.
+
 ### Reader and test-discovery checks
 
 - Use cl-mcp structural edits for Lisp. A rejected patch that would add an extra
@@ -309,3 +328,38 @@ this mode.
   changes. Compare the Lisp behavior with those references and explain any
   deliberate differences.
 - Project workflow: review each milestone with a subagent.
+
+
+### SBCL descriptor streams and global variables
+
+- An anonymous stream created by `sb-sys:make-fd-stream` need not support
+  `file-length`, even when its descriptor names a regular file. The stale-PID
+  restart test exposed this distinction. Use `sb-posix:fstat` / `stat-size` for
+  descriptor metadata, and exercise the reopen path as well as initial creation.
+- Some SBCL runtime variables are global lexicals rather than dynamically bound
+  specials. `sb-ext:*exit-hooks*` cannot be LET-bound in this SBCL. A task-owned
+  isolated test may save and restore its value with `unwind-protect`; do not infer
+  dynamic binding behavior from earmuff naming. Use REPL introspection/compiler
+  diagnostics to verify the variable kind when a test binding is rejected.
+
+### Startup and timeout debugging
+
+- Patroni's driver wrapper appends `-c search_path=pg_catalog` to connection
+  options. Inspect the actual wrapper as well as ConnectionPool defaults. A
+  startup setter can emit ParameterStatus through the backend stream even if
+  its SQL response stream is discarded; suppress reports until authentication
+  is complete. The private control REPL can instrument `write-message` in the
+  owning server to distinguish discarded messages from actual wire output.
+- Ordinary control evaluations hold live-operation admission. To test a closed
+  reload gate, create a separate task-owned worker and use private file/semaphore
+  barriers. Let the control client disconnect before releasing the worker to
+  close admission; otherwise its `(quit)` can wait behind the gate it triggered.
+- Check the exact C interrupt handler before making cancellation more aggressive.
+  Pinned `ProcessClientWriteInterrupt` handles only ProcDiePending, deliberately
+  deferring statement timeout during blocked partial output. Unwinding an SBCL
+  write and retrying a whole frame can duplicate bytes; adding an IO timeout is
+  not a safe substitute for reviewing protocol buffering and C behavior.
+- Restart the cl-mcp worker after backend structure layout changes. A replacement
+  worker loses ASDF registrations as well as definitions; register the project's
+  `.asd` and load the system before interpreting a missing-dependency result as
+  a source or dependency regression.

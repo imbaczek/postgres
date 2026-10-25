@@ -1,0 +1,1390 @@
+# Physical HA and Patroni backend work
+
+Status: durable native intake/bootstrap/recovery, continuous TCP receipt/reconnect,
+advancing source retention, explicit/automatic local restartpoints and Linux
+PGDATA/PID ownership and a six-setting startup/reload configuration subset are
+implemented, 2026-10-25. Pinned Patroni direct startup, process discovery,
+reload and stop plus a psycopg2 driver smoke test pass. Full physical-slot SQL/control,
+promotion, synchronous durability and remaining Patroni interfaces are unfinished.
+This is an implementation ledger, not a
+claim of physical replication support. Coordination is excluded; tests use
+manual control. Behavior oracle: the repository's original C PostgreSQL source.
+
+## Verified starting points
+
+### Exact WAL LSN difference checkpoint
+
+`pg_wal_lsn_diff(pg_lsn, pg_lsn)` now returns an exact integral `numeric`
+(OID 1700, variable length), matching `xlogfuncs.c` and `pg_lsn_mi` rather than
+silently narrowing to signed int64. Unknown SQL literals resolve through the
+existing pg_lsn input routine; explicitly typed text and integer arguments are
+rejected with 42883. NULL arguments produce a typed SQL NULL. Lisp bignums retain
+both signs through the full uint64 input range. Explicit numeric-to-integer
+casts check their target range and raise 22003, including numeric-to-bigint;
+comparison with integer expressions preserves exact values.
+
+This supplies an integral numeric producer, not general decimal numeric input,
+storage, arithmetic, or typmods. Numeric arithmetic is explicitly rejected with
+0A000 rather than routed into the existing integer arithmetic path. The parser
+does not claim general numeric cast syntax. Future decimal support must preserve
+C rounding, scale, special values, and output contracts before expanding this.
+
+Rove checks full unsigned subtraction and cast bounds. A cl-spec property runs
+200 cases with seed 42 over uint64 pairs, proving exact reconstruction and
+antisymmetry. `t/interop/wal-sql.py` is shared unchanged between Lisp and C: all
+49 boundary pairs and 50 seeded random pairs, numeric OID/Decimal decoding,
+typed NULLs, valid int64 endpoints, overflow and bad overload/input checks pass.
+Native evidence: `/tmp/pg-patroni-start.NOVr1a` and
+`/tmp/pg-wal-sql-native.log`; pinned C: `/tmp/pg-c-wal-sql.kuaQ0H`.
+The native run also passes the existing real Patroni connection, timeout/gate,
+history, process, startup and reload checks. All 127 physical cases pass.
+After review, literal conversion reuses `coerce-in-constant`, and diagnostics name
+numeric/pg_lsn argument types correctly. Final native acceptance passed in
+`/tmp/pg-patroni-start.GtrfoZ` (`/tmp/pg-wal-diff-final-native.log`); strict compile,
+formatting, 135 interop cases and 1,598 legacy checks pass. Final logs use the
+`/tmp/pg-wal-diff-final-` prefix. Luna max and Sol high found no blocking defect;
+Sol medium suggested the applied literal-coercion simplification.
+
+The pinned `pg_walfile_name()` uses `XLByteToSeg`, so an exact segment boundary
+names the new segment. Do not import older PostgreSQL's previous-segment rule.
+The complete Patroni TL_LSN expression additionally needs `||` tokenization,
+`substr`, `bit(32)::int` (signed bit pattern), lazy `COALESCE`, actual timeline
+filename reporting, and receiver/control statistics. These remain unfinished.
+
+### Replay pause control checkpoint
+
+The four `xlogfuncs.c` recovery controls now resolve as native SQL functions:
+`pg_wal_replay_pause()` and `pg_wal_replay_resume()` return `void` (OID 2278,
+empty non-NULL text output); `pg_is_wal_replay_paused()` returns Boolean and
+`pg_get_wal_replay_pause_state()` returns text. All reject a primary with 55000;
+failed recovery remains fenced with 57P03.
+
+Native redo holds exclusive operation admission. Pause runs under ordinary
+admission, so it acknowledges a complete applied boundary synchronously and
+reports `paused` immediately. C instead requests pause asynchronously and can
+temporarily report `pause requested`. Native pause can wait for the current
+replay pass to finish; the C nonblocking request latency is not implemented.
+The pause flag survives code reload and receiver lifecycle changes, but not a
+process restart. Startup must still replay the required durable prefix.
+Replay checks pause after closing admission and before any storage changes;
+the follow worker skips repeated gate closures while paused. Receipt, flush,
+feedback, and read-only SQL remain available. This adds no coordination or
+promotion authority. Promotion-trigger rejection remains part of the unfinished
+promotion implementation.
+
+Rove covers primary rejection, state transitions, idempotence, unchanged replay
+progress, void typing, and failed-recovery precedence. `t/physical-follow.sh`
+also exercises receipt advancing with apply fixed, SQL-visible data staying at
+the paused frontier, pause across live reload, resume, and crash recovery from a
+received-but-unapplied prefix. Native acceptance passed in
+`/tmp/pg-physical-follow.wYFiWq` (`/tmp/pg-pause-follow-final.log`). All 125
+physical Rove cases and 135 interop cases pass; forced strict compilation and
+formatting pass (`/tmp/pg-pause-compile.log`, `/tmp/pg-pause-format.log`). Luna max
+checkpoint, Sol high full review, and Sol medium refactor review found no defects
+or useful refactor; all changed production functions remain under 120 lines.
+An explicit barrier test for requesting pause during active redo remains a
+coverage gap; admission serialization was inspected but not raced in that test.
+
+The pinned Patroni 4.1.5 `Postgresql.TL_LSN` expression was rechecked: this closes
+its replay-pause predicate dependency, but the full query still needs WAL filename,
+`substr`, bit casts, LSN difference functions, and receiver/control statistics.
+Do not infer complete Patroni monitoring compatibility from the four controls.
+
+| Contract | Current evidence | Required acceptance |
+| --- | --- | --- |
+| Streaming | Explicit native physical START, separate receive/replay workers and durable-prefix reconnect implemented | Scalable physical slots/restartpoints and full C-compatible control contract remain |
+| Identity/history | `identify-replication-system` uses durable catalog identity but literal timeline `1` | Shared bootstrap identity, real timeline/history, wrong-cluster and divergent-history rejection |
+| WAL storage | `backend/storage/wal.lisp` has custom versioned full-page after-image records, local durable LSN and recovery state | Audit replay atomicity, catalog/CLOG reconstruction, retention, restart and interrupted-record handling before continuous recovery |
+| Physical bootstrap | Durable source pins and a source-pausing coherent copy implemented; online copy remains missing | Consistent replica while primary writes; retention pin until copy/stream handoff completes |
+| Standby write exclusion | Static/streaming role guards and coarse reader-conflict deferral implemented; C targeted conflict cancellation remains missing | Recovery owns role; all application mutation paths reject writes, including attempts to disable read-only |
+| Promotion/rejoin | Not yet audited comprehensively | Durable promotion boundary/history, restart-safe completion, rebuild/rejoin of old primary |
+| Sync commit | C `access/transam/xact.c` calls `SyncRepWaitForLSN` after local commit WAL | Remote write/flush/apply modes, candidate selection, wakeup/cancellation and ambiguous-commit tests |
+
+The custom WAL format is not C physical compatibility. Preserve both directions
+of logical C interop while staging physical disk/WAL compatibility separately.
+Do not add SQL functions returning guessed standby state to make probes pass.
+
+## Patroni call inventory
+
+Reference version: [Patroni v4.1.5](https://github.com/patroni/patroni/tree/v4.1.5).
+The process/driver smoke test pins psycopg2-binary 2.9.11 and psutil 7.1.3;
+`t/interop/patroni-requirements.txt` records the complete tested Python environment. This inventory
+is incomplete until bootstrap, slots, sync, rewind and driver
+modules have also been inspected and their calls exercised. Config and process
+call sites below have partial native acceptance; the complete interface matrix
+remains unverified.
+
+| Source | Observed contract | Implementation status |
+| --- | --- | --- |
+| `postgresql/__init__.py`, `TL_LSN` | Recovery state, WAL filename timeline, current/flush LSN, receive/replay LSN differences, replay pause state | Inventory started; backend implementations and exact SQL composition require audit |
+| `Postgresql.__init__` | `PG_VERSION`, `global/pg_control`, process discovery and current settings | Native pg-lisp metadata/layout and lifecycle mapping require audit |
+| `postgresql/connection.py`, `NamedConnection` | Real psycopg connection, integer server version, parameterized queries, error/reconnect behavior | psycopg2 2.9.11 simple parameterized SQL/version smoke passes; actual NamedConnection queries/reconnect suite remains |
+| `ConnectionPool.conn_kwargs` | Startup options for statement timeout and extension-qualified settings; application name and connection timeout | Startup-option handling requires audit |
+| `config.py:load_current_server_parameters` | Parameterized `pg_settings` query with `current_setting`, setting provenance/sourcefile and `ANY`/`ALL` array comparisons | Exact SQL/parser, catalog and driver array adaptation require audit |
+| `config.py:_get_pg_settings`, `_read_recovery_params` | `name, setting, unit, vartype, context, sourcefile`; distinguishes restart-only from reloadable recovery changes | Real GUC registry and recovery config/restart semantics required |
+| `postmaster.py:_read_postmaster_pidfile`, `_is_postmaster_process` | Multi-line PID file, PGDATA, start time, port and listener metadata; PID reuse/start-time safety checks | Real v4.1.5 discovery/start-time rejection and signal_stop smoke pass with owned Linux PID file; full startup/config/shutdown lifecycle remains |
+| `postmaster.py:start` | Direct executable launch with `-D`, `--config-file=...` and options; process survives launcher | Real pinned direct start passes for the implemented configuration subset; complete generated configurations remain unsupported |
+
+
+Primary references:
+[Postgresql control layer](https://github.com/patroni/patroni/blob/v4.1.5/patroni/postgresql/__init__.py),
+[connection layer](https://github.com/patroni/patroni/blob/v4.1.5/patroni/postgresql/connection.py).
+
+## Implementation order and completion evidence
+
+1. Complete C/Patroni inventory and record explicit version pins and deferred
+   compatibility. Audit local WAL replay and bootstrap consistency boundaries.
+2. Implement persistent recovery state and a continuous physical data path,
+   preserving transaction, catalog, page and CLOG invariants across restart.
+3. Implement truthful SQL/control role and progress reporting, recovery write
+   exclusion, timeline/history and promotion. Exercise manual promotion/reseed.
+4. Implement synchronous durability semantics and validate against an independent
+   client acknowledgment ledger under crashes and delayed remote flush/apply.
+5. Exercise real pinned Patroni control interfaces without DCS, election or
+   automatic failover; retain native logical interop and switchover regressions.
+
+Each milestone needs native runtime evidence and the requested reviews. A passing
+logical row comparison does not establish physical correctness, and received WAL
+does not prove remote durability. Do not claim zero acknowledged-commit loss until synchronous
+commit and eligible-candidate semantics are implemented and verified. Rewind and cross-C physical compatibility
+must have explicit staging decisions and tests before they are claimed supported.
+
+## Intake checkpoint
+
+`backend/replication/physical.lisp` now assembles native WAL records across
+arbitrary byte fragments with bounded header/body allocation and CRC validation.
+A failed decoder cannot be reused; reconnect starts a new decoder at the owning
+receiver's durable record boundary. Its next-LSN is only an intake cursor; it
+does not write WAL, replay batches or send acknowledgments. Segment rotation is
+checked for format plausibility, not proven omission-free: native records have
+no predecessor link, so continuity also depends on the ordered sender protocol.
+
+`pg-physical-tests` runs deterministic fragmentation, corruption, invalid-header,
+position, reconnect and rotation cases, plus a cl-spec fragmentation property
+(200 trials, seed 42). This is not evidence of a running physical standby.
+
+### Recovery and bootstrap audit findings
+
+- Startup currently performs `wal-init`, `xact-init`, `wal-recover`, slot loading,
+  `catalog-init`, orphan removal and XID-wrap completion. Standby mode must be
+  checked before initializers can synthesize identity, write catalog upgrades,
+  clean relations or perform local wrap maintenance.
+- `wal-replay-finish-batch` applies page images and the validated terminal
+  operation; incomplete batches remain staged. Live replay must serialize the
+  complete batch with readers and publish replay progress only after applying
+  pages, CLOG and catalog state. Startup redo writes the catalog file but does
+  not refresh live `*catalog*`; reuse alone is insufficient.
+- `global/pg_control` is currently ASCII next-XID reservation, not C control data.
+  A copied reservation becomes stale while the source allocates more XIDs.
+  Promotion must recover a safe FullXID, including wrap/CLOG-reset semantics;
+  do not reinterpret this file as Patroni-compatible binary control metadata.
+- Concurrent copying of relfiles, catalog, CLOG and independent control files is
+  not a consistent base backup. The initial coherent bootstrap now drains operations through the reload
+  quiescence gate and pauses SQL for a checkpoint/copy while retaining source
+  WAL. Online copying with continuing source writes remains an acceptance
+  requirement, not a completed capability.
+- Existing retention slots are logical/plugin-specific. Physical bootstrap needs
+  a durable cluster-wide retention point before copying, and must require reseed
+  when retention is lost. The startup-oriented `wal-scan` can truncate tails;
+  it must not be blindly used on live incoming bytes.
+
+C anchors for implementation: `replication/walreceiver.c` write/flush ordering,
+`access/transam/xlogrecovery.c` replay publication,
+`access/transam/xlogreader.c` bounded header/CRC validation,
+`backup/basebackup.c` backup consistency, and `access/transam/varsup.c` next-XID.
+
+Patroni configuration and process references:
+[config.py](https://github.com/patroni/patroni/blob/v4.1.5/patroni/postgresql/config.py),
+[postmaster.py](https://github.com/patroni/patroni/blob/v4.1.5/patroni/postgresql/postmaster.py).
+
+Intake review: Luna max's framing-contract and missing segment-boundary cases
+were addressed. Sol high found a partial-input uint64 LSN overflow; intake now
+rejects an out-of-range input end before copying bytes, with a regression.
+Current focused suite has seven Rove cases including the 200-trial property;
+135 logical interop Rove cases and 1,598 legacy checks pass. Strict forced
+compilation passes with a task-local ASDF cache. These checks cover the decoder
+and existing behavior, not physical storage/replay or Patroni runtime integration.
+
+Sol medium completed the post-implementation refactor review: no additional
+macro/helper abstraction was justified; invariant checks and reset paths are
+already centralized and all new production functions are below 120 lines.
+
+## Durable receive-store checkpoint
+
+`backend/replication/physical-store.lisp` adds a dedicated native WAL receive
+spool with a stable local ownership lock and a CRC-protected manifest binding
+system identity, timeline, initial record boundary, acknowledged flush LSN and
+a checksum of the exact ordered raw-record prefix.
+The decoder now optionally delivers exact validated raw record bytes to its
+storage callback; supported older versions are preserved verbatim.
+
+Intake, complete-record write and manifest-backed flush positions are separate.
+The store fsyncs rotated/current WAL segments and their directory entries before
+atomically replacing and syncing its manifest, and publishes flush in memory
+only after that succeeds. Any intake/I/O error latches failure and requires
+reopen; close does not acknowledge pending writes. A post-rename error may have
+persisted a newer manifest, so reopen is authoritative for the resulting prefix.
+
+Reopen validates every acknowledged record and its CRC before discarding any
+unacknowledged tail. Missing/corrupt control, missing/corrupt acknowledged WAL,
+wrong identity/timeline and concurrent local ownership fail closed. Creation
+requires a preexisting empty dedicated directory and syncs its name in the
+existing parent; the caller must supply a durable parent directory hierarchy.
+The timeline is fixed for this store; history transitions are not implemented.
+
+Tests cover partial input, raw-byte preservation, no flush on write alone,
+nonzero bootstrap boundaries, segment rotation, bad prefixes without destructive
+truncation, tail removal, duplicate ownership, and errors before/after manifest
+publication. Eight task-owned subprocesses are killed with SIGKILL around segment
+fsync, manifest fsync, rename and directory fsync, then reopened. These test
+process death and local-lock release, not power loss or storage hardware behavior.
+
+The receive spool is not yet wired into startup, transport, live replay or
+promotion. It does not itself create a consistent base backup or authorize a
+standby to serve queries. Next integration must bind it to retained source WAL,
+a coherent base copy and persistent recovery mode before opening SQL listeners.
+
+Sol high identified a restart hole in checking only record CRCs: truncating an
+acknowledged whole record near rotation could leave an apparently valid segment
+gap. The v2 spool manifest now stores an FNV-1a-64 prefix checksum; reopening
+recomputes it before any tail deletion. The concrete omission regression failed
+before the fix (including unwanted truncation of the later unacknowledged tail)
+and passes afterward. This checksum detects accidental damage, not malicious
+rewriting. Sol high re-reviewed the fix and found no remaining blocker.
+
+Current physical suite: 20 Rove cases, including eight SIGKILL boundaries and
+the original 200-trial fragmentation property. The local ownership lock is a
+single-spool concurrency guard, not distributed coordination or writer fencing.
+
+A real ten-page after-image WAL batch, larger than the 64 KiB reopen read
+buffer, also survives fragmented receipt, durable flush and reopen with its
+page checksums intact. Final forced compilation, 135 logical interop tests and
+1,598 legacy checks pass. Luna max checkpoint, Sol high full review/fix review
+and Sol medium final refactor review are complete for the receive store.
+
+## Source-retention checkpoint
+
+`backend/replication/physical-source.lisp` persists named bootstrap WAL holds.
+Creation captures the current durable checkpoint under the global writer and WAL
+locks, validates its record, and atomically persists a marker before publishing
+the in-memory recycling horizon. It retains checkpoint-end minus the native
+32-byte record header, so a checkpoint ending exactly on a segment boundary
+keeps its own record. The zero-checkpoint case retains from zero.
+
+The marker binds cluster identity, initial timeline 1, checkpoint and restart
+coordinates with a CRC. Startup loads and validates all markers after catalog
+identity initialization and before cleanup, workers or SQL listeners. Required
+segments and the checkpoint record must still exist and validate. Release unlinks
+and fsyncs the marker directory before permitting recycling.
+
+These holds share the existing recycler's EQ retention map with snapshot pins;
+no second recycling implementation was added. Each physical pin owns its own
+registration, and loading/releasing them preserves unrelated snapshot pins.
+The native API is a bootstrap hold, not a completed SQL physical replication
+slot: acknowledgment advancement, retention-cap invalidation and slot statistics
+remain outstanding. Holds currently retain WAL until explicitly released.
+
+Source-retention unit cases cover exact-segment-boundary retention, reload,
+release, unrelated snapshot pins, duplicate names, foreign identity and corrupt
+checkpoint records. `t/physical-source.sh` exercises real SQL writes, multiple
+WAL segments, checkpointing, SIGKILL, startup restoration and release/recycling
+through the source server's private control REPL. This establishes WAL retention,
+not a coherent base copy or a running physical standby. C anchors are
+`replication/slot.c:ReplicationSlotReserveWal`, the existing native checkpoint
+recycler, and `backup/basebackup.c:SendBaseBackup` for the additional consistency
+work still required during copying.
+
+The native source test passes with full ordered-row comparison across crash and
+release, not just counts. It additionally corrupts a durable pin while stopped
+and verifies startup refusal. Latest artifacts: `/tmp/pg-physical-source.4oTOnG`.
+The physical unit suite now has 24 Rove cases, including a dedicated
+zero-checkpoint retention/release boundary case. Luna max checkpoint, Sol high
+full review and Sol medium refactor review found no blocking retention issue;
+no extra macro extraction was justified. Coherent copy, standby startup/write
+exclusion, physical streaming/replay, promotion/history, synchronous durability
+and Patroni runtime interfaces remain incomplete.
+
+Final retention checks: strict forced compile, 135 logical interop Rove cases,
+1,598 legacy checks, shell syntax and whitespace checks pass.
+
+## Coherent gated base-copy checkpoint
+
+`physical-base-backup` is a native control operation with two literal string
+arguments: an existing empty target directory and a new source pin name. It
+serializes with reload, drains active SQL/control operations, and temporarily
+closes operation admission. Transactions that still hold XIDs and pending XID
+wrap cause refusal; a plain idle BEGIN without an XID is harmless. Optional
+Swank must be off because its evaluation bypasses this gate. Eligibility is
+rechecked after draining, so an already-admitted control request cannot enable
+Swank during that interval and evade the check.
+
+While quiescent it checkpoints, creates a durable source pin, and marks the
+separate empty target `recovery.required` before writing database files. It
+copies only implemented durable cluster state and catalog-referenced relation
+forks, preserving exact catalog identity. The last WAL file is capped at the
+captured durable end. File contents are copied in bounded chunks and atomically
+synced; the complete manifest records identity, checkpoint/end, FullXID state
+and per-file lengths/checksums only after the image is durable. Source pins stay
+retained through success or post-pin failure until explicitly released after a
+future durable receive handoff. Invalidated logical-slot cleanup runs after the
+operation gate reopens, avoiding a cleanup-versus-admission deadlock.
+
+Target startup now validates the recovery guard/control/manifest before storage
+initialization and serves the verified image as a static read-only standby, as
+described below. Remaining integration must replay retained/received WAL in
+terminal batches, refresh live catalog state, handle reader conflicts and advance
+safe FullXID state before promotion. The source-pausing copy does not satisfy
+the final online-copy acceptance gate.
+
+`t/physical-bootstrap.sh` passes with an idle writer transaction refusal, a
+concurrent SQL client observed waiting at the closed admission gate, manifest/
+file checksums and copied checkpoint validation, and an independent source SQL
+versus read-only copied heap/CLOG row comparison. The rolled-back tuple and a
+later concurrent insert are excluded. The test refuses writable target startup,
+SIGKILLs the source after a copied file is durable, and restores both source
+pins on restart while the partial target remains recovery-required. Latest
+artifacts: `/tmp/pg-physical-bootstrap.Z8AkfL`. These are process-crash tests,
+not hardware power-loss simulations.
+
+Luna max and Sol high reviews found no remaining blocking ordering defect after
+the Swank recheck and independent row oracle were added. The focused physical
+suite now has 30 Rove cases, including startup-guard, target-path, bounded-copy,
+strict-prefix, gate-ownership and eligibility checks.
+
+Final bootstrap checks pass: 30 physical Rove cases, 135 logical interop cases,
+strict forced compilation, the native copy/concurrency/SIGKILL script, existing
+control-REPL reload tests and existing Swank listener regressions. The final
+native script also requires the source crash exit to be SIGKILL (137).
+Latest native artifacts: `/tmp/pg-physical-bootstrap.edqhA0`. Sol medium's final
+refactor review recommends no extra macros/helpers; all new production functions
+remain below 120 lines.
+
+## Verified static standby checkpoint
+
+A complete newly produced image now starts as a static read-only standby. Before
+any mutable storage initializer, `physical-recovery.lisp` checks bounded manifest
+bytes and CRC, literal syntax with reader evaluation disabled, schema, safe paths,
+file sizes/checksums, catalog/system identity, checkpoint/end, XID reservation and
+exact inventories of `base/`, `global/` and `pg_wal/`. Runtime root files and query
+temp namespaces are outside that durable inventory; abandoned query temp cleanup
+still runs. Missing or corrupt durable state is never synthesized during recovery.
+
+The base-copy producer writes a pending `physical-recovery.control` before copying
+any database files. First startup persists a static recovery phase bound to the
+verified manifest digest, system identity, timeline, applied checkpoint and safe
+XID reservation. Marker/manifest loss cannot silently become primary startup while
+that durable control remains. SQL users cannot alter recovery role. Filesystem
+owners and explicitly enabled arbitrary-Lisp debugging interfaces remain privileged
+host actors, rather than SQL session settings or an external fencing mechanism.
+
+The static branch opens CLOG for input and avoids primary WAL initialization,
+local recovery-tail promotion, catalog upgrade/creation, orphan deletion and XID
+wrap maintenance. The immutable base is revalidated on restart. Actual streaming
+replay must persist a new recovery phase before changing those files; it cannot
+skip original-base validation merely because one startup previously succeeded.
+
+Recovery write exclusion is independent of backend read-only flags and applies to
+SQL command dispatch, XID allocation, catalog saves, sequence functions nested in
+SELECT/COPY/EXPLAIN ANALYZE, transaction mode changes and logical replication state
+changes. Unknown databases are rejected at connection startup. Table readers use
+negative virtual relation-lock identities instead of allocating real XIDs, and
+release those identities on transaction/session cleanup. `in_hot_standby` and
+`transaction_read_only` report the role. `pg_is_in_recovery` is true;
+`pg_last_wal_replay_lsn` reports the verified applied base boundary, while receive
+LSN is NULL until a real receiver exists. Primary WAL-position functions reject
+recovery. Local primary startup progress records the last applied terminal,
+excluding durable records in an incomplete batch.
+
+The manifest producer now canonicalizes strings before readable printing: SBCL
+otherwise emits some dynamic BASE-CHAR strings as #A arrays. The decoder retains
+its strict non-evaluating literal grammar; it does not enable reader evaluation.
+Older experimental #A manifests require a newly generated native copy. The new
+cl-spec roundtrip property covers dynamic, Unicode, quoted and #.literal strings
+(200 trials, seed 42).
+
+`t/physical-standby.sh` passes real table/sequence/DDL/maintenance/function write
+rejection, failed-transaction SQLSTATE precedence, logical replication mutation
+rejection, role/progress reporting, private control reload, SIGKILL/restart, full
+row/sequence comparison and immutable-base checksums. Separate damaged copies
+with lost marker+manifest, missing/corrupt recovery control, missing XID control
+or a corrupt page all refuse startup; missing metadata is not recreated.
+Latest artifacts: `/tmp/pg-physical-bootstrap.Xk0ntp`.
+
+Current focused physical suite: 39 Rove cases. Continuous WAL transport/replay,
+recovery snapshot conflicts, timeline/history promotion/rejoin, synchronous commit
+and the complete Patroni runtime interface contract remain unfinished. The current
+copy still pauses the source, so online-copy acceptance also remains outstanding.
+
+Static recovery verification: 39 focused Rove cases and 135 existing logical
+interop cases pass after formatting. Strict forced compilation passes. Sol high
+and Sol medium reviews found no blocker or worthwhile new macro extraction in
+this static milestone; the explicit SQL fault model excludes filesystem-owner
+rewriting of all provenance and arbitrary privileged debugger evaluation.
+Automatic review rejected temporary unpaired guard-removal edits during an
+error-precedence cleanup; atomic whole-form replacements preserved the guard
+throughout, and the failed-transaction regression passes.
+
+Final static checkpoint evidence: the legacy suite passes 1,598 checks with zero
+failures after preserving the original primary-path lexical `get-current-xid`
+call in the relation-lock macro. The recovery branch alone selects virtual reader
+identities. The final strict compile and native standby reload/crash/damaged-copy
+matrix pass; latest native artifacts: `/tmp/pg-physical-bootstrap.sdD0pU`.
+
+## Durable replay-input traversal
+
+`physical-store-map-durable-records` exposes only the manifest-backed flushed
+prefix to a future replayer. An exclusive resume cursor must be the receive base
+or an actual durable record end, including the frozen flush position. The entire
+prefix checksum and cursor membership are validated before any caller callback.
+Segment padding is skipped; a prior record end resumes at the next segment's
+first record. Merely written records remain invisible. Traversal returns the
+captured flush boundary and never publishes applied progress.
+
+The traversal reuses the bounded prefix validator in two passes rather than
+retaining all WAL in memory. Callback errors latch the store; prior callbacks
+are not rolled back. Callbacks run under the receive mutex and must not reenter
+it. Repeated whole-prefix scans and holding this mutex while applying records
+are not the final continuous replay architecture: an incremental cursor and an
+explicit writer/catalog lock-order design remain necessary for integration.
+
+The audit also found and fixed a reopen edge case: if the first received record
+rotates immediately after the base cursor, its preceding receive segment need
+not exist. The decoder still verifies that the record could not fit there, and
+the ordered-prefix digest still checks omissions. Tests cover restart at this
+boundary, rotation-gap cursors, unflushed exclusion, prefix corruption before
+callbacks, and callback errors. After formatting and a clean FASL rebuild,
+45 physical Rove cases and 135 existing interop Rove cases pass. C references:
+`walreceiver.c:XLogWalRcvFlush` publishes flush after fsync;
+`xlogrecovery.c:ApplyWalRecord` publishes replay after successful redo.
+
+Next integration must separate bounded receive reads from the reader-conflict /
+writer/catalog application barrier. Persist a streaming recovery phase before
+the first base-file change; restart must then verify its durable progress and
+redo retained complete batches instead of comparing changed files against the
+original immutable-base checksums. Apply only complete native terminal batches,
+refresh live catalog/cache state, and sync affected relations, catalog and CLOG
+before persisting an applied boundary. Incomplete batches and receiver flush
+must never advance replay SQL reporting. The source FullXID reservation can
+advance without a committed transaction, so received page/commit records alone
+do not prove a safe promotion counter. These remain implementation requirements,
+not behavior supplied by the traversal API.
+
+Traversal milestone checks: strict forced compilation and whitespace checks pass.
+Luna max checkpoint and Sol full review report no blocking issue. Sol medium's
+final review recommends retaining the explicit two-pass production code: the
+existing store macro centralizes locking/failure, and the prefix validator
+centralizes decoding/digest checks. Both production functions are below 120
+lines. A possible test-only open/close wrapper is optional and was not introduced
+as a prerequisite to the replay integration.
+
+## Live complete-batch replay checkpoint
+
+`physical-replay.lisp` now applies durable native WAL to a running read-only
+standby. `physical-recovery-enable-streaming` creates a local receive spool and
+persists recovery phase 2 before database mutation. It can reuse an empty valid
+spool left by a crash between spool creation and phase publication. This is a
+native control API, not a completed network receiver or Patroni follow command.
+`physical-recovery-receive` and `physical-recovery-flush` keep receipt separate
+from `physical-recovery-replay`; the last operation owns the admission gate.
+
+After draining active operations, replay defers if any backend transaction or
+snapshot remains. Admission reopens so those clients can commit/roll back; it
+never waits for an idle transaction while holding the closed gate. This is
+conservative delay, coarser than C's targeted standby conflict resolution.
+Optional Swank must be off during application, as for the gated base copy.
+
+The existing native batch decoder stages partial batches. Replay rereads any
+unfinished batch from the preceding applied terminal on the next call. Complete
+batches update pages/CLOG/catalog with readers excluded, fsync relation streams,
+CLOG and directory entries, persist applied progress, and refresh the live
+catalog and page-cache state before admission reopens. Any error or nonlocal
+exit during live application latches recovery failure; SQL and replication
+queries then reject with 57P03 until process restart. Reload preserves the spool,
+role, progress and failure latch.
+
+The base checkpoint remains the permanent redo floor; source checkpoint records
+are not local restartpoints. Every phase-2 restart validates marker/control/
+manifest provenance, unchanged base WAL/control/version files, required mutable
+metadata, and the full durable receive prefix. It then replays all complete
+post-base batches before admitting SQL, checks that previous applied progress
+was reached, and verifies referenced durable files. Changed base pages/catalog/
+CLOG cannot be compared to original image hashes. Retained WAL must not be
+recycled until a separate restartpoint implementation is proved sound.
+
+Read snapshot FullXID advances from full record XIDs, v4+ page contributor XIDs,
+and CLOG-reset next-XID boundaries. Older page records without contributors are
+rejected for streaming redo. This observed counter is not a promotion-safe source
+reservation: allocation without emitted WAL remains a promotion requirement.
+Standby `IDENTIFY_SYSTEM` now follows C `GetStandbyFlushRecPtr`, exposing the
+greater of applied and same-timeline received durable progress. Receive SQL can
+advance while replay remains at the preceding terminal.
+
+`t/physical-replay.sh` runs real source/standby SQL servers and private control
+REPLs. Test-only helpers transport native frames manually, with no network WAL
+or coordination claim. It verifies partial-batch exclusion, successive inserts/
+updates/deletes, DDL and sequence state, deferred repeatable-read transactions,
+live reload, SIGKILL after page/CLOG redo followed by full-prefix restart, and an
+injected Lisp redo error that blocks SQL until restart. Ordered rows are compared
+against source SQL. Latest passing artifacts: `/tmp/pg-physical-replay.6icWSh`.
+The existing static standby/corrupt-image matrix also passes:
+`/tmp/pg-physical-bootstrap.5LCoOb`. Current unit checks: 50 physical Rove cases,
+135 logical interop Rove cases, strict compilation, shell syntax and whitespace.
+Continuous transport/worker/reconnect, scalable replay reads/restartpoints,
+targeted conflict cancellation, promotion/history/rejoin, synchronous replication
+and Patroni runtime interfaces remain unfinished. Coordination remains excluded.
+
+Review fixes: Luna found that an empty table had no native file-creation redo;
+the new regression first failed during base copy of a never-read empty table.
+Primary `create-table*` now durably creates its heap inside the rollback handler.
+Native catalog terminals imply creation on the heap's first appearance in replay
+history; the history starts at the base inventory and resets for full restart
+redo. Established live heaps are never silently recreated by unrelated catalog
+changes, and index contents are never synthesized. This adapts C's explicit
+`RelationCreateStorage` / `smgr_redo` semantics to the existing native catalog WAL
+format rather than claiming C physical compatibility. Empty tables before and
+after bootstrap now survive crash/restart.
+
+Sol high found a second integrity hole: redo could create a lost original heap
+using only post-base page images and leave untouched base pages absent. Before
+redo, phase 2 requires manifest-declared base forks to exist with at least
+their original length unless complete validated durable catalog WAL proves
+their deletion/replacement. The mutable disk catalog no longer grants that
+exemption (see the later history preflight milestone). Native same-ID shrinking
+is not implemented; VACUUM FULL replaces relfilenodes and TRUNCATE retains pages. Damaged-clone
+tests reject missing/truncated live base heaps before listeners; latest full
+native artifacts: `/tmp/pg-physical-replay.TTj2tD`. Sol high re-reviewed the fix
+and reports no remaining high-confidence blocker. Arbitrary corruption of
+already changed heap/catalog bytes cannot be compared to the original base
+hashes; this milestone primarily verifies process crash recovery, not exhaustive
+disk-corruption repair.
+
+Sol medium's final refactor review found all new production functions below 120
+lines and recommended a future shared macro for the ten replay-state special
+bindings in primary `wal-recover` and standby replay. That optional extraction
+was deferred: cl-mcp's structural reader rejects the valid `#.` forms preceding
+`wal-recover`, including with the standard-readtable override. The valid WAL
+source was left intact rather than using a nonstructural Lisp edit. Admission
+and failure cleanup remain explicit because setup and application have different
+ownership semantics.
+
+Final live milestone evidence: strict compile and the static standby matrix pass
+after the reviewed base-fork fix (`/tmp/pg-physical-bootstrap.ORsV3N`). The live
+matrix also passes with a 201-row, multiple-page base so post-base page WAL does
+not contain every original heap page; missing/truncated base clones reject
+before redo (`/tmp/pg-physical-replay.Qu5Cix`). All 1,598 legacy checks pass, as
+do all three manual logical switchovers and both native C logical interop crash/
+feedback matrices. Pinned C revision remains
+`9c0909b34939f2d5a37b82b9d1efc8b08e310252`; reference clients require their matching
+`libpq` via `LD_LIBRARY_PATH` in this relocated installation. Initial C readiness
+failures were caused by loading system `libpq` (missing `PQfullProtocolVersion`),
+and the corrected rerun passes. Switchover artifacts:
+`/tmp/pg-switchover.Szdfs2`, `/tmp/pg-switchover.st140b`,
+`/tmp/pg-switchover.pb1XUP`; native interop artifacts:
+`/tmp/pg-logical-interop.Rn6Rof`, `/tmp/pg-logical-interop.SXAJ4e`.
+
+## Continuous native transport checkpoint
+
+`physical-stream.lisp` and `physical-follow.lisp` connect the existing durable
+spool/replayer to a real TCP source. They reuse CopyBoth/XLogData/keepalive/status
+envelopes but require explicit native format negotiation; plain C physical START
+syntax is refused. This is native Lisp WAL, not C physical WAL or disk support.
+The current client uses the existing database-scoped replication frontend;
+standard physical startup/slot/control interfaces remain in the Patroni audit.
+
+The native request binds a source bootstrap pin, system identifier, timeline 1,
+base boundary, requested record end and cumulative received-prefix checksum:
+
+```
+START_REPLICATION SLOT pin PHYSICAL lsn
+(native_format 'pg_lisp_wal_5', system_id '...', timeline '1',
+ base_lsn '...', prefix_digest '...')
+```
+
+Source acquisition validates identity/base and claims the pin under the WAL
+mutex; pin release rejects active senders. The durable pin remains after network
+loss for reconnect. Source reads are bounded to one complete CRC-checked record
+and the captured durable end, with no destructive startup `wal-scan`. Network
+frames are at most 64 KiB of raw WAL. A walk from the persisted confirmed floor
+and checksum proves the requested record end and ordered suffix before sending
+any WAL bytes; an unconfirmed bootstrap pin starts that proof at the base.
+After identity/base validation, CopyBoth permits keepalives during that proof,
+avoiding a fixed startup deadline for long prefix verification. Prefix hashing
+checks for keepalives between bounded chunks. This checksum detects accidental
+prefix/history mismatch; it is not a cryptographic authentication protocol.
+
+The receiver flushes the spool before acknowledging flush, and reports write,
+flush and applied positions independently. A separate replay thread invokes the
+existing admission/conflict policy, so idle transactions can defer replay while
+receipt continues. The current mapper still pauses receipt during actual batch
+application and rescans retained WAL; scalable incremental replay remains work.
+Source feedback is monotonic and bounded by actually sent bytes, never merely
+the keepalive's WAL-end hint. Sender/receiver socket I/O, timeouts, retry delays
+and joins run outside admission and storage locks.
+
+Transport loss resets the same healthy store object to manifest-backed flush:
+verify the prefix, discard unacknowledged bytes, reset the partial decoder and
+written checksum, then reconnect at flush. I/O/decoder/replay failures do not
+clear their failure latch through reconnect. Wrong peer identity, unsupported
+timeline, invalid source base/prefix or malformed input stop the worker visibly.
+Temporary connection loss, shutdown, pin contention and socket timeout retry.
+In particular, a sender timeout closes the connection without translating it
+into a terminal XX000 response at the receiver.
+
+`physical-follow-start` persists a bounded versioned CRC/literal configuration
+after streaming role setup, then starts one receiver/replayer pair. Startup
+first recovers the durable prefix, then starts that saved configuration. Reload
+preserves workers/state. A separate command mutex serializes config/start/stop;
+workers are released from a readiness barrier only after both are created.
+`physical-follow-stop` durably disables autostart, closes the owned connection
+and joins outside admission, preserving standby role and durable data. These
+are local backend lifecycle controls, with no election or promotion policy.
+
+`t/physical-follow.sh` verifies continuous SQL changes, a fragmented 1,000-row
+batch, deliberate TCP loss midway through a record, independent receive versus
+replay while RR is idle, catch-up after COMMIT, live source/target reload, source
+SIGKILL/reconnect, target SIGKILL/autostart, active-pin release rejection, stop,
+and terminal wrong-cluster rejection. It also delays feedback for 11 seconds:
+SQL remains usable, the sender times out, and the receiver retries and catches
+up. Latest formatted run passes: `/tmp/pg-physical-follow.qNmrrT`.
+
+Luna max checkpoint and Sol high full review found availability/lifecycle gaps
+that were fixed: source I/O deadlines, retryable timeout classification, proof
+heartbeats, linear retained-segment validation, serialized follow commands,
+paired worker startup, and explicit-transaction rejection for physical START
+(C `walsender.c:2299`). Current focused checks: 57 physical Rove cases and 135
+logical interop Rove cases. Automatic edit review once mistakenly treated a
+new test file as existing; direct file/Git checks proved it absent, and a minimal
+creation followed by structural test insertion preserved all existing work.
+
+Important remaining acceptance gaps: source holds now advance and obey caps as
+described below, but the full physical slot SQL/control contract is unfinished.
+Local restart still retains the whole post-base prefix, so receiver retention
+can grow without bound. Incremental replay, safe spool compaction and durable
+local restartpoints remain necessary before calling this a production HA path.
+Timeline/history/promotion/rejoin, online base
+copy, synchronous candidate/commit-wait semantics and the actual pinned Patroni
+interface matrix also remain unfinished. No zero-acknowledged-commit-loss claim
+or C physical compatibility claim follows from the native transport tests.
+
+Final transport verification: after the review fixes, strict compilation, the
+continuous TCP timeout/partial-record/reconnect matrix, manual replay/crash
+matrix and all 1,598 legacy checks pass. Sol medium recommended a checked-feedback
+helper; it now centralizes socket-read versus admission ordering and monotonic
+status validation for fragment, idle and resume-proof paths. Its follow-up review
+found no invariant regression; all new production functions remain below 120
+lines. The 57 physical and 135 interop Rove tests pass after this extraction.
+Both native C logical interop/crash/feedback matrices pass against the pinned
+reference: `/tmp/pg-logical-interop.fgqV9T`, `/tmp/pg-logical-interop.CLpiOJ`.
+Latest continuous transport artifacts: `/tmp/pg-physical-follow.rF0lSj`.
+
+## Advancing source retention checkpoint
+
+Native source pins now retain three distinct facts: immutable bootstrap boundary
+and identity, a confirmed complete-record flush boundary with its cumulative
+prefix checksum, and terminal retention-loss state. Version-2 marker files are
+bounded and CRC protected; legacy v1 bootstrap markers remain readable. Before
+the receiver handoff, the original checkpoint record remains pinned. After a
+verified handoff (including a confirmation exactly at the base), retention moves
+to the receiver's durable record boundary and no longer needs that old source
+checkpoint record. The bootstrap coordinate is never repurposed as a live floor.
+
+Resume proof begins at the persisted confirmed floor/checksum, not at the original
+base. The request still proves the receiver's cumulative prefix through its own
+flush. Proof-stage keepalive replies cannot advance retention; publication starts
+only after the requested prefix matches. Subsequent feedback proves each newly
+acknowledged interval once and rejects interior record positions. Only `flush`
+advances retention, independently of `write` or `apply`.
+
+Receipt and cap invalidation both copy the pin, atomically save/fsync/rename/sync
+the candidate, then update the stable live pin and recycler registration. A failed
+save retains the conservative live floor and fails the WAL operation. This is
+stricter persistence than C `PhysicalConfirmReceivedLocation`, which marks a slot
+dirty and can conservatively lose recent advancement on crash. The stricter native
+publication is needed because its persisted checksum is the new suffix anchor.
+
+Checkpoint maintenance now applies the existing per-slot retained-byte-span cap
+to physical pins as well. It durably marks an over-limit pin lost before removing
+only that pin's own retention registration; unrelated snapshots remain intact.
+An active sender rechecks loss before reading or advancing. Lost markers load
+without requiring already recycled WAL, so they do not prevent primary startup.
+They remain lost after restart and native follow returns a reseed-required error.
+This is checkpoint-time per-pin byte-span behavior, matching the existing native
+logical cap; it is not a hard bound on total directory size or a claim that the
+full C physical slot SQL/statistics contract is implemented.
+
+`t/physical-retention.sh` passes with 1,800 SQL commits and over 30 MiB of real
+WAL. While a target transaction delays replay, durable receipt advances source
+retention, a checkpoint removes the original bootstrap segment, and reconnect
+no longer scans that missing prefix. It SIGKILLs the source immediately after a
+new confirmed marker is durable but before live publication, then verifies source
+and target restart plus ordered-row equality. A second SIGKILL immediately after
+the lost marker is durable verifies primary admission and terminal reseed refusal.
+Latest artifacts: `/tmp/pg-physical-retention.E9t027`.
+
+The larger test exposed two transport problems and one latency issue beyond the
+small earlier matrix. SBCL timeouts are not ordinary `error` conditions: a timeout
+escaped the receiver thread and terminated the server while request construction
+waited for replay admission. Request construction now occurs outside the network
+timer, and the retry loop explicitly catches SBCL timeouts. A focused Rove test
+reproduces the non-error condition and proves the retry loop continues. Test polls
+now detect dead owned servers rather than repeatedly connecting after a crash.
+
+The live source and standby control REPLs also showed Nagle enabled on the
+replication connection. Changing TCP_NODELAY on those actual sockets improved
+progress without restarting Lisp. Saved setup now matches C `pq_init` for backend
+TCP sockets and libpq `connectNoDelay` for the receiver client. Receiver writes
+and flushes are batched separately (1 MiB while busy, flush on keepalive while
+caught up), following C walreceiver's write-then-flush cycle. Neither a keepalive
+WAL-end hint nor merely written bytes become a durable acknowledgment. Rove
+coverage proves the batching/keepalive distinction. The large restart still
+replays the full local prefix; its test allows measured startup time beyond the
+small-fixture default without weakening listener ownership checks.
+
+Current focused suite: 63 physical Rove cases, including v1 migration, saved-floor
+reload after recycling, pre/post-save failures, durable cap loss, independent
+snapshot pins, receiver flush batching and SBCL timeout recovery. Luna max found
+no source-publication ordering defect; its requested publication-boundary SIGKILL
+coverage was added. Sol medium found no worthwhile new macro and all new
+production functions remain below 120 lines.
+
+### Local restartpoints and spool floors: design requirements
+
+Source advancement is independent of local retention. With immutable base `B`,
+source confirmed cursor `S`, local restartpoint `R`, applied `A` and receive flush
+`F`, require `B <= R <= A <= F` and a reconnecting receiver's `S <= F`. At the
+source-retention checkpoint `R = B`; the explicit local restartpoint milestone
+below now advances R and recycles the receiver's older complete segments.
+
+Astra high's design audit requires an immutable restartpoint generation binding
+`R`, cumulative checksum at `R`, original manifest digest/identity/timeline,
+observed read FullXID, exact catalog snapshot, and every live fork's minimum
+durable length, including relations created or grown after bootstrap. The live
+catalog can be ahead after a crash and cannot substitute for this snapshot.
+Publish synced data and generation, then a synced restartpoint pointer, then the
+receive manifest's floor/seed, and only then delete obsolete complete segments.
+New pointer plus old spool floor is a valid crash state; spool floor newer than
+its published restartpoint is invalid.
+
+Restart must validate the retained suffix and its complete catalog transitions
+before restoring the restartpoint catalog and replaying it. A missing fork from
+`R` is permitted only when complete, validated retained history proves its later
+drop/replacement; an incomplete catalog batch or the current on-disk catalog is
+insufficient proof. Surviving forks need their `R` minimum lengths checked before
+redo can synthesize holes. Chunked catalogs, empty tables, relfilenode history and
+CLOG resets must be covered. Receive control needs separate floor, floor seed,
+flush and cumulative flush checksum so compaction preserves reconnect identity.
+The local primitive implementation is recorded below. Automatic scheduling,
+promotion/history/rejoin, synchronous durability, online base backup and the
+pinned Patroni interface matrix remain active goal work.
+
+Final source-retention checks pass: strict forced compilation, 63 physical Rove
+cases, 135 logical interop Rove cases, all 1,598 legacy checks, native continuous
+follow (`/tmp/pg-physical-follow.QMVmLk`), and the original unconfirmed bootstrap
+pin/restart/release regression (`/tmp/pg-physical-source.ZZD8xi`). Sol high's full
+review found no remaining production blocker after comparing C source retention,
+slot invalidation, receiver flush ordering and TCP socket setup. Both native C
+logical interop matrices and all three manual switchovers also pass after the
+global TCP_NODELAY setup change. Switchover artifacts:
+`/tmp/pg-switchover.eNcHld`, `/tmp/pg-switchover.OWtfXt`,
+`/tmp/pg-switchover.1nTK89`; C-to-Lisp interop artifacts:
+`/tmp/pg-logical-interop.Vmaxpf`. Shell syntax and whitespace checks pass.
+
+
+### Local restartpoint prerequisite: validated checksum anchors
+
+The receive store now exposes `physical-store-prefix-digest` at an exact durable
+record end or its original base. The store derives the cumulative checksum from
+validated spool bytes, never a caller-supplied seed. The existing full-prefix
+validator captures the anchor during its ordinary checksum pass and returns it
+only after validating the entire acknowledged prefix, including records after
+the requested anchor. The durable replay mapper uses the same boundary check.
+Rotation padding, interior offsets and unflushed positions are rejected and latch
+the store. This API certifies neither a complete terminal batch nor fsynced data.
+
+Three new Rove cases cover exact checksums across rotation and reopen, unflushed
+input, invalid boundaries, and corruption beyond the requested anchor. The
+existing immediate-first-record rotation case also checks the base seed and
+final checksum directly. All 66 physical Rove cases pass; strict compilation
+and formatting pass. Sol high found no correctness issue in this change.
+
+At this checksum-anchor checkpoint, local R still remained at B. The later
+history and explicit restartpoint milestones below add the catalog/fork validation,
+publication ordering, receive control v3, compaction and suffix restart.
+
+The native replay regression also passes after mapper integration
+(`/tmp/pg-physical-replay.caIznx`). Luna max found no checkpoint blocker; its
+README test-discovery observation is fixed by documenting the physical ASDF
+suite alongside the interop suite. The invariant/LOC review found no useful
+additional abstraction; all receive-store production functions remain under
+120 lines.
+
+
+### Local restartpoint prerequisite: complete catalog history before redo
+
+Phase-2 startup now validates the receive spool and scans its complete native
+batch history before opening CLOG for writes or applying any database redo.
+`physical-history.lisp` checks batch transitions, page images, logical chunks and
+all terminal payloads with the existing pure native decoders. Only a complete
+catalog terminal, including reassembled chunked images, certifies its explicit
+relfilenode delete list. An unfinished batch proves no deletion. A later catalog
+reference revokes earlier deletion proof. Original base main/visibility forks
+without such proof must exist and meet the manifest's minimum durable length.
+
+The catalog proof reader requires one form, a matching cluster identity and
+unambiguous property keys. It collects every serialized table/index reference
+before catalog hash-table construction, so duplicate names cannot hide a live
+fork. Sol high and Luna max identified a circular-reader-label startup hang;
+the reader now rejects label definition/reference dispatch and read-time
+evaluation while preserving native vector and SBCL readable string-array forms.
+Sol high verified the fix. The shared `with-physical-replay-staging` macro resets
+the same batch state for the proof reader and applying replay. The final
+invariant/LOC review found no additional useful abstraction and all production
+functions below 120 lines.
+
+All 73 physical Rove cases, 135 interop Rove cases and 1,598 legacy checks pass;
+strict forced compilation and formatting pass. The expanded native replay test
+passes at `/tmp/pg-physical-replay.3V1rOW`: it recovers a real post-base DROP,
+replays after process crashes, and rejects missing/truncated base heap clones,
+including one whose mutable disk catalog has been damaged to omit the heap.
+The native harness also reloads saved code through the actual task-owned control
+socket. These are process-crash tests, not power-loss evidence.
+
+This history milestone initially left local R at the immutable bootstrap base.
+The restartpoint milestone below adds generation/pointer publication, receive
+manifest v3 floor/seed, suffix restart and spool compaction using this validator.
+Automatic restartpoint scheduling was still unfinished at that checkpoint;
+the later automatic-worker milestone below completes it.
+
+Continuous native follow/reconnect and source/target crash restart also pass
+with the preflight enabled (`/tmp/pg-physical-follow.oOby6g`).
+
+
+### Explicit local restartpoints and receive-spool compaction
+
+`(physical-recovery-restartpoint)` is a literal, no-argument private control API.
+It shares replay's admission/serialization barrier, defers for retained reader
+transactions, and never promotes. With a validated checksum at the last applied
+terminal R, it syncs relation streams, CLOG, the catalog and data directories;
+writes a generation that will never be overwritten; syncs a pointer naming that
+generation; publishes receive control v3; and only then deletes complete spool
+segments strictly before R's segment and syncs the directory. It preserves
+complete unflushed writes and a partially decoded record. The floor-only control
+update saves H(F), even when W > F; it never promotes H(W) to durable receipt.
+Obsolete generations are removed only after pointer/floor/deletion durability.
+
+A generation binds original base B, cluster identity/system ID/timeline, original
+manifest digest, R/H(R), observed read FullXID, the exact catalog bytes, every
+catalog-referenced main/visibility fork's minimum durable length, and relation
+identity history. Raw catalog references drive coverage checks. Every catalog
+terminal now records index identities as well as heaps in replay history. Native
+metadata is bounded to 16 MiB; a generation including catalog bytes is bounded to
+1 GiB, and publication enforces the same bounds used by its reader. This remains
+a native format, not PostgreSQL's `pg_control` or C WAL format.
+
+Receive control v3 preserves immutable B separately from local floor R and seed
+H(R), durable F and cumulative H(F). Existing v2 controls open with floor B and
+the original seed, and upgrade on their next publication. Startup validates the
+authoritative pointer/generation and receive suffix, requires
+`floor <= R <= old-applied <= F`, checks H(R), complete terminal history and every
+surviving R fork's minimum length, then restores the R catalog before suffix redo.
+A new pointer with the old floor is valid; a newer floor without its generation
+is rejected. Corrupt or missing authoritative state never selects an older image.
+Startup progress persistence cannot lower the pre-crash required applied/XID
+watermarks when replay revisits earlier terminals, including after a second crash.
+Original immutable bootstrap provenance files and base WAL are still retained on
+the receiver; this milestone compacts its receive spool only.
+
+Astra high reviewed the design against C `CreateRestartPoint` (xlog.c:8641,
+8720, 8732 onward). Luna max checked publication windows, Sol high reviewed the
+full implementation, and Sol medium found no useful additional invariant/LOC
+refactor. No production function exceeds 120 lines. The deliberate native
+difference is using a locally captured complete terminal/catalog/fork snapshot,
+where C selects a replayed checkpoint record. Interrupted publication fails
+recovery closed, including nonlocal exits before the pointer is published.
+
+All 87 physical Rove cases and 135 logical interop Rove cases pass, as do strict
+forced compilation, formatting, shell syntax and whitespace checks. Tests cover
+checksum/floor migration, new-pointer/old-floor recovery, F > A > R and an
+unfinished tail, unflushed/partial input preservation, missing or corrupt pointer
+and generation, R-fork minimum lengths, complete later DROP exemptions, and
+monotonic startup minimums. The first two-restartpoint native replay run passes
+(`/tmp/pg-physical-replay.W3c1nN`). The >30 MiB continuous native test also passes
+(`/tmp/pg-physical-retention.uKw01D`): it advances source retention independently,
+publishes local R, proves the receiver's original segment was deleted, reloads
+the task-owned live image, SIGKILLs the receiver and resumes from its compacted
+spool. It also retains the source receipt/lost-pin crash cases. Publication-window
+SIGKILL cases are run separately below. These tests establish process-crash
+behavior, not power-loss durability or C physical compatibility.
+
+Remaining work includes automatic/periodic and shutdown restartpoints, online
+bootstrap, real promotion/timelines/history/rejoin, synchronous commit semantics,
+and the pinned Patroni backend interface matrix. Coordination remains excluded.
+
+The final native replay run passes with intentional SIGKILL after pointer
+publication (new pointer, old receive floor) and after receive-floor publication
+(before deletion/GC), followed by fresh-process recovery and full SQL comparison:
+`/tmp/pg-physical-replay.9xJYy1`. The final 1,598 legacy checks also pass
+(`/tmp/pg-restartpoint-unit.log`).
+
+Both pinned native C logical interop directions pass after restartpoint
+integration: `/tmp/pg-logical-interop.FJGu2n` (Lisp-to-C) and
+`/tmp/pg-logical-interop.ImqVR6` (C-to-Lisp). These remain logical compatibility
+regressions; they do not establish physical WAL or disk compatibility.
+
+All three manual logical switchovers also pass after the final restartpoint
+changes: Lisp-to-Lisp `/tmp/pg-switchover.6oOXHy`, Lisp-to-C
+`/tmp/pg-switchover.IpjB8v`, and C-to-Lisp `/tmp/pg-switchover.ucVyil`.
+
+
+### Automatic standby restartpoints and SQL CHECKPOINT
+
+Streaming recovery now starts exactly one local maintenance worker, independently
+of native following. Startup and first streaming enablement share a mutex around
+worker creation. The worker requests R after 300 seconds or 1 GiB of applied WAL
+since the receive floor, only when apply has advanced. It checks floor/apply under
+the receive-store mutex, leaves ordinary admission before requesting replay
+quiescence, and rechecks due status inside the barrier. Retained transactions
+still defer background publication with a one-second retry delay. Reload preserves
+the worker and settings; each iteration calls a replaceable step function. The
+native thresholds are presently Lisp globals, not completed PostgreSQL GUC or
+Patroni configuration support.
+
+SQL CHECKPOINT is now allowed in recovery, including inside read transactions.
+C utility.c:247-256 classifies it as strictly read-only specifically so recovery
+can request restartpoints; utility.c:947-949 and checkpointer.c:1000-1044 impose no
+transaction-block ban. The Lisp command now routes to the shared publication core
+under its existing SQL admission, without reacquiring the reload mutex or closing
+its own gate. Admission pins apply and excludes replay; the store mutex serializes
+publication. A reader snapshot can remain open because publication does not alter
+MVCC data. An immutable static base with no receive spool returns success without
+creating an R generation. Primary CHECKPOINT also no longer rejects a transaction
+block; the native test verifies that it does not commit a pending INSERT.
+
+The shared core keeps Swank exclusion and the nonlocal-exit failure latch over
+publication and generation cleanup. An automatic checkpoint error fences SQL with
+57P03 until restart. The worker stops on recovery failure. Luna max identified a
+startup/control worker-creation race, fixed by the start mutex; Sol high found no
+remaining verified blocker. Sol medium found no useful additional macro/LOC
+refactor, and all production functions remain under 120 lines.
+
+The native automatic test passes at `/tmp/pg-restartpoint-auto.x94csv`: static
+CHECKPOINT, timer-only and WAL-distance triggers, a retained repeatable-read
+snapshot, SQL CHECKPOINT in a transaction, single-worker live reload, an injected
+background publication failure, SQL failure fencing, and fresh-process recovery.
+The continuous >30 MiB test also passes with automatic byte-triggered compaction
+(`/tmp/pg-physical-retention.rzXzpZ`), receiver segment deletion, reload, SIGKILL,
+reconnection and source retention/lost-pin crash regressions. All 93 physical
+Rove cases (including the new 200-trial cl-spec scheduling property, seed 42),
+135 interop Rove cases and 1,598 legacy checks pass. The scheduling property checks
+LSN translation invariance, monotonicity and no-progress suppression across large
+coordinate ranges. Strict compilation, formatting, shell syntax and whitespace
+checks pass.
+
+Shutdown restartpoints remain explicitly unfinished. C ShutdownXLOG invokes
+CreateRestartPoint before orderly exit (xlog.c:7422). The current Lisp postmaster
+exits directly from last-backend cleanup; SBCL exit hooks unwind admission first,
+run in unspecified order and swallow hook errors, so an exit-hook implementation
+would not provide C-compatible completion/error semantics. Implement a proper
+postmaster finalization step before claiming clean-shutdown checkpoint coverage.
+This limitation does not invalidate recovery from the already durable R/suffix.
+Promotion/timelines/history/rejoin, online bootstrap, synchronous commit and the
+pinned Patroni interface matrix remain active goal work; coordination is excluded.
+
+The static-standby acceptance run also passes with CHECKPOINT removed from its
+mutation rejection list and exercised inside a transaction as a successful no-op:
+`/tmp/pg-physical-bootstrap.ZKEdza`. Other mutation, recovery-role and immutable
+base checks remain in that regression.
+
+
+### Local PGDATA ownership and pinned Patroni process discovery
+
+`backend/postmaster/pidfile.lisp` claims PGDATA immediately after argument/path
+setup and before recovery preparation, spill cleanup or any storage initializer.
+It validates directory type, effective UID and the C 0700/0750 permission policy;
+a missing final directory is created atomically with mode 0700, and existing
+permissions are never silently repaired. Physical test copy directories now use
+0700 explicitly. A stable, dedicated regular `.pg_lisp.lock` inode provides an
+exclusive local flock for Lisp contenders and stays open until OS process exit.
+No lock symlink, hardlink or special-file target is accepted. This is local data
+ownership, not a distributed lease or writer-generation mechanism.
+
+Under that lock, startup uses a bounded regular, nonblocking/no-follow PID reader,
+C's live-PID and ancestor/grandparent rules, and O_EXCL creation of a mode-0600
+`postmaster.pid`. Empty/malformed/oversized or nonregular PID metadata fails
+before database initialization. The eight C-layout lines contain the actual PID,
+canonical PGDATA, Linux process creation timestamp from /proc, port, blank Unix
+SQL socket and SysV shared-memory fields, actual TCP listen address, and padded
+status. Status starts as `starting`; `ready   ` is synced only after successful
+SQL listener bind. No listen address is invented before bind. Normal exit removes
+only the still-owned PID inode; the stable flock remains held through all exit
+hooks. SIGKILL releases the kernel lock and leaves a reclaimable stale PID file.
+Startup errors after PID creation remove that process's PID file. Reload preserves
+ownership and start time.
+
+C references are `miscinit.c:296-383,1159-1453` and `include/utils/pidfile.h`.
+The private flock serializes cooperating Lisp servers only. Native C does not
+honor it; the shared C-style PID check does not eliminate C's own read/unlink
+stale-reclaim race when incompatible implementations are started simultaneously
+on the same PGDATA. Neither cross-C physical data compatibility nor protection
+against a same-UID actor replacing directory entries is claimed. Do not start C
+against native pg-lisp data. PID cleanup's inode check handles an already-replaced
+file, but cannot make check-then-unlink atomic against external pathname mutation.
+This implementation is Linux-specific; non-Linux process-time support, stopping/
+standby status transitions, postmaster.opts, direct Patroni start/config arguments,
+GUC/config reload and proper orderly shutdown finalization remain incomplete.
+
+The real Patroni 4.1.5 `PostmasterProcess` reader discovers the task-owned server,
+validates its process start time, and fast-stops it with `signal_stop`. The test
+verifier is a sibling process because Patroni deliberately rejects its own direct
+child as an already-running postmaster. The pinned psycopg2-binary 2.9.11 driver
+connects, reports server_version 200000 and executes parameterized SQL; this does
+not exercise the full Patroni SQL matrix or erase native PG_VERSION/control-file
+format differences. `t/interop/patroni-requirements.txt` pins all installed packages.
+No Patroni HA controller, DCS or election process is started by this test.
+
+Initial native acceptance passes at `/tmp/pg-postmaster-pid.WMB1i2`; the final run
+adds wrong-start-time rejection, PID FIFO refusal and the final lock/endpoint
+checks. Five new Rove PID cases cover metadata width/permissions, cleanup after
+inode replacement, duplicate local lock acquisition, permission refusal without
+repair, and symlink non-following. All 98 physical Rove tests, 135 interop Rove
+tests and 1,598 legacy checks pass. Strict compilation and formatting pass.
+Luna max checked ownership/startup boundaries and the native-C concurrency limit;
+Sol high reviewed normal lifecycle correctness and same-UID pathname caveats.
+The dedicated-lock symlink risk was fixed, and Sol medium found no useful further
+macro/LOC refactor; all production functions remain under 120 lines.
+
+The attempted shutdown checkpoint edit remains blocked specifically by cl-mcp's
+reader rejecting valid #. syntax in postmaster.lisp. A dry-run structural edit
+confirmed the restriction again; no valid C-shaped reader forms were rewritten
+and no unsafe exit-hook substitute was introduced. Other active goal work
+continues independently of that tooling limitation.
+
+Final PID/Patroni acceptance passes at `/tmp/pg-postmaster-pid.8oqxb7`, including
+wrong process-start-time rejection, special-file refusal, live reload, regular
+lock-file guards and fresh ownership after SIGKILL. The first final run exposed
+an anonymous SBCL descriptor stream that cannot answer FILE-LENGTH; the PID reader
+now uses FSTAT/STAT-SIZE, with a direct stale-reader regression assertion. This
+was a real stale-reopen failure, not missing Lisp forms or parentheses.
+
+Existing static-standby/bootstrap acceptance passes with ownership acquired before
+recovery preparation (`/tmp/pg-physical-bootstrap.xZLCvj`), including source
+SIGKILL and stale PID reclaim. Existing shutdown acceptance also passes after
+PID cleanup integration (`/tmp/pg-pid-shutdown.log`: smart/fast/immediate,
+escalation and administrative cancel/terminate). This verifies existing shutdown
+behavior and PID removal, not the still-missing shutdown restartpoint.
+
+Continuous native follow/reconnect also passes with PGDATA ownership enabled
+(`/tmp/pg-physical-follow.uAARci`). Descriptor inspection in the live cl-mcp image
+showed the newly opened ownership/PID FDs lacked close-on-exec flags; they now
+open atomically with Linux O_CLOEXEC so future executed helpers cannot retain the
+server's ownership descriptor. The metadata Rove case asserts both descriptor
+flags in addition to its stale-reader coverage.
+
+The final close-on-exec build passes strict compilation and the complete pinned
+Patroni/PID native smoke at `/tmp/pg-postmaster-pid.c4adKw`.
+
+
+## Direct startup and configuration checkpoint
+
+The pinned Patroni 4.1.5 `ConfigWriter`, `get_postgres_version` and
+`PostmasterProcess.start` now exercise the actual native executable. Configuration
+supports `port`, `listen_addresses`, `data_directory`, `checkpoint_timeout`,
+`max_wal_size` and `max_slot_wal_keep_size`, plus the immutable `config_file`
+location. Includes resolve relative to the lexical parent path, including symlink
+paths; extensionless includes and sorted nonhidden `.conf` include directories
+work. Precedence is defaults, primary/includes, actual PGDATA auto.conf, then CLI.
+Unknown parameters and CLI arguments fail visibly rather than being ignored.
+
+Parsing follows pinned C `guc-file.l`, `conffiles.c` and `guc.c`: literal quoted
+strings, doubled quotes and C/octal escapes never invoke Lisp READ; numeric
+conversion uses libc and C unit rounding. Native C executable comparisons cover
+hex, ties and intermediate unit rounding. SHOW reports installed values. SQL SET
+and RESET reject server-context parameters with C SQLSTATE 55P02.
+
+SIGHUP validates the full configuration before installing reloadable values.
+Restart-only changes keep active values and record pending restart internally.
+A malformed or unsupported setting retains the previous configuration. CLI
+settings persist across reload. Reload now restores configured restartpoint
+thresholds; tests that temporarily override private variables must reinject them
+after reload. Boot compilation output goes to stderr so `--version` has clean
+stdout even with an empty FASL cache.
+
+The native smoke passes at `/tmp/pg-patroni-start.wdb6zm`, including live reload,
+restart-only behavior, failed reload retention, session-context errors, direct
+process cleanup and the pinned C numeric oracle. All 105 physical Rove tests
+pass. Luna max and Sol high reviewed this milestone; reported include-path,
+lexer and escape defects were fixed. Sol medium found no useful additional
+macro/invariant refactor; production functions remain below 120 lines.
+
+This is a subset, not general Patroni compatibility. Full `pg_settings` and
+`current_setting` SQL/provenance, recovery parameters, startup connection options,
+NamedConnection queries and utilities still need implementation and acceptance.
+Empty or multiple listen addresses are explicitly unsupported. Native defaults
+remain port 5433 and a 1 GiB slot retention cap; C defaults differ. Private native
+byte-limit options can override the displayed slot limit. Configuration reload
+is atomic for this subset; C can apply some valid entries alongside semantic
+errors. Primary automatic checkpoints and shutdown restartpoints remain missing.
+No HA controller, DCS, election or failover coordination runs in these tests.
+
+Final validation also passes strict forced compilation, all 135 interop Rove
+tests and the automatic restartpoint native regression
+(`/tmp/pg-restartpoint-auto.OmEFO7`). Formatting and `git diff --check` pass.
+
+
+## Typed settings catalog checkpoint
+
+`pg_catalog.pg_settings` now exposes real installed rows for the supported
+startup GUCs, with typed name/setting/unit/context/vartype/source/sourcefile/
+sourceline/pending_restart columns. Numeric settings use base-unit text rather
+than SHOW's human formatting, following `guc_funcs.c:GetConfigOptionValues`.
+Only supported settings are present. The selected config and data paths have
+source `override` and NULL file metadata, matching `SelectConfigFiles`; the data
+path remains locked on reload. Removal of a file-sourced restart-only setting
+marks pending restart even if its old value equals the default. SQL `set_config`
+now uses the same server-context rejection as SET/RESET.
+
+The pinned C initdb catalog reports pg_settings OID 12109. Virtual catalog
+attribute introspection now uses each descriptor's original C attribute numbers,
+matching RowDescription, while executor row slots remain dense internally.
+`relnatts` spans the highest exposed original attribute. Unimplemented columns
+remain absent rather than being populated with invented metadata.
+
+The native byte-cap option is a documented extension: when used, its row reports
+unit B and its actual command-line/environment source, avoiding silent fractional
+megabyte truncation. Ordinary GUC values retain C's fixed MB units. Full C view
+columns and all existing SHOW-only session GUC rows remain unfinished, as do
+`current_setting`, `lower` and the complete pinned ConfigHandler SQL call path.
+Next acceptance must invoke `_get_pg_settings` and
+`load_current_server_parameters` themselves through psycopg2 with adapted arrays;
+a named-column catalog smoke does not establish that those calls work.
+
+Acceptance passes at `/tmp/pg-patroni-start.9Yzhjw`: base units/provenance,
+pending restart, selected data-path override, catalog attribute numbers and
+SET/RESET/set_config context errors are checked through real psycopg2 SQL.
+All 107 physical and 135 interop Rove tests pass; strict forced compilation
+passes. Sol high's catalog-origin mismatch was fixed; Sol medium found no
+useful further refactor and verified the reviewed functions are below 120 lines.
+
+## Patroni configuration SQL checkpoint
+
+`current_setting(text[, boolean])` and C/POSIX `lower(text)` now run through the
+ordinary function analyzer and evaluator. SHOW and current_setting share one
+value lookup, including per-session values and human unit formatting. Missing
+settings report 42704 or NULL with missing_ok; strict NULL arguments propagate.
+Unknown Boolean string literals resolve through Boolean input, matching C
+function overload resolution. Lowering is ASCII-only under the supported C/POSIX
+collation; other collation providers remain unimplemented.
+
+The real pinned `ConfigHandler._get_pg_settings` and
+`load_current_server_parameters` methods pass against the native server with
+psycopg2 2.9.11 adapted arrays. The harness supplies an actual SQL connection
+without constructing a Patroni HA controller; it does not test the full
+ConfigHandler constructor or its generated configuration. The latter query
+exposed missing scalar-array ALL support, now shared with ANY and compared with
+C `ExecEvalScalarArrayOp` for empty-array identities, NULL results and decisive
+short circuit. One-dimensional text-array literal input follows C
+`ReadArrayToken` escaping, quotes, whitespace and unescaped NULL rules. This
+also handles psycopg2's empty-list representation. Explicit dimensions and
+multidimensional arrays reject 0A000; general numeric-array inference remains
+unfinished.
+
+### Scalar-array inference correction
+
+A late Luna checkpoint identified that bare string array literals must resolve
+their element type from the scalar operand before input conversion. The analyzer
+now applies the selected scalar input function to the complete literal array
+and stores a private scalar-array constant. This covers numeric literals,
+internal char first-byte input and name clipping without pretending that all
+standalone array types are implemented. Invalid later elements and invalid
+literals in unreachable CASE arms fail during analysis; explicitly typed text[]
+does not gain numeric coercions. Pinned C standalone execution confirms the
+numeric/char/empty examples and rejects the bad integer with 22P02.
+
+The correction passes native acceptance at `/tmp/pg-patroni-start.HC2GXL`, all
+111 physical and 135 interop Rove tests, strict forced compilation and formatting.
+Sol high reviewed the final eager-input representation; Sol medium found no
+useful refactor and verified the function length limit.
+
+### NamedConnection and timeout intake
+
+The actual pinned ConnectionPool/NamedConnection connects and reconnects against
+the native server (`/tmp/pg-named-connection-audit.WYmAMk`). Its default startup
+options are `-c statement_timeout=2000 -c pg_stat_statements.track=none`. This
+audit found both options silently ignored: current_setting with missing_ok
+returns NULL, and the task-owned server's control REPL shows an empty session
+settings table for `Patroni audit`. This is an outstanding behavioral defect,
+not successful timeout acceptance.
+
+The next implementation must follow C postinit.c pg_split_opts and
+process_startup_options: backslash escapes, whitespace separation, literal quote
+characters, client source, and first-equals assignment splitting. Dotted custom
+GUC placeholders can hold pg_stat_statements.track without claiming extension
+execution or emitting a pg_settings row. statement_timeout needs a typed ms
+USERSET setting and a startup RESET baseline independent of transaction undo.
+Arm before query parsing after admission, reset between statements, clear on
+every exit, and report 57014 with C's timeout message. Existing B-tree waits are
+unbounded, so adding only a deadline check would leave a false timeout promise;
+bounded interruptible lock waits are part of this milestone. Validate blocked
+locks, idle gaps, multiple statements, rollback/RESET, cancellation precedence,
+and reload-gate/drain behavior before claiming the NamedConnection contract.
+
+## Session startup options and statement timeout checkpoint
+
+The ignored NamedConnection options identified above are now implemented.
+Startup `options` follow C `pg_split_opts` whitespace/backslash splitting and
+`-c`/long assignment parsing; additional startup GUC fields follow those options.
+Invalid names, invalid timeout values and attempts to change server-context GUCs
+reject startup with FATAL errors. Dotted custom GUCs are inert placeholders, so
+`pg_stat_statements.track=none` can be stored/read/reset without claiming that
+the extension runs or showing placeholders in pg_settings.
+
+statement_timeout is a typed per-session millisecond setting. SQL SET, RESET,
+set_config, SHOW and current_setting share its value path; pg_settings reports
+the actual base-unit value and client/session/default source. A separate startup
+baseline survives RESET ALL and transaction rollback. Default restoration keeps
+client provenance, including mixed-case startup names. Custom placeholders also
+retain their empty default after reset or rollback, as verified against pinned C.
+
+Deadlines arm after reload admission before parsing, reset between statements
+within one simple-query frame, and clear on errors and frontend cleanup. The
+drain-lane parse-only pass can carry its first-statement deadline into execution.
+Existing interrupt checks report 57014 with C's statement-timeout message.
+Transaction/schema waits and B-tree relation waits poll the remaining deadline
+with bounded condition waits, preserving mutex reacquisition and waiter cleanup.
+The backend structure gained reset/deadline slots; existing Lisp images require
+a restart for this layout change.
+
+Native acceptance at `/tmp/pg-patroni-start.R9Kc1e` calls the actual pinned
+ConnectionPool/NamedConnection with its unchanged default options. It checks
+client values/source, hidden placeholders, rollback/RESET/default provenance,
+reconnect, invalid startup rejection, a blocked UPDATE timing out, successful SQL
+after that error and an idle gap, and two statements taking over one total timeout
+budget while each stays within its own budget. A private control-created worker
+also holds reload admission closed beyond the client timeout, verifies that the
+waiting backend has no deadline, and releases it for successful SQL. A file start
+barrier lets the originating control session disconnect before the worker closes
+admission; ordinary control evaluations themselves require admission.
+
+The same NamedConnection timeout/reset/reconnect helper passes against the pinned
+C executable (`/tmp/pg-c-session-timeout.XynlxD`). All 115 physical and 135 interop
+Rove tests and 1,598 legacy checks pass. Strict forced compilation and formatting
+pass. New generated option escaping coverage runs 200 cl-spec trials
+at seed 42, alongside the previous array/recovery properties. Sol high's two
+provenance findings were fixed; Sol medium found no useful refactor and verified
+production functions stay below 120 lines.
+
+Luna initially reported blocked output as a timeout gap, then withdrew that
+finding after checking the pinned implementation. Astra high independently
+confirmed C `secure_write` waits indefinitely and `ProcessClientWriteInterrupt`
+handles only ProcDiePending. Ordinary statement cancellation is deliberately
+deferred while a partial output frame is blocked. No SBCL IO timeout/unwind/retry
+was added: that could corrupt a partially transmitted frame. Deadline handling
+uses safe interrupt points, not asynchronous exceptions inside storage code.
+
+This does not complete the full GUC contract: SET LOCAL, file-configured USERSET
+defaults, complete session catalog coverage, recovery GUCs and additional utility
+and process interfaces remain unfinished. More cancellation/drain-boundary and
+stalled-output regression coverage remains useful; this checkpoint introduces no
+HA controller or coordination.
+
+The broad native regression initially caught an actual Lisp-to-C subscription
+startup regression: C libpqwalreceiver appends `datestyle=ISO`,
+`intervalstyle=postgres` and `extra_float_digits=3`. These now pass explicit typed
+validation. DateStyle uses the existing C-style SplitIdentifierString parser,
+including spaces and quoted tokens, and supports ISO/MDY; IntervalStyle supports
+postgres. Other formatting modes reject visibly. extra_float_digits uses C's
+integer range -15..3 and default 1; native SQL float types remain unsupported.
+
+Final results include 116 physical tests, 135 interop tests,
+NamedConnection/config/reload acceptance at `/tmp/pg-patroni-start.ByD03d`,
+native Lisp-to-C logical acceptance at `/tmp/pg-logical-interop.yahQHc`, and C-to-Lisp acceptance at
+`/tmp/pg-logical-interop.WNBJTi`. All manual switchovers pass: Lisp-to-Lisp
+`/tmp/pg-switchover.Zc6rC1`, Lisp-to-C `/tmp/pg-switchover.8ksuPe`, and C-to-Lisp
+`/tmp/pg-switchover.l6Q2cN`. The final NamedConnection helper also passes pinned C
+at `/tmp/pg-c-session-final.bBKOKB`, including startup FATAL rejection and custom
+placeholder rollback. This preserves logical interoperability, not C physical
+WAL or disk compatibility.
+
+## Promotion intake and history interfaces
+
+Promotion remains unimplemented. C `StartupXLOG`, `FinishWalRecovery`,
+`XLogInitNewTimeline` and `CreateEndOfRecoveryRecord` establish the ordering
+requirements: choose an unused timeline, preserve the valid ancestor segment
+prefix, publish history and durable end-of-recovery/checkpoint state, initialize
+writer/XID state, then expose the end of recovery. Native receive WAL lives in a
+separate spool and restartpoint compaction may have removed its old prefix;
+received flush may also exceed the last applied terminal. Neither copying the
+remaining spool nor clearing recovery.required can perform a safe promotion.
+
+The next writer milestone needs timeline-aware primary WAL paths/control/scans
+and backup inventories, durable promotion intent and a positive committed-primary
+state, recovery worker shutdown/join, exact-terminal replay and receive-tail
+discard, XID allocation reservation, a validated child segment prefix, history,
+end-of-recovery record and checkpoint before reopening writes. Preserve the
+immutable bootstrap manifest. Crash injection must cover every durable step.
+Ancestry and numeric TLI alone cannot reject independently promoted sibling TLI2
+branches; verify system identity and exact prefix/branch identity as well.
+
+The required WAL structural edits are currently tool-blocked: a fresh cl-mcp
+dry-run on wal-init rejects the file's valid read-time `#.` forms with
+`*READ-EVAL* is false`. That is not a parenthesis error. No valid reader forms
+were rewritten and no direct-file-edit or live function-shadowing workaround was
+used to sidestep the requested structural editing workflow. Independent backend
+interfaces continue to progress while this specific limitation remains.
+
+`backend/access/transam/timeline.lisp` now provides the history prerequisites.
+Parsing uses the exact C scanf conversions/low-word width from `timeline.c`,
+preserves increasing ancestor identifiers and newest-first intervals, and ignores
+reason text as C does. A separate forward-lineage validator rejects backward
+switchpoints before native safety checks. WAL point lookup uses half-open
+intervals; a prefix cursor ending at a fork may still belong to its parent.
+The latter predicate proves only an ancestry position, never equality of bytes
+or writer authority. Missing non-1 history fails closed here; C's general reader
+can instead assume no parents. Native history reads also impose regular-file,
+16 MiB file and 1023-byte line bounds.
+
+The replication protocol implements TIMELINE_HISTORY with C's filename/content
+text columns and exact raw file bytes. Missing files return 58P01 and explicit
+transactions reject the command. History and SHOW remain read-only on a standby.
+Startup replication=true is now accepted for physical inspection: IDENTIFY_SYSTEM
+returns a NULL database, ordinary SQL is rejected, and database-dependent logical
+decoding is refused. Database-scoped replication keeps its SQL fallback. SHOW is
+a replication command in both modes, including C's distinction between plain
+SHOW and a leading SQL comment. Leading comments/semicolons are not skipped by
+the replication classifier; normal drain classification keeps its SQL-trivia
+handling. IDENTIFY_SYSTEM retains the pinned C tree's int8 timeline column.
+
+This is inspection/history support, not C physical streaming or promotion.
+Primary WAL, recovery controls, native source pins and follow still support only
+timeline 1. The test writes a clearly synthetic timeline4 history fixture to the
+owned throwaway cluster, calls the unchanged pinned Patroni Postgresql.get_history
+and get_connection_cursor methods, then removes that fixture; IDENTIFY_SYSTEM
+continues to report the actual timeline1. No active timeline or recovery role is
+changed. Native acceptance passes at `/tmp/pg-patroni-start.TGeU11`.
+Identical assertions pass pinned C at `/tmp/pg-c-history-final.xpMQ4v`.
+All 123 physical and 135 interop Rove tests pass, including 200 generated fork
+boundary cases at seed42. Luna's SHOW/comment dispatch findings were fixed;
+Sol high found no further defect in the implemented slice, and Sol medium found
+no worthwhile refactor or function exceeding 120 lines.
+
+Existing continuous native follow/reconnect acceptance also passes after this
+startup/dispatch change (`/tmp/pg-physical-follow.p5p7xz`), including live reload
+and owned source/target crash/restart. All 1,598 legacy checks, strict forced
+compilation, formatter checks and `git diff --check` pass.
+
+Native acceptance passes at `/tmp/pg-patroni-start.KVANBR`, including empty
+parameter lists and current_setting after live reload. All 111 physical and 135
+interop Rove tests and 1,598 legacy checks pass. A new cl-spec array input/output roundtrip checks 200
+cases at seed 42, with zero rejections. Strict forced compilation and formatting
+pass. Pinned C standalone execution independently confirms ASCII lower with
+non-ASCII preservation, empty ANY/ALL identities and NULL/missing-setting cases.
+Luna max's unknown-Boolean coercion finding was fixed. Sol high found no further
+defect within the supported settings/text-array scope; Sol medium found no useful
+refactor and verified the production function length limit.
+
+Remaining configuration acceptance includes all supported session GUC catalog
+rows, complete view columns, recovery parameter persistence/restart rules,
+startup connection options and the actual NamedConnection/reconnect path. Those
+requirements remain in the active goal alongside promotion/timeline, sync commit,
+online backup and process/utility work; this checkpoint does not complete Patroni
+integration and introduces no coordination.
