@@ -310,6 +310,13 @@ and their dependencies. From `src/lisp/` in a Quicklisp-enabled REPL:
 See the [interop test inventory](t/interop/README.md) for refactor decisions,
 generated-check domains, replay seeds and verification limits.
 
+`t/logical-interior-ack.sh` checks publisher crash/restart with a flush inside
+a commit record and subsequent end acknowledgment. `t/logical-mixed-mode.sh`
+requires `C_PG_BINDIR` for the reference C build and checks subscriber metadata
+protection while standard and extension subscriptions share a target. Both
+scripts require Linux `ss` to verify listener ownership and create isolated
+peers; `KEEP_ARTIFACTS=1` preserves their evidence.
+
 ```sh
 cd src/lisp
 ./t/run-unit-tests.sh     # page/tuple/index/visibility and VACUUM horizon tests
@@ -623,10 +630,12 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   because catalog changes and statistics have no rollback log.
 - `COUNT(*)` and `GROUP BY` are supported. Hash aggregation is bounded by query
   work memory and spills through recursive hash partitions, with external sort
-  as the skew/depth fallback. Subqueries, CTEs, `DISTINCT`, and `HAVING` are not
-  implemented. Joins use nested loops; INNER/CROSS join order uses a greedy
-  statistics-based choice, while outer joins retain source order. NATURAL JOIN
-  and comma-separated FROM items are not supported.
+  as the skew/depth fallback. Noncorrelated derived SELECTs in `FROM`, ordinary
+  `DISTINCT`, and `UNION ALL` are supported. Correlated and expression subqueries,
+  CTEs, `DISTINCT ON`, and `HAVING` remain unsupported. Joins use nested loops;
+  INNER/CROSS join order uses a greedy statistics-based choice, while outer
+  joins retain source order. NATURAL JOIN
+  is not supported; comma-separated `FROM` items act as cross joins.
 - No `OFFSET`/`FETCH`. `ORDER BY` accepts multiple keys with `ASC`/`DESC` and
   uses bounded in-memory runs with external merge when needed.
 - No general `DEFAULT` expressions (only `DEFAULT nextval('sequence')`), `CHECK`,

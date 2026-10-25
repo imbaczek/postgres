@@ -1,9 +1,10 @@
 (in-package #:pg)
 
-;; These relations belong to the subscriber's progress machinery, not the
-;; publisher's replicated schema. Keep them out of the strict schema contract.
+;; Subscriber-owned metadata: one registry for allowlists, bootstrap/schema
+;; projection, and replicated utility guards so new state tables cannot diverge.
 (defparameter +logical-private-schema-table-names+
-  '("pg_lisp_subscription_progress" "pg_lisp_subscription_config"))
+  '("pg_lisp_subscription_progress" "pg_lisp_subscription_config"
+    "pg_lisp_standard_subscriptions"))
 
 (defun logical-private-metadata-table-name-p (name)
   (and (stringp name)

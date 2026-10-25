@@ -95,11 +95,7 @@
       (error "at least one --table allowlist entry is required"))
     (dolist (table (logical-subscription-options-tables options))
       (unless (and (logical-simple-identifier-p table)
-                   (not (member table
-                                (list +subscription-progress-table+
-                                      +subscription-config-table+
-                                      "pg_lisp_standard_subscriptions")
-                                :test #'string=)))
+                   (not (logical-private-metadata-table-name-p table)))
         (error "unsupported allowlist table identifier ~s" table)))
     (setf (logical-subscription-options-tables options)
           (remove-duplicates (logical-subscription-options-tables options)

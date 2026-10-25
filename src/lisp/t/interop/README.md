@@ -17,7 +17,17 @@ Inventory and refactor review: 2026-10-25, based on commit `19df2752d7e`.
 
 The existing six test files lose 117 net lines, including the new SQLSTATE
 helper regression. New generated checks live in `property-tests.lisp`.
-No server implementation changed.
+That refactor changed no server implementation.
+
+The subsequent metadata/partial-ACK hardening adds a fifth Property for replay
+eligibility around a commit record, and a deterministic standard-state protection
+test (135 primary Rove tests total). The generated checks still run through four
+Rove cases. `../logical-interior-ack.sh` verifies the raw-wire replay contract
+across real publisher crashes; it uses a scripted transport peer because the
+bundled subscriber correctly acknowledges complete transactions and cannot
+produce interior feedback. `../logical-mixed-mode.sh` verifies standard metadata
+survives extension bootstrap and DDL on the same target. See the main
+compatibility document for their commands, semantics and review evidence.
 
 ## Running
 

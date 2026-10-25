@@ -51,6 +51,23 @@
     (eql (<= (max confirmed restart) marker)
          (pg::logical-standard-resume-slot-safe-p row marker))))
 
+(cl-spec:defproperty replay-retains-unacknowledged-commit-end
+    ((start (range integer 0 18446744073709551487))
+     (width (range integer 2 128))
+     (position (range integer 0 4)))
+  (:about pg::standard-transaction-visible-p)
+  (:trials (:normal 200))
+  (let* ((end (+ start width))
+         (floor (ecase position
+                  (0 (max 0 (1- start)))
+                  (1 start)
+                  (2 (1+ start))
+                  (3 end)
+                  (4 (1+ end))))
+         (transaction (pg::make-logical-transaction :commit-record-lsn start :commit-lsn end)))
+    ;; Before/start/inside do not certify completion; end/after do.
+    (eql (< position 3) (pg::standard-transaction-visible-p transaction floor))))
+
 (cl-spec:defproperty identity-keys-exclude-include-tail
     ((rotation (range integer 0 5)) (count (range integer 1 6)))
   (:about pg::logical-standard-key-attnums)
@@ -82,7 +99,8 @@
   (check-generated-property 'commit-timestamps-roundtrip))
 
 (deftest generated-resume-floors
-    (check-generated-property 'resume-requires-both-source-floors))
+    (check-generated-property 'resume-requires-both-source-floors)
+  (check-generated-property 'replay-retains-unacknowledged-commit-end))
 
 (deftest generated-identity-keys
     (check-generated-property 'identity-keys-exclude-include-tail))

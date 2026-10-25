@@ -141,6 +141,54 @@ from C. Record the negotiated protocol version separately from these options.
 
 ## Implementation checkpoints
 
+### Metadata and partial-acknowledgment hardening (2026-10-25)
+
+- `pg_lisp_standard_subscriptions` is subscriber-owned metadata alongside the
+  extension progress/config relations. The shared registry excludes it and its
+  owned indexes from extension bootstrap/schema contracts and blocks replicated
+  CREATE/ALTER/DROP targeting the table or its indexes before utility execution.
+- Standard `pgoutput` eligibility now compares the transaction's commit **end**
+  strictly above `max(requested_start, confirmed_flush)`. An accepted flush inside
+  the commit record persists the exact byte position but does not certify that
+  transaction. Its complete row transaction must replay; the earlier aligned
+  restart floor and pending-XID retention remain intact. An end acknowledgment
+  suppresses replay. A receiver that has durably applied a transaction must resume
+  from its end to avoid duplicates; C's apply worker does so.
+- This deliberately strengthens handling of arbitrary interior feedback relative
+  to C `decode.c:DecodeTXNNeedSkip`/`snapbuild.c:SnapBuildXactNeedsSkip`, which
+  compare the record start. C `walsender.c:ProcessStandbyReplyMessage` also accepts
+  raw flush positions, but its normal apply worker records `commit_data->end_lsn`
+  in the origin and feedback mapping (`worker.c:2565–2582`). The private `pg_lisp`
+  terminal-only acknowledgment rules are unchanged.
+- `t/logical-interior-ack.sh` receives a real published transaction, persists a
+  flush strictly inside its Commit record, SIGKILLs/restarts the publisher and
+  compares the complete replayed Begin/Relation/Insert/Commit payloads. It then
+  acknowledges the end, repeats the crash/restart and requires the next newly
+  published row to arrive without replaying the old transaction. Run
+  `KEEP_ARTIFACTS=1 ./t/logical-interior-ack.sh`; it prints the observed positions
+  and preserves evidence under `/tmp/pg-interior-ack.*`.
+- `t/logical-mixed-mode.sh` runs an actual C standard subscription and a separate
+  extension subscription into the same target. It verifies bootstrap omits
+  publisher-owned private indexes, rejects CREATE/ALTER/DROP table/index events,
+  leaves failed DDL unconfirmed, and applies a new non-idempotent standard update
+  after every rejection while retaining the standard subscription's actual slot.
+  Run `C_PG_BINDIR=/path/to/reference/bin KEEP_ARTIFACTS=1 ./t/logical-mixed-mode.sh`
+  (with the reference library path if needed); evidence is under `/tmp/pg-mixed-mode.*`.
+  Both harnesses verify listener PID ownership before SQL readiness probes. An
+  occupied-port negative check confirmed rejection without modifying the sentinel.
+- Focused Rove tests first reproduced both findings, then all 135 primary tests
+  passed. A generated replay-boundary Property covers before/start/interior/end/
+  after positions (200 trials, seed 42 and fresh seed 541594578902587107;
+  definition digest `fnv1a64-v1:38ffe7879bcd5089` matched on rerun). Its reported
+  gaps remain `rejection-counts-unmeasured, input-coverage-unmeasured`.
+- Both complete C interop topologies pass, along with the existing private-DDL
+  and extension replication gates. The old private-DDL harness now uses supported
+  mutation SQL; legacy qualified event ASTs remain covered by unit tests. Strict
+  compilation and formatting pass. Luna max checkpoint, Sol high complete-diff
+  review, Sol xhigh ACK-semantics advice and Sol medium refactor/polish review
+  completed. The polish pass shares the metadata registry with allowlist
+  validation and keeps visibility filtering in one place before history lookup.
+
 ### Final acceptance audit (2026-10-25)
 
 The current implementation supersedes the unfinished status recorded in older
@@ -563,9 +611,9 @@ properties follows merely from passing the two logical C-peer tests.
   DROP WAIT waits interruptibly for an active sender without retaining reload
   admission or the lifecycle mutex across the wait.
 - Standard decoding scans from an aligned retained cursor independently of
-  feedback. It suppresses commits whose record start precedes
-  `max(requested_start, confirmed_flush)`, including C's zero/stale/future start
-  semantics. Nonfinal XLogData headers carry zero positions; only a completed
+  feedback. This checkpoint originally filtered by commit record start; the
+  partial-acknowledgment hardening above supersedes that filter with commit-end
+  eligibility. Nonfinal XLogData headers carry zero positions; only a completed
   Commit or completely filtered scan establishes an advertised safe frontier.
   Idle progress uses ordinary keepalives, with no private progress Message.
 - Feedback uses flush independently of write/apply, ignores stale/zero flush,

@@ -185,9 +185,11 @@
           (otherwise (ereport "0A000" "unsupported logical row operation")))))
 
 (defun standard-transaction-visible-p (transaction floor)
-  (let ((start (logical-transaction-commit-record-lsn transaction)))
-    (unless start (error "logical transaction has no commit record position"))
-    (>= start floor)))
+  "Replay a transaction until its complete commit end is acknowledged.
+C decode.c compares the commit record start, and normal C apply feedback reports
+the end. We also accept interior flush positions, so conservatively replay when
+that position cannot certify the whole transaction; retention alone is not enough."
+  (> (logical-transaction-commit-lsn transaction) floor))
 
 (defun pgoutput-standard-begin (transaction)
   (unless (logical-transaction-commit-timestamp transaction)
@@ -346,9 +348,10 @@
       (standard-keepalive state requested))))
 
 (defun standard-send-transaction (state transaction changes)
-  "Nonfinal headers stay zero; only fully transmitted Commit advances the frontier."
-  (when (and changes
-             (standard-transaction-visible-p transaction (standard-stream-emit-floor state)))
+  "Send an eligible transaction; only its fully sent Commit advertises progress.
+The stream loop filters before resolving historic selection, so skipped legacy
+records need not decode their publication history. Keep eligibility there."
+  (when changes
     (unless (standard-xlog-data state (pgoutput-standard-begin transaction))
       (return-from standard-send-transaction nil))
     (dolist (change changes)

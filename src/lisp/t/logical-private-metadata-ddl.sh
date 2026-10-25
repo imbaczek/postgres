@@ -259,15 +259,17 @@ sql "$SOURCE_PORT" \
 # start from a fresh slot with a schema that the ordinary bootstrap path accepts.
 assert_rejected_ddl logical_create_progress pg_lisp_subscription_progress \
     "CREATE TABLE IF NOT EXISTS pg_lisp_subscription_progress (source_slot varchar PRIMARY KEY, source_lsn varchar, state varchar NOT NULL, snapshot_token varchar)"
-assert_rejected_ddl logical_qualified_alter_progress pg_lisp_subscription_progress \
-    "ALTER TABLE \"public.public.pg_lisp_subscription_progress\" ADD UNIQUE (source_slot, source_lsn)"
+# Mutation SQL no longer accepts dotted literal identifiers. Legacy qualified
+# event AST resolution remains covered by test-logical-private-metadata-ddl-targets.
+assert_rejected_ddl logical_alter_progress pg_lisp_subscription_progress \
+    "ALTER TABLE pg_lisp_subscription_progress ADD UNIQUE (source_slot, source_lsn)"
 assert_rejected_ddl logical_drop_progress pg_lisp_subscription_progress \
     "DROP TABLE pg_lisp_subscription_progress"
 
 assert_rejected_ddl logical_create_config pg_lisp_subscription_config \
     "CREATE TABLE IF NOT EXISTS pg_lisp_subscription_config (source_slot varchar PRIMARY KEY, source_host varchar NOT NULL, source_port integer NOT NULL, source_database varchar NOT NULL, table_allowlist varchar NOT NULL)"
-assert_rejected_ddl logical_qualified_alter_config pg_lisp_subscription_config \
-    "ALTER TABLE \"public.public.pg_lisp_subscription_config\" ADD UNIQUE (source_slot, source_host)"
+assert_rejected_ddl logical_alter_config pg_lisp_subscription_config \
+    "ALTER TABLE pg_lisp_subscription_config ADD UNIQUE (source_slot, source_host)"
 assert_rejected_ddl logical_drop_config pg_lisp_subscription_config \
     "DROP TABLE pg_lisp_subscription_config"
 

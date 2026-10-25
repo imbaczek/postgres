@@ -1,5 +1,36 @@
 # Shared helpers for server-backed shell tests.
 
+# A successful psql probe alone can hit an unrelated server on an occupied port.
+# Verify the launched PID owns the TCP listener before sending even a SQL probe.
+test_wait_owned_sql_server() {
+    TEST_WAIT_PID=$1
+    TEST_WAIT_PORT=$2
+    TEST_WAIT_PSQL=${3:-psql}
+    command -v ss >/dev/null || { echo 'SQL test readiness requires ss' >&2; return 1; }
+    TEST_WAIT_ATTEMPT=0
+    while [ "$TEST_WAIT_ATTEMPT" -lt 200 ]; do
+        kill -0 "$TEST_WAIT_PID" 2>/dev/null || {
+            echo "SQL test server $TEST_WAIT_PID exited before owning port $TEST_WAIT_PORT" >&2
+            return 1
+        }
+        TEST_WAIT_LISTENER=$(ss -H -ltnp "sport = :$TEST_WAIT_PORT")
+        if [ -n "$TEST_WAIT_LISTENER" ]; then
+            if ! printf '%s\n' "$TEST_WAIT_LISTENER" | grep -F "pid=$TEST_WAIT_PID," >/dev/null; then
+                echo "SQL test port $TEST_WAIT_PORT belongs to another process" >&2
+                return 1
+            fi
+            if PGCONNECT_TIMEOUT=1 "$TEST_WAIT_PSQL" -X -h 127.0.0.1 \
+                    -p "$TEST_WAIT_PORT" -U postgres -d postgres -c '' >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        TEST_WAIT_ATTEMPT=$((TEST_WAIT_ATTEMPT + 1))
+        sleep 0.1
+    done
+    echo "SQL test server $TEST_WAIT_PID did not own port $TEST_WAIT_PORT" >&2
+    return 1
+}
+
 # EXPLAIN emits a tree, so check for a node as an indented exact line instead
 # of comparing the full plan output to a single scan node.
 plan_contains_indented_node() {

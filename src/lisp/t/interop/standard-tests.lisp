@@ -97,7 +97,9 @@
                   commit))
       (ok (pg::standard-transaction-visible-p transaction 0))
       (ok (pg::standard-transaction-visible-p transaction 160))
-      (ok (not (pg::standard-transaction-visible-p transaction 161)))
+      (ok (pg::standard-transaction-visible-p transaction 161))
+      (ok (pg::standard-transaction-visible-p transaction 170)
+          "a flush inside the commit record does not certify the transaction")
       (ok (not (pg::standard-transaction-visible-p transaction 192)))
       (ok (not (pg::standard-transaction-visible-p transaction 256)))))
 

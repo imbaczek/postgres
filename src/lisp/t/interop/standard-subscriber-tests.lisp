@@ -1,5 +1,39 @@
 (in-package #:pg-interop-tests)
 
+(deftest standard-state-is-protected-extension-metadata
+    (let* ((name "pg_lisp_standard_subscriptions")
+           (database (pg::make-database :name "postgres" :oid 7))
+           (table (pg::make-pg-class :oid 701 :name name))
+           (index-name "standard_state_owned_idx")
+           (index (pg::make-pg-index :oid 801 :name index-name :table-oid 701))
+           (bootstrap (list :database-oid 7
+                            :tables (list (list :name name :sql "private table")
+                                          (list :name "rows" :sql "ordinary table"))
+                            :indexes (list (list :name index-name :table-name name :sql "private index")
+                                           (list :name "rows_idx" :table-name "rows" :sql "ordinary index"))
+                            :sequences nil)))
+      (setf (gethash name (pg::database-tables database)) table
+            (gethash index-name (pg::database-indexes database)) index)
+      (ok (pg::logical-private-metadata-table-name-p name))
+      (dolist (mode '("standard" "extension"))
+        (ok (handler-case
+                (progn (pg::parse-logical-subscription-args
+                        (append (list "--mode" mode "--slot" "guard" "--table" name)
+                                (when (string= mode "standard") '("--publication" "p")))) nil)
+              (error (condition)
+                (search "unsupported allowlist table" (princ-to-string condition))))))
+      (let ((view (pg::logical-replication-bootstrap-view bootstrap)))
+        (ok (equal '("rows") (mapcar (lambda (entry) (getf entry :name)) (getf view :tables))))
+        (ok (equal '("rows_idx") (mapcar (lambda (entry) (getf entry :name)) (getf view :indexes)))))
+      (dolist (sql '("CREATE TABLE IF NOT EXISTS pg_lisp_standard_subscriptions (id int)"
+                     "ALTER TABLE pg_lisp_standard_subscriptions ADD UNIQUE (subscription_key)"
+                     "DROP TABLE pg_lisp_standard_subscriptions"
+                     "CREATE INDEX extra_idx ON pg_lisp_standard_subscriptions (source_lsn)"
+                     "DROP INDEX standard_state_owned_idx"
+                     "ALTER INDEX standard_state_owned_idx RENAME TO renamed_idx"))
+        (ok (equal name (pg::logical-private-metadata-ddl-target-name
+                         database (first (pg::parse-statements sql)))) sql))))
+
 (deftest standard-subscriber-explicit-mode
     (let ((options (pg::parse-logical-subscription-args
                     '("--mode" "standard" "--publication" "pub" "--slot" "subscriber" "--table" "rows"))))
