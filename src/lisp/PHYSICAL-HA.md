@@ -12,6 +12,25 @@ manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
 
+### Lazy COALESCE checkpoint
+
+SQL `COALESCE` is parsed as an expression, resolves and coerces every input to
+its common type, rejects set-returning inputs, and evaluates left to right only
+until its first non-NULL value. False and zero are non-NULL. Metadata preserves
+matching typmods and the `coalesce` column name, including through casts. CASE
+and COALESCE now share the post-coercion typmod check. Integral casts to numeric
+follow C's implicit int2/int4/int8 rules; general decimal input remains unfinished.
+
+All 131 physical cases, 135 interop cases, and 1,598 legacy checks pass. The new
+cl-spec NULL-pattern property passes 200 trials with seed 42. The shared wire
+probe passes native Lisp (`/tmp/pg-patroni-start.ETETve`) and pinned C
+(`/tmp/pg-c-coalesce.QkypaH`), covering type/name/typmod metadata, lazy errors,
+coercion errors, SRFs, nullable rows and supported aggregate results. Strict
+compile/format and actual standby receipt/reload/crash-follow checks pass; final
+logs use `/tmp/pg-coalesce-`. The standby check exercises the actual receive-LSN
+fallback before receipt and after durable progress. Luna max and Sol high reviews
+found no production defect; Sol medium's shared typmod refactor was applied.
+
 ### Exact WAL LSN difference checkpoint
 
 `pg_wal_lsn_diff(pg_lsn, pg_lsn)` now returns an exact integral `numeric`
@@ -48,7 +67,7 @@ Sol medium suggested the applied literal-coercion simplification.
 The pinned `pg_walfile_name()` uses `XLByteToSeg`, so an exact segment boundary
 names the new segment. Do not import older PostgreSQL's previous-segment rule.
 The complete Patroni TL_LSN expression additionally needs `||` tokenization,
-`substr`, `bit(32)::int` (signed bit pattern), lazy `COALESCE`, actual timeline
+`substr`, `bit(32)::int` (signed bit pattern), actual timeline
 filename reporting, and receiver/control statistics. These remain unfinished.
 
 ### Replay pause control checkpoint

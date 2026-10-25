@@ -67,12 +67,15 @@ start_source
 sql "$PORT" "CREATE TABLE data (id integer PRIMARY KEY,label varchar(32)); INSERT INTO data VALUES (1,'base'); CREATE TABLE empty_base (id integer)"
 checked source "(physical-base-backup \"$TMP/copy/\" \"network_base\")" backup
 start_target
+test "$(sql "$TARGET_PORT" "SELECT pg_wal_lsn_diff(COALESCE(pg_last_wal_receive_lsn(),'0/0'),'0/0')::bigint")" = 0
 checked target "(physical-follow-start \"127.0.0.1\" $PORT \"network_base\")" follow
 sql "$PORT" "INSERT INTO data VALUES (2,'network')"
 wait_target 'SELECT count(*) FROM data' 2
+test "$(sql "$TARGET_PORT" "SELECT pg_wal_lsn_diff(COALESCE(pg_last_wal_receive_lsn(),'0/0'),'0/0')::bigint > 0")" = t
 compare
 checked source '(reload)' source-reload
 checked target '(reload)' target-reload
+test "$(sql "$TARGET_PORT" 'SELECT COALESCE(NULL,1)')" = 1
 # SQL pause stops only apply: durable receipt and feedback continue.
 test "$(sql "$TARGET_PORT" 'SELECT pg_get_wal_replay_pause_state()')" = 'not paused'
 test "$(sql "$TARGET_PORT" 'SELECT pg_wal_replay_pause()')" = ''

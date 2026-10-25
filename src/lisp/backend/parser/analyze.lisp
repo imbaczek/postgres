@@ -757,6 +757,24 @@ exist\" messages."
                              :type type :typmod typmod))))
       (getf target :type))))
 
+(defun common-expression-typmod (expressions)
+  "Retain a typmod only when all already-coerced expressions agree."
+  (let ((typmod (expr-typmod (first expressions))))
+    (if (every (lambda (expression) (= typmod (expr-typmod expression))) expressions)
+        typmod -1)))
+
+(defun analyze-coalesce-expression (expression scope)
+  "Match transformCoalesceExpr: resolve and coerce every argument before execution."
+  (let* ((arguments (mapcar (lambda (argument) (analyze-expr argument scope))
+                            (second expression)))
+         (type (common-expression-type arguments "COALESCE"))
+         (coerced (mapcar (lambda (argument) (coerce-common-expression argument type))
+                          arguments)))
+    (when (analyzed-expression-contains-set-p arguments)
+      (ereport "0A000" "set-returning functions are not allowed in COALESCE"))
+    (list :coalesce coerced :type type
+          :typmod (common-expression-typmod coerced))))
+
 (defun analyze-case-expression (expression scope)
   (let* ((branches
            (mapcar
@@ -777,9 +795,7 @@ exist\" messages."
           (loop for branch in branches for value in (rest coerced)
                 collect (list (first branch) value))
           (first coerced) :type type
-          :typmod (if (every (lambda (value) (= (expr-typmod value)
-                                                (expr-typmod (first coerced)))) coerced)
-                      (expr-typmod (first coerced)) -1))))
+          :typmod (common-expression-typmod coerced))))
 
 (defun analyze-array-literal (expression scope)
   (let ((items (mapcar (lambda (item) (analyze-expr item scope)) (second expression))))
@@ -834,6 +850,7 @@ exist\" messages."
                 :typmod -1))
          ((stringp v) (list :const v :type :text :typmod -1))
          (t (list :const v :type :text :typmod -1)))))
+    (:coalesce (analyze-coalesce-expression expr table))
     (:case (analyze-case-expression expr table))
     (:array-literal (analyze-array-literal expr table))
     ((:any :all) (analyze-any-expression expr table))
@@ -900,7 +917,7 @@ exist\" messages."
     (loop while (eq (first argument) :cast) do (setf argument (second argument)))
     (case (first argument)
       (:func (second argument))
-      ((:column :count-star) (target-default-name argument))
+      ((:column :count-star :coalesce) (target-default-name argument))
       (t (if (eq (third ast) :pg-lsn) "pg_lsn"
              (string-downcase (symbol-name (third ast))))))))
 
@@ -908,6 +925,7 @@ exist\" messages."
   (case (first ast)
     (:column
      (if (third ast) (third ast) (second ast)))
+    (:coalesce "coalesce")
     (:count-star "count")
     (:func (second ast))
     (:record-field (third ast))
@@ -1308,6 +1326,7 @@ exist\" messages."
   (or (eq source target)
       (member (list source target)
               '((:int2 :int4) (:int2 :int8) (:int2 :oid) (:int4 :int8) (:int4 :oid) (:int8 :oid)
+                (:int2 :numeric) (:int4 :numeric) (:int8 :numeric)
                 (:name :text) (:text :name) (:text :varchar)
                 (:varchar :text) (:varchar :name)
                 (:char :text) (:pg-node-tree :text))
@@ -1693,6 +1712,12 @@ exist\" messages."
     (let ((result (if null-seen-p +null+ nil)))
       (if negated-p (sql-3val-not result) result))))
 
+(defun eval-coalesce-expression (expression environment)
+  "Evaluate left to right and stop at the first SQL non-NULL, including NIL or zero."
+  (dolist (argument (second expression) +null+)
+    (let ((value (eval-expr argument environment)))
+      (unless (eq value +null+) (return value)))))
+
 (defun eval-case-expression (expression environment)
   (dolist (branch (second expression))
     (when (eq (eval-expr (first branch) environment) t)
@@ -1730,6 +1755,7 @@ exist\" messages."
 (defun eval-expr (expr env)
   (case (first expr)
     ((:const :scalar-array-const) (second expr))
+    (:coalesce (eval-coalesce-expression expr env))
     (:case (eval-case-expression expr env))
     ((:any :all) (eval-any-expression expr env))
     (:array-length (eval-array-length expr env))
