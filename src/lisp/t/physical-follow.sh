@@ -7,6 +7,12 @@ SBCL=${SBCL:-sbcl}
 PSQL=${PSQL:-psql}
 PORT=${PORT:-5876}
 TARGET_PORT=$((PORT + 1))
+PATRONI_PYTHON=${PATRONI_PYTHON:-/tmp/pg-patroni-4.1.5-venv/bin/python3}
+test -x "$PATRONI_PYTHON" || {
+    echo 'set PATRONI_PYTHON to the pinned Patroni 4.1.5 test environment' >&2
+    exit 1
+}
+"$PATRONI_PYTHON" -c 'import importlib.metadata, psycopg2; from patroni.postgresql import Postgresql; assert importlib.metadata.version("patroni") == "4.1.5"'
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-physical-follow.XXXXXX")
 SOURCE= TARGET= TX=
 sql() {
@@ -67,6 +73,8 @@ start_source
 sql "$PORT" "CREATE TABLE data (id integer PRIMARY KEY,label varchar(32)); INSERT INTO data VALUES (1,'base'); CREATE TABLE empty_base (id integer)"
 checked source "(physical-base-backup \"$TMP/copy/\" \"network_base\")" backup
 start_target
+"$PATRONI_PYTHON" "$BASE/t/interop/patroni-tl-lsn.py" "$PORT" primary
+"$PATRONI_PYTHON" "$BASE/t/interop/patroni-tl-lsn.py" "$TARGET_PORT" standby
 test "$(sql "$TARGET_PORT" "SELECT pg_wal_lsn_diff(COALESCE(pg_last_wal_receive_lsn(),'0/0'),'0/0')::bigint")" = 0
 checked target "(physical-follow-start \"127.0.0.1\" $PORT \"network_base\")" follow
 sql "$PORT" "INSERT INTO data VALUES (2,'network')"
@@ -76,6 +84,7 @@ compare
 checked source '(reload)' source-reload
 checked target '(reload)' target-reload
 test "$(sql "$TARGET_PORT" 'SELECT COALESCE(NULL,1)')" = 1
+"$PATRONI_PYTHON" "$BASE/t/interop/patroni-tl-lsn.py" "$TARGET_PORT" standby
 # SQL pause stops only apply: durable receipt and feedback continue.
 test "$(sql "$TARGET_PORT" 'SELECT pg_get_wal_replay_pause_state()')" = 'not paused'
 test "$(sql "$TARGET_PORT" 'SELECT pg_wal_replay_pause()')" = ''
@@ -87,12 +96,14 @@ paused_flush=$(sql "$PORT" 'SELECT pg_current_wal_flush_lsn()')
 wait_target "SELECT pg_last_wal_receive_lsn() >= '$paused_flush'::pg_lsn" t
 test "$(sql "$TARGET_PORT" 'SELECT pg_last_wal_replay_lsn()')" = "$paused_replay"
 test "$(sql "$TARGET_PORT" 'SELECT label FROM data WHERE id=1')" = base
+"$PATRONI_PYTHON" "$BASE/t/interop/patroni-tl-lsn.py" "$TARGET_PORT" standby paused
 checked target '(physical-recovery-replay)' paused-direct-replay
 grep -q '^:PAUSED$' "$TMP/paused-direct-replay.log"
 checked target '(reload)' paused-reload
 test "$(sql "$TARGET_PORT" 'SELECT pg_get_wal_replay_pause_state()')" = paused
 test "$(sql "$TARGET_PORT" 'SELECT pg_wal_replay_resume()')" = ''
 wait_target "SELECT label FROM data WHERE id=1" received-while-paused
+"$PATRONI_PYTHON" "$BASE/t/interop/patroni-tl-lsn.py" "$TARGET_PORT" standby
 test "$(sql "$TARGET_PORT" 'SELECT pg_is_wal_replay_paused()')" = f
 # Release while connected must fail without poisoning source WAL.
 control source '(physical-source-pin-release "network_base")' >"$TMP/release-active.log"

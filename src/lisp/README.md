@@ -729,9 +729,13 @@ uv venv /tmp/pg-patroni-4.1.5-venv
 uv pip install --python /tmp/pg-patroni-4.1.5-venv/bin/python3 -r t/interop/patroni-requirements.txt
 PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/postmaster-pid.sh
 PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/patroni-start.sh
+PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/physical-follow.sh
 ```
 
-These check process discovery, start-time validation, direct startup, fast stop,
+Physical follow also requires that pinned environment and checks Patroni's unchanged
+five-column timeline/LSN fragment on primary, standby and paused standby, including
+reload and resume. This does not verify the larger cluster status query.
+These tests check process discovery, start-time validation, direct startup, fast stop,
 configuration precedence, SIGHUP and the pinned ConfigHandler's settings queries
 through real psycopg2. The configuration subset supports `port`,
 `listen_addresses`, `data_directory`, `checkpoint_timeout`, `max_wal_size` and

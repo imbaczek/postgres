@@ -12,6 +12,38 @@ manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
 
+### Boolean execution and Patroni TL_LSN checkpoint
+
+AND/OR now follow `execExprInterp.c` short circuit: false AND and true OR skip
+the right operand; NULL still evaluates it and combines with SQL three-valued
+logic. AND/OR/NOT analyze every operand through Boolean coercion first, matching
+`coerce_to_boolean` for supported types: unknown literals use Boolean input,
+known non-Boolean types fail with 42804, invalid literals fail with 22P02, and
+set-valued Boolean inputs are rejected. Runtime skipping does not suppress
+analysis errors. A shared native/C wire probe checks all nine input pairs,
+Boolean OIDs, unknown-input coercion, type errors and volatile sequence calls
+to prove both skipped evaluation and required evaluation after NULL.
+
+The installed pinned Patroni 4.1.5 `Postgresql.TL_LSN` constant now runs unchanged
+with both write and flush variants. Its five result types and values are checked
+on native primary, bootstrap-only standby, receiving/replaying standby, and
+paused standby with receipt ahead of replay, including live reload. Primary
+evaluation skips the recovery-only pause function; standby CASE branches skip
+primary-only functions. C primary evidence: `/tmp/pg-c-patroni-tl.Tj7slu`;
+C streaming standby and paused-standby evidence: `/tmp/pg-c-tl-standby.94mF1E`.
+Boolean C wire evidence: `/tmp/pg-c-boolean-final.tQobwJ`. Native direct-start/reload
+evidence: `/tmp/pg-patroni-start.J0oHad`; final complete physical follow/crash/
+reconnect evidence: `/tmp/pg-physical-follow.Atal5o`. All 160 interop and 131
+physical tests pass. Formatting and strict compilation pass. Sol medium found
+no useful refactor; changed production functions remain below 120 lines.
+All 1,598 legacy checks pass. Luna max found no executor/coercion defect; Sol high's
+type-name diagnostic and test-prerequisite findings are fixed and re-reviewed.
+
+This verifies the five-column timeline/LSN fragment, not Patroni's larger
+`cluster_info_query`, which still needs receiver statistics, postmaster/control
+metadata and additional configuration interfaces. Promotion, synchronous commit
+waits, slots and coordination are unchanged and remain outside this checkpoint.
+
 ### WAL filename reporting checkpoint
 
 `pg_catalog.pg_walfile_name(pg_lsn)` now follows pinned `xlogfuncs.c` and
@@ -31,8 +63,8 @@ shutdown smoke checks. Strict compilation passes.
 Luna's recovery message/hint finding is fixed and covered by explicit condition
 field assertions. Sol high found no other defects; Sol medium recommended no
 refactor. Formatting and 1,598 legacy checks pass. The full Patroni timeline/LSN
-fragment remains the next acceptance target: its recovery AND replay-paused
-guard also requires correct lazy Boolean evaluation on a primary.
+fragment required lazy Boolean evaluation on a primary; the newer checkpoint
+above now verifies that fragment.
 
 ### Fixed-bit cast checkpoint
 
@@ -69,8 +101,8 @@ found no useful LOC-saving refactor; all changed production functions remain
 under 120 lines.
 
 Varying-bit types, bitwise operations, bit concatenation and bit table storage
-remain unfinished. The complete Patroni status query still needs WAL filename
-and receiver/control reporting. This milestone adds no coordination.
+remain unfinished. WAL filename reporting is covered above; the complete Patroni
+status query still needs receiver/control reporting. This milestone adds no coordination.
 
 ### String status-expression checkpoint
 
