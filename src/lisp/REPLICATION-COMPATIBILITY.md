@@ -177,9 +177,11 @@ Additional verification: 129 focused Rove tests, three live native C subscriber
 tests, and the selected C-to-C historic-publication oracle pass. Strict compile
 is recorded in `/tmp/pg-history-barrier-compile.log`; legacy and smoke results
 are `/tmp/pg-history-final-unit.log` and `/tmp/pg-history-final-smoke.log`.
-`cl-spec/check-it` is unavailable in the configured ASDF environment, so no
-generated-contract result is claimed. The preexisting JOIN/DDL concurrency
-timeout reproduced on committed HEAD remains separate baseline test debt.
+`cl-spec/check-it` was unavailable during milestone acceptance, so no
+generated-contract result is claimed for that run. It is now an explicit
+interop-test dependency; see the README for installation. The preexisting
+JOIN/DDL concurrency timeout reproduced on committed HEAD remains separate
+baseline test debt.
 
 This accepts only the initial supported contract above. Physical WAL/disk
 compatibility, general SQL/catalog coverage, DDL/sequence replication in standard

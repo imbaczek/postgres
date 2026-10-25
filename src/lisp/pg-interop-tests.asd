@@ -1,12 +1,13 @@
 (asdf:defsystem "pg-interop-tests"
   :description "Independent PostgreSQL logical replication wire contracts"
-  :depends-on ("pg" "rove")
+  :depends-on ("pg" "rove" "cl-spec/check-it")
   :serial t
   :components ((:file "t/interop/protocol-tests")
                (:file "t/interop/standard-tests")
                (:file "t/interop/copy-tests")
                (:file "t/interop/standard-subscriber-tests")
-               (:file "t/interop/publication-history-tests"))
+               (:file "t/interop/publication-history-tests")
+               (:file "t/interop/property-tests"))
   :perform (asdf:test-op (operation component)
                          (declare (ignore operation component))
                          (unless (uiop:symbol-call :rove :run :pg-interop-tests)

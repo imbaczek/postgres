@@ -1,6 +1,22 @@
 (defpackage #:pg-interop-apply-tests (:use #:cl #:rove))
 (in-package #:pg-interop-apply-tests)
 
+(defmacro with-reference-clients ((client reference) &body body)
+  "Close both peers on exit, including a failed second connection."
+  `(let ((,client (pg::pg-client-connect
+                   "127.0.0.1" (parse-integer
+                                (or (uiop:getenv "PG_INTEROP_TARGET_PORT")
+                                    (error "isolated target port required"))) "postgres")))
+     (unwind-protect
+          (let ((,reference (pg::pg-client-connect
+                             "127.0.0.1" (parse-integer
+                                          (or (uiop:getenv "PG_INTEROP_REFERENCE_PORT")
+                                              (error "unmodified C reference port required")))
+                             "postgres" :user
+                             (or (uiop:getenv "PG_INTEROP_REFERENCE_USER") "postgres"))))
+            (unwind-protect (progn ,@body) (pg::pg-client-close ,reference)))
+       (pg::pg-client-close ,client))))
+
 (defun observed-query-wire (client sql)
   "Retain successful wire frames verbatim; compare error SQLSTATE separately."
   (pg::pg-client-send-query client sql)
@@ -28,11 +44,7 @@ ORDER BY 1,2"
           publication-list publication-list))
 
 (deftest discovery-catalogs-match-c-wire
-    (let* ((port (parse-integer (or (uiop:getenv "PG_INTEROP_TARGET_PORT") (error "target port required"))))
-           (reference-port (parse-integer (or (uiop:getenv "PG_INTEROP_REFERENCE_PORT") (error "reference port required"))))
-           (client (pg::pg-client-connect "127.0.0.1" port "postgres"))
-           (reference (pg::pg-client-connect "127.0.0.1" reference-port "postgres"
-                                             :user (or (uiop:getenv "PG_INTEROP_REFERENCE_USER") "postgres"))))
+    (with-reference-clients (client reference)
       (unwind-protect
            (progn
              (dolist (connection (list client reference))
@@ -103,256 +115,208 @@ ORDER BY 1,2"
           (dolist (name '("catalog_wire_later" "catalog_wire_counter"))
             (ignore-errors (pg::pg-client-query connection (format nil "DROP SEQUENCE ~a" name))))
           (dolist (name '("catalog_wire_b" "catalog_wire_a"))
-            (ignore-errors (pg::pg-client-query connection (format nil "DROP TABLE ~a" name))))
-          (pg::pg-client-close connection)))))
+            (ignore-errors (pg::pg-client-query connection (format nil "DROP TABLE ~a" name))))))))
 
 (deftest casts-match-c-reference-wire
-    (let* ((port (parse-integer (or (uiop:getenv "PG_INTEROP_TARGET_PORT")
-                                    (error "isolated target port required"))))
-           (reference-port (parse-integer (or (uiop:getenv "PG_INTEROP_REFERENCE_PORT")
-                                              (error "unmodified C reference port required"))))
-           (client (pg::pg-client-connect "127.0.0.1" port "postgres"))
-           (reference (pg::pg-client-connect
-                       "127.0.0.1" reference-port "postgres" :user
-                       (or (uiop:getenv "PG_INTEROP_REFERENCE_USER") "postgres"))))
-      (unwind-protect
-           (dolist (sql '("SELECT '42'::int4, CAST('42' AS integer)"
-                          "SELECT '0x_FF'::int4, '-0b_100'::int8"
-                          "SELECT true::name, true::varchar, true::text"
-                          "SELECT 'S'::\"char\", NULL::int2vector, '1 2 -3'::int2vector"
-                          "SELECT 'é'::\"char\", ''::\"char\", (-128)::\"char\"::int4"
-                          "SELECT 'abcdefgh'::varchar(3), 'x'::varchar(400)"
-                          "SELECT '1'::text::int4, length('x')::text"
-                          "SELECT 'x'::\"char\" IN ('x'::text, 'y'::text)"
-                          "SELECT 'x'::\"char\" IN ('x'::\"char\", 'y'::text)"
-                          "SELECT 1 IN ('1'::text, '2'::text)"
-                          "SELECT 1 = '1'::text WHERE false"
-                          "SELECT 'x'::\"char\" IN ('x'::\"char\", 'y'::\"char\")"
-                          "SELECT '1 2'::int2vector IN ('1 2'::int2vector)"
-                          "SELECT 'x'::\"char\"='x'::text, 'x'::\"char\"='x'::name"
-                          "SELECT 'abc'::varchar(2) AS \"from\""
-                          "SELECT 9223372036854775808::int8"
-                          "SELECT (-9223372036854775808)::int8"
-                          "SELECT '2147483648'::int4"
-                          "SELECT '9223372036854775808'::int8"
-                          "SELECT '0x__1'::int4"
-                          "SELECT 'maybe'::bool"
-                          "SELECT '32768'::int2vector"
-                          "SELECT true::int8"
-                          "SELECT 'x'::\"char\" > 0"
-                          "SELECT '1 2'::int2vector='1 2'::text"
-                          "SELECT 'invalid'::int4 WHERE false"
-                          "SELECT CAST(\"true\" AS text)"
-                          "SELECT length(VARIADIC 'x')"))
-             (ok (equalp (observed-query-wire reference sql)
-                         (observed-query-wire client sql))
-                 sql))
-        (pg::pg-client-close reference)
-        (pg::pg-client-close client))))
+    (with-reference-clients (client reference)
+      (dolist (sql '("SELECT '42'::int4, CAST('42' AS integer)"
+                     "SELECT '0x_FF'::int4, '-0b_100'::int8"
+                     "SELECT true::name, true::varchar, true::text"
+                     "SELECT 'S'::\"char\", NULL::int2vector, '1 2 -3'::int2vector"
+                     "SELECT 'é'::\"char\", ''::\"char\", (-128)::\"char\"::int4"
+                     "SELECT 'abcdefgh'::varchar(3), 'x'::varchar(400)"
+                     "SELECT '1'::text::int4, length('x')::text"
+                     "SELECT 'x'::\"char\" IN ('x'::text, 'y'::text)"
+                     "SELECT 'x'::\"char\" IN ('x'::\"char\", 'y'::text)"
+                     "SELECT 1 IN ('1'::text, '2'::text)"
+                     "SELECT 1 = '1'::text WHERE false"
+                     "SELECT 'x'::\"char\" IN ('x'::\"char\", 'y'::\"char\")"
+                     "SELECT '1 2'::int2vector IN ('1 2'::int2vector)"
+                     "SELECT 'x'::\"char\"='x'::text, 'x'::\"char\"='x'::name"
+                     "SELECT 'abc'::varchar(2) AS \"from\""
+                     "SELECT 9223372036854775808::int8"
+                     "SELECT (-9223372036854775808)::int8"
+                     "SELECT '2147483648'::int4"
+                     "SELECT '9223372036854775808'::int8"
+                     "SELECT '0x__1'::int4"
+                     "SELECT 'maybe'::bool"
+                     "SELECT '32768'::int2vector"
+                     "SELECT true::int8"
+                     "SELECT 'x'::\"char\" > 0"
+                     "SELECT '1 2'::int2vector='1 2'::text"
+                     "SELECT 'invalid'::int4 WHERE false"
+                     "SELECT CAST(\"true\" AS text)"
+                     "SELECT length(VARIADIC 'x')"))
+        (ok (equalp (observed-query-wire reference sql)
+                    (observed-query-wire client sql))
+            sql))))
 
 (deftest array-aggregates-match-c-wire
-    (let* ((port (parse-integer (or (uiop:getenv "PG_INTEROP_TARGET_PORT")
-                                    (error "isolated target port required"))))
-           (reference-port (parse-integer (or (uiop:getenv "PG_INTEROP_REFERENCE_PORT")
-                                              (error "C reference port required"))))
-           (client (pg::pg-client-connect "127.0.0.1" port "postgres"))
-           (reference (pg::pg-client-connect "127.0.0.1" reference-port "postgres"
-                                             :user (or (uiop:getenv "PG_INTEROP_REFERENCE_USER")
-                                                       "postgres"))))
-      (unwind-protect
-           (progn
-             (dolist (connection (list client reference))
-               (pg::pg-client-query connection "CREATE TABLE array_wire_rows (id int, label text)")
-               (pg::pg-client-query connection "INSERT INTO array_wire_rows VALUES (1,'a'),(1,'a'),(2,NULL),(2,NULL)")
-               (pg::pg-client-query connection "CREATE SEQUENCE array_wire_seq"))
-             (dolist (sql '("SELECT DISTINCT COUNT(*) ORDER BY COUNT(*)"
-                            "SELECT DISTINCT array_agg('x'::text) ORDER BY array_agg('x'::text)"
-                            "SELECT DISTINCT array_agg('x'::text) ORDER BY pg_catalog.array_agg('x'::text)"
-                            "SELECT 1 ORDER BY array_agg('x'::text)"
-                            "SELECT COUNT(*) ORDER BY array_agg('x'::text)"
-                            "SELECT DISTINCT 1 ORDER BY COUNT(*)"
-                            "SELECT length(array_agg('x'::text))"
-                            "SELECT array_agg('x'::text) + 1"
-                            "SELECT array_agg('a,b'::text), array_agg('NULL'::text), array_agg(''::text), array_agg('é'::text)"
-                            "SELECT array_agg('x'::text)"
-                            "SELECT array_agg(NULL::text), COUNT(*)"
-                            "SELECT array_agg(label::text), COUNT(*) FROM array_wire_rows WHERE false"
-                            "SELECT CAST(COUNT(*) AS text), COUNT(*) + COUNT(*) FROM array_wire_rows"
-                            "SELECT id+0 AS id,array_agg(label::text),COUNT(*) FROM array_wire_rows GROUP BY id ORDER BY id"
-                            "SELECT array_agg(label::text)::text FROM array_wire_rows"
-                            "SELECT length(array_agg(label::text)::text) FROM array_wire_rows"
-                            "SELECT DISTINCT array_agg(label::text) FROM array_wire_rows GROUP BY id ORDER BY 1"
-                            "SELECT COUNT(*) FROM array_wire_rows ORDER BY COUNT(*)"
-                            "SELECT COUNT(*)::text FROM array_wire_rows ORDER BY COUNT(*)"
-                            "SELECT array_agg(nextval('array_wire_seq')::text) FROM array_wire_rows"
-                            "SELECT array_agg(nextval('array_wire_seq')::text),array_agg(nextval('array_wire_seq')::text) FROM array_wire_rows"
-                            "SELECT currval('array_wire_seq')"
-                            "SELECT array_agg('x')"
-                            "SELECT array_agg(COUNT(*)::text)"))
-               (ok (equalp (observed-query-wire reference sql)
-                           (observed-query-wire client sql)) sql))
-             (dolist (connection (list client reference))
-               (pg::pg-client-query connection "DROP TABLE array_wire_rows")
-               (pg::pg-client-query connection "DROP SEQUENCE array_wire_seq")))
-        (pg::pg-client-close reference)
-        (pg::pg-client-close client))))
+    (with-reference-clients (client reference)
+      (progn
+        (dolist (connection (list client reference))
+          (pg::pg-client-query connection "CREATE TABLE array_wire_rows (id int, label text)")
+          (pg::pg-client-query connection "INSERT INTO array_wire_rows VALUES (1,'a'),(1,'a'),(2,NULL),(2,NULL)")
+          (pg::pg-client-query connection "CREATE SEQUENCE array_wire_seq"))
+        (dolist (sql '("SELECT DISTINCT COUNT(*) ORDER BY COUNT(*)"
+                       "SELECT DISTINCT array_agg('x'::text) ORDER BY array_agg('x'::text)"
+                       "SELECT DISTINCT array_agg('x'::text) ORDER BY pg_catalog.array_agg('x'::text)"
+                       "SELECT 1 ORDER BY array_agg('x'::text)"
+                       "SELECT COUNT(*) ORDER BY array_agg('x'::text)"
+                       "SELECT DISTINCT 1 ORDER BY COUNT(*)"
+                       "SELECT length(array_agg('x'::text))"
+                       "SELECT array_agg('x'::text) + 1"
+                       "SELECT array_agg('a,b'::text), array_agg('NULL'::text), array_agg(''::text), array_agg('é'::text)"
+                       "SELECT array_agg('x'::text)"
+                       "SELECT array_agg(NULL::text), COUNT(*)"
+                       "SELECT array_agg(label::text), COUNT(*) FROM array_wire_rows WHERE false"
+                       "SELECT CAST(COUNT(*) AS text), COUNT(*) + COUNT(*) FROM array_wire_rows"
+                       "SELECT id+0 AS id,array_agg(label::text),COUNT(*) FROM array_wire_rows GROUP BY id ORDER BY id"
+                       "SELECT array_agg(label::text)::text FROM array_wire_rows"
+                       "SELECT length(array_agg(label::text)::text) FROM array_wire_rows"
+                       "SELECT DISTINCT array_agg(label::text) FROM array_wire_rows GROUP BY id ORDER BY 1"
+                       "SELECT COUNT(*) FROM array_wire_rows ORDER BY COUNT(*)"
+                       "SELECT COUNT(*)::text FROM array_wire_rows ORDER BY COUNT(*)"
+                       "SELECT array_agg(nextval('array_wire_seq')::text) FROM array_wire_rows"
+                       "SELECT array_agg(nextval('array_wire_seq')::text),array_agg(nextval('array_wire_seq')::text) FROM array_wire_rows"
+                       "SELECT currval('array_wire_seq')"
+                       "SELECT array_agg('x')"
+                       "SELECT array_agg(COUNT(*)::text)"))
+          (ok (equalp (observed-query-wire reference sql)
+                      (observed-query-wire client sql)) sql))
+        (dolist (connection (list client reference))
+          (pg::pg-client-query connection "DROP TABLE array_wire_rows")
+          (pg::pg-client-query connection "DROP SEQUENCE array_wire_seq")))))
 
 (deftest publication-srfs-match-c-wire
-    (let* ((port (parse-integer (or (uiop:getenv "PG_INTEROP_TARGET_PORT")
-                                    (error "isolated target port required"))))
-           (reference-port (parse-integer (or (uiop:getenv "PG_INTEROP_REFERENCE_PORT")
-                                              (error "C reference port required"))))
-           (client (pg::pg-client-connect "127.0.0.1" port "postgres"))
-           (reference (pg::pg-client-connect "127.0.0.1" reference-port "postgres"
-                                             :user (or (uiop:getenv "PG_INTEROP_REFERENCE_USER") "postgres"))))
-      (unwind-protect
-           (progn
-             (dolist (connection (list client reference))
-               (pg::pg-client-query connection "CREATE TABLE srf_wire_a (id int PRIMARY KEY, label varchar(20))")
-               (pg::pg-client-query connection "CREATE TABLE srf_wire_b (id int PRIMARY KEY)")
-               (pg::pg-client-query connection "CREATE PUBLICATION srf_wire_p FOR TABLE srf_wire_a,srf_wire_b")
-               (pg::pg-client-query connection "CREATE PUBLICATION srf_wire_q FOR TABLE srf_wire_a"))
-             ;; OIDs are cluster-local. Compare the complete descriptor on an empty
-             ;; projection and use identical scalar properties for populated rows.
-             (dolist (sql '("SELECT (pg_get_publication_tables('srf_wire_p')).* WHERE false"
-                            "SELECT (pg_get_publication_tables('srf_wire_p')).attrs, (pg_get_publication_tables('srf_wire_p')).qual"
-                            "SELECT 9, (pg_get_publication_tables('srf_wire_p')).attrs LIMIT 1"
-                            "SELECT (pg_get_publication_tables('srf_wire_p')).attrs, (pg_get_publication_tables('srf_wire_q')).attrs"
-                            "SELECT (pg_get_publication_tables('srf_wire_p','srf_wire_p')).attrs"
-                            "SELECT (pg_get_publication_tables()).*"
-                            "SELECT (pg_get_publication_tables(VARIADIC NULL)).*"
-                            "SELECT (pg_get_publication_tables(NULL)).*"
-                            "SELECT (pg_get_publication_tables('srf_wire_missing')).*"
-                            "SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).attrs FROM pg_catalog.pg_publication WHERE pubname IN ('srf_wire_p')"
-                            "SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).* FROM pg_catalog.pg_publication WHERE pubname IN ('srf_wire_missing')"
-                            "SELECT array_agg(pg_get_publication_tables('srf_wire_p'))"
-                            "SELECT 1 WHERE pg_get_publication_tables('srf_wire_p') IS NULL"))
-               (ok (equalp (observed-query-wire reference sql) (observed-query-wire client sql)) sql))
-             (dolist (connection (list client reference))
-               (let ((before (pg::pg-client-query connection "SELECT oid FROM pg_catalog.pg_publication WHERE pubname = 'srf_wire_p'")))
-                 (pg::pg-client-query connection "ALTER PUBLICATION srf_wire_p SET (publish = 'insert')")
-                 (ok (equalp before (pg::pg-client-query connection "SELECT oid FROM pg_catalog.pg_publication WHERE pubname = 'srf_wire_p'")))
-                 (pg::pg-client-query connection "DROP PUBLICATION srf_wire_p")
-                 (pg::pg-client-query connection "CREATE PUBLICATION srf_wire_p FOR TABLE srf_wire_a")
-                 (ok (not (equalp before (pg::pg-client-query connection "SELECT oid FROM pg_catalog.pg_publication WHERE pubname = 'srf_wire_p'")))))
-               (pg::pg-client-query connection "DROP PUBLICATION srf_wire_p")
-               (pg::pg-client-query connection "DROP PUBLICATION srf_wire_q")
-               (pg::pg-client-query connection "DROP TABLE srf_wire_a")
-               (pg::pg-client-query connection "DROP TABLE srf_wire_b")))
-        (pg::pg-client-close reference)
-        (pg::pg-client-close client))))
+    (with-reference-clients (client reference)
+      (progn
+        (dolist (connection (list client reference))
+          (pg::pg-client-query connection "CREATE TABLE srf_wire_a (id int PRIMARY KEY, label varchar(20))")
+          (pg::pg-client-query connection "CREATE TABLE srf_wire_b (id int PRIMARY KEY)")
+          (pg::pg-client-query connection "CREATE PUBLICATION srf_wire_p FOR TABLE srf_wire_a,srf_wire_b")
+          (pg::pg-client-query connection "CREATE PUBLICATION srf_wire_q FOR TABLE srf_wire_a"))
+        ;; OIDs are cluster-local. Compare the complete descriptor on an empty
+        ;; projection and use identical scalar properties for populated rows.
+        (dolist (sql '("SELECT (pg_get_publication_tables('srf_wire_p')).* WHERE false"
+                       "SELECT (pg_get_publication_tables('srf_wire_p')).attrs, (pg_get_publication_tables('srf_wire_p')).qual"
+                       "SELECT 9, (pg_get_publication_tables('srf_wire_p')).attrs LIMIT 1"
+                       "SELECT (pg_get_publication_tables('srf_wire_p')).attrs, (pg_get_publication_tables('srf_wire_q')).attrs"
+                       "SELECT (pg_get_publication_tables('srf_wire_p','srf_wire_p')).attrs"
+                       "SELECT (pg_get_publication_tables()).*"
+                       "SELECT (pg_get_publication_tables(VARIADIC NULL)).*"
+                       "SELECT (pg_get_publication_tables(NULL)).*"
+                       "SELECT (pg_get_publication_tables('srf_wire_missing')).*"
+                       "SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).attrs FROM pg_catalog.pg_publication WHERE pubname IN ('srf_wire_p')"
+                       "SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).* FROM pg_catalog.pg_publication WHERE pubname IN ('srf_wire_missing')"
+                       "SELECT array_agg(pg_get_publication_tables('srf_wire_p'))"
+                       "SELECT 1 WHERE pg_get_publication_tables('srf_wire_p') IS NULL"))
+          (ok (equalp (observed-query-wire reference sql) (observed-query-wire client sql)) sql))
+        (dolist (connection (list client reference))
+          (let ((before (pg::pg-client-query connection "SELECT oid FROM pg_catalog.pg_publication WHERE pubname = 'srf_wire_p'")))
+            (pg::pg-client-query connection "ALTER PUBLICATION srf_wire_p SET (publish = 'insert')")
+            (ok (equalp before (pg::pg-client-query connection "SELECT oid FROM pg_catalog.pg_publication WHERE pubname = 'srf_wire_p'")))
+            (pg::pg-client-query connection "DROP PUBLICATION srf_wire_p")
+            (pg::pg-client-query connection "CREATE PUBLICATION srf_wire_p FOR TABLE srf_wire_a")
+            (ok (not (equalp before (pg::pg-client-query connection "SELECT oid FROM pg_catalog.pg_publication WHERE pubname = 'srf_wire_p'")))))
+          (pg::pg-client-query connection "DROP PUBLICATION srf_wire_p")
+          (pg::pg-client-query connection "DROP PUBLICATION srf_wire_q")
+          (pg::pg-client-query connection "DROP TABLE srf_wire_a")
+          (pg::pg-client-query connection "DROP TABLE srf_wire_b")))))
 
 (deftest publication-srf-sharing-matches-c
-    (let* ((port (parse-integer (or (uiop:getenv "PG_INTEROP_TARGET_PORT") (error "target port required"))))
-           (reference-port (parse-integer (or (uiop:getenv "PG_INTEROP_REFERENCE_PORT") (error "reference port required"))))
-           (client (pg::pg-client-connect "127.0.0.1" port "postgres"))
-           (reference (pg::pg-client-connect "127.0.0.1" reference-port "postgres"
-                                             :user (or (uiop:getenv "PG_INTEROP_REFERENCE_USER") "postgres"))))
-      (unwind-protect
-           (dolist (connection (list client reference))
-             (unwind-protect
-                  (progn
-                    (pg::pg-client-query connection "CREATE TABLE srf_volatile_a (id int PRIMARY KEY)")
-                    (pg::pg-client-query connection "CREATE SEQUENCE srf_field_calls")
-                    (loop for index from 1 to 4 do
-                      (pg::pg-client-query connection
-                                           (format nil "CREATE PUBLICATION ~c~a~c FOR TABLE srf_volatile_a"
-                                                   #\" index #\")))
-                    (dolist (case
-                                '(("SELECT (pg_get_publication_tables(nextval('srf_field_calls')::text)).* ORDER BY relid" "1")
-                                  ("SELECT pg_get_publication_tables(nextval('srf_field_calls')::text), pg_get_publication_tables(nextval('srf_field_calls')::text)" "2")
-                                  ("SELECT pg_get_publication_tables(nextval('srf_field_calls')::text), (pg_get_publication_tables(nextval('srf_field_calls')::text)).pubid" "1")
-                                  ("SELECT (pg_get_publication_tables(VARIADIC array_agg(nextval('srf_field_calls')::text))).* FROM (SELECT 1) AS input" "4")))
-                      (pg::pg-client-query connection "SELECT setval('srf_field_calls',1,false)")
-                      (ok (= 1 (length (pg::pg-client-query connection (first case)))) (first case))
-                      (ok (equalp (list (vector (second case)))
-                                  (pg::pg-client-query connection "SELECT currval('srf_field_calls')"))
-                          (first case))))
+    (with-reference-clients (client reference)
+      (dolist (connection (list client reference))
+        (unwind-protect
+             (progn
+               (pg::pg-client-query connection "CREATE TABLE srf_volatile_a (id int PRIMARY KEY)")
+               (pg::pg-client-query connection "CREATE SEQUENCE srf_field_calls")
                (loop for index from 1 to 4 do
-                 (ignore-errors
-                  (pg::pg-client-query connection (format nil "DROP PUBLICATION ~c~a~c" #\" index #\"))))
-               (ignore-errors (pg::pg-client-query connection "DROP SEQUENCE srf_field_calls"))
-               (ignore-errors (pg::pg-client-query connection "DROP TABLE srf_volatile_a"))))
-        (pg::pg-client-close reference)
-        (pg::pg-client-close client))))
+                 (pg::pg-client-query connection
+                                      (format nil "CREATE PUBLICATION ~c~a~c FOR TABLE srf_volatile_a"
+                                              #\" index #\")))
+               (dolist (case
+                           '(("SELECT (pg_get_publication_tables(nextval('srf_field_calls')::text)).* ORDER BY relid" "1")
+                             ("SELECT pg_get_publication_tables(nextval('srf_field_calls')::text), pg_get_publication_tables(nextval('srf_field_calls')::text)" "2")
+                             ("SELECT pg_get_publication_tables(nextval('srf_field_calls')::text), (pg_get_publication_tables(nextval('srf_field_calls')::text)).pubid" "1")
+                             ("SELECT (pg_get_publication_tables(VARIADIC array_agg(nextval('srf_field_calls')::text))).* FROM (SELECT 1) AS input" "4")))
+                 (pg::pg-client-query connection "SELECT setval('srf_field_calls',1,false)")
+                 (ok (= 1 (length (pg::pg-client-query connection (first case)))) (first case))
+                 (ok (equalp (list (vector (second case)))
+                             (pg::pg-client-query connection "SELECT currval('srf_field_calls')"))
+                     (first case))))
+          (loop for index from 1 to 4 do
+            (ignore-errors
+             (pg::pg-client-query connection (format nil "DROP PUBLICATION ~c~a~c" #\" index #\"))))
+          (ignore-errors (pg::pg-client-query connection "DROP SEQUENCE srf_field_calls"))
+          (ignore-errors (pg::pg-client-query connection "DROP TABLE srf_volatile_a"))))))
 
 (deftest union-all-matches-c-wire
-    (let* ((port (parse-integer (or (uiop:getenv "PG_INTEROP_TARGET_PORT") (error "target port required"))))
-           (reference-port (parse-integer (or (uiop:getenv "PG_INTEROP_REFERENCE_PORT") (error "reference port required"))))
-           (client (pg::pg-client-connect "127.0.0.1" port "postgres"))
-           (reference (pg::pg-client-connect "127.0.0.1" reference-port "postgres"
-                                             :user (or (uiop:getenv "PG_INTEROP_REFERENCE_USER") "postgres"))))
-      (unwind-protect
-           (progn
-             (dolist (sql '("SELECT 1 AS x UNION ALL SELECT 1"
-                            "SELECT 3 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY x DESC LIMIT 2"
-                            "(SELECT 3 ORDER BY 1 LIMIT 1) UNION ALL SELECT 1"
-                            "(SELECT 3 ORDER BY 1 LIMIT 0) UNION ALL SELECT 1"
-                            "SELECT 3 UNION ALL (SELECT 1 UNION ALL SELECT 2 ORDER BY 1 LIMIT 1) ORDER BY 1"
-                            "SELECT * FROM (SELECT 1 AS x UNION ALL SELECT 2) AS u ORDER BY x"
-                            "SELECT count(*) FROM (SELECT 1 UNION ALL SELECT 1) AS u"
-                            "SELECT 1 WHERE false UNION ALL SELECT 2"
-                            "SELECT 1 UNION ALL SELECT 2 LIMIT 0"
-                            "SELECT '1' UNION ALL SELECT 2"
-                            "SELECT NULL UNION ALL SELECT 2"
-                            "SELECT NULL UNION ALL SELECT NULL"
-                            "SELECT 1 UNION ALL SELECT 2147483648"
-                            "SELECT 'abc'::varchar(3) UNION ALL SELECT 'def'::varchar(3)"
-                            "SELECT 'abc'::varchar(3) UNION ALL SELECT 'def'::varchar(4)"
-                            "SELECT 'abc'::varchar UNION ALL SELECT 'def'::text"
-                            "SELECT 'abc'::text UNION ALL SELECT 'def'::varchar"
-                            "SELECT 'abc'::name UNION ALL SELECT 'def'::varchar"
-                            "SELECT 'abc'::varchar UNION ALL SELECT 'def'::name"
-                            "SELECT NULL::int2vector UNION ALL SELECT '1 2'::int2vector"
-                            "SELECT pubname FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT 'x'::name"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT -1"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT -1::bigint"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT 4294967296"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '0x10'"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '010'"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '0b101'"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '0B1'"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '0b2'"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '09'"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '١'"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '0x١'"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '-1'"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '-18446744073709551615'"
-                            "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '18446744073709551616x'"
-                            "SELECT 1 UNION ALL SELECT 1,2"
-                            "SELECT 1 UNION ALL SELECT true"
-                            "SELECT NULL UNION ALL SELECT NULL UNION ALL SELECT 1"
-                            "SELECT 'bad' UNION ALL SELECT 1"
-                            "SELECT 1 AS x UNION ALL SELECT 2 AS y ORDER BY y"
-                            "SELECT 1 AS x UNION ALL SELECT 2 ORDER BY x+1"
-                            "SELECT 1 AS x UNION ALL SELECT 2 ORDER BY t.x"
-                            "SELECT 1 AS x,2 AS x UNION ALL SELECT 2,3 ORDER BY x"
-                            "SELECT 1 UNION ALL SELECT 2 ORDER BY 3"
-                            "SELECT 1 UNION ALL SELECT 2 ORDER BY 'x'"
-                            "(SELECT 1 LIMIT 1) LIMIT 2"))
-               (ok (equalp (observed-query-wire reference sql) (observed-query-wire client sql)) sql))
-             (dolist (connection (list client reference))
-               (unwind-protect
-                    (progn
-                      (pg::pg-client-query connection "CREATE SEQUENCE union_call_counter")
-                      (dolist (case '(("SELECT nextval('union_call_counter') UNION ALL SELECT nextval('union_call_counter') LIMIT 1" "2")
-                                      ("(SELECT nextval('union_call_counter') LIMIT 1) UNION ALL SELECT nextval('union_call_counter')" "3")
-                                      ("SELECT nextval('union_call_counter') UNION ALL SELECT nextval('union_call_counter') LIMIT 0" "1")))
-                        (pg::pg-client-query connection "SELECT setval('union_call_counter',1,false)")
-                        (pg::pg-client-query connection (first case))
-                        (ok (equalp (list (vector (second case)))
-                                    (pg::pg-client-query connection "SELECT nextval('union_call_counter')"))
-                            (first case))))
-                 (ignore-errors (pg::pg-client-query connection "DROP SEQUENCE union_call_counter")))))
-        (pg::pg-client-close reference)
-        (pg::pg-client-close client))))
+    (with-reference-clients (client reference)
+      (progn
+        (dolist (sql '("SELECT 1 AS x UNION ALL SELECT 1"
+                       "SELECT 3 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY x DESC LIMIT 2"
+                       "(SELECT 3 ORDER BY 1 LIMIT 1) UNION ALL SELECT 1"
+                       "(SELECT 3 ORDER BY 1 LIMIT 0) UNION ALL SELECT 1"
+                       "SELECT 3 UNION ALL (SELECT 1 UNION ALL SELECT 2 ORDER BY 1 LIMIT 1) ORDER BY 1"
+                       "SELECT * FROM (SELECT 1 AS x UNION ALL SELECT 2) AS u ORDER BY x"
+                       "SELECT count(*) FROM (SELECT 1 UNION ALL SELECT 1) AS u"
+                       "SELECT 1 WHERE false UNION ALL SELECT 2"
+                       "SELECT 1 UNION ALL SELECT 2 LIMIT 0"
+                       "SELECT '1' UNION ALL SELECT 2"
+                       "SELECT NULL UNION ALL SELECT 2"
+                       "SELECT NULL UNION ALL SELECT NULL"
+                       "SELECT 1 UNION ALL SELECT 2147483648"
+                       "SELECT 'abc'::varchar(3) UNION ALL SELECT 'def'::varchar(3)"
+                       "SELECT 'abc'::varchar(3) UNION ALL SELECT 'def'::varchar(4)"
+                       "SELECT 'abc'::varchar UNION ALL SELECT 'def'::text"
+                       "SELECT 'abc'::text UNION ALL SELECT 'def'::varchar"
+                       "SELECT 'abc'::name UNION ALL SELECT 'def'::varchar"
+                       "SELECT 'abc'::varchar UNION ALL SELECT 'def'::name"
+                       "SELECT NULL::int2vector UNION ALL SELECT '1 2'::int2vector"
+                       "SELECT pubname FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT 'x'::name"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT -1"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT -1::bigint"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT 4294967296"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '0x10'"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '010'"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '0b101'"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '0B1'"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '0b2'"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '09'"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '١'"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '0x١'"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '-1'"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '-18446744073709551615'"
+                       "SELECT oid FROM pg_catalog.pg_publication WHERE false UNION ALL SELECT '18446744073709551616x'"
+                       "SELECT 1 UNION ALL SELECT 1,2"
+                       "SELECT 1 UNION ALL SELECT true"
+                       "SELECT NULL UNION ALL SELECT NULL UNION ALL SELECT 1"
+                       "SELECT 'bad' UNION ALL SELECT 1"
+                       "SELECT 1 AS x UNION ALL SELECT 2 AS y ORDER BY y"
+                       "SELECT 1 AS x UNION ALL SELECT 2 ORDER BY x+1"
+                       "SELECT 1 AS x UNION ALL SELECT 2 ORDER BY t.x"
+                       "SELECT 1 AS x,2 AS x UNION ALL SELECT 2,3 ORDER BY x"
+                       "SELECT 1 UNION ALL SELECT 2 ORDER BY 3"
+                       "SELECT 1 UNION ALL SELECT 2 ORDER BY 'x'"
+                       "(SELECT 1 LIMIT 1) LIMIT 2"))
+          (ok (equalp (observed-query-wire reference sql) (observed-query-wire client sql)) sql))
+        (dolist (connection (list client reference))
+          (unwind-protect
+               (progn
+                 (pg::pg-client-query connection "CREATE SEQUENCE union_call_counter")
+                 (dolist (case '(("SELECT nextval('union_call_counter') UNION ALL SELECT nextval('union_call_counter') LIMIT 1" "2")
+                                 ("(SELECT nextval('union_call_counter') LIMIT 1) UNION ALL SELECT nextval('union_call_counter')" "3")
+                                 ("SELECT nextval('union_call_counter') UNION ALL SELECT nextval('union_call_counter') LIMIT 0" "1")))
+                   (pg::pg-client-query connection "SELECT setval('union_call_counter',1,false)")
+                   (pg::pg-client-query connection (first case))
+                   (ok (equalp (list (vector (second case)))
+                               (pg::pg-client-query connection "SELECT nextval('union_call_counter')"))
+                       (first case))))
+            (ignore-errors (pg::pg-client-query connection "DROP SEQUENCE union_call_counter")))))))
 
 (deftest union-all-indexed-arm-domains
-    (let* ((port (parse-integer (or (uiop:getenv "PG_INTEROP_TARGET_PORT") (error "target port required"))))
-           (reference-port (parse-integer (or (uiop:getenv "PG_INTEROP_REFERENCE_PORT") (error "reference port required"))))
-           (client (pg::pg-client-connect "127.0.0.1" port "postgres"))
-           (reference (pg::pg-client-connect "127.0.0.1" reference-port "postgres"
-                                             :user (or (uiop:getenv "PG_INTEROP_REFERENCE_USER") "postgres"))))
+    (with-reference-clients (client reference)
       (unwind-protect
            (progn
              (dolist (connection (list client reference))
@@ -383,8 +347,7 @@ ORDER BY 1,2"
                               while position count position)))))
         (dolist (connection (list client reference))
           (ignore-errors (pg::pg-client-query connection "DROP TABLE union_arm_b"))
-          (ignore-errors (pg::pg-client-query connection "DROP TABLE union_arm_a"))
-          (pg::pg-client-close connection)))))
+          (ignore-errors (pg::pg-client-query connection "DROP TABLE union_arm_a"))))))
 
 (defun observed-column-origin (client query)
   "Read one result column's origin and type directly from its wire descriptor."

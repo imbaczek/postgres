@@ -51,11 +51,8 @@
        (pg::standard-accept-feedback state (standard-test-feedback 0 0 0))
        (ok (= 200 (pg::wal-replication-slot-confirmed-flush-lsn slot)))
        (ok (equal '(224) (pg::standard-stream-pending-boundaries state)))
-       (ok (handler-case
-               (progn (pg::standard-accept-feedback
-                       state (standard-test-feedback 300 300 300)) nil)
-             (pg::pg-error (condition)
-               (equal "22023" (pg::pg-error-sqlstate condition))))))))
+       (ok (equal "22023" (sqlstate-of (pg::standard-accept-feedback
+                                        state (standard-test-feedback 300 300 300))))))))
 
 (deftest standard-feedback-preserves-private-ack-rules
     (call-with-owned-standard-stream
@@ -63,17 +60,11 @@
        (declare (ignore state))
        (ok (eq slot (pg::wal-acknowledge-standard-replication-slot
                      "native_slot" 0 0 0)))
-       (ok (handler-case
-               (progn (pg::wal-acknowledge-standard-replication-slot
-                       "native_slot" 160 128 150) nil)
-             (pg::pg-error (condition)
-               (equal "22023" (pg::pg-error-sqlstate condition)))))
+       (ok (equal "22023" (sqlstate-of (pg::wal-acknowledge-standard-replication-slot
+                                        "native_slot" 160 128 150))))
        (let ((pg::*wal-logical-slot-owner* nil))
-         (ok (handler-case
-                 (progn (pg::wal-acknowledge-standard-replication-slot
-                         "native_slot" 160 128 192) nil)
-               (pg::pg-error (condition)
-                 (equal "55006" (pg::pg-error-sqlstate condition)))))))))
+         (ok (equal "55006" (sqlstate-of (pg::wal-acknowledge-standard-replication-slot
+                                          "native_slot" 160 128 192))))))))
 
 (deftest standard-start-negotiation
     (dolist (version '(1 2 3 4))
@@ -127,12 +118,9 @@
                       (pg::pgoutput-standard-begin transaction) 9)))
     (ok (= timestamp (pg::replication-read-u64
                       (pg::pgoutput-standard-commit transaction) 18))))
-  (ok (handler-case
-          (progn (pg::pgoutput-standard-begin
-                  (pg::make-logical-transaction :xid 1 :commit-record-lsn 160
-                                                :commit-lsn 192)) nil)
-        (pg::pg-error (condition)
-          (equal "0A000" (pg::pg-error-sqlstate condition))))))
+  (ok (equal "0A000" (sqlstate-of (pg::pgoutput-standard-begin
+                                   (pg::make-logical-transaction :xid 1 :commit-record-lsn 160
+                                                                 :commit-lsn 192))))))
 
 (defun call-with-standard-socket-pair (function)
   (let ((listener (pg::make-listener "127.0.0.1" 0))
@@ -190,12 +178,8 @@
                         (declare (ignore ignored))
                         (when (= (incf polls) 2)
                           (pg::ereport "57014" "injected cancellation"))))
-                (ok (handler-case
-                        (progn (pg::standard-write-frame
-                                state #\d (make-array 100 :element-type '(unsigned-byte 8)))
-                               nil)
-                      (pg::pg-error (condition)
-                        (equal "57014" (pg::pg-error-sqlstate condition)))))
+                (ok (equal "57014" (sqlstate-of (pg::standard-write-frame
+                                                 state #\d (make-array 100 :element-type '(unsigned-byte 8))))))
                 (ok (not (open-stream-p (pg::standard-stream-stream state))))
                 (sb-ext:with-timeout 2
                   (ok (equalp (octets '(100 0 0 0 104)) (pg::read-exact-bytes input 5)))
@@ -258,10 +242,7 @@
       (ok (null (pg::logical-change-key-attnums
                  (second (first (pg::standard-transaction-changes transaction selection))))))
       (setf (pg::logical-change-event-payload change) "(:TABLES (\"a\"))")
-      (ok (handler-case
-              (progn (pg::standard-transaction-changes transaction selection) nil)
-            (pg::pg-error (condition)
-              (equal "0A000" (pg::pg-error-sqlstate condition)))))))
+      (ok (equal "0A000" (sqlstate-of (pg::standard-transaction-changes transaction selection))))))
 
 (deftest standard-fragmented-feedback-and-copydone-boundary
     (call-with-owned-standard-stream

@@ -291,6 +291,25 @@ reference, test matrix, recovery evidence, and exact options.
 
 ## Testing
 
+The `pg-interop-tests` ASDF system depends on Rove and `cl-spec/check-it` for
+new executable contracts and property checks. These are test dependencies;
+the `pg` server system does not load them. Install
+[cl-spec](https://github.com/masatoi/cl-spec) in your Quicklisp `local-projects/`
+directory (for Roswell, under `~/.roswell/lisp/quicklisp/`). The verified revision
+is `147e3de5d0ab636cf8cc4c83253e03e5a7d7e639`. Quicklisp supplies Rove, check-it,
+and their dependencies. From `src/lisp/` in a Quicklisp-enabled REPL:
+
+```lisp
+(ql:register-local-projects)
+(asdf:load-asd (truename "pg.asd"))
+(asdf:load-asd (truename "pg-interop-tests.asd"))
+(ql:quickload "pg-interop-tests")
+(asdf:test-system "pg-interop-tests")
+```
+
+See the [interop test inventory](t/interop/README.md) for refactor decisions,
+generated-check domains, replay seeds and verification limits.
+
 ```sh
 cd src/lisp
 ./t/run-unit-tests.sh     # page/tuple/index/visibility and VACUUM horizon tests

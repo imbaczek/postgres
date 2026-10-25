@@ -45,8 +45,7 @@
              (old (pg::logical-decode-change legacy)))
         (ok (= 1 (aref legacy 1)))
         (ok (eq :unknown (pg::logical-change-publication-selection old)))
-        (ok (handler-case (progn (history-test-select (list old) '("p")) nil)
-              (pg::pg-error (condition) (equal "0A000" (pg::pg-error-sqlstate condition))))))
+        (ok (equal "0A000" (sqlstate-of (history-test-select (list old) '("p"))))))
       (setf (pg::logical-change-publication-selection change)
             '((:relation-oid 999 :publications nil)))
       (ok (handler-case (progn (pg::logical-encode-change change) nil) (error () t)))))
@@ -84,8 +83,7 @@
                                     '((:relation-oid 201 :publications
                                        ((:name "filtered" :oid 9 :generation 1 :unsupported t)))))))
     (ok (null (history-test-select (list filtered) '("other"))))
-    (ok (handler-case (progn (history-test-select (list filtered) '("filtered")) nil)
-          (pg::pg-error (condition) (equal "0A000" (pg::pg-error-sqlstate condition)))))))
+    (ok (equal "0A000" (sqlstate-of (history-test-select (list filtered) '("filtered")))))))
 
 (deftest historic-truncate-selection-is-per-relation
     (call-with-publication-srf-fixture

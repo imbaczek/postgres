@@ -1,9 +1,5 @@
 (in-package #:pg-interop-tests)
 
-(defun copy-contract-sqlstate (sql)
-  (handler-case (progn (scalar-sql-value sql) nil)
-    (pg::pg-error (condition) (pg::pg-error-sqlstate condition))))
-
 (deftest initial-copy-scalar-expressions
     (dolist (case '(("SELECT CASE WHEN true THEN 7 ELSE 1/0 END" 7)
                     ("SELECT CASE WHEN NULL THEN 1 WHEN true THEN 2 ELSE 3 END" 2)
@@ -26,7 +22,7 @@
                   ("SELECT CASE WHEN 1 THEN 2 END" "42804")
                   ("SELECT ARRAY[]" "42P18")
                   ("SELECT 2::int2 = ANY(ARRAY['2'])" "42883")))
-    (ok (equal (second case) (copy-contract-sqlstate (first case))) (first case))))
+    (ok (equal (second case) (sqlstate-of (scalar-sql-value (first case)))) (first case))))
 
 (deftest native-tablesync-catalog-expressions
     (call-with-publication-srf-fixture
@@ -53,6 +49,4 @@
       (ok (string= "\\b\\t\\n\\v\\f\\r\\\\"
                    (encode (coerce (mapcar #'code-char '(8 9 10 11 12 13 92)) 'string))))
       (ok (string= "żółw" (encode "żółw")))
-      (ok (handler-case (progn (encode (string (code-char 0))) nil)
-            (pg::pg-error (condition)
-              (string= "22021" (pg::pg-error-sqlstate condition)))))))
+      (ok (equal "22021" (sqlstate-of (encode (string (code-char 0))))))))

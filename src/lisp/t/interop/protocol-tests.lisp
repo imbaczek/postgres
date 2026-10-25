@@ -6,6 +6,19 @@
 (defun octets (values)
   (make-array (length values) :element-type '(unsigned-byte 8) :initial-contents values))
 
+(defmacro sqlstate-of (&body body)
+  "Return a PostgreSQL error's SQLSTATE, NIL on success; propagate other errors."
+  `(handler-case (progn ,@body nil)
+     (pg::pg-error (condition) (pg::pg-error-sqlstate condition))))
+
+(deftest sqlstate-observation-keeps-error-boundary
+    (let ((calls 0))
+      (ok (null (sqlstate-of (incf calls))))
+      (ok (= 1 calls)))
+  (ok (equal "22003" (sqlstate-of (error 'pg::pg-error :sqlstate "22003" :message "out of range"))))
+  (ok (handler-case (progn (sqlstate-of (error "unexpected host error")) nil)
+        (simple-error () t))))
+
 (defun call-with-standard-slot-fixture (function)
   (let* ((directory (merge-pathnames (format nil "pg-native-slot-~a/" (gensym))
                                      (uiop:temporary-directory)))
@@ -153,9 +166,7 @@
               ("CREATE_REPLICATION_SLOT \"s\"\"bad\" LOGICAL pgoutput" "42602")
               ("CREATE_REPLICATION_SLOT 's' LOGICAL pgoutput" "42601")))
       (ok
-       (handler-case (progn (pg::parse-replication-command (first case)) nil)
-         (pg::pg-error (condition)
-           (equal (second case) (pg::pg-error-sqlstate condition))))
+       (equal (second case) (sqlstate-of (pg::parse-replication-command (first case))))
        (first case))))
 
 (deftest standard-slot-parser-options
@@ -392,8 +403,7 @@
                   ("SELECT true::oid" "42846")
                   ("SELECT 1::oid+1" "42883")
                   ("SELECT -(1::oid)" "42883")))
-    (ok (handler-case (progn (derived-query-rows (first case)) nil)
-          (pg::pg-error (condition) (string= (second case) (pg::pg-error-sqlstate condition))))
+    (ok (equal (second case) (sqlstate-of (derived-query-rows (first case))))
         (first case))))
 
 (deftest catalog-slot-lsn-values-are-numeric
@@ -410,19 +420,14 @@
   (ok (equalp '(#(t)) (derived-query-rows "SELECT 'F/FFFFFFFF'::pg_lsn<'10/0'::pg_lsn")))
   (ok (equalp '(#("0/00000001")) (derived-query-rows "SELECT '0/1'::pg_lsn::text")))
   (dolist (text '(" 0/1" "+0/1" "0x1/1" "000000000/1" "0/1 " "١/1"))
-    (ok (handler-case (progn (pg::sql-pg-lsn-input text) nil)
-          (pg::pg-error (condition) (string= "22P02" (pg::pg-error-sqlstate condition)))))))
+    (ok (equal "22P02" (sqlstate-of (pg::sql-pg-lsn-input text))))))
 
 (deftest star-expansion-keeps-merged-join-expressions
     (ok (equalp '(#(1) #(2))
                 (derived-query-rows
                  "SELECT * FROM (SELECT 1 AS id) a FULL JOIN (SELECT 2 AS id) b USING (id) ORDER BY id")))
-  (ok (handler-case
-          (progn
-            (derived-query-rows
-             "SELECT id,a.id,b.id FROM (SELECT 1 AS id) a FULL JOIN (SELECT 2 AS id) b USING (id) ORDER BY id")
-            nil)
-        (pg::pg-error (condition) (string= "42702" (pg::pg-error-sqlstate condition))))))
+  (ok (equal "42702" (sqlstate-of (derived-query-rows
+                                   "SELECT id,a.id,b.id FROM (SELECT 1 AS id) a FULL JOIN (SELECT 2 AS id) b USING (id) ORDER BY id")))))
 
 (deftest publication-srf-expanded-records
     (call-with-publication-srf-fixture
@@ -540,12 +545,10 @@
                        ("SELECT (pg_get_publication_tables(NULL)).*" "22004")
                        ("SELECT 1 WHERE pg_get_publication_tables('p') IS NULL" "0A000")
                        ("SELECT array_agg(pg_get_publication_tables('p'))" "0A000")))
-         (ok (handler-case (progn (derived-query-rows (first case)) nil)
-               (pg::pg-error (condition) (string= (second case) (pg::pg-error-sqlstate condition))))))
+         (ok (equal (second case) (sqlstate-of (derived-query-rows (first case))))))
        (setf (getf (first (pg::pg-publication-tables
                            (gethash "q" (pg::database-publications database)))) :filter) '(:bool t))
-       (ok (handler-case (progn (derived-query-rows "SELECT (pg_get_publication_tables('q')).*") nil)
-             (pg::pg-error (condition) (string= "0A000" (pg::pg-error-sqlstate condition))))))))
+       (ok (equal "0A000" (sqlstate-of (derived-query-rows "SELECT (pg_get_publication_tables('q')).*")))))))
 
 (deftest publication-oids-roundtrip-and-upgrade
     (let* ((catalog (pg::make-catalog :next-oid 500))
@@ -616,8 +619,7 @@
 (deftest aggregates-in-order-by
     (ok (equalp '(#(1)) (derived-query-rows "SELECT 1 ORDER BY array_agg('x'::text)")))
   (ok (equalp '(#(1)) (derived-query-rows "SELECT COUNT(*) ORDER BY array_agg('x'::text)")))
-  (ok (handler-case (progn (derived-query-rows "SELECT DISTINCT 1 ORDER BY COUNT(*)") nil)
-        (pg::pg-error (condition) (string= "42P10" (pg::pg-error-sqlstate condition))))))
+  (ok (equal "42P10" (sqlstate-of (derived-query-rows "SELECT DISTINCT 1 ORDER BY COUNT(*)")))))
 
 (deftest distinct-aggregate-order-reuses-selected-values
     (ok (equalp '(#(1)) (derived-query-rows "SELECT DISTINCT COUNT(*) ORDER BY COUNT(*)")))
@@ -630,8 +632,7 @@
 (deftest array-invalid-operators
     (dolist (sql '("SELECT length(array_agg('x'::text))"
                    "SELECT array_agg('x'::text) + 1"))
-      (ok (handler-case (progn (derived-query-rows sql) nil)
-            (pg::pg-error (condition) (string= "42883" (pg::pg-error-sqlstate condition)))))))
+      (ok (equal "42883" (sqlstate-of (derived-query-rows sql))))))
 
 (deftest array-aggregate-analysis-errors
     (dolist (case '(("SELECT array_agg('x')" "42725")
@@ -639,8 +640,7 @@
                     ("SELECT array_agg(COUNT(*)::text)" "42803")
                     ("SELECT 1 WHERE array_agg('x'::text) IS NULL" "42803")
                     ("SELECT q.x, array_agg(q.x) FROM (SELECT 'x'::text AS x) q" "42803")))
-      (ok (handler-case (progn (derived-query-rows (first case)) nil)
-            (pg::pg-error (condition) (string= (second case) (pg::pg-error-sqlstate condition)))))))
+      (ok (equal (second case) (sqlstate-of (derived-query-rows (first case)))))))
 
 (deftest array-aggregate-result-metadata
     (let* ((plan (pg::plan-select-query (first (pg::parse-statements "SELECT array_agg('x'::text)"))))
@@ -667,16 +667,12 @@
   (dolist (sql '("SELECT 'x'::\"char\" > 0"
                  "SELECT '1 2'::int2vector = '1 2'::text"
                  "SELECT 'x'::\"char\" + 1"))
-    (ok (handler-case (progn (derived-query-rows sql) nil)
-          (pg::pg-error (condition) (string= "42883" (pg::pg-error-sqlstate condition))))))
-  (ok (handler-case (progn (derived-query-rows "SELECT 1 IN ('1'::text, '2'::text)") nil)
-        (pg::pg-error (condition) (string= "42883" (pg::pg-error-sqlstate condition))))))
+    (ok (equal "42883" (sqlstate-of (derived-query-rows sql)))))
+  (ok (equal "42883" (sqlstate-of (derived-query-rows "SELECT 1 IN ('1'::text, '2'::text)")))))
 
 (deftest cast-quoted-identifiers-are-columns
     (dolist (name '("true" "false" "null" "default" "current_user"))
-      (ok (handler-case
-              (progn (derived-query-rows (format nil "SELECT CAST(\"~a\" AS text)" name)) nil)
-            (pg::pg-error (condition) (string= "42703" (pg::pg-error-sqlstate condition)))))))
+      (ok (equal "42703" (sqlstate-of (derived-query-rows (format nil "SELECT CAST(\"~a\" AS text)" name)))))))
 
 (deftest cast-name-strength
     (dolist (case '(("SELECT '1'::text::int4" "int4")
@@ -694,17 +690,13 @@
       (ok (getf (cdddr expression) :variadic))
       (ok (string= "pg_catalog" (getf (cdddr expression) :schema)))
       (ok (eq :cast (first (first (third (first (third expression))))))))
-  (ok (handler-case
-          (progn (pg::parse-statements "SELECT f(VARIADIC x, 1)") nil)
-        (pg::pg-error (condition) (string= "42601" (pg::pg-error-sqlstate condition)))))
+  (ok (equal "42601" (sqlstate-of (pg::parse-statements "SELECT f(VARIADIC x, 1)"))))
   ;; C clears the marker when an exact nonvariadic signature matches.
   (ok (equalp '(#(1)) (derived-query-rows "SELECT length(VARIADIC 'x')"))))
 
 (deftest cast-unknown-literal-is-analyzed
-    (ok (handler-case
-            (progn (pg::prepare-select
-                    (first (pg::parse-statements "SELECT 'invalid'::int4 WHERE false"))) nil)
-          (pg::pg-error (condition) (string= "22P02" (pg::pg-error-sqlstate condition))))))
+    (ok (equal "22P02" (sqlstate-of (pg::prepare-select
+                                     (first (pg::parse-statements "SELECT 'invalid'::int4 WHERE false")))))))
 
 (deftest expression-cast-syntax-and-values
     (dolist (case '(("SELECT '42'::int4" 42)
@@ -733,10 +725,7 @@
                     ("SELECT true::int8" "42846")
                     ("SELECT 1::int2vector" "42846")
                     ("SELECT 1::char" "0A000")))
-      (ok (handler-case
-              (progn (derived-query-rows (first case)) nil)
-            (pg::pg-error (condition)
-              (string= (second case) (pg::pg-error-sqlstate condition)))))))
+      (ok (equal (second case) (sqlstate-of (derived-query-rows (first case)))))))
 
 (deftest expression-cast-result-types
     (dolist (case '(("SELECT 'S'::\"char\"" 18 1 -1 "char")
@@ -793,8 +782,7 @@
                   ("SELECT 1 UNION SELECT 2" "0A000")
                   ("SELECT 1 INTERSECT SELECT 2" "0A000")
                   ("SELECT 1 EXCEPT SELECT 2" "0A000")))
-    (ok (handler-case (progn (derived-query-rows (first case)) nil)
-          (pg::pg-error (condition) (string= (second case) (pg::pg-error-sqlstate condition))))
+    (ok (equal (second case) (sqlstate-of (derived-query-rows (first case))))
         (first case))))
 
 (deftest union-all-spill-and-relation-domains
@@ -825,8 +813,7 @@
       (ok (= (second case) (pg::sql-oid-input (first case)))))
   (dolist (case '(("١" "22P02") ("0x١" "22P02") ("09" "22P02") ("0b2" "22P02") ("1_0" "22P02")
                   ("4294967296" "22003") ("-2147483649" "22003")))
-    (ok (handler-case (progn (pg::sql-oid-input (first case)) nil)
-          (pg::pg-error (condition) (string= (second case) (pg::pg-error-sqlstate condition)))))))
+    (ok (equal (second case) (sqlstate-of (pg::sql-oid-input (first case)))))))
 
 (deftest derived-select-execution
     (dolist (sql '("SELECT q.a FROM (SELECT 7 AS a) AS q"
@@ -848,10 +835,7 @@
                     ("SELECT a FROM (SELECT 1 AS a) q CROSS JOIN (SELECT 2 AS a) r" "42702")
                     ("SELECT q.hidden FROM (SELECT 1 AS a) q" "42703")
                     ("SELECT q.a FROM (SELECT 1 AS a) q CROSS JOIN (SELECT q.a) r" "42P01")))
-      (ok (handler-case
-              (progn (pg::plan-select-query (first (pg::parse-statements (first case)))) nil)
-            (pg::pg-error (condition)
-              (string= (second case) (pg::pg-error-sqlstate condition)))))))
+      (ok (equal (second case) (sqlstate-of (pg::plan-select-query (first (pg::parse-statements (first case)))))))))
 
 (deftest derived-select-flat-plan
     (let* ((plan (pg::plan-select-query
@@ -908,10 +892,7 @@
       (ok (getf ast :distinct))
       (ok (find :hash-distinct (pg::collect-query-plan-nodes (pg::query-plan-physical plan))
                 :key #'first)))
-  (ok (handler-case
-          (progn (pg::parse-statements "SELECT DISTINCT ON (1) 1") nil)
-        (pg::pg-error (condition)
-          (string= (pg::pg-error-sqlstate condition) "0A000")))))
+  (ok (equal "0A000" (sqlstate-of (pg::parse-statements "SELECT DISTINCT ON (1) 1")))))
 
 (deftest distinct-executor-projected-values
     (let* ((keys '((:col 1 :type :int4) (:col 2 :type :text)))
@@ -1020,21 +1001,13 @@
                      '((:expr (:column "value") :desc t)) table targets nil nil)))
         (ok (= 1 (second (caar order))))
         (ok (cdar order))
-        (ok (handler-case
-                (progn
-                  (pg::analyze-distinct-order '((:expr (:column "b"))) table targets nil nil)
-                  nil)
-              (pg::pg-error (condition)
-                (string= (pg::pg-error-sqlstate condition) "42P10")))))))
+        (ok (equal "42P10" (sqlstate-of (pg::analyze-distinct-order '((:expr (:column "b"))) table targets nil nil)))))))
 
 (deftest distinct-order-noninteger-constants
     (dolist (sql '("SELECT DISTINCT 'x' ORDER BY 'x'"
                    "SELECT DISTINCT NULL ORDER BY NULL"
                    "SELECT DISTINCT TRUE ORDER BY TRUE"))
-      (ok (handler-case
-              (progn (pg::plan-select-query (first (pg::parse-statements sql))) nil)
-            (pg::pg-error (condition)
-              (string= "42601" (pg::pg-error-sqlstate condition)))))))
+      (ok (equal "42601" (sqlstate-of (pg::plan-select-query (first (pg::parse-statements sql))))))))
 
 (deftest name-input-clips-at-utf8-boundary
     (let* ((long (concatenate 'string "a" (make-string 40 :initial-element #\ą)))
@@ -1049,8 +1022,7 @@
   (ok (eq t (scalar-sql-value "SELECT 1 IN ('01', '2')")))
   (ok (eq t (scalar-sql-value "SELECT true IN ('true', 'false')")))
   (ok (eq pg::+null+ (scalar-sql-value "SELECT 1 NOT IN ('2', NULL)")))
-  (ok (handler-case (progn (scalar-sql-value "SELECT 1 IN ('invalid')") nil)
-        (pg::pg-error (condition) (string= (pg::pg-error-sqlstate condition) "22P02")))))
+  (ok (equal "22P02" (sqlstate-of (scalar-sql-value "SELECT 1 IN ('invalid')")))))
 
 (deftest publication-result-column-origins
     (let ((table (pg::lookup-sql-system-relation "pg_publication")))
@@ -1113,9 +1085,7 @@
                    "DROP TABLE \"public.rows\""
                    "ALTER TABLE \"public.rows\" ADD UNIQUE (id)"
                    "CREATE TABLE \"public.rows\" (id integer)"))
-      (ok (handler-case (progn (pg::parse-statements sql) nil)
-            (pg::pg-error (condition)
-              (string= (pg::pg-error-sqlstate condition) "0A000"))))))
+      (ok (equal "0A000" (sqlstate-of (pg::parse-statements sql))))))
 
 (deftest search-path-set-list-boundaries
     (ok (string= "public, pg_catalog"
@@ -1132,19 +1102,14 @@
   (ok (equal '("public,pg_catalog")
              (pg::search-path-identifiers "\"public,pg_catalog\"")))
   (dolist (value '("public," ",public" "public pg_catalog" "\"unterminated"))
-    (ok (handler-case (progn (pg::search-path-identifiers value) nil)
-          (pg::pg-error (condition)
-            (string= (pg::pg-error-sqlstate condition) "22023"))))))
+    (ok (equal "22023" (sqlstate-of (pg::search-path-identifiers value))))))
 
 (deftest search-path-setting-is-session-state
     (let ((pg::*backend* (pg::make-backend)))
       (ok (string= "" (pg::set-config-value "search_path" "" nil)))
       (ok (string= "" (pg::session-search-path)))
       (ok (eq pg::+null+ (pg::current-schema-name)))
-      (ok (handler-case
-              (progn (pg::set-config-value "search_path" "public" t) nil)
-            (pg::pg-error (condition)
-              (string= (pg::pg-error-sqlstate condition) "0A000"))))
+      (ok (equal "0A000" (sqlstate-of (pg::set-config-value "search_path" "public" t))))
       (ok (string= "" (pg::session-search-path)))
       (ok (string= "\"$user\", public"
                    (pg::set-config-value "search_path" pg::+null+ nil)))))
@@ -1152,9 +1117,7 @@
 (deftest no-default-creation-schema
     (let ((pg::*backend* (pg::make-backend)))
       (pg::set-config-value "search_path" "" nil)
-      (ok (handler-case (progn (pg::ensure-sql-creation-schema) nil)
-            (pg::pg-error (condition)
-              (string= (pg::pg-error-sqlstate condition) "3F000"))))))
+      (ok (equal "3F000" (sqlstate-of (pg::ensure-sql-creation-schema))))))
 
 (deftest namespace-does-not-alias-user-tables
     (let* ((pg::*backend* (pg::make-backend))
@@ -1209,30 +1172,15 @@
                    (pg::eval-expr
                     (pg::analyze-expr (list :func name nil :schema "pg_catalog") nil) nil))))
   (dolist (name '("user" "current_catalog"))
-    (ok (handler-case
-            (progn
-              (pg::analyze-expr (list :func name nil :schema "pg_catalog") nil)
-              nil)
-          (pg::pg-error (condition)
-            (string= (pg::pg-error-sqlstate condition) "42883"))))))
+    (ok (equal "42883" (sqlstate-of (pg::analyze-expr (list :func name nil :schema "pg_catalog") nil))))))
 
 (deftest replication-command-transaction-context
     (let ((pg::*backend* (pg::make-backend :state :in-progress :explicit t)))
-      (ok (handler-case
-              (progn
-                (pg::validate-replication-command-context
-                 (pg::make-logical-replication-command :type :start))
-                nil)
-            (pg::pg-error (condition)
-              (string= (pg::pg-error-sqlstate condition) "25001"))))
+      (ok (equal "25001" (sqlstate-of (pg::validate-replication-command-context
+                                       (pg::make-logical-replication-command :type :start)))))
       (setf (pg::backend-state pg::*backend*) :aborted)
-      (ok (handler-case
-              (progn
-                (pg::validate-replication-command-context
-                 (pg::make-logical-replication-command :type :drop))
-                nil)
-            (pg::pg-error (condition)
-              (string= (pg::pg-error-sqlstate condition) "25P02"))))))
+      (ok (equal "25P02" (sqlstate-of (pg::validate-replication-command-context
+                                       (pg::make-logical-replication-command :type :drop)))))))
 
 (deftest dotted-literal-function-name-is-not-a-schema
     (let* ((ast (first (pg::parse-statements "SELECT \"pg_catalog.version\"()")))
