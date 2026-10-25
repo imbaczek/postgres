@@ -1157,10 +1157,10 @@ exist\" messages."
 (defun raw-aggregate-kind (form)
   (cond ((and (consp form) (eq (first form) :count-star)) :count)
         ((and (consp form) (eq (first form) :func)
-              (string= (second form) "array_agg")
               (or (null (getf (cdddr form) :schema))
                   (string= (getf (cdddr form) :schema) "pg_catalog")))
-         :array-agg)))
+         (cond ((string= (second form) "array_agg") :array-agg)
+               ((string= (second form) "sum") :sum)))))
 
 (defun contains-aggregate-p (form)
   (and (consp form)
@@ -1180,38 +1180,47 @@ exist\" messages."
            (analyzed-expression-volatile-p (car form))
            (analyzed-expression-volatile-p (cdr form)))))
 
+(defun analyze-aggregate-input (raw scope kind)
+  "Resolve the supported pg_aggregate input and result types before transition setup."
+  (when (eq kind :count) (return-from analyze-aggregate-input (values nil :int8)))
+  (unless (= 1 (length (third raw)))
+    (ereport "42883" "function ~a requires one argument" (second raw)))
+  (let* ((*inside-aggregate-input-p* t)
+         (argument (analyze-expr (first (third raw)) scope))
+         (type (expr-type argument)))
+    (when (in-unknown-constant-p argument)
+      (ereport "42725" "function ~a(unknown) is not unique" (second raw)))
+    (ecase kind
+      (:array-agg
+       (unless (eq type :text) (ereport "0A000" "array_agg currently supports text input"))
+       (values argument :text-array))
+      (:sum
+       (unless (member type '(:int2 :int4 :int8 :numeric))
+         (ereport "42883" "function sum(~a) does not exist" (typed-arg-name argument)))
+       (values argument (if (member type '(:int2 :int4)) :int8 :numeric))))))
+
 (defun analyze-aggregate-call (raw scope)
   (unless *select-aggregate-analysis*
     (ereport "42803" "aggregate functions are not allowed in this expression"))
   (when *inside-aggregate-input-p*
     (ereport "42803" "aggregate function calls cannot be nested"))
-  (let* ((descriptors (getf *select-aggregate-analysis* :descriptors))
-         (kind (raw-aggregate-kind raw))
-         (type (if (eq kind :count) :int8 :text-array))
-         (input
-           (when (eq kind :array-agg)
-             (unless (= 1 (length (third raw))) (ereport "42883" "array_agg requires one argument"))
-             (let* ((*inside-aggregate-input-p* t)
-                    (argument (analyze-expr (first (third raw)) scope)))
-               (when (in-unknown-constant-p argument)
-                 (ereport "42725" "function array_agg(unknown) is not unique"))
-               (unless (eq (expr-type argument) :text)
-                 (ereport "0A000" "array_agg currently supports text input"))
-               argument)))
-         (existing
-           (when (or *aggregate-order-mode* (not (analyzed-expression-volatile-p input)))
-             (position-if (lambda (descriptor)
-                            (and (eq kind (getf descriptor :kind))
-                                 (selected-expression-equal-p input (getf descriptor :input))))
-                          descriptors)))
-         (index (or existing (length descriptors))))
-    (when (and (eq *aggregate-order-mode* :existing-only) (null existing))
-      (ereport "42803" "aggregate is not present in the SELECT list"))
-    (unless existing
-      (vector-push-extend (list :kind kind :input input :type type :source-expr raw) descriptors))
-    (append (aggregate-output-ref
-             (+ (length (getf *select-aggregate-analysis* :group-keys)) index 1) type)
-            (list :aggregate-output t))))
+  (let ((kind (raw-aggregate-kind raw)))
+    (multiple-value-bind (input type) (analyze-aggregate-input raw scope kind)
+      (let* ((descriptors (getf *select-aggregate-analysis* :descriptors))
+             (existing
+               (when (or *aggregate-order-mode* (not (analyzed-expression-volatile-p input)))
+                 (position-if (lambda (descriptor)
+                                (and (eq kind (getf descriptor :kind))
+                                     (selected-expression-equal-p input (getf descriptor :input))))
+                              descriptors)))
+             (index (or existing (length descriptors))))
+        (when (and (eq *aggregate-order-mode* :existing-only) (null existing))
+          (ereport "42803" "aggregate is not present in the SELECT list"))
+        (unless existing
+          (vector-push-extend (list :kind kind :input input :type type :source-expr raw) descriptors))
+        (append (aggregate-output-ref
+                 (+ (length (getf *select-aggregate-analysis* :group-keys)) index 1) type)
+                (list :aggregate-output t))))))
 
 (defun aggregate-expression-signature (form descriptors)
   "Compare semantic aggregate identities independently of their result slots."

@@ -661,7 +661,12 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   because catalog changes and statistics have no rollback log.
 - `COUNT(*)` and `GROUP BY` are supported. Hash aggregation is bounded by query
   work memory and spills through recursive hash partitions, with external sort
-  as the skew/depth fallback. Noncorrelated derived SELECTs in `FROM`, ordinary
+  as the skew/depth fallback. `SUM` supports smallint/integer inputs with bigint
+  results, and bigint/existing integral numeric expressions with exact numeric
+  results. Empty or all-NULL sums return NULL. SUM and text `array_agg` use sorted
+  grouping with spill; mixed aggregates preserve those semantics. General decimal,
+  floating point, interval and money types remain unsupported.
+  Noncorrelated derived SELECTs in `FROM`, ordinary
   `DISTINCT`, and `UNION ALL` are supported. Correlated and expression subqueries,
   CTEs, `DISTINCT ON`, and `HAVING` remain unsupported. Joins use nested loops;
   INNER/CROSS join order uses a greedy statistics-based choice, while outer

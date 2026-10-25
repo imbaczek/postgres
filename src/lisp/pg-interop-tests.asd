@@ -3,6 +3,7 @@
   :depends-on ("pg" "rove" "cl-spec/check-it")
   :serial t
   :components ((:file "t/interop/protocol-tests")
+               (:file "t/interop/sum-tests")
                (:file "t/interop/standard-tests")
                (:file "t/interop/copy-tests")
                (:file "t/interop/standard-subscriber-tests")

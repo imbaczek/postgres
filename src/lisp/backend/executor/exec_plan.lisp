@@ -276,8 +276,9 @@ reordered tree, and each parameterized path can reference only joined Vars."
                 (list :and left right :type :bool :typmod -1))
               (rest quals) :initial-value (first quals)))))
 
-(defun prepared-array-aggregate-p (prepared)
-  (some (lambda (descriptor) (eq (getf descriptor :kind) :array-agg))
+(defun prepared-transition-aggregate-p (prepared)
+  "Only COUNT(*) can use the count-only hash aggregate fast path."
+  (some (lambda (descriptor) (not (eq (getf descriptor :kind) :count)))
         (getf prepared :aggregates)))
 
 (defun build-select-plan-tree (prepared physical-p paths)
@@ -291,10 +292,10 @@ reordered tree, and each parameterized path can reference only joined Vars."
     (when aggregate-p
       (setf input
             (list (if physical-p
-                      (if (prepared-array-aggregate-p prepared) :sorted-aggregate :hash-aggregate)
+                      (if (prepared-transition-aggregate-p prepared) :sorted-aggregate :hash-aggregate)
                       :aggregate)
                   (getf prepared :group-keys)
-                  (if (prepared-array-aggregate-p prepared)
+                  (if (prepared-transition-aggregate-p prepared)
                       (getf prepared :aggregates) (getf prepared :aggregate-count))
                   input)))
     (when (getf prepared :set-functions)
@@ -855,6 +856,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
     (map 'vector (lambda (descriptor)
                    (ecase (getf descriptor :kind)
                      (:count 0)
+                     (:sum +null+)
                      (:array-agg (make-query-row-spool budget))))
          descriptors)))
 
@@ -866,10 +868,26 @@ reordered tree, and each parameterized path can reference only joined Vars."
                (when (query-row-spool-pathname state)
                  (delete-query-temp-file (query-row-spool-pathname state))))))
 
+(defun sum-aggregate-transition (state value result-type)
+  "Match C's NULL start, int64 int2/int4 accumulator, and exact numeric totals."
+  (if (eq value +null+) state
+      (let ((total (if (eq state +null+) value (+ state value))))
+        (if (eq result-type :int8)
+            ;; numeric.c:int2_sum/int4_sum use plain int64 addition, which the
+            ;; pinned C build wraps; SUM(int8/numeric) retains a wider total.
+            (let ((bits (logand total #xffffffffffffffff)))
+              (if (logbitp 63 bits) (- bits (ash 1 64)) bits))
+            total))))
+
 (defun step-aggregate-transition-states (states descriptors inputs offset)
   (loop for descriptor in descriptors for index from 0
         do (ecase (getf descriptor :kind)
              (:count (incf (aref states index)))
+             (:sum
+              (setf (aref states index)
+                    (sum-aggregate-transition (aref states index)
+                                              (aref inputs (+ offset index))
+                                              (getf descriptor :type))))
              (:array-agg
               (query-row-spool-append (aref states index) (aref inputs (+ offset index)))))))
 

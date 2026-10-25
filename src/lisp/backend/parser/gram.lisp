@@ -1163,10 +1163,13 @@
 
 (defun parse-function-call (p name &optional schema)
   "Parse a call with explicit schema and VARIADIC argument metadata."
-  (if (and (string= name "count")
+  (if (and (member name '("count" "sum") :test #'string=)
            (or (null schema) (string= schema "pg_catalog"))
            (match-op p "*"))
-      (progn (expect-punct p #\)) (list :count-star))
+      (progn
+        (expect-punct p #\))
+        (if (string= name "count") (list :count-star)
+            (append (list :func name nil) (when schema (list :schema schema)))))
       (multiple-value-bind (arguments variadic) (parse-call-arguments p)
         (append (list :func name arguments)
                 (when schema (list :schema schema))

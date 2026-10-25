@@ -12,6 +12,34 @@ manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
 
+### SUM intermission
+
+The original `COALESCE(sum(a),0)` acceptance query has been restored. SUM now
+uses C's overload result types: int2/int4 to int8 and int8/existing integral
+numeric expressions to numeric. Transitions start at SQL NULL, skip NULL inputs,
+and preserve NULL for empty/all-NULL input. int2/int4 accumulation follows the
+pinned C build's int64 wrap behavior (also checked through direct int2_sum and
+int4_sum calls); numeric results retain exact wide integer totals.
+
+SUM uses the existing descriptor-driven sorted aggregate path, including bounded
+sort spill, mixed COUNT/SUM/array_agg transitions, cleanup, and input evaluation
+before spilling. COUNT-only queries keep their hash fast path. New tests cover
+metadata, empty/all-NULL input, wide totals, overload/context errors, grouped
+SQL execution under forced spill, repeated SUM in ORDER BY, and distinct volatile
+SUM inputs. The new cl-spec total/NULL property passes 200 trials with seed 42.
+The shared native/C wire probe includes the restored query; no alternate
+aggregate is substituted for it. Decimal/float/interval/money support is not
+claimed because those input types are not implemented by the server.
+
+Initial native acceptance passed in `/tmp/pg-patroni-start.kzcFYS`, including
+aggregate queries after live server reload. Pinned C extended wire checks pass
+in `/tmp/pg-c-coalesce.SANVjm`. Final validation logs use `/tmp/pg-sum-`.
+Final native acceptance passed in `/tmp/pg-patroni-start.GxDe1L`; all 140 interop
+cases, 131 physical cases, 1,598 legacy checks, forced strict compilation and
+formatting pass. Luna max and Sol high reviews found no defect; Sol medium
+recommended no further refactor. The SQL-level grouped spill and repeated-SUM
+ORDER BY checks cover the review's initial coverage observation.
+
 ### Lazy COALESCE checkpoint
 
 SQL `COALESCE` is parsed as an expression, resolves and coerces every input to

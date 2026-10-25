@@ -397,6 +397,10 @@ def main():
         write_auto("120s")
         process.send_signal(signal.SIGHUP)
         wait_for(lambda: show("checkpoint_timeout") == "2min")
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT COALESCE(sum(1),0)")
+            assert cursor.fetchone() == (1,)
+        print("patroni-start: aggregate definitions survive live reload PASS", flush=True)
         for argument in ("--typo=1", "unexpected"):
             rejected = root / ("rejected-" + str(len(argument)))
             result = subprocess.run([executable, "-D", str(rejected), argument],

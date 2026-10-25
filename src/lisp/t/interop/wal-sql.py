@@ -94,8 +94,34 @@ def main():
             cursor.execute("CREATE TABLE coalesce_wire_items (k integer, a integer, b integer)")
             try:
                 cursor.execute("INSERT INTO coalesce_wire_items VALUES (1,NULL,NULL),(1,NULL,2),(2,0,9),(2,5,NULL)")
-                cursor.execute("SELECT k, COALESCE(count(*),0) FROM coalesce_wire_items GROUP BY k ORDER BY k")
-                assert cursor.fetchall() == [(1, 2), (2, 2)]
+                cursor.execute("SELECT k, COALESCE(sum(a),0) FROM coalesce_wire_items GROUP BY k ORDER BY k")
+                assert cursor.fetchall() == [(1, 0), (2, 5)]
+                for expression, oid, expected in [
+                    ("sum(a::smallint)", 20, 5), ("sum(a)", 20, 5),
+                    ("sum(a::bigint)", 1700, Decimal(5)),
+                    ("sum(pg_wal_lsn_diff('FFFFFFFF/FFFFFFFF','0/0'))", 1700,
+                     Decimal(4 * ((1 << 64) - 1))),
+                ]:
+                    cursor.execute(f"SELECT {expression} FROM coalesce_wire_items")
+                    column = cursor.description[0]
+                    assert (column.name, column.type_code) == ("sum", oid)
+                    result = cursor.fetchone()[0]
+                    assert result == expected, (expression, result, expected)
+                    if oid == 1700:
+                        assert isinstance(result, Decimal)
+                cursor.execute("SELECT sum(a),sum(a::bigint) FROM coalesce_wire_items WHERE false")
+                assert [column.type_code for column in cursor.description] == [20, 1700]
+                assert cursor.fetchone() == (None, None)
+                cursor.execute("SELECT k,sum(a),sum(a),count(*) FROM coalesce_wire_items GROUP BY k ORDER BY sum(a)")
+                assert cursor.fetchall() == [(2, 5, 5, 2), (1, None, None, 2)]
+                cursor.execute("CREATE SEQUENCE sum_wire_sequence")
+                try:
+                    cursor.execute("SELECT sum(nextval('sum_wire_sequence')),sum(nextval('sum_wire_sequence')) FROM coalesce_wire_items")
+                    assert cursor.fetchone() == (Decimal(16), Decimal(20))
+                    cursor.execute("SELECT nextval('sum_wire_sequence')")
+                    assert cursor.fetchone() == (9,)
+                finally:
+                    cursor.execute("DROP SEQUENCE sum_wire_sequence")
                 cursor.execute("SELECT COALESCE(array_agg(a::text),'{}'::text[]) FROM coalesce_wire_items WHERE k=3")
                 assert cursor.fetchone() == ([],)
                 cursor.execute("SELECT count(*) FROM coalesce_wire_items WHERE COALESCE(a,b)>0")
@@ -104,6 +130,7 @@ def main():
                 cursor.execute("DROP TABLE coalesce_wire_items")
         print(f"wal-sql: {len(cases)} exact numeric differences, NULL/type/overflow checks PASS")
         print("wal-sql: COALESCE lazy values/types/metadata/errors and receive-LSN fallback PASS")
+        print("wal-sql: restored SUM probe and integral SUM type/range/NULL checks PASS")
     finally:
         connection.close()
 
