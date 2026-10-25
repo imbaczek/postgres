@@ -12,6 +12,35 @@ manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
 
+### String status-expression checkpoint
+
+Text `||` and `substr(text,int4[,int4])` are implemented for the remaining string
+part of Patroni's TL_LSN expression. Concatenation follows C precedence (below
+arithmetic, above comparisons), text/anynonarray casts and SQL NULL propagation.
+Array concatenation is explicitly unsupported. Substring counts Unicode
+characters, adjusts zero/negative starts, rejects negative lengths with 22011,
+and matches C's end-overflow-to-tail behavior. int2 positions widen implicitly;
+int8 positions do not narrow implicitly. The shared coercion helper preserves
+these overload boundaries.
+
+The boundary probes also fixed raw integer negation to match `gram.y:doNegate`
+before type selection, so -2147483648 resolves as int4. SQL integer arithmetic
+now checks int2/int4/int8 results (including unary negation) and raises 22003 on
+overflow before a string function can consume an invalid value. Remainder uses
+truncation toward zero, matching C for negative operands.
+
+The new character-partition property passes 200 trials with seed 42. All 146
+interop cases and 131 physical cases pass. The same Python wire fixture passes
+pinned C initialized with UTF8 (`/tmp/pg-c-string.YjnmoO`), including 106
+substring cases, coercion/NULL/error checks and arithmetic boundaries. Initial
+native acceptance passed in `/tmp/pg-patroni-start.2MVxhc`; final acceptance
+passed in `/tmp/pg-patroni-start.ZbwX2I`, including string queries after live
+reload. Final strict compile, formatting and 1,598 legacy checks pass; logs use
+`/tmp/pg-string-accepted-`. Luna max found the integer result-range gap described
+above; it was fixed and pinned in native/C probes. Sol high reviewed the initial
+and arithmetic follow-up changes without further findings. Sol medium's shared
+coercion refactor was applied. No coordination is added by this work.
+
 ### SUM intermission
 
 The original `COALESCE(sum(a),0)` acceptance query has been restored. SUM now
@@ -94,8 +123,8 @@ Sol medium suggested the applied literal-coercion simplification.
 
 The pinned `pg_walfile_name()` uses `XLByteToSeg`, so an exact segment boundary
 names the new segment. Do not import older PostgreSQL's previous-segment rule.
-The complete Patroni TL_LSN expression additionally needs `||` tokenization,
-`substr`, `bit(32)::int` (signed bit pattern), actual timeline
+The complete Patroni TL_LSN expression additionally needs
+`bit(32)::int` (signed bit pattern), actual timeline
 filename reporting, and receiver/control statistics. These remain unfinished.
 
 ### Replay pause control checkpoint
@@ -134,7 +163,7 @@ coverage gap; admission serialization was inspected but not raced in that test.
 
 The pinned Patroni 4.1.5 `Postgresql.TL_LSN` expression was rechecked: this closes
 its replay-pause predicate dependency, but the full query still needs WAL filename,
-`substr`, bit casts, LSN difference functions, and receiver/control statistics.
+bit casts, and receiver/control statistics.
 Do not infer complete Patroni monitoring compatibility from the four controls.
 
 | Contract | Current evidence | Required acceptance |

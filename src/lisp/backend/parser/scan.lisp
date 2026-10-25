@@ -100,7 +100,7 @@
             ((member c '(#\( #\) #\[ #\] #\, #\; #\.))
              (push (make-token :kind :punct :value (string c) :pos i) out)
              (incf i))
-            ((member c '(#\= #\< #\> #\! #\+ #\- #\* #\/ #\% #\:))
+            ((member c '(#\= #\< #\> #\! #\+ #\- #\* #\/ #\% #\: #\|))
              (let ((start i))
                (incf i)
                (cond
@@ -112,6 +112,8 @@
                  ((and (char= c #\!) (peek) (char= (peek) #\=))
                   (incf i))
                  ((and (char= c #\:) (peek) (char= (peek) #\:))
+                  (incf i))
+                 ((and (char= c #\|) (peek) (char= (peek) #\|))
                   (incf i)))
                (push (make-token :kind :op
                                  :value (subseq sql start i)

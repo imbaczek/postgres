@@ -1040,7 +1040,7 @@
       (parse-comparison p)))
 
 (defun parse-comparison (p)
-  (let ((left (parse-additive p)))
+  (let ((left (parse-concatenation p)))
     (cond
       ((and (eq (pkind p) :op)
             (member (pval p) '("=" "<>" "!=" "<" "<=" ">" ">=") :test #'string=))
@@ -1049,7 +1049,7 @@
          (cond
            ((match-kw p "any") (list :any op left (with-parens (p) (parse-expr p))))
            ((match-kw p "all") (list :all op left (with-parens (p) (parse-expr p))))
-           (t (list :binop op left (parse-additive p))))))
+           (t (list :binop op left (parse-concatenation p))))))
       ((or (kw-p p "in") (kw-p p "not"))
        (let ((negated (match-kw p "not")))
          (expect-kw p "in")
@@ -1072,6 +1072,9 @@
       (let ((op (pval p)))
         (pnext p)
         (setf left (list :binop op left (funcall next p)))))))
+
+(defun parse-concatenation (p)
+  (parse-binary-level p '("||") #'parse-additive))
 
 (defun parse-additive (p)
   (parse-binary-level p '("+" "-") #'parse-multiplicative))
@@ -1146,7 +1149,12 @@
 
 (defun parse-unary (p)
   (cond
-    ((match-op p "-") (list :unary "-" (parse-unary p)))
+    ((match-op p "-")
+     (let ((argument (parse-unary p)))
+       ;; gram.y:doNegate folds raw integer constants before selecting their type.
+       (if (and (eq (first argument) :const) (integerp (second argument)))
+           (list :const (- (second argument)))
+           (list :unary "-" argument))))
     ((match-op p "+") (parse-unary p))
     (t (parse-postfix-expression p))))
 

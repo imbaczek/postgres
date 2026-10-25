@@ -337,6 +337,9 @@ on process restart. These functions reject a primary with SQLSTATE `55000`.
 `pg_wal_lsn_diff()` returns an exact integral `numeric`, including differences
 outside signed int64; `::bigint` checks overflow. This does not add general
 decimal numeric input, storage or arithmetic.
+Text `||` and `substr(text, start [, length])` support the string operations used
+by Patroni's status expression. Substring positions count Unicode characters,
+including SQL's adjusted zero/negative starts. Array concatenation remains unsupported.
 
 See the [interop test inventory](t/interop/README.md) for refactor decisions,
 generated-check domains, replay seeds and verification limits.

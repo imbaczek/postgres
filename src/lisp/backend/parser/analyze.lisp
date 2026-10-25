@@ -191,6 +191,35 @@ exist\" messages."
   (sql-strict-let ((left (first arguments)) (right (second arguments)))
     (- left right)))
 
+(defun cast-expression-to-text (argument)
+  (if (eq (expr-type argument) :text) argument
+      (list :cast argument :type :text :typmod -1)))
+
+(defun analyze-substr-function (name arguments)
+  (unless (and (member (length arguments) '(2 3))
+               (sql-implicit-coercion-p (expr-type (first arguments)) :text)
+               (every (lambda (argument)
+                        (or (in-unknown-constant-p argument)
+                            (member (expr-type argument) '(:int2 :int4))))
+                      (rest arguments)))
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+  (list :func name
+        (cons (cast-expression-to-text (first arguments))
+              (mapcar (lambda (argument) (coerce-common-expression argument :int4))
+                      (rest arguments)))
+        :type :text :typmod -1))
+
+(defun eval-substr-function (arguments)
+  "Match text_substring's character positions, negative starts and overflow-to-tail."
+  (when (member +null+ arguments) (return-from eval-substr-function +null+))
+  (destructuring-bind (text start &optional (length nil length-p)) arguments
+    (when (and length-p (minusp length))
+      (ereport "22011" "negative substring length not allowed"))
+    (let* ((size (length text))
+           (begin (min size (1- (max 1 start))))
+           (end (if length-p (min size (max 0 (1- (+ start length)))) size)))
+      (subseq text begin (max begin end)))))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
@@ -200,6 +229,7 @@ exist\" messages."
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     (cond
+      ((string= name "substr") (analyze-substr-function name args))
       ((string= name "pg_wal_lsn_diff") (analyze-wal-lsn-diff name args))
       ((member name '("lower" "current_setting") :test #'string=)
        (analyze-setting-function name args))
@@ -711,10 +741,24 @@ exist\" messages."
        argument)
       (t (list :cast argument :type target :typmod typmod)))))
 
+(defun analyze-text-concatenation (left right)
+  "Resolve textcat and text/anynonarray overloads without treating arrays as text."
+  (when (some (lambda (argument) (member (expr-type argument) '(:text-array :int2vector)))
+              (list left right))
+    (ereport "0A000" "array concatenation is not implemented"))
+  (unless (some (lambda (argument) (sql-implicit-coercion-p (expr-type argument) :text))
+                (list left right))
+    (ereport "42883" "operator does not exist: ~a || ~a"
+             (typed-arg-name left) (typed-arg-name right)))
+  (list :concat (cast-expression-to-text left) (cast-expression-to-text right)
+        :type :text :typmod -1))
+
 (defun analyze-binop-expression (expression scope)
   (let* ((operator (second expression))
          (left (analyze-expr (third expression) scope))
          (right (analyze-expr (fourth expression) scope)))
+    (when (string= operator "||")
+      (return-from analyze-binop-expression (analyze-text-concatenation left right)))
     (if (member operator '("=" "<>" "<" "<=" ">" ">=") :test #'string=)
         (let ((operands (analyze-comparison-operands left right)))
           (list :binop operator (first operands) (second operands) :type :bool :typmod -1))
@@ -1175,7 +1219,7 @@ exist\" messages."
                 (not (member (second form)
                              '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                "current_catalog" "current_user" "session_user" "user"
-                               "length" "char_length" "character_length" "pg_backend_pid")
+                               "substr" "length" "char_length" "character_length" "pg_backend_pid")
                              :test #'string=)))
            (analyzed-expression-volatile-p (car form))
            (analyzed-expression-volatile-p (cdr form)))))
@@ -1508,7 +1552,7 @@ exist\" messages."
       ((string= op "%")
        (when (zerop right)
          (ereport "22012" "division by zero"))
-       (mod left right))
+       (rem left right))
       (t (ereport "XX000" "bad arithmetic operator ~a" op)))))
 
 (defun sql-3val-and (a b)
@@ -1590,6 +1634,7 @@ exist\" messages."
 
 (defun eval-func (name args)
   (cond
+    ((string= name "substr") (eval-substr-function args))
     ((string= name "pg_wal_lsn_diff") (eval-wal-lsn-diff args))
     ((member name '("lower" "current_setting") :test #'string=)
      (eval-setting-function name args))
@@ -1786,6 +1831,10 @@ exist\" messages."
            left)))
     (:join-relabel
      (eval-expr (second expr) env))
+    (:concat
+     (sql-strict-let ((left (eval-expr (second expr) env))
+                      (right (eval-expr (third expr) env)))
+       (concatenate 'string left right)))
     (:binop
      (let ((op (second expr))
            (l (eval-expr (third expr) env))
@@ -1793,15 +1842,15 @@ exist\" messages."
        (if (member op '("=" "<>" "<" "<=" ">" ">=") :test #'string=)
            (sql-compare op l r)
            (let ((value (sql-arith op l r)))
-             (if (eq (expr-type expr) :int2)
-                 (sql-cast-value value :int2 :int2 -1) value)))))
+             (if (member (expr-type expr) '(:int2 :int4 :int8))
+                 (sql-cast-value value (expr-type expr) (expr-type expr) -1) value)))))
     (:unary
      (sql-strict-let ((value (eval-expr (third expr) env)))
        (cond
          ((string= (second expr) "-")
           (let ((result (- value)))
-            (if (eq (expr-type expr) :int2)
-                (sql-cast-value result :int2 :int2 -1) result)))
+            (if (member (expr-type expr) '(:int2 :int4 :int8))
+                (sql-cast-value result (expr-type expr) (expr-type expr) -1) result)))
          (t (ereport "42883" "unsupported unary operator ~a"
                      (second expr))))))
     (:and (sql-3val-and (eval-expr (second expr) env)

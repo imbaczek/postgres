@@ -180,6 +180,10 @@ appropriate instead of replacing the native C peer or adding a message relay.
   parsing behavior and is not a universal workaround for `#.`. Preserve valid
   source and report unsupported syntax instead of rewriting wire fixtures or
   enabling arbitrary read-time evaluation just to make a tool accept the file.
+- The tokenizer's valid SBCL character name `#\Nul` is accepted by cl-mcp's
+  `readtable: "standard"` override for both reading and structural patching.
+  This allowed edits without rewriting existing reader forms. It does not solve
+  the separate `#.` restriction when reader evaluation is disabled.
 - Balanced parentheses do not establish the intended top-level structure. After
   inserting multiple definitions, inspect the collapsed outline and test names;
   a misplaced close once nested a `deftest` inside another form in this session.
