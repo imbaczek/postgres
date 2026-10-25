@@ -439,7 +439,7 @@ select l.id, r.label from join_left l left join join_right r
 select * from join_left l full join join_right r using (id)
   order by id, l.label, r.label;
 select id, l.id, r.id from join_left l full join join_right r using (id)
-  order by id, l.id, r.id;
+  order by 1, l.id, r.id;
 select * from join_left l inner join join_right r using (id)
   order by id, r.label;
 select * from join_left l left join join_right r using (id)
@@ -449,7 +449,7 @@ select * from join_left l right join join_right r using (id)
 select id, l.id, r.id, c.id, l.label, r.label, c.label
   from join_left l full join join_right r using (id)
   full join join_third c using (id)
-  order by id, l.id, r.id, c.id;
+  order by 1, l.id, r.id, c.id;
 select l.id, c.id from join_left l cross join join_third c
   where l.id = 1 order by c.id;
 

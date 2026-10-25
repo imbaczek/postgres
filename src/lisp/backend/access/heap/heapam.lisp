@@ -355,12 +355,17 @@
     (page-set-u32 page (+ offset +heap-tuple-cid-off+) cid)
     t))
 
+(defun heapam-set-ctid-unlocked (relfilenode block offnum ctid-block ctid-offnum)
+  (unless (sb-thread:holding-mutex-p *write-lock*)
+    (error "heap CTID mutation requires the writer lock"))
+  (with-heap-tuple-edit (page offset relfilenode block offnum)
+    (page-set-u32 page (+ offset +heap-tuple-ctid-block-off+) ctid-block)
+    (page-set-u16 page (+ offset +heap-tuple-ctid-offnum-off+) ctid-offnum)
+    t))
+
 (defun heapam-set-ctid (relfilenode block offnum ctid-block ctid-offnum)
   (with-write-lock
-    (with-heap-tuple-edit (page offset relfilenode block offnum)
-      (page-set-u32 page (+ offset +heap-tuple-ctid-block-off+) ctid-block)
-      (page-set-u16 page (+ offset +heap-tuple-ctid-offnum-off+) ctid-offnum)
-      t)))
+    (heapam-set-ctid-unlocked relfilenode block offnum ctid-block ctid-offnum)))
 
 (defun fresh-delete-snapshot (fallback)
   (if *backend*
@@ -377,14 +382,15 @@
              (member xid (snapshot-xip snapshot) :test #'=)))))
 
 (defun heapam-delete-tid (relfilenode columns block offnum xid cid
-                          &optional (matches-p (constantly t)))
+                          &optional (matches-p (constantly t)) on-delete)
   "Delete the latest qualifying version of TID, waiting for a writer.
 
 Under READ COMMITTED, follow a committed update's ctid chain and evaluate
 MATCHES-P against the refreshed row before claiming it. Under REPEATABLE READ,
 return a serialization-conflict status when the row changed after the retained
 snapshot. Return T, the tuple whose xmax was set, its physical location, and a
-status keyword."
+status keyword. ON-DELETE runs under the successful mutation\'s writer lock;
+when supplied, its result is returned as a sixth value."
   (register-relation-writer relfilenode xid)
   (let ((target-block block)
         (target-offnum offnum)
@@ -405,7 +411,8 @@ status keyword."
                     ((and expected-xmin
                           (/= (htup-xmin tuple) expected-xmin))
                      :skip)
-                    ((= (htup-xmax tuple) xid) (list :done tuple))
+                    ((= (htup-xmax tuple) xid)
+                     (list :done tuple (when on-delete (funcall on-delete))))
                     ((and (not (zerop (htup-xmax tuple)))
                           (xid-active-p (htup-xmax tuple))
                           (/= (htup-xmax tuple) xid))
@@ -440,13 +447,14 @@ status keyword."
                      (if (funcall matches-p tuple)
                          (if (heapam-set-xmax relfilenode target-block
                                               target-offnum xid cid)
-                             (list :done tuple)
+                             (list :done tuple (when on-delete (funcall on-delete)))
                              :skip)
                          :skip))
                     (t :skip))))))
         (case (if (consp action) (car action) action)
-          (:done (return (values t (second action)
-                                 target-block target-offnum :ok)))
+          (:done (return (if on-delete
+                             (values t (second action) target-block target-offnum :ok (third action))
+                             (values t (second action) target-block target-offnum :ok))))
           (:skip (return (values nil nil nil nil :skip)))
           (:serialization-update-conflict
            (return (values nil nil nil nil :serialization-update-conflict)))

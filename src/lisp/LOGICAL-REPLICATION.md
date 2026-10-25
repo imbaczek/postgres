@@ -9,6 +9,28 @@ subscriber apply worker. The completion regression boots one master and two
 replicas, copies a table snapshot, runs a transaction workload on the master,
 and verifies both replicas converge.
 
+## C PostgreSQL interoperability
+
+[REPLICATION-COMPATIBILITY.md](REPLICATION-COMPATIBILITY.md) records the
+compatibility assessment, observed protocol mistakes, and the implementation
+checkpoints. Its acceptance tests are pg-lisp publisher -> unmodified C native
+subscriber and C publisher -> pg-lisp subscriber, each with initial copy,
+ongoing replication, and restart/reconnect. These are separate one-way tests.
+The reference is the C implementation in this checkout (`20devel`), revision
+`9c0909b34939f2d5a37b82b9d1efc8b08e310252`. Pg-lisp now advertises that version;
+the harness prints both revisions, versions, executable hashes, and observed
+protocol versions.
+
+The original milestones below describe the pg-lisp extension path. A separate
+standard `pgoutput` sender and `--mode standard` subscriber now implement the
+bounded C-peer subset. Ordinary Message framing, native TRUNCATE, N-only UPDATE,
+historic publication selection, standard snapshot ownership, and native
+discovery SQL/text COPY have independent C-reference coverage. Initial copy,
+concurrent handoff, apply/copy worker recovery, lost feedback, and endpoint
+restarts pass in both one-way topologies. See the compatibility document for
+the final audit and evidence. Physical standby/Patroni support and blue-green
+authority transfer remain distinct follow-on work.
+
 ## Current state: implemented subset
 
 `backend/storage/wal.lisp` stores physical page after-images. Page records can
@@ -23,10 +45,11 @@ The executor still has the logical row values at the right points:
 `backend/executor/exec_delete.lisp:exec-delete`. `wal-commit-transaction`
 serializes transaction commit under `*wal-lock*`; `commit-transaction` only
 publishes CLOG after the commit record is flushed. The existing exported
-snapshot path captures a WAL boundary while writers are gated, persists a slot
-before exposing the snapshot, and prevents acknowledgment until the copy has
-finished. Slot acknowledgment already validates a terminal batch and persists
-the new restart horizon before publishing it in memory.
+snapshot path captures a WAL boundary while writers are gated and persists a
+slot before exposing the snapshot. Extension mode prevents acknowledgment until
+its private copy-complete handshake and validates terminal batch positions.
+Standard mode follows C snapshot ownership and feedback semantics independently.
+Both persist a new restart horizon before publishing it in memory.
 
 The implemented path captures row changes at the executor boundary because
 this backend writes page after-images rather than PostgreSQL heap WAL records.
@@ -46,6 +69,18 @@ target markers with the corresponding durable catalog update.
 `backend/replication/client.lisp` is the small wire frontend used by the worker.
 Run `t/logical-replication.sh` to boot one source and two independent replicas
 and exercise this path.
+
+`backend/replication/standard.lisp` sends standard publication-selected rows
+without private DDL, sequence, or progress messages. Selection metadata is
+captured with each successful mutation and persists in logical WAL, so later
+publication edits cannot reinterpret retained rows. Standard Commit positions
+and timestamps come from the durable source transaction. Its bounded sender
+tracks safely emitted frontiers separately from subscriber flush feedback.
+`standard-subscriber.lisp` uses standard C identity/catalog discovery and a
+read-only repeatable-read USE snapshot. It records owned attempt slots before
+creation, safely retries interrupted copy, and resumes READY targets from their
+durable source marker. Run `t/logical-interop.sh both` with the reference C build
+to exercise both independent C-peer topologies.
 
 PostgreSQL's C implementation remains the behavioral reference. In particular,
 `decode.c` and `reorderbuffer.c` show how heap changes are decoded and grouped by
@@ -135,7 +170,7 @@ upgrades.
 
 1. Recognize the PostgreSQL startup parameter `replication=database` and keep
    replication connections out of ordinary SQL transaction dispatch. Add
-   strict handlers for `CREATE_REPLICATION_SLOT ... LOGICAL pgoutput
+   strict handlers for `CREATE_REPLICATION_SLOT ... LOGICAL pg_lisp
    EXPORT_SNAPSHOT`, `DROP_REPLICATION_SLOT`, and `START_REPLICATION SLOT ...
    LOGICAL ...`. Validate the database, plugin, slot state, and requested LSN
    before entering streaming mode. Follow `tcop/postgres.c`'s walsender query
@@ -158,8 +193,11 @@ upgrades.
    standalone sequence-state changes as pgoutput v2 `Message` records. Relation
    metadata marks unique replica-identity columns; UPDATE/DELETE use a `K` key
    tuple when present and an `O` full old tuple otherwise. The worker requires
-   `K` identity for its configured tables. The v2 message payload is a private
-   pg-lisp event envelope, so only the bundled subscriber can apply it. Send
+   `K` identity for its configured tables. The message payload is a private
+   pg-lisp event envelope, so only the bundled subscriber can apply it. Current
+   transactional `M` framing also prepends XID outside streamed blocks; this
+   shared sender/receiver mistake must be corrected under the compatibility
+   plan, not treated as a PostgreSQL v2 requirement. Send
    keepalives for safe progress
    across batches with no rows for this database.
    For the initial connection, wait for the client's first standby status update
@@ -433,17 +471,21 @@ samples the subscriber's RSS, failing above the configurable 256 MiB default
 (`BLOCKED_WORKER_RSS_MAX_KB`); the fast-consumer workload continues to report
 its high-water mark and concurrent-writer latency.
 
-## Follow-on milestone
+## Follow-on milestone: cutover after protocol compatibility
 
-Add blue-green cutover guidance: prepare matching supported tables/indexes,
-copy under the exported snapshot, wait for replay to reach a source commit
-barrier, fence old-primary writes, validate, then promote the subscriber.
-General-purpose upgrade safety still requires publication semantics, broader
-schema/type/storage coverage, conflict handling, and loop prevention.
+After the [C-peer compatibility milestone](REPLICATION-COMPATIBILITY.md), add
+blue-green cutover: verify complete data coverage and one apply owner, fence
+old-primary writes, drain transactions, establish a final durable barrier,
+wait for target durability, validate schema/data/sequences, then transfer write
+authority and routing. Recover interrupted transfers without two writers.
+Cross-build logical compatibility and forward-only post-cutover recovery must
+be explicit. General-purpose upgrade safety also requires broader schema/type/
+storage coverage, conflict handling, and loop prevention. Patroni-compatible
+physical standby behavior is a separate implementation milestone.
 
-## Validation
+## Historical validation of the pg-lisp subset
 
-Validation completed:
+Previously reported validation (not rerun for the compatibility assessment):
 
 - `./t/format.sh --check` for all changed Lisp files
 - `./t/compile.sh`
@@ -462,5 +504,8 @@ Validation completed:
   blocked sender termination, and slot reseeding.
 
 
-The tests compare transaction visibility, snapshot handoff, pgoutput framing,
-and acknowledgment ordering with the PostgreSQL C references above.
+The tests exercise transaction visibility, snapshot handoff, and acknowledgment
+ordering within the pg-lisp subset, with C source as a design reference. They
+do not establish C-peer interoperability; some codec expectations share the
+implementation's framing mistake. Independent C-backed fixtures and both live
+replication directions are required by the next milestone.

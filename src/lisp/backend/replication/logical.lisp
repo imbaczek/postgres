@@ -17,10 +17,10 @@
 
 (defstruct logical-change
   kind database-oid relation-oid relation-name columns key-attnums
-  old-values new-values event-payload)
+  old-values new-values event-payload (publication-selection :unknown))
 
 (defstruct logical-transaction
-  xid commit-lsn changes)
+  xid commit-lsn commit-record-lsn commit-timestamp changes)
 
 (defstruct logical-cursor
   bytes (offset 0))
@@ -153,7 +153,70 @@
                              indexes))))
     (and index (copy-list (pg-index-columns index)))))
 
+(defun logical-capture-publications (tables kind)
+  "Freeze selection at the successful mutation's writer-lock linearization point."
+  (unless (sb-thread:holding-mutex-p *write-lock*)
+    (error "historic publication capture requires the writer lock"))
+  (unless (member kind '(:insert :update :delete :truncate))
+    (error "unsupported historic publication operation"))
+  (sb-thread:with-mutex (*catalog-mutex*)
+    (loop for table in tables
+          collect
+          (list :relation-oid (pg-class-oid table)
+                :publications
+                (sort
+                 (loop for publication being the hash-values of (database-publications (current-database))
+                       for entry = (publication-table-entry publication (pg-class-name table))
+                       when (and entry (member kind (pg-publication-publish-actions publication)))
+                         collect (list :name (copy-seq (pg-publication-name publication))
+                                       :oid (pg-publication-oid publication)
+                                       :generation (or (pg-publication-generation publication) 0)
+                                       :unsupported (not (null (getf entry :filter)))))
+                 #'string< :key (lambda (entry) (getf entry :name)))))))
+
+(defun logical-publication-entry-valid-p (entry)
+  (and (logical-plist-has-exact-keys-p entry '(:name :oid :generation :unsupported))
+       (let ((name (getf entry :name)) (oid (getf entry :oid)) (generation (getf entry :generation)))
+         (and (stringp name) (not (find (code-char 0) name))
+              (<= 1 (length (string->bytes name)) 63)
+              (integerp oid) (< 0 oid #x100000000)
+              (integerp generation) (<= 0 generation #xffffffffffffffff)
+              (member (getf entry :unsupported) '(nil t))))))
+
+(defun logical-validate-publication-selection (selection)
+  (unless (and (listp selection) (<= (length selection) #xffff))
+    (error "invalid historic publication selection"))
+  (let ((oids nil))
+    (dolist (relation selection)
+      (unless (logical-plist-has-exact-keys-p relation '(:relation-oid :publications))
+        (error "invalid historic publication relation"))
+      (let ((oid (getf relation :relation-oid)) (publications (getf relation :publications)))
+        (unless (and (integerp oid) (< 0 oid #x100000000) (not (member oid oids))
+                     (listp publications) (<= (length publications) #xffff)
+                     (every #'logical-publication-entry-valid-p publications)
+                     (= (length publications)
+                        (length (remove-duplicates publications :key (lambda (entry) (getf entry :name))
+                                                                :test #'equal)))
+                     (= (length publications)
+                        (length (remove-duplicates publications :key (lambda (entry) (getf entry :oid))))))
+          (error "invalid or duplicate historic publication metadata"))
+        (push oid oids))))
+  selection)
+
+(defun logical-write-publication-selection (buffer selection)
+  (logical-validate-publication-selection selection)
+  (logical-write-u16 buffer (length selection))
+  (dolist (relation selection)
+    (logical-write-u32 buffer (getf relation :relation-oid))
+    (logical-write-u16 buffer (length (getf relation :publications)))
+    (dolist (publication (getf relation :publications))
+      (logical-write-string-u32 buffer (getf publication :name))
+      (logical-write-u32 buffer (getf publication :oid))
+      (logical-write-u64 buffer (getf publication :generation))
+      (logical-write-u8 buffer (if (getf publication :unsupported) 1 0)))))
+
 (defun logical-encode-change (change)
+  (logical-validate-change-publications change)
   (let ((buffer (make-array 0 :element-type '(unsigned-byte 8)
                               :adjustable t :fill-pointer 0))
         (columns (logical-change-columns change))
@@ -161,18 +224,24 @@
     (when (member (logical-change-kind change)
                   '(:truncate :ddl :sequence-state))
       (logical-write-u8 buffer 0)
-      (logical-write-u8 buffer 2)
+      (logical-write-u8 buffer (if (and (eq (logical-change-kind change) :truncate)
+                                        (not (eq (logical-change-publication-selection change) :unknown))) 4 2))
       (logical-write-u8 buffer (logical-kind-code (logical-change-kind change)))
       (logical-write-u32 buffer (logical-change-database-oid change))
+      (when (and (eq (logical-change-kind change) :truncate)
+                 (not (eq (logical-change-publication-selection change) :unknown)))
+        (logical-write-publication-selection buffer (logical-change-publication-selection change)))
       (logical-write-string-u32 buffer (logical-change-event-payload change))
       (return-from logical-encode-change buffer))
-    ;; Event format 1 adds immutable replica-identity attnums. The zero marker
-    ;; cannot collide with the legacy 1/2/3 kind tags, so existing WAL remains
-    ;; decodable without a physical WAL format bump.
+    ;; Row format 3 adds per-change publication selection to format 1's keys.
+    ;; TRUNCATE format 4 extends event format 2 similarly. Legacy formats keep
+    ;; :unknown history; a zero marker distinguishes versions from old kind tags.
     (logical-write-u8 buffer 0)
-    (logical-write-u8 buffer 1)
+    (logical-write-u8 buffer (if (eq (logical-change-publication-selection change) :unknown) 1 3))
     (logical-write-u8 buffer (logical-kind-code (logical-change-kind change)))
     (logical-write-u32 buffer (logical-change-database-oid change))
+    (unless (eq (logical-change-publication-selection change) :unknown)
+      (logical-write-publication-selection buffer (logical-change-publication-selection change)))
     (logical-write-u32 buffer (logical-change-relation-oid change))
     (logical-write-string-u32 buffer (logical-change-relation-name change))
     (logical-write-u16 buffer (length columns))
@@ -263,23 +332,57 @@
                 collect (logical-read-value cursor (getf column :type)))
           'vector))
 
+(defun logical-read-publication-selection (cursor)
+  (logical-validate-publication-selection
+   (loop repeat (logical-read-u16 cursor)
+         collect
+         (list :relation-oid (logical-read-u32 cursor)
+               :publications
+               (loop repeat (logical-read-u16 cursor)
+                     collect (list :name (logical-read-string-u32 cursor)
+                                   :oid (logical-read-u32 cursor)
+                                   :generation (logical-read-u64 cursor)
+                                   :unsupported
+                                   (case (logical-read-u8 cursor)
+                                     (0 nil) (1 t)
+                                     (otherwise (error "invalid historic publication flags")))))))))
+
+(defun logical-validate-change-publications (change)
+  (let ((selection (logical-change-publication-selection change)))
+    (unless (eq selection :unknown)
+      (logical-validate-publication-selection selection)
+      (let ((expected
+              (case (logical-change-kind change)
+                ((:insert :update :delete) (list (logical-change-relation-oid change)))
+                (:truncate (getf (logical-read-data-string (logical-change-event-payload change))
+                                 :relation-oids))
+                (otherwise (error "historic selection on unsupported logical operation")))))
+        (unless (equal (sort (copy-list expected) #'<)
+                       (sort (mapcar (lambda (entry) (getf entry :relation-oid)) selection) #'<))
+          (error "historic publication relation identities do not match the change")))))
+  change)
+
 (defun logical-decode-change (bytes)
   (let* ((cursor (make-logical-cursor :bytes bytes))
          (marker (logical-read-u8 cursor))
          (event-version (if (zerop marker) (logical-read-u8 cursor) 0))
          (kind (logical-kind-from-code
                 (if (zerop marker) (logical-read-u8 cursor) marker)))
-         (database-oid (logical-read-u32 cursor)))
-    (when (= event-version 2)
-      (unless (member kind '(:truncate :ddl :sequence-state))
+         (database-oid (logical-read-u32 cursor))
+         (selection (if (member event-version '(3 4))
+                        (logical-read-publication-selection cursor) :unknown)))
+    (when (member event-version '(2 4))
+      (unless (if (= event-version 4) (eq kind :truncate)
+                  (member kind '(:truncate :ddl :sequence-state)))
         (error "invalid logical catalog-event kind ~a" kind))
       (let ((payload (logical-read-string-u32 cursor)))
         (unless (= (logical-cursor-offset cursor) (length bytes))
           (error "logical event payload has trailing bytes"))
         (return-from logical-decode-change
-          (make-logical-change :kind kind :database-oid database-oid
-                               :event-payload payload))))
-    (unless (member event-version '(0 1))
+          (logical-validate-change-publications
+           (make-logical-change :kind kind :database-oid database-oid
+                                :publication-selection selection :event-payload payload)))))
+    (unless (member event-version '(0 1 3))
       (error "unsupported logical row-change event version"))
     (let* ((relation-oid (logical-read-u32 cursor))
            (relation-name (logical-read-string-u32 cursor))
@@ -297,7 +400,7 @@
                                             (1 t)
                                             (otherwise
                                              (error "invalid logical column flags"))))))
-           (key-attnums (if (= event-version 1)
+           (key-attnums (if (member event-version '(1 3))
                             (loop repeat (logical-read-u16 cursor)
                                   collect (logical-read-u16 cursor))
                             (progn
@@ -315,7 +418,8 @@
                                         :columns columns
                                         :key-attnums key-attnums
                                         :old-values (first rows)
-                                        :new-values (second rows))))
+                                        :new-values (second rows)
+                                        :publication-selection selection)))
       (unless (= (logical-cursor-offset cursor) (length bytes))
         (error "logical row-change payload has trailing bytes"))
       (unless (and (<= (length key-attnums) (length columns))
@@ -334,7 +438,7 @@
                 (:delete (and (logical-change-old-values change)
                               (null (logical-change-new-values change)))))
         (error "logical row change has inconsistent old/new images"))
-      change)))
+      (logical-validate-change-publications change))))
 
 (defun logical-encode-catalog-event (database-oid ast)
   (let* ((text (catalog-readable-data-string
@@ -402,7 +506,7 @@
               :last (pg-sequence-last-value sequence)
               :called (pg-sequence-called-p sequence))))))))
 
-(defun logical-note-transaction-event (kind payload)
+(defun logical-note-transaction-event (kind payload &key (publication-selection :unknown))
   "Capture a transactional utility event such as TRUNCATE before XID commit."
   (when (and *backend* (backend-xid *backend*))
     (unless (eq kind :truncate)
@@ -412,7 +516,7 @@
                      (let ((*print-readably* t) (*print-pretty* nil))
                        (prin1 payload stream)))))
            (change (make-logical-change
-                    :kind kind
+                    :kind kind :publication-selection publication-selection
                     :database-oid (database-oid (current-database))
                     :event-payload text))
            (encoded (logical-encode-change change))
@@ -424,20 +528,30 @@
       (setf (backend-logical-change-bytes *backend*) total)
       change)))
 
-(defun logical-note-row-change (kind table &key old-values new-values)
+(defun logical-relation-columns (table)
+  "Copy the immutable relation descriptor used by both row and TRUNCATE WAL."
+  (loop for column across (pg-class-columns table)
+        collect (list :attnum (pg-column-attnum column)
+                      :name (copy-seq (pg-column-name column))
+                      :type (pg-column-type column)
+                      :typmod (pg-column-typmod column)
+                      :notnull (pg-column-notnull column))))
+
+(defun logical-relation-description (table)
+  (list :oid (pg-class-oid table) :name (copy-seq (pg-class-name table))
+        :columns (logical-relation-columns table)
+        :key-attnums (copy-list (logical-table-replica-identity table))))
+
+(defun logical-note-row-change (kind table &key old-values new-values (publication-selection :unknown))
   "Capture a successful executor row operation for its current transaction.
 
 PostgreSQL's logical decode path queues heap changes in DecodeInsert,
 DecodeUpdate, and DecodeDelete; this subset already has decoded values in the
 executor, so capture the same operation before transaction commit."
   (when (and *backend* (backend-xid *backend*))
+    (logical-test-failpoint :before-logical-row-encode kind (pg-class-name table))
     (let* ((columns
-             (loop for column across (pg-class-columns table)
-                   collect (list :attnum (pg-column-attnum column)
-                                 :name (copy-seq (pg-column-name column))
-                                 :type (pg-column-type column)
-                                 :typmod (pg-column-typmod column)
-                                 :notnull (pg-column-notnull column))))
+             (logical-relation-columns table))
            (key-attnums (logical-table-replica-identity table))
            (change (make-logical-change
                     :kind kind
@@ -446,6 +560,7 @@ executor, so capture the same operation before transaction commit."
                     :relation-name (copy-seq (pg-class-name table))
                     :columns columns
                     :key-attnums key-attnums
+                    :publication-selection publication-selection
                     :old-values (and old-values (copy-seq old-values))
                     :new-values (and new-values (copy-seq new-values))))
            (encoded (logical-encode-change change))
@@ -681,6 +796,9 @@ executor, so capture the same operation before transaction commit."
            (error "logical WAL chunks do not match their commit record")))
        (when changes
          (push (make-logical-transaction :xid (wal-record-xid record)
+                                         :commit-timestamp
+                                         (wal-decode-commit-timestamp (wal-record-payload record))
+                                         :commit-record-lsn (wal-record-start record)
                                          :commit-lsn (wal-record-end record)
                                          :changes changes)
                (logical-reader-state-transactions state))))
@@ -689,6 +807,7 @@ executor, so capture the same operation before transaction commit."
          (error "logical row changes are attached to a catalog WAL batch"))
        (when changes
          (push (make-logical-transaction :xid 0
+                                         :commit-record-lsn (wal-record-start record)
                                          :commit-lsn (wal-record-end record)
                                          :changes changes)
                (logical-reader-state-transactions state))))
@@ -720,6 +839,39 @@ executor, so capture the same operation before transaction commit."
           (max (or *wal-logical-slot-read-progress* progress-lsn)
                progress-lsn)))
   (values transactions progress-lsn))
+
+(defun wal-acknowledge-standard-replication-slot
+    (name acknowledged-lsn restart-floor sent-lsn)
+  "Persist exact standard feedback while retaining an aligned decoding cursor.
+RESTART-FLOOR is a complete batch boundary at or below the reported flush,
+tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
+  (sb-thread:with-mutex (*wal-lock*)
+    (wal-check-healthy)
+    (let ((slot (gethash name *wal-replication-slots*)))
+      (unless slot
+        (ereport "42704" "replication slot ~s does not exist" name))
+      (unless (and *wal-logical-slot-owner*
+                   (eq *wal-logical-slot-owner*
+                       (wal-replication-slot-active-owner slot)))
+        (ereport "55006" "replication slot is not owned by this reader"))
+      (when (eq (wal-replication-slot-wal-status slot) :lost)
+        (ereport "55000" "replication slot has lost its WAL"))
+      (unless (equal (wal-replication-slot-plugin slot) "pgoutput")
+        (ereport "55000" "standard feedback requires a pgoutput slot"))
+      (unless (and (integerp acknowledged-lsn)
+                   (<= 0 acknowledged-lsn #xFFFFFFFFFFFFFFFF))
+        (ereport "22023" "invalid standard feedback position"))
+      (when (<= acknowledged-lsn (wal-replication-slot-confirmed-flush-lsn slot))
+        (return-from wal-acknowledge-standard-replication-slot slot))
+      (unless (and (integerp acknowledged-lsn) (integerp restart-floor)
+                   (integerp sent-lsn) (integerp *wal-logical-slot-read-progress*)
+                   (<= 0 acknowledged-lsn sent-lsn
+                       *wal-logical-slot-read-progress* *wal-durable-lsn*)
+                   (<= (wal-replication-slot-restart-lsn slot)
+                       restart-floor acknowledged-lsn))
+        (ereport "22023" "standard feedback is outside safe replication progress"))
+      (wal-persist-replication-slot-ack-under-lock
+       slot acknowledged-lsn restart-floor))))
 
 (defun wal-logical-slot-validate-start-position (name requested-lsn)
   "Validate the requested initial or resumed stream boundary for NAME."
@@ -777,7 +929,7 @@ executor, so capture the same operation before transaction commit."
       requested-lsn)))
 
 (defun wal-logical-slot-read-transactions
-    (name &key upto-lsn
+    (name &key upto-lsn from-lsn
             (max-transactions +max-logical-read-transactions+)
             (max-bytes +max-logical-read-bytes+)
             (max-scan-bytes +max-logical-read-scan-bytes+))
@@ -787,14 +939,16 @@ MAX-BYTES limits encoded row-change bytes per read; a first transaction may
 exceed it, up to the per-transaction limit, so callers can always make progress.
 MAX-SCAN-BYTES bounds WAL scanning through the next terminal batch boundary.
 The second return value is the last safe progress LSN: the last terminal fully
-scanned, or the slot's starting position when no scan was needed."
+scanned, or the slot's starting position when no scan was needed.
+FROM-LSN is an aligned cursor returned by an earlier bounded read, or the
+slot restart point. It permits standard senders to scan ahead of feedback."
   (wal-logical-reader-validate-limits max-transactions max-bytes max-scan-bytes)
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
     (let* ((slot (gethash name *wal-replication-slots*))
            (owner (and slot (wal-replication-slot-active-owner slot)))
            (start-lsn (and slot
-                           (or (wal-replication-slot-confirmed-flush-lsn slot)
+                           (or from-lsn (wal-replication-slot-confirmed-flush-lsn slot)
                                (wal-replication-slot-consistent-lsn slot))))
            (end-lsn (or upto-lsn *wal-durable-lsn*)))
       (unless slot
@@ -808,6 +962,9 @@ scanned, or the slot's starting position when no scan was needed."
         (ereport "55000" "replication slot initial copy is not acknowledged"))
       (unless (and (integerp (wal-replication-slot-database-oid slot)) start-lsn)
         (ereport "55000" "logical replication slot is not initialized"))
+      (unless (and (integerp start-lsn)
+                   (>= start-lsn (wal-replication-slot-restart-lsn slot)))
+        (ereport "22023" "logical replication cursor is outside retained WAL"))
       (unless (and (integerp end-lsn) (<= start-lsn end-lsn *wal-durable-lsn*))
         (ereport "22023" "logical replication read end is outside durable WAL"))
       (when (= start-lsn end-lsn)

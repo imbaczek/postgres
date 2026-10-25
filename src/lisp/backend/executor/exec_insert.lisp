@@ -123,7 +123,9 @@ index's B-tree mutex."
     (let ((indexes (table-indexes table)))
       (values indexes (mapcar #'pg-index-relfilenode indexes)))))
 
-(defun insert-tuple-with-unique (table values &key exclude-tid)
+(defun insert-tuple-with-unique (table values &key exclude-tid on-success publication-kind)
+  "ON-SUCCESS runs under B-tree locks and the writer lock; it must not wait.
+When PUBLICATION-KIND is supplied, return immutable selection as a third value."
   (let* ((xid (get-current-xid))
          (relfilenode (pg-class-relfilenode table))
          (indexes nil)
@@ -157,8 +159,11 @@ index's B-tree mutex."
                                     types)))
                          (btree-insert-unlocked (pg-index-relfilenode idx)
                                                 key block off)))
+                     (when on-success (funcall on-success block off))
                      (return-from insert-tuple-with-unique
-                       (values block off)))))
+                       (if publication-kind
+                           (values block off (logical-capture-publications (list table) publication-kind))
+                           (values block off))))))
                 ((eq (car check) :violation)
                  (ereport "23505"
                           "duplicate key value violates unique constraint \"~a\""
@@ -207,7 +212,9 @@ index's B-tree mutex."
                                          (pg-column-type col)
                                          (pg-column-typmod col))))
           (check-not-null values columns)
-          (insert-tuple-with-unique table values)
-          (logical-note-row-change :insert table :new-values values)
+          (multiple-value-bind (block off publications)
+              (insert-tuple-with-unique table values :publication-kind :insert)
+            (declare (ignore block off))
+            (logical-note-row-change :insert table :new-values values :publication-selection publications))
           (incf count)))
       (send-command-complete stream (format nil "INSERT 0 ~a" count)))))

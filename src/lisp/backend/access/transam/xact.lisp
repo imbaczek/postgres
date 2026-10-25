@@ -19,6 +19,7 @@
   (snapshot nil)
   (transaction-snapshot nil)
   (transaction-snapshot-registration nil)
+  (transaction-schema-read-lock-held-p nil)
   (first-snapshot-set nil)
   (dirty-relations '())
   (logical-changes '())
@@ -288,10 +289,14 @@ handoff are interrupt-free so cancellation cannot strand either state."
       (sb-thread:condition-broadcast *schema-lock-cv*)))
   (values))
 
+(defun backend-holds-schema-read-lock-p (&optional (backend *backend*))
+  (and backend (backend-transaction-schema-read-lock-held-p backend)))
+
 (defmacro with-schema-read-lock (&body body)
   "Hold a schema-stable view through BODY, blocking incompatible DDL."
   (let ((acquired (gensym "SCHEMA-READ-ACQUIRED-")))
-    `(if (or *schema-write-lock-held* *schema-read-lock-held*)
+    `(if (or *schema-write-lock-held* *schema-read-lock-held*
+             (backend-holds-schema-read-lock-p))
          (progn ,@body)
          (let ((,acquired nil))
            (unwind-protect
@@ -311,7 +316,7 @@ Independent schema changers may overlap; relation/catalog locks order DDL."
         (acquired (gensym "SCHEMA-WRITE-ACQUIRED-")))
     `(cond
        (*schema-write-lock-held* (progn ,@body))
-       (*schema-read-lock-held*
+       ((or *schema-read-lock-held* (backend-holds-schema-read-lock-p))
         (ereport "25001"
                  "schema changes cannot run inside an exported snapshot scope"))
        (t
@@ -986,7 +991,7 @@ excluded, so a sequence advance before slot publication remains streamable."
 
 (defun wal-publish-replication-slot-under-wal-lock
     (name boundary-lsn restart-lsn register active-owner
-     &optional active-xids database-oid)
+     &optional active-xids database-oid (plugin "pg_lisp"))
   "Persist and publish a slot while *WAL-LOCK* protects its retention point."
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid replication slot name \"~a\"" name))
@@ -998,7 +1003,8 @@ excluded, so a sequence advance before slot publication remains streamable."
     (ereport "42710" "replication slot \"~a\" already exists" name))
   (let ((slot (make-wal-replication-slot
                :name name :restart-lsn restart-lsn
-               :consistent-lsn boundary-lsn
+               :consistent-lsn boundary-lsn :plugin plugin
+               :confirmed-flush-lsn (when (string= plugin "pgoutput") boundary-lsn)
                :database-oid database-oid
                :active-owner active-owner
                :active-owner-backend (and active-owner *backend*))))
@@ -1041,7 +1047,7 @@ excluded, so a sequence advance before slot publication remains streamable."
 
 (defun wal-publish-captured-replication-slot
     (name boundary-lsn restart-lsn register
-     &optional active-owner active-xids database-oid)
+     &optional active-owner active-xids database-oid (plugin "pg_lisp"))
   "Publish a captured slot after the wraparound gate has been released.
 
 The active snapshot registration keeps RESTART-LSN pinned if a checkpoint runs
@@ -1051,7 +1057,7 @@ between snapshot capture and this durable publication."
     (let ((slot
             (wal-publish-replication-slot-under-wal-lock
              name boundary-lsn restart-lsn register active-owner active-xids
-             database-oid)))
+             database-oid plugin)))
       ;; Switch atomically from the provisional snapshot interest to the durable
       ;; slot visible to catalog-event writers under this same WAL lock.
       (remhash register *wal-logical-catalog-event-interests*)
@@ -1068,6 +1074,79 @@ between snapshot capture and this durable publication."
     (incf *exported-logical-snapshot-counter*)
     (format nil "pg_lisp_~X_~X"
             (get-internal-real-time) *exported-logical-snapshot-counter*)))
+
+(defun validate-standard-snapshot-use (backend)
+  "Match CreateReplicationSlot's checks before retaining a transaction snapshot."
+  (unless (and (backend-explicit backend) (eq (backend-state backend) :in-progress))
+    (ereport "XX000" "SNAPSHOT 'use' must be called inside a transaction"))
+  (unless (eq (backend-isolation-level backend) :repeatable-read)
+    (ereport "XX000" "SNAPSHOT 'use' requires REPEATABLE READ isolation"))
+  (unless (backend-read-only backend)
+    (ereport "XX000" "SNAPSHOT 'use' requires a read-only transaction"))
+  (when (or (backend-first-snapshot-set backend)
+            (backend-transaction-snapshot backend)
+            (backend-holds-schema-read-lock-p backend))
+    (ereport "XX000" "SNAPSHOT 'use' must be called before any query")))
+
+(defun create-standard-logical-slot (slot-name snapshot-action)
+  "Publish a confirmed slot; only USE transfers MVCC and schema ownership to SQL."
+  (unless *backend* (ereport "55000" "slot creation requires an active backend"))
+  (unless (member snapshot-action '(:nothing :use))
+    (ereport "0A000" "standard snapshot export is not implemented"))
+  (when (eq snapshot-action :use) (validate-standard-snapshot-use *backend*))
+  (prepare-xid-wraparound-for-statement *backend*)
+  (let* ((backend *backend*)
+         (registration (make-snapshot-registration))
+         (owner (gensym "STANDARD-LOGICAL-SLOT-"))
+         (database-id (database-oid (get-database (backend-database backend))))
+         (schema-lease nil) (installed nil) (returned nil))
+    (unwind-protect
+         (progn
+           (when (eq snapshot-action :use)
+             (acquire-schema-read-lock (lambda () (setf schema-lease t))))
+           (multiple-value-bind (snapshot boundary)
+               (wait-for-xid-wraparound
+                backend
+                (lambda ()
+                  (with-write-lock
+                    (multiple-value-bind (snapshot boundary restart)
+                        (wal-capture-snapshot-boundary-under-writer-lock
+                         (backend-command-id backend) registration)
+                      ;; Writers must see the slot before they can produce WAL
+                      ;; after this boundary, including XIDs absent from XIP.
+                      (when *logical-test-after-snapshot-capture-hook*
+                        (funcall *logical-test-after-snapshot-capture-hook*
+                                 slot-name boundary))
+                      (logical-test-failpoint
+                       :after-snapshot-boundary-capture slot-name boundary)
+                      (logical-test-failpoint
+                       :before-initial-slot-publication slot-name boundary)
+                      (wal-publish-captured-replication-slot
+                       slot-name boundary restart registration owner
+                       (snapshot-xip snapshot) database-id "pgoutput")
+                      (values snapshot boundary)))))
+             (logical-test-failpoint :after-initial-slot-file-publication slot-name boundary)
+             (when (eq snapshot-action :use)
+               (sb-sys:without-interrupts
+                 (setf (backend-transaction-snapshot backend) snapshot
+                       (backend-transaction-snapshot-registration backend) registration
+                       (backend-transaction-schema-read-lock-held-p backend) schema-lease
+                       (backend-first-snapshot-set backend) t
+                       schema-lease nil installed t))
+               (logical-test-failpoint :after-standard-snapshot-installation slot-name boundary))
+             (wal-release-replication-slot-owner slot-name owner)
+             (setf owner nil returned t)
+             (values boundary nil)))
+      ;; A permanent slot remains durable even when the command or its SQL
+      ;; transaction fails. In particular, uncertain rename/fsync keeps its pin.
+      (when owner (ignore-errors (wal-release-replication-slot-owner slot-name owner)))
+      (cond
+        ((and installed (not returned))
+         (release-backend-transaction-snapshot backend))
+        ((not installed)
+         (when (snapshot-registration-active-p registration)
+           (release-snapshot-registration registration))))
+      (when schema-lease (release-schema-read-lock)))))
 
 (defun create-exported-logical-snapshot-slot (slot-name)
   "Create an unconfirmed logical slot and return its copy boundary and token.
@@ -1436,11 +1515,15 @@ remains after BODY and should be dropped when its WAL is no longer needed."
       snap)))
 
 (defun release-backend-transaction-snapshot (backend)
-  (when (backend-transaction-snapshot-registration backend)
-    (release-snapshot-registration
-     (backend-transaction-snapshot-registration backend)))
-  (setf (backend-transaction-snapshot backend) nil
-        (backend-transaction-snapshot-registration backend) nil)
+  (sb-sys:without-interrupts
+    (let ((registration (backend-transaction-snapshot-registration backend))
+          (schema-lease (backend-transaction-schema-read-lock-held-p backend)))
+      (setf (backend-transaction-snapshot backend) nil
+            (backend-transaction-snapshot-registration backend) nil
+            (backend-transaction-schema-read-lock-held-p backend) nil)
+      (unwind-protect
+           (when registration (release-snapshot-registration registration))
+        (when schema-lease (release-schema-read-lock)))))
   (values))
 
 (defun reset-backend-transaction (b)
@@ -1489,6 +1572,15 @@ remains after BODY and should be dropped when its WAL is no longer needed."
           (clog-set (backend-xid b) +clog-aborted+ :fsync t))
         (release-xid (backend-xid b)))
       (reset-backend-transaction b)))
+  (values))
+
+(defun abort-transaction-block ()
+  "Abort resources immediately while retaining the explicit failed-block status."
+  (let ((explicit (backend-explicit *backend*)))
+    (abort-transaction)
+    (when explicit
+      (setf (backend-explicit *backend*) t)
+      (set-backend-state *backend* :aborted)))
   (values))
 
 (defun end-backend-session ()

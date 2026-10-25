@@ -8,7 +8,7 @@
 
 (defstruct logical-subscription-options
   (source-host "127.0.0.1") (source-port 5433) (source-database "postgres")
-  source-identity
+  source-identity (mode :extension) publication actual-slot
   (target-host "127.0.0.1") (target-port 5433) (target-database "postgres")
   slot-name (tables '()))
 
@@ -44,6 +44,14 @@
       (loop while remaining
             for arg = (pop remaining)
             do (cond
+                 ((string= arg "--mode")
+                  (setf (logical-subscription-options-mode options)
+                        (cond ((string= (first remaining) "standard") :standard)
+                              ((string= (first remaining) "extension") :extension)
+                              (t (error "--mode expects standard or extension"))))
+                  (next-value arg))
+                 ((string= arg "--publication")
+                  (setf (logical-subscription-options-publication options) (next-value arg)))
                  ((string= arg "--source-host")
                   (setf (logical-subscription-options-source-host options)
                         (next-value arg)))
@@ -78,13 +86,19 @@
                  (wal-valid-replication-slot-name-p
                   (logical-subscription-options-slot-name options)))
       (error "--slot requires a valid lowercase replication slot name"))
+    (if (eq (logical-subscription-options-mode options) :standard)
+        (unless (logical-simple-identifier-p (logical-subscription-options-publication options))
+          (error "standard mode requires --publication with a simple identifier"))
+        (when (logical-subscription-options-publication options)
+          (error "--publication requires standard mode")))
     (unless (logical-subscription-options-tables options)
       (error "at least one --table allowlist entry is required"))
     (dolist (table (logical-subscription-options-tables options))
       (unless (and (logical-simple-identifier-p table)
                    (not (member table
                                 (list +subscription-progress-table+
-                                      +subscription-config-table+)
+                                      +subscription-config-table+
+                                      "pg_lisp_standard_subscriptions")
                                 :test #'string=)))
         (error "unsupported allowlist table identifier ~s" table)))
     (setf (logical-subscription-options-tables options)
@@ -251,6 +265,8 @@
    :application-name "pg-lisp-subscribe-copy"))
 
 (defun logical-read-source-identity (options)
+  (when (eq (logical-subscription-options-mode options) :standard)
+    (return-from logical-read-source-identity (logical-standard-source-identity options)))
   (let ((source (logical-startup-source-client options)))
     (unwind-protect
          (let* ((rows (pg-client-query source "SELECT pg_lisp_cluster_identity()"))
@@ -286,10 +302,10 @@
          (let* ((rows
                   (pg-client-query
                    client
-                   (format nil "CREATE_REPLICATION_SLOT ~a LOGICAL pgoutput EXPORT_SNAPSHOT"
+                   (format nil "CREATE_REPLICATION_SLOT ~a LOGICAL pg_lisp EXPORT_SNAPSHOT"
                            (logical-subscription-options-slot-name options))))
                 (row (first rows)))
-           (unless (and row (= (length row) 4)
+           (unless (and row (= (length row) 4) (equal (aref row 3) "pg_lisp")
                         (string= (aref row 0)
                                  (logical-subscription-options-slot-name options)))
              (error "source returned an invalid replication slot result"))
@@ -323,9 +339,9 @@
              (error "source and target schemas differ at table ~a column ~a"
                     table (pg-client-column-name source)))))
 
-(defun logical-table-schema (client table)
+(defun logical-table-schema (client table &optional public-p)
   (multiple-value-bind (rows columns tag)
-      (pg-client-query client (format nil "SELECT * FROM ~a LIMIT 0" table))
+      (pg-client-query client (format nil "SELECT * FROM ~a~a LIMIT 0" (if public-p "public." "") table))
     (declare (ignore rows tag))
     columns))
 
@@ -509,8 +525,8 @@
      (lambda ()
        (logical-test-failpoint :after-copy-chunk-commit table)))))
 
-(defun logical-copy-source-table (source target table)
-  (let ((columns (logical-validate-copy-schema source target table))
+(defun logical-copy-source-table (source target table &optional (validate-schema #'logical-validate-copy-schema) (source-table table))
+  (let ((columns (funcall validate-schema source target table))
         (rows '())
         (chunk-bytes 0)
         (chunk-limit (logical-copy-chunk-limit-bytes)))
@@ -530,7 +546,7 @@
                  (incf chunk-bytes row-bytes))))
       ;; Executor SELECT streams DataRow frames; the callback commits each
       ;; bounded chunk while this source Repeatable Read snapshot remains open.
-      (pg-client-query source (format nil "SELECT * FROM ~a" table)
+      (pg-client-query source (format nil "SELECT * FROM ~a" source-table)
                        :on-row #'consume-row)
       (flush-chunk))))
 
@@ -555,9 +571,34 @@
           :expired
           (error condition)))))
 
+(defun logical-persist-copy-ready (options target boundary)
+  (let* ((slot (logical-subscription-options-slot-name options))
+         (before (lambda () (logical-test-failpoint :before-copy-ready-commit slot boundary)))
+         (after (lambda () (logical-test-failpoint :after-copy-ready-commit slot boundary))))
+    (if (eq (logical-subscription-options-mode options) :standard)
+        (logical-standard-persist-state target options "ready" boundary
+                                        :before-commit before :after-commit after)
+        (logical-persist-progress target slot boundary "ready" nil
+                                  :before-commit before :after-commit after))))
+
+(defun logical-copy-data-and-finish (options target source boundary
+                                     &optional (validate-schema #'logical-validate-copy-schema))
+  "Keep reset/copy/snapshot commit/durable READY ordering shared across modes."
+  (let ((slot (logical-subscription-options-slot-name options)))
+    (logical-test-failpoint :before-copy-reset slot boundary)
+    (logical-reset-target-tables target (logical-subscription-options-tables options))
+    (logical-test-failpoint :after-copy-reset slot boundary)
+    (dolist (table (logical-subscription-options-tables options))
+      (logical-copy-source-table source target table validate-schema
+                                 (if (eq (logical-subscription-options-mode options) :standard)
+                                     (format nil "public.~a" table) table)))
+    (pg-client-query source "COMMIT")
+    (logical-test-failpoint :after-copy-snapshot-transaction-commit slot boundary)
+    (logical-persist-copy-ready options target boundary))
+  :ready)
+
 (defun logical-copy-from-exported-snapshot (options target boundary token)
-  (let ((source (logical-startup-source-client options))
-        (slot (logical-subscription-options-slot-name options)))
+  (let ((source (logical-startup-source-client options)))
     (unwind-protect
          (if (eq (logical-import-copy-snapshot source token) :expired)
              :snapshot-expired
@@ -584,26 +625,7 @@
                ;; after every schema and replica-identity check has succeeded.
                (logical-bootstrap-set-sequence-state
                 target (logical-read-replication-bootstrap source))
-               (logical-test-failpoint :before-copy-reset slot boundary)
-               (logical-reset-target-tables
-                target (logical-subscription-options-tables options))
-               (logical-test-failpoint :after-copy-reset slot boundary)
-               (dolist (table (logical-subscription-options-tables options))
-                 (logical-copy-source-table source target table))
-               (pg-client-query source "COMMIT")
-               (logical-test-failpoint
-                :after-copy-snapshot-transaction-commit slot boundary)
-               (logical-persist-progress
-                target slot boundary "ready" nil
-                :before-commit
-                (lambda ()
-                  (logical-test-failpoint
-                   :before-copy-ready-commit slot boundary))
-                :after-commit
-                (lambda ()
-                  (logical-test-failpoint :after-copy-ready-commit slot boundary)))
-               (pg-client-close source)
-               (setf source nil)
+               (logical-copy-data-and-finish options target source boundary)
                :ready))
       (when source (pg-client-close source)))))
 
@@ -660,8 +682,10 @@
                  (pgoutput-relation-columns relation))
          target-columns)
         (unless (string= (logical-relation-key-signature relation)
-                         (logical-table-identity-signature
-                          (logical-subscription-runtime-target runtime) name))
+                         (funcall (if (eq (logical-subscription-options-mode options) :standard)
+                                      #'logical-standard-key-signature
+                                      #'logical-table-identity-signature)
+                                  (logical-subscription-runtime-target runtime) name))
           (error "source and target replica identities differ for table ~a" name))
         (setf (gethash name
                        (logical-subscription-runtime-validated-relations runtime)) t)))))
@@ -674,7 +698,7 @@
        (gethash (pgoutput-relation-name relation)
                 (logical-subscription-runtime-validated-relations runtime))))
 
-(defun logical-pgoutput-read-relation (payload)
+(defun logical-pgoutput-read-relation (payload &optional standard-p)
   (let* ((position 1)
          (oid (bytes-to-u32 payload position))
          (namespace nil)
@@ -687,6 +711,8 @@
       (setf position next)
       (when (> position (1- (length payload)))
         (error "truncated pgoutput Relation message"))
+      (when (and standard-p (/= (aref payload position) (char-code #\d)))
+        (error "standard replication requires default replica identity"))
       (incf position) ; replica identity mode
       (let ((count (bytes-to-u16 payload position)))
         (incf position 2)
@@ -694,6 +720,8 @@
           (when (> (+ position 1) (length payload))
             (error "truncated pgoutput Relation column flags"))
           (let ((key-p (= (aref payload position) 1)))
+            (unless (member (aref payload position) '(0 1))
+              (error "unsupported pgoutput Relation column flags"))
             (incf position)
             (multiple-value-bind (column-name after-name)
                 (pg-client-cstring payload position)
@@ -792,28 +820,43 @@
        (logical-subscription-runtime-target runtime)
        (logical-row-insert-sql relation tuple)))))
 
-(defun logical-apply-update (runtime relation payload position)
+(defun logical-pgoutput-read-update (payload position)
+  "Read nonstreamed UPDATE tuples in C logicalrep_read_update field order."
   (when (>= position (length payload)) (error "truncated pgoutput UPDATE"))
-  (let ((old-kind (code-char (aref payload position)))
-        (position (1+ position))
+  (let ((kind (code-char (aref payload position)))
+        (initial-kind (code-char (aref payload position)))
         (old-tuple nil)
         (new-tuple nil))
-    (when (member old-kind '(#\K #\O))
+    (when (member kind '(#\K #\O))
       (multiple-value-setq (old-tuple position)
-        (logical-pgoutput-read-tuple payload position)))
-    (unless (and (< position (length payload))
-                 (= (aref payload position) (char-code #\N)))
+        (logical-pgoutput-read-tuple payload (1+ position)))
+      (when (>= position (length payload)) (error "truncated pgoutput UPDATE"))
+      (setf kind (code-char (aref payload position))))
+    (unless (char= kind #\N)
       (error "pgoutput UPDATE lacks a new tuple"))
     (multiple-value-setq (new-tuple position)
       (logical-pgoutput-read-tuple payload (1+ position)))
     (unless (= position (length payload))
       (error "pgoutput UPDATE has trailing bytes"))
+    (values old-tuple new-tuple initial-kind)))
+
+(defun logical-pgoutput-key-values (relation tuple)
+  "Project a relation-width tuple onto its replica identity columns."
+  (unless (= (length tuple) (length (pgoutput-relation-columns relation)))
+    (error "pgoutput identity tuple width does not match relation metadata"))
+  (unless (pgoutput-relation-key-columns relation)
+    (error "pgoutput relation has no replica identity"))
+  (coerce (loop for column in (pgoutput-relation-columns relation)
+                for value across tuple
+                when (pgoutput-column-key-p column) collect value)
+          'vector))
+
+(defun logical-apply-update (runtime relation payload position)
+  (multiple-value-bind (old-tuple new-tuple kind)
+      (logical-pgoutput-read-update payload position)
     (when (logical-relation-selected-p runtime relation)
-      (unless (and (char= old-kind #\K)
-                   (= (length old-tuple)
-                      (length (pgoutput-relation-key-columns relation))))
-        (error "allowlisted table ~a requires a pgoutput K identity tuple"
-               (pgoutput-relation-name relation)))
+      (when (char= kind #\O)
+        (error "REPLICA IDENTITY FULL is not supported"))
       (unless (= (length new-tuple) (length (pgoutput-relation-columns relation)))
         (error "pgoutput UPDATE tuple is not a full row"))
       (let* ((all-columns (pgoutput-relation-columns relation))
@@ -827,7 +870,7 @@
                                               (pgoutput-column-type-oid column)
                                               value :pgoutput)))))
              (where (logical-row-key-predicate
-                     old-tuple
+                     (logical-pgoutput-key-values relation (or old-tuple new-tuple))
                      (pgoutput-relation-key-columns relation)))
              (tag (nth-value
                    2 (logical-target-query
@@ -843,13 +886,12 @@
         (logical-pgoutput-read-tuple payload (1+ position))
       (unless (= end (length payload)) (error "pgoutput DELETE has trailing bytes"))
       (when (logical-relation-selected-p runtime relation)
-        (unless (and (char= kind #\K)
-                     (= (length tuple)
-                        (length (pgoutput-relation-key-columns relation))))
+        (unless (char= kind #\K)
           (error "allowlisted table ~a requires a pgoutput K identity tuple"
                  (pgoutput-relation-name relation)))
         (let* ((where (logical-row-key-predicate
-                       tuple (pgoutput-relation-key-columns relation)))
+                       (logical-pgoutput-key-values relation tuple)
+                       (pgoutput-relation-key-columns relation)))
                (tag (nth-value
                      2 (logical-target-query
                         (logical-subscription-runtime-target runtime)
@@ -864,7 +906,9 @@
          (lsn-text (wal-format-lsn commit-lsn)))
     ;; Match apply_handle_commit_internal(): the source transaction and its
     ;; applied-origin marker commit atomically on the subscriber.
-    (logical-replace-progress-row target slot lsn-text "ready" nil)
+    (if (eq (logical-subscription-options-mode options) :standard)
+        (logical-standard-save-lsn target options lsn-text)
+        (logical-replace-progress-row target slot lsn-text "ready" nil))
     (logical-test-failpoint :before-target-commit slot commit-lsn)
     (logical-target-query target "COMMIT")
     (setf (logical-subscription-runtime-current-lsn runtime) commit-lsn
@@ -907,41 +951,29 @@
      (logical-subscription-runtime-current-lsn runtime))))
 
 (defun logical-pgoutput-read-message (runtime payload)
-  "Decode pgoutput v2 M, whose transactional XID precedes its flags."
-  (let* ((transactional-p
-           (logical-subscription-runtime-transaction-open-p runtime))
-         (position 1))
-    (when transactional-p
-      (when (> (+ position 4) (length payload))
-        (error "truncated transactional pgoutput Message xid"))
-      (unless (= (bytes-to-u32 payload position)
-                 (logical-subscription-runtime-source-xid runtime))
-        (error "pgoutput Message xid does not match its transaction"))
-      (incf position 4))
-    (when (>= position (length payload))
-      (error "truncated pgoutput Message flags"))
-    (let ((flags (aref payload position)))
-      (incf position)
-      (unless (= flags (if transactional-p 1 0))
-        (error "pgoutput Message transactional flag does not match its context")))
-    (when (> (+ position 8) (length payload))
-      (error "truncated pgoutput Message LSN"))
-    (let ((lsn (pg-client-u64 payload position))
-          (prefix nil)
-          (content nil))
-      (incf position 8)
-      (multiple-value-setq (prefix position)
-        (pg-client-cstring payload position))
-      (when (> (+ position 4) (length payload))
-        (error "truncated pgoutput Message content length"))
-      (let ((size (bytes-to-u32 payload position)))
-        (incf position 4)
-        (unless (and (<= size +max-logical-transaction-bytes+)
-                     (= (+ position size) (length payload)))
-          (error "invalid pgoutput Message content length"))
-        (setf content (bytes->string payload :start position
-                                             :end (length payload))))
-      (values prefix lsn content))))
+  "Decode a nonstreamed Message and return prefix, LSN, content, transactional-p."
+  (when (< (length payload) 10)
+    (error "truncated pgoutput Message header"))
+  (let ((flags (aref payload 1))
+        (position 10)
+        (lsn (pg-client-u64 payload 2))
+        (prefix nil))
+    (unless (member flags '(0 1))
+      (error "unsupported pgoutput Message flags"))
+    (when (and (= flags 1)
+               (not (logical-subscription-runtime-transaction-open-p runtime)))
+      (error "transactional pgoutput Message outside a transaction"))
+    (multiple-value-setq (prefix position) (pg-client-cstring payload position))
+    (when (> (+ position 4) (length payload))
+      (error "truncated pgoutput Message content length"))
+    (let ((size (bytes-to-u32 payload position)))
+      (incf position 4)
+      (unless (and (<= size +max-logical-transaction-bytes+)
+                   (= (+ position size) (length payload)))
+        (error "invalid pgoutput Message content length"))
+      (values prefix lsn
+              (bytes->string payload :start position :end (length payload))
+              (= flags 1)))))
 
 (defun logical-standalone-event-key (options database-oid)
   (format nil "~a:~d:~a:~a:~d:~a"
@@ -978,22 +1010,56 @@
     (pg-client-send-standby-status
      (logical-subscription-runtime-source-client runtime) lsn)))
 
+(defun logical-pgoutput-read-truncate (payload)
+  "Decode native TRUNCATE; reject flags whose effects we cannot preserve."
+  (unless (and (>= (length payload) 6)
+               (= (aref payload 0) (char-code #\T)))
+    (error "invalid pgoutput TRUNCATE header"))
+  (let ((count (bytes-to-u32 payload 1))
+        (flags (aref payload 5)))
+    (unless (zerop flags)
+      (error "unsupported pgoutput TRUNCATE flags ~d" flags))
+    (unless (= (length payload) (+ 6 (* count 4)))
+      (error "invalid pgoutput TRUNCATE relation count"))
+    (loop for offset from 6 below (length payload) by 4
+          collect (bytes-to-u32 payload offset))))
+
+(defun logical-truncate-target-tables (runtime names)
+  "Apply one TRUNCATE operation with shared fault boundaries for all its tables."
+  (when names
+    (dolist (name names)
+      (logical-test-failpoint :before-row-change :truncate name))
+    (logical-target-query
+     (logical-subscription-runtime-target runtime)
+     (format nil "TRUNCATE TABLE ~{~a~^, ~}" (mapcar #'catalog-sql-quote-ident names)))
+    (dolist (name names)
+      (logical-test-failpoint :after-row-change :truncate name))))
+
+(defun logical-apply-truncate (runtime payload)
+  "Apply native TRUNCATE inside the current durable apply transaction."
+  (unless (logical-subscription-runtime-transaction-open-p runtime)
+    (error "pgoutput TRUNCATE appeared outside a transaction"))
+  (let ((relations
+          (loop for oid in (logical-pgoutput-read-truncate payload)
+                collect (or (gethash oid (logical-subscription-runtime-relations runtime))
+                            (error "pgoutput TRUNCATE has no Relation metadata")))))
+    ;; C apply_handle_truncate collects the relations for one ExecuteTruncateGuts.
+    (logical-truncate-target-tables
+     runtime (loop for relation in relations
+                   when (logical-relation-selected-p runtime relation)
+                     collect (pgoutput-relation-name relation)))))
+
 (defun logical-apply-truncate-message (runtime payload)
   (let* ((data (logical-read-data-string payload))
          (tables (getf data :tables))
-         (options (logical-subscription-runtime-options runtime))
-         (target (logical-subscription-runtime-target runtime)))
+         (options (logical-subscription-runtime-options runtime)))
     (unless (and (listp tables) (every #'stringp tables))
       (error "invalid pgoutput TRUNCATE message payload"))
-    ;; pgoutput.c emits one transactional Truncate message; treat each selected
-    ;; relation as a change inside the already-open target transaction.
-    (dolist (name tables)
-      (when (member name (logical-subscription-options-tables options)
-                    :test #'string=)
-        (logical-test-failpoint :before-row-change :truncate name)
-        (logical-target-query
-         target (format nil "TRUNCATE TABLE ~a" (catalog-sql-quote-ident name)))
-        (logical-test-failpoint :after-row-change :truncate name)))))
+    (logical-truncate-target-tables
+     runtime (remove-if-not
+              (lambda (name)
+                (member name (logical-subscription-options-tables options) :test #'string=))
+              tables))))
 
 (defun logical-pgoutput-dispatch (runtime payload)
   (when (zerop (length payload)) (error "empty pgoutput message"))
@@ -1009,7 +1075,9 @@
              (logical-subscription-runtime-source-xid runtime)
              (bytes-to-u32 payload 17)))
       (#\R
-       (let ((relation (logical-pgoutput-read-relation payload)))
+       (let ((relation (logical-pgoutput-read-relation
+                        payload (eq (logical-subscription-options-mode
+                                     (logical-subscription-runtime-options runtime)) :standard))))
          (setf (gethash (pgoutput-relation-oid relation)
                         (logical-subscription-runtime-relations runtime)) relation)
          (logical-validate-stream-relation runtime relation)))
@@ -1029,14 +1097,21 @@
            (#\D (logical-apply-delete runtime relation payload 5)))
          (logical-test-failpoint
           :after-row-change kind (pgoutput-relation-name relation))))
+      (#\T (logical-apply-truncate runtime payload))
       (#\M
-       (multiple-value-bind (prefix lsn content)
+       (when (eq (logical-subscription-options-mode
+                  (logical-subscription-runtime-options runtime)) :standard)
+         (error "standard subscriber does not accept extension Message events"))
+       (multiple-value-bind (prefix lsn content transactional-p)
            (logical-pgoutput-read-message runtime payload)
          (cond
            ((string= prefix "pg_lisp/truncate")
             (unless (logical-subscription-runtime-transaction-open-p runtime)
               (error "pgoutput TRUNCATE message is outside a transaction"))
-            (logical-apply-truncate-message runtime content))
+            (progn
+              (unless transactional-p
+                (error "pgoutput TRUNCATE message is not transactional"))
+              (logical-apply-truncate-message runtime content)))
            ((member prefix '("pg_lisp/ddl" "pg_lisp/sequence-state")
                     :test #'string=)
             (when (logical-subscription-runtime-transaction-open-p runtime)
@@ -1079,11 +1154,15 @@
     (unwind-protect
          (progn
            (setf (logical-subscription-runtime-source-client runtime) source)
+           (when (eq (logical-subscription-options-mode options) :standard)
+             (logical-standard-validate-resume-slot options marker))
            (pg-client-start-replication
             source
-            (format nil "START_REPLICATION SLOT ~a LOGICAL ~a (proto_version '2')"
-                    (logical-subscription-options-slot-name options)
-                    (wal-format-lsn marker)))
+            (if (eq (logical-subscription-options-mode options) :standard)
+                (logical-standard-start-command options marker)
+                (format nil "START_REPLICATION SLOT ~a LOGICAL ~a (proto_version '2')"
+                        (logical-subscription-options-slot-name options)
+                        (wal-format-lsn marker))))
            ;; The first feedback is the copy boundary or the target's durable
            ;; restart marker; walsender.c validates it before entering its loop.
            (pg-client-send-standby-status source marker)
@@ -1100,6 +1179,8 @@
       (pg-client-close source))))
 
 (defun logical-subscription-run (options)
+  (when (eq (logical-subscription-options-mode options) :standard)
+    (return-from logical-subscription-run (logical-standard-subscription-run options)))
   (let ((target (logical-startup-target-client options)))
     (unwind-protect
          (progn
@@ -1137,7 +1218,7 @@
       (let ((options (parse-logical-subscription-args
                       (cdr sb-ext:*posix-argv*))))
         (if (eq options :help)
-            (format t "usage: pg-lisp-subscribe --slot NAME --table TABLE [--table TABLE] [--source-host HOST] [--source-port PORT] [--source-database DB] [--target-host HOST] [--target-port PORT] [--target-database DB]~%")
+            (format t "usage: pg-lisp-subscribe --slot NAME --table TABLE [--table TABLE] [--mode extension|standard] [--publication NAME] [--source-host HOST] [--source-port PORT] [--source-database DB] [--target-host HOST] [--target-port PORT] [--target-database DB]~%")
             (logical-subscription-run options)))
     (error (condition)
       (format *error-output* "pg-lisp-subscribe: ~a~%" condition)

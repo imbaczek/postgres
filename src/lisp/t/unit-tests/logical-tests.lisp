@@ -91,14 +91,14 @@
         (logical-pgoutput-read-tuple update-payload 6)
       (check (and (= (aref update-payload 5) (char-code #\K))
                   (= (aref update-payload end) (char-code #\N))
-                  (equalp key #("10")))
-             "pgoutput UPDATE sends the replica identity before the new tuple"))
+                  (equalp key #("10" nil nil)))
+             "pgoutput UPDATE retains relation width in its old key tuple"))
     (multiple-value-bind (key end)
         (logical-pgoutput-read-tuple delete-payload 6)
       (check (and (= (aref delete-payload 5) (char-code #\K))
                   (= end (length delete-payload))
-                  (equalp key #("10")))
-             "pgoutput DELETE sends only its key tuple"))
+                  (equalp key #("10" nil nil)))
+             "pgoutput DELETE retains relation width in its old key tuple"))
     (check (string= (logical-row-key-predicate
                      #(nil) (list (make-pgoutput-column :name "id" :type-oid 23)))
                     "id IS NULL")
@@ -129,10 +129,9 @@
                   (= (pg-client-u64 standalone 2) lsn))
              "pgoutput v2 emits standalone DDL Message without an XID")
       (check (and (= (aref transactional 0) (char-code #\M))
-                  (= (bytes-to-u32 transactional 1) 91)
-                  (= (aref transactional 5) 1)
-                  (= (pg-client-u64 transactional 6) lsn))
-             "pgoutput v2 emits transactional TRUNCATE Message with its XID")
+                  (= (aref transactional 1) 1)
+                  (= (pg-client-u64 transactional 2) lsn))
+             "ordinary transactional Message has flags and LSN without an XID")
       (multiple-value-bind (prefix event-lsn content)
           (logical-pgoutput-read-message
            (make-logical-subscription-runtime) standalone)
@@ -146,7 +145,7 @@
            transactional)
         (check (and (string= prefix "pg_lisp/truncate") (= event-lsn lsn)
                     (string= content (logical-change-event-payload truncate)))
-               "subscriber validates transactional v2 Message XID and content")))
+               "subscriber validates ordinary transactional Message flags and content")))
     (check (eq :create
                (logical-replication-command-type
                 (parse-replication-command

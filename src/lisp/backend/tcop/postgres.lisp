@@ -144,6 +144,7 @@ CancelRequest, before the rest of that packet is read."
             (save-catalog)))
         (send-auth-ok stream)
         (send-parameter-status stream "server_version" *server-version*)
+        (send-parameter-status stream "search_path" (session-search-path))
         (send-parameter-status stream "server_version_num"
                                (princ-to-string *server-version-num*))
         (send-parameter-status stream "server_encoding" "UTF8")
@@ -182,15 +183,12 @@ CancelRequest, before the rest of that packet is read."
               payload
               (= (length payload) (- length 4))))))
 
-(defun simple-query-payload-starts-with-transaction-end-p
-    (payload &optional (end (and payload
-                                 (or (position 0 payload) (length payload)))))
-  "Recognize a transaction-ending first command in raw query bytes.
-
-This bounded byte-only check selects drain admission; full validation and
-frontend-message construction happen after admission."
+(defun simple-query-payload-starts-with-word-p
+    (payload words &optional (end (and payload
+                                       (or (position 0 payload) (length payload)))))
+  "Classify a raw query's first word before reload admission and full decoding."
   (unless payload
-    (return-from simple-query-payload-starts-with-transaction-end-p nil))
+    (return-from simple-query-payload-starts-with-word-p nil))
   (let ((start 0))
     (labels ((whitespace-byte-p (byte)
                (member byte '(9 10 11 12 13 32)))
@@ -236,14 +234,24 @@ frontend-message construction happen after admission."
       (let ((word-start start))
         (loop while (and (< start end) (word-byte-p (aref payload start)))
               do (incf start))
-        (let ((word-end start))
-          ;; This byte-level check only decides whether the first command could
-          ;; be a transaction end. The AST parser remains authoritative, and a
-          ;; real statement before that command never enters the drain lane.
-          (or (matches-word-p "COMMIT" word-start word-end)
-              (matches-word-p "ROLLBACK" word-start word-end)
-              (matches-word-p "END" word-start word-end)
-              (matches-word-p "ABORT" word-start word-end)))))))
+        (some (lambda (word) (matches-word-p word word-start start)) words)))))
+
+(defun simple-query-payload-starts-with-transaction-end-p
+    (payload &optional (end (and payload
+                                 (or (position 0 payload) (length payload)))))
+  "Recognize a possible transaction end; the SQL parser remains authoritative."
+  (simple-query-payload-starts-with-word-p
+   payload '("COMMIT" "ROLLBACK" "END" "ABORT") end))
+
+(defun replication-query-payload-p (payload)
+  "Select the replication parser only for replication-command keywords.
+
+Like C exec_replication_command, logical walsenders otherwise execute SQL.
+This classifier does not construct or validate a frontend message."
+  (simple-query-payload-starts-with-word-p
+   payload '("IDENTIFY_SYSTEM" "CREATE_REPLICATION_SLOT" "DROP_REPLICATION_SLOT"
+             "START_REPLICATION" "READ_REPLICATION_SLOT" "TIMELINE_HISTORY"
+             "BASE_BACKUP" "UPLOAD_MANIFEST" "ALTER_REPLICATION_SLOT")))
 
 (defun simple-query-frame-needs-drain-p (length-bytes payload)
   "Route malformed query frames through drain so their fatal error can clean up.
@@ -390,7 +398,8 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
     ;; Query dispatch needs its byte-only classifier first so an already-active
     ;; transaction can still send COMMIT/ROLLBACK while reload drains.
     ((and (= type-byte (char-code #\Q))
-          (eq (backend-replication-mode *backend*) :database))
+          (eq (backend-replication-mode *backend*) :database)
+          (replication-query-payload-p payload))
      (handle-replication-query-frame stream type-byte length-bytes payload)
      :continue)
     ((= type-byte (char-code #\Q))
@@ -440,6 +449,7 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
       (sb-sys:without-interrupts
         (unwind-protect
              (when backend
+               (logical-release-subscription-owner backend)
                (unregister-backend backend))
           (connection-finished))))))
 

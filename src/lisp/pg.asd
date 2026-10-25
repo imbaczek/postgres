@@ -85,6 +85,8 @@
       :components ((:file "dest")
                    (:file "control")
                    (:file "../replication/protocol")
+                   (:file "../replication/standard")
                    (:file "../replication/worker")
+                   (:file "../replication/standard-subscriber")
                    (:file "postgres")))
      (:file "replication/logical-retention")))))

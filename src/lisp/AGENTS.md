@@ -4,6 +4,23 @@ Scope: the Common Lisp PostgreSQL-wire server under `src/lisp/`. See the
 `README.md` in this directory for what the server supports and for the
 storage/concurrency rules.
 
+## Common Lisp agent prompts
+
+Read the relevant prompts in [`agent-prompts/`](agent-prompts/README.md) when
+working on Common Lisp code:
+
+- [Common Lisp expert](agent-prompts/common-lisp-expert.md): design, style,
+  performance, and review guidance.
+- [REPL-driven development](agent-prompts/repl-driven-development.md): explore,
+  experiment, persist, and verify changes in a live Lisp image.
+- [cl-spec-driven development](agent-prompts/cl-spec-driven-development.md):
+  contracts and property checks when working with cl-spec.
+
+These are upstream reference prompts. This file's project-specific rules and
+the user's instructions take precedence. Use the tools available in the session
+and this project's existing reload and test workflows; the prompts do not
+require installing cl-mcp, cl-spec, or Rove.
+
 ## Lisp host
 
 The scripts default to `sbcl` from `PATH`. Set `SBCL` to a local executable or

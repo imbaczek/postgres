@@ -78,6 +78,9 @@
   (let ((selected (sb-ext:posix-getenv "PG_LISP_TEST_FAILPOINT")))
     (when (and selected
                (string-equal selected (string-downcase (symbol-name point))))
+      (let ((object (sb-ext:posix-getenv "PG_LISP_TEST_FAILPOINT_OBJECT")))
+        (when (and object (not (equal object (first details))))
+          (return-from logical-test-failpoint-selected-p nil)))
       (let ((guard-file
               (sb-ext:posix-getenv "PG_LISP_TEST_FAILPOINT_GUARD_FILE")))
         (unless (logical-test-failpoint-guard-open-p guard-file)

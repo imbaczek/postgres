@@ -66,9 +66,10 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
   (let ((oid (type-oid (getf target :type))))
     (make-result-column :name (getf target :name)
                         :table-oid (getf target :table-oid)
-                        :attnum (getf target :attnum)
+                        :attnum (sql-result-column-attnum
+                                 (getf target :table-oid) (getf target :attnum))
                         :type-oid oid
-                        :typlen (type-typlen oid)
+                        :typlen (sql-expression-type-length (getf target :type))
                         :typmod (getf target :typmod)
                         :format 0)))
 
@@ -499,36 +500,45 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
     (choose-cheapest-select-path table candidates)))
 
 (defun select-relation-columns (relation)
+  (when (and (select-relation-origins relation)
+             (/= (length (select-relation-origins relation))
+                 (length (pg-class-columns (select-relation-table relation)))))
+    (error "Derived column origins do not match projected columns"))
   (loop for column across (pg-class-columns (select-relation-table relation))
-        collect (let* ((attnum (pg-column-attnum column))
-                       (expr (list :col (+ (select-relation-offset relation)
-                                           attnum)
-                                   :type (pg-column-type column)
-                                   :typmod (pg-column-typmod column)
-                                   :table-oid
-                                   (pg-class-oid (select-relation-table relation))
-                                   :attnum attnum)))
-                  (make-select-column
-                   :name (pg-column-name column)
-                   :expr expr
-                   :type (pg-column-type column)
-                   :typmod (pg-column-typmod column)
-                   :table-oid (pg-class-oid (select-relation-table relation))
-                   :attnum attnum))))
+        for origin in (or (select-relation-origins relation)
+                          (make-list (select-relation-width relation)))
+        for slot = (pg-column-attnum column)
+        for table-oid = (if origin (getf origin :table-oid)
+                            (pg-class-oid (select-relation-table relation)))
+        for attnum = (if origin (getf origin :attnum) slot)
+        for expr = (list :col (+ (select-relation-offset relation) slot)
+                         :type (pg-column-type column) :typmod (pg-column-typmod column)
+                         :notnull (pg-column-notnull column)
+                         :table-oid table-oid :attnum attnum)
+        collect (make-select-column
+                 :name (pg-column-name column) :expr expr
+                 :type (pg-column-type column) :typmod (pg-column-typmod column)
+                 :table-oid table-oid :attnum attnum)))
+
+(defun select-relation-initial-scope (relation)
+  "Construct the first FROM namespace from one relation's columns and width."
+  (make-select-scope :relations (list relation)
+                     :columns (select-relation-columns relation)
+                     :width (select-relation-width relation)))
 
 (defun make-base-select-scope (name alias table)
-  (let* ((width (length (pg-class-columns table)))
-         (relation (make-select-relation :name name :alias alias
-                                         :table table :offset 0 :width width)))
-    (make-select-scope :relations (list relation)
-                       :columns (select-relation-columns relation)
-                       :width width)))
+  (select-relation-initial-scope
+   (make-select-relation :name (sql-relation-base-name name) :alias alias
+                         :table table :offset 0
+                         :width (length (pg-class-columns table)))))
 
 (defun extend-select-scope (scope relation)
   (let* ((qualifier (select-relation-qualifier relation))
          (duplicate
-           (find qualifier (select-scope-relations scope)
-                 :key #'select-relation-qualifier :test #'string=)))
+           (and qualifier
+                (find qualifier (select-scope-relations scope)
+                      :key #'select-relation-qualifier
+                      :test (lambda (a b) (and b (string= a b)))))))
     (when duplicate
       (ereport "42712" "table name \"~a\" specified more than once"
                qualifier))
@@ -646,132 +656,157 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
               right-columns)))
 
 (defun select-table-or-error (name)
-  (let ((table (or (when (member name '("pg_replication_slots"
-                                        "pg_catalog.pg_replication_slots")
-                                 :test #'string=)
-                     (make-pg-class
-                      :oid #x7FFFFFFE :name "pg_replication_slots"
-                      :relfilenode #x7FFFFFFD
-                      :columns
-                      (vector (make-pg-column :name "slot_name" :type :varchar
-                                              :typmod -1 :attnum 1 :notnull t)
-                              (make-pg-column :name "active" :type :bool
-                                              :typmod -1 :attnum 2 :notnull t)
-                              (make-pg-column :name "restart_lsn" :type :varchar
-                                              :typmod -1 :attnum 3 :notnull t)
-                              (make-pg-column :name "confirmed_flush_lsn"
-                                              :type :varchar :typmod -1
-                                              :attnum 4 :notnull nil)
-                              (make-pg-column :name "retained_wal_bytes"
-                                              :type :int8 :typmod -1
-                                              :attnum 5 :notnull t)
-                              (make-pg-column :name "wal_status" :type :varchar
-                                              :typmod -1 :attnum 6 :notnull t))))
-                   (lookup-table name))))
-    (unless table
-      (ereport "42P01" "relation \"~a\" does not exist" name))
-    table))
+  (sql-relation-or-error name))
 
 (defun select-virtual-row-source (table)
-  (when (string= (pg-class-name table) "pg_replication_slots")
-    #'wal-replication-slot-rows))
+  (sql-system-row-source table))
 
 (defun make-select-relation-spec (name alias table offset)
   (let ((row-source (select-virtual-row-source table)))
-    (list :name name :alias alias :table table
+    (list :name (sql-relation-base-name name) :alias alias :table table
           :columns (pg-class-columns table)
           :offset offset
           :width (length (pg-class-columns table))
           :virtual-p (not (null row-source))
           :row-source row-source)))
 
+(defun prepare-select-source (source alias offset)
+  "Prepare a FROM namespace entry; callers hold the catalog view lock."
+  (if (sql-derived-relation-p source)
+      (let* ((prepared (prepare-select-internal (sql-derived-relation-query source)))
+             (targets (getf prepared :targets))
+             (table (make-pg-class
+                     :oid 0 :name (or alias "*SELECT*")
+                     :columns (coerce
+                               (loop for target in targets for slot from 1
+                                     collect (make-pg-column
+                                              :name (getf target :name)
+                                              :type (getf target :type)
+                                              :typmod (getf target :typmod)
+                                              :attnum slot))
+                               'vector))))
+        (list :name alias :alias alias :table table :offset offset
+              :width (length targets) :columns (pg-class-columns table)
+              :virtual-p t :origins targets :subquery-prepared prepared
+              :subquery-plan nil :subquery-logical nil :subquery-physical nil))
+      (make-select-relation-spec source alias (select-table-or-error source) offset)))
+
+(defun select-source-scope-relation (source)
+  (make-select-relation :name (getf source :name) :alias (getf source :alias)
+                        :table (getf source :table) :origins (getf source :origins)
+                        :offset (getf source :offset) :width (getf source :width)))
+
 (defun prepare-select (ast)
+  "Resolve the complete nested query under one catalog view."
+  (with-write-lock (prepare-select-internal ast)))
+
+(defun prepare-union-select (ast)
+  "Prepare both arms under the caller's catalog view."
+  (let* ((left (prepare-select-internal (getf ast :left)))
+         (right (prepare-select-internal (getf ast :right))))
+    (multiple-value-bind (targets coercions)
+        (analyze-union-targets (getf left :targets) (getf right :targets))
+      (list :set-operation :union-all :left left :right right :coercions coercions
+            :targets targets :relations nil
+            :order (analyze-union-order (getf ast :order-by) targets)
+            :limit (getf ast :limit)))))
+
+(defun prepare-select-internal (ast)
+  (when (getf ast :set-operation)
+    (return-from prepare-select-internal (prepare-union-select ast)))
   ;; Resolve all names on one catalog view. Reader registration below protects
   ;; that view from DDL before any heap or index page is scanned.
-  (with-write-lock
-    (let* ((from-name (getf ast :from))
-           (from-alias (getf ast :from-alias))
-           (first-table (when from-name (select-table-or-error from-name)))
-           (scope (when first-table
-                    (make-base-select-scope from-name from-alias first-table)))
-           (relations (when scope
-                        (list (make-select-relation-spec
-                               from-name from-alias first-table 0))))
-           (joins '()))
-      (dolist (join-ast (getf ast :joins))
-        (let* ((name (getf join-ast :table))
-               (alias (getf join-ast :alias))
-               (table (select-table-or-error name))
-               (offset (select-scope-width scope))
-               (relation (make-select-relation
-                          :name name :alias alias :table table :offset offset
-                          :width (length (pg-class-columns table))))
-               (right-columns (select-relation-columns relation))
-               (join-type (getf join-ast :type))
-               (using-names (and (getf join-ast :using)
-                                 (getf join-ast :condition)))
-               (pairs (when using-names
-                        (using-column-pairs (select-scope-columns scope)
-                                            right-columns using-names)))
-               (join-scope (extend-select-scope scope relation))
-               (qual (cond
-                       ((eq join-type :cross) '(:bool t))
-                       (using-names (using-join-qual pairs))
-                       (t (analyze-expr (getf join-ast :condition)
-                                        join-scope))))
-               (columns (if using-names
-                            (using-output-columns
-                             (select-scope-columns scope) right-columns
-                             using-names pairs join-type)
-                            (select-scope-columns join-scope))))
-          (setf scope (make-select-scope
-                       :relations (select-scope-relations join-scope)
-                       :columns columns
-                       :width (select-scope-width join-scope)))
-          (push (list :type join-type :qual qual :left-width offset
-                      :right-width (select-relation-width relation))
-                joins)
-          (setf relations
-                (append relations
-                        (list (make-select-relation-spec
-                               name alias table offset))))))
-      (setf joins (nreverse joins))
-      (let* ((where (when (getf ast :where)
-                      (analyze-expr (getf ast :where) scope)))
-             (aggregate-p
-               (or (getf ast :group-by)
-                   (some (lambda (target)
-                           (eq (first (getf target :expr)) :count-star))
-                         (getf ast :targets))))
-             (group-keys (when (getf ast :group-by)
-                           (analyze-group-keys (getf ast :group-by) scope)))
-             (targets (if aggregate-p
-                          (analyze-aggregate-targets
-                           (getf ast :targets) scope group-keys)
-                          (analyze-targets (getf ast :targets) scope)))
-             (aggregate-count
-               (if aggregate-p
-                   (count-if (lambda (target)
-                               (getf target :aggregate-index))
-                             targets)
-                   0))
-             (order (if aggregate-p
-                        (analyze-aggregate-order
-                         (getf ast :order-by) scope targets group-keys)
-                        (analyze-order (getf ast :order-by) scope targets)))
-             (limit (getf ast :limit)))
-        (list :table first-table
-              :relations relations
-              :scope scope
-              :targets targets
-              :where where
-              :group-keys group-keys
-              :aggregate-p aggregate-p
-              :aggregate-count aggregate-count
-              :order order
-              :limit limit
-              :join-order nil
-              :joins joins)))))
+  (let* ((from-name (getf ast :from))
+         (from-alias (getf ast :from-alias))
+         (first-source (when from-name (prepare-select-source from-name from-alias 0)))
+         (first-table (getf first-source :table))
+         (scope (when first-source
+                  (select-relation-initial-scope
+                   (select-source-scope-relation first-source))))
+         (relations (when first-source (list first-source)))
+         (joins '()))
+    (dolist (join-ast (getf ast :joins))
+      (let* ((name (getf join-ast :table))
+             (alias (getf join-ast :alias))
+             (offset (select-scope-width scope))
+             (source (prepare-select-source name alias offset))
+             (relation (select-source-scope-relation source))
+             (right-columns (select-relation-columns relation))
+             (join-type (getf join-ast :type))
+             (using-names (and (getf join-ast :using)
+                               (getf join-ast :condition)))
+             (pairs (when using-names
+                      (using-column-pairs (select-scope-columns scope)
+                                          right-columns using-names)))
+             (join-scope (extend-select-scope scope relation))
+             (qual (cond
+                     ((eq join-type :cross) '(:bool t))
+                     (using-names (using-join-qual pairs))
+                     (t (analyze-expr (getf join-ast :condition)
+                                      join-scope))))
+             (columns (if using-names
+                          (using-output-columns
+                           (select-scope-columns scope) right-columns
+                           using-names pairs join-type)
+                          (select-scope-columns join-scope))))
+        (setf scope (make-select-scope
+                     :relations (select-scope-relations join-scope)
+                     :columns columns
+                     :width (select-scope-width join-scope)))
+        (push (list :type join-type :qual qual :left-width offset
+                    :right-width (select-relation-width relation))
+              joins)
+        (setf relations
+              (append relations
+                      (list source)))))
+    (setf joins (nreverse joins))
+    (let* ((where (when (getf ast :where)
+                    (analyze-expr (getf ast :where) scope)))
+           (aggregate-p
+             (or (getf ast :group-by)
+                 (some (lambda (item) (contains-aggregate-p (getf item :expr)))
+                       (getf ast :order-by))
+                 (some (lambda (target)
+                         (contains-aggregate-p (getf target :expr)))
+                       (getf ast :targets))))
+           (group-keys (when (getf ast :group-by)
+                         (analyze-group-keys (getf ast :group-by) scope)))
+           (aggregate-analysis
+             (when aggregate-p
+               (multiple-value-list
+                (analyze-aggregate-targets (getf ast :targets) scope group-keys))))
+           (targets (if aggregate-p (first aggregate-analysis)
+                        (analyze-targets (getf ast :targets) scope)))
+           (aggregates (third aggregate-analysis))
+           (order (cond
+                    ((getf ast :distinct)
+                     (analyze-distinct-order
+                      (getf ast :order-by) scope targets aggregate-p group-keys aggregates))
+                    (aggregate-p
+                     (analyze-aggregate-order
+                      (getf ast :order-by) scope targets group-keys aggregates t))
+                    (t (analyze-order (getf ast :order-by) scope targets))))
+           (limit (getf ast :limit))
+           (set-analysis
+             (multiple-value-list
+              (prepare-select-project-set
+               targets order
+               (if aggregate-p (+ (length group-keys) (length aggregates))
+                   (if scope (select-scope-width scope) 0))
+               (getf ast :distinct)))))
+      (list :table first-table
+            :relations relations
+            :scope scope
+            :targets (first set-analysis) :set-functions (third set-analysis) :distinct (getf ast :distinct)
+            :where where
+            :group-keys group-keys
+            :aggregate-p aggregate-p
+            :aggregate-count (length aggregates) :aggregates (coerce aggregates 'list)
+            :order (second set-analysis)
+            :limit limit
+            :join-order nil
+            :joins joins))))
+
 (defun select-index-current-p (table idx)
   (and (= (pg-index-table-oid idx) (pg-class-oid table))
        (member idx (table-indexes table) :test #'eq)))
@@ -874,8 +909,9 @@ registration-to-DDL handoff free of a lock-order inversion."
 
 (defun make-select-relation-environment (relations relation row)
   "Place ROW in its source-order slots after a greedy join-order scan."
-  (let* ((width (reduce #'+ relations :key (lambda (spec) (getf spec :width))
-                                      :initial-value 0))
+  (let* ((width (or (getf relation :environment-width)
+                    (reduce #'+ relations :key (lambda (spec) (getf spec :width))
+                                          :initial-value 0)))
          (environment (make-array width :initial-element +null+)))
     (replace environment row :start1 (getf relation :offset))
     environment))

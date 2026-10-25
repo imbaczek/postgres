@@ -242,26 +242,52 @@ Meta-commands that need `pg_catalog` and regular-expression operators (`\d`,
 
 ## Logical replication
 
-`./pg-lisp-subscribe` streams from one `pg-lisp` server to another. It creates a
+`./pg-lisp-subscribe` defaults to extension mode between two `pg-lisp` servers. It creates a
 logical slot with an exported snapshot, initializes supported table/index/sequence
 definitions on the target, copies rows from an explicit `--table` allowlist, then
 applies committed row transactions and supported DDL/sequence events. Each target
 stores a durable source-LSN marker in the same catalog commit as an applied event;
-the worker sends replication feedback only after that commit. `t/logical-replication.sh`
+the worker sends replication feedback only after that commit. The worker explicitly
+requests the `pg_lisp` output plugin for its snapshot lifecycle and private events.
+`t/logical-replication.sh`
 exercises initial copy, DDL and sequence changes, two independent replicas, and
 restart after a lost feedback message.
 
-This is a `pg-lisp` to `pg-lisp` subset, not a general PostgreSQL subscription
-implementation. Table definitions and supported DDL cover the SQL subset listed
+Extension table definitions and supported DDL cover the SQL subset listed
 above. Initial bootstrap mirrors supported schema objects in `public`; `--table`
 selects which tables have rows copied and whose row changes are applied. DDL and
 sequence events are database-wide and are applied independently of that table
-allowlist. Publication objects, publication row filters, replication origins,
+allowlist. Publication row filters, cascading replication origins,
 cascading-loop prevention, arbitrary DDL, and unsupported types or storage
 features are not implemented. The wire stream uses pgoutput row messages plus
 the v2 `Message` form for the worker's DDL and sequence events; those custom
 events require the bundled subscriber. A single catalog event must fit within
 one WAL segment.
+
+Standard mode interoperates with the unmodified C `20devel` reference in both
+directions: pg-lisp publishes through `pgoutput` to native `CREATE SUBSCRIPTION`,
+and the bundled worker subscribes to a C publication:
+
+```sh
+./pg-lisp-subscribe --mode standard --publication interop_pub --slot receiver_key \
+  --source-port 5432 --target-port 5433 --table interop_rows --table interop_other
+```
+
+Precreate matching ordinary `public` tables with non-null primary keys. The
+supported types are `int4`, `int8`, and bounded `varchar`; supported operations
+are INSERT, UPDATE including key changes, DELETE, and plain transactional
+TRUNCATE. Initial copy and concurrent writes use a consistent snapshot/WAL
+handoff. Target effects and source progress commit together before feedback.
+`--slot` identifies the target subscription; standard mode records a random
+owned source slot and durable creating/copying/ready state for crash recovery.
+Ready subscriptions resume without resetting target data.
+
+Standard mode uses explicit publication table lists and text tuples with
+streaming, binary, two-phase, and failover options disabled. DDL/sequence
+automation remains in extension mode. Row filters, column lists, partitions,
+generated columns, TOAST, and replica identity FULL remain outside the subset.
+See [C-peer acceptance and limits](REPLICATION-COMPATIBILITY.md) for the pinned
+reference, test matrix, recovery evidence, and exact options.
 
 ## Testing
 

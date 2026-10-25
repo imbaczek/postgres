@@ -28,6 +28,7 @@
   `(progn
      (defun ,predicate (p ,value)
        (and (eq (pkind p) ,kind)
+            ,@(when (eq kind :ident) '((not (token-quoted-p (pcur p)))))
             (string= (pval p)
                      ,(if normalize `(,normalize ,value) value))))
      (defun ,matcher (p ,value)
@@ -81,7 +82,7 @@
             "intersect" "except" "offset" "fetch" "for" "join" "inner"
             "left" "right" "full" "outer" "cross" "on" "using"
             "natural" "asc" "desc"
-            "and" "or")
+            "and" "or" "when" "then" "else" "end")
           :test #'string=))
 
 ;;; ---- statements ----
@@ -106,6 +107,8 @@
   (cond
     ((match-kw p "explain") (parse-explain p))
     ((match-kw p "select") (parse-select p))
+    ((punct-p p #\() (parse-select-expression p))
+    ((match-kw p "copy") (parse-copy-to p))
     ((match-kw p "insert") (parse-insert p))
     ((match-kw p "update") (parse-update p))
     ((match-kw p "delete") (parse-delete p))
@@ -160,10 +163,10 @@
        (expect-punct p #\))
        (setf full-p t)))
     (list :type :vacuum :full-p full-p
-          :table (strip-schema (pident p)))))
+          :table (parse-mutation-relation-identifier p))))
 
 (defun parse-analyze (p)
-  (list :type :analyze :table (strip-schema (pident p))))
+  (list :type :analyze :table (parse-mutation-relation-identifier p)))
 
 (defun parse-explain (p)
   (let ((analyze-p (match-kw p "analyze")))
@@ -179,41 +182,51 @@
 
 ;;; ---- SELECT ----
 
+(defun parse-select-core (p)
+  (let ((distinct (match-kw p "distinct")))
+    (when (and distinct (kw-p p "on"))
+      (ereport "0A000" "SELECT DISTINCT ON is not supported"))
+    (unless distinct (match-kw p "all"))
+    (let ((targets (parse-target-list p))
+          (from nil) (from-alias nil) (joins nil) (where nil) (group-by nil))
+      (when (match-kw p "from")
+        (multiple-value-setq (from from-alias joins) (parse-from p)))
+      (when (match-kw p "where") (setf where (parse-expr p)))
+      (when (match-kw p "group")
+        (expect-kw p "by")
+        (setf group-by (parse-expr-list p)))
+      (when (kw-p p "having") (ereport "0A000" "HAVING is not supported"))
+      (list :type :select :targets targets :from from :from-alias from-alias
+            :joins joins :where where :group-by group-by :distinct distinct))))
+
+(defun parse-select-operand (p)
+  (if (match-punct p #\()
+      (with-parens (p :opening-consumed t) (parse-select-expression p))
+      (progn (expect-kw p "select") (parse-select-core p))))
+
+(defun parse-select-expression (p)
+  (parse-select-tail p (parse-select-operand p)))
+
+(defun parse-select-tail (p left)
+  "Set operations bind more tightly than an unparenthesized ORDER BY or LIMIT."
+  (loop while (match-kw p "union")
+        do (unless (match-kw p "all")
+             (ereport "0A000" "UNION without ALL is not supported"))
+           (setf left (list :type :select :set-operation :union-all
+                            :left left :right (parse-select-operand p))))
+  (when (or (kw-p p "intersect") (kw-p p "except"))
+    (ereport "0A000" "INTERSECT and EXCEPT are not supported"))
+  (when (match-kw p "order")
+    (when (getf left :order-by) (syntax-error p "multiple ORDER BY clauses"))
+    (expect-kw p "by")
+    (setf (getf left :order-by) (parse-order-list p)))
+  (when (match-kw p "limit")
+    (when (getf left :limit) (syntax-error p "multiple LIMIT clauses"))
+    (setf (getf left :limit) (parse-integer-literal p)))
+  left)
+
 (defun parse-select (p)
-  (when (match-kw p "distinct")
-    (ereport "0A000" "SELECT DISTINCT is not supported"))
-  (match-kw p "all")
-  (let ((targets (parse-target-list p))
-        (from nil)
-        (from-alias nil)
-        (joins nil)
-        (where nil)
-        (group-by nil)
-        (order-by nil)
-        (limit nil))
-    (when (match-kw p "from")
-      (multiple-value-setq (from from-alias joins) (parse-from p)))
-    (when (match-kw p "where")
-      (setf where (parse-expr p)))
-    (when (match-kw p "group")
-      (expect-kw p "by")
-      (setf group-by (parse-expr-list p)))
-    (when (kw-p p "having")
-      (ereport "0A000" "HAVING is not supported"))
-    (when (match-kw p "order")
-      (expect-kw p "by")
-      (setf order-by (parse-order-list p)))
-    (when (match-kw p "limit")
-      (setf limit (parse-integer-literal p)))
-    (list :type :select
-          :targets targets
-          :from from
-          :from-alias from-alias
-          :joins joins
-          :where where
-          :group-by group-by
-          :order-by order-by
-          :limit limit)))
+  (parse-select-tail p (parse-select-core p)))
 
 (defun parse-target-list (p)
   (loop collect (if (match-op p "*")
@@ -228,21 +241,44 @@
       ((match-kw p "as")
        (setf alias (pident p)))
       ((and (eq (pkind p) :ident)
-            (not (clause-keyword-p (pval p))))
+            (or (token-quoted-p (pcur p)) (not (clause-keyword-p (pval p)))))
        (setf alias (pident p))))
     (list :expr expr :alias alias)))
 
+(defun parse-mutation-relation-identifier (p)
+  "Reject unsupported dotted literal names before legacy mutation name handling."
+  (let ((name (pident p)))
+    (when (find #\. name)
+      (ereport "0A000" "dotted literal relation identifiers are not supported for mutations"))
+    name))
+
+(defun parse-from-item (p)
+  (when (match-punct p #\()
+    (return-from parse-from-item
+      (with-parens (p :opening-consumed t)
+        (make-sql-derived-relation :query (parse-select-expression p)))))
+  (let* ((name (pident p))
+         (schema (when (match-punct p #\.)
+                   (prog1 name (setf name (pident p))))))
+    (if (match-punct p #\()
+        (let ((call (parse-function-call p name schema)))
+          ;; Noncorrelated composite functions reuse ProjectSet and the same
+          ;; derived-relation registration domain as an explicit subquery.
+          (values (make-sql-derived-relation
+                   :query (list :type :select
+                                :targets (list (list :expr (list :record-expand call)))))
+                  name))
+        (if schema (make-sql-relation-name :schema schema :name name) name))))
+
 (defun parse-from-relation (p)
-  (let* ((first-name (pident p))
-         (table (strip-schema
-                 (if (match-punct p #\.) (pident p) first-name)))
-         (alias nil))
-    (when (match-kw p "as")
-      (setf alias (pident p)))
-    (when (and (eq (pkind p) :ident)
-               (not (clause-keyword-p (pval p))))
-      (setf alias (pident p)))
-    (values table alias)))
+  (multiple-value-bind (source default-alias) (parse-from-item p)
+    (let ((alias default-alias))
+      (if (match-kw p "as")
+          (setf alias (pident p))
+          (when (and (eq (pkind p) :ident)
+                     (or (token-quoted-p (pcur p)) (not (clause-keyword-p (pval p)))))
+            (setf alias (pident p))))
+      (values source alias))))
 
 (defun parse-join-clause (p)
   (let ((join-type :inner)
@@ -280,14 +316,21 @@
 
 (defun parse-from (p)
   (multiple-value-bind (table alias) (parse-from-relation p)
-    (let ((joins '()))
+    (let ((joins nil) (comma-p nil) (explicit-p nil))
       (loop
         (cond
           ((or (kw-p p "join") (kw-p p "inner") (kw-p p "left")
                (kw-p p "right") (kw-p p "full") (kw-p p "cross"))
+           (when comma-p
+             (ereport "0A000" "mixed comma and explicit JOIN syntax is not supported"))
+           (setf explicit-p t)
            (push (parse-join-clause p) joins))
-          ((punct-p p #\,)
-           (ereport "0A000" "comma-separated FROM items are not supported"))
+          ((match-punct p #\,)
+           (when explicit-p
+             (ereport "0A000" "mixed comma and explicit JOIN syntax is not supported"))
+           (setf comma-p t)
+           (multiple-value-bind (source source-alias) (parse-from-relation p)
+             (push (list :type :cross :table source :alias source-alias) joins)))
           (t (return))))
       (values table alias (nreverse joins)))))
 
@@ -301,9 +344,31 @@
 
 ;;; ---- INSERT / UPDATE / DELETE ----
 
+(defun parse-copy-to (p)
+  (let ((query
+          (if (match-punct p #\()
+              (with-parens (p :opening-consumed t) (parse-select-expression p))
+              (let* ((name (pident p))
+                     (table (if (match-punct p #\.)
+                                (make-sql-relation-name :schema name :name (pident p)) name))
+                     (columns (when (match-punct p #\()
+                                (with-parens (p :opening-consumed t) (parse-ident-list p)))))
+                (when (/= (length columns) (length (remove-duplicates columns :test #'string=)))
+                  (ereport "42701" "COPY column specified more than once"))
+                (list :type :select :from table
+                      :targets (if columns
+                                   (mapcar (lambda (column) (list :expr (list :column column)))
+                                           columns)
+                                   (list (list :star t))))))))
+    (unless (match-kw p "to") (ereport "0A000" "only COPY TO STDOUT is supported"))
+    (unless (match-kw p "stdout") (ereport "0A000" "only COPY TO STDOUT is supported"))
+    (when (match-kw p "with")
+      (ereport "0A000" "COPY options are not supported"))
+    (list :type :copy-to :query query)))
+
 (defun parse-insert (p)
   (expect-kw p "into")
-  (let ((table (strip-schema (pident p)))
+  (let ((table (parse-mutation-relation-identifier p))
         (columns nil))
     (when (match-punct p #\()
       (setf columns
@@ -325,7 +390,7 @@
   (loop collect (parse-expr p) while (match-punct p #\,)))
 
 (defun parse-update (p)
-  (let ((table (strip-schema (pident p))))
+  (let ((table (parse-mutation-relation-identifier p)))
     (expect-kw p "set")
     (let ((sets (loop collect (let ((col (pident p)))
                                 (expect-op p "=")
@@ -338,7 +403,7 @@
 
 (defun parse-delete (p)
   (expect-kw p "from")
-  (let ((table (strip-schema (pident p)))
+  (let ((table (parse-mutation-relation-identifier p))
         (where nil))
     (when (match-kw p "where")
       (setf where (parse-expr p)))
@@ -347,7 +412,7 @@
 (defun parse-truncate (p)
   (match-kw p "table")
   (list :type :truncate
-        :tables (loop collect (strip-schema (pident p))
+        :tables (loop collect (parse-mutation-relation-identifier p)
                       while (match-punct p #\,))))
 
 ;;; ---- CREATE / DROP / ALTER ----
@@ -370,7 +435,7 @@
             (expect-kw p "not")
             (expect-kw p "exists")
             t))
-        (name (strip-schema (pident p)))
+        (name (parse-mutation-relation-identifier p))
         (increment 1)
         (start nil)
         (minimum nil)
@@ -404,6 +469,42 @@
     (list :type :create-sequence :name name :if-not-exists if-not-exists
           :start start :increment increment :min minimum :max maximum)))
 
+(defun parse-publication-actions (text)
+  "Read the publish option's identifier list, as SplitIdentifierString does in C."
+  (let* ((parser (make-sql-parser :tokens (tokenize text)))
+         (actions nil))
+    (unless (at-eof-p parser)
+      (loop
+        (let* ((name (pident parser))
+               (action (cdr (assoc name '(("insert" . :insert) ("update" . :update)
+                                          ("delete" . :delete) ("truncate" . :truncate))
+                                   :test #'string=))))
+          (unless action
+            (ereport "42601" "unrecognized value for publication option publish: ~s" name))
+          (pushnew action actions))
+        (unless (match-punct parser #\,) (return))))
+    (unless (at-eof-p parser)
+      (syntax-error parser "invalid list syntax in publication option publish"))
+    (loop for action in '(:insert :update :delete :truncate)
+          when (member action actions) collect action)))
+
+(defun parse-publication-options (p)
+  "Parse the supported publication options; refuse unsupported semantics."
+  (with-parens (p)
+    (let ((actions nil)
+          (publish-seen nil))
+      (loop
+        (let ((name (pident p)))
+          (unless (string= name "publish")
+            (ereport "0A000" "unsupported publication parameter ~s" name))
+          (when publish-seen
+            (ereport "42601" "conflicting or redundant publication options"))
+          (setf publish-seen t)
+          (expect-op p "=")
+          (setf actions (parse-publication-actions (parse-string-literal p))))
+        (unless (match-punct p #\,) (return)))
+      actions)))
+
 (defun parse-create-publication (p)
   (let ((name (pident p))
         (all-tables-p nil)
@@ -411,18 +512,24 @@
         (sequences nil))
     (expect-kw p "for")
     (if (match-kw p "all")
-        (progn (expect-kw p "tables") (setf all-tables-p t))
+        (cond ((match-kw p "tables") (setf all-tables-p t))
+              ((match-kw p "sequences") (setf sequences :all))
+              (t (syntax-error p "expected TABLES or SEQUENCES")))
         (progn
           (expect-kw p "table")
           (setf tables (parse-publication-table-list p))))
     (when (match-kw p "sequences")
+      (when sequences (syntax-error p "sequences specified more than once"))
       (setf sequences (parse-publication-sequence-list p)))
-    (list :type :create-publication :name name :all-tables-p all-tables-p
-          :tables tables :sequences sequences)))
+    (let ((ast (list :type :create-publication :name name :all-tables-p all-tables-p
+                     :tables tables :sequences sequences)))
+      (when (match-kw p "with")
+        (setf (getf ast :publish-actions) (parse-publication-options p)))
+      ast)))
 
 (defun parse-publication-table-list (p)
   (loop collect
-        (let ((table (strip-schema (pident p)))
+        (let ((table (parse-mutation-relation-identifier p))
               (filter nil))
           (when (match-kw p "where")
             (setf filter (with-parens (p) (parse-expr p))))
@@ -433,7 +540,7 @@
   (if (match-kw p "all")
       :all
       (with-parens (p)
-        (loop collect (strip-schema (pident p))
+        (loop collect (parse-mutation-relation-identifier p)
               while (match-punct p #\,)))))
 
 (defun parse-create-table (p)
@@ -442,7 +549,7 @@
             (expect-kw p "not")
             (expect-kw p "exists")
             t))
-        (name (strip-schema (pident p)))
+        (name (parse-mutation-relation-identifier p))
         (columns '())
         (constraints '()))
     (expect-punct p #\()
@@ -503,6 +610,14 @@
             :default-sequence-name default-sequence))))
 
 (defun parse-type (p)
+  (when (token-quoted-p (pcur p))
+    (let ((name (pident p)))
+      (return-from parse-type
+        (cond ((string= name "int4") (values :int4 -1))
+              ((string= name "int8") (values :int8 -1))
+              ((string= name "varchar") (values :varchar (parse-varchar-typmod p)))
+              ((string= name "text") (values :varchar 130))
+              (t (ereport "0A000" "unsupported storage type \"~a\"" name))))))
   (cond
     ((match-kw p "int") (values :int4 -1))
     ((match-kw p "integer") (values :int4 -1))
@@ -565,9 +680,9 @@
             (expect-kw p "not")
             (expect-kw p "exists")
             t))
-        (name (strip-schema (pident p))))
+        (name (parse-mutation-relation-identifier p)))
     (expect-kw p "on")
-    (let ((table (strip-schema (pident p))))
+    (let ((table (parse-mutation-relation-identifier p)))
       (when (match-kw p "using")
         (unless (match-kw p "btree")
           (ereport "0A000" "only btree indexes are supported")))
@@ -612,14 +727,14 @@
                         (expect-kw p "exists")
                         t)))
        (list :type :drop-sequence :names
-             (loop collect (strip-schema (pident p))
+             (loop collect (parse-mutation-relation-identifier p)
                    while (match-punct p #\,))
              :if-exists if-exists)))
     ((match-kw p "table")
      (let ((if-exists (when (match-kw p "if")
                         (expect-kw p "exists")
                         t)))
-       (let ((names (loop collect (strip-schema (pident p))
+       (let ((names (loop collect (parse-mutation-relation-identifier p)
                           while (match-punct p #\,))))
          (match-kw p "cascade")
          (match-kw p "restrict")
@@ -628,7 +743,7 @@
      (let ((if-exists (when (match-kw p "if")
                         (expect-kw p "exists")
                         t)))
-       (let ((names (loop collect (strip-schema (pident p))
+       (let ((names (loop collect (parse-mutation-relation-identifier p)
                           while (match-punct p #\,))))
          (match-kw p "cascade")
          (match-kw p "restrict")
@@ -641,7 +756,7 @@
     ((match-kw p "publication")
      (parse-alter-publication p))
     ((match-kw p "sequence")
-     (let ((name (strip-schema (pident p))))
+     (let ((name (parse-mutation-relation-identifier p)))
        (cond
          ((match-kw p "increment")
           (match-kw p "by")
@@ -653,7 +768,7 @@
                 :restart (parse-signed-integer-literal p)))
          (t (ereport "0A000" "unsupported ALTER SEQUENCE option")))))
     ((match-kw p "index")
-     (let ((name (strip-schema (pident p))))
+     (let ((name (parse-mutation-relation-identifier p)))
        (expect-kw p "rename")
        (expect-kw p "to")
        (list :type :alter-index :name name :new-name (pident p))))
@@ -672,18 +787,18 @@
                 :tables (parse-publication-table-list p)))
          ((match-kw p "sequence")
           (list :type :alter-publication :name name :action :add-sequence
-                :sequences (loop collect (strip-schema (pident p))
+                :sequences (loop collect (parse-mutation-relation-identifier p)
                                  while (match-punct p #\,))))
          (t (ereport "0A000" "ALTER PUBLICATION ADD supports TABLE or SEQUENCE"))))
       ((match-kw p "drop")
        (cond
          ((match-kw p "table")
           (list :type :alter-publication :name name :action :drop-table
-                :tables (loop collect (list :name (strip-schema (pident p)))
+                :tables (loop collect (list :name (parse-mutation-relation-identifier p))
                               while (match-punct p #\,))))
          ((match-kw p "sequence")
           (list :type :alter-publication :name name :action :drop-sequence
-                :sequences (loop collect (strip-schema (pident p))
+                :sequences (loop collect (parse-mutation-relation-identifier p)
                                  while (match-punct p #\,))))
          (t (ereport "0A000" "ALTER PUBLICATION DROP supports TABLE or SEQUENCE"))))
       ((match-kw p "set")
@@ -694,14 +809,17 @@
          ((match-kw p "sequences")
           (list :type :alter-publication :name name :action :set-sequences
                 :sequences (parse-publication-sequence-list p)))
-         (t (ereport "0A000" "ALTER PUBLICATION SET supports TABLE or SEQUENCES"))))
+         ((punct-p p #\()
+          (list :type :alter-publication :name name :action :set-options
+                :publish-actions (parse-publication-options p)))
+         (t (ereport "0A000" "ALTER PUBLICATION SET supports TABLE, SEQUENCES or options"))))
       (t (ereport "0A000" "unsupported ALTER PUBLICATION action")))))
 
 (defun parse-alter-table (p)
   (let ((if-exists (when (match-kw p "if")
                      (expect-kw p "exists")
                      t))
-        (table (strip-schema (pident p))))
+        (table (parse-mutation-relation-identifier p)))
     (let ((actions (list (parse-alter-table-action p))))
       (loop while (match-punct p #\,)
             do (push (parse-alter-table-action p) actions))
@@ -742,7 +860,7 @@
               (progn
                 (expect-kw p "index")
                 (list :action :add-primary-key
-                      :using-index (strip-schema (pident p))
+                      :using-index (parse-mutation-relation-identifier p)
                       :constraint-name cname))
               (list :action :add-primary-key
                     :columns (with-parens (p) (parse-ident-list p))
@@ -756,7 +874,7 @@
                 (progn
                   (expect-kw p "index")
                   (list :action :add-unique
-                        :using-index (strip-schema (pident p))
+                        :using-index (parse-mutation-relation-identifier p)
                         :constraint-name cname
                         :nulls-not-distinct nulls-not-distinct))
                 (list :action :add-unique
@@ -830,6 +948,21 @@
          (pident p)))
     (t (syntax-error p "expected setting value"))))
 
+(defun parse-search-path-setting (p)
+  "Keep SET's list elements distinct from commas within a quoted SQL value."
+  (let ((values (loop collect (parse-set-value p) while (match-punct p #\,))))
+    (if (equal values '(:default))
+        :default
+        (progn
+          (when (member :default values)
+            (syntax-error p "DEFAULT cannot be combined with other search_path values"))
+          (format nil "~{~a~^, ~}"
+                  (mapcar (lambda (name)
+                            (if (member name '("public" "pg_catalog") :test #'string=)
+                                name
+                                (catalog-sql-quote-ident name)))
+                          values))))))
+
 (defun parse-set (p)
   (let ((session-p (match-kw p "session")))
     (when (match-kw p "local")
@@ -862,7 +995,10 @@
          (when (eq (pkind p) :op)
            (pnext p))
          (match-kw p "to")
-         (list :type :set :name name :value (parse-set-value p)))))))
+         (list :type :set :name name
+               :value (if (string-equal name "search_path")
+                          (parse-search-path-setting p)
+                          (parse-set-value p))))))))
 
 (defun parse-show (p)
   (let ((name (pident p)))
@@ -907,13 +1043,16 @@
   (let ((left (parse-additive p)))
     (cond
       ((and (eq (pkind p) :op)
-            (member (pval p) '("=" "<>" "!=" "<" "<=" ">" ">=")
-                    :test #'string=))
-       (let ((op (pval p)))
+            (member (pval p) '("=" "<>" "!=" "<" "<=" ">" ">=") :test #'string=))
+       (let ((op (if (string= (pval p) "!=") "<>" (pval p))))
          (pnext p)
-         (list :binop (if (string= op "!=") "<>" op)
-               left
-               (parse-additive p))))
+         (if (match-kw p "any")
+             (list :any op left (with-parens (p) (parse-expr p)))
+             (list :binop op left (parse-additive p)))))
+      ((or (kw-p p "in") (kw-p p "not"))
+       (let ((negated (match-kw p "not")))
+         (expect-kw p "in")
+         (list :in left (with-parens (p) (parse-expr-list p)) negated)))
       ((match-kw p "is")
        (let ((negated (match-kw p "not")))
          (cond
@@ -939,11 +1078,120 @@
 (defun parse-multiplicative (p)
   (parse-binary-level p '("*" "/" "%") #'parse-unary))
 
+(defun parse-expression-varchar-typmod (p)
+  (if (match-punct p #\()
+      (with-parens (p :opening-consumed t)
+        (let ((length (parse-integer-literal p)))
+          (unless (<= 1 length 10485760)
+            (ereport "22023" "length for type varchar is out of range"))
+          (+ length 4)))
+      -1))
+
+(defun parse-scalar-cast-type (p)
+  "Resolve supported expression types independently of table storage aliases."
+  (let* ((quoted (token-quoted-p (pcur p)))
+         (name (pident p))
+         (qualified (match-punct p #\.)))
+    (when qualified
+      (unless (string= name "pg_catalog")
+        (ereport "42704" "type \"~a.~a\" does not exist" name (pval p)))
+      (setf quoted (token-quoted-p (pcur p)) name (pident p)))
+    (cond
+      ((string= name "text") (values :text -1))
+      ((string= name "name") (values :name -1))
+      ((string= name "oid") (values :oid -1))
+      ((string= name "pg_lsn") (values :pg-lsn -1))
+      ((or (string= name "int2")
+           (and (not quoted) (not qualified) (string= name "smallint")))
+       (values :int2 -1))
+      ((string= name "int2vector") (values :int2vector -1))
+      ((and (string= name "char") (or quoted qualified)) (values :char -1))
+      ((or (string= name "int4")
+           (and (not quoted) (not qualified) (member name '("int" "integer") :test #'string=)))
+       (values :int4 -1))
+      ((or (string= name "int8")
+           (and (not quoted) (not qualified) (string= name "bigint")))
+       (values :int8 -1))
+      ((or (string= name "bool")
+           (and (not quoted) (not qualified) (string= name "boolean")))
+       (values :bool -1))
+      ((string= name "varchar") (values :varchar (parse-expression-varchar-typmod p)))
+      ((and (not quoted) (not qualified) (string= name "character")
+            (match-kw p "varying"))
+       (values :varchar (parse-expression-varchar-typmod p)))
+      (t (ereport "0A000" "unsupported expression type \"~a\"" name)))))
+
+(defun parse-cast-type (p)
+  (multiple-value-bind (type typmod) (parse-scalar-cast-type p)
+    (when (match-punct p #\[)
+      (expect-punct p #\])
+      (unless (eq type :text)
+        (ereport "0A000" "only text array casts are supported"))
+      (setf type :text-array typmod -1))
+    (values type typmod)))
+
+(defun parse-postfix-expression (p)
+  (let ((expression (parse-primary p)))
+    (loop
+      (cond
+        ((match-op p "::")
+         (multiple-value-bind (type typmod) (parse-cast-type p)
+           (setf expression (list :cast expression type typmod))))
+        ((match-punct p #\.)
+         (setf expression
+               (if (match-op p "*") (list :record-expand expression)
+                   (list :record-field expression (pident p)))))
+        (t (return expression))))))
+
 (defun parse-unary (p)
   (cond
     ((match-op p "-") (list :unary "-" (parse-unary p)))
     ((match-op p "+") (parse-unary p))
-    (t (parse-primary p))))
+    (t (parse-postfix-expression p))))
+
+(defun parse-call-arguments (p)
+  "Read arguments after the opening parenthesis; VARIADIC may occur only last."
+  (if (match-punct p #\))
+      (values nil nil)
+      (with-parens (p :opening-consumed t)
+        (loop with arguments = nil
+              for variadic = (and (not (token-quoted-p (pcur p))) (match-kw p "variadic"))
+              do (push (parse-expr p) arguments)
+              when variadic do (return (values (nreverse arguments) t))
+                unless (match-punct p #\,) do (return (values (nreverse arguments) nil))))))
+
+(defun parse-function-call (p name &optional schema)
+  "Parse a call with explicit schema and VARIADIC argument metadata."
+  (if (and (string= name "count")
+           (or (null schema) (string= schema "pg_catalog"))
+           (match-op p "*"))
+      (progn (expect-punct p #\)) (list :count-star))
+      (multiple-value-bind (arguments variadic) (parse-call-arguments p)
+        (append (list :func name arguments)
+                (when schema (list :schema schema))
+                (when variadic (list :variadic t))))))
+
+(defun parse-case-expression (p)
+  "Read searched CASE; a CASE value expression remains outside this SQL subset."
+  (unless (kw-p p "when")
+    (ereport "0A000" "only searched CASE is supported"))
+  (let ((branches nil))
+    (loop while (match-kw p "when")
+          do (let ((condition (parse-expr p)))
+               (expect-kw p "then")
+               (push (list condition (parse-expr p)) branches)))
+    (let ((otherwise (if (match-kw p "else") (parse-expr p) (list :const +null+))))
+      (expect-kw p "end")
+      (list :case (nreverse branches) otherwise))))
+
+(defun parse-array-expression (p)
+  (expect-punct p #\[)
+  (let ((items nil))
+    (unless (punct-p p #\])
+      (push (parse-expr p) items)
+      (loop while (match-punct p #\,) do (push (parse-expr p) items)))
+    (expect-punct p #\])
+    (list :array-literal (nreverse items))))
 
 (defun parse-primary (p)
   (cond
@@ -954,32 +1202,31 @@
     ((match-punct p #\()
      (with-parens (p :opening-consumed t)
        (parse-expr p)))
+    ((and (not (token-quoted-p (pcur p))) (match-kw p "cast"))
+     (with-parens (p)
+       (let ((argument (parse-expr p)))
+         (expect-kw p "as")
+         (multiple-value-bind (type typmod) (parse-cast-type p)
+           (list :cast argument type typmod)))))
+    ((match-kw p "case") (parse-case-expression p))
+    ((match-kw p "array") (parse-array-expression p))
     ((match-kw p "null") (list :const +null+))
     ((match-kw p "default") (list :default))
     ((match-kw p "true") (list :bool t))
     ((match-kw p "false") (list :bool nil))
     ((eq (pkind p) :ident)
-     (let ((name (pident p)))
+     (let* ((quoted (token-quoted-p (pcur p)))
+            (name (pident p)))
        (cond
          ((match-punct p #\.)
           (let ((col (pident p)))
-            (list :column name col)))
-         ((match-punct p #\()
-          (if (and (string= name "count")
-                   (match-op p "*"))
-              (progn
-                (expect-punct p #\))
-                (list :count-star))
-              (let ((args (if (match-punct p #\))
-                              '()
-                              (with-parens (p :opening-consumed t)
-                                (parse-expr-list p)))))
-                (list :func name args))))
-         ((member name '("current_user" "session_user" "user"
-                         "current_database" "current_schema" "current_catalog")
-                  :test #'string=)
+            (if (match-punct p #\()
+                (parse-function-call p col name)
+                (list :column name col))))
+         ((match-punct p #\() (parse-function-call p name))
+         ((and (not quoted) (member name '("current_user" "session_user" "user"
+                                           "current_database" "current_schema" "current_catalog")
+                                    :test #'string=))
           (list :func name '()))
-         (t
-          (list :column name)))))
-    (t
-     (syntax-error p))))
+         (t (list :column name)))))
+    (t (syntax-error p))))

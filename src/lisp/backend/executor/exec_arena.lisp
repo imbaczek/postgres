@@ -123,6 +123,9 @@ is used only for heap-produced SQL rows and copies of those same rows;
 expression evaluation must never run in the arena. Arenas remain visible to
 SBCL's GC so borrowed heap scalars remain live and their pointers are updated."
   (cond
+    ((sql-record-p value)
+     (make-sql-record :fields (copy-query-sort-value (sql-record-fields value))
+                      :values (copy-query-sort-value (sql-record-values value))))
     ((consp value)
      ;; Iterate over list spines: a run can contain many thousands of items.
      (let* ((head (cons (copy-query-sort-value (car value)) nil))

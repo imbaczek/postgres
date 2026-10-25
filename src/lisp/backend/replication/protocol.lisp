@@ -3,45 +3,158 @@
 (in-package #:pg)
 
 (defstruct logical-replication-command
-  type slot-name plugin export-snapshot-p requested-lsn protocol-version)
+  type slot-name plugin snapshot-action requested-lsn protocol-version options)
 
 (defparameter +logical-replication-type-oids+
   '((:int4 . 23) (:int8 . 20) (:varchar . 1043)))
 
 (defun replication-command-words (query)
-  (let ((query (string-right-trim '(#\Space #\Tab #\Newline #\Return #\;)
-                                  query))
-        (words '())
-        (position 0))
-    (loop while (< position (length query))
-          do (loop while (and (< position (length query))
-                              (find (char query position)
-                                    '(#\Space #\Tab #\Newline #\Return)))
-                   do (incf position))
-             (when (< position (length query))
-               (let ((start position)
-                     (char (char query position)))
-                 (cond
-                   ((find char '(#\( #\)))
-                    (incf position)
-                    (push (subseq query start position) words))
-                   ((char= char #\')
-                    (incf position)
-                    (loop while (and (< position (length query))
-                                     (not (char= (char query position) #\')))
-                          do (incf position))
-                    (unless (< position (length query))
-                      (ereport "42601" "unterminated replication command option"))
-                    (incf position)
-                    (push (subseq query start position) words))
-                   (t
-                    (loop while (and (< position (length query))
-                                     (not (find (char query position)
-                                                '(#\Space #\Tab #\Newline #\Return
-                                                  #\( #\) #\'))))
-                          do (incf position))
-                    (push (subseq query start position) words))))))
-    (nreverse words)))
+  "Tokenize repl_scanner-style quoted words and command punctuation."
+  (let ((words nil) (position 0) (length (length query)))
+    (loop while (< position length)
+          for character = (char query position)
+          do (cond
+               ((find character '(#\Space #\Tab #\Newline #\Return #\Page))
+                (incf position))
+               ((find character '(#\( #\) #\, #\;))
+                (push (string character) words)
+                (incf position))
+               ((find character '(#\' #\"))
+                (let ((start position))
+                  (setf position (nth-value 1 (scan-quoted-text query position character)))
+                  (push (subseq query start position) words)))
+               (t
+                (let ((start position))
+                  (loop while (and (< position length)
+                                   (not (find (char query position)
+                                              '(#\Space #\Tab #\Newline #\Return #\Page
+                                                #\( #\) #\, #\; #\' #\"))))
+                        do (incf position))
+                  (push (subseq query start position) words)))))
+    (setf words (nreverse words))
+    (when (equal (car (last words)) ";") (setf words (butlast words)))
+    (when (member ";" words :test #'equal)
+      (ereport "42601" "expected a single replication command"))
+    words))
+
+(defun replication-command-identifier (word)
+  "Decode an IDENT with C's ASCII folding and UTF8-safe name clipping."
+  (unless (and word (plusp (length word)))
+    (ereport "42601" "expected a replication identifier"))
+  (if (char= (char word 0) #\")
+      (let ((value (scan-quoted-text word 0 #\")))
+        (when (zerop (length value))
+          (ereport "42601" "zero-length delimited identifier"))
+        (sql-name-input value))
+      (labels ((letter-p (character)
+                 (or (find character "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
+                     (>= (char-code character) 128))))
+        (unless (and (letter-p (char word 0))
+                     (every (lambda (character)
+                              (or (letter-p character) (find character "0123456789$")))
+                            word))
+          (ereport "42601" "invalid replication identifier"))
+        (sql-name-input
+         (map 'string (lambda (character)
+                        (if (<= 65 (char-code character) 90)
+                            (code-char (+ 32 (char-code character))) character))
+              word)))))
+
+(defun replication-command-value (word)
+  (cond
+    ((null word) nil)
+    ((char= (char word 0) #\') (scan-quoted-text word 0 #\'))
+    ((every (lambda (character) (find character "0123456789")) word) word)
+    (t (replication-command-identifier word))))
+
+(defun parse-replication-generic-options (words)
+  "Read the nonempty comma-separated generic_option_list in repl_gram.y."
+  (unless (and (equal (first words) "(") (equal (car (last words)) ")"))
+    (ereport "42601" "expected parenthesized replication options"))
+  (let ((remaining (butlast (rest words))) (options nil))
+    (unless remaining (ereport "42601" "expected a replication option"))
+    (loop
+      (let* ((name (replication-command-identifier (pop remaining)))
+             (value (unless (or (null remaining) (equal (first remaining) ","))
+                      (pop remaining))))
+        (when value (replication-command-value value))
+        (push (cons name value) options))
+      (unless remaining (return))
+      (unless (and (equal (pop remaining) ",") remaining)
+        (ereport "42601" "expected another comma-separated replication option")))
+    (nreverse options)))
+
+(defun replication-option-boolean (name word)
+  "Match defGetBoolean, including the distinction between UCONST and strings."
+  (cond
+    ((null word) t)
+    ((every (lambda (character) (find character "0123456789")) word)
+     (let ((value (parse-integer word)))
+       (case value
+         (0 nil) (1 t)
+         (otherwise (ereport "42601" "~a requires a Boolean value" name)))))
+    (t
+     (let ((value (replication-command-value word)))
+       (cond ((member value '("true" "on") :test #'string-equal) t)
+             ((member value '("false" "off") :test #'string-equal) nil)
+             (t (ereport "42601" "~a requires a Boolean value" name)))))))
+
+(defun parse-create-slot-options (words)
+  "Normalize legacy spelling and apply parseCreateReplSlotOptions rules."
+  (let ((options
+          (if (equal (first words) "(")
+              (parse-replication-generic-options words)
+              (loop for word in words
+                    collect (cond
+                              ((string-equal word "EXPORT_SNAPSHOT")
+                               (cons "snapshot" "'export'"))
+                              ((string-equal word "NOEXPORT_SNAPSHOT")
+                               (cons "snapshot" "'nothing'"))
+                              ((string-equal word "USE_SNAPSHOT")
+                               (cons "snapshot" "'use'"))
+                              ((string-equal word "TWO_PHASE") (cons "two_phase" nil))
+                              ((string-equal word "RESERVE_WAL") (cons "reserve_wal" nil))
+                              (t (ereport "42601" "invalid replication slot option"))))))
+        (seen nil) (snapshot :export))
+    (dolist (option options)
+      (let ((name (car option)) (word (cdr option)))
+        (when (member name seen :test #'equal)
+          (ereport "42601" "conflicting or redundant options"))
+        (push name seen)
+        (cond
+          ((equal name "snapshot")
+           (unless word (ereport "42601" "snapshot requires a parameter"))
+           (let ((value (replication-command-value word)))
+             (setf snapshot
+                   (cond ((equal value "export") :export)
+                         ((equal value "nothing") :nothing)
+                         ((equal value "use") :use)
+                         (t (ereport "22023" "unrecognized snapshot action"))))))
+          ((member name '("two_phase" "failover") :test #'equal)
+           (when (replication-option-boolean name word)
+             (ereport "0A000" "~a slots are not supported" name)))
+          ((equal name "reserve_wal")
+           (ereport "42601" "reserve_wal is only valid for physical slots"))
+          (t (ereport "42601" "unrecognized replication slot option ~a" name)))))
+    snapshot))
+
+(defun parse-create-replication-slot (words)
+  (let* ((slot-name (replication-command-identifier (second words)))
+         (remaining (cddr words)))
+    (when (string-equal (first remaining) "TEMPORARY")
+      (ereport "0A000" "temporary replication slots are not supported"))
+    (unless (and (string-equal (first remaining) "LOGICAL") (second remaining))
+      (ereport "42601" "expected LOGICAL and an output plugin"))
+    (unless (wal-valid-replication-slot-name-p slot-name)
+      (ereport "42602" "invalid replication slot name ~s" slot-name))
+    (let* ((plugin (replication-command-identifier (second remaining)))
+           (snapshot (parse-create-slot-options (cddr remaining))))
+      (unless (member plugin '("pgoutput" "pg_lisp") :test #'equal)
+        (ereport "0A000" "unsupported output plugin ~s" plugin))
+      (when (and (equal plugin "pg_lisp") (not (eq snapshot :export)))
+        (ereport "0A000" "pg_lisp slots require an exported snapshot"))
+      (make-logical-replication-command
+       :type :create :slot-name slot-name :plugin plugin :snapshot-action snapshot))))
 
 (defun parse-replication-lsn (text)
   (let ((slash (position #\/ text)))
@@ -64,57 +177,62 @@
   (let* ((words (replication-command-words query))
          (verb (and words (string-upcase (first words)))))
     (cond
-      ((equal verb "CREATE_REPLICATION_SLOT")
-       (unless (and (= (length words) 5)
-                    (string-equal (third words) "LOGICAL")
-                    (string-equal (fourth words) "pgoutput")
-                    (string-equal (fifth words) "EXPORT_SNAPSHOT"))
-         (ereport "0A000"
-                  "supported syntax is CREATE_REPLICATION_SLOT name LOGICAL pgoutput EXPORT_SNAPSHOT"))
-       (unless (wal-valid-replication-slot-name-p (second words))
-         (ereport "42602" "invalid replication slot name \"~a\""
-                  (second words)))
-       (make-logical-replication-command
-        :type :create :slot-name (second words) :plugin "pgoutput"
-        :export-snapshot-p t))
+      ((equal verb "IDENTIFY_SYSTEM")
+       (unless (= (length words) 1)
+         (ereport "42601" "IDENTIFY_SYSTEM does not accept options"))
+       (make-logical-replication-command :type :identify))
+      ((equal verb "CREATE_REPLICATION_SLOT") (parse-create-replication-slot words))
       ((equal verb "DROP_REPLICATION_SLOT")
-       (unless (= (length words) 2)
-         (ereport "0A000" "supported syntax is DROP_REPLICATION_SLOT name"))
-       (unless (wal-valid-replication-slot-name-p (second words))
-         (ereport "42602" "invalid replication slot name \"~a\""
-                  (second words)))
-       (make-logical-replication-command :type :drop :slot-name (second words)))
+       (unless (or (= (length words) 2)
+                   (and (= (length words) 3) (string-equal (third words) "WAIT")))
+         (ereport "42601" "expected DROP_REPLICATION_SLOT name [WAIT]"))
+       (let ((name (replication-command-identifier (second words))))
+         (unless (wal-valid-replication-slot-name-p name)
+           (ereport "42602" "invalid replication slot name ~s" name))
+         (make-logical-replication-command :type :drop :slot-name name
+                                           :options (when (third words)
+                                                      (list (cons "wait" t))))))
       ((equal verb "START_REPLICATION")
        (unless (and (<= 5 (length words))
                     (string-equal (second words) "SLOT")
-                    (wal-valid-replication-slot-name-p (third words))
                     (string-equal (fourth words) "LOGICAL"))
-         (ereport "0A000"
-                  "supported syntax is START_REPLICATION SLOT name LOGICAL lsn"))
-       (let ((protocol-version 2))
-         (when (> (length words) 5)
-           (unless (equal words
-                          (append (subseq words 0 5)
-                                  '("(" "proto_version" "'2'" ")")))
-             (ereport "0A000" "only pgoutput protocol version 2 is supported")))
-         (make-logical-replication-command
-          :type :start :slot-name (third words)
-          :requested-lsn (parse-replication-lsn (fifth words))
-          :protocol-version protocol-version)))
-      (t
-       (ereport "42601" "unsupported replication command")))))
+         (ereport "42601" "expected START_REPLICATION SLOT name LOGICAL lsn"))
+       (let ((name (replication-command-identifier (third words))))
+         (unless (wal-valid-replication-slot-name-p name)
+           (ereport "42602" "invalid replication slot name ~s" name))
+         (multiple-value-bind (version options)
+             (parse-start-replication-options (nthcdr 5 words))
+           (make-logical-replication-command
+            :type :start :slot-name name
+            :requested-lsn (parse-replication-lsn (fifth words))
+            :protocol-version version :options options))))
+      (t (ereport "42601" "unsupported replication command")))))
 
 (defun replication-result-columns ()
   (mapcar (lambda (name)
             (make-result-column :name name :type-oid +textoid+ :typlen -1))
           '("slot_name" "consistent_point" "snapshot_name" "output_plugin")))
 
-(defun send-create-replication-slot-result (stream name boundary token)
+(defun identify-replication-system (stream)
+  "Return C IdentifySystem's four columns using our durable cluster identity."
+  (send-row-description
+   stream (list (make-result-column :name "systemid" :type-oid +textoid+ :typlen -1)
+                (make-result-column :name "timeline" :type-oid +int8oid+ :typlen 8)
+                (make-result-column :name "xlogpos" :type-oid +textoid+ :typlen -1)
+                (make-result-column :name "dbname" :type-oid +textoid+ :typlen -1)))
+  (let ((flushed (sb-thread:with-mutex (*wal-lock*) *wal-durable-lsn*)))
+    (send-data-row-text
+     stream (list (format nil "~d" (catalog-system-identifier)) "1"
+                  (wal-format-lsn flushed) (backend-database *backend*))))
+  (send-command-complete stream "IDENTIFY_SYSTEM")
+  (send-ready-for-query stream (transaction-status-char)))
+
+(defun send-create-replication-slot-result (stream name boundary token &optional (plugin "pg_lisp"))
   (send-row-description stream (replication-result-columns))
   (send-data-row-text
-   stream (list name (wal-format-lsn boundary) token "pgoutput"))
+   stream (list name (wal-format-lsn boundary) token plugin))
   (send-command-complete stream "CREATE_REPLICATION_SLOT")
-  (send-ready-for-query stream #\I))
+  (send-ready-for-query stream (transaction-status-char)))
 
 (defun replication-push-u64 (payload value)
   (unless (and (integerp value) (<= 0 value #xFFFFFFFFFFFFFFFF))
@@ -223,20 +341,18 @@
         (:varchar value)
         (otherwise (error "unsupported pgoutput value type ~a" type)))))
 
-(defun pgoutput-build-tuple (columns values &optional attnums)
-  (let* ((selected
-           (if attnums
-               (remove-if-not
-                (lambda (column)
-                  (member (getf column :attnum) attnums :test #'=))
-                columns)
-               columns))
-         (payload (make-payload)))
+(defun pgoutput-build-tuple (columns values &optional key-attnums)
+  ;; logicalrep_write_tuple() preserves relation width for old key images.
+  ;; ReorderBuffer's identity tuple has NULL in non-key attributes.
+  (let ((payload (make-payload)))
     (unless (= (length values) (length columns))
       (error "logical row image no longer matches its relation schema"))
-    (payload-push-u16 payload (length selected))
-    (dolist (column selected)
-      (let* ((value (aref values (1- (getf column :attnum))))
+    (payload-push-u16 payload (length columns))
+    (dolist (column columns)
+      (let* ((attnum (getf column :attnum))
+             (value (if (or (null key-attnums) (member attnum key-attnums))
+                        (aref values (1- attnum))
+                        +null+))
              (text (pgoutput-value-text value (getf column :type))))
         (if text
             (let ((bytes (string->bytes text)))
@@ -292,17 +408,25 @@
     (:progress "pg_lisp/progress")
     (otherwise (error "logical change kind has no Message prefix"))))
 
+(defun pgoutput-build-truncate (relation-oids)
+  "Encode a plain nonstreamed TRUNCATE as logicalrep_write_truncate does."
+  (let ((payload (make-payload)))
+    (payload-push-byte payload (char-code #\T))
+    (payload-push-u32 payload (length relation-oids))
+    (payload-push-byte payload 0) ; neither CASCADE nor RESTART IDENTITY
+    (dolist (oid relation-oids)
+      (payload-push-u32 payload oid))
+    payload))
+
 (defun pgoutput-build-message (change transaction)
-  ;; logicalrep_write_message() in src/backend/replication/logical/proto.c
-  ;; includes XID only for transactional messages, then flags, LSN, prefix,
-  ;; and sized content. Version 2 enables that XID field for this worker.
+  ;; pgoutput_message() passes InvalidTransactionId outside streamed blocks.
+  ;; An ordinary transactional Message has flags first, even with protocol v2.
+  ;; See src/backend/replication/logical/proto.c:logicalrep_write_message.
   (let* ((payload (make-payload))
          (transactional-p (plusp (logical-transaction-xid transaction)))
          (content (string->bytes (logical-change-event-payload change)))
          (prefix (pgoutput-message-prefix change)))
     (payload-push-byte payload (char-code #\M))
-    (when transactional-p
-      (payload-push-u32 payload (logical-transaction-xid transaction)))
     (payload-push-byte payload (if transactional-p 1 0))
     (replication-push-u64 payload (logical-transaction-commit-lsn transaction))
     (payload-push-cstring payload prefix)
@@ -413,7 +537,17 @@ keepalive's WAL-end field, which may include changes not yet applied."
   (send-command-complete stream "START_REPLICATION")
   (send-ready-for-query stream #\I))
 
-(defun start-logical-replication (stream slot-name requested-lsn)
+(defun start-logical-replication (stream slot-name requested-lsn &optional command)
+  (when (and command
+             (sb-thread:with-mutex (*wal-lock*)
+               (let ((slot (gethash slot-name *wal-replication-slots*)))
+                 (and slot (equal (wal-replication-slot-plugin slot) "pgoutput")))))
+    (return-from start-logical-replication
+      (start-standard-logical-replication stream command)))
+  (when (and command
+             (assoc "publication_names" (logical-replication-command-options command)
+                    :test #'equal))
+    (ereport "0A000" "publication options require a pgoutput slot"))
   (let ((copy-mode-p nil))
     (handler-case-nonfatal
      (progn
@@ -421,6 +555,8 @@ keepalive's WAL-end field, which may include changes not yet applied."
        (call-with-logical-replication-slot
         slot-name
         (lambda (slot)
+          (unless (equal (wal-replication-slot-plugin slot) "pg_lisp")
+            (ereport "0A000" "standard pgoutput streaming is not implemented"))
           (let ((initial-copy-p
                   (null (wal-replication-slot-confirmed-flush-lsn slot))))
             (wal-logical-slot-validate-start-position
@@ -508,28 +644,60 @@ keepalive's WAL-end field, which may include changes not yet applied."
                     (sleep 0.05)))))))))
 
 (defun create-replication-slot-command (stream command)
-  (multiple-value-bind (boundary token)
-      (sb-thread:with-mutex (*logical-slot-lifecycle-lock*)
-        (create-exported-logical-snapshot-slot
-         (logical-replication-command-slot-name command)))
-    (send-create-replication-slot-result
-     stream (logical-replication-command-slot-name command) boundary token)))
+  (let ((name (logical-replication-command-slot-name command))
+        (plugin (logical-replication-command-plugin command))
+        (snapshot (logical-replication-command-snapshot-action command)))
+    ;; Serialize DROP until the success row is sent, as C retains the slot's
+    ;; active owner through do_tup_output. Sending failure still unlocks.
+    (sb-thread:with-mutex (*logical-slot-lifecycle-lock*)
+      (multiple-value-bind (boundary token)
+          (if (equal plugin "pg_lisp")
+              (create-exported-logical-snapshot-slot name)
+              (create-standard-logical-slot name snapshot))
+        (send-create-replication-slot-result stream name boundary token plugin)))))
 
 (defun drop-replication-slot-command (stream command)
-  (let ((name (logical-replication-command-slot-name command)))
-    ;; Serialize slot removal with CREATE's slot/token publication so dropping
-    ;; an old generation cannot release a newly recreated generation by name.
-    (sb-thread:with-mutex (*logical-slot-lifecycle-lock*)
-      (wal-drop-replication-slot name)
-      (release-exported-logical-snapshot-for-slot name))
-    (send-command-complete stream "DROP_REPLICATION_SLOT")
-    (send-ready-for-query stream #\I)))
+  (let ((name (logical-replication-command-slot-name command))
+        (wait-p (assoc "wait" (logical-replication-command-options command)
+                       :test #'equal)))
+    (loop
+      (check-for-interrupts)
+      (when (handler-case
+                (with-live-operation
+                  ;; Never retain the lifecycle lock or reload admission while
+                  ;; WAIT sleeps for an active sender to release its slot.
+                  (sb-thread:with-mutex (*logical-slot-lifecycle-lock*)
+                    (wal-drop-replication-slot name)
+                    (release-exported-logical-snapshot-for-slot name))
+                  t)
+              (pg-error (condition)
+                (unless (and wait-p (equal "55006" (pg-error-sqlstate condition)))
+                  (error condition))
+                nil))
+        (return))
+      (sleep 0.01))
+    (with-live-operation
+      (send-command-complete stream "DROP_REPLICATION_SLOT")
+      (send-ready-for-query stream (transaction-status-char)))))
 
 (defun replication-frame-query-string (type-byte length-bytes payload)
   (let* ((message (decode-frontend-message type-byte length-bytes payload))
          (query-payload (frontend-message-payload message))
          (end (or (position 0 query-payload) (length query-payload))))
     (bytes->string query-payload :start 0 :end end)))
+
+(defun validate-replication-command-context (command)
+  "Enforce C walsender transaction restrictions before touching replication state."
+  (when (eq (backend-state *backend*) :aborted)
+    (ereport "25P02"
+             "current transaction is aborted, commands ignored until end of transaction block"))
+  (when (and (eq (logical-replication-command-type command) :create)
+             (eq (logical-replication-command-snapshot-action command) :export)
+             (backend-explicit *backend*))
+    (ereport "25001" "EXPORT_SNAPSHOT cannot run inside a transaction block"))
+  (when (and (eq (logical-replication-command-type command) :start)
+             (backend-explicit *backend*))
+    (ereport "25001" "START_REPLICATION cannot run inside a transaction block")))
 
 (defun handle-replication-query-frame (stream type-byte length-bytes payload)
   (with-backend-query-execution (:backend *backend* :cleanup :query-state)
@@ -540,20 +708,22 @@ keepalive's WAL-end field, which may include changes not yet applied."
                     type-byte length-bytes payload)))
                (command (with-live-operation
                           (parse-replication-command query))))
+          (with-live-operation (validate-replication-command-context command))
           (case (logical-replication-command-type command)
+            (:identify
+             (with-live-operation (identify-replication-system stream)))
             (:create
              (with-live-operation
                (create-replication-slot-command stream command)))
-            (:drop
-             (with-live-operation
-               (drop-replication-slot-command stream command)))
+            (:drop (drop-replication-slot-command stream command))
             (:start
              (start-logical-replication
               stream (logical-replication-command-slot-name command)
-              (logical-replication-command-requested-lsn command)))))
+              (logical-replication-command-requested-lsn command) command))))
       (pg-error (condition)
         (if (fatal-error-p condition)
             (error condition)
-            (progn
+            (with-live-operation-captured-backend-cleanup
+              (note-query-error)
               (send-error-response stream condition)
-              (send-ready-for-query stream #\I)))))))
+              (send-ready-for-query stream (transaction-status-char))))))))

@@ -37,30 +37,33 @@
   (or (ddl-p ast) (eq (getf ast :type) :analyze)))
 
 (defun exec-truncate (stream ast)
-  ;; PostgreSQL's standard_ProcessUtility routes TRUNCATE through its dedicated
-  ;; relation truncation path. This subset marks every live tuple deleted in the
-  ;; current transaction so rollback preserves MVCC visibility; it deliberately
-  ;; avoids queuing one logical DELETE event per row.
-  ;; A table may be empty, but TRUNCATE still needs a commit-ordered logical
-  ;; event just as PostgreSQL's heap_truncate_one_rel() is WAL-visible.
+  ;; Capture one transactional event, including immutable source relation OIDs,
+  ;; even for empty tables. Tuple deletion preserves rollback/MVCC semantics.
   (get-current-xid)
-  (dolist (name (getf ast :tables))
-    (let ((table (resolve-table-or-error name)))
-      (with-registered-table (table rel xid :write)
-        (let ((columns (pg-class-columns table)))
-          (dolist (tid (collect-matching-tids table nil))
-            (check-for-interrupts)
-            (multiple-value-bind (deleted tuple block offnum status)
-                (heapam-delete-tid
-                 rel columns (car tid) (cdr tid) xid
-                 (backend-command-id *backend*))
-              (declare (ignore tuple block offnum))
-              (check-heapam-write-status status)
-              (unless deleted
-                (ereport "40001"
-                         "could not truncate relation after concurrent update"))))))))
-  (logical-note-transaction-event :truncate
-                                  (list :tables (getf ast :tables)))
+  (let ((names nil) (oids nil) (relations nil) (tables nil))
+    (dolist (name (remove-duplicates (getf ast :tables) :test #'equal :from-end t))
+      (let ((table (resolve-table-or-error name)))
+        (with-registered-table (table rel xid :write)
+          (push (copy-seq (pg-class-name table)) names)
+          (push (pg-class-oid table) oids)
+          (push table tables)
+          (push (logical-relation-description table) relations)
+          (let ((columns (pg-class-columns table)))
+            (dolist (tid (collect-matching-tids table nil))
+              (check-for-interrupts)
+              (multiple-value-bind (deleted tuple block offnum status)
+                  (heapam-delete-tid
+                   rel columns (car tid) (cdr tid) xid
+                   (backend-command-id *backend*))
+                (declare (ignore tuple block offnum))
+                (check-heapam-write-status status)
+                (unless deleted
+                  (ereport "40001"
+                           "could not truncate relation after concurrent update"))))))))
+    (logical-note-transaction-event
+     :truncate (list :tables (nreverse names) :relation-oids (nreverse oids)
+                     :relations (nreverse relations))
+     :publication-selection (with-write-lock (logical-capture-publications (nreverse tables) :truncate))))
   (send-command-complete stream "TRUNCATE TABLE"))
 
 (defun exec-apply-sequence-state (stream ast)
@@ -297,6 +300,9 @@
     entry))
 
 (defun validate-publication-definition (publication db)
+  (unless (every (lambda (action) (member action '(:insert :update :delete :truncate)))
+                 (pg-publication-publish-actions publication))
+    (ereport "0A000" "unsupported publication actions"))
   (unless (pg-publication-all-tables-p publication)
     (let ((names (mapcar (lambda (entry) (getf entry :name))
                          (pg-publication-tables publication))))
@@ -324,7 +330,10 @@
                                 :all-tables-p (getf ast :all-tables-p)
                                 :tables (copy-tree (getf ast :tables))
                                 :sequences (copy-tree (getf ast :sequences))
-                                :generation 1))
+                                :generation 1
+                                :publish-actions
+                                (copy-list (getf ast :publish-actions
+                                                 '(:insert :update :delete :truncate)))))
          (created nil))
     (call-with-catalog-durability-rollback
      (lambda ()
@@ -334,6 +343,7 @@
        (when (gethash name (database-publications db))
          (ereport "42710" "publication \"~a\" already exists" name))
        (validate-publication-definition publication db)
+       (setf (pg-publication-oid publication) (allocate-oid))
        (setf (gethash name (database-publications db)) publication
              created t)
        (save-catalog :logical-event
@@ -410,14 +420,17 @@
                  (copy-tree (pg-publication-tables current))
                  (pg-publication-sequences candidate)
                  (copy-tree (pg-publication-sequences current)))
-           (if (member (getf ast :action) '(:add-table :drop-table :set-table))
-               (alter-publication-tables candidate ast)
-               (alter-publication-sequences candidate ast))
+           (cond
+             ((eq (getf ast :action) :set-options)
+              (setf (pg-publication-publish-actions candidate)
+                    (copy-list (getf ast :publish-actions))))
+             ((member (getf ast :action) '(:add-table :drop-table :set-table))
+              (alter-publication-tables candidate ast))
+             (t (alter-publication-sequences candidate ast)))
            (incf (pg-publication-generation candidate))
            (validate-publication-definition candidate db)
            (setf (gethash name (database-publications db)) candidate)
-           (save-catalog :logical-event
-                         (logical-catalog-event-for-ast ast))))))
+           (save-catalog :logical-event (logical-catalog-event-for-ast ast))))))
     (send-command-complete stream "ALTER PUBLICATION")))
 
 (defun exec-drop-publication (stream ast)
@@ -455,7 +468,7 @@ rolled back immediately."
   (when *backend*
     (when (eq (backend-state *backend*) :in-progress)
       (if (backend-explicit *backend*)
-          (set-backend-state *backend* :aborted)
+          (abort-transaction-block)
           (abort-transaction)))))
 
 ;;; ---- transaction commands ----
@@ -466,12 +479,15 @@ rolled back immediately."
     copy))
 
 (defun restore-session-settings (stream)
-  (let ((settings (backend-settings-transaction-start *backend*)))
+  (let ((settings (backend-settings-transaction-start *backend*))
+        (previous-path (session-search-path)))
     (when settings
       (setf (backend-settings *backend*) settings
             (backend-settings-transaction-start *backend*) nil)
       (send-parameter-status stream "TimeZone"
-                             (or (gethash "timezone" settings) "UTC")))))
+                             (or (gethash "timezone" settings) "UTC"))
+      (unless (string= previous-path (session-search-path))
+        (send-parameter-status stream "search_path" (session-search-path))))))
 
 (defun command-begin (stream ast)
   (if (eq (backend-state *backend*) :idle)
@@ -534,7 +550,7 @@ rolled back immediately."
   (member name '("transaction_isolation" "server_version"
                  "server_version_num" "client_encoding" "server_encoding"
                  "timezone" "datestyle" "standard_conforming_strings"
-                 "is_superuser")
+                 "is_superuser" "search_path")
           :test #'string=))
 
 (defun valid-timezone-value-p (value)
@@ -584,6 +600,8 @@ rolled back immediately."
                       (t :default))
                     raw-value)))
     (cond
+      ((string= name "search_path")
+       (set-session-search-path (if (eq raw-value :default) +null+ value)))
       ((getf ast :transaction-options-p)
        (exec-set-transaction (getf ast :transaction-options)))
       ;; Session characteristics set defaults for future transactions. This
@@ -667,7 +685,9 @@ rolled back immediately."
 (defun exec-reset (stream ast)
   (let ((name (string-downcase (getf ast :name))))
     (cond
+      ((string= name "search_path") (set-session-search-path +null+))
       ((string= name "all")
+       (set-session-search-path +null+)
        (clrhash (backend-settings *backend*))
        (send-parameter-status stream "TimeZone" "UTC"))
       ((string= name "timezone")
@@ -694,6 +714,7 @@ rolled back immediately."
                      (:read-committed "read committed")
                      (:repeatable-read "repeatable read")))
                   ((string= name "server_version") *server-version*)
+                  ((string= name "search_path") (session-search-path))
                   ((string= name "server_version_num")
                    (princ-to-string *server-version-num*))
                   ((string= name "client_encoding") "UTF8")
@@ -880,7 +901,7 @@ before this removal horizon is captured."
       (setf db (current-database)
             relations
             (mapcar (lambda (name)
-                      (let ((class (gethash name (database-tables db))))
+                      (let ((class (lookup-sql-user-relation name)))
                         (unless (or class if-exists)
                           (ereport "42P01" "table \"~a\" does not exist" name))
                         (cons name class)))
@@ -1288,7 +1309,7 @@ before this removal horizon is captured."
          (table nil))
     (with-write-lock
       (setf db (current-database)
-            table (lookup-table name)))
+            table (lookup-sql-user-relation name)))
     (unless table
       (if (getf ast :if-exists)
           (progn
@@ -1368,7 +1389,8 @@ before this removal horizon is captured."
 
 (defun execute-in-transaction (stream ast)
   (let ((implicit (not (backend-explicit *backend*)))
-        (logical-ddl-responses nil))
+        (logical-ddl-responses nil)
+        (copy-row-count nil))
     (when (and (backend-read-only *backend*)
                (member (getf ast :type)
                        '(:insert :update :delete :truncate :create-table :drop-table
@@ -1378,11 +1400,14 @@ before this removal horizon is captured."
     (when (and (catalog-change-p ast) (backend-explicit *backend*))
       (ereport "0A000"
                "catalog changes are not supported inside an explicit transaction block"))
+    (when (member (getf ast :type) '(:create-table :create-sequence))
+      (ensure-sql-creation-schema))
     (with-statement-snapshot (snap #'statement-start)
       (handler-case
           (flet ((execute-body ()
                    (case (getf ast :type)
                      (:select (exec-select stream ast))
+                     (:copy-to (setf copy-row-count (exec-copy-to stream ast)))
                      (:explain (exec-explain stream ast))
                      (:analyze (exec-analyze stream ast))
                      (:insert (exec-insert stream ast))
@@ -1441,14 +1466,19 @@ before this removal horizon is captured."
               (error e)
               (progn
                 (if implicit
-                    (abort-transaction)
-                    (set-backend-state *backend* :aborted))
+                    (progn
+                      (abort-transaction)
+                      (restore-session-settings stream))
+                    (abort-transaction-block))
                 (error e))))))
     ;; postgres.c:exec_simple_query commits before EndCommand reports success.
     (when implicit
       (if logical-ddl-responses
           (commit-ddl-and-flush-responses logical-ddl-responses)
-          (commit-transaction)))))
+          (prog1 (commit-transaction)
+            (setf (backend-settings-transaction-start *backend*) nil))))
+    (when copy-row-count
+      (send-copy-command-complete stream copy-row-count))))
 
 (defun execute-statement (stream ast)
   (let ((type (getf ast :type)))

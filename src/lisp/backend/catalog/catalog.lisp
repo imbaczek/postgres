@@ -46,7 +46,8 @@
   oid name increment start-value min-value max-value last-value called-p)
 
 (defstruct pg-publication
-  name all-tables-p tables sequences generation)
+  oid name all-tables-p tables sequences generation
+  (publish-actions '(:insert :update :delete :truncate)))
 
 (defun pg-index-constraint-owned-p (index)
   "Return whether a table constraint depends on INDEX.
@@ -74,6 +75,17 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
   (databases (make-hash-table :test #'equal)))
 
 (defvar *catalog* nil)
+
+(defun catalog-system-identifier (&optional (catalog *catalog*))
+  "Stable protocol systemid: FNV-1a-64 of the durable UTF8 cluster identity.
+The projection is part of the protocol contract; preserve its constants and
+the original private cluster identity when loading or migrating catalogs."
+  (let ((hash #xCBF29CE484222325))
+    (loop for octet across (string->bytes (catalog-cluster-identity catalog))
+          do (setf hash (logand #xFFFFFFFFFFFFFFFF
+                                (* (logxor hash octet) #x100000001B3))))
+    hash))
+
 (defvar *catalog-identity-needs-persist-p* nil)
 (defvar *catalog-mutex* (sb-thread:make-mutex :name "pg catalog mutex"))
 (defvar *catalog-oldest-relfrozenxid* nil)
@@ -99,7 +111,8 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
 (defmacro define-catalog-codec (name constructor &body fields)
   "Define NAME-TO-SEXP and NAME-FROM-SEXP from explicit field mappings.
 
-Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
+Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE DEFAULT).
+DEFAULT applies only when the serialized key is absent, preserving explicit NIL."
   (let ((to-sexp (intern (format nil "~a-TO-SEXP" name) *package*))
         (from-sexp (intern (format nil "~a-FROM-SEXP" name) *package*)))
     `(progn
@@ -108,9 +121,9 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
           ,@(loop for field in fields
                   append
                   (destructuring-bind (key accessor constructor-key
-                                       &key encode decode)
+                                       &key encode decode default)
                       field
-                    (declare (ignore constructor-key decode))
+                    (declare (ignore constructor-key decode default))
                     `(,key
                       ,(if encode
                            `(funcall ,encode (,accessor object))
@@ -120,13 +133,13 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
           ,@(loop for field in fields
                   append
                   (destructuring-bind (key accessor constructor-key
-                                       &key encode decode)
+                                       &key encode decode default)
                       field
                     (declare (ignore accessor encode))
                     `(,constructor-key
                       ,(if decode
-                           `(funcall ,decode (getf sexp ,key))
-                           `(getf sexp ,key))))))))))
+                           `(funcall ,decode (getf sexp ,key ,default))
+                           `(getf sexp ,key ,default))))))))))
 
 (define-catalog-codec column make-pg-column
   (:name pg-column-name :name)
@@ -147,11 +160,14 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
   (:called pg-sequence-called-p :called-p))
 
 (define-catalog-codec publication make-pg-publication
+  (:oid pg-publication-oid :oid)
   (:name pg-publication-name :name)
   (:all-tables pg-publication-all-tables-p :all-tables-p)
   (:tables pg-publication-tables :tables)
   (:sequences pg-publication-sequences :sequences)
-  (:generation pg-publication-generation :generation))
+  (:generation pg-publication-generation :generation)
+  (:publish-actions pg-publication-publish-actions :publish-actions
+                    :default '(:insert :update :delete :truncate)))
 
 (define-catalog-codec column-statistics make-pg-column-statistics
   (:null-fraction pg-column-statistics-null-fraction :null-fraction)
@@ -393,12 +409,30 @@ Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE)."
   (prog1 (catalog-next-oid *catalog*)
     (incf (catalog-next-oid *catalog*))))
 
+(defun catalog-upgrade-publication-oids (catalog)
+  "Assign durable identities to legacy publications before admitting clients."
+  (let ((changed-p nil))
+    (dolist (database (sort (loop for db being the hash-values of (catalog-databases catalog)
+                                  collect db)
+                            #'string< :key #'database-name))
+      (dolist (publication
+               (sort (loop for pub being the hash-values of (database-publications database)
+                           collect pub)
+                     #'string< :key #'pg-publication-name))
+        (unless (pg-publication-oid publication)
+          (setf (pg-publication-oid publication) (catalog-next-oid catalog)
+                changed-p t)
+          (incf (catalog-next-oid catalog)))))
+    changed-p))
+
 (defun catalog-init ()
   (setf *catalog-identity-needs-persist-p* nil
         *catalog* (or (load-catalog) (make-catalog)))
+  (when (catalog-upgrade-publication-oids *catalog*)
+    (setf *catalog-identity-needs-persist-p* t))
   (when *catalog-identity-needs-persist-p*
-    ;; Persist the generated identity before a subscriber can save it as the
-    ;; publisher incarnation, so a restart never looks like a new publisher.
+    ;; Persist generated cluster/publication identities before any client can
+    ;; observe them, so restart retains the same publisher incarnation and OIDs.
     (save-catalog)
     (setf *catalog-identity-needs-persist-p* nil))
   (unless (gethash "postgres" (catalog-databases *catalog*))
@@ -568,14 +602,16 @@ longer contain transaction-status references."
         (pg-sequence-called-p sequence) (pg-sequence-called-p saved)))
 
 (defun catalog-mutation-restore-publication (publication saved)
-  (setf (pg-publication-name publication) (pg-publication-name saved)
+  (setf (pg-publication-oid publication) (pg-publication-oid saved)
+        (pg-publication-name publication) (pg-publication-name saved)
         (pg-publication-all-tables-p publication)
         (pg-publication-all-tables-p saved)
         (pg-publication-tables publication) (pg-publication-tables saved)
         (pg-publication-sequences publication)
         (pg-publication-sequences saved)
         (pg-publication-generation publication)
-        (pg-publication-generation saved)))
+        (pg-publication-generation saved)
+        (pg-publication-publish-actions publication) (pg-publication-publish-actions saved)))
 
 (defun catalog-restore-mutation-snapshot (snapshot)
   (let ((database (catalog-mutation-snapshot-database snapshot)))
@@ -927,6 +963,7 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
         :name (pg-publication-name publication)
         :all-tables (pg-publication-all-tables-p publication)
         :generation (pg-publication-generation publication)
+        :publish-actions (copy-list (pg-publication-publish-actions publication))
         :tables (if (pg-publication-all-tables-p publication)
                     (mapcar (lambda (name)
                               (list :name name

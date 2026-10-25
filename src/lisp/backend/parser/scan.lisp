@@ -3,12 +3,30 @@
 (in-package #:pg)
 
 (defstruct token
+  quoted-p
   kind     ; :ident | :string | :integer | :op | :punct | :eof
   value
   pos)
 
 (defun scan-error (message pos)
   (ereport "42601" message :position (1+ pos)))
+
+(defun scan-quoted-text (sql start delimiter)
+  "Return quoted contents and the next position, accepting doubled delimiters."
+  (let ((position (1+ start))
+        (buffer (make-array 0 :adjustable t :fill-pointer 0 :element-type 'character)))
+    (loop
+      (when (>= position (length sql))
+        (scan-error (if (char= delimiter #\') "unterminated quoted string"
+                        "unterminated quoted identifier") start))
+      (let ((character (char sql position)))
+        (incf position)
+        (if (char= character delimiter)
+            (if (and (< position (length sql))
+                     (char= (char sql position) delimiter))
+                (progn (vector-push-extend delimiter buffer) (incf position))
+                (return (values (coerce buffer 'string) position)))
+            (vector-push-extend character buffer))))))
 
 (defun tokenize (sql)
   (let ((i 0)
@@ -71,51 +89,15 @@
                                  :value (parse-integer sql :start start :end i)
                                  :pos start)
                      out)))
-            ((char= c #\')
+            ((member c '(#\' #\"))
              (let ((start i))
-               (incf i)
-               (let ((buf (make-array 0 :adjustable t :fill-pointer 0
-                                        :element-type 'character)))
-                 (loop
-                   (when (>= i n)
-                     (scan-error "unterminated quoted string" start))
-                   (let ((ch (char sql i)))
-                     (cond
-                       ((char= ch #\')
-                        (incf i)
-                        (if (and (< i n) (char= (char sql i) #\'))
-                            (progn (vector-push-extend #\' buf) (incf i))
-                            (return)))
-                       (t
-                        (vector-push-extend ch buf)
-                        (incf i)))))
-                 (push (make-token :kind :string
-                                   :value (coerce buf 'string)
-                                   :pos start)
+               (multiple-value-bind (value next) (scan-quoted-text sql start c)
+                 (setf i next)
+                 (push (make-token :kind (if (char= c #\') :string :ident)
+                                   :quoted-p (char= c #\")
+                                   :value value :pos start)
                        out))))
-            ((char= c #\")
-             (let ((start i))
-               (incf i)
-               (let ((buf (make-array 0 :adjustable t :fill-pointer 0
-                                        :element-type 'character)))
-                 (loop
-                   (when (>= i n)
-                     (scan-error "unterminated quoted identifier" start))
-                   (let ((ch (char sql i)))
-                     (cond
-                       ((char= ch #\")
-                        (incf i)
-                        (if (and (< i n) (char= (char sql i) #\"))
-                            (progn (vector-push-extend #\" buf) (incf i))
-                            (return)))
-                       (t
-                        (vector-push-extend ch buf)
-                        (incf i)))))
-                 (push (make-token :kind :ident
-                                   :value (coerce buf 'string)
-                                   :pos start)
-                       out))))
-            ((member c '(#\( #\) #\, #\; #\.))
+            ((member c '(#\( #\) #\[ #\] #\, #\; #\.))
              (push (make-token :kind :punct :value (string c) :pos i) out)
              (incf i))
             ((member c '(#\= #\< #\> #\! #\+ #\- #\* #\/ #\% #\:))

@@ -458,26 +458,28 @@
   (values))
 
 (defmacro with-query-temp-files (&body body)
-  "Delete every query-local spill file, including files from failed execution."
-  `(let* ((*query-temp-files* nil)
-          (*query-temp-file-scope-active-p* t)
-          (*query-temp-scope-directory* nil)
-          (*query-temp-quota* (or *query-temp-quota*
-                                  (make-query-temp-quota
-                                   *query-temp-file-limit-bytes*))))
-     (unwind-protect
-          (progn ,@body)
-       (dolist (pathname *query-temp-files*)
-         (multiple-value-bind (deleted-p condition)
-             (ignore-errors (unlink-query-temp-file pathname))
-           (declare (ignore condition))
-           (when deleted-p
-             (forget-query-temp-file-space pathname))))
-       (when (and *query-temp-scope-directory* (null *query-temp-directory*))
-         (ignore-errors
-          (uiop:delete-directory-tree *query-temp-scope-directory*
-                                      :validate t
-                                      :if-does-not-exist :ignore))))))
+  "Own spill files at the outermost scope, including allocations by callbacks."
+  `(if *query-temp-file-scope-active-p*
+       (progn ,@body)
+       (let* ((*query-temp-files* nil)
+              (*query-temp-file-scope-active-p* t)
+              (*query-temp-scope-directory* nil)
+              (*query-temp-quota* (or *query-temp-quota*
+                                      (make-query-temp-quota
+                                       *query-temp-file-limit-bytes*))))
+         (unwind-protect
+              (progn ,@body)
+           (dolist (pathname *query-temp-files*)
+             (multiple-value-bind (deleted-p condition)
+                 (ignore-errors (unlink-query-temp-file pathname))
+               (declare (ignore condition))
+               (when deleted-p
+                 (forget-query-temp-file-space pathname))))
+           (when (and *query-temp-scope-directory* (null *query-temp-directory*))
+             (ignore-errors
+              (uiop:delete-directory-tree *query-temp-scope-directory*
+                                          :validate t
+                                          :if-does-not-exist :ignore)))))))
 
 (defun query-temp-file-pathname ()
   (let* ((sequence (next-query-temp-sequence))
@@ -553,6 +555,9 @@
 (defun query-spill-value-size (value)
   "Estimate retained row memory without building its printed representation."
   (cond
+    ((sql-record-p value)
+     (+ 64 (query-spill-value-size (sql-record-fields value))
+        (query-spill-value-size (sql-record-values value))))
     ((stringp value)
      (+ 40 (* 4 (length value))))
     ((and (vectorp value) (typep value '(vector (unsigned-byte 8))))
@@ -579,6 +584,9 @@
 
 (defun query-spill-decode (value)
   (cond
+    ((and (consp value) (eq (first value) :pg-query-spill-record))
+     (make-sql-record :fields (query-spill-decode (second value))
+                      :values (query-spill-decode (third value))))
     ((and (consp value) (eq (first value) :pg-query-spill-vector))
      (let* ((element-type (second value))
             (elements (third value)))
@@ -602,6 +610,12 @@
 
 (defun query-spill-write-value (stream value)
   (cond
+    ((sql-record-p value)
+     (write-string "(:pg-query-spill-record " stream)
+     (query-spill-write-value stream (sql-record-fields value))
+     (write-char #\Space stream)
+     (query-spill-write-value stream (sql-record-values value))
+     (write-char #\) stream))
     ((stringp value)
      (write value :stream stream))
     ((vectorp value)

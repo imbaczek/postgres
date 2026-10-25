@@ -190,7 +190,7 @@ result set. This is used by the initial copy so its memory bound is the worker's
              (declare (ignore end))
              (setf tag value)))
           (#\E (setf server-error (pg-client-error-from-payload payload)))
-          (#\N nil)
+          ((#\N #\S) nil)
           (#\Z
            (when server-error (error server-error))
            (return (values (nreverse rows) columns tag)))

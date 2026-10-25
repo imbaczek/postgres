@@ -9,8 +9,9 @@
 (defconstant +cancel-request-code+ 80877102)       ; 1234,5678
 
 ;;; Reported server version.
-(defparameter *server-version* "16.0")
-(defparameter *server-version-num* 160000)
+(defparameter *server-version* "20devel")
+
+(defparameter *server-version-num* 200000)
 
 ;;; Type OIDs.
 (defconstant +booloid+ 16)

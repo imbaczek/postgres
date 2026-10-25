@@ -39,8 +39,17 @@
 (defstruct wal-replication-slot
   name database-oid restart-lsn consistent-lsn confirmed-flush-lsn active-owner
   active-owner-backend
+  ;; PGSLOT1-3 were the private protocol even though the old wire name was pgoutput.
+  (plugin "pg_lisp")
   (pending-xids (make-hash-table :test #'eql))
   (wal-status :reserved))
+
+(defun wal-valid-slot-plugin-state-p (plugin database-oid confirmed-flush-lsn)
+  "A standard slot must be database-bound and confirmed in its first durable image."
+  (and (stringp plugin)
+       (member plugin '("pg_lisp" "pgoutput") :test #'string=)
+       (or (string= plugin "pg_lisp")
+           (and database-oid confirmed-flush-lsn))))
 
 (defvar *wal-lock* (sb-thread:make-mutex :name "pg wal and page cache lock"))
 (defvar *wal-page-cache* (make-hash-table :test #'equal))
@@ -749,6 +758,28 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
                 (remhash key contributors))))))))
   (values))
 
+(defun postgres-current-timestamp ()
+  "Microseconds since PostgreSQL's 2000-01-01 epoch, as GetCurrentTimestamp."
+  (multiple-value-bind (seconds microseconds) (sb-ext:get-time-of-day)
+    (+ (* (- seconds 946684800) 1000000) microseconds)))
+
+(defun wal-encode-commit-timestamp (timestamp)
+  (unless (and (integerp timestamp) (<= (- (ash 1 63)) timestamp (1- (ash 1 63))))
+    (error "invalid WAL commit timestamp"))
+  (let ((payload (make-array 8 :element-type '(unsigned-byte 8))))
+    (dotimes (index 8 payload)
+      (setf (aref payload index) (ldb (byte 8 (* index 8)) timestamp)))))
+
+(defun wal-decode-commit-timestamp (payload)
+  ;; Earlier commit records have an empty payload. An eight-byte payload adds
+  ;; signed microseconds without changing the record header or row-change codec.
+  (case (length payload)
+    (0 nil)
+    (8 (let ((value (loop for index below 8
+                          sum (ash (aref payload index) (* index 8)))))
+         (if (logbitp 63 value) (- value (ash 1 64)) value)))
+    (otherwise (error "WAL commit record has an invalid payload"))))
+
 (defun wal-commit-transaction (xid after-durable-function &optional logical-changes)
   "Flush page images, LOGICAL-CHANGES, and XID's commit as one WAL boundary."
   (unless *wal-ready*
@@ -771,7 +802,7 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
       (wal-test-pause :after-page-images)
       (let ((commit-lsn
               (wal-append-record +wal-record-commit+ xid
-                                 (make-array 0 :element-type '(unsigned-byte 8)))))
+                                 (wal-encode-commit-timestamp (postgres-current-timestamp)))))
         (wal-flush)
         (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn))
       (wal-test-pause :after-wal-flush)
@@ -1402,8 +1433,7 @@ src/backend/access/transam/xlogreader.c."
                       (= (+ 8 (wal-u32 payload 4)) (length payload)))
            (error "logical catalog event has an invalid payload"))))
       (#.+wal-record-commit+
-       (unless (zerop (length (wal-record-payload record)))
-         (error "WAL commit record has an invalid payload"))
+       (wal-decode-commit-timestamp (wal-record-payload record))
        (wal-recovery-validate-logical-terminal
         :commit (wal-record-xid record))
        (wal-replay-finish-batch
@@ -1499,29 +1529,26 @@ src/backend/access/transam/xlogreader.c."
          (database-oid (wal-replication-slot-database-oid slot))
          (restart-lsn (wal-replication-slot-restart-lsn slot))
          (consistent-lsn (wal-replication-slot-consistent-lsn slot))
-         (confirmed-flush-lsn
-           (wal-replication-slot-confirmed-flush-lsn slot))
-         (wal-status (wal-replication-slot-wal-status slot)))
+         (confirmed-flush-lsn (wal-replication-slot-confirmed-flush-lsn slot))
+         (wal-status (wal-replication-slot-wal-status slot))
+         (plugin (wal-replication-slot-plugin slot)))
     (unless (and (wal-valid-replication-slot-name-p name)
+                 (wal-valid-slot-plugin-state-p plugin database-oid confirmed-flush-lsn)
                  (or (null database-oid)
-                     (and (integerp database-oid)
-                          (<= 1 database-oid #xFFFFFFFF)))
-                 (integerp restart-lsn) (<= 0 restart-lsn #xFFFFFFFFFFFFFFFF)
-                 (integerp consistent-lsn)
-                 (<= 0 consistent-lsn #xFFFFFFFFFFFFFFFF)
+                     (and (integerp database-oid) (<= 1 database-oid #xffffffff)))
+                 (integerp restart-lsn) (<= 0 restart-lsn #xffffffffffffffff)
+                 (integerp consistent-lsn) (<= 0 consistent-lsn #xffffffffffffffff)
                  (or (null confirmed-flush-lsn)
                      (and (integerp confirmed-flush-lsn)
-                          (<= consistent-lsn confirmed-flush-lsn
-                              #xFFFFFFFFFFFFFFFF)
+                          (<= consistent-lsn confirmed-flush-lsn #xffffffffffffffff)
                           (<= restart-lsn confirmed-flush-lsn)))
                  (or confirmed-flush-lsn (<= restart-lsn consistent-lsn))
                  (member wal-status '(:reserved :lost)))
       (error "invalid WAL replication slot state ~s" slot))
-    (let* ((prefix (format nil "PGSLOT3 ~a ~a ~a ~a ~a ~a"
-                           name (or database-oid "-")
-                           restart-lsn consistent-lsn
+    (let* ((prefix (format nil "PGSLOT4 ~a ~a ~a ~a ~a ~a ~a"
+                           name (or database-oid "-") restart-lsn consistent-lsn
                            (or confirmed-flush-lsn "-")
-                           (string-downcase (symbol-name wal-status))))
+                           (string-downcase (symbol-name wal-status)) plugin))
            (crc (wal-crc32 (string->bytes prefix))))
       (string->bytes (format nil "~a ~8,'0X~%" prefix crc)))))
 
@@ -1557,88 +1584,56 @@ src/backend/access/transam/xlogreader.c."
   (with-open-file (stream path :direction :input)
     (let* ((line (read-line stream nil nil))
            (fields (and line (wal-split-fields line)))
-           (version (and fields (first fields)))
-           (legacy-v1-p (and version (string= version "PGSLOT1")))
-           (legacy-v2-p (and version (string= version "PGSLOT2")))
-           (version-ok-p (or legacy-v1-p legacy-v2-p
-                             (and version (string= version "PGSLOT3"))))
-           (expected-count (cond (legacy-v1-p 5)
-                                 (legacy-v2-p 7)
-                                 (t 8)))
-           (database-index (if (string= (or version "") "PGSLOT3") 2 nil))
+           (version (first fields))
+           (legacy-v1-p (equal version "PGSLOT1"))
+           (legacy-v2-p (equal version "PGSLOT2"))
+           (v3-p (equal version "PGSLOT3"))
+           (v4-p (equal version "PGSLOT4"))
+           (expected-count (cond (legacy-v1-p 5) (legacy-v2-p 7) (v3-p 8) (v4-p 9)))
+           (database-index (when (or v3-p v4-p) 2))
            (restart-index (if database-index 3 2))
            (consistent-index (1+ restart-index))
-           (confirmed-index (and (not legacy-v1-p) (+ restart-index 2)))
-           (status-index (and (not legacy-v1-p) (+ restart-index 3)))
-           (crc-index (if legacy-v1-p 4 (+ restart-index 4))))
-      (unless (and version-ok-p (= (length fields) expected-count)
+           (confirmed-index (unless legacy-v1-p (+ restart-index 2)))
+           (status-index (unless legacy-v1-p (+ restart-index 3))))
+      (unless (and expected-count (= (length fields) expected-count)
                    (every (lambda (field) (plusp (length field))) fields)
                    (null (read-line stream nil nil)))
         (error "replication slot file ~a is malformed" path))
       (let* ((name (second fields))
-             (database-text (and database-index (nth database-index fields)))
-             (database-oid (and database-text (not (string= database-text "-"))
-                                (ignore-errors (parse-integer database-text))))
-             (database-field-valid-p
-               (or (null database-index)
-                   (string= database-text "-")
-                   (and database-oid
-                        (<= 1 database-oid #xFFFFFFFF))))
-             (restart-text (nth restart-index fields))
-             (consistent-text (nth consistent-index fields))
-             (confirmed-text (and confirmed-index (nth confirmed-index fields)))
-             (restart-lsn (ignore-errors (parse-integer restart-text)))
-             (consistent-lsn (ignore-errors (parse-integer consistent-text)))
-             (confirmed-flush-lsn
-               (and confirmed-text (not (string= confirmed-text "-"))
-                    (ignore-errors (parse-integer confirmed-text))))
-             (wal-status (if legacy-v1-p :reserved
-                             (cond ((string= (nth status-index fields) "reserved") :reserved)
-                                   ((string= (nth status-index fields) "lost") :lost)
-                                   (t nil))))
-             (crc-field (nth crc-index fields))
-             (crc (ignore-errors (parse-integer crc-field :radix 16)))
-             (prefix (cond
-                       (legacy-v1-p
-                        (format nil "PGSLOT1 ~a ~a ~a"
-                                name restart-text consistent-text))
-                       (legacy-v2-p
-                        (format nil "PGSLOT2 ~a ~a ~a ~a ~a"
-                                name restart-text consistent-text
-                                confirmed-text (nth status-index fields)))
-                       (t
-                        (format nil "PGSLOT3 ~a ~a ~a ~a ~a ~a"
-                                name database-text restart-text consistent-text
-                                confirmed-text (nth status-index fields)))))
-             (slot (make-wal-replication-slot
-                    :name name :database-oid database-oid
-                    :restart-lsn restart-lsn
-                    :consistent-lsn consistent-lsn
-                    :confirmed-flush-lsn confirmed-flush-lsn
-                    :wal-status wal-status)))
+             (database-text (when database-index (nth database-index fields)))
+             (database-oid (when (and database-text (not (string= database-text "-")))
+                             (ignore-errors (parse-integer database-text))))
+             (database-valid-p (or (null database-index) (string= database-text "-")
+                                   (and database-oid (<= 1 database-oid #xffffffff))))
+             (restart-lsn (ignore-errors (parse-integer (nth restart-index fields))))
+             (consistent-lsn (ignore-errors (parse-integer (nth consistent-index fields))))
+             (confirmed-text (when confirmed-index (nth confirmed-index fields)))
+             (confirmed-flush-lsn (when (and confirmed-text (not (string= confirmed-text "-")))
+                                    (ignore-errors (parse-integer confirmed-text))))
+             (status-text (if legacy-v1-p "reserved" (nth status-index fields)))
+             (wal-status (cond ((string= status-text "reserved") :reserved)
+                               ((string= status-text "lost") :lost)))
+             ;; Every older format was the private extension protocol.
+             (plugin (if v4-p (nth 7 fields) "pg_lisp"))
+             (prefix (format nil "~{~a~^ ~}" (butlast fields)))
+             (crc (ignore-errors (parse-integer (car (last fields)) :radix 16))))
         (unless (and (wal-valid-replication-slot-name-p name)
                      (string= name (pathname-name path))
-                     restart-lsn consistent-lsn crc
-                     wal-status
-                     database-field-valid-p
-                     (or legacy-v1-p (string= confirmed-text "-")
-                         confirmed-flush-lsn)
-                     (or (null database-oid)
-                         (<= 1 database-oid #xFFFFFFFF))
-                     (<= 0 restart-lsn *wal-durable-lsn* #xFFFFFFFFFFFFFFFF)
-                     (<= 0 consistent-lsn *wal-durable-lsn*
-                         #xFFFFFFFFFFFFFFFF)
+                     restart-lsn consistent-lsn crc wal-status database-valid-p
+                     (or legacy-v1-p (string= confirmed-text "-") confirmed-flush-lsn)
+                     (wal-valid-slot-plugin-state-p plugin database-oid confirmed-flush-lsn)
+                     (<= 0 restart-lsn *wal-durable-lsn* #xffffffffffffffff)
+                     (<= 0 consistent-lsn *wal-durable-lsn* #xffffffffffffffff)
                      (or (null confirmed-flush-lsn)
-                         (<= consistent-lsn confirmed-flush-lsn
-                             *wal-durable-lsn*))
-                     (or (null confirmed-flush-lsn)
-                         (<= restart-lsn confirmed-flush-lsn))
-                     (or confirmed-flush-lsn
-                         (<= restart-lsn consistent-lsn))
+                         (and (<= consistent-lsn confirmed-flush-lsn *wal-durable-lsn*)
+                              (<= restart-lsn confirmed-flush-lsn)))
+                     (or confirmed-flush-lsn (<= restart-lsn consistent-lsn))
                      (= crc (wal-crc32 (string->bytes prefix))))
-          (error "replication slot file ~a is corrupt or outside durable WAL"
-                 path))
-        slot))))
+          (error "replication slot file ~a is corrupt or outside durable WAL" path))
+        (make-wal-replication-slot
+         :name name :database-oid database-oid :restart-lsn restart-lsn
+         :consistent-lsn consistent-lsn :confirmed-flush-lsn confirmed-flush-lsn
+         :wal-status wal-status :plugin plugin)))))
 
 (defun wal-validate-replication-slot-wal (slot segments)
   (let ((restart-lsn (wal-replication-slot-restart-lsn slot)))
@@ -1750,10 +1745,11 @@ src/backend/access/transam/xlogreader.c."
              pending)
     restart-lsn))
 
-(defun wal-persist-replication-slot-ack-under-lock (slot acknowledged-lsn)
+(defun wal-persist-replication-slot-ack-under-lock (slot acknowledged-lsn
+                                                    &optional (restart-floor acknowledged-lsn))
   "Persist an already-validated slot acknowledgment while *WAL-LOCK* is held."
   (let* ((pending (wal-slot-pending-after-ack slot acknowledged-lsn))
-         (restart-lsn (wal-slot-restart-for-ack acknowledged-lsn pending))
+         (restart-lsn (wal-slot-restart-for-ack restart-floor pending))
          (candidate (copy-wal-replication-slot slot)))
     (setf (wal-replication-slot-confirmed-flush-lsn candidate) acknowledged-lsn
           (wal-replication-slot-restart-lsn candidate) restart-lsn
