@@ -28,6 +28,9 @@ spinning at full speed while it retries."
       nil)))
 
 (defun socket->stream (sock)
+  ;; Match C pq_init: avoid delayed ACK/Nagle stalls between small result frames.
+  (when (typep sock 'sb-bsd-sockets:inet-socket)
+    (setf (sb-bsd-sockets:sockopt-tcp-nodelay sock) t))
   ;; A small send buffer lets logical-replication fault tests exercise the
   ;; blocking-write case without constructing multi-megabyte row transactions.
   (let ((send-buffer-text

@@ -63,7 +63,8 @@
                    (:file "client")
                    (:file "physical")
                    (:file "physical-store")
-                   (:file "physical-source")))
+                   (:file "physical-source")
+                   (:file "../postmaster/pidfile")))
      (:module "commands"
       :serial t
       :components ((:file "vacuum")
@@ -88,7 +89,15 @@
       :serial t
       :components ((:file "dest")
                    (:file "control")
+                   (:file "../replication/physical-bootstrap")
+                   (:file "../replication/physical-recovery")
+                   (:file "../access/transam/timeline")
+                   (:file "../replication/physical-history")
+                   (:file "../replication/physical-replay")
+                   (:file "../replication/physical-restartpoint")
                    (:file "../replication/protocol")
+                   (:file "../replication/physical-stream")
+                   (:file "../replication/physical-follow")
                    (:file "../replication/standard")
                    (:file "../replication/worker")
                    (:file "../replication/standard-subscriber")
