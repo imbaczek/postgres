@@ -310,6 +310,9 @@ must not run inside a handler either; the reloader thread polls the flag."
        (sb-thread:condition-broadcast *live-operation-cv*)))))
 
 (defun fence-live-operation-shutdown ()
+  "Permanently close admission and wait for admitted operations to leave.
+The caller is outside admission. Do not take over another quiescence owner's
+token; its later cleanup must also respect this terminal shutdown fence."
   (when (plusp *live-operation-depth*) (error "shutdown fence requires an unadmitted caller"))
   (call-with-live-operation-lock
    (lambda ()

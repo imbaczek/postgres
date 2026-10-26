@@ -1994,6 +1994,8 @@ src/backend/access/transam/xlogreader.c."
   (values))
 
 (defun wal-read-control-fields ()
+  "Read one bounded regular control image, returning NIL only when absent.
+Reject extra lines before decoding its CRC and checkpoint metadata."
   (let ((path (wal-control-path)))
     (handler-case
         (with-input-from-string
@@ -2009,6 +2011,8 @@ src/backend/access/transam/xlogreader.c."
           (error condition))))))
 
 (defun wal-save-control-fields (checkpoint-lsn durable-lsn)
+  "Save WAL positions and retain any known primary identity and lifecycle state.
+Refresh its modification time. Update memory only after atomic publication."
   (let ((metadata (when *wal-control-metadata*
                     (make-wal-control-metadata
                      (getf *wal-control-metadata* :system-id)

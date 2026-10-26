@@ -3,17 +3,97 @@
 Open development audits, including cold-image/load-order correctness, are tracked
 in [TODO.md](TODO.md).
 
-Status: durable native intake/bootstrap/recovery, continuous TCP receipt/reconnect,
-advancing source retention, explicit/automatic local restartpoints and Linux
-PGDATA/PID ownership and a startup/reload configuration subset are
-implemented, 2026-10-25. Pinned Patroni direct startup, process discovery,
-reload and stop plus a psycopg2 driver smoke test pass. Full physical-slot SQL/control,
-promotion, synchronous durability and remaining Patroni interfaces are unfinished.
-This is an implementation ledger, not a
-claim of physical replication support. Coordination is excluded; tests use
-manual control. Behavior oracle: the repository's original C PostgreSQL source.
+Status, 2026-10-26: native intake/bootstrap/recovery, continuous receipt/reconnect,
+advancing source retention, explicit/automatic local restartpoints, PGDATA/PID
+ownership, a startup/reload configuration subset and online promotion are
+implemented. Pinned Patroni's full promotion method now passes through native
+pg_ctl and pg_controldata, including its production-state wait. Child-history
+follow/rejoin, complete physical-slot interfaces, synchronous durability and
+remaining Patroni interfaces are unfinished. C physical WAL/disk compatibility
+remains future work. Coordination is excluded. The repository's original C
+source is the behavior oracle.
 
 ## Verified starting points
+
+### Native pg_controldata and durable primary lifecycle
+
+`bin/pg_controldata` now reads native control facts without starting storage,
+replaying WAL or changing PGDATA. Its labels and DB state strings follow pinned
+C `pg_controldata.c`. It reports identity, lifecycle state, control time,
+checkpoint start/redo/TLI/previous TLI, available checkpoint counters, applied
+recovery floor, block size and WAL segment size. Native control stores checkpoint
+ends; the utility reports starts, as C does. Unsupported checksum and rewind
+settings are omitted. Native storage remains incompatible with C utilities.
+
+Identity, state and Unix modification time extend the existing CRC-protected
+PGWAL6 image from eight fields to eleven. Flush, checkpoint and namespace
+migration preserve them. Older images remain readable; an unknown primary
+lifecycle is reported as `unrecognized status code`, never inferred from PID
+absence. Legacy identity comes from the saved catalog. Catalog reads allow the
+supported 1 GiB generation bound rather than the unrelated 16 MiB WAL limit.
+
+Startup marks a known primary `in crash recovery` before initializing storage.
+A committed child uses that state until initialization and recovery-trigger
+retirement finish, then publishes `in production`. Native `pg_ctl -w promote`
+requires production and removal of pending recovery control; an older child
+image without lifecycle metadata cannot satisfy the wait.
+
+Smart/fast shutdown follows C `ShutdownXLOG`/`CreateCheckPoint` ordering:
+`shutting down`, abandoned transaction/snapshot cleanup, synced checkpoint,
+then `shut down`. Fast backend teardown defers storage cleanup so it can finish
+while admission is closed. After all clients leave, MAIN takes reload exclusion
+and permanently fences admission before cleanup. An old quiescence owner cannot
+reopen that fence. Durable commits survive; unfinished transactions abort.
+Immediate shutdown does not publish clean state. After process death, the last
+published control remains authoritative, including a completed clean checkpoint.
+
+A standby uses recovery control's state/applied floor and the authenticated
+selected restartpoint's source checkpoint. Verified child control takes
+precedence over obsolete base, GEN and spool data. Inspection compares controls
+before and after validation and retries changes; generations are bound by the
+selected pointer and digest. Shared readers check descriptor type/size before
+allocation, reject final symlinks and open nonblocking to reject FIFOs. Startup's
+WAL-control read uses the same rule.
+
+Pinned Patroni 4.1.5's unchanged `Postgresql.promote`, `pg_ctl`, `controldata`,
+`_wait_promote`, `sysid` and `pg_control_timeline` methods pass with an isolated
+native-node fixture and no DCS. At child-control publication and pending-control
+retirement barriers, inspection reports crash recovery and Patroni keeps waiting.
+Removing retired GEN/spool data at the second barrier preserves that result.
+Only completed initialization reports production. Evidence:
+
+- Eight lifecycle/crash cases: `/tmp/pg-controldata-lifecycle.log`, artifacts
+  `/tmp/pg-control-data.pDdfyN`.
+- Two production-readiness barriers:
+  `/tmp/pg-controldata-production-boundary.log`, artifacts
+  `/tmp/pg-control-promote.dFYQd7`.
+- Ten invalid/special-file fixtures reject without changing storage:
+  `/tmp/pg-controldata-rejections.log`.
+- Full Patroni online method: `/tmp/pg-controldata-patroni-promote-real.log`,
+  artifacts `/tmp/pg-promotion-online.ZfGXyA`.
+- All 315 physical tests, 170 interop tests and 1,598 legacy checks pass, plus
+  shutdown, smoke, continuous follow, checkpoint, namespace migration, WAL crash
+  recovery, all 45 cold-promotion cases, both C/Lisp logical directions and all
+  three manual switchovers. Cold compile:
+  `/tmp/pg-controldata-final-compile.log`.
+- Metadata roundtrips: 100 property trials, seed 42, normal profile, declaration
+  digest `fnv1a64-v1:d028098defc29c0b`. Coverage/rejection counts are unmeasured;
+  this property does not test process durability.
+
+Design, checkpoint, full correctness, delta and refactoring reviews are complete.
+Findings fixed old-control readiness, selected-GEN file reads and the catalog
+size limit. Refactoring centralized startup/inspection file checks; no macro was
+warranted. Exact-profile creation hit the thread limit, so some reused review
+threads had unavailable model profiles. Documentation followed code gates; its
+separate review corrected the error-after-clean-publication wording.
+
+This closes the earlier online milestone's native utility gap. SQL
+`pg_promote(wait => true)` still needs admission-safe deferred waiting.
+Child-aware source/bootstrap/follow/rejoin, divergence rejection and safe reseed
+remain next. `PG_VERSION` still says 16 while the wire server reports 20devel;
+the full utility/version/configuration matrix needs reconciliation. Synchronous
+commit waits and an independent acknowledgment-loss oracle remain required.
+C rewind and C physical compatibility remain staged. No coordination is added.
 
 ### Timeline-qualified native WAL namespace
 
@@ -580,17 +660,18 @@ service limit. No further extraction was recommended; production functions stay
 below 120 lines. Source documentation followed code tests/reviews; its separate
 review corrected the utility entry point's description.
 
-`bin/pg_ctl` currently implements only native promote. Patroni's entire
-`Postgresql.promote()` path is not verified: its `_wait_promote` calls
-`pg_controldata`, which still needs a native implementation. SQL
+`bin/pg_ctl` currently implements only native promote. At this checkpoint,
+Patroni's entire promotion method was unverified. The later native pg_controldata
+milestone above closes that utility and wait gap. SQL
 `pg_promote(wait => true)` also remains open: the current SELECT path holds
 operation admission, so it needs a deferred wait that releases admission before
-the promotion worker can drain it. Implement both, then extend physical
+the promotion worker can drain it. Extend physical
 follow/rejoin to child histories with divergence rejection and safe reseed.
 Synchronous commit waits, the remaining Patroni interfaces and C physical
 compatibility remain in the full goal. No coordination is introduced. This
 section supersedes earlier milestone statements that public online requests are
-not implemented; the remaining SQL and utility gaps above are still real.
+not implemented. The SQL gap remains; the later utility milestone supersedes the
+utility gap recorded here.
 
 ### Committed child primary and automatic pending completion
 
@@ -1637,6 +1718,7 @@ remains unverified.
 | `config.py:_get_pg_settings`, `_read_recovery_params` | `name, setting, unit, vartype, context, sourcefile`; distinguishes restart-only from reloadable recovery changes | Real GUC registry and recovery config/restart semantics required |
 | `postmaster.py:_read_postmaster_pidfile`, `_is_postmaster_process` | Multi-line PID file, PGDATA, start time, port and listener metadata; PID reuse/start-time safety checks | Real v4.1.5 discovery/start-time rejection and signal_stop smoke pass with owned Linux PID file; full startup/config/shutdown lifecycle remains |
 | `postmaster.py:start` | Direct executable launch with `-D`, `--config-file=...` and options; process survives launcher | Real pinned direct start passes for the implemented configuration subset; complete generated configurations remain unsupported |
+| `Postgresql.promote`, `controldata`, `_wait_promote` | Native utility request, durable production-state wait, system identity and checkpoint timeline | Full pinned method passes with native pg_ctl/pg_controldata; DCS and complete utility/version matrix remain outside this acceptance |
 
 
 Primary references:
@@ -2821,6 +2903,9 @@ placeholder rollback. This preserves logical interoperability, not C physical
 WAL or disk compatibility.
 
 ## Promotion intake and history interfaces
+
+Historical intake below; the verified promotion milestones above supersede its
+original promotion and tool blockers.
 
 Promotion remains unimplemented. C `StartupXLOG`, `FinishWalRecovery`,
 `XLogInitNewTimeline` and `CreateEndOfRecoveryRecord` establish the ordering

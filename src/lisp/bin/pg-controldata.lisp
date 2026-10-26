@@ -1,4 +1,8 @@
 (require :asdf)
+
+;;;; Load the control-data formatter without starting the SQL server.
+;;;; Compilation output goes to stderr so stdout remains machine-readable.
+
 (in-package #:cl-user)
 
 (let ((base (merge-pathnames "../" (uiop:pathname-directory-pathname *load-truename*))))

@@ -1,11 +1,25 @@
+;;;; Native control inspection and primary lifecycle publication.
+;;;;
+;;;; The server records primary state in pg_wal_control. A standby instead uses
+;;;; its recovery control and the checkpoint in its selected restartpoint.
+;;;; A committed child control takes precedence over retired recovery files.
+;;;;
+;;;; Inspection never starts storage or repairs files. It validates a stable
+;;;; set of controls and reports the native facts with pg_controldata's labels.
+;;;; See C pg_controldata.c and xlog.c for the output and lifecycle ordering.
+
 (in-package #:pg)
 
 (defvar *native-control-test-hook* nil)
 
 (defun native-control-test-point (point)
+  "Call the optional test hook at a control publication boundary."
   (when *native-control-test-hook* (funcall *native-control-test-hook* point)))
 
 (defun wal-mark-primary-startup ()
+  "Mark an existing primary unclean before storage startup can change files.
+Retain its checkpoint and identity. Legacy controls have no lifecycle state;
+leave that state unknown until successful initialization publishes production."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-id namespace metadata)
       (wal-read-control-fields)
     (when metadata
@@ -21,6 +35,9 @@
   (values))
 
 (defun wal-set-primary-state (state)
+  "Publish STATE with the initialized catalog's system identifier.
+Hold the WAL lock across publication. Install the in-memory metadata only after
+the durable control write succeeds; an existing identity must match the catalog."
   (prevent-recovery-primary-operation "primary control publication")
   (unless (and *wal-ready* *catalog*) (error "primary storage has not been initialized"))
   (let ((system-id (catalog-system-identifier)))
@@ -35,6 +52,8 @@
   (values))
 
 (defun wal-note-primary-ready ()
+  "Publish production after primary initialization and promotion cleanup.
+The caller must finish those steps before calling this function."
   (unless (and *wal-control-metadata*
                (= +db-in-production+ (getf *wal-control-metadata* :db-state))
                (= (catalog-system-identifier) (getf *wal-control-metadata* :system-id)))
@@ -42,6 +61,11 @@
   (values))
 
 (defun prepare-primary-shutdown ()
+  "Finish smart or fast shutdown in the owning postmaster, outside admission.
+Clients must already be gone. Serialize with reload, close admission permanently,
+retire abandoned transactions, then sync a checkpoint before recording clean
+shutdown. An error keeps admission closed. Do not roll back a possibly
+published clean state."
   (unless (and *postmaster-data-lock* (postmaster-pid-owned-p)
                *shutdown-finalizing-p* (zerop *live-operation-depth*))
     (error "primary shutdown requires the owning unadmitted postmaster"))
@@ -57,11 +81,16 @@
   (values))
 
 (defun native-control-optional-bytes (path)
+  "Return bounded regular-file bytes, or NIL only when PATH is absent.
+A present file with invalid type, size or access permissions is an error."
   (handler-case (physical-promotion-read-file path)
     (sb-posix:syscall-error (condition)
       (unless (= sb-posix:enoent (sb-posix:syscall-errno condition)) (error condition)))))
 
 (defun native-control-capture ()
+  "Read the controls that select the current native role and checkpoint.
+Keep their bytes for the stability check. A committed child no longer depends
+on the old base manifest or restartpoint pointer."
   (let* ((wal (native-control-optional-bytes (wal-control-path)))
          (insertion (and wal (nth-value 3 (wal-decode-control-line (bytes->string wal)))))
          (recovery (native-control-optional-bytes (physical-recovery-control-path)))
@@ -74,6 +103,9 @@
             (native-control-optional-bytes (physical-restartpoint-pointer-path))))))
 
 (defun native-control-catalog-system-id ()
+  "Recover a legacy primary's identifier from its saved catalog identity.
+Read the catalog without initialization or reader evaluation. Its size bound
+matches the supported restartpoint generation bound rather than a WAL segment."
   (let* ((bytes (read-bounded-regular-file (catalog-path) (ash 1 30) :minimum 1))
          (image (physical-history-read-catalog bytes))
          (identity (getf image :cluster-identity)))
@@ -82,6 +114,9 @@
     (catalog-system-identifier (make-catalog :cluster-identity identity))))
 
 (defun native-control-recovery-checkpoint (control snapshot)
+  "Select the latest authenticated source checkpoint for a standby.
+Verify the base manifest and selected generation, and reject a restartpoint
+ahead of durable applied progress. Use the base copy when no newer copy exists."
   (multiple-value-bind (manifest digest) (recovery-read-manifest *pgdata*)
     (recovery-check-manifest-schema manifest)
     (unless (and (every (lambda (key) (eql (getf control key) (getf manifest key)))
@@ -95,6 +130,10 @@
       (or (getf metadata :source-checkpoint) snapshot))))
 
 (defun native-control-facts (capture)
+  "Validate CAPTURE and return the facts used by native pg_controldata.
+A verified child control wins over obsolete recovery metadata. A standby takes
+its state and applied floor from recovery control. Report checkpoint starts,
+although native WAL control stores checkpoint ends."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-id namespace metadata)
       (wal-decode-control-line (bytes->string (first capture)))
     (declare (ignore durable namespace))
@@ -131,6 +170,9 @@
             :recovery-lsn recovery-lsn :recovery-timeline recovery-timeline))))
 
 (defun native-control-read (directory)
+  "Read coherent control facts without starting storage or changing PGDATA.
+Compare controls before and after validation, retrying when publication changed
+them. Immutable generations are bound by the selected pointer and digest."
   (let ((*pgdata* (uiop:ensure-directory-pathname (truename directory))))
     (loop repeat 8
           for capture = (native-control-capture)
@@ -144,6 +186,7 @@
     (error "native control files changed throughout inspection")))
 
 (defun native-control-time-text (unix-time)
+  "Format Unix seconds in local time, or return ??? for an unsupported time."
   (handler-case
       (multiple-value-bind (second minute hour day month year weekday)
           (decode-universal-time (+ unix-time 2208988800))
@@ -154,6 +197,9 @@
     (error () "???")))
 
 (defun native-control-data-rows (facts)
+  "Return supported native facts under C pg_controldata's field names.
+Omit fields the native format does not establish, including rewind settings
+and checksum versions. A legacy primary's unknown lifecycle stays unknown."
   (let* ((snapshot (getf facts :snapshot))
          (timeline (or (getf snapshot :timeline) (getf facts :checkpoint-timeline)))
          (redo (or (getf snapshot :redo) (getf facts :checkpoint)))
@@ -191,6 +237,7 @@
     (nreverse rows)))
 
 (defun native-controldata-directory (arguments)
+  "Resolve the supported -D options, positional directory and PGDATA fallback."
   (let ((directory nil) (operands nil) (options t))
     (loop while arguments
           for argument = (pop arguments)
@@ -212,6 +259,8 @@
     (or directory (uiop:getenv "PGDATA") (error "no data directory specified"))))
 
 (defun native-controldata-main (arguments &optional (output *standard-output*) (errors *error-output*))
+  "Print native control data and return a process exit code.
+Inspection must not initialize or repair the cluster."
   (handler-case
       (cond
         ((member (first arguments) '("--help" "-?") :test #'equal)

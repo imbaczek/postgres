@@ -184,10 +184,12 @@ Parent segments are never selected. Sync the WAL directory after removals."
     (when orphans (fsync-directory (wal-directory)))))
 
 (defun physical-promotion-save-child-control (plan)
-  "Atomically replace PGWAL6 with the planned child checkpoint and durable end.
+  "Atomically commit the planned child checkpoint and durable end in PGWAL6.
 The caller must already have synced all referenced WAL and database files.
 Once this image survives, startup must recover the child even if later cleanup
-fails. Do not restore parent control on an error after the rename."
+fails. Do not restore parent control on an error after the rename.
+Use crash-recovery state until primary initialization and trigger retirement
+finish; a durable child is not yet a production-ready postmaster."
   (let ((snapshot (getf plan :snapshot)) (child (getf plan :child)) (end (getf plan :end)))
     (with-atomic-output
         (stream (wal-control-path) (merge-pathnames "global/pg_wal_control.tmp" *pgdata*)

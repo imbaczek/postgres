@@ -10,6 +10,9 @@
 SB-POSIX does not export this flag in the supported SBCL.")
 
 (defun open-bounded-regular-file (path maximum &optional writable)
+  "Open PATH as a bounded regular file and return its stream and byte size.
+Check the opened descriptor before allocating a buffer. Do not follow a final
+symlink or block opening a FIFO. The caller owns and must close the stream."
   (let ((fd (sb-posix:open (namestring path)
                            (logior (if writable sb-posix:o-rdwr sb-posix:o-rdonly)
                                    sb-posix:o-nofollow sb-posix:o-nonblock +postmaster-o-cloexec+)))
@@ -24,6 +27,9 @@ SB-POSIX does not export this flag in the supported SBCL.")
       (unless stream (sb-posix:close fd)))))
 
 (defun read-bounded-regular-file (path maximum &key (minimum 0))
+  "Read the descriptor's checked byte count, enforcing MINIMUM and MAXIMUM.
+Reject a short read and close the stream on every exit. Callers that need a
+coherent view across atomic publications must compare their control images."
   (multiple-value-bind (stream size) (open-bounded-regular-file path maximum)
     (unwind-protect
          (progn

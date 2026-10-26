@@ -69,7 +69,9 @@
 ;;; instead of FATAL 57P03.  Backends enter the registry before reading the
 ;;; startup packet so fast shutdown can interrupt a stalled handshake too.
 
-(defvar *shutdown-abandoned-backends* nil)
+(defvar *shutdown-abandoned-backends* nil
+  "Backend objects whose storage cleanup was deferred during fast shutdown.
+The registry lock protects this queue. MAIN retires it after all clients leave.")
 
 (defvar *backend-registry* (make-hash-table :test #'eql))
 (defvar *backend-registry-lock*
@@ -113,10 +115,14 @@
   (values))
 
 (defun postmaster-remember-abandoned-backend (backend)
+  "Retain BACKEND for MAIN without waiting for storage admission during teardown."
   (sb-thread:with-mutex (*backend-registry-lock*)
     (pushnew backend *shutdown-abandoned-backends* :test #'eq)))
 
 (defun postmaster-retire-abandoned-backends ()
+  "Release deferred transactions and snapshots after the last client exits.
+The caller must exclude new storage work. ABORT-TRANSACTION preserves a commit
+already recorded in CLOG while releasing the backend's remaining registrations."
   (let ((backends (sb-thread:with-mutex (*backend-registry-lock*)
                     (unless (and (zerop *n-connections*) (zerop *n-backends*))
                       (error "shutdown still has live client connections"))

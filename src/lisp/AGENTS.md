@@ -380,6 +380,12 @@ this mode.
   changes. Compare the Lisp behavior with those references and explain any
   deliberate differences.
 - Project workflow: review each milestone with a subagent.
+- After implementation, tests and code reviews are complete, give the affected
+  modules, functions and structures a separate source documentation pass. Use
+  the original C source as the style reference: readable, straightforward prose
+  and simple language. Explain purpose and the assumptions, invariants, ownership
+  or failure behavior that a reader needs. Review the documentation separately
+  after writing it.
 
 
 ### SBCL descriptor streams and global variables

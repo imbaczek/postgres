@@ -129,6 +129,7 @@
     (wal-decode-checkpoint-snapshot bytes)))
 
 (defun wal-control-metadata-valid-p (metadata)
+  "Recognize the exact optional system identity, DB state and Unix-time fields."
   (and (listp metadata) (= 6 (length metadata))
        (let ((keys (loop for (key value) on metadata by #'cddr collect key)))
          (and (every #'keywordp keys) (= 3 (length (remove-duplicates keys)))
@@ -138,6 +139,7 @@
        (typep (getf metadata :state-time) '(signed-byte 64))))
 
 (defun make-wal-control-metadata (system-id state &optional (time (- (get-universal-time) 2208988800)))
+  "Build checked primary lifecycle metadata, using Unix seconds for TIME."
   (let ((metadata (list :system-id system-id :db-state state :state-time time)))
     (unless (wal-control-metadata-valid-p metadata) (error "invalid primary control metadata"))
     metadata))
@@ -145,7 +147,9 @@
 (defun wal-encode-control-image (checkpoint durable snapshot
                                  &key (timeline 1) (namespace :legacy) metadata
                                    (checkpoint-timeline (if snapshot (getf snapshot :timeline) 1)))
-  "Persist insertion identity independently of the checkpoint record's timeline."
+  "Encode a CRC-bound control image with independent insertion/checkpoint TLIs.
+Optional lifecycle metadata extends PGWAL6 from eight to eleven fields.
+NIL preserves the older representation; the CRC covers every supplied field."
   (unless (and (typep checkpoint '(unsigned-byte 64))
                (typep durable '(unsigned-byte 64)) (<= checkpoint durable)
                (typep timeline '(integer 1 4294967295))
@@ -169,7 +173,9 @@
     (string->bytes (format nil "~a ~8,'0X~%" prefix crc))))
 
 (defun wal-decode-control-line (line)
-  "Legacy control implies timeline 1 and legacy names; PGWAL6 binds filename grammar."
+  "Return checkpoint end, durable end, snapshot, insertion TLI, checkpoint TLI,
+namespace and optional lifecycle metadata. Legacy control implies timeline 1
+and legacy names. An older image's absent lifecycle metadata is unknown state."
   (let* ((fields (and line (wal-split-fields line)))
          (version (first fields))
          (v6 (equal version "PGWAL6"))
