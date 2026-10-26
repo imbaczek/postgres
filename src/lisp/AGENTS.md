@@ -384,8 +384,8 @@ this mode.
   modules, functions and structures a separate source documentation pass. Use
   the original C source as the style reference: readable, straightforward prose
   and simple language. Explain purpose and the assumptions, invariants, ownership
-  or failure behavior that a reader needs. Review the documentation separately
-  after writing it.
+  or failure behavior that a reader needs. Have a gpt-6.1-terra subagent write
+  that documentation pass, then have the primary agent review it separately.
 
 
 ### SBCL descriptor streams and global variables

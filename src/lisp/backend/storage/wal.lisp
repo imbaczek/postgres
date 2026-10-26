@@ -46,6 +46,8 @@
   version type xid start end payload)
 
 (defstruct wal-page-image
+  ;; XIDS lists actual writer FullXIDs, excluding internal markers 0 and 1.
+  ;; Provenance describes the whole image: :unknown, :row, or :maintenance.
   relfilenode (fork :main) block page (xids '()) (provenance :unknown))
 
 (defstruct wal-replication-slot
@@ -69,7 +71,8 @@
 (defvar *wal-page-batch* nil)
 (defvar *wal-page-batch-xids* nil)
 
-(defvar *wal-row-page-write-p* nil)
+(defvar *wal-row-page-write-p* nil
+  "True only while executing certified SQL row writes.")
 
 (defvar *wal-page-batch-split* nil)
 (defvar *wal-xid-first-lsn* (make-hash-table :test #'eql))
@@ -343,6 +346,9 @@ Legacy 16-hex segment names always belong to timeline 1."
         (smgr-read relfilenode block fork))))
 
 (defun wal-note-page-xid-under-lock (key)
+  ;; Marker 1 means tracked; 0 is sticky non-row or unknown history. Inspect
+  ;; the old cache entry before assigning the new page, so old dirt cannot be
+  ;; recertified. An XID alone does not certify a row write.
   (let* ((local (and *wal-page-batch* (nth-value 1 (gethash key *wal-page-batch*))))
          (dirty (or local (nth-value 1 (gethash key *wal-page-cache*))))
          (prior (if local (gethash key *wal-page-batch-xids*) (gethash key *wal-page-cache-xids*)))
@@ -358,6 +364,7 @@ Legacy 16-hex segment names always belong to timeline 1."
   (values))
 
 (defun wal-merge-page-xids (source destination)
+  ;; Union includes marker 0, so a tainted batch stays tainted.
   (when source
     (maphash (lambda (key xids)
                (dolist (xid xids)
@@ -503,6 +510,8 @@ Legacy 16-hex segment names always belong to timeline 1."
   (+ 4 (loop for image in images sum (wal-page-image-encoded-size image))))
 
 (defun wal-encode-page-images (images lsn)
+  ;; The contributor count uses low 30 bits; high bits encode provenance:
+  ;; 00 unknown, 10 row, 11 maintenance. 01 is reserved and rejected.
   (let ((payload (make-array (wal-page-payload-length images)
                              :element-type '(unsigned-byte 8)
                              :initial-element 0))
@@ -533,6 +542,8 @@ Legacy 16-hex segment names always belong to timeline 1."
     payload))
 
 (defun wal-decode-page-images (payload lsn &optional (version +wal-version+))
+  ;; Unflagged older images remain readable but cannot pass retained readers.
+  ;; Flags are valid only in version 7 or later.
   (when (< (length payload) 4)
     (error "WAL page-image record is too short"))
   (let* ((count (wal-u32 payload 0))

@@ -3,9 +3,11 @@
 - [ ] After implementation, tests and code reviews are complete, document modules,
   functions and structures in the style of the original C source. Use simple,
   straightforward language; explain purpose, assumptions, invariants, ownership
-  and failure behavior where they matter. Review the documentation separately.
-  The child checkpoint/primary and online promotion modules have completed this
-  pass and its review. Keep the same order for the remaining HA work.
+  and failure behavior where they matter. A gpt-6.1-terra subagent should write
+  this pass; the primary agent reviews its documentation separately.
+  The child checkpoint/primary, online promotion and reader-safe row replay
+  modules have completed this pass and its review. Keep the same order for the
+  remaining HA work.
 
 - [ ] Audit cold-image compilation and ASDF load-order dependencies across `pg`
   and its test systems. A warm REPL must not conceal missing declarations or

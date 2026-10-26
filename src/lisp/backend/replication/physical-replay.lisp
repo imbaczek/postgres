@@ -80,6 +80,7 @@ can be ahead after a crash and never grants a missing-file exemption."
                          :create create :start-lsn (getf *physical-recovery-state* :end))))
 
 (defun physical-recovery-open-clog-redo ()
+  ;; Open once when streaming starts. Keep the old stream if opening fails.
   (sb-thread:with-mutex (*clog-lock*)
     (let ((replacement nil) (installed nil) (previous *clog-stream*))
       (unwind-protect
@@ -232,6 +233,7 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
    (catalog-databases catalog)))
 
 (defun physical-replay-publish-progress (record next-xid reservation)
+  ;; Make redo durable before recording the applied terminal and visibility.
   (smgr-fsync-all)
   (clog-fsync)
   (fsync-directory (merge-pathnames "base/" *pgdata*))
@@ -320,8 +322,8 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
 (defun physical-recovery-replay-core ()
   "Replay complete durable batches while owning a closed admission gate.
 Require no old reader transactions or Swank listener. The public replay command
-checks pause first; promotion clears pause before calling this core. Reopen CLOG
-for redo and fence any error or nonlocal exit once replay starts."
+checks pause first; promotion clears pause before calling this core. CLOG is
+already writable; fence any error or nonlocal exit once replay starts."
   (unless (and (zerop *live-operation-depth*)
                (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
                (not *live-operation-drain-open*) (not *swank-listener-enabled-p*)
@@ -340,7 +342,7 @@ for redo and fence any error or nonlocal exit once replay starts."
 (declaim (ftype function physical-replay-with-readers))
 
 (defun physical-recovery-replay ()
-  "Apply durable terminal batches between transactions; return :DEFERRED on conflict."
+  "Apply durable batches under closed admission, deferring an unsafe reader prefix."
   (check-physical-recovery-work)
   (unless *physical-receive-store* (error "no native physical receiver spool"))
   (when (plusp *live-operation-depth*) (error "replay requires its own admission gate"))

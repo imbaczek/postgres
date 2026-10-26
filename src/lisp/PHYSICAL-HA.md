@@ -143,11 +143,13 @@ and catalog storage. Dropping admission alone is unsafe and still leaves a
 snapshot conflict. Deferring a result or replaying the query does not preserve
 arbitrary expressions, volatile effects, streamed rows or explicit transactions.
 
-The next implementation slice is reader-safe steady-state replay:
+The first reader-safe steady-state replay slice is now implemented, as recorded
+below. Items 1–3 describe its scope; item 4 remains future work:
 
 1. Classify complete page-image/commit batches. With old readers present, permit
    only batches whose committing XID is at or beyond every active snapshot's
-   xmax. Defer older XIDs and catalog, DDL and maintenance work. Do not skip an
+   xmax, and require the same of every page-image contributor. Defer older
+   XIDs, unknown or maintenance images, and catalog/DDL work. Do not skip an
    unsafe batch to apply a later one.
 2. Keep CLOG/smgr handles, snapshot registrations, virtual reader IDs and catalog
    objects intact. Existing smgr/CLOG locks protect their file access; synchronize
@@ -172,6 +174,71 @@ explicit transactions. An accepted request survives cancellation of its waiter.
 The full C oracle remains the acceptance target. Design reviews agree that
 replay safety precedes the SQL wrapper; private copies of the whole data directory
 are not a required C mechanism. No coordination is introduced.
+
+### Reader-safe row replay checkpoint
+
+Active SQL still drains under the whole admission gate. Between statements,
+idle repeatable-read snapshots stay registered while certified row batches
+apply. The commit FullXID and every image contributor must be normal and at
+least the greatest retained snapshot xmax. Images lacking contributor metadata
+or certified row provenance defer. An empty reservation-only batch can proceed
+when validated by the decoder; source allocation capacity remains separate from
+reader visibility. Safe earlier terminals can publish before a later unsafe
+batch, but replay never skips that batch. Preflight checks every page before
+applying any: a known catalog relation node, regular main file, allowed fork,
+no duplicate or hole, and contiguous extension. Catalog objects, open CLOG and
+smgr handles, old snapshots and virtual reader IDs are preserved. Writable CLOG
+opens once at the phase 1-to-2 transition; the replacement opens before the old
+stream closes, preserving reads on failure.
+
+Page provenance closes a concrete race: source VACUUM can stage an LP_DEAD
+change, then a DML commit can flush that page before the maintenance terminal.
+The regression first lost an old reader's row; the provenance fix makes the
+image defer. Only the three SQL DML execution branches certify row writes.
+Other writes default to non-row even when a backend has an XID. Future
+destructive maintenance inside DML must clear that flag or refine certification.
+Internal contributor marker 1 means tracked and marker 0 is sticky taint; tracking runs
+before cache assignment, unions retain taint, and both markers are filtered from
+serialized XIDs. Legacy dirty pages cannot be recertified as row pages.
+
+The native WAL version remains 7. The contributor count's high bits encode 00
+unknown, 10 row, 11 tainted and 01 invalid; its low 30 bits hold the count.
+Flags before version 7 reject. Older unflagged records remain readable for broad
+redo but defer with retained readers. Older executables reject new flagged v7
+images, so the same version number does not imply mixed-checkout compatibility.
+This is native WAL and makes no C physical compatibility claim. C's standby.c
+conflict handling and heapam_xlog.c conflict-horizon-before-FPI ordering inform
+the safety boundary, not a claim of identical machinery.
+
+Validation passed 324 physical and 170 interop Rove tests, 1,598 legacy checks,
+and two new properties at seed 42 (200 snapshot-exclusion and 100 provenance
+codec trials; digests fnv1a64-v1:ae3e33e967c3a3ce and
+fnv1a64-v1:b0590b2b5537c418). Coverage and rejections were not measured;
+properties do not establish process durability.
+The nine-case native reader matrix passed at
+`/tmp/pg-row-readers-full-matrix-ready.log` (artifacts
+`/tmp/pg-physical-readers.Tcj3mt`), including old views and runtime identity,
+safe progress, older commit and contributor deferral, unflagged v7 recovery,
+DDL and VACUUM barriers, the staged VACUUM race, and two crash points. The red
+race is `/tmp/pg-row-readers-vacuum-race-red.log`.
+
+Physical follow, replay, automatic restartpoint and WAL crash regressions passed
+in `/tmp/pg-row-physical-follow-regression.log`,
+`/tmp/pg-row-physical-replay-regression.log`,
+`/tmp/pg-row-physical-restartpoint-auto-regression.log` and
+`/tmp/pg-row-wal-crash-recovery-regression.log`. Both logical directions, all
+three manual switchovers and postmaster PID acceptance passed in
+`/tmp/pg-row-logical-both.log`, `/tmp/pg-row-switchover-all.log` and
+`/tmp/pg-row-postmaster-pid.log`. Strict empty-cache compilation and formatting
+passed. SQL pg_promote, in-place promotion with retained readers, the remaining
+conflict handling in item 4, follow/rejoin and sync replication goals remain;
+no HA coordination is introduced.
+
+Code gates included Luna max checkpoint, Sol high full/delta review, Sol xhigh
+design advice, Astra high safety advice and Sol medium refactoring review.
+No further extraction was warranted; changed production functions remain below
+120 lines. Terra 6.1 wrote the source documentation after these gates. Primary
+review is complete, including the empty-reservation and storage-handle wording.
 
 ### Timeline-qualified native WAL namespace
 

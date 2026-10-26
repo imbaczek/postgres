@@ -1,6 +1,14 @@
+;; physical-row-replay.lisp
+;;
+;; Apply a conservative contiguous prefix of row WAL between statements while
+;; admission is closed. Idle repeatable-read snapshots and their storage remain
+;; in place; batches that cannot be proved safe wait for those readers to end.
+
 (in-package #:pg)
 
 (defun physical-row-replay-reader-horizon ()
+  ;; Idle recovery snapshots remain registered between statements.
+  ;; Every applied contributor must be at or beyond the greatest xmax.
   (sb-thread:with-mutex (*snapshot-count-lock*)
     (let ((horizon 0))
       (maphash (lambda (snapshot present)
@@ -11,6 +19,9 @@
       horizon)))
 
 (defun physical-row-replay-allowed-p (record horizon)
+  ;; Stop at the first record outside the certified row replay prefix.
+  ;; Empty allocation-reservation batches are allowed; the decoder validates
+  ;; that they have the required empty shape.
   (let ((type (wal-record-type record)) (xid (wal-record-xid record)))
     (cond
       ((= type +wal-record-commit+)
@@ -20,6 +31,7 @@
                             +wal-record-logical-changes+ +wal-record-xid-reservation+))))))
 
 (defun physical-row-replay-images-allowed-p (images horizon)
+  ;; Unknown, maintenance and contributor-free images cannot pass a reader.
   (every (lambda (image)
            (let ((xids (wal-page-image-xids image)))
              (and (eq :row (wal-page-image-provenance image)) xids
@@ -30,6 +42,8 @@
          images))
 
 (defun physical-row-replay-file-blocks (node fork)
+  ;; Check the regular fork before extension. An absent visibility fork starts
+  ;; at zero blocks; a missing main fork is an error.
   (handler-case
       (multiple-value-bind (stream size)
           (open-bounded-regular-file (relation-file-path node fork) (* +blcksz+ (ash 1 32)))
@@ -44,6 +58,8 @@
           (error condition)))))
 
 (defun physical-row-replay-preflight-images (images)
+  ;; Validate the whole batch before applying any image: known relation,
+  ;; allowed fork, no duplicate pages and only contiguous extension.
   (let ((nodes (wal-relation-filennodes))
         (sizes (make-hash-table :test #'equal))
         (seen (make-hash-table :test #'equal)))
@@ -64,6 +80,7 @@
   (values))
 
 (defun physical-row-replay-publish-terminal (record next-xid reservation)
+  ;; Publish progress only after redo; restart can repeat an unpublished batch.
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-redo record))
   (physical-replay-publish-progress record next-xid reservation)
@@ -72,6 +89,7 @@
     (funcall *physical-replay-test-hook* :after-progress record)))
 
 (defun physical-row-replay-prefix (horizon)
+  ;; Publish each safe terminal in order, and defer at the first unsafe batch.
   (with-physical-replay-staging ()
     (let ((next-xid *next-xid*)
           (reservation (copy-list (getf *physical-recovery-state* :source-reservation))))
@@ -97,6 +115,8 @@
   *last-replay-lsn*)
 
 (defun physical-replay-with-readers ()
+  ;; Run between statements under closed admission, retaining idle snapshots and
+  ;; their storage state. Active SQL has already drained from the gate.
   (unless (and (zerop *live-operation-depth*)
                (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
                (not *live-operation-drain-open*) (not *swank-listener-enabled-p*)
