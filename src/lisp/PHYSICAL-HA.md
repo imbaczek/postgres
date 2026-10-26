@@ -351,6 +351,72 @@ The reused design and full-diff/refactoring review threads found no blocker or
 useful further extraction; their model profiles were not exposed. New staging
 has no SIGKILL/power-loss test yet and does not claim promotion completion.
 
+### Native end-of-recovery record and switch checks
+
+The current experimental WAL format adds type 13 for end of recovery. Its canonical 24-byte payload
+preserves `xl_end_of_recovery`'s signed PostgreSQL timestamp, child TLI, previous
+TLI and C `WalLevel` value (0/1/2), with four zero reserved bytes. The pinned C
+headers confirm offsets 0/8/12/16 and size 24 on this platform
+(`t/interop/eor-layout.c`); a zero-initialized C fixture matches native payload
+bytes. C's writer does not promise zero ABI padding, so this is native semantic
+layout, not C WAL binary compatibility. C references: `xlog_internal.h:305–311`,
+`CreateEndOfRecoveryRecord`, and `xlog.c:9489–9510`.
+
+The research project has no deployed compatibility contract: native record
+version 7 and the `pg_lisp_wal_7` negotiation token remain unchanged. EOR extends
+that experimental format directly. No protocol upgrade machinery is introduced.
+
+EOR syntax is checked after CRC validation and before receive callbacks, including
+zero XID, version/type/length, field bounds and record positions. The encoder is
+pure and private; there is no EOR append/publication command. A shared guard blocks
+EOR from ordinary append, batch consumers, ordinary WAL scans, receive-store
+writes/validation and source export/range proofs. In particular, startup must not
+adopt an EOR beyond its previous durable boundary into parent control, or truncate
+it as an ordinary unflushed tail. Slot acknowledgment/rebuild and logical readers
+cannot silently cross it. The separate read-only lineage scanner can inspect it.
+
+`timeline-check-end-of-recovery` implements C's previous/current TLI agreement,
+expected history and minimum-recovery-point rule (`xlogrecovery.c:1913–1963`,
+`checkTimeLineSwitch:2368–2406`) plus native record interval coverage. Equal-fork
+zero-length ancestors need not be adjacent to the record's previous TLI. It returns
+the checked child without changing replay, role, control or writer state. The
+application path must later install the replay TLI before EOR redo. C logical
+decoding treats EOR as a serialization point; native logical progress must gain
+that behavior with verified lineage before operational child timelines are admitted.
+
+A native EOR totals 56 bytes. If it cannot fit at the applied fork, its actual
+record starts in the next child segment; the pending intent must retain the
+original fork and prefix. Durable child installation, EOR flush, minimum recovery
+point/TLI publication and restart reconciliation are still missing. Pending phase
+3 startup and child insertion remain blocked; no coordination is introduced.
+
+EOR validation: 273 physical tests, 169 interop tests, 1,598 legacy checks and
+fresh strict compilation pass (`/tmp/pg-eor-final-unit.log`,
+`/tmp/pg-eor-final-compile.log`). The 200-trial seed-42 field property has digest
+`fnv1a64-v1:5281b787ce171e54`; no FunctionSpec is registered, and generated input
+coverage/rejection counts remain unmeasured. Reused reviews found and fixed an
+ordinary-scan omission that could adopt EOR into parent durable control before
+redo rejected it. Startup regressions now preserve valid, malformed and incomplete
+EOR bytes without adopting or truncating them; slot acknowledgment/rebuild also
+refuse them. Refactoring centralized record sizes and the ordinary-path guard;
+all production functions remain below 120 lines. Requested model-specific threads
+were refused by the service thread limit, so reviews reused threads with unexposed
+model identity.
+
+Native checkpoint upgrade/crash/restartpoint checks pass
+(`/tmp/pg-eor-checkpoint-final.log`, `/tmp/pg-checkpoint-snapshot.cE8RIr`).
+Continuous physical follow/reconnect/restart and pinned Patroni 4.1.5 queries pass
+(`/tmp/pg-eor-follow-final.log`, `/tmp/pg-physical-follow.gwdLGy`); an earlier
+parallel run stopped at its startup port-ownership check, and the isolated retry
+passed without relaxing that guard. C logical replication passes both directions
+(`/tmp/pg-eor-logical-interop-final.log`). All manual logical switchovers pass
+(`/tmp/pg-eor-logical-switchover-final.log`): Lisp→Lisp
+`/tmp/pg-switchover.Umeidb`, Lisp→C `/tmp/pg-switchover.TyQgtJ`, C→Lisp
+`/tmp/pg-switchover.DRYRtx`. The complete native WAL crash-recovery regression also
+passes (`/tmp/pg-eor-wal-crash-final.log`). These protect existing behavior and
+do not prove operational EOR publication, physical promotion or synchronous
+acknowledged-commit-loss semantics.
+
 ### Timeline history publication prerequisite
 
 The C promotion sequence selects a new timeline, initializes a writable child WAL
@@ -1634,7 +1700,7 @@ base boundary, requested record end and cumulative received-prefix checksum:
 
 ```
 START_REPLICATION SLOT pin PHYSICAL lsn
-(native_format 'pg_lisp_wal_7', system_id '...', timeline '1',
+ (native_format 'pg_lisp_wal_7', system_id '...', timeline '1',
  base_lsn '...', prefix_digest '...')
 ```
 

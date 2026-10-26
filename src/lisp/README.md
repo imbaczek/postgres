@@ -73,8 +73,10 @@ Native WAL checkpoints (payload introduced in version 6) preserve source counter
 and explicit start/end/redo positions in the record and the CRC-checked WAL
 control copy. The copy advances only after data/CLOG sync. Stored legacy WAL and
 controls remain readable with unknown checkpoint facts until a new checkpoint.
-Native streaming now negotiates `pg_lisp_wal_7`; upgrade both peers before
-reconnecting. This does not provide C WAL or control-file disk compatibility.
+Native streaming uses the experimental `pg_lisp_wal_7` format. End-of-recovery
+syntax and read-only timeline checks use that same format; operational promotion
+remains unfinished.
+This does not provide C WAL or control-file disk compatibility.
 `./t/checkpoint-snapshot.sh` covers legacy upgrade, both publication crash
 boundaries, control-copy mismatch rejection and standby restartpoint preservation.
 Version 7 additionally logs native XID reservations before allocation. Standby
