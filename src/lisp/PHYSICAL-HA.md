@@ -293,18 +293,18 @@ FullXID flag. Ordinary writes remain byte-compatible 72-byte v3 controls;
 v1/v2/v3 reads remain supported. A generation hash identifies an immutable local
 restartpoint image, not a writer-generation coordination token.
 
-This format is not yet a verified ownership publisher. The ordinary progress
-writer rejects pending phase/state/child markers before its monotonic-max or
-atomic-write path, so it cannot silently rewrite the intent as ordinary recovery.
+The private verified intent publisher described below now writes this format.
+The ordinary progress writer rejects pending phase/state/child markers, globally
+pending state and failed recovery before its monotonic-max or atomic-write path,
+so stale state cannot silently rewrite the intent as ordinary recovery.
 Runtime SQL/worker admission rejects phase 3, and startup refuses it before base
 manifest processing, recovery-control rewriting or opening storage. No child
 WAL/history artifact is adopted and no writer authority is granted. Dedicated
-publication and restart reconciliation remain missing; the format is not exposed
-as a promotion command. In particular, a future publisher must verify the exact
-GEN2/v4 pointer and prefix, source checkpoint and complete allocation reservation,
-bind the source namespace (legacy is allowed), and install pending memory under
-quiescence before releasing exclusion. It must not overwrite immutable base WAL
-or control to change the namespace in advance. A final target namespace switch
+restart reconciliation remains missing; the format is not exposed as a promotion
+command. Publication verifies the exact GEN2/v4 pointer and prefix, source
+checkpoint and complete allocation reservation, binds the source namespace
+(legacy is allowed), and installs pending memory under quiescence before releasing
+exclusion. It preserves immutable base WAL and control. A final target namespace switch
 also needs durable parent-file inventory reconciliation before primary admission.
 
 Pending-format validation: 258 physical tests, 169 interop tests, 1,598 legacy
@@ -326,6 +326,63 @@ does not claim resume or EOR crash safety. Sol high full-diff review's snapshot
 finding is fixed; reused design/checkpoint/refactoring threads found no remaining
 blocker or useful extraction. The service refused new Sol xhigh, Luna max and
 Sol medium threads; reused thread model profiles were not exposed.
+
+### Verified local promotion intent publication
+
+`physical-promotion-publish-intent` now publishes phase 3 from verified live
+standby state. Its private caller owns follow-command exclusion, reload exclusion
+and quiescence, in that order. The publisher then takes restartpoint registration
+and history locks. Receiver and restartpoint workers must already be stopped;
+it never joins workers while holding these locks. Open reader transactions and
+Swank admission reject publication. A future public command must orchestrate
+worker shutdown and restore recovery after an eligibility rejection.
+
+Child selection follows C `findNewestTimeLine` (`timeline.c:264–290`): probe
+consecutive local history files and choose the first absent identifier, with
+explicit exhaustion and special-file checks. Archive lookup remains missing.
+The selected GEN2/v4 generation must prove the exact applied fork, actual next-XID,
+authenticated segment prefix, source checkpoint and complete allocation capacity.
+Immutable base control, source namespace, receive identity and cumulative receive
+digest must agree. Complete durable backlog must be replayed first; an unfinished
+native batch cannot advance the chosen fork. Reading the restartpoint returns
+its already-validated generation hash rather than rereading the pointer.
+
+The shared control-byte persister retains existing fsync/rename/directory-sync
+ordering and hooks. Successful publication installs pending state in memory
+before quiescence ends. Any error or nonlocal exit once publication begins fences
+recovery, including uncertainty before memory installation. Ordinary progress
+writes cannot erase this fence or overwrite globally pending state with an older
+phase-2 object. Base WAL, parent WAL control and runtime insertion timeline stay
+unchanged. Native WAL and physical negotiation stay at version 7.
+
+C flushes EOR before advancing minimum-recovery-point control
+(`xlog.c:8275–8299`). This milestone does not perform that later transition:
+canonical child installation, history/EOR publication, pending startup resume,
+writer admission and operational promotion remain required. No coordination or
+custom writer-generation token is introduced.
+
+Validation passes: 282 physical tests, 169 interop tests, 1,598 legacy checks,
+fresh strict compilation and formatting. The intent property runs 50 trials at
+seed 42, declaration digest `fnv1a64-v1:62e65d7f2ed89d2c`; no FunctionSpec is
+registered, and input coverage/rejection counts remain unmeasured. Reviews of
+the full change and final stale-state/failure guards found no remaining blocker;
+the reused review threads did not expose their model profiles. The refactoring
+review found no useful additional extraction; production functions stay below
+120 lines.
+
+`t/promotion-intent.sh` invokes the actual private publisher in an owned native
+process, then uses SIGKILL after file fsync, rename, directory fsync and memory
+installation. Before rename, restart remains an ordinary readable standby.
+After publication, startup refuses pending state and preserves independent
+SHA256 snapshots of all 14 selected storage files, including root `pg_xact`.
+The Python inspector independently binds recovery CRC/fork/child/namespace to
+the current generation and verifies its embedded prefix against source WAL.
+Normal publication also denies runtime admission. Evidence:
+`/tmp/pg-promotion-intent-native-final.log`, artifact
+`/tmp/pg-promotion-intent.bcT7b1`, using the stopped seed
+`/tmp/pg-restartpoint-auto.VWaiXp`. The optional seed route was exercised;
+the harness's default seed-generation route was not rerun. These are process-crash
+tests, not simulated power-loss evidence or completed promotion recovery.
 
 Replay publishes an applied terminal after syncing
 pages/CLOG and its recovery progress, but source allocation reservation and

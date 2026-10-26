@@ -118,10 +118,31 @@ def verify_pending(target, snapshot):
     print(f"pending-control-fixture: unchanged {len(expected)} storage files PASS")
 
 
+def snapshot_pending(target, source, snapshot):
+    root = pathlib.Path(target)
+    lsn, digest = main(target, source)
+    control = (root / "physical-recovery.control").read_bytes()
+    assert len(control) == 88 and control[:8] == b"PGRSTAT4"
+    checked_crc(control, 84)
+    assert struct.unpack_from("<I", control, 8)[0] & 0x7FFFFFFF == 3
+    assert struct.unpack_from("<I", control, 12)[0] == 1
+    assert struct.unpack_from("<Q", control, 40)[0] == lsn
+    assert struct.unpack_from("<Q", control, 76)[0] == digest
+    assert struct.unpack_from("<I", control, 68)[0] == 2
+    fields = (root / "global" / "pg_wal_control").read_bytes().split()
+    assert fields[0] == b"PGWAL6"
+    assert zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    assert struct.unpack_from("<I", control, 72)[0] == {b"legacy": 0, b"timeline": 1}[fields[5]]
+    pathlib.Path(snapshot).write_text(json.dumps(storage_snapshot(root), sort_keys=True))
+    print(f"pending-intent: actual publisher bound fork={lsn} generation={digest:016X} PASS")
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "--pending-fixture":
         prepare_pending(*sys.argv[2:])
     elif sys.argv[1] == "--verify-pending":
         verify_pending(*sys.argv[2:])
+    elif sys.argv[1] == "--snapshot-pending":
+        snapshot_pending(*sys.argv[2:])
     else:
         main(*sys.argv[1:])
