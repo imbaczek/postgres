@@ -72,3 +72,26 @@ is written. At an exact segment boundary no parent file is needed."
         (when fd (ignore-errors (sb-posix:close fd)))
         (when (and temporary (not finished))
           (ignore-errors (sb-posix:unlink temporary)))))))
+
+(defun wal-install-timeline-prefix (source-timeline child fork prefix namespace)
+  "Force-install owned uncommitted bytes; caller proves intent and excludes history.
+The caller fences uncertain publication and must never use this after history."
+  (let ((destination (wal-segment-path (floor fork +wal-segment-size+) child :timeline))
+        (temporary nil))
+    (wal-namespace-file-stat destination t)
+    (unwind-protect
+         (progn
+           (setf temporary (wal-stage-timeline-prefix source-timeline fork
+                                                      :namespace namespace :prefix prefix))
+           (when (wal-namespace-file-stat destination t)
+             (sb-posix:unlink (namestring destination)))
+           (wal-timeline-test-point :after-child-unlink)
+           (fsync-directory (wal-directory))
+           (wal-timeline-test-point :after-child-unlink-directory-fsync)
+           (sb-posix:rename (namestring temporary) (namestring destination))
+           (setf temporary nil)
+           (wal-timeline-test-point :after-child-rename)
+           (fsync-directory (wal-directory))
+           (wal-timeline-test-point :after-child-directory-fsync)
+           destination)
+      (when temporary (ignore-errors (sb-posix:unlink (namestring temporary)))))))

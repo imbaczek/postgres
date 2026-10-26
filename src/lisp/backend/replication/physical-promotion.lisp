@@ -124,8 +124,52 @@ The caller owns PGDATA and follow-command/reload/quiescence in that order."
                    pending)
               (unless finished (setf *physical-recovery-failed-p* t)))))))))
 
-(defun physical-promotion-check-pending (state metadata prefix generation)
+(defun physical-promotion-open-file (path &optional writable)
+  "Open an existing bounded regular inode without following symlinks."
+  (let ((fd (sb-posix:open (namestring path)
+                           (logior (if writable sb-posix:o-rdwr sb-posix:o-rdonly)
+                                   sb-posix:o-nofollow sb-posix:o-nonblock +postmaster-o-cloexec+)))
+        (stream nil))
+    (unwind-protect
+         (let* ((stat (sb-posix:fstat fd)) (size (sb-posix:stat-size stat)))
+           (unless (and (= (logand (sb-posix:stat-mode stat) sb-posix:s-ifmt) sb-posix:s-ifreg)
+                        (<= 0 size +wal-segment-size+))
+             (error "invalid pending promotion file: ~a" path))
+           (setf stream (sb-sys:make-fd-stream fd :input t :output writable
+                                                  :element-type '(unsigned-byte 8)))
+           (values stream size))
+      (unless stream (sb-posix:close fd)))))
+
+(defun physical-promotion-read-file (path)
+  (multiple-value-bind (stream size) (physical-promotion-open-file path)
+    (unwind-protect
+         (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
+           (unless (= size (read-sequence bytes stream)) (error "short pending promotion file"))
+           bytes)
+      (close stream))))
+
+(defun physical-promotion-history-image (state)
+  "Canonical native reason, fixed for retry; C history bytes carry no authority."
+  (timeline-encode-history (getf state :promotion-child) (getf state :timeline)
+                           (getf state :applied) "pg-lisp promotion"
+                           (unless (= 1 (getf state :timeline))
+                             (timeline-history-bytes (getf state :timeline)))))
+
+(defun physical-promotion-check-history (state allow-history)
+  (let* ((parent (getf state :timeline)) (child (getf state :promotion-child))
+                                         (path (timeline-history-path child *pgdata*)))
+    (if (wal-namespace-file-stat path t)
+        (unless (and allow-history
+                     (loop for timeline from (1+ parent) below child
+                           always (wal-namespace-file-stat (timeline-history-path timeline *pgdata*) t))
+                     (equalp (physical-promotion-history-image state) (physical-promotion-read-file path)))
+          (error "pending child history is already published or differs"))
+        (unless (= child (physical-promotion-select-child parent))
+          (error "pending child selection changed")))))
+
+(defun physical-promotion-check-pending (state metadata prefix generation &key allow-history)
   "Revalidate durable ownership; history publication ends prefix-install eligibility."
+  (physical-promotion-check-history state allow-history)
   (let ((control (physical-recovery-read-control *pgdata*)))
     (unless (and
              (every (lambda (key) (eql (getf state key) (getf control key)))
@@ -135,8 +179,6 @@ The caller owns PGDATA and follow-command/reload/quiescence in that order."
              (= generation (getf control :promotion-generation))
              (eq (physical-promotion-check-base-control state)
                  (getf control :promotion-source-namespace))
-             (= (getf control :promotion-child)
-                (physical-promotion-select-child (getf control :timeline)))
              (= (getf state :wal-prefix-lsn) (getf control :applied))
              (equalp prefix (getf state :wal-prefix-bytes))
              (equal (getf metadata :source-checkpoint) (getf state :source-checkpoint))
@@ -153,31 +195,11 @@ history/EOR instead of calling this helper and overwriting child WAL."
       (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
         (declare (ignore catalog))
         (physical-promotion-check-pending state metadata prefix generation)
-        (let* ((fork (getf state :applied))
-               (child (getf state :promotion-child))
-               (destination (wal-segment-path (floor fork +wal-segment-size+) child :timeline))
-               (temporary nil) (finished nil))
-          ;; Reject special destinations before starting any publication.
-          (wal-namespace-file-stat destination t)
+        (let ((fork (getf state :applied)) (child (getf state :promotion-child)) (finished nil))
+          (wal-namespace-file-stat (wal-segment-path (floor fork +wal-segment-size+) child :timeline) t)
           (unwind-protect
-               (progn
-                 (setf temporary
-                       (wal-stage-timeline-prefix
-                        (getf state :timeline) fork
-                        :namespace (getf state :promotion-source-namespace) :prefix prefix))
-                 ;; C InstallXLogFileSegment(find_free=false): durable unlink,
-                 ;; then durable rename. Quiescence/history exclusion spans both.
-                 (when (wal-namespace-file-stat destination t)
-                   (sb-posix:unlink (namestring destination)))
-                 (wal-timeline-test-point :after-child-unlink)
-                 (fsync-directory (wal-directory))
-                 (wal-timeline-test-point :after-child-unlink-directory-fsync)
-                 (sb-posix:rename (namestring temporary) (namestring destination))
-                 (setf temporary nil)
-                 (wal-timeline-test-point :after-child-rename)
-                 (fsync-directory (wal-directory))
-                 (wal-timeline-test-point :after-child-directory-fsync)
-                 (setf finished t)
-                 destination)
-            (unless finished (setf *physical-recovery-failed-p* t))
-            (when temporary (ignore-errors (sb-posix:unlink (namestring temporary))))))))))
+               (prog1
+                   (wal-install-timeline-prefix (getf state :timeline) child fork prefix
+                                                (getf state :promotion-source-namespace))
+                 (setf finished t))
+            (unless finished (setf *physical-recovery-failed-p* t))))))))
