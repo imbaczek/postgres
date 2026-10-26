@@ -326,7 +326,7 @@ compacts the receive spool. A local worker also requests a restartpoint after
 300 seconds or 1 GiB of applied WAL progress; received-but-unapplied WAL never
 triggers one. SQL `CHECKPOINT` requests a standby restartpoint and succeeds as a
 no-op on an unchanged static base. Smart/fast standby shutdown also publishes an
-applied restartpoint; durable clean-shutdown control metadata remains unfinished.
+applied restartpoint and records clean recovery state in native control metadata.
 The startup configuration subset below controls these restartpoint thresholds.
 
 Recovery SQL supports `pg_wal_replay_pause()`, `pg_wal_replay_resume()`,
@@ -753,9 +753,13 @@ control form `(physical-recovery-prepare-shutdown)` preserves follow configurati
 and blocks further supported recovery mutations after preparation. It does not
 exit the server. Automatic smart/fast integration is exercised by
 `./t/physical-shutdown-signals.sh`, including received-ahead WAL, restart,
-immediate escalation during preparation and failure exit status. The durable
-clean-shutdown marker remains unfinished. Changed active main/accept-loop frames
-require a fresh process rather than reload.
+immediate escalation during preparation and failure exit status. Versioned native
+control records active recovery before storage initialization and clean recovery
+after durable shutdown preparation, including an unchanged restartpoint. Legacy
+60-byte controls migrate to the 72-byte format; older binaries cannot read it.
+An independent binary probe checks state/CRC, migration and startup/shutdown
+fsync failure behavior. This does not add C `pg_control` disk compatibility.
+Changed active main/accept-loop frames require a fresh process rather than reload.
 `pg_postmaster_start_time()` reports the captured server-initialization timestamp
 as timestamptz and remains unchanged across connections and reloads. The pinned
 Patroni method is included in direct-start acceptance. An already-running image

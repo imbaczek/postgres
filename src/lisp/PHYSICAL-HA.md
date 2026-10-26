@@ -12,6 +12,64 @@ manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
 
+### Durable native recovery control state
+
+Native recovery control now records the C `DBState` distinction between startup
+(0), active archive recovery (5) and clean shutdown in recovery (2). These are
+separate from the native bootstrap phases 0/1/2; clean state never grants primary
+write authority. `recovery.required` and verified provenance remain mandatory.
+The new 72-byte `PGRSTAT2` format retains existing identity/progress fields, adds
+state and a diagnostic Unix-seconds update time, and CRC-checks the entire record.
+Legacy 60-byte `PGRSTATE` files read as unknown state/time and migrate before
+mutable initialization. All new writes use v2; earlier binaries cannot read v2.
+This is native metadata, not C `pg_control` byte compatibility.
+
+Startup validates control/manifest/base provenance, then atomically persists
+active state before catalog restoration, CLOG reopening or redo. Replay also
+publishes active state while preserving the maximum previously required applied
+boundary and observed XID. After durable receive flush and restartpoint/floor
+publication, shutdown records clean state while the final admission gate remains
+closed, even for an unchanged point or immutable base. Clean publication refuses
+an incompletely reconstructed required boundary. The shared writer returns a
+copied state only after successful publication; callers install it explicitly,
+including the durable phase. Timestamps never determine authority or safety.
+
+Failure before rename retains the prior record; failure after rename may leave a
+valid clean record visible because its data/restartpoint is already durable.
+Either way shutdown failure fences recovery and exits nonzero. It must not try
+to roll a valid published record back. Startup failure to persist active state
+prevents storage initialization; an unchanged prior clean record remains truthful.
+
+`t/physical-shutdown-signals.sh` passes in
+`/tmp/pg-physical-shutdown-signals.SVRE4p`. Its independent Python decoder checks
+raw magic, layout, CRC, state and applied LSN after smart/fast/immediate shutdown,
+restartpoint and clean-control fsync failures, repeated shutdown at the identical
+pointer, legacy migration and restart. A startup fsync failpoint leaves hashes of
+all base/global/WAL/CLOG files unchanged. Recovery still rejects application
+writes after migration and automatically recovers all seven source rows.
+`t/physical-shutdown-prepare.sh` also passes in
+`/tmp/pg-physical-shutdown.52GUAR`. Native following and actual pinned Patroni
+status queries pass in `/tmp/pg-physical-follow.noud9w`.
+
+The pinned C-to-C `t/physical-control-c.sh` oracle passes in
+`/tmp/pg-control-state-c.gVUxyF`: `pg_controldata` reports active recovery after
+startup and clean recovery after shutdown, twice at the same checkpoint location.
+C references are `pg_control.h:97-106`, `StartupXLOG`, and `CreateRestartPoint`'s
+unchanged/new-point shutdown branches (`xlog.c:8525-8593`, `8665-8696`). This oracle
+does not pass C physical WAL to Lisp. Use `C_PG_BINDIR`/`C_PG_REVISION` for the
+pinned C installation when running it.
+
+All 159 physical, 169 interop and 1,598 legacy checks pass, with formatting and
+fresh strict compilation. The new cl-spec property checks 200 valid codec
+round trips at seed 42, declaration digest `fnv1a64-v1:f2b3e56b7204dc16`.
+Its Function Spec is not registered; generated input coverage and rejection
+counts are unmeasured, and the property does not prove I/O durability. Separate
+Rove tests and process fixtures exercise those failure paths. Checkpoint and
+crash-safety review found no remaining blocker; refactoring review's returned
+phase postcondition is implemented. Full checkpoint metadata, primary shutdown
+checkpoint parity, promotion, timeline changes, rejoin and synchronous durability
+remain unfinished. No coordination is introduced.
+
 ### Postmaster startup timestamp and checkpoint reporting inventory
 
 `pg_catalog.pg_postmaster_start_time()` now returns a stable timestamptz
@@ -101,10 +159,10 @@ pass in `/tmp/pg-switchover.TGXcV5`, `.PUDtro` and `.JItVuE`.
 C oracle: `PostmasterStateMachine` waits for regular backends and dispatches a
 shutdown checkpoint to the checkpointer (`postmaster.c:3083-3117`);
 `ShutdownXLOG` requests a shutdown restartpoint in recovery (`xlog.c:7394-7436`).
-Native workers remain threads in one process. The durable counterpart of
-`DB_SHUTDOWNED_IN_RECOVERY`, including unchanged restartpoints, is still missing;
-this does not complete C clean-shutdown control metadata, primary shutdown
-checkpoint parity, promotion or synchronous replication. Existing 15-second
+Native workers remain threads in one process. The durable native counterpart of
+`DB_SHUTDOWNED_IN_RECOVERY` is now recorded as described above. This does not
+complete C control metadata, primary shutdown checkpoint parity, promotion or
+synchronous replication. Existing 15-second
 worker joins can fail closed on slow I/O. No coordination is introduced.
 
 ### Callable standby shutdown preparation
@@ -149,9 +207,9 @@ Luna max and Sol high found no production defect; Sol medium found no useful
 refactor beyond the shared runtime-quiescence extraction.
 
 This primitive is now used by automatic signal integration above, but does not
-complete C `ShutdownXLOG` equivalence. The native counterpart of the durable
-`DB_SHUTDOWNED_IN_RECOVERY` marker, including duplicate-restartpoint shutdowns,
-remains missing. The cl-mcp fork's inert source readtable now permits structural
+complete C `ShutdownXLOG` equivalence. Durable recovery state is now recorded
+even for duplicate restartpoints, as described above. The cl-mcp fork's inert
+source readtable now permits structural
 edits of the original valid `#.` source without enabling read-time evaluation.
 No shell-edit, shadow-definition or exit-hook workaround was used.
 C oracle: `ShutdownXLOG` and
@@ -204,7 +262,7 @@ below 120 lines.
 
 This receiver primitive is now used by whole-server smart/fast finalization
 above, which stops/joins native workers and publishes an applied restartpoint.
-Durable clean-shutdown metadata remains part of the HA roadmap, alongside
+The durable recovery state is now recorded too; remaining HA work includes
 promotion, child timelines and synchronous commit waits.
 
 ### Receiver statistics and ordinary Patroni cluster status
@@ -1411,8 +1469,8 @@ Orderly standby restartpoints now run from proper main-thread finalization
 above, following C ShutdownXLOG's CreateRestartPoint call (xlog.c:7422). The
 earlier direct last-backend exit was unsuitable: SBCL exit hooks unwind admission
 first, run in unspecified order and swallow hook errors, so an exit-hook solution
-would not provide the required completion/error semantics. Durable clean-shutdown
-control metadata remains unfinished; already durable R/suffix recovery is verified.
+would not provide the required completion/error semantics. Native durable recovery
+state is now recorded above; full C control metadata remains unfinished.
 Promotion/timelines/history/rejoin, online bootstrap, synchronous commit and the
 pinned Patroni interface matrix remain active goal work; coordination is excluded.
 

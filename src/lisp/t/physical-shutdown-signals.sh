@@ -5,6 +5,7 @@ BASE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$BASE/t/test-support.sh"
 SBCL=${SBCL:-sbcl}
 PSQL=${PSQL:-psql}
+PYTHON=${PYTHON:-python3}
 PORT=${PORT:-5986}
 TARGET_PORT=$((PORT + 1))
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-physical-shutdown-signals.XXXXXX")
@@ -19,6 +20,23 @@ control() {
 checked() {
     control "$1" "$2" >"$TMP/$3.log"
     if grep -q ';; error:' "$TMP/$3.log"; then cat "$TMP/$3.log" >&2; exit 1; fi
+}
+control_state() {
+    "$PYTHON" "$BASE/t/interop/recovery-control-state.py" \
+        "$TMP/copy/physical-recovery.control" "$@"
+}
+snapshot_data() {
+    "$PYTHON" - "$TMP/copy" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+result = {}
+for directory in ('base', 'global', 'pg_wal', 'pg_xact'):
+    for path in sorted((root / directory).rglob('*')):
+        if path.is_file():
+            result[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
+print(json.dumps(result, sort_keys=True))
+PY
 }
 close_held() {
     if [ "$FD_OPEN" = 1 ]; then exec 7>&-; FD_OPEN=0; fi
@@ -52,6 +70,7 @@ start_target() {
         >"$TMP/target-$START.log" 2>&1 &
     TARGET=$!
     test_wait_owned_sql_server "$TARGET" "$TARGET_PORT" "$PSQL"
+    control_state active
 }
 wait_target() {
     attempt=0
@@ -126,6 +145,7 @@ kill -0 "$TARGET"
 test ! -f "$TMP/smart-prepared"
 close_held
 wait_exit 0
+control_state clean --applied "$applied"
 test -f "$TMP/smart-prepared"
 cmp "$TMP/saved-follow.control" "$TMP/copy/physical-follow.control"
 start_target
@@ -138,6 +158,7 @@ verify_preparation fast-prepared
 hold_connection
 kill -INT "$TARGET"
 wait_exit 0
+control_state clean --applied "$applied"
 close_held
 test -f "$TMP/fast-prepared"
 cmp "$TMP/saved-follow.control" "$TMP/copy/physical-follow.control"
@@ -152,6 +173,7 @@ kill -INT "$TARGET"
 wait_file "$TMP/preparation-entered"
 kill -QUIT "$TARGET"
 wait_exit 0
+control_state active --applied "$applied"
 test ! -f "$TMP/incorrect-preparation-completed"
 grep -q 'received immediate shutdown request' "$TMP/target-$START.log"
 start_target
@@ -163,13 +185,58 @@ receive_ahead 6
 checked target '(setf *physical-restartpoint-test-hook* (lambda (point) (when (eq point :after-generation) (error "signal shutdown publication failpoint"))))' fail-publication
 kill -INT "$TARGET"
 wait_exit 1
+control_state active --applied "$applied"
 grep -q 'signal shutdown publication failpoint' "$TMP/target-$START.log"
 if grep -q 'database system is shut down' "$TMP/target-$START.log"; then exit 1; fi
 cmp "$TMP/saved-follow.control" "$TMP/copy/physical-follow.control"
 start_target
 wait_target 'SELECT count(*) FROM signal_data' 6
+
+# Failure of the final clean-control fsync must not publish clean shutdown.
+STAGE=shutdown-control-fsync
+receive_ahead 7
+checked target '(setf *physical-recovery-control-test-hook* (lambda (point state) (when (and (eq point :before-fsync) (= state +db-shutdowned-in-recovery+)) (error "shutdown recovery control fsync failpoint"))))' fail-clean-control
+kill -INT "$TARGET"
+wait_exit 1
+control_state active --applied "$applied"
+grep -q 'shutdown recovery control fsync failpoint' "$TMP/target-$START.log"
+if grep -q 'database system is shut down' "$TMP/target-$START.log"; then exit 1; fi
+start_target
+wait_target 'SELECT count(*) FROM signal_data' 7
+
+# A duplicate restartpoint still transitions the durable state to clean.
+STAGE=unchanged-restartpoint
+sql "$TARGET_PORT" CHECKPOINT
+applied=$(sql "$TARGET_PORT" 'SELECT pg_last_wal_replay_lsn()')
+cp "$TMP/copy/physical-restartpoint.control" "$TMP/unchanged-point.control"
 kill -INT "$TARGET"
 wait_exit 0
+control_state clean --applied "$applied"
+cmp "$TMP/unchanged-point.control" "$TMP/copy/physical-restartpoint.control"
+
+# Startup must fail before changing data if it cannot durably mark recovery active.
+STAGE=startup-control-fsync
+snapshot_data >"$TMP/data-before.json"
+startup_status=0
+timeout -k 5 20 "$SBCL" --script "$BASE/t/physical-control-startup-failure.lisp" \
+    -p "$TARGET_PORT" -D "$TMP/copy" >"$TMP/startup-control-failure.log" 2>&1 || startup_status=$?
+test "$startup_status" -eq 1
+grep -q 'startup recovery control fsync failpoint' "$TMP/startup-control-failure.log"
+snapshot_data >"$TMP/data-after.json"
+cmp "$TMP/data-before.json" "$TMP/data-after.json"
+control_state clean --applied "$applied"
+
+# Legacy state is unknown, never inferred clean from a valid applied position.
+STAGE=legacy-control-migration
+control_state legacy --legacy-fixture --applied "$applied"
+start_target
+wait_target 'SELECT count(*) FROM signal_data' 7
+checked target '(assert (null (getf *physical-recovery-state* :previous-db-state)))' legacy-unknown
+test "$(sql "$TARGET_PORT" 'SELECT pg_is_in_recovery()')" = t
+if sql "$TARGET_PORT" 'INSERT INTO signal_data VALUES (999)' >"$TMP/reject-primary-write.log" 2>&1; then exit 1; fi
+kill -INT "$TARGET"
+wait_exit 0
+control_state clean --applied "$applied"
 checked source '(assert (loop repeat 100 thereis (with-wal-critical (not (gethash "signals_base" *physical-source-senders*))) do (sleep 0.05)))' sender-stopped
 checked source '(physical-source-pin-release "signals_base")' release
-echo 'physical-shutdown-signals: smart/fast restartpoints, immediate escalation, failure and restart PASS'
+echo 'physical-shutdown-signals: clean/active state, migration, startup/shutdown fsync, signals and restart PASS'

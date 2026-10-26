@@ -1,0 +1,16 @@
+;;;; Fail startup's active-control fsync before mutable recovery initialization.
+(require :asdf)
+(let ((base (merge-pathnames "../" (uiop:pathname-directory-pathname *load-truename*))))
+  (pushnew base asdf:*central-registry* :test #'equal)
+  (pushnew (merge-pathnames "vendor/swank/" base) asdf:*central-registry* :test #'equal))
+(let ((*compile-verbose* nil) (*load-verbose* nil) (*standard-output* *error-output*))
+  (asdf:load-system "pg")
+  (asdf:load-system "pg-swank"))
+(setf pg::*physical-recovery-control-test-hook*
+      (lambda (point state)
+        (when (and (eq point :before-fsync) (= state pg::+db-in-archive-recovery+))
+          (error "startup recovery control fsync failpoint"))))
+(handler-case (pg:main)
+  (error (condition)
+    (format *error-output* "~&startup recovery control rejected: ~a~%" condition)
+    (sb-ext:exit :code 1)))

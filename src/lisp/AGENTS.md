@@ -352,6 +352,12 @@ this mode.
 
 ### SBCL descriptor streams and global variables
 
+- Adding a missing key with `(setf (getf state ...))` can replace a plist's head.
+  Mutating a function's local parameter does not install that head in its caller.
+  Persistent-control helpers return a copied state after durable publication;
+  callers explicitly install it. Test that returned phase/progress matches disk
+  and that the input remains unchanged, including when publication fails.
+
 - An anonymous stream created by `sb-sys:make-fd-stream` need not support
   `file-length`, even when its descriptor names a regular file. The stale-PID
   restart test exposed this distinction. Use `sb-posix:fstat` / `stat-size` for
