@@ -86,11 +86,12 @@ def primary_committed(root):
     not probe a SQL listener or establish synchronous replication durability.
     """
     fields = read_regular(root / "global/pg_wal_control", 1024).split()
-    if len(fields) != 8 or fields[0] != b"PGWAL6":
+    if len(fields) not in (8, 11) or fields[0] != b"PGWAL6":
         raise ValueError("invalid native WAL control")
     if zlib.crc32(b" ".join(fields[:-1])) != int(fields[-1], 16):
         raise ValueError("native WAL control checksum mismatch")
     return (int(fields[3]) > 1 and fields[3] == fields[4] and fields[5] == b"timeline"
+            and len(fields) == 11 and fields[8] == b"6"
             and not (root / "physical-recovery.control").exists())
 
 

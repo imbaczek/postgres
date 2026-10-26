@@ -69,6 +69,8 @@
 ;;; instead of FATAL 57P03.  Backends enter the registry before reading the
 ;;; startup packet so fast shutdown can interrupt a stalled handshake too.
 
+(defvar *shutdown-abandoned-backends* nil)
+
 (defvar *backend-registry* (make-hash-table :test #'eql))
 (defvar *backend-registry-lock*
   (sb-thread:make-mutex :name "pg backend registry lock"))
@@ -108,6 +110,23 @@
              (>= (shutdown-mode) +fast-shutdown+))
     (ereport-fatal "57P01"
                    "terminating connection due to administrator command"))
+  (values))
+
+(defun postmaster-remember-abandoned-backend (backend)
+  (sb-thread:with-mutex (*backend-registry-lock*)
+    (pushnew backend *shutdown-abandoned-backends* :test #'eq)))
+
+(defun postmaster-retire-abandoned-backends ()
+  (let ((backends (sb-thread:with-mutex (*backend-registry-lock*)
+                    (unless (and (zerop *n-connections*) (zerop *n-backends*))
+                      (error "shutdown still has live client connections"))
+                    (copy-list *shutdown-abandoned-backends*))))
+    (dolist (backend backends)
+      (let ((*backend* backend)) (abort-transaction)))
+    (unless (and (active-xids-empty-p) (active-snapshots-empty-p))
+      (error "shutdown still has transaction or snapshot registrations"))
+    (sb-thread:with-mutex (*backend-registry-lock*)
+      (setf *shutdown-abandoned-backends* nil)))
   (values))
 
 (defun unregister-backend (backend)
@@ -236,6 +255,8 @@ command (idle) is ignored; the connection and its transaction state survive."
         (error condition))))
   (values))
 
+(declaim (ftype function prepare-primary-shutdown call-with-live-operation))
+
 (defun prepare-postmaster-shutdown ()
   "Finalize storage from MAIN after SERVE returns, outside live admission."
   (when (plusp *live-operation-depth*)
@@ -245,8 +266,11 @@ command (idle) is ignored; the connection and its transaction state survive."
   (unless (sb-thread:with-mutex (*shutdown-lock*) *shutdown-finished*)
     ;; Like C ShutdownXLOG, recovery shutdown publishes an applied restartpoint.
     ;; The signal worker remains free to process SIGQUIT while this waits.
-    (when (recovery-in-progress-p)
-      (physical-recovery-prepare-shutdown))
+    (if (recovery-in-progress-p)
+        (progn
+          (call-with-live-operation #'postmaster-retire-abandoned-backends)
+          (physical-recovery-prepare-shutdown))
+        (prepare-primary-shutdown))
     (sb-thread:with-mutex (*shutdown-lock*)
       (setf *shutdown-finished* t)))
   (values))

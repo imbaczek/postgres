@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+UTILITY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${SBCL:-sbcl}" --script "$UTILITY_DIR/pg-controldata.lisp" "$@"

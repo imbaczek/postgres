@@ -38,7 +38,8 @@ def read_copy(pgdata):
     fields = prefix.split(" ")
     namespace = "legacy"
     if fields[0] == "PGWAL6":
-        version, end, durable, insertion, checkpoint_tli, namespace, payload = fields
+        assert len(fields) in (7, 10)
+        version, end, durable, insertion, checkpoint_tli, namespace, payload = fields[:7]
         assert int(insertion) == int(checkpoint_tli) == 1
         assert namespace in ("legacy", "timeline")
     elif fields[0] == "PGWAL5":

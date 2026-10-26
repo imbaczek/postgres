@@ -511,16 +511,15 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                         (when body
                           (process-startup stream body)
                           (backend-loop stream)))
-                   ;; Fast shutdown terminates every backend and exits the
-                   ;; process, so startup recovery can classify in-progress
-                   ;; CLOG entries as aborted. Smart shutdown still permits
-                   ;; sessions to continue and must release disconnected XIDs.
-                   (when (and (< (shutdown-mode) +fast-shutdown+)
-                              *backend*
+                   ;; Fast teardown cannot wait behind a closed reload gate.
+                   ;; MAIN retires its captured transaction after all clients exit.
+                   (when (and *backend*
                               (or (backend-xid *backend*)
                                   (not (eq (backend-state *backend*) :idle))))
-                     (with-live-operation-transaction-drain
-                       (end-backend-session))))))
+                     (if (>= (shutdown-mode) +fast-shutdown+)
+                         (postmaster-remember-abandoned-backend *backend*)
+                         (with-live-operation-transaction-drain
+                           (end-backend-session)))))))
            (pg-error (e)
              (with-live-operation-backend-shutdown-cleanup (backend)
                (when stream (ignore-errors (send-error-response stream e)))))
@@ -646,6 +645,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
 
 (defun initialize-primary-storage ()
   "Initialize a cold or promoted primary from its durable WAL/control checkpoint."
+  (wal-mark-primary-startup)
   (wal-init)
   (xact-init)
   (wal-recover)
@@ -680,6 +680,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
         (if (recovery-in-progress-p)
             (physical-recovery-open-storage)
             (initialize-primary-storage)))
+      (unless (recovery-in-progress-p) (wal-note-primary-ready))
       (enable-reload)
       (enable-shutdown-handlers)
       (start-swank-listener swank-port swank-bind-address)

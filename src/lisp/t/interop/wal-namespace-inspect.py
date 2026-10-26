@@ -11,7 +11,9 @@ def inspect(root):
     assert raw.endswith('\n') and raw.count('\n') == 1
     prefix, crc = raw.rstrip('\n').rsplit(' ', 1)
     assert zlib.crc32(prefix.encode()) == int(crc, 16)
-    magic, checkpoint, durable, insertion, record_tli, namespace, payload = prefix.split(' ')
+    fields = prefix.split(' ')
+    assert len(fields) in (7, 10)
+    magic, checkpoint, durable, insertion, record_tli, namespace, payload = fields[:7]
     assert magic == 'PGWAL6' and insertion == record_tli == '1'
     assert namespace in ('legacy', 'timeline')
     files = {}

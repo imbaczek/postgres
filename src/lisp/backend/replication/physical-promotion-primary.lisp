@@ -45,7 +45,7 @@ or backup manifest: child control is now the recovery authority."
           (close stream)))
       (values snapshot history))))
 
-(defun physical-promotion-check-retiring-control (snapshot history)
+(defun physical-promotion-check-retiring-control (snapshot history &optional system-id)
   "Check any remaining pending request against the committed child.
 An absent request is normal after cleanup. If it remains, require the same
 system identity, parent, child and fork, with no larger replay visibility counter.
@@ -54,13 +54,13 @@ Do not open its selected generation or receive spool."
     (when (wal-namespace-file-stat path t)
       (let* ((control (physical-recovery-read-control *pgdata*))
              (*catalog-identity-needs-persist-p* nil)
-             (catalog (load-catalog)))
+             (catalog (unless system-id (load-catalog))))
         (unless (and (eql 3 (getf control :phase))
                      (= (getf control :promotion-child) (getf snapshot :timeline))
                      (= (getf control :timeline) (getf snapshot :prev-timeline))
                      (= (getf control :applied) (timeline-history-entry-begin (first history)))
                      (<= (getf control :next-xid) (getf snapshot :next-xid))
-                     (= (getf control :system-id) (catalog-system-identifier catalog)))
+                     (= (getf control :system-id) (or system-id (catalog-system-identifier catalog))))
           (error "committed child contradicts its pending recovery metadata"))))))
 
 (defun physical-promotion-retire-recovery ()
@@ -118,6 +118,8 @@ Return NIL when there is no pending request; propagate any validation failure."
            :publisher #'physical-promotion-complete-child))))
     t))
 
+(declaim (ftype function wal-note-primary-ready))
+
 (defun physical-promotion-start-child-primary ()
   "Initialize a committed child as an ordinary primary under closed admission.
 Close standby storage first. Hide the recovery role only in the initializer's
@@ -133,6 +135,7 @@ The caller must fence any failure and restart from durable child control."
   (physical-promotion-retire-recovery)
   (setf *physical-recovery-state* nil *physical-recovery-failed-p* nil
         *physical-replay-seen-relfilenodes* nil)
+  (wal-note-primary-ready)
   (physical-promotion-test-point :after-child-primary-ready))
 
 (defun physical-promotion-complete-child ()

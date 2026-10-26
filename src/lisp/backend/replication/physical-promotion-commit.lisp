@@ -199,7 +199,11 @@ fails. Do not restore parent control on an error after the rename."
                 (lambda (directory) (fsync-directory directory)
                   (physical-promotion-test-point :after-child-control-directory-fsync)))
       (write-sequence (wal-encode-control-image end end snapshot :timeline child
-                                                                 :checkpoint-timeline child :namespace :timeline)
+                                                                 :checkpoint-timeline child :namespace :timeline
+                                                                 :metadata
+                                                                 (make-wal-control-metadata
+                                                                  (getf *physical-recovery-state* :system-id)
+                                                                  +db-in-crash-recovery+))
                       stream))))
 
 (defun physical-promotion-publish-child-control ()

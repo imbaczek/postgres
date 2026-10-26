@@ -40,6 +40,9 @@
 (defvar *live-operation-cv*
   (sb-thread:make-waitqueue :name "pg live operation condition"))
 (defvar *live-operation-admission-open* t)
+
+(defvar *live-operation-terminal-shutdown* nil)
+
 (defvar *live-operation-drain-open* nil)
 (defvar *live-operation-count* 0)
 (defvar *live-operation-backend-counts* (make-hash-table :test #'eq))
@@ -125,6 +128,7 @@ must not run inside a handler either; the reloader thread polls the flag."
 (defun live-operation-admitted-p (drain-p)
   "Return the lane admitted now, evaluating DRAIN-P under the gate lock."
   (cond
+    (*live-operation-terminal-shutdown* nil)
     (*live-operation-admission-open* :normal)
     ((and *live-operation-drain-open*
           (if (functionp drain-p) (funcall drain-p) drain-p))
@@ -302,8 +306,19 @@ must not run inside a handler either; the reloader thread polls the flag."
              *live-operation-drain-backends* nil
              *live-operation-cleanup-backends* nil
              *live-operation-drain-open* nil
-             *live-operation-admission-open* t)
+             *live-operation-admission-open* (not *live-operation-terminal-shutdown*))
        (sb-thread:condition-broadcast *live-operation-cv*)))))
+
+(defun fence-live-operation-shutdown ()
+  (when (plusp *live-operation-depth*) (error "shutdown fence requires an unadmitted caller"))
+  (call-with-live-operation-lock
+   (lambda ()
+     (setf *live-operation-terminal-shutdown* t
+           *live-operation-admission-open* nil
+           *live-operation-drain-open* nil)
+     (loop while (plusp *live-operation-count*)
+           do (sb-thread:condition-wait *live-operation-cv* *live-operation-lock*))))
+  (values))
 
 (defun close-live-operation-admission (&optional requested-owner)
   (when (plusp *live-operation-depth*)
@@ -361,7 +376,7 @@ must not run inside a handler either; the reloader thread polls the flag."
                *live-operation-drain-backends* nil
                *live-operation-cleanup-backends* nil
                *live-operation-drain-open* nil
-               *live-operation-admission-open* t)
+               *live-operation-admission-open* (not *live-operation-terminal-shutdown*))
          (sb-thread:condition-broadcast *live-operation-cv*)))))
   (values))
 

@@ -21,7 +21,7 @@ def crc(data, offset):
 
 def control(root):
     fields = (root / "global/pg_wal_control").read_bytes().split()
-    assert fields[0] == b"PGWAL6" and len(fields) == 8
+    assert fields[0] == b"PGWAL6" and len(fields) in (8, 11)
     assert zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
     return int(fields[1]), int(fields[2]), int(fields[3]), int(fields[4]), fields[5], bytes.fromhex(fields[6].decode())
 
@@ -55,6 +55,7 @@ def save_expected(target, output):
     if floor < (1 << 64) and floor & 0xFFFFFFFF < 3:
         floor = (floor & ~0xFFFFFFFF) + 3
     expected = {"fork": fork, "actual": actual, "floor": floor, "oid": int(oids[0]),
+                "system_id": struct.unpack_from("<Q", state, 16)[0],
                 "child": struct.unpack_from("<I", state, 68)[0],
                 "parent": struct.unpack_from("<I", state, 12)[0],
                 "time": struct.unpack_from("<q", state, 60)[0], "parents": parents(root)}
@@ -77,6 +78,9 @@ def check_primary(target, expected_path, initial):
     root = pathlib.Path(target)
     expected = json.loads(pathlib.Path(expected_path).read_text())
     checkpoint, durable, child, checkpoint_child, namespace, snapshot = control(root)
+    fields = (root / "global/pg_wal_control").read_bytes().split()
+    if len(fields) == 11:
+        assert int(fields[7]) == expected["system_id"] and int(fields[8]) == 6
     assert child == checkpoint_child == expected["child"] and namespace == b"timeline"
     assert len(snapshot) == 88 and snapshot[:8] == b"PGCKPT02"
     start, end, redo = struct.unpack_from("<QQQ", snapshot, 8)
