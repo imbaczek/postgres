@@ -716,6 +716,13 @@
        (uiop:delete-directory-tree test-pgdata :validate t
                                                :if-does-not-exist :ignore)))))
 
+(defun wal-test-legacy-checkpoint-record (start)
+  (let ((bytes (wal-encode-record +wal-record-checkpoint+ 0 start #())))
+    (wal-set-u16 bytes 4 5)
+    (wal-set-u32 bytes 28 0)
+    (wal-set-u32 bytes 28 (wal-crc32 bytes))
+    bytes))
+
 (defun test-wal-segment-rotation ()
   (let* ((test-pgdata (merge-pathnames "wal-segment-test/" *pgdata*))
          (*pgdata* test-pgdata)
@@ -726,6 +733,9 @@
          (*wal-output-segment* nil)
          (*wal-new-segments* '())
          (*wal-poisoned* nil)
+         (*wal-checkpoint-snapshot* nil)
+         (*next-xid* 3) (*xid-batch-end* 3) (*active-xids* nil)
+         (checkpoint-snapshot nil)
          (directory-synced-on-rotation nil)
          (original-fsync-directory (symbol-function 'fsync-directory)))
     (wal-ensure-directory-durable *pgdata*)
@@ -743,7 +753,10 @@
             (make-array (- +wal-segment-size+ +wal-header-size+)
                         :element-type '(unsigned-byte 8)
                         :initial-element 0))
-           (wal-append-record +wal-record-checkpoint+ 0 #())
+           (setf checkpoint-snapshot
+                 (wal-capture-checkpoint-snapshot (wal-next-record-start (wal-checkpoint-record-size))))
+           (wal-append-record +wal-record-checkpoint+ 0
+                              (wal-encode-checkpoint-snapshot checkpoint-snapshot))
            (check directory-synced-on-rotation
                   "WAL rotation syncs segment names before opening the next segment")
            (wal-flush)
@@ -755,7 +768,7 @@
                (check (= records 2) "WAL scanner reads records across a segment boundary")
                (check (= end-lsn *wal-end-lsn*) "WAL scan ends at the last segment LSN")
                (check (equal segments '(0 1)) "WAL scan discovers contiguous segments")
-               (wal-save-checkpoint-control end-lsn)
+               (wal-save-checkpoint-control end-lsn checkpoint-snapshot)
                (wal-remove-checkpointed-segments end-lsn)
                (check (not (probe-file (wal-segment-path 0)))
                       "checkpoint recycling removes older WAL segments")
@@ -1376,8 +1389,7 @@
            (wal-encode-record +wal-record-commit+ 3
                               (* 2 +wal-segment-size+) #()))
          (checkpoint-start (+ (* 2 +wal-segment-size+) +wal-header-size+))
-         (checkpoint (wal-encode-record +wal-record-checkpoint+ 0
-                                        checkpoint-start #()))
+         (checkpoint (wal-test-legacy-checkpoint-record checkpoint-start))
          (post-checkpoint (wal-encode-record
                            +wal-record-commit+ 2
                            (+ checkpoint-start +wal-header-size+) #()))
@@ -1449,7 +1461,9 @@
              (type (if (zerop segment)
                        +wal-record-checkpoint+
                        +wal-record-commit+))
-             (record (wal-encode-record type 0 start #())))
+             (record (if (= type +wal-record-checkpoint+)
+                         (wal-test-legacy-checkpoint-record start)
+                         (wal-encode-record type 0 start #()))))
         (with-open-file (stream (wal-segment-path segment)
                                 :direction :output
                                 :element-type '(unsigned-byte 8)

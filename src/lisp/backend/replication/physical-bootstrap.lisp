@@ -35,7 +35,7 @@
     (fsync-stream stream))
   (fsync-directory target))
 
-(defun physical-bootstrap-inventory ()
+(defun physical-bootstrap-inventory (&optional (checkpoint-start (wal-checkpoint-record-start)))
   "Return only durable cluster state and catalog-referenced relation forks."
   (let ((files (list "PG_VERSION" "pg_xact" "global/pg_control"
                      "global/pg_catalog.dat" "global/pg_wal_control")))
@@ -43,8 +43,7 @@
       (push (format nil "base/~d" relfilenode) files)
       (when (probe-file (relation-file-path relfilenode :visibility))
         (push (format nil "base/~d.vm" relfilenode) files)))
-    (let* ((restart (if (zerop *wal-checkpoint-lsn*) 0
-                        (- *wal-checkpoint-lsn* +wal-header-size+)))
+    (let* ((restart checkpoint-start)
            (last (and (plusp *wal-durable-lsn*) (floor (1- *wal-durable-lsn*) +wal-segment-size+))))
       (when last
         (loop for segment from (floor restart +wal-segment-size+) to last
@@ -113,9 +112,10 @@
                              :limit (when (equal relative last-segment)
                                       (1+ (mod (1- end) +wal-segment-size+)))))
                           (physical-bootstrap-inventory)))
-           (manifest (list :version 1 :system-id system-id
+           (manifest (list :version 2 :system-id system-id
                            :cluster-identity (catalog-cluster-identity *catalog*) :timeline 1
-                           :checkpoint checkpoint :end end :next-xid *next-xid*
+                           :checkpoint checkpoint :checkpoint-start (wal-checkpoint-record-start checkpoint)
+                           :end end :next-xid *next-xid*
                            :source-pin (physical-source-pin-name pin) :files files)))
       (physical-bootstrap-test-point :before-manifest target)
       (let* ((*print-readably* t)

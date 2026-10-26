@@ -1,19 +1,20 @@
 (in-package #:pg-physical-tests)
 
 (defun native-test-start-query (&optional (cursor 64) (base 32) (identity 123))
-  (format nil "START_REPLICATION SLOT copy PHYSICAL ~a (native_format 'pg_lisp_wal_5', system_id '~d', timeline '1', base_lsn '~a', prefix_digest '14695981039346656037')"
+  (format nil "START_REPLICATION SLOT copy PHYSICAL ~a (native_format 'pg_lisp_wal_6', system_id '~d', timeline '1', base_lsn '~a', prefix_digest '14695981039346656037')"
           (pg::wal-format-lsn cursor) identity (pg::wal-format-lsn base)))
 
 (deftest native-physical-start-requires-format-and-base
     (let ((command (pg::parse-replication-command (native-test-start-query))))
       (ok (eq :physical-start (pg::logical-replication-command-type command)))
       (ok (= 64 (pg::logical-replication-command-requested-lsn command)))
-      (ok (equal "pg_lisp_wal_5" (pg::physical-stream-option command "native_format"))))
+      (ok (equal "pg_lisp_wal_6" (pg::physical-stream-option command "native_format"))))
   (dolist (query '("START_REPLICATION PHYSICAL 0/0"
                    "START_REPLICATION SLOT copy PHYSICAL 0/0"
                    "START_REPLICATION SLOT copy PHYSICAL 0/0 (native_format 'other')"
-                   "START_REPLICATION SLOT copy PHYSICAL 0/0 (native_format 'pg_lisp_wal_5', system_id '123', timeline '2', base_lsn '0/0')"
-                   "START_REPLICATION SLOT copy PHYSICAL 0/0 (native_format 'pg_lisp_wal_5', system_id '123', timeline '1', timeline '1')"))
+                   "START_REPLICATION SLOT copy PHYSICAL 0/0 (native_format 'pg_lisp_wal_6', system_id '123', timeline '2', base_lsn '0/0')"
+                   "START_REPLICATION SLOT copy PHYSICAL 0/0 (native_format 'pg_lisp_wal_6', system_id '123', timeline '1', timeline '1')"
+                   "START_REPLICATION SLOT copy PHYSICAL 0/0 (native_format 'pg_lisp_wal_5', system_id '123', timeline '1', base_lsn '0/0', prefix_digest '14695981039346656037')"))
     (ok (intake-fails-p (lambda () (pg::parse-replication-command query))))))
 
 (deftest native-physical-start-rejects-transaction-blocks
@@ -124,7 +125,7 @@
              (pg::*wal-checkpoint-lsn* 64) (pg::*wal-durable-lsn* 128)
              (pg::*wal-poisoned* nil)
              (records (list (sample-physical-record 0)
-                            (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 32 (empty-octets))
+                            (legacy-checkpoint-record 32)
                             (sample-physical-record 64)
                             (pg::wal-encode-record pg::+wal-record-maintenance+ 0 96 (empty-octets)))))
         (pg::wal-ensure-directory-durable (pg::wal-directory))

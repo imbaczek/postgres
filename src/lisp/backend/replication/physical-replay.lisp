@@ -48,7 +48,7 @@ can be ahead after a crash and never grants a missing-file exemption."
 
 (defun physical-recovery-check-live-files ()
   "After redo, every currently referenced main fork must exist; never synthesize it."
-  (dolist (name (physical-bootstrap-inventory))
+  (dolist (name (physical-bootstrap-inventory (physical-manifest-checkpoint-start *physical-recovery-state*)))
     (unless (probe-file (merge-pathnames name *pgdata*))
       (error "replayed catalog references missing durable file ~a" name))))
 
@@ -190,6 +190,9 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
           *next-xid* next-xid
           *xid-batch-end* next-xid
           *last-replay-lsn* (wal-record-end record))
+    (when (= (wal-record-type record) +wal-record-checkpoint+)
+      (setf (getf *physical-recovery-state* :source-checkpoint)
+            (wal-checkpoint-record-snapshot record)))
     (catalog-refresh-oldest-relfrozenxid)
     (wal-clear-page-cache))
   (when *physical-replay-test-hook*

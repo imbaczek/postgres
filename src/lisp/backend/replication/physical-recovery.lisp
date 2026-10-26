@@ -176,7 +176,7 @@
   "Read only the bounded literal grammar, with reader evaluation disabled."
   (recovery-check-literal-text text)
   (with-standard-io-syntax
-    (let ((*read-eval* nil) (*package* (find-package "KEYWORD")))
+    (let ((*read-eval* nil) (*package* (find-package "CL-USER")))
       (multiple-value-bind (manifest position) (read-from-string text)
         (unless (every (lambda (char) (find char '(#\Space #\Tab #\Newline #\Return)))
                        (subseq text position))
@@ -215,17 +215,26 @@
                 (string= name ".wal" :start1 23)
                 (every (lambda (char) (digit-char-p char 16)) (subseq name 7 23))))))
 
+(defun physical-manifest-checkpoint-start (manifest)
+  (if (eql 2 (getf manifest :version)) (getf manifest :checkpoint-start)
+      (- (getf manifest :checkpoint) +wal-header-size+)))
+
 (defun recovery-check-manifest-schema (manifest)
-  (unless (and (listp manifest) (= (length manifest) 18)
+  (unless (and (listp manifest) (member (getf manifest :version) '(1 2))
                (equal (loop for (key value) on manifest by #'cddr collect key)
-                      '(:version :system-id :cluster-identity :timeline :checkpoint
-                        :end :next-xid :source-pin :files))
-               (eql 1 (getf manifest :version)) (eql 1 (getf manifest :timeline))
+                      (if (eql 2 (getf manifest :version))
+                          '(:version :system-id :cluster-identity :timeline :checkpoint
+                            :checkpoint-start :end :next-xid :source-pin :files)
+                          '(:version :system-id :cluster-identity :timeline :checkpoint
+                            :end :next-xid :source-pin :files))) (eql 1 (getf manifest :timeline))
                (typep (getf manifest :system-id) '(unsigned-byte 64))
                (stringp (getf manifest :cluster-identity))
                (plusp (length (getf manifest :cluster-identity)))
                (typep (getf manifest :checkpoint) '(integer 32 18446744073709551615))
                (= (getf manifest :checkpoint) (getf manifest :end))
+               (typep (physical-manifest-checkpoint-start manifest) '(unsigned-byte 64))
+               (member (- (getf manifest :checkpoint) (physical-manifest-checkpoint-start manifest))
+                       (list +wal-header-size+ (wal-checkpoint-record-size)))
                (typep (getf manifest :next-xid)
                       '(integer 3 18446744073709551615))
                (wal-valid-replication-slot-name-p (getf manifest :source-pin))
@@ -265,6 +274,7 @@
          (*catalog* (load-catalog))
          (*wal-checkpoint-lsn* (getf manifest :checkpoint))
          (*wal-durable-lsn* (getf manifest :end))
+         (*wal-checkpoint-snapshot* (nth-value 2 (wal-read-control-fields)))
          (names (sort (mapcar #'first (getf manifest :files)) #'string<)))
     (unless (and (not *catalog-identity-needs-persist-p*)
                  (equal (catalog-cluster-identity *catalog*) (getf manifest :cluster-identity))
@@ -285,7 +295,8 @@
       (unless (and (equal "16" (read-line stream nil nil)) (null (read-line stream nil nil)))
         (error "unsupported native physical recovery data version")))
     (multiple-value-bind (checkpoint durable) (wal-read-control-fields)
-      (unless (and (eql checkpoint *wal-checkpoint-lsn*) (eql durable *wal-durable-lsn*))
+      (unless (and (eql checkpoint *wal-checkpoint-lsn*) (eql durable *wal-durable-lsn*)
+                   (= (physical-manifest-checkpoint-start manifest) (wal-checkpoint-record-start)))
         (error "physical recovery WAL control differs from manifest")))
     (unless (and (not (probe-file (xid-wrap-marker-path)))
                  (<= (getf manifest :next-xid) (load-next-xid)))
@@ -294,7 +305,7 @@
      (make-physical-source-pin :name (getf manifest :source-pin)
                                :system-id (getf manifest :system-id)
                                :consistent-lsn *wal-checkpoint-lsn*
-                               :restart-lsn (- *wal-checkpoint-lsn* +wal-header-size+)))
+                               :restart-lsn (physical-manifest-checkpoint-start manifest)))
     *catalog*))
 
 (defun physical-recovery-prepare ()
@@ -323,6 +334,13 @@
          (unless (and (= (getf control :applied) (getf manifest :end))
                       (= (getf control :next-xid) (load-next-xid)))
            (error "physical recovery control does not match its immutable base image"))))
+      (multiple-value-bind (checkpoint durable snapshot) (wal-read-control-fields)
+        (unless (and (eql checkpoint (getf manifest :checkpoint))
+                     (eql durable (getf manifest :end))
+                     (= (physical-manifest-checkpoint-start manifest)
+                        (if snapshot (getf snapshot :start) (- checkpoint +wal-header-size+))))
+          (error "base checkpoint control differs from manifest"))
+        (setf (getf manifest :source-checkpoint) snapshot))
       (setf (getf manifest :manifest-digest) digest
             (getf manifest :phase) (if (= 2 (getf control :phase)) 2 1)
             (getf manifest :required-applied) (getf control :applied)
@@ -353,7 +371,8 @@
   "Open verified recovery; phase 2 redoes its entire retained prefix before SQL."
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
   (let ((streaming (= 2 (getf *physical-recovery-state* :phase))))
-    (setf *wal-checkpoint-lsn* (getf *physical-recovery-state* :checkpoint)
+    (setf *wal-checkpoint-snapshot* (copy-list (getf *physical-recovery-state* :source-checkpoint))
+          *wal-checkpoint-lsn* (getf *physical-recovery-state* :checkpoint)
           *wal-durable-lsn* (getf *physical-recovery-state* :end)
           *wal-end-lsn* *wal-durable-lsn*
           *last-replay-lsn* *wal-durable-lsn*

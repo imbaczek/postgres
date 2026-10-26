@@ -20,7 +20,10 @@
 (defconstant +wal-version-v2+ 2)
 (defconstant +wal-version-v3+ 3)
 (defconstant +wal-version-v4+ 4)
-(defconstant +wal-version+ 5)
+
+(defconstant +wal-version-v5+ 5)
+
+(defconstant +wal-version+ 6)
 
 (defparameter *max-slot-wal-keep-bytes* (* 1024 1024 1024)
   "Maximum WAL retained by one replication slot at checkpoint; NIL disables the cap.")
@@ -68,6 +71,10 @@
 (defvar *wal-poisoned* nil)
 (defvar *wal-end-lsn* 0)
 (defvar *wal-checkpoint-lsn* 0)
+
+(defvar *wal-checkpoint-snapshot* nil
+  "Facts belonging to the published checkpoint, never a merely flushed candidate.")
+
 (defvar *wal-durable-lsn* 0)
 (defvar *wal-ready* nil)
 (defvar *wal-output-stream* nil)
@@ -1122,9 +1129,9 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
                               +wal-record-catalog-commit+
                               +wal-record-maintenance+))
            (and (= type +wal-record-logical-changes+)
-                (>= version +wal-version+))
+                (>= version +wal-version-v5+))
            (and (= type +wal-record-logical-catalog-event+)
-                (>= version +wal-version+)))
+                (>= version +wal-version-v5+)))
        (or (/= type +wal-record-maintenance+)
            ;; Maintenance terminals were already emitted by v3. Keep them
            ;; readable after the v4/v5 page-image extensions, as PostgreSQL's
@@ -1142,6 +1149,7 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
                  (member version (list +wal-version-v2+
                                        +wal-version-v3+
                                        +wal-version-v4+
+                                       +wal-version-v5+
                                        +wal-version+))
                  (= (wal-u32 bytes 8) (length bytes))
                  (= (wal-u64 bytes 12) expected-lsn)
@@ -1215,26 +1223,16 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
                    (error condition))))
            record-length))))))
 
-(defun wal-scan-checkpoint-record (record record-lsn scan-from-lsn
-                                   checkpoint-record-start)
-  "Validate checkpoint pointers encountered while scanning from the WAL head."
-  (let ((checkpoint-found nil))
-    (when (and (not scan-from-lsn)
-               (plusp *wal-checkpoint-lsn*)
-               (= record-lsn checkpoint-record-start))
-      (unless (and (= (wal-record-end record) *wal-checkpoint-lsn*)
-                   (= (wal-record-type record) +wal-record-checkpoint+)
-                   (zerop (length (wal-record-payload record))))
-        (error "WAL checkpoint LSN ~a does not point to a valid checkpoint record"
-               *wal-checkpoint-lsn*))
-      (setf checkpoint-found t))
-    (when (and (not scan-from-lsn)
-               (= (wal-record-end record) *wal-checkpoint-lsn*))
-      (unless (= (wal-record-type record) +wal-record-checkpoint+)
-        (error "WAL checkpoint LSN ~a points to a non-checkpoint record"
-               *wal-checkpoint-lsn*))
-      (setf checkpoint-found t))
-    checkpoint-found))
+(defun wal-scan-checkpoint-record (record record-lsn scan-from-lsn checkpoint-record-start)
+  "Validate the published checkpoint against its independent durable control copy."
+  (when (and (not scan-from-lsn) (plusp *wal-checkpoint-lsn*)
+             (or (= record-lsn checkpoint-record-start)
+                 (= (wal-record-end record) *wal-checkpoint-lsn*)))
+    (unless (and (= record-lsn checkpoint-record-start)
+                 (= (wal-record-end record) *wal-checkpoint-lsn*)
+                 (equal (wal-checkpoint-record-snapshot record) *wal-checkpoint-snapshot*))
+      (error "WAL checkpoint differs from its durable control copy"))
+    t))
 
 (defun wal-scan-segment (function segment last-segment scan-start-offset
                          scan-end-lsn scanned-end-lsn scan-from-lsn
@@ -1279,9 +1277,7 @@ src/backend/access/transam/xlogreader.c."
   (let* ((segments (wal-discover-segments))
          (last-segment (car (last segments)))
          (checkpoint-record-start
-           (if (zerop *wal-checkpoint-lsn*)
-               0
-               (- *wal-checkpoint-lsn* +wal-header-size+)))
+           (wal-checkpoint-record-start))
          (scan-start-lsn (or scan-from-lsn checkpoint-record-start))
          (scan-start-segment (floor scan-start-lsn +wal-segment-size+))
          (scan-start-offset (mod scan-start-lsn +wal-segment-size+))
@@ -1482,8 +1478,7 @@ src/backend/access/transam/xlogreader.c."
           t)))
       (#.+wal-record-checkpoint+
        (wal-recovery-validate-logical-terminal :other)
-       (unless (zerop (length (wal-record-payload record)))
-         (error "WAL checkpoint record has an invalid payload"))
+       (wal-checkpoint-record-snapshot record)
        (wal-replay-finish-batch (lambda () #'values)))
       (#.+wal-record-maintenance+
        (wal-recovery-validate-logical-terminal :other)
@@ -1881,41 +1876,17 @@ src/backend/access/transam/xlogreader.c."
   (let ((path (wal-control-path)))
     (when (probe-file path)
       (with-open-file (stream path :direction :input)
-        (let* ((line (read-line stream nil nil))
-               (fields (and line
-                            (loop with start = 0
-                                  for end = (position #\Space line :start start)
-                                  collect (subseq line start end)
-                                  while end
-                                  do (setf start (1+ end)))))
-               (control-version (and (= (length fields) 4)
-                                     (find (first fields)
-                                           '("PGWAL2" "PGWAL3")
-                                           :test #'string=)))
-               (checkpoint-lsn (and control-version
-                                    (ignore-errors
-                                     (parse-integer (second fields)))))
-               (durable-lsn (and checkpoint-lsn
-                                 (ignore-errors
-                                  (parse-integer (third fields)))))
-               (crc (and durable-lsn
-                         (ignore-errors
-                          (parse-integer (fourth fields) :radix 16))))
-               (prefix (and control-version checkpoint-lsn durable-lsn
-                            (format nil "~a ~a ~a" control-version
-                                    checkpoint-lsn durable-lsn))))
-          (unless (and checkpoint-lsn durable-lsn crc
-                       (= crc (wal-crc32 (string->bytes prefix)))
-                       (<= 0 checkpoint-lsn durable-lsn #xFFFFFFFFFFFFFFFF)
-                       (null (read-line stream nil nil)))
+        (let ((line (read-line stream nil nil)))
+          (unless (and line (<= (length line) 512) (null (read-line stream nil nil)))
             (error "WAL control file ~a is corrupt" path))
-          (values checkpoint-lsn durable-lsn))))))
+          (handler-case (wal-decode-control-line line)
+            (error (condition)
+              (error "WAL control file ~a is corrupt: ~a" path condition))))))))
 
 (defun wal-save-control-fields (checkpoint-lsn durable-lsn)
-  (let* ((prefix (format nil "PGWAL3 ~a ~a" checkpoint-lsn durable-lsn))
-         (crc (wal-crc32 (string->bytes prefix)))
-         (text (format nil "~a ~8,'0X~%" prefix crc)))
-    (wal-atomic-write-bytes (wal-control-path) (string->bytes text)))
+  (wal-atomic-write-bytes
+   (wal-control-path)
+   (wal-encode-control-image checkpoint-lsn durable-lsn *wal-checkpoint-snapshot*))
   (values))
 
 (defun wal-save-durable-lsn (lsn)
@@ -1926,12 +1897,14 @@ src/backend/access/transam/xlogreader.c."
   (setf *wal-durable-lsn* lsn)
   (values))
 
-(defun wal-save-checkpoint-control (lsn)
+(defun wal-save-checkpoint-control (lsn &optional snapshot)
   (when (> lsn *wal-durable-lsn*)
-    (error "WAL checkpoint LSN ~a is past durable LSN ~a"
-           lsn *wal-durable-lsn*))
-  (wal-save-control-fields lsn *wal-durable-lsn*)
-  (setf *wal-checkpoint-lsn* lsn)
+    (error "WAL checkpoint LSN ~a is past durable LSN ~a" lsn *wal-durable-lsn*))
+  ;; WAL-FLUSH retains the old copy. Publish a candidate only after page/CLOG sync.
+  (let ((*wal-checkpoint-snapshot* snapshot))
+    (wal-save-control-fields lsn *wal-durable-lsn*))
+  (setf *wal-checkpoint-lsn* lsn
+        *wal-checkpoint-snapshot* (copy-list snapshot))
   (values))
 
 (defun wal-sync-segments (segments)
@@ -1953,11 +1926,12 @@ src/backend/access/transam/xlogreader.c."
   ;; first successful WAL directory sync, before reusing any existing segment.
   (fsync-directory (wal-directory))
   (let ((segments (wal-discover-segments)))
-    (multiple-value-bind (checkpoint-lsn durable-lsn)
+    (multiple-value-bind (checkpoint-lsn durable-lsn snapshot)
         (wal-read-control-fields)
       (when (and (null checkpoint-lsn) segments)
         (error "WAL control file is missing while WAL segments exist"))
-      (setf *wal-checkpoint-lsn* (or checkpoint-lsn 0)
+      (setf *wal-checkpoint-snapshot* snapshot
+            *wal-checkpoint-lsn* (or checkpoint-lsn 0)
             *wal-durable-lsn* (or durable-lsn 0)
             *wal-end-lsn* 0
             *wal-ready* t
@@ -2068,10 +2042,11 @@ src/backend/access/transam/xlogreader.c."
         (wal-record-page-xids-at-batch-start
          images (wal-append-batch-start))
         (wal-append-page-images images)
-        (let ((checkpoint-end
-                (wal-append-record
-                 +wal-record-checkpoint+ 0
-                 (make-array 0 :element-type '(unsigned-byte 8)))))
+        (let* ((start (wal-next-record-start (wal-checkpoint-record-size)))
+               (snapshot (wal-capture-checkpoint-snapshot start))
+               (checkpoint-end
+                 (wal-append-record +wal-record-checkpoint+ 0
+                                    (wal-encode-checkpoint-snapshot snapshot))))
           (wal-flush)
           (wal-test-pause :after-checkpoint-wal-flush)
           (wal-apply-page-images images)
@@ -2081,7 +2056,7 @@ src/backend/access/transam/xlogreader.c."
           (fsync-directory *pgdata*)
           (fsync-directory (merge-pathnames "base/" *pgdata*))
           (fsync-directory (merge-pathnames "global/" *pgdata*))
-          (wal-save-checkpoint-control checkpoint-end)
+          (wal-save-checkpoint-control checkpoint-end snapshot)
           (wal-test-pause :after-checkpoint-control)
           (wal-remove-checkpointed-segments-under-wal-lock
            checkpoint-end)))))

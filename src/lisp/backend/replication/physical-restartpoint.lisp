@@ -65,9 +65,11 @@
 
 (defun physical-restartpoint-check-metadata (metadata catalog-bytes state)
   (physical-history-check-plist
-   metadata '(:version :system-id :cluster-identity :timeline :manifest-digest
-              :base :lsn :prefix-digest :next-xid :forks :seen))
-  (unless (and (= (length metadata) 22) (eql 1 (getf metadata :version))
+   metadata (append '(:version :system-id :cluster-identity :timeline :manifest-digest
+                      :base :lsn :prefix-digest :next-xid :forks :seen)
+                    (when (eql 2 (getf metadata :version)) '(:source-checkpoint))))
+  (unless (and (if (eql 2 (getf metadata :version)) (= (length metadata) 24)
+                   (and (eql 1 (getf metadata :version)) (= (length metadata) 22)))
                (eql (getf metadata :system-id) (getf state :system-id))
                (equal (getf metadata :cluster-identity) (getf state :cluster-identity))
                (eql (getf metadata :timeline) (getf state :timeline))
@@ -78,6 +80,11 @@
                (<= (getf state :end) (getf metadata :lsn))
                (<= 3 (getf metadata :next-xid)))
     (error "foreign or malformed physical restartpoint metadata"))
+  (let ((snapshot (getf metadata :source-checkpoint)))
+    (when snapshot
+      (unless (and (wal-checkpoint-snapshot-valid-p snapshot)
+                   (<= (getf state :end) (getf snapshot :end) (getf metadata :lsn)))
+        (error "restartpoint source checkpoint lies outside its applied history"))))
   (let ((names (make-hash-table :test #'equal))
         (seen (make-hash-table :test #'eql))
         (live (physical-history-catalog-relfilenodes catalog-bytes (getf state :cluster-identity))))
@@ -122,11 +129,12 @@
          (seen (loop for node being the hash-keys of *physical-replay-seen-relfilenodes* collect node)))
     (dolist (entry forks)
       (pushnew (parse-integer (first entry) :start 5 :junk-allowed t) seen))
-    (list :version 1 :system-id (getf state :system-id)
+    (list :version 2 :system-id (getf state :system-id)
           :cluster-identity (getf state :cluster-identity) :timeline (getf state :timeline)
           :manifest-digest (getf state :manifest-digest) :base (getf state :end)
           :lsn *last-replay-lsn* :prefix-digest digest :next-xid *next-xid*
-          :forks forks :seen (sort seen #'<))))
+          :forks forks :seen (sort seen #'<)
+          :source-checkpoint (copy-list (getf state :source-checkpoint)))))
 
 (defun physical-restartpoint-publish (digest)
   "Called at a complete applied terminal with replay/admission and store locks held."
@@ -210,7 +218,9 @@
                 (setf (gethash node *physical-replay-seen-relfilenodes*) t))
               (setf *next-xid* (getf metadata :next-xid)
                     *xid-batch-end* *next-xid*
-                    (getf state :restartpoint-lsn) start))
+                    (getf state :restartpoint-lsn) start
+                    (getf *physical-recovery-state* :source-checkpoint)
+                    (copy-list (getf metadata :source-checkpoint))))
             (physical-recovery-reset-replay-history))
         (setf *last-replay-lsn* start *wal-checkpoint-lsn* start)
         start))))

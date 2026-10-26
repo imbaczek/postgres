@@ -130,11 +130,10 @@ a still-referenced relfilenode when checking a terminal's delete list."
         identity removed))
       (t
        (wal-recovery-validate-logical-terminal :other)
-       (if (= type +wal-record-clog-reset+)
-           (wal-read-u64-payload payload)
-           (unless (and (zerop (length payload))
-                        (or (= type +wal-record-checkpoint+) (zerop (wal-record-xid record))))
-             (error "invalid noncatalog terminal in history"))))))
+       (cond ((= type +wal-record-clog-reset+) (wal-read-u64-payload payload))
+             ((= type +wal-record-checkpoint+) (wal-checkpoint-record-snapshot record))
+             ((not (and (zerop (length payload)) (zerop (wal-record-xid record))))
+              (error "invalid noncatalog terminal in history"))))))
   (physical-history-reset nil))
 
 (defun physical-history-accept-record (record identity removed)

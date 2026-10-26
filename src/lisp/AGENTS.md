@@ -210,6 +210,15 @@ appropriate instead of replacing the native C peer or adding a message relay.
   their runners from the test system, and check Function Specs and Properties
   separately. Record selection, seed and actual trial counts; a declaration
   digest does not identify the implementation or the server image being tested.
+- A bounded literal reader still needs the right package: reading printed `NIL`
+  with `*package*` bound to KEYWORD produces `:NIL`, not the empty list. Preserve
+  CL literal semantics, keep reader evaluation disabled, and test optional NIL
+  fields through the actual serialization/parser pair.
+- When changing the native WAL version, retain the introduction versions of
+  existing record types, update physical stream negotiation, and check independent
+  test inspectors. Stored legacy WAL readability does not imply live mixed-version
+  peer compatibility. Crash tests must inspect the durable checkpoint copy both
+  before data sync and after control publication.
 
 ## Live SQL and SLIME debugging
 

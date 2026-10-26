@@ -1,7 +1,7 @@
 ;;;; Explicitly native WAL transport using PostgreSQL replication envelopes.
 (in-package #:pg)
 
-(defparameter +physical-native-format+ "pg_lisp_wal_5")
+(defparameter +physical-native-format+ (format nil "pg_lisp_wal_~d" +wal-version+))
 
 (defvar *physical-stream-test-hook* nil)
 

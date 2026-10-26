@@ -20,8 +20,7 @@
                                        :direction :output :element-type '(unsigned-byte 8))
                  (write-byte 0 stream)))
       (let* ((start (- pg::*wal-checkpoint-lsn* pg::+wal-header-size+))
-             (record (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 start
-                                            (empty-octets))))
+             (record (legacy-checkpoint-record start)))
         (with-open-file (stream (pg::wal-segment-path 1) :direction :io :if-exists :overwrite
                                                          :element-type '(unsigned-byte 8))
           (file-position stream (mod start pg::+wal-segment-size+))

@@ -71,7 +71,7 @@ phase postcondition is implemented. Full checkpoint metadata, primary shutdown
 checkpoint parity, promotion, timeline changes, rejoin and synchronous durability
 remain unfinished. No coordination is introduced.
 
-### Native checkpoint snapshot codec groundwork
+### Native checkpoint snapshots and durable publication
 
 The internal checkpoint snapshot codec now preserves explicit record start/end,
 native redo position, actual next FullXID, separately reserved-through FullXID,
@@ -79,16 +79,31 @@ next OID (including an explicit unknown state), signed Unix checkpoint time,
 timeline lineage and oldest active FullXID. Its versioned 88-byte payload binds
 to the containing version-6 checkpoint record and validates segment boundaries.
 Legacy version-2 through version-5 empty checkpoints retain unknown metadata.
-The writer still emits version-5 empty checkpoints: this is codec groundwork,
-not a published control snapshot or a completed checkpoint reporting interface.
+New writers emit version-6 records with 88-byte payloads and 32-byte headers.
+The native stream negotiation token is `pg_lisp_wal_6`; old live peers are
+rejected during negotiation, rather than accepted and sent unreadable WAL.
+Stored WAL versions 2–5 remain readable, including version-5 logical records.
+Upgrade both native streaming peers before reconnecting them.
 
-The next integration must change the WAL writer, durable control copy, scan
-start, source-pin validation, bootstrap inventory/manifest, replay history and
-restartpoint metadata together. Existing consumers derive checkpoint start as
-end minus 32; that assumption cannot survive a nonempty checkpoint. As in C's
-`CheckPoint`/`ControlFileData`, retain a durable copy independently of recycled
-WAL. A WAL flush before data fsync must preserve the previously published
-checkpoint copy; only successful checkpoint control publication advances it.
+As in C's `CheckPoint`/`ControlFileData`, `PGWAL4` keeps a CRC-bound copy alongside
+checkpoint-end and durable-end positions. Capture reads the real next FullXID,
+inclusive reservation bound and active-XID horizon under the XID lock, with the
+existing writer-to-WAL-to-XID lock order. OID allocation is excluded by the writer
+lock. Native v1 redo equals the checkpoint record start: native checkpoints
+synchronously install every preceding page, unlike C's concurrent checkpoint
+algorithm. Earlier redo is rejected until a future format implements that scan
+contract. WAL flushes preserve the previously published copy until page, CLOG and
+directory syncs finish. Only checkpoint control publication installs the candidate.
+
+Scanning and physical pins use explicit checkpoint starts; pin/base validation
+compares the complete record with its control copy. New bootstrap manifest v2
+persists that start, while v1 derives it only for legacy empty records. Replay
+preserves source checkpoint facts separately from standby read-visibility XIDs.
+Restartpoint metadata v2 retains them through receive-spool compaction and restores
+them before suffix replay. Legacy restartpoint metadata v1 remains readable with
+unknown source facts. The bounded literal reader now reads NIL as CL NIL, fixing
+its former interpretation as the keyword `:NIL`. New persistent formats require
+the upgraded binary; older binaries cannot read these records.
 
 A captured reservation bound alone does not make promotion safe at a later
 LSN. Native XID allocation can reserve another batch in `global/pg_control`
@@ -97,12 +112,24 @@ before promotion can reuse the allocator safely. Preserve the WAL-to-XID lock
 order when implementing it. No authority follows from these snapshot fields.
 The full 20-column C checkpoint SQL contract remains incomplete.
 
-Codec validation: 165 physical tests, 169 interop tests, 1,598 legacy checks,
+Validation: 173 physical tests, 169 interop tests, 1,598 legacy checks,
 strict fresh compilation and formatting pass. The cl-spec round-trip property
 passed 200 trials with seed 42 (digest `fnv1a64-v1:dfb6fd7c9db473c3`);
 input coverage and rejection counts are unmeasured, and no FunctionSpec is
-registered. These checks do not validate writer publication or crash recovery
-of the new payload, which are not integrated yet.
+registered. `t/checkpoint-snapshot.sh` independently decodes control/WAL CRCs,
+upgrades a stopped legacy fixture, kills the primary before data sync and after
+control publication, rejects a CRC-valid mismatching control copy, and checks
+source facts through standby replay, restartpoint compaction and restart.
+Evidence with v6 negotiation: `/tmp/pg-checkpoint-snapshot.yNodwn`; native shutdown signals:
+`/tmp/pg-physical-shutdown-signals.ZwccYD`; explicit preparation:
+`/tmp/pg-physical-shutdown.RpLJiv`. The ordinary pinned Patroni query and native
+follow regression pass (`/tmp/pg-physical-follow.ACIbvj`), as do both C logical
+directions and all three manual logical switchovers (`/tmp/pg-checkpoint-logical-*.log`).
+The broader WAL crash/corruption regression also passes
+(`/tmp/pg-checkpoint-wal-crash.log`), after updating its independent inspectors for
+version-6 checkpoints and the existing timestamped commit record format. Automatic
+standby restartpoints pass at `/tmp/pg-restartpoint-auto.1a2jz2`.
+These are native physical and C logical results, not C physical compatibility.
 
 ### Postmaster startup timestamp and checkpoint reporting inventory
 
@@ -135,14 +162,14 @@ current allocator state. These are required compatibility fields:
 
 | Fields | Native evidence/dependency before SQL exposure |
 | --- | --- |
-| `checkpoint_lsn`, `redo_lsn`, `redo_wal_file` | Define and persist checkpoint versus redo positions; do not substitute the WAL tail or duplicate a restartpoint LSN without matching semantics. |
-| `timeline_id`, `prev_timeline_id` | Persist checkpoint lineage alongside promotion/history; current native writer supports timeline 1 only. |
+| `checkpoint_lsn`, `redo_lsn`, `redo_wal_file` | Native snapshots now persist record start/end and synchronous redo. Map C's checkpoint record start and redo filename explicitly; do not expose native checkpoint-end or a local restartpoint as C's checkpoint LSN. |
+| `timeline_id`, `prev_timeline_id` | Native snapshots persist both as 1. Promotion/history must supply real changing lineage before dynamic reporting. |
 | `full_page_writes`, `logical_decoding` | Persist the actual checkpoint policy flags; full native page images and logical events alone are not a C control snapshot. |
-| `next_xid`, `next_oid` | Snapshot counters at the checkpoint; restartpoints already save FullXID/catalog data, but the API needs C's `epoch:xid` text and C20 `oid8` type contract. |
+| `next_xid`, `next_oid` | Native snapshots now preserve actual source counters, separately from reservation bounds and standby visibility. The API still needs C's `epoch:xid` text and C20 `oid8` type contract. |
 | `next_multixact_id`, `next_multi_offset`, `oldest_multi_xid`, `oldest_multi_dbid` | MultiXact lifecycle/control fields are not implemented. |
-| `oldest_xid`, `oldest_xid_dbid`, `oldest_active_xid` | Add durable C-compatible freeze/retention metadata rather than sampling current active sessions. |
+| `oldest_xid`, `oldest_xid_dbid`, `oldest_active_xid` | Native checkpoints now capture the oldest active FullXID, including C's no-active nextXid sentinel. Durable C-compatible freeze/retention metadata and SQL type mapping remain. |
 | `oldest_commit_ts_xid`, `newest_commit_ts_xid` | Implement truthful commit-timestamp tracking/control state; logical commit timestamps are a separate facility. |
-| `data_page_checksum_version`, `checkpoint_time` | Persist page-checksum policy and checkpoint wall-clock time; native WAL CRCs are not C data-page checksums. |
+| `data_page_checksum_version`, `checkpoint_time` | Signed Unix checkpoint time is now durable. Page-checksum policy/control state and the complete SQL record remain; native WAL CRCs are not C data-page checksums. |
 
 SQL `xid`/`oid8` output contracts and coherent publication of all these fields
 remain necessary. No partial all-NULL record or invented constants were added
@@ -786,9 +813,10 @@ and Sol medium final refactor review are complete for the receive store.
 `backend/replication/physical-source.lisp` persists named bootstrap WAL holds.
 Creation captures the current durable checkpoint under the global writer and WAL
 locks, validates its record, and atomically persists a marker before publishing
-the in-memory recycling horizon. It retains checkpoint-end minus the native
-32-byte record header, so a checkpoint ending exactly on a segment boundary
-keeps its own record. The zero-checkpoint case retains from zero.
+the in-memory recycling horizon. It retains the explicit checkpoint record start,
+so a checkpoint ending exactly on a segment boundary keeps its own record.
+Only legacy empty records derive start as end minus the 32-byte header. The
+zero-checkpoint case retains from zero.
 
 The marker binds cluster identity, initial timeline 1, checkpoint and restart
 coordinates with a CRC. Startup loads and validates all markers after catalog
@@ -1115,7 +1143,7 @@ base boundary, requested record end and cumulative received-prefix checksum:
 
 ```
 START_REPLICATION SLOT pin PHYSICAL lsn
-(native_format 'pg_lisp_wal_5', system_id '...', timeline '1',
+(native_format 'pg_lisp_wal_6', system_id '...', timeline '1',
  base_lsn '...', prefix_digest '...')
 ```
 

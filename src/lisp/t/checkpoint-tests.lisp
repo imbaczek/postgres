@@ -40,7 +40,7 @@
     (ok (intake-fails-p (lambda () (pg::wal-decode-checkpoint-snapshot bytes))))))
 
 (deftest checkpoint-snapshot-rejects-invalid-schema-and-bounds
-    (dolist (changes '((:end 153) (:redo 33) (:next-xid 2) (:xid-reserved-through 40)
+    (dolist (changes '((:end 153) (:redo 31) (:redo 33) (:next-xid 2) (:xid-reserved-through 40)
                        (:oldest-active-xid 43) (:oldest-active-xid 2) (:timeline 0)
                        (:time 9223372036854775808) (:next-oid -1)
                        (:start 16777100 :end 16777220 :redo 16777100)))
@@ -91,3 +91,116 @@
     (let ((data (cl-spec:result-data
                  (cl-spec:run-property 'checkpoint-snapshot-preserves-full-source-facts :seed 42))))
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest checkpoint-control-copy-is-crc-bound-and-legacy-readable
+    (let* ((snapshot (sample-checkpoint-snapshot))
+           (text (string-right-trim '(#\Newline)
+                                    (pg::bytes->string (pg::wal-encode-control-image 152 300 snapshot)))))
+      (multiple-value-bind (checkpoint durable copy) (pg::wal-decode-control-line text)
+        (ok (= checkpoint 152)) (ok (= durable 300))
+        (ok (equal copy snapshot)))
+      (let ((bad (copy-seq text)))
+        (setf (char bad 30) (if (char= (char bad 30) #\0) #\1 #\0))
+        (ok (intake-fails-p (lambda () (pg::wal-decode-control-line bad)))))
+      (ok (intake-fails-p (lambda () (pg::wal-encode-control-image 153 300 snapshot))))
+      (ok (intake-fails-p (lambda () (pg::wal-encode-control-image 152 151 snapshot)))))
+  (dolist (version '("PGWAL2" "PGWAL3"))
+    (let* ((prefix (format nil "~a 64 300" version))
+           (text (format nil "~a ~8,'0X" prefix (pg::wal-crc32 (pg::string->bytes prefix)))))
+      (multiple-value-bind (checkpoint durable copy) (pg::wal-decode-control-line text)
+        (ok (= checkpoint 64)) (ok (= durable 300)) (ok (null copy))))))
+
+(deftest checkpoint-unknown-fields-survive-literal-metadata-reader
+    (let* ((metadata (list :source-checkpoint (sample-checkpoint-snapshot :next-oid nil)
+                           :empty nil))
+           (text (pg::physical-bootstrap-manifest-text metadata))
+           (decoded (pg::recovery-parse-manifest-text text)))
+      (ok (equal metadata decoded))
+      (ok (null (getf (getf decoded :source-checkpoint) :next-oid)))
+      (ok (null (getf decoded :empty)))))
+
+(deftest checkpoint-control-rejects-earlier-redo-even-with-valid-crc
+    (let ((bytes (pg::wal-encode-checkpoint-snapshot (sample-checkpoint-snapshot))))
+      (pg::wal-set-u64 bytes 24 31)
+      (ok (intake-fails-p (lambda () (pg::wal-decode-checkpoint-snapshot bytes))))
+      (let* ((hex (with-output-to-string (out)
+                    (loop for byte across bytes do (format out "~2,'0X" byte))))
+             (prefix (format nil "PGWAL4 152 300 ~a" hex))
+             (line (format nil "~a ~8,'0X" prefix (pg::wal-crc32 (pg::string->bytes prefix)))))
+        (ok (intake-fails-p (lambda () (pg::wal-decode-control-line line)))))))
+
+(deftest checkpoint-capture-distinguishes-real-counter-and-reserved-capacity
+    (let* ((pg::*next-xid* 42) (pg::*xid-batch-end* 1042)
+                               (pg::*active-xids* '(17 31))
+                               (pg::*catalog* (pg::make-catalog :next-oid 17001))
+                               (snapshot (pg::wal-capture-checkpoint-snapshot 32)))
+      (ok (= 42 (getf snapshot :next-xid)))
+      (ok (= 1041 (getf snapshot :xid-reserved-through)))
+      (ok (= 17001 (getf snapshot :next-oid)))
+      (ok (= 17 (getf snapshot :oldest-active-xid)))
+      (setf pg::*active-xids* nil)
+      (ok (= 42 (getf (pg::wal-capture-checkpoint-snapshot 32) :oldest-active-xid)))))
+
+(deftest checkpoint-failed-publication-keeps-previous-runtime-copy
+    (let* ((old (sample-checkpoint-snapshot))
+           (candidate (sample-checkpoint-snapshot :start 300 :end 420 :redo 300))
+           (pg::*wal-checkpoint-lsn* 152) (pg::*wal-durable-lsn* 500)
+           (pg::*wal-checkpoint-snapshot* old)
+           (writer (symbol-function 'pg::wal-save-control-fields)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::wal-save-control-fields)
+                   (lambda (checkpoint durable)
+                     (ok (= checkpoint 420)) (ok (= durable 500))
+                     (ok (equal candidate pg::*wal-checkpoint-snapshot*))
+                     (error "injected checkpoint publication failure")))
+             (ok (intake-fails-p (lambda () (pg::wal-save-checkpoint-control 420 candidate))))
+             (ok (= 152 pg::*wal-checkpoint-lsn*))
+             (ok (equal old pg::*wal-checkpoint-snapshot*)))
+        (setf (symbol-function 'pg::wal-save-control-fields) writer))))
+
+(deftest checkpoint-source-pin-binds-full-record-to-control-copy
+    (dolist (start (list 32 (- pg::+wal-segment-size+ 120)))
+      (with-physical-store-directory (root)
+        (let* ((pg::*pgdata* root)
+               (end (+ start 120))
+               (snapshot (sample-checkpoint-snapshot :start start :end end :redo start))
+               (pg::*wal-checkpoint-lsn* end) (pg::*wal-durable-lsn* end)
+               (pg::*wal-checkpoint-snapshot* snapshot)
+               (pin (pg::make-physical-source-pin :name "snapshot" :restart-lsn start
+                                                  :consistent-lsn end)))
+          (pg::wal-ensure-directory-durable (pg::wal-directory))
+          (with-open-file (stream (pg::wal-segment-path 0) :direction :output
+                                                           :element-type '(unsigned-byte 8))
+            (file-position stream start)
+            (write-sequence (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 start
+                                                   (pg::wal-encode-checkpoint-snapshot snapshot)) stream))
+          (ok (not (intake-fails-p (lambda () (pg::physical-source-pin-check-wal pin)))))
+          (setf pg::*wal-checkpoint-snapshot* (copy-list snapshot)
+                (getf pg::*wal-checkpoint-snapshot* :time) 0)
+          (ok (intake-fails-p (lambda () (pg::physical-source-pin-check-wal pin))))))))
+
+(deftest checkpoint-manifest-start-preserves-legacy-and-new-boundaries
+    (let* ((legacy (list :version 1 :system-id 123 :cluster-identity "checkpoint-test"
+                         :timeline 1 :checkpoint 64 :end 64 :next-xid 42
+                         :source-pin "checkpoint_test" :files '(("PG_VERSION" 3 7))))
+           (new (append (subseq legacy 0 8) (list :checkpoint 152 :checkpoint-start 32
+                                                  :end 152) (nthcdr 12 legacy))))
+      (setf (getf new :version) 2)
+      (ok (pg::recovery-check-manifest-schema legacy))
+      (ok (= 32 (pg::physical-manifest-checkpoint-start legacy)))
+      (ok (pg::recovery-check-manifest-schema new))
+      (ok (= 32 (pg::physical-manifest-checkpoint-start new)))
+      (setf (getf new :checkpoint-start) 33)
+      (ok (intake-fails-p (lambda () (pg::recovery-check-manifest-schema new))))))
+
+(deftest version-five-logical-records-remain-readable-after-checkpoint-upgrade
+    (dolist (type (list pg::+wal-record-logical-changes+ pg::+wal-record-logical-catalog-event+))
+      (let ((bytes (pg::wal-encode-record type 0 0 #(1 2 3))))
+        (pg::wal-set-u16 bytes 4 5)
+        (pg::wal-set-u32 bytes 28 0)
+        (pg::wal-set-u32 bytes 28 (pg::wal-crc32 bytes))
+        (let ((records (pg::physical-wal-decode-input (pg::make-physical-wal-decoder) 0 bytes)))
+          (ok (= 1 (length records)))
+          (ok (= 5 (pg::wal-record-version (first records))))
+          (ok (= type (pg::wal-record-type (first records))))))))
