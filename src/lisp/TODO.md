@@ -7,8 +7,8 @@
   this pass; the primary agent reviews its documentation separately.
   The child checkpoint/primary, online promotion and reader-safe row replay
   modules, source running-transaction metadata helpers and covered standby
-  snapshots have completed this pass and its review. Keep the same order for
-  the remaining HA work.
+  snapshots and virtual reader lifecycle helpers have completed this pass and
+  its review. Keep the same order for the remaining HA work.
 
 - [ ] Audit cold-image compilation and ASDF load-order dependencies across `pg`
   and its test systems. A warm REPL must not conceal missing declarations or

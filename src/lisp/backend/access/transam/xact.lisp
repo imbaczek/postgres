@@ -225,7 +225,10 @@ or :QUERY-STATE for the wire dispatch's existing reload/shutdown cleanup lane."
 (defvar *relation-writers* (make-hash-table :test #'eql))
 (defvar *relation-readers* (make-hash-table :test #'eql))
 
-(defvar *recovery-reader-xids* (make-hash-table :test #'eql))
+(defvar *recovery-reader-xids* (make-hash-table :test #'eql)
+  "Process-local negative reader IDs, protected by *RELATION-LOCK-MUTEX*.
+Membership lasts until transaction cleanup, including deferred backend cleanup.
+These identities never enter the real active-XID set, CLOG or WAL.")
 
 (defvar *relation-maintainers* (make-hash-table :test #'eql))
 
@@ -459,6 +462,9 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
     (null *active-xids*)))
 
 (defun xid-wrap-users-empty-p ()
+  "Return true when both virtual readers and real XIDs have drained.
+
+Take the relation lock before the XID lock, as in transaction cleanup."
   (sb-thread:with-mutex (*relation-lock-mutex*)
     (and (zerop (hash-table-count *recovery-reader-xids*))
          (active-xids-empty-p))))
@@ -570,6 +576,9 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
     (values)))
 
 (defun backend-xid-wrap-resource-free-p (backend)
+  "Return true if BACKEND holds no resource that wraparound must drain.
+
+Both wraparound waiting and coordinator selection use this test."
   (and (null (backend-xid backend))
        (null (backend-virtual-reader-xid backend))
        (null (backend-transaction-snapshot backend))))
@@ -579,9 +588,9 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
     do (sb-thread:with-mutex (*xid-wrap-lock*)
          (when *xid-wrap-failure*
            (xid-wraparound-failed-error))
-         ;; A retained snapshot is itself one of the resources the wraparound
-         ;; coordinator waits to drain. Let its owner run read statements so it
-         ;; can end; ASSIGN-XID still refuses a new writer at the epoch edge.
+         ;; Real XIDs, virtual IDs and retained snapshots must drain before
+         ;; wraparound. Let their owners run so they can end; ASSIGN-XID still
+         ;; refuses a new writer at the epoch edge.
          (if (and *xid-wrap-pending*
                   (backend-xid-wrap-resource-free-p backend))
              (with-backend-wait-state (backend backend-wraparound-waiting t)
@@ -594,8 +603,8 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
        (values)))
 
 (defun prepare-xid-wraparound-for-statement (backend)
-  ;; Do not make a transaction with a retained snapshot become the wraparound
-  ;; coordinator: its own registration would make the coordinator wait forever.
+  ;; Do not make a transaction with a real XID, virtual reader ID or retained
+  ;; snapshot coordinate wraparound: it would wait for its own resources.
   (when (backend-xid-wrap-resource-free-p backend)
     (let ((should-coordinate
             (sb-thread:with-mutex (*xid-wrap-lock*)
@@ -912,9 +921,13 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
      ,@body))
 
 (defun release-relation-writer-xid (xid &optional backend)
-  "Forget XID's relation accesses atomically with its removal from active XIDs."
-  ;; Keep the relation gate closed until the XID is no longer in snapshots.
-  ;; No path takes these two locks in the opposite order.
+  "Release XID's relation accesses and transaction registration.
+
+For a virtual reader, BACKEND identifies the owner and its cached ID is cleared
+under the relation lock.  Real XIDs are removed from the active set under the
+XID lock.  Relation waiters are notified after the registrations are removed."
+  ;; Hold the relation lock before the XID lock so the relation gate stays
+  ;; closed until a real XID is no longer in the active set.
   (sb-thread:with-mutex (*relation-lock-mutex*)
     (when backend
       (unless (eql xid (backend-virtual-reader-xid backend))
@@ -940,6 +953,9 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
   (values))
 
 (defun release-xid (xid &optional backend)
+  "Release XID and wake transaction waiters after its registrations are gone.
+
+Pass BACKEND when releasing its virtual reader ID."
   (release-relation-writer-xid xid backend)
   (broadcast-xact)
   (values))
@@ -949,6 +965,7 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
     (and (member xid *active-xids* :test #'=) t)))
 
 (defun relation-user-active-p (xid)
+  "Check a virtual reader in its registry or a real XID in the active set."
   (if (minusp xid)
       (sb-thread:with-mutex (*relation-lock-mutex*)
         (not (null (gethash xid *recovery-reader-xids*))))
@@ -1531,6 +1548,10 @@ remains after BODY and should be dropped when its WAL is no longer needed."
 (defvar *recovery-reader-xid-counter* 0)
 
 (defun ensure-recovery-reader-identity (backend)
+  "Register BACKEND's virtual reader ID, allocating one if needed.
+
+A cached ID is enrolled again with the same value.  It belongs to the
+transaction until cleanup and is not a durable XID."
   (sb-sys:without-interrupts
     (sb-thread:with-mutex (*relation-lock-mutex*)
       (when (backend-xid backend)
@@ -1544,7 +1565,10 @@ remains after BODY and should be dropped when its WAL is no longer needed."
         xid))))
 
 (defun get-current-reader-xid ()
-  "Use a virtual relation-lock identity in recovery, never a durable transaction ID."
+  "Return the transaction's relation-lock identity.
+
+A recovery reader uses a virtual ID.  Keep that ID across a role change until
+transaction cleanup; otherwise obtain a real XID outside recovery."
   (if (or (backend-virtual-reader-xid *backend*) (recovery-in-progress-p))
       (ensure-recovery-reader-identity *backend*)
       (get-current-xid)))
@@ -1556,7 +1580,9 @@ remains after BODY and should be dropped when its WAL is no longer needed."
     snapshot))
 
 (defun ensure-transaction-snapshot (backend curcid)
-  "Acquire BACKEND's retained snapshot once, atomically publishing its owner."
+  "Acquire BACKEND's retained snapshot once, atomically publishing its owner.
+
+In recovery, enroll the virtual reader even if it has not accessed a relation."
   (when (recovery-in-progress-p)
     (ensure-recovery-reader-identity backend))
   (or (backend-transaction-snapshot backend)
@@ -1642,6 +1668,10 @@ READ WRITE outside recovery."
   (values))
 
 (defun reset-backend-transaction (b)
+  "Release transaction resources and return B to idle.
+
+Mask interrupts until cleanup and the idle transition finish, so no interrupt
+can discard the owner of a virtual ID or its remaining relation locks."
   (sb-sys:without-interrupts
     (release-backend-transaction-snapshot b)
     (when (backend-virtual-reader-xid b)

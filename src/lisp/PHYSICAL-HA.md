@@ -373,6 +373,29 @@ required CLI review sessions with the same requested profiles; the Sol Lisp revi
 used verbatim cl-mcp source snapshots when read-only MCP setup was unavailable.
 No coordination or SQL pg_promote support is added by this milestone.
 
+### Virtual reader lifecycle prerequisite
+
+Recovery readers now register a virtual transaction identity even when they retain a
+snapshot without accessing a relation. The identity is tracked separately from real
+XIDs, survives role changes for the life of the transaction, and is released with
+relation registrations before waiters are woken. Wraparound drains both kinds of
+identity, and transaction cleanup masks interrupts through the idle transition. This is
+a prerequisite for reader-preserving promotion; current promotion still drains old
+transactions. Reconciliation of idle or abandoned readers under quiescence and a live
+child adopter remain to be implemented. There is no protocol bump.
+
+A clean worker passed 363 physical Rove tests, 170 interop tests and 1,598 legacy
+checks. Eight lifecycle regressions and an injected asynchronous interrupt regression
+pass, including relation-builder blocking and wakeup and abandoned retained-snapshot
+cleanup. The native online run passed reload with an idle retained reader and
+promotion/crash coverage (`/tmp/pg-virtual-online-final.log`); all 11 reader scenarios
+passed (`/tmp/pg-virtual-readers-final.log`, artifacts
+`/tmp/pg-physical-readers.3omrsa`). Fresh strict compilation
+(`/tmp/pg-virtual-compile-final.log`) and formatting passed. Independent reviews found
+the interrupt cleanup gap, which was fixed and rereviewed without new findings.
+Snapshot-only ownership and actual wrap drain were tested separately; their combined
+scenario remains useful before promotion activation.
+
 ### Timeline-qualified native WAL namespace
 
 Filename construction/parsing now centralizes C `XLogFileName`'s TLI/log/segment
