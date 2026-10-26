@@ -46,7 +46,7 @@
   version type xid start end payload)
 
 (defstruct wal-page-image
-  relfilenode (fork :main) block page (xids '()))
+  relfilenode (fork :main) block page (xids '()) (provenance :unknown))
 
 (defstruct wal-replication-slot
   name database-oid restart-lsn consistent-lsn confirmed-flush-lsn active-owner
@@ -68,6 +68,9 @@
 (defvar *wal-page-cache-xids* (make-hash-table :test #'equal))
 (defvar *wal-page-batch* nil)
 (defvar *wal-page-batch-xids* nil)
+
+(defvar *wal-row-page-write-p* nil)
+
 (defvar *wal-page-batch-split* nil)
 (defvar *wal-xid-first-lsn* (make-hash-table :test #'eql))
 (defvar *wal-snapshot-retention-pins* (make-hash-table :test #'eq))
@@ -340,16 +343,18 @@ Legacy 16-hex segment names always belong to timeline 1."
         (smgr-read relfilenode block fork))))
 
 (defun wal-note-page-xid-under-lock (key)
-  "Record the current transaction as a contributor to KEY's staged page."
-  (let ((xid (and *backend* (backend-xid *backend*))))
-    (when xid
-      (let* ((contributors
-               (if *wal-page-batch*
-                   *wal-page-batch-xids*
-                   *wal-page-cache-xids*))
-             (xids (gethash key contributors)))
-        (unless (member xid xids :test #'eql)
-          (setf (gethash key contributors) (cons xid xids))))))
+  (let* ((local (and *wal-page-batch* (nth-value 1 (gethash key *wal-page-batch*))))
+         (dirty (or local (nth-value 1 (gethash key *wal-page-cache*))))
+         (prior (if local (gethash key *wal-page-batch-xids*) (gethash key *wal-page-cache-xids*)))
+         (contributors (if *wal-page-batch* *wal-page-batch-xids* *wal-page-cache-xids*))
+         (xids (copy-list prior))
+         (xid (and *backend* (backend-xid *backend*))))
+    (when (and dirty (not (member 1 xids :test #'eql))) (pushnew 0 xids :test #'eql))
+    (pushnew 1 xids :test #'eql)
+    (unless (and *wal-row-page-write-p* xid (>= xid 3) (>= (logand xid #xffffffff) 3))
+      (pushnew 0 xids :test #'eql))
+    (when xid (pushnew xid xids :test #'eql))
+    (setf (gethash key contributors) xids))
   (values))
 
 (defun wal-merge-page-xids (source destination)
@@ -381,11 +386,11 @@ Legacy 16-hex segment names always belong to timeline 1."
   (let ((key (wal-page-key relfilenode block fork))
         (copy (wal-copy-dirty-page page)))
     (with-wal-page-state-lock
+      (wal-note-page-xid-under-lock key)
       (setf (gethash key (if *wal-page-batch*
                              *wal-page-batch*
                              *wal-page-cache*))
-            copy)
-      (wal-note-page-xid-under-lock key)))
+            copy)))
   (wal-test-pause :after-page-stage)
   (values))
 
@@ -414,12 +419,12 @@ Legacy 16-hex segment names always belong to timeline 1."
       (smgr-extend relfilenode page fork)
       (with-wal-page-state-lock
         (let ((block (wal-visible-nblocks-under-lock relfilenode fork)))
+          (wal-note-page-xid-under-lock (wal-page-key relfilenode block fork))
           (setf (gethash (wal-page-key relfilenode block fork)
                          (if *wal-page-batch*
                              *wal-page-batch*
                              *wal-page-cache*))
                 (wal-copy-dirty-page page))
-          (wal-note-page-xid-under-lock (wal-page-key relfilenode block fork))
           (unless *wal-page-batch*
             (wal-test-pause :after-page-stage))
           block))))
@@ -469,9 +474,13 @@ Legacy 16-hex segment names always belong to timeline 1."
                                             :fork (second key)
                                             :block (third key)
                                             :page (copy-seq page)
-                                            :xids (copy-list
-                                                   (gethash key
-                                                            *wal-page-cache-xids*)))
+                                            :xids (remove-if (lambda (xid) (< xid 3))
+                                                             (gethash key *wal-page-cache-xids*))
+                                            :provenance
+                                            (let ((xids (gethash key *wal-page-cache-xids*)))
+                                              (cond ((member 0 xids :test #'eql) :maintenance)
+                                                    ((member 1 xids :test #'eql) :row)
+                                                    (t :unknown))))
                        images)))
              *wal-page-cache*)
     (sort images
@@ -512,7 +521,11 @@ Legacy 16-hex segment names always belong to timeline 1."
       (let* ((xids (wal-page-image-xids image))
              (xid-count-offset (+ offset 12 +blcksz+))
              (xid-offset (+ xid-count-offset 4)))
-        (wal-set-u32 payload xid-count-offset (length xids))
+        (unless (<= (length xids) #x3fffffff) (error "too many page contributors"))
+        (wal-set-u32 payload xid-count-offset
+                     (logior (length xids)
+                             (ecase (wal-page-image-provenance image)
+                               (:unknown 0) (:row #x80000000) (:maintenance #xc0000000))))
         (loop for xid in xids
               do (wal-set-u64 payload xid-offset xid)
                  (incf xid-offset 8))
@@ -538,14 +551,19 @@ Legacy 16-hex segment names always belong to timeline 1."
                (unless (<= page-end (length payload))
                  (error "WAL page-image record has a truncated page"))
                (let* ((page (subseq payload page-offset page-end))
-                      (xids nil)
+                      (xids nil) (provenance :unknown)
                       (next-offset page-end))
                  (when (>= version +wal-version-v4+)
                    (unless (<= (+ next-offset 4) (length payload))
                      (error "WAL page-image record has a truncated contributor count"))
-                   (let* ((xid-count (wal-u32 payload next-offset))
+                   (let* ((tagged-count (wal-u32 payload next-offset))
+                          (flags (ldb (byte 2 30) tagged-count))
+                          (xid-count (logand tagged-count #x3fffffff))
                           (xids-start (+ next-offset 4))
                           (xids-end (+ xids-start (* xid-count 8))))
+                     (unless (and (/= flags 1) (or (zerop flags) (>= version 7)))
+                       (error "invalid page provenance flags"))
+                     (setf provenance (case flags (0 :unknown) (2 :row) (3 :maintenance)))
                      (unless (<= xids-end (length payload))
                        (error "WAL page-image record has truncated contributors"))
                      (setf xids
@@ -557,7 +575,7 @@ Legacy 16-hex segment names always belong to timeline 1."
                    (error "WAL page image has an invalid LSN or checksum"))
                  (push (make-wal-page-image :relfilenode relfilenode
                                             :fork fork :block block :page page
-                                            :xids xids)
+                                            :xids xids :provenance provenance)
                        images)
                  (setf offset next-offset))))
     (unless (= offset (length payload))

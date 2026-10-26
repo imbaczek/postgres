@@ -577,7 +577,11 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.wal"))):
                 if version >= 4:
                     if item + 4 > offset + length:
                         raise SystemExit("truncated contributor count in checkpoint WAL")
-                    xid_count = struct.unpack_from("<I", data, item)[0]
+                    tagged_count = struct.unpack_from("<I", data, item)[0]
+                    flags = tagged_count >> 30
+                    if flags == 1 or (flags and version < 7):
+                        raise SystemExit("invalid page provenance flags")
+                    xid_count = tagged_count & 0x3fffffff
                     item += 4 + xid_count * 8
                     if item > offset + length:
                         raise SystemExit("truncated contributors in checkpoint WAL")
