@@ -274,6 +274,7 @@
            (pg::*backend* (pg::make-backend))
            (pg::*next-xid* 50) (pg::*active-xids* nil)
            (pg::*recovery-reader-xid-counter* 0)
+           (pg::*recovery-reader-xids* (make-hash-table :test #'eql))
            (pg::*relation-readers* (make-hash-table :test #'eql))
            (pg::*relation-writers* (make-hash-table :test #'eql))
            (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
@@ -288,6 +289,292 @@
       (ok (null (pg::backend-virtual-reader-xid pg::*backend*)))
       (ok (zerop (hash-table-count pg::*relation-readers*)))
       (ok (= 50 pg::*next-xid*))))
+
+(deftest recovery-reader-keeps-lock-identity-after-role-change
+    (let* ((pg::*physical-recovery-state* (sample-recovery-manifest))
+           (pg::*backend* (pg::make-backend :state :in-progress :explicit t
+                                            :read-only t))
+           (pg::*next-xid* 50)
+           (pg::*active-xids* nil)
+           (pg::*recovery-reader-xid-counter* 0)
+           (pg::*recovery-reader-xids* (make-hash-table :test #'eql))
+           (pg::*relation-readers* (make-hash-table :test #'eql))
+           (pg::*relation-writers* (make-hash-table :test #'eql))
+           (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+           (token (pg::get-current-reader-xid)))
+      (unwind-protect
+           (progn
+             (pg::register-relation-readers '(16384) token)
+             (setf pg::*physical-recovery-state* nil)
+             (ok (= token (pg::get-current-reader-xid)))
+             (pg::register-relation-readers '(16385) (pg::get-current-reader-xid))
+             (ok (equal (list token) (gethash 16384 pg::*relation-readers*)))
+             (ok (equal (list token) (gethash 16385 pg::*relation-readers*)))
+             (ok (null (pg::backend-xid pg::*backend*)))
+             (ok (null pg::*active-xids*))
+             (ok (= 50 pg::*next-xid*))
+             (ok (pg::backend-transaction-read-only-p))
+             (pg::reset-backend-transaction pg::*backend*)
+             (ok (null (pg::backend-virtual-reader-xid pg::*backend*)))
+             (ok (zerop (hash-table-count pg::*relation-readers*)))
+             (ok (not (pg::backend-transaction-read-only-p))))
+        (pg::reset-backend-transaction pg::*backend*))))
+
+(deftest virtual-reader-can-finish-during-pending-wrap
+    (let* ((pg::*physical-recovery-state* nil)
+           (pg::*backend* (pg::make-backend :state :in-progress :explicit t
+                                            :read-only t :virtual-reader-xid -7))
+           (pg::*xid-wrap-pending* t)
+           (pg::*xid-wrap-failure* nil))
+      (ok (handler-case
+              (sb-ext:with-timeout 1
+                (pg::prepare-xid-wraparound-for-statement pg::*backend*)
+                t)
+            (sb-ext:timeout () nil)))
+      (ok (not (pg::backend-wraparound-waiting pg::*backend*)))))
+
+(deftest virtual-reader-registry-protects-wrap-and-relation-waits
+    (let* ((pg::*physical-recovery-state* (sample-recovery-manifest))
+           (pg::*backend* (pg::make-backend :state :in-progress :read-only t))
+           (pg::*active-xids* nil)
+           (pg::*recovery-reader-xids* (make-hash-table :test #'eql))
+           (pg::*relation-readers* (make-hash-table :test #'eql))
+           (pg::*relation-writers* (make-hash-table :test #'eql))
+           (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+           (token (pg::get-current-reader-xid)))
+      (unwind-protect
+           (progn
+             (ok (pg::active-xids-empty-p))
+             (ok (not (pg::xid-wrap-users-empty-p)))
+             (ok (not (pg::xid-active-p token)))
+             (ok (pg::relation-user-active-p token))
+             (clrhash pg::*recovery-reader-xids*)
+             (ok (= token (pg::get-current-reader-xid)))
+             (ok (pg::relation-user-active-p token))
+             (setf (pg::backend-cancel-pending pg::*backend*) t)
+             (ok (equal "57014" (recovery-state-of (lambda () (pg::wait-for-xid token)))))
+             (ok (null (pg::backend-waiting-xid pg::*backend*)))
+             (pg::reset-backend-transaction pg::*backend*)
+             (ok (pg::xid-wrap-users-empty-p))
+             (ok (not (pg::relation-user-active-p token)))
+             (pg::wait-for-xid token)
+             (ok (null (pg::backend-virtual-reader-xid pg::*backend*))))
+        (pg::reset-backend-transaction pg::*backend*))))
+
+(deftest standby-snapshot-without-relation-access-owns-a-virtual-identity
+    (let* ((pg::*physical-recovery-state* (sample-recovery-manifest))
+           (pg::*backend* (pg::make-backend :state :in-progress :explicit t
+                                            :read-only t :isolation-level :repeatable-read))
+           (pg::*next-xid* 50) (pg::*active-xids* nil)
+           (pg::*active-snapshots* 0)
+           (pg::*active-snapshot-set* (make-hash-table :test #'eq))
+           (pg::*recovery-reader-xids* (make-hash-table :test #'eql))
+           (pg::*relation-readers* (make-hash-table :test #'eql))
+           (pg::*relation-writers* (make-hash-table :test #'eql))
+           (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql)))
+      (unwind-protect
+           (let ((snapshot (pg::ensure-transaction-snapshot pg::*backend* 1)))
+             (ok (minusp (pg::backend-virtual-reader-xid pg::*backend*)))
+             (ok (zerop (hash-table-count pg::*relation-readers*)))
+             (ok (not (pg::xid-wrap-users-empty-p)))
+             (setf pg::*physical-recovery-state* nil)
+             (ok (eq snapshot (pg::ensure-transaction-snapshot pg::*backend* 2)))
+             (ok (minusp (pg::get-current-reader-xid)))
+             (ok (null (pg::backend-xid pg::*backend*)))
+             (ok (= 50 pg::*next-xid*)))
+        (pg::reset-backend-transaction pg::*backend*))
+      (ok (pg::xid-wrap-users-empty-p))
+      (ok (zerop pg::*active-snapshots*))))
+
+(deftest wrap-coordinator-drains-virtual-readers-before-freeze
+    (let* ((pg::*physical-recovery-state* (sample-recovery-manifest))
+           (pg::*backend* (pg::make-backend :state :in-progress :read-only t))
+           (pg::*active-xids* nil)
+           (pg::*recovery-reader-xids* (make-hash-table :test #'eql))
+           (pg::*relation-readers* (make-hash-table :test #'eql))
+           (pg::*relation-writers* (make-hash-table :test #'eql))
+           (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+           (registry pg::*recovery-reader-xids*)
+           (waiting (sb-thread:make-semaphore))
+           (frozen (sb-thread:make-semaphore))
+           (worker nil))
+      (pg::get-current-reader-xid)
+      (unwind-protect
+           (progn
+             (setf worker
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (let ((pg::*backend* (pg::make-backend))
+                            (pg::*next-xid* (+ pg::+xid-cycle+ pg::+first-normal-xid+))
+                            (pg::*xid-batch-end* 0)
+                            (pg::*active-xids* nil)
+                            (pg::*recovery-reader-xids* registry)
+                            (pg::*xid-wrap-pending* nil)
+                            (pg::*xid-wrap-failure* nil)
+                            (pg::*xid-wrap-completed-through* nil))
+                        (pg::complete-xid-wraparound
+                         :load-marker-function (constantly nil)
+                         :save-next-xid-function (constantly nil)
+                         :save-marker-function (constantly nil)
+                         :wait-for-xids-function
+                         (lambda ()
+                           (sb-thread:signal-semaphore waiting)
+                           (pg::wait-for-no-active-xids))
+                         :wait-for-snapshots-function (constantly nil)
+                         :freeze-function (lambda (epoch)
+                                            (declare (ignore epoch))
+                                            (sb-thread:signal-semaphore frozen))
+                         :reset-clog-function (constantly nil)
+                         :delete-marker-function (constantly nil)
+                         :shutdown-function (constantly nil))
+                        :completed))
+                    :name "virtual reader wrap regression"))
+             (ok (sb-thread:wait-on-semaphore waiting :timeout 5))
+             (ok (not (sb-thread:wait-on-semaphore frozen :timeout 0.1)))
+             (pg::reset-backend-transaction pg::*backend*)
+             (ok (eq :completed
+                     (sb-thread:join-thread worker :timeout 5 :default :timed-out)))
+             (ok (sb-thread:try-semaphore frozen)))
+        (pg::reset-backend-transaction pg::*backend*)
+        (when worker
+          (sb-thread:join-thread worker :timeout 5 :default :timed-out)))))
+
+(deftest virtual-reader-cleanup-releases-identity-on-every-transaction-exit
+    (dolist (exit (list #'pg::commit-transaction #'pg::abort-transaction
+                        #'pg::abort-transaction-block #'pg::end-backend-session))
+      (let* ((pg::*physical-recovery-state* (sample-recovery-manifest))
+             (pg::*backend* (pg::make-backend :state :in-progress :explicit t :read-only t))
+             (pg::*active-xids* nil)
+             (pg::*recovery-reader-xids* (make-hash-table :test #'eql))
+             (pg::*relation-readers* (make-hash-table :test #'eql))
+             (pg::*relation-writers* (make-hash-table :test #'eql))
+             (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+             (token (pg::get-current-reader-xid)))
+        (unwind-protect
+             (progn
+               (pg::register-relation-readers '(16384) token)
+               (funcall exit)
+               (ok (pg::xid-wrap-users-empty-p))
+               (ok (zerop (hash-table-count pg::*relation-readers*)))
+               (ok (null (pg::backend-virtual-reader-xid pg::*backend*)))
+               (pg::reset-backend-transaction pg::*backend*)
+               (ok (pg::xid-wrap-users-empty-p)))
+          (pg::reset-backend-transaction pg::*backend*)))))
+
+(deftest virtual-reader-is-not-its-own-wrap-coordinator
+    (let ((pg::*backend* (pg::make-backend :virtual-reader-xid -7))
+          (pg::*xid-wrap-pending* nil)
+          (pg::*xid-wrap-failure* nil)
+          (original (symbol-function 'pg::complete-xid-wraparound))
+          (called nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::complete-xid-wraparound)
+                   (lambda () (setf called t)))
+             (pg::prepare-xid-wraparound-for-statement pg::*backend*)
+             (ok (not called)))
+        (setf (symbol-function 'pg::complete-xid-wraparound) original))))
+
+(deftest virtual-only-commit-defers-interrupt-until-resource-cleanup
+    (let* ((pg::*physical-recovery-state* (sample-recovery-manifest))
+           (pg::*backend* (pg::make-backend :state :in-progress :explicit t :read-only t))
+           (pg::*active-xids* nil)
+           (pg::*recovery-reader-xids* (make-hash-table :test #'eql))
+           (pg::*relation-readers* (make-hash-table :test #'eql))
+           (pg::*relation-writers* (make-hash-table :test #'eql))
+           (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+           (original (symbol-function 'pg::wal-forget-xid-under-xid-lock))
+           (token (pg::get-current-reader-xid))
+           (interrupted nil))
+      (pg::register-relation-readers '(16384) token)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::wal-forget-xid-under-xid-lock)
+                   (lambda (xid)
+                     (funcall original xid)
+                     (sb-thread:interrupt-thread
+                      sb-thread:*current-thread*
+                      (lambda () (setf interrupted t) (throw 'reader-interrupt :interrupted)))))
+             (ok (eq :interrupted
+                     (catch 'reader-interrupt (pg::commit-transaction) :not-interrupted)))
+             (ok interrupted)
+             (ok (pg::xid-wrap-users-empty-p))
+             (ok (zerop (hash-table-count pg::*relation-readers*)))
+             (ok (null (pg::backend-virtual-reader-xid pg::*backend*)))
+             (ok (eq :idle (pg::backend-state pg::*backend*))))
+        (setf (symbol-function 'pg::wal-forget-xid-under-xid-lock) original)
+        (pg::release-xid token)
+        (pg::reset-backend-transaction pg::*backend*))))
+
+(deftest relation-builder-waits-for-abandoned-virtual-reader-cleanup
+    (let* ((pg::*physical-recovery-state* (sample-recovery-manifest))
+           (pg::*backend* (pg::make-backend :state :in-progress :explicit t
+                                            :read-only t :isolation-level :repeatable-read))
+           (pg::*next-xid* 50) (pg::*active-xids* nil)
+           (pg::*active-snapshots* 0)
+           (pg::*active-snapshot-set* (make-hash-table :test #'eq))
+           (pg::*recovery-reader-xids* (make-hash-table :test #'eql))
+           (pg::*relation-readers* (make-hash-table :test #'eql))
+           (pg::*relation-writers* (make-hash-table :test #'eql))
+           (pg::*relation-builders* (make-hash-table :test #'eql))
+           (pg::*relation-reader-blockers* (make-hash-table :test #'eql))
+           (pg::*relation-build-groups* (make-hash-table :test #'eq))
+           (pg::*relation-maintainers* (make-hash-table :test #'eql))
+           (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+           (pg::*n-connections* 0) (pg::*n-backends* 0)
+           (pg::*shutdown-abandoned-backends* nil)
+           (registry pg::*recovery-reader-xids*)
+           (readers pg::*relation-readers*) (writers pg::*relation-writers*)
+           (builders pg::*relation-builders*) (blockers pg::*relation-reader-blockers*)
+           (groups pg::*relation-build-groups*) (maintainers pg::*relation-maintainers*)
+           (published (sb-thread:make-semaphore))
+           (completed (sb-thread:make-semaphore))
+           (worker nil)
+           (identity (pg::get-current-reader-xid)))
+      (pg::ensure-transaction-snapshot pg::*backend* 1)
+      (pg::register-relation-readers '(16384) identity)
+      (unwind-protect
+           (progn
+             (setf pg::*physical-recovery-state* nil)
+             (setf worker
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (let ((pg::*backend* (pg::make-backend))
+                            (pg::*active-xids* nil)
+                            (pg::*recovery-reader-xids* registry)
+                            (pg::*relation-readers* readers)
+                            (pg::*relation-writers* writers)
+                            (pg::*relation-builders* builders)
+                            (pg::*relation-reader-blockers* blockers)
+                            (pg::*relation-build-groups* groups)
+                            (pg::*relation-maintainers* maintainers))
+                        (let ((token
+                                (pg::acquire-relation-build-locks
+                                 '(16384) nil t
+                                 (lambda (relations token)
+                                   (declare (ignore relations token))
+                                   (sb-thread:signal-semaphore published)))))
+                          (pg::release-relation-build-locks '(16384) token))
+                        (sb-thread:signal-semaphore completed)
+                        :completed))
+                    :name "virtual reader DDL regression"))
+             (ok (sb-thread:wait-on-semaphore published :timeout 5))
+             (ok (not (sb-thread:wait-on-semaphore completed :timeout 0.1)))
+             (ok (= identity (pg::get-current-reader-xid)))
+             (pg::register-relation-readers '(16384) identity)
+             (pg::postmaster-remember-abandoned-backend pg::*backend*)
+             (ok (not (pg::xid-wrap-users-empty-p)))
+             (pg::postmaster-retire-abandoned-backends)
+             (ok (pg::xid-wrap-users-empty-p))
+             (ok (pg::active-snapshots-empty-p))
+             (ok (null pg::*shutdown-abandoned-backends*))
+             (ok (eq :completed
+                     (sb-thread:join-thread worker :timeout 5 :default :timed-out)))
+             (ok (zerop (hash-table-count readers)))
+             (ok (zerop (hash-table-count builders))))
+        (pg::reset-backend-transaction pg::*backend*)
+        (when worker
+          (sb-thread:join-thread worker :timeout 5 :default :timed-out)))))
 
 (deftest primary-replay-progress-excludes-incomplete-batch
     (with-physical-store-directory (root)

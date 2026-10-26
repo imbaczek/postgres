@@ -129,7 +129,7 @@ already recorded in CLOG while releasing the backend's remaining registrations."
                     (copy-list *shutdown-abandoned-backends*))))
     (dolist (backend backends)
       (let ((*backend* backend)) (abort-transaction)))
-    (unless (and (active-xids-empty-p) (active-snapshots-empty-p))
+    (unless (and (xid-wrap-users-empty-p) (active-snapshots-empty-p))
       (error "shutdown still has transaction or snapshot registrations"))
     (sb-thread:with-mutex (*backend-registry-lock*)
       (setf *shutdown-abandoned-backends* nil)))

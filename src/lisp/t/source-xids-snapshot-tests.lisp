@@ -70,7 +70,7 @@
                  (ok (null (pg::snapshot-sequence-state-captured-p statement)))
                  (ok (null (pg::snapshot-sequence-states statement)))))
           (pg::release-snapshot-registration registration)
-          (pg::release-backend-transaction-snapshot backend)))))
+          (pg::reset-backend-transaction backend)))))
 
 (deftest mixed-snapshot-horizon-only-counts-incomplete-coverage
     (let* ((pg::*active-snapshots* 0) (pg::*active-snapshot-set* (make-hash-table :test #'eq))
