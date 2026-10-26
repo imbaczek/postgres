@@ -7,6 +7,7 @@
            (pg::*physical-recovery-state*
              (list :system-id 123 :timeline 1 :manifest-digest 77 :end 32 :checkpoint 32
                    :cluster-identity "history-source" :next-xid 50 :required-applied 96 :observed-next-xid 50))
+           (pg::*physical-recovery-failed-p* nil)
            (pg::*last-replay-lsn* 96) (pg::*next-xid* 50) (pg::*xid-batch-end* 50)
            (pg::*wal-checkpoint-lsn* 32) (pg::*catalog* nil) (pg::*clog-stream* nil)
            (pg::*relation-streams* (make-hash-table :test #'equal))
@@ -23,6 +24,12 @@
         (pg::wal-atomic-write-bytes (pg::catalog-path) bytes))
       (pg::wal-atomic-write-bytes (merge-pathnames "base/900" root)
                                   (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+      (let* ((base (sample-physical-record 0))
+             (name "pg_wal/0000000000000000.wal"))
+        (pg::wal-atomic-write-bytes (merge-pathnames name root) base)
+        (setf (getf pg::*physical-recovery-state* :wal-namespace) :legacy
+              (getf pg::*physical-recovery-state* :files)
+              (list (list name 32 (pg::physical-store-update-digest #xCBF29CE484222325 base)))))
       (let ((store (pg::physical-store-open spool 123 1 :create t :start-lsn 32)))
         (unwind-protect
              (progn
@@ -30,7 +37,7 @@
                (pg::physical-store-input store 64
                                          (legacy-checkpoint-record 64))
                (pg::physical-store-flush store)
-               (funcall function root store))
+               (let ((pg::*physical-receive-store* store)) (funcall function root store)))
           (pg::physical-store-close store))))))
 
 (defmacro with-restartpoint-fixture ((root store) &body body)

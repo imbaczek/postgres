@@ -237,6 +237,7 @@
            (let ((legacy (copy-list metadata)))
              (setf (getf legacy :version) version)
              (remf legacy :source-reservation)
+             (remf legacy :wal-prefix-digest)
              (when (= version 1) (remf legacy :source-checkpoint))
              (multiple-value-bind (decoded bytes)
                  (pg::physical-restartpoint-decode (pg::physical-restartpoint-encode legacy catalog))
