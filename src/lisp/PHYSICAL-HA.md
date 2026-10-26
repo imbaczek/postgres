@@ -12,6 +12,62 @@ manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
 
+### Independent WAL control timeline identities
+
+C's insertion timeline and latest checkpoint-record timeline can differ between
+end-of-recovery publication and the first child checkpoint. `StartupXLOG` assigns
+`InsertTimeLineID`/`PrevTimeLineID` at `xlog.c:6699–6703`;
+`CreateEndOfRecoveryRecord` flushes child WAL before advancing `minRecoveryPoint`
+and its TLI (`xlog.c:8277–8299`). Inferring current insertion from the checkpoint
+copy would lose this distinction.
+
+Native `PGWAL5` now CRC-binds checkpoint end, durable end, committed insertion TLI,
+checkpoint-record TLI and the existing optional checkpoint copy. Ordinary flushes
+preserve both identities; checkpoint publication changes only the checkpoint
+identity. PGWAL2/3/4 remain readable as implicit TLI 1. Primary startup rejects any
+unsupported child identity before WAL directory sync, scan, tail truncation or
+adoption; standby preparation also rejects it before dirty-control publication.
+The codec can represent distinct TLIs, but the operational namespace remains TLI 1.
+This native control layout is an implementation choice, not C disk compatibility.
+Current checks: 213 physical tests, 169 interop tests, 1,598 legacy checks, fresh strict compilation,
+and a 200-trial property at seed 42, declaration digest
+`fnv1a64-v1:7b7392006a76e7a6`. The encoder has no registered FunctionSpec;
+generated input coverage and rejection counts remain unmeasured. The native
+checkpoint script writes a valid-CRC insertion-TLI-2 fixture into a stopped owned
+primary, verifies startup refusal and compares exact hashes of table, CLOG, WAL
+and global metadata before/after. Legacy upgrade and both checkpoint crash
+boundaries still pass (`/tmp/pg-control-timelines-checkpoint-final.log`). Native
+follow/restart and pinned Patroni status calls pass at
+`/tmp/pg-physical-follow.OeXAOv`. New PGWAL5 writes require upgraded binaries;
+unchanged WAL7 framing does not imply an older binary can open the new control.
+The focused standby guard test presents real child WAL-control bytes and recovery
+control bytes while stubbing only the preceding read-only base check; it verifies
+the exact unsupported-timeline error and zero dirty-control publication events.
+Design and final source reviews found no correctness blocker or useful macro
+extraction. Existing review threads were reused; their model identity was not
+exposed. All production functions remain below the required length limit.
+
+The namespace inventory identifies the next integration requirements:
+
+| Area | Current evidence | Required before child WAL can be operational |
+| --- | --- | --- |
+| Primary segments | `wal-segment-path`/`wal-discover-segments`: 16-hex segment `.wal`, no TLI | Explicit `(TLI, segment)` keys and durable namespace migration; old names always mean TLI 1 |
+| Native record transport | WAL7, raw XLogData, TLI-1 negotiation only | Versioned branch identity or validated switch event; preserve existing live WAL7 behavior |
+| Source retention | `PGPHYSPIN2` embeds literal TLI 1 | Timeline-bound restart/confirmed positions and prefix proof |
+| Base/recovery | Manifest v3 and recovery-control v3 require TLI 1 | Distinguish immutable base lineage, replay position and source current lineage |
+| Receive/R-point | Receive-control v3 stores one TLI; segment files omit it | Bind floor/flush/digest and R-point replay to their branch |
+| Follow/reporting | Query and identity checks require TLI 1 | Fetch/validate ancestry; report the TLI paired with chosen receive/replay LSN |
+| Promotion | History publication only | Pending transition recovery, child prefix initialization, durable EOR and control, then writer admission |
+
+Scanner selection must follow verified history intervals at each record start,
+stop parent reads at the fork and never select the highest-numbered file. C copies
+only the valid parent prefix for an in-segment switch; at a segment boundary it
+creates the next child segment (`XLogInitNewTimeline`, `xlog.c:5867–5937`). A child
+file or history file alone grants no writer authority. Pending child bytes must
+not be published through ordinary parent `wal-save-durable-lsn` updates. Future
+promotion needs recoverable pending/committed state and its own crash tests; no
+coordination, custom writer generations or automatic failover is introduced.
+
 ### Timeline history publication prerequisite
 
 The C promotion sequence selects a new timeline, initializes a writable child WAL
