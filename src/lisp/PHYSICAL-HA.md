@@ -12,6 +12,77 @@ manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
 
+### Timeline-qualified native WAL namespace
+
+Filename construction/parsing now centralizes C `XLogFileName`'s TLI/log/segment
+arithmetic (`xlog_internal.h:165–169`) while retaining the native `.wal` suffix.
+Legacy 16-hex names always identify TLI 1; qualified names contain 24 uppercase
+hex digits. Discovery selects exactly the requested TLI and grammar. SQL WAL
+filename reporting shares the same arithmetic. This does not change native WAL
+record bytes, insertion timeline, physical stream version or server role.
+
+PGWAL6 adds a CRC-bound `legacy`/`timeline` namespace independently of both timeline
+identities. Older controls imply legacy names. Startup chooses the recorded grammar
+before scanning and rejects missing control when any `.wal` file exists. Recovery
+uses the verified base control namespace for provenance/inventory and checkpoint
+reads; the receive spool retains its independent legacy naming. Bootstrap inventory
+and prefix-copy limits follow the selected source paths.
+
+The explicit primary-only `wal-migrate-timeline-namespace` control operation owns
+reload quiescence, writer and WAL locks. It reconciles the entire qualified TLI-1
+inventory, requiring existing aliases to be regular files with identical device
+and inode; equal contents or symlinks do not suffice. Unmatched destinations are
+rejected before mutation. It flushes WAL, creates hard-link aliases, syncs their
+directory, durably publishes the new namespace, installs memory state, then removes
+only reverified legacy aliases and syncs again. Errors/nonlocal exits during this
+mutation fence WAL before releasing its lock; uncertain control publication must
+never permit continued legacy-mode writing. Before normal writes or recycling,
+startup reconciles inactive aliases: legacy control rolls back verified qualified
+staging links, while qualified control finishes verified legacy cleanup. Both
+directions prevalidate the complete plan and preserve active names. Ambiguous or
+unpaired aliases refuse startup instead of being adopted or discarded. Explicit
+operator retry also finishes verified cleanup after a committed switch. A shared
+unlink helper rechecks both inode identities and rejects removal of the active name.
+
+Current evidence: 228 physical tests, 169 interop tests, 1,598 legacy checks and fresh strict compilation
+pass. The filename identity property passes 200 trials at seed 42, digest
+`fnv1a64-v1:1d287bbeea620499`; no FunctionSpec is registered, and generated coverage
+and rejection counts remain unmeasured. A task-owned live primary migrated through
+its control socket, committed another row, and survived SIGKILL/restart with both
+rows and the qualified namespace intact; the independent checkpoint inspector
+passed (`/tmp/pg-wal-namespace-manual.xXzJOW`). Unit tests cover stale destinations,
+different inodes with equal bytes, symlinks, retryable same-inode aliases, control
+rename followed by directory-sync failure, and nonlocal exits before memory adoption.
+
+`t/wal-namespace.sh` builds three retained segments with 2,200 committed updates,
+then kills the actual server after partial linking, link sync, control rename,
+durable control before memory adoption, memory adoption and partial cleanup. It
+also kills startup during rollback/cleanup and verifies repeated recovery. The
+independent inspector compares complete active-segment SHA256 hashes and control
+identity/LSNs; it does not independently parse each WAL record. Continued follow
+from a legacy base, qualified bootstrap, source/standby restart and inactive-alias
+removal before SQL admission pass. Evidence: `/tmp/pg-wal-namespace-saved-source.log`;
+the fixture can reuse its stopped task-owned baseline via `WAL_NAMESPACE_SEED`.
+These SIGKILL tests are not simulated power-loss tests. C logical replication in
+both directions and all three manual logical switchovers pass at
+`/tmp/pg-wal-namespace-logical-interop.log` and
+`/tmp/pg-wal-namespace-logical-switchover.log`.
+Checkpoint legacy-format upgrade, publication crash boundaries and unsupported
+child rejection also pass at `/tmp/pg-wal-namespace-checkpoint-upgrade.log`.
+
+The live-image investigation also exposed a directory-enumeration hazard:
+`directory :resolve-symlinks nil` omitted a dangling alias in this SBCL. WAL
+inventory now uses `opendir`/`readdir`, checks EOF versus errno as C `ReadDirExtended`
+does, and closes the handle on every exit. Unit and process tests preserve the
+unmatched-dangling-alias rejection rather than weakening that invariant.
+
+Final reviews found no remaining correctness blocker. Refactoring review's shared
+verify/unlink helper is implemented; production functions remain under 120 lines.
+The service refused new model-specific threads, so existing review threads were
+reused without exposed model identity. Insertion TLI above 1 is still rejected.
+Lineage-aware parent/child scanning, durable promotion completion and rejoin remain
+subsequent requirements; no coordination is introduced.
+
 ### Independent WAL control timeline identities
 
 C's insertion timeline and latest checkpoint-record timeline can differ between

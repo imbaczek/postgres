@@ -225,6 +225,14 @@ appropriate instead of replacing the native C peer or adding a message relay.
   required-applied/observed floors separately, and check that redo restores them
   before listeners start. Reusing a future counter caused a real native follow
   restart failure despite valid WAL and a valid base.
+- Namespace migration must reconcile interrupted aliases during startup before
+  normal writes or checkpoint recycling. An operator retry alone can be too late:
+  recycling may remove one member of a previously paired inode. Prevalidate the
+  complete inactive inventory and never unlink an active or unpaired name.
+- Inspect actual directory-entry names for migration inventory. In this SBCL,
+  `directory` with `:resolve-symlinks nil` omitted a dangling WAL alias. The WAL
+  helper uses `opendir`/`readdir`, EOF/errno checking and `unwind-protect` cleanup.
+  Keep a dangling-alias regression and verify behavior in the owning Lisp image.
 - A new metadata flush can precede a test's intended commit flush. Prime allocation
   before arming a commit-specific generic fault hook through the owned control
   port; exercise the metadata flush in its own crash regression. Do not disable

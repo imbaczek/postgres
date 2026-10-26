@@ -70,7 +70,7 @@ state before advancing the recovery pointer. This is a small physical WAL
 implementation for the server's supported operations.
 
 Native WAL checkpoints (payload introduced in version 6) preserve source counters, checkpoint time
-and explicit start/end/redo positions in the record and the CRC-checked `PGWAL4`
+and explicit start/end/redo positions in the record and the CRC-checked WAL
 control copy. The copy advances only after data/CLOG sync. Stored legacy WAL and
 controls remain readable with unknown checkpoint facts until a new checkpoint.
 Native streaming now negotiates `pg_lisp_wal_7`; upgrade both peers before
@@ -86,6 +86,14 @@ images require reseeding. The regression `./t/xid-reservation.sh` checks both
 control-file crash windows, reader-only allocation, checkpoint-only actual counter
 progress, and crashes during migration of real v1/v2 restartpoints. This adds no
 promotion authority, coordination or synchronous acknowledged-commit guarantee.
+
+WAL control v6 records filename namespace separately from insertion/checkpoint
+timelines. Fresh and legacy clusters retain 16-digit native names until an explicit
+primary control call `(wal-migrate-timeline-namespace)` selects 24-digit
+timeline-qualified native names. Startup reconciles interrupted migration before
+writes or recycling. `./t/wal-namespace.sh` covers multi-segment migration/startup
+crashes, continued follow and qualified replica bootstrap. Runtime timeline 1 and
+native WAL7 framing remain in use; this is not promotion or C disk compatibility.
 
 ## Hot reload and control REPL
 
