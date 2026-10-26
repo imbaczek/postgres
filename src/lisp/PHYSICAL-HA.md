@@ -12,6 +12,56 @@ manual control. Behavior oracle: the repository's original C PostgreSQL source.
 
 ## Verified starting points
 
+### Timeline history publication prerequisite
+
+The C promotion sequence selects a new timeline, initializes a writable child WAL
+segment, writes history, then flushes an end-of-recovery WAL record and updates
+the recovery control boundary before ordinary writes. References:
+`xlog.c:6658–6703`, `CreateEndOfRecoveryRecord:8257–8302`, and
+`timeline.c:writeTimeLineHistory:304–454`. History publication alone does not
+perform any of these role or WAL transitions.
+
+The new internal history encoder copies parent octets verbatim and emits C's
+decimal parent, tab, uppercase high/zero-padded low LSN words, tab, reason and
+newline, including C's extra newline whenever a parent file existed. Publication
+uses an exclusive temporary inode, file sync, no-clobber link installation,
+installed-inode sync and directory sync. It never overwrites an existing child.
+Later errors preserve a complete installed file and report failure; callers must
+not interpret pathname visibility as durable promotion completion.
+
+Native ancestry validation deliberately requires a parent history above timeline
+1, rejects backward forks and embedded reason NUL/newline, and retains existing
+native line/file bounds. C allows a missing parent file and uses a larger line
+buffer. Archive restoration and archive notification remain unimplemented.
+An existing empty or partial parent file remains representable, as in C: ancestry
+may begin above timeline 1. The encoder does not certify that this lineage belongs
+to a particular base image. Promotion/rejoin must prove that relationship from
+the node's verified WAL prefix and system identity before adopting a child.
+
+Current evidence: 208 physical tests and fresh strict compilation pass. The new
+encoder property runs 200 trials at seed 42, declaration digest
+`fnv1a64-v1:d21b5f8e46f5379e`; no FunctionSpec is registered, and rejection counts
+and generated input coverage are unmeasured. `t/timeline-publication.sh` passes
+SIGKILL before installation, after installation and after directory sync, followed
+by actual SQL-server restart and exact history reads through both replication
+connection modes. Independent publishers race at the same destination; the loser
+cannot alter the winner, including an existing dangling symlink. The pinned Patroni
+4.1.5 reader parses the published lineage, and SQL/protocol identity checks confirm
+that runtime role/timeline remain unchanged. Task-worker PIDs are verified against
+their command, PGDATA environment and owned launcher before SIGKILL. Evidence:
+`/tmp/pg-timeline-publication.zli598`. These are process-crash tests, not simulated
+power-loss evidence. Crashes may leave unreferenced temporary history files;
+subsequent publication creates a new exclusive temporary file.
+Design and final source/process reviews found no publication blocker and no
+worthwhile macro extraction; production functions remain below 120 lines. The
+reused review thread's model identity was not exposed. Existing 169 logical
+interop tests also pass. Native source roles and WAL namespaces remain unchanged.
+
+The next promotion requirements remain timeline-keyed WAL/storage/control and
+receive progress, recoverable end-of-recovery publication, restoration of source
+allocation floors, truthful role transition and manual physical promotion/rejoin
+tests. No coordinator or custom writer-generation authority is introduced.
+
 ### Durable native recovery control state
 
 Native recovery control now records the C `DBState` distinction between startup
