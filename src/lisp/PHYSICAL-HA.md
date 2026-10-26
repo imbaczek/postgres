@@ -271,13 +271,13 @@ temporary file. SIGKILL may leave an unclaimed `.timeline-*` temporary, which
 ordinary WAL discovery ignores; no startup path adopts it. Successful callers
 own the returned temporary and must install or remove it.
 
-Canonical installation is still missing, rather than replaced with no-clobber
-semantics. C's in-segment `InstallXLogFileSegment(find_free=false)` explicitly
+Canonical installation now follows the private verified intent as described below.
+C's in-segment `InstallXLogFileSegment(find_free=false)` explicitly
 durably unlinks an existing destination and durably renames its prepared file
 (`xlog.c:3698–3724`). At a boundary, `XLogFileInit` may reuse a preallocated file
 (`xlog.c:3325–3339`); native variable-length reuse must distinguish an empty owned
-pending child from uncommitted record bytes. Before implementing either branch,
-recovery must persist and recheck ownership of the pending child. An existing
+pending child from uncommitted record bytes. Both branches require recovery to
+persist and recheck ownership of the pending child. An existing
 child history/filename or matching prefix is insufficient evidence. Parent WAL
 control and write exclusion must remain authoritative through preparation and
 installation; only later EOR flush and durable recovery/control transition can
@@ -357,7 +357,7 @@ unchanged. Native WAL and physical negotiation stay at version 7.
 
 C flushes EOR before advancing minimum-recovery-point control
 (`xlog.c:8275–8299`). This milestone does not perform that later transition:
-canonical child installation, history/EOR publication, pending startup resume,
+history/EOR publication, pending startup resume,
 writer admission and operational promotion remain required. No coordination or
 custom writer-generation token is introduced.
 
@@ -383,6 +383,64 @@ Normal publication also denies runtime admission. Evidence:
 `/tmp/pg-restartpoint-auto.VWaiXp`. The optional seed route was exercised;
 the harness's default seed-generation route was not rerun. These are process-crash
 tests, not simulated power-loss evidence or completed promotion recovery.
+
+### Installing the pending child prefix
+
+`physical-promotion-install-prefix` now revalidates phase-3 intent and installs
+the authenticated generation prefix at the timeline-qualified child filename,
+including when its immutable source uses legacy names. It rereads every persisted
+intent field, selected generation hash, exact fork/visibility counters, source
+checkpoint/reservation and receive provenance. Cached prefix/proof must agree
+with that generation. The shared promotion exclusion macro centralizes the
+command/reload/quiescence precondition, registration lock, stopped-worker check
+and history lock for both publication stages.
+
+The staging helper accepts explicitly supplied authenticated bytes and requires
+their exact fork-offset length, avoiding the incomplete parent `pg_wal` suffix.
+After temporary-file sync, installation checks the destination is regular or
+absent, unlinks it, syncs the directory, renames the temporary and syncs again.
+This follows C's force-install ordering. At an exact boundary, native segments
+start empty; stale regular destination bytes are replaced rather than trusted as
+preallocated WAL. Special files reject before staging. Errors/nonlocal exits
+during staging or installation fence recovery; ordinary failure cleanup removes
+this call's temporary file.
+
+Child history must still be absent. C `StartupXLOG` installs the segment at
+`xlog.c:6670`, publishes history at `6692`, then emits EOR. Future native
+orchestration must preserve this durable order. Once history exists, this helper
+refuses and preserves any later child/EOR bytes; a distinct resume path must
+inspect them. Repeated installation before history is idempotent. It does not
+change recovery intent, parent WAL/control, insertion/checkpoint TLIs, namespace
+or admission. Startup still refuses phase 3. Operational promotion, orphan staging
+cleanup and pending startup reconciliation remain unfinished.
+
+Validation: 288 physical tests, 169 interop tests, 1,598 legacy checks and fresh
+strict compilation pass. The new child-prefix
+property runs 50 trials at seed 42, digest `fnv1a64-v1:6622f1083b64c304`;
+no FunctionSpec is registered, and input coverage/rejection counts are unmeasured.
+Tests cover both source namespaces, stale destinations, repeated installation,
+changed proof, symlinks, history/EOR preservation, errors and nonlocal exits at
+all staging/install boundaries. Empty-prefix segment boundaries are covered by
+the lower-level staging test, not the complete native promotion fixture.
+
+`t/promotion-prefix.sh` kills the actual native installer after prefix fsync,
+staging directory sync, unlink, unlink directory sync, rename and final directory
+sync, plus a normal run. Its independent Python inspector compares installed
+bytes with the verified generation/source, distinguishes stale/absent/installed
+children, then checks startup refusal and unchanged critical storage snapshots
+including `pg_xact` and parent WAL control. Evidence:
+`/tmp/pg-promotion-prefix-native-final.log`, artifact
+`/tmp/pg-promotion-prefix.OOP8x9`, stopped seed
+`/tmp/pg-restartpoint-auto.VWaiXp`, fork 51787. SIGKILL before rename can leave
+an inert unique `.timeline-*` file; startup never adopts it. These process-crash
+checks do not establish power-loss durability or successful startup resume.
+
+Sol xhigh design advice, Luna max checkpoint and Sol high full-diff reviews found
+no remaining correctness blocker. A reused refactoring thread recommended the
+shared exclusion macro; the requested Sol medium thread was refused by the
+service limit. A reused full-review thread found no issue in the final macro
+delta. Production functions remain below 120 lines. Native WAL and
+physical negotiation remain version 7; no coordination is introduced.
 
 Replay publishes an applied terminal after syncing
 pages/CLOG and its recovery progress, but source allocation reservation and

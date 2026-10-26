@@ -137,6 +137,32 @@ def snapshot_pending(target, source, snapshot):
     print(f"pending-intent: actual publisher bound fork={lsn} generation={digest:016X} PASS")
 
 
+def check_child_prefix(target, source, expected):
+    root = pathlib.Path(target)
+    lsn, digest = main(target, source)
+    control = (root / "physical-recovery.control").read_bytes()
+    checked_crc(control, 84)
+    assert control[:8] == b"PGRSTAT4" and len(control) == 88
+    assert struct.unpack_from("<I", control, 8)[0] & 0x7FFFFFFF == 3
+    assert struct.unpack_from("<Q", control, 40)[0] == lsn
+    assert struct.unpack_from("<Q", control, 76)[0] == digest
+    child = struct.unpack_from("<I", control, 68)[0]
+    assert not (root / "pg_wal" / f"{child:08X}.history").exists()
+    segment = lsn // (16 * 1024 * 1024)
+    path = root / "pg_wal" / f"{child:08X}{segment // 256:08X}{segment % 256:08X}.wal"
+    if expected == "absent":
+        assert not path.exists(), "child should be durably unlinked"
+    elif expected == "stale":
+        assert path.read_bytes() == b"pending-stale-child"
+    else:
+        assert expected == "installed"
+        image = (root / "pg_physical_restartpoints" / f"{lsn:016X}-{digest:016X}.rp").read_bytes()
+        length = struct.unpack_from("<I", image, 20)[0]
+        prefix = image[-length:] if length else b""
+        assert path.read_bytes() == prefix, "child differs from authenticated prefix"
+    print(f"promotion-child-prefix: {expected} PASS")
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "--pending-fixture":
         prepare_pending(*sys.argv[2:])
@@ -144,5 +170,7 @@ if __name__ == "__main__":
         verify_pending(*sys.argv[2:])
     elif sys.argv[1] == "--snapshot-pending":
         snapshot_pending(*sys.argv[2:])
+    elif sys.argv[1] == "--check-child-prefix":
+        check_child_prefix(*sys.argv[2:])
     else:
         main(*sys.argv[1:])
