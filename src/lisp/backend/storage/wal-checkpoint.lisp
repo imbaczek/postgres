@@ -25,7 +25,9 @@
          (or (zerop active) (<= 3 active next))
          (or (null oid) (typep oid '(unsigned-byte 64)))
          (typep (getf snapshot :time) '(signed-byte 64))
-         (eql 1 (getf snapshot :timeline)) (eql 1 (getf snapshot :prev-timeline)))))
+         (typep (getf snapshot :timeline) '(integer 1 4294967295))
+         (typep (getf snapshot :prev-timeline) '(integer 1 4294967295))
+         (<= (getf snapshot :prev-timeline) (getf snapshot :timeline)))))
 
 (defun wal-encode-checkpoint-snapshot (snapshot)
   "V2 uses explicit flags for one-past FullXIDs, without truncating the sentinel."
@@ -183,10 +185,15 @@
         (error "checkpoint control copy names another record or timeline"))
       (values checkpoint durable snapshot timeline checkpoint-timeline namespace))))
 
+(declaim (ftype function physical-promotion-check-child-control))
+
 (defun wal-require-supported-timelines (insertion checkpoint)
-  "Refuse unsupported branches before any scan, truncation or storage mutation."
+  "Accept children only through verified child checkpoint control before mutation."
   (unless (and (eql insertion 1) (eql checkpoint 1))
-    (error "native timeline-keyed WAL is not yet supported")))
+    (handler-case (physical-promotion-check-child-control insertion checkpoint)
+      (error (condition)
+        (error "native timeline-keyed WAL is not yet supported without a verified child checkpoint: ~a"
+               condition)))))
 
 (declaim (special *xid-lock* *next-xid* *xid-batch-end* *active-xids* *catalog*))
 
@@ -202,7 +209,7 @@
                            :redo start :next-xid next :xid-reserved-through (1- *xid-batch-end*)
                            :next-oid (when *catalog* (catalog-next-oid *catalog*))
                            :time (- (get-universal-time) 2208988800)
-                           :timeline 1 :prev-timeline 1 :oldest-active-xid active)))
+                           :timeline *wal-insert-timeline* :prev-timeline *wal-prev-timeline* :oldest-active-xid active)))
       (unless (wal-checkpoint-snapshot-valid-p snapshot)
         (error "source allocation state cannot be represented in checkpoint"))
       snapshot)))

@@ -87,6 +87,9 @@
 (defvar *wal-checkpoint-timeline* 1
   "Timeline of the checkpoint record, independently of current insertion.")
 
+(defvar *wal-prev-timeline* 1
+  "Previous recovery timeline, as C XLogCtl PrevTimeLineID; persists across checkpoints.")
+
 (defvar *wal-segment-namespace* :legacy
   "Explicit filename grammar; changing insertion TLI never reinterprets old names.")
 
@@ -605,14 +608,17 @@ Legacy 16-hex segment names always belong to timeline 1."
      (error (condition)
        (wal-fail-stop condition))))
 
-(defun wal-next-record-start (length)
-  (when (> length +wal-segment-size+)
-    (error "WAL record of ~a bytes exceeds the segment size" length))
-  (multiple-value-bind (segment offset)
-      (wal-segment-and-offset *wal-end-lsn*)
+(defun wal-record-start-after (cursor length)
+  "Plan native rotation without changing insertion state."
+  (unless (and (typep cursor '(unsigned-byte 64))
+               (typep length (list 'integer 1 +wal-segment-size+)))
+    (error "invalid native WAL record position or length"))
+  (multiple-value-bind (segment offset) (wal-segment-and-offset cursor)
     (if (> (+ offset length) +wal-segment-size+)
-        (* (1+ segment) +wal-segment-size+)
-        *wal-end-lsn*)))
+        (* (1+ segment) +wal-segment-size+) cursor)))
+
+(defun wal-next-record-start (length)
+  (wal-record-start-after *wal-end-lsn* length))
 
 (defun wal-open-output (segment)
   (unless (eql segment *wal-output-segment*)
@@ -673,16 +679,17 @@ Legacy 16-hex segment names always belong to timeline 1."
     (error (condition)
       (wal-fail-stop condition))))
 
+(defun wal-sync-output-bytes (stream sync-names)
+  "Make WAL bytes/names durable without advancing any control-file claim."
+  (when stream (finish-output stream) (fsync-stream stream))
+  (when sync-names (fsync-directory (wal-directory))))
+
 (defun wal-flush ()
   (wal-check-healthy)
   (handler-case
       (progn
-        (when *wal-output-stream*
-          (finish-output *wal-output-stream*)
-          (fsync-stream *wal-output-stream*))
-        (when *wal-new-segments*
-          (fsync-directory (wal-directory))
-          (setf *wal-new-segments* '()))
+        (wal-sync-output-bytes *wal-output-stream* *wal-new-segments*)
+        (setf *wal-new-segments* '())
         (wal-test-pause :after-wal-bytes-flush)
         ;; Record the durable end only after the WAL bytes and segment names
         ;; have reached stable storage. Recovery uses it to distinguish an
@@ -2041,7 +2048,10 @@ src/backend/access/transam/xlogreader.c."
   (multiple-value-bind (checkpoint-lsn durable-lsn snapshot insertion checkpoint-timeline namespace)
       (wal-read-control-fields)
     (when checkpoint-lsn (wal-require-supported-timelines insertion checkpoint-timeline))
-    (setf *wal-segment-namespace* (or namespace :legacy))
+    (setf *wal-segment-namespace* (or namespace :legacy)
+          *wal-insert-timeline* (or insertion 1)
+          *wal-checkpoint-timeline* (or checkpoint-timeline 1)
+          *wal-prev-timeline* (getf snapshot :prev-timeline (or insertion 1)))
     (wal-ensure-directory-durable *pgdata*)
     (wal-ensure-directory-durable (merge-pathnames "global/" *pgdata*))
     (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))

@@ -53,6 +53,8 @@
 (defun wal-reconcile-namespace-at-startup ()
   "Reconcile inactive aliases before normal writes or checkpoint recycling.
 Control remains authoritative: legacy rolls staging back; timeline finishes cleanup."
+  ;; A promoted child's legacy TLI-1 names are ancestors, not migration aliases.
+  (when (> *wal-insert-timeline* 1) (return-from wal-reconcile-namespace-at-startup (values)))
   (let* ((legacy (eq *wal-segment-namespace* :legacy))
          (opposite (if legacy :timeline :legacy)))
     (when (wal-discover-segments 1 opposite)
