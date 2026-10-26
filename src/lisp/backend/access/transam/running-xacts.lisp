@@ -154,7 +154,20 @@ NIL state stays unknown until an anchor. Inferred XIDs may already have aborted.
           (getf result :running) (when complete (append running (nreverse added))))
     result))
 
+;;; Source WAL emission
+;;;
+;;; The pure helpers above do not capture or replay WAL themselves.  The
+;;; source commit path now emits this metadata, using the WAL-then-XID lock
+;;; order described above.  The record decoder validates the metadata, but
+;;; replay does not yet publish its membership.  Standby snapshot and
+;;; generation integration remain future work.
+;;;
+;;; Native record type 14 was introduced in the same unpublished native WAL
+;;; version 7.  Older executables reject the new type, so mixed checkouts are
+;;; not compatible.  This private format is not PostgreSQL C disk WAL.
+
 (defun wal-running-xacts-record-info (record)
+  "Validate a native record and return its decoded snapshot."
   (unless (and (= (wal-record-type record) +wal-record-running-xacts+)
                (>= (wal-record-version record) 7)
                (zerop (wal-record-xid record))
@@ -169,7 +182,17 @@ NIL state stays unknown until an anchor. Inferred XIDs may already have aborted.
     (error "invalid native running transaction record"))
   (wal-decode-running-xacts (wal-record-payload record)))
 
+;;; The caller holds the WAL lock.  As in LogStandbySnapshot, keep the XID
+;;; lock from capturing the actual next XID and active set through appending
+;;; the batch marker and metadata.  Release it before the normal row batch;
+;;; the normal commit flush makes the records durable together.
+;;;
+;;; Only a registered committer can establish coverage.  A standalone caller
+;;; without a registered XID emits no anchor.  If the active set exceeds the
+;;; bound, emit an explicit incomplete snapshot instead of a partial set.
+
 (defun wal-append-running-xacts-under-lock (committer)
+  "Append a running-XID snapshot for a registered COMMITTER under the WAL lock."
   (sb-thread:with-mutex (*xid-lock*)
     ;; Standalone WAL callers do not necessarily register transactions.
     ;; Only the actual allocator registry can provide coverage.

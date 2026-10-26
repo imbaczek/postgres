@@ -242,10 +242,21 @@ review is complete, including the empty-reservation and storage-handle wording.
 
 ### Source running-transaction metadata prerequisite
 
-The native codec and pure state helpers in `running-xacts.lisp` are implemented
-and reviewed. They are **not yet connected to source WAL emission, standby
-snapshots, replay or restartpoint generations**. The reader-safe replay cutoff
-therefore remains unchanged.
+The native codec, pure state helpers and source WAL emission in
+`running-xacts.lisp` are implemented and reviewed. Registered row committers emit
+an empty batch containing type 14 immediately before their ordinary commit batch.
+The caller holds WAL and the emitter holds XID from capture through both metadata
+appends, matching C's `LogStandbySnapshot` XidGenLock lifetime. The normal commit
+flush makes both batches durable. Unregistered standalone WAL callers emit no
+coverage proof.
+
+Redo, history validation, logical reading and reader-safe row replay recognize
+the empty metadata terminal. Replay may publish that terminal even when the
+following row batch is incomplete or unsafe. Logical reading advances its safe
+cursor without inventing a row transaction. **Source membership is not yet used
+by standby snapshots or persisted in restartpoint generations**; the existing
+reader cutoff remains unchanged. Source actual-next observations include the
+new metadata counter.
 
 The custom `PGRUNX01` payload carries actual next FullXID, sorted unique running
 FullXIDs and a complete/unknown flag. Allocation capacity is not a visibility
@@ -255,11 +266,12 @@ ordered progress conservatively adds intervening normal FullXIDs and removes a
 committer only at its applied terminal. State updates preserve their inputs.
 Native ABORT has no WAL record yet, so a later exact anchor removes stale aborted
 membership. This is not C `xl_running_xacts` binary compatibility.
+Type 14 extends the unpublished native v7 format without a version bump, as
+requested for this research project. Older executables reject it; the unchanged
+version does not promise interoperability between different checkouts.
 
 Next integration steps retain C's `RecordKnownAssignedTransactionIds` principle:
 
-- Serialize source snapshot capture and its WAL insertion with commit ordering,
-  using WAL then XID lock order. Never substitute reservation capacity for next.
 - Publish source membership and actual next at the same complete replay terminal.
   Save and restore them from the same restartpoint generation boundary; do not
   filter restored membership using mutable CLOG, which may be ahead after a crash.
@@ -276,6 +288,20 @@ digest `fnv1a64-v1:332906d1d21a338d`; rejection counts and input coverage were n
 measured. Fresh empty-cache strict compilation passed. Luna max checkpoint,
 Sol high full-diff and Sol medium refactoring reviews completed. These checks
 cover isolated helpers, not runtime transaction-tracking or durability behavior.
+
+Source WAL integration validation: 337 physical tests and 170 interop tests passed
+in a fresh worker; the additional lock-ownership test and four focused tests passed
+after extending XID lock lifetime. All 1,598 legacy checks passed. One synthetic
+logical test helper needed to advance next-XID when registering its selected XID;
+production validation remains strict. The nine native retained-reader scenarios,
+WAL crash recovery, physical follow, manual replay and automatic restartpoints
+passed, as did both C logical directions and all three manual switchovers against
+the pinned C build. Partial-input tests now check the exact metadata terminal
+without permitting row visibility before COMMIT, and the redo-error hook waits
+for page redo so metadata cannot consume its mutation boundary. Fresh strict
+compilation, formatting, Luna max checkpoint, Sol high full-diff/re-review and Sol
+medium refactoring review passed. This evidence does not yet cover persistent
+running membership or snapshots using that membership.
 
 ### Timeline-qualified native WAL namespace
 
