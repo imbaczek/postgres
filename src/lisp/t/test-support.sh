@@ -17,8 +17,15 @@ test_wait_owned_sql_server() {
         TEST_WAIT_LISTENER=$(ss -H -ltnp "sport = :$TEST_WAIT_PORT")
         if [ -n "$TEST_WAIT_LISTENER" ]; then
             if ! printf '%s\n' "$TEST_WAIT_LISTENER" | grep -F "pid=$TEST_WAIT_PID," >/dev/null; then
-                echo "SQL test port $TEST_WAIT_PORT belongs to another process" >&2
-                return 1
+                if printf '%s\n' "$TEST_WAIT_LISTENER" | grep -Eq 'pid=[0-9]'; then
+                    echo "SQL test port $TEST_WAIT_PORT belongs to another process: $TEST_WAIT_LISTENER" >&2
+                    return 1
+                fi
+                # ss can see the listener before it can attribute its owner.
+                # Keep waiting without probing SQL on an unverified endpoint.
+                TEST_WAIT_ATTEMPT=$((TEST_WAIT_ATTEMPT + 1))
+                sleep 0.1
+                continue
             fi
             if PGCONNECT_TIMEOUT=1 "$TEST_WAIT_PSQL" -X -h 127.0.0.1 \
                     -p "$TEST_WAIT_PORT" -U postgres -d postgres -c '' >/dev/null 2>&1; then
