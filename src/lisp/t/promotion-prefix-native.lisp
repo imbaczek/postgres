@@ -6,6 +6,12 @@
     (asdf:load-system "pg")))
 (in-package #:pg)
 
+(defun promotion-prefix-native-pause (point)
+  (when (string-equal (symbol-name point) (uiop:getenv "PG_PROMOTION_PAUSE"))
+    (wal-atomic-write-bytes (pathname (uiop:getenv "PG_PROMOTION_MARKER"))
+                            (string->bytes (format nil "~d~%" (sb-posix:getpid))))
+    (loop (sleep 1))))
+
 (defun promotion-prefix-native ()
   (setf *pgdata* (uiop:ensure-directory-pathname (uiop:getenv "PG_PROMOTION_DATA")))
   (postmaster-own-data-directory "127.0.0.1" (parse-integer (uiop:getenv "PG_PROMOTION_PORT")))
@@ -24,14 +30,15 @@
                (let ((child (wal-segment-path (floor *last-replay-lsn* +wal-segment-size+)
                                               (getf *physical-recovery-state* :promotion-child) :timeline)))
                  (wal-atomic-write-bytes child (string->bytes "pending-stale-child")))
-               (let ((*wal-timeline-test-hook*
-                       (lambda (point)
-                         (when (string-equal (symbol-name point) (uiop:getenv "PG_PROMOTION_PAUSE"))
-                           (wal-atomic-write-bytes
-                            (pathname (uiop:getenv "PG_PROMOTION_MARKER"))
-                            (string->bytes (format nil "~d~%" (sb-posix:getpid))))
-                           (loop (sleep 1))))))
-                 (physical-promotion-install-prefix)))))
+               (let ((*wal-timeline-test-hook* #'promotion-prefix-native-pause))
+                 (physical-promotion-install-prefix))
+               (when (equal "1" (uiop:getenv "PG_PROMOTION_WAL"))
+                 (let ((*physical-promotion-test-hook* #'promotion-prefix-native-pause)
+                       (*timeline-history-test-hook*
+                         (lambda (point)
+                           (when (eq point :after-install)
+                             (promotion-prefix-native-pause :after-history-install)))))
+                   (physical-promotion-publish-wal))))))
          (assert (= 3 (getf *physical-recovery-state* :phase)))
          (assert (handler-case (progn (check-recovery-available) nil)
                    (pg-error (condition) (equal "57P03" (pg-error-sqlstate condition)))))

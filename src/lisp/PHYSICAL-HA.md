@@ -357,7 +357,7 @@ unchanged. Native WAL and physical negotiation stay at version 7.
 
 C flushes EOR before advancing minimum-recovery-point control
 (`xlog.c:8275–8299`). This milestone does not perform that later transition:
-history/EOR publication, pending startup resume,
+pending startup resume and committed child control,
 writer admission and operational promotion remain required. No coordination or
 custom writer-generation token is introduced.
 
@@ -441,6 +441,74 @@ shared exclusion macro; the requested Sol medium thread was refused by the
 service limit. A reused full-review thread found no issue in the final macro
 delta. Production functions remain below 120 lines. Native WAL and
 physical negotiation remain version 7; no coordination is introduced.
+
+### Durable pending history and end-of-recovery WAL
+
+`physical-promotion-publish-wal` now continues the verified pending transition
+through immutable history and durable EOR bytes. C's relevant order is child
+segment installation, history publication (`StartupXLOG`, `xlog.c:6670/6692`),
+then EOR flush before minimum-recovery-point control (`8277–8299`). Native
+publication preserves the parent control and closed recovery admission until a
+later committed-control transition; writing these bytes does not promote a node.
+
+The publisher revalidates every pending identity field, selected generation,
+authenticated prefix, checkpoint/allocation proof and complete durable receive
+terminal under the existing promotion exclusion. The prefix installer still
+refuses published history. The continuation accepts an existing history only if
+its complete bytes match the canonical split. Its reason is fixed to
+`pg-lisp promotion`; native logical WAL capture uses fixed EOR level 2. EOR time
+is derived from the persisted intent's Unix seconds into PostgreSQL-epoch
+microseconds, so interrupted attempts generate the same record bytes. No new
+wire or disk protocol version is introduced.
+
+If EOR cannot fit after the fork, the valid prefix remains in its first child
+segment and EOR starts at the next segment boundary. Before history, a shared
+force-install helper prepares that next child file empty, replacing only an
+uncommitted regular destination. After history, neither file can be force
+replaced. Exact matching history is synced again through its no-follow regular
+inode and the WAL directory, including retry after a prior link installation
+that did not reach directory sync. EOR is written only after this ordering point.
+
+Retries verify the complete authenticated prefix and bound the uncommitted suffix
+to one 56-byte EOR frame. An incomplete or bad-CRC suffix can be overwritten with
+the deterministic record while old parent control still owns recovery. Any
+different complete CRC-valid native frame, including unsupported type/version,
+or a longer tail rejects before mutation. EOR inode and directory are synced
+before success. Errors/nonlocal exits during mutation latch failed recovery;
+that process cannot retry or resume admission. Fixture-local bindings model
+subsequent recovery for unit checks; actual phase-3 startup still refuses pending
+state. Startup reconciliation and committed-primary control remain unfinished.
+
+Validation: 294 physical tests, 169 interop tests, 1,598 legacy checks and fresh
+strict compilation pass. A new property reconstructs generated partial/torn EOR
+suffixes in 50 trials at seed 42, digest `fnv1a64-v1:a9d85d3df61ddb6a`;
+no FunctionSpec is registered, and input coverage/rejection counts are unmeasured.
+Fixed tests cover stable repeated publication, changed history/prefix, valid
+foreign and unsupported frames, all publication error/nonlocal-exit boundaries,
+and a real 16 MiB maintenance prefix with EOR rotation. The rotated case stops
+after history, then verifies both exact child files on recovery and retry. It
+exposed and fixed an untyped `#()` being passed where an empty octet vector was
+required. A shared descriptor helper enforces bounded no-follow regular files.
+
+`t/promotion-wal.sh` reuses the owned native prefix fixture and runs normal
+publication plus SIGKILL before history, after history link installation, after
+history sync, before/after EOR write and after EOR inode/directory sync. The
+independent Python oracle validates the complete history line, WAL header/CRC,
+child/parent/level/time fields and embedded prefix against source WAL. Subsequent
+startup refusal preserves critical storage including `pg_xact` and parent WAL
+control. All eight runs pass at `/tmp/pg-promotion-wal-native.log`, artifact
+`/tmp/pg-promotion-prefix.BWs90u`, using stopped seed
+`/tmp/pg-restartpoint-auto.VWaiXp`. The original seven-case prefix regression
+also passes (`/tmp/pg-promotion-prefix-eor-regression.log`). Native crashes use
+the in-segment fork 51787; rotation/retry is covered by the full unit fixture.
+These checks establish process-crash refusal, not power-loss durability or
+operational startup resume.
+
+Reused design/checkpoint/full-diff review threads found no blocker; their model
+profiles were not exposed after exact-profile creation hit the service limit.
+Sol medium's final refactoring review found no further useful extraction. Shared
+force installation, file opening and promotion exclusion centralize the relevant
+invariants; production functions remain below 120 lines. No coordination is added.
 
 Replay publishes an applied terminal after syncing
 pages/CLOG and its recovery progress, but source allocation reservation and

@@ -163,6 +163,50 @@ def check_child_prefix(target, source, expected):
     print(f"promotion-child-prefix: {expected} PASS")
 
 
+def check_promotion_eor(target, source, expected):
+    root = pathlib.Path(target)
+    fork, digest = main(target, source)
+    control = (root / "physical-recovery.control").read_bytes()
+    assert len(control) == 88 and control[:8] == b"PGRSTAT4"
+    checked_crc(control, 84)
+    assert struct.unpack_from("<I", control, 8)[0] & 0x7FFFFFFF == 3
+    parent = struct.unpack_from("<I", control, 12)[0]
+    child = struct.unpack_from("<I", control, 68)[0]
+    assert struct.unpack_from("<Q", control, 40)[0] == fork
+    assert struct.unpack_from("<Q", control, 76)[0] == digest
+    image = (root / "pg_physical_restartpoints" / f"{fork:016X}-{digest:016X}.rp").read_bytes()
+    length = struct.unpack_from("<I", image, 20)[0]
+    prefix = image[-length:] if length else b""
+    size = 16 * 1024 * 1024
+    start = fork if fork % size + 56 <= size else (fork // size + 1) * size
+    def child_path(lsn):
+        segment = lsn // size
+        return root / "pg_wal" / f"{child:08X}{segment // 256:08X}{segment % 256:08X}.wal"
+    history = root / "pg_wal" / f"{child:08X}.history"
+    if expected == "no-history":
+        assert not history.exists()
+    else:
+        assert history.read_bytes() == f"{parent}\t{fork >> 32:X}/{fork & 0xFFFFFFFF:08X}\tpg-lisp promotion\n".encode()
+    first = child_path(fork).read_bytes()
+    assert first[:length] == prefix
+    if expected != "eor":
+        assert first == prefix
+        if start != fork:
+            assert child_path(start).read_bytes() == b""
+    else:
+        assert expected == "eor"
+        if start != fork:
+            assert first == prefix
+        data = child_path(start).read_bytes()
+        record = data[start % size:]
+        assert len(record) == 56 and record[:4] == b"PGWL"
+        assert struct.unpack_from("<HHIQQ", record, 4) == (7, 13, 56, start, 0)
+        checked_crc(record, 28)
+        timestamp = (struct.unpack_from("<q", control, 60)[0] - 946684800) * 1000000
+        assert struct.unpack_from("<qIIII", record, 32) == (timestamp, child, parent, 2, 0)
+    print(f"promotion-history-eor: {expected} PASS")
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "--pending-fixture":
         prepare_pending(*sys.argv[2:])
@@ -172,5 +216,7 @@ if __name__ == "__main__":
         snapshot_pending(*sys.argv[2:])
     elif sys.argv[1] == "--check-child-prefix":
         check_child_prefix(*sys.argv[2:])
+    elif sys.argv[1] == "--check-promotion-eor":
+        check_promotion_eor(*sys.argv[2:])
     else:
         main(*sys.argv[1:])

@@ -23,13 +23,17 @@ else
 fi
 test -d "$SEED/copy"
 test -d "$SEED/source"
-for point in normal after-prefix-fsync after-prefix-directory-fsync after-child-unlink \
-    after-child-unlink-directory-fsync after-child-rename after-child-directory-fsync; do
+if [ "${PROMOTION_WAL:-0}" = 1 ]; then
+    points='normal before-history after-history-install after-history before-eor-write after-eor-write after-eor-fsync after-eor-directory-fsync'
+else
+    points='normal after-prefix-fsync after-prefix-directory-fsync after-child-unlink after-child-unlink-directory-fsync after-child-rename after-child-directory-fsync'
+fi
+for point in $points; do
     CASE=$TMP/$point
     mkdir -m 700 "$CASE"
     cp -a "$SEED/copy" "$CASE/data"
     before=$(sha256sum "$CASE/data/global/pg_wal_control")
-    PG_PROMOTION_DATA="$CASE/data" PG_PROMOTION_PORT="$PORT" \
+    PG_PROMOTION_DATA="$CASE/data" PG_PROMOTION_PORT="$PORT" PG_PROMOTION_WAL="${PROMOTION_WAL:-0}" \
         PG_PROMOTION_PAUSE="$point" PG_PROMOTION_MARKER="$CASE/marker" \
         "$SBCL" --script "$BASE/t/promotion-prefix-native.lisp" >"$CASE/publisher.log" 2>&1 &
     HELPER=$!
@@ -48,13 +52,23 @@ for point in normal after-prefix-fsync after-prefix-directory-fsync after-child-
         wait "$HELPER" 2>/dev/null || :
         HELPER=
     fi
-    case "$point" in
-        after-prefix-*) expected=stale ;;
-        after-child-unlink*) expected=absent ;;
-        *) expected=installed ;;
-    esac
-    python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --check-child-prefix \
-        "$CASE/data" "$SEED/source" "$expected"
+    if [ "${PROMOTION_WAL:-0}" = 1 ]; then
+        case "$point" in
+            before-history) expected=no-history ;;
+            after-history*|before-eor-write) expected=history ;;
+            *) expected=eor ;;
+        esac
+        python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --check-promotion-eor \
+            "$CASE/data" "$SEED/source" "$expected"
+    else
+        case "$point" in
+            after-prefix-*) expected=stale ;;
+            after-child-unlink*) expected=absent ;;
+            *) expected=installed ;;
+        esac
+        python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --check-child-prefix \
+            "$CASE/data" "$SEED/source" "$expected"
+    fi
     python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --snapshot-pending \
         "$CASE/data" "$SEED/source" "$CASE/before.json"
     set +e
@@ -67,4 +81,8 @@ for point in normal after-prefix-fsync after-prefix-directory-fsync after-child-
         "$CASE/data" "$CASE/before.json"
     test "$before" = "$(sha256sum "$CASE/data/global/pg_wal_control")"
 done
-echo 'promotion-prefix: canonical installation and process-crash boundaries PASS'
+if [ "${PROMOTION_WAL:-0}" = 1 ]; then
+    echo 'promotion-wal: history/EOR publication and process-crash boundaries PASS'
+else
+    echo 'promotion-prefix: canonical installation and process-crash boundaries PASS'
+fi
