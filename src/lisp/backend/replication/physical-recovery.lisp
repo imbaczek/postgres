@@ -20,22 +20,30 @@
 (defconstant +db-in-archive-recovery+ 5)
 
 (defun physical-recovery-control-valid-p (control &key legacy)
-  "Validate role/progress and native recovery DBState as separate invariants."
+  "Validate recovery progress separately from a pending child's local identity."
   (destructuring-bind (&key phase system-id timeline manifest-digest checkpoint
-                         applied next-xid db-state state-time (control-version 3) &allow-other-keys)
+                         applied next-xid db-state state-time (control-version 3)
+                         promotion-child promotion-generation promotion-source-namespace
+                       &allow-other-keys)
       control
-    (and (member phase '(0 1 2))
-         (eql timeline 1)
+    (and (member phase '(0 1 2 3)) (eql timeline 1)
          (every (lambda (value) (typep value '(unsigned-byte 64)))
                 (list system-id manifest-digest checkpoint applied))
-         (member control-version '(1 2 3))
+         (member control-version '(1 2 3 4))
          (integerp next-xid)
-         (<= 3 next-xid (if (= control-version 3) 18446744073709551616
+         (<= 3 next-xid (if (member control-version '(3 4)) 18446744073709551616
                             18446744073709551615))
          (<= 32 checkpoint applied)
-         (or (= phase 2) (= checkpoint applied))
-         (<= 3 next-xid)
+         (or (member phase '(2 3)) (= checkpoint applied))
          (or (plusp phase) (zerop manifest-digest))
+         (if (= phase 3)
+             (and (= control-version 4) (not legacy)
+                  (typep promotion-child '(integer 2 4294967295))
+                  (typep promotion-generation '(unsigned-byte 64))
+                  (member promotion-source-namespace '(:legacy :timeline))
+                  (eql db-state +db-in-archive-recovery+))
+             (and (/= control-version 4) (null promotion-child)
+                  (null promotion-generation) (null promotion-source-namespace)))
          (if legacy
              (and (null db-state) (null state-time))
              (and (typep state-time '(signed-byte 64))
@@ -47,63 +55,77 @@
 (defun physical-recovery-control-image (phase system-id timeline manifest-digest checkpoint applied next-xid
                                         &key (db-state (if (zerop phase) +db-startup+
                                                            +db-in-archive-recovery+))
-                                          (state-time (- (get-universal-time) 2208988800)))
-  "Encode v3 progress with an explicit exhausted FullXID flag; no write authority."
-  (unless (physical-recovery-control-valid-p
-           (list :phase phase :system-id system-id :timeline timeline
-                 :manifest-digest manifest-digest :checkpoint checkpoint :applied applied
-                 :next-xid next-xid :db-state db-state :state-time state-time))
-    (error "unrepresentable physical recovery control state"))
-  (let ((bytes (make-array 72 :element-type '(unsigned-byte 8) :initial-element 0)))
-    (replace bytes #(80 71 82 83 84 65 84 51))
-    (wal-set-u32 bytes 8 (logior phase (if (= next-xid 18446744073709551616)
-                                           #x80000000 0)))
-    (wal-set-u32 bytes 12 timeline)
-    (wal-set-u64 bytes 16 system-id)
-    (wal-set-u64 bytes 24 manifest-digest)
-    (wal-set-u64 bytes 32 checkpoint)
-    (wal-set-u64 bytes 40 applied)
-    (wal-set-u64 bytes 48 (if (= next-xid 18446744073709551616) 0 next-xid))
-    (wal-set-u32 bytes 56 db-state)
-    (wal-set-i64 bytes 60 state-time)
-    (wal-set-u32 bytes 68 (wal-crc32 bytes))
-    bytes))
+                                          (state-time (- (get-universal-time) 2208988800))
+                                          promotion-child promotion-generation promotion-source-namespace)
+  "Keep ordinary v3 bytes; v4 binds a pending child to APPLIED and one generation.
+This is local incomplete-recovery state, never child insertion or writer authority."
+  (let* ((pending (= phase 3)) (version (if pending 4 3))
+                               (crc-offset (if pending 84 68)))
+    (unless (physical-recovery-control-valid-p
+             (list :control-version version :phase phase :system-id system-id :timeline timeline
+                   :manifest-digest manifest-digest :checkpoint checkpoint :applied applied
+                   :next-xid next-xid :db-state db-state :state-time state-time
+                   :promotion-child promotion-child :promotion-generation promotion-generation
+                   :promotion-source-namespace promotion-source-namespace))
+      (error "unrepresentable physical recovery control state"))
+    (let ((bytes (make-array (+ crc-offset 4) :element-type '(unsigned-byte 8) :initial-element 0)))
+      (replace bytes (if pending #(80 71 82 83 84 65 84 52) #(80 71 82 83 84 65 84 51)))
+      (wal-set-u32 bytes 8 (logior phase (if (= next-xid 18446744073709551616) #x80000000 0)))
+      (wal-set-u32 bytes 12 timeline)
+      (wal-set-u64 bytes 16 system-id)
+      (wal-set-u64 bytes 24 manifest-digest)
+      (wal-set-u64 bytes 32 checkpoint)
+      (wal-set-u64 bytes 40 applied)
+      (wal-set-u64 bytes 48 (if (= next-xid 18446744073709551616) 0 next-xid))
+      (wal-set-u32 bytes 56 db-state)
+      (wal-set-i64 bytes 60 state-time)
+      (when pending
+        (wal-set-u32 bytes 68 promotion-child)
+        (wal-set-u32 bytes 72 (ecase promotion-source-namespace (:legacy 0) (:timeline 1)))
+        (wal-set-u64 bytes 76 promotion-generation))
+      (wal-set-u32 bytes crc-offset (wal-crc32 bytes))
+      bytes)))
 
 (defun physical-recovery-decode-control (bytes)
-  "Read all native control versions; only v3 represents an exhausted FullXID."
-  (unless (member (length bytes) '(60 72))
+  "Read legacy recovery progress and v4 pending state without granting authority."
+  (unless (member (length bytes) '(60 72 88))
     (error "invalid physical recovery control length"))
-  (let* ((legacy (= (length bytes) 60))
-         (magic (subseq bytes 0 8))
-         (version (cond
-                    ((and legacy (equalp magic #(80 71 82 83 84 65 84 69))) 1)
-                    ((and (not legacy) (equalp magic #(80 71 82 83 84 65 84 50))) 2)
-                    ((and (not legacy) (equalp magic #(80 71 82 83 84 65 84 51))) 3)))
-         (crc-offset (if legacy 56 68))
-         (copy (copy-seq bytes))
-         (crc (wal-u32 copy crc-offset))
-         (raw-phase (wal-u32 bytes 8))
-         (exhausted (and (eql version 3) (logbitp 31 raw-phase))))
+  (let* ((legacy (= (length bytes) 60)) (pending (= (length bytes) 88))
+                                        (magic (subseq bytes 0 8))
+                                        (version (cond
+                                                   ((and legacy (equalp magic #(80 71 82 83 84 65 84 69))) 1)
+                                                   ((and (= (length bytes) 72) (equalp magic #(80 71 82 83 84 65 84 50))) 2)
+                                                   ((and (= (length bytes) 72) (equalp magic #(80 71 82 83 84 65 84 51))) 3)
+                                                   ((and pending (equalp magic #(80 71 82 83 84 65 84 52))) 4)))
+                                        (crc-offset (cond (legacy 56) (pending 84) (t 68)))
+                                        (copy (copy-seq bytes)) (crc (wal-u32 copy crc-offset))
+                                        (raw-phase (wal-u32 bytes 8))
+                                        (exhausted (and (member version '(3 4)) (logbitp 31 raw-phase))))
     (wal-set-u32 copy crc-offset 0)
     (unless (and version (= crc (wal-crc32 copy))
                  (or (not exhausted) (zerop (wal-u64 bytes 48))))
       (error "corrupt or unsupported physical recovery control"))
     (let ((control
             (list :control-version version
-                  :phase (if (= version 3) (logand raw-phase #x7fffffff) raw-phase)
+                  :phase (if (member version '(3 4)) (logand raw-phase #x7fffffff) raw-phase)
                   :timeline (wal-u32 bytes 12)
                   :system-id (wal-u64 bytes 16) :manifest-digest (wal-u64 bytes 24)
                   :checkpoint (wal-u64 bytes 32) :applied (wal-u64 bytes 40)
                   :next-xid (if exhausted 18446744073709551616 (wal-u64 bytes 48))
                   :db-state (unless legacy (wal-u32 bytes 56))
                   :state-time (unless legacy (wal-i64 bytes 60)))))
+      (when pending
+        (setf (getf control :promotion-child) (wal-u32 bytes 68)
+              (getf control :promotion-source-namespace)
+              (case (wal-u32 bytes 72) (0 :legacy) (1 :timeline))
+              (getf control :promotion-generation) (wal-u64 bytes 76)))
       (unless (physical-recovery-control-valid-p control :legacy legacy)
         (error "corrupt or unsupported physical recovery control"))
       control)))
 
 (defun physical-recovery-read-control (directory)
   (physical-recovery-decode-control
-   (recovery-read-bytes (physical-recovery-control-path directory) :maximum 72)))
+   (recovery-read-bytes (physical-recovery-control-path directory) :maximum 88)))
 
 (defvar *physical-recovery-control-test-hook* nil
   "Optional deterministic hook for recovery control publication failures.")
@@ -114,7 +136,9 @@
 
 (defun physical-recovery-write-control (state phase applied next-xid
                                         &key (db-state +db-in-archive-recovery+))
-  "Publish role/progress/state atomically; never lower startup recovery requirements."
+  "Publish ordinary progress; pending child state needs its dedicated publisher."
+  (when (or (eql phase 3) (eql (getf state :phase) 3) (getf state :promotion-child))
+    (error "pending native promotion requires a dedicated control publisher"))
   (when (and (= db-state +db-shutdowned-in-recovery+)
              (< applied (or (getf state :required-applied) applied)))
     (error "clean recovery has not reached its previously applied boundary"))
@@ -342,6 +366,10 @@
     (unless (equal marker (format nil "PGPHYSICAL-RECOVERY-REQUIRED-1~%"))
       (error "corrupt physical recovery marker")))
   (let ((control (physical-recovery-read-control *pgdata*)))
+    ;; Pending control must never fall through the ordinary phase rewrite/redo path.
+    ;; A later milestone will verify and reconcile this exact generation before SQL.
+    (when (= 3 (getf control :phase))
+      (error "pending native promotion requires reconciliation before startup"))
     (multiple-value-bind (manifest digest) (recovery-read-manifest *pgdata*)
       (recovery-check-manifest-schema manifest)
       (unless (and (= (getf control :system-id) (getf manifest :system-id))

@@ -62,6 +62,8 @@
     (error 'physical-recovery-worker-shutdown)))
 
 (defun check-recovery-available ()
+  (when (eql 3 (getf *physical-recovery-state* :phase))
+    (ereport "57P03" "pending native promotion requires reconciliation"))
   (when *physical-recovery-failed-p*
     (ereport "57P03" "physical recovery failed; restart is required")))
 
