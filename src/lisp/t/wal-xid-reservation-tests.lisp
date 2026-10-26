@@ -83,8 +83,8 @@
                                (pg::*wal-replication-slots* (make-hash-table :test #'equal))
                                (pg::*clog-stream* nil) (pg::*next-xid* 3) (pg::*xid-batch-end* 3)
                                (pg::*active-xids* nil) (pg::*xid-wrap-pending* nil) (pg::*xid-wrap-completed-through* nil)
-                               (pg::*pm-requested-mode* pg::+no-shutdown+) (pg::*accept-stop* nil)
-                               (pg::*shutdown-finalizing-p* nil) (pg::*shutdown-finished-p* nil)
+                               (pg::*pm-requested-mode* pg::+no-shutdown+) (pg::*accept-stop-requested* nil)
+                               (pg::*shutdown-finalizing-p* nil) (pg::*shutdown-finished* nil)
                                (pg::*xid-reservation-test-hook* nil))
       (unwind-protect
            (progn (pg::wal-init) (pg::xact-init) (funcall function))
