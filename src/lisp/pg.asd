@@ -108,6 +108,7 @@
                    (:file "../replication/protocol")
                    (:file "../replication/physical-stream")
                    (:file "../replication/physical-follow")
+                   (:file "../replication/physical-promotion")
                    (:file "../replication/standard")
                    (:file "../replication/worker")
                    (:file "../replication/standard-subscriber")

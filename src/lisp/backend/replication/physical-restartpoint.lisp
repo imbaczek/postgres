@@ -218,7 +218,7 @@
       (multiple-value-bind (metadata catalog-bytes prefix) (physical-restartpoint-decode bytes)
         (physical-restartpoint-check-metadata metadata catalog-bytes state prefix)
         (unless (= lsn (getf metadata :lsn)) (error "restartpoint pointer boundary mismatch"))
-        (values metadata catalog-bytes prefix)))))
+        (values metadata catalog-bytes prefix digest)))))
 
 (defun physical-restartpoint-prepare-storage (store)
   "Validate provenance, suffix and surviving forks before restoring an R catalog."

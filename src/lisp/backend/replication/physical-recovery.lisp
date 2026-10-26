@@ -134,23 +134,9 @@ This is local incomplete-recovery state, never child insertion or writer authori
   (when *physical-recovery-control-test-hook*
     (funcall *physical-recovery-control-test-hook* point state)))
 
-(defun physical-recovery-write-control (state phase applied next-xid
-                                        &key (db-state +db-in-archive-recovery+))
-  "Publish ordinary progress; pending child state needs its dedicated publisher."
-  (when (or (eql phase 3) (eql (getf state :phase) 3) (getf state :promotion-child))
-    (error "pending native promotion requires a dedicated control publisher"))
-  (when (and (= db-state +db-shutdowned-in-recovery+)
-             (< applied (or (getf state :required-applied) applied)))
-    (error "clean recovery has not reached its previously applied boundary"))
-  (let* ((state (copy-list state))
-         (applied (max applied (or (getf state :required-applied) applied)))
-         (next-xid (max next-xid (or (getf state :observed-next-xid) next-xid)))
-         (time (- (get-universal-time) 2208988800))
-         (bytes (physical-recovery-control-image
-                 phase (getf state :system-id) (getf state :timeline)
-                 (getf state :manifest-digest) (getf state :checkpoint) applied next-xid
-                 :db-state db-state :state-time time))
-         (path (physical-recovery-control-path)))
+(defun physical-recovery-persist-control-bytes (bytes db-state)
+  "Sync and atomically publish encoded bytes; the caller installs runtime state."
+  (let ((path (physical-recovery-control-path)))
     (physical-recovery-control-test-point :before-write db-state)
     (with-atomic-output
         (stream path (make-pathname :type "tmp" :defaults path) *pgdata*
@@ -170,7 +156,28 @@ This is local incomplete-recovery state, never child insertion or writer authori
                   (physical-recovery-control-test-point :before-directory-fsync db-state)
                   (fsync-directory directory)
                   (physical-recovery-control-test-point :after-directory-fsync db-state)))
-      (write-sequence bytes stream))
+      (write-sequence bytes stream))))
+
+(defun physical-recovery-write-control (state phase applied next-xid
+                                        &key (db-state +db-in-archive-recovery+))
+  "Publish ordinary progress; pending child state needs its dedicated publisher."
+  (when *physical-recovery-failed-p*
+    (error "failed recovery cannot publish ordinary progress"))
+  (when (or (eql phase 3) (eql (getf state :phase) 3) (getf state :promotion-child)
+            (eql 3 (getf *physical-recovery-state* :phase)))
+    (error "pending native promotion requires a dedicated control publisher"))
+  (when (and (= db-state +db-shutdowned-in-recovery+)
+             (< applied (or (getf state :required-applied) applied)))
+    (error "clean recovery has not reached its previously applied boundary"))
+  (let* ((state (copy-list state))
+         (applied (max applied (or (getf state :required-applied) applied)))
+         (next-xid (max next-xid (or (getf state :observed-next-xid) next-xid)))
+         (time (- (get-universal-time) 2208988800))
+         (bytes (physical-recovery-control-image
+                 phase (getf state :system-id) (getf state :timeline)
+                 (getf state :manifest-digest) (getf state :checkpoint) applied next-xid
+                 :db-state db-state :state-time time)))
+    (physical-recovery-persist-control-bytes bytes db-state)
     (setf (getf state :phase) phase
           (getf state :db-state) db-state
           (getf state :state-time) time
