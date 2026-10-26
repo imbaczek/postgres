@@ -5,6 +5,10 @@
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :sb-posix))
 
+(defconstant +postmaster-o-cloexec+ #o2000000
+  "Linux bits/fcntl-linux.h O_CLOEXEC, shared by storage and postmaster descriptors.
+SB-POSIX does not export this flag in the supported SBCL.")
+
 (defun open-relation-file (pathname)
   (ensure-directories-exist pathname)
   (open pathname

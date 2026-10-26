@@ -24,7 +24,7 @@ cold builds are an independent verification path.
 This remains an **open audit**. It was prompted by the receive-store lock opener
 using the close-on-exec constant before its defining file loaded: the live image
 already knew the constant, while fresh compilation warned. The compile harness
-also returned success for that deferred warning; its warning handling is being
-strengthened as part of the same work.
+also returned success for that deferred warning. It now rejects deferred
+compilation-unit warnings; the broader dependency audit remains open.
 
 The active HA/backend implementation roadmap is [PHYSICAL-HA.md](PHYSICAL-HA.md).

@@ -3,9 +3,6 @@
 
 (defvar *postmaster-data-lock* nil)
 
-(defconstant +postmaster-o-cloexec+ #o2000000
-  "Linux bits/fcntl-linux.h O_CLOEXEC; SB-POSIX does not export it here.")
-
 (defvar *postmaster-pid-stream* nil)
 
 (defvar *postmaster-pid-directory* nil)
