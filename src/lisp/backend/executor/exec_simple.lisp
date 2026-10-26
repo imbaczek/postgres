@@ -735,7 +735,7 @@ rolled back immediately."
      (ecase (backend-isolation-level *backend*)
        (:read-committed "read committed") (:repeatable-read "repeatable read")))
     ((string= name "transaction_read_only")
-     (if (or (recovery-in-progress-p) (backend-read-only *backend*)) "on" "off"))
+     (if (backend-transaction-read-only-p) "on" "off"))
     ((string= name "in_hot_standby") (if (recovery-in-progress-p) "on" "off"))
     ((string= name "default_transaction_read_only") "off")
     ((string= name "server_version") *server-version*)
@@ -1411,7 +1411,7 @@ before this removal horizon is captured."
   (let ((implicit (not (backend-explicit *backend*)))
         (logical-ddl-responses nil)
         (copy-row-count nil))
-    (when (and (backend-read-only *backend*)
+    (when (and (backend-transaction-read-only-p)
                (member (getf ast :type)
                        '(:insert :update :delete :truncate :create-table :drop-table
                          :create-index :drop-index :alter-index :alter-table

@@ -42,6 +42,14 @@
 (defvar *physical-recovery-failed-p* nil
   "A failed replay never admits further SQL until process restart.")
 
+(define-condition physical-promotion-shutdown (error) ())
+
+(defvar *physical-promotion-stopping-p* nil)
+
+(defvar *physical-promotion-requested-p* nil)
+
+(defvar *physical-promotion-worker* nil)
+
 (defvar *physical-shutdown-state* nil
   "Process-local native standby shutdown phase; reset only by process restart.")
 
@@ -58,7 +66,8 @@
 
 (defun check-physical-recovery-worker-start ()
   (check-recovery-available)
-  (when (or *physical-shutdown-state* (shutdown-in-progress-p))
+  (when (or *physical-shutdown-state* *physical-promotion-stopping-p*
+            (shutdown-in-progress-p))
     (error 'physical-recovery-worker-shutdown)))
 
 (defun check-recovery-available ()

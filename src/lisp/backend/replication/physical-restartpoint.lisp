@@ -342,7 +342,7 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
   "Keep the running worker's iteration replaceable by a live reload."
   ;; A previous loop frame may survive reload. Exit only this registered
   ;; worker, synchronously before entering admission or doing storage work.
-  (when (and *physical-shutdown-state*
+  (when (and (or *physical-shutdown-state* *physical-promotion-stopping-p*)
              (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
                (eq sb-thread:*current-thread* *physical-restartpoint-worker*)))
     (sb-thread:return-from-thread :stopped))
@@ -355,7 +355,8 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
       :failed)))
 
 (defun physical-restartpoint-worker-loop ()
-  (loop until (or *physical-shutdown-state* (shutdown-in-progress-p) *physical-recovery-failed-p*)
+  (loop until (or *physical-shutdown-state* *physical-promotion-stopping-p*
+                  (shutdown-in-progress-p) *physical-recovery-failed-p*)
         for result = (physical-restartpoint-worker-step)
         do (sleep (if (eq result :deferred) 1 0.2))))
 

@@ -10,6 +10,8 @@
                (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
                (not *live-operation-drain-open*))
     (error "pending promotion requires owned command/reload exclusion and quiescence"))
+  (when (and (= phase 2) (shutdown-in-progress-p))
+    (error 'physical-promotion-shutdown))
   (if (= phase 2) (check-recovery-available)
       (when *physical-recovery-failed-p* (error "failed recovery cannot install child WAL")))
   (unless (and (member phase '(2 3)) (eql phase (getf *physical-recovery-state* :phase))

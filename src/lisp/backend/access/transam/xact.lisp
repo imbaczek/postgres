@@ -1552,6 +1552,11 @@ remains after BODY and should be dropped when its WAL is no longer needed."
     (push relfilenode (backend-dirty-relations *backend*)))
   (values))
 
+(defun backend-transaction-read-only-p (&optional (backend *backend*))
+  (or (recovery-in-progress-p)
+      (and backend (not (eq (backend-state backend) :idle))
+           (backend-read-only backend))))
+
 (defun statement-start (registration)
   (let ((b *backend*))
     (when (eq (backend-state b) :aborted)
@@ -1559,7 +1564,7 @@ remains after BODY and should be dropped when its WAL is no longer needed."
                "current transaction is aborted, commands ignored until end of transaction block"))
     (unless (recovery-in-progress-p)
       (prepare-xid-wraparound-for-statement b))
-    (when (recovery-in-progress-p) (setf (backend-read-only b) t))
+    (setf (backend-read-only b) (backend-transaction-read-only-p b))
     (when (eq (backend-state b) :idle)
       (setf (backend-explicit b) nil
             (backend-command-id b) 0)

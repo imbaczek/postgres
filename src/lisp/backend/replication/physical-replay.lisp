@@ -281,6 +281,10 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
       (check-physical-recovery-work))
     (unless (recovery-in-progress-p)
       (ereport "55000" "recovery is not in progress"))
+    (when (and *physical-promotion-stopping-p*
+               (member name '("pg_wal_replay_pause" "pg_wal_replay_resume") :test #'string=))
+      (ereport "55000" "standby promotion is ongoing"
+               :hint (format nil "~a() cannot be executed after promotion is triggered." name)))
     (sb-thread:with-mutex (*physical-replay-pause-lock*)
       ;; Unlike C's independently running startup process, native redo runs
       ;; exclusively behind this admission gate. A request is already at a
@@ -297,6 +301,25 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
          (if *physical-replay-paused-p* "paused" "not paused"))
         (t (error "unknown replay control function: ~a" name))))))
 
+(defun physical-recovery-replay-core ()
+  (unless (and (zerop *live-operation-depth*)
+               (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+               (not *live-operation-drain-open*) (not *swank-listener-enabled-p*)
+               (not (physical-recovery-reader-conflict-p)))
+    (error "native replay requires owned quiescence without readers"))
+  (check-physical-recovery-work)
+  (unless *physical-receive-store* (error "no native physical receiver spool"))
+  (let ((finished nil))
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex (*clog-lock*)
+             (when *clog-stream* (close *clog-stream*))
+             (setf *clog-stream* (open (clog-path) :direction :io
+                                                   :element-type '(unsigned-byte 8)
+                                                   :if-exists :overwrite :if-does-not-exist :error)))
+           (prog1 (physical-replay-from *last-replay-lsn*) (setf finished t)))
+      (unless finished (setf *physical-recovery-failed-p* t)))))
+
 (defun physical-recovery-replay ()
   "Apply durable terminal batches between transactions; return :DEFERRED on conflict."
   (check-physical-recovery-work)
@@ -310,16 +333,4 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
         (when *physical-replay-paused-p*
           (return-from physical-recovery-replay :paused)))
       (when (physical-recovery-reader-conflict-p) (return-from physical-recovery-replay :deferred))
-      (let ((finished nil))
-        (unwind-protect
-             (progn
-               (sb-thread:with-mutex (*clog-lock*)
-                 (when *clog-stream* (close *clog-stream*))
-                 (setf *clog-stream* (open (clog-path) :direction :io
-                                                       :element-type '(unsigned-byte 8)
-                                                       :if-exists :overwrite :if-does-not-exist :error)))
-               (physical-replay-from *last-replay-lsn*)
-               (setf finished t))
-          ;; Nonlocal exits and asynchronous interrupts also fail closed.
-          (unless finished (setf *physical-recovery-failed-p* t))))
-      *last-replay-lsn*)))
+      (physical-recovery-replay-core))))
