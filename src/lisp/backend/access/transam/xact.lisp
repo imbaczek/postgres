@@ -371,6 +371,20 @@ Independent schema changers may overlap; relation/catalog locks order DDL."
   (+ (* (1+ (floor xid +xid-cycle+)) +xid-cycle+)
      +first-normal-xid+))
 
+(defun canonical-next-full-xid (xid)
+  "Round a reservation end past special low IDs; preserve the exhaustion sentinel."
+  (unless (typep xid '(integer 3 18446744073709551616))
+    (error "invalid FullXID reservation end"))
+  (if (= xid +max-xid-one-past+) xid
+      (+ xid (max 0 (- +first-normal-xid+ (mod xid +xid-cycle+))))))
+
+(defun xid-reservation-end (next-xid)
+  (unless (and (typep next-xid '(integer 3 18446744073709551615))
+               (>= (mod next-xid +xid-cycle+) +first-normal-xid+))
+    (error "cannot reserve a batch from a special or exhausted FullXID"))
+  (canonical-next-full-xid
+   (min +max-xid-one-past+ (xid-next-epoch-boundary next-xid) (+ next-xid 1000))))
+
 (defun xid-epoch-start (xid)
   (+ (* (floor xid +xid-cycle+) +xid-cycle+)
      +first-normal-xid+))
@@ -589,37 +603,39 @@ Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
     (wal-test-pause-once :after-statement-snapshot)
     snapshot))
 
+(defun xid-check-allocation-under-lock (oldest-relfrozenxid)
+  ;; A waiter may have passed its first health check before another writer failed.
+  (when *wal-ready* (wal-check-healthy))
+  (when (> *next-xid* +max-xid+)
+    (ereport-fatal "54000" "transaction ID space exhausted"))
+  (when (and oldest-relfrozenxid
+             (>= (- *next-xid* oldest-relfrozenxid) +manual-vacuum-xid-stop-age+))
+    (ereport "55000" "transaction ID allocation stopped because manual VACUUM is required"))
+  (when (and (first-normal-xid-of-epoch-p *next-xid*)
+             (not (eql *next-xid* *xid-wrap-completed-through*)))
+    (ereport "55000" "transaction ID wraparound is waiting for a safe tuple freeze; retry the statement")))
+
+(defun xid-allocate-under-lock ()
+  (let ((xid *next-xid*))
+    (setf *next-xid* (advance-full-xid xid))
+    (push xid *active-xids*)
+    xid))
+
 (defun assign-xid ()
   (prevent-recovery-write "transaction ID assignment")
-  (let ((oldest-relfrozenxid (catalog-oldest-relfrozenxid)))
+  (when *wal-ready* (wal-check-healthy))
+  (let ((oldest (catalog-oldest-relfrozenxid)))
     (sb-thread:with-mutex (*xid-lock*)
-      (when (> *next-xid* +max-xid+)
-        (ereport-fatal "54000" "transaction ID space exhausted"))
-      (when (and oldest-relfrozenxid
-                 (>= (- *next-xid* oldest-relfrozenxid)
-                     +manual-vacuum-xid-stop-age+))
-        (ereport "55000"
-                 "transaction ID allocation stopped because manual VACUUM is required"))
-      (when (and (first-normal-xid-of-epoch-p *next-xid*)
-                 (not (eql *next-xid* *xid-wrap-completed-through*)))
-        (ereport "55000"
-                 "transaction ID wraparound is waiting for a safe tuple freeze; retry the statement"))
-      (when (>= *next-xid* *xid-batch-end*)
-        (let ((old-end *xid-batch-end*)
-              (new-end (min +max-xid-one-past+
-                            (xid-next-epoch-boundary *next-xid*)
-                            (+ *next-xid* 1000))))
-          (setf *xid-batch-end* new-end)
-          (handler-case
-              (save-next-xid)
-            (error (e)
-              ;; Never hand out an XID unless its whole batch boundary is durable.
-              (setf *xid-batch-end* old-end)
-              (error e)))))
-      (let ((xid *next-xid*))
-        (setf *next-xid* (advance-full-xid xid))
-        (push xid *active-xids*)
-        xid))))
+      (xid-check-allocation-under-lock oldest)
+      (when (< *next-xid* *xid-batch-end*)
+        (return-from assign-xid (xid-allocate-under-lock)))
+      (unless *wal-ready*
+        ;; Standalone storage use retains the pre-WAL file durability contract.
+        (let ((*xid-batch-end* (xid-reservation-end *next-xid*))) (save-next-xid))
+        (setf *xid-batch-end* (xid-reservation-end *next-xid*))
+        (return-from assign-xid (xid-allocate-under-lock))))
+    ;; Never acquire WAL while holding XID; checkpoints take WAL then XID.
+    (xid-assign-with-wal-reservation oldest)))
 
 (defun relation-build-group-has-user-p (token xid writers-p readers-p)
   (let ((group (gethash token *relation-build-groups*)))
@@ -1663,7 +1679,9 @@ reclaimable."
         (format s "16~%")
         (finish-output s)
         (sb-posix:fsync (sb-sys:fd-stream-fd s)))))
-  (let ((next-xid (load-next-xid)))
+  (let* ((saved-next-xid (load-next-xid))
+         (next-xid (canonical-next-full-xid
+                    (max saved-next-xid (1+ (or *wal-xid-reserved-through* 2))))))
     (when (> next-xid +max-xid-one-past+)
       (error "transaction ID space exhausted"))
     (setf *xid-batch-end* next-xid
@@ -1672,7 +1690,7 @@ reclaimable."
           *xid-wrap-completed-through* nil)
     ;; Persist the initial control state too. A missing control file on a later
     ;; startup then cannot be mistaken for a fresh data directory.
-    (unless (probe-file (control-path))
+    (when (or (not (probe-file (control-path))) (/= saved-next-xid next-xid))
       (save-next-xid))
     (let ((marker (load-xid-wrap-marker)))
       (when marker

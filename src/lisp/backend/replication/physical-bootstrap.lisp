@@ -112,7 +112,7 @@
                              :limit (when (equal relative last-segment)
                                       (1+ (mod (1- end) +wal-segment-size+)))))
                           (physical-bootstrap-inventory)))
-           (manifest (list :version 2 :system-id system-id
+           (manifest (list :version 3 :system-id system-id
                            :cluster-identity (catalog-cluster-identity *catalog*) :timeline 1
                            :checkpoint checkpoint :checkpoint-start (wal-checkpoint-record-start checkpoint)
                            :end end :next-xid *next-xid*

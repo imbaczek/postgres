@@ -8,13 +8,20 @@ from pathlib import Path
 def decode(raw):
     assert len(raw) in (60, 72), ('length', len(raw))
     legacy = len(raw) == 60
-    assert raw[:8] == (b'PGRSTATE' if legacy else b'PGRSTAT2'), 'magic'
+    versions = {b'PGRSTATE': 1} if legacy else {b'PGRSTAT2': 2, b'PGRSTAT3': 3}
+    magic = bytes(raw[:8])
+    assert magic in versions, 'magic'
+    version = versions[magic]
     crc_offset = 56 if legacy else 68
     expected, = struct.unpack_from('<I', raw, crc_offset)
     checked = bytearray(raw)
     struct.pack_into('<I', checked, crc_offset, 0)
     assert zlib.crc32(checked) == expected, 'CRC'
     phase, timeline, system_id, digest, checkpoint, applied, xid = struct.unpack_from('<IIQQQQQ', raw, 8)
+    if version == 3 and phase & (1 << 31):
+        assert xid == 0, 'hidden exhausted XID value'
+        xid = 1 << 64
+        phase &= ~(1 << 31)
     assert phase in (0, 1, 2) and timeline == 1
     assert 32 <= checkpoint <= applied and xid >= 3
     assert phase == 2 or checkpoint == applied
@@ -24,8 +31,8 @@ def decode(raw):
     if not legacy:
         assert state in ((0,) if phase == 0 else (2, 5)), 'DBState'
         assert -(2**63) <= when < 2**63, 'state time'
-    return dict(version=1 if legacy else 2, phase=phase, system_id=system_id,
-                applied=applied, state=state, time=when)
+    return dict(version=version, phase=phase, system_id=system_id,
+                applied=applied, next_xid=xid, state=state, time=when)
 
 
 def main():
@@ -40,6 +47,7 @@ def main():
     decode(raw)
     if args.legacy_fixture:
         assert args.expected == 'legacy' and len(raw) == 72
+        assert not (struct.unpack_from('<I', raw, 8)[0] & (1 << 31)), 'legacy cannot represent exhaustion'
         old = bytearray(raw[:56] + bytes(4))
         old[:8] = b'PGRSTATE'
         struct.pack_into('<I', old, 56, zlib.crc32(old))

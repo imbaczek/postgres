@@ -39,7 +39,7 @@
          (version (wal-u16 header 4)))
     (unless (and (equalp (subseq header 0 4) #(80 71 87 76))
                  (member version (list +wal-version-v2+ +wal-version-v3+
-                                       +wal-version-v4+ +wal-version-v5+ +wal-version+))
+                                       +wal-version-v4+ +wal-version-v5+ +wal-version-v6+ +wal-version+))
                  (wal-valid-type-p (wal-u16 header 6) version)
                  (= (wal-u64 header 12) start)
                  (<= +wal-header-size+ length +wal-segment-size+)

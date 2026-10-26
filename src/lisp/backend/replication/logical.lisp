@@ -784,6 +784,10 @@ executor, so capture the same operation before transaction commit."
                    (member (logical-change-kind change)
                            '(:insert :update :delete :truncate)))
                  changes)))
+    (when (= record-type +wal-record-xid-reservation+)
+      (unless *wal-recovery-reservation-batch-clean-p*
+        (error "logical reader reservation is not the sole record after its batch marker"))
+      (wal-xid-reservation-record-bound record))
     (cond
       ((= record-type +wal-record-commit+)
        (when catalog-event-p
@@ -970,7 +974,8 @@ slot restart point. It permits standard senders to scan ahead of feedback."
       (when (= start-lsn end-lsn)
         (return-from wal-logical-slot-read-transactions
           (wal-logical-reader-return '() start-lsn)))
-      (let ((state (make-logical-reader-state
+      (let ((*wal-recovery-reservation-batch-clean-p* nil)
+            (state (make-logical-reader-state
                     :database-oid (wal-replication-slot-database-oid slot)))
             (transaction-count 0)
             (change-bytes 0)
@@ -980,6 +985,7 @@ slot restart point. It permits standard senders to scan ahead of feedback."
         ;; recycling while the bounded scan is in progress.
         (wal-scan
          (lambda (record)
+           (wal-note-recovery-batch-record record)
            (let ((record-type (wal-record-type record)))
              (case record-type
                (#.+wal-record-batch-start+

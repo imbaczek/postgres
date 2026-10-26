@@ -2,21 +2,12 @@
 (in-package #:pg)
 
 (defmacro with-physical-replay-staging (() &body body)
-  "Isolate the native batch decoder in a reader or applying replay operation."
-  `(let ((*wal-recovery-group-active* nil)
-         (*wal-recovery-page-images* '())
-         (*wal-recovery-catalog-chunks* '())
-         (*wal-recovery-catalog-chunk-count* nil)
-         (*wal-recovery-catalog-next-chunk* 0)
-         (*wal-recovery-logical-xid* nil)
-         (*wal-recovery-logical-chunk-count* nil)
-         (*wal-recovery-logical-next-chunk* 0)
-         (*wal-recovery-logical-bytes* 0)
-         (*wal-recovery-logical-catalog-event-p* nil))
-     ,@body))
+  `(with-wal-replay-staging () ,@body))
 
 (defun physical-history-reset (active)
-  (setf *wal-recovery-group-active* active
+  (unless active (setf *wal-recovery-reservation-batch-clean-p* nil))
+  (setf *wal-recovery-page-images* nil
+        *wal-recovery-group-active* active
         *wal-recovery-catalog-chunks* nil
         *wal-recovery-catalog-chunk-count* nil
         *wal-recovery-catalog-next-chunk* 0
@@ -130,7 +121,11 @@ a still-referenced relfilenode when checking a terminal's delete list."
         identity removed))
       (t
        (wal-recovery-validate-logical-terminal :other)
-       (cond ((= type +wal-record-clog-reset+) (wal-read-u64-payload payload))
+       (cond ((= type +wal-record-xid-reservation+)
+              (unless *wal-recovery-reservation-batch-clean-p*
+                (error "reservation cannot finish a nonempty batch in history"))
+              (wal-xid-reservation-record-bound record))
+             ((= type +wal-record-clog-reset+) (wal-read-u64-payload payload))
              ((= type +wal-record-checkpoint+) (wal-checkpoint-record-snapshot record))
              ((not (and (zerop (length payload)) (zerop (wal-record-xid record))))
               (error "invalid noncatalog terminal in history"))))))
@@ -138,6 +133,7 @@ a still-referenced relfilenode when checking a terminal's delete list."
 
 (defun physical-history-accept-record (record identity removed)
   "Validate native batch ordering and payloads without applying any storage."
+  (wal-note-recovery-batch-record record)
   (let ((type (wal-record-type record)))
     (cond
       ((= type +wal-record-batch-start+) (physical-history-reset t))

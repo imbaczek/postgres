@@ -12,6 +12,8 @@
                (:file "t/physical-recovery-tests")
                (:file "t/physical-control-tests")
                (:file "t/checkpoint-tests")
+               (:file "t/xid-reservation-tests")
+               (:file "t/wal-xid-reservation-tests")
                (:file "t/physical-history-tests")
                (:file "t/timeline-tests")
                (:file "t/physical-restartpoint-tests")

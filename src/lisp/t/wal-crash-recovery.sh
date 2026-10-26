@@ -5,6 +5,7 @@ set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
 PORT=${PORT:-5462}
+SBCL=${SBCL:-sbcl}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-wal-crash.XXXXXX")
 PGDATA="$TMP/data"
 LOG="$TMP/server.log"
@@ -29,7 +30,13 @@ start_server() {
     if [ -n "$pause_at" ]; then
         rm -f "$data_dir/pg_wal/test-paused-$pause_at" \
             "$data_dir/pg_wal/test-resume-$pause_at"
-        if [ -n "$pause_relation" ]; then
+        if [ "$pause_at" = after-wal-bytes-flush ]; then
+            # Prime allocation before arming this commit-specific crash point.
+            # Otherwise v7's first reservation flush pauses before the INSERT.
+            rm -f "$TMP/control.sock"
+            "$BASE/pg-lisp.sh" -p "$PORT" -D "$data_dir" \
+                --control-socket "$TMP/control.sock" >> "$LOG" 2>&1 &
+        elif [ -n "$pause_relation" ]; then
             PG_WAL_TEST_PAUSE_AT="$pause_at" \
                 PG_WAL_TEST_PAUSE_RELATION="$pause_relation" \
                 "$BASE/pg-lisp.sh" -p "$PORT" -D "$data_dir" \
@@ -43,24 +50,22 @@ start_server() {
     fi
     SRV=$!
 
-    i=0
-    while [ "$i" -lt "$max_start" ]; do
-        if PGPASSWORD=x psql -X -h 127.0.0.1 -p "$PORT" -U postgres \
-                -d postgres -c '' >/dev/null 2>&1; then
-            return 0
-        fi
-        if ! kill -0 "$SRV" 2>/dev/null; then
-            echo "wal-crash-recovery: server exited during startup" >&2
-            cat "$LOG" >&2
+    if ! PGPASSWORD=x test_wait_owned_sql_server "$SRV" "$PORT" psql "$((max_start * 2))"; then
+        echo "wal-crash-recovery: server did not start" >&2
+        cat "$LOG" >&2
+        return 1
+    fi
+    if [ "$pause_at" = after-wal-bytes-flush ]; then
+        psql_db -c 'SELECT id FROM wal_rows' >/dev/null
+        printf '(setf pg::*wal-test-pause-at* "after-wal-bytes-flush")\n(quit)\n' |
+            "$SBCL" --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" \
+            >"$TMP/arm-wal-bytes.log"
+        if grep -q ';; error:' "$TMP/arm-wal-bytes.log"; then
+            cat "$TMP/arm-wal-bytes.log" >&2
             return 1
         fi
-        i=$((i + 1))
-        sleep 0.2
-    done
-
-    echo "wal-crash-recovery: server did not start" >&2
-    cat "$LOG" >&2
-    return 1
+    fi
+    return 0
 }
 
 stop_server() {
@@ -545,7 +550,7 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.wal"))):
         if data[offset:offset + 4] != b"PGWL":
             raise SystemExit("invalid WAL while inspecting checkpoint images")
         version = struct.unpack_from("<H", data, offset + 4)[0]
-        if version not in (2, 3, 4, 5, 6):
+        if version not in (2, 3, 4, 5, 6, 7):
             raise SystemExit("unsupported WAL version while inspecting checkpoint images")
         record_type = struct.unpack_from("<H", data, offset + 6)[0]
         length = struct.unpack_from("<I", data, offset + 8)[0]
@@ -921,10 +926,11 @@ elif mode in ("final-length", "final-inflated", "final-checksum",
     path, _, offset, length, data = records[-1]
     record_type = struct.unpack_from("<H", data, offset + 6)[0]
     version = struct.unpack_from("<H", data, offset + 4)[0]
-    expected_lengths = (32, 40) if record_type == 2 else ((120,) if record_type == 4 and version == 6 else (32,))
+    expected_lengths = (32, 40) if record_type == 2 else ((120,) if record_type == 4 and version >= 6 else (32,))
     if length not in expected_lengths or record_type not in (2, 3, 4, 5):
         raise SystemExit(f"last durable record is not a terminal record: type={record_type} version={version} length={length}")
-    if record_type == 4 and version == 6 and data[offset + 32:offset + 40] != b"PGCKPT01":
+    if record_type == 4 and version >= 6 and data[offset + 32:offset + 40] not in (
+            (b"PGCKPT01", b"PGCKPT02") if version >= 7 else (b"PGCKPT01",)):
         raise SystemExit("checkpoint snapshot is missing before corruption")
     if mode == "final-length":
         struct.pack_into("<I", data, offset + 8, 0)

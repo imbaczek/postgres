@@ -67,19 +67,31 @@
   (physical-history-check-plist
    metadata (append '(:version :system-id :cluster-identity :timeline :manifest-digest
                       :base :lsn :prefix-digest :next-xid :forks :seen)
-                    (when (eql 2 (getf metadata :version)) '(:source-checkpoint))))
-  (unless (and (if (eql 2 (getf metadata :version)) (= (length metadata) 24)
-                   (and (eql 1 (getf metadata :version)) (= (length metadata) 22)))
+                    (when (member (getf metadata :version) '(2 3)) '(:source-checkpoint))
+                    (when (eql 3 (getf metadata :version)) '(:source-reservation))))
+  (unless (and (case (getf metadata :version)
+                 (1 (= (length metadata) 22)) (2 (= (length metadata) 24))
+                 (3 (= (length metadata) 26)) (otherwise nil))
                (eql (getf metadata :system-id) (getf state :system-id))
                (equal (getf metadata :cluster-identity) (getf state :cluster-identity))
                (eql (getf metadata :timeline) (getf state :timeline))
                (eql (getf metadata :manifest-digest) (getf state :manifest-digest))
                (eql (getf metadata :base) (getf state :end))
                (every (lambda (key) (typep (getf metadata key) '(unsigned-byte 64)))
-                      '(:lsn :prefix-digest :next-xid))
+                      '(:lsn :prefix-digest))
                (<= (getf state :end) (getf metadata :lsn))
-               (<= 3 (getf metadata :next-xid)))
+               (typep (getf metadata :next-xid)
+                      (if (eql 3 (getf metadata :version))
+                          '(integer 3 18446744073709551616)
+                          '(integer 3 18446744073709551615))))
     (error "foreign or malformed physical restartpoint metadata"))
+  (let ((reservation (getf metadata :source-reservation)))
+    (when reservation
+      (unless (and (physical-source-reservation-valid-p reservation)
+                   (= (getf reservation :through) (getf metadata :lsn))
+                   (or (not (getf reservation :complete))
+                       (<= (getf metadata :next-xid) (1+ (getf reservation :bound)))))
+        (error "invalid restartpoint source allocation frontier"))))
   (let ((snapshot (getf metadata :source-checkpoint)))
     (when snapshot
       (unless (and (wal-checkpoint-snapshot-valid-p snapshot)
@@ -129,12 +141,13 @@
          (seen (loop for node being the hash-keys of *physical-replay-seen-relfilenodes* collect node)))
     (dolist (entry forks)
       (pushnew (parse-integer (first entry) :start 5 :junk-allowed t) seen))
-    (list :version 2 :system-id (getf state :system-id)
+    (list :version 3 :system-id (getf state :system-id)
           :cluster-identity (getf state :cluster-identity) :timeline (getf state :timeline)
           :manifest-digest (getf state :manifest-digest) :base (getf state :end)
           :lsn *last-replay-lsn* :prefix-digest digest :next-xid *next-xid*
           :forks forks :seen (sort seen #'<)
-          :source-checkpoint (copy-list (getf state :source-checkpoint)))))
+          :source-checkpoint (copy-list (getf state :source-checkpoint))
+          :source-reservation (copy-list (getf state :source-reservation)))))
 
 (defun physical-restartpoint-publish (digest)
   "Called at a complete applied terminal with replay/admission and store locks held."
@@ -194,14 +207,19 @@
          (identity (getf state :cluster-identity))
          (required (getf state :required-applied)))
     (multiple-value-bind (metadata catalog-bytes) (physical-restartpoint-read state)
+      ;; Legacy generations stored capacity as visibility. A complete retained
+      ;; prefix can reconstruct actual counters; compacted legacy images cannot.
+      (when (and metadata (< (getf metadata :version) 3))
+        (unless (<= (physical-store-floor-lsn store) (getf state :end))
+          (error "legacy restartpoint lost actual XID history; reseed required"))
+        (setf metadata nil catalog-bytes nil))
       (let ((start (if metadata (getf metadata :lsn) (getf state :end))))
         (unless (and (<= (physical-store-floor-lsn store) start required
                          (physical-store-flushed-lsn store))
                      (or metadata (= start (physical-store-base-lsn store))))
           (error "receive floor lacks its required published restartpoint"))
         (when metadata
-          (unless (and (= (getf metadata :prefix-digest) (physical-store-prefix-digest store start))
-                       (<= (getf metadata :next-xid) (getf state :observed-next-xid)))
+          (unless (= (getf metadata :prefix-digest) (physical-store-prefix-digest store start))
             (error "restartpoint differs from its durable receive prefix")))
         (let ((removed (physical-recovery-proven-drops
                         store identity :start-lsn start :required-lsn required)))
@@ -220,8 +238,14 @@
                     *xid-batch-end* *next-xid*
                     (getf state :restartpoint-lsn) start
                     (getf *physical-recovery-state* :source-checkpoint)
-                    (copy-list (getf metadata :source-checkpoint))))
-            (physical-recovery-reset-replay-history))
+                    (copy-list (getf metadata :source-checkpoint))
+                    (getf *physical-recovery-state* :source-reservation)
+                    (copy-list (getf metadata :source-reservation))))
+            (progn
+              (physical-recovery-reset-replay-history)
+              ;; Latest control visibility belongs to REQUIRED, not the older base.
+              (setf *next-xid* (canonical-next-full-xid (getf state :next-xid))
+                    *xid-batch-end* *next-xid*)))
         (setf *last-replay-lsn* start *wal-checkpoint-lsn* start)
         start))))
 

@@ -6,7 +6,7 @@
     (let* ((pg::*pgdata* root)
            (pg::*physical-recovery-state*
              (list :system-id 123 :timeline 1 :manifest-digest 77 :end 32 :checkpoint 32
-                   :cluster-identity "history-source" :required-applied 96 :observed-next-xid 50))
+                   :cluster-identity "history-source" :next-xid 50 :required-applied 96 :observed-next-xid 50))
            (pg::*last-replay-lsn* 96) (pg::*next-xid* 50) (pg::*xid-batch-end* 50)
            (pg::*wal-checkpoint-lsn* 32) (pg::*catalog* nil) (pg::*clog-stream* nil)
            (pg::*relation-streams* (make-hash-table :test #'equal))
@@ -15,6 +15,7 @@
       (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
       (pg::wal-ensure-directory-durable (merge-pathnames "global/" root))
       (pg::wal-ensure-directory-durable spool)
+      (let ((pg::*xid-batch-end* 1003)) (pg::save-next-xid))
       (setf (gethash 900 pg::*physical-replay-seen-relfilenodes*) t)
       (multiple-value-bind (deletes bytes) (pg::wal-decode-catalog-payload
                                             (history-catalog-payload '(900) nil))
@@ -51,6 +52,43 @@
       (ok (= 96 pg::*last-replay-lsn*))
       (ok (= 96 pg::*wal-checkpoint-lsn*))
       (ok (gethash 900 pg::*physical-replay-seen-relfilenodes*))))
+
+(deftest exhausted-next-xid-survives-restartpoint-publication-and-restoration
+    (with-restartpoint-fixture (root store)
+      (declare (ignore root))
+      (setf pg::*next-xid* 18446744073709551616
+            (getf pg::*physical-recovery-state* :observed-next-xid) 18446744073709551616)
+      (pg::physical-store-compact store 96 #'pg::physical-restartpoint-publish)
+      (setf pg::*next-xid* 3)
+      (ok (= 96 (pg::physical-restartpoint-prepare-storage store)))
+      (ok (= 18446744073709551616 pg::*next-xid*))))
+
+(deftest legacy-restartpoint-requires-retained-full-prefix-for-actual-visibility
+    (dolist (compact '(nil t))
+      (with-restartpoint-fixture (root store)
+        (declare (ignore root))
+        (let ((reader (symbol-function 'pg::physical-restartpoint-read)))
+          (unwind-protect
+               (progn
+                 (if compact
+                     (pg::physical-store-compact store 96 #'pg::physical-restartpoint-publish)
+                     (pg::physical-restartpoint-publish (pg::physical-store-prefix-digest store 96)))
+                 (setf (getf pg::*physical-recovery-state* :files) '(("base/900" 32 0)))
+                 ;; Supply an already validated legacy generation at the restore boundary.
+                 (setf (symbol-function 'pg::physical-restartpoint-read)
+                       (lambda (state)
+                         (multiple-value-bind (metadata bytes) (funcall reader state)
+                           (setf (getf metadata :version) 2 (getf metadata :next-xid) 1003)
+                           (values metadata bytes))))
+                 (if compact
+                     (ok (handler-case
+                             (progn (pg::physical-restartpoint-prepare-storage store) nil)
+                           (error () t)))
+                     (progn
+                       (ok (= 32 (pg::physical-restartpoint-prepare-storage store)))
+                       (ok (= 50 pg::*next-xid*))
+                       (ok (= 1003 (pg::load-next-xid))))))
+            (setf (symbol-function 'pg::physical-restartpoint-read) reader))))))
 
 (deftest restartpoint-new-pointer-with-old-floor-is-valid
     (with-restartpoint-fixture (root store)

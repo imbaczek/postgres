@@ -16,6 +16,9 @@
 (defconstant +wal-record-maintenance+ 9)
 (defconstant +wal-record-logical-changes+ 10)
 (defconstant +wal-record-logical-catalog-event+ 11)
+
+(defconstant +wal-record-xid-reservation+ 12)
+
 (defconstant +wal-catalog-chunk-header-size+ 8)
 (defconstant +wal-version-v2+ 2)
 (defconstant +wal-version-v3+ 3)
@@ -23,7 +26,9 @@
 
 (defconstant +wal-version-v5+ 5)
 
-(defconstant +wal-version+ 6)
+(defconstant +wal-version-v6+ 6)
+
+(defconstant +wal-version+ 7)
 
 (defparameter *max-slot-wal-keep-bytes* (* 1024 1024 1024)
   "Maximum WAL retained by one replication slot at checkpoint; NIL disables the cap.")
@@ -75,6 +80,8 @@
 (defvar *wal-checkpoint-snapshot* nil
   "Facts belonging to the published checkpoint, never a merely flushed candidate.")
 
+(defvar *wal-xid-reserved-through* nil)
+
 (defvar *wal-durable-lsn* 0)
 (defvar *wal-ready* nil)
 (defvar *wal-output-stream* nil)
@@ -95,6 +102,9 @@
 (declaim (special *backend* *xid-lock* *active-xids*)
          (notinline backend-xid))
 (defvar *wal-recovery-group-active* nil)
+
+(defvar *wal-recovery-reservation-batch-clean-p* nil)
+
 (defvar *wal-recovery-page-images* '())
 (defvar *wal-recovery-catalog-chunks* '())
 (defvar *wal-recovery-catalog-chunk-count* nil)
@@ -1128,6 +1138,7 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
                               +wal-record-catalog-chunk+
                               +wal-record-catalog-commit+
                               +wal-record-maintenance+))
+           (and (= type +wal-record-xid-reservation+) (>= version 7))
            (and (= type +wal-record-logical-changes+)
                 (>= version +wal-version-v5+))
            (and (= type +wal-record-logical-catalog-event+)
@@ -1150,6 +1161,7 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
                                        +wal-version-v3+
                                        +wal-version-v4+
                                        +wal-version-v5+
+                                       +wal-version-v6+
                                        +wal-version+))
                  (= (wal-u32 bytes 8) (length bytes))
                  (= (wal-u64 bytes 12) expected-lsn)
@@ -1369,7 +1381,8 @@ src/backend/access/transam/xlogreader.c."
       (error "WAL terminal validation did not produce an apply operation"))
     (wal-apply-page-images (nreverse *wal-recovery-page-images*))
     (funcall terminal-function))
-  (setf *wal-recovery-group-active* nil
+  (setf *wal-recovery-reservation-batch-clean-p* nil
+        *wal-recovery-group-active* nil
         *wal-recovery-page-images* '()
         *wal-recovery-catalog-chunks* '()
         *wal-recovery-catalog-chunk-count* nil
@@ -1393,8 +1406,20 @@ src/backend/access/transam/xlogreader.c."
        (error "logical changes are attached to an unsupported WAL terminal"))))
   (values))
 
+(defun wal-note-recovery-batch-record (record)
+  "A reservation terminal must immediately follow a valid empty batch marker."
+  (let ((type (wal-record-type record)))
+    (cond
+      ((= type +wal-record-batch-start+)
+       (unless (and (zerop (wal-record-xid record)) (zerop (length (wal-record-payload record))))
+         (error "invalid WAL batch-start marker"))
+       (setf *wal-recovery-reservation-batch-clean-p* t))
+      ((/= type +wal-record-xid-reservation+)
+       (setf *wal-recovery-reservation-batch-clean-p* nil)))))
+
 (defun wal-replay-record (record)
   (when (> (wal-record-end record) *wal-checkpoint-lsn*)
+    (wal-note-recovery-batch-record record)
     (case (wal-record-type record)
       (#.+wal-record-batch-start+
        ;; A prior group without a terminal record is a crash tail. Ignore its
@@ -1480,6 +1505,15 @@ src/backend/access/transam/xlogreader.c."
        (wal-recovery-validate-logical-terminal :other)
        (wal-checkpoint-record-snapshot record)
        (wal-replay-finish-batch (lambda () #'values)))
+      (#.+wal-record-xid-reservation+
+       (wal-recovery-validate-logical-terminal :other)
+       (unless *wal-recovery-reservation-batch-clean-p*
+         (error "XID reservation must be the sole record after its batch marker"))
+       (let ((bound (wal-xid-reservation-record-bound record)))
+         (wal-replay-finish-batch
+          (lambda ()
+            (lambda ()
+              (unless (recovery-in-progress-p) (xid-restore-reservation-floor bound)))))))
       (#.+wal-record-maintenance+
        (wal-recovery-validate-logical-terminal :other)
        (unless (zerop (wal-record-xid record))
@@ -1493,21 +1527,24 @@ src/backend/access/transam/xlogreader.c."
        (wal-replay-finish-batch
         (lambda () (lambda () (clog-reset :wal-reset-p nil))))))))
 
+(defmacro with-wal-replay-staging (() &body body)
+  "Isolate one native batch decoder; primary redo and history share this state."
+  `(let ((*wal-recovery-reservation-batch-clean-p* nil)
+         (*wal-recovery-group-active* nil)
+         (*wal-recovery-page-images* '())
+         (*wal-recovery-catalog-chunks* '())
+         (*wal-recovery-catalog-chunk-count* nil)
+         (*wal-recovery-catalog-next-chunk* 0)
+         (*wal-recovery-logical-xid* nil)
+         (*wal-recovery-logical-chunk-count* nil)
+         (*wal-recovery-logical-next-chunk* 0)
+         (*wal-recovery-logical-bytes* 0)
+         (*wal-recovery-logical-catalog-event-p* nil))
+     ,@body))
+
 (defun wal-recover ()
-  "Redo durable records after the checkpoint before loading the catalog."
-  (unless *wal-ready*
-    (return-from wal-recover (values)))
-  (let ((*wal-recovery-group-active* nil)
-        (*wal-recovery-page-images* '())
-        (*wal-recovery-catalog-chunks* '())
-        (*wal-recovery-catalog-chunk-count* nil)
-        (*wal-recovery-catalog-next-chunk* 0)
-        (*wal-recovery-logical-xid* nil)
-        (*wal-recovery-logical-chunk-count* nil)
-        (*wal-recovery-logical-next-chunk* 0)
-        (*wal-recovery-logical-bytes* 0)
-        (*wal-recovery-logical-catalog-event-p* nil))
-    (wal-scan #'wal-replay-record))
+  "Redo durable complete batches before loading the catalog."
+  (with-wal-replay-staging () (wal-scan #'wal-replay-record))
   (clog-fsync)
   (values))
 
@@ -1656,7 +1693,7 @@ src/backend/access/transam/xlogreader.c."
 (defun wal-terminal-record-type-p (type)
   (member type (list +wal-record-commit+ +wal-record-catalog+
                      +wal-record-catalog-commit+ +wal-record-checkpoint+
-                     +wal-record-maintenance+ +wal-record-clog-reset+)
+                     +wal-record-maintenance+ +wal-record-clog-reset+ +wal-record-xid-reservation+)
           :test #'=))
 
 (defun wal-slot-terminal-ack-p (slot target-lsn)
@@ -1930,7 +1967,8 @@ src/backend/access/transam/xlogreader.c."
         (wal-read-control-fields)
       (when (and (null checkpoint-lsn) segments)
         (error "WAL control file is missing while WAL segments exist"))
-      (setf *wal-checkpoint-snapshot* snapshot
+      (setf *wal-xid-reserved-through* (getf snapshot :xid-reserved-through)
+            *wal-checkpoint-snapshot* snapshot
             *wal-checkpoint-lsn* (or checkpoint-lsn 0)
             *wal-durable-lsn* (or durable-lsn 0)
             *wal-end-lsn* 0

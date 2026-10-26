@@ -22,12 +22,16 @@
 (defun physical-recovery-control-valid-p (control &key legacy)
   "Validate role/progress and native recovery DBState as separate invariants."
   (destructuring-bind (&key phase system-id timeline manifest-digest checkpoint
-                         applied next-xid db-state state-time &allow-other-keys)
+                         applied next-xid db-state state-time (control-version 3) &allow-other-keys)
       control
     (and (member phase '(0 1 2))
          (eql timeline 1)
          (every (lambda (value) (typep value '(unsigned-byte 64)))
-                (list system-id manifest-digest checkpoint applied next-xid))
+                (list system-id manifest-digest checkpoint applied))
+         (member control-version '(1 2 3))
+         (integerp next-xid)
+         (<= 3 next-xid (if (= control-version 3) 18446744073709551616
+                            18446744073709551615))
          (<= 32 checkpoint applied)
          (or (= phase 2) (= checkpoint applied))
          (<= 3 next-xid)
@@ -44,45 +48,53 @@
                                         &key (db-state (if (zerop phase) +db-startup+
                                                            +db-in-archive-recovery+))
                                           (state-time (- (get-universal-time) 2208988800)))
-  "Encode v2 native recovery control; never persist cluster write authority."
+  "Encode v3 progress with an explicit exhausted FullXID flag; no write authority."
   (unless (physical-recovery-control-valid-p
            (list :phase phase :system-id system-id :timeline timeline
                  :manifest-digest manifest-digest :checkpoint checkpoint :applied applied
                  :next-xid next-xid :db-state db-state :state-time state-time))
     (error "unrepresentable physical recovery control state"))
   (let ((bytes (make-array 72 :element-type '(unsigned-byte 8) :initial-element 0)))
-    (replace bytes #(80 71 82 83 84 65 84 50))
-    (wal-set-u32 bytes 8 phase)
+    (replace bytes #(80 71 82 83 84 65 84 51))
+    (wal-set-u32 bytes 8 (logior phase (if (= next-xid 18446744073709551616)
+                                           #x80000000 0)))
     (wal-set-u32 bytes 12 timeline)
     (wal-set-u64 bytes 16 system-id)
     (wal-set-u64 bytes 24 manifest-digest)
     (wal-set-u64 bytes 32 checkpoint)
     (wal-set-u64 bytes 40 applied)
-    (wal-set-u64 bytes 48 next-xid)
+    (wal-set-u64 bytes 48 (if (= next-xid 18446744073709551616) 0 next-xid))
     (wal-set-u32 bytes 56 db-state)
     (wal-set-i64 bytes 60 state-time)
     (wal-set-u32 bytes 68 (wal-crc32 bytes))
     bytes))
 
 (defun physical-recovery-decode-control (bytes)
-  "Read legacy progress conservatively, or v2 state with exact length and CRC."
+  "Read all native control versions; only v3 represents an exhausted FullXID."
   (unless (member (length bytes) '(60 72))
     (error "invalid physical recovery control length"))
   (let* ((legacy (= (length bytes) 60))
+         (magic (subseq bytes 0 8))
+         (version (cond
+                    ((and legacy (equalp magic #(80 71 82 83 84 65 84 69))) 1)
+                    ((and (not legacy) (equalp magic #(80 71 82 83 84 65 84 50))) 2)
+                    ((and (not legacy) (equalp magic #(80 71 82 83 84 65 84 51))) 3)))
          (crc-offset (if legacy 56 68))
          (copy (copy-seq bytes))
-         (crc (wal-u32 copy crc-offset)))
+         (crc (wal-u32 copy crc-offset))
+         (raw-phase (wal-u32 bytes 8))
+         (exhausted (and (eql version 3) (logbitp 31 raw-phase))))
     (wal-set-u32 copy crc-offset 0)
-    (unless (and (equalp (subseq bytes 0 8)
-                         (if legacy #(80 71 82 83 84 65 84 69) #(80 71 82 83 84 65 84 50)))
-                 (= crc (wal-crc32 copy)))
+    (unless (and version (= crc (wal-crc32 copy))
+                 (or (not exhausted) (zerop (wal-u64 bytes 48))))
       (error "corrupt or unsupported physical recovery control"))
     (let ((control
-            (list :control-version (if legacy 1 2)
-                  :phase (wal-u32 bytes 8) :timeline (wal-u32 bytes 12)
+            (list :control-version version
+                  :phase (if (= version 3) (logand raw-phase #x7fffffff) raw-phase)
+                  :timeline (wal-u32 bytes 12)
                   :system-id (wal-u64 bytes 16) :manifest-digest (wal-u64 bytes 24)
                   :checkpoint (wal-u64 bytes 32) :applied (wal-u64 bytes 40)
-                  :next-xid (wal-u64 bytes 48)
+                  :next-xid (if exhausted 18446744073709551616 (wal-u64 bytes 48))
                   :db-state (unless legacy (wal-u32 bytes 56))
                   :state-time (unless legacy (wal-i64 bytes 60)))))
       (unless (physical-recovery-control-valid-p control :legacy legacy)
@@ -138,7 +150,7 @@
     (setf (getf state :phase) phase
           (getf state :db-state) db-state
           (getf state :state-time) time
-          (getf state :control-version) 2
+          (getf state :control-version) 3
           (getf state :required-applied) applied
           (getf state :observed-next-xid) next-xid)
     (physical-recovery-control-test-point :after-write db-state)
@@ -151,7 +163,7 @@
   (wal-atomic-write-bytes
    (physical-recovery-control-path directory)
    (physical-recovery-control-image 0 (catalog-system-identifier) 1 0
-                                    *wal-checkpoint-lsn* *wal-durable-lsn* (load-next-xid))))
+                                    *wal-checkpoint-lsn* *wal-durable-lsn* *next-xid*)))
 
 (defun recovery-check-literal-text (text)
   "Accept only the literal list/string/number/keyword grammar emitted by our manifest."
@@ -216,13 +228,13 @@
                 (every (lambda (char) (digit-char-p char 16)) (subseq name 7 23))))))
 
 (defun physical-manifest-checkpoint-start (manifest)
-  (if (eql 2 (getf manifest :version)) (getf manifest :checkpoint-start)
+  (if (member (getf manifest :version) '(2 3)) (getf manifest :checkpoint-start)
       (- (getf manifest :checkpoint) +wal-header-size+)))
 
 (defun recovery-check-manifest-schema (manifest)
-  (unless (and (listp manifest) (member (getf manifest :version) '(1 2))
+  (unless (and (listp manifest) (member (getf manifest :version) '(1 2 3))
                (equal (loop for (key value) on manifest by #'cddr collect key)
-                      (if (eql 2 (getf manifest :version))
+                      (if (member (getf manifest :version) '(2 3))
                           '(:version :system-id :cluster-identity :timeline :checkpoint
                             :checkpoint-start :end :next-xid :source-pin :files)
                           '(:version :system-id :cluster-identity :timeline :checkpoint
@@ -236,7 +248,9 @@
                (member (- (getf manifest :checkpoint) (physical-manifest-checkpoint-start manifest))
                        (list +wal-header-size+ (wal-checkpoint-record-size)))
                (typep (getf manifest :next-xid)
-                      '(integer 3 18446744073709551615))
+                      (if (eql 3 (getf manifest :version))
+                          '(integer 3 18446744073709551616)
+                          '(integer 3 18446744073709551615)))
                (wal-valid-replication-slot-name-p (getf manifest :source-pin))
                (listp (getf manifest :files)) (getf manifest :files))
     (error "unsupported or malformed physical recovery manifest"))
@@ -332,7 +346,9 @@
          (recovery-check-manifest-files manifest *pgdata*)
          (recovery-check-image-metadata manifest *pgdata*)
          (unless (and (= (getf control :applied) (getf manifest :end))
-                      (= (getf control :next-xid) (load-next-xid)))
+                      (= (getf control :next-xid)
+                         (if (= 3 (getf control :control-version))
+                             (getf manifest :next-xid) (load-next-xid))))
            (error "physical recovery control does not match its immutable base image"))))
       (multiple-value-bind (checkpoint durable snapshot) (wal-read-control-fields)
         (unless (and (eql checkpoint (getf manifest :checkpoint))
@@ -341,17 +357,21 @@
                         (if snapshot (getf snapshot :start) (- checkpoint +wal-header-size+))))
           (error "base checkpoint control differs from manifest"))
         (setf (getf manifest :source-checkpoint) snapshot))
+      (setf (getf manifest :source-reservation) (physical-recovery-initial-reservation manifest))
       (setf (getf manifest :manifest-digest) digest
             (getf manifest :phase) (if (= 2 (getf control :phase)) 2 1)
             (getf manifest :required-applied) (getf control :applied)
-            (getf manifest :observed-next-xid) (getf control :next-xid)
+            (getf manifest :observed-next-xid)
+            (if (= 3 (getf control :control-version))
+                (getf control :next-xid) (getf manifest :next-xid))
             (getf manifest :previous-db-state) (getf control :db-state)
             (getf manifest :previous-state-time) (getf control :state-time))
       ;; Includes phase 0 -> 1 and legacy migration. A clean previous run never
       ;; allows catalog restoration or redo to start with a clean control file.
       (setf manifest
             (physical-recovery-write-control
-             manifest (getf manifest :phase) (getf control :applied) (getf control :next-xid)))
+             manifest (getf manifest :phase) (getf control :applied)
+             (getf manifest :observed-next-xid)))
       (setf *physical-recovery-state* manifest))))
 
 (defun note-primary-startup-replay ()
@@ -378,7 +398,7 @@
           *last-replay-lsn* *wal-durable-lsn*
           *wal-ready* t
           *wal-poisoned* nil
-          *next-xid* (getf *physical-recovery-state* :observed-next-xid)
+          *next-xid* (getf *physical-recovery-state* :next-xid)
           *xid-batch-end* *next-xid*
           *active-xids* nil
           *catalog* (load-catalog))
@@ -400,7 +420,10 @@
         (physical-replay-from *last-replay-lsn*))
       (unless (<= (getf *physical-recovery-state* :required-applied) *last-replay-lsn*)
         (error "streaming redo did not reach its previously applied terminal"))
-      (physical-recovery-check-live-files))
+      (unless (<= (getf *physical-recovery-state* :observed-next-xid) *next-xid*)
+        (error "streaming redo did not restore its observed XID visibility floor"))
+      (physical-recovery-check-live-files)
+      (physical-recovery-save-progress *last-replay-lsn* *next-xid*))
     (unless streaming
       (setf *clog-stream* (open (clog-path) :element-type '(unsigned-byte 8)
                                             :direction :input :if-does-not-exist :error)))

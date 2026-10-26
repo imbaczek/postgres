@@ -24,7 +24,7 @@ can be ahead after a crash and never grants a missing-file exemption."
 (defun physical-recovery-check-streaming-base (manifest control)
   "Validate unchanged provenance; changed relation/CLOG/catalog bytes require redo."
   (unless (and (<= (getf manifest :end) (getf control :applied))
-               (<= (load-next-xid) (getf control :next-xid))
+               (<= (getf manifest :next-xid) (getf control :next-xid))
                (probe-file (clog-path))
                (probe-file (catalog-path))
                (not (probe-file (xid-wrap-marker-path))))
@@ -130,6 +130,10 @@ Direct control operation; does not promote, follow a network source or coordinat
              (setf next-xid (max next-xid (advance-full-xid xid))))))
     (observe (wal-record-xid record))
     (cond
+      ((= (wal-record-type record) +wal-record-checkpoint+)
+       (let ((snapshot (wal-checkpoint-record-snapshot record)))
+         (when snapshot
+           (setf next-xid (max next-xid (getf snapshot :next-xid))))))
       ((= (wal-record-type record) +wal-record-pages+)
        (unless (>= (wal-record-version record) +wal-version-v4+)
          (error "streaming redo requires FullXID contributor metadata"))
@@ -140,6 +144,57 @@ Direct control operation; does not promote, follow a network source or coordinat
       ((= (wal-record-type record) +wal-record-clog-reset+)
        (setf next-xid (max next-xid (wal-read-u64-payload (wal-record-payload record))))))
     next-xid))
+
+(defun physical-source-reservation-valid-p (state)
+  (and (listp state) (= (length state) 8)
+       (equal (loop for (key value) on state by #'cddr collect key)
+              '(:version :through :bound :complete))
+       (eql 1 (getf state :version))
+       (typep (getf state :through) '(unsigned-byte 64))
+       (wal-xid-reservation-valid-bound-p (getf state :bound))
+       (member (getf state :complete) '(nil t))))
+
+(defun physical-recovery-initial-reservation (manifest)
+  "Only after immutable base verification; old source formats do not prove coverage."
+  (let* ((end (getf manifest :end))
+         (record (wal-read-checkpoint-record (physical-manifest-checkpoint-start manifest) end))
+         (bound (1- (canonical-next-full-xid (load-next-xid))))
+         (complete (>= (wal-record-version record) 7)))
+    (when complete
+      (let ((snapshot (wal-checkpoint-record-snapshot record)))
+        (unless (and (= bound (getf snapshot :xid-reserved-through))
+                     (= (getf manifest :next-xid) (getf snapshot :next-xid)))
+          (error "base XID counters differ from checkpoint"))))
+    (list :version 1 :through end :bound bound :complete complete)))
+
+(defun physical-source-reservation-next (prior record observed-next)
+  "Track source capacity separately from reader visibility; no promotion authority."
+  (when (and prior (not (physical-source-reservation-valid-p prior)))
+    (error "invalid source allocation frontier"))
+  (when (and prior (> (getf prior :through) (wal-record-start record)))
+    (error "source allocation history moved backwards"))
+  (let ((bound (if prior (getf prior :bound) 2))
+        (complete (and prior (getf prior :complete)))
+        (type (wal-record-type record))
+        (version (wal-record-version record)))
+    (when (< version 7) (setf complete nil))
+    (cond
+      ((= type +wal-record-xid-reservation+)
+       (let ((new-bound (wal-xid-reservation-record-bound record)))
+         (when (< new-bound bound) (error "source XID reservation regressed"))
+         (setf bound new-bound complete t)))
+      ((= type +wal-record-checkpoint+)
+       (let ((snapshot (wal-checkpoint-record-snapshot record)))
+         (when snapshot
+           (let ((new-bound (1- (canonical-next-full-xid
+                                 (1+ (getf snapshot :xid-reserved-through))))))
+             (when (and (>= version 7) (< new-bound bound))
+               (error "checkpoint XID reservation regressed"))
+             (setf bound (max bound new-bound))))
+         (when (>= version 7) (setf complete t)))))
+    (when (and complete (> observed-next (1+ bound)))
+      (error "observed XID exceeds the source's durable allocation reservation"))
+    (list :version 1 :through (wal-record-end record) :bound bound :complete complete)))
 
 (defun physical-replay-create-heap-forks (catalog)
   "Native catalog terminals redo a heap's first appearance in catalog history.
@@ -163,7 +218,7 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
       (database-tables database)))
    (catalog-databases catalog)))
 
-(defun physical-replay-publish-terminal (record next-xid)
+(defun physical-replay-publish-terminal (record next-xid reservation)
   "Durably finish pages/CLOG/catalog before publishing an applied terminal."
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-redo record))
@@ -186,6 +241,7 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
     (fsync-directory (merge-pathnames "base/" *pgdata*))
     (fsync-directory (merge-pathnames "global/" *pgdata*))
     (physical-recovery-save-progress (wal-record-end record) next-xid)
+    (setf (getf *physical-recovery-state* :source-reservation) (copy-list reservation))
     (setf *catalog* catalog
           *next-xid* next-xid
           *xid-batch-end* next-xid
@@ -201,17 +257,19 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
 (defun physical-replay-from (start-lsn)
   "Called only before listeners or under operation quiescence, with no old readers."
   (with-physical-replay-staging ()
-    (let ((next-xid *next-xid*))
+    (let ((next-xid *next-xid*)
+          (reservation (copy-list (getf *physical-recovery-state* :source-reservation))))
       (physical-store-map-durable-records
        *physical-receive-store*
        (lambda (record raw)
          (declare (ignore raw))
          (when *physical-replay-test-hook*
            (funcall *physical-replay-test-hook* :before-record record))
-         (setf next-xid (physical-replay-observed-next-xid record next-xid))
+         (setf next-xid (physical-replay-observed-next-xid record next-xid)
+               reservation (physical-source-reservation-next reservation record next-xid))
          (wal-replay-record record)
          (unless *wal-recovery-group-active*
-           (physical-replay-publish-terminal record next-xid)))
+           (physical-replay-publish-terminal record next-xid reservation)))
        :start-lsn start-lsn)))
   *last-replay-lsn*)
 

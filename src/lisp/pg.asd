@@ -39,7 +39,8 @@
         :serial t
         :components ((:file "clog")
                      (:file "snapshot")
-                     (:file "xact")))
+                     (:file "xact")
+                     (:file "xid-reservation")))
        (:module "heap"
         :serial t
         :components ((:file "visibilitymap")

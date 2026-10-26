@@ -34,6 +34,19 @@
         (write-byte (char-code #\Z) stream))
       (ok (intake-fails-p (lambda () (pg::recovery-read-manifest root))))))
 
+(deftest recovery-manifest-v3-preserves-exhausted-actual-next-xid
+    (with-physical-store-directory (root)
+      (let* ((manifest (list :version 3 :system-id 123 :cluster-identity "fixture#identity"
+                             :timeline 1 :checkpoint 152 :checkpoint-start 32 :end 152
+                             :next-xid 18446744073709551616 :source-pin "copy"
+                             :files '(("PG_VERSION" 3 9))))
+             (text (pg::physical-bootstrap-manifest-text manifest)))
+        (write-recovery-manifest-text root text)
+        (ok (equal manifest (pg::recovery-check-manifest-schema
+                             (pg::recovery-read-manifest root))))
+        (setf (getf manifest :version) 2)
+        (ok (intake-fails-p (lambda () (pg::recovery-check-manifest-schema manifest)))))))
+
 (cl-spec:defproperty recovery-manifest-dynamic-strings-roundtrip
     ((value (range integer 0 1000000)) (kind (range integer 0 3)))
   (:about pg::physical-bootstrap-manifest-text pg::recovery-parse-manifest-text)

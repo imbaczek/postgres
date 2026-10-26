@@ -9,14 +9,21 @@ import zlib
 
 
 def checkpoint(data):
-    assert len(data) == 88 and data[:8] == b"PGCKPT01"
+    assert len(data) == 88 and data[:8] in (b"PGCKPT01", b"PGCKPT02")
     start, end, redo, xid, reserved, oid = struct.unpack_from("<6Q", data, 8)
     timestamp = struct.unpack_from("<q", data, 56)[0]
     timeline, previous, active, known_oid, tail = struct.unpack_from("<IIQII", data, 64)
+    assert tail == 0 if data[:8] == b"PGCKPT01" else 0 <= tail <= 3
+    if tail & 1:
+        assert xid == 0
+        xid = 1 << 64
+    if tail & 2:
+        assert active == 0
+        active = 1 << 64
     assert end == start + 120 and start // 16777216 == (end - 1) // 16777216
     assert redo == start and 3 <= xid <= reserved + 1 and reserved >= 2
     assert active == 0 or 3 <= active <= xid
-    assert timeline == previous == 1 and known_oid in (0, 1) and tail == 0
+    assert timeline == previous == 1 and known_oid in (0, 1)
     assert known_oid or oid == 0
     return dict(start=start, end=end, redo=redo, next_xid=xid,
                 reserved_through=reserved, next_oid=oid if known_oid else None,
@@ -38,7 +45,9 @@ def read_copy(pgdata):
         stream.seek(facts["start"] % 16777216)
         record = bytearray(stream.read(120))
     magic, wal_version, kind, size, start, xid, crc = struct.unpack_from("<4sHHIQQI", record)
-    assert (magic, wal_version, kind, size, start, xid) == (b"PGWL", 6, 4, 120, facts["start"], 0)
+    assert wal_version in (6, 7)
+    assert wal_version >= 7 or data[:8] == b"PGCKPT01"
+    assert (magic, kind, size, start, xid) == (b"PGWL", 4, 120, facts["start"], 0)
     struct.pack_into("<I", record, 28, 0)
     assert zlib.crc32(record) == crc and record[32:] == data
     return facts, payload

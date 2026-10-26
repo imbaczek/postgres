@@ -16,7 +16,15 @@
                        phase 123 1 456 32 applied 1003 :db-state state :state-time 123456))
                (control (pg::physical-recovery-decode-control bytes)))
           (ok (= 72 (length bytes)))
-          (ok (= 2 (getf control :control-version)))
+          (ok (= 3 (getf control :control-version)))
+          (let ((v2 (copy-seq bytes)))
+            (setf (aref v2 7) 50)
+            (pg::wal-set-u32 v2 68 0)
+            (pg::wal-set-u32 v2 68 (pg::wal-crc32 v2))
+            (let ((old (pg::physical-recovery-decode-control v2)))
+              (ok (= 2 (getf old :control-version)))
+              (ok (= 1003 (getf old :next-xid)))
+              (ok (= state (getf old :db-state)))))
           (ok (= phase (getf control :phase)))
           (ok (= state (getf control :db-state)))
           (ok (= 123456 (getf control :state-time)))
@@ -26,6 +34,19 @@
             (ok (null (getf legacy :db-state)))
             (ok (null (getf legacy :state-time)))
             (ok (= applied (getf legacy :applied))))))))
+
+(deftest recovery-control-v3-rejects-ambiguous-exhaustion-flags
+    (dolist (mutation '(hidden-value missing-flag unknown-phase-bit))
+      (let ((bytes (pg::physical-recovery-control-image
+                    2 123 1 456 32 96 18446744073709551616)))
+        (ecase mutation
+          (hidden-value (pg::wal-set-u64 bytes 48 3))
+          (missing-flag (pg::wal-set-u32 bytes 8 2))
+          (unknown-phase-bit (pg::wal-set-u32 bytes 8 #xc0000002)))
+        (pg::wal-set-u32 bytes 68 0)
+        (pg::wal-set-u32 bytes 68 (pg::wal-crc32 bytes))
+        (ok (handler-case (progn (pg::physical-recovery-decode-control bytes) nil)
+              (error () t))))))
 
 (deftest recovery-control-rejects-invalid-state-and-corruption
     (dolist (arguments '((0 123 1 0 32 32 1003 :db-state 2)
