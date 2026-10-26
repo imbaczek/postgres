@@ -1,7 +1,7 @@
 ;;;; Local pending-promotion publication; EOR and writer admission remain separate.
 (in-package #:pg)
 
-(defun physical-promotion-check-context ()
+(defun physical-promotion-check-context (&optional (phase 2))
   "The caller owns follow-command -> reload -> quiescence; no worker joins here."
   (unless (and (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*)
@@ -10,13 +10,24 @@
                (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
                (not *live-operation-drain-open*))
     (error "pending promotion requires owned command/reload exclusion and quiescence"))
-  (check-recovery-available)
-  (unless (and (eql 2 (getf *physical-recovery-state* :phase))
+  (if (= phase 2) (check-recovery-available)
+      (when *physical-recovery-failed-p* (error "failed recovery cannot install child WAL")))
+  (unless (and (member phase '(2 3)) (eql phase (getf *physical-recovery-state* :phase))
                *physical-receive-store* *wal-ready*
                (not *physical-follow-runtime*) (not *physical-shutdown-state*)
                (not (shutdown-in-progress-p)) (not *swank-listener-enabled-p*)
                (not (physical-recovery-reader-conflict-p)))
     (error "pending promotion requires stopped workers and no open reader transactions")))
+
+(defmacro with-physical-promotion-exclusion ((phase) &body body)
+  "Require owned command/reload quiescence before registration/history exclusion."
+  `(progn
+     (physical-promotion-check-context ,phase)
+     (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+       (when (and *physical-restartpoint-worker*
+                  (sb-thread:thread-alive-p *physical-restartpoint-worker*))
+         (error "promotion restartpoint worker has not been joined"))
+       (sb-thread:with-mutex (*timeline-history-lock*) ,@body))))
 
 (defun physical-promotion-select-child (parent)
   "Match C findNewestTimeLine's consecutive local history probe, then select +1."
@@ -40,7 +51,7 @@
       (error "promotion base WAL identity or namespace changed"))
     namespace))
 
-(defun physical-promotion-check-progress (state metadata prefix generation)
+(defun physical-promotion-check-progress (state metadata prefix generation &optional (phase 2))
   (let* ((fork *last-replay-lsn*) (next *next-xid*)
                                   (control (physical-recovery-read-control *pgdata*))
                                   (snapshot (getf metadata :source-checkpoint))
@@ -51,7 +62,7 @@
                     (getf state :required-applied))
                  (= next (getf metadata :next-xid) (getf control :next-xid)
                     (getf state :observed-next-xid))
-                 (eql 2 (getf control :phase))
+                 (eql phase (getf control :phase))
                  (every (lambda (key) (eql (getf state key) (getf control key)))
                         '(:system-id :timeline :manifest-digest :checkpoint))
                  snapshot (wal-checkpoint-snapshot-valid-p snapshot)
@@ -82,40 +93,91 @@
   "Privately bind a chosen child to verified local recovery; never grant writer authority.
 Worker shutdown/join and rejection recovery belong to the future public orchestrator.
 The caller owns PGDATA and follow-command/reload/quiescence in that order."
-  (physical-promotion-check-context)
-  ;; Acquire registration exclusion only AFTER reload/drain, matching streaming
-  ;; setup. Do not join workers while holding this mutex.
-  (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
-    (when (and *physical-restartpoint-worker*
-               (sb-thread:thread-alive-p *physical-restartpoint-worker*))
-      (error "promotion restartpoint worker has not been joined"))
-    (sb-thread:with-mutex (*timeline-history-lock*)
-      (let* ((state *physical-recovery-state*)
-             (namespace (physical-promotion-check-base-control state))
-             (child (physical-promotion-select-child (getf state :timeline))))
-        (when (and requested-child (not (eql requested-child child)))
-          (error "requested promotion child is not the next local timeline"))
-        (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
-          (declare (ignore catalog))
-          (multiple-value-bind (fork next) (physical-promotion-check-progress state metadata prefix generation)
-            (let* ((time (- (get-universal-time) 2208988800))
-                   (bytes (physical-recovery-control-image
-                           3 (getf state :system-id) (getf state :timeline)
-                           (getf state :manifest-digest) (getf state :checkpoint) fork next
-                           :state-time time :promotion-child child :promotion-generation generation
-                           :promotion-source-namespace namespace))
-                   (pending (copy-list state)) (finished nil))
-              (loop for (key value) on (physical-recovery-decode-control bytes) by #'cddr
-                    do (setf (getf pending key) value))
-              (setf (getf pending :required-applied) fork (getf pending :observed-next-xid) next
-                    (getf pending :wal-prefix-lsn) fork (getf pending :wal-prefix-bytes) prefix
-                    (getf pending :source-checkpoint) (copy-list (getf metadata :source-checkpoint))
-                    (getf pending :source-reservation) (copy-list (getf metadata :source-reservation)))
-              (unwind-protect
-                   (progn
-                     (physical-recovery-persist-control-bytes bytes +db-in-archive-recovery+)
-                     (setf *physical-recovery-state* pending)
-                     (physical-recovery-control-test-point :after-write +db-in-archive-recovery+)
-                     (setf finished t)
-                     pending)
-                (unless finished (setf *physical-recovery-failed-p* t))))))))))
+  (with-physical-promotion-exclusion (2)
+    (let* ((state *physical-recovery-state*)
+           (namespace (physical-promotion-check-base-control state))
+           (child (physical-promotion-select-child (getf state :timeline))))
+      (when (and requested-child (not (eql requested-child child)))
+        (error "requested promotion child is not the next local timeline"))
+      (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
+        (declare (ignore catalog))
+        (multiple-value-bind (fork next) (physical-promotion-check-progress state metadata prefix generation)
+          (let* ((time (- (get-universal-time) 2208988800))
+                 (bytes (physical-recovery-control-image
+                         3 (getf state :system-id) (getf state :timeline)
+                         (getf state :manifest-digest) (getf state :checkpoint) fork next
+                         :state-time time :promotion-child child :promotion-generation generation
+                         :promotion-source-namespace namespace))
+                 (pending (copy-list state)) (finished nil))
+            (loop for (key value) on (physical-recovery-decode-control bytes) by #'cddr
+                  do (setf (getf pending key) value))
+            (setf (getf pending :required-applied) fork (getf pending :observed-next-xid) next
+                  (getf pending :wal-prefix-lsn) fork (getf pending :wal-prefix-bytes) prefix
+                  (getf pending :source-checkpoint) (copy-list (getf metadata :source-checkpoint))
+                  (getf pending :source-reservation) (copy-list (getf metadata :source-reservation)))
+            (unwind-protect
+                 (progn
+                   (physical-recovery-persist-control-bytes bytes +db-in-archive-recovery+)
+                   (setf *physical-recovery-state* pending)
+                   (physical-recovery-control-test-point :after-write +db-in-archive-recovery+)
+                   (setf finished t)
+                   pending)
+              (unless finished (setf *physical-recovery-failed-p* t)))))))))
+
+(defun physical-promotion-check-pending (state metadata prefix generation)
+  "Revalidate durable ownership; history publication ends prefix-install eligibility."
+  (let ((control (physical-recovery-read-control *pgdata*)))
+    (unless (and
+             (every (lambda (key) (eql (getf state key) (getf control key)))
+                    '(:control-version :phase :system-id :timeline :manifest-digest
+                      :checkpoint :applied :next-xid :db-state :state-time
+                      :promotion-child :promotion-generation :promotion-source-namespace))
+             (= generation (getf control :promotion-generation))
+             (eq (physical-promotion-check-base-control state)
+                 (getf control :promotion-source-namespace))
+             (= (getf control :promotion-child)
+                (physical-promotion-select-child (getf control :timeline)))
+             (= (getf state :wal-prefix-lsn) (getf control :applied))
+             (equalp prefix (getf state :wal-prefix-bytes))
+             (equal (getf metadata :source-checkpoint) (getf state :source-checkpoint))
+             (equal (getf metadata :source-reservation) (getf state :source-reservation)))
+      (error "pending promotion ownership or generation proof changed"))
+    (physical-promotion-check-progress state metadata prefix generation 3)))
+
+(defun physical-promotion-install-prefix ()
+  "Install the verified pending child prefix before history/EOR; never admit writes.
+Retry only while child history is absent. Later transition recovery must inspect
+history/EOR instead of calling this helper and overwriting child WAL."
+  (with-physical-promotion-exclusion (3)
+    (let ((state *physical-recovery-state*))
+      (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
+        (declare (ignore catalog))
+        (physical-promotion-check-pending state metadata prefix generation)
+        (let* ((fork (getf state :applied))
+               (child (getf state :promotion-child))
+               (destination (wal-segment-path (floor fork +wal-segment-size+) child :timeline))
+               (temporary nil) (finished nil))
+          ;; Reject special destinations before starting any publication.
+          (wal-namespace-file-stat destination t)
+          (unwind-protect
+               (progn
+                 (setf temporary
+                       (wal-stage-timeline-prefix
+                        (getf state :timeline) fork
+                        :namespace (getf state :promotion-source-namespace) :prefix prefix))
+                 ;; C InstallXLogFileSegment(find_free=false): durable unlink,
+                 ;; then durable rename. Quiescence/history exclusion spans both.
+                 (when (wal-namespace-file-stat destination t)
+                   (sb-posix:unlink (namestring destination)))
+                 (wal-timeline-test-point :after-child-unlink)
+                 (fsync-directory (wal-directory))
+                 (wal-timeline-test-point :after-child-unlink-directory-fsync)
+                 (sb-posix:rename (namestring temporary) (namestring destination))
+                 (setf temporary nil)
+                 (wal-timeline-test-point :after-child-rename)
+                 (fsync-directory (wal-directory))
+                 (wal-timeline-test-point :after-child-directory-fsync)
+                 (setf finished t)
+                 destination)
+            (unless finished (setf *physical-recovery-failed-p* t))
+            (when temporary (ignore-errors (sb-posix:unlink (namestring temporary))))))))))

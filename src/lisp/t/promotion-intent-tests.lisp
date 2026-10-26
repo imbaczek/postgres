@@ -59,6 +59,111 @@
 (defmacro with-promotion-fixture ((root store) &body body)
   `(call-with-promotion-fixture (lambda (,root ,store) ,@body)))
 
+(deftest promotion-child-prefix-replaces-stale-files-without-changing-parent
+    (dolist (namespace '(:legacy :timeline))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (let* ((parent (pg::wal-segment-path 0 1 namespace))
+                (before (lineage-test-bytes parent))
+                (control (lineage-test-bytes (pg::wal-control-path)))
+                (child (pg::wal-segment-path 0 2 :timeline)))
+           (pg::wal-atomic-write-bytes child #(9 8 7))
+           (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent)
+           (let ((intent (lineage-test-bytes (pg::physical-recovery-control-path))))
+             (loop repeat 2 do
+               (ok (equal child (call-with-promotion-exclusion #'pg::physical-promotion-install-prefix)))
+               (ok (equalp (getf pg::*physical-recovery-state* :wal-prefix-bytes)
+                           (lineage-test-bytes child))))
+             (ok (equalp intent (lineage-test-bytes (pg::physical-recovery-control-path))))
+             (ok (equalp control (lineage-test-bytes (pg::wal-control-path))))
+             (ok (equalp before (lineage-test-bytes parent)))
+             (ok (= 1 pg::*wal-insert-timeline* pg::*wal-checkpoint-timeline*))
+             (ok (equal "57P03" (recovery-state-of #'pg::check-recovery-available)))
+             (ok (null pg::*physical-recovery-failed-p*)))))
+       :namespace namespace)))
+
+(deftest promotion-child-prefix-rejects-changed-proof-or-special-destination
+    (dolist (change '(:memory-child :memory-prefix :generation :checkpoint :reservation :special))
+      (with-promotion-fixture (root store)
+        (declare (ignore root store))
+        (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent)
+        (let ((child (pg::wal-segment-path 0 2 :timeline)))
+          (pg::wal-atomic-write-bytes child #(1 2 3))
+          (case change
+            (:memory-child (setf (getf pg::*physical-recovery-state* :promotion-child) 3))
+            (:memory-prefix (setf (getf pg::*physical-recovery-state* :wal-prefix-bytes) #(7)))
+            (:generation (setf (getf pg::*physical-recovery-state* :promotion-generation) 0))
+            (:checkpoint (setf (getf pg::*physical-recovery-state* :source-checkpoint) nil))
+            (:reservation (setf (getf pg::*physical-recovery-state* :source-reservation) nil))
+            (:special (delete-file child) (sb-posix:symlink "/missing-promotion-child" (namestring child))))
+          (ok (intake-fails-p (lambda () (call-with-promotion-exclusion #'pg::physical-promotion-install-prefix))))
+          (ok (null pg::*physical-recovery-failed-p*))
+          (unless (eq change :special) (ok (equalp #(1 2 3) (lineage-test-bytes child))))))))
+
+(deftest promotion-child-prefix-preserves-later-history-and-eor
+    (with-promotion-fixture (root store)
+      (declare (ignore root store))
+      (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent)
+      (let* ((child (pg::wal-segment-path 0 2 :timeline))
+             (bytes (concatenate '(vector (unsigned-byte 8))
+                                 (getf pg::*physical-recovery-state* :wal-prefix-bytes)
+                                 (pg::wal-encode-end-of-recovery-record 216 1 2 1 1))))
+        (pg::wal-atomic-write-bytes child bytes)
+        (pg::wal-atomic-write-bytes (pg::timeline-history-path 2 pg::*pgdata*) #(49 9 48 47 68 56 10))
+        (ok (intake-fails-p (lambda () (call-with-promotion-exclusion #'pg::physical-promotion-install-prefix))))
+        (ok (equalp bytes (lineage-test-bytes child)))
+        (ok (null pg::*physical-recovery-failed-p*)))))
+
+(deftest promotion-child-prefix-failures-fence-and-clean-temporaries
+    (dolist (point '(:before-prefix-fsync :after-prefix-fsync :after-prefix-directory-fsync :after-child-unlink
+                     :after-child-unlink-directory-fsync :after-child-rename :after-child-directory-fsync))
+      (dolist (nonlocal '(nil t))
+        (with-promotion-fixture (root store)
+          (declare (ignore root store))
+          (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent)
+          (let ((child (pg::wal-segment-path 0 2 :timeline)))
+            (pg::wal-atomic-write-bytes child #(9))
+            (let ((pg::*wal-timeline-test-hook*
+                    (lambda (seen) (when (eq point seen)
+                                     (if nonlocal (throw 'abort-install :aborted)
+                                         (error "injected install failure"))))))
+              (if nonlocal
+                  (ok (eq :aborted (catch 'abort-install
+                                     (call-with-promotion-exclusion #'pg::physical-promotion-install-prefix))))
+                  (ok (intake-fails-p (lambda () (call-with-promotion-exclusion #'pg::physical-promotion-install-prefix))))))
+            (ok pg::*physical-recovery-failed-p*)
+            (ok (= 3 (getf (pg::physical-recovery-read-control pg::*pgdata*) :phase)))
+            (ok (null (timeline-test-staging-files)))
+            ;; Simulate a new recovery attempt after the owning process has ended.
+            (let ((pg::*physical-recovery-failed-p* nil))
+              (call-with-promotion-exclusion #'pg::physical-promotion-install-prefix)
+              (ok (equalp (getf pg::*physical-recovery-state* :wal-prefix-bytes)
+                          (lineage-test-bytes child)))))))))
+
+(cl-spec:defproperty child-installation-replaces-only-the-uncommitted-child
+    ((stale (range integer 0 255)) (qualified (member nil t)))
+  (:about pg::physical-promotion-install-prefix)
+  (:trials (:normal 50))
+  (call-with-promotion-fixture
+   (lambda (root store)
+     (declare (ignore root store))
+     (let* ((parent (pg::wal-segment-path 0 1 pg::*wal-segment-namespace*))
+            (before (lineage-test-bytes parent))
+            (child (pg::wal-segment-path 0 2 :timeline)))
+       (pg::wal-atomic-write-bytes child (make-array 300 :element-type '(unsigned-byte 8) :initial-element stale))
+       (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent)
+       (call-with-promotion-exclusion #'pg::physical-promotion-install-prefix)
+       (and (equalp before (lineage-test-bytes parent))
+            (equalp (getf pg::*physical-recovery-state* :wal-prefix-bytes) (lineage-test-bytes child))
+            (= 1 pg::*wal-insert-timeline*) (not pg::*physical-recovery-failed-p*))))
+   :namespace (if qualified :timeline :legacy)))
+
+(deftest generated-promotion-child-prefix
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'child-installation-replaces-only-the-uncommitted-child :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (deftest promotion-intent-binds-the-selected-generation-without-changing-parent-wal
     (dolist (namespace '(:legacy :timeline))
       (call-with-promotion-fixture

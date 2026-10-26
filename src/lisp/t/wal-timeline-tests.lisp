@@ -35,6 +35,19 @@
               (delete-file temporary))))
         (ok (null (timeline-test-staging-files))))))
 
+(deftest timeline-prefix-staging-accepts-exact-authenticated-bytes-including-boundaries
+    (with-physical-store-directory (root)
+      (let ((pg::*pgdata* root))
+        (dolist (fork (list 0 33 pg::+wal-segment-size+ (+ pg::+wal-segment-size+ 65)))
+          (let* ((bytes (make-array (mod fork pg::+wal-segment-size+)
+                                    :element-type '(unsigned-byte 8) :initial-element 42))
+                 (temporary (pg::wal-stage-timeline-prefix 1 fork :prefix bytes)))
+            (unwind-protect (ok (equalp bytes (lineage-test-bytes temporary)))
+              (delete-file temporary))))
+        (dolist (bad (list nil #(1) (vector "x")))
+          (ok (intake-fails-p (lambda () (pg::wal-stage-timeline-prefix 1 33 :prefix bad)))))
+        (ok (null (timeline-test-staging-files))))))
+
 (deftest timeline-prefix-staging-copies-multiple-chunks-from-a-later-segment
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root) (start (* 2 pg::+wal-segment-size+))

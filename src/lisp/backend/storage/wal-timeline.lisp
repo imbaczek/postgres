@@ -17,12 +17,14 @@
              (write-sequence buffer destination :end length)
              (decf remaining length))))
 
-(defun wal-stage-timeline-prefix (source-timeline fork &key (namespace *wal-segment-namespace*))
+(defun wal-stage-timeline-prefix (source-timeline fork &key (namespace *wal-segment-namespace*) (prefix nil prefix-p))
   "Prepare C XLogInitNewTimeline's prefix in a unique, synced temporary inode.
 The caller pins immutable source files and has already verified FORK as a durable
 applied terminal with cluster/history provenance. This copies bytes, not proof.
 Return a temporary pathname owned by the caller, which must install or delete it.
 No canonical child file, history, WAL control or runtime identity is published.
+With PREFIX explicitly supplied, stage those independently authenticated bytes
+instead of reading a parent file; require its exact fork-offset length.
 Native variable-length segments end at the fork offset; unlike C, no zero tail
 is written. At an exact segment boundary no parent file is needed."
   (unless (and (typep fork '(unsigned-byte 64))
@@ -31,10 +33,13 @@ is written. At an exact segment boundary no parent file is needed."
                (or (eq namespace :timeline) (= source-timeline 1)))
     (error "invalid parent WAL prefix identity"))
   (multiple-value-bind (segment offset) (wal-segment-and-offset fork)
+    (when (and prefix-p
+               (not (and (typep prefix '(vector (unsigned-byte 8))) (= offset (length prefix)))))
+      (error "authenticated timeline prefix has the wrong length or type"))
     (let ((source nil) (temporary nil) (fd nil) (destination nil) (finished nil))
       (unwind-protect
            (progn
-             (when (plusp offset)
+             (when (and (not prefix-p) (plusp offset))
                (multiple-value-bind (stream timeline size)
                    (wal-lineage-open-segment
                     segment (list (make-timeline-history-entry :timeline source-timeline :begin 0))
@@ -51,6 +56,7 @@ is written. At an exact segment boundary no parent file is needed."
                (wal-copy-timeline-prefix source destination offset)
                (close source)
                (setf source nil))
+             (when prefix-p (write-sequence prefix destination))
              (finish-output destination)
              (wal-timeline-test-point :before-prefix-fsync)
              (fsync-stream destination)
