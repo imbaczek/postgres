@@ -141,4 +141,20 @@ compare
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 5
 checked target '(assert (= 1 (count "native standby restartpoints" (sb-thread:list-all-threads) :test (function string=) :key (function sb-thread:thread-name))))' restarted-worker
 python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" "$TMP/copy" "$TMP/source"
+# A CRC-valid incomplete promotion must fail before redo or a control rewrite.
+kill -INT "$TARGET"
+wait "$TARGET"
+TARGET=
+cp -a "$TMP/copy" "$TMP/pending"
+python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --pending-fixture \
+    "$TMP/pending" "$TMP/source" "$TMP/pending-before.json"
+set +e
+timeout 15 "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/pending" \
+    >"$TMP/pending-startup.log" 2>&1
+pending_status=$?
+set -e
+test "$pending_status" -eq 1
+grep -q 'pending native promotion requires reconciliation' "$TMP/pending-startup.log"
+python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --verify-pending \
+    "$TMP/pending" "$TMP/pending-before.json"
 echo 'physical-restartpoint-auto: PASS'

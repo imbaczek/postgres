@@ -2,6 +2,8 @@
 """Independently compare a selected GEN2 prefix with stopped/idle source WAL."""
 
 import pathlib
+import hashlib
+import json
 import re
 import struct
 import sys
@@ -66,7 +68,60 @@ def main(target, source):
         with path.open("rb") as stream:
             assert stream.read(prefix_length) == prefix, "prefix differs from source WAL"
     print(f"restartpoint-prefix-inspect: PASS lsn={lsn} bytes={prefix_length}")
+    return lsn, digest
+
+
+def storage_snapshot(root):
+    directories = {"base", "global", "pg_wal", "pg_physical_receive", "pg_physical_restartpoints"}
+    names = {"PG_VERSION", "pg_xact", "physical-backup.manifest", "physical-recovery.control",
+             "physical-restartpoint.control", "recovery.required"}
+    result = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if relative.parts[0] in directories or str(relative) in names:
+            assert not path.is_symlink(), f"unexpected fixture symlink: {relative}"
+            if path.is_file():
+                result[str(relative)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return result
+
+
+def prepare_pending(target, source, snapshot):
+    root = pathlib.Path(target)
+    lsn, digest = main(target, source)
+    path = root / "physical-recovery.control"
+    ordinary = path.read_bytes()
+    assert len(ordinary) == 72 and ordinary[:8] == b"PGRSTAT3"
+    checked_crc(ordinary, 68)
+    phase = struct.unpack_from("<I", ordinary, 8)[0]
+    assert phase & 0x7FFFFFFF == 2
+    assert struct.unpack_from("<Q", ordinary, 40)[0] == lsn
+    assert struct.unpack_from("<I", ordinary, 12)[0] == 1
+    fields = (root / "global" / "pg_wal_control").read_bytes().split()
+    assert fields[0] == b"PGWAL6"
+    assert zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    source_namespace = {b"legacy": 0, b"timeline": 1}[fields[5]]
+    pending = bytearray(88)
+    pending[:68] = ordinary[:68]
+    pending[:8] = b"PGRSTAT4"
+    struct.pack_into("<I", pending, 8, (phase & 0x80000000) | 3)
+    struct.pack_into("<I", pending, 56, 5)  # DB_IN_ARCHIVE_RECOVERY
+    struct.pack_into("<IIQ", pending, 68, 2, source_namespace, digest)
+    struct.pack_into("<I", pending, 84, zlib.crc32(pending))
+    path.write_bytes(pending)
+    pathlib.Path(snapshot).write_text(json.dumps(storage_snapshot(root), sort_keys=True))
+    print(f"pending-control-fixture: prepared fork={lsn} child=2 generation={digest:016X}")
+
+
+def verify_pending(target, snapshot):
+    expected = json.loads(pathlib.Path(snapshot).read_text())
+    assert storage_snapshot(pathlib.Path(target)) == expected, "pending startup mutated storage"
+    print(f"pending-control-fixture: unchanged {len(expected)} storage files PASS")
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:])
+    if sys.argv[1] == "--pending-fixture":
+        prepare_pending(*sys.argv[2:])
+    elif sys.argv[1] == "--verify-pending":
+        verify_pending(*sys.argv[2:])
+    else:
+        main(*sys.argv[1:])

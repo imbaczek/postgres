@@ -283,9 +283,51 @@ control and write exclusion must remain authoritative through preparation and
 installation; only later EOR flush and durable recovery/control transition can
 admit child writes. This is local crash recovery state, not coordination.
 
-The current recovery control accepts only phases 0/1/2 and TLI 1
-(`physical-recovery-control-valid-p`); there is no persisted pending-child
-ownership to reuse yet. Replay publishes an applied terminal after syncing
+Operational recovery still uses phases 0/1/2 and TLI 1. The new private v4
+recovery-control format can represent phase 3: parent recovery remains in
+`DB_IN_ARCHIVE_RECOVERY`, while child TLI, original source filename namespace
+and the exact restartpoint generation hash are CRC-bound to `applied` as the
+chosen fork. The 88-byte layout retains the existing source system identity,
+checkpoint/base provenance, actual next-XID visibility and canonical exhausted
+FullXID flag. Ordinary writes remain byte-compatible 72-byte v3 controls;
+v1/v2/v3 reads remain supported. A generation hash identifies an immutable local
+restartpoint image, not a writer-generation coordination token.
+
+This format is not yet a verified ownership publisher. The ordinary progress
+writer rejects pending phase/state/child markers before its monotonic-max or
+atomic-write path, so it cannot silently rewrite the intent as ordinary recovery.
+Runtime SQL/worker admission rejects phase 3, and startup refuses it before base
+manifest processing, recovery-control rewriting or opening storage. No child
+WAL/history artifact is adopted and no writer authority is granted. Dedicated
+publication and restart reconciliation remain missing; the format is not exposed
+as a promotion command. In particular, a future publisher must verify the exact
+GEN2/v4 pointer and prefix, source checkpoint and complete allocation reservation,
+bind the source namespace (legacy is allowed), and install pending memory under
+quiescence before releasing exclusion. It must not overwrite immutable base WAL
+or control to change the namespace in advance. A final target namespace switch
+also needs durable parent-file inventory reconciliation before primary admission.
+
+Pending-format validation: 258 physical tests, 169 interop tests, 1,598 legacy
+checks (`/tmp/pg-pending-control-final-unit.log`) and fresh strict compilation
+(`/tmp/pg-pending-control-final-compile.log`) pass. A 200-trial seed-42 identity
+property has digest `fnv1a64-v1:45f9cb42bbf4c06c`; no FunctionSpec is registered,
+and generated coverage/rejection counts remain unmeasured. Fixed cases cover
+valid-CRC invalid schema, every new identity field's CRC binding, canonical
+exhaustion, ordinary-writer refusal and unchanged startup storage.
+The native automatic-restartpoint/crash test passes with an independent
+CRC-valid v4 fixture prepared only in a stopped PGDATA clone
+(`/tmp/pg-pending-control-native.log`, `/tmp/pg-restartpoint-auto.VWaiXp`).
+After review added the omitted root `pg_xact` to the critical snapshot, a fresh
+clone again refused startup for the pending-state reason and preserved exact
+SHA256 hashes of all 15 selected storage files
+(`/tmp/pg-pending-control-final.n5Bqqp`). PID/option lifecycle files are outside
+that storage snapshot. The fixture is not a live intent publisher, and this test
+does not claim resume or EOR crash safety. Sol high full-diff review's snapshot
+finding is fixed; reused design/checkpoint/refactoring threads found no remaining
+blocker or useful extraction. The service refused new Sol xhigh, Luna max and
+Sol medium threads; reused thread model profiles were not exposed.
+
+Replay publishes an applied terminal after syncing
 pages/CLOG and its recovery progress, but source allocation reservation and
 checkpoint provenance remain separate in-memory facts until a restartpoint
 captures them (`physical-replay-publish-terminal`). Promotion must bind these
