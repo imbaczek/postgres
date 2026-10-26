@@ -9,6 +9,30 @@
   "Linux bits/fcntl-linux.h O_CLOEXEC, shared by storage and postmaster descriptors.
 SB-POSIX does not export this flag in the supported SBCL.")
 
+(defun open-bounded-regular-file (path maximum &optional writable)
+  (let ((fd (sb-posix:open (namestring path)
+                           (logior (if writable sb-posix:o-rdwr sb-posix:o-rdonly)
+                                   sb-posix:o-nofollow sb-posix:o-nonblock +postmaster-o-cloexec+)))
+        (stream nil))
+    (unwind-protect
+         (let* ((stat (sb-posix:fstat fd)) (size (sb-posix:stat-size stat)))
+           (unless (and (sb-posix:s-isreg (sb-posix:stat-mode stat)) (<= 0 size maximum))
+             (error "invalid bounded regular file: ~a" path))
+           (setf stream (sb-sys:make-fd-stream fd :input t :output writable
+                                                  :element-type '(unsigned-byte 8)))
+           (values stream size))
+      (unless stream (sb-posix:close fd)))))
+
+(defun read-bounded-regular-file (path maximum &key (minimum 0))
+  (multiple-value-bind (stream size) (open-bounded-regular-file path maximum)
+    (unwind-protect
+         (progn
+           (unless (<= minimum size) (error "invalid regular metadata length: ~a" path))
+           (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
+             (unless (= size (read-sequence bytes stream)) (error "short regular file read: ~a" path))
+             bytes))
+      (close stream))))
+
 (defun open-relation-file (pathname)
   (ensure-directories-exist pathname)
   (open pathname

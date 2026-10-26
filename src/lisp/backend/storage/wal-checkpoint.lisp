@@ -128,8 +128,22 @@
                    (parse-integer text :start (* index 2) :end (+ (* index 2) 2) :radix 16)))
     (wal-decode-checkpoint-snapshot bytes)))
 
+(defun wal-control-metadata-valid-p (metadata)
+  (and (listp metadata) (= 6 (length metadata))
+       (let ((keys (loop for (key value) on metadata by #'cddr collect key)))
+         (and (every #'keywordp keys) (= 3 (length (remove-duplicates keys)))
+              (null (set-difference '(:system-id :db-state :state-time) keys))))
+       (typep (getf metadata :system-id) '(unsigned-byte 64))
+       (typep (getf metadata :db-state) '(integer 0 6))
+       (typep (getf metadata :state-time) '(signed-byte 64))))
+
+(defun make-wal-control-metadata (system-id state &optional (time (- (get-universal-time) 2208988800)))
+  (let ((metadata (list :system-id system-id :db-state state :state-time time)))
+    (unless (wal-control-metadata-valid-p metadata) (error "invalid primary control metadata"))
+    metadata))
+
 (defun wal-encode-control-image (checkpoint durable snapshot
-                                 &key (timeline 1) (namespace :legacy)
+                                 &key (timeline 1) (namespace :legacy) metadata
                                    (checkpoint-timeline (if snapshot (getf snapshot :timeline) 1)))
   "Persist insertion identity independently of the checkpoint record's timeline."
   (unless (and (typep checkpoint '(unsigned-byte 64))
@@ -138,6 +152,7 @@
                (typep checkpoint-timeline '(integer 1 4294967295))
                (<= checkpoint-timeline timeline)
                (member namespace '(:legacy :timeline))
+               (or (null metadata) (wal-control-metadata-valid-p metadata))
                (or (null snapshot)
                    (and (wal-checkpoint-snapshot-valid-p snapshot)
                         (= checkpoint (getf snapshot :end))
@@ -146,6 +161,10 @@
   (let* ((prefix (format nil "PGWAL6 ~d ~d ~d ~d ~a ~a" checkpoint durable timeline
                          checkpoint-timeline (ecase namespace (:legacy "legacy") (:timeline "timeline"))
                          (if snapshot (wal-checkpoint-snapshot-hex snapshot) "-")))
+         (prefix (if metadata
+                     (format nil "~a ~d ~d ~d" prefix (getf metadata :system-id)
+                             (getf metadata :db-state) (getf metadata :state-time))
+                     prefix))
          (crc (wal-crc32 (string->bytes prefix))))
     (string->bytes (format nil "~a ~8,'0X~%" prefix crc))))
 
@@ -164,7 +183,7 @@
                                  ((equal (sixth fields) "timeline") :timeline))
                         :legacy))
          (crc (ignore-errors (parse-integer (car (last fields)) :radix 16))))
-    (unless (and (cond (v6 (= (length fields) 8)) (identities (= (length fields) 7))
+    (unless (and (cond (v6 (member (length fields) '(8 11))) (identities (= (length fields) 7))
                        (v4 (= (length fields) 5))
                        (t (and (= (length fields) 4)
                                (member version '("PGWAL2" "PGWAL3") :test #'equal))))
@@ -183,7 +202,13 @@
       (when (and snapshot (or (/= checkpoint (getf snapshot :end))
                               (/= checkpoint-timeline (getf snapshot :timeline))))
         (error "checkpoint control copy names another record or timeline"))
-      (values checkpoint durable snapshot timeline checkpoint-timeline namespace))))
+      (if (and v6 (= 11 (length fields)))
+          (values checkpoint durable snapshot timeline checkpoint-timeline namespace
+                  (make-wal-control-metadata
+                   (ignore-errors (parse-integer (eighth fields)))
+                   (ignore-errors (parse-integer (ninth fields)))
+                   (ignore-errors (parse-integer (tenth fields)))))
+          (values checkpoint durable snapshot timeline checkpoint-timeline namespace)))))
 
 (declaim (ftype function physical-promotion-check-child-control))
 

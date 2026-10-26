@@ -3,12 +3,7 @@
 
 (defun recovery-read-bytes (path &key (maximum (* 16 1024 1024)))
   "Read bounded control metadata without creating or changing any file."
-  (with-open-file (stream path :element-type '(unsigned-byte 8))
-    (let ((length (file-length stream)))
-      (unless (<= 1 length maximum) (error "invalid recovery metadata length"))
-      (let ((bytes (make-array length :element-type '(unsigned-byte 8))))
-        (unless (= length (read-sequence bytes stream)) (error "short recovery metadata read"))
-        bytes))))
+  (read-bounded-regular-file path maximum :minimum 1))
 
 (defun physical-recovery-check-required-marker ()
   "Validate the exact bounded guard before ordinary or pending reconstruction."
@@ -21,12 +16,6 @@
 
 (defun physical-recovery-control-path (&optional (directory *pgdata*))
   (merge-pathnames "physical-recovery.control" directory))
-
-(defconstant +db-startup+ 0)
-
-(defconstant +db-shutdowned-in-recovery+ 2)
-
-(defconstant +db-in-archive-recovery+ 5)
 
 (defun physical-recovery-control-valid-p (control &key legacy)
   "Validate recovery progress separately from a pending child's local identity."

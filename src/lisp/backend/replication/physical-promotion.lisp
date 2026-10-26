@@ -128,27 +128,10 @@ The caller owns PGDATA and follow-command/reload/quiescence in that order."
 
 (defun physical-promotion-open-file (path &optional writable)
   "Open an existing bounded regular inode without following symlinks."
-  (let ((fd (sb-posix:open (namestring path)
-                           (logior (if writable sb-posix:o-rdwr sb-posix:o-rdonly)
-                                   sb-posix:o-nofollow sb-posix:o-nonblock +postmaster-o-cloexec+)))
-        (stream nil))
-    (unwind-protect
-         (let* ((stat (sb-posix:fstat fd)) (size (sb-posix:stat-size stat)))
-           (unless (and (= (logand (sb-posix:stat-mode stat) sb-posix:s-ifmt) sb-posix:s-ifreg)
-                        (<= 0 size +wal-segment-size+))
-             (error "invalid pending promotion file: ~a" path))
-           (setf stream (sb-sys:make-fd-stream fd :input t :output writable
-                                                  :element-type '(unsigned-byte 8)))
-           (values stream size))
-      (unless stream (sb-posix:close fd)))))
+  (open-bounded-regular-file path +wal-segment-size+ writable))
 
 (defun physical-promotion-read-file (path)
-  (multiple-value-bind (stream size) (physical-promotion-open-file path)
-    (unwind-protect
-         (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
-           (unless (= size (read-sequence bytes stream)) (error "short pending promotion file"))
-           bytes)
-      (close stream))))
+  (read-bounded-regular-file path +wal-segment-size+))
 
 (defun physical-promotion-history-image (state)
   "Canonical native reason, fixed for retry; C history bytes carry no authority."

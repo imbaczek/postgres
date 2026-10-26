@@ -1,6 +1,20 @@
 ;;;; Cluster-owned recovery role; session settings never grant write authority.
 (in-package #:pg)
 
+(defconstant +db-startup+ 0)
+
+(defconstant +db-shutdowned+ 1)
+
+(defconstant +db-shutdowned-in-recovery+ 2)
+
+(defconstant +db-shutdowning+ 3)
+
+(defconstant +db-in-crash-recovery+ 4)
+
+(defconstant +db-in-archive-recovery+ 5)
+
+(defconstant +db-in-production+ 6)
+
 (defvar *physical-recovery-state* nil
   "Verified native recovery image metadata, preserved across code reloads.")
 

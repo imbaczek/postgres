@@ -96,6 +96,8 @@
 (defvar *wal-checkpoint-snapshot* nil
   "Facts belonging to the published checkpoint, never a merely flushed candidate.")
 
+(defvar *wal-control-metadata* nil)
+
 (defvar *wal-xid-reserved-through* nil)
 
 (defvar *wal-durable-lsn* 0)
@@ -1993,22 +1995,31 @@ src/backend/access/transam/xlogreader.c."
 
 (defun wal-read-control-fields ()
   (let ((path (wal-control-path)))
-    (when (probe-file path)
-      (with-open-file (stream path :direction :input)
-        (let ((line (read-line stream nil nil)))
-          (unless (and line (<= (length line) 512) (null (read-line stream nil nil)))
-            (error "WAL control file ~a is corrupt" path))
-          (handler-case (wal-decode-control-line line)
-            (error (condition)
-              (error "WAL control file ~a is corrupt: ~a" path condition))))))))
+    (handler-case
+        (with-input-from-string
+            (stream (bytes->string (read-bounded-regular-file path 513 :minimum 1)))
+          (let ((line (read-line stream nil nil)))
+            (unless (and line (<= (length line) 512) (null (read-line stream nil nil)))
+              (error "WAL control file ~a is corrupt" path))
+            (handler-case (wal-decode-control-line line)
+              (error (condition)
+                (error "WAL control file ~a is corrupt: ~a" path condition)))))
+      (sb-posix:syscall-error (condition)
+        (unless (= sb-posix:enoent (sb-posix:syscall-errno condition))
+          (error condition))))))
 
 (defun wal-save-control-fields (checkpoint-lsn durable-lsn)
-  (wal-atomic-write-bytes
-   (wal-control-path)
-   (wal-encode-control-image checkpoint-lsn durable-lsn *wal-checkpoint-snapshot*
-                             :timeline *wal-insert-timeline*
-                             :checkpoint-timeline *wal-checkpoint-timeline*
-                             :namespace *wal-segment-namespace*))
+  (let ((metadata (when *wal-control-metadata*
+                    (make-wal-control-metadata
+                     (getf *wal-control-metadata* :system-id)
+                     (getf *wal-control-metadata* :db-state)))))
+    (wal-atomic-write-bytes
+     (wal-control-path)
+     (wal-encode-control-image checkpoint-lsn durable-lsn *wal-checkpoint-snapshot*
+                               :timeline *wal-insert-timeline*
+                               :checkpoint-timeline *wal-checkpoint-timeline*
+                               :namespace *wal-segment-namespace* :metadata metadata))
+    (setf *wal-control-metadata* metadata))
   (values))
 
 (defun wal-save-durable-lsn (lsn)
@@ -2045,10 +2056,11 @@ src/backend/access/transam/xlogreader.c."
 (defun wal-init ()
   ;; Control identities must be accepted before even syncing directories: a child
   ;; control cannot cause legacy segment scanning, truncation, or tail adoption.
-  (multiple-value-bind (checkpoint-lsn durable-lsn snapshot insertion checkpoint-timeline namespace)
+  (multiple-value-bind (checkpoint-lsn durable-lsn snapshot insertion checkpoint-timeline namespace metadata)
       (wal-read-control-fields)
     (when checkpoint-lsn (wal-require-supported-timelines insertion checkpoint-timeline))
-    (setf *wal-segment-namespace* (or namespace :legacy)
+    (setf *wal-control-metadata* metadata
+          *wal-segment-namespace* (or namespace :legacy)
           *wal-insert-timeline* (or insertion 1)
           *wal-checkpoint-timeline* (or checkpoint-timeline 1)
           *wal-prev-timeline* (getf snapshot :prev-timeline (or insertion 1)))
