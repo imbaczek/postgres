@@ -175,6 +175,11 @@ def check_promotion_eor(target, source, expected):
     assert struct.unpack_from("<Q", control, 40)[0] == fork
     assert struct.unpack_from("<Q", control, 76)[0] == digest
     image = (root / "pg_physical_restartpoints" / f"{fork:016X}-{digest:016X}.rp").read_bytes()
+    text_length = struct.unpack_from("<I", image, 8)[0]
+    catalog_length = struct.unpack_from("<Q", image, 12)[0]
+    actual_next = (1 << 64) if struct.unpack_from("<I", control, 8)[0] & (1 << 31) else struct.unpack_from("<Q", control, 48)[0]
+    assert field(image[32:32 + text_length].decode("ascii"), "NEXT-XID") == actual_next
+    assert (root / "global" / "pg_catalog.dat").read_bytes() == image[32 + text_length:32 + text_length + catalog_length]
     length = struct.unpack_from("<I", image, 20)[0]
     prefix = image[-length:] if length else b""
     size = 16 * 1024 * 1024
@@ -207,6 +212,138 @@ def check_promotion_eor(target, source, expected):
     print(f"promotion-history-eor: {expected} PASS")
 
 
+def snapshot_storage(target, snapshot):
+    pathlib.Path(snapshot).write_text(json.dumps(storage_snapshot(pathlib.Path(target)), sort_keys=True))
+
+
+def damage_resume(target, change):
+    root = pathlib.Path(target)
+    control_path = root / "physical-recovery.control"
+    control = bytearray(control_path.read_bytes())
+    fork = struct.unpack_from("<Q", control, 40)[0]
+    child = struct.unpack_from("<I", control, 68)[0]
+    segment = fork // (16 * 1024 * 1024)
+    child_path = root / "pg_wal" / f"{child:08X}{segment // 256:08X}{segment % 256:08X}.wal"
+    pointer_path = root / "physical-restartpoint.control"
+    pointer = bytearray(pointer_path.read_bytes())
+    digest = struct.unpack_from("<Q", pointer, 16)[0]
+    generation_path = root / "pg_physical_restartpoints" / f"{fork:016X}-{digest:016X}.rp"
+    if change == "marker":
+        (root / "recovery.required").unlink()
+    elif change == "pointer":
+        pointer[-1] ^= 1
+        pointer_path.write_bytes(pointer)
+    elif change == "generation":
+        data = bytearray(generation_path.read_bytes())
+        data[32] ^= 1
+        generation_path.write_bytes(data)
+    elif change == "allocation":
+        data = generation_path.read_bytes()
+        length = struct.unpack_from("<I", data, 8)[0]
+        text = data[32:32 + length]
+        assert text.count(b":COMPLETE T") == 1
+        text = text.replace(b":COMPLETE T", b":COMPLETE NIL")
+        image = bytearray(data[:32] + text + data[32 + length:])
+        struct.pack_into("<I", image, 8, len(text))
+        struct.pack_into("<I", image, 24, 0)
+        struct.pack_into("<I", image, 24, zlib.crc32(image))
+        new_digest = fnv(image)
+        (generation_path.parent / f"{fork:016X}-{new_digest:016X}.rp").write_bytes(image)
+        struct.pack_into("<Q", pointer, 16, new_digest)
+        struct.pack_into("<I", pointer, 24, 0)
+        struct.pack_into("<I", pointer, 24, zlib.crc32(pointer))
+        pointer_path.write_bytes(pointer)
+        struct.pack_into("<Q", control, 76, new_digest)
+        struct.pack_into("<I", control, 84, 0)
+        struct.pack_into("<I", control, 84, zlib.crc32(control))
+        control_path.write_bytes(control)
+    elif change == "receive":
+        path = root / "pg_physical_receive" / "receive.control"
+        data = bytearray(path.read_bytes())
+        data[-1] ^= 1
+        path.write_bytes(data)
+    elif change == "backlog":
+        path = root / "pg_physical_receive" / "receive.control"
+        receive = bytearray(path.read_bytes())
+        assert len(receive) == 68
+        flush = struct.unpack_from("<Q", receive, 32)[0]
+        assert flush == fork and flush % (16 * 1024 * 1024) + 64 <= 16 * 1024 * 1024
+        records = []
+        for kind, start in ((6, flush), (9, flush + 32)):
+            record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 7, kind, 32, start, 0, 0))
+            struct.pack_into("<I", record, 28, zlib.crc32(record))
+            records.append(record)
+        batch = b"".join(records)
+        value = struct.unpack_from("<Q", receive, 40)[0]
+        for byte in batch:
+            value = ((value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+        segment_path = path.parent / f"{flush // (16 * 1024 * 1024):016X}.wal"
+        offset = flush % (16 * 1024 * 1024)
+        prefix = segment_path.read_bytes()[:offset] if segment_path.exists() else b"\0" * offset
+        assert len(prefix) == offset
+        segment_path.write_bytes(prefix + batch)
+        struct.pack_into("<Q", receive, 32, flush + 64)
+        struct.pack_into("<Q", receive, 40, value)
+        struct.pack_into("<I", receive, 64, 0)
+        struct.pack_into("<I", receive, 64, zlib.crc32(receive))
+        path.write_bytes(receive)
+    elif change == "lock":
+        (root / "pg_physical_receive" / "receive.lock").unlink()
+    elif change == "child":
+        data = bytearray(child_path.read_bytes())
+        data[0] ^= 1
+        child_path.write_bytes(data)
+    elif change == "missing-child":
+        child_path.unlink()
+    elif change == "history":
+        (root / "pg_wal" / f"{child:08X}.history").write_bytes(b"1\t0/00000000\tforeign\n")
+    elif change == "base-control":
+        path = root / "global" / "pg_wal_control"
+        path.write_bytes(path.read_bytes() + b" ")
+    elif change == "ahead-catalog":
+        path = root / "global" / "pg_catalog.dat"
+        data, count = re.subn(rb"(:NEXT-OID\s+)([0-9]+)",
+                             lambda match: match[1] + str(int(match[2]) + 17).encode(),
+                             path.read_bytes(), count=1)
+        assert count == 1
+        path.write_bytes(data)
+    elif change == "fork":
+        paths = [path for path in (root / "base").iterdir()
+                 if path.name.isdecimal() and path.is_file() and path.stat().st_size > 0]
+        assert paths
+        paths[0].unlink()
+    elif change == "system":
+        struct.pack_into("<Q", control, 16, struct.unpack_from("<Q", control, 16)[0] ^ 1)
+        struct.pack_into("<I", control, 84, 0)
+        struct.pack_into("<I", control, 84, zlib.crc32(control))
+        control_path.write_bytes(control)
+    elif change == "valid-tail":
+        data = child_path.read_bytes()
+        offset = fork % (16 * 1024 * 1024)
+        record = bytearray(data[offset:])
+        assert len(record) == 56
+        struct.pack_into("<I", record, 40, child + 1)
+        struct.pack_into("<I", record, 28, 0)
+        struct.pack_into("<I", record, 28, zlib.crc32(record))
+        child_path.write_bytes(data[:offset] + record)
+    elif change == "oversized-tail":
+        with child_path.open("ab") as stream:
+            stream.write(b"x")
+    elif change == "unacknowledged":
+        path = root / "pg_physical_receive" / "receive.control"
+        flush = struct.unpack_from("<Q", path.read_bytes(), 32)[0]
+        path = path.parent / f"{flush // (16 * 1024 * 1024):016X}.wal"
+        offset = flush % (16 * 1024 * 1024)
+        prefix = path.read_bytes()[:offset] if path.exists() else b"\0" * offset
+        assert len(prefix) == offset
+        path.write_bytes(prefix + b"unacknowledged-tail")
+    elif change.startswith("torn-"):
+        count = int(change[5:])
+        child_path.write_bytes(child_path.read_bytes()[:fork % (16 * 1024 * 1024)] + b"\xA5" * count)
+    else:
+        raise AssertionError(f"unknown resume damage: {change}")
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "--pending-fixture":
         prepare_pending(*sys.argv[2:])
@@ -218,5 +355,9 @@ if __name__ == "__main__":
         check_child_prefix(*sys.argv[2:])
     elif sys.argv[1] == "--check-promotion-eor":
         check_promotion_eor(*sys.argv[2:])
+    elif sys.argv[1] == "--snapshot-storage":
+        snapshot_storage(*sys.argv[2:])
+    elif sys.argv[1] == "--damage-resume":
+        damage_resume(*sys.argv[2:])
     else:
         main(*sys.argv[1:])

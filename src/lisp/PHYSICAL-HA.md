@@ -513,6 +513,78 @@ Sol medium's final refactoring review found no further useful extraction. Shared
 force installation, file opening and promotion exclusion centralize the relevant
 invariants; production functions remain below 120 lines. No coordination is added.
 
+### Cold reconstruction of pending promotion
+
+`physical-promotion-resume-pending` now reconstructs a pending transition in a
+fresh process owning PGDATA, with cold storage and command/reload quiescence.
+It reads the exact phase-3 control and manifest, checks system identity and base
+WAL provenance, and requires the selected GEN2/v4 generation, fork, actual next-XID,
+authenticated prefix, source checkpoint and complete allocation proof to agree.
+Existing receive ownership/control/acknowledged segment files must be regular;
+the spool opens without creating a missing lock or trimming unacknowledged bytes.
+
+Before restoring catalog bytes it validates receive digest and complete-terminal
+progress, surviving fork sizes, history and child/EOR artifacts through the same
+proof and artifact-plan helpers used by live publication. A complete durable
+backlog beyond the chosen fork rejects rather than silently changing that fork.
+It then restores only the selected restartpoint catalog and visibility state,
+without ordinary replay, progress publication or follow startup. The actual
+next-XID stays distinct from allocation capacity. Missing pre-history child bytes
+are installed from the authenticated prefix; published history requires exact
+existing child proof, after which the existing EOR publisher handles bounded repair.
+
+Failures fence the process and close only resources opened by this constructor.
+Restored globals may remain after a late failure; another attempt requires a fresh
+process. Successful recovery still retains phase 3 and denies admission with
+57P03. This is a private cold-start primitive exercised by the native fixture,
+not automatic promotion: ordinary server startup continues to refuse pending
+state until committed-child control and primary child-WAL recovery are complete.
+C similarly establishes control/checkpoint state before end-of-recovery actions
+(`StartupXLOG`, `xlog.c:6220–6238`) and allows ordinary writes only later
+(`6911–6937`). No new public maintenance command or coordination is introduced.
+
+Validation passes 299 physical tests, 169 interop tests and 1,598 legacy checks.
+The generated no-tail-trimming property passes 50 trials at seed 42, digest
+`fnv1a64-v1:58b522b89191caae`; no FunctionSpec is registered, and input coverage
+and rejection counts remain unmeasured. Shared marker creation/validation keeps
+the original bytes and rejects special files. Sol xhigh design advice and Sol
+high full-diff review completed; reused checkpoint/refactoring/delta threads did
+not expose their model profiles after exact-profile creation hit the service
+limit. The suggested marker extraction is implemented. Production functions
+remain below 120 lines.
+
+`t/promotion-resume.sh` verifies fresh-process recovery from all 15 prior
+prefix/history/EOR publication states, four torn EOR suffix lengths, an actual
+unacknowledged spool tail, an ahead catalog, and two repeated SIGKILL boundaries
+around restartpoint restoration. Fifteen damaged or inconsistent clones reject
+without changing critical storage. Every rejection fixture first advances its
+mutable catalog counter so premature catalog restoration would change its hash.
+Cases include a validly checksummed complete receive backlog, a rehashed/rebound
+generation lacking allocation proof, lost forks, a foreign valid EOR and an
+oversized tail. Semantic error checks distinguish these from envelope corruption.
+Independent Python checks compare restored catalog bytes and actual next-XID
+with the selected generation, verify source prefix/history/EOR, and confirm
+ordinary startup still refuses without storage changes.
+
+All 38 scenarios pass from a private empty FASL cache at
+`/tmp/pg-promotion-resume-native-clean.log`, artifact
+`/tmp/pg-promotion-resume.deVF2M`. The stopped base/prefix/WAL seeds are
+`/tmp/pg-restartpoint-auto.VWaiXp`, `/tmp/pg-promotion-prefix.LW1Gvu` and
+`/tmp/pg-promotion-prefix.BWs90u`; the default seed-producer route was not rerun.
+These are process-crash checks, not simulated power loss or completed writer
+promotion. The test fixture initially wrote a tail below the receive floor when
+compaction left no spool file; it now constructs the sparse prefix and puts new
+bytes at the actual acknowledged flush position.
+
+Fresh compilation also found the new lock opener referencing the close-on-exec
+constant before its defining file loaded. Moving that unchanged constant into
+the earlier SBCL file layer fixes the dependency. The compile harness previously
+returned success for deferred compilation-unit warnings; it now fails them while
+excluding expected SBCL redefinition notices. Empty-cache compilation is clean
+(`/tmp/pg-promotion-resume-compile-clean.log`), and an injected end-of-system
+warning is rejected (`/tmp/pg-compile-warning-check.h7HshK/output.log`). The broader
+cold-image/load-order audit remains open in [TODO.md](TODO.md).
+
 Replay publishes an applied terminal after syncing
 pages/CLOG and its recovery progress, but source allocation reservation and
 checkpoint provenance remain separate in-memory facts until a restartpoint
