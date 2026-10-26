@@ -126,37 +126,60 @@
                    (parse-integer text :start (* index 2) :end (+ (* index 2) 2) :radix 16)))
     (wal-decode-checkpoint-snapshot bytes)))
 
-(defun wal-encode-control-image (checkpoint durable snapshot)
+(defun wal-encode-control-image (checkpoint durable snapshot
+                                 &key (timeline 1)
+                                   (checkpoint-timeline (if snapshot (getf snapshot :timeline) 1)))
+  "Persist insertion identity independently of the checkpoint record's timeline."
   (unless (and (typep checkpoint '(unsigned-byte 64))
                (typep durable '(unsigned-byte 64)) (<= checkpoint durable)
+               (typep timeline '(integer 1 4294967295))
+               (typep checkpoint-timeline '(integer 1 4294967295))
+               (<= checkpoint-timeline timeline)
                (or (null snapshot)
                    (and (wal-checkpoint-snapshot-valid-p snapshot)
-                        (= checkpoint (getf snapshot :end)))))
+                        (= checkpoint (getf snapshot :end))
+                        (= checkpoint-timeline (getf snapshot :timeline)))))
     (error "invalid WAL control checkpoint copy"))
-  (let* ((prefix (if snapshot
-                     (format nil "PGWAL4 ~d ~d ~a" checkpoint durable
-                             (wal-checkpoint-snapshot-hex snapshot))
-                     (format nil "PGWAL3 ~d ~d" checkpoint durable)))
+  (let* ((prefix (format nil "PGWAL5 ~d ~d ~d ~d ~a" checkpoint durable timeline
+                         checkpoint-timeline
+                         (if snapshot (wal-checkpoint-snapshot-hex snapshot) "-")))
          (crc (wal-crc32 (string->bytes prefix))))
     (string->bytes (format nil "~a ~8,'0X~%" prefix crc))))
 
 (defun wal-decode-control-line (line)
+  "Legacy control implies timeline 1; PGWAL5 binds both WAL timeline identities."
   (let* ((fields (and line (wal-split-fields line)))
-         (new (equal (first fields) "PGWAL4"))
+         (version (first fields))
+         (v5 (equal version "PGWAL5"))
+         (v4 (equal version "PGWAL4"))
          (checkpoint (ignore-errors (parse-integer (second fields))))
          (durable (ignore-errors (parse-integer (third fields))))
+         (timeline (if v5 (ignore-errors (parse-integer (fourth fields))) 1))
+         (checkpoint-timeline (if v5 (ignore-errors (parse-integer (fifth fields))) 1))
          (crc (ignore-errors (parse-integer (car (last fields)) :radix 16))))
-    (unless (and (if new (= (length fields) 5)
-                     (and (= (length fields) 4)
-                          (member (first fields) '("PGWAL2" "PGWAL3") :test #'equal)))
+    (unless (and (cond (v5 (= (length fields) 7)) (v4 (= (length fields) 5))
+                       (t (and (= (length fields) 4)
+                               (member version '("PGWAL2" "PGWAL3") :test #'equal))))
                  (typep checkpoint '(unsigned-byte 64))
                  (typep durable '(unsigned-byte 64)) (<= checkpoint durable)
+                 (typep timeline '(integer 1 4294967295))
+                 (typep checkpoint-timeline '(integer 1 4294967295))
+                 (<= checkpoint-timeline timeline)
                  crc (= crc (wal-crc32 (string->bytes (format nil "~{~a~^ ~}" (butlast fields))))))
       (error "corrupt WAL control image"))
-    (let ((snapshot (when new (wal-checkpoint-snapshot-from-hex (fourth fields)))))
-      (when (and snapshot (/= checkpoint (getf snapshot :end)))
-        (error "checkpoint control copy names another record"))
-      (values checkpoint durable snapshot))))
+    (let ((snapshot
+            (cond ((and v5 (not (equal (sixth fields) "-")))
+                   (wal-checkpoint-snapshot-from-hex (sixth fields)))
+                  (v4 (wal-checkpoint-snapshot-from-hex (fourth fields))))))
+      (when (and snapshot (or (/= checkpoint (getf snapshot :end))
+                              (/= checkpoint-timeline (getf snapshot :timeline))))
+        (error "checkpoint control copy names another record or timeline"))
+      (values checkpoint durable snapshot timeline checkpoint-timeline))))
+
+(defun wal-require-supported-timelines (insertion checkpoint)
+  "Refuse unsupported branches before any scan, truncation or storage mutation."
+  (unless (and (eql insertion 1) (eql checkpoint 1))
+    (error "native timeline-keyed WAL is not yet supported")))
 
 (declaim (special *xid-lock* *next-xid* *xid-batch-end* *active-xids* *catalog*))
 

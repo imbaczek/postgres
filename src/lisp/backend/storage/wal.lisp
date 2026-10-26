@@ -77,6 +77,12 @@
 (defvar *wal-end-lsn* 0)
 (defvar *wal-checkpoint-lsn* 0)
 
+(defvar *wal-insert-timeline* 1
+  "Committed insertion identity; a pending recovery child must not overwrite it.")
+
+(defvar *wal-checkpoint-timeline* 1
+  "Timeline of the checkpoint record, independently of current insertion.")
+
 (defvar *wal-checkpoint-snapshot* nil
   "Facts belonging to the published checkpoint, never a merely flushed candidate.")
 
@@ -1923,7 +1929,9 @@ src/backend/access/transam/xlogreader.c."
 (defun wal-save-control-fields (checkpoint-lsn durable-lsn)
   (wal-atomic-write-bytes
    (wal-control-path)
-   (wal-encode-control-image checkpoint-lsn durable-lsn *wal-checkpoint-snapshot*))
+   (wal-encode-control-image checkpoint-lsn durable-lsn *wal-checkpoint-snapshot*
+                             :timeline *wal-insert-timeline*
+                             :checkpoint-timeline *wal-checkpoint-timeline*))
   (values))
 
 (defun wal-save-durable-lsn (lsn)
@@ -1938,10 +1946,12 @@ src/backend/access/transam/xlogreader.c."
   (when (> lsn *wal-durable-lsn*)
     (error "WAL checkpoint LSN ~a is past durable LSN ~a" lsn *wal-durable-lsn*))
   ;; WAL-FLUSH retains the old copy. Publish a candidate only after page/CLOG sync.
-  (let ((*wal-checkpoint-snapshot* snapshot))
+  (let ((*wal-checkpoint-snapshot* snapshot)
+        (*wal-checkpoint-timeline* (if snapshot (getf snapshot :timeline) *wal-insert-timeline*)))
     (wal-save-control-fields lsn *wal-durable-lsn*))
   (setf *wal-checkpoint-lsn* lsn
-        *wal-checkpoint-snapshot* (copy-list snapshot))
+        *wal-checkpoint-snapshot* (copy-list snapshot)
+        *wal-checkpoint-timeline* (if snapshot (getf snapshot :timeline) *wal-insert-timeline*))
   (values))
 
 (defun wal-sync-segments (segments)
@@ -1954,20 +1964,24 @@ src/backend/access/transam/xlogreader.c."
   (values))
 
 (defun wal-init ()
-  (wal-ensure-directory-durable *pgdata*)
-  (wal-ensure-directory-durable (merge-pathnames "global/" *pgdata*))
-  (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
-  (wal-ensure-directory-durable (merge-pathnames "pg_wal/" *pgdata*))
-  (wal-ensure-directory-durable (wal-replication-slot-directory))
-  ;; Persist segment entries left visible by a process that exited before its
-  ;; first successful WAL directory sync, before reusing any existing segment.
-  (fsync-directory (wal-directory))
-  (let ((segments (wal-discover-segments)))
-    (multiple-value-bind (checkpoint-lsn durable-lsn snapshot)
-        (wal-read-control-fields)
+  ;; Control identities must be accepted before even syncing directories: a child
+  ;; control cannot cause legacy segment scanning, truncation, or tail adoption.
+  (multiple-value-bind (checkpoint-lsn durable-lsn snapshot insertion checkpoint-timeline)
+      (wal-read-control-fields)
+    (when checkpoint-lsn (wal-require-supported-timelines insertion checkpoint-timeline))
+    (wal-ensure-directory-durable *pgdata*)
+    (wal-ensure-directory-durable (merge-pathnames "global/" *pgdata*))
+    (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
+    (wal-ensure-directory-durable (merge-pathnames "pg_wal/" *pgdata*))
+    (wal-ensure-directory-durable (wal-replication-slot-directory))
+    ;; Persist segment entries left visible before an earlier directory sync.
+    (fsync-directory (wal-directory))
+    (let ((segments (wal-discover-segments)))
       (when (and (null checkpoint-lsn) segments)
         (error "WAL control file is missing while WAL segments exist"))
-      (setf *wal-xid-reserved-through* (getf snapshot :xid-reserved-through)
+      (setf *wal-insert-timeline* (or insertion 1)
+            *wal-checkpoint-timeline* (or checkpoint-timeline 1)
+            *wal-xid-reserved-through* (getf snapshot :xid-reserved-through)
             *wal-checkpoint-snapshot* snapshot
             *wal-checkpoint-lsn* (or checkpoint-lsn 0)
             *wal-durable-lsn* (or durable-lsn 0)
@@ -1987,22 +2001,19 @@ src/backend/access/transam/xlogreader.c."
             *wal-test-pause-at* nil
             *wal-test-pause-relfilenode* nil
             *wal-test-pause-fired* nil)
-      (unless checkpoint-lsn
-        (wal-save-control-fields 0 0))
+      (unless checkpoint-lsn (wal-save-control-fields 0 0))
       (multiple-value-bind (end-lsn found-segments)
           (wal-scan (lambda (record) (declare (ignore record))))
         (setf *wal-end-lsn* end-lsn)
         (when (> end-lsn *wal-durable-lsn*)
-          ;; WAL can reach disk just before a process exits without updating
-          ;; the control file. Make that complete tail durable before redo.
+          ;; Adopt only a complete, synced tail belonging to this insertion identity.
           (wal-sync-segments found-segments)
           (wal-save-durable-lsn end-lsn)))
       (setf *wal-test-pause-at*
             (let ((value (sb-ext:posix-getenv "PG_WAL_TEST_PAUSE_AT")))
               (and value (string-downcase value)))
             *wal-test-pause-relfilenode*
-            (let ((value (sb-ext:posix-getenv
-                          "PG_WAL_TEST_PAUSE_RELATION")))
+            (let ((value (sb-ext:posix-getenv "PG_WAL_TEST_PAUSE_RELATION")))
               (and value (parse-integer value :junk-allowed t)))))
     (values)))
 

@@ -35,8 +35,13 @@ def read_copy(pgdata):
     assert raw.endswith("\n") and raw.count("\n") == 1
     prefix, crc = raw.rstrip("\n").rsplit(" ", 1)
     assert zlib.crc32(prefix.encode("ascii")) == int(crc, 16)
-    version, end, durable, payload = prefix.split(" ")
-    assert version == "PGWAL4"
+    fields = prefix.split(" ")
+    if fields[0] == "PGWAL5":
+        version, end, durable, insertion, checkpoint_tli, payload = fields
+        assert int(insertion) == int(checkpoint_tli) == 1
+    else:
+        version, end, durable, payload = fields
+        assert version == "PGWAL4"
     data = bytes.fromhex(payload)
     facts = checkpoint(data)
     assert facts["end"] == int(end) <= int(durable)
@@ -62,13 +67,15 @@ def check_stopped(pgdata):
     raise AssertionError("fixture conversion requires a stopped, owned test server")
 
 
-def convert_fixture(pgdata, facts, payload, legacy):
+def convert_fixture(pgdata, facts, payload, legacy, unsupported_insertion=False):
     """Only the shell regression calls this, after killing and waiting its PID."""
     check_stopped(pgdata)
     control = pgdata / "global/pg_wal_control"
     fields = control.read_text().split()
     assert int(fields[1]) == int(fields[2]) == facts["end"]
-    if legacy:
+    if unsupported_insertion:
+        prefix = f"PGWAL5 {facts['end']} {facts['end']} 2 1 {payload}"
+    elif legacy:
         segment = pgdata / f"pg_wal/{facts['start'] // 16777216:016X}.wal"
         assert sorted((pgdata / "pg_wal").glob("*.wal"))[-1] == segment
         header = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 5, 4, 32, facts["start"], 0, 0))
@@ -101,10 +108,12 @@ def main():
     fixture = parser.add_mutually_exclusive_group()
     fixture.add_argument("--legacy-fixture", action="store_true")
     fixture.add_argument("--corrupt-copy-fixture", action="store_true")
+    fixture.add_argument("--unsupported-insertion-fixture", action="store_true")
     args = parser.parse_args()
     facts, payload = read_copy(args.pgdata)
-    if args.legacy_fixture or args.corrupt_copy_fixture:
-        convert_fixture(args.pgdata, facts, payload, args.legacy_fixture)
+    if args.legacy_fixture or args.corrupt_copy_fixture or args.unsupported_insertion_fixture:
+        convert_fixture(pgdata=args.pgdata, facts=facts, payload=payload, legacy=args.legacy_fixture,
+                        unsupported_insertion=args.unsupported_insertion_fixture)
         return
     if args.expect:
         assert facts == json.loads(args.expect.read_text())

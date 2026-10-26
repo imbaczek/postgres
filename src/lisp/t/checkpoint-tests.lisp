@@ -110,6 +110,103 @@
       (multiple-value-bind (checkpoint durable copy) (pg::wal-decode-control-line text)
         (ok (= checkpoint 64)) (ok (= durable 300)) (ok (null copy))))))
 
+(deftest wal-control-keeps-insertion-timeline-separate-from-checkpoint-timeline
+    (let* ((snapshot (sample-checkpoint-snapshot))
+           (text (string-right-trim '(#\Newline)
+                                    (pg::bytes->string
+                                     (pg::wal-encode-control-image 152 300 snapshot
+                                                                   :timeline 3 :checkpoint-timeline 1)))))
+      (multiple-value-bind (checkpoint durable copy insertion checkpoint-timeline)
+          (pg::wal-decode-control-line text)
+        (ok (= checkpoint 152)) (ok (= durable 300)) (ok (equal copy snapshot))
+        (ok (= insertion 3)) (ok (= checkpoint-timeline 1))))
+  (ok (intake-fails-p
+       (lambda () (pg::wal-encode-control-image 152 300 (sample-checkpoint-snapshot)
+                                                :timeline 1 :checkpoint-timeline 2))))
+  (dolist (version '("PGWAL2" "PGWAL3"))
+    (let* ((prefix (format nil "~a 64 300" version))
+           (line (format nil "~a ~8,'0X" prefix (pg::wal-crc32 (pg::string->bytes prefix)))))
+      (multiple-value-bind (checkpoint durable copy insertion checkpoint-timeline)
+          (pg::wal-decode-control-line line)
+        (declare (ignore checkpoint durable copy))
+        (ok (= insertion 1)) (ok (= checkpoint-timeline 1))))))
+
+(deftest wal-startup-rejects-child-control-before-mutating-legacy-storage
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root) (pg::*wal-ready* nil)
+                                 (pg::*wal-insert-timeline* 1) (pg::*wal-checkpoint-timeline* 1)
+                                 (control (pg::wal-control-path))
+                                 (wal (merge-pathnames "pg_wal/0000000000000000.wal" root))
+                                 (bytes (pg::wal-encode-control-image 0 64 nil :timeline 2 :checkpoint-timeline 1))
+                                 (tail (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3))))
+        (pg::wal-atomic-write-bytes control bytes)
+        (pg::wal-atomic-write-bytes wal tail)
+        (ok (intake-fails-p #'pg::wal-init))
+        (ok (not pg::*wal-ready*))
+        (ok (= 1 pg::*wal-insert-timeline* pg::*wal-checkpoint-timeline*))
+        (ok (not (probe-file (merge-pathnames "base/" root))))
+        (ok (equalp bytes (pg::recovery-read-bytes control)))
+        (ok (equalp tail (pg::recovery-read-bytes wal))))))
+
+(deftest standby-rejects-child-wal-control-before-publishing-dirty-recovery-state
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root) (pg::*physical-recovery-state* nil)
+                                 (writes 0) (checked nil)
+                                 (pg::*physical-recovery-control-test-hook* (lambda (&rest args) (declare (ignore args)) (incf writes)))
+                                 (checker (symbol-function 'pg::physical-recovery-check-streaming-base))
+                                 (marker (pg::string->bytes (format nil "PGPHYSICAL-RECOVERY-REQUIRED-1~%"))))
+        (pg::wal-atomic-write-bytes (merge-pathnames "recovery.required" root) marker)
+        (write-recovery-manifest-text
+         root (pg::physical-bootstrap-manifest-text (sample-recovery-manifest)))
+        (multiple-value-bind (manifest digest) (pg::recovery-read-manifest root)
+          (declare (ignore manifest))
+          (let ((before (pg::physical-recovery-control-image 2 123 1 digest 32 96 3 :db-state 2)))
+            (pg::wal-atomic-write-bytes (pg::physical-recovery-control-path) before)
+            (pg::wal-atomic-write-bytes
+             (pg::wal-control-path)
+             (pg::wal-encode-control-image 32 32 nil :timeline 2 :checkpoint-timeline 1))
+            (unwind-protect
+                 (progn
+                   ;; Isolate the post-provenance timeline gate; keep real control readers/writer.
+                   (setf (symbol-function 'pg::physical-recovery-check-streaming-base)
+                         (lambda (&rest args) (declare (ignore args)) (setf checked t)))
+                   (ok (handler-case (progn (pg::physical-recovery-prepare) nil)
+                         (error (condition)
+                           (search "native timeline-keyed WAL is not yet supported"
+                                   (princ-to-string condition)))))
+                   (ok checked)
+                   (ok (zerop writes))
+                   (ok (null pg::*physical-recovery-state*))
+                   (ok (equalp before (pg::recovery-read-bytes (pg::physical-recovery-control-path)))))
+              (setf (symbol-function 'pg::physical-recovery-check-streaming-base) checker)))))))
+
+(deftest wal-control-v4-remains-explicitly-timeline-one
+    (let* ((snapshot (sample-checkpoint-snapshot))
+           (prefix (format nil "PGWAL4 152 300 ~a" (pg::wal-checkpoint-snapshot-hex snapshot)))
+           (line (format nil "~a ~8,'0X" prefix (pg::wal-crc32 (pg::string->bytes prefix)))))
+      (multiple-value-bind (checkpoint durable copy insertion checkpoint-timeline)
+          (pg::wal-decode-control-line line)
+        (ok (= checkpoint 152)) (ok (= durable 300)) (ok (equal copy snapshot))
+        (ok (= insertion 1)) (ok (= checkpoint-timeline 1)))))
+
+(cl-spec:defproperty wal-control-preserves-independent-insertion-identity
+    ((timeline (range integer 1 4294967295)))
+  (:about pg::wal-encode-control-image)
+  (:trials (:normal 200))
+  (let ((text (string-right-trim '(#\Newline)
+                                 (pg::bytes->string
+                                  (pg::wal-encode-control-image 152 300 (sample-checkpoint-snapshot)
+                                                                :timeline timeline :checkpoint-timeline 1)))))
+    (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline)
+        (pg::wal-decode-control-line text)
+      (and (= checkpoint 152) (= durable 300) (equal snapshot (sample-checkpoint-snapshot))
+           (= insertion timeline) (= checkpoint-timeline 1)))))
+
+(deftest generated-independent-wal-control-timelines
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'wal-control-preserves-independent-insertion-identity :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (deftest checkpoint-unknown-fields-survive-literal-metadata-reader
     (let* ((metadata (list :source-checkpoint (sample-checkpoint-snapshot :next-oid nil)
                            :empty nil))
