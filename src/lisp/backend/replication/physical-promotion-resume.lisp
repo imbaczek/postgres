@@ -111,9 +111,16 @@
 
 (defun physical-promotion-resume-pending (&key (artifact-checker #'physical-promotion-wal-plan)
                                             (publisher #'physical-promotion-publish-wal))
-  "Privately reconstruct a cold phase-3 process and finish WAL publication only.
-Ordinary startup stays guarded until committed-primary recovery is implemented.
-The caller retains command/reload quiescence; successful resources remain owned."
+  "Reconstruct a cold phase-3 process from its exact saved recovery proof.
+Validate identity, generation, receive progress and child artifacts before catalog
+restoration. The default callbacks finish only history/EOR publication and retain
+recovery exclusion. Normal startup supplies the checkpoint artifact checker and
+child completion publisher instead. ARTIFACT-CHECKER receives STATE, PREFIX and
+:ALLOW-UNINSTALLED T under restartpoint-start and history locks. The zero-argument
+PUBLISHER runs after those locks are released, still under caller-owned command
+and reload quiescence. Successful resources remain owned. On failure, fence the
+process and close resources opened here. Retry in a fresh process rather than
+reuse partially restored state."
   (physical-promotion-check-cold-context)
   (let ((store nil) (finished nil))
     (unwind-protect

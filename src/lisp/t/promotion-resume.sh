@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fresh-process pending reconstruction; ordinary startup still refuses writer admission.
+# Fresh-process EOR-only reconstruction; automatic completion has its own harness.
 set -eu
 BASE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SBCL=${SBCL:-sbcl}

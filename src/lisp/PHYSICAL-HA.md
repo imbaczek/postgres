@@ -513,6 +513,80 @@ Sol medium's final refactoring review found no further useful extraction. Shared
 force installation, file opening and promotion exclusion centralize the relevant
 invariants; production functions remain below 120 lines. No coordination is added.
 
+### Committed child primary and automatic pending completion
+
+A valid phase-3 request now finishes during normal postmaster startup, before
+listeners open. The postmaster restores the exact saved generation, installs
+the child prefix and history, writes end-of-recovery WAL and a full child
+checkpoint, and syncs database files. It then atomically replaces PGWAL6 control
+with the child checkpoint. This is the irreversible commit point. A failure
+afterward must recover the child; it must never restore the parent generation.
+
+The checkpoint records the insertion and previous timelines separately. Its
+allocator floor covers actual replay visibility, the source's proven reservation
+and the local persisted floor. A large reservation does not mean that those
+transactions were replayed. Retries use fixed timestamps, catalog counters,
+positions and bytes. Before restoring the catalog, startup rejects contradictory
+complete records, oversized staging or, after history publication, unexplained
+child segments. Bounded torn staging can be rewritten. Pre-history abandoned
+child segments may be removed; parent WAL is preserved.
+
+Committed startup validates child control against its checkpoint and history
+before WAL scanning or repair. It needs neither the old generation nor the
+receive spool. It retires recovery triggers, with pending control removed last,
+and uses the ordinary primary initializer. Following configuration is retired
+too, so the primary cannot reconnect to its old source. Later writes and
+checkpoints remain on the child. IDENTIFY_SYSTEM and SQL WAL filenames report
+the insertion timeline; Patroni's unchanged TL_LSN expression uses the latter.
+
+This native recovery bridge takes a full checkpoint before admission. Pinned C
+`StartupXLOG` installs the prefix and publishes history before end-of-recovery
+actions (`xlog.c:6658–6694`). `PerformRecoveryXLogAction` uses a full checkpoint
+in one path, but ordinary triggered promotion normally writes a lightweight
+end-of-recovery record and requests a checkpoint later (`xlog.c:7049–7117`).
+Lisp does not yet implement that online fast path. SQL filename reporting uses
+the insertion timeline as C does (`xlogfuncs.c:468–487`). WAL remains native
+version 7; this does not establish C physical compatibility.
+
+Validation passes 304 physical tests, 170 interop tests and 1,598 legacy checks.
+The checkpoint property runs 100 trials at seed 42, digest
+`fnv1a64-v1:122ba80a76ac5f43`; no FunctionSpec is registered, and input coverage
+and rejection counts remain unmeasured. Strict compilation from a private empty
+cache passes (`/tmp/pg-promotion-commit-sql-compile.log`). General WAL crash,
+checkpoint snapshot and continuous follow regressions pass. Native C/Lisp logical
+replication passes both directions, and all three manual logical switchovers pass.
+An initial switchover run failed before replication because the reference `psql`
+loaded an incompatible libpq; its matching library path fixes the environment.
+
+`t/promotion-commit.sh` passes 45 scenarios: 17 publication/cleanup points, five
+torn checkpoint suffixes, pre-history orphan cleanup, six rejected clones, all
+15 earlier prefix/history/EOR crash images, and a timeline-qualified source.
+Four cases also create and write a table, crash, recover, write again, cross a
+WAL segment boundary, checkpoint, verify old child-segment removal, crash again
+and recover both rows. Independent Python checks verify checkpoint/control CRCs
+and fields, history, EOR and unchanged parent WAL. Rejection cases advance the
+mutable catalog first and compare critical storage bytes afterward. Post-commit
+cases remove obsolete generation and spool directories before restart. Patroni
+4.1.5's write/flush TL_LSN fragments pass on child timeline 2 for both source
+filename formats. Final evidence is `/tmp/pg-promotion-commit-patroni-final.log`,
+artifact `/tmp/pg-promotion-commit.bLk0Pc`. These are process-crash checks, not
+power-loss simulation or proof of synchronous replication durability.
+
+Design, full correctness, orphan-fix, SQL-timeline and refactoring reviews are
+complete. Reused threads did not expose their model profiles after exact-profile
+creation hit the service limit. No further refactor was recommended; production
+functions remain below 120 lines. Source documentation was written after code
+tests and reviews. Its separate review corrected record/segment wording,
+callback lock scopes and the historical supersession note.
+
+Next work is public online promotion and worker shutdown/admission ordering,
+then child-aware physical follow/rejoin with divergent-history rejection and
+safe reseed. Synchronous commit waits and remaining pinned Patroni interfaces
+still need implementation and durability evidence. Coordination remains out of
+scope. Earlier milestone sections throughout this ledger describe prerequisites
+and their original tests. Their claims that pending startup is refused or that
+primary startup only supports timeline 1 are superseded by this section.
+
 ### Cold reconstruction of pending promotion
 
 `physical-promotion-resume-pending` now reconstructs a pending transition in a
@@ -535,10 +609,9 @@ existing child proof, after which the existing EOR publisher handles bounded rep
 
 Failures fence the process and close only resources opened by this constructor.
 Restored globals may remain after a late failure; another attempt requires a fresh
-process. Successful recovery still retains phase 3 and denies admission with
-57P03. This is a private cold-start primitive exercised by the native fixture,
-not automatic promotion: ordinary server startup continues to refuse pending
-state until committed-child control and primary child-WAL recovery are complete.
+process. With its default EOR-only callbacks, successful recovery retains phase 3
+and denies admission with 57P03. Normal startup now supplies the full child
+checkpoint callbacks described above; it does not stop at this private primitive.
 C similarly establishes control/checkpoint state before end-of-recovery actions
 (`StartupXLOG`, `xlog.c:6220–6238`) and allows ordinary writes only later
 (`6911–6937`). No new public maintenance command or coordination is introduced.

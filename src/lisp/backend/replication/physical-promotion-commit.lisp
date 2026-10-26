@@ -1,8 +1,31 @@
 ;;;; Child checkpoint/control is the irreversible native promotion commit point.
+;;;; A pending promotion still belongs to the parent until child control is saved.
+;;;; Build one fixed sequence: end-of-recovery, batch start, then checkpoint.
+;;;; The plan uses the selected restartpoint's catalog and reservation proof;
+;;;; retries must produce the same bytes, including timestamps and counters.
+;;;;
+;;;; The caller owns PGDATA and holds promotion exclusion with admission closed.
+;;;; Check existing child files before restoring data. Before history publication,
+;;;; abandoned child staging may be replaced. After history publication, accept
+;;;; only the planned files and bounded incomplete records.
+;;;;
+;;;; Sync WAL, relation data, CLOG and catalog before replacing PGWAL6 control.
+;;;; That replacement commits the child. A later failure must restart from child
+;;;; control, never restore the parent generation. See physical-promotion-primary.
+;;;; This native checkpoint bridge is slower than C's lightweight promotion path;
+;;;; compare StartupXLOG and PerformRecoveryXLogAction in access/transam/xlog.c.
+
 (in-package #:pg)
 
 (defun physical-promotion-checkpoint-plan (state next-oid local-floor)
-  "Derive stable EOR/checkpoint bytes without changing parent controls or visibility."
+  "Build the child WAL plan without changing files or runtime state.
+STATE is the verified pending request. NEXT-OID comes from its saved catalog;
+LOCAL-FLOOR is the persisted allocation floor. Keep actual replay visibility
+separate from the capacity that the new primary must reserve.
+
+Return a plist with :FORK, :CHILD, :SNAPSHOT, :END and :FRAMES. Each frame is
+a list of its start LSN and encoded bytes. Each record fits entirely within
+one segment; rotation leaves an EOF gap rather than inventing padding records."
   (unless (and (eql 3 (getf state :phase)) (typep next-oid '(unsigned-byte 64))
                (physical-source-reservation-valid-p (getf state :source-reservation))
                (getf (getf state :source-reservation) :complete)
@@ -29,7 +52,10 @@
                                                          (wal-encode-checkpoint-snapshot snapshot))))))))
 
 (defun physical-promotion-checkpoint-files (plan prefix)
-  "Materialize only the authenticated prefix and planned frames; rotation gaps stay EOF."
+  "Return the complete expected child files as (segment bytes) pairs.
+PREFIX is the authenticated parent prefix ending at the fork. Include it
+unchanged, append only planned records, and leave rotation gaps at EOF.
+The returned byte vectors describe the whole allowed extent of each file."
   (let ((files (make-hash-table :test #'eql)) (fork (getf plan :fork)))
     (unless (= (length prefix) (mod fork +wal-segment-size+)) (error "invalid child checkpoint prefix"))
     (setf (gethash (floor fork +wal-segment-size+) files) prefix)
@@ -43,6 +69,8 @@
           #'< :key #'first)))
 
 (defun physical-promotion-current-checkpoint-plan (state)
+  "Read the exact saved catalog and local XID floor, then build the child plan.
+Do not use mutable runtime catalog counters to choose retry bytes."
   (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
     (declare (ignore metadata prefix generation))
     (physical-promotion-checkpoint-plan state
@@ -50,7 +78,12 @@
                                         (load-next-xid))))
 
 (defun physical-promotion-checkpoint-artifacts (state prefix &key allow-uninstalled)
-  "Validate the bounded deterministic staging window before catalog restoration."
+  "Check child files without changing them, before restoring the catalog.
+Before history exists, ALLOW-UNINSTALLED permits replacement from the saved
+prefix. Once history exists, every child segment must belong to the plan.
+Reject a foreign complete record, an oversized file or checkpoint staging
+without its exact EOR. Bounded torn records may be rewritten by the publisher.
+Return the verified plan; signal an error for contradictory artifacts."
   (let* ((plan (physical-promotion-current-checkpoint-plan state))
          (files (physical-promotion-checkpoint-files plan prefix))
          (child (getf state :promotion-child))
@@ -98,6 +131,9 @@
     plan))
 
 (defun physical-promotion-open-staging-file (path)
+  "Open a regular child file for reading and writing, or create it exclusively.
+Return its stream and size. The caller closes the stream. Do not follow a
+symlink or replace an existing special file."
   (if (wal-namespace-file-stat path t)
       (physical-promotion-open-file path t)
       (let ((fd (sb-posix:open (namestring path)
@@ -108,7 +144,10 @@
           (error (condition) (sb-posix:close fd) (error condition))))))
 
 (defun physical-promotion-stage-frame (child frame)
-  "Never rewrite an exact durable frame, especially EOR preceding a staged checkpoint."
+  "Write and sync one planned frame, preserving any exact existing bytes.
+Earlier preflight must have checked the file extent and all staged records.
+Never create a hole or rewrite an exact EOR beneath a later checkpoint.
+Close the stream on every exit; the enclosing publisher fences failures."
   (destructuring-bind (start record) frame
     (let* ((path (wal-segment-path (floor start +wal-segment-size+) child :timeline))
            (offset (mod start +wal-segment-size+)))
@@ -129,7 +168,10 @@
           (close stream))))))
 
 (defun physical-promotion-remove-child-orphans (state files)
-  "Only pending, unadmitted selected-child names outside the complete plan are retired."
+  "Remove abandoned selected-child segments outside FILES before history exists.
+Preflight all orphan names as regular files before unlinking any of them.
+Published history makes an unexpected segment an error, not disposable staging.
+Parent segments are never selected. Sync the WAL directory after removals."
   (let* ((child (getf state :promotion-child))
          (segments (wal-discover-segments child :timeline))
          (orphans (remove-if (lambda (segment) (assoc segment files)) segments)))
@@ -142,7 +184,10 @@
     (when orphans (fsync-directory (wal-directory)))))
 
 (defun physical-promotion-save-child-control (plan)
-  "The atomic child PGWAL6 replacement is the irreversible promotion commit point."
+  "Atomically replace PGWAL6 with the planned child checkpoint and durable end.
+The caller must already have synced all referenced WAL and database files.
+Once this image survives, startup must recover the child even if later cleanup
+fails. Do not restore parent control on an error after the rename."
   (let ((snapshot (getf plan :snapshot)) (child (getf plan :child)) (end (getf plan :end)))
     (with-atomic-output
         (stream (wal-control-path) (merge-pathnames "global/pg_wal_control.tmp" *pgdata*)
@@ -158,7 +203,14 @@
                       stream))))
 
 (defun physical-promotion-publish-child-control ()
-  "Stage and sync child checkpoint and data before committing control; never admit SQL."
+  "Commit a pending promotion while writer admission remains closed.
+Require owned promotion exclusion, the exact saved generation and an empty
+application write cache. Validate staging, sync history and planned WAL, then
+sync database files before publishing child control. Return the checkpoint end.
+
+This function does not initialize the primary or clear recovery exclusion.
+An error or nonlocal exit after publication starts fences this process; restart
+must determine from durable control whether parent or child is authoritative."
   (with-physical-promotion-exclusion (3)
     (let ((state *physical-recovery-state*) (finished nil))
       (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)

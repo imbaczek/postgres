@@ -10,7 +10,11 @@
 (declaim (ftype function physical-promotion-startup-primary-p physical-promotion-startup-pending-p))
 
 (defun physical-bootstrap-check-startup ()
-  "Classify committed control first, then finish a valid pending request before SQL."
+  "Choose primary or standby recovery before listeners or ordinary storage setup.
+Committed child control takes precedence over leftover standby triggers. A valid
+pending request completes the transition and returns :PRIMARY-READY, telling MAIN
+not to initialize storage twice. Other paths return no values and leave ordinary
+primary or standby initialization to MAIN. Invalid recovery proof is an error."
   (cond
     ((physical-promotion-startup-primary-p) (values))
     ((physical-promotion-startup-pending-p) :primary-ready)

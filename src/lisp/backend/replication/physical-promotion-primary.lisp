@@ -1,8 +1,22 @@
 ;;;; Committed child startup never restores the retired standby generation.
+;;;; Startup must choose its authority before it opens ordinary recovery storage.
+;;;; Parent control plus a pending request requires the exact saved generation.
+;;;; Child control instead requires a matching child checkpoint and history; it
+;;;; must not depend on the old generation or receive spool, which may be gone.
+;;;;
+;;;; Only the owning postmaster, before listeners or under closed admission, may
+;;;; finish the transition. Once child control is verified, initialize storage as
+;;;; an ordinary primary and retire recovery triggers. Remove pending control last
+;;;; so an interrupted cleanup remains distinguishable from an ordinary standby.
+;;;; A failure after child control is saved requires restart, not parent rollback.
+
 (in-package #:pg)
 
 (defun physical-promotion-check-child-control (insertion checkpoint-timeline)
-  "Read-only acceptance of a standalone child checkpoint, before any scan or repair."
+  "Verify child control, its checkpoint record and timeline history without writes.
+Return the checkpoint snapshot and parsed history. This check must precede WAL
+scanning or tail repair. It deliberately needs no old generation, receive spool
+or backup manifest: child control is now the recovery authority."
   (multiple-value-bind (checkpoint durable snapshot timeline checkpoint-id namespace) (wal-read-control-fields)
     (unless (and (typep insertion '(integer 2 4294967295))
                  (= insertion checkpoint-timeline timeline checkpoint-id)
@@ -32,7 +46,10 @@
       (values snapshot history))))
 
 (defun physical-promotion-check-retiring-control (snapshot history)
-  "Retired pending metadata may be absent; if present it must agree with commitment."
+  "Check any remaining pending request against the committed child.
+An absent request is normal after cleanup. If it remains, require the same
+system identity, parent, child and fork, with no larger replay visibility counter.
+Do not open its selected generation or receive spool."
   (let ((path (physical-recovery-control-path)))
     (when (wal-namespace-file-stat path t)
       (let* ((control (physical-recovery-read-control *pgdata*))
@@ -47,7 +64,11 @@
           (error "committed child contradicts its pending recovery metadata"))))))
 
 (defun physical-promotion-retire-recovery ()
-  "Retire triggers only after child control commits; pending control is removed last."
+  "Remove recovery triggers after verifying committed child control.
+Require the owning cold postmaster or closed admission under quiescence.
+Check every name before deleting any, then unlink and sync the PGDATA directory
+for each step. Remove pending control last. Leave old generation and receive
+directories inert; they are no longer required for primary startup."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline) (wal-read-control-fields)
     (declare (ignore checkpoint durable))
     (multiple-value-bind (checked history) (physical-promotion-check-child-control insertion checkpoint-timeline)
@@ -72,7 +93,9 @@
   (values))
 
 (defun physical-promotion-startup-primary-p ()
-  "Classify child control before any standby preparation, including cleanup retries."
+  "Recognize committed child control before ordinary standby preparation.
+Finish interrupted trigger cleanup and return true. Return NIL for parent
+control. Invalid child control is an error; never fall back to parent recovery."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline) (wal-read-control-fields)
     (declare (ignore checkpoint durable snapshot))
     (when (and insertion (> insertion 1))
@@ -81,7 +104,10 @@
       t)))
 
 (defun physical-promotion-startup-pending-p ()
-  "Complete a durable pending request in the owning cold postmaster before listeners."
+  "Complete a phase-3 request in the owning cold postmaster before listeners.
+Hold command and reload locks, then close admission for reconstruction, child
+commit and primary initialization. Return true only after all three succeed.
+Return NIL when there is no pending request; propagate any validation failure."
   (when (and (wal-namespace-file-stat (physical-recovery-control-path) t)
              (eql 3 (getf (physical-recovery-read-control *pgdata*) :phase)))
     (sb-thread:with-mutex (*physical-follow-command-lock*)
@@ -93,7 +119,11 @@
     t))
 
 (defun physical-promotion-start-child-primary ()
-  "Use the ordinary primary initializer under closed admission after irreversible control."
+  "Initialize a committed child as an ordinary primary under closed admission.
+Close standby storage first. Hide the recovery role only in the initializer's
+dynamic scope; the outer pending role still excludes writers. Retire recovery
+triggers before clearing that outer role and declaring the primary ready.
+The caller must fence any failure and restart from durable child control."
   (when *physical-receive-store* (physical-store-close *physical-receive-store*))
   (setf *physical-receive-store* nil)
   (when *clog-stream* (close *clog-stream*) (setf *clog-stream* nil))
@@ -106,7 +136,10 @@
   (physical-promotion-test-point :after-child-primary-ready))
 
 (defun physical-promotion-complete-child ()
-  "Commit child control and initialize it; any uncertainty requires process restart."
+  "Commit child control, initialize the primary and return the checkpoint end.
+Keep admission closed through this entire transition. Any error or nonlocal
+exit fences the process, including failures after the irreversible control
+replacement. A new process must classify durable control before retrying."
   (let ((finished nil))
     (unwind-protect
          (let ((end (physical-promotion-publish-child-control)))
