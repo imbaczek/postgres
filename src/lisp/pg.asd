@@ -41,7 +41,8 @@
         :components ((:file "clog")
                      (:file "snapshot")
                      (:file "xact")
-                     (:file "xid-reservation")))
+                     (:file "xid-reservation")
+                     (:file "running-xacts")))
        (:module "heap"
         :serial t
         :components ((:file "visibilitymap")
