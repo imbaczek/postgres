@@ -240,6 +240,43 @@ No further extraction was warranted; changed production functions remain below
 120 lines. Terra 6.1 wrote the source documentation after these gates. Primary
 review is complete, including the empty-reservation and storage-handle wording.
 
+### Source running-transaction metadata prerequisite
+
+The native codec and pure state helpers in `running-xacts.lisp` are implemented
+and reviewed. They are **not yet connected to source WAL emission, standby
+snapshots, replay or restartpoint generations**. The reader-safe replay cutoff
+therefore remains unchanged.
+
+The custom `PGRUNX01` payload carries actual next FullXID, sorted unique running
+FullXIDs and a complete/unknown flag. Allocation capacity is not a visibility
+counter. Membership and inferred gaps are bounded at 65,536 entries; overflow
+clears membership and marks coverage unknown. An exact anchor replaces the set;
+ordered progress conservatively adds intervening normal FullXIDs and removes a
+committer only at its applied terminal. State updates preserve their inputs.
+Native ABORT has no WAL record yet, so a later exact anchor removes stale aborted
+membership. This is not C `xl_running_xacts` binary compatibility.
+
+Next integration steps retain C's `RecordKnownAssignedTransactionIds` principle:
+
+- Serialize source snapshot capture and its WAL insertion with commit ordering,
+  using WAL then XID lock order. Never substitute reservation capacity for next.
+- Publish source membership and actual next at the same complete replay terminal.
+  Save and restore them from the same restartpoint generation boundary; do not
+  filter restored membership using mutable CLOG, which may be ahead after a crash.
+- Copy coverage and membership into each new standby snapshot. Existing snapshots
+  retain their original coverage. Incomplete snapshots keep the strict cutoff;
+  covered snapshots need a COMMIT membership check, not a page-contributor cutoff.
+- Exercise older writers, aborted page contributors, incomplete batches, overflow,
+  restartpoint compaction and crashes before claiming reader-preserving promotion.
+
+Validation: a fresh worker passed the 330-test physical suite, then two added
+malformed-input tests and all eight new tests passed separately. The round-trip
+property passed 200 trials each with seeds 42 and 2540284543247004935, declaration
+digest `fnv1a64-v1:332906d1d21a338d`; rejection counts and input coverage were not
+measured. Fresh empty-cache strict compilation passed. Luna max checkpoint,
+Sol high full-diff and Sol medium refactoring reviews completed. These checks
+cover isolated helpers, not runtime transaction-tracking or durability behavior.
+
 ### Timeline-qualified native WAL namespace
 
 Filename construction/parsing now centralizes C `XLogFileName`'s TLI/log/segment

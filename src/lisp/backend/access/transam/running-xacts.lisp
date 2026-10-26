@@ -1,6 +1,20 @@
 ;;;; Native source transaction visibility metadata.
 (in-package #:pg)
 
+;;; These helpers describe source transaction visibility for a future WAL and
+;;; replay integration.  They do not themselves capture, write, or replay WAL.
+;;; The corresponding PostgreSQL C code is LogStandbySnapshot in standby.c
+;;; and RecordKnownAssignedTransactionIds in procarray.c.
+;;;
+;;; A producer must serialize snapshot capture through WAL insertion in WAL
+;;; order.  The planned lock order is WAL then XID under the commit WAL lock.
+;;; NEXT is the actual next XID, not the end of a reserved allocation range.
+;;; Do not filter a restored running set through CLOG: on-disk CLOG can be
+;;; ahead of the generation that supplies the authoritative replay position.
+;;;
+;;; Bound the exact set so a long interval between anchors cannot consume
+;;; unbounded memory.  An incomplete snapshot carries no running XIDs.
+
 (defconstant +running-xacts-limit+ 65536)
 
 (defun running-xacts-normal-xid-p (xid)
@@ -26,7 +40,15 @@
     (error "invalid source running transaction snapshot"))
   t)
 
+;;; PGRUNX01 is a private payload, not PostgreSQL's standby record format.
+;;; Its 24-byte header contains the eight-byte magic, a u32 flags word, a
+;;; u64 next XID, and a u32 count, followed by count u64 XIDs.  Integers use
+;;; the WAL helpers' byte order.  Flag bit 0 marks a complete set; bit 1
+;;; represents the one-past-maximum next XID with a zero next field.  Other
+;;; bits are invalid.  XIDs must be sorted, unique, normal, and below NEXT.
+
 (defun wal-encode-running-xacts (next running complete)
+  "Encode native visibility metadata with little-endian integer fields."
   (running-xacts-check next running complete)
   (let* ((exhausted (= next +max-xid-one-past+))
          (bytes (make-array (+ 24 (* 8 (length running)))
@@ -60,6 +82,11 @@
       (running-xacts-check next running complete)
       (list :next-xid next :running running :complete complete))))
 
+;;; An anchor replaces the known state with an exact or incomplete snapshot
+;;; at LSN.  ANCHOR identifies that snapshot; THROUGH is the position through
+;;; which later progress has been applied.  Copy the list so the caller retains
+;;; ownership of the snapshot.
+
 (defun running-xacts-anchor (snapshot lsn)
   (unless (typep lsn '(unsigned-byte 64))
     (error "invalid running transaction anchor position"))
@@ -83,7 +110,18 @@
   (running-xacts-check (getf state :next-xid) (getf state :running)
                        (getf state :complete)))
 
+;;; Return a new state without changing STATE.  Advance monotonically through
+;;; WAL positions and actual next-XID values, adding newly assigned XIDs to an
+;;; exact set.  If the bound is exceeded, discard the set and mark it
+;;; incomplete until a later anchor replaces it.
+;;;
+;;; Remove only an ordered COMMIT XID.  Native ABORT currently has no WAL
+;;; record, so aborted XIDs can remain in the set; a later exact anchor clears
+;;; that stale membership.
+
 (defun running-xacts-advance (state next through &key committed-xid)
+  "Preserve complete coverage as a conservative superset, not exact live membership.
+NIL state stays unknown until an anchor. Inferred XIDs may already have aborted."
   (unless (and (running-xacts-next-p next)
                (typep through '(unsigned-byte 64))
                (or (null committed-xid)
