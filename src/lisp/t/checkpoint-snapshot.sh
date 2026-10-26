@@ -126,4 +126,27 @@ checked target "(assert (equal (wal-checkpoint-snapshot-hex (getf *physical-reco
 if sql "$TARGET_PORT" 'INSERT INTO cp_data VALUES (5)' >"$TMP/write-guard.log" 2>&1; then exit 1; fi
 checked target '(physical-recovery-prepare-shutdown)' prepare
 checked source '(physical-source-pin-release "checkpoint_base")' release
-echo 'checkpoint-snapshot: legacy upgrade, both crash boundaries, corrupt copy rejection and replay/restartpoint preservation PASS'
+kill -KILL "$TARGET"; wait "$TARGET" 2>/dev/null || :; TARGET=
+kill -KILL "$SOURCE"; wait "$SOURCE" 2>/dev/null || :; SOURCE=
+probe --unsupported-insertion-fixture
+snapshot_storage() {
+    python3 - "$TMP/source" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+facts = {}
+for directory in ('base', 'global', 'pg_wal', 'pg_xact'):
+    for path in sorted((root / directory).rglob('*')):
+        if path.is_file():
+            facts[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
+print(json.dumps(facts, sort_keys=True))
+PY
+}
+snapshot_storage >"$TMP/unsupported-before.json"
+result=0
+timeout 20 "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" >"$TMP/unsupported-insertion.log" 2>&1 || result=$?
+test "$result" -eq 1
+grep -q 'native timeline-keyed WAL is not yet supported' "$TMP/unsupported-insertion.log"
+snapshot_storage >"$TMP/unsupported-after.json"
+cmp "$TMP/unsupported-before.json" "$TMP/unsupported-after.json"
+echo 'checkpoint-snapshot: legacy upgrade, crash boundaries, checkpoint identity, replay/restartpoint and unsupported child rejection PASS'
