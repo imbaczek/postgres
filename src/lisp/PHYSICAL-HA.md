@@ -130,14 +130,39 @@ The namespace inventory identifies the next integration requirements:
 | Follow/reporting | Query and identity checks require TLI 1 | Fetch/validate ancestry; report the TLI paired with chosen receive/replay LSN |
 | Promotion | History publication only | Pending transition recovery, child prefix initialization, durable EOR and control, then writer admission |
 
-Scanner selection must follow verified history intervals at each record start,
-stop parent reads at the fork and never select the highest-numbered file. C copies
+Record ownership must follow verified history intervals at each record start,
+stop parent-owned records at the fork and never select the highest-numbered file. C copies
 only the valid parent prefix for an in-segment switch; at a segment boundary it
 creates the next child segment (`XLogInitNewTimeline`, `xlog.c:5867–5937`). A child
 file or history file alone grants no writer authority. Pending child bytes must
 not be published through ordinary parent `wal-save-durable-lsn` updates. Future
 promotion needs recoverable pending/committed state and its own crash tests; no
 coordination, custom writer generations or automatic failover is introduced.
+
+File selection is a separate operation from record ownership. C's
+`XLogFileReadAnyTLI` (`xlogrecovery.c:4300–4394`) tries entries from the selected
+history newest first, excludes timelines whose starting segment is later than
+the requested segment, and never goes below the previously opened file's TLI.
+It deliberately does not filter an ancestor by its ending segment. A child file
+can therefore supply the copied parent prefix; requiring the parent-named file
+would reject valid C recovery layouts. The internal `timeline-segment-candidates`
+helper now reproduces this filename search order, including partial known roots
+and equal forks. Its additional input guard requires the previous file TLI to
+be zero (initial/random access) or present in the selected history.
+
+This helper is not yet wired into the native scanner and confers no recovery or
+writer authority. Next, the read-only scanner must validate record ownership at
+the record's start (`xlogrecovery.c:3864–3875`), reject records crossing a fork,
+preserve the successful filename TLI as its monotonic floor, and validate native
+segment rotation gaps. It must never invoke the primary scanner's tail
+truncation on ancestor files. Native WAL7 record headers still carry neither TLI
+nor system identity: filenames, history and a valid record CRC alone do not prove
+that a copied prefix belongs to this cluster. Durable branch-bound provenance
+and transport/control integration remain prerequisites for operational child WAL.
+The candidate prerequisite passes all 230 physical tests after a fresh ASDF
+rebuild, both focused cases after formatting, and fresh strict compilation
+(`/tmp/pg-lineage-candidates-compile.log`). A reused review thread found no
+correctness blocker; its model profile was not exposed by the service.
 
 ### Timeline history publication prerequisite
 

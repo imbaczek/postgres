@@ -19,3 +19,31 @@
   (ok (intake-fails-p
        (lambda ()
          (pg::timeline-encode-history 2 1 64 (make-string 1024 :initial-element #\a) nil)))))
+
+(deftest timeline-segment-candidates-follow-c-file-order-and-monotonic-floor
+    (let* ((size pg::+wal-segment-size+)
+           (history (list (pg::make-timeline-history-entry :timeline 7 :begin (* 2 size))
+                          (pg::make-timeline-history-entry :timeline 4 :begin (+ size 64) :end (* 2 size))
+                          (pg::make-timeline-history-entry :timeline 1 :begin 0 :end (+ size 64)))))
+      ;; The child's copied prefix can contain records belonging to its parent.
+      (ok (equal '(1) (pg::timeline-segment-candidates 0 history)))
+      (ok (equal '(4 1) (pg::timeline-segment-candidates 1 history)))
+      (ok (= 1 (pg::timeline-at-point size history)))
+      (ok (equal '(7 4 1) (pg::timeline-segment-candidates 2 history)))
+      ;; C does not filter ancestors by end segment: callers validate record TLI.
+      (ok (equal '(7 4 1) (pg::timeline-segment-candidates 3 history)))
+      (ok (equal '(7 4) (pg::timeline-segment-candidates 3 history 4)))
+      (ok (null (pg::timeline-segment-candidates 1 history 7)))
+      (dolist (bad '(-1 1099511627776))
+        (ok (intake-fails-p (lambda () (pg::timeline-segment-candidates bad history)))))
+      (ok (intake-fails-p (lambda () (pg::timeline-segment-candidates 0 history -1))))
+      (ok (intake-fails-p (lambda () (pg::timeline-segment-candidates 0 history 2))))
+      (ok (intake-fails-p (lambda () (pg::timeline-segment-candidates 0 nil))))))
+
+(deftest timeline-segment-candidates-keep-equal-forks-and-partial-known-roots
+    (let ((history (list (pg::make-timeline-history-entry :timeline 9 :begin 64)
+                         (pg::make-timeline-history-entry :timeline 6 :begin 64 :end 64)
+                         (pg::make-timeline-history-entry :timeline 3 :begin 0 :end 64))))
+      (ok (equal '(9 6 3) (pg::timeline-segment-candidates 0 history)))
+      (ok (= 9 (pg::timeline-at-point 64 history)))
+      (ok (equal '(9 6) (pg::timeline-segment-candidates 0 history 6)))))

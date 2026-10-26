@@ -69,6 +69,28 @@
     (unless entry (error "WAL point is outside timeline history"))
     (timeline-history-entry-timeline entry)))
 
+(defun timeline-segment-candidates (segment history &optional (previous-file-timeline 0))
+  "Return C XLogFileReadAnyTLI's newest-first file candidates, not record owners.
+A descendant file can contain an ancestor's copied prefix. The caller must
+validate record identity separately, and retain the successful file TLI as its
+monotonic floor. This function grants no recovery or insertion authority."
+  (unless (typep segment '(integer 0 1099511627775))
+    (error "invalid WAL segment number"))
+  (unless (typep previous-file-timeline '(unsigned-byte 32))
+    (error "invalid previous WAL file timeline"))
+  (timeline-check-lineage history)
+  (unless (or (zerop previous-file-timeline)
+              (find previous-file-timeline history
+                    :key #'timeline-history-entry-timeline))
+    (error "previous WAL file timeline is outside selected history"))
+  ;; xlogrecovery.c:4331-4361 deliberately checks only the begin segment.
+  (loop for entry in history
+        for timeline = (timeline-history-entry-timeline entry)
+        while (>= timeline previous-file-timeline)
+        when (>= segment (floor (timeline-history-entry-begin entry)
+                                +wal-segment-size+))
+          collect timeline))
+
 (defun timeline-prefix-boundary-p (timeline boundary history)
   "Test ancestry position for a prefix ending at BOUNDARY, not equality of WAL bytes.
 The parent's end is allowed here: a cursor at the fork has consumed no child WAL.
