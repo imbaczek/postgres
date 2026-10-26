@@ -13,17 +13,45 @@
 (defun physical-recovery-control-path (&optional (directory *pgdata*))
   (merge-pathnames "physical-recovery.control" directory))
 
-(defun physical-recovery-control-image (phase system-id timeline manifest-digest checkpoint applied next-xid)
-  "Persist local recovery role and its verified boundary, never cluster write authority."
-  (unless (and (member phase '(0 1 2)) (= timeline 1)
-               (every (lambda (value) (typep value '(unsigned-byte 64)))
-                      (list system-id manifest-digest checkpoint applied next-xid))
-               (<= 32 checkpoint applied)
-               (or (= phase 2) (= checkpoint applied)) (<= 3 next-xid)
-               (or (plusp phase) (zerop manifest-digest)))
+(defconstant +db-startup+ 0)
+
+(defconstant +db-shutdowned-in-recovery+ 2)
+
+(defconstant +db-in-archive-recovery+ 5)
+
+(defun physical-recovery-control-valid-p (control &key legacy)
+  "Validate role/progress and native recovery DBState as separate invariants."
+  (destructuring-bind (&key phase system-id timeline manifest-digest checkpoint
+                         applied next-xid db-state state-time &allow-other-keys)
+      control
+    (and (member phase '(0 1 2))
+         (eql timeline 1)
+         (every (lambda (value) (typep value '(unsigned-byte 64)))
+                (list system-id manifest-digest checkpoint applied next-xid))
+         (<= 32 checkpoint applied)
+         (or (= phase 2) (= checkpoint applied))
+         (<= 3 next-xid)
+         (or (plusp phase) (zerop manifest-digest))
+         (if legacy
+             (and (null db-state) (null state-time))
+             (and (typep state-time '(unsigned-byte 63))
+                  (if (zerop phase)
+                      (eql db-state +db-startup+)
+                      (member db-state (list +db-in-archive-recovery+
+                                             +db-shutdowned-in-recovery+))))))))
+
+(defun physical-recovery-control-image (phase system-id timeline manifest-digest checkpoint applied next-xid
+                                        &key (db-state (if (zerop phase) +db-startup+
+                                                           +db-in-archive-recovery+))
+                                          (state-time (- (get-universal-time) 2208988800)))
+  "Encode v2 native recovery control; never persist cluster write authority."
+  (unless (physical-recovery-control-valid-p
+           (list :phase phase :system-id system-id :timeline timeline
+                 :manifest-digest manifest-digest :checkpoint checkpoint :applied applied
+                 :next-xid next-xid :db-state db-state :state-time state-time))
     (error "unrepresentable physical recovery control state"))
-  (let ((bytes (make-array 60 :element-type '(unsigned-byte 8) :initial-element 0)))
-    (replace bytes #(80 71 82 83 84 65 84 69))
+  (let ((bytes (make-array 72 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace bytes #(80 71 82 83 84 65 84 50))
     (wal-set-u32 bytes 8 phase)
     (wal-set-u32 bytes 12 timeline)
     (wal-set-u64 bytes 16 system-id)
@@ -31,29 +59,90 @@
     (wal-set-u64 bytes 32 checkpoint)
     (wal-set-u64 bytes 40 applied)
     (wal-set-u64 bytes 48 next-xid)
-    (wal-set-u32 bytes 56 (wal-crc32 bytes))
+    (wal-set-u32 bytes 56 db-state)
+    (wal-set-u64 bytes 60 state-time)
+    (wal-set-u32 bytes 68 (wal-crc32 bytes))
     bytes))
 
+(defun physical-recovery-decode-control (bytes)
+  "Read legacy progress conservatively, or v2 state with exact length and CRC."
+  (unless (member (length bytes) '(60 72))
+    (error "invalid physical recovery control length"))
+  (let* ((legacy (= (length bytes) 60))
+         (crc-offset (if legacy 56 68))
+         (copy (copy-seq bytes))
+         (crc (wal-u32 copy crc-offset)))
+    (wal-set-u32 copy crc-offset 0)
+    (unless (and (equalp (subseq bytes 0 8)
+                         (if legacy #(80 71 82 83 84 65 84 69) #(80 71 82 83 84 65 84 50)))
+                 (= crc (wal-crc32 copy)))
+      (error "corrupt or unsupported physical recovery control"))
+    (let ((control
+            (list :control-version (if legacy 1 2)
+                  :phase (wal-u32 bytes 8) :timeline (wal-u32 bytes 12)
+                  :system-id (wal-u64 bytes 16) :manifest-digest (wal-u64 bytes 24)
+                  :checkpoint (wal-u64 bytes 32) :applied (wal-u64 bytes 40)
+                  :next-xid (wal-u64 bytes 48)
+                  :db-state (unless legacy (wal-u32 bytes 56))
+                  :state-time (unless legacy (wal-u64 bytes 60)))))
+      (unless (physical-recovery-control-valid-p control :legacy legacy)
+        (error "corrupt or unsupported physical recovery control"))
+      control)))
+
 (defun physical-recovery-read-control (directory)
-  (let ((bytes (recovery-read-bytes (physical-recovery-control-path directory) :maximum 60)))
-    (unless (= 60 (length bytes)) (error "invalid physical recovery control length"))
-    (let ((crc (wal-u32 bytes 56)))
-      (wal-set-u32 bytes 56 0)
-      (unless (and (equalp (subseq bytes 0 8) #(80 71 82 83 84 65 84 69))
-                   (= crc (wal-crc32 bytes))
-                   (member (wal-u32 bytes 8) '(0 1 2))
-                   (= 1 (wal-u32 bytes 12))
-                   (<= 32 (wal-u64 bytes 32))
-                   (<= (wal-u64 bytes 32) (wal-u64 bytes 40))
-                   (or (= 2 (wal-u32 bytes 8))
-                       (= (wal-u64 bytes 32) (wal-u64 bytes 40)))
-                   (<= 3 (wal-u64 bytes 48))
-                   (or (plusp (wal-u32 bytes 8)) (zerop (wal-u64 bytes 24))))
-        (error "corrupt or unsupported physical recovery control")))
-    (list :phase (wal-u32 bytes 8) :timeline (wal-u32 bytes 12)
-          :system-id (wal-u64 bytes 16) :manifest-digest (wal-u64 bytes 24)
-          :checkpoint (wal-u64 bytes 32) :applied (wal-u64 bytes 40)
-          :next-xid (wal-u64 bytes 48))))
+  (physical-recovery-decode-control
+   (recovery-read-bytes (physical-recovery-control-path directory) :maximum 72)))
+
+(defvar *physical-recovery-control-test-hook* nil
+  "Optional deterministic hook for recovery control publication failures.")
+
+(defun physical-recovery-control-test-point (point state)
+  (when *physical-recovery-control-test-hook*
+    (funcall *physical-recovery-control-test-hook* point state)))
+
+(defun physical-recovery-write-control (state phase applied next-xid
+                                        &key (db-state +db-in-archive-recovery+))
+  "Publish role/progress/state atomically; never lower startup recovery requirements."
+  (when (and (= db-state +db-shutdowned-in-recovery+)
+             (< applied (or (getf state :required-applied) applied)))
+    (error "clean recovery has not reached its previously applied boundary"))
+  (let* ((state (copy-list state))
+         (applied (max applied (or (getf state :required-applied) applied)))
+         (next-xid (max next-xid (or (getf state :observed-next-xid) next-xid)))
+         (time (- (get-universal-time) 2208988800))
+         (bytes (physical-recovery-control-image
+                 phase (getf state :system-id) (getf state :timeline)
+                 (getf state :manifest-digest) (getf state :checkpoint) applied next-xid
+                 :db-state db-state :state-time time))
+         (path (physical-recovery-control-path)))
+    (physical-recovery-control-test-point :before-write db-state)
+    (with-atomic-output
+        (stream path (make-pathname :type "tmp" :defaults path) *pgdata*
+                :element-type '(unsigned-byte 8)
+                :fsync-function
+                (lambda (fd)
+                  (physical-recovery-control-test-point :before-fsync db-state)
+                  (sb-posix:fsync fd)
+                  (physical-recovery-control-test-point :after-fsync db-state))
+                :rename-function
+                (lambda (from to)
+                  (physical-recovery-control-test-point :before-rename db-state)
+                  (sb-posix:rename from to)
+                  (physical-recovery-control-test-point :after-rename db-state))
+                :fsync-directory-function
+                (lambda (directory)
+                  (physical-recovery-control-test-point :before-directory-fsync db-state)
+                  (fsync-directory directory)
+                  (physical-recovery-control-test-point :after-directory-fsync db-state)))
+      (write-sequence bytes stream))
+    (setf (getf state :phase) phase
+          (getf state :db-state) db-state
+          (getf state :state-time) time
+          (getf state :control-version) 2
+          (getf state :required-applied) applied
+          (getf state :observed-next-xid) next-xid)
+    (physical-recovery-control-test-point :after-write db-state)
+    state))
 
 (defun physical-recovery-mark-target (directory)
   "Persist incomplete recovery role before any copied database files are created."
@@ -209,7 +298,7 @@
     *catalog*))
 
 (defun physical-recovery-prepare ()
-  "Validate durable recovery provenance before any mutable storage initialization."
+  "Validate provenance, then durably enter active recovery before any restoration."
   (unless (probe-file (merge-pathnames "recovery.required" *pgdata*))
     (error "physical recovery control or manifest has lost its required recovery marker"))
   (let ((marker (bytes->string (recovery-read-bytes
@@ -233,18 +322,19 @@
          (recovery-check-image-metadata manifest *pgdata*)
          (unless (and (= (getf control :applied) (getf manifest :end))
                       (= (getf control :next-xid) (load-next-xid)))
-           (error "physical recovery control does not match its immutable base image"))
-         (when (zerop (getf control :phase))
-           (wal-atomic-write-bytes
-            (physical-recovery-control-path)
-            (physical-recovery-control-image
-             1 (getf control :system-id) (getf control :timeline) digest
-             (getf control :checkpoint) (getf control :applied) (getf control :next-xid))))))
+           (error "physical recovery control does not match its immutable base image"))))
       (setf (getf manifest :manifest-digest) digest
             (getf manifest :phase) (if (= 2 (getf control :phase)) 2 1)
             (getf manifest :required-applied) (getf control :applied)
             (getf manifest :observed-next-xid) (getf control :next-xid)
-            *physical-recovery-state* manifest))))
+            (getf manifest :previous-db-state) (getf control :db-state)
+            (getf manifest :previous-state-time) (getf control :state-time))
+      ;; Includes phase 0 -> 1 and legacy migration. A clean previous run never
+      ;; allows catalog restoration or redo to start with a clean control file.
+      (setf manifest
+            (physical-recovery-write-control
+             manifest (getf manifest :phase) (getf control :applied) (getf control :next-xid)))
+      (setf *physical-recovery-state* manifest))))
 
 (defun note-primary-startup-replay ()
   "Report the last applied terminal, excluding complete records in an unfinished batch."

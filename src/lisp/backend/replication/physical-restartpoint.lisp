@@ -363,8 +363,14 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
                        (physical-recovery-flush)))
                    (setf terminal (if *physical-receive-store*
                                       (physical-recovery-restartpoint-core)
-                                      (or *last-replay-lsn* (getf *physical-recovery-state* :end)))
-                         *physical-shutdown-state* :prepared)))
+                                      (or *last-replay-lsn* (getf *physical-recovery-state* :end))))
+                   ;; C records clean recovery even when no checkpoint advanced.
+                   ;; Publish only after durable data/pointer/floor and while gated.
+                   (setf *physical-recovery-state*
+                         (physical-recovery-write-control
+                          *physical-recovery-state* (getf *physical-recovery-state* :phase)
+                          terminal *next-xid* :db-state +db-shutdowned-in-recovery+))
+                   (setf *physical-shutdown-state* :prepared)))
                ;; A failure while reopening admission is a failed preparation too.
                (setf finished t)
                terminal)

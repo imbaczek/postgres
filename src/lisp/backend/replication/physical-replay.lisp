@@ -67,14 +67,9 @@ can be ahead after a crash and never grants a missing-file exemption."
             (list-backends))))
 
 (defun physical-recovery-save-progress (applied next-xid)
-  (let ((state *physical-recovery-state*))
-    (wal-atomic-write-bytes
-     (physical-recovery-control-path)
-     (physical-recovery-control-image
-      2 (getf state :system-id) (getf state :timeline)
-      (getf state :manifest-digest) (getf state :checkpoint)
-      (max applied (or (getf state :required-applied) applied))
-      (max next-xid (or (getf state :observed-next-xid) next-xid))))))
+  ;; Replay and the transition to streaming always publish active recovery.
+  (setf *physical-recovery-state*
+        (physical-recovery-write-control *physical-recovery-state* 2 applied next-xid)))
 
 (defun physical-recovery-open-receive-store (&key create)
   (let ((directory (physical-recovery-spool-directory)))
