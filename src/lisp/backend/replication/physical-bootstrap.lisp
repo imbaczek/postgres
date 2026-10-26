@@ -26,12 +26,16 @@
       (error "physical backup target must be empty and separate from source"))
     target))
 
+(defun physical-recovery-marker-bytes ()
+  "Canonical recovery exclusion marker shared by creation and both startup paths."
+  (string->bytes (format nil "PGPHYSICAL-RECOVERY-REQUIRED-1~%")))
+
 (defun physical-bootstrap-mark-target (target)
   "Persist the recovery guard before placing any database files in TARGET."
   (fsync-directory (uiop:pathname-parent-directory-pathname target))
   (with-open-file (stream (merge-pathnames "recovery.required" target)
                           :direction :output :if-exists :error :if-does-not-exist :create)
-    (write-line "PGPHYSICAL-RECOVERY-REQUIRED-1" stream)
+    (write-string (bytes->string (physical-recovery-marker-bytes)) stream)
     (fsync-stream stream))
   (fsync-directory target))
 

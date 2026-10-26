@@ -284,11 +284,29 @@ Do not call from a mapper callback. Preserve unflushed writes and decoder state.
           (close (physical-store-lock-stream store))))))
   (values))
 
-(defun physical-store-open (directory system-id timeline &key create (start-lsn 0))
+(defun physical-store-open-lock (store create)
+  "Keep a stable regular ownership inode; pending validation never creates it."
+  (let ((fd (sb-posix:open (namestring (physical-store-path store "receive.lock"))
+                           (logior sb-posix:o-rdwr sb-posix:o-nofollow +postmaster-o-cloexec+
+                                   (if create sb-posix:o-creat 0))
+                           #o600))
+        (stream nil))
+    (unwind-protect
+         (progn
+           (unless (= (logand (sb-posix:stat-mode (sb-posix:fstat fd)) sb-posix:s-ifmt)
+                      sb-posix:s-ifreg)
+             (error "physical receive ownership inode is not regular"))
+           (setf stream (sb-sys:make-fd-stream fd :input t :output t))
+           stream)
+      (unless stream (sb-posix:close fd)))))
+
+(defun physical-store-open (directory system-id timeline &key create (start-lsn 0) (discard-tail t) (create-lock t))
   "Own a native receive spool, creating only in an existing empty directory.
 CREATE never overwrites an old incarnation; opening an existing spool validates
 its acknowledged prefix before discarding tails. An OS file lock excludes other
-local receivers and is released on crash; it is not a distributed writer lease."
+local receivers and is released on crash; it is not a distributed writer lease.
+With DISCARD-TAIL and CREATE-LOCK both NIL, validate pending recovery without
+changing spool bytes or creating a missing lock; do not resume input in that mode."
   (unless (and (typep system-id '(unsigned-byte 64))
                (typep timeline '(integer 1 4294967295))
                (typep start-lsn '(unsigned-byte 64))
@@ -302,8 +320,7 @@ local receivers and is released on crash; it is not a distributed writer lease."
     (unwind-protect
          (progn
            (setf (physical-store-lock-stream store)
-                 (open (physical-store-path store "receive.lock")
-                       :direction :io :if-exists :overwrite :if-does-not-exist :create))
+                 (physical-store-open-lock store create-lock))
            ;; POSIX flock LOCK_EX | LOCK_NB; per-open-description ownership also
            ;; excludes a second receiver in this Lisp process.
            (unless (zerop (physical-store-flock
@@ -325,7 +342,7 @@ local receivers and is released on crash; it is not a distributed writer lease."
                (progn
                  (physical-store-load-control store)
                  (physical-store-validate-prefix store)
-                 (physical-store-discard-tail store)))
+                 (when discard-tail (physical-store-discard-tail store))))
            (setf (physical-store-decoder store)
                  (make-physical-wal-decoder :start-lsn (physical-store-flushed-lsn store))
                  success t)

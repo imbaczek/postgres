@@ -70,6 +70,26 @@
   (fsync-directory (wal-directory))
   (physical-promotion-test-point :after-eor-directory-fsync))
 
+(defun physical-promotion-wal-plan (state prefix &key allow-uninstalled)
+  "Check child artifacts before mutation, including cold recovery's catalog restore."
+  (multiple-value-bind (eor start) (physical-promotion-eor-image state)
+    (let* ((fork (getf state :applied)) (child (getf state :promotion-child))
+                                        (first (wal-segment-path (floor fork +wal-segment-size+) child :timeline))
+                                        (target (wal-segment-path (floor start +wal-segment-size+) child :timeline))
+                                        (rotated (/= start fork))
+                                        (target-prefix (if rotated (make-array 0 :element-type '(unsigned-byte 8)) prefix))
+                                        (history-p (wal-namespace-file-stat (timeline-history-path child *pgdata*) t)))
+      (if (and allow-uninstalled (not history-p))
+          (progn (wal-namespace-file-stat first t) (wal-namespace-file-stat target t))
+          (progn
+            (physical-promotion-check-eor-file first prefix (if rotated #() eor)
+                                               :before-history (not history-p))
+            (if (and rotated (not history-p))
+                (wal-namespace-file-stat target t)
+                (physical-promotion-check-eor-file target target-prefix eor
+                                                   :before-history (not history-p)))))
+      (values target target-prefix eor start rotated history-p))))
+
 (defun physical-promotion-publish-wal ()
   "Privately publish history then durable EOR; parent control and admission stay closed.
 A failed process remains fenced. Startup reconciliation is a separate transition."
@@ -78,23 +98,14 @@ A failed process remains fenced. Startup reconciliation is a separate transition
       (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
         (declare (ignore catalog))
         (physical-promotion-check-pending state metadata prefix generation :allow-history t)
-        (multiple-value-bind (eor start) (physical-promotion-eor-image state)
-          (let* ((fork (getf state :applied)) (child (getf state :promotion-child))
-                                              (first (wal-segment-path (floor fork +wal-segment-size+) child :timeline))
-                                              (target (wal-segment-path (floor start +wal-segment-size+) child :timeline))
-                                              (rotated (/= start fork)) (target-prefix (if rotated (make-array 0 :element-type '(unsigned-byte 8)) prefix))
-                                              (history-p (wal-namespace-file-stat (timeline-history-path child *pgdata*) t))
-                                              (finished nil))
-            (physical-promotion-check-eor-file first prefix (if rotated #() eor)
-                                               :before-history (not history-p))
-            (if (and rotated (not history-p))
-                (wal-namespace-file-stat target t)
-                (physical-promotion-check-eor-file target target-prefix eor
-                                                   :before-history (not history-p)))
+        (multiple-value-bind (target target-prefix eor start rotated history-p)
+            (physical-promotion-wal-plan state prefix)
+          (let ((finished nil))
             (unwind-protect
                  (progn
                    (when (and rotated (not history-p))
-                     (wal-install-timeline-prefix (getf state :timeline) child start target-prefix
+                     (wal-install-timeline-prefix (getf state :timeline) (getf state :promotion-child)
+                                                  start target-prefix
                                                   (getf state :promotion-source-namespace)))
                    (physical-promotion-test-point :before-history)
                    (physical-promotion-sync-history state)

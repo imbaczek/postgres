@@ -110,6 +110,7 @@
                    (:file "../replication/physical-follow")
                    (:file "../replication/physical-promotion")
                    (:file "../replication/physical-promotion-wal")
+                   (:file "../replication/physical-promotion-resume")
                    (:file "../replication/standard")
                    (:file "../replication/worker")
                    (:file "../replication/standard-subscriber")

@@ -10,6 +10,15 @@
         (unless (= length (read-sequence bytes stream)) (error "short recovery metadata read"))
         bytes))))
 
+(defun physical-recovery-check-required-marker ()
+  "Validate the exact bounded guard before ordinary or pending reconstruction."
+  (let* ((path (merge-pathnames "recovery.required" *pgdata*))
+         (stat (sb-posix:lstat (namestring path))))
+    (unless (= (logand (sb-posix:stat-mode stat) sb-posix:s-ifmt) sb-posix:s-ifreg)
+      (error "physical recovery marker is not a regular file"))
+    (unless (equalp (recovery-read-bytes path :maximum 128) (physical-recovery-marker-bytes))
+      (error "corrupt physical recovery marker"))))
+
 (defun physical-recovery-control-path (&optional (directory *pgdata*))
   (merge-pathnames "physical-recovery.control" directory))
 
@@ -366,12 +375,7 @@ This is local incomplete-recovery state, never child insertion or writer authori
 
 (defun physical-recovery-prepare-with-namespace ()
   "Validate provenance, then durably enter active recovery before any restoration."
-  (unless (probe-file (merge-pathnames "recovery.required" *pgdata*))
-    (error "physical recovery control or manifest has lost its required recovery marker"))
-  (let ((marker (bytes->string (recovery-read-bytes
-                                (merge-pathnames "recovery.required" *pgdata*) :maximum 128))))
-    (unless (equal marker (format nil "PGPHYSICAL-RECOVERY-REQUIRED-1~%"))
-      (error "corrupt physical recovery marker")))
+  (physical-recovery-check-required-marker)
   (let ((control (physical-recovery-read-control *pgdata*)))
     ;; Pending control must never fall through the ordinary phase rewrite/redo path.
     ;; A later milestone will verify and reconcile this exact generation before SQL.

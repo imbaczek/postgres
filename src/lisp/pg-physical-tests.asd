@@ -26,6 +26,7 @@
                (:file "t/physical-prefix-tests")
                (:file "t/promotion-intent-tests")
                (:file "t/promotion-wal-tests")
+               (:file "t/promotion-resume-tests")
                (:file "t/physical-stream-tests")
                (:file "t/physical-follow-exit-tests")
                (:file "t/physical-shutdown-tests"))
