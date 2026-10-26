@@ -54,10 +54,58 @@ current allocator state. These are required compatibility fields:
 
 SQL `xid`/`oid8` output contracts and coherent publication of all these fields
 remain necessary. No partial all-NULL record or invented constants were added
-to make Patroni's standby-leader query pass. Writer/control integration also
-depends on the still-blocked structural edits to valid `#.` source files. The
+to make Patroni's standby-leader query pass. The cl-mcp reader fix now permits
+the necessary writer/control edits to valid `#.` source files. The
 ordinary Patroni cluster query remains verified separately; enabled slots,
 synchronous replication and standby-leader variants are not yet complete.
+
+### Automatic smart/fast standby shutdown
+
+Smart and fast process shutdown now invoke native recovery preparation before
+successful exit. Last-connection cleanup only claims finalization and stops the
+accept loop under the existing accept/accounting lock. It does not publish a
+restartpoint or exit while its backend still holds live-operation admission.
+After `serve` returns, the main thread performs preparation at depth zero, then
+marks shutdown finished, logs completion and exits. The separate signal worker
+remains available for SIGQUIT while main-thread preparation waits. Preparation
+errors propagate to the launcher's fatal path and exit 1 without a successful
+shutdown log. Primary shutdown storage behavior is unchanged.
+
+The accept loop no longer erases an earlier stop request. Startup catches only
+the specific recovery-worker shutdown condition when process shutdown has
+actually begun; this closes the signal interval between either worker-start
+check and launch. Other startup errors and prepared-recovery refusals without
+process shutdown remain errors. Changed active `main`/`serve` frames need a
+fresh process; ordinary reload cannot replace an already executing frame.
+
+`t/physical-shutdown-signals.sh` passed at
+`/tmp/pg-physical-shutdown-signals.RGlJeh`: SIGTERM waits for the last connected
+read transaction; SIGINT terminates one; both preserve pause and received-ahead
+F>A WAL while checkpointing R=A, join recovery workers and retain follow
+configuration. Fresh processes automatically follow and recover subsequent
+rows. SIGQUIT remains responsive while a bounded hook blocks main-thread
+preparation. A restartpoint publication error exits 1, preserves recoverable
+state and configuration, and a fresh process recovers all six source rows.
+Hooks wrap the real preparation routine in the actual owned server image.
+
+All 151 physical, 169 interop and 1,598 legacy checks pass. Formatting and fresh
+strict compilation pass. The existing primary shutdown script stops at an
+earlier admin-function timeout coercion assertion, also reproduced unchanged
+at `2153fdf16d1`; its unmodified signal sections pass separately, including
+smart/fast/immediate, escalation and fast shutdown during reload quiescence.
+Native following and pinned Patroni status regression passes in
+`/tmp/pg-physical-follow.XywJjc`. Both real C logical directions pass in
+`/tmp/pg-shutdown-logical-interop.log`; all three manual logical switchovers
+pass in `/tmp/pg-switchover.TGXcV5`, `.PUDtro` and `.JItVuE`.
+
+C oracle: `PostmasterStateMachine` waits for regular backends and dispatches a
+shutdown checkpoint to the checkpointer (`postmaster.c:3083-3117`);
+`ShutdownXLOG` requests a shutdown restartpoint in recovery (`xlog.c:7394-7436`).
+Native workers remain threads in one process. The durable counterpart of
+`DB_SHUTDOWNED_IN_RECOVERY`, including unchanged restartpoints, is still missing;
+this does not complete C clean-shutdown control metadata, primary shutdown
+checkpoint parity, promotion or synchronous replication. Existing 15-second
+worker joins can fail closed on slow I/O. No coordination is introduced.
 
 ### Callable standby shutdown preparation
 
@@ -100,15 +148,13 @@ strict compilation pass.
 Luna max and Sol high found no production defect; Sol medium found no useful
 refactor beyond the shared runtime-quiescence extraction.
 
-This is necessary groundwork, not completed C `ShutdownXLOG` equivalence. The
-postmaster still exits directly from its last-backend path, which can hold live
-admission; finalization must instead run later from the postmaster worker for
-smart/fast shutdown. It must also publish the native counterpart of C's durable
-`DB_SHUTDOWNED_IN_RECOVERY` marker, including duplicate-restartpoint shutdowns.
-SIGQUIT must remain abrupt. The valid `#.` forms in `postmaster.lisp` still cause
-cl-mcp structural tools to reject that file with reader evaluation disabled;
-no shell-edit, shadow-definition or exit-hook workaround was used. Automatic
-signal integration remains unimplemented. C oracle: `ShutdownXLOG` and
+This primitive is now used by automatic signal integration above, but does not
+complete C `ShutdownXLOG` equivalence. The native counterpart of the durable
+`DB_SHUTDOWNED_IN_RECOVERY` marker, including duplicate-restartpoint shutdowns,
+remains missing. The cl-mcp fork's inert source readtable now permits structural
+edits of the original valid `#.` source without enabling read-time evaluation.
+No shell-edit, shadow-definition or exit-hook workaround was used.
+C oracle: `ShutdownXLOG` and
 `CreateRestartPoint` in `xlog.c`, plus `016_min_consistency.pl`'s offline recovery
 point-versus-page-LSN check. No coordination or C physical disk compatibility
 is added by this primitive.
@@ -156,10 +202,10 @@ Formatting and strict compilation pass; requested reviews
 found no blocking issue or useful further refactor. Production functions remain
 below 120 lines.
 
-This covers receiver session exit and explicit stop, not whole-server shutdown
-ordering. Smart/fast postmaster shutdown still needs to stop/join native workers
-and publish a shutdown restartpoint before process exit. That remains part of
-the HA roadmap, alongside promotion, child timelines and synchronous commit waits.
+This receiver primitive is now used by whole-server smart/fast finalization
+above, which stops/joins native workers and publishes an applied restartpoint.
+Durable clean-shutdown metadata remains part of the HA roadmap, alongside
+promotion, child timelines and synchronous commit waits.
 
 ### Receiver statistics and ordinary Patroni cluster status
 
@@ -1361,13 +1407,12 @@ LSN translation invariance, monotonicity and no-progress suppression across larg
 coordinate ranges. Strict compilation, formatting, shell syntax and whitespace
 checks pass.
 
-Shutdown restartpoints remain explicitly unfinished. C ShutdownXLOG invokes
-CreateRestartPoint before orderly exit (xlog.c:7422). The current Lisp postmaster
-exits directly from last-backend cleanup; SBCL exit hooks unwind admission first,
-run in unspecified order and swallow hook errors, so an exit-hook implementation
-would not provide C-compatible completion/error semantics. Implement a proper
-postmaster finalization step before claiming clean-shutdown checkpoint coverage.
-This limitation does not invalidate recovery from the already durable R/suffix.
+Orderly standby restartpoints now run from proper main-thread finalization
+above, following C ShutdownXLOG's CreateRestartPoint call (xlog.c:7422). The
+earlier direct last-backend exit was unsuitable: SBCL exit hooks unwind admission
+first, run in unspecified order and swallow hook errors, so an exit-hook solution
+would not provide the required completion/error semantics. Durable clean-shutdown
+control metadata remains unfinished; already durable R/suffix recovery is verified.
 Promotion/timelines/history/rejoin, online bootstrap, synchronous commit and the
 pinned Patroni interface matrix remain active goal work; coordination is excluded.
 
@@ -1452,7 +1497,8 @@ recovery preparation (`/tmp/pg-physical-bootstrap.xZLCvj`), including source
 SIGKILL and stale PID reclaim. Existing shutdown acceptance also passes after
 PID cleanup integration (`/tmp/pg-pid-shutdown.log`: smart/fast/immediate,
 escalation and administrative cancel/terminate). This verifies existing shutdown
-behavior and PID removal, not the still-missing shutdown restartpoint.
+behavior and PID removal. Standby shutdown restartpoint integration was added
+later, as recorded above.
 
 Continuous native follow/reconnect also passes with PGDATA ownership enabled
 (`/tmp/pg-physical-follow.uAARci`). Descriptor inspection in the live cl-mcp image
@@ -1504,7 +1550,8 @@ Empty or multiple listen addresses are explicitly unsupported. Native defaults
 remain port 5433 and a 1 GiB slot retention cap; C defaults differ. Private native
 byte-limit options can override the displayed slot limit. Configuration reload
 is atomic for this subset; C can apply some valid entries alongside semantic
-errors. Primary automatic checkpoints and shutdown restartpoints remain missing.
+errors. Primary automatic and shutdown checkpoint parity remain missing;
+native standby shutdown restartpoints are now integrated above.
 No HA controller, DCS, election or failover coordination runs in these tests.
 
 Final validation also passes strict forced compilation, all 135 interop Rove

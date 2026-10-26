@@ -325,7 +325,8 @@ standbys support explicit local restartpoints through the private control REPL:
 compacts the receive spool. A local worker also requests a restartpoint after
 300 seconds or 1 GiB of applied WAL progress; received-but-unapplied WAL never
 triggers one. SQL `CHECKPOINT` requests a standby restartpoint and succeeds as a
-no-op on an unchanged static base. Orderly-shutdown restartpoints remain unfinished.
+no-op on an unchanged static base. Smart/fast standby shutdown also publishes an
+applied restartpoint; durable clean-shutdown control metadata remains unfinished.
 The startup configuration subset below controls these restartpoint thresholds.
 
 Recovery SQL supports `pg_wal_replay_pause()`, `pg_wal_replay_resume()`,
@@ -743,14 +744,18 @@ output currently supports UTC aliases only; other session time zones fail explic
 below-threshold receive flushing on disconnect and explicit stop, target crash/
 restart, and receive-control fsync failure. Receiver session exit flushes complete
 native records before clearing status; failed flush closes recovery until restart.
-Whole-server shutdown worker ordering and shutdown restartpoints remain unfinished.
+Smart/fast standby shutdown joins recovery workers outside backend admission and
+publishes an applied restartpoint before successful process exit.
 `./t/physical-shutdown-prepare.sh` tests the callable preparation primitive:
 worker joins, a checkpoint at the applied terminal with received-ahead WAL
 preserved, automatic following after restart, and failed publication. The private
 control form `(physical-recovery-prepare-shutdown)` preserves follow configuration
 and blocks further supported recovery mutations after preparation. It does not
-exit the server; automatic smart/fast shutdown integration and a durable
-clean-shutdown marker remain unfinished.
+exit the server. Automatic smart/fast integration is exercised by
+`./t/physical-shutdown-signals.sh`, including received-ahead WAL, restart,
+immediate escalation during preparation and failure exit status. The durable
+clean-shutdown marker remains unfinished. Changed active main/accept-loop frames
+require a fresh process rather than reload.
 `pg_postmaster_start_time()` reports the captured server-initialization timestamp
 as timestamptz and remains unchanged across connections and reloads. The pinned
 Patroni method is included in direct-start acceptance. An already-running image

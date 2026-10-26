@@ -189,6 +189,13 @@ appropriate instead of replacing the native C peer or adding a message relay.
   parsing behavior and is not a universal workaround for `#.`. Preserve valid
   source and report unsupported syntax instead of rewriting wire fixtures or
   enabling arbitrary read-time evaluation just to make a tool accept the file.
+- The cl-mcp fork now provides `readtable: "cl-mcp-syntax-only"` for valid
+  otherwise-standard source containing `#.`. Its inert reader preserves both
+  read-time expressions and `#S` literals without evaluation or constructor
+  calls; the edit tools still splice raw source. Verify registration in the
+  parent MCP server, not just the worker. Use raw source for exact text: collapsed
+  displays may show opaque placeholders, and this mode does not supply semantic
+  values for macroexpansion. Do not rewrite source constants for the tool.
 - The tokenizer's valid SBCL character name `#\Nul` is accepted by cl-mcp's
   `readtable: "standard"` override for both reading and structural patching.
   This allowed edits without rewriting existing reader forms. It does not solve

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Explicit standby shutdown preparation; postmaster signal integration is pending.
+# Explicit standby preparation, also used by automatic smart/fast shutdown.
 set -eu
 BASE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$BASE/t/test-support.sh"
