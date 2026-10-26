@@ -18,11 +18,13 @@ Native recovery control now records the C `DBState` distinction between startup
 (0), active archive recovery (5) and clean shutdown in recovery (2). These are
 separate from the native bootstrap phases 0/1/2; clean state never grants primary
 write authority. `recovery.required` and verified provenance remain mandatory.
-The new 72-byte `PGRSTAT2` format retains existing identity/progress fields, adds
+The 72-byte `PGRSTAT3` format retains existing identity/progress fields, adds
 state and a signed 64-bit diagnostic Unix-seconds update time (`pg_time_t`), and
 CRC-checks the entire record.
-Legacy 60-byte `PGRSTATE` files read as unknown state/time and migrate before
-mutable initialization. All new writes use v2; earlier binaries cannot read v2.
+Legacy 60-byte `PGRSTATE` files read as unknown state/time; v2 remains readable.
+Both migrate before mutable initialization. All new writes use v3, whose explicit
+phase-word flag represents the exhausted one-past FullXID without wrapping to zero.
+Earlier binaries cannot read v3.
 This is native metadata, not C `pg_control` byte compatibility.
 
 Startup validates control/manifest/base provenance, then atomically persists
@@ -71,18 +73,118 @@ phase postcondition is implemented. Full checkpoint metadata, primary shutdown
 checkpoint parity, promotion, timeline changes, rejoin and synchronous durability
 remain unfinished. No coordination is introduced.
 
+### FullXID reservation boundary correction
+
+The reservation audit found a native allocator bug independent of WAL transport:
+the old exclusive end `nextXid + 1000` could land on low 32 bits 0, 1 or 2.
+After a crash, startup loaded that end as the next assignable FullXID. C's
+`FullTransactionIdAdvance` (`src/include/access/transam.h:127–138`) skips those
+special low IDs, and `GetNewTransactionId` relies on that behavior.
+
+`canonical-next-full-xid` now rounds reservation ends past special low IDs,
+preserving the 2^64 one-past exhaustion sentinel. New batches use that canonical
+end. Startup also canonicalizes and durably replaces pre-upgrade bad end values
+before opening CLOG or admitting SQL. Reaching a new epoch's first normal XID
+still requires the existing freeze/wrap completion path; normalizing an end
+does not bypass it. Snapshot v1 still cannot encode an exhausted one-past next
+XID and fails closed rather than wrapping it.
+
+The new Rove cases exercise actual assignment/save and actual `xact-init` over
+all three special low-bit values, high epochs and exhaustion. Two cl-spec
+properties pass 200 trials each with seed 42: arbitrary-end idempotence/bounds
+(`fnv1a64-v1:8bc7ced5240fd0ef`) and targeted special-end rounding across epochs
+(`fnv1a64-v1:1dead604fc4cc1d3`). Input coverage and rejection counts are
+unmeasured; there is no FunctionSpec. All 178 physical tests, 169 interop tests
+and 1,598 legacy checks pass. Model review of this correction is pending because
+the review service currently rejects new runs at its agent thread limit.
+
+### Replayable native XID reservations — implemented, model review pending
+
+C advances recovery's next FullXID past WAL record XIDs (`varsup.c:298–338`,
+`xlogrecovery.c:1911`). The native primary additionally preserves a 1,000-ID
+reservation file. Logging that reservation preserves a native contract; it is
+not C WAL binary compatibility or a C allocation algorithm.
+
+Native WAL v7 adds type 12, an eight-byte inclusive reserved-through value.
+The successor must be a canonical normal FullXID or the 2^64 exhaustion sentinel.
+A reservation is the sole terminal after an empty, zero-XID `BATCH_START`; page,
+catalog or logical changes cannot share its batch. The marker validator is shared
+by primary redo and standby history validation. Source allocation flushes this
+batch before saving `global/pg_control` and before handing out any XID. The fast
+path retains its XID-only lock; capacity exhaustion releases that lock before
+entering WAL-to-XID order and rechecking. Ordinary wrap/exhaustion refusals occur
+before critical I/O. I/O failure and nonlocal exits fence further WAL allocation
+without handing out an ID.
+
+Primary startup takes the maximum of the native control reservation and the
+checkpoint copy, normalizes it, then durably incorporates replayed reservation
+records before SQL listeners start. Standby redo never writes its immutable base
+reservation file or substitutes the source upper bound for reader visibility.
+Its separate source frontier records the bound, applied-through LSN and allocation
+coverage. V7 checkpoint/reservation anchors establish coverage; older records make
+it unknown until another anchor. A regressing source bound or an observed XID
+beyond a covered bound is rejected. This coverage says only that the allocation
+contract is known through that LSN; it grants no writer authority and makes no
+no-acknowledged-commit-loss claim.
+
+Restartpoint metadata v3 persists this frontier before spool compaction. Bootstrap
+manifest v3 and restartpoint v3 preserve the exact exhausted next-XID sentinel.
+Base visibility comes from the manifest's actual counter, checked against the
+source checkpoint, independently of the copied reservation file. Checkpoint redo
+advances actual visibility even for transactions without row-change WAL.
+Legacy v1/v2 restartpoints remain decodable, but their ambiguous capacity counter
+requires rebuilding actual visibility from the complete retained base prefix;
+already compacted legacy images require reseeding. Legacy recovery controls keep
+their required-applied boundary while migrating visibility from the base actual
+counter. Startup reconstructs that boundary before SQL admission. New actual
+observed-XID floors remain monotonic across subsequent restarts.
+
+Stored WAL versions 2–6 remain readable, including v6 checkpoint payloads. Native
+streaming now negotiates `pg_lisp_wal_7`, derived from the writer version. Upgrade
+both live native peers; a v6 peer cannot consume reservation records.
+
+The new `t/xid-reservation.sh` kills the source after reservation WAL flush but
+before its XID control-file update, and again after bytes reach disk but before
+WAL control advances. It verifies primary startup adoption/floors, then drives
+1,005 native reader transactions that roll back without row-change WAL. The
+standby learns their reservation while keeping its original visibility counter
+and immutable base control file, and retains it through compaction and restart.
+It then applies a source checkpoint carrying the actual reader-only progress,
+verifies that value independently of capacity, and restarts through another local
+restartpoint. Real legacy v1/v2 generations and v2 recovery controls are converted
+offline, then startup is killed after dirty v3 control publication: the full
+prefix recovers, while compacted legacy history refuses with a reseed requirement.
+Evidence: `/tmp/pg-xid-reservation.iLlMhw`. Checkpoint crash/legacy conversion
+passes at `/tmp/pg-checkpoint-snapshot.yh7Saa`.
+
+All 201 physical tests, 169 interop tests and 1,598 legacy checks pass; strict
+compilation also passes. The reservation codec property passed 200 trials with
+seed 42, digest `fnv1a64-v1:c3baa8de42545025`; coverage/rejection gaps remain
+unmeasured and no FunctionSpec is registered. Both C logical directions and all
+three manual switchovers pass (`/tmp/pg-wal-xid-logical-*.log`). Native shutdown
+signals and automatic restartpoints pass. The native follow regression passes
+after the base-visibility correction (`/tmp/pg-physical-follow.nSRygj`). Allocation
+waiters recheck WAL health under the XID lock, including failures after their
+early check; nonlocal exits after capacity publication also fence handoff.
+Existing review threads were reused after the service refused new agents with
+`agent thread limit reached`. Reviews found and prompted fixes for logical batch
+grammar, shared replay staging, actual versus reserved visibility, and exhausted
+counter persistence. Final stabilized-source and process-fixture reviews found no
+remaining correctness blocker; the existing thread's model identity was not
+exposed, so this does not certify the originally requested model profiles.
+
 ### Native checkpoint snapshots and durable publication
 
 The internal checkpoint snapshot codec now preserves explicit record start/end,
 native redo position, actual next FullXID, separately reserved-through FullXID,
 next OID (including an explicit unknown state), signed Unix checkpoint time,
 timeline lineage and oldest active FullXID. Its versioned 88-byte payload binds
-to the containing version-6 checkpoint record and validates segment boundaries.
+to the containing version-6-or-newer checkpoint record and validates segment boundaries.
 Legacy version-2 through version-5 empty checkpoints retain unknown metadata.
-New writers emit version-6 records with 88-byte payloads and 32-byte headers.
-The native stream negotiation token is `pg_lisp_wal_6`; old live peers are
+Checkpoint payloads introduced in version 6 have 88-byte payloads and 32-byte headers.
+The current native stream negotiation token is `pg_lisp_wal_7`; old live peers are
 rejected during negotiation, rather than accepted and sent unreadable WAL.
-Stored WAL versions 2–5 remain readable, including version-5 logical records.
+Stored WAL versions 2–6 remain readable, including version-5 logical records.
 Upgrade both native streaming peers before reconnecting them.
 
 As in C's `CheckPoint`/`ControlFileData`, `PGWAL4` keeps a CRC-bound copy alongside
@@ -105,11 +207,11 @@ unknown source facts. The bounded literal reader now reads NIL as CL NIL, fixing
 its former interpretation as the keyword `:NIL`. New persistent formats require
 the upgraded binary; older binaries cannot read these records.
 
-A captured reservation bound alone does not make promotion safe at a later
-LSN. Native XID allocation can reserve another batch in `global/pg_control`
-without a WAL record. That reservation needs a durable replayable contract
-before promotion can reuse the allocator safely. Preserve the WAL-to-XID lock
-order when implementing it. No authority follows from these snapshot fields.
+A captured checkpoint reservation alone does not make promotion safe at a later
+LSN. Post-checkpoint reservations now have a durable replayable contract, described
+above, with separate allocation coverage and visibility. Promotion still needs its
+own timeline/history, recovery completion and durability contracts. No authority
+follows from these snapshot fields.
 The full 20-column C checkpoint SQL contract remains incomplete.
 
 Validation: 173 physical tests, 169 interop tests, 1,598 legacy checks,
@@ -1143,7 +1245,7 @@ base boundary, requested record end and cumulative received-prefix checksum:
 
 ```
 START_REPLICATION SLOT pin PHYSICAL lsn
-(native_format 'pg_lisp_wal_6', system_id '...', timeline '1',
+(native_format 'pg_lisp_wal_7', system_id '...', timeline '1',
  base_lsn '...', prefix_digest '...')
 ```
 

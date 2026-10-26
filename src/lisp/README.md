@@ -69,14 +69,23 @@ advances the durable LSN. Run `CHECKPOINT` to flush staged pages and catalog/CLO
 state before advancing the recovery pointer. This is a small physical WAL
 implementation for the server's supported operations.
 
-New native WAL version 6 checkpoints preserve source counters, checkpoint time
+Native WAL checkpoints (payload introduced in version 6) preserve source counters, checkpoint time
 and explicit start/end/redo positions in the record and the CRC-checked `PGWAL4`
 control copy. The copy advances only after data/CLOG sync. Stored legacy WAL and
 controls remain readable with unknown checkpoint facts until a new checkpoint.
-Native streaming now negotiates `pg_lisp_wal_6`; upgrade both peers before
+Native streaming now negotiates `pg_lisp_wal_7`; upgrade both peers before
 reconnecting. This does not provide C WAL or control-file disk compatibility.
 `./t/checkpoint-snapshot.sh` covers legacy upgrade, both publication crash
 boundaries, control-copy mismatch rejection and standby restartpoint preservation.
+Version 7 additionally logs native XID reservations before allocation. Standby
+restartpoint v3 preserves their source upper bounds separately from reader
+visibility. Checkpoint v2, recovery control v3, bootstrap manifest v3 and
+restartpoint v3 preserve exhausted FullXIDs exactly. Older restartpoint generations
+require the full retained prefix to rebuild actual visibility; compacted legacy
+images require reseeding. The regression `./t/xid-reservation.sh` checks both
+control-file crash windows, reader-only allocation, checkpoint-only actual counter
+progress, and crashes during migration of real v1/v2 restartpoints. This adds no
+promotion authority, coordination or synchronous acknowledged-commit guarantee.
 
 ## Hot reload and control REPL
 

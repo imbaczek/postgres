@@ -219,6 +219,21 @@ appropriate instead of replacing the native C peer or adding a message relay.
   test inspectors. Stored legacy WAL readability does not imply live mixed-version
   peer compatibility. Crash tests must inspect the durable checkpoint copy both
   before data sync and after control publication.
+- Recovery counters belong to a replay position. When reconstructing a prefix
+  from an older base/R-point, restore that point's visibility counter before
+  comparing it with historical allocation bounds. Preserve latest durable
+  required-applied/observed floors separately, and check that redo restores them
+  before listeners start. Reusing a future counter caused a real native follow
+  restart failure despite valid WAL and a valid base.
+- A new metadata flush can precede a test's intended commit flush. Prime allocation
+  before arming a commit-specific generic fault hook through the owned control
+  port; exercise the metadata flush in its own crash regression. Do not disable
+  a production fault point or weaken the expected recovered-row checks.
+- Keep actual next-XID visibility distinct from allocation capacity in bootstrap,
+  replay and restartpoint fixtures. Make them unequal in tests. For metadata
+  migration, crash after the new dirty control is durable, then restart again;
+  an in-memory legacy flag cannot survive that boundary. Use real old generation
+  bytes and preserve their already observed counter when constructing fixtures.
 
 ## Live SQL and SLIME debugging
 
