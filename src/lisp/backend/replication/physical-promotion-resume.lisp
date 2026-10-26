@@ -20,6 +20,9 @@
                (not (shutdown-in-progress-p)) (not *swank-listener-enabled-p*))
     (error "pending reconstruction requires a cold process owning PGDATA and exclusion")))
 
+;;; Pending reconstruction keeps its own copy of the selected generation's
+;;; membership, including unknown coverage when that optional field is absent.
+
 (defun physical-promotion-read-pending-state ()
   "Read provenance and exact selected generation before opening or restoring storage."
   (physical-recovery-check-required-marker)

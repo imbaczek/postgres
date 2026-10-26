@@ -212,6 +212,13 @@ Direct control operation; does not promote, follow a network source or coordinat
       (error "observed XID exceeds the source's durable allocation reservation"))
     (list :version 1 :through (wal-record-end record) :bound bound :complete complete)))
 
+;;; Compute prospective membership for each record in WAL order.  An anchor
+;;; replaces prior coverage; a reset or missing prior state leaves it unknown.
+;;; The set is conservative: aborted transactions can remain because native
+;;; ABORT has no WAL record.  Between anchors, only an ordered commit removes
+;;; its XID.
+;;; This result is not published until its batch reaches an applied terminal.
+
 (defun physical-source-xids-next (prior record observed-next)
   (when prior
     (running-xacts-check-state prior)
@@ -256,6 +263,10 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
           (setf (gethash relfilenode *physical-replay-seen-relfilenodes*) t)))
       (database-tables database)))
    (catalog-databases catalog)))
+
+;;; Publish the terminal's source membership together with actual next XID and
+;;; replay LSN under the XID lock, after data and control progress are durable.
+;;; Copy membership so the prospective replay state remains independently owned.
 
 (defun physical-replay-publish-progress (record next-xid reservation source-xids)
   ;; Make redo durable before recording the applied terminal and visibility.

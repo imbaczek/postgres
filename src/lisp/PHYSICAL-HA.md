@@ -253,10 +253,22 @@ coverage proof.
 Redo, history validation, logical reading and reader-safe row replay recognize
 the empty metadata terminal. Replay may publish that terminal even when the
 following row batch is incomplete or unsafe. Logical reading advances its safe
-cursor without inventing a row transaction. **Source membership is not yet used
-by standby snapshots or persisted in restartpoint generations**; the existing
-reader cutoff remains unchanged. Source actual-next observations include the
-new metadata counter.
+cursor without inventing a row transaction. Both replay paths now stage source
+membership per record and publish a copied set only at an applied terminal,
+together with actual next-XID and last-replay LSN under the XID lock. Data and
+recovery control are synced first. Unfinished or deferred batches cannot publish
+their prospective membership or counter.
+
+GENv4 optionally stores `:source-xids`. Validation binds its actual next-XID to
+the generation counter and its through-LSN to the applied generation boundary;
+the anchor must lie between the base and through-LSN. Identity and timeline come
+from the enclosing generation. Cold ordinary recovery and pending-promotion
+reconstruction copy that selected state, without consulting mutable CLOG.
+Missing generations and old generations without the field restore unknown
+coverage. Explicit incomplete state also survives serialization and restoration.
+The writer appends the optional field, preserving the existing metadata order.
+**Standby snapshots do not yet consume membership**; the reader cutoff remains
+unchanged.
 
 The custom `PGRUNX01` payload carries actual next FullXID, sorted unique running
 FullXIDs and a complete/unknown flag. Allocation capacity is not a visibility
@@ -272,9 +284,6 @@ version does not promise interoperability between different checkouts.
 
 Next integration steps retain C's `RecordKnownAssignedTransactionIds` principle:
 
-- Publish source membership and actual next at the same complete replay terminal.
-  Save and restore them from the same restartpoint generation boundary; do not
-  filter restored membership using mutable CLOG, which may be ahead after a crash.
 - Copy coverage and membership into each new standby snapshot. Existing snapshots
   retain their original coverage. Incomplete snapshots keep the strict cutoff;
   covered snapshots need a COMMIT membership check, not a page-contributor cutoff.
@@ -302,6 +311,22 @@ for page redo so metadata cannot consume its mutation boundary. Fresh strict
 compilation, formatting, Luna max checkpoint, Sol high full-diff/re-review and Sol
 medium refactoring review passed. This evidence does not yet cover persistent
 running membership or snapshots using that membership.
+
+Standby publication/persistence validation: a clean worker passed 346 physical
+tests and 170 interop tests; all nine focused source-membership tests passed after
+the final optional-field ordering change. The legacy suite passed all 1,598
+checks. `SOURCE-XIDS-PROGRESS-RETAINS-EVERY-UNFINISHED-TRANSACTION` passed 200 trials
+each with seeds 42 and 3097709049996050795, declaration digest
+`fnv1a64-v1:23e4bc80c1e52a8e`; rejection counts and input coverage were not measured.
+Native retained-reader hooks verified that CLOG can be ahead before terminal
+publication while the published set still contains the committer. After progress,
+membership, actual next-XID and last-replay LSN matched. The nine reader/crash
+scenarios, manual replay with generation-restore assertions, continuous follow,
+automatic restartpoints and prefix publication crash boundaries passed. Fresh
+pending-resume processes verified both a current generation's membership and an
+older generation's missing-field downgrade. Strict compilation and the requested
+checkpoint, full-diff and refactoring reviews passed. This proves neither a
+snapshot consumer nor reader-preserving SQL promotion; those remain next steps.
 
 ### Timeline-qualified native WAL namespace
 

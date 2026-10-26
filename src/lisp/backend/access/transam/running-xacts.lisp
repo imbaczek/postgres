@@ -1,18 +1,18 @@
 ;;;; Native source transaction visibility metadata.
 (in-package #:pg)
 
-;;; These helpers describe source transaction visibility for a future WAL and
-;;; replay integration.  They do not themselves capture, write, or replay WAL.
+;;; These helpers describe source transaction visibility.  The pure codec and
+;;; state helpers do not themselves capture, write, or replay WAL.
 ;;; The corresponding PostgreSQL C code is LogStandbySnapshot in standby.c
 ;;; and RecordKnownAssignedTransactionIds in procarray.c.
 ;;;
-;;; A producer must serialize snapshot capture through WAL insertion in WAL
-;;; order.  The planned lock order is WAL then XID under the commit WAL lock.
+;;; The producer serializes snapshot capture through WAL insertion in WAL
+;;; order, taking the XID lock while holding the commit WAL lock.
 ;;; NEXT is the actual next XID, not the end of a reserved allocation range.
 ;;; Do not filter a restored running set through CLOG: on-disk CLOG can be
 ;;; ahead of the generation that supplies the authoritative replay position.
 ;;;
-;;; Bound the exact set so a long interval between anchors cannot consume
+;;; Bound the running set so a long interval between anchors cannot consume
 ;;; unbounded memory.  An incomplete snapshot carries no running XIDs.
 
 (defconstant +running-xacts-limit+ 65536)
@@ -111,8 +111,8 @@
                        (getf state :complete)))
 
 ;;; Return a new state without changing STATE.  Advance monotonically through
-;;; WAL positions and actual next-XID values, adding newly assigned XIDs to an
-;;; exact set.  If the bound is exceeded, discard the set and mark it
+;;; WAL positions and actual next-XID values, adding newly assigned XIDs to a
+;;; conservative set.  If the bound is exceeded, discard the set and mark it
 ;;; incomplete until a later anchor replaces it.
 ;;;
 ;;; Remove only an ordered COMMIT XID.  Native ABORT currently has no WAL
@@ -157,10 +157,9 @@ NIL state stays unknown until an anchor. Inferred XIDs may already have aborted.
 ;;; Source WAL emission
 ;;;
 ;;; The pure helpers above do not capture or replay WAL themselves.  The
-;;; source commit path now emits this metadata, using the WAL-then-XID lock
-;;; order described above.  The record decoder validates the metadata, but
-;;; replay does not yet publish its membership.  Standby snapshot and
-;;; generation integration remain future work.
+;;; source commit path emits this metadata using the WAL-then-XID lock order.
+;;; Replay validates it and publishes membership at applied terminals;
+;;; restartpoints preserve it.  The snapshot factory does not yet consume it.
 ;;;
 ;;; Native record type 14 was introduced in the same unpublished native WAL
 ;;; version 7.  Older executables reject the new type, so mixed checkouts are

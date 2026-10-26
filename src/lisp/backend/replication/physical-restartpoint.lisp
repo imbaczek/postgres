@@ -75,6 +75,11 @@
       (physical-restartpoint-check-wal-prefix metadata prefix)
       (values metadata (subseq bytes (+ 32 text-length) catalog-end) prefix))))
 
+;;; Membership is optional in a generation.  When present, it must describe
+;;; the same applied LSN and actual next XID as the enclosing generation, and
+;;; its anchor cannot precede the base.  Source identity belongs to that
+;;; enclosing generation and is checked with its other provenance.
+
 (defun physical-restartpoint-check-source-xids (metadata)
   (let ((source (getf metadata :source-xids)))
     (when source
@@ -165,6 +170,9 @@
      live)
     (sort forks #'string< :key #'first)))
 
+;;; Save a private copy of the applied membership with its replay boundary.
+;;; A missing field means coverage is unknown, not that no XIDs are running.
+
 (defun physical-restartpoint-metadata (digest catalog-bytes &optional prefix-bytes)
   (let* ((state *physical-recovery-state*)
          (forks (physical-restartpoint-fork-inventory catalog-bytes))
@@ -239,6 +247,11 @@
         (physical-restartpoint-check-metadata metadata catalog-bytes state prefix)
         (unless (= lsn (getf metadata :lsn)) (error "restartpoint pointer boundary mismatch"))
         (values metadata catalog-bytes prefix digest)))))
+
+;;; Restore membership from the selected, validated generation without CLOG
+;;; filtering: on-disk CLOG can be ahead of that replay boundary.  Missing
+;;; membership and legacy fallback leave coverage unknown.  The restored list
+;;; is copied so recovery owns it independently of the decoded generation.
 
 (defun physical-restartpoint-prepare-storage (store)
   "Validate provenance, suffix and surviving forks before restoring an R catalog."

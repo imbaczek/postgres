@@ -80,6 +80,9 @@
           (setf (gethash key sizes) (max size (1+ block)))))))
   (values))
 
+;;; The reader-safe replay path uses the same durable terminal publication as
+;;; full replay; prospective per-record membership is not visible before it.
+
 (defun physical-row-replay-publish-terminal (record next-xid reservation source-xids)
   ;; Publish progress only after redo; restart can repeat an unpublished batch.
   (when *physical-replay-test-hook*
