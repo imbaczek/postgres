@@ -103,6 +103,7 @@
                    (:file "../storage/wal-timeline")
                    (:file "../replication/physical-history")
                    (:file "../replication/physical-replay")
+                   (:file "../replication/physical-row-replay")
                    (:file "../replication/physical-prefix")
                    (:file "../replication/physical-restartpoint")
                    (:file "../replication/protocol")

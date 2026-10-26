@@ -149,12 +149,21 @@ rows=$(python3 - <<'PY'
 print(",".join(f"({i},'fragmented-network')" for i in range(1000, 2000)))
 PY
 )
-sql "$PORT" "INSERT INTO data VALUES $rows; CREATE TABLE network_empty (id integer)"
+sql "$PORT" "INSERT INTO data VALUES $rows"
+row_flush=$(sql "$PORT" 'SELECT pg_current_wal_flush_lsn()')
+sql "$PORT" "CREATE TABLE network_empty (id integer)"
 source_flush=$(sql "$PORT" 'SELECT pg_current_wal_flush_lsn()')
 wait_target "SELECT pg_last_wal_receive_lsn() >= '$source_flush'::pg_lsn" t
 test -f "$TMP/partial-disconnect"
-test "$(sql "$TARGET_PORT" 'SELECT pg_last_wal_replay_lsn()')" = "$replay_before"
-test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 2
+wait_target "SELECT pg_last_wal_replay_lsn() >= '$row_flush'::pg_lsn" t
+test "$(sql "$TARGET_PORT" 'SELECT pg_last_wal_replay_lsn()')" = "$row_flush"
+test "$(sql "$TARGET_PORT" "SELECT pg_last_wal_replay_lsn() > '$replay_before'::pg_lsn")" = t
+test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 1002
+printf 'SELECT count(*) FROM data;\n' >&7
+attempt=0
+while [ "$(grep -c '^2$' "$TMP/tx.log")" -lt 2 ]; do
+    attempt=$((attempt + 1)); test "$attempt" -lt 100; sleep 0.05
+done
 printf 'COMMIT;\n\\q\n' >&7
 exec 7>&-
 wait "$TX"

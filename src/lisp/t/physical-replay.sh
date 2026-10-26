@@ -93,7 +93,7 @@ compare
 test "$(sql "$TARGET_PORT" 'SELECT pg_last_wal_receive_lsn()')" = "$(sql "$TARGET_PORT" 'SELECT pg_last_wal_replay_lsn()')"
 checked target '(reload)' live-reload
 grep -q 'reload complete' "$TMP/live-reload.log"
-# Retained transactions delay replay without blocking the COMMIT needed to release them.
+# A safe row prefix advances; retained transactions still delay catalog replay.
 mkfifo "$TMP/tx.fifo"
 PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$TARGET_PORT" -U postgres -d postgres \
     -qAt -v ON_ERROR_STOP=1 <"$TMP/tx.fifo" >"$TMP/tx.log" 2>&1 &
@@ -109,7 +109,12 @@ export_wal
 receive_all
 checked target '(physical-recovery-replay)' deferred
 grep -q ':DEFERRED' "$TMP/deferred.log"
-test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = "$((base_count + 1))"
+test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = "$((base_count + 2))"
+printf 'SELECT count(*) FROM data;\n' >&7
+attempt=0
+while [ "$(grep -c "^$((base_count + 1))$" "$TMP/tx.log")" -lt 2 ]; do
+    attempt=$((attempt + 1)); test "$attempt" -lt 100; sleep 0.05
+done
 printf 'COMMIT;\n\\q\n' >&7
 exec 7>&-
 wait "$TX"

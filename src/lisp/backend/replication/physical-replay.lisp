@@ -79,6 +79,19 @@ can be ahead after a crash and never grants a missing-file exemption."
                          (getf *physical-recovery-state* :timeline)
                          :create create :start-lsn (getf *physical-recovery-state* :end))))
 
+(defun physical-recovery-open-clog-redo ()
+  (sb-thread:with-mutex (*clog-lock*)
+    (let ((replacement nil) (installed nil) (previous *clog-stream*))
+      (unwind-protect
+           (sb-sys:without-interrupts
+             (setf replacement (open (clog-path) :direction :io
+                                                 :element-type '(unsigned-byte 8)
+                                                 :if-exists :overwrite :if-does-not-exist :error))
+             (setf *clog-stream* replacement installed t)
+             (when previous (close previous)))
+        (when (and replacement (not installed)) (close replacement)))))
+  (values))
+
 (defun physical-recovery-enable-streaming ()
   "Enter restartable native receive/replay, retaining all WAL from the base.
 Direct control operation; does not promote, follow a network source or coordinate."
@@ -102,7 +115,7 @@ Direct control operation; does not promote, follow a network source or coordinat
                  (unless (= (physical-store-base-lsn store) (physical-store-flushed-lsn store)
                             (getf *physical-recovery-state* :end))
                    (error "unattached receive spool is not an empty base continuation"))
-                 ;; Persist the role transition before reopening CLOG for redo.
+                 (physical-recovery-open-clog-redo)
                  (physical-recovery-save-progress *last-replay-lsn* *next-xid*)
                  (physical-recovery-reset-replay-history)
                  (setf *physical-receive-store* store success t
@@ -218,6 +231,20 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
       (database-tables database)))
    (catalog-databases catalog)))
 
+(defun physical-replay-publish-progress (record next-xid reservation)
+  (smgr-fsync-all)
+  (clog-fsync)
+  (fsync-directory (merge-pathnames "base/" *pgdata*))
+  (fsync-directory (merge-pathnames "global/" *pgdata*))
+  (physical-recovery-save-progress (wal-record-end record) next-xid)
+  (sb-thread:with-mutex (*xid-lock*)
+    (setf (getf *physical-recovery-state* :source-reservation) (copy-list reservation)
+          *next-xid* next-xid *xid-batch-end* next-xid
+          *last-replay-lsn* (wal-record-end record))
+    (when (= (wal-record-type record) +wal-record-checkpoint+)
+      (setf (getf *physical-recovery-state* :source-checkpoint)
+            (wal-checkpoint-record-snapshot record)))))
+
 (defun physical-replay-publish-terminal (record next-xid reservation)
   "Durably finish pages/CLOG/catalog before publishing an applied terminal."
   (when *physical-replay-test-hook*
@@ -236,19 +263,8 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
           (setf (gethash node *physical-replay-seen-relfilenodes*) t))))
     (unless *physical-replay-restarting-p*
       (let ((*catalog* catalog)) (physical-recovery-check-live-files)))
-    (smgr-fsync-all)
-    (clog-fsync)
-    (fsync-directory (merge-pathnames "base/" *pgdata*))
-    (fsync-directory (merge-pathnames "global/" *pgdata*))
-    (physical-recovery-save-progress (wal-record-end record) next-xid)
-    (setf (getf *physical-recovery-state* :source-reservation) (copy-list reservation))
-    (setf *catalog* catalog
-          *next-xid* next-xid
-          *xid-batch-end* next-xid
-          *last-replay-lsn* (wal-record-end record))
-    (when (= (wal-record-type record) +wal-record-checkpoint+)
-      (setf (getf *physical-recovery-state* :source-checkpoint)
-            (wal-checkpoint-record-snapshot record)))
+    (physical-replay-publish-progress record next-xid reservation)
+    (setf *catalog* catalog)
     (catalog-refresh-oldest-relfrozenxid)
     (wal-clear-page-cache))
   (when *physical-replay-test-hook*
@@ -316,13 +332,12 @@ for redo and fence any error or nonlocal exit once replay starts."
   (let ((finished nil))
     (unwind-protect
          (progn
-           (sb-thread:with-mutex (*clog-lock*)
-             (when *clog-stream* (close *clog-stream*))
-             (setf *clog-stream* (open (clog-path) :direction :io
-                                                   :element-type '(unsigned-byte 8)
-                                                   :if-exists :overwrite :if-does-not-exist :error)))
+           (unless (and *clog-stream* (output-stream-p *clog-stream*))
+             (error "recovery CLOG is not open for replay"))
            (prog1 (physical-replay-from *last-replay-lsn*) (setf finished t)))
       (unless finished (setf *physical-recovery-failed-p* t)))))
+
+(declaim (ftype function physical-replay-with-readers))
 
 (defun physical-recovery-replay ()
   "Apply durable terminal batches between transactions; return :DEFERRED on conflict."
@@ -336,5 +351,6 @@ for redo and fence any error or nonlocal exit once replay starts."
       (sb-thread:with-mutex (*physical-replay-pause-lock*)
         (when *physical-replay-paused-p*
           (return-from physical-recovery-replay :paused)))
-      (when (physical-recovery-reader-conflict-p) (return-from physical-recovery-replay :deferred))
-      (physical-recovery-replay-core))))
+      (if (physical-recovery-reader-conflict-p)
+          (physical-replay-with-readers)
+          (physical-recovery-replay-core)))))
