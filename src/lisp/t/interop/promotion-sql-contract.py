@@ -1,3 +1,10 @@
+"""SQL promotion assertions for task-owned source and standby peers.
+
+The harness must create promotion_sql_items with row (1, 'before').
+This test writes source rows and promotes the standby with two old RR views open.
+It currently passes against C; native SQL promotion remains unimplemented.
+"""
+
 import sys
 import time
 from contextlib import closing

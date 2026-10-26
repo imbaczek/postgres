@@ -88,12 +88,90 @@ threads had unavailable model profiles. Documentation followed code gates; its
 separate review corrected the error-after-clean-publication wording.
 
 This closes the earlier online milestone's native utility gap. SQL
-`pg_promote(wait => true)` still needs admission-safe deferred waiting.
+`pg_promote(wait => true)` needs reader-preserving replay/promotion and safe
+admission. The C oracle and prerequisite plan below supersede the earlier
+proposal to defer a frontend Boolean result.
 Child-aware source/bootstrap/follow/rejoin, divergence rejection and safe reseed
 remain next. `PG_VERSION` still says 16 while the wire server reports 20devel;
 the full utility/version/configuration matrix needs reconciliation. Synchronous
 commit waits and an independent acknowledgment-loss oracle remain required.
 C rewind and C physical compatibility remain staged. No coordination is added.
+
+### SQL promotion oracle and reader-safe replay prerequisite
+
+`t/promotion-sql-c.sh` now checks SQL promotion against isolated C source and
+physical standby processes. The shared assertions are in
+`t/interop/promotion-sql-contract.py`. The final run passes at
+`/tmp/pg-sql-promotion-c-contract-reviewed.log`, artifacts
+`/tmp/pg-promotion-sql-c.lrazvy`. The harness prints the binary version and a
+caller-supplied build revision; it does not extract a Git revision from the
+binary. This session uses the established reference installation for
+`9c0909b34939f2d5a37b82b9d1efc8b08e310252`.
+
+The test establishes these C behaviors:
+
+- NULL arguments return NULL without requesting promotion. Wrong argument
+  types reject with 42883. On a primary, 55000 (not in recovery) precedes the
+  nonpositive-seconds 22003 check. A standby rejects nonpositive seconds.
+- Two explicit repeatable-read transactions retain row 1 as `before` while
+  source UPDATE/INSERT commits replay through the observed source flush LSN.
+- The caller promotes inside its open transaction with
+  `pg_promote(wait_seconds => 5)`, exercising default `wait=true`. Volatile
+  session-setting expressions before and after it execute in order without
+  repeating the earlier expression.
+- Both old transactions keep their original row view and forced read-only
+  state after promotion. COMMIT releases that view; new transactions see the
+  latest rows and report read-only mode off.
+
+C's catalog declares defaults `true, 60`. This fixture checks default
+`wait=true` while supplying five seconds; it does not time the 60-second default.
+
+The positive test and its code review pass. Review findings added the standby
+default-argument check and cleanup after a failed startup utility. Failure
+injection makes pg_ctl return failure after successfully launching each peer in
+turn; both cases clean up all owned processes. Evidence is
+`/tmp/pg-sql-promote-cleanup.d1ja5550/`, including `process-scan.txt`.
+No native backend code changes in this
+checkpoint. Native positional `pg_promote` still returns 42883; named argument
+notation currently fails parsing with 42601.
+
+C `xlogfuncs.c:682-769` waits inline, preserving the caller's transaction and
+snapshot. Its independent recovery process can advance while that call waits.
+Our current bridge holds whole-query admission and a statement snapshot; the
+promotion worker waits for both to drain, then closes/reinitializes CLOG, smgr
+and catalog storage. Dropping admission alone is unsafe and still leaves a
+snapshot conflict. Deferring a result or replaying the query does not preserve
+arbitrary expressions, volatile effects, streamed rows or explicit transactions.
+
+The next implementation slice is reader-safe steady-state replay:
+
+1. Classify complete page-image/commit batches. With old readers present, permit
+   only batches whose committing XID is at or beyond every active snapshot's
+   xmax. Defer older XIDs and catalog, DDL and maintenance work. Do not skip an
+   unsafe batch to apply a later one.
+2. Keep CLOG/smgr handles, snapshot registrations, virtual reader IDs and catalog
+   objects intact. Existing smgr/CLOG locks protect their file access; synchronize
+   replay page writes/cache invalidation with the WAL cache path. Publish applied
+   progress and the new visibility counter at the replay/snapshot boundary.
+3. Verify the C oracle's old-reader UPDATE/INSERT scenario on native peers.
+   A source writer that predates a live snapshot must defer until its visibility
+   can be established safely.
+4. Add C-style running/known-assigned XID tracking, then DDL/catalog and
+   vacuum/prune conflict handling. Current snapshot xip comes only from local
+   active XIDs; removing the global reader guard without source transaction
+   tracking can change an old snapshot's visibility.
+
+After reader-safe replay, implement in-place promotion that preserves reader
+state and a lifecycle dependency lane that lets promotion progress while its SQL
+caller waits. Add the function's signature, defaults, strict NULL handling and
+named argument syntax as exercised by the C contract. Reload must neither
+redefine code under the waiter/worker nor hold
+a lock that the worker needs while draining that waiter. Preserve cancellation,
+statement timeout, warning/false on promotion timeout, expression order and
+explicit transactions. An accepted request survives cancellation of its waiter.
+The full C oracle remains the acceptance target. Design reviews agree that
+replay safety precedes the SQL wrapper; private copies of the whole data directory
+are not a required C mechanism. No coordination is introduced.
 
 ### Timeline-qualified native WAL namespace
 
@@ -663,9 +741,9 @@ review corrected the utility entry point's description.
 `bin/pg_ctl` currently implements only native promote. At this checkpoint,
 Patroni's entire promotion method was unverified. The later native pg_controldata
 milestone above closes that utility and wait gap. SQL
-`pg_promote(wait => true)` also remains open: the current SELECT path holds
-operation admission, so it needs a deferred wait that releases admission before
-the promotion worker can drain it. Extend physical
+`pg_promote(wait => true)` also remains open. The SQL promotion oracle above
+establishes its reader-preserving inline-wait requirements; releasing admission
+alone is insufficient for the current storage bridge. Extend physical
 follow/rejoin to child histories with divergence rejection and safe reseed.
 Synchronous commit waits, the remaining Patroni interfaces and C physical
 compatibility remain in the full goal. No coordination is introduced. This
