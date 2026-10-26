@@ -28,7 +28,8 @@
        (and (typep xid '(integer 3 18446744073709551615))
             (>= (xid32-of xid) 3) (>= xid horizon)))
       (t (member type (list +wal-record-batch-start+ +wal-record-pages+
-                            +wal-record-logical-changes+ +wal-record-xid-reservation+))))))
+                            +wal-record-logical-changes+ +wal-record-xid-reservation+
+                            +wal-record-running-xacts+))))))
 
 (defun physical-row-replay-images-allowed-p (images horizon)
   ;; Unknown, maintenance and contributor-free images cannot pass a reader.

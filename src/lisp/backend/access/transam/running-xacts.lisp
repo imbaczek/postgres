@@ -153,3 +153,31 @@ NIL state stays unknown until an anchor. Inferred XIDs may already have aborted.
           (getf result :complete) complete
           (getf result :running) (when complete (append running (nreverse added))))
     result))
+
+(defun wal-running-xacts-record-info (record)
+  (unless (and (= (wal-record-type record) +wal-record-running-xacts+)
+               (>= (wal-record-version record) 7)
+               (zerop (wal-record-xid record))
+               (typep (wal-record-start record) '(unsigned-byte 64))
+               (typep (wal-record-end record) '(unsigned-byte 64))
+               (= (wal-record-end record)
+                  (+ (wal-record-start record) +wal-header-size+
+                     (length (wal-record-payload record))))
+               (> (wal-record-end record) (wal-record-start record))
+               (= (floor (wal-record-start record) +wal-segment-size+)
+                  (floor (1- (wal-record-end record)) +wal-segment-size+)))
+    (error "invalid native running transaction record"))
+  (wal-decode-running-xacts (wal-record-payload record)))
+
+(defun wal-append-running-xacts-under-lock (committer)
+  (sb-thread:with-mutex (*xid-lock*)
+    ;; Standalone WAL callers do not necessarily register transactions.
+    ;; Only the actual allocator registry can provide coverage.
+    (when (member committer *active-xids* :test #'eql)
+      (let* ((complete (<= (length *active-xids*) +running-xacts-limit+))
+             (payload (wal-encode-running-xacts
+                       *next-xid*
+                       (when complete (sort (copy-list *active-xids*) #'<))
+                       complete)))
+        (wal-append-batch-start)
+        (wal-append-record +wal-record-running-xacts+ 0 payload)))))

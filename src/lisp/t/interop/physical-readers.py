@@ -1,4 +1,5 @@
 import subprocess
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -57,6 +58,23 @@ def applied(source, target):
     return position
 
 
+def running_snapshot_end(base, root):
+    output = control(base, root, """
+      (sb-thread:with-mutex (*wal-lock*)
+        (let ((end nil))
+          (wal-scan (lambda (record)
+                      (when (= (wal-record-type record) +wal-record-running-xacts+)
+                        (setf end (wal-record-end record)))))
+          (format t "~&RUNNING-END=~d~%" end)))
+    """, server="source")
+    return int(re.search(r"RUNNING-END=(\d+)", output)[1])
+
+
+def replay_at(target, position):
+    lsn = f"{position >> 32:X}/{position & 0xffffffff:X}"
+    wait(target, f"SELECT pg_last_wal_replay_lsn() = '{lsn}'::pg_lsn", True)
+
+
 def check(base, root, source, target, readers, older):
     before = [(1, "before")]
     begin_readers(readers, before)
@@ -77,17 +95,17 @@ def check(base, root, source, target, readers, older):
     applied(source, target)
     current = [(1, "after"), (2, "new")]
     begin_readers(readers, current)
-    floor = scalar(target, "SELECT pg_last_wal_replay_lsn()")
     older.commit()
+    anchor = running_snapshot_end(base, root)
     query(source, "INSERT INTO row_barriers VALUES (2)")
     received(source, target)
     time.sleep(0.3)
-    assert scalar(target, "SELECT pg_last_wal_replay_lsn()") == floor
+    replay_at(target, anchor)
     assert scalar(target, "SELECT count(*) FROM row_barriers") == 1
     begin_readers(readers, current)
     readers[0].commit()
     time.sleep(0.2)
-    assert scalar(target, "SELECT pg_last_wal_replay_lsn()") == floor
+    replay_at(target, anchor)
     readers[1].commit()
     applied(source, target)
     assert scalar(target, "SELECT count(*) FROM row_barriers") == 2
@@ -98,12 +116,12 @@ def check(base, root, source, target, readers, older):
     query(source, "INSERT INTO row_barriers VALUES (50)")
     applied(source, target)
     begin_readers(readers, current)
-    floor = scalar(target, "SELECT pg_last_wal_replay_lsn()")
     query(older, "UPDATE promotion_sql_items SET label='older-pending' WHERE id=1")
     query(source, "INSERT INTO row_barriers VALUES (51)")
+    anchor = running_snapshot_end(base, root)
     received(source, target)
     control(base, root, "(physical-recovery-replay)")
-    assert scalar(target, "SELECT pg_last_wal_replay_lsn()") == floor
+    replay_at(target, anchor)
     assert scalar(target, "SELECT count(*) FROM row_barriers WHERE id=51") == 0
     begin_readers(readers, current)
     older.commit()
@@ -115,14 +133,14 @@ def check(base, root, source, target, readers, older):
     print("physical-readers: an older page contributor blocks a newer commit PASS", flush=True)
 
     begin_readers(readers, current)
-    floor = scalar(target, "SELECT pg_last_wal_replay_lsn()")
     control(base, root, f'(load "{base}/t/physical-row-replay-native.lisp")', server="source")
     control(base, root, "(row-replay-test-legacy-next-page-batch)", server="source")
     query(source, "INSERT INTO row_barriers VALUES (52)")
+    anchor = running_snapshot_end(base, root)
     query(source, "INSERT INTO row_barriers VALUES (53)")
     received(source, target)
     control(base, root, "(physical-recovery-replay)")
-    assert scalar(target, "SELECT pg_last_wal_replay_lsn()") == floor
+    replay_at(target, anchor)
     assert scalar(target, "SELECT count(*) FROM row_barriers WHERE id>=50") == 0
     begin_readers(readers, current)
     for reader in readers:
@@ -191,10 +209,11 @@ def check(base, root, source, target, readers, older):
                 assert time.monotonic() < deadline
                 time.sleep(0.05)
             query(source, "INSERT INTO promotion_sql_items VALUES (3,'vacuum-interleaving')")
+            anchor = running_snapshot_end(base, root)
             received(source, target)
             control(base, root, "(physical-recovery-replay)")
             begin_readers(readers, current)
-            assert scalar(target, "SELECT pg_last_wal_replay_lsn()") == delete_end
+            replay_at(target, anchor)
             assert scalar(target, "SELECT count(*) FROM promotion_sql_items WHERE id=3") == 0
         finally:
             release.touch()

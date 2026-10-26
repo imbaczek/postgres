@@ -19,6 +19,11 @@
 
 (defconstant +wal-record-xid-reservation+ 12)
 
+(defconstant +wal-record-running-xacts+ 14)
+
+(declaim (ftype function wal-running-xacts-record-info
+                wal-append-running-xacts-under-lock))
+
 (defconstant +wal-catalog-chunk-header-size+ 8)
 (defconstant +wal-version-v2+ 2)
 (defconstant +wal-version-v3+ 3)
@@ -899,6 +904,7 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
     (funcall after-durable-function)
     (return-from wal-commit-transaction (values)))
   (with-wal-critical
+    (wal-append-running-xacts-under-lock xid)
     (let* ((split-p *wal-pending-btree-split*)
            (images (wal-page-images)))
       (wal-record-page-xids-at-batch-start
@@ -1241,6 +1247,7 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
                               +wal-record-catalog-commit+
                               +wal-record-maintenance+))
            (and (= type +wal-record-xid-reservation+) (>= version 7))
+           (and (= type +wal-record-running-xacts+) (>= version 7))
            (and (= type +wal-record-end-of-recovery+) (>= version 7))
            (and (= type +wal-record-logical-changes+)
                 (>= version +wal-version-v5+))
@@ -1519,7 +1526,7 @@ src/backend/access/transam/xlogreader.c."
   (values))
 
 (defun wal-note-recovery-batch-record (record)
-  "A reservation terminal must immediately follow a valid empty batch marker."
+  "Allocation and running-transaction terminals require an empty batch marker."
   (wal-require-ordinary-record-type (wal-record-type record))
   (let ((type (wal-record-type record)))
     (cond
@@ -1527,7 +1534,7 @@ src/backend/access/transam/xlogreader.c."
        (unless (and (zerop (wal-record-xid record)) (zerop (length (wal-record-payload record))))
          (error "invalid WAL batch-start marker"))
        (setf *wal-recovery-reservation-batch-clean-p* t))
-      ((/= type +wal-record-xid-reservation+)
+      ((not (member type (list +wal-record-xid-reservation+ +wal-record-running-xacts+)))
        (setf *wal-recovery-reservation-batch-clean-p* nil)))))
 
 (defun wal-replay-record (record)
@@ -1617,6 +1624,12 @@ src/backend/access/transam/xlogreader.c."
       (#.+wal-record-checkpoint+
        (wal-recovery-validate-logical-terminal :other)
        (wal-checkpoint-record-snapshot record)
+       (wal-replay-finish-batch (lambda () #'values)))
+      (#.+wal-record-running-xacts+
+       (wal-recovery-validate-logical-terminal :other)
+       (unless *wal-recovery-reservation-batch-clean-p*
+         (error "running transaction snapshot requires an empty metadata batch"))
+       (wal-running-xacts-record-info record)
        (wal-replay-finish-batch (lambda () #'values)))
       (#.+wal-record-xid-reservation+
        (wal-recovery-validate-logical-terminal :other)
@@ -1806,7 +1819,8 @@ src/backend/access/transam/xlogreader.c."
 (defun wal-terminal-record-type-p (type)
   (member type (list +wal-record-commit+ +wal-record-catalog+
                      +wal-record-catalog-commit+ +wal-record-checkpoint+
-                     +wal-record-maintenance+ +wal-record-clog-reset+ +wal-record-xid-reservation+)
+                     +wal-record-maintenance+ +wal-record-clog-reset+ +wal-record-xid-reservation+
+                     +wal-record-running-xacts+)
           :test #'=))
 
 (defun wal-slot-terminal-ack-p (slot target-lsn)

@@ -133,3 +133,124 @@
       (let ((bad (copy-list state)))
         (setf (first bad) :unexpected)
         (ok (intake-fails-p (lambda () (pg::running-xacts-check-state bad)))))))
+
+(deftest running-xacts-native-record-requires-v7-and-empty-metadata-batch
+    (let* ((payload (pg::wal-encode-running-xacts 10 '(3 9) t))
+           (bytes (pg::wal-encode-record pg::+wal-record-running-xacts+ 0 32 payload))
+           (record (pg::wal-decode-record bytes 32)))
+      (ok (equal '(3 9) (getf (pg::wal-running-xacts-record-info record) :running)))
+      (ok (zerop (hash-table-count
+                  (history-drop-proof (history-batch pg::+wal-record-running-xacts+ payload)))))
+      (ok (intake-fails-p
+           (lambda () (history-drop-proof (list (list pg::+wal-record-running-xacts+ payload))))))
+      (ok (intake-fails-p
+           (lambda ()
+             (history-drop-proof
+              (list (list pg::+wal-record-batch-start+ (empty-octets))
+                    (list pg::+wal-record-pages+ (pg::wal-encode-page-images nil 0))
+                    (list pg::+wal-record-running-xacts+ payload))))))
+      (setf (pg::wal-record-xid record) 3)
+      (ok (intake-fails-p (lambda () (pg::wal-running-xacts-record-info record))))
+      (pg::wal-set-u16 bytes 4 6)
+      (pg::wal-set-u32 bytes 28 0)
+      (pg::wal-set-u32 bytes 28 (pg::wal-crc32 bytes))
+      (ok (intake-fails-p (lambda () (pg::wal-decode-record bytes 32))))))
+
+(deftest source-commit-records-running-snapshot-before-committing-batch
+    (call-with-wal-allocation-fixture
+     (lambda ()
+       (let ((writer (pg::assign-xid)) (other (pg::assign-xid)) (records nil))
+         (pg::wal-commit-transaction writer
+                                     (lambda () (pg::clog-set writer 1) (pg::release-xid writer)))
+         (pg::wal-scan (lambda (record) (push record records)))
+         (setf records (nreverse records))
+         (ok (equal '(6 12 6 14 6 2) (mapcar #'pg::wal-record-type records)))
+         (let ((snapshot (pg::wal-running-xacts-record-info (fourth records))))
+           (ok (= 5 (getf snapshot :next-xid)))
+           (ok (equal (list writer other) (getf snapshot :running)))
+           (ok (getf snapshot :complete))
+           (ok (< (getf snapshot :next-xid) pg::*xid-batch-end*)))
+         (ok (not (member writer pg::*active-xids*)))
+         (ok (member other pg::*active-xids*))))))
+
+(deftest source-running-snapshot-holds-wal-and-xid-locks-through-insertion
+    (call-with-wal-allocation-fixture
+     (lambda ()
+       (let ((writer (pg::assign-xid))
+             (append-record (symbol-function 'pg::wal-append-record))
+             (checked 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::wal-append-record)
+                      (lambda (type xid payload)
+                        (when (or (= type pg::+wal-record-running-xacts+)
+                                  (and (= type pg::+wal-record-batch-start+) (zerop checked)))
+                          (ok (sb-thread:holding-mutex-p pg::*wal-lock*))
+                          (ok (sb-thread:holding-mutex-p pg::*xid-lock*))
+                          (incf checked))
+                        (funcall append-record type xid payload)))
+                (pg::wal-commit-transaction writer
+                                            (lambda () (pg::clog-set writer 1) (pg::release-xid writer)))
+                (ok (= 2 checked)))
+           (setf (symbol-function 'pg::wal-append-record) append-record))))))
+
+(deftest running-xacts-redo-validates-without-changing-local-transaction-state
+    (let* ((pg::*next-xid* 50) (pg::*active-xids* '(49))
+                               (payload (pg::wal-encode-running-xacts 10 '(3 9) t))
+                               (record (pg::wal-decode-record
+                                        (pg::wal-encode-record pg::+wal-record-running-xacts+ 0 32 payload) 32))
+                               (pg::*wal-checkpoint-lsn* 0))
+      (pg::with-physical-replay-staging ()
+        (pg::wal-replay-record
+         (pg::wal-decode-record
+          (pg::wal-encode-record pg::+wal-record-batch-start+ 0 0 (empty-octets)) 0))
+        (pg::wal-replay-record record)
+        (ok (not pg::*wal-recovery-group-active*)))
+      (ok (= 50 pg::*next-xid*))
+      (ok (equal '(49) pg::*active-xids*))
+      (ok (= 10 (pg::physical-replay-observed-next-xid record 3)))
+      (ok (= 50 (pg::physical-replay-observed-next-xid record 50)))))
+
+(deftest logical-reader-advances-through-running-snapshots-without-row-events
+    (dolist (mixed '(nil t))
+      (call-with-wal-allocation-fixture
+       (lambda ()
+         (let* ((owner (gensym "RUNNING-READER"))
+                (pg::*wal-logical-slot-owner* owner)
+                (pg::*wal-logical-slot-read-progress* nil)
+                (slot (pg::make-wal-replication-slot
+                       :name "running" :database-oid 1 :restart-lsn 0
+                       :consistent-lsn 0 :confirmed-flush-lsn 0 :active-owner owner)))
+           (setf (gethash "running" pg::*wal-replication-slots*) slot)
+           (pg::wal-append-batch-start)
+           (when mixed
+             (pg::wal-append-record pg::+wal-record-pages+ 0 (pg::wal-encode-page-images nil 0)))
+           (pg::wal-append-record pg::+wal-record-running-xacts+ 0
+                                  (pg::wal-encode-running-xacts 10 '(3 9) t))
+           (pg::wal-flush)
+           (if mixed
+               (ok (intake-fails-p (lambda () (pg::wal-logical-slot-read-transactions "running"))))
+               (multiple-value-bind (transactions progress)
+                   (pg::wal-logical-slot-read-transactions "running")
+                 (ok (null transactions))
+                 (ok (= progress pg::*wal-durable-lsn*)))))))))
+
+(deftest source-running-snapshot-overflow-is-explicit-and-legacy-callers-give-no-proof
+    (call-with-wal-allocation-fixture
+     (lambda ()
+       (let ((pg::*next-xid* 100000)
+             (pg::*active-xids* (loop for xid from 3 below (+ 4 pg::+running-xacts-limit+)
+                                      collect xid)))
+         (sb-thread:with-mutex (pg::*wal-lock*)
+           (pg::wal-append-running-xacts-under-lock 3)
+           (pg::wal-flush))
+         (let ((records nil))
+           (pg::wal-scan (lambda (record) (push record records)))
+           (let ((info (pg::wal-running-xacts-record-info (first records))))
+             (ok (= 100000 (getf info :next-xid)))
+             (ok (not (getf info :complete)))
+             (ok (null (getf info :running))))))
+       (let ((end pg::*wal-end-lsn*) (pg::*active-xids* nil))
+         (sb-thread:with-mutex (pg::*wal-lock*)
+           (ok (null (pg::wal-append-running-xacts-under-lock 3))))
+         (ok (= end pg::*wal-end-lsn*))))))

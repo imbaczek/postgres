@@ -144,6 +144,8 @@ Direct control operation; does not promote, follow a network source or coordinat
              (setf next-xid (max next-xid (advance-full-xid xid))))))
     (observe (wal-record-xid record))
     (cond
+      ((= (wal-record-type record) +wal-record-running-xacts+)
+       (setf next-xid (max next-xid (getf (wal-running-xacts-record-info record) :next-xid))))
       ((= (wal-record-type record) +wal-record-checkpoint+)
        (let ((snapshot (wal-checkpoint-record-snapshot record)))
          (when snapshot

@@ -49,11 +49,14 @@
               (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill))))))
 
 (defun physical-test-error-after-redo ()
-  (setf *physical-replay-test-hook*
-        (lambda (point record)
-          (declare (ignore record))
-          (when (eq point :after-redo)
-            (error "injected redo failure after mutation")))))
+  (let ((saw-pages nil))
+    (setf *physical-replay-test-hook*
+          (lambda (point record)
+            (when (and (eq point :before-record)
+                       (= (wal-record-type record) +wal-record-pages+))
+              (setf saw-pages t))
+            (when (and (eq point :after-redo) saw-pages)
+              (error "injected redo failure after mutation"))))))
 
 (defun physical-test-hide-disk-table (directory name)
   "Damage only an offline test clone: omit a base table without catalog WAL."

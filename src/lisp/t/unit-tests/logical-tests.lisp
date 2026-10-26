@@ -2159,6 +2159,9 @@
 (defun logical-test-commit-insert (xid table values)
   (let* ((*backend* (make-backend :xid xid))
          (*active-xids* (cons xid *active-xids*)))
+    ;; Model allocation as well as registration: every active XID precedes NEXT.
+    (sb-thread:with-mutex (*xid-lock*)
+      (setf *next-xid* (max *next-xid* (advance-full-xid xid))))
     (setf (backend-database *backend*) "postgres"
           (backend-state *backend*) :in-progress)
     (logical-note-row-change :insert table :new-values values)

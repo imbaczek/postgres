@@ -79,9 +79,31 @@ checked target '(physical-recovery-replay)' drain-read-batches
 before=$(sql "$TARGET_PORT" 'SELECT pg_last_wal_replay_lsn()')
 sql "$PORT" "INSERT INTO data VALUES (2,'first')"
 export_wal
+partial_boundary=$(python3 - "$TMP/frames.bin" <<'PY'
+import struct
+import sys
+data = open(sys.argv[1], "rb").read()
+offset = 0
+snapshots = []
+while offset < len(data):
+    start, length = struct.unpack_from("<QI", data, offset)
+    offset += 12
+    record = data[offset:offset + length]
+    assert len(record) == length and record[:4] == b"PGWL"
+    if struct.unpack_from("<H", record, 6)[0] == 14:
+        assert record[32:40] == b"PGRUNX01"
+        snapshots.append(start + length)
+    offset += length
+assert len(snapshots) == 1
+end = snapshots[0]
+print(f"{end >> 32:X}/{end & 0xffffffff:08X}")
+PY
+)
 checked target "(physical-test-receive-file \"$TMP/frames.bin\" :omit-last t)" partial
 checked target '(physical-recovery-replay)' partial-replay
-test "$(sql "$TARGET_PORT" 'SELECT pg_last_wal_replay_lsn()')" = "$before"
+# Metadata is independently complete; the missing row terminal publishes no rows.
+test "$(sql "$TARGET_PORT" 'SELECT pg_last_wal_replay_lsn()')" = "$partial_boundary"
+test "$(sql "$TARGET_PORT" "SELECT pg_last_wal_replay_lsn() > '$before'::pg_lsn")" = t
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = "$base_count"
 PGCONNECT_TIMEOUT=2 "$PSQL" -X \
     -d "host=127.0.0.1 port=$TARGET_PORT user=postgres dbname=postgres replication=database" \

@@ -121,7 +121,11 @@ a still-referenced relfilenode when checking a terminal's delete list."
         identity removed))
       (t
        (wal-recovery-validate-logical-terminal :other)
-       (cond ((= type +wal-record-xid-reservation+)
+       (cond ((= type +wal-record-running-xacts+)
+              (unless *wal-recovery-reservation-batch-clean-p*
+                (error "running transaction snapshot cannot finish a nonempty batch"))
+              (wal-running-xacts-record-info record))
+             ((= type +wal-record-xid-reservation+)
               (unless *wal-recovery-reservation-batch-clean-p*
                 (error "reservation cannot finish a nonempty batch in history"))
               (wal-xid-reservation-record-bound record))
