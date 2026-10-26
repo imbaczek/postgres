@@ -75,6 +75,16 @@
       (physical-restartpoint-check-wal-prefix metadata prefix)
       (values metadata (subseq bytes (+ 32 text-length) catalog-end) prefix))))
 
+(defun physical-restartpoint-check-source-xids (metadata)
+  (let ((source (getf metadata :source-xids)))
+    (when source
+      (running-xacts-check-state source)
+      (unless (and (= (getf source :through) (getf metadata :lsn))
+                   (= (getf source :next-xid) (getf metadata :next-xid))
+                   (<= (getf metadata :base) (getf source :anchor)))
+        (error "restartpoint source membership differs from its replay boundary"))))
+  (values))
+
 (defun physical-restartpoint-check-metadata (metadata catalog-bytes state &optional prefix-bytes)
   (physical-history-check-plist
    metadata (append '(:version :system-id :cluster-identity :timeline :manifest-digest
@@ -84,7 +94,12 @@
                     (when (eql 4 (getf metadata :version)) '(:wal-prefix-digest))))
   (unless (and (case (getf metadata :version)
                  (1 (= (length metadata) 22)) (2 (= (length metadata) 24))
-                 (3 (= (length metadata) 26)) (4 (= (length metadata) 28)) (otherwise nil))
+                 (3 (= (length metadata) 26))
+                 (4 (or (= (length metadata) 28)
+                        (and (= (length metadata) 30)
+                             (loop for key in metadata by #'cddr
+                                     thereis (eq key :source-xids)))))
+                 (otherwise nil))
                (eql (getf metadata :system-id) (getf state :system-id))
                (equal (getf metadata :cluster-identity) (getf state :cluster-identity))
                (eql (getf metadata :timeline) (getf state :timeline))
@@ -98,6 +113,7 @@
                           '(integer 3 18446744073709551616)
                           '(integer 3 18446744073709551615))))
     (error "foreign or malformed physical restartpoint metadata"))
+  (physical-restartpoint-check-source-xids metadata)
   (let ((reservation (getf metadata :source-reservation)))
     (when reservation
       (unless (and (physical-source-reservation-valid-p reservation)
@@ -155,15 +171,19 @@
          (seen (loop for node being the hash-keys of *physical-replay-seen-relfilenodes* collect node)))
     (dolist (entry forks)
       (pushnew (parse-integer (first entry) :start 5 :junk-allowed t) seen))
-    (list :version 4 :system-id (getf state :system-id)
-          :cluster-identity (getf state :cluster-identity) :timeline (getf state :timeline)
-          :manifest-digest (getf state :manifest-digest) :base (getf state :end)
-          :lsn *last-replay-lsn* :prefix-digest digest :next-xid *next-xid*
-          :forks forks :seen (sort seen #'<)
-          :source-checkpoint (copy-list (getf state :source-checkpoint))
-          :source-reservation (copy-list (getf state :source-reservation))
-          :wal-prefix-digest (when prefix-bytes
-                               (physical-store-update-digest #xCBF29CE484222325 prefix-bytes)))))
+    (let ((metadata
+            (list :version 4 :system-id (getf state :system-id)
+                  :cluster-identity (getf state :cluster-identity) :timeline (getf state :timeline)
+                  :manifest-digest (getf state :manifest-digest) :base (getf state :end)
+                  :lsn *last-replay-lsn* :prefix-digest digest :next-xid *next-xid*
+                  :forks forks :seen (sort seen #'<)
+                  :source-checkpoint (copy-list (getf state :source-checkpoint))
+                  :source-reservation (copy-list (getf state :source-reservation))
+                  :wal-prefix-digest (when prefix-bytes
+                                       (physical-store-update-digest #xCBF29CE484222325 prefix-bytes)))))
+      (when (getf state :source-xids)
+        (setf metadata (append metadata (list :source-xids (copy-tree (getf state :source-xids))))))
+      metadata)))
 
 (defun physical-restartpoint-publish (digest)
   "Called at a complete applied terminal with replay/admission and store locks held."
@@ -261,11 +281,14 @@
                     (getf *physical-recovery-state* :source-checkpoint)
                     (copy-list (getf metadata :source-checkpoint))
                     (getf *physical-recovery-state* :source-reservation)
-                    (copy-list (getf metadata :source-reservation))))
+                    (copy-list (getf metadata :source-reservation))
+                    (getf *physical-recovery-state* :source-xids)
+                    (copy-tree (getf metadata :source-xids))))
             (progn
               (physical-recovery-reset-replay-history)
               ;; Latest control visibility belongs to REQUIRED, not the older base.
-              (setf *next-xid* (canonical-next-full-xid (getf state :next-xid))
+              (setf (getf *physical-recovery-state* :source-xids) nil
+                    *next-xid* (canonical-next-full-xid (getf state :next-xid))
                     *xid-batch-end* *next-xid*)))
         (setf *last-replay-lsn* start *wal-checkpoint-lsn* start)
         start))))

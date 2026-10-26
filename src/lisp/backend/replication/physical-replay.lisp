@@ -212,6 +212,29 @@ Direct control operation; does not promote, follow a network source or coordinat
       (error "observed XID exceeds the source's durable allocation reservation"))
     (list :version 1 :through (wal-record-end record) :bound bound :complete complete)))
 
+(defun physical-source-xids-next (prior record observed-next)
+  (when prior
+    (running-xacts-check-state prior)
+    (when (> (getf prior :through) (wal-record-start record))
+      (error "source transaction history moved backwards")))
+  (let ((type (wal-record-type record)) (end (wal-record-end record)))
+    (cond
+      ((= type +wal-record-running-xacts+)
+       (let ((snapshot (wal-running-xacts-record-info record)))
+         (unless (and (= observed-next (getf snapshot :next-xid))
+                      (or (null prior) (<= (getf prior :next-xid) observed-next)))
+           (error "source running snapshot differs from observed actual next XID"))
+         (running-xacts-anchor snapshot end)))
+      ((= type +wal-record-clog-reset+) nil)
+      ((null prior) nil)
+      (t
+       (let ((next (running-xacts-advance
+                    prior observed-next end
+                    :committed-xid (when (= type +wal-record-commit+) (wal-record-xid record)))))
+         (when (< (wal-record-version record) 7)
+           (setf (getf next :complete) nil (getf next :running) nil))
+         next)))))
+
 (defun physical-replay-create-heap-forks (catalog)
   "Native catalog terminals redo a heap's first appearance in catalog history.
 Never recreate a previously established live heap or synthesize index contents.
@@ -234,7 +257,7 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
       (database-tables database)))
    (catalog-databases catalog)))
 
-(defun physical-replay-publish-progress (record next-xid reservation)
+(defun physical-replay-publish-progress (record next-xid reservation source-xids)
   ;; Make redo durable before recording the applied terminal and visibility.
   (smgr-fsync-all)
   (clog-fsync)
@@ -242,14 +265,15 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
   (fsync-directory (merge-pathnames "global/" *pgdata*))
   (physical-recovery-save-progress (wal-record-end record) next-xid)
   (sb-thread:with-mutex (*xid-lock*)
-    (setf (getf *physical-recovery-state* :source-reservation) (copy-list reservation)
+    (setf (getf *physical-recovery-state* :source-xids) (copy-tree source-xids)
+          (getf *physical-recovery-state* :source-reservation) (copy-list reservation)
           *next-xid* next-xid *xid-batch-end* next-xid
           *last-replay-lsn* (wal-record-end record))
     (when (= (wal-record-type record) +wal-record-checkpoint+)
       (setf (getf *physical-recovery-state* :source-checkpoint)
             (wal-checkpoint-record-snapshot record)))))
 
-(defun physical-replay-publish-terminal (record next-xid reservation)
+(defun physical-replay-publish-terminal (record next-xid reservation source-xids)
   "Durably finish pages/CLOG/catalog before publishing an applied terminal."
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-redo record))
@@ -267,7 +291,7 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
           (setf (gethash node *physical-replay-seen-relfilenodes*) t))))
     (unless *physical-replay-restarting-p*
       (let ((*catalog* catalog)) (physical-recovery-check-live-files)))
-    (physical-replay-publish-progress record next-xid reservation)
+    (physical-replay-publish-progress record next-xid reservation source-xids)
     (setf *catalog* catalog)
     (catalog-refresh-oldest-relfrozenxid)
     (wal-clear-page-cache))
@@ -278,6 +302,7 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
   "Called only before listeners or under operation quiescence, with no old readers."
   (with-physical-replay-staging ()
     (let ((next-xid *next-xid*)
+          (source-xids (copy-tree (getf *physical-recovery-state* :source-xids)))
           (reservation (copy-list (getf *physical-recovery-state* :source-reservation))))
       (physical-store-map-durable-records
        *physical-receive-store*
@@ -286,10 +311,11 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
          (when *physical-replay-test-hook*
            (funcall *physical-replay-test-hook* :before-record record))
          (setf next-xid (physical-replay-observed-next-xid record next-xid)
-               reservation (physical-source-reservation-next reservation record next-xid))
+               reservation (physical-source-reservation-next reservation record next-xid)
+               source-xids (physical-source-xids-next source-xids record next-xid))
          (wal-replay-record record)
          (unless *wal-recovery-group-active*
-           (physical-replay-publish-terminal record next-xid reservation)))
+           (physical-replay-publish-terminal record next-xid reservation source-xids)))
        :start-lsn start-lsn)))
   *last-replay-lsn*)
 

@@ -24,6 +24,16 @@
                             (string->bytes (format nil "~d~%" (sb-posix:getpid))))
                            (loop (sleep 1))))))
                  (setf end (physical-promotion-resume-pending))))))
+         (let* ((metadata (physical-restartpoint-read *physical-recovery-state*))
+                (expected (getf metadata :source-xids))
+                (restored (getf *physical-recovery-state* :source-xids)))
+           (assert (equal expected restored))
+           (when restored
+             (running-xacts-check-state restored)
+             (assert (= *last-replay-lsn* (getf restored :through)))
+             (assert (= *next-xid* (getf restored :next-xid))))
+           (format t "promotion-resume-native: source-membership ~a PASS~%"
+                   (if restored "restored" "unknown")))
          (assert (= 3 (getf *physical-recovery-state* :phase)))
          (assert (= *next-xid* (getf *physical-recovery-state* :observed-next-xid)))
          (assert (= *last-replay-lsn* (getf *physical-recovery-state* :applied)))

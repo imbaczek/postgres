@@ -66,3 +66,17 @@
     (unless (remhash name (database-tables database))
       (error "test clone has no table ~a" name))
     (wal-atomic-write-bytes (catalog-path) (catalog-image-bytes))))
+
+(defun physical-test-verify-source-xids (&key generation)
+  (let ((source (sb-thread:with-mutex (*xid-lock*)
+                  (let ((source (copy-tree (getf *physical-recovery-state* :source-xids))))
+                    (running-xacts-check-state source)
+                    (assert (getf source :complete))
+                    (assert (= *next-xid* (getf source :next-xid)))
+                    (assert (= *last-replay-lsn* (getf source :through)))
+                    source))))
+    (when generation
+      (let ((metadata (physical-restartpoint-read *physical-recovery-state*)))
+        (assert (equal source (getf metadata :source-xids)))))
+    (format t "source-xids: applied membership~a PASS~%"
+            (if generation " and restartpoint generation" ""))))

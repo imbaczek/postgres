@@ -59,7 +59,8 @@
             (setf (getf state :wal-prefix-lsn) (getf metadata :lsn)
                   (getf state :wal-prefix-bytes) prefix
                   (getf state :source-checkpoint) (copy-list (getf metadata :source-checkpoint))
-                  (getf state :source-reservation) (copy-list (getf metadata :source-reservation)))
+                  (getf state :source-reservation) (copy-list (getf metadata :source-reservation))
+                  (getf state :source-xids) (copy-tree (getf metadata :source-xids)))
             (values state metadata prefix generation)))))))
 
 (defun physical-promotion-open-pending-store (state)

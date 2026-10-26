@@ -80,11 +80,11 @@
           (setf (gethash key sizes) (max size (1+ block)))))))
   (values))
 
-(defun physical-row-replay-publish-terminal (record next-xid reservation)
+(defun physical-row-replay-publish-terminal (record next-xid reservation source-xids)
   ;; Publish progress only after redo; restart can repeat an unpublished batch.
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-redo record))
-  (physical-replay-publish-progress record next-xid reservation)
+  (physical-replay-publish-progress record next-xid reservation source-xids)
   (wal-clear-page-cache)
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-progress record)))
@@ -93,6 +93,7 @@
   ;; Publish each safe terminal in order, and defer at the first unsafe batch.
   (with-physical-replay-staging ()
     (let ((next-xid *next-xid*)
+          (source-xids (copy-tree (getf *physical-recovery-state* :source-xids)))
           (reservation (copy-list (getf *physical-recovery-state* :source-reservation))))
       (physical-store-map-durable-records
        *physical-receive-store*
@@ -103,14 +104,15 @@
          (when *physical-replay-test-hook*
            (funcall *physical-replay-test-hook* :before-record record))
          (setf next-xid (physical-replay-observed-next-xid record next-xid)
-               reservation (physical-source-reservation-next reservation record next-xid))
+               reservation (physical-source-reservation-next reservation record next-xid)
+               source-xids (physical-source-xids-next source-xids record next-xid))
          (if (wal-terminal-record-type-p (wal-record-type record))
              (sb-thread:with-mutex (*wal-lock*)
                (unless (physical-row-replay-images-allowed-p *wal-recovery-page-images* horizon)
                  (return-from physical-row-replay-prefix :deferred))
                (physical-row-replay-preflight-images (reverse *wal-recovery-page-images*))
                (wal-replay-record record)
-               (physical-row-replay-publish-terminal record next-xid reservation))
+               (physical-row-replay-publish-terminal record next-xid reservation source-xids))
              (wal-replay-record record)))
        :start-lsn *last-replay-lsn*)))
   *last-replay-lsn*)

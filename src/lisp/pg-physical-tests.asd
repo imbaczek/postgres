@@ -26,6 +26,7 @@
                (:file "t/timeline-tests")
                (:file "t/timeline-publication-tests")
                (:file "t/physical-restartpoint-tests")
+               (:file "t/source-xids-replay-tests")
                (:file "t/physical-prefix-tests")
                (:file "t/promotion-intent-tests")
                (:file "t/promotion-wal-tests")

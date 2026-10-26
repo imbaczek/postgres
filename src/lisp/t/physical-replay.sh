@@ -111,6 +111,7 @@ PGCONNECT_TIMEOUT=2 "$PSQL" -X \
 test "$(awk -F'|' '{print $3}' "$TMP/identify-received")" = "$(sql "$TARGET_PORT" 'SELECT pg_last_wal_receive_lsn()')"
 checked target "(physical-test-receive-file \"$TMP/frames.bin\" :only-last t)" terminal
 checked target '(physical-recovery-replay)' first-replay
+checked target '(physical-test-verify-source-xids)' first-membership
 compare
 test "$(sql "$TARGET_PORT" 'SELECT pg_last_wal_receive_lsn()')" = "$(sql "$TARGET_PORT" 'SELECT pg_last_wal_replay_lsn()')"
 checked target '(reload)' live-reload
@@ -155,7 +156,9 @@ TARGET=
 start_target
 compare
 checked target '(assert (< (physical-store-floor-lsn *physical-receive-store*) *last-replay-lsn*))' old-floor-new-pointer
+checked target '(physical-test-verify-source-xids :generation t)' restored-pointer-membership
 checked target '(physical-recovery-restartpoint)' first-restartpoint
+checked target '(physical-test-verify-source-xids :generation t)' first-generation-membership
 # Redo failure after mutating pages must recover from the full retained prefix.
 sql "$PORT" "DELETE FROM data WHERE id=2; INSERT INTO data VALUES (4,'crash')"
 export_wal
@@ -168,6 +171,7 @@ test "$crash_status" -eq 137
 TARGET=
 start_target
 compare
+checked target '(physical-test-verify-source-xids)' redo-crash-membership
 test "$(sql "$TARGET_PORT" 'SELECT id FROM extra')" = 42
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM base_empty')" = 0
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM empty_after_base')" = 0
@@ -180,6 +184,7 @@ test "$crash_status" -eq 137
 TARGET=
 start_target
 compare
+checked target '(physical-test-verify-source-xids :generation t)' restored-floor-membership
 checked target '(physical-recovery-restartpoint)' second-restartpoint
 checked target '(assert (= 1 (length (directory (merge-pathnames "*.rp" (physical-restartpoint-directory))))))' generation-gc
 # A Lisp error must not reopen SQL over partially applied state.
