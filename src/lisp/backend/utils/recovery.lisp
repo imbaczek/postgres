@@ -52,10 +52,14 @@
   (when (member *physical-shutdown-state* '(:prepared :failed))
     (ereport "55000" "native standby shutdown is prepared; restart is required")))
 
+(define-condition physical-recovery-worker-shutdown (pg-error) ()
+  (:default-initargs :sqlstate "55000"
+                     :message "cannot start native recovery workers during shutdown"))
+
 (defun check-physical-recovery-worker-start ()
   (check-recovery-available)
   (when (or *physical-shutdown-state* (shutdown-in-progress-p))
-    (ereport "55000" "cannot start native recovery workers during shutdown")))
+    (error 'physical-recovery-worker-shutdown)))
 
 (defun check-recovery-available ()
   (when *physical-recovery-failed-p*

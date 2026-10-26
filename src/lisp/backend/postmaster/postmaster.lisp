@@ -31,6 +31,9 @@
 (defvar *shutdown-lock* (sb-thread:make-mutex :name "pg shutdown lock"))
 (defvar *shutdown-finished* nil)
 
+(defvar *shutdown-finalizing-p* nil
+  "The accept loop is stopping; the main thread must finalize storage before exit.")
+
 ;; Requested vs processed level.  Handlers only raise *PM-REQUESTED-MODE*, a
 ;; plain fixnum store with no lock; the worker observes it.  The mode is
 ;; monotonic (upward only), so there is nothing to reset and no lost-wakeup
@@ -77,7 +80,7 @@
 (declaim (special *live-operation-lock* *live-operation-cv*
                   *live-operation-backend-query-tokens*
                   *live-operation-admission-open*
-                  *live-operation-cleanup-backends*))
+                  *live-operation-cleanup-backends* *live-operation-depth*))
 
 (defun list-backends ()
   (sb-thread:with-mutex (*backend-registry-lock*)
@@ -203,24 +206,47 @@ command (idle) is ignored; the connection and its transaction state survive."
 ;;; ---- shutdown state machine ----
 
 (defun finish-shutdown ()
-  "Exit once every client connection has gone (smart/fast shutdown)."
-  (let ((go nil))
-    ;; Serialize the zero-connection check with ACCEPT plus its connection
-    ;; count update.  Otherwise shutdown can exit in the gap after ACCEPT
-    ;; returns but before the new socket is counted.
-    (sb-thread:with-mutex (*accept-lock*)
-      (when (and (<= +smart-shutdown+ (shutdown-mode) +fast-shutdown+)
-                 (sb-thread:with-mutex (*backend-registry-lock*)
-                   (zerop *n-connections*)))
-        (sb-thread:with-mutex (*shutdown-lock*)
-          (when (and (not *shutdown-finished*)
-                     (<= +smart-shutdown+ *shutdown* +fast-shutdown+))
-            (setf *accept-stop-requested* t
-                  *shutdown-finished* t
-                  go t)))))
-    (when go
-      (admin-log "database system is shut down")
-      (sb-ext:exit :code 0))))
+  "Request main-thread finalization after every client connection has gone."
+  ;; A backend can still hold live-operation admission here. Never join recovery
+  ;; workers, close admission, or exit from this cleanup stack.
+  (sb-thread:with-mutex (*accept-lock*)
+    (when (and (<= +smart-shutdown+ (shutdown-mode) +fast-shutdown+)
+               (sb-thread:with-mutex (*backend-registry-lock*)
+                 (zerop *n-connections*)))
+      (sb-thread:with-mutex (*shutdown-lock*)
+        (when (and (not *shutdown-finished*) (not *shutdown-finalizing-p*)
+                   (<= +smart-shutdown+ *shutdown* +fast-shutdown+))
+          (setf *shutdown-finalizing-p* t
+                *accept-stop-requested* t)))))
+  (values))
+
+(defun start-postmaster-recovery-workers ()
+  "Start recovery services, tolerating only a concurrent process shutdown."
+  (handler-case
+      (progn
+        (physical-follow-autostart)
+        (physical-restartpoint-start-worker))
+    (physical-recovery-worker-shutdown (condition)
+      ;; Shutdown can be processed between either guard and either start.
+      ;; A prepared recovery image without process shutdown is still an error.
+      (unless (shutdown-in-progress-p)
+        (error condition))))
+  (values))
+
+(defun prepare-postmaster-shutdown ()
+  "Finalize storage from MAIN after SERVE returns, outside live admission."
+  (when (plusp *live-operation-depth*)
+    (error "postmaster shutdown finalization requires an unadmitted main thread"))
+  (unless *shutdown-finalizing-p*
+    (error "postmaster shutdown finalization was not requested"))
+  (unless (sb-thread:with-mutex (*shutdown-lock*) *shutdown-finished*)
+    ;; Like C ShutdownXLOG, recovery shutdown publishes an applied restartpoint.
+    ;; The signal worker remains free to process SIGQUIT while this waits.
+    (when (recovery-in-progress-p)
+      (physical-recovery-prepare-shutdown))
+    (sb-thread:with-mutex (*shutdown-lock*)
+      (setf *shutdown-finished* t)))
+  (values))
 
 (defun maybe-finish-shutdown ()
   (when (and (shutdown-in-progress-p)
