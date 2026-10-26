@@ -214,7 +214,7 @@
               (physical-store-update-digest #xCBF29CE484222325 bytes)))))
 
 (defun recovery-manifest-path-p (name)
-  "Whitelist the native producer's file grammar before opening manifest paths."
+  "Whitelist native file grammars before opening paths; children remain unsupported."
   (and (stringp name)
        (or (member name '("PG_VERSION" "pg_xact" "global/pg_control"
                           "global/pg_catalog.dat" "global/pg_wal_control") :test #'equal)
@@ -223,9 +223,11 @@
                        (digits (if (uiop:string-suffix-p suffix ".vm")
                                    (subseq suffix 0 (- (length suffix) 3)) suffix)))
                   (and (plusp (length digits)) (every #'digit-char-p digits))))
-           (and (= (length name) 27) (uiop:string-prefix-p "pg_wal/" name)
-                (string= name ".wal" :start1 23)
-                (every (lambda (char) (digit-char-p char 16)) (subseq name 7 23))))))
+           (and (uiop:string-prefix-p "pg_wal/" name)
+                (uiop:string-suffix-p name ".wal")
+                (let ((stem (subseq name 7 (- (length name) 4))))
+                  (or (eql 1 (wal-parse-segment-name stem :legacy))
+                      (eql 1 (wal-parse-segment-name stem :timeline))))))))
 
 (defun physical-manifest-checkpoint-start (manifest)
   (if (member (getf manifest :version) '(2 3)) (getf manifest :checkpoint-start)
@@ -323,6 +325,15 @@
     *catalog*))
 
 (defun physical-recovery-prepare ()
+  "Select only the CRC-bound base namespace while verifying immutable provenance."
+  (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace)
+      (wal-read-control-fields)
+    (declare (ignore checkpoint durable snapshot insertion checkpoint-timeline))
+    (let ((*wal-segment-namespace* namespace))
+      (physical-recovery-prepare-with-namespace)
+      (setf (getf *physical-recovery-state* :wal-namespace) namespace))))
+
+(defun physical-recovery-prepare-with-namespace ()
   "Validate provenance, then durably enter active recovery before any restoration."
   (unless (probe-file (merge-pathnames "recovery.required" *pgdata*))
     (error "physical recovery control or manifest has lost its required recovery marker"))
@@ -393,7 +404,8 @@
   "Open verified recovery; phase 2 redoes its entire retained prefix before SQL."
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
   (let ((streaming (= 2 (getf *physical-recovery-state* :phase))))
-    (setf *wal-checkpoint-snapshot* (copy-list (getf *physical-recovery-state* :source-checkpoint))
+    (setf *wal-segment-namespace* (getf *physical-recovery-state* :wal-namespace :legacy)
+          *wal-checkpoint-snapshot* (copy-list (getf *physical-recovery-state* :source-checkpoint))
           *wal-checkpoint-lsn* (getf *physical-recovery-state* :checkpoint)
           *wal-durable-lsn* (getf *physical-recovery-state* :end)
           *wal-end-lsn* *wal-durable-lsn*

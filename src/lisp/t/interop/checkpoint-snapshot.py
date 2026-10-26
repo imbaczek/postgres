@@ -36,7 +36,12 @@ def read_copy(pgdata):
     prefix, crc = raw.rstrip("\n").rsplit(" ", 1)
     assert zlib.crc32(prefix.encode("ascii")) == int(crc, 16)
     fields = prefix.split(" ")
-    if fields[0] == "PGWAL5":
+    namespace = "legacy"
+    if fields[0] == "PGWAL6":
+        version, end, durable, insertion, checkpoint_tli, namespace, payload = fields
+        assert int(insertion) == int(checkpoint_tli) == 1
+        assert namespace in ("legacy", "timeline")
+    elif fields[0] == "PGWAL5":
         version, end, durable, insertion, checkpoint_tli, payload = fields
         assert int(insertion) == int(checkpoint_tli) == 1
     else:
@@ -45,7 +50,9 @@ def read_copy(pgdata):
     data = bytes.fromhex(payload)
     facts = checkpoint(data)
     assert facts["end"] == int(end) <= int(durable)
-    segment = pgdata / f"pg_wal/{facts['start'] // 16777216:016X}.wal"
+    number = facts['start'] // 16777216
+    name = (f"{number:016X}" if namespace == "legacy" else f"00000001{number // 256:08X}{number % 256:08X}")
+    segment = pgdata / f"pg_wal/{name}.wal"
     with segment.open("rb") as stream:
         stream.seek(facts["start"] % 16777216)
         record = bytearray(stream.read(120))

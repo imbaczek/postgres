@@ -83,6 +83,9 @@
 (defvar *wal-checkpoint-timeline* 1
   "Timeline of the checkpoint record, independently of current insertion.")
 
+(defvar *wal-segment-namespace* :legacy
+  "Explicit filename grammar; changing insertion TLI never reinterprets old names.")
+
 (defvar *wal-checkpoint-snapshot* nil
   "Facts belonging to the published checkpoint, never a merely flushed candidate.")
 
@@ -163,8 +166,38 @@
       (fsync-directory parent))
     path))
 
-(defun wal-segment-path (segment)
-  (merge-pathnames (format nil "~16,'0X.wal" segment) (wal-directory)))
+(defun wal-segment-filename (segment timeline namespace)
+  "C's 24-hex timeline/log/segment identity, with the native .wal suffix.
+Legacy 16-hex segment names always belong to timeline 1."
+  (unless (and (typep segment '(integer 0 1099511627775))
+               (typep timeline '(integer 1 4294967295))
+               (member namespace '(:legacy :timeline))
+               (or (eq namespace :timeline) (= timeline 1)))
+    (error "invalid native WAL segment identity"))
+  (if (eq namespace :legacy)
+      (format nil "~16,'0X.wal" segment)
+      (let ((per-id (floor (ash 1 32) +wal-segment-size+)))
+        (format nil "~8,'0X~8,'0X~8,'0X.wal"
+                timeline (floor segment per-id) (mod segment per-id)))))
+
+(defun wal-parse-segment-name (name namespace)
+  "Decode one canonical filename stem without guessing its timeline or grammar."
+  (when (and (stringp name)
+             (= (length name) (ecase namespace (:legacy 16) (:timeline 24)))
+             (every (lambda (char) (find char "0123456789ABCDEF")) name))
+    (if (eq namespace :legacy)
+        (let ((segment (parse-integer name :radix 16)))
+          (when (<= segment 1099511627775) (values 1 segment)))
+        (let* ((timeline (parse-integer name :start 0 :end 8 :radix 16))
+               (log (parse-integer name :start 8 :end 16 :radix 16))
+               (low (parse-integer name :start 16 :end 24 :radix 16))
+               (per-id (floor (ash 1 32) +wal-segment-size+)))
+          (when (and (plusp timeline) (< low per-id))
+            (values timeline (+ (* log per-id) low)))))))
+
+(defun wal-segment-path (segment &optional (timeline *wal-insert-timeline*)
+                                   (namespace *wal-segment-namespace*))
+  (merge-pathnames (wal-segment-filename segment timeline namespace) (wal-directory)))
 
 (defun wal-control-path ()
   (merge-pathnames "global/pg_wal_control" *pgdata*))
@@ -1125,17 +1158,32 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
       (setf *wal-pending-btree-split* nil)))
   (values))
 
-(defun wal-discover-segments ()
-  (sort
-   (loop for path in (directory (merge-pathnames "*.wal" (wal-directory)))
-         for name = (pathname-name path)
-         when (and name (= (length name) 16)
-                   (every (lambda (char)
-                            (or (digit-char-p char 16)
-                                (and (char>= char #\A) (char<= char #\F))))
-                          name))
-           collect (parse-integer name :radix 16))
-   #'<))
+(defun wal-segment-entry-names ()
+  "Enumerate actual WAL entries, including dangling symlinks; never accept an I/O-short list."
+  (let ((directory (handler-case (sb-posix:opendir (namestring (wal-directory)))
+                     (sb-posix:syscall-error (condition)
+                       (if (= (sb-posix:syscall-errno condition) sb-posix:enoent)
+                           nil (error condition))))))
+    (when directory
+      (unwind-protect
+           (loop for entry = (progn (sb-alien:set-errno 0) (sb-posix:readdir directory))
+                 for errno = (sb-alien:get-errno)
+                 for name = (unless (sb-alien:null-alien entry) (sb-posix:dirent-name entry))
+                 do (when (and (sb-alien:null-alien entry) (not (zerop errno)))
+                      (error "could not read WAL directory: errno ~d" errno))
+                 until (sb-alien:null-alien entry)
+                 when (and (> (length name) 4) (uiop:string-suffix-p name ".wal"))
+                   collect name)
+        (sb-posix:closedir directory)))))
+
+(defun wal-discover-segments (&optional (timeline *wal-insert-timeline*)
+                                (namespace *wal-segment-namespace*))
+  "Select only the explicit timeline and grammar; never pick the newest branch."
+  (sort (loop for name in (wal-segment-entry-names)
+              append (multiple-value-bind (candidate segment)
+                         (wal-parse-segment-name (subseq name 0 (- (length name) 4)) namespace)
+                       (when (eql candidate timeline) (list segment))))
+        #'<))
 
 (defun wal-valid-type-p (type version)
   (and (or (member type (list +wal-record-pages+ +wal-record-commit+
@@ -1931,7 +1979,8 @@ src/backend/access/transam/xlogreader.c."
    (wal-control-path)
    (wal-encode-control-image checkpoint-lsn durable-lsn *wal-checkpoint-snapshot*
                              :timeline *wal-insert-timeline*
-                             :checkpoint-timeline *wal-checkpoint-timeline*))
+                             :checkpoint-timeline *wal-checkpoint-timeline*
+                             :namespace *wal-segment-namespace*))
   (values))
 
 (defun wal-save-durable-lsn (lsn)
@@ -1963,12 +2012,15 @@ src/backend/access/transam/xlogreader.c."
       (fsync-stream stream)))
   (values))
 
+(declaim (ftype function wal-reconcile-namespace-at-startup))
+
 (defun wal-init ()
   ;; Control identities must be accepted before even syncing directories: a child
   ;; control cannot cause legacy segment scanning, truncation, or tail adoption.
-  (multiple-value-bind (checkpoint-lsn durable-lsn snapshot insertion checkpoint-timeline)
+  (multiple-value-bind (checkpoint-lsn durable-lsn snapshot insertion checkpoint-timeline namespace)
       (wal-read-control-fields)
     (when checkpoint-lsn (wal-require-supported-timelines insertion checkpoint-timeline))
+    (setf *wal-segment-namespace* (or namespace :legacy))
     (wal-ensure-directory-durable *pgdata*)
     (wal-ensure-directory-durable (merge-pathnames "global/" *pgdata*))
     (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
@@ -1976,9 +2028,10 @@ src/backend/access/transam/xlogreader.c."
     (wal-ensure-directory-durable (wal-replication-slot-directory))
     ;; Persist segment entries left visible before an earlier directory sync.
     (fsync-directory (wal-directory))
-    (let ((segments (wal-discover-segments)))
-      (when (and (null checkpoint-lsn) segments)
+    (progn
+      (when (and (null checkpoint-lsn) (wal-segment-entry-names))
         (error "WAL control file is missing while WAL segments exist"))
+      (when checkpoint-lsn (wal-reconcile-namespace-at-startup))
       (setf *wal-insert-timeline* (or insertion 1)
             *wal-checkpoint-timeline* (or checkpoint-timeline 1)
             *wal-xid-reserved-through* (getf snapshot :xid-reserved-through)

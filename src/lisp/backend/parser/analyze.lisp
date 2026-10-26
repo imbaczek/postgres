@@ -218,10 +218,7 @@ exist\" messages."
                :hint "pg_walfile_name() cannot be executed during recovery."))
     ;; Native primary startup currently supports timeline 1 only. Promotion must
     ;; replace this alongside the writer's insertion timeline before admitting writes.
-    (let* ((segment (floor location +wal-segment-size+))
-           (segments-per-id (floor (ash 1 32) +wal-segment-size+)))
-      (format nil "~8,'0X~8,'0X~8,'0X"
-              1 (floor segment segments-per-id) (mod segment segments-per-id)))))
+    (subseq (wal-segment-filename (floor location +wal-segment-size+) 1 :timeline) 0 24)))
 
 (defun cast-expression-to-text (argument)
   (if (eq (expr-type argument) :text) argument

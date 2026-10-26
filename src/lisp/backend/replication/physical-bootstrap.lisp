@@ -47,7 +47,7 @@
            (last (and (plusp *wal-durable-lsn*) (floor (1- *wal-durable-lsn*) +wal-segment-size+))))
       (when last
         (loop for segment from (floor restart +wal-segment-size+) to last
-              do (push (format nil "pg_wal/~16,'0X.wal" segment) files))))
+              do (push (concatenate 'string "pg_wal/" (file-namestring (wal-segment-path segment))) files))))
     (sort files #'string<)))
 
 (defun physical-bootstrap-copy-file (relative target &key limit)
@@ -104,8 +104,9 @@
     (let* ((checkpoint *wal-checkpoint-lsn*)
            (end *wal-durable-lsn*)
            (system-id (catalog-system-identifier))
-           (last-segment (and (plusp end) (format nil "pg_wal/~16,'0X.wal"
-                                                  (floor (1- end) +wal-segment-size+))))
+           (last-segment (and (plusp end) (concatenate 'string "pg_wal/"
+                                                       (file-namestring (wal-segment-path
+                                                                         (floor (1- end) +wal-segment-size+))))))
            (files (mapcar (lambda (relative)
                             (physical-bootstrap-copy-file
                              relative target

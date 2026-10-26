@@ -14,6 +14,7 @@
                (:file "t/checkpoint-tests")
                (:file "t/xid-reservation-tests")
                (:file "t/wal-xid-reservation-tests")
+               (:file "t/wal-namespace-tests")
                (:file "t/physical-history-tests")
                (:file "t/timeline-tests")
                (:file "t/timeline-publication-tests")

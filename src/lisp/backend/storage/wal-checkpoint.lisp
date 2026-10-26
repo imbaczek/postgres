@@ -127,7 +127,7 @@
     (wal-decode-checkpoint-snapshot bytes)))
 
 (defun wal-encode-control-image (checkpoint durable snapshot
-                                 &key (timeline 1)
+                                 &key (timeline 1) (namespace :legacy)
                                    (checkpoint-timeline (if snapshot (getf snapshot :timeline) 1)))
   "Persist insertion identity independently of the checkpoint record's timeline."
   (unless (and (typep checkpoint '(unsigned-byte 64))
@@ -135,46 +135,53 @@
                (typep timeline '(integer 1 4294967295))
                (typep checkpoint-timeline '(integer 1 4294967295))
                (<= checkpoint-timeline timeline)
+               (member namespace '(:legacy :timeline))
                (or (null snapshot)
                    (and (wal-checkpoint-snapshot-valid-p snapshot)
                         (= checkpoint (getf snapshot :end))
                         (= checkpoint-timeline (getf snapshot :timeline)))))
     (error "invalid WAL control checkpoint copy"))
-  (let* ((prefix (format nil "PGWAL5 ~d ~d ~d ~d ~a" checkpoint durable timeline
-                         checkpoint-timeline
+  (let* ((prefix (format nil "PGWAL6 ~d ~d ~d ~d ~a ~a" checkpoint durable timeline
+                         checkpoint-timeline (ecase namespace (:legacy "legacy") (:timeline "timeline"))
                          (if snapshot (wal-checkpoint-snapshot-hex snapshot) "-")))
          (crc (wal-crc32 (string->bytes prefix))))
     (string->bytes (format nil "~a ~8,'0X~%" prefix crc))))
 
 (defun wal-decode-control-line (line)
-  "Legacy control implies timeline 1; PGWAL5 binds both WAL timeline identities."
+  "Legacy control implies timeline 1 and legacy names; PGWAL6 binds filename grammar."
   (let* ((fields (and line (wal-split-fields line)))
          (version (first fields))
-         (v5 (equal version "PGWAL5"))
+         (v6 (equal version "PGWAL6"))
+         (identities (member version '("PGWAL5" "PGWAL6") :test #'equal))
          (v4 (equal version "PGWAL4"))
          (checkpoint (ignore-errors (parse-integer (second fields))))
          (durable (ignore-errors (parse-integer (third fields))))
-         (timeline (if v5 (ignore-errors (parse-integer (fourth fields))) 1))
-         (checkpoint-timeline (if v5 (ignore-errors (parse-integer (fifth fields))) 1))
+         (timeline (if identities (ignore-errors (parse-integer (fourth fields))) 1))
+         (checkpoint-timeline (if identities (ignore-errors (parse-integer (fifth fields))) 1))
+         (namespace (if v6 (cond ((equal (sixth fields) "legacy") :legacy)
+                                 ((equal (sixth fields) "timeline") :timeline))
+                        :legacy))
          (crc (ignore-errors (parse-integer (car (last fields)) :radix 16))))
-    (unless (and (cond (v5 (= (length fields) 7)) (v4 (= (length fields) 5))
+    (unless (and (cond (v6 (= (length fields) 8)) (identities (= (length fields) 7))
+                       (v4 (= (length fields) 5))
                        (t (and (= (length fields) 4)
                                (member version '("PGWAL2" "PGWAL3") :test #'equal))))
                  (typep checkpoint '(unsigned-byte 64))
                  (typep durable '(unsigned-byte 64)) (<= checkpoint durable)
                  (typep timeline '(integer 1 4294967295))
                  (typep checkpoint-timeline '(integer 1 4294967295))
-                 (<= checkpoint-timeline timeline)
+                 (<= checkpoint-timeline timeline) namespace
                  crc (= crc (wal-crc32 (string->bytes (format nil "~{~a~^ ~}" (butlast fields))))))
       (error "corrupt WAL control image"))
-    (let ((snapshot
-            (cond ((and v5 (not (equal (sixth fields) "-")))
-                   (wal-checkpoint-snapshot-from-hex (sixth fields)))
-                  (v4 (wal-checkpoint-snapshot-from-hex (fourth fields))))))
+    (let* ((payload (if v6 (seventh fields) (sixth fields)))
+           (snapshot
+             (cond ((and identities (not (equal payload "-")))
+                    (wal-checkpoint-snapshot-from-hex payload))
+                   (v4 (wal-checkpoint-snapshot-from-hex (fourth fields))))))
       (when (and snapshot (or (/= checkpoint (getf snapshot :end))
                               (/= checkpoint-timeline (getf snapshot :timeline))))
         (error "checkpoint control copy names another record or timeline"))
-      (values checkpoint durable snapshot timeline checkpoint-timeline))))
+      (values checkpoint durable snapshot timeline checkpoint-timeline namespace))))
 
 (defun wal-require-supported-timelines (insertion checkpoint)
   "Refuse unsupported branches before any scan, truncation or storage mutation."
