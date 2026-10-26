@@ -15,6 +15,11 @@ Inventory and refactor review: 2026-10-25, based on commit `19df2752d7e`.
 | C frame fixtures, native subscriber and COPY/apply crash tests | Their value comes from independent bytes, native workers, visibility and durable progress. | Keep explicit. A self-roundtrip property cannot replace these oracles. |
 | Legacy `t/unit-tests/` and shell concurrency/crash suites | Many tests manage real files, threads, sockets, WAL and failpoints. | Retain their runners and fixtures; no bulk Rove/cl-spec migration. Existing setup helpers already centralize most shared state. |
 
+The legacy-unit decision above describes the initial interop refactor. The later
+[complete test inventory](../TEST-INVENTORY.md) records the reviewed migration of
+68 independently runnable cases to `pg-unit-tests` and the 161 deferred cases;
+process and concurrency harnesses retain their coverage.
+
 The existing six test files lose 117 net lines, including the new SQLSTATE
 helper regression. New generated checks live in `property-tests.lisp`.
 That refactor changed no server implementation.

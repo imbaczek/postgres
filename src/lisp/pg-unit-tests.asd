@@ -1,0 +1,25 @@
+;;;; Fast, independently selectable regressions migrated from t/unit-tests/.
+(asdf:defsystem "pg-unit-tests"
+  :description "Unit regressions and generated contracts"
+  :depends-on ("pg" "rove" "cl-spec/check-it")
+  :serial t
+  :components ((:file "t/rove/support")
+               (:file "t/rove/primitives-tests")
+               (:file "t/rove/storage-tests")
+               (:file "t/rove/sql-tests")
+               (:file "t/rove/catalog-tests")
+               (:file "t/rove/protocol-tests")
+               (:file "t/rove/logical-tests")
+               (:file "t/rove/vacuum-tests")
+               (:file "t/rove/join-tests")
+               (:file "t/rove/spill-tests")
+               (:file "t/rove/concurrency-tests")
+               (:file "t/rove/snapshot-tests")
+               (:file "t/rove/transaction-tests")
+               (:file "t/rove/wal-tests")
+               (:file "t/rove/backend-lifecycle-tests")
+               (:file "t/rove/property-tests"))
+  :perform (asdf:test-op (operation component)
+                         (declare (ignore operation component))
+                         (unless (uiop:symbol-call :rove :run :pg-unit-tests)
+                           (error "Unit regressions or generated contracts failed"))))

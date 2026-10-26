@@ -37,14 +37,6 @@
     (sb-thread:condition-broadcast *live-operation-cv*))
   (values))
 
-(defun test-query-message (query)
-  (let* ((query-bytes (string->bytes query))
-         (payload (make-array (1+ (length query-bytes))
-                              :element-type '(unsigned-byte 8)
-                              :initial-element 0)))
-    (replace payload query-bytes)
-    (make-frontend-message #\Q payload)))
-
 (defun test-read-frontend-message (stream)
   (multiple-value-bind (type-byte length-bytes payload)
       (read-message-frame stream)

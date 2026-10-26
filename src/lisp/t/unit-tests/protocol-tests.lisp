@@ -2,64 +2,6 @@
 
 (in-package #:pg)
 
-(defun test-swank-arguments ()
-  (multiple-value-bind (host port pgdata control-port control-socket
-                        swank-port swank-bind-address)
-      (parse-args '("--swank-port=4512" "--swank-bind-address=0.0.0.0"))
-    (declare (ignore pgdata control-port control-socket))
-    (check (string= host "127.0.0.1") "default SQL host is unchanged")
-    (check (= port 5433) "default SQL port is unchanged")
-    (check (= swank-port 4512) "Swank port accepts --option=value")
-    (check (string= swank-bind-address "0.0.0.0")
-           "Swank bind address accepts --option=value"))
-  (multiple-value-bind (host port pgdata control-port control-socket
-                        swank-port swank-bind-address)
-      (parse-args '("--swank-bind-address" "0.0.0.0"))
-    (declare (ignore host port pgdata control-port control-socket))
-    (check (null swank-port) "Swank bind address alone does not enable listener")
-    (check (string= swank-bind-address "0.0.0.0")
-           "Swank bind address is preserved without a listener"))
-  (check (handler-case
-             (progn (parse-args '("--swank-port=")) nil)
-           (error () t))
-         "empty Swank port is rejected")
-  (check (handler-case
-             (progn (parse-args '("--swank-port")) nil)
-           (error () t))
-         "missing Swank port is rejected")
-  (check (handler-case
-             (progn (parse-args '("--swank-port" "65536")) nil)
-           (error () t))
-         "out-of-range Swank port is rejected")
-  (check (handler-case
-             (progn (parse-args '("--swank-bind-address=")) nil)
-           (error () t))
-         "empty Swank bind address is rejected")
-  (check (handler-case
-             (progn (parse-args '("--swank-bind-address")) nil)
-           (error () t))
-         "missing Swank bind address is rejected"))
-
-(defun test-replication-slot-retention-option-parsing ()
-  (multiple-value-bind (host port pgdata control-port control-socket
-                        swank-port bind-address temp-limit arena-limit slot-limit)
-      (parse-args '("--max-slot-wal-keep-bytes=4096"))
-    (declare (ignore host port pgdata control-port control-socket swank-port
-                     bind-address temp-limit arena-limit))
-    (check (= slot-limit 4096)
-           "slot retention option accepts a finite byte cap"))
-  (multiple-value-bind (host port pgdata control-port control-socket
-                        swank-port bind-address temp-limit arena-limit slot-limit)
-      (parse-args '("--max-slot-wal-keep-bytes" "-1"))
-    (declare (ignore host port pgdata control-port control-socket swank-port
-                     bind-address temp-limit arena-limit))
-    (check (null slot-limit)
-           "slot retention option uses -1 to disable the cap"))
-  (check (handler-case
-             (progn (parse-args '("--max-slot-wal-keep-bytes" "-2")) nil)
-           (error () t))
-         "slot retention option rejects negative values other than -1"))
-
 (defun test-malformed-packet-p (path bytes reader &optional expected-message)
   (with-open-file (stream path
                           :direction :output

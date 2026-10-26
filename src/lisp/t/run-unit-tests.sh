@@ -9,4 +9,5 @@ exec "$SBCL" --non-interactive \
     --eval '(require :asdf)' \
     --eval "(push #p\"$BASE/\" asdf:*central-registry*)" \
     --eval '(asdf:load-system "pg")' \
+    --load "$BASE/t/test-dependencies.lisp" \
     --load "$BASE/t/unit-tests.lisp"

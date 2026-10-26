@@ -358,18 +358,21 @@ it does not use SIGSTOP. The executor SQL mode adds test-only barriers around
 promotion and callback resumption; the common SQL contract runs without them.
 See [physical HA implementation and limits](PHYSICAL-HA.md) for validation scope.
 
-The `pg-interop-tests` and `pg-physical-tests` ASDF systems depend on Rove and
-`cl-spec/check-it` for
-new executable contracts and property checks. These are test dependencies;
-the `pg` server system does not load them. Install
+The `pg-unit-tests`, `pg-interop-tests` and `pg-physical-tests` ASDF systems depend
+on Rove and `cl-spec/check-it` for executable regressions and property checks.
+These are test dependencies; the `pg` server system does not load them. Install
 [cl-spec](https://github.com/masatoi/cl-spec) in your Quicklisp `local-projects/`
-directory (for Roswell, under `~/.roswell/lisp/quicklisp/`). The verified revision
+directory of the Quicklisp installation used by the test SBCL (for Roswell,
+under `~/.roswell/lisp/quicklisp/`). The verified revision
 is `147e3de5d0ab636cf8cc4c83253e03e5a7d7e639`. Quicklisp supplies Rove, check-it,
 and their dependencies. From `src/lisp/` in a Quicklisp-enabled REPL:
 
 ```lisp
 (ql:register-local-projects)
 (asdf:load-asd (truename "pg.asd"))
+(asdf:load-asd (truename "pg-unit-tests.asd"))
+(ql:quickload "pg-unit-tests")
+(asdf:test-system "pg-unit-tests")
 (asdf:load-asd (truename "pg-interop-tests.asd"))
 (ql:quickload "pg-interop-tests")
 (asdf:test-system "pg-interop-tests")
@@ -377,6 +380,25 @@ and their dependencies. From `src/lisp/` in a Quicklisp-enabled REPL:
 (ql:quickload "pg-physical-tests")
 (asdf:test-system "pg-physical-tests")
 ```
+
+The shell runner preserves SBCL's normal init configuration. Its
+`t/test-dependencies.lisp` bootstrap first tries configured ASDF systems, then
+uses the active Quicklisp installation. If Quicklisp is not loaded, it tries
+`QUICKLISP_HOME/setup.lisp` or `~/quicklisp/setup.lisp`. It does not switch an
+already loaded Quicklisp installation. A cl-spec checkout elsewhere can be
+registered through standard ASDF configuration, for example:
+
+```sh
+CL_SOURCE_REGISTRY='(:source-registry (:directory "/path/to/cl-spec/") :inherit-configuration)' \
+  ./t/run-unit-tests.sh
+```
+
+The unit suite contains 68 regressions migrated from the legacy runner, eight
+Properties and one Function Spec, all explicitly executed through Rove. Loading
+it alone does not run tests. `./t/run-unit-tests.sh` executes this ASDF suite and
+then the 161 deferred legacy cases (arena cases remain conditional on runtime
+support). See the [complete test inventory](t/TEST-INVENTORY.md) for every case,
+shared helper, retained process harness, deferral reason and generated domain.
 
 The physical suite checks native WAL intake, durable receive progress, source
 retention, bootstrap, recovery write exclusion and streaming contracts. See

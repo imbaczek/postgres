@@ -842,42 +842,6 @@
                   "operation-entry interruption releases the reload count"))
       (setf (symbol-function 'try-enter-live-operation) original-try-enter))))
 
-(defun test-transaction-ending-statement-classifier ()
-  (dolist (query '("COMMIT" "END" "ROLLBACK" "ABORT"))
-    (check (some #'transaction-ending-statement-p (parse-statements query))
-           (format nil "transaction-ending AST recognized: ~a" query)))
-  (let* ((statements (parse-statements "; ; SELECT 1; COMMIT; SELECT 2"))
-         (ending-position (position-if #'transaction-ending-statement-p
-                                       statements)))
-    (check (= ending-position 1)
-           "AST classifier finds a terminal after a nonterminal prefix")
-    (check (= (length statements) 3)
-           "the full simple-query message is parsed before dispatch"))
-  (check (simple-query-payload-starts-with-transaction-end-p
-          (frontend-message-payload
-           (test-query-message "COMMIT; CHECKPOINT")))
-         "a transaction-ending first command may enter drain admission")
-  (dolist (query (list "/* leading comment */ COMMIT"
-                       (format nil "-- leading comment~%ROLLBACK")
-                       "; ; COMMIT"))
-    (check (simple-query-payload-starts-with-transaction-end-p
-            (frontend-message-payload (test-query-message query)))
-           (format nil "SQL trivia before a transaction end is ignored: ~a"
-                   query)))
-  (check (not (simple-query-payload-starts-with-transaction-end-p
-               (frontend-message-payload
-                (test-query-message "SELECT 1; COMMIT"))))
-         "work before COMMIT cannot enter drain admission")
-  (check (not (simple-query-payload-starts-with-transaction-end-p
-               (frontend-message-payload
-                (test-query-message "SELECT 'COMMIT'"))))
-         "a transaction keyword inside a string cannot enter drain admission")
-  (check (handler-case
-             (progn (parse-statements "COMMIT; SELECT") nil)
-           (pg-error () t)
-           (error () t))
-         "a syntax error after COMMIT is detected while parsing the full message"))
-
 (defun test-simple-query-terminal-statement-drain ()
   (let* ((backend *backend*)
          (events '())
