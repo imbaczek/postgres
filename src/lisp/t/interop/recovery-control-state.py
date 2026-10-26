@@ -20,10 +20,10 @@ def decode(raw):
     assert phase == 2 or checkpoint == applied
     assert phase != 0 or digest == 0
     state = None if legacy else struct.unpack_from('<I', raw, 56)[0]
-    when = None if legacy else struct.unpack_from('<Q', raw, 60)[0]
+    when = None if legacy else struct.unpack_from('<q', raw, 60)[0]
     if not legacy:
         assert state in ((0,) if phase == 0 else (2, 5)), 'DBState'
-        assert 0 <= when < 2**63, 'state time'
+        assert -(2**63) <= when < 2**63, 'state time'
     return dict(version=1 if legacy else 2, phase=phase, system_id=system_id,
                 applied=applied, state=state, time=when)
 

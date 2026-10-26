@@ -30,7 +30,7 @@
 (deftest recovery-control-rejects-invalid-state-and-corruption
     (dolist (arguments '((0 123 1 0 32 32 1003 :db-state 2)
                          (1 123 1 456 32 32 1003 :db-state 6)
-                         (2 123 1 456 32 96 1003 :state-time -1)
+                         (2 123 1 456 32 96 1003 :state-time -9223372036854775809)
                          (2 123 1 456 32 96 1003 :state-time 9223372036854775808)))
       (ok (intake-fails-p (lambda () (apply #'pg::physical-recovery-control-image arguments)))))
   (let ((bytes (pg::physical-recovery-control-image 2 123 1 456 32 96 1003 :state-time 1)))
@@ -47,7 +47,7 @@
 (cl-spec:defproperty recovery-control-roundtrip-preserves-clean-and-active-state
     ((identifier (range integer 0 18446744073709551615))
      (position (range integer 0 18446744073709551615))
-     (time (range integer 0 9223372036854775807))
+     (time (range integer -9223372036854775808 9223372036854775807))
      (state-bit (range integer 0 1)))
   (:about pg::physical-recovery-decode-control)
   (:trials (:normal 200))
@@ -109,3 +109,12 @@
           (ok (equalp before
                       (pg::recovery-read-bytes (pg::physical-recovery-control-path root)))))
         (ok (= 5 (getf (pg::physical-recovery-read-control root) :db-state))))))
+
+(deftest recovery-control-time-matches-signed-c-pg-time-t
+    (dolist (time '(-9223372036854775808 -1 0 1 9223372036854775807))
+      (let* ((bytes (pg::physical-recovery-control-image
+                     2 123 1 456 32 96 1003 :state-time time))
+             (decoded (pg::physical-recovery-decode-control bytes)))
+        (ok (= time (getf decoded :state-time)))
+        (when (= time -1)
+          (ok (every (lambda (byte) (= byte 255)) (subseq bytes 60 68)))))))

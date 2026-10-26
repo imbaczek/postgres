@@ -19,7 +19,8 @@ Native recovery control now records the C `DBState` distinction between startup
 separate from the native bootstrap phases 0/1/2; clean state never grants primary
 write authority. `recovery.required` and verified provenance remain mandatory.
 The new 72-byte `PGRSTAT2` format retains existing identity/progress fields, adds
-state and a diagnostic Unix-seconds update time, and CRC-checks the entire record.
+state and a signed 64-bit diagnostic Unix-seconds update time (`pg_time_t`), and
+CRC-checks the entire record.
 Legacy 60-byte `PGRSTATE` files read as unknown state/time and migrate before
 mutable initialization. All new writes use v2; earlier binaries cannot read v2.
 This is native metadata, not C `pg_control` byte compatibility.
@@ -54,14 +55,14 @@ status queries pass in `/tmp/pg-physical-follow.noud9w`.
 The pinned C-to-C `t/physical-control-c.sh` oracle passes in
 `/tmp/pg-control-state-c.gVUxyF`: `pg_controldata` reports active recovery after
 startup and clean recovery after shutdown, twice at the same checkpoint location.
-C references are `pg_control.h:97-106`, `StartupXLOG`, and `CreateRestartPoint`'s
+C references are `pg_control.h:97-106`, `pgtime.h:23`, `StartupXLOG`, and `CreateRestartPoint`'s
 unchanged/new-point shutdown branches (`xlog.c:8525-8593`, `8665-8696`). This oracle
 does not pass C physical WAL to Lisp. Use `C_PG_BINDIR`/`C_PG_REVISION` for the
 pinned C installation when running it.
 
-All 159 physical, 169 interop and 1,598 legacy checks pass, with formatting and
+All 160 physical, 169 interop and 1,598 legacy checks pass, with formatting and
 fresh strict compilation. The new cl-spec property checks 200 valid codec
-round trips at seed 42, declaration digest `fnv1a64-v1:f2b3e56b7204dc16`.
+round trips at seed 42, declaration digest `fnv1a64-v1:ac618bec08e490b6`.
 Its Function Spec is not registered; generated input coverage and rejection
 counts are unmeasured, and the property does not prove I/O durability. Separate
 Rove tests and process fixtures exercise those failure paths. Checkpoint and
