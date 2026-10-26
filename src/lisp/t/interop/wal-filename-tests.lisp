@@ -12,6 +12,15 @@
                   (derived-query-rows
                    (format nil "SELECT pg_catalog.pg_walfile_name('~a')" (first example)))))))
 
+(deftest wal-filename-uses-the-current-insertion-timeline
+    (let ((pg::*physical-recovery-state* nil)
+          (pg::*wal-insert-timeline* 2)
+          (pg::*wal-checkpoint-timeline* 1))
+      (ok (equalp (list (vector "000000020000000000000000"))
+                  (derived-query-rows "SELECT pg_walfile_name('0/0')")))
+      (ok (equalp (list (vector "000000020000000100000000"))
+                  (derived-query-rows "SELECT pg_walfile_name('1/0')")))))
+
 (deftest wal-filename-strict-input-and-recovery
     (ok (equalp (list (vector pg::+null+))
                 (derived-query-rows "SELECT pg_walfile_name(NULL)")))

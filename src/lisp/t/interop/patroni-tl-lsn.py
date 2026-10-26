@@ -1,5 +1,6 @@
 """Run pinned Patroni's unchanged five-column TL_LSN fragment; no HA loop."""
 import importlib.metadata
+import os
 import sys
 
 import psycopg2
@@ -11,6 +12,7 @@ def main():
     port, role = int(sys.argv[1]), sys.argv[2]
     assert role in ("primary", "standby")
     paused = len(sys.argv) > 3 and sys.argv[3] == "paused"
+    expected_timeline = int(os.environ.get("EXPECTED_TIMELINE", "1"))
     connection = psycopg2.connect(host="127.0.0.1", port=port, user="postgres",
                                   dbname="postgres", connect_timeout=2)
     connection.autocommit = True
@@ -26,7 +28,7 @@ def main():
                     cursor.execute(f"SELECT pg_current_wal{flush}_lsn(), "
                                    "pg_last_wal_replay_lsn(), pg_last_wal_receive_lsn()")
                     current, replay, receive = cursor.fetchone()
-                    expected = (1, lsn(current), lsn(replay), lsn(receive) or 0, False)
+                    expected = (expected_timeline, lsn(current), lsn(replay), lsn(receive) or 0, False)
                 else:
                     cursor.execute("SELECT pg_last_wal_replay_lsn(), pg_last_wal_receive_lsn()")
                     replay, receive = cursor.fetchone()

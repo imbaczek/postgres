@@ -216,9 +216,8 @@ exist\" messages."
     (when (recovery-in-progress-p)
       (ereport "55000" "recovery is in progress"
                :hint "pg_walfile_name() cannot be executed during recovery."))
-    ;; Native primary startup currently supports timeline 1 only. Promotion must
-    ;; replace this alongside the writer's insertion timeline before admitting writes.
-    (subseq (wal-segment-filename (floor location +wal-segment-size+) 1 :timeline) 0 24)))
+    (subseq (wal-segment-filename (floor location +wal-segment-size+)
+                                  *wal-insert-timeline* :timeline) 0 24)))
 
 (defun cast-expression-to-text (argument)
   (if (eq (expr-type argument) :text) argument
