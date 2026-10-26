@@ -140,4 +140,5 @@ start_target
 compare
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 5
 checked target '(assert (= 1 (count "native standby restartpoints" (sb-thread:list-all-threads) :test (function string=) :key (function sb-thread:thread-name))))' restarted-worker
+python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" "$TMP/copy" "$TMP/source"
 echo 'physical-restartpoint-auto: PASS'

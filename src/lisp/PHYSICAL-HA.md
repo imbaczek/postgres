@@ -198,6 +198,57 @@ extraction; the service did not expose the requested model profiles.
 
 ### Preparing child WAL prefixes
 
+Restartpoints now preserve the authenticated final-segment prefix before
+receive-floor advancement. The old receive checksum starts at its retained floor;
+it cannot authenticate earlier bytes still present in that segment, and a spool
+whose original base starts mid-segment has no base bytes in that initial hole.
+Promotion cannot safely copy that raw file and declare its prefix verified.
+
+New GEN2 generations with metadata v4 embed at most one native segment prefix.
+Its exact length is `LSN mod segment-size`; an additional prefix digest, generation
+CRC and pointer-bound whole-generation hash cover the bytes. Capture starts with
+the immutable manifest-bound base prefix or a previously verified generation
+anchor, then appends only validated raw-record callbacks through the applied
+cursor. Coverage must be contiguous. Bytes below the receive floor are never
+read from the spool as proof, and original bootstrap WAL remains unchanged.
+The generation and pointer become durable before runtime anchor adoption, receive
+floor publication and spool deletion. Startup validates the selected embedded
+prefix before restoring catalog/storage, including the pointer-ahead-of-floor
+crash window. Fresh plist keys are installed through the global recovery state,
+including the restored restartpoint LSN.
+
+GEN1/v1–v3 remain readable. Legacy images with no authenticated pre-floor anchor
+can continue recovery and restartpoint publication with an explicitly unavailable
+prefix (`NIL`), rather than trusting leftover bytes. They regain a known prefix
+at an exact segment boundary or in a fully validated later segment; a known empty
+byte vector is distinct from unavailable proof. Promotion must refuse/reseed if
+required proof is still unavailable. Metadata v4 retains checkpoint/source-XID
+reservation checks and the exhausted FullXID representation. New GEN2 writes
+require upgraded binaries. This is a native storage format, not C disk/WAL
+compatibility and not an operational promotion transition.
+
+Prefix-retention validation: 250 physical tests, 169 interop tests, 1,598 legacy
+checks and fresh strict compilation pass (`/tmp/pg-restartpoint-prefix-final-unit.log`,
+`/tmp/pg-restartpoint-prefix-final-compile.log`). The embedded-prefix property ran
+100 trials at seed 42, digest `fnv1a64-v1:fcee0f270a2059d7`; no FunctionSpec is
+registered, and generated input coverage/rejection counts remain unmeasured.
+Fixed tests cover repeated same-segment compaction despite corrupted pre-floor
+spool bytes, pointer-ahead-of-floor recovery followed by another compaction,
+valid-envelope corruption rejected before catalog restoration, legacy unavailable
+proof, later-segment recovery and known-empty/unknown/old-format distinction.
+Native automatic restartpoints survive injected generation-publication failure,
+SIGKILL and fresh-process recovery; the independent Python inspector checks
+pointer/generation/prefix checksums and compares the complete embedded prefix with
+source WAL (`/tmp/pg-restartpoint-prefix-auto-final.log`, artifact
+`/tmp/pg-restartpoint-auto.FbFj4t`). This is process-crash evidence, not simulated
+power loss. Continuous follow/reconnect/restart and pinned Patroni 4.1.5 status
+calls pass at `/tmp/pg-physical-follow.OIqgFA`
+(`/tmp/pg-restartpoint-prefix-follow.log`). Astra high design advice, Luna max
+checkpoint and Sol high full-diff reviews completed; the latter's fresh-startup
+plist-key finding is fixed and asserted. A reused refactoring thread found no
+useful extraction; exact Sol medium creation was refused by the service thread
+limit, and the reused thread's model profile was not exposed.
+
 C's `XLogInitNewTimeline` (`xlog.c:5867–5937`) copies only the valid parent prefix
 for an in-segment fork; at an exact boundary it initializes the following child
 segment without copying the previous segment. `XLogFileCopy` syncs its temporary
