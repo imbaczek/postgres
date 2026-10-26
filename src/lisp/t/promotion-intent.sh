@@ -68,14 +68,7 @@ for point in normal after-fsync after-rename after-directory-fsync after-write; 
     else
         python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --snapshot-pending \
             "$CASE/data" "$SEED/source" "$CASE/before.json"
-        set +e
-        timeout 15 "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$CASE/data" >"$CASE/startup.log" 2>&1
-        startup_status=$?
-        set -e
-        test "$startup_status" -eq 1
-        grep -q 'pending native promotion requires reconciliation' "$CASE/startup.log"
-        python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --verify-pending \
-            "$CASE/data" "$CASE/before.json"
+        # Valid pending startup completion is checked by promotion-commit.sh.
     fi
     test "$before" = "$(sha256sum "$CASE/data/global/pg_wal_control")"
 done

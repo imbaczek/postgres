@@ -243,7 +243,10 @@
                           (or (getf *physical-recovery-state* :receive-lsn) 0))
                      (sb-thread:with-mutex (*wal-lock*) *wal-durable-lsn*))))
     (send-data-row-text
-     stream (list (format nil "~d" (catalog-system-identifier)) "1"
+     stream (list (format nil "~d" (catalog-system-identifier))
+                  (format nil "~d" (if (recovery-in-progress-p)
+                                       (getf *physical-recovery-state* :timeline)
+                                       *wal-insert-timeline*))
                   (wal-format-lsn flushed)
                   (unless (eq (backend-replication-mode *backend*) :physical)
                     (backend-database *backend*)))))

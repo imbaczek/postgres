@@ -7,15 +7,21 @@
   (when *physical-bootstrap-test-hook*
     (funcall *physical-bootstrap-test-hook* point target)))
 
+(declaim (ftype function physical-promotion-startup-primary-p physical-promotion-startup-pending-p))
+
 (defun physical-bootstrap-check-startup ()
-  "Choose recovery from durable image metadata before any mutable initialization."
-  (if (or (probe-file (merge-pathnames "recovery.required" *pgdata*))
-          (probe-file (merge-pathnames "physical-backup.manifest" *pgdata*))
-          (probe-file (merge-pathnames "physical-recovery.control" *pgdata*)))
-      (physical-recovery-prepare)
-      (when (recovery-in-progress-p)
-        (error "cannot clear recovery role by removing its metadata")))
-  (values))
+  "Classify committed control first, then finish a valid pending request before SQL."
+  (cond
+    ((physical-promotion-startup-primary-p) (values))
+    ((physical-promotion-startup-pending-p) :primary-ready)
+    (t
+     (if (or (probe-file (merge-pathnames "recovery.required" *pgdata*))
+             (probe-file (merge-pathnames "physical-backup.manifest" *pgdata*))
+             (probe-file (merge-pathnames "physical-recovery.control" *pgdata*)))
+         (physical-recovery-prepare)
+         (when (recovery-in-progress-p)
+           (error "cannot clear recovery role by removing its metadata")))
+     (values))))
 
 (defun physical-bootstrap-target (directory)
   "Require an existing empty target outside the source directory hierarchy."

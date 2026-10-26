@@ -66,6 +66,11 @@ SOURCE=$!
 test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 sql "$PORT" 'CREATE TABLE data (id integer); INSERT INTO data VALUES (1)'
 checked source "(load \"$BASE/t/physical-replay-native.lisp\")" source-hooks
+case "${SOURCE_WAL_NAMESPACE:-legacy}" in
+    timeline) checked source '(wal-migrate-timeline-namespace)' source-namespace ;;
+    legacy) : ;;
+    *) echo 'invalid SOURCE_WAL_NAMESPACE' >&2; exit 1 ;;
+esac
 checked source "(physical-base-backup \"$TMP/copy/\" \"auto_r\")" backup
 start_target
 # Static recovery has no newer terminal. CHECKPOINT must remain a successful no-op.
@@ -154,7 +159,7 @@ timeout 15 "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/pending" \
 pending_status=$?
 set -e
 test "$pending_status" -eq 1
-grep -q 'pending native promotion requires reconciliation' "$TMP/pending-startup.log"
+grep -q 'pending promotion lost its exact selected generation' "$TMP/pending-startup.log"
 python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --verify-pending \
     "$TMP/pending" "$TMP/pending-before.json"
 echo 'physical-restartpoint-auto: PASS'

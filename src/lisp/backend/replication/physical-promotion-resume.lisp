@@ -81,14 +81,14 @@
     (physical-store-open directory (getf state :system-id) (getf state :timeline)
                          :discard-tail nil :create-lock nil)))
 
-(defun physical-promotion-validate-cold-state (state metadata prefix generation store)
+(defun physical-promotion-validate-cold-state (state metadata prefix generation store &optional (artifact-checker #'physical-promotion-wal-plan))
   "Use the live publisher's proof checker without installing candidate globals."
   (let ((*physical-recovery-state* state) (*physical-receive-store* store)
                                           (*last-replay-lsn* (getf state :applied)) (*next-xid* (getf state :next-xid))
                                           (*wal-segment-namespace* (getf state :wal-namespace))
                                           (*wal-insert-timeline* 1) (*wal-checkpoint-timeline* 1))
     (physical-promotion-check-pending state metadata prefix generation :allow-history t)
-    (physical-promotion-wal-plan state prefix :allow-uninstalled t)
+    (funcall artifact-checker state prefix :allow-uninstalled t)
     (physical-recovery-check-base-forks
      (list :files (getf metadata :forks)) (make-hash-table :test #'eql))))
 
@@ -109,7 +109,8 @@
   (physical-recovery-check-live-files)
   (catalog-refresh-oldest-relfrozenxid))
 
-(defun physical-promotion-resume-pending ()
+(defun physical-promotion-resume-pending (&key (artifact-checker #'physical-promotion-wal-plan)
+                                            (publisher #'physical-promotion-publish-wal))
   "Privately reconstruct a cold phase-3 process and finish WAL publication only.
 Ordinary startup stays guarded until committed-primary recovery is implemented.
 The caller retains command/reload quiescence; successful resources remain owned."
@@ -121,14 +122,14 @@ The caller retains command/reload quiescence; successful resources remain owned.
              (sb-thread:with-mutex (*timeline-history-lock*)
                (multiple-value-bind (state metadata prefix generation) (physical-promotion-read-pending-state)
                  (setf store (physical-promotion-open-pending-store state))
-                 (physical-promotion-validate-cold-state state metadata prefix generation store)
+                 (physical-promotion-validate-cold-state state metadata prefix generation store artifact-checker)
                  (physical-promotion-test-point :before-pending-restore)
                  (physical-promotion-restore-cold-state state store)
                  (physical-promotion-test-point :after-pending-restore))))
            (unless (wal-namespace-file-stat
                     (timeline-history-path (getf *physical-recovery-state* :promotion-child) *pgdata*) t)
              (physical-promotion-install-prefix))
-           (prog1 (physical-promotion-publish-wal) (setf finished t)))
+           (prog1 (funcall publisher) (setf finished t)))
       (unless finished
         (setf *physical-recovery-failed-p* t)
         (when *clog-stream* (ignore-errors (close *clog-stream*)))

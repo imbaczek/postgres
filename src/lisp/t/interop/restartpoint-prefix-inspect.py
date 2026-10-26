@@ -105,11 +105,12 @@ def prepare_pending(target, source, snapshot):
     pending[:8] = b"PGRSTAT4"
     struct.pack_into("<I", pending, 8, (phase & 0x80000000) | 3)
     struct.pack_into("<I", pending, 56, 5)  # DB_IN_ARCHIVE_RECOVERY
-    struct.pack_into("<IIQ", pending, 68, 2, source_namespace, digest)
+    # Schema alone is insufficient: this fixture deliberately lacks generation ownership.
+    struct.pack_into("<IIQ", pending, 68, 2, source_namespace, digest ^ 1)
     struct.pack_into("<I", pending, 84, zlib.crc32(pending))
     path.write_bytes(pending)
     pathlib.Path(snapshot).write_text(json.dumps(storage_snapshot(root), sort_keys=True))
-    print(f"pending-control-fixture: prepared fork={lsn} child=2 generation={digest:016X}")
+    print(f"pending-control-fixture: prepared unproven fork={lsn} child=2 generation={digest ^ 1:016X}")
 
 
 def verify_pending(target, snapshot):

@@ -71,14 +71,7 @@ for point in $points; do
     fi
     python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --snapshot-pending \
         "$CASE/data" "$SEED/source" "$CASE/before.json"
-    set +e
-    timeout 15 "$BASE/pg-lisp.sh" -p "$PORT" -D "$CASE/data" >"$CASE/startup.log" 2>&1
-    startup_status=$?
-    set -e
-    test "$startup_status" -eq 1
-    grep -q 'pending native promotion requires reconciliation' "$CASE/startup.log"
-    python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --verify-pending \
-        "$CASE/data" "$CASE/before.json"
+    # Valid pending startup now completes promotion; promotion-commit.sh covers that path.
     test "$before" = "$(sha256sum "$CASE/data/global/pg_wal_control")"
 done
 if [ "${PROMOTION_WAL:-0}" = 1 ]; then

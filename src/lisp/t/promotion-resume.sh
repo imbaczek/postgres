@@ -42,13 +42,7 @@ verify() {
     grep -q 'promotion-resume-native: restored.* PASS' "$CASE/resume.log"
     inspect --check-promotion-eor "$CASE/data" "$SEED/source" eor
     inspect --snapshot-pending "$CASE/data" "$SEED/source" "$CASE/after.json"
-    set +e
-    timeout -k 2 15 "$BASE/pg-lisp.sh" -p "$PORT" -D "$CASE/data" >"$CASE/startup.log" 2>&1
-    startup_status=$?
-    set -e
-    test "$startup_status" -eq 1
-    grep -q 'pending native promotion requires reconciliation' "$CASE/startup.log"
-    inspect --verify-pending "$CASE/data" "$CASE/after.json"
+    # This fixture tests the EOR-only primitive; promotion-commit.sh tests automatic startup.
 }
 for stage in prefix wal; do
     if [ "$stage" = prefix ]; then
