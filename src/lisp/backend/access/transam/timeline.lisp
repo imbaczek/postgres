@@ -84,10 +84,46 @@ System identity and exact prefix digest must still be verified by the caller."
   (unless (typep timeline '(integer 1 4294967295)) (error "invalid timeline identifier"))
   (format nil "~8,'0X.history" timeline))
 
+(defun timeline-history-path (timeline directory)
+  (merge-pathnames (concatenate 'string "pg_wal/" (timeline-history-filename timeline)) directory))
+
+(defun timeline-encode-history (child parent switchpoint reason parent-bytes)
+  "Copy parent bytes and append C writeTimeLineHistory's exact split-line layout.
+Native ancestry requires the parent history and a forward fork; no role is changed."
+  (unless (and (typep child '(integer 1 4294967295))
+               (typep parent '(integer 1 4294967295)) (> child parent)
+               (typep switchpoint '(unsigned-byte 64))
+               (stringp reason)
+               (notany (lambda (char) (member (char-code char) '(0 10 13))) reason)
+               (if (= parent 1) (null parent-bytes)
+                   (typep parent-bytes '(vector (unsigned-byte 8)))))
+    (error "invalid native timeline split"))
+  (let* ((history (timeline-check-lineage
+                   (timeline-parse-history parent (if parent-bytes (bytes->string parent-bytes) ""))))
+         (line (string->bytes
+                (format nil "~d~c~X/~8,'0X~c~a~%" parent #\Tab
+                        (ldb (byte 32 32) switchpoint) (ldb (byte 32 0) switchpoint)
+                        #\Tab reason))))
+    (unless (and (<= (timeline-history-entry-begin (first history)) switchpoint)
+                 (<= (1- (length line)) 1023))
+      (error "backward or oversized native timeline split"))
+    (let ((bytes (concatenate '(vector (unsigned-byte 8))
+                              (or parent-bytes #())
+                              (if parent-bytes #(10) #()) line)))
+      (unless (<= (length bytes) (* 16 1024 1024))
+        (error "timeline history exceeds readable size"))
+      bytes)))
+
+(defvar *timeline-history-lock* (sb-thread:make-mutex :name "timeline history publication"))
+
+(defvar *timeline-history-test-hook* nil)
+
+(defun timeline-history-test-point (point)
+  (when *timeline-history-test-hook* (funcall *timeline-history-test-hook* point)))
+
 (defun timeline-history-bytes (timeline &optional (directory *pgdata*))
   "Read an immutable history file without hanging on special files or following growth."
-  (let* ((path (merge-pathnames (concatenate 'string "pg_wal/" (timeline-history-filename timeline))
-                                directory))
+  (let* ((path (timeline-history-path timeline directory))
          (fd (handler-case
                  (sb-posix:open (namestring path)
                                 (logior sb-posix:o-rdonly sb-posix:o-nonblock +postmaster-o-cloexec+))
@@ -110,6 +146,43 @@ System identity and exact prefix digest must still be verified by the caller."
 (defun timeline-read-history (timeline &optional (directory *pgdata*))
   (if (= timeline 1) (timeline-parse-history 1 "")
       (timeline-parse-history timeline (bytes->string (timeline-history-bytes timeline directory)))))
+
+(defun timeline-publish-history-bytes (path bytes)
+  "Exclusively install a synced inode; never replace an existing pathname."
+  (let ((directory (uiop:pathname-directory-pathname path)))
+    (wal-ensure-directory-durable directory)
+    (multiple-value-bind (fd temporary)
+        (sb-posix:mkstemp (namestring (merge-pathnames ".history-XXXXXX" directory)))
+      (unwind-protect
+           (progn
+             (let ((stream (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8))))
+               (setf fd nil)
+               (unwind-protect
+                    (progn
+                      (write-sequence bytes stream)
+                      (finish-output stream)
+                      (timeline-history-test-point :before-file-fsync)
+                      (fsync-stream stream)
+                      (timeline-history-test-point :after-file-fsync)
+                      (sb-posix:link temporary (namestring path))
+                      (timeline-history-test-point :after-install)
+                      ;; durable_rename fsyncs the installed inode, then its directory.
+                      (fsync-stream stream))
+                 (close stream)))
+             (sb-posix:unlink temporary)
+             (fsync-directory directory)
+             (timeline-history-test-point :after-directory-fsync)
+             path)
+        (when fd (sb-posix:close fd))
+        (ignore-errors (sb-posix:unlink temporary))))))
+
+(defun timeline-write-history (child parent switchpoint reason &optional (directory *pgdata*))
+  "Durably publish immutable history without changing runtime timeline or role.
+The caller's future recovery transition must handle publication errors fail-closed."
+  (sb-thread:with-mutex (*timeline-history-lock*)
+    (let* ((parent-bytes (unless (= parent 1) (timeline-history-bytes parent directory)))
+           (bytes (timeline-encode-history child parent switchpoint reason parent-bytes)))
+      (timeline-publish-history-bytes (timeline-history-path child directory) bytes))))
 
 (defun send-timeline-history (stream timeline)
   "Match SendTimeLineHistory's text columns and exact file bytes."

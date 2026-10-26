@@ -80,3 +80,59 @@
     (let ((data (cl-spec:result-data
                  (cl-spec:run-property 'timeline-point-switches-at-the-fork-not-before :seed 42))))
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest timeline-history-encoding-matches-c-parent-copy-and-line-layout
+    (let* ((parent (pg::string->bytes (format nil "# preserved~%1~c0/00000040~cfirst" #\Tab #\Tab)))
+           (bytes (pg::timeline-encode-history 4 3 128 "promoted" parent)))
+      (ok (equalp parent (subseq bytes 0 (length parent))))
+      (ok (equal (pg::bytes->string bytes)
+                 (format nil "# preserved~%1~c0/00000040~cfirst~%3~c0/00000080~cpromoted~%"
+                         #\Tab #\Tab #\Tab #\Tab)))
+      (ok (= 4 (pg::timeline-at-point 128 (pg::timeline-parse-history 4 (pg::bytes->string bytes))))))
+  (ok (equal (pg::bytes->string (pg::timeline-encode-history 2 1 64 "first" nil))
+             (format nil "1~c0/00000040~cfirst~%" #\Tab #\Tab))))
+
+(deftest timeline-history-encoding-rejects-invalid-or-unknown-native-ancestry
+    (dolist (args (list (list 2 2 64 "same" nil) (list 4294967296 1 64 "overflow" nil)
+                        (list 4 3 128 "missing" nil) (list 2 1 -1 "negative" nil)
+                        (list 2 1 64 (format nil "injected~%3 0/80") nil)
+                        (list 2 1 64 (string #\Null) nil)
+                        (list 4 3 32 "backward" (pg::string->bytes "1 0/40"))))
+      (ok (intake-fails-p (lambda () (apply #'pg::timeline-encode-history args))))))
+
+(cl-spec:defproperty timeline-encoded-child-starts-at-exact-fork
+    ((fork (range integer 1 18446744073709551615)))
+  (:about pg::timeline-encode-history)
+  (:trials (:normal 200))
+  (let* ((bytes (pg::timeline-encode-history 2 1 fork "promoted" nil))
+         (history (pg::timeline-parse-history 2 (pg::bytes->string bytes))))
+    (and (= 1 (pg::timeline-at-point (1- fork) history))
+         (= 2 (pg::timeline-at-point fork history))
+         (pg::timeline-prefix-boundary-p 1 fork history))))
+
+(deftest generated-timeline-history-encoding
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'timeline-encoded-child-starts-at-exact-fork :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest timeline-history-publication-never-overwrites-an-existing-child
+    (with-physical-store-directory (root)
+      (let ((path (pg::timeline-write-history 2 1 64 "first" root)))
+        (ok (probe-file path))
+        (ok (= 2 (pg::timeline-at-point 64 (pg::timeline-read-history 2 root))))
+        (let ((before (pg::timeline-history-bytes 2 root)))
+          (ok (intake-fails-p (lambda () (pg::timeline-write-history 2 1 128 "changed" root))))
+          (ok (equalp before (pg::timeline-history-bytes 2 root))))
+        (pg::timeline-write-history 3 2 128 "second" root)
+        (ok (= 3 (pg::timeline-at-point 128 (pg::timeline-read-history 3 root))))
+        (ok (= 2 (pg::timeline-at-point 127 (pg::timeline-read-history 3 root)))))))
+
+(deftest timeline-history-publication-failure-keeps-only-complete-final-files
+    (dolist (point '(:before-file-fsync :after-file-fsync :after-install :after-directory-fsync))
+      (with-physical-store-directory (root)
+        (let ((pg::*timeline-history-test-hook*
+                (lambda (current) (when (eq point current) (error "history publication failure")))))
+          (ok (intake-fails-p (lambda () (pg::timeline-write-history 2 1 64 "first" root)))))
+        (if (member point '(:after-install :after-directory-fsync))
+            (ok (= 2 (pg::timeline-at-point 64 (pg::timeline-read-history 2 root))))
+            (ok (not (probe-file (merge-pathnames "pg_wal/00000002.history" root))))))))

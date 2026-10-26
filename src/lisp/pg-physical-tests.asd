@@ -16,6 +16,7 @@
                (:file "t/wal-xid-reservation-tests")
                (:file "t/physical-history-tests")
                (:file "t/timeline-tests")
+               (:file "t/timeline-publication-tests")
                (:file "t/physical-restartpoint-tests")
                (:file "t/physical-stream-tests")
                (:file "t/physical-follow-exit-tests")
