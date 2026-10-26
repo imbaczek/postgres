@@ -98,6 +98,7 @@
                    (:file "../replication/physical-recovery")
                    (:file "../access/transam/timeline")
                    (:file "../storage/wal-namespace")
+                   (:file "../storage/wal-lineage")
                    (:file "../replication/physical-history")
                    (:file "../replication/physical-replay")
                    (:file "../replication/physical-restartpoint")

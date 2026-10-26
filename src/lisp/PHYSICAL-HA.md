@@ -150,11 +150,12 @@ helper now reproduces this filename search order, including partial known roots
 and equal forks. Its additional input guard requires the previous file TLI to
 be zero (initial/random access) or present in the selected history.
 
-This helper is not yet wired into the native scanner and confers no recovery or
-writer authority. Next, the read-only scanner must validate record ownership at
-the record's start (`xlogrecovery.c:3864–3875`), reject records crossing a fork,
-preserve the successful filename TLI as its monotonic floor, and validate native
-segment rotation gaps. It must never invoke the primary scanner's tail
+This helper confers no recovery or writer authority. The new internal
+`wal-scan-lineage` reader now uses it for explicitly bounded, read-only inspection
+of an immutable/quiesced segment set. It validates record ownership at the
+record's start (`xlogrecovery.c:3864–3875`), rejects records crossing a fork,
+preserves the successful filename TLI as its monotonic floor, and validates native
+segment rotation gaps. It never invokes the primary scanner's tail
 truncation on ancestor files. Native WAL7 record headers still carry neither TLI
 nor system identity: filenames, history and a valid record CRC alone do not prove
 that a copied prefix belongs to this cluster. Durable branch-bound provenance
@@ -163,6 +164,37 @@ The candidate prerequisite passes all 230 physical tests after a fresh ASDF
 rebuild, both focused cases after formatting, and fresh strict compilation
 (`/tmp/pg-lineage-candidates-compile.log`). A reused review thread found no
 correctness blocker; its model profile was not exposed by the service.
+
+The bounded reader clips a parent file at its history fork, ignoring any
+divergent physical tail. If child WAL starts in the following segment, its first
+record must be too large for the remaining capacity; a fork strictly inside that
+gap is rejected. Child-named files may contain copied ancestor records. Missing
+files permit older history candidates, but corrupt, symlink or special-file
+candidates fail without fallback. Opens use no-follow/nonblocking flags and
+regular-file descriptor checks; all streams close on callback errors/nonlocal
+exits. The callback receives record owner and filename TLI separately. Results
+include the actual cursor, used file identities and whether the requested end
+was reached, including early callback stops.
+
+The caller must supply a previously verified starting cursor and independent
+cluster/history/prefix provenance. A zero-length range reads no bytes and proves
+no boundary; a valid embedded header alone cannot authenticate an arbitrary
+starting offset. This reader is not wired into primary redo, standby replay,
+streaming or promotion yet. Those paths still enforce the operational TLI-1
+restriction. Integrating authenticated branch state and recoverable child
+publication remains the next operational milestone.
+
+Reader validation: 238 physical tests, 169 interop tests, 1,598 legacy checks
+(`/tmp/pg-wal-lineage-final-unit.log`) and fresh strict compilation
+(`/tmp/pg-wal-lineage-final-compile.log`). The generated ownership
+property ran 100 trials at seed 42, declaration digest
+`fnv1a64-v1:6c5dcc1e0dfb0a73`; no FunctionSpec is registered, and rejection counts
+and generated input coverage are unmeasured. Fixed cases exercise copied prefixes
+without parent files, CRC failure without fallback, unchanged files after read
+errors, divergent parent tails, exact boundaries/equal forks, rotation gaps,
+backward file selection and symlink/FIFO refusal. Reused-thread design,
+full-diff and refactoring reviews found no remaining blocker or useful macro
+extraction; the service did not expose the requested model profiles.
 
 ### Timeline history publication prerequisite
 
