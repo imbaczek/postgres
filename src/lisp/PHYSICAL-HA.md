@@ -196,6 +196,68 @@ backward file selection and symlink/FIFO refusal. Reused-thread design,
 full-diff and refactoring reviews found no remaining blocker or useful macro
 extraction; the service did not expose the requested model profiles.
 
+### Preparing child WAL prefixes
+
+C's `XLogInitNewTimeline` (`xlog.c:5867–5937`) copies only the valid parent prefix
+for an in-segment fork; at an exact boundary it initializes the following child
+segment without copying the previous segment. `XLogFileCopy` syncs its temporary
+file before installation (`xlog.c:3535–3652`). Native
+`wal-stage-timeline-prefix` now implements this preparation step with a unique
+temporary inode: copy exactly the fork offset from an explicit regular,
+no-follow parent source, or prepare an empty file at a segment boundary; sync the
+file and its directory; return the temporary pathname to its owner. It supports
+explicit legacy TLI-1 or qualified source filenames. Native segments have variable
+length, so their prepared EOF is the fork offset; C's zero-filled remainder is a
+fixed-size segment detail, not appended native WAL.
+
+The caller must pin immutable source files and independently verify the fork's
+durable applied-terminal and cluster/history provenance. The bounded reader
+does not supply these proofs. In particular, an applied standby suffix may be
+in its receive spool rather than `pg_wal`: promotion must materialize/pin that
+prefix before calling this helper. No child filename, history, control or runtime
+timeline is published. Ordinary errors and nonlocal exits clean up this call's
+temporary file. SIGKILL may leave an unclaimed `.timeline-*` temporary, which
+ordinary WAL discovery ignores; no startup path adopts it. Successful callers
+own the returned temporary and must install or remove it.
+
+Canonical installation is still missing, rather than replaced with no-clobber
+semantics. C's in-segment `InstallXLogFileSegment(find_free=false)` explicitly
+durably unlinks an existing destination and durably renames its prepared file
+(`xlog.c:3698–3724`). At a boundary, `XLogFileInit` may reuse a preallocated file
+(`xlog.c:3325–3339`); native variable-length reuse must distinguish an empty owned
+pending child from uncommitted record bytes. Before implementing either branch,
+recovery must persist and recheck ownership of the pending child. An existing
+child history/filename or matching prefix is insufficient evidence. Parent WAL
+control and write exclusion must remain authoritative through preparation and
+installation; only later EOR flush and durable recovery/control transition can
+admit child writes. This is local crash recovery state, not coordination.
+
+The current recovery control accepts only phases 0/1/2 and TLI 1
+(`physical-recovery-control-valid-p`); there is no persisted pending-child
+ownership to reuse yet. Replay publishes an applied terminal after syncing
+pages/CLOG and its recovery progress, but source allocation reservation and
+checkpoint provenance remain separate in-memory facts until a restartpoint
+captures them (`physical-replay-publish-terminal`). Promotion must bind these
+facts to its selected fork before stopping recovery. C then flushes its EOR
+record before advancing `minRecoveryPoint` and `minRecoveryPointTLI`
+(`CreateEndOfRecoveryRecord`, `xlog.c:8257–8302`). Neither the parent durable LSN
+nor an older checkpoint TLI can stand in for this child boundary. Required next
+work is restartable pending ownership/source-prefix materialization, canonical
+child installation, versioned EOR and control publication, and only then clearing
+recovery exclusion; startup crash tests must cover each boundary.
+
+Preparation validation: 244 physical tests, 169 interop tests, 1,598 legacy
+checks (`/tmp/pg-timeline-prefix-final-unit.log`) and fresh strict compilation
+(`/tmp/pg-timeline-prefix-final-compile.log`). The generated prefix property ran
+100 trials at seed 42, digest `fnv1a64-v1:426990b225941da2`; no FunctionSpec is
+registered, and generated input coverage/rejection counts remain unmeasured.
+Tests include both source namespaces, exact boundaries without a source file,
+multi-buffer copy from a later segment, unchanged parent/control/runtime facts,
+short/symlink/FIFO source rejection, and cleanup after three nonlocal exits.
+The reused design and full-diff/refactoring review threads found no blocker or
+useful further extraction; their model profiles were not exposed. New staging
+has no SIGKILL/power-loss test yet and does not claim promotion completion.
+
 ### Timeline history publication prerequisite
 
 The C promotion sequence selects a new timeline, initializes a writable child WAL

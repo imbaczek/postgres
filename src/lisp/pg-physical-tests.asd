@@ -16,6 +16,7 @@
                (:file "t/wal-xid-reservation-tests")
                (:file "t/wal-namespace-tests")
                (:file "t/wal-lineage-tests")
+               (:file "t/wal-timeline-tests")
                (:file "t/physical-history-tests")
                (:file "t/timeline-tests")
                (:file "t/timeline-publication-tests")
