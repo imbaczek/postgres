@@ -1,12 +1,18 @@
 ;; physical-row-replay.lisp
 ;;
-;; Apply a conservative contiguous prefix of row WAL between statements while
-;; admission is closed. Idle repeatable-read snapshots and their storage remain
-;; in place; batches that cannot be proved safe wait for those readers to end.
+;; Apply certified row WAL between statements while admission is closed.
+;; Incomplete snapshots impose strict XID cutoffs; covered snapshots keep their
+;; source exclusion sets. Storage and reader registrations remain in place.
+;; Maintenance/catalog batches wait; invalid covered commits fence recovery.
 
 (in-package #:pg)
 
 (defun physical-row-replay-reader-horizon ()
+  "Return the maximum xmax of incomplete snapshots and the covered snapshots.
+
+Only incomplete snapshots impose a contributor cutoff.  The covered list is
+used to check commits against each snapshot's acquisition boundary.
+Zero is valid when every registered snapshot is covered."
   (sb-thread:with-mutex (*snapshot-count-lock*)
     (let ((horizon 0) (registered 0) (covered nil))
       (maphash (lambda (snapshot present)
@@ -34,6 +40,10 @@
                             +wal-record-running-xacts+))))))
 
 (defun physical-row-replay-check-covered-commit (record snapshots)
+  "Check a source COMMIT against each covered snapshot before applying images.
+
+Its XID must be at or above the snapshot's xmax or be in its immutable XIP.
+A violation is an error; the outer replay path fences recovery."
   (when (= (wal-record-type record) +wal-record-commit+)
     (let ((xid (wal-record-xid record)))
       (dolist (snapshot snapshots)
@@ -46,6 +56,9 @@
 
 (defun physical-row-replay-images-allowed-p (images horizon)
   ;; Unknown, maintenance and contributor-free images cannot pass a reader.
+  ;; The horizon comes from incomplete snapshots only.  An old aborted page
+  ;; contributor may be below a covered snapshot's xmax and absent from XIP;
+  ;; native ABORT has no WAL record.
   (every (lambda (image)
            (let ((xids (wal-page-image-xids image)))
              (and (eq :row (wal-page-image-provenance image)) xids
@@ -107,6 +120,10 @@
 
 (defun physical-row-replay-prefix (horizon &optional covered)
   ;; Publish each safe terminal in order, and defer at the first unsafe batch.
+  ;; Coverage checks do not replace provenance, storage or quiescence barriers.
+  ;; Ordinary DML preserves heap and index versions, including during splits.
+  ;; C insertion-time index pruning is not implemented; adding it requires
+  ;; revisiting row certification and conflicts.
   (with-physical-replay-staging ()
     (let ((next-xid *next-xid*)
           (source-xids (copy-tree (getf *physical-recovery-state* :source-xids)))

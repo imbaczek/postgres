@@ -6,8 +6,9 @@
   and failure behavior where they matter. A gpt-6.1-terra subagent should write
   this pass; the primary agent reviews its documentation separately.
   The child checkpoint/primary, online promotion and reader-safe row replay
-  modules and source running-transaction metadata helpers have completed this
-  pass and its review. Keep the same order for the remaining HA work.
+  modules, source running-transaction metadata helpers and covered standby
+  snapshots have completed this pass and its review. Keep the same order for
+  the remaining HA work.
 
 - [ ] Audit cold-image compilation and ASDF load-order dependencies across `pg`
   and its test systems. A warm REPL must not conceal missing declarations or

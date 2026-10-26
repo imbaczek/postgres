@@ -946,7 +946,12 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
 (declaim (ftype function running-xacts-check-state))
 
 (defun make-snapshot-under-xid-lock (curcid &key register)
-  "Build a snapshot while the caller holds *XID-LOCK*."
+  "Build a snapshot while the caller holds *XID-LOCK*.
+
+During recovery, copy complete applied source membership into XIP after
+checking its next XID and replay position against the acquisition boundary.
+Otherwise use local active XIDs and leave source coverage incomplete.  The
+snapshot retains its coverage and XIP for its lifetime."
   (when (and register (not (snapshot-registration-p register)))
     (error "REGISTER must be a snapshot-registration token or NIL"))
   (let* ((source (and (recovery-in-progress-p) (getf *physical-recovery-state* :source-xids)))
@@ -1296,7 +1301,10 @@ snapshot lifecycle."
        (wal-release-logical-catalog-event-interest registration)))))
 
 (defun import-exported-logical-snapshot (token)
-  "Import TOKEN into the current read-only RR transaction as an independent pin."
+  "Import TOKEN into the current read-only RR transaction as an independent pin.
+
+The generated copier carries coverage and other value slots.  The imported
+snapshot owns copies of XIP and sequence states."
   (unless (and *backend*
                (eq (backend-state *backend*) :in-progress)
                (backend-explicit *backend*)
@@ -1533,7 +1541,10 @@ remains after BODY and should be dropped when its WAL is no longer needed."
             (release-snapshot-registration registration))))))
 
 (defun begin-transaction-snapshot (backend curcid statement-registration)
-  "Return a per-statement view over BACKEND's stable transaction horizon."
+  "Return a per-statement view over BACKEND's stable transaction horizon.
+
+The generated copier carries coverage and other value slots.  The view borrows
+the retained snapshot's immutable XIP, sets CURCID, and clears sequence metadata."
   (let* ((retained (ensure-transaction-snapshot backend curcid))
          (snapshot (copy-snapshot retained)))
     (setf (snapshot-curcid snapshot) curcid

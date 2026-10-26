@@ -12,6 +12,8 @@
   sequence-database-oid
   sequence-state-captured-p
   sequence-states
+  ;; True when source tracking covered this snapshot's acquisition boundary.
+  ;; Coverage and XIP stay fixed while replay advances.
   (source-xids-complete-p nil))
 
 (defstruct (snapshot-registration

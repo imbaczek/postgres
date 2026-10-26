@@ -159,7 +159,8 @@ NIL state stays unknown until an anchor. Inferred XIDs may already have aborted.
 ;;; The pure helpers above do not capture or replay WAL themselves.  The
 ;;; source commit path emits this metadata using the WAL-then-XID lock order.
 ;;; Replay validates it and publishes membership at applied terminals;
-;;; restartpoints preserve it.  The snapshot factory does not yet consume it.
+;;; restartpoints preserve it.  The snapshot factory copies complete applied
+;;; membership when it captures a recovery snapshot.
 ;;;
 ;;; Native record type 14 was introduced in the same unpublished native WAL
 ;;; version 7.  Older executables reject the new type, so mixed checkouts are

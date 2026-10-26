@@ -143,25 +143,24 @@ and catalog storage. Dropping admission alone is unsafe and still leaves a
 snapshot conflict. Deferring a result or replaying the query does not preserve
 arbitrary expressions, volatile effects, streamed rows or explicit transactions.
 
-The first reader-safe steady-state replay slice is now implemented, as recorded
-below. Items 1–3 describe its scope; item 4 remains future work:
+Reader-safe steady-state replay and source membership snapshots are implemented,
+as recorded below. Items 1–3 describe their scope; item 4 remains future work:
 
 1. Classify complete page-image/commit batches. With old readers present, permit
-   only batches whose committing XID is at or beyond every active snapshot's
-   xmax, and require the same of every page-image contributor. Defer older
-   XIDs, unknown or maintenance images, and catalog/DDL work. Do not skip an
-   unsafe batch to apply a later one.
+   only certified row batches. Incomplete snapshots require the commit and every
+   contributor to be at or beyond their xmax. Covered snapshots instead require
+   the commit to be excluded by their immutable xmax/xip. Unknown or maintenance
+   images and catalog/DDL work still defer. Never skip an unsafe batch.
 2. Keep CLOG/smgr handles, snapshot registrations, virtual reader IDs and catalog
    objects intact. Existing smgr/CLOG locks protect their file access; synchronize
    replay page writes/cache invalidation with the WAL cache path. Publish applied
    progress and the new visibility counter at the replay/snapshot boundary.
 3. Verify the C oracle's old-reader UPDATE/INSERT scenario on native peers.
-   A source writer that predates a live snapshot must defer until its visibility
-   can be established safely.
-4. Add C-style running/known-assigned XID tracking, then DDL/catalog and
-   vacuum/prune conflict handling. Current snapshot xip comes only from local
-   active XIDs; removing the global reader guard without source transaction
-   tracking can change an old snapshot's visibility.
+   Covered snapshots now permit older source writers to commit while retaining
+   the original view. Snapshots without complete source coverage remain strict.
+4. Add DDL/catalog and vacuum/prune conflict handling. Source running/known-assigned
+   tracking and its snapshot consumer are implemented; they do not authorize
+   destructive maintenance across retained readers.
 
 After reader-safe replay, implement in-place promotion that preserves reader
 state and a lifecycle dependency lane that lets promotion progress while its SQL
@@ -179,8 +178,9 @@ are not a required C mechanism. No coordination is introduced.
 
 Active SQL still drains under the whole admission gate. Between statements,
 idle repeatable-read snapshots stay registered while certified row batches
-apply. The commit FullXID and every image contributor must be normal and at
-least the greatest retained snapshot xmax. Images lacking contributor metadata
+apply. The initial slice required the commit FullXID and every contributor to
+be normal and at least the greatest retained snapshot xmax. The covered-snapshot
+extension below widens that cutoff. Images lacking contributor metadata
 or certified row provenance defer. An empty reservation-only batch can proceed
 when validated by the decoder; source allocation capacity remains separate from
 reader visibility. Safe earlier terminals can publish before a later unsafe
@@ -267,8 +267,9 @@ reconstruction copy that selected state, without consulting mutable CLOG.
 Missing generations and old generations without the field restore unknown
 coverage. Explicit incomplete state also survives serialization and restoration.
 The writer appends the optional field, preserving the existing metadata order.
-**Standby snapshots do not yet consume membership**; the reader cutoff remains
-unchanged.
+New standby snapshots consume complete membership at the matching applied
+next-XID/through boundary. Existing snapshots retain their original coverage;
+the covered-snapshot section below records the resulting replay rules.
 
 The custom `PGRUNX01` payload carries actual next FullXID, sorted unique running
 FullXIDs and a complete/unknown flag. Allocation capacity is not a visibility
@@ -282,13 +283,9 @@ Type 14 extends the unpublished native v7 format without a version bump, as
 requested for this research project. Older executables reject it; the unchanged
 version does not promise interoperability between different checkouts.
 
-Next integration steps retain C's `RecordKnownAssignedTransactionIds` principle:
-
-- Copy coverage and membership into each new standby snapshot. Existing snapshots
-  retain their original coverage. Incomplete snapshots keep the strict cutoff;
-  covered snapshots need a COMMIT membership check, not a page-contributor cutoff.
-- Exercise older writers, aborted page contributors, incomplete batches, overflow,
-  restartpoint compaction and crashes before claiming reader-preserving promotion.
+The integration retains C's `RecordKnownAssignedTransactionIds` principle.
+Reader-preserving promotion still needs the remaining conflict handling and an
+in-place lifecycle path; source membership alone does not provide them.
 
 Validation: a fresh worker passed the 330-test physical suite, then two added
 malformed-input tests and all eight new tests passed separately. The round-trip
@@ -325,8 +322,55 @@ scenarios, manual replay with generation-restore assertions, continuous follow,
 automatic restartpoints and prefix publication crash boundaries passed. Fresh
 pending-resume processes verified both a current generation's membership and an
 older generation's missing-field downgrade. Strict compilation and the requested
-checkpoint, full-diff and refactoring reviews passed. This proves neither a
-snapshot consumer nor reader-preserving SQL promotion; those remain next steps.
+checkpoint, full-diff and refactoring reviews passed. That validation predates
+the snapshot consumer recorded next; reader-preserving SQL promotion remains open.
+
+### Covered standby snapshots
+
+The snapshot factory now copies complete applied source membership under the XID
+lock, checking that its next-XID and through-LSN match the published recovery
+boundary. Each snapshot retains its coverage flag and exclusion list independently
+of later source anchors, overflow, and transaction completion. Missing or incomplete
+coverage keeps the conservative replay cutoff. Later anchors do not upgrade those
+older snapshots. A downgrade affects newly acquired snapshots, while already
+covered snapshots remain usable.
+
+Replay computes the maximum xmax of incomplete snapshots only. Their cutoff still
+applies to COMMIT and every page contributor. For each covered snapshot, COMMIT
+must be at/above xmax or in its retained xip. A violation reports the writer, LSN
+and snapshot xmax and fences recovery before applying any image or commit bit.
+Covered snapshots impose no contributor cutoff: an older aborted contributor can
+legitimately be below xmax and absent from xip. Certified ordinary heap/index
+versions preserve the old view. Catalog, maintenance, unknown provenance and XID
+reset barriers remain, as do storage preflight and whole-operation admission.
+Porting C's insertion-time index pruning would require revisiting this certification.
+
+Generated snapshot copying preserves the coverage flag and future value slots.
+Imported snapshots own copies of xip and sequence state. RR statement views borrow
+the immutable exclusion list, update curcid and continue to clear sequence-copy
+metadata. Changing the snapshot structure requires a fresh Lisp image; the MCP
+worker and native peers were restarted for this layout.
+
+Validation: the final clean worker passed 354 physical tests, 170 interop tests
+and all 1,598 legacy checks. The mixed-snapshot exclusion property passed 200
+trials each with seeds 42 and 2764529561460969219, digest
+`fnv1a64-v1:c1484c0736c6a9bc`; rejection counts and input coverage were not measured.
+An injected invalid COMMIT verified diagnostic fencing before page/CLOG mutation.
+The expanded 11-scenario native reader matrix passed in
+`/tmp/pg-covered-readers-final.log`: mixed coverage and downgrade, older writers,
+aborted contributors, indexed views through splits/key updates/deletes, legacy
+images, catalog/VACUUM barriers, staged destructive maintenance, and both crash
+boundaries. The maintenance hook now waits for an actual staged LP_DEAD page,
+rather than an unchanged early heap page. Physical follow/replay/restartpoint
+checks passed. Both pinned C logical directions and all three manual switchovers
+passed in `/tmp/pg-covered-logical-final.log` and `/tmp/pg-covered-switch-final.log`.
+Fresh strict compilation and formatting passed.
+
+Luna max checkpoint, Sol high full and refactor re-review, Astra high safety advice
+and Sol medium refactoring review completed. The review service's thread limit
+required CLI review sessions with the same requested profiles; the Sol Lisp review
+used verbatim cl-mcp source snapshots when read-only MCP setup was unavailable.
+No coordination or SQL pg_promote support is added by this milestone.
 
 ### Timeline-qualified native WAL namespace
 
