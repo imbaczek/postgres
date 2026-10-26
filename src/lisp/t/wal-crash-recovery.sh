@@ -545,7 +545,7 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.wal"))):
         if data[offset:offset + 4] != b"PGWL":
             raise SystemExit("invalid WAL while inspecting checkpoint images")
         version = struct.unpack_from("<H", data, offset + 4)[0]
-        if version not in (2, 3, 4, 5):
+        if version not in (2, 3, 4, 5, 6):
             raise SystemExit("unsupported WAL version while inspecting checkpoint images")
         record_type = struct.unpack_from("<H", data, offset + 6)[0]
         length = struct.unpack_from("<I", data, offset + 8)[0]
@@ -920,8 +920,12 @@ elif mode in ("final-length", "final-inflated", "final-checksum",
               "final-magic", "final-version", "final-lsn", "final-type"):
     path, _, offset, length, data = records[-1]
     record_type = struct.unpack_from("<H", data, offset + 6)[0]
-    if length != 32 or record_type not in (2, 3, 4, 5):
-        raise SystemExit("last durable record is not a terminal record")
+    version = struct.unpack_from("<H", data, offset + 4)[0]
+    expected_lengths = (32, 40) if record_type == 2 else ((120,) if record_type == 4 and version == 6 else (32,))
+    if length not in expected_lengths or record_type not in (2, 3, 4, 5):
+        raise SystemExit(f"last durable record is not a terminal record: type={record_type} version={version} length={length}")
+    if record_type == 4 and version == 6 and data[offset + 32:offset + 40] != b"PGCKPT01":
+        raise SystemExit("checkpoint snapshot is missing before corruption")
     if mode == "final-length":
         struct.pack_into("<I", data, offset + 8, 0)
     elif mode == "final-inflated":
