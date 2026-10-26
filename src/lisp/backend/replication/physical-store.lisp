@@ -175,6 +175,7 @@ is not a base/record-end boundary. No value returns until all validation passes.
                              decoder (+ (* segment +wal-segment-size+) offset)
                              (subseq buffer 0 count)
                              :on-record (lambda (record raw)
+                                          (wal-require-ordinary-record-type (wal-record-type record))
                                           (setf digest
                                                 (physical-store-update-digest digest raw))
                                           (when (eql digest-cursor (wal-record-end record))
@@ -347,6 +348,7 @@ local receivers and is released on crash; it is not a distributed writer lease."
   (physical-store-stream store))
 
 (defun physical-store-write-record (store record bytes)
+  (wal-require-ordinary-record-type (wal-record-type record))
   (let* ((start (wal-record-start record))
          (stream (physical-store-open-segment store (floor start +wal-segment-size+))))
     (file-position stream (mod start +wal-segment-size+))

@@ -112,7 +112,9 @@
               (replace raw header)
               (unless (= length (read-sequence raw input :start +wal-header-size+))
                 (error "truncated retained physical source record"))
-              (values (wal-decode-record raw start) raw durable))))))))
+              (let ((record (wal-decode-record raw start)))
+                (wal-require-ordinary-record-type (wal-record-type record))
+                (values record raw durable)))))))))
 
 (defun physical-source-prove-range (name owner cursor requested digest &optional progress)
   "Hash only a newly acknowledged suffix, rejecting an interior record cursor."

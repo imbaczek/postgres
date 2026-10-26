@@ -28,6 +28,10 @@
 
 (defconstant +wal-version-v6+ 6)
 
+(defconstant +wal-record-end-of-recovery+ 13)
+
+(declaim (ftype function wal-end-of-recovery-record-info))
+
 (defconstant +wal-version+ 7)
 
 (defparameter *max-slot-wal-keep-bytes* (* 1024 1024 1024)
@@ -565,6 +569,11 @@ Legacy 16-hex segment names always belong to timeline 1."
          :format-control control
          :format-arguments arguments))
 
+(defun wal-require-ordinary-record-type (type)
+  "EOR needs a verified timeline transition, not ordinary batch/progress handling."
+  (when (= type +wal-record-end-of-recovery+)
+    (wal-invalid-input "end-of-recovery requires a verified timeline transition")))
+
 (defun wal-fail-stop (condition)
   (setf *wal-poisoned* t)
   (when (fboundp 'request-fast-shutdown)
@@ -647,6 +656,7 @@ Legacy 16-hex segment names always belong to timeline 1."
     record))
 
 (defun wal-append-record (type xid payload)
+  (wal-require-ordinary-record-type type)
   (wal-check-healthy)
   (handler-case
       (let* ((length (+ +wal-header-size+ (length payload)))
@@ -1193,6 +1203,7 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
                               +wal-record-catalog-commit+
                               +wal-record-maintenance+))
            (and (= type +wal-record-xid-reservation+) (>= version 7))
+           (and (= type +wal-record-end-of-recovery+) (>= version 7))
            (and (= type +wal-record-logical-changes+)
                 (>= version +wal-version-v5+))
            (and (= type +wal-record-logical-catalog-event+)
@@ -1230,8 +1241,11 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
            (xid (wal-u64 bytes 20))
            (payload (subseq bytes +wal-header-size+))
            (end (+ expected-lsn (length bytes))))
-      (make-wal-record :version version :type type :xid xid
-                       :start expected-lsn :end end :payload payload))))
+      (let ((record (make-wal-record :version version :type type :xid xid
+                                     :start expected-lsn :end end :payload payload)))
+        (when (= type +wal-record-end-of-recovery+)
+          (wal-end-of-recovery-record-info record))
+        record))))
 
 (defun wal-truncate-tail (path offset)
   (with-open-file (stream path :direction :io
@@ -1261,6 +1275,11 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
                               :element-type '(unsigned-byte 8))))
       (unless (= (read-sequence header stream) +wal-header-size+)
         (error "could not read WAL record header"))
+      ;; Recognized timeline-transition bytes must not enter ordinary tail repair,
+      ;; even if an interrupted write left their body incomplete or malformed.
+      (when (and (equalp (subseq header 0 4) #(80 71 87 76))
+                 (>= (wal-u16 header 4) 7))
+        (wal-require-ordinary-record-type (wal-u16 header 6)))
       (let ((record-length (wal-u32 header 8)))
         (unless (and (>= record-length +wal-header-size+)
                      (<= record-length +wal-segment-size+)
@@ -1318,6 +1337,7 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
               do (multiple-value-bind (record record-length)
                      (wal-read-scan-record stream segment last-segment offset size)
                    (unless record (return))
+                   (wal-require-ordinary-record-type (wal-record-type record))
                    (when (and scan-end-lsn
                               (> (wal-record-end record) scan-end-lsn))
                      (error "WAL scan end ~a is not a record boundary"
@@ -1462,6 +1482,7 @@ src/backend/access/transam/xlogreader.c."
 
 (defun wal-note-recovery-batch-record (record)
   "A reservation terminal must immediately follow a valid empty batch marker."
+  (wal-require-ordinary-record-type (wal-record-type record))
   (let ((type (wal-record-type record)))
     (cond
       ((= type +wal-record-batch-start+)

@@ -102,6 +102,32 @@ System identity and exact prefix digest must still be verified by the caller."
          (or (null (timeline-history-entry-end entry))
              (<= boundary (timeline-history-entry-end entry))))))
 
+(defun timeline-check-end-of-recovery (record replay-timeline history
+                                       &key (min-recovery-point 0) (min-recovery-timeline 0))
+  "Check C's timeline switch before redo; return the child without changing state.
+The caller separately verifies cluster/prefix provenance and publishes replay TLI
+before applying EOR. This check grants neither recovery completion nor writer admission."
+  (unless (and (typep replay-timeline '(integer 1 4294967295))
+               (typep min-recovery-point '(unsigned-byte 64))
+               (typep min-recovery-timeline '(unsigned-byte 32))
+               (or (zerop min-recovery-point) (plusp min-recovery-timeline)))
+    (error "invalid end-of-recovery replay context"))
+  (timeline-check-lineage history)
+  (let* ((info (wal-end-of-recovery-record-info record))
+         (child (getf info :timeline)) (previous (getf info :prev-timeline))
+         (end (wal-record-end record)))
+    (unless (and (= child (timeline-at-point (wal-record-start record) history))
+                 (timeline-prefix-boundary-p child end history))
+      (error "end-of-recovery record is outside expected timeline history"))
+    ;; ApplyWalRecord calls checkTimeLineSwitch only when the TLI changes.
+    (unless (= child replay-timeline)
+      (unless (and (= previous replay-timeline) (>= child replay-timeline))
+        (error "end-of-recovery record disagrees with current replay timeline"))
+      (when (and (plusp min-recovery-point) (< end min-recovery-point)
+                 (> child min-recovery-timeline))
+        (error "timeline switch precedes required minimum recovery point")))
+    child))
+
 (defun timeline-history-filename (timeline)
   (unless (typep timeline '(integer 1 4294967295)) (error "invalid timeline identifier"))
   (format nil "~8,'0X.history" timeline))
