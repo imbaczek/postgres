@@ -198,6 +198,9 @@ out=$(q "select pg_terminate_backend('abc')" 2>&1 || true)
 echo "$out" | grep -q 'invalid input syntax for type integer: "abc"' \
     || fail "bad pid string was not rejected with 22P02"
 out=$(q 'select pg_terminate_backend(999999, 9223372036854775808)' 2>&1 || true)
+echo "$out" | grep -q 'function pg_terminate_backend(integer, numeric) does not exist' \
+    || fail "numeric timeout incorrectly resolved to bigint"
+out=$(q "select pg_terminate_backend(999999, '9223372036854775808')" 2>&1 || true)
 echo "$out" | grep -q 'bigint out of range' \
     || fail "timeout outside bigint range was accepted"
 out=$(q 'select pg_cancel_backend(true)' 2>&1 || true)

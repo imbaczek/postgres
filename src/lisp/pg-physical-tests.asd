@@ -13,6 +13,7 @@
                (:file "t/physical-control-tests")
                (:file "t/promotion-control-tests")
                (:file "t/checkpoint-tests")
+               (:file "t/control-data-tests")
                (:file "t/xid-reservation-tests")
                (:file "t/wal-xid-reservation-tests")
                (:file "t/wal-namespace-tests")

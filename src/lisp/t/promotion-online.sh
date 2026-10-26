@@ -70,7 +70,8 @@ if [ "${PROMOTION_REQUEST:-patroni}" = wait ]; then
     "$BASE/bin/pg_ctl" promote -D "$TMP/copy" -w -t 30 >"$TMP/utility.log" 2>&1 &
     UTILITY=$!
 else
-    "$PATRONI_PYTHON" "$BASE/t/interop/patroni-promote-request.py" "$TMP/copy"
+    "$PATRONI_PYTHON" "$BASE/t/interop/patroni-promote.py" "$TMP/copy" >"$TMP/utility.log" 2>&1 &
+    UTILITY=$!
 fi
 attempt=0
 while [ -e "$TMP/copy/promote" ]; do
@@ -79,6 +80,11 @@ while [ -e "$TMP/copy/promote" ]; do
 done
 attempt=0
 while :; do
+    if [ -n "$UTILITY" ] && ! kill -0 "$UTILITY" 2>/dev/null; then
+        cat "$TMP/utility.log" >&2
+        wait "$UTILITY"
+        exit 1
+    fi
     checked target '(if *physical-promotion-stopping-p* :stopping :waiting)' promotion-pending
     if grep -q '^:STOPPING$' "$TMP/promotion-pending.log"; then break; fi
     kill -0 "$TARGET"
