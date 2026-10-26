@@ -30,6 +30,7 @@
       :components ((:file "bufpage")
                    (:file "smgr")
                    (:file "wal")
+                   (:file "wal-checkpoint")
                    (:file "bufmgr")))
      (:module "access"
       :serial t

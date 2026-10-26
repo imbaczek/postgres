@@ -1,0 +1,81 @@
+;;;; Versioned native checkpoint facts; the native WAL format is not C WAL.
+(in-package #:pg)
+
+(defconstant +wal-checkpoint-snapshot-size+ 88)
+
+(defun wal-checkpoint-record-size ()
+  (+ +wal-header-size+ +wal-checkpoint-snapshot-size+))
+
+(defun wal-checkpoint-snapshot-valid-p (snapshot)
+  (let ((start (getf snapshot :start)) (end (getf snapshot :end))
+                                       (redo (getf snapshot :redo)) (next (getf snapshot :next-xid))
+                                       (reserved (getf snapshot :xid-reserved-through))
+                                       (oid (getf snapshot :next-oid)) (active (getf snapshot :oldest-active-xid)))
+    (and (eql 1 (getf snapshot :version))
+         (every (lambda (value) (typep value '(unsigned-byte 64)))
+                (list start end redo next reserved active))
+         (= end (+ start (wal-checkpoint-record-size)))
+         (= (floor start +wal-segment-size+) (floor (1- end) +wal-segment-size+))
+         (<= redo start)
+         (<= 3 next (1+ reserved))
+         (<= 2 reserved)
+         ;; C uses nextXid when the active set is empty; zero also denotes unknown.
+         (or (zerop active) (<= 3 active next))
+         (or (null oid) (typep oid '(unsigned-byte 64)))
+         (typep (getf snapshot :time) '(signed-byte 64))
+         ;; Native writer lineage is currently restricted to timeline 1.
+         (eql 1 (getf snapshot :timeline))
+         (eql 1 (getf snapshot :prev-timeline)))))
+
+(defun wal-encode-checkpoint-snapshot (snapshot)
+  "Encode captured source values, preserving unknown OID separately from zero."
+  (unless (wal-checkpoint-snapshot-valid-p snapshot)
+    (error "invalid native checkpoint snapshot"))
+  (let ((bytes (make-array +wal-checkpoint-snapshot-size+
+                           :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace bytes #(80 71 67 75 80 84 48 49))
+    (loop for key in '(:start :end :redo :next-xid :xid-reserved-through :next-oid)
+          for offset from 8 by 8
+          do (wal-set-u64 bytes offset (or (getf snapshot key) 0)))
+    (wal-set-i64 bytes 56 (getf snapshot :time))
+    (wal-set-u32 bytes 64 (getf snapshot :timeline))
+    (wal-set-u32 bytes 68 (getf snapshot :prev-timeline))
+    (wal-set-u64 bytes 72 (getf snapshot :oldest-active-xid))
+    (when (getf snapshot :next-oid) (wal-set-u32 bytes 80 1))
+    bytes))
+
+(defun wal-decode-checkpoint-snapshot (bytes)
+  "Decode only the exact snapshot schema; containing WAL/control supplies CRC."
+  (unless (and (= (length bytes) +wal-checkpoint-snapshot-size+)
+               (equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 49))
+               (member (wal-u32 bytes 80) '(0 1))
+               (zerop (wal-u32 bytes 84))
+               (or (= 1 (wal-u32 bytes 80)) (zerop (wal-u64 bytes 48))))
+    (error "corrupt or unsupported native checkpoint snapshot"))
+  (let ((snapshot (list :version 1 :start (wal-u64 bytes 8) :end (wal-u64 bytes 16)
+                        :redo (wal-u64 bytes 24) :next-xid (wal-u64 bytes 32)
+                        :xid-reserved-through (wal-u64 bytes 40)
+                        :next-oid (when (= 1 (wal-u32 bytes 80)) (wal-u64 bytes 48))
+                        :time (wal-i64 bytes 56) :timeline (wal-u32 bytes 64)
+                        :prev-timeline (wal-u32 bytes 68) :oldest-active-xid (wal-u64 bytes 72))))
+    (unless (wal-checkpoint-snapshot-valid-p snapshot)
+      (error "invalid native checkpoint snapshot"))
+    snapshot))
+
+(defun wal-checkpoint-record-snapshot (record)
+  "Validate a checkpoint terminal; legacy empty payloads have unknown metadata."
+  (unless (and (= (wal-record-type record) +wal-record-checkpoint+)
+               (zerop (wal-record-xid record)))
+    (error "invalid native checkpoint record"))
+  (if (zerop (length (wal-record-payload record)))
+      (progn
+        (unless (and (member (wal-record-version record) '(2 3 4 5))
+                     (= (wal-record-end record) (+ (wal-record-start record) +wal-header-size+)))
+          (error "invalid legacy checkpoint record boundary"))
+        nil)
+      (let ((snapshot (wal-decode-checkpoint-snapshot (wal-record-payload record))))
+        (unless (and (eql 6 (wal-record-version record))
+                     (= (wal-record-start record) (getf snapshot :start))
+                     (= (wal-record-end record) (getf snapshot :end)))
+          (error "checkpoint snapshot differs from its WAL record"))
+        snapshot)))

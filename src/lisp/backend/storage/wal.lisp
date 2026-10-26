@@ -167,6 +167,10 @@
   (logior (wal-u32 bytes offset)
           (ash (wal-u32 bytes (+ offset 4)) 32)))
 
+(defun wal-i64 (bytes offset)
+  (let ((raw (wal-u64 bytes offset)))
+    (if (logbitp 63 raw) (- raw #x10000000000000000) raw)))
+
 (defun wal-set-u16 (bytes offset value)
   (setf (aref bytes offset) (logand value #xFF)
         (aref bytes (+ offset 1)) (logand (ash value -8) #xFF))
@@ -182,6 +186,11 @@
 (defun wal-set-u64 (bytes offset value)
   (wal-set-u32 bytes offset (logand value #xFFFFFFFF))
   (wal-set-u32 bytes (+ offset 4) (logand (ash value -32) #xFFFFFFFF))
+  value)
+
+(defun wal-set-i64 (bytes offset value)
+  (unless (typep value '(signed-byte 64)) (error "unrepresentable signed WAL integer"))
+  (wal-set-u64 bytes offset (ldb (byte 64 0) value))
   value)
 
 (defun make-wal-crc32-table ()

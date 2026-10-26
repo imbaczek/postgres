@@ -60,7 +60,7 @@
     (wal-set-u64 bytes 40 applied)
     (wal-set-u64 bytes 48 next-xid)
     (wal-set-u32 bytes 56 db-state)
-    (wal-set-u64 bytes 60 (ldb (byte 64 0) state-time))
+    (wal-set-i64 bytes 60 state-time)
     (wal-set-u32 bytes 68 (wal-crc32 bytes))
     bytes))
 
@@ -84,9 +84,7 @@
                   :checkpoint (wal-u64 bytes 32) :applied (wal-u64 bytes 40)
                   :next-xid (wal-u64 bytes 48)
                   :db-state (unless legacy (wal-u32 bytes 56))
-                  :state-time (unless legacy
-                                (let ((raw (wal-u64 bytes 60)))
-                                  (if (logbitp 63 raw) (- raw #x10000000000000000) raw))))))
+                  :state-time (unless legacy (wal-i64 bytes 60)))))
       (unless (physical-recovery-control-valid-p control :legacy legacy)
         (error "corrupt or unsupported physical recovery control"))
       control)))

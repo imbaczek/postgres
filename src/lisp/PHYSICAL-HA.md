@@ -71,6 +71,39 @@ phase postcondition is implemented. Full checkpoint metadata, primary shutdown
 checkpoint parity, promotion, timeline changes, rejoin and synchronous durability
 remain unfinished. No coordination is introduced.
 
+### Native checkpoint snapshot codec groundwork
+
+The internal checkpoint snapshot codec now preserves explicit record start/end,
+native redo position, actual next FullXID, separately reserved-through FullXID,
+next OID (including an explicit unknown state), signed Unix checkpoint time,
+timeline lineage and oldest active FullXID. Its versioned 88-byte payload binds
+to the containing version-6 checkpoint record and validates segment boundaries.
+Legacy version-2 through version-5 empty checkpoints retain unknown metadata.
+The writer still emits version-5 empty checkpoints: this is codec groundwork,
+not a published control snapshot or a completed checkpoint reporting interface.
+
+The next integration must change the WAL writer, durable control copy, scan
+start, source-pin validation, bootstrap inventory/manifest, replay history and
+restartpoint metadata together. Existing consumers derive checkpoint start as
+end minus 32; that assumption cannot survive a nonempty checkpoint. As in C's
+`CheckPoint`/`ControlFileData`, retain a durable copy independently of recycled
+WAL. A WAL flush before data fsync must preserve the previously published
+checkpoint copy; only successful checkpoint control publication advances it.
+
+A captured reservation bound alone does not make promotion safe at a later
+LSN. Native XID allocation can reserve another batch in `global/pg_control`
+without a WAL record. That reservation needs a durable replayable contract
+before promotion can reuse the allocator safely. Preserve the WAL-to-XID lock
+order when implementing it. No authority follows from these snapshot fields.
+The full 20-column C checkpoint SQL contract remains incomplete.
+
+Codec validation: 165 physical tests, 169 interop tests, 1,598 legacy checks,
+strict fresh compilation and formatting pass. The cl-spec round-trip property
+passed 200 trials with seed 42 (digest `fnv1a64-v1:dfb6fd7c9db473c3`);
+input coverage and rejection counts are unmeasured, and no FunctionSpec is
+registered. These checks do not validate writer publication or crash recovery
+of the new payload, which are not integrated yet.
+
 ### Postmaster startup timestamp and checkpoint reporting inventory
 
 `pg_catalog.pg_postmaster_start_time()` now returns a stable timestamptz
