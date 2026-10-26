@@ -1,5 +1,8 @@
 # Physical HA and Patroni backend work
 
+Open development audits, including cold-image/load-order correctness, are tracked
+in [TODO.md](TODO.md).
+
 Status: durable native intake/bootstrap/recovery, continuous TCP receipt/reconnect,
 advancing source retention, explicit/automatic local restartpoints and Linux
 PGDATA/PID ownership and a startup/reload configuration subset are
