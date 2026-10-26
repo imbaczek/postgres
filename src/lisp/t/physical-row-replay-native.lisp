@@ -149,5 +149,6 @@
                             collect value)
                       :key #'pg-index-table-oid)))
     (assert index)
-    (assert (> (smgr-nblocks (pg-index-relfilenode index)) 1)))
+    ;; An unsplit tree already has a metapage and one leaf.
+    (assert (> (smgr-nblocks (pg-index-relfilenode index)) 2)))
   t)

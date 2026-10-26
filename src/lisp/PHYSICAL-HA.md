@@ -357,10 +357,11 @@ trials each with seeds 42 and 2764529561460969219, digest
 `fnv1a64-v1:c1484c0736c6a9bc`; rejection counts and input coverage were not measured.
 An injected invalid COMMIT verified diagnostic fencing before page/CLOG mutation.
 The expanded 11-scenario native reader matrix passed in
-`/tmp/pg-covered-readers-final.log`: mixed coverage and downgrade, older writers,
+`/tmp/pg-covered-readers-split-proof.log`: mixed coverage and downgrade, older writers,
 aborted contributors, indexed views through splits/key updates/deletes, legacy
 images, catalog/VACUUM barriers, staged destructive maintenance, and both crash
-boundaries. The maintenance hook now waits for an actual staged LP_DEAD page,
+boundaries. The split check requires growth beyond the metapage and initial leaf.
+The maintenance hook now waits for an actual staged LP_DEAD page,
 rather than an unchanged early heap page. Physical follow/replay/restartpoint
 checks passed. Both pinned C logical directions and all three manual switchovers
 passed in `/tmp/pg-covered-logical-final.log` and `/tmp/pg-covered-switch-final.log`.
