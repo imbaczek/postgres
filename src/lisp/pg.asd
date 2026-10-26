@@ -113,6 +113,7 @@
                    (:file "../replication/physical-promotion-resume")
                    (:file "../replication/physical-promotion-commit")
                    (:file "../replication/physical-promotion-primary")
+                   (:file "../replication/physical-promotion-online")
                    (:file "../replication/standard")
                    (:file "../replication/worker")
                    (:file "../replication/standard-subscriber")

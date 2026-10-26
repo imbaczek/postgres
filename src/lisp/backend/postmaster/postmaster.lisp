@@ -220,12 +220,15 @@ command (idle) is ignored; the connection and its transaction state survive."
                 *accept-stop-requested* t)))))
   (values))
 
+(declaim (ftype function physical-promotion-start-worker))
+
 (defun start-postmaster-recovery-workers ()
   "Start recovery services, tolerating only a concurrent process shutdown."
   (handler-case
       (progn
         (physical-follow-autostart)
-        (physical-restartpoint-start-worker))
+        (physical-restartpoint-start-worker)
+        (physical-promotion-start-worker))
     (physical-recovery-worker-shutdown (condition)
       ;; Shutdown can be processed between either guard and either start.
       ;; A prepared recovery image without process shutdown is still an error.

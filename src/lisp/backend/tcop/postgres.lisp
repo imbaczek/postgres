@@ -122,6 +122,21 @@ CancelRequest, before the rest of that packet is read."
          (when (sql-cast-boolean-input value) :physical)
        (pg-error () (ereport-fatal "22023" "invalid replication startup value: ~s" value))))))
 
+(defvar *hot-standby-reported-backends* (make-hash-table :test #'eq :weakness :key))
+
+(defvar *hot-standby-report-lock* (sb-thread:make-mutex :name "hot standby status reports"))
+
+(defun report-hot-standby-status (stream &optional initial)
+  (let* ((standby (recovery-in-progress-p))
+         (report (sb-thread:with-mutex (*hot-standby-report-lock*)
+                   (prog1 (or initial
+                              (and (not standby)
+                                   (gethash *backend* *hot-standby-reported-backends*)))
+                     (if standby
+                         (when initial (setf (gethash *backend* *hot-standby-reported-backends*) t))
+                         (remhash *backend* *hot-standby-reported-backends*))))))
+    (when report (send-parameter-status stream "in_hot_standby" (if standby "on" "off")))))
+
 (defun process-startup (stream body)
   (with-live-operation
     (let* ((code (bytes-to-u32 body 0))
@@ -169,7 +184,7 @@ CancelRequest, before the rest of that packet is read."
         (send-parameter-status stream "session_authorization" "postgres")
         (send-parameter-status stream "application_name" app)
         (send-parameter-status stream "default_transaction_read_only" "off")
-        (send-parameter-status stream "in_hot_standby" (if (recovery-in-progress-p) "on" "off"))
+        (report-hot-standby-status stream t)
         (let ((key (random-cancel-key)))
           (setf (backend-cancel-key *backend*) key)
           (send-backend-key-data stream (backend-pid *backend*) key))
@@ -288,6 +303,7 @@ The admitted decoder repeats these checks authoritatively."
               ;; Only transactions and already-admitted sessions captured at
               ;; gate closure can continue through the drain lane.
               (with-live-operation-query-dispatch drain-command-p
+                (report-hot-standby-status stream)
                 (setf query
                       (query-string
                        (decode-frontend-message
@@ -646,7 +662,10 @@ CL's RENAME-FILE merges a relative target with the source's directory."
           *query-sort-arena-limit-bytes* sort-arena-limit-bytes
           *max-slot-wal-keep-bytes* max-slot-wal-keep-bytes)
     (startup-install-settings startup-settings startup-native startup-overrides)
+    (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
     (postmaster-own-data-directory host port)
+    (physical-promotion-initialize-requests)
+    (physical-promotion-test-point :after-promotion-request-initialization)
     ;; Reject an unsupported SBCL before pending reconstruction can open storage.
     (call-with-query-sort-arena (lambda (arena) (declare (ignore arena))))
     (let ((primary-ready (eq :primary-ready (physical-bootstrap-check-startup))))

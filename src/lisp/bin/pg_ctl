@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import pathlib
+import re
+import select
+import signal
+import stat
+import struct
+import sys
+import time
+import zlib
+
+
+def read_regular(path, limit):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError(f"invalid native metadata file: {path}")
+        data = os.read(fd, limit + 1)
+        if len(data) > limit:
+            raise ValueError(f"oversized native metadata file: {path}")
+        return data
+    finally:
+        os.close(fd)
+
+
+def recovery_phase(root):
+    data = read_regular(root / "physical-recovery.control", 88)
+    if (len(data), data[:8]) not in ((72, b"PGRSTAT3"), (88, b"PGRSTAT4")):
+        raise ValueError("invalid native recovery control")
+    saved = struct.unpack_from("<I", data, len(data) - 4)[0]
+    if zlib.crc32(data[:-4] + b"\0" * 4) != saved:
+        raise ValueError("native recovery control checksum mismatch")
+    return struct.unpack_from("<I", data, 8)[0] & 0x7FFFFFFF
+
+
+def open_postmaster(root):
+    metadata = read_regular(root / "postmaster.pid", 8192)
+    lines = metadata.decode().splitlines()
+    if len(lines) < 8 or pathlib.Path(lines[1]).resolve() != root or lines[7].strip() != "ready":
+        raise ValueError("native postmaster is not ready in this data directory")
+    pid = int(lines[0])
+    if pid <= 1:
+        raise ValueError("invalid postmaster PID")
+    handle = os.pidfd_open(pid)
+    try:
+        lock = (root / ".pg_lisp.lock").lstat()
+        if not stat.S_ISREG(lock.st_mode) or lock.st_nlink != 1:
+            raise ValueError("invalid native ownership lock")
+        owned = False
+        for entry in pathlib.Path(f"/proc/{pid}/fd").iterdir():
+            try:
+                info = entry.stat()
+                if (info.st_dev, info.st_ino) == (lock.st_dev, lock.st_ino):
+                    text = pathlib.Path(f"/proc/{pid}/fdinfo/{entry.name}").read_text()
+                    owned |= bool(re.search(rf"lock:.*FLOCK\s+ADVISORY\s+WRITE\s+{pid}\s", text))
+            except FileNotFoundError:
+                continue
+        if not owned or metadata != read_regular(root / "postmaster.pid", 8192):
+            raise ValueError("PID does not own this native data directory")
+        return handle, metadata
+    except BaseException:
+        os.close(handle)
+        raise
+
+
+def primary_committed(root):
+    fields = read_regular(root / "global/pg_wal_control", 1024).split()
+    if len(fields) != 8 or fields[0] != b"PGWAL6":
+        raise ValueError("invalid native WAL control")
+    if zlib.crc32(b" ".join(fields[:-1])) != int(fields[-1], 16):
+        raise ValueError("native WAL control checksum mismatch")
+    return (int(fields[3]) > 1 and fields[3] == fields[4] and fields[5] == b"timeline"
+            and not (root / "physical-recovery.control").exists())
+
+
+def promote(root, wait, timeout, quiet):
+    handle, metadata = open_postmaster(root)
+    try:
+        try:
+            phase = recovery_phase(root)
+        except FileNotFoundError:
+            raise ValueError("server is not in standby mode") from None
+        if phase not in (2, 3):
+            raise ValueError("native promotion requires a streaming standby")
+        path = root / "promote"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid():
+                raise ValueError("invalid promote signal file")
+            os.ftruncate(fd, 0)
+        finally:
+            os.close(fd)
+        if metadata != read_regular(root / "postmaster.pid", 8192):
+            raise ValueError("postmaster changed before promote signal")
+        signal.pidfd_send_signal(handle, signal.SIGUSR1)
+        if wait:
+            poller = select.poll()
+            poller.register(handle, select.POLLIN)
+            deadline = time.monotonic() + timeout
+            while True:
+                if poller.poll(0):
+                    raise ValueError("postmaster exited during promotion")
+                if primary_committed(root):
+                    break
+                if time.monotonic() >= deadline:
+                    raise ValueError("server did not promote in time")
+                time.sleep(0.1)
+        if not quiet:
+            print("server promoted" if wait else "server promoting")
+    finally:
+        os.close(handle)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Native pg-lisp promotion utility")
+    parser.add_argument("command", choices=["promote"])
+    parser.add_argument("-D", "--pgdata", default=os.environ.get("PGDATA"))
+    parser.add_argument("-w", "--wait", dest="wait", action="store_true", default=True)
+    parser.add_argument("-W", "--no-wait", dest="wait", action="store_false")
+    parser.add_argument("-t", "--timeout", type=int, default=os.environ.get("PGCTLTIMEOUT", "60"))
+    parser.add_argument("-s", "--silent", action="store_true")
+    args = parser.parse_args()
+    if not args.pgdata or args.timeout < 0:
+        parser.error("an existing -D directory and a nonnegative timeout are required")
+    promote(pathlib.Path(args.pgdata).resolve(strict=True), args.wait, args.timeout, args.silent)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError) as error:
+        print(f"pg_ctl: {error}", file=sys.stderr)
+        sys.exit(1)
