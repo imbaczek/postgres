@@ -1553,6 +1553,10 @@ remains after BODY and should be dropped when its WAL is no longer needed."
   (values))
 
 (defun backend-transaction-read-only-p (&optional (backend *backend*))
+  "Use the current recovery role for a new transaction, as C StartTransaction does.
+An idle backend may retain an old recovery flag after promotion. Active explicit
+transactions keep their selected READ ONLY mode; the supported idle default is
+READ WRITE outside recovery."
   (or (recovery-in-progress-p)
       (and backend (not (eq (backend-state backend) :idle))
            (backend-read-only backend))))

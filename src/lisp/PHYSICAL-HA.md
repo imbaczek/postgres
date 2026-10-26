@@ -513,6 +513,85 @@ Sol medium's final refactoring review found no further useful extraction. Shared
 force installation, file opening and promotion exclusion centralize the relevant
 invariants; production functions remain below 120 lines. No coordination is added.
 
+### Live promotion request and native pg_ctl
+
+A running phase-2 standby can now promote without restarting its postmaster.
+The native `bin/pg_ctl promote -D PGDATA -W` writes `promote` and sends SIGUSR1,
+matching C `pg_ctl.c:1192–1267`. `-W` returns after signaling; `-w` waits for child
+control and pending-trigger removal. A wait timeout does not cancel promotion.
+The utility checks bounded regular native metadata, the ready PID file and the
+process's ownership flock. A Linux pidfd keeps the signal tied to that process
+even if the numeric PID is reused. Special signal files and unrelated PIDs reject
+before signaling or changing their data.
+
+The signal handler only sets a flag. A dedicated worker holds shutdown then
+follow-command exclusion, blocks new recovery worker starts, clears replay pause,
+and joins receive, replay and restartpoint workers. Joins happen outside admission
+and the reload lock because worker exit can need both. Each attempt then takes
+reload exclusion and closes admission. An idle reader transaction causes the gate
+to reopen before retry, allowing its COMMIT or ROLLBACK to run. Once readers are
+gone, promotion flushes receipt, replays every complete durable batch, saves a fresh
+restartpoint, binds intent to that exact fork and completes the child transition.
+An incomplete trailing batch does not become applied data.
+
+Shutdown before intent can take over without marking healthy recovery failed.
+After intent, errors still require restart. A crash before intent restarts as a
+standby and needs another request; a crash after intent uses automatic completion.
+MAIN installs SIGUSR1 handling before publishing its PID file and removes stale
+request files before recovery startup, following C `postmaster.c:1057–1074`.
+Requests queued afterward survive until the worker starts.
+
+Connections remain usable after promotion. New transactions recompute read-only
+mode from the current recovery role, as C `StartTransaction` does
+(`xact.c:2171–2188`); explicit READ ONLY transactions keep their restriction.
+Existing connections receive `in_hot_standby=off` at their next query, following
+`ReportChangedGUCOptions` (`guc.c:2503–2519`). The request path remains a native
+full-checkpoint bridge. It waits for old reader transactions rather than keeping
+them open across the transition as C can. It does not implement C's fast path.
+
+Validation passes 307 physical tests, 170 interop tests and 1,598 legacy checks.
+Strict empty-cache compilation passes (`/tmp/pg-promotion-online-compile.log`).
+`t/promotion-online.sh` passes the actual pinned Patroni 4.1.5
+`Postgresql.pgcommand`/`pg_ctl('promote', '-W')` call, paused durable backlog,
+reader deferral and commit, writes through both surviving idle and transactional
+connections, explicit READ ONLY rejection, wire status changes, reload during
+the wait, native utility timeout/success, and child DDL/write crash recovery.
+The utility also rejects symlink, hardlink and FIFO signal files and an unrelated
+live PID without changing the sentinel data. Final Patroni-request evidence is
+`/tmp/pg-promotion-online-patroni-final.log`, artifact
+`/tmp/pg-promotion-online.QMVohP`; native wait evidence is
+`/tmp/pg-promotion-online-wait-reload-final.log`.
+
+Smart, fast and immediate shutdown during reader deferral pass independently
+(`/tmp/pg-promotion-online-{smart,fast,immediate}-shutdown.log`). Six additional
+scenarios pass in `t/promotion-online-crash.sh`: crashes before intent, after
+intent and after child control; stale and queued startup requests; and an
+unfinished receive batch. Evidence is `/tmp/pg-promotion-online-crash-first.log`,
+artifact `/tmp/pg-promotion-online-crash.SdtgrM`. All 45 cold-promotion cases,
+continuous physical follow, both C/Lisp logical directions and all three manual
+logical switchovers pass again. These checks cover process crashes, not power loss
+or synchronous commit durability.
+
+Design advice and checkpoint, full correctness, shutdown-delta and refactoring
+reviews are complete. Review findings fixed surviving-session read-only mode,
+wire recovery status, startup signals and pre-intent shutdown. Some reused review
+threads did not expose their model profiles after exact-profile creation hit the
+service limit. No further extraction was recommended; production functions stay
+below 120 lines. Source documentation followed code tests/reviews; its separate
+review corrected the utility entry point's description.
+
+`bin/pg_ctl` currently implements only native promote. Patroni's entire
+`Postgresql.promote()` path is not verified: its `_wait_promote` calls
+`pg_controldata`, which still needs a native implementation. SQL
+`pg_promote(wait => true)` also remains open: the current SELECT path holds
+operation admission, so it needs a deferred wait that releases admission before
+the promotion worker can drain it. Implement both, then extend physical
+follow/rejoin to child histories with divergence rejection and safe reseed.
+Synchronous commit waits, the remaining Patroni interfaces and C physical
+compatibility remain in the full goal. No coordination is introduced. This
+section supersedes earlier milestone statements that public online requests are
+not implemented; the remaining SQL and utility gaps above are still real.
+
 ### Committed child primary and automatic pending completion
 
 A valid phase-3 request now finishes during normal postmaster startup, before

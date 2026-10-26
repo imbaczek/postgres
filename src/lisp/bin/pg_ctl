@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Request promotion of a native pg-lisp standby.
+
+Use C pg_ctl's promote file and SIGUSR1 interface, with native control files.
+Only the promote command is implemented. A Linux pidfd binds the signal to the
+validated postmaster process; a reused PID must not redirect the request.
+"""
 import argparse
 import os
 import pathlib
@@ -13,6 +19,7 @@ import zlib
 
 
 def read_regular(path, limit):
+    """Read bounded native metadata without following links or blocking on a FIFO."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     try:
         info = os.fstat(fd)
@@ -27,6 +34,7 @@ def read_regular(path, limit):
 
 
 def recovery_phase(root):
+    """Read and check native recovery control; do not infer a role from file names."""
     data = read_regular(root / "physical-recovery.control", 88)
     if (len(data), data[:8]) not in ((72, b"PGRSTAT3"), (88, b"PGRSTAT4")):
         raise ValueError("invalid native recovery control")
@@ -37,6 +45,11 @@ def recovery_phase(root):
 
 
 def open_postmaster(root):
+    """Return a process handle and the unchanged ready PID metadata.
+
+    Require the named process to hold this PGDATA's dedicated ownership flock.
+    The caller closes the pidfd. Keep it open through signaling and waiting.
+    """
     metadata = read_regular(root / "postmaster.pid", 8192)
     lines = metadata.decode().splitlines()
     if len(lines) < 8 or pathlib.Path(lines[1]).resolve() != root or lines[7].strip() != "ready":
@@ -67,6 +80,11 @@ def open_postmaster(root):
 
 
 def primary_committed(root):
+    """Check durable child control and completion of pending-trigger removal.
+
+    This is a control-file wait, like C pg_ctl's production-state wait. It does
+    not probe a SQL listener or establish synchronous replication durability.
+    """
     fields = read_regular(root / "global/pg_wal_control", 1024).split()
     if len(fields) != 8 or fields[0] != b"PGWAL6":
         raise ValueError("invalid native WAL control")
@@ -77,6 +95,11 @@ def primary_committed(root):
 
 
 def promote(root, wait, timeout, quiet):
+    """Create the request file, signal the verified owner and optionally wait.
+
+    -W returns once the signal is sent. A -w timeout stops only this utility's
+    wait; it does not cancel the accepted request in the postmaster.
+    """
     handle, metadata = open_postmaster(root)
     try:
         try:
@@ -116,6 +139,7 @@ def promote(root, wait, timeout, quiet):
 
 
 def main():
+    """Parse the supported C-style options and dispatch native promotion."""
     parser = argparse.ArgumentParser(description="Native pg-lisp promotion utility")
     parser.add_argument("command", choices=["promote"])
     parser.add_argument("-D", "--pgdata", default=os.environ.get("PGDATA"))

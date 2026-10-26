@@ -302,6 +302,10 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
         (t (error "unknown replay control function: ~a" name))))))
 
 (defun physical-recovery-replay-core ()
+  "Replay complete durable batches while owning a closed admission gate.
+Require no old reader transactions or Swank listener. The public replay command
+checks pause first; promotion clears pause before calling this core. Reopen CLOG
+for redo and fence any error or nonlocal exit once replay starts."
   (unless (and (zerop *live-operation-depth*)
                (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
                (not *live-operation-drain-open*) (not *swank-listener-enabled-p*)

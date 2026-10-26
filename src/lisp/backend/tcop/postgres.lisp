@@ -127,6 +127,11 @@ CancelRequest, before the rest of that packet is read."
 (defvar *hot-standby-report-lock* (sb-thread:make-mutex :name "hot standby status reports"))
 
 (defun report-hot-standby-status (stream &optional initial)
+  "Report startup recovery status and its later change to off on this connection.
+Call under admission, before query execution. Remember only connections that
+were told on, using weak keys so disconnected backends are not retained. Send
+outside the report lock; a blocked client must not hold up other reports.
+Like C ReportChangedGUCOptions, recovery can only change from on to off."
   (let* ((standby (recovery-in-progress-p))
          (report (sb-thread:with-mutex (*hot-standby-report-lock*)
                    (prog1 (or initial
