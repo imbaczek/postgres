@@ -4,14 +4,15 @@
 
 (defstruct (snapshot (:constructor make-snapshot-struct
                          (&key xmin xmax xip curcid sequence-database-oid
-                            sequence-state-captured-p sequence-states)))
+                            sequence-state-captured-p sequence-states source-xids-complete-p)))
   xmin
   xmax
   xip
   curcid
   sequence-database-oid
   sequence-state-captured-p
-  sequence-states)
+  sequence-states
+  (source-xids-complete-p nil))
 
 (defstruct (snapshot-registration
             (:constructor make-snapshot-registration ()))

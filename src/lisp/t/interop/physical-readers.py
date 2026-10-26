@@ -75,10 +75,22 @@ def replay_at(target, position):
     wait(target, f"SELECT pg_last_wal_replay_lsn() = '{lsn}'::pg_lsn", True)
 
 
+def applied_control(base, root, target):
+    output = control(base, root, """
+      (sb-thread:with-mutex (*wal-lock*)
+        (format t "~&SOURCE-FLUSH=~a~%" (wal-format-lsn *wal-durable-lsn*)))
+    """, server="source")
+    position = re.search(r"SOURCE-FLUSH=([0-9A-Fa-f]+/[0-9A-Fa-f]+)", output)[1]
+    wait(target, f"SELECT pg_last_wal_receive_lsn() >= '{position}'::pg_lsn", True)
+    wait(target, f"SELECT pg_last_wal_replay_lsn() >= '{position}'::pg_lsn", True)
+
+
 def check(base, root, source, target, readers, older):
     before = [(1, "before")]
     begin_readers(readers, before)
     control(base, root, f'(load "{base}/t/physical-row-replay-native.lisp")')
+    control(base, root, f'(load "{base}/t/physical-row-replay-native.lisp")', server="source")
+    control(base, root, "(row-replay-test-coverage 0 2)")
     control(base, root, "(row-replay-test-install)")
     query(source, "UPDATE promotion_sql_items SET label='after' WHERE id=1")
     query(source, "INSERT INTO promotion_sql_items VALUES (2,'new')")
@@ -94,43 +106,98 @@ def check(base, root, source, target, readers, older):
     query(source, "INSERT INTO row_barriers VALUES (1)")
     applied(source, target)
     current = [(1, "after"), (2, "new")]
-    begin_readers(readers, current)
+    begin_readers([readers[1]], current)
+    control(base, root, "(row-replay-test-coverage 1 0)")
+    control(base, root, "(row-replay-test-incomplete-next-running-snapshot)", server="source")
+    query(source, "INSERT INTO row_barriers VALUES (2)")
+    applied_control(base, root, target)
+    control(base, root, "(row-replay-test-coverage 1 0)")
+    begin_readers([readers[0]], current)
+    control(base, root, "(row-replay-test-coverage 1 1)")
+    query(source, "INSERT INTO row_barriers VALUES (7)")
+    applied(source, target)
+    control(base, root, "(row-replay-test-coverage 1 1)")
     older.commit()
     anchor = running_snapshot_end(base, root)
-    query(source, "INSERT INTO row_barriers VALUES (2)")
+    query(source, "INSERT INTO row_barriers VALUES (8)")
     received(source, target)
     time.sleep(0.3)
     replay_at(target, anchor)
-    assert scalar(target, "SELECT count(*) FROM row_barriers") == 1
+    assert scalar(target, "SELECT count(*) FROM row_barriers") == 3
     begin_readers(readers, current)
     readers[0].commit()
-    time.sleep(0.2)
-    replay_at(target, anchor)
-    readers[1].commit()
     applied(source, target)
-    assert scalar(target, "SELECT count(*) FROM row_barriers") == 2
-    print("physical-readers: older writer defers without skipping a later safe batch PASS", flush=True)
+    assert scalar(target, "SELECT count(*) FROM row_barriers") == 4
+    assert scalar(target, "SELECT label FROM promotion_sql_items WHERE id=1") == "older-pending"
+    begin_readers([readers[1]], current)
+    readers[1].commit()
+    barriers = 4
+    print("physical-readers: incomplete snapshot stays strict; covered reader admits older commit after downgrade PASS", flush=True)
 
     current = [(1, "older-pending"), (2, "new")]
     query(older, "UPDATE promotion_sql_items SET label='mixed-first' WHERE id=1")
     query(source, "INSERT INTO row_barriers VALUES (50)")
     applied(source, target)
     begin_readers(readers, current)
-    query(older, "UPDATE promotion_sql_items SET label='older-pending' WHERE id=1")
+    query(older, "UPDATE promotion_sql_items SET label='mixed-final' WHERE id=1")
     query(source, "INSERT INTO row_barriers VALUES (51)")
-    anchor = running_snapshot_end(base, root)
-    received(source, target)
-    control(base, root, "(physical-recovery-replay)")
-    replay_at(target, anchor)
-    assert scalar(target, "SELECT count(*) FROM row_barriers WHERE id=51") == 0
+    applied(source, target)
+    assert scalar(target, "SELECT count(*) FROM row_barriers WHERE id=51") == 1
     begin_readers(readers, current)
     older.commit()
+    applied(source, target)
+    assert scalar(target, "SELECT label FROM promotion_sql_items WHERE id=1") == "mixed-final"
+    begin_readers(readers, current)
     for reader in readers:
         reader.commit()
     applied(source, target)
     query(source, "DELETE FROM row_barriers WHERE id>=50")
     applied(source, target)
-    print("physical-readers: an older page contributor blocks a newer commit PASS", flush=True)
+    current = [(1, "mixed-final"), (2, "new")]
+    print("physical-readers: covered snapshots admit older page contributors and preserve versions PASS", flush=True)
+
+    query(older, "UPDATE promotion_sql_items SET label='aborted' WHERE id=1")
+    output = control(base, root, "(row-replay-test-only-active-xid)", server="source")
+    aborted = int(re.search(r"ACTIVE-XID=(\d+)", output)[1])
+    older.rollback()
+    control(base, root, f"(row-replay-test-has-contributor {aborted})", server="source")
+    control(base, root, "(row-replay-test-flush-running-snapshot)", server="source")
+    applied_control(base, root, target)
+    begin_readers(readers, current)
+    control(base, root, f"(row-replay-test-coverage 2 0 {aborted})")
+    query(source, "INSERT INTO row_barriers VALUES (54)")
+    applied(source, target)
+    assert scalar(target, "SELECT count(*) FROM row_barriers WHERE id=54") == 1
+    begin_readers(readers, current)
+    for reader in readers:
+        reader.commit()
+    query(source, "DELETE FROM row_barriers WHERE id>=50")
+    applied(source, target)
+    print("physical-readers: aborted contributor below xmax and absent from xip does not stall replay PASS", flush=True)
+
+    begin_readers(readers, current)
+    query(source, "INSERT INTO promotion_sql_items VALUES " + ",".join(
+        f"({value},'split')" for value in range(100, 1300)))
+    query(source, "UPDATE promotion_sql_items SET id=2000 WHERE id=1")
+    query(source, "DELETE FROM promotion_sql_items WHERE id=2")
+    applied(source, target)
+    control(base, root, "(row-replay-test-index-split)")
+    for reader in readers:
+        plan = "\n".join(row[0] for row in query(reader, "EXPLAIN SELECT label FROM promotion_sql_items WHERE id=1"))
+        assert "Index Scan" in plan, plan
+        assert query(reader, "SELECT id,label FROM promotion_sql_items WHERE id=1") == [current[0]]
+        assert query(reader, "SELECT id,label FROM promotion_sql_items WHERE id=2") == [current[1]]
+        assert scalar(reader, "SELECT count(*) FROM promotion_sql_items WHERE id>=100") == 0
+    assert scalar(target, "SELECT count(*) FROM promotion_sql_items WHERE id>=100") == 1201
+    assert scalar(target, "SELECT count(*) FROM promotion_sql_items WHERE id=1") == 0
+    assert scalar(target, "SELECT count(*) FROM promotion_sql_items WHERE id=2") == 0
+    for reader in readers:
+        reader.commit()
+    query(source, "UPDATE promotion_sql_items SET id=1 WHERE id=2000")
+    query(source, "INSERT INTO promotion_sql_items VALUES (2,'new')")
+    query(source, "DELETE FROM promotion_sql_items WHERE id>=100")
+    applied(source, target)
+    print("physical-readers: retained indexed views survive splits, key updates and deletes PASS", flush=True)
 
     begin_readers(readers, current)
     control(base, root, f'(load "{base}/t/physical-row-replay-native.lisp")', server="source")
@@ -159,12 +226,12 @@ def check(base, root, source, target, readers, older):
     received(source, target)
     wait(target, f"SELECT pg_last_wal_replay_lsn() >= '{row_end}'::pg_lsn", True)
     assert scalar(target, "SELECT pg_last_wal_replay_lsn()") == row_end
-    assert scalar(target, "SELECT count(*) FROM row_barriers") == 3
+    assert scalar(target, "SELECT count(*) FROM row_barriers") == barriers + 1
     begin_readers(readers, current)
     for reader in readers:
         reader.commit()
     applied(source, target)
-    assert scalar(target, "SELECT count(*) FROM row_barriers") == 4
+    assert scalar(target, "SELECT count(*) FROM row_barriers") == barriers + 2
     assert scalar(target, "SELECT count(*) FROM row_ddl_barrier") == 0
     print("physical-readers: safe prefix applies before a catalog barrier PASS", flush=True)
 

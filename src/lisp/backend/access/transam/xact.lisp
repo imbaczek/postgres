@@ -943,18 +943,26 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
           (condition-wait-with-timeout *xact-cv* *xact-cv-mutex*)))) )
   (values))
 
+(declaim (ftype function running-xacts-check-state))
+
 (defun make-snapshot-under-xid-lock (curcid &key register)
   "Build a snapshot while the caller holds *XID-LOCK*."
   (when (and register (not (snapshot-registration-p register)))
     (error "REGISTER must be a snapshot-registration token or NIL"))
-  (let* ((xmax *next-xid*)
-         (xip (copy-list *active-xids*))
-         (xmin (if xip (reduce #'min xip) xmax))
-         (snapshot (make-snapshot-struct :xmin xmin :xmax xmax
-                                         :xip xip :curcid curcid)))
-    (when register
-      (register-active-snapshot snapshot register))
-    snapshot))
+  (let* ((source (and (recovery-in-progress-p) (getf *physical-recovery-state* :source-xids)))
+         (covered (and source (getf source :complete)))
+         (xmax *next-xid*))
+    (when covered
+      (running-xacts-check-state source)
+      (unless (and (= xmax (getf source :next-xid))
+                   (eql *last-replay-lsn* (getf source :through)))
+        (error "standby snapshot source membership differs from its applied boundary")))
+    (let* ((xip (copy-list (if covered (getf source :running) *active-xids*)))
+           (xmin (if xip (reduce #'min xip) xmax))
+           (snapshot (make-snapshot-struct :xmin xmin :xmax xmax :xip xip :curcid curcid
+                                           :source-xids-complete-p (not (null covered)))))
+      (when register (register-active-snapshot snapshot register))
+      snapshot)))
 
 (defun make-snapshot (curcid &key register)
   (sb-thread:with-mutex (*xid-lock*)
@@ -1318,19 +1326,11 @@ snapshot lifecycle."
              (when *logical-test-after-snapshot-token-lookup-hook*
                (funcall *logical-test-after-snapshot-token-lookup-hook* state))
              (let* ((source-snapshot (exported-logical-snapshot-snapshot state))
-                    (snapshot
-                      (make-snapshot-struct
-                       :xmin (snapshot-xmin source-snapshot)
-                       :xmax (snapshot-xmax source-snapshot)
-                       :xip (copy-list (snapshot-xip source-snapshot))
-                       :curcid (snapshot-curcid source-snapshot)
-                       :sequence-database-oid
-                       (snapshot-sequence-database-oid source-snapshot)
-                       :sequence-state-captured-p
-                       (snapshot-sequence-state-captured-p source-snapshot)
-                       :sequence-states
-                       (copy-tree (snapshot-sequence-states source-snapshot)))))
-               (setf registration (make-snapshot-registration))
+                    (snapshot (copy-snapshot source-snapshot)))
+               (setf (snapshot-xip snapshot) (copy-list (snapshot-xip source-snapshot))
+                     (snapshot-sequence-states snapshot)
+                     (copy-tree (snapshot-sequence-states source-snapshot))
+                     registration (make-snapshot-registration))
                (sb-sys:without-interrupts
                  (sb-thread:with-mutex (*xid-lock*)
                    (register-active-snapshot snapshot registration))
@@ -1535,11 +1535,11 @@ remains after BODY and should be dropped when its WAL is no longer needed."
 (defun begin-transaction-snapshot (backend curcid statement-registration)
   "Return a per-statement view over BACKEND's stable transaction horizon."
   (let* ((retained (ensure-transaction-snapshot backend curcid))
-         (snapshot (make-snapshot-struct
-                    :xmin (snapshot-xmin retained)
-                    :xmax (snapshot-xmax retained)
-                    :xip (snapshot-xip retained)
-                    :curcid curcid)))
+         (snapshot (copy-snapshot retained)))
+    (setf (snapshot-curcid snapshot) curcid
+          (snapshot-sequence-database-oid snapshot) nil
+          (snapshot-sequence-state-captured-p snapshot) nil
+          (snapshot-sequence-states snapshot) nil)
     ;; The transaction registration protects the horizon until transaction
     ;; cleanup; register the statement view too so its dynamic lifetime follows
     ;; the existing WITH-STATEMENT-SNAPSHOT contract.

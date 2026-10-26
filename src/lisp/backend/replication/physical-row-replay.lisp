@@ -7,16 +7,18 @@
 (in-package #:pg)
 
 (defun physical-row-replay-reader-horizon ()
-  ;; Idle recovery snapshots remain registered between statements.
-  ;; Every applied contributor must be at or beyond the greatest xmax.
   (sb-thread:with-mutex (*snapshot-count-lock*)
-    (let ((horizon 0))
+    (let ((horizon 0) (registered 0) (covered nil))
       (maphash (lambda (snapshot present)
-                 (when present (setf horizon (max horizon (snapshot-xmax snapshot)))))
+                 (when present
+                   (incf registered)
+                   (if (snapshot-source-xids-complete-p snapshot)
+                       (push snapshot covered)
+                       (setf horizon (max horizon (snapshot-xmax snapshot))))))
                *active-snapshot-set*)
-      (when (and (plusp *active-snapshots*) (zerop horizon))
-        (error "active recovery snapshots lack a visibility horizon"))
-      horizon)))
+      (when (and (plusp *active-snapshots*) (zerop registered))
+        (error "active recovery snapshots lack visibility information"))
+      (values horizon (nreverse covered)))))
 
 (defun physical-row-replay-allowed-p (record horizon)
   ;; Stop at the first record outside the certified row replay prefix.
@@ -30,6 +32,17 @@
       (t (member type (list +wal-record-batch-start+ +wal-record-pages+
                             +wal-record-logical-changes+ +wal-record-xid-reservation+
                             +wal-record-running-xacts+))))))
+
+(defun physical-row-replay-check-covered-commit (record snapshots)
+  (when (= (wal-record-type record) +wal-record-commit+)
+    (let ((xid (wal-record-xid record)))
+      (dolist (snapshot snapshots)
+        (unless (and (snapshot-source-xids-complete-p snapshot)
+                     (or (>= xid (snapshot-xmax snapshot))
+                         (member xid (snapshot-xip snapshot) :test #'=)))
+          (error "source COMMIT ~d at LSN ~d violates retained snapshot coverage (xmax ~d)"
+                 xid (wal-record-end record) (snapshot-xmax snapshot))))))
+  (values))
 
 (defun physical-row-replay-images-allowed-p (images horizon)
   ;; Unknown, maintenance and contributor-free images cannot pass a reader.
@@ -92,7 +105,7 @@
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-progress record)))
 
-(defun physical-row-replay-prefix (horizon)
+(defun physical-row-replay-prefix (horizon &optional covered)
   ;; Publish each safe terminal in order, and defer at the first unsafe batch.
   (with-physical-replay-staging ()
     (let ((next-xid *next-xid*)
@@ -111,6 +124,7 @@
                source-xids (physical-source-xids-next source-xids record next-xid))
          (if (wal-terminal-record-type-p (wal-record-type record))
              (sb-thread:with-mutex (*wal-lock*)
+               (physical-row-replay-check-covered-commit record covered)
                (unless (physical-row-replay-images-allowed-p *wal-recovery-page-images* horizon)
                  (return-from physical-row-replay-prefix :deferred))
                (physical-row-replay-preflight-images (reverse *wal-recovery-page-images*))
@@ -131,6 +145,7 @@
   (check-physical-recovery-work)
   (let ((finished nil))
     (unwind-protect
-         (prog1 (physical-row-replay-prefix (physical-row-replay-reader-horizon))
-           (setf finished t))
+         (multiple-value-bind (horizon covered) (physical-row-replay-reader-horizon)
+           (prog1 (physical-row-replay-prefix horizon covered)
+             (setf finished t)))
       (unless finished (setf *physical-recovery-failed-p* t)))))

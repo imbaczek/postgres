@@ -60,6 +60,13 @@
             (error "row replay crash barrier was not killed"))))
   t)
 
+(defun row-replay-test-staged-dead-page-p (node block)
+  (sb-thread:with-mutex (*wal-lock*)
+    (let ((page (gethash (wal-page-key node block) *wal-page-cache*)))
+      (and page
+           (loop for offnum from 1 to (page-lp-count page)
+                   thereis (= +lp-dead+ (nth-value 1 (page-get-lp page offnum))))))))
+
 (defun row-replay-test-pause-vacuum (marker release)
   (let ((original (symbol-function 'heap-vacuum-relation-locked)))
     (setf (symbol-function 'heap-vacuum-relation-locked)
@@ -70,7 +77,8 @@
                        :after-page-function
                        (lambda (&rest arguments)
                          (when after-page-function (apply after-page-function arguments))
-                         (unless paused
+                         (when (and (not paused)
+                                    (apply #'row-replay-test-staged-dead-page-p arguments))
                            (setf paused t)
                            (with-open-file (out marker :direction :output :if-exists :error)
                              (format out "~d~%" (sb-posix:getpid)))
@@ -87,4 +95,59 @@
             (let ((images (funcall original excluded)))
               (dolist (image images) (setf (wal-page-image-provenance image) :unknown))
               images))))
+  t)
+
+(defun row-replay-test-incomplete-next-running-snapshot ()
+  (let ((original (symbol-function 'wal-encode-running-xacts)))
+    (setf (symbol-function 'wal-encode-running-xacts)
+          (lambda (next running complete)
+            (declare (ignore running complete))
+            (setf (symbol-function 'wal-encode-running-xacts) original)
+            (funcall original next nil nil))))
+  t)
+
+(defun row-replay-test-flush-running-snapshot ()
+  (with-wal-critical
+    (sb-thread:with-mutex (*xid-lock*)
+      (wal-append-batch-start)
+      (wal-append-record +wal-record-running-xacts+ 0
+                         (wal-encode-running-xacts
+                          *next-xid* (sort (copy-list *active-xids*) #'<) t))
+      (wal-flush)))
+  t)
+
+(defun row-replay-test-coverage (covered incomplete &optional absent)
+  (sb-thread:with-mutex (*snapshot-count-lock*)
+    (let ((flags (loop for snapshot being the hash-keys of *active-snapshot-set*
+                       collect (snapshot-source-xids-complete-p snapshot))))
+      (assert (= covered (count t flags)))
+      (assert (= incomplete (count nil flags))))
+    (when absent
+      (maphash (lambda (snapshot present)
+                 (when present
+                   (assert (< absent (snapshot-xmax snapshot)))
+                   (assert (not (member absent (snapshot-xip snapshot))))))
+               *active-snapshot-set*)))
+  (format t "snapshot coverage PASS~%"))
+
+(defun row-replay-test-only-active-xid ()
+  (sb-thread:with-mutex (*xid-lock*)
+    (assert (= 1 (length *active-xids*)))
+    (format t "~&ACTIVE-XID=~d~%" (first *active-xids*))))
+
+(defun row-replay-test-has-contributor (xid)
+  (sb-thread:with-mutex (*wal-lock*)
+    (assert (some (lambda (image) (member xid (wal-page-image-xids image)))
+                  (wal-page-images))))
+  t)
+
+(defun row-replay-test-index-split ()
+  (let* ((database (gethash "postgres" (catalog-databases *catalog*)))
+         (table (gethash "promotion_sql_items" (database-tables database)))
+         (index (find (pg-class-oid table)
+                      (loop for value being the hash-values of (database-indexes database)
+                            collect value)
+                      :key #'pg-index-table-oid)))
+    (assert index)
+    (assert (> (smgr-nblocks (pg-index-relfilenode index)) 1)))
   t)
