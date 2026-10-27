@@ -50,7 +50,9 @@ The caller must validate their meaning."
             (subseq image (+ 16 metadata-size) crc-offset))))
 
 (defun physical-retained-extent-history (metadata)
-  "Validate extent metadata and return its parsed lineage."
+  "Validate extent metadata and return its parsed lineage.
+
+The file timeline must be an eligible carrier for the segment in that lineage."
   (physical-follow-check-plist metadata *physical-retained-extent-keys*)
   (unless (and (eql 1 (getf metadata :version))
                (every (lambda (key) (typep (getf metadata key) '(unsigned-byte 64)))

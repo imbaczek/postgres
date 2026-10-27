@@ -1,6 +1,12 @@
+;;;; Project retained WAL onto a verified applied parent and fork.
+;;;; The resulting archive root grants no replay, role or serving authority.
 (in-package #:pg)
 
 (defun physical-retained-project-history (source identity parent text fork)
+  "Check the applied fork and project SOURCE's ancestry onto PARENT.
+
+The parent history retains older intervals and leaves PARENT open-ended. The
+caller supplies the independently verified fork."
   (timeline-check-lineage source)
   (let* ((history (timeline-check-lineage (timeline-parse-history parent text)))
          (suffix (member parent source :key #'timeline-history-entry-timeline))
@@ -16,6 +22,12 @@
     history))
 
 (defun physical-retained-project-extent (image parent text history-digest end &optional checked-history)
+  "Re-encode an extent through an exact record boundary on the parent history.
+
+Choose the newest eligible segment carrier and trim bytes after END. This makes
+an archive image; it does not assert that its bytes came from that carrier path.
+CHECKED-HISTORY, when supplied, must already match PARENT and TEXT. Encoding
+still validates the resulting metadata and records."
   (multiple-value-bind (metadata bytes) (physical-retained-extent-decode image)
     (unless (and (typep end '(unsigned-byte 64))
                  (< (getf metadata :start) end) (<= end (getf metadata :end)))
@@ -33,6 +45,12 @@
       (values (physical-retained-extent-encode metadata bytes) metadata))))
 
 (defun physical-retained-root-project-source (hold id history owner fork)
+  "Return a fresh source index containing entries before FORK.
+
+For a non-NIL ID, require its registered owner and copy all object protection
+under the archive mutex before I/O. Validate the index and overlap and reread
+selected images in full, including a crossing image's tail. Discarded images
+rely on prior registration and immutable files. The source inventory is unchanged."
   (unless (or (null id) (typep id '(unsigned-byte 64)))
     (error "invalid retained projection source root"))
   (when id
@@ -69,6 +87,7 @@
         index))))
 
 (defun physical-retained-root-project-overlap (hold source supplied)
+  "Return a copy of a protected base overlap descriptor, rejecting conflicts."
   (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
     (physical-retained-root-check-hold hold)
     (let ((entry (physical-retained-root-merge-overlap
@@ -82,6 +101,15 @@
 
 (defun physical-retained-root-project-prefix
     (hold source-id source-history parent parent-text parent-digest fork digest &key base-overlap source-owner)
+  "Project a retained prefix to the independently verified applied FORK.
+
+The caller must check durable source control against SOURCE-OWNER and SOURCE-ID,
+and independently prove the applied fork, receive digest and parent selection.
+The parent selection digest is NIL for the base timeline. Re-encode kept extents and
+check metadata growth before staging. At the base, require the protected
+overlap and fixed receive seed without reading extents. HOLD protects source
+and candidate objects through later durable control selection and readback.
+The returned root grants no replay, role or serving authority."
   (unless (and (stringp parent-text) (<= (length parent-text) +physical-retained-metadata-limit+))
     (error "retained projection parent history exceeds its bound"))
   (let* ((directory (physical-retained-root-hold-directory hold))
