@@ -42,7 +42,7 @@
       (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace)
           (wal-read-control-fields)
         (unless (and (= checkpoint (getf manifest :checkpoint)) (= durable (getf manifest :end))
-                     (= insertion checkpoint-timeline 1)
+                     (= insertion checkpoint-timeline (getf manifest :timeline))
                      (eq namespace (getf control :promotion-source-namespace))
                      (= (physical-manifest-checkpoint-start manifest)
                         (if snapshot (getf snapshot :start) (- checkpoint +wal-header-size+))))
@@ -90,7 +90,8 @@
   (let ((*physical-recovery-state* state) (*physical-receive-store* store)
                                           (*last-replay-lsn* (getf state :applied)) (*next-xid* (getf state :next-xid))
                                           (*wal-segment-namespace* (getf state :wal-namespace))
-                                          (*wal-insert-timeline* 1) (*wal-checkpoint-timeline* 1))
+                                          (*wal-insert-timeline* (getf state :timeline))
+                                          (*wal-checkpoint-timeline* (getf state :timeline)))
     (physical-promotion-check-pending state metadata prefix generation :allow-history t)
     (funcall artifact-checker state prefix :allow-uninstalled t)
     (physical-recovery-check-base-forks
@@ -100,7 +101,8 @@
   "Restore only the selected restartpoint; never redo or publish ordinary progress."
   (setf *physical-recovery-state* state *physical-receive-store* store
         *wal-segment-namespace* (getf state :wal-namespace)
-        *wal-insert-timeline* 1 *wal-checkpoint-timeline* 1
+        *wal-insert-timeline* (getf state :timeline)
+        *wal-checkpoint-timeline* (getf state :timeline)
         *wal-checkpoint-lsn* (getf state :checkpoint)
         *wal-durable-lsn* (getf state :end) *wal-end-lsn* (getf state :end)
         *wal-checkpoint-snapshot* (copy-list (getf state :source-checkpoint))

@@ -33,7 +33,7 @@
     (sb-thread:with-mutex (*physical-follow-lock*)
       (setf *physical-follow-statistics*
             (list :runtime runtime :pid (sb-thread:thread-os-tid sb-thread:*current-thread*)
-                  :receive-start-lsn cursor :receive-start-tli 1
+                  :receive-start-lsn cursor :receive-start-tli (getf *physical-recovery-state* :timeline)
                   :last-send-time now :last-receipt-time now
                   :latest-end-lsn *physical-follow-last-end-lsn*
                   :latest-end-time now)
@@ -177,17 +177,22 @@
 (defun physical-follow-start-query (runtime cursor)
   (with-live-operation
     (format nil
-            "START_REPLICATION SLOT ~a PHYSICAL ~a (native_format '~a', system_id '~d', timeline '1', base_lsn '~a', prefix_digest '~d')"
+            "START_REPLICATION SLOT ~a PHYSICAL ~a (native_format '~a', system_id '~d', timeline '~d', base_lsn '~a', prefix_digest '~d'~a)"
             (physical-follow-runtime-pin runtime) (wal-format-lsn cursor)
             +physical-native-format+ (getf *physical-recovery-state* :system-id)
+            (getf *physical-recovery-state* :timeline)
             (wal-format-lsn (getf *physical-recovery-state* :end))
-            (physical-store-flushed-digest *physical-receive-store*))))
+            (physical-store-flushed-digest *physical-receive-store*)
+            (if (getf *physical-recovery-state* :manifest-digest)
+                (format nil ", manifest_digest '~d'" (getf *physical-recovery-state* :manifest-digest))
+                ""))))
 
 (defun physical-follow-check-identity (rows)
   (unless (and (= (length rows) 1) (= (length (first rows)) 4)
                (equal (aref (first rows) 0)
                       (format nil "~d" (getf *physical-recovery-state* :system-id)))
-               (equal (aref (first rows) 1) "1"))
+               (equal (aref (first rows) 1)
+                      (format nil "~d" (getf *physical-recovery-state* :timeline))))
     (physical-follow-reject "source identity or timeline differs from the native recovery base")))
 
 (defun physical-follow-flush-on-exit (runtime)

@@ -194,12 +194,19 @@ phase-2 recovery can yield to shutdown."
 (defun physical-promotion-check-base-control (state)
   (let ((entry (find "global/pg_wal_control" (getf state :files) :key #'first :test #'equal)))
     (unless entry (error "promotion lost immutable base WAL control provenance"))
-    (recovery-check-manifest-files (list :files (list entry)) *pgdata*))
+    (recovery-check-manifest-files
+     (list :files (remove-if-not
+                   (lambda (file)
+                     (or (equal (first file) "global/pg_wal_control")
+                         (recovery-history-file-timeline (first file))))
+                   (getf state :files)))
+     *pgdata*))
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace)
       (wal-read-control-fields)
     (declare (ignore snapshot))
     (unless (and (= checkpoint (getf state :checkpoint)) (= durable (getf state :end))
-                 (= insertion checkpoint-timeline *wal-insert-timeline* *wal-checkpoint-timeline* 1)
+                 (= insertion checkpoint-timeline *wal-insert-timeline* *wal-checkpoint-timeline*
+                    (getf state :timeline))
                  (eq namespace (getf state :wal-namespace))
                  (eq namespace *wal-segment-namespace*))
       (error "promotion base WAL identity or namespace changed"))

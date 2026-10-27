@@ -9,6 +9,10 @@
 
 (declaim (ftype function physical-promotion-startup-primary-p physical-promotion-startup-pending-p))
 
+(defun physical-bootstrap-standby-control-p ()
+  (when (wal-namespace-file-stat (physical-recovery-control-path) t)
+    (member (getf (physical-recovery-read-control *pgdata*) :phase) '(0 1 2))))
+
 (defun physical-bootstrap-check-startup ()
   "Choose primary or standby recovery before listeners or ordinary storage setup.
 Committed child control takes precedence over leftover standby triggers. A valid
@@ -16,6 +20,7 @@ pending request completes the transition and returns :PRIMARY-READY, telling MAI
 not to initialize storage twice. Other paths return no values and leave ordinary
 primary or standby initialization to MAIN. Invalid recovery proof is an error."
   (cond
+    ((physical-bootstrap-standby-control-p) (physical-recovery-prepare) (values))
     ((physical-promotion-startup-primary-p) (values))
     ((physical-promotion-startup-pending-p) :primary-ready)
     (t
@@ -49,6 +54,16 @@ primary or standby initialization to MAIN. Invalid recovery proof is an error."
     (fsync-stream stream))
   (fsync-directory target))
 
+(defun physical-bootstrap-history-inventory (timeline)
+  (let ((history (timeline-check-lineage (timeline-read-history timeline))))
+    (sort (loop for entry in history
+                for ancestor = (timeline-history-entry-timeline entry)
+                when (and (> ancestor 1)
+                          (or (= ancestor timeline)
+                              (probe-file (timeline-history-path ancestor *pgdata*))))
+                  collect (concatenate 'string "pg_wal/" (timeline-history-filename ancestor)))
+          #'string<)))
+
 (defun physical-bootstrap-inventory (&optional (checkpoint-start (wal-checkpoint-record-start)))
   "Return only durable cluster state and catalog-referenced relation forks."
   (let ((files (list "PG_VERSION" "pg_xact" "global/pg_control"
@@ -62,7 +77,7 @@ primary or standby initialization to MAIN. Invalid recovery proof is an error."
       (when last
         (loop for segment from (floor restart +wal-segment-size+) to last
               do (push (concatenate 'string "pg_wal/" (file-namestring (wal-segment-path segment))) files))))
-    (sort files #'string<)))
+    (sort (append files (physical-bootstrap-history-inventory *wal-insert-timeline*)) #'string<)))
 
 (defun physical-bootstrap-copy-file (relative target &key limit)
   "Copy and fsync a stable source file or exact prefix, returning its length and checksum."
@@ -128,7 +143,7 @@ primary or standby initialization to MAIN. Invalid recovery proof is an error."
                                       (1+ (mod (1- end) +wal-segment-size+)))))
                           (physical-bootstrap-inventory)))
            (manifest (list :version 3 :system-id system-id
-                           :cluster-identity (catalog-cluster-identity *catalog*) :timeline 1
+                           :cluster-identity (catalog-cluster-identity *catalog*) :timeline *wal-insert-timeline*
                            :checkpoint checkpoint :checkpoint-start (wal-checkpoint-record-start checkpoint)
                            :end end :next-xid *next-xid*
                            :source-pin (physical-source-pin-name pin) :files files)))
@@ -136,10 +151,11 @@ primary or standby initialization to MAIN. Invalid recovery proof is an error."
       (let* ((*print-readably* t)
              (text (physical-bootstrap-manifest-text manifest))
              (bytes (string->bytes text))
-             (crc (wal-crc32 bytes)))
-        (wal-atomic-write-bytes
-         (merge-pathnames "physical-backup.manifest" target)
-         (string->bytes (format nil "PGPHYSICALBACKUP1 ~8,'0X~%~a~%" crc text))))
+             (crc (wal-crc32 bytes))
+             (image (string->bytes (format nil "PGPHYSICALBACKUP1 ~8,'0X~%~a~%" crc text))))
+        (physical-source-pin-bind-manifest pin (physical-store-update-digest #xCBF29CE484222325 image))
+        (physical-bootstrap-test-point :after-pin-binding target)
+        (wal-atomic-write-bytes (merge-pathnames "physical-backup.manifest" target) image))
       (fsync-directory target)
       (physical-bootstrap-test-point :after-manifest target)
       manifest)))

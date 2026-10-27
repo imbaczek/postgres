@@ -2,7 +2,7 @@
 (in-package #:pg)
 
 (defstruct physical-source-pin name system-id restart-lsn consistent-lsn
-  confirmed-lsn (prefix-digest #xCBF29CE484222325) (lost-p nil))
+           (timeline 1) manifest-digest confirmed-lsn (prefix-digest #xCBF29CE484222325) (lost-p nil))
 
 (defvar *physical-source-pins* (make-hash-table :test #'equal))
 
@@ -33,7 +33,9 @@
          (consistent (physical-source-pin-consistent-lsn pin))
          (confirmed (physical-source-pin-confirmed-lsn pin))
          (segments (wal-discover-segments)))
-    (unless (and (<= 0 consistent *wal-durable-lsn*)
+    (unless (and (typep (physical-source-pin-timeline pin) '(integer 1 4294967295))
+                 (= (physical-source-pin-timeline pin) *wal-insert-timeline*)
+                 (<= 0 consistent *wal-durable-lsn*)
                  (if confirmed (= restart confirmed)
                      (if (zerop consistent) (zerop restart)
                          (and (typep restart '(unsigned-byte 64))
@@ -76,13 +78,16 @@
             (error "physical source pin does not name a checkpoint record")))))))
 
 (defun physical-source-pin-encode (pin)
-  (let* ((prefix (format nil "PGPHYSPIN2 ~a ~d 1 ~d ~d ~d ~d ~a"
+  (let* ((prefix (format nil "PGPHYSPIN2 ~a ~d ~d ~d ~d ~d ~d ~a"
                          (physical-source-pin-name pin) (physical-source-pin-system-id pin)
+                         (physical-source-pin-timeline pin)
                          (physical-source-pin-restart-lsn pin)
                          (physical-source-pin-consistent-lsn pin)
                          (or (physical-source-pin-confirmed-lsn pin) -1)
                          (physical-source-pin-prefix-digest pin)
                          (if (physical-source-pin-lost-p pin) "lost" "reserved")))
+         (prefix (if (physical-source-pin-manifest-digest pin)
+                     (format nil "~a ~d" prefix (physical-source-pin-manifest-digest pin)) prefix))
          (crc (wal-crc32 (string->bytes prefix))))
     (string->bytes (format nil "~a ~8,'0X~%" prefix crc))))
 
@@ -93,8 +98,11 @@
     (let* ((line (read-line stream nil nil))
            (fields (and line (wal-split-fields line)))
            (legacy (equal (first fields) "PGPHYSPIN1"))
+           (extended (and (not legacy) (= (length fields) 11)))
+           (manifest-digest (when extended (ignore-errors (parse-integer (tenth fields)))))
            (name (second fields))
            (system-id (ignore-errors (parse-integer (third fields))))
+           (timeline (ignore-errors (parse-integer (fourth fields))))
            (restart (ignore-errors (parse-integer (fifth fields))))
            (consistent (ignore-errors (parse-integer (sixth fields))))
            (confirmed (if legacy -1 (ignore-errors (parse-integer (seventh fields)))))
@@ -103,9 +111,13 @@
            (status (if legacy "reserved" (ninth fields)))
            (crc (ignore-errors (parse-integer (car (last fields)) :radix 16))))
       (unless (and (if legacy (= (length fields) 7)
-                       (and (= (length fields) 10) (equal (first fields) "PGPHYSPIN2")))
+                       (and (member (length fields) '(10 11)) (equal (first fields) "PGPHYSPIN2")))
                    (wal-valid-replication-slot-name-p name)
-                   (equal name (pathname-name path)) (equal (fourth fields) "1")
+                   (equal name (pathname-name path))
+                   (typep timeline '(integer 1 4294967295))
+                   (or (not extended) (typep manifest-digest '(unsigned-byte 64)))
+                   (or (not legacy) (= timeline 1))
+                   (= timeline *wal-insert-timeline*)
                    (typep system-id '(unsigned-byte 64)) (= system-id (catalog-system-identifier))
                    (typep restart '(unsigned-byte 64)) (typep consistent '(unsigned-byte 64))
                    (or (eql confirmed -1) (typep confirmed '(unsigned-byte 64)))
@@ -114,7 +126,8 @@
                                           (format nil "~{~a~^ ~}" (butlast fields)))))
                    (null (read-line stream nil nil)))
         (error "corrupt or foreign physical source pin ~a" path))
-      (let ((pin (make-physical-source-pin :name name :system-id system-id
+      (let ((pin (make-physical-source-pin :name name :system-id system-id :timeline timeline
+                                           :manifest-digest manifest-digest
                                            :restart-lsn restart :consistent-lsn consistent
                                            :confirmed-lsn (unless (= confirmed -1) confirmed)
                                            :prefix-digest digest :lost-p (equal status "lost"))))
@@ -134,7 +147,7 @@
         (error "unregistered physical source pin file ~a" name))
       (let* ((end *wal-checkpoint-lsn*)
              (pin (make-physical-source-pin
-                   :name name :system-id (catalog-system-identifier)
+                   :name name :system-id (catalog-system-identifier) :timeline *wal-insert-timeline*
                    :consistent-lsn end
                    :restart-lsn (wal-checkpoint-record-start end))))
         (physical-source-pin-check-wal pin)
@@ -144,6 +157,24 @@
               (physical-source-pin-restart-lsn pin)
               (gethash name *physical-source-pins*) pin)
         pin))))
+
+(defun physical-source-pin-bind-manifest (pin digest)
+  (with-write-lock
+    (with-wal-critical
+      (unless (and (typep digest '(unsigned-byte 64))
+                   (eq pin (gethash (physical-source-pin-name pin) *physical-source-pins*))
+                   (= (physical-source-pin-timeline pin) *wal-insert-timeline*)
+                   (= (physical-source-pin-consistent-lsn pin) *wal-checkpoint-lsn*)
+                   (not (physical-source-pin-lost-p pin))
+                   (null (physical-source-pin-confirmed-lsn pin))
+                   (null (physical-source-pin-manifest-digest pin))
+                   (null (gethash (physical-source-pin-name pin) *physical-source-senders*)))
+        (wal-invalid-input "physical source pin cannot bind this backup manifest"))
+      (let ((candidate (copy-physical-source-pin pin)))
+        (setf (physical-source-pin-manifest-digest candidate) digest)
+        (physical-source-pin-save candidate)
+        (setf (physical-source-pin-manifest-digest pin) digest))))
+  pin)
 
 (defun physical-source-pin-load ()
   "Restore source retention before startup can admit checkpoint/recycle work."
@@ -176,6 +207,7 @@
     (let* ((pin (gethash name *physical-source-pins*))
            (old (and pin (physical-source-pin-confirmed-lsn pin))))
       (unless (and pin (not (physical-source-pin-lost-p pin))
+                   (= (physical-source-pin-timeline pin) *wal-insert-timeline*)
                    (eq owner (gethash name *physical-source-senders*))
                    (typep digest '(unsigned-byte 64))
                    (<= (or old (physical-source-pin-consistent-lsn pin)) lsn *wal-durable-lsn*))

@@ -11,6 +11,7 @@
                (:file "t/physical-bootstrap-tests")
                (:file "t/physical-recovery-tests")
                (:file "t/physical-control-tests")
+               (:file "t/child-bootstrap-tests")
                (:file "t/physical-row-replay-tests")
                (:file "t/promotion-control-tests")
                (:file "t/checkpoint-tests")

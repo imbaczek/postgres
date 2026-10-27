@@ -24,7 +24,9 @@
                          promotion-child promotion-generation promotion-source-namespace
                        &allow-other-keys)
       control
-    (and (member phase '(0 1 2 3)) (eql timeline 1)
+    (and (member phase '(0 1 2 3))
+         (typep timeline '(integer 1 4294967295))
+         (or (member control-version '(3 4)) (eql timeline 1))
          (every (lambda (value) (typep value '(unsigned-byte 64)))
                 (list system-id manifest-digest checkpoint applied))
          (member control-version '(1 2 3 4))
@@ -37,6 +39,8 @@
          (if (= phase 3)
              (and (= control-version 4) (not legacy)
                   (typep promotion-child '(integer 2 4294967295))
+                  (> promotion-child timeline)
+                  (or (eql timeline 1) (eq promotion-source-namespace :timeline))
                   (typep promotion-generation '(unsigned-byte 64))
                   (member promotion-source-namespace '(:legacy :timeline))
                   (eql db-state +db-in-archive-recovery+))
@@ -191,7 +195,7 @@ This is local incomplete-recovery state, never child insertion or writer authori
     (error "physical recovery control already exists"))
   (wal-atomic-write-bytes
    (physical-recovery-control-path directory)
-   (physical-recovery-control-image 0 (catalog-system-identifier) 1 0
+   (physical-recovery-control-image 0 (catalog-system-identifier) *wal-insert-timeline* 0
                                     *wal-checkpoint-lsn* *wal-durable-lsn* *next-xid*)))
 
 (defun recovery-check-literal-text (text)
@@ -242,8 +246,16 @@ This is local incomplete-recovery state, never child insertion or writer authori
                (bytes->string bytes :start text-start :end text-end))
               (physical-store-update-digest #xCBF29CE484222325 bytes)))))
 
-(defun recovery-manifest-path-p (name)
-  "Whitelist native file grammars before opening paths; children remain unsupported."
+(defun recovery-history-file-timeline (name)
+  (when (and (stringp name) (= (length name) 23)
+             (uiop:string-prefix-p "pg_wal/" name)
+             (string= name ".history" :start1 15)
+             (every (lambda (character) (find character "0123456789ABCDEF"))
+                    (subseq name 7 15)))
+    (let ((timeline (parse-integer name :start 7 :end 15 :radix 16)))
+      (when (> timeline 1) timeline))))
+
+(defun recovery-manifest-path-p (name &optional (timeline 1))
   (and (stringp name)
        (or (member name '("PG_VERSION" "pg_xact" "global/pg_control"
                           "global/pg_catalog.dat" "global/pg_wal_control") :test #'equal)
@@ -252,11 +264,13 @@ This is local incomplete-recovery state, never child insertion or writer authori
                        (digits (if (uiop:string-suffix-p suffix ".vm")
                                    (subseq suffix 0 (- (length suffix) 3)) suffix)))
                   (and (plusp (length digits)) (every #'digit-char-p digits))))
+           (and (> timeline 1) (recovery-history-file-timeline name)
+                (<= (recovery-history-file-timeline name) timeline))
            (and (uiop:string-prefix-p "pg_wal/" name)
                 (uiop:string-suffix-p name ".wal")
                 (let ((stem (subseq name 7 (- (length name) 4))))
-                  (or (eql 1 (wal-parse-segment-name stem :legacy))
-                      (eql 1 (wal-parse-segment-name stem :timeline))))))))
+                  (or (and (= timeline 1) (eql 1 (wal-parse-segment-name stem :legacy)))
+                      (eql timeline (wal-parse-segment-name stem :timeline))))))))
 
 (defun physical-manifest-checkpoint-start (manifest)
   (if (member (getf manifest :version) '(2 3)) (getf manifest :checkpoint-start)
@@ -269,7 +283,8 @@ This is local incomplete-recovery state, never child insertion or writer authori
                           '(:version :system-id :cluster-identity :timeline :checkpoint
                             :checkpoint-start :end :next-xid :source-pin :files)
                           '(:version :system-id :cluster-identity :timeline :checkpoint
-                            :end :next-xid :source-pin :files))) (eql 1 (getf manifest :timeline))
+                            :end :next-xid :source-pin :files))) (typep (getf manifest :timeline) '(integer 1 4294967295))
+               (or (eql 3 (getf manifest :version)) (eql 1 (getf manifest :timeline)))
                (typep (getf manifest :system-id) '(unsigned-byte 64))
                (stringp (getf manifest :cluster-identity))
                (plusp (length (getf manifest :cluster-identity)))
@@ -288,12 +303,16 @@ This is local incomplete-recovery state, never child insertion or writer authori
   (let ((names (make-hash-table :test #'equal)))
     (dolist (entry (getf manifest :files))
       (unless (and (listp entry) (= (length entry) 3)
-                   (recovery-manifest-path-p (first entry))
+                   (recovery-manifest-path-p (first entry) (getf manifest :timeline))
                    (typep (second entry) '(unsigned-byte 64))
                    (typep (third entry) '(unsigned-byte 64))
                    (not (gethash (first entry) names)))
         (error "invalid or duplicate physical recovery file entry"))
       (setf (gethash (first entry) names) t)))
+  (when (and (> (getf manifest :timeline) 1)
+             (not (find (concatenate 'string "pg_wal/" (timeline-history-filename (getf manifest :timeline)))
+                        (getf manifest :files) :key #'first :test #'equal)))
+    (error "child physical recovery manifest lacks its timeline history"))
   manifest)
 
 (defun recovery-check-manifest-files (manifest directory)
@@ -320,8 +339,13 @@ This is local incomplete-recovery state, never child insertion or writer authori
          (*wal-checkpoint-lsn* (getf manifest :checkpoint))
          (*wal-durable-lsn* (getf manifest :end))
          (*wal-checkpoint-snapshot* (nth-value 2 (wal-read-control-fields)))
+         (*wal-insert-timeline* (nth-value 3 (wal-read-control-fields)))
+         (*wal-checkpoint-timeline* (nth-value 4 (wal-read-control-fields)))
+         (*wal-segment-namespace* (nth-value 5 (wal-read-control-fields)))
          (names (sort (mapcar #'first (getf manifest :files)) #'string<)))
-    (unless (and (not *catalog-identity-needs-persist-p*)
+    (unless (and (= *wal-insert-timeline* *wal-checkpoint-timeline* (getf manifest :timeline))
+                 (or (= *wal-insert-timeline* 1) (eq *wal-segment-namespace* :timeline))
+                 (not *catalog-identity-needs-persist-p*)
                  (equal (catalog-cluster-identity *catalog*) (getf manifest :cluster-identity))
                  (= (catalog-system-identifier) (getf manifest :system-id))
                  (gethash "postgres" (catalog-databases *catalog*))
@@ -348,7 +372,7 @@ This is local incomplete-recovery state, never child insertion or writer authori
       (error "physical recovery XID reservation mismatch"))
     (physical-source-pin-check-wal
      (make-physical-source-pin :name (getf manifest :source-pin)
-                               :system-id (getf manifest :system-id)
+                               :system-id (getf manifest :system-id) :timeline (getf manifest :timeline)
                                :consistent-lsn *wal-checkpoint-lsn*
                                :restart-lsn (physical-manifest-checkpoint-start manifest)))
     *catalog*))
@@ -357,8 +381,10 @@ This is local incomplete-recovery state, never child insertion or writer authori
   "Select only the CRC-bound base namespace while verifying immutable provenance."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace)
       (wal-read-control-fields)
-    (declare (ignore checkpoint durable snapshot insertion checkpoint-timeline))
-    (let ((*wal-segment-namespace* namespace))
+    (declare (ignore checkpoint durable snapshot))
+    (let ((*wal-segment-namespace* namespace)
+          (*wal-insert-timeline* insertion)
+          (*wal-checkpoint-timeline* checkpoint-timeline))
       (physical-recovery-prepare-with-namespace)
       (setf (getf *physical-recovery-state* :wal-namespace) namespace))))
 
@@ -392,7 +418,8 @@ This is local incomplete-recovery state, never child insertion or writer authori
       (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline)
           (wal-read-control-fields)
         (wal-require-supported-timelines insertion checkpoint-timeline)
-        (unless (and (eql checkpoint (getf manifest :checkpoint))
+        (unless (and (= insertion checkpoint-timeline (getf manifest :timeline))
+                     (eql checkpoint (getf manifest :checkpoint))
                      (eql durable (getf manifest :end))
                      (= (physical-manifest-checkpoint-start manifest)
                         (if snapshot (getf snapshot :start) (- checkpoint +wal-header-size+))))
@@ -433,6 +460,8 @@ This is local incomplete-recovery state, never child insertion or writer authori
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
   (let ((streaming (= 2 (getf *physical-recovery-state* :phase))))
     (setf *wal-segment-namespace* (getf *physical-recovery-state* :wal-namespace :legacy)
+          *wal-insert-timeline* (getf *physical-recovery-state* :timeline)
+          *wal-checkpoint-timeline* (getf *physical-recovery-state* :timeline)
           *wal-checkpoint-snapshot* (copy-list (getf *physical-recovery-state* :source-checkpoint))
           *wal-checkpoint-lsn* (getf *physical-recovery-state* :checkpoint)
           *wal-durable-lsn* (getf *physical-recovery-state* :end)

@@ -6,7 +6,7 @@
   (let* ((state *physical-recovery-state*) (base (getf state :end))
                                            (namespace (getf state :wal-namespace :legacy))
                                            (segment (floor base +wal-segment-size+)) (offset (mod base +wal-segment-size+))
-                                           (name (concatenate 'string "pg_wal/" (wal-segment-filename segment 1 namespace)))
+                                           (name (concatenate 'string "pg_wal/" (wal-segment-filename segment (getf state :timeline) namespace)))
                                            (entry (find name (getf state :files) :key #'first :test #'equal)))
     (when (zerop offset)
       (return-from physical-recovery-base-wal-prefix (make-array 0 :element-type '(unsigned-byte 8))))
@@ -14,7 +14,7 @@
       (error "base manifest lacks its exact final WAL prefix"))
     (multiple-value-bind (stream timeline size)
         (wal-lineage-open-segment segment
-                                  (list (make-timeline-history-entry :timeline 1 :begin 0))
+                                  (timeline-read-history (getf state :timeline))
                                   0 namespace)
       (declare (ignore timeline))
       (unwind-protect
