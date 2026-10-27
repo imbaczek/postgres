@@ -29,8 +29,7 @@ leave that state unknown until successful initialization publishes production."
        (wal-encode-control-image
         checkpoint durable snapshot :timeline insertion :checkpoint-timeline checkpoint-id
         :namespace namespace
-        :metadata (make-wal-control-metadata
-                   (getf metadata :system-id) +db-in-crash-recovery+)))))
+        :metadata (wal-refresh-control-metadata metadata +db-in-crash-recovery+)))))
   (native-control-test-point :after-primary-startup-dirty)
   (values))
 
@@ -45,7 +44,9 @@ the durable control write succeeds; an existing identity must match the catalog.
                (/= system-id (getf *wal-control-metadata* :system-id)))
       (error "primary control and catalog system identifiers differ"))
     (with-wal-critical
-      (let ((*wal-control-metadata* (make-wal-control-metadata system-id state)))
+      (let ((*wal-control-metadata* (if *wal-control-metadata*
+                                        (wal-refresh-control-metadata *wal-control-metadata* state)
+                                        (make-wal-control-metadata system-id state))))
         (wal-save-control-fields *wal-checkpoint-lsn* *wal-durable-lsn*))
       (setf *wal-control-metadata*
             (nth-value 6 (wal-read-control-fields)))))

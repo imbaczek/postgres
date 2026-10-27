@@ -55,6 +55,115 @@
     (ok (= 8 (length (pg::wal-split-fields (pg::bytes->string bytes)))))
     (ok (null (seventh values)))))
 
+(deftest wal-control-retained-reference-roundtrips-and-is-crc-bound
+    (dolist (root-id '(0 18446744073709551615))
+      (let* ((reference (list :root-id root-id :base-timeline 1 :base 32
+                              :manifest-digest 18446744073709551615 :end 96
+                              :end-digest 18446744073709551615))
+             (metadata (list :system-id 18446744073709551615 :db-state 6 :state-time -1
+                             :retained-reference reference))
+             (bytes (pg::wal-encode-control-image 152 300 (sample-checkpoint-snapshot)
+                                                  :timeline 2 :namespace :timeline :metadata metadata))
+             (loaded (nth-value 6 (pg::wal-decode-control-line (pg::bytes->string bytes))))
+             (fields (pg::wal-split-fields (pg::bytes->string bytes))))
+        (ok (equal metadata loaded))
+        (ok (= 17 (length fields)))
+        (ok (<= (length bytes) 513))
+        (setf (nth 10 fields) (if (zerop root-id) "1" "0"))
+        (ok (signals (pg::wal-decode-control-line (format nil "~{~a~^ ~}~%" fields)) 'error)))))
+
+(deftest wal-control-refresh-preserves-retained-reference
+    (let* ((reference '(:root-id 0 :base-timeline 1 :base 32 :manifest-digest 7 :end 96 :end-digest 8))
+           (metadata (list :system-id 42 :db-state 6 :state-time 0 :retained-reference reference))
+           (refreshed (pg::wal-refresh-control-metadata metadata 4 17)))
+      (ok (= 4 (getf refreshed :db-state)))
+      (ok (= 17 (getf refreshed :state-time)))
+      (ok (equal reference (getf refreshed :retained-reference)))
+      (ok (not (eq reference (getf refreshed :retained-reference))))
+      (ok (equal metadata
+                 (list :system-id 42 :db-state 6 :state-time 0 :retained-reference reference)))))
+
+(deftest wal-control-retained-reference-rejects-invalid-shapes
+    (let ((reference '(:root-id 0 :base-timeline 1 :base 32 :manifest-digest 7 :end 96 :end-digest 8)))
+      (dolist (bad (list nil (append reference '(:root-id 1))
+                         (append reference '(:extra 1))
+                         (list* :root-id -1 (cddr reference))
+                         (list* :base-timeline 0 (cddr reference))))
+        (ok (signals (pg::wal-encode-control-image
+                      0 0 nil :metadata
+                      (list :system-id 42 :db-state 6 :state-time 0 :retained-reference bad))
+                     'error)))
+      (dolist (replacement '(:root-id :unknown))
+        (let ((bad (copy-list reference)))
+          (setf (nth 2 bad) replacement)
+          (ok (not (pg::wal-retained-reference-valid-p bad)))))
+      (let ((bad (copy-list reference)))
+        (setf (getf bad :end) 31)
+        (ok (not (pg::wal-retained-reference-valid-p bad))))))
+
+(deftest wal-control-position-rewrites-retain-reference-and-startup-fails-closed
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (reference '(:root-id 0 :base-timeline 1 :base 32 :manifest-digest 7 :end 96 :end-digest 8))
+             (pg::*wal-control-metadata*
+               (list :system-id 42 :db-state 6 :state-time 0 :retained-reference reference))
+             (pg::*wal-checkpoint-snapshot* nil)
+             (pg::*wal-insert-timeline* 1)
+             (pg::*wal-checkpoint-timeline* 1)
+             (pg::*wal-segment-namespace* :legacy))
+        (ensure-directories-exist (pg::wal-control-path))
+        (pg::wal-save-control-fields 0 96)
+        (ok (equal reference (getf (nth-value 6 (pg::wal-read-control-fields)) :retained-reference)))
+        (pg::wal-save-control-fields 0 128)
+        (ok (= 128 (nth-value 1 (pg::wal-read-control-fields))))
+        (ok (equal reference (getf (nth-value 6 (pg::wal-read-control-fields)) :retained-reference)))
+        (let ((before (pg::read-bounded-regular-file (pg::wal-control-path) 513)))
+          (ok (signals (pg::wal-mark-primary-startup) 'error))
+          (ok (equalp before (pg::read-bounded-regular-file (pg::wal-control-path) 513)))))))
+
+(deftest wal-control-state-writer-retains-reference
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*catalog* (pg::make-catalog :cluster-identity "retained-state-writer"))
+             (reference '(:root-id 0 :base-timeline 1 :base 32 :manifest-digest 7 :end 96 :end-digest 8))
+             (pg::*wal-control-metadata*
+               (list :system-id (pg::catalog-system-identifier) :db-state 6 :state-time 0
+                     :retained-reference reference))
+             (pg::*physical-recovery-state* nil)
+             (pg::*physical-recovery-failed-p* nil)
+             (pg::*wal-ready* t)
+             (pg::*wal-poisoned* nil)
+             (pg::*wal-checkpoint-lsn* 0)
+             (pg::*wal-durable-lsn* 96)
+             (pg::*wal-checkpoint-snapshot* nil)
+             (pg::*wal-insert-timeline* 1)
+             (pg::*wal-checkpoint-timeline* 1)
+             (pg::*wal-segment-namespace* :legacy))
+        (ensure-directories-exist (pg::wal-control-path))
+        (pg::wal-set-primary-state 4)
+        (let ((loaded (nth-value 6 (pg::wal-read-control-fields))))
+          (ok (= 4 (getf loaded :db-state)))
+          (ok (equal reference (getf loaded :retained-reference)))))))
+
+(deftest wal-control-reference-validation-survives-recomputed-crc
+    (let* ((reference '(:root-id 0 :base-timeline 1 :base 32 :manifest-digest 7 :end 96 :end-digest 8))
+           (bytes (pg::wal-encode-control-image
+                   0 96 nil :metadata
+                   (list :system-id 42 :db-state 6 :state-time 0 :retained-reference reference)))
+           (fields (butlast (pg::wal-split-fields (pg::bytes->string bytes)))))
+      (flet ((rejected (words)
+               (let ((prefix (format nil "~{~a~^ ~}" words)))
+                 (signals (pg::wal-decode-control-line
+                           (format nil "~a ~8,'0X~%" prefix (pg::wal-crc32 (pg::string->bytes prefix))))
+                          'error))))
+        (dolist (change '((10 "-1") (11 "0") (11 "4294967296") (12 "97")
+                          (13 "18446744073709551616") (14 "31") (15 "-1")))
+          (let ((bad (copy-list fields)))
+            (setf (nth (first change) bad) (second change))
+            (ok (rejected bad))))
+        (ok (rejected (butlast fields)))
+        (ok (rejected (append fields '("0")))))))
+
 (deftest wal-control-rejects-invalid-or-damaged-primary-state
     (dolist (metadata '((:system-id -1 :db-state 6 :state-time 0)
                         (:system-id 1 :db-state 7 :state-time 0)

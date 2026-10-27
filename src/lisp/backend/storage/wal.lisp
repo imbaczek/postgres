@@ -2047,9 +2047,8 @@ Reject extra lines before decoding its CRC and checkpoint metadata."
   "Save WAL positions and retain any known primary identity and lifecycle state.
 Refresh its modification time. Update memory only after atomic publication."
   (let ((metadata (when *wal-control-metadata*
-                    (make-wal-control-metadata
-                     (getf *wal-control-metadata* :system-id)
-                     (getf *wal-control-metadata* :db-state)))))
+                    (wal-refresh-control-metadata
+                     *wal-control-metadata* (getf *wal-control-metadata* :db-state)))))
     (wal-atomic-write-bytes
      (wal-control-path)
      (wal-encode-control-image checkpoint-lsn durable-lsn *wal-checkpoint-snapshot*

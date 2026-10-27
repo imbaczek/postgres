@@ -128,21 +128,45 @@
                    (parse-integer text :start (* index 2) :end (+ (* index 2) 2) :radix 16)))
     (wal-decode-checkpoint-snapshot bytes)))
 
+(defparameter *wal-retained-reference-keys*
+  '(:root-id :base-timeline :base :manifest-digest :end :end-digest))
+
+(defun wal-retained-reference-valid-p (reference)
+  (and (listp reference) (= 12 (length reference))
+       (let ((keys (loop for (key value) on reference by #'cddr collect key)))
+         (and (= 6 (length (remove-duplicates keys)))
+              (null (set-difference keys *wal-retained-reference-keys*))))
+       (every (lambda (key) (typep (getf reference key) '(unsigned-byte 64)))
+              '(:root-id :base :manifest-digest :end :end-digest))
+       (typep (getf reference :base-timeline) '(integer 1 4294967295))
+       (<= (getf reference :base) (getf reference :end))))
+
 (defun wal-control-metadata-valid-p (metadata)
-  "Recognize the exact optional system identity, DB state and Unix-time fields."
-  (and (listp metadata) (= 6 (length metadata))
+  "Recognize lifecycle fields and an optional exact retained archive reference."
+  (and (listp metadata) (member (length metadata) '(6 8))
        (let ((keys (loop for (key value) on metadata by #'cddr collect key)))
-         (and (every #'keywordp keys) (= 3 (length (remove-duplicates keys)))
-              (null (set-difference '(:system-id :db-state :state-time) keys))))
+         (and (= (/ (length metadata) 2) (length (remove-duplicates keys)))
+              (null (set-difference '(:system-id :db-state :state-time) keys))
+              (null (set-difference keys '(:system-id :db-state :state-time :retained-reference)))))
        (typep (getf metadata :system-id) '(unsigned-byte 64))
        (typep (getf metadata :db-state) '(integer 0 6))
-       (typep (getf metadata :state-time) '(signed-byte 64))))
+       (typep (getf metadata :state-time) '(signed-byte 64))
+       (or (= 6 (length metadata))
+           (wal-retained-reference-valid-p (getf metadata :retained-reference)))))
 
 (defun make-wal-control-metadata (system-id state &optional (time (- (get-universal-time) 2208988800)))
   "Build checked primary lifecycle metadata, using Unix seconds for TIME."
   (let ((metadata (list :system-id system-id :db-state state :state-time time)))
     (unless (wal-control-metadata-valid-p metadata) (error "invalid primary control metadata"))
     metadata))
+
+(defun wal-refresh-control-metadata (metadata state &optional (time (- (get-universal-time) 2208988800)))
+  "Change lifecycle state without losing the selected archive reference."
+  (unless (wal-control-metadata-valid-p metadata)
+    (error "invalid primary control metadata"))
+  (append (make-wal-control-metadata (getf metadata :system-id) state time)
+          (when (getf metadata :retained-reference)
+            (list :retained-reference (copy-list (getf metadata :retained-reference))))))
 
 (defun wal-encode-control-image (checkpoint durable snapshot
                                  &key (timeline 1) (namespace :legacy) metadata
@@ -169,6 +193,12 @@ NIL preserves the older representation; the CRC covers every supplied field."
                      (format nil "~a ~d ~d ~d" prefix (getf metadata :system-id)
                              (getf metadata :db-state) (getf metadata :state-time))
                      prefix))
+         (reference (getf metadata :retained-reference))
+         (prefix (if reference
+                     (format nil "~a~{ ~d~}" prefix
+                             (mapcar (lambda (key) (getf reference key))
+                                     *wal-retained-reference-keys*))
+                     prefix))
          (crc (wal-crc32 (string->bytes prefix))))
     (string->bytes (format nil "~a ~8,'0X~%" prefix crc))))
 
@@ -189,7 +219,7 @@ and legacy names. An older image's absent lifecycle metadata is unknown state."
                                  ((equal (sixth fields) "timeline") :timeline))
                         :legacy))
          (crc (ignore-errors (parse-integer (car (last fields)) :radix 16))))
-    (unless (and (cond (v6 (member (length fields) '(8 11))) (identities (= (length fields) 7))
+    (unless (and (cond (v6 (member (length fields) '(8 11 17))) (identities (= (length fields) 7))
                        (v4 (= (length fields) 5))
                        (t (and (= (length fields) 4)
                                (member version '("PGWAL2" "PGWAL3") :test #'equal))))
@@ -208,18 +238,31 @@ and legacy names. An older image's absent lifecycle metadata is unknown state."
       (when (and snapshot (or (/= checkpoint (getf snapshot :end))
                               (/= checkpoint-timeline (getf snapshot :timeline))))
         (error "checkpoint control copy names another record or timeline"))
-      (if (and v6 (= 11 (length fields)))
-          (values checkpoint durable snapshot timeline checkpoint-timeline namespace
-                  (make-wal-control-metadata
-                   (ignore-errors (parse-integer (eighth fields)))
-                   (ignore-errors (parse-integer (ninth fields)))
-                   (ignore-errors (parse-integer (tenth fields)))))
-          (values checkpoint durable snapshot timeline checkpoint-timeline namespace)))))
+      (let ((metadata
+              (when (and v6 (member (length fields) '(11 17)))
+                (let ((metadata
+                        (make-wal-control-metadata
+                         (ignore-errors (parse-integer (eighth fields)))
+                         (ignore-errors (parse-integer (ninth fields)))
+                         (ignore-errors (parse-integer (tenth fields))))))
+                  (when (= 17 (length fields))
+                    (setf metadata
+                          (append metadata
+                                  (list :retained-reference
+                                        (loop for key in *wal-retained-reference-keys*
+                                              for field in (subseq fields 10 16)
+                                              append (list key (ignore-errors (parse-integer field))))))))
+                  (unless (wal-control-metadata-valid-p metadata)
+                    (error "invalid primary control metadata"))
+                  metadata))))
+        (values checkpoint durable snapshot timeline checkpoint-timeline namespace metadata)))))
 
 (declaim (ftype function physical-promotion-check-child-control))
 
 (defun wal-require-supported-timelines (insertion checkpoint)
   "Accept children only through verified child checkpoint control before mutation."
+  (when (getf (nth-value 6 (wal-read-control-fields)) :retained-reference)
+    (error "retained primary archive startup validation is not yet installed"))
   (unless (and (eql insertion 1) (eql checkpoint 1))
     (handler-case (physical-promotion-check-child-control insertion checkpoint)
       (error (condition)
