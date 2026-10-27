@@ -64,4 +64,4 @@ SBCL="$SBCL" timeout --foreground --kill-after=5 "${PARKING_DRIVER_TIMEOUT:-180}
     "$BASE" "$TMP" "$PORT" "$TARGET_PORT" "$TARGET"
 signal_owned "$TARGET" "$TMP/copy" INT 20; wait "$TARGET"; TARGET=
 signal_owned "$SOURCE" "$TMP/source" INT 20; wait "$SOURCE"; SOURCE=
-echo 'live-operation-parking: inline continuation, promotion, deferred reload and retained RR PASS'
+echo 'live-operation-parking: driver assertions and owned peer cleanup PASS'

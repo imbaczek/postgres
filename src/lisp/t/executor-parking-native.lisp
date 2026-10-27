@@ -243,3 +243,43 @@ Clear the test hooks after verification."
   (assert (>= *resource-parking-arenas* minimum-arenas))
   (assert (>= *resource-parking-repairs* minimum-repairs))
   (resource-parking-verify-cleanup))
+
+(defun resource-parking-install-sql-promotion (root backend-pid)
+  (let ((capture *live-operation-parking-test-hook*)
+        (open *live-operation-before-open-hook*)
+        (setting (symbol-function 'eval-setting-function))
+        (wait (symbol-function 'physical-promotion-wait-for-sql)))
+    (sql-promotion-test-install root backend-pid :normal)
+    (let ((park *live-operation-parking-test-hook*))
+      (setf *live-operation-parking-test-hook*
+            (lambda (point token)
+              (funcall park point token)
+              (when (and (eq point :after-park) (resource-parking-backend-p))
+                (funcall capture point token)
+                (incf *parking-native-calls*)
+                (setf *parking-native-captured*
+                      (list *backend* (backend-transaction-snapshot *backend*)
+                            (backend-virtual-reader-xid *backend*)))
+                (parking-native-marker "parked")))
+            *live-operation-before-open-hook* open))
+    (setf *parking-native-wrapper*
+          (lambda (name arguments)
+            (if (and (string= name "current_setting")
+                     (equal (first arguments) "pg_lisp_test_resource_park"))
+                (progn
+                  (incf *resource-parking-visits*)
+                  (if (= *resource-parking-after* *resource-parking-visits*) "promote" "visited"))
+                (funcall setting name arguments)))
+          (symbol-function 'eval-setting-function) *parking-native-wrapper*
+          (symbol-function 'physical-promotion-wait-for-sql)
+          (lambda (deadline)
+            (let ((result (funcall wait deadline)))
+              (when (and result (resource-parking-backend-p))
+                (parking-native-marker "sql-wait-completed")
+                (loop repeat 3000
+                      until (probe-file (merge-pathnames "release" root))
+                      do (check-for-interrupts) (sleep 0.01))
+                (assert (probe-file (merge-pathnames "release" root)))
+                (setf *resource-parking-resumed* t))
+              result))))
+  t)

@@ -20,6 +20,8 @@ def effect(value):
     before = "set_config('pg_lisp.resource_effects',current_setting('pg_lisp.resource_effects') || ':b',false)"
     after = "set_config('pg_lisp.resource_effects',current_setting('pg_lisp.resource_effects') || ':a',false)"
     hook = "current_setting('pg_lisp_test_resource_park')"
+    if os.environ.get("RESOURCE_SQL_PROMOTION") == "1":
+        hook = f"CASE WHEN {hook}='promote' THEN pg_promote(true,60) ELSE true END"
     return (f"CASE WHEN {before} IS NOT NULL THEN CASE WHEN {hook} IS NOT NULL "
             f"THEN CASE WHEN {after} IS NOT NULL THEN {value} ELSE {value} END "
             f"ELSE {value} END ELSE {value} END")
@@ -261,6 +263,7 @@ def run(base, root, source_port, target_port, target_pid):
             for index in ("resource_outer_label_idx", "resource_inner_owner_idx"):
                 assert any(index in row[0] for row in plan), (name, index, plan)
         query(reader, "SELECT set_config('pg_lisp.resource_effects','trace',false)")
+        backend_pid = int(scalar(reader, "SELECT pg_backend_pid()"))
         control(base, root, f'(load "{base}/t/live-operation-parking-native.lisp")')
         control(base, root, f'(load "{base}/t/executor-parking-native.lisp")')
         options = [case.get(key, 0) for key in ("files", "readers", "writers", "io")]
@@ -268,6 +271,10 @@ def run(base, root, source_port, target_port, target_pid):
         control(base, root, f'(resource-parking-install #p"{root}/" {case["after"]} '
                 f'{case.get("budget", 1)} {arena} ' + " ".join(map(str, options)) +
                 f' {case.get("match_phase", ":any")} {case.get("index_scans", 0)})')
+        sql_promotion = os.environ.get("RESOURCE_SQL_PROMOTION") == "1"
+        if sql_promotion:
+            control(base, root, f'(load "{base}/t/promotion-sql-native.lisp")')
+            control(base, root, f'(resource-parking-install-sql-promotion #p"{root}/" {backend_pid})')
         future = pool.submit(query, reader, case["query"])
         wait_until(lambda: (root / "parked").exists() or future.done())
         if future.done():
@@ -288,9 +295,14 @@ def run(base, root, source_port, target_port, target_pid):
         mutate(source, "parent-after", 1000, case.get("indexed"))
         position = scalar(source, "SELECT pg_current_wal_flush_lsn()")
         wait_until(lambda: scalar(target, f"SELECT pg_last_wal_replay_lsn() >= '{position}'::pg_lsn"))
-        result = subprocess.run([str(base / "bin/pg_ctl"), "promote", "-D", str(root / "copy"),
-                                 "-w", "-t", "30"], text=True, capture_output=True, timeout=40)
-        assert result.returncode == 0, result.stdout + result.stderr
+        if sql_promotion:
+            wait_until(lambda: (root / "sql-worker-held").exists())
+            (root / "sql-worker-release").touch()
+            wait_until(lambda: (root / "sql-wait-completed").exists())
+        else:
+            result = subprocess.run([str(base / "bin/pg_ctl"), "promote", "-D", str(root / "copy"),
+                                     "-w", "-t", "30"], text=True, capture_output=True, timeout=40)
+            assert result.returncode == 0, result.stdout + result.stderr
         assert scalar(target, "SELECT pg_is_in_recovery()") is False
         assert not future.done(), f"{name} resumed before release"
         verify_mutations(target, "parent-after", 1000, case.get("indexed"))
@@ -323,6 +335,7 @@ def run(base, root, source_port, target_port, target_pid):
         print(f"executor-parking: {name} replay, promotion, GC, exact continuation and reload PASS", flush=True)
     finally:
         (root / "release").touch()
+        (root / "sql-worker-release").touch()
         reader.close()
         pool.shutdown(wait=True)
         source.close()

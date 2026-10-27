@@ -2,7 +2,7 @@
 
 The harness must create promotion_sql_items with row (1, 'before').
 This test writes source rows and promotes the standby with two old RR views open.
-It currently passes against C; native SQL promotion remains unimplemented.
+The same assertions run against pinned C and native physical peers.
 """
 
 import sys
@@ -39,14 +39,48 @@ def retained_view(connection):
         return cursor.fetchall()
 
 
+def signature_contract(connection):
+    for expression in ("pg_promote(NULL)", "pg_promote(wait_seconds=>NULL)",
+                       "pg_promote(wait_seconds:=NULL)", "pg_promote(VARIADIC NULL::boolean)",
+                       "pg_promote(NULL::boolean,1)", "pg_promote(false,NULL::integer)"):
+        assert scalar(connection, "SELECT " + expression) is None
+    for expression, state in (
+        ("pg_promote(VARIADIC wait_seconds=>1)", "42883"),
+        ("pg_promote('bad',1::bigint)", "42883"),
+        ("pg_promote('bad',wrong=>1)", "42883"),
+        ("pg_promote(1)", "42883"),
+        ("pg_promote(true,1::bigint)", "42883"),
+        ("pg_promote('true'::text,1)", "42883"),
+        ("pg_promote(wrong=>NULL)", "42883"),
+        ('pg_promote("WAIT"=>NULL)', "42883"),
+        ("pg_promote(true,wait=>false)", "42883"),
+        ("pg_promote(wait=>true,wait=>false)", "42601"),
+        ("pg_promote(wait=>true,true)", "42601"),
+        ("pg_promote(NULL,'bad')", "22P02"),
+        ("pg_promote(true,'2147483648')", "22003"),
+    ):
+        rejects(connection, "SELECT " + expression, state)
+    scalar(connection, "SELECT set_config('application_name','trace',false)")
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT pg_promote(
+                wait_seconds=>CASE WHEN set_config('application_name',current_setting('application_name')||':seconds',false)
+                    IS NOT NULL THEN NULL::integer END,
+                wait=>CASE WHEN set_config('application_name',current_setting('application_name')||':wait',false)
+                    IS NOT NULL THEN true END), current_setting('application_name')
+        """)
+        assert cursor.fetchone() == (None, "trace:wait:seconds")
+    scalar(connection, "SELECT set_config('application_name','sql-promotion-contract',false)")
+
+
 def check(primary, standby, reader):
     primary.autocommit = standby.autocommit = True
     for connection in (primary, standby):
-        assert scalar(connection, "SELECT pg_promote(NULL::boolean,1)") is None
-        assert scalar(connection, "SELECT pg_promote(false,NULL::integer)") is None
-        rejects(connection, "SELECT pg_promote(1)", "42883")
+        signature_contract(connection)
     for sql in ("SELECT pg_promote()", "SELECT pg_promote(false,0)",
-                "SELECT pg_promote(true,-1)", "SELECT pg_promote(wait_seconds => 1)"):
+                "SELECT pg_promote(true,-1)", "SELECT pg_promote(wait_seconds => 1)",
+                "SELECT pg_promote(true,1::smallint)", "SELECT pg_promote(VARIADIC true)",
+                "SELECT pg_promote('on',0)"):
         rejects(primary, sql, "55000")
     for seconds in (0, -1):
         rejects(standby, f"SELECT pg_promote(false,{seconds})", "22003")
