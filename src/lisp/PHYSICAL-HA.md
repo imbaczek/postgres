@@ -266,6 +266,80 @@ it; `walsender.c:1044-1087` returns the next timeline after COPY;
 the recovery target. Native prefix digests and spool publication are custom
 storage mechanisms, not new coordinator contracts.
 
+### Network onboarding contract audit
+
+The next source-admission change needs more than a new receiver identity check.
+The current pin reader and validator require the pin timeline to equal the
+writer timeline. An unused pin starts at the writer's bootstrap checkpoint.
+Sender acquisition also requires the receiver's immutable base end to equal
+the pin's consistent LSN. A new checkpoint pin therefore cannot resume an
+ancestor sibling at an older fork. These checks live in
+`physical-source-pin-check-wal`, `physical-source-pin-read` and
+`physical-source-acquire-sender`.
+
+The sender currently reads only the pin's current timeline and rejects EOR as
+an ordinary transport record. Its retention confirmation and reconnect proof
+share one cumulative digest starting at the backup end. Historical streaming
+needs an explicit requested timeline and fork limit, separate from the current
+writer timeline. The receiver must fetch history and finish any retained
+parent suffix before publishing child selection. Source admission must not
+wait for network I/O while holding replay quiescence.
+
+A resume anchor must distinguish evidence independently verified by the new
+source from a cumulative digest carried by the receiver. Comparing the copied
+fork-segment prefix does not prove equality of already recycled parent bytes.
+At an exact segment boundary that prefix is empty and proves no byte overlap.
+Missing required overlap or retained suffix must produce an explicit reseed
+result, rather than an invented confirmation floor or a claim of full-prefix
+verification. The source must persist retention before returning anchor proof
+and must restore it before startup recycling can run.
+
+The planned follow-anchor mode is separate from bootstrap-pin verification.
+It preserves the receiver's existing provenance and cumulative digest, binds
+the compatible history and independently compared overlap, and checks later
+source bytes as a continuation from that seed. The carried digest is not a
+source-verified checksum of recycled history. Existing bootstrap requests must
+keep their current full retained-prefix checks.
+
+Applied and received positions may already belong to different timelines when
+receipt is ahead of EOR replay. Admission must validate each LSN/timeline pair
+against the source history, rather than assigning both to the immutable base
+timeline or resetting the digest at a fork.
+
+Acceptance must cover a sibling exactly at the fork, one behind the fork with
+the parent suffix retained, and durable parent receipt beyond the fork.
+It must also cover a source checkpoint beyond the fork, unavailable old WAL,
+empty overlap, mismatched identity/history/bytes, lost retention, reconnect
+after confirmed progress, and crashes around pin publication and child
+selection. Both direct follow commands and Patroni's existing recovery
+configuration/reload path need the same admission checks. Native autostart
+currently reads `physical-follow.control`; `primary_conninfo`,
+`primary_slot_name` and `recovery_target_timeline` are not implemented settings.
+Patroni 4.1.5 constructs those recovery parameters in
+`ConfigHandler.build_recovery_params` and writes them before
+`Postgresql.follow` calls reload, restart or start. The native private control
+path does not satisfy that contract. These are backend
+contracts; they add no distributed authority or coordination.
+
+### SQL configuration reload
+
+`pg_reload_conf()` now requests SIGHUP instead of returning an unconditional
+success without reloading. It shares the signal helper with `pg_reload_code()`.
+As in C `signalfuncs.c:285-296`, true means the signal was accepted; it does
+not mean configuration validation or application has completed. The existing
+Lisp reload thread reloads code and then configuration under quiescence.
+
+The control-REPL regression changes `checkpoint_timeout`, calls
+`pg_reload_conf()` through SQL, and checks eventual application while SQL
+remains available. The old implementation failed this check; the fix passes.
+The new SQL reload and polling calls have 20-second timeouts. The SQL and TCP
+control listeners are checked against the owned test PID.
+Evidence: `/tmp/pg-sql-reload-before.log` and
+`/tmp/pg-sql-reload-owned-bounded.log`. The change also passes 556 physical
+tests, 170 interop tests, 1,598 legacy checks and fresh-cache strict compilation.
+This fixes reload notification; it does not add the missing recovery connection
+settings or network source admission.
+
 ### SQL pg_promote
 
 SQL `pg_promote` now submits the native promotion request and can wait inline

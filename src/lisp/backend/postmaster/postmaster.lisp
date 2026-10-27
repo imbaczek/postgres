@@ -430,6 +430,9 @@ are killed abruptly."
            t)))))
 
 (defun admin-request-reload ()
+  "Send SIGHUP to the owning process and return whether the signal was accepted.
+On error, issue a warning and return NIL. Reload runs asynchronously after the
+caller can leave operation admission."
   (handler-case
       (progn
         (sb-posix:kill (sb-posix:getpid) sb-unix:sighup)
@@ -439,7 +442,11 @@ are killed abruptly."
       nil)))
 
 (defun admin-reload-conf ()
+  "Request the existing SIGHUP reload of code and startup settings.
+True means the signal was accepted, not that reload completed or settings are valid."
   (admin-request-reload))
 
 (defun admin-reload-code ()
+  "Request the existing SIGHUP reload of code and startup settings.
+True means the signal was accepted, not that reload completed or settings are valid."
   (admin-request-reload))
