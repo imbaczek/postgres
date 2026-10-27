@@ -46,6 +46,8 @@ An unsafe complete batch defers promotion; an unfinished tail does not."
     (declare (ignore removed))
     (= terminal *last-replay-lsn*)))
 
+(declaim (ftype (function () *) physical-promotion-awaiting-child-initialization-p))
+
 (defun physical-promotion-try-online ()
   "Attempt promotion under reload exclusion and closed admission.
 
@@ -54,6 +56,8 @@ pass them; otherwise save the fork, publish intent and complete the child."
   (sb-thread:with-mutex (*reload-run-lock*)
     (with-live-operation-quiescence
       (physical-promotion-check-online)
+      (when (physical-promotion-awaiting-child-initialization-p)
+        (return-from physical-promotion-try-online :awaiting-child-initialization))
       (call-with-physical-promotion-readers
        (lambda ()
          (if (not (physical-promotion-replay-backlog))
@@ -67,6 +71,49 @@ pass them; otherwise save the fork, publish intent and complete the child."
                (prog1 (physical-promotion-complete-child)
                  (setf *physical-promotion-stopping-p* nil)))))))))
 
+(defun physical-promotion-awaiting-child-initialization-p ()
+  "Check the validated durable suffix before stopping receive and replay workers."
+  (let* ((*physical-recovery-state* (copy-list *physical-recovery-state*))
+         (store *physical-receive-store*)
+         (timeline (physical-recovery-replay-timeline))
+         (terminal *last-replay-lsn*)
+         (next *next-xid*)
+         (reservation (copy-list (getf *physical-recovery-state* :source-reservation)))
+         (removed (make-hash-table :test #'eql)))
+    (with-physical-replay-staging ()
+      (physical-store-map-durable-records
+       store
+       (lambda (record raw)
+         (if (= (wal-record-type record) +wal-record-end-of-recovery+)
+             (setf timeline (physical-replay-check-selected-eor store record raw terminal timeline)
+                   (getf *physical-recovery-state* :replay-timeline) timeline)
+             (progn
+               (physical-replay-check-child-initialization record next)
+               (setf next (physical-replay-observed-next-xid record next))
+               (physical-history-accept-record
+                record (getf *physical-recovery-state* :cluster-identity) removed)
+               (when (= (wal-record-type record) +wal-record-checkpoint+)
+                 (setf (getf *physical-recovery-state* :source-checkpoint)
+                       (wal-checkpoint-record-snapshot record)))))
+         (setf reservation (physical-source-reservation-next reservation record next))
+         (unless *wal-recovery-group-active*
+           (setf terminal (wal-record-end record))))
+       :start-lsn *last-replay-lsn*))
+    (/= timeline (getf (getf *physical-recovery-state* :source-checkpoint)
+                       :timeline (getf *physical-recovery-state* :timeline)))))
+
+(defun physical-promotion-resume-recovery-workers (config paused restartpoint)
+  "Undo a pre-intent worker stop after finding newly received child EOR."
+  (with-live-operation
+    (physical-promotion-check-online)
+    (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+      (sb-thread:with-mutex (*physical-replay-pause-lock*)
+        (setf *physical-replay-paused-p* paused
+              *physical-promotion-stopping-p* nil))))
+  (when config (physical-follow-launch config))
+  (when restartpoint (physical-restartpoint-start-worker))
+  :awaiting-child-initialization)
+
 (defun physical-recovery-promote ()
   "Promote the owning live standby without restarting its postmaster.
 
@@ -79,22 +126,36 @@ before intent.  Other failures after work starts fence the process for restart."
     (error "online promotion must run outside operation admission"))
   (sb-thread:with-mutex (*physical-shutdown-lock*)
     (sb-thread:with-mutex (*physical-follow-command-lock*)
-      (with-live-operation (physical-promotion-check-online))
-      (let ((finished nil))
+      (with-live-operation
+        (physical-promotion-check-online)
+        (when (physical-promotion-awaiting-child-initialization-p)
+          (return-from physical-recovery-promote :awaiting-child-initialization)))
+      (let* ((finished nil)
+             (runtime *physical-follow-runtime*)
+             (config (when runtime
+                       (list 1 (physical-follow-runtime-host runtime)
+                             (physical-follow-runtime-port runtime)
+                             (physical-follow-runtime-pin runtime))))
+             (paused nil)
+             (restartpoint (and *physical-restartpoint-worker*
+                                (sb-thread:thread-alive-p *physical-restartpoint-worker*))))
         (unwind-protect
              (handler-case
                  (progn
                    (with-live-operation
                      (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
-                       (setf *physical-promotion-stopping-p* t))
-                     (sb-thread:with-mutex (*physical-replay-pause-lock*)
-                       (setf *physical-replay-paused-p* nil)))
+                       (sb-thread:with-mutex (*physical-replay-pause-lock*)
+                         (setf paused *physical-replay-paused-p*
+                               *physical-promotion-stopping-p* t
+                               *physical-replay-paused-p* nil))))
                    (physical-follow-quiesce-runtime)
                    (physical-restartpoint-join-for-shutdown)
                    (physical-promotion-test-point :after-online-worker-join)
                    (loop for result = (physical-promotion-try-online)
                          unless (eq result :deferred)
-                           do (setf finished t) (return result)
+                           do (when (eq result :awaiting-child-initialization)
+                                (physical-promotion-resume-recovery-workers config paused restartpoint))
+                              (setf finished t) (return result)
                          do (sleep 0.05)))
                (physical-promotion-shutdown (condition)
                  (unless (physical-promotion-can-yield-to-shutdown-p)
@@ -207,14 +268,18 @@ writer admission. Cold startup also uses it to discard stale requests."
       t)))
 
 (defun physical-promotion-worker-step ()
-  "Consume one signaled request and run promotion outside admission.
-Log errors; the transition itself decides whether recovery must be fenced."
+  "Keep an accepted request until child initialization is durable, then promote."
   (when *physical-promotion-requested-p*
     (setf *physical-promotion-requested-p* nil)
     (handler-case
-        (when (physical-promotion-consume-signal)
-          (admin-log "received promote request")
-          (physical-recovery-promote))
+        (if (with-live-operation
+              (physical-promotion-check-online)
+              (physical-promotion-awaiting-child-initialization-p))
+            (setf *physical-promotion-requested-p* t)
+            (when (physical-promotion-consume-signal)
+              (admin-log "received promote request")
+              (when (eq :awaiting-child-initialization (physical-recovery-promote))
+                (with-live-operation (physical-promotion-request-from-sql)))))
       (error (condition)
         (admin-log "native promotion failed: ~a" condition)))))
 

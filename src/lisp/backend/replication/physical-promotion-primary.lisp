@@ -57,7 +57,7 @@ Do not open its selected generation or receive spool."
              (catalog (unless system-id (load-catalog))))
         (unless (and (eql 3 (getf control :phase))
                      (= (getf control :promotion-child) (getf snapshot :timeline))
-                     (= (getf control :timeline) (getf snapshot :prev-timeline))
+                     (= (getf control :applied-timeline (getf control :timeline)) (getf snapshot :prev-timeline))
                      (= (getf control :applied) (timeline-history-entry-begin (first history)))
                      (<= (getf control :next-xid) (getf snapshot :next-xid))
                      (= (getf control :system-id) (or system-id (catalog-system-identifier catalog))))

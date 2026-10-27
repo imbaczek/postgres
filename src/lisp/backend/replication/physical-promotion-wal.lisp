@@ -13,7 +13,7 @@
          (start (if (<= +wal-end-of-recovery-record-size+ remaining) fork (+ fork remaining)))
          (time (* 1000000 (- (getf state :state-time) 946684800))))
     (values (wal-encode-end-of-recovery-record
-             start time (getf state :promotion-child) (getf state :timeline) 2)
+             start time (getf state :promotion-child) (physical-recovery-replay-timeline state) 2)
             start)))
 
 (defun physical-promotion-valid-tail-frame-p (bytes)
@@ -104,9 +104,9 @@ A failed process remains fenced. Startup reconciliation is a separate transition
             (unwind-protect
                  (progn
                    (when (and rotated (not history-p))
-                     (wal-install-timeline-prefix (getf state :timeline) (getf state :promotion-child)
+                     (wal-install-timeline-prefix (physical-recovery-replay-timeline state) (getf state :promotion-child)
                                                   start target-prefix
-                                                  (getf state :promotion-source-namespace)))
+                                                  (physical-promotion-parent-namespace state)))
                    (physical-promotion-test-point :before-history)
                    (physical-promotion-sync-history state)
                    (physical-promotion-test-point :after-history)

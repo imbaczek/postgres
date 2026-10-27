@@ -236,17 +236,11 @@
                 (make-result-column :name "timeline" :type-oid +int8oid+ :typlen 8)
                 (make-result-column :name "xlogpos" :type-oid +textoid+ :typlen -1)
                 (make-result-column :name "dbname" :type-oid +textoid+ :typlen -1)))
-  (let ((flushed (if (recovery-in-progress-p)
-                     ;; C GetStandbyFlushRecPtr can expose received durable WAL
-                     ;; ahead of replay when both are on the same timeline.
-                     (max (or *last-replay-lsn* 0)
-                          (or (getf *physical-recovery-state* :receive-lsn) 0))
-                     (sb-thread:with-mutex (*wal-lock*) *wal-durable-lsn*))))
+  (multiple-value-bind (flushed timeline)
+      (if (recovery-in-progress-p) (physical-recovery-identify-position)
+          (sb-thread:with-mutex (*wal-lock*) (values *wal-durable-lsn* *wal-insert-timeline*)))
     (send-data-row-text
-     stream (list (format nil "~d" (catalog-system-identifier))
-                  (format nil "~d" (if (recovery-in-progress-p)
-                                       (getf *physical-recovery-state* :timeline)
-                                       *wal-insert-timeline*))
+     stream (list (format nil "~d" (catalog-system-identifier)) (format nil "~d" timeline)
                   (wal-format-lsn flushed)
                   (unless (eq (backend-replication-mode *backend*) :physical)
                     (backend-database *backend*)))))

@@ -227,7 +227,13 @@ phase-2 recovery can yield to shutdown."
                  (eql phase (getf control :phase))
                  (every (lambda (key) (eql (getf state key) (getf control key)))
                         '(:system-id :timeline :manifest-digest :checkpoint))
+                 (= (physical-recovery-replay-timeline state)
+                    (getf control :applied-timeline (getf control :timeline))
+                    (getf metadata :replay-timeline (getf metadata :timeline)))
+                 (equal (getf control :history-target) (getf state :history-target))
+                 (equal (getf control :history-digest) (getf state :history-digest))
                  snapshot (wal-checkpoint-snapshot-valid-p snapshot)
+                 (= (getf snapshot :timeline) (physical-recovery-replay-timeline state))
                  reservation (physical-source-reservation-valid-p reservation)
                  (getf reservation :complete) (= fork (getf reservation :through))
                  (<= next (1+ (getf reservation :bound))))
@@ -261,9 +267,10 @@ preflight the runtime allocation and retention state.  A preflight rejection
 leaves phase 2 unchanged.  The caller owns PGDATA and follow-command, reload
 and quiescence in that order; worker shutdown and join occur outside this call."
   (with-physical-promotion-exclusion (2)
+    (physical-recovery-publish-selected-history *physical-receive-store*)
     (let* ((state *physical-recovery-state*)
            (namespace (physical-promotion-check-base-control state))
-           (child (physical-promotion-select-child (getf state :timeline))))
+           (child (physical-promotion-select-child (physical-recovery-replay-timeline state))))
       (when (and requested-child (not (eql requested-child child)))
         (error "requested promotion child is not the next local timeline"))
       (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
@@ -277,6 +284,8 @@ and quiescence in that order; worker shutdown and join occur outside this call."
                          3 (getf state :system-id) (getf state :timeline)
                          (getf state :manifest-digest) (getf state :checkpoint) fork next
                          :state-time time :promotion-child child :promotion-generation generation
+                         :applied-timeline (physical-recovery-replay-timeline state)
+                         :history-target (getf state :history-target) :history-digest (getf state :history-digest)
                          :promotion-source-namespace namespace))
                  (pending (copy-list state)) (finished nil))
             (loop for (key value) on (physical-recovery-decode-control bytes) by #'cddr
@@ -303,14 +312,14 @@ and quiescence in that order; worker shutdown and join occur outside this call."
 
 (defun physical-promotion-history-image (state)
   "Canonical native reason, fixed for retry; C history bytes carry no authority."
-  (timeline-encode-history (getf state :promotion-child) (getf state :timeline)
-                           (getf state :applied) "pg-lisp promotion"
-                           (unless (= 1 (getf state :timeline))
-                             (timeline-history-bytes (getf state :timeline)))))
+  (let ((parent (physical-recovery-replay-timeline state)))
+    (timeline-encode-history (getf state :promotion-child) parent
+                             (getf state :applied) "pg-lisp promotion"
+                             (unless (= 1 parent) (timeline-history-bytes parent)))))
 
 (defun physical-promotion-check-history (state allow-history)
-  (let* ((parent (getf state :timeline)) (child (getf state :promotion-child))
-                                         (path (timeline-history-path child *pgdata*)))
+  (let* ((parent (physical-recovery-replay-timeline state)) (child (getf state :promotion-child))
+                                                            (path (timeline-history-path child *pgdata*)))
     (if (wal-namespace-file-stat path t)
         (unless (and allow-history
                      (loop for timeline from (1+ parent) below child
@@ -352,7 +361,7 @@ history/EOR instead of calling this helper and overwriting child WAL."
           (wal-namespace-file-stat (wal-segment-path (floor fork +wal-segment-size+) child :timeline) t)
           (unwind-protect
                (prog1
-                   (wal-install-timeline-prefix (getf state :timeline) child fork prefix
-                                                (getf state :promotion-source-namespace))
+                   (wal-install-timeline-prefix (physical-recovery-replay-timeline state) child fork prefix
+                                                (physical-promotion-parent-namespace state))
                  (setf finished t))
             (unless finished (setf *physical-recovery-failed-p* t))))))))

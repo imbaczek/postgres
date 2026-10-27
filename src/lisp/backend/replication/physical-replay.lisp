@@ -66,10 +66,12 @@ can be ahead after a crash and never grants a missing-file exemption."
               (member (backend-state backend) '(:in-progress :aborted)))
             (list-backends))))
 
-(defun physical-recovery-save-progress (applied next-xid)
-  ;; Replay and the transition to streaming always publish active recovery.
-  (setf *physical-recovery-state*
-        (physical-recovery-write-control *physical-recovery-state* 2 applied next-xid)))
+(defun physical-recovery-save-progress (applied next-xid
+                                        &key (replay-timeline (getf *physical-recovery-state* :replay-timeline
+                                                                    (getf *physical-recovery-state* :timeline))))
+  (let ((candidate (copy-list *physical-recovery-state*)))
+    (setf (getf candidate :replay-timeline) replay-timeline)
+    (setf *physical-recovery-state* (physical-recovery-write-control candidate 2 applied next-xid))))
 
 (defun physical-recovery-open-receive-store (&key create)
   (let ((directory (physical-recovery-spool-directory)))
@@ -195,6 +197,7 @@ Direct control operation; does not promote, follow a network source or coordinat
         (version (wal-record-version record)))
     (when (< version 7) (setf complete nil))
     (cond
+      ((= type +wal-record-end-of-recovery+) (setf complete nil))
       ((= type +wal-record-xid-reservation+)
        (let ((new-bound (wal-xid-reservation-record-bound record)))
          (when (< new-bound bound) (error "source XID reservation regressed"))
@@ -232,7 +235,7 @@ Direct control operation; does not promote, follow a network source or coordinat
                       (or (null prior) (<= (getf prior :next-xid) observed-next)))
            (error "source running snapshot differs from observed actual next XID"))
          (running-xacts-anchor snapshot end)))
-      ((= type +wal-record-clog-reset+) nil)
+      ((member type (list +wal-record-clog-reset+ +wal-record-end-of-recovery+)) nil)
       ((null prior) nil)
       (t
        (let ((next (running-xacts-advance
@@ -268,13 +271,15 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
 ;;; replay LSN under the XID lock, after data and control progress are durable.
 ;;; Copy membership so the prospective replay state remains independently owned.
 
-(defun physical-replay-publish-progress (record next-xid reservation source-xids)
+(defun physical-replay-publish-progress (record next-xid reservation source-xids &key replay-timeline)
   ;; Make redo durable before recording the applied terminal and visibility.
   (smgr-fsync-all)
   (clog-fsync)
   (fsync-directory (merge-pathnames "base/" *pgdata*))
   (fsync-directory (merge-pathnames "global/" *pgdata*))
-  (physical-recovery-save-progress (wal-record-end record) next-xid)
+  (if replay-timeline
+      (physical-recovery-save-progress (wal-record-end record) next-xid :replay-timeline replay-timeline)
+      (physical-recovery-save-progress (wal-record-end record) next-xid))
   (sb-thread:with-mutex (*xid-lock*)
     (setf (getf *physical-recovery-state* :source-xids) (copy-tree source-xids)
           (getf *physical-recovery-state* :source-reservation) (copy-list reservation)
@@ -309,6 +314,8 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-progress record)))
 
+(declaim (ftype function physical-replay-selected-eor physical-replay-check-child-initialization))
+
 (defun physical-replay-from (start-lsn)
   "Called only before listeners or under operation quiescence, with no old readers."
   (with-physical-replay-staging ()
@@ -318,15 +325,19 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
       (physical-store-map-durable-records
        *physical-receive-store*
        (lambda (record raw)
-         (declare (ignore raw))
          (when *physical-replay-test-hook*
            (funcall *physical-replay-test-hook* :before-record record))
-         (setf next-xid (physical-replay-observed-next-xid record next-xid)
-               reservation (physical-source-reservation-next reservation record next-xid)
-               source-xids (physical-source-xids-next source-xids record next-xid))
-         (wal-replay-record record)
-         (unless *wal-recovery-group-active*
-           (physical-replay-publish-terminal record next-xid reservation source-xids)))
+         (if (= (wal-record-type record) +wal-record-end-of-recovery+)
+             (multiple-value-setq (reservation source-xids)
+               (physical-replay-selected-eor record raw next-xid reservation source-xids))
+             (progn
+               (physical-replay-check-child-initialization record next-xid)
+               (setf next-xid (physical-replay-observed-next-xid record next-xid)
+                     reservation (physical-source-reservation-next reservation record next-xid)
+                     source-xids (physical-source-xids-next source-xids record next-xid))
+               (wal-replay-record record)
+               (unless *wal-recovery-group-active*
+                 (physical-replay-publish-terminal record next-xid reservation source-xids)))))
        :start-lsn start-lsn)))
   *last-replay-lsn*)
 
@@ -338,21 +349,16 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
       (check-physical-recovery-work))
     (unless (recovery-in-progress-p)
       (ereport "55000" "recovery is not in progress"))
-    (when (and *physical-promotion-stopping-p*
-               (member name '("pg_wal_replay_pause" "pg_wal_replay_resume") :test #'string=))
-      (ereport "55000" "standby promotion is ongoing"
-               :hint (format nil "~a() cannot be executed after promotion is triggered." name)))
     (sb-thread:with-mutex (*physical-replay-pause-lock*)
-      ;; Unlike C's independently running startup process, native redo runs
-      ;; exclusively behind this admission gate. A request is already at a
-      ;; complete applied boundary, so it can acknowledge PAUSED immediately.
+      (when (and *physical-promotion-stopping-p*
+                 (member name '("pg_wal_replay_pause" "pg_wal_replay_resume") :test #'string=))
+        (ereport "55000" "standby promotion is ongoing"
+                 :hint (format nil "~a() cannot be executed after promotion is triggered." name)))
+      ;; Native redo runs exclusively behind this admission gate. A request is
+      ;; already at a complete applied boundary and can acknowledge PAUSED here.
       (cond
-        ((string= name "pg_wal_replay_pause")
-         (setf *physical-replay-paused-p* t)
-         "")
-        ((string= name "pg_wal_replay_resume")
-         (setf *physical-replay-paused-p* nil)
-         "")
+        ((string= name "pg_wal_replay_pause") (setf *physical-replay-paused-p* t) "")
+        ((string= name "pg_wal_replay_resume") (setf *physical-replay-paused-p* nil) "")
         ((string= name "pg_is_wal_replay_paused") *physical-replay-paused-p*)
         ((string= name "pg_get_wal_replay_pause_state")
          (if *physical-replay-paused-p* "paused" "not paused"))

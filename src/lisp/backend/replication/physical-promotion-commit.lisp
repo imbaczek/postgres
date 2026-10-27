@@ -41,7 +41,7 @@ one segment; rotation leaves an EOF gap rather than inventing padding records."
            (snapshot (list :version 2 :start start :end end :redo start
                            :next-xid next :xid-reserved-through (1- next) :next-oid next-oid
                            :time (getf state :state-time) :timeline (getf state :promotion-child)
-                           :prev-timeline (getf state :timeline) :oldest-active-xid next)))
+                           :prev-timeline (physical-recovery-replay-timeline state) :oldest-active-xid next)))
       (unless (and (<= end #xffffffffffffffff) (wal-checkpoint-snapshot-valid-p snapshot))
         (error "invalid child checkpoint plan"))
       (list :fork (getf state :applied) :child (getf state :promotion-child)
@@ -236,10 +236,10 @@ must determine from durable control whether parent or child is authoritative."
                  (physical-promotion-remove-child-orphans state files)
                  (unless history-p
                    (dolist (entry (rest files))
-                     (wal-install-timeline-prefix (getf state :timeline) child
+                     (wal-install-timeline-prefix (physical-recovery-replay-timeline state) child
                                                   (* (first entry) +wal-segment-size+)
                                                   (make-array 0 :element-type '(unsigned-byte 8))
-                                                  (getf state :promotion-source-namespace))))
+                                                  (physical-promotion-parent-namespace state))))
                  (physical-promotion-sync-history state)
                  (physical-promotion-test-point :after-child-history-sync)
                  (dolist (frame (getf plan :frames))

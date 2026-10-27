@@ -90,6 +90,17 @@
         (error "restartpoint source membership differs from its replay boundary"))))
   (values))
 
+(defun physical-restartpoint-history-fields-valid-p (metadata)
+  (let* ((base (getf metadata :timeline)) (target (getf metadata :history-target))
+                                          (digest (getf metadata :history-digest))
+                                          (replay (getf metadata :replay-timeline base))
+                                          (source-xids (loop for key in metadata by #'cddr thereis (eq key :source-xids))))
+    (and (= (length metadata) (+ 28 (if source-xids 2 0) (if target 6 0)))
+         (physical-recovery-selection-fields-valid-p 2 3 base replay target digest)
+         (or (not target)
+             (every (lambda (key) (loop for name in metadata by #'cddr thereis (eq key name)))
+                    '(:replay-timeline :history-target :history-digest))))))
+
 (defun physical-restartpoint-check-metadata (metadata catalog-bytes state &optional prefix-bytes)
   (physical-history-check-plist
    metadata (append '(:version :system-id :cluster-identity :timeline :manifest-digest
@@ -100,10 +111,7 @@
   (unless (and (case (getf metadata :version)
                  (1 (= (length metadata) 22)) (2 (= (length metadata) 24))
                  (3 (= (length metadata) 26))
-                 (4 (or (= (length metadata) 28)
-                        (and (= (length metadata) 30)
-                             (loop for key in metadata by #'cddr
-                                     thereis (eq key :source-xids)))))
+                 (4 (physical-restartpoint-history-fields-valid-p metadata))
                  (otherwise nil))
                (eql (getf metadata :system-id) (getf state :system-id))
                (equal (getf metadata :cluster-identity) (getf state :cluster-identity))
@@ -191,6 +199,11 @@
                                        (physical-store-update-digest #xCBF29CE484222325 prefix-bytes)))))
       (when (getf state :source-xids)
         (setf metadata (append metadata (list :source-xids (copy-tree (getf state :source-xids))))))
+      (when (getf state :history-target)
+        (setf metadata (append metadata
+                               (list :replay-timeline (physical-recovery-replay-timeline state)
+                                     :history-target (getf state :history-target)
+                                     :history-digest (getf state :history-digest)))))
       metadata)))
 
 (defun physical-restartpoint-publish (digest)
@@ -266,15 +279,18 @@
           (error "legacy restartpoint lost actual XID history; reseed required"))
         (setf metadata nil catalog-bytes nil))
       (let ((start (if metadata (getf metadata :lsn) (getf state :end))))
-        (unless (and (<= (physical-store-floor-lsn store) start required
-                         (physical-store-flushed-lsn store))
+        (unless (and (<= (physical-store-floor-lsn store) start (physical-store-flushed-lsn store))
                      (or metadata (= start (physical-store-base-lsn store))))
           (error "receive floor lacks its required published restartpoint"))
         (when metadata
+          (physical-recovery-check-history-reference store (getf metadata :history-target)
+                                                     (getf metadata :history-digest))
+          (physical-recovery-check-store-point
+           store start (getf metadata :replay-timeline (getf metadata :timeline)))
           (unless (= (getf metadata :prefix-digest) (physical-store-prefix-digest store start))
             (error "restartpoint differs from its durable receive prefix")))
         (let ((removed (physical-recovery-proven-drops
-                        store identity :start-lsn start :required-lsn required)))
+                        store identity :start-lsn start :required-lsn (max required start))))
           (physical-recovery-check-base-forks
            (if metadata (list :files (getf metadata :forks)) state) removed))
         (setf (getf *physical-recovery-state* :wal-prefix-lsn) (and metadata start)
@@ -303,6 +319,14 @@
               (setf (getf *physical-recovery-state* :source-xids) nil
                     *next-xid* (canonical-next-full-xid (getf state :next-xid))
                     *xid-batch-end* *next-xid*)))
+        (setf (getf *physical-recovery-state* :replay-timeline)
+              (if metadata (getf metadata :replay-timeline (getf metadata :timeline))
+                  (getf state :timeline)))
+        (when (> start required)
+          (setf (getf *physical-recovery-state* :required-applied) start
+                (getf *physical-recovery-state* :required-timeline) (physical-recovery-replay-timeline)
+                (getf *physical-recovery-state* :observed-next-xid)
+                (max (or (getf state :observed-next-xid) 3) *next-xid*)))
         (setf *last-replay-lsn* start *wal-checkpoint-lsn* start)
         start))))
 

@@ -156,6 +156,8 @@ a still-referenced relfilenode when checking a terminal's delete list."
        (physical-history-accept-terminal record identity removed))
       (t (error "unsupported record in catalog history")))))
 
+(declaim (ftype function physical-replay-check-selected-eor))
+
 (defun physical-recovery-proven-drops (store identity &key
                                                         (start-lsn (physical-store-floor-lsn store)) required-lsn)
   "Certify drops only from complete catalog terminals in validated durable WAL.
@@ -164,11 +166,13 @@ Return the deletion set and last terminal. No database files are written."
   (with-physical-replay-staging ()
     (let ((removed (make-hash-table :test #'eql))
           (terminal start-lsn)
+          (timeline (physical-store-prefix-timeline store start-lsn))
           (required-found (eql required-lsn start-lsn)))
       (physical-store-map-durable-records
        store (lambda (record raw)
-               (declare (ignore raw))
-               (physical-history-accept-record record identity removed)
+               (if (= (wal-record-type record) +wal-record-end-of-recovery+)
+                   (setf timeline (physical-replay-check-selected-eor store record raw terminal timeline))
+                   (physical-history-accept-record record identity removed))
                (unless *wal-recovery-group-active*
                  (setf terminal (wal-record-end record))
                  (when (eql required-lsn terminal) (setf required-found t))))

@@ -83,7 +83,7 @@
                                           (t "connecting"))
                             :written-lsn (physical-store-written-lsn store)
                             :flushed-lsn (physical-store-flushed-lsn store)
-                            :received-tli (physical-store-timeline store))))))))))
+                            :received-tli (physical-store-prefix-timeline store (physical-store-flushed-lsn store)))))))))))
 
 (defparameter *physical-receive-flush-bytes* (* 1024 1024)
   "Batch native flushes while busy; a keepalive flushes all completed records.")
@@ -376,6 +376,33 @@ Include the verified base manifest digest when it is available."
         (delete-file (physical-follow-config-path))
         (fsync-directory *pgdata*)))
     (physical-follow-quiesce-runtime)))
+
+(defun physical-recovery-select-history (target history-text eor-bytes)
+  (when (plusp *live-operation-depth*) (error "history selection requires its own operation admission"))
+  (sb-thread:with-mutex (*physical-follow-command-lock*)
+    (check-physical-recovery-worker-start)
+    (when *physical-follow-runtime* (error "stop native follow before selecting receive history"))
+    (sb-thread:with-mutex (*reload-run-lock*)
+      (with-live-operation-quiescence
+        (check-physical-recovery-worker-start)
+        (unless (and *physical-receive-store* (eql 2 (getf *physical-recovery-state* :phase)))
+          (error "history selection requires streaming recovery"))
+        (let ((history (timeline-check-lineage (timeline-parse-history target history-text)))
+              (finished nil))
+          (unless (physical-store-history-extends-p
+                   (timeline-read-history (getf *physical-recovery-state* :timeline)) history)
+            (error "receive history changes immutable base ancestry"))
+          (unwind-protect
+               (progn
+                 (physical-store-select-history *physical-receive-store* target history-text eor-bytes)
+                 (physical-recovery-publish-selected-history *physical-receive-store*)
+                 (let ((candidate (physical-recovery-attach-selected-store
+                                   *physical-recovery-state* *physical-receive-store*)))
+                   (setf *physical-recovery-state*
+                         (physical-recovery-write-control candidate 2 *last-replay-lsn* *next-xid*)))
+                 (setf finished t)
+                 target)
+            (unless finished (setf *physical-recovery-failed-p* t))))))))
 
 (defun physical-follow-autostart ()
   (sb-thread:with-mutex (*physical-follow-command-lock*)

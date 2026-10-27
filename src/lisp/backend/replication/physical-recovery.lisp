@@ -17,10 +17,19 @@
 (defun physical-recovery-control-path (&optional (directory *pgdata*))
   (merge-pathnames "physical-recovery.control" directory))
 
+(defun physical-recovery-selection-fields-valid-p (phase version base applied target digest)
+  (if (or target digest)
+      (and (member phase '(2 3)) (member version '(3 4))
+           (typep target '(integer 1 4294967295)) (> target base)
+           (typep digest '(unsigned-byte 64))
+           (typep applied '(integer 1 4294967295)) (<= base applied target))
+      (eql applied base)))
+
 (defun physical-recovery-control-valid-p (control &key legacy)
   "Validate recovery progress separately from a pending child's local identity."
   (destructuring-bind (&key phase system-id timeline manifest-digest checkpoint
                          applied next-xid db-state state-time (control-version 3)
+                         (applied-timeline timeline) history-target history-digest
                          promotion-child promotion-generation promotion-source-namespace
                        &allow-other-keys)
       control
@@ -30,6 +39,8 @@
          (every (lambda (value) (typep value '(unsigned-byte 64)))
                 (list system-id manifest-digest checkpoint applied))
          (member control-version '(1 2 3 4))
+         (physical-recovery-selection-fields-valid-p
+          phase control-version timeline applied-timeline history-target history-digest)
          (integerp next-xid)
          (<= 3 next-xid (if (member control-version '(3 4)) 18446744073709551616
                             18446744073709551615))
@@ -39,7 +50,7 @@
          (if (= phase 3)
              (and (= control-version 4) (not legacy)
                   (typep promotion-child '(integer 2 4294967295))
-                  (> promotion-child timeline)
+                  (> promotion-child applied-timeline)
                   (or (eql timeline 1) (eq promotion-source-namespace :timeline))
                   (typep promotion-generation '(unsigned-byte 64))
                   (member promotion-source-namespace '(:legacy :timeline))
@@ -55,18 +66,19 @@
                                              +db-shutdowned-in-recovery+))))))))
 
 (defun physical-recovery-control-image (phase system-id timeline manifest-digest checkpoint applied next-xid
-                                        &key (db-state (if (zerop phase) +db-startup+
-                                                           +db-in-archive-recovery+))
+                                        &key (db-state (if (zerop phase) +db-startup+ +db-in-archive-recovery+))
                                           (state-time (- (get-universal-time) 2208988800))
+                                          (applied-timeline timeline) history-target history-digest
                                           promotion-child promotion-generation promotion-source-namespace)
-  "Keep ordinary v3 bytes; v4 binds a pending child to APPLIED and one generation.
-This is local incomplete-recovery state, never child insertion or writer authority."
   (let* ((pending (= phase 3)) (version (if pending 4 3))
-                               (crc-offset (if pending 84 68)))
+                               (extension-start (if pending 84 68))
+                               (selected (not (null history-target)))
+                               (crc-offset (+ extension-start (if selected 16 0))))
     (unless (physical-recovery-control-valid-p
              (list :control-version version :phase phase :system-id system-id :timeline timeline
                    :manifest-digest manifest-digest :checkpoint checkpoint :applied applied
                    :next-xid next-xid :db-state db-state :state-time state-time
+                   :applied-timeline applied-timeline :history-target history-target :history-digest history-digest
                    :promotion-child promotion-child :promotion-generation promotion-generation
                    :promotion-source-namespace promotion-source-namespace))
       (error "unrepresentable physical recovery control state"))
@@ -85,24 +97,29 @@ This is local incomplete-recovery state, never child insertion or writer authori
         (wal-set-u32 bytes 68 promotion-child)
         (wal-set-u32 bytes 72 (ecase promotion-source-namespace (:legacy 0) (:timeline 1)))
         (wal-set-u64 bytes 76 promotion-generation))
+      (when selected
+        (wal-set-u32 bytes extension-start applied-timeline)
+        (wal-set-u32 bytes (+ extension-start 4) history-target)
+        (wal-set-u64 bytes (+ extension-start 8) history-digest))
       (wal-set-u32 bytes crc-offset (wal-crc32 bytes))
       bytes)))
 
 (defun physical-recovery-decode-control (bytes)
-  "Read legacy recovery progress and v4 pending state without granting authority."
-  (unless (member (length bytes) '(60 72 88))
+  (unless (member (length bytes) '(60 72 88 104))
     (error "invalid physical recovery control length"))
-  (let* ((legacy (= (length bytes) 60)) (pending (= (length bytes) 88))
-                                        (magic (subseq bytes 0 8))
-                                        (version (cond
-                                                   ((and legacy (equalp magic #(80 71 82 83 84 65 84 69))) 1)
-                                                   ((and (= (length bytes) 72) (equalp magic #(80 71 82 83 84 65 84 50))) 2)
-                                                   ((and (= (length bytes) 72) (equalp magic #(80 71 82 83 84 65 84 51))) 3)
-                                                   ((and pending (equalp magic #(80 71 82 83 84 65 84 52))) 4)))
-                                        (crc-offset (cond (legacy 56) (pending 84) (t 68)))
-                                        (copy (copy-seq bytes)) (crc (wal-u32 copy crc-offset))
-                                        (raw-phase (wal-u32 bytes 8))
-                                        (exhausted (and (member version '(3 4)) (logbitp 31 raw-phase))))
+  (let* ((size (length bytes)) (magic (subseq bytes 0 8))
+                               (version (cond
+                                          ((and (= size 60) (equalp magic #(80 71 82 83 84 65 84 69))) 1)
+                                          ((and (= size 72) (equalp magic #(80 71 82 83 84 65 84 50))) 2)
+                                          ((and (member size '(72 88)) (equalp magic #(80 71 82 83 84 65 84 51))) 3)
+                                          ((and (member size '(88 104)) (equalp magic #(80 71 82 83 84 65 84 52))) 4)))
+                               (legacy (eql version 1)) (pending (eql version 4))
+                               (extension-start (if pending 84 68))
+                               (selected (and (member version '(3 4)) (= size (+ extension-start 20))))
+                               (crc-offset (- size 4))
+                               (copy (copy-seq bytes)) (crc (wal-u32 copy crc-offset))
+                               (raw-phase (wal-u32 bytes 8))
+                               (exhausted (and (member version '(3 4)) (logbitp 31 raw-phase))))
     (wal-set-u32 copy crc-offset 0)
     (unless (and version (= crc (wal-crc32 copy))
                  (or (not exhausted) (zerop (wal-u64 bytes 48))))
@@ -121,13 +138,17 @@ This is local incomplete-recovery state, never child insertion or writer authori
               (getf control :promotion-source-namespace)
               (case (wal-u32 bytes 72) (0 :legacy) (1 :timeline))
               (getf control :promotion-generation) (wal-u64 bytes 76)))
+      (when selected
+        (setf (getf control :applied-timeline) (wal-u32 bytes extension-start)
+              (getf control :history-target) (wal-u32 bytes (+ extension-start 4))
+              (getf control :history-digest) (wal-u64 bytes (+ extension-start 8))))
       (unless (physical-recovery-control-valid-p control :legacy legacy)
         (error "corrupt or unsupported physical recovery control"))
       control)))
 
 (defun physical-recovery-read-control (directory)
   (physical-recovery-decode-control
-   (recovery-read-bytes (physical-recovery-control-path directory) :maximum 88)))
+   (recovery-read-bytes (physical-recovery-control-path directory) :maximum 104)))
 
 (defvar *physical-recovery-control-test-hook* nil
   "Optional deterministic hook for recovery control publication failures.")
@@ -160,6 +181,17 @@ This is local incomplete-recovery state, never child insertion or writer authori
                   (physical-recovery-control-test-point :after-directory-fsync db-state)))
       (write-sequence bytes stream))))
 
+(defun physical-recovery-control-frontier (state applied)
+  (let* ((base (getf state :timeline))
+         (runtime (getf state :replay-timeline base))
+         (required (getf state :required-applied))
+         (required-timeline (getf state :required-timeline base)))
+    (when (and required (= applied required) (/= runtime required-timeline))
+      (error "replay timeline differs at the required applied boundary"))
+    (if (and required (< applied required))
+        (values required required-timeline)
+        (values applied runtime))))
+
 (defun physical-recovery-write-control (state phase applied next-xid
                                         &key (db-state +db-in-archive-recovery+))
   "Publish ordinary progress; pending child state needs its dedicated publisher."
@@ -171,23 +203,26 @@ This is local incomplete-recovery state, never child insertion or writer authori
   (when (and (= db-state +db-shutdowned-in-recovery+)
              (< applied (or (getf state :required-applied) applied)))
     (error "clean recovery has not reached its previously applied boundary"))
-  (let* ((state (copy-list state))
-         (applied (max applied (or (getf state :required-applied) applied)))
-         (next-xid (max next-xid (or (getf state :observed-next-xid) next-xid)))
-         (time (- (get-universal-time) 2208988800))
-         (bytes (physical-recovery-control-image
-                 phase (getf state :system-id) (getf state :timeline)
-                 (getf state :manifest-digest) (getf state :checkpoint) applied next-xid
-                 :db-state db-state :state-time time)))
-    (physical-recovery-persist-control-bytes bytes db-state)
-    (setf (getf state :phase) phase
-          (getf state :db-state) db-state
-          (getf state :state-time) time
-          (getf state :control-version) 3
-          (getf state :required-applied) applied
-          (getf state :observed-next-xid) next-xid)
-    (physical-recovery-control-test-point :after-write db-state)
-    state))
+  (multiple-value-bind (required required-timeline) (physical-recovery-control-frontier state applied)
+    (let* ((state (copy-list state))
+           (next-xid (max next-xid (or (getf state :observed-next-xid) next-xid)))
+           (time (- (get-universal-time) 2208988800))
+           (bytes (physical-recovery-control-image
+                   phase (getf state :system-id) (getf state :timeline)
+                   (getf state :manifest-digest) (getf state :checkpoint) required next-xid
+                   :applied-timeline required-timeline
+                   :history-target (getf state :history-target) :history-digest (getf state :history-digest)
+                   :db-state db-state :state-time time)))
+      (physical-recovery-persist-control-bytes bytes db-state)
+      (setf (getf state :phase) phase
+            (getf state :db-state) db-state
+            (getf state :state-time) time
+            (getf state :control-version) 3
+            (getf state :required-applied) required
+            (getf state :required-timeline) required-timeline
+            (getf state :observed-next-xid) next-xid)
+      (physical-recovery-control-test-point :after-write db-state)
+      state)))
 
 (defun physical-recovery-mark-target (directory)
   "Persist incomplete recovery role before any copied database files are created."
@@ -434,6 +469,10 @@ Pending promotion is reconciled separately."
       (setf (getf manifest :manifest-digest) digest
             (getf manifest :phase) (if (= 2 (getf control :phase)) 2 1)
             (getf manifest :required-applied) (getf control :applied)
+            (getf manifest :required-timeline) (getf control :applied-timeline (getf control :timeline))
+            (getf manifest :replay-timeline) (getf manifest :timeline)
+            (getf manifest :history-target) (getf control :history-target)
+            (getf manifest :history-digest) (getf control :history-digest)
             (getf manifest :observed-next-xid)
             (if (= 3 (getf control :control-version))
                 (getf control :next-xid) (getf manifest :next-xid))
@@ -443,7 +482,7 @@ Pending promotion is reconciled separately."
       ;; allows catalog restoration or redo to start with a clean control file.
       (setf manifest
             (physical-recovery-write-control
-             manifest (getf manifest :phase) (getf control :applied)
+             manifest (getf manifest :phase) (getf manifest :end)
              (getf manifest :observed-next-xid)))
       (setf *physical-recovery-state* manifest))))
 
@@ -460,11 +499,16 @@ Pending promotion is reconciled separately."
        (setf *last-replay-lsn* (wal-record-end record)))))
   (values))
 
+(declaim (ftype function physical-recovery-attach-selected-store physical-recovery-check-required-pair))
+
+(declaim (ftype function physical-recovery-publish-selected-history))
+
 (defun physical-recovery-open-storage ()
   "Open verified recovery; phase 2 redoes its entire retained prefix before SQL."
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
   (let ((streaming (= 2 (getf *physical-recovery-state* :phase))))
-    (setf *wal-segment-namespace* (getf *physical-recovery-state* :wal-namespace :legacy)
+    (setf (getf *physical-recovery-state* :replay-timeline) (getf *physical-recovery-state* :timeline)
+          *wal-segment-namespace* (getf *physical-recovery-state* :wal-namespace :legacy)
           *wal-insert-timeline* (getf *physical-recovery-state* :timeline)
           *wal-checkpoint-timeline* (getf *physical-recovery-state* :timeline)
           *wal-checkpoint-snapshot* (copy-list (getf *physical-recovery-state* :source-checkpoint))
@@ -483,19 +527,21 @@ Pending promotion is reconciled separately."
       (unless (= (physical-store-base-lsn *physical-receive-store*)
                  (getf *physical-recovery-state* :end))
         (error "streaming receive base differs from verified backup"))
-      (setf (getf *physical-recovery-state* :receive-lsn)
+      (setf *physical-recovery-state*
+            (physical-recovery-attach-selected-store *physical-recovery-state* *physical-receive-store*)
+            (getf *physical-recovery-state* :receive-lsn)
             (physical-store-flushed-lsn *physical-receive-store*))
       (unless (<= (getf *physical-recovery-state* :required-applied)
                   (physical-store-flushed-lsn *physical-receive-store*))
         (error "streaming receive spool lost previously applied WAL"))
+      (physical-recovery-publish-selected-history *physical-receive-store*)
       (physical-restartpoint-prepare-storage *physical-receive-store*)
       (setf *clog-stream* (open (clog-path) :element-type '(unsigned-byte 8)
                                             :direction :io :if-exists :overwrite
                                             :if-does-not-exist :error))
       (let ((*physical-replay-restarting-p* t))
         (physical-replay-from *last-replay-lsn*))
-      (unless (<= (getf *physical-recovery-state* :required-applied) *last-replay-lsn*)
-        (error "streaming redo did not reach its previously applied terminal"))
+      (physical-recovery-check-required-pair *physical-receive-store*)
       (unless (<= (getf *physical-recovery-state* :observed-next-xid) *next-xid*)
         (error "streaming redo did not restore its observed XID visibility floor"))
       (physical-recovery-check-live-files)

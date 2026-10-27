@@ -847,6 +847,8 @@ this listener evaluates arbitrary Lisp."
 
 (declaim (ftype function physical-base-backup))
 
+(declaim (ftype function physical-recovery-select-history))
+
 (defun control-eval (stream form)
   "Evaluate FORM, printing its values (or an error) to STREAM."
   (handler-case
@@ -864,6 +866,12 @@ this listener evaluates arbitrary Lisp."
                        (member (first form) '(physical-recovery-enable-streaming physical-recovery-replay physical-recovery-restartpoint physical-recovery-prepare-shutdown physical-recovery-promote physical-follow-stop wal-migrate-timeline-namespace))
                        (null (rest form)))
                   (funcall (first form)))
+                 ((and (consp form) (eq (first form) 'physical-recovery-select-history)
+                       (= (length form) 4) (integerp (second form)) (stringp (third form))
+                       (listp (fourth form)) (= (length (fourth form)) +wal-end-of-recovery-record-size+)
+                       (every (lambda (byte) (typep byte '(unsigned-byte 8))) (fourth form)))
+                  (physical-recovery-select-history
+                   (second form) (third form) (coerce (fourth form) '(vector (unsigned-byte 8)))))
                  ((and (consp form) (eq (first form) 'physical-follow-start)
                        (= (length form) 4) (stringp (second form))
                        (integerp (third form)) (stringp (fourth form)))
