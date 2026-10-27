@@ -309,9 +309,10 @@ The caller must fence any failure and restart from durable child control."
 
 (defun physical-promotion-complete-child ()
   "Commit child control, initialize the primary and return the checkpoint end.
-Keep admission closed through this entire transition. Any error or nonlocal
-exit fences the process, including failures after the irreversible control
-replacement. A new process must classify durable control before retrying."
+
+Keep admission closed throughout.  The scoped reader-preservation flag selects
+live adoption; otherwise initialize cold storage.  Any error or nonlocal exit
+fences the process.  A new process must classify durable control before retrying."
   (let ((finished nil))
     (unwind-protect
          (let ((end (physical-promotion-publish-child-control)))

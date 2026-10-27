@@ -24,8 +24,9 @@ precede scanning. Registration and locking remain the caller's responsibility."
     ((relfilenodes xid mode) relation-expression validation-form &body body)
   "Register relation users before validating catalog state under *WRITE-LOCK*.
 
-MODE is the literal :READ or :WRITE. Readers register the complete set
-atomically; writers must register exactly one relation."
+MODE is the literal :READ or :WRITE.  Readers register the complete set
+atomically and use the reader identity helper, which preserves an existing
+virtual ID across a role change.  Writers must register exactly one relation."
   (let* ((captured-relfilenodes (gensym "CAPTURED-RELFILENODES-"))
          (register-form
            (ecase mode

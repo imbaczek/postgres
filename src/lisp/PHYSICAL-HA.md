@@ -162,8 +162,8 @@ as recorded below. Items 1–3 describe their scope; item 4 remains future work:
    tracking and its snapshot consumer are implemented; they do not authorize
    destructive maintenance across retained readers.
 
-After reader-safe replay, implement in-place promotion that preserves reader
-state and a lifecycle dependency lane that lets promotion progress while its SQL
+In-place promotion now preserves reader state, as recorded below. The remaining
+SQL work needs a lifecycle dependency lane that lets promotion progress while its
 caller waits. Add the function's signature, defaults, strict NULL handling and
 named argument syntax as exercised by the C contract. Reload must neither
 redefine code under the waiter/worker nor hold
@@ -284,8 +284,9 @@ requested for this research project. Older executables reject it; the unchanged
 version does not promise interoperability between different checkouts.
 
 The integration retains C's `RecordKnownAssignedTransactionIds` principle.
-Reader-preserving promotion still needs the remaining conflict handling and an
-in-place lifecycle path; source membership alone does not provide them.
+The in-place promotion path below now uses that membership with retained readers.
+Remaining destructive recovery conflicts need separate handling; source membership
+alone does not authorize them.
 
 Validation: a fresh worker passed the 330-test physical suite, then two added
 malformed-input tests and all eight new tests passed separately. The round-trip
@@ -379,10 +380,9 @@ Recovery readers now register a virtual transaction identity even when they reta
 snapshot without accessing a relation. The identity is tracked separately from real
 XIDs, survives role changes for the life of the transaction, and is released with
 relation registrations before waiters are woken. Wraparound drains both kinds of
-identity, and transaction cleanup masks interrupts through the idle transition. This is
-a prerequisite for reader-preserving promotion; current promotion still drains old
-transactions. Reconciliation of idle or abandoned readers under quiescence remains
-to be implemented. The private child adopter is described below.
+identity, and transaction cleanup masks interrupts through the idle transition.
+The promotion path below now reconciles idle and abandoned reader ownership under
+quiescence before replay and child adoption.
 
 A clean worker passed 363 physical Rove tests, 170 interop tests and 1,598 legacy
 checks. Eight lifecycle regressions and an injected asynchronous interrupt regression
@@ -393,8 +393,8 @@ passed (`/tmp/pg-virtual-readers-final.log`, artifacts
 `/tmp/pg-physical-readers.3omrsa`). Fresh strict compilation
 (`/tmp/pg-virtual-compile-final.log`) and formatting passed. Independent reviews found
 the interrupt cleanup gap, which was fixed and rereviewed without new findings.
-Snapshot-only ownership and actual wrap drain were tested separately; their combined
-scenario remains useful before promotion activation.
+These initial checks tested snapshot-only ownership and actual wrap drain separately.
+The combined promotion scenario is covered below.
 
 ### Private live child adoption
 
@@ -417,15 +417,14 @@ installing child scalars. Catalog, CLOG stream, storage handles, snapshots, virt
 retention tables and pins remain in place; the parent replay position is retained.
 Failure during adoption fences the process for cold restart from durable child control.
 Live completion closes the receive spool, retires recovery triggers and then declares
-the primary ready. Cold completion remains the default, and public online promotion
-still drains old transactions.
+the primary ready. Cold completion remains the default outside the scoped live path.
+Online promotion now uses this adopter.
 
 This is a conservative fail-closed prerequisite. C `StartupXLOG` calls `TrimCLOG` at the
 end of recovery; equivalent CLOG repair remains open. Nonempty slots and source pins
-need child-relative continuity and pending-progress proof. The full phase-2 to phase-3
-reader-preserving wrapper, replay choice and generic SQL `pg_promote` remain future
-work. The private reader census described below is ready for integration. The broader
-cold-load audit also remains open.
+need child-relative continuity and pending-progress proof. The online wrapper and
+reader-aware replay choice are described below. Generic SQL `pg_promote` and the
+broader cold-load audit remain open.
 
 A clean worker passed 380 physical Rove tests, 170 interop tests and 1,598 legacy
 checks. An additional post-review test injects an invalid in-memory batch end after a
@@ -460,10 +459,50 @@ and Sol full-diff reviews passed after fixing a missing global active-XID guard;
 regression failed before the fix and passed afterward. Sol's refactoring review
 recommended no further abstraction.
 
-Public online promotion still drains old transactions. This helper has not yet been
-tested through native promotion. The complete phase-2 to phase-3 wrapper, reader-safe
-replay selection, native disconnect/shutdown tests and the combined snapshot-only
-wraparound case remain before activation. SQL `pg_promote` also remains open.
+Enrollment now runs before replay selection in online promotion. The native integration
+and combined snapshot-only wraparound case are recorded below. SQL `pg_promote`
+remains open.
+
+### Reader-preserving online promotion
+
+Online native promotion preserves idle repeatable-read, read-committed and snapshot-only
+transactions through the child transition. Retained snapshots, catalog objects, CLOG
+streams and storage handles stay in place. Cached virtual identities remain valid;
+missing identities are enrolled before replay. Old transactions stay read-only until
+they end. EOF cleanup waits at the admission gate.
+
+The promotion attempt audits ownership before selecting replay. It applies the safe
+durable prefix and defers at an unsafe complete batch, reopening admission so readers
+can finish. An unfinished tail is permitted. After saving the restartpoint, the scoped
+live path publishes intent, commits child control and adopts the primary runtime before
+admission reopens. Healthy phase-2 shutdown can take over before intent; uncertain exits
+from the transition fence recovery. Cold completion remains strict.
+
+Validation passed 390 physical tests, 170 interop tests and 1,598 legacy checks. Six
+focused tests also passed after sharing the shutdown predicate. Fresh strict compilation
+passed at `/tmp/pg-live-promotion-refactor-compile.log`. Native tests passed for multiple
+readers, a sole snapshot-only reader and actual wraparound
+(`/tmp/pg-live-promotion-readers-final.log`). Four retained-reader crash cases passed
+(`/tmp/pg-live-promotion-reader-crashes-final.log`), along with the broader crash,
+stale-signal and unfinished-tail matrix (`/tmp/pg-live-promotion-crash-matrix.log`).
+TERM/INT shutdown passed (`/tmp/pg-live-promotion-shutdown-final.log`), as did reload,
+the Patroni utility request and object identity checks
+(`/tmp/pg-live-promotion-online-final.log`). Both C logical interop directions passed
+(`/tmp/pg-live-promotion-logical.log`), as did all three manual switchovers
+(`/tmp/pg-live-promotion-switchovers.log`).
+
+A wraparound failure exposed a read macro that repeated the role check and bypassed
+the reader identity helper. Its regression failed before the fix and passed afterward.
+The saved fix was also reloaded into the same owned server while its old snapshot-only
+transaction remained alive (`/tmp/pg-live-promotion-wrap-live-reload.log`,
+`/tmp/pg-live-promotion-wrap-debug.log`). Legacy fixtures were updated to mock the
+central reader getter while retaining their ID, evaluation-count and blocking assertions.
+Luna and Sol reviews passed; Sol's refactoring review led to the shared shutdown check.
+
+SQL `pg_promote` remains unimplemented. Its generic wait and admission parking must
+preserve the caller's stack, snapshot and evaluation order. CLOG tail repair, remaining
+recovery conflicts, follow/rejoin, synchronous replication and the broader Patroni
+interface matrix also remain open. Coordination remains outside this work.
 
 ### Timeline-qualified native WAL namespace
 

@@ -8,8 +8,9 @@
   The child checkpoint/primary, online promotion and reader-safe row replay
   modules, source running-transaction metadata helpers, covered standby snapshots,
   virtual reader lifecycle helpers, private child adoption and the private
-  promotion reader-enrollment prerequisite have completed this pass and its
-  review. Keep the same order for the remaining HA work.
+  promotion reader-enrollment prerequisite, native online reader-preserving
+  promotion and relation reader identity selection have completed this pass and
+  its review. Keep the same order for the remaining HA work.
 
 - [ ] Audit cold-image compilation and ASDF load-order dependencies across `pg`
   and its test systems. A warm REPL must not conceal missing declarations or

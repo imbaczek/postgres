@@ -5,14 +5,13 @@
 ;;;; Serialize against standby shutdown, then hold the follow command lock.
 ;;;; Stop new recovery workers and join existing workers before taking reload
 ;;;; exclusion or closing admission: their exit paths can need those gates.
-;;;; If an idle transaction still owns a snapshot, reopen admission and retry.
-;;;; Its client must remain able to commit or roll back.
+;;;; Under closed admission, enroll retained readers and replay the safe durable
+;;;; prefix. An unsafe complete batch defers the attempt until readers can end;
+;;;; an unfinished tail does not advance the fork.
 ;;;;
-;;;; With readers gone, flush and replay all complete durable received batches.
 ;;;; Save a fresh restartpoint before binding intent to a fork and child timeline.
-;;;; The existing child publisher then commits WAL/control and initializes the
-;;;; primary before admission reopens. There is no authority or election service.
-;;;; Before intent, process shutdown may take over without poisoning recovery.
+;;;; The child publisher commits WAL/control and adopts the live runtime before
+;;;; admission reopens. Before intent, shutdown may take over healthy recovery.
 ;;;; After intent, an uncertain failure requires restart from durable control.
 (in-package #:pg)
 
@@ -30,6 +29,10 @@ orchestrator can yield before intent without marking recovery failed."
     (error "online promotion requires an owned healthy streaming standby")))
 
 (defun physical-promotion-replay-backlog ()
+  "Flush receipt and replay the safe durable backlog with verified readers.
+
+Return true when no complete terminal remains beyond the applied position.
+An unsafe complete batch defers promotion; an unfinished tail does not."
   (unless *physical-promotion-preserve-readers-p*
     (error "promotion replay requires verified reader ownership"))
   (physical-recovery-flush)
@@ -44,6 +47,10 @@ orchestrator can yield before intent without marking recovery failed."
     (= terminal *last-replay-lsn*)))
 
 (defun physical-promotion-try-online ()
+  "Attempt promotion under reload exclusion and closed admission.
+
+Enroll readers before replay.  Return :DEFERRED if a complete batch cannot
+pass them; otherwise save the fork, publish intent and complete the child."
   (sb-thread:with-mutex (*reload-run-lock*)
     (with-live-operation-quiescence
       (physical-promotion-check-online)
@@ -62,11 +69,12 @@ orchestrator can yield before intent without marking recovery failed."
 
 (defun physical-recovery-promote ()
   "Promote the owning live standby without restarting its postmaster.
-Run outside operation admission. Hold shutdown and follow-command exclusion,
-latch worker starts, unpause replay and join workers before closing either gate.
-Retry reader conflicts outside the gates; do not terminate reader sessions.
-Return the child checkpoint end, or :SHUTDOWN if shutdown takes over before
-intent. Other failures after work starts fence the process for restart."
+
+Run outside operation admission.  Hold shutdown and follow-command exclusion,
+stop worker starts, unpause replay and join workers before closing admission.
+Retry unsafe complete replay barriers outside the gates, allowing readers to
+finish.  Return the child checkpoint end, or :SHUTDOWN if shutdown takes over
+before intent.  Other failures after work starts fence the process for restart."
   (when (plusp *live-operation-depth*)
     (error "online promotion must run outside operation admission"))
   (sb-thread:with-mutex (*physical-shutdown-lock*)

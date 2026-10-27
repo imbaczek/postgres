@@ -1,13 +1,17 @@
 ;;;; Local pending-promotion publication; EOR and writer admission remain separate.
 (in-package #:pg)
 
-(defvar *physical-promotion-preserve-readers-p* nil)
+(defvar *physical-promotion-preserve-readers-p* nil
+  "Dynamically select live reader preservation after the ownership census.
+The default is NIL, so cold completion retains its strict checks.  This is not
+a configuration setting.")
 
 (defun physical-promotion-check-context (phase &key preserve-readers)
   "Check PHASE and the caller's promotion exclusion.
 
 The caller owns follow-command, reload and quiescence in that order; no worker
-joins occur here.  PRESERVE-READERS is for the private live adopter."
+joins occur here.  PRESERVE-READERS permits retained reader transactions; their
+ownership must be checked by the live promotion path."
   (unless (and (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*)
                (sb-thread:holding-mutex-p *reload-run-lock*)
@@ -125,11 +129,17 @@ IDs, and keep retained transactions read-only."
        (sb-thread:with-mutex (*timeline-history-lock*) ,@body))))
 
 (defun physical-promotion-can-yield-to-shutdown-p ()
+  "Return true if shutdown can take over healthy recovery before intent."
   (and (shutdown-in-progress-p)
        (eql 2 (getf *physical-recovery-state* :phase))
        (not *physical-recovery-failed-p*)))
 
 (defun call-with-physical-promotion-readers (function)
+  "Enroll retained readers and call FUNCTION with live preservation enabled.
+
+The caller owns closed admission and has joined the recovery workers.  Within
+the scoped transition, an incomplete exit fences recovery, except when healthy
+phase-2 recovery can yield to shutdown."
   (physical-promotion-enroll-readers)
   (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
     (when (and *physical-restartpoint-worker*

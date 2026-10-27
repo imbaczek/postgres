@@ -210,6 +210,11 @@ appropriate instead of replacing the native C peer or adding a message relay.
   their runners from the test system, and check Function Specs and Properties
   separately. Record selection, seed and actual trial counts; a declaration
   digest does not identify the implementation or the server image being tested.
+- The legacy unit runner exits its process when checks fail. A cl-mcp worker EOF
+  can therefore conceal a failing fixture. For this failure mode, capture the
+  existing `t/run-unit-tests.sh` output to identify the failure before restarting
+  workers repeatedly. When a getter boundary changes, update lexical mocks at
+  that boundary while preserving ID, call-count, registration and blocking checks.
 - A bounded literal reader still needs the right package: reading printed `NIL`
   with `*package*` bound to KEYWORD produces `:NIL`, not the empty list. Preserve
   CL literal semantics, keep reader evaluation disabled, and test optional NIL
