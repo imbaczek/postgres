@@ -37,7 +37,10 @@
 
 (defvar *current-snapshot* nil)
 
-(defvar *statement-snapshot-registrations* nil)
+(defvar *statement-snapshot-registrations* nil
+  "Registration tokens for the dynamically enclosing statement snapshot scopes.
+A token can be present before acquisition makes it active.  This list alone
+does not park admission or authorize replay.")
 
 (defvar *exported-logical-snapshot-lock*
   (sb-thread:make-mutex :name "pg exported logical snapshots"))
@@ -292,9 +295,11 @@ its owner finishes the remaining importer cleanup before reuse."
 (defmacro with-statement-snapshot ((snapshot acquire-function) &body body)
   "Acquire a registered statement snapshot inside its cleanup scope.
 
-ACQUIRE-FUNCTION is called with a registration token and must return the
-registered snapshot. The token is already protected if acquisition is
-interrupted after publication but before the function returns."
+ACQUIRE-FUNCTION receives the registration token and must return the registered
+snapshot.  The actual token is in *STATEMENT-SNAPSHOT-REGISTRATIONS* during
+acquisition, BODY and release; it may not yet be active during acquisition.
+Nested scopes restore the outer list.  Cleanup protects the token if acquisition
+is interrupted after publication but before it returns."
   (let ((registration (gensym "SNAPSHOT-REGISTRATION-")))
     `(let* ((,registration (make-snapshot-registration))
             (*statement-snapshot-registrations*

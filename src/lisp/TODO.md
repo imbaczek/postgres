@@ -9,8 +9,9 @@
   modules, source running-transaction metadata helpers, covered standby snapshots,
   virtual reader lifecycle helpers, private child adoption and the private
   promotion reader-enrollment prerequisite, native online reader-preserving
-  promotion and relation reader identity selection have completed this pass and
-  its review. Keep the same order for the remaining HA work.
+  promotion, relation reader identity selection and statement snapshot scope
+  bookkeeping have completed this pass and its review. Keep the same order for
+  the remaining HA work.
 
 - [ ] Audit cold-image compilation and ASDF load-order dependencies across `pg`
   and its test systems. A warm REPL must not conceal missing declarations or

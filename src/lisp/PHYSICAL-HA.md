@@ -137,10 +137,11 @@ notation currently fails parsing with 42601.
 
 C `xlogfuncs.c:682-769` waits inline, preserving the caller's transaction and
 snapshot. Its independent recovery process can advance while that call waits.
-Our current bridge holds whole-query admission and a statement snapshot; the
-promotion worker waits for both to drain, then closes/reinitializes CLOG, smgr
-and catalog storage. Dropping admission alone is unsafe and still leaves a
-snapshot conflict. Deferring a result or replaying the query does not preserve
+Native in-place promotion now preserves CLOG, smgr, catalog storage and retained
+readers. A SQL expression still holds whole-query admission and a registered
+statement snapshot. Its wait needs generic admission parking and an exact census
+of those registrations. Dropping admission alone is unsafe. Deferring a result
+or replaying the query does not preserve
 arbitrary expressions, volatile effects, streamed rows or explicit transactions.
 
 Reader-safe steady-state replay and source membership snapshots are implemented,
@@ -503,6 +504,42 @@ SQL `pg_promote` remains unimplemented. Its generic wait and admission parking m
 preserve the caller's stack, snapshot and evaluation order. CLOG tail repair, remaining
 recovery conflicts, follow/rejoin, synchronous replication and the broader Patroni
 interface matrix also remain open. Coordination remains outside this work.
+
+### Statement snapshot scopes and SQL promotion plan
+
+Statement snapshot scopes now expose their actual registration tokens through a
+dynamic list spanning acquisition, body and release. Nested scopes restore the outer
+list. A token can appear before acquisition makes it active. This bookkeeping does
+not park admission or authorize replay.
+
+Two new tests failed before implementation and pass afterward. Validation passed
+392 physical tests, 170 interop tests and 1,598 legacy checks. Fresh strict compilation
+passed (`/tmp/pg-statement-snapshot-scope-compile.log`). Luna and Sol reviews found
+no remaining findings; the refactoring review recommended keeping ownership in the
+existing snapshot macro.
+
+Sol and Astra design reviews identified three remaining implementation steps:
+
+1. Add generic parking with reload and shutdown handling. Each outer operation must
+   own exactly one active credit or parked registration. Capture its charged backend,
+   thread and snapshot generations, allow sequential parks, and restore credit before
+   stack cleanup, including fatal cleanup. Terminal cleanup must wait for any storage
+   quiescence owner to release exclusion. Reload must back off outside its mutex and
+   admission gate while parked owners remain. Snapshot auditing must cover the exact
+   union of retained transaction and parked statement registrations.
+2. Make suspended scans safe. B-tree callbacks currently retain shared leases, and
+   unfinished cursors cannot safely span replay or splits. Before parking, detach each
+   enclosing scan's unread TIDs into an ordered, bounded or spillable private spool.
+   Do not evaluate qualification, projection or volatile expressions while detaching.
+   Release each lease exactly once. Preserve ordinary LIMIT laziness when no parking
+   occurs, and audit heap, join and aggregate callbacks for the same safety boundary.
+3. Add SQL `pg_promote` through ordinary inline function evaluation, with its C
+   signature, defaults, strict NULL behavior and named arguments. Do not replay the
+   query or special-case a top-level SELECT. C normalizes named arguments into
+   parameter order; it does not promise textual argument evaluation order.
+
+These steps remain open. The scope bookkeeping alone does not implement SQL
+`pg_promote`, and the broader HA goal and coordination exclusion are unchanged.
 
 ### Timeline-qualified native WAL namespace
 
