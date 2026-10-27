@@ -6,6 +6,7 @@
   (when (and (not (getf prepared :set-operation))
              (zerop (getf prepared :aggregate-count 0))
              (not (getf prepared :set-functions))
+             (not (getf prepared :windows))
              (or (null (getf prepared :limit)) (plusp (getf prepared :limit))))
     (setf (getf prepared :targets) nil
           (getf prepared :order) nil

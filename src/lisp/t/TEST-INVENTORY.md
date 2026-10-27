@@ -296,6 +296,24 @@ wrappers. Each contract ran at seed 42 and the additional seed shown:
 | `subquery-quantified-fold-truth` Property | 300 | 1553238518679453301 | `fnv1a64-v1:f04501586e6b165d` | rejection-counts-unmeasured, input-coverage-unmeasured |
 | `subquery-generated-scalar-cardinality` Property | 150 | 2279626208607443807 | `fnv1a64-v1:270189609c6b43bd` | rejection-counts-unmeasured, input-coverage-unmeasured |
 
+## Window coverage
+
+[window-tests.lisp](rove/window-tests.lisp) adds nine Rove cases, increasing the
+unit suite from 99 to 108, and one Function Spec and two Properties.
+Final verification passed 108 unit,
+170 interop and 531 physical Rove cases, 1,131 legacy checks, strict compile,
+smoke, JOIN streaming, sort arena and subquery regressions. The native/C harness
+passed 168 SQL cases, including 30 deterministic generated cases with ties,
+plus spill, cancellation and recovery checks.
+
+Final direct cl-spec verification ran 1,500 trials, in addition to Rove wrappers:
+
+| Contract | Trials per seed | Seeds | Digest | Measurement gaps |
+| --- | ---: | --- | --- | --- |
+| window-rank-step Function Spec | 300 | 42, 1959987157382440046 | `fnv1a64-v1:7094ded7ea5ec5c3` | properties-not-run, input-coverage-unmeasured |
+| window-ranking-peer-sequence Property | 300 | 42, 1553238518679453301 | `fnv1a64-v1:529175196b310703` | rejection-counts-unmeasured, input-coverage-unmeasured |
+| window-generated-prefix-totals Property | 150 | 42, 2279626208607443807 | `fnv1a64-v1:037354165c5b9e0c` | rejection-counts-unmeasured, input-coverage-unmeasured |
+
 ## Running and failure behavior
 
 From `src/lisp/`, `./t/run-unit-tests.sh` loads [test-dependencies.lisp](test-dependencies.lisp),

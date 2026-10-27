@@ -85,7 +85,7 @@
           '("from" "where" "order" "limit" "group" "having" "union"
             "intersect" "except" "offset" "fetch" "for" "join" "inner"
             "left" "right" "full" "outer" "cross" "on" "using"
-            "natural" "asc" "desc"
+            "natural" "asc" "desc" "window"
             "and" "or" "when" "then" "else" "end")
           :test #'string=))
 
@@ -201,7 +201,8 @@
         (setf group-by (parse-expr-list p)))
       (when (kw-p p "having") (ereport "0A000" "HAVING is not supported"))
       (list :type :select :targets targets :from from :from-alias from-alias
-            :joins joins :where where :group-by group-by :distinct distinct))))
+            :joins joins :where where :group-by group-by :distinct distinct
+            :windows (when (match-kw p "window") (parse-window-clause p))))))
 
 (defun parse-select-operand (p)
   (if (match-punct p #\()
@@ -245,7 +246,9 @@
       ((match-kw p "as")
        (setf alias (pident p)))
       ((and (eq (pkind p) :ident)
-            (or (token-quoted-p (pcur p)) (not (clause-keyword-p (pval p)))))
+            (or (token-quoted-p (pcur p))
+                (and (not (string= (pval p) "filter"))
+                     (not (clause-keyword-p (pval p))))))
        (setf alias (pident p))))
     (list :expr expr :alias alias)))
 
@@ -1252,18 +1255,29 @@
                 unless (match-punct p #\,) do (return (values (nreverse arguments) nil))))))
 
 (defun parse-function-call (p name &optional schema)
-  "Parse a call with explicit schema and VARIADIC argument metadata."
-  (if (and (member name '("count" "sum") :test #'string=)
-           (or (null schema) (string= schema "pg_catalog"))
-           (match-op p "*"))
-      (progn
-        (expect-punct p #\))
-        (if (string= name "count") (list :count-star)
-            (append (list :func name nil) (when schema (list :schema schema)))))
-      (multiple-value-bind (arguments variadic) (parse-call-arguments p)
-        (append (list :func name arguments)
-                (when schema (list :schema schema))
-                (when variadic (list :variadic t))))))
+  "Parse an ordinary call or an OVER expression."
+  (when (kw-p p "distinct")
+    (ereport "0A000" "DISTINCT function arguments are not supported"))
+  (let ((call
+          (if (and (member name '("count" "sum") :test #'string=)
+                   (or (null schema) (string= schema "pg_catalog"))
+                   (match-op p "*"))
+              (progn
+                (expect-punct p #\))
+                (if (string= name "count") (list :count-star)
+                    (append (list :func name nil) (when schema (list :schema schema)))))
+              (multiple-value-bind (arguments variadic) (parse-call-arguments p)
+                (append (list :func name arguments)
+                        (when schema (list :schema schema))
+                        (when variadic (list :variadic t)))))))
+    (when (and (kw-p p "filter")
+               (let ((probe (copy-sql-parser p)))
+                 (pnext probe)
+                 (punct-p probe #\()))
+      (ereport "0A000" "aggregate FILTER clauses are not supported"))
+    (if (match-kw p "over")
+        (list :window call (if (punct-p p #\() (parse-window-definition p) (pident p)))
+        call)))
 
 (defun parse-case-expression (p)
   "Read searched CASE; a CASE value expression remains outside this SQL subset."

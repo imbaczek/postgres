@@ -361,6 +361,9 @@ Convert supplied expressions in source order, then return them in parameter orde
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
          (args (analyze-call-argument-list name (third expr) table (getf (cdddr expr) :variadic))))
+    (when (member name '("row_number" "rank" "dense_rank") :test #'string=)
+      (when args (ereport "42883" "function ~a with these arguments does not exist" name))
+      (ereport "42809" "window function ~a requires an OVER clause" name))
     ;; C ParseFuncOrColumn clears explicit VARIADIC for a nonvariadic match.
     (when (string= name "pg_get_publication_tables")
       (return-from analyze-function-expression
@@ -1048,6 +1051,7 @@ Convert supplied expressions in source order, then return them in parameter orde
   "Resolve column references and annotate expression types."
   (case (first expr)
     (:sublink (analyze-sublink expr table))
+    (:window (analyze-window-call expr table))
     (:const
      (let ((v (second expr)))
        (cond
@@ -1124,12 +1128,13 @@ Convert supplied expressions in source order, then return them in parameter orde
     (loop while (eq (first argument) :cast) do (setf argument (second argument)))
     (case (first argument)
       (:func (second argument))
-      ((:column :count-star :coalesce) (target-default-name argument))
+      ((:column :count-star :coalesce :window) (target-default-name argument))
       (t (if (eq (third ast) :pg-lsn) "pg_lsn"
              (string-downcase (symbol-name (third ast))))))))
 
 (defun target-default-name (ast)
   (case (first ast)
+    (:window (target-default-name (second ast)))
     (:column
      (if (third ast) (third ast) (second ast)))
     (:coalesce "coalesce")
@@ -1397,7 +1402,7 @@ Convert supplied expressions in source order, then return them in parameter orde
 
 (defun contains-aggregate-p (form)
   (and (consp form)
-       (if (eq (first form) :sublink)
+       (if (member (first form) '(:sublink :window))
            (contains-aggregate-p (fourth form))
            (or (raw-aggregate-kind form)
                (contains-aggregate-p (car form))
@@ -1513,7 +1518,7 @@ Convert supplied expressions in source order, then return them in parameter orde
   "Rebase grouped input Vars while leaving lifted aggregate result slots intact."
   (cond
     ((atom form) form)
-    ((eq (first form) :outer-ref) form)
+    ((member (first form) '(:outer-ref :window-ref)) form)
     ((eq (first form) :subplan)
      (rewrite-subplan-group-columns form group-keys scope))
     ((eq (first form) :col)
@@ -1572,13 +1577,16 @@ Convert supplied expressions in source order, then return them in parameter orde
 
 (defun analyze-order-expression (raw scope targets)
   "Reuse complete selected expressions, discarding only unused probe transitions."
-  ;; A probe can add transitions to any ancestor; roll them all back only when
+  ;; A probe can add transitions or window descriptors; roll them back only when
   ;; the complete expression matches a target (parse_clause.c SQL99 matching).
-  (let* ((contexts (if *select-analysis-frame*
+  (let* ((key-targets *window-key-targets*)
+         (contexts (if *select-analysis-frame*
                        (loop for frame = *select-analysis-frame* then (getf frame :parent)
                              while frame collect frame)
                        (list *select-aggregate-analysis*)))
-         (snapshots (loop for context in contexts
+         (snapshots (loop for context in (append contexts
+                                                 (list (list :descriptors *select-window-functions*)
+                                                       (list :descriptors *select-window-specifications*)))
                           for descriptors = (getf context :descriptors)
                           when (and descriptors (array-has-fill-pointer-p descriptors))
                             collect (cons descriptors (fill-pointer descriptors))))
@@ -1588,6 +1596,7 @@ Convert supplied expressions in source order, then return them in parameter orde
                              :test #'selected-expression-equal-p)))
     (if position
         (progn
+          (setf *window-key-targets* key-targets)
           (dolist (snapshot snapshots)
             (setf (fill-pointer (car snapshot)) (cdr snapshot)))
           (getf (nth position targets) :expr))
@@ -1719,6 +1728,14 @@ Convert supplied expressions in source order, then return them in parameter orde
 (defun selected-expression-equal-p (left right)
   ;; SQL99 target matching compares meaning, independent of transition slots.
   (cond ((equal left right) t)
+        ((and (sql-expression-key-p left) (sql-expression-key-p right))
+         (equal (sql-expression-key-value left) (sql-expression-key-value right)))
+        ((and (consp left) (consp right)
+              (member (first left) '(:col :window-ref))
+              (member (first right) '(:col :window-ref))
+              (getf (cddr left) :window-key) (getf (cddr right) :window-key))
+         (equal (sql-expression-key-value (getf (cddr left) :window-key))
+                (sql-expression-key-value (getf (cddr right) :window-key))))
         ((and (consp left) (consp right)
               (eq (first left) :col) (eq (first right) :col)
               (getf (cddr left) :aggregate-key) (getf (cddr right) :aggregate-key))
@@ -1748,7 +1765,7 @@ Convert supplied expressions in source order, then return them in parameter orde
   (let* ((*select-set-functions-allowed-p* t)
          (resolved (if aggregate-p
                        (caar (analyze-aggregate-order (list item) scope targets group-keys descriptors t))
-                       (analyze-expr (getf item :expr) scope)))
+                       (analyze-order-expression (getf item :expr) scope targets)))
          (position (position resolved targets :key (lambda (target) (getf target :expr))
                                               :test #'selected-expression-equal-p)))
     (unless position

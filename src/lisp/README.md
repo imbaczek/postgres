@@ -238,6 +238,12 @@ supported clauses and types, including their metadata and type checks. See
 [the subquery design and tests](t/SUBQUERIES.md) for concurrency semantics and
 known parity limits.
 
+Window expressions support `row_number()`, `rank()`, `dense_rank()`, `count(*)`,
+`sum` and text `array_agg`, with multiple inline or named windows and supported
+inheritance. The default is peer-aware `RANGE UNBOUNDED PRECEDING` through
+`CURRENT ROW`; explicit `ROWS` or `RANGE` supports that prefix or an unbounded
+following end. See [window functions](t/WINDOWS.md) for boundaries and tests.
+
 Sequence expressions support `nextval('sequence')`, `currval('sequence')`, and
 `setval('sequence', value [, is_called])`. The only supported column default is
 `DEFAULT nextval('sequence')`. Sequence values use the implemented signed `int8`
@@ -345,6 +351,11 @@ compares the native server with the repository's installed C PostgreSQL and owns
 its peers and ports. It honors `SBCL` and `PYTHON` (default `python3`, standard
 library only). See [subquery tests](t/SUBQUERIES.md) for scope and the known
 concurrent semijoin boundary.
+
+From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/windows.sh`
+compares window cases with the repository's installed C PostgreSQL. The harness
+honors `SBCL` and `PYTHON` (default `python3`, standard library only); see
+[window tests](t/WINDOWS.md).
 
 From `src/lisp`, `./t/child-bootstrap.sh` exercises a fresh child backup through
 grandchild promotion. Set `CHILD_BOOTSTRAP_BACKUP_FAULTS=1`,
@@ -779,6 +790,10 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   INNER/CROSS join order uses a greedy statistics-based choice, while outer
   joins retain source order. NATURAL JOIN
   is not supported; comma-separated `FROM` items act as cross joins.
+- Window support is limited to the functions and frames listed above. `lead`,
+  `lag`, value functions, `ntile`, floating-point rank functions, offset frame
+  bounds, `GROUPS`, exclusions, `FILTER`, `DISTINCT` and `count(expr)` windows
+  are deferred.
 - No `OFFSET`/`FETCH`. `ORDER BY` accepts multiple keys with `ASC`/`DESC` and
   uses bounded in-memory runs with external merge when needed.
 - No general `DEFAULT` expressions (only `DEFAULT nextval('sequence')`), `CHECK`,

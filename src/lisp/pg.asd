@@ -79,6 +79,7 @@
                    (:file "../utils/adt/varbit")
                    (:file "gram")
                    (:file "subselect")
+                   (:file "window")
                    (:file "analyze")))
      (:module "executor"
       :serial t
@@ -86,6 +87,7 @@
                    (:file "exec_spill")
                    (:file "exec_scan")
                    (:file "exec_plan")
+                   (:file "exec_window")
                    (:file "exec_subplan")
                    (:file "exec_analyze")
                    (:file "exec_insert")

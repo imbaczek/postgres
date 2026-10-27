@@ -300,6 +300,12 @@ reordered tree, and each parameterized path can reference only joined Vars."
                   (if (prepared-transition-aggregate-p prepared)
                       (getf prepared :aggregates) (getf prepared :aggregate-count))
                   input)))
+    ;; Project shared keys after grouping; window stages append their slots before
+    ;; set-returning expressions and final target projection.
+    (when (getf prepared :window-keys)
+      (setf input (list :window-input (getf prepared :window-keys) input)))
+    (dolist (stage (window-plan-stages prepared))
+      (setf input (list :window stage input)))
     (when (getf prepared :set-functions)
       (setf input (list :project-set (getf prepared :set-functions) input)))
     (setf input (list :project (getf prepared :targets) input))
@@ -319,7 +325,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
   (and (consp node)
        (or (query-plan-relation-node-p node)
            (member (first node)
-                   '(:append :result :filter :join :nested-loop-join :project :aggregate
+                   '(:window-input :window :append :result :filter :join :nested-loop-join :project :aggregate
                      :sort :top-n :limit :project-set :hash-aggregate :sorted-aggregate :distinct :hash-distinct)
                    :test #'eq))))
 
@@ -1071,6 +1077,16 @@ on an abnormal exit."
             (lambda (right-callback)
               (funcall run-child right right-callback))
             join emit))))
+    (:window-input
+     (funcall run-child (third node)
+              (lambda (environment)
+                (funcall emit
+                         (concatenate 'vector environment
+                                      (map 'vector (lambda (expression) (eval-expr expression environment))
+                                           (second node)))))))
+    (:window
+     (stream-window-stage (lambda (callback) (funcall run-child (third node) callback))
+                          (second node) emit))
     (:project-set
      (funcall run-child (third node)
               (lambda (environment) (stream-project-set environment (second node) emit))))
@@ -1205,7 +1221,7 @@ on an abnormal exit."
 (defun physical-plan-node-children (node)
   (case (first node)
     (:append (mapcar #'second (second node)))
-    ((:filter :project :sort :limit :hash-distinct :project-set) (list (third node)))
+    ((:window-input :window :filter :project :sort :limit :hash-distinct :project-set) (list (third node)))
     ((:top-n :subquery-scan) (list (fourth node)))
     (:nested-loop-join (list (third node) (fourth node)))
     ((:hash-aggregate :sorted-aggregate) (list (fourth node)))
@@ -1258,6 +1274,8 @@ on an abnormal exit."
     (:filter "Filter")
     (:project "Project")
     (:project-set "ProjectSet")
+    (:window "WindowAgg")
+    (:window-input "Window Key Projection")
     (:sort "Sort")
     (:top-n (format nil "Top-N Sort (limit ~a)" (third node)))
     (:limit "Limit")

@@ -725,6 +725,12 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
 (defun prepare-select-internal (ast &optional (parent *select-outer-scope*))
   (let* ((*select-outer-scope* parent)
          (*select-sublinks* nil)
+         (*select-window-functions* (make-array 0 :adjustable t :fill-pointer 0))
+         (*select-window-specifications* (make-array 0 :adjustable t :fill-pointer 0))
+         (*select-named-windows* (prepare-named-windows (getf ast :windows)))
+         (*inside-window-call-p* nil)
+         (*window-analysis-targets* nil)
+         (*window-key-targets* nil)
          (*defer-group-rewrite-p* t)
          (*select-sublinks-allowed-p* t)
          (*select-analysis-frame*
@@ -804,7 +810,10 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                      (getf *select-analysis-frame* :group-keys) group-keys)
                (multiple-value-list
                 (analyze-aggregate-targets (getf ast :targets) scope group-keys))))
-           (targets (first aggregate-analysis))
+           (targets (progn
+                      (setf *window-analysis-targets* (first aggregate-analysis))
+                      (resolve-query-window-specifications scope (first aggregate-analysis))
+                      (first aggregate-analysis)))
            (aggregates (third aggregate-analysis))
            (aggregate-p (or group-keys (plusp (length aggregates))))
            (order (progn
@@ -820,15 +829,22 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
            (aggregate-p (or aggregate-p (plusp (length aggregates))))
            (order (if aggregate-p (finalize-query-group-expressions targets order group-keys scope (getf ast :distinct))
                       order))
+           (width (if aggregate-p (+ (length group-keys) (length aggregates))
+                      (select-scope-width scope)))
+           (window-analysis (multiple-value-list
+                             (finalize-query-windows targets order group-keys scope aggregate-p width)))
+           (order (first window-analysis))
+           (width (second window-analysis))
            (limit (getf ast :limit))
            (set-analysis
              (multiple-value-list
               (prepare-select-project-set
                targets order
-               (if aggregate-p (+ (length group-keys) (length aggregates))
-                   (if scope (select-scope-width scope) 0))
+               (+ width (length *select-window-functions*))
                (getf ast :distinct)))))
-      (list :table first-table
+      (list :window-keys (third window-analysis)
+            :windows (coerce *select-window-functions* 'list) :window-input-width width
+            :table first-table
             :source-relations relations
             :relations relations
             :scope scope
