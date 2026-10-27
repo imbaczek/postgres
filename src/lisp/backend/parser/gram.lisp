@@ -217,10 +217,10 @@
 (defun parse-select-tail (p left)
   "Set operations bind more tightly than an unparenthesized ORDER BY or LIMIT."
   (loop while (match-kw p "union")
-        do (unless (match-kw p "all")
-             (ereport "0A000" "UNION without ALL is not supported"))
-           (setf left (list :type :select :set-operation :union-all
-                            :left left :right (parse-select-operand p))))
+        do (let ((all-p (match-kw p "all")))
+             (unless all-p (match-kw p "distinct"))
+             (setf left (list :type :select :set-operation (if all-p :union-all :union)
+                              :left left :right (parse-select-operand p)))))
   (when (or (kw-p p "intersect") (kw-p p "except"))
     (ereport "0A000" "INTERSECT and EXCEPT are not supported"))
   (when (match-kw p "order")

@@ -19,52 +19,239 @@
 
 (defvar *sql-open-iterators* nil)
 
+(defvar *recursive-cte-worktables* nil)
+
+(defvar *recursive-cte-generation-caches* nil)
+
+(defun prepared-query-worktable-cache (prepared)
+  ;; Select the nearest active generation actually referenced by this query.
+  ;; The visited set is needed because prepared CTE graphs can be cyclic.
+  (declare (notinline sql-subplan-prepared sql-subplan-test))
+  (unless *recursive-cte-generation-caches* (return-from prepared-query-worktable-cache nil))
+  (let ((seen (make-hash-table :test #'eq)) (found nil))
+    (labels ((expression (form)
+               (when (consp form)
+                 (if (subquery-expression-p form)
+                     (progn (expression (sql-subplan-test (second form)))
+                            (query (sql-subplan-prepared (second form))))
+                     (progn (expression (car form)) (expression (cdr form))))))
+             (query (state)
+               (unless (gethash state seen)
+                 (setf (gethash state seen) t)
+                 (if (getf state :set-operation)
+                     (progn (query (getf state :left)) (query (getf state :right)))
+                     (progn
+                       (dolist (key '(:where :having :group-keys :window-keys :windows :order :set-functions))
+                         (expression (getf state key)))
+                       (dolist (target (getf state :targets)) (expression (getf target :expr)))
+                       (dolist (aggregate (getf state :aggregates)) (expression (getf aggregate :input)))
+                       (dolist (join (getf state :joins)) (expression (getf join :qual)))
+                       (dolist (relation (getf state :source-relations (getf state :relations)))
+                         (cond
+                           ((getf relation :cte-worktable)
+                            (when (assoc (getf relation :cte) *recursive-cte-worktables* :test #'eq)
+                              (pushnew (getf relation :cte) found :test #'eq)))
+                           ((getf relation :cte) (query (sql-cte-prepared (getf relation :cte))))
+                           ((getf relation :subquery-prepared) (query (getf relation :subquery-prepared))))))))))
+      (query prepared))
+    (loop for binding in *recursive-cte-generation-caches*
+          when (member (car binding) found :test #'eq) return (cdr binding))))
+
+(defvar *select-recursive-definition* nil)
+
+(defvar *select-recursive-worktables* nil)
+
+(defun raw-select-query-p (form)
+  (and (consp form)
+       (loop for (key value) on form by #'cddr
+               thereis (and (eq key :type) (eq value :select)))))
+
+(defun map-raw-cte-references (function query &optional hidden (context :okay))
+  ;; Follow raw WITH scope before name resolution, as parse_cte.c does.  Only
+  ;; unqualified FROM names can denote CTEs; expression sublinks forbid self use.
+  (labels
+      ((nullable-context (current)
+         (if (eq current :okay) :outer-join current))
+       (source (item names current)
+         (cond ((stringp item)
+                (unless (member item names :test #'equal) (funcall function item current)))
+               ((sql-derived-relation-p item)
+                (query (sql-derived-relation-query item) names current))
+               ((consp item)
+                (let* ((join (second item)) (kind (getf join :type)))
+                  (source (first item) names
+                          (if (member kind '(:right :full)) (nullable-context current) current))
+                  (source (getf join :table) names
+                          (if (member kind '(:left :full)) (nullable-context current) current))
+                  (expression (getf join :condition) names current)))))
+       (expression (form names current)
+         (cond ((atom form) nil)
+               ((raw-select-query-p form) (query form names current))
+               ((eq (first form) :sublink)
+                (query (third form) names :subquery)
+                (expression (fourth form) names current)
+                (expression (fifth form) names current))
+               (t (dolist (part form) (expression part names current)))))
+       (body (state names current)
+         (if (getf state :set-operation)
+             (progn (query (getf state :left) names current)
+                    (query (getf state :right) names current))
+             (let ((tree (getf state :from)))
+               (dolist (join (getf state :joins)) (setf tree (list tree join)))
+               (source tree names current)))
+         (dolist (key '(:targets :where :group-by :having :windows :order-by))
+           (expression (getf state key) names current)))
+       (query (state names current)
+         (when state
+           (let ((definitions (getf state :with)))
+             (if (getf state :with-recursive)
+                 (let ((local (append (mapcar (lambda (raw) (getf raw :name)) definitions) names)))
+                   (dolist (raw definitions) (query (getf raw :query) local current))
+                   (body state local current))
+                 (let ((local names))
+                   (dolist (raw definitions)
+                     (query (getf raw :query) local current)
+                     (push (getf raw :name) local))
+                   (body state local current)))))))
+    (query query hidden context)))
+
+(defun order-recursive-with-definitions (definitions)
+  ;; Order forward dependencies before analysis; self edges are handled by the
+  ;; recursive worktable, while cycles between definitions are unsupported.
+  (let* ((definitions (mapcar (lambda (raw) (list* :recursive-p nil raw)) definitions))
+         (names (mapcar (lambda (raw) (getf raw :name)) definitions))
+         (pending (copy-list definitions))
+         (dependencies (make-hash-table :test #'eq))
+         (ordered nil))
+    (dolist (raw definitions)
+      (let ((needed nil) (self nil))
+        (map-raw-cte-references
+         (lambda (name context)
+           (declare (ignore context))
+           (when (member name names :test #'equal)
+             (if (equal name (getf raw :name)) (setf self t)
+                 (pushnew name needed :test #'equal))))
+         (getf raw :query))
+        (setf (gethash raw dependencies) needed
+              (getf raw :recursive-p) self)))
+    (loop while pending
+          for next = (find-if (lambda (raw) (null (gethash raw dependencies))) pending)
+          do (unless next (ereport "0A000" "mutual recursion between WITH items is not implemented"))
+             (setf pending (remove next pending :test #'eq))
+             (push next ordered)
+             (dolist (raw pending)
+               (setf (gethash raw dependencies)
+                     (remove (getf next :name) (gethash raw dependencies) :test #'equal))))
+    (nreverse ordered)))
+
+(defun validate-recursive-cte (raw)
+  (let ((query (getf raw :query)) (name (getf raw :name)) (count 0))
+    (unless (member (getf query :set-operation) '(:union :union-all))
+      (ereport "42P19" "recursive query ~s does not have the form non-recursive-term UNION [ALL] recursive-term" name))
+    (labels ((reference (source context)
+               (when (equal source name)
+                 (unless (eq context :okay)
+                   (ereport "42P19" "recursive reference to query ~s is not allowed in ~a" name context))
+                 (when (> (incf count) 1)
+                   (ereport "42P19" "recursive reference to query ~s must not appear more than once" name)))))
+      ;; A WITH belonging to the UNION itself cannot contain a recursive use.
+      (when (getf query :with)
+        (let ((wrapper (copy-list query)))
+          (setf (getf wrapper :left) nil (getf wrapper :right) nil
+                (getf wrapper :targets) nil (getf wrapper :order-by) nil)
+          (map-raw-cte-references #'reference wrapper nil :non-recursive-term)))
+      (when (getf query :order-by)
+        (ereport "0A000" "ORDER BY in a recursive query is not implemented"))
+      (when (getf query :limit)
+        (ereport "0A000" "LIMIT in a recursive query is not implemented"))
+      (map-raw-cte-references #'reference (getf query :left) nil :non-recursive-term)
+      (map-raw-cte-references #'reference (getf query :right))
+      (unless (= count 1)
+        (ereport "42P19" "recursive query ~s has no recursive reference in its recursive term" name)))))
+
+(defun apply-cte-column-aliases (targets aliases)
+  (when (> (length aliases) (length targets))
+    (ereport "42P10" "WITH query has fewer columns than its column alias list"))
+  (loop for alias in aliases for target in targets do (setf (getf target :name) alias))
+  targets)
+
+(defun freeze-recursive-cte-targets (targets aliases)
+  ;; Worktable columns are fixed from the non-recursive arm.  In particular,
+  ;; unknown literals become text before the recursive arm is analyzed.
+  (let ((frozen (mapcar #'copy-list targets)))
+    (dolist (target frozen)
+      (when (in-unknown-constant-p (getf target :expr))
+        (setf (getf target :expr)
+              (append (coerce-common-expression (getf target :expr) :text) (list :explicit-cast t))
+              (getf target :type) :text (getf target :typmod) -1))
+      (setf (getf target :table-oid) 0 (getf target :attnum) 0))
+    (apply-cte-column-aliases frozen aliases)))
+
+(defun validate-recursive-term-aggregates (prepared)
+  ;; C rejects aggregates at a query level with a direct self-reference RTE.
+  (map-prepared-query-expressions
+   (lambda (form depth) (declare (ignore depth)) form)
+   prepared 0
+   (lambda (state depth)
+     (declare (ignore depth))
+     (when (and (plusp (getf state :aggregate-count 0))
+                (some (lambda (relation) (getf relation :cte-worktable))
+                      (getf state :source-relations (getf state :relations))))
+       (ereport "42P19" "aggregate functions are not allowed in a recursive query's recursive term"))))
+  prepared)
+
 (defun parse-with-select (p)
   (expect-kw p "with")
-  (when (match-kw p "recursive") (ereport "0A000" "recursive CTEs are not supported"))
-  (let ((definitions
-          (loop collect
-                (let* ((name (pident p))
-                       (aliases (when (punct-p p #\()
-                                  (with-parens (p) (parse-ident-list p)))))
-                  (expect-kw p "as")
-                  (let ((policy (cond ((match-kw p "materialized") :always)
-                                      ((match-kw p "not") (expect-kw p "materialized") :never))))
-                    (list :name name :aliases aliases :materialized policy
-                          :query (with-parens (p)
-                                   (when (member (pval p) '("insert" "update" "delete" "merge")
-                                                 :test #'equal)
-                                     (ereport "0A000" "data-modifying CTEs are not supported"))
-                                   (parse-select-expression p)))))
-                while (match-punct p #\,))))
+  (let* ((recursive-p (match-kw p "recursive"))
+         (definitions
+           (loop collect
+                 (let* ((name (pident p))
+                        (aliases (when (punct-p p #\()
+                                   (with-parens (p) (parse-ident-list p)))))
+                   (expect-kw p "as")
+                   (let ((policy (cond ((match-kw p "materialized") :always)
+                                       ((match-kw p "not") (expect-kw p "materialized") :never))))
+                     (list :name name :aliases aliases :materialized policy
+                           :query (with-parens (p)
+                                    (when (member (pval p) '("insert" "update" "delete" "merge")
+                                                  :test #'equal)
+                                      (ereport "0A000" "data-modifying CTEs are not supported"))
+                                    (parse-select-expression p)))))
+                 while (match-punct p #\,))))
+    (when (or (kw-p p "search") (kw-p p "cycle"))
+      (ereport "0A000" "recursive SEARCH and CYCLE clauses are not supported"))
     (unless (or (kw-p p "select") (punct-p p #\())
       (ereport "0A000" "WITH currently supports SELECT statements only"))
     (let ((query (parse-select-expression p)))
       (when (getf query :with) (syntax-error p "multiple WITH clauses"))
-      (setf (getf query :with) definitions)
+      (setf (getf query :with) definitions
+            (getf query :with-recursive) recursive-p)
       query)))
 
-(defun prepare-with-definitions (definitions)
-  ;; Publish each binding only after analysis, so later definitions see earlier
-  ;; ones while nested WITH clauses can shadow their enclosing environment.
+(defun prepare-with-definitions (definitions &optional recursive-p)
+  ;; Nonrecursive WITH publishes bindings sequentially; RECURSIVE first orders
+  ;; forward references, and publishes a seed-shaped worktable for each self use.
   (let ((names nil) (result nil))
     (dolist (raw definitions)
       (when (member (getf raw :name) names :test #'equal)
         (ereport "42712" "WITH query name \"~a\" specified more than once" (getf raw :name)))
       (push (getf raw :name) names))
-    (dolist (raw definitions (nreverse result))
-      (let* ((definition (make-sql-cte :name (getf raw :name) :aliases (getf raw :aliases)
+    (dolist (raw (if recursive-p (order-recursive-with-definitions definitions) definitions)
+                 (nreverse result))
+      (let* ((self-p (and recursive-p (getf raw :recursive-p)))
+             (definition (make-sql-cte :name (getf raw :name) :aliases (getf raw :aliases)
                                        :materialized (getf raw :materialized) :query (getf raw :query)
-                                       :owner-level *select-cte-level*))
-             (prepared (let ((*cte-definition-analysis-p* t))
-                         (prepare-select-internal (sql-cte-query definition) (make-select-scope))))
-             (aliases (sql-cte-aliases definition))
-             (targets (getf prepared :targets)))
-        (when (> (length aliases) (length targets))
-          (ereport "42P10" "WITH query has fewer columns than its column alias list"))
-        (loop for alias in aliases for target in targets do (setf (getf target :name) alias))
-        (setf (sql-cte-prepared definition) prepared)
-        (push (cons (sql-cte-name definition) definition) *select-cte-environment*)
+                                       :owner-level *select-cte-level*)))
+        (when self-p
+          (validate-recursive-cte raw)
+          (push (cons (sql-cte-name definition) definition) *select-cte-environment*))
+        (let* ((*cte-definition-analysis-p* t)
+               (*select-recursive-definition* (and self-p definition))
+               (prepared (prepare-select-internal (sql-cte-query definition) (make-select-scope))))
+          (apply-cte-column-aliases (getf prepared :targets) (sql-cte-aliases definition))
+          (setf (sql-cte-prepared definition) prepared))
+        (unless self-p
+          (push (cons (sql-cte-name definition) definition) *select-cte-environment*))
         (push definition result)))))
 
 (defun cte-source-definition (source)
@@ -72,7 +259,8 @@
     (cdr (assoc source *select-cte-environment* :test #'equal))))
 
 (defun make-cte-relation-spec (definition alias offset)
-  (incf (sql-cte-references definition))
+  (unless (member definition *select-recursive-worktables* :test #'eq)
+    (incf (sql-cte-references definition)))
   (let* ((targets (getf (sql-cte-prepared definition) :targets))
          (name (or alias (sql-cte-name definition)))
          (table (make-pg-class
@@ -86,7 +274,8 @@
                            'vector))))
     (list :name (sql-cte-name definition) :alias alias :table table :offset offset
           :width (length targets) :columns (pg-class-columns table) :virtual-p t :origins targets
-          :cte definition :cte-filter nil :cte-reference-plan nil :cte-levelsup (- *select-cte-level* (sql-cte-owner-level definition)))))
+          :cte definition :cte-worktable (not (null (member definition *select-recursive-worktables* :test #'eq)))
+          :cte-filter nil :cte-reference-plan nil :cte-levelsup (- *select-cte-level* (sql-cte-owner-level definition)))))
 
 (defun cte-function-volatile-p (name)
   "Use pg_proc.dat volatility for supported builtins; unknown helpers stay fenced."
@@ -127,11 +316,12 @@
     volatile))
 
 (defun plan-query-ctes (prepared)
-  ;; Volatile producers are shared even with NOT MATERIALIZED; otherwise the
-  ;; policy and reference count determine whether readers share one producer.
+  ;; Recursive and volatile producers are shared even with NOT MATERIALIZED;
+  ;; otherwise policy and reference count determine whether readers share one.
   (dolist (definition (getf prepared :ctes))
     (setf (sql-cte-shared-p definition)
-          (or (eq (sql-cte-materialized definition) :always)
+          (or (getf (sql-cte-prepared definition) :recursive-cte)
+              (eq (sql-cte-materialized definition) :always)
               (cte-query-volatile-p (sql-cte-prepared definition))
               (and (not (eq (sql-cte-materialized definition) :never))
                    (> (sql-cte-references definition) 1))))

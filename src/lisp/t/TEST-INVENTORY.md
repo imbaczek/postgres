@@ -330,6 +330,19 @@ each with seeds `42` and `20261027`, definition digest
 checks generated in-memory reader interleavings, while the C harness checks
 spill and SQL behavior separately. The fresh legacy runner passed 1,131 checks.
 
+## Recursive CTE coverage
+
+[recursive-ctes.sh](recursive-ctes.sh) and its independent C differential
+client [recursive_ctes.py](interop/recursive_ctes.py) remain process tests:
+they passed 60 SQL comparisons and forced frontier, result and seen-set spill,
+cycle, cancellation (`57014`), temporary quota (`53400`), error and recovery
+checks. The Rove unit suite passed 126 cases, interop 170 and physical 531;
+the legacy runner passed 1,131 checks.
+Existing CTE (114), HAVING (118), window (168), subquery, join, index and
+smoke regressions, strict fresh compilation and formatting checks passed.
+See [recursive CTEs](RECURSIVE-CTES.md) for scope and
+performance limits.
+
 ## Running and failure behavior
 
 From `src/lisp/`, `./t/run-unit-tests.sh` loads [test-dependencies.lisp](test-dependencies.lisp),

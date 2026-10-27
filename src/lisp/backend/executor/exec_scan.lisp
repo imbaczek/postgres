@@ -749,11 +749,32 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
 (defun prepare-union-select (ast)
   "Prepare both arms under the caller's catalog view."
   (let* ((*select-cte-level* (1- *select-cte-level*))
+         (definition (and *select-recursive-definition*
+                          (eq ast (sql-cte-query *select-recursive-definition*))
+                          *select-recursive-definition*))
          (left (prepare-select-internal (getf ast :left)))
-         (right (prepare-select-internal (getf ast :right))))
+         (frozen (when definition
+                   (freeze-recursive-cte-targets (getf left :targets) (sql-cte-aliases definition))))
+         (right (progn
+                  (when definition
+                    (setf (sql-cte-prepared definition)
+                          (list :targets frozen :recursive-cte definition :recursive-placeholder t)))
+                  (let ((*select-recursive-worktables*
+                          (if definition (cons definition *select-recursive-worktables*)
+                              *select-recursive-worktables*)))
+                    (prepare-select-internal (getf ast :right))))))
+    (when definition (validate-recursive-term-aggregates right))
     (multiple-value-bind (targets coercions)
-        (analyze-union-targets (getf left :targets) (getf right :targets))
-      (list :set-operation :union-all :left left :right right :coercions coercions
+        (analyze-union-targets (or frozen (getf left :targets)) (getf right :targets))
+      (when definition
+        (loop for seed in frozen for target in targets for position from 1
+              unless (and (eq (getf seed :type) (getf target :type))
+                          (eql (getf seed :typmod) (getf target :typmod)))
+                do (ereport "42804" "recursive query ~s column ~d has a different type or typmod overall"
+                            (sql-cte-name definition) position)))
+      (list :set-operation (getf ast :set-operation) :left left :right right :coercions coercions
+            :recursive-cte definition
+            :recursive-union-all (eq (getf ast :set-operation) :union-all)
             :targets targets :relations nil
             :order (analyze-union-order (getf ast :order-by) targets)
             :limit (getf ast :limit)))))
@@ -779,7 +800,7 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
          (*inside-aggregate-input-p* nil)
          (*aggregate-order-mode* nil)
          (*select-set-functions-allowed-p* nil)
-         (definitions (prepare-with-definitions (getf ast :with)))
+         (definitions (prepare-with-definitions (getf ast :with) (getf ast :with-recursive)))
          (prepared (%prepare-select-internal ast)))
     (setf (getf prepared :ctes) definitions
           (getf prepared :deferred-window-folding) *cte-definition-analysis-p*)

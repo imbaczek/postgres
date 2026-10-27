@@ -4,8 +4,9 @@
 earlier ones, and nested `WITH` clauses can shadow outer names. Column alias
 lists and default, `MATERIALIZED`, and `NOT MATERIALIZED` policies are
 supported. Scalar SELECT subqueries containing `WITH` can appear in DML
-expressions. Recursive CTEs, data-modifying CTE bodies, and top-level `WITH`
-on DML are rejected with `0A000`. See [HAVING and LATERAL](HAVING-LATERAL.md)
+expressions. Data-modifying CTE bodies and top-level `WITH` on DML are rejected with
+`0A000`. See [recursive CTEs](RECURSIVE-CTES.md) for recursive SELECTs and
+[HAVING and LATERAL](HAVING-LATERAL.md)
 for their supported scope.
 
 A shared CTE has a lazy producer and an appendable replay store that can spill;

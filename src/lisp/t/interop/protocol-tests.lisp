@@ -774,6 +774,9 @@
 
 (deftest union-all-types-and-errors
     (ok (equalp '(#(1) #(2)) (derived-query-rows "SELECT '1' UNION ALL SELECT 2")))
+  (ok (equalp '(#(1) #(2)) (derived-query-rows "SELECT 1 UNION SELECT 1 UNION SELECT 2 ORDER BY 1")))
+  (ok (equalp (list (vector pg::+null+)) (derived-query-rows "SELECT NULL UNION SELECT NULL")))
+  (ok (equalp '(#("A") #("a")) (derived-query-rows "SELECT 'a' UNION SELECT 'A' ORDER BY 1")))
   (ok (equalp (list (vector pg::+null+) #(2))
               (derived-query-rows "SELECT NULL UNION ALL SELECT 2")))
   (dolist (case '(("SELECT 1 UNION ALL SELECT 1,2" "42601")
@@ -782,7 +785,6 @@
                   ("SELECT 'bad' UNION ALL SELECT 1" "22P02")
                   ("SELECT 1 AS x UNION ALL SELECT 2 AS y ORDER BY y" "42703")
                   ("SELECT 1 AS x UNION ALL SELECT 2 ORDER BY x+1" "0A000")
-                  ("SELECT 1 UNION SELECT 2" "0A000")
                   ("SELECT 1 INTERSECT SELECT 2" "0A000")
                   ("SELECT 1 EXCEPT SELECT 2" "0A000")))
     (ok (equal (second case) (sqlstate-of (derived-query-rows (first case))))

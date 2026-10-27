@@ -214,6 +214,8 @@
        (make-sql-iterator (lambda () (unless done (setf done t) (values #() t))))))
     ((:seq-scan :index-scan) (make-select-scan-iterator node relations))
     (:cte-scan (make-cte-scan-iterator (physical-scan-relation node relations)))
+    (:worktable-scan (make-cte-worktable-iterator (physical-scan-relation node relations)))
+    (:recursive-union (make-recursive-union-iterator node relations))
     (:with-ctes (make-with-ctes-iterator (second node) (third node) relations))
     (:append (make-append-sql-iterator (second node) relations))
     (:subquery-scan

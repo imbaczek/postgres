@@ -241,7 +241,10 @@ known parity limits.
 Nonrecursive `WITH` supports SELECT CTEs, sequential lexical bindings, nested
 shadowing, column aliases, and default, `MATERIALIZED` and `NOT MATERIALIZED`
 policies. Scalar SELECT subqueries with `WITH` also work in DML expressions.
-See [CTE behavior and limits](t/CTES.md) for materialization and planning details.
+Recursive SELECT CTEs support `UNION` and `UNION ALL`, including forward
+dependencies and a single legal self-reference. Ordinary `UNION DISTINCT` is
+also supported. See [nonrecursive CTEs](t/CTES.md) and [recursive CTEs](t/RECURSIVE-CTES.md)
+for behavior and limits.
 
 Window expressions support `row_number()`, `rank()`, `dense_rank()`, `count(*)`,
 `sum` and text `array_agg`, with multiple inline or named windows and supported
@@ -359,7 +362,9 @@ concurrent semijoin boundary.
 
 From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/ctes.sh`
 compares CTE behavior with the repository's installed C PostgreSQL. See
-[CTE tests](t/CTES.md) for scope and resource checks.
+[CTE tests](t/CTES.md) for scope and resource checks. Run
+`PG_C_BINDIR=/path/to/installed/postgres/bin ./t/recursive-ctes.sh` for the
+[recursive CTE differential and resource tests](t/RECURSIVE-CTES.md).
 
 From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/windows.sh`
 compares window cases with the repository's installed C PostgreSQL. The harness
@@ -792,7 +797,7 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   grouping with spill; mixed aggregates preserve those semantics. General decimal,
   floating point, interval and money types remain unsupported.
   Derived SELECTs in `FROM` support `LATERAL` references. `HAVING`, ordinary
-  `DISTINCT`, `UNION ALL`, and the expression subqueries described above are
+  `DISTINCT`, `UNION`/`UNION ALL`, and the expression subqueries described above are
   supported; see [HAVING and LATERAL](t/HAVING-LATERAL.md) for scope and tests.
   Row-valued and MULTIEXPR subqueries and `DISTINCT ON` remain unsupported.
   Hash subplans, full optimizer constant folding, and subquery decorrelation are
@@ -800,9 +805,10 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   INNER/CROSS join order uses a greedy statistics-based choice, while outer
   joins retain source order. NATURAL JOIN
   is not supported; comma-separated `FROM` items act as cross joins.
-- Recursive CTEs and top-level `WITH` on DML are rejected. CTE producer scans
-  use sequential scans and source order. `NOT MATERIALIZED` uses per-reference
-  plans with limited safe filter pushdown, not full joint optimization; remaining
+- `SEARCH`/`CYCLE`, data-modifying CTEs, top-level `WITH` on DML and
+  mutual recursion are rejected (`0A000`). CTE producer scans
+  use sequential scans and source order. Nonrecursive `NOT MATERIALIZED` uses
+  per-reference plans with limited safe filter pushdown, not full joint optimization; remaining
   planning differences can affect error timing as well as performance.
 - Window support is limited to the functions and frames listed above. `lead`,
   `lag`, value functions, `ntile`, floating-point rank functions, offset frame

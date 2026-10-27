@@ -77,12 +77,14 @@
   (copy-query-sort-value value))
 
 (defun subquery-cache-for (descriptor)
-  "Return the live dependency owner's cache, or NIL for a directly correlated scan."
+  "Return the dependency owner's cache, additionally scoped by worktable generation."
   (when (member (sql-subplan-kind descriptor) '(:scalar :exists :array))
-    (let ((depths (sql-subplan-depths descriptor)))
-      (cond ((null depths) *subquery-result-cache*)
-            ((member 1 depths) nil)
-            (t (cdr (nth (- (first depths) 2) *subquery-outer-frames*)))))))
+    (let* ((depths (sql-subplan-depths descriptor))
+           (owner (cond ((null depths) *subquery-result-cache*)
+                        ((member 1 depths) nil)
+                        (t (cdr (nth (- (first depths) 2) *subquery-outer-frames*)))))
+           (generation (prepared-query-worktable-cache (sql-subplan-prepared descriptor))))
+      (if (and owner generation) (recursive-cte-parameter-cache owner generation) owner))))
 
 (defun subquery-quantified-step (kind accumulated value)
   (ecase kind

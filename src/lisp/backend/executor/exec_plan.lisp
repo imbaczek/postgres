@@ -216,6 +216,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
 (defun select-scan-plan-form (relation-index relation path physical-p)
   (let ((table (getf relation :table)))
     (cond
+      ((getf relation :cte-worktable) (list :worktable-scan relation-index 0))
       ((getf relation :cte) (list :cte-scan relation-index 0))
       ((getf relation :subquery-plan)
        (list :subquery-scan relation-index 0
@@ -334,13 +335,13 @@ reordered tree, and each parameterized path can reference only joined Vars."
 (defun query-plan-relation-node-p (node)
   "Relation handles occupy slot two; rebasing must cover every such IR node."
   (and (consp node)
-       (member (first node) '(:scan :seq-scan :index-scan :subquery-scan :cte-scan))))
+       (member (first node) '(:scan :seq-scan :index-scan :subquery-scan :cte-scan :worktable-scan))))
 
 (defun query-plan-operator-p (node)
   (and (consp node)
        (or (query-plan-relation-node-p node)
            (member (first node)
-                   '(:with-ctes :window-input :window :append :result :filter :join :nested-loop-join :project :aggregate
+                   '(:recursive-union :with-ctes :window-input :window :append :result :filter :join :nested-loop-join :project :aggregate
                      :sort :top-n :limit :project-set :hash-aggregate :sorted-aggregate :distinct :hash-distinct)
                    :test #'eq))))
 
@@ -432,11 +433,22 @@ reordered tree, and each parameterized path can reference only joined Vars."
              (push (list coercions (rebase-select-plan-tree (query-plan-physical child) offset))
                    physical-arms)
              (setf relations (append relations (getf (query-plan-prepared child) :relations))))
-    (finish-query-plan
-     prepared relations
-     (finish-select-plan-tree (list :append (nreverse logical-arms)) prepared nil)
-     (finish-select-plan-tree (list :append (nreverse physical-arms)) prepared t)
-     nil)))
+    (labels ((union-tree (arms physical-p)
+               (let* ((arms (nreverse arms))
+                      (definition (getf prepared :recursive-cte))
+                      (tree (if definition
+                                (list :recursive-union definition
+                                      (second (first arms)) (second (second arms))
+                                      (mapcar #'first arms))
+                                (list :append arms))))
+                 (when (and (not definition) (eq (getf prepared :set-operation) :union))
+                   (setf tree (list (if physical-p :hash-distinct :distinct)
+                                    (loop for target in (getf prepared :targets) for slot from 1
+                                          collect (projected-target-ref target slot))
+                                    tree)))
+                 (finish-select-plan-tree tree prepared physical-p))))
+      (finish-query-plan prepared relations (union-tree logical-arms nil)
+                         (union-tree physical-arms t) nil))))
 
 (defun having-gate-value (expression)
   ;; Return VALUE, KNOWN-P.  Unknown leaves never enter EVAL-EXPR.  Boolean
@@ -1175,6 +1187,12 @@ on an abnormal exit."
     (:cte-scan
      (let ((reader (make-cte-scan-iterator (physical-scan-relation node registered-relations))))
        (unwind-protect (map-sql-iterator reader emit) (close-sql-iterator reader))))
+    (:worktable-scan
+     (let ((reader (make-cte-worktable-iterator (physical-scan-relation node registered-relations))))
+       (unwind-protect (map-sql-iterator reader emit) (close-sql-iterator reader))))
+    (:recursive-union
+     (let ((input (make-recursive-union-iterator node registered-relations)))
+       (unwind-protect (map-sql-iterator input emit) (close-sql-iterator input))))
     (:append (stream-union-all (second node) emit run-child))
     ((:seq-scan :index-scan)
      (let* ((relation (physical-scan-relation node registered-relations))
@@ -1382,7 +1400,7 @@ on an abnormal exit."
     (:append (mapcar #'second (second node)))
     ((:with-ctes :window-input :window :filter :project :sort :limit :hash-distinct :project-set) (list (third node)))
     ((:top-n :subquery-scan) (list (fourth node)))
-    (:nested-loop-join (list (third node) (fourth node)))
+    ((:nested-loop-join :recursive-union) (list (third node) (fourth node)))
     ((:hash-aggregate :sorted-aggregate) (list (fourth node)))
     (otherwise nil)))
 
@@ -1427,6 +1445,8 @@ on an abnormal exit."
        (select-path-description table path)))
     (:result "Result")
     (:append "Append")
+    (:recursive-union "Recursive Union")
+    (:worktable-scan (format nil "WorkTable Scan on ~a" (sql-cte-name (getf (physical-scan-relation node relations) :cte))))
     (:subquery-scan
      (let ((relation (physical-scan-relation node relations)))
        (format nil "Subquery Scan~@[ on ~a~]" (getf relation :alias))))
