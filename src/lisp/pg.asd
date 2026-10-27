@@ -111,6 +111,7 @@
                    (:file "../replication/physical-follow-pin")
                    (:file "../replication/physical-follow-anchor")
                    (:file "../replication/physical-retained-extent")
+                   (:file "../replication/physical-retained-inventory")
                    (:file "../replication/physical-restartpoint")
                    (:file "../replication/protocol")
                    (:file "../replication/physical-stream")
