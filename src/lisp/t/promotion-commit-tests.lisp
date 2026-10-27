@@ -122,6 +122,96 @@
         (pg::reset-backend-transaction pg::*backend*)
         (when pg::*clog-stream* (close pg::*clog-stream*) (setf pg::*clog-stream* nil))))))
 
+(defun call-with-promotion-reader-fixture (function)
+  (call-with-live-child-fixture
+   (lambda (root store)
+     (declare (ignore root store))
+     (let ((pg::*backend-registry* (make-hash-table :test #'eql))
+           (pg::*shutdown-abandoned-backends* nil)
+           (pg::*recovery-reader-xid-counter* 0))
+       (setf (gethash 1 pg::*backend-registry*) pg::*backend*)
+       (call-with-promotion-exclusion function)))
+   :committed-child nil))
+
+(deftest promotion-enrolls-old-readers-before-changing-role
+    (call-with-promotion-reader-fixture
+     (lambda ()
+       (let* ((backend pg::*backend*)
+              (snapshot (pg::ensure-transaction-snapshot backend 1))
+              (old-id (pg::backend-virtual-reader-xid backend))
+              (abandoned (pg::make-backend :state :in-progress :read-only nil))
+              (idle (pg::make-backend :state :idle)))
+         (remhash old-id pg::*recovery-reader-xids*)
+         (setf (pg::backend-read-only backend) nil
+               (gethash 2 pg::*backend-registry*) idle
+               pg::*shutdown-abandoned-backends* (list abandoned backend))
+         (pg::physical-promotion-enroll-readers)
+         (ok (= old-id (pg::backend-virtual-reader-xid backend)))
+         (ok (gethash old-id pg::*recovery-reader-xids*))
+         (ok (eq snapshot (pg::backend-transaction-snapshot backend)))
+         (ok (pg::backend-read-only backend))
+         (ok (pg::backend-read-only abandoned))
+         (ok (minusp (pg::backend-virtual-reader-xid abandoned)))
+         (ok (/= old-id (pg::backend-virtual-reader-xid abandoned)))
+         (ok (null (pg::backend-virtual-reader-xid idle)))
+         (ok (= 2 (hash-table-count pg::*recovery-reader-xids*)))
+         (pg::reset-backend-transaction abandoned)))))
+
+(deftest promotion-enrolls-snapshot-only-readers-without-reusing-cached-identities
+    (call-with-promotion-reader-fixture
+     (lambda ()
+       (let* ((backend pg::*backend*)
+              (snapshot (pg::ensure-transaction-snapshot backend 1))
+              (old (pg::make-backend :state :in-progress :virtual-reader-xid -100)))
+         (pg::release-xid (pg::backend-virtual-reader-xid backend) backend)
+         (setf (gethash 2 pg::*backend-registry*) old)
+         (pg::physical-promotion-enroll-readers)
+         (ok (eq snapshot (pg::backend-transaction-snapshot backend)))
+         (ok (< (pg::backend-virtual-reader-xid backend) -100))
+         (ok (= -100 (pg::backend-virtual-reader-xid old)))
+         (ok (gethash -100 pg::*recovery-reader-xids*))
+         (pg::reset-backend-transaction old)))))
+
+(deftest promotion-reader-enrollment-rejects-unowned-or-invalid-resources
+    (dolist (kind '(:orphan :relation-reader :relation-writer :duplicate :real-xid :active-xid
+                    :idle-owner :invalid-id :snapshot-owner :snapshot-registration))
+      (call-with-promotion-reader-fixture
+       (lambda ()
+         (let ((backend pg::*backend*))
+           (case kind
+             (:orphan (setf (gethash -90 pg::*recovery-reader-xids*) t))
+             (:relation-reader (setf (gethash 900 pg::*relation-readers*) '(-90)))
+             (:relation-writer (setf (gethash 900 pg::*relation-writers*) '(-90)))
+             (:snapshot-owner
+              (setf (gethash (pg::make-snapshot-struct :xmin 3 :xmax 50)
+                             pg::*active-snapshot-set*) t
+                    pg::*active-snapshots* 1))
+             (:snapshot-registration
+              (pg::ensure-transaction-snapshot backend 1)
+              (setf (pg::snapshot-registration-active-p
+                     (pg::backend-transaction-snapshot-registration backend)) nil))
+             (:duplicate
+              (setf (pg::backend-virtual-reader-xid backend) -80
+                    (gethash 2 pg::*backend-registry*)
+                    (pg::make-backend :state :in-progress :virtual-reader-xid -80)))
+             (:real-xid (setf (pg::backend-xid backend) 42))
+             (:active-xid (setf pg::*active-xids* '(42)))
+             (:idle-owner
+              (setf (pg::backend-state backend) :idle
+                    (pg::backend-virtual-reader-xid backend) -80))
+             (:invalid-id (setf (pg::backend-virtual-reader-xid backend) 80)))
+           (unwind-protect
+                (ok (intake-fails-p #'pg::physical-promotion-enroll-readers)
+                    (format nil "~a" kind))
+             (when (eq kind :snapshot-registration)
+               (setf (pg::snapshot-registration-active-p
+                      (pg::backend-transaction-snapshot-registration backend)) t))
+             (setf (pg::backend-xid backend) nil
+                   (pg::backend-virtual-reader-xid backend) nil)))))))
+
+(deftest promotion-reader-enrollment-requires-owned-closed-admission
+    (ok (intake-fails-p #'pg::physical-promotion-enroll-readers)))
+
 (defun call-with-live-child-adoption ()
   (call-with-current-promotion-owner
    (lambda ()
