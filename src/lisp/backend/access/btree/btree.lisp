@@ -53,42 +53,100 @@
                                (btree-relation-lock-state-mutex state))
   (check-for-interrupts))
 
-(defun call-with-btree-relation-read-lock (relfilenode function)
-  (let* ((state (btree-relation-lock relfilenode))
-         (thread sb-thread:*current-thread*)
-         (writer-reentrant nil)
-         (registered nil))
-    (sb-thread:with-mutex ((btree-relation-lock-state-mutex state))
-      (when (eq (btree-relation-lock-state-writer-owner state) thread)
-        (setf writer-reentrant t))
-      (unless writer-reentrant
-        (loop while (or (btree-relation-lock-state-writer-owner state)
-                        (and (zerop (gethash thread
-                                             (btree-relation-lock-state-reader-owners
-                                              state)
-                                             0))
-                             (plusp
-                              (btree-relation-lock-state-waiting-writers state))))
-              do (btree-relation-condition-wait state))
-        (incf (btree-relation-lock-state-reader-count state))
-        (incf (gethash thread
-                       (btree-relation-lock-state-reader-owners state)
-                       0))
-        (setf registered t)))
+(defstruct btree-read-lease
+  lock-state thread (status :new) writer-reentrant-p)
+
+(defun btree-read-lease-active-p (lease)
+  (eq (btree-read-lease-status lease) :held))
+
+(defvar *btree-read-leases* nil)
+
+(defun call-with-btree-read-lease-lock (state function)
+  (let ((mutex (btree-relation-lock-state-mutex state)))
+    (sb-sys:without-interrupts
+      (sb-thread:grab-mutex mutex)
+      (unwind-protect
+           (sb-sys:allow-with-interrupts (funcall function))
+        (when (eq (sb-thread:mutex-owner mutex) sb-thread:*current-thread*)
+          (sb-thread:release-mutex mutex))))))
+
+(defun acquire-btree-read-lease (lease)
+  (unless (and (eq (btree-read-lease-thread lease) sb-thread:*current-thread*)
+               (eq (btree-read-lease-status lease) :new))
+    (error "B-tree read lease must be new and owned by this thread"))
+  (let ((state (btree-read-lease-lock-state lease))
+        (thread (btree-read-lease-thread lease)))
+    (call-with-btree-read-lease-lock
+     state
+     (lambda ()
+       (if (eq (btree-relation-lock-state-writer-owner state) thread)
+           (sb-sys:without-interrupts
+             (setf (btree-read-lease-writer-reentrant-p lease) t
+                   (btree-read-lease-status lease) :held))
+           (progn
+             (loop while (or (btree-relation-lock-state-writer-owner state)
+                             (and (zerop (gethash thread
+                                                  (btree-relation-lock-state-reader-owners state) 0))
+                                  (plusp (btree-relation-lock-state-waiting-writers state))))
+                   do (btree-relation-condition-wait state))
+             (sb-sys:without-interrupts
+               (let ((next-count (1+ (btree-relation-lock-state-reader-count state)))
+                     (next-depth (1+ (gethash thread
+                                              (btree-relation-lock-state-reader-owners state) 0))))
+                 (setf (gethash thread (btree-relation-lock-state-reader-owners state)) next-depth
+                       (btree-relation-lock-state-reader-count state) next-count
+                       (btree-read-lease-status lease) :held))))))))
+  lease)
+
+(defun release-btree-read-lease (lease)
+  (sb-sys:without-interrupts
+    (unless (eq (btree-read-lease-thread lease) sb-thread:*current-thread*)
+      (error "B-tree read lease belongs to another thread"))
+    (unless (btree-read-lease-active-p lease)
+      (setf (btree-read-lease-status lease) :released)
+      (return-from release-btree-read-lease nil))
+    (let ((state (btree-read-lease-lock-state lease))
+          (thread (btree-read-lease-thread lease))
+          (pending nil))
+      (loop
+        (handler-case
+            (return
+              (call-with-btree-read-lease-lock
+               state
+               (lambda ()
+                 (unless (btree-read-lease-writer-reentrant-p lease)
+                   (let ((depth (gethash thread (btree-relation-lock-state-reader-owners state) 0))
+                         (count (btree-relation-lock-state-reader-count state)))
+                     (unless (and (plusp depth) (plusp count))
+                       (error "B-tree read lease ownership mismatch"))
+                     (if (= depth 1)
+                         (remhash thread (btree-relation-lock-state-reader-owners state))
+                         (setf (gethash thread (btree-relation-lock-state-reader-owners state))
+                               (1- depth)))
+                     (setf (btree-relation-lock-state-reader-count state) (1- count))))
+                 (setf (btree-read-lease-status lease) :released)
+                 (when (zerop (btree-relation-lock-state-reader-count state))
+                   (sb-thread:condition-broadcast (btree-relation-lock-state-waitqueue state))))))
+          (sb-ext:timeout (condition) (setf pending condition))))
+      (when pending (error pending)))
+    t))
+
+(defun call-with-btree-relation-read-lease (relfilenode function)
+  (let ((lease (make-btree-read-lease :lock-state (btree-relation-lock relfilenode)
+                                      :thread sb-thread:*current-thread*)))
     (unwind-protect
-         (funcall function)
-      (when registered
-        (sb-thread:with-mutex ((btree-relation-lock-state-mutex state))
-          (decf (btree-relation-lock-state-reader-count state))
-          (let ((depth (gethash thread
-                                (btree-relation-lock-state-reader-owners state))))
-            (if (= depth 1)
-                (remhash thread (btree-relation-lock-state-reader-owners state))
-                (decf (gethash thread
-                               (btree-relation-lock-state-reader-owners state)))))
-          (when (zerop (btree-relation-lock-state-reader-count state))
-            (sb-thread:condition-broadcast
-             (btree-relation-lock-state-waitqueue state))))))))
+         (progn
+           (acquire-btree-read-lease lease)
+           (let ((*btree-read-leases* (cons lease *btree-read-leases*)))
+             (funcall function lease)))
+      (sb-sys:without-interrupts (release-btree-read-lease lease)))))
+
+(defun call-with-btree-relation-read-lock (relfilenode function)
+  (call-with-btree-relation-read-lease
+   relfilenode
+   (lambda (lease)
+     (declare (ignore lease))
+     (funcall function))))
 
 (defun call-with-btree-relation-write-lock (relfilenode function)
   (let* ((state (btree-relation-lock relfilenode))
