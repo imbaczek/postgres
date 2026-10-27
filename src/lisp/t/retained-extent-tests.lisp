@@ -179,3 +179,17 @@
               (pg::physical-store-update-digest #xCBF29CE484222325 bytes))
         (setf (second images) (pg::physical-retained-extent-encode metadata bytes)))
       (ok (signals (pg::physical-retained-wal-plan images identity history 32 120) 'error))))
+
+(deftest retained-extent-rejects-carrier-before-its-first-segment
+    (let* ((bytes (overlap-test-bytes 96))
+           (raw (legacy-checkpoint-record 96))
+           (data (concatenate '(vector (unsigned-byte 8)) bytes raw))
+           (metadata (list :version 1 :system-id 123 :base-timeline 1 :base 96 :manifest-digest 77
+                           :history-target 2 :history-digest 99 :history-text (store-history-text 1 pg::+wal-segment-size+)
+                           :start 96 :end 128 :start-digest #xCBF29CE484222325
+                           :end-digest (pg::physical-store-update-digest #xCBF29CE484222325 raw)
+                           :segment 0 :file-timeline 2
+                           :prefix-digest (pg::physical-store-update-digest #xCBF29CE484222325 data))))
+      (ok (intake-fails-p (lambda () (pg::physical-retained-extent-encode metadata data))))
+      (setf (getf metadata :file-timeline) 1)
+      (ok (pg::physical-retained-extent-encode metadata data))))

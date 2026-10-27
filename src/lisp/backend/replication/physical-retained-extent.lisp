@@ -71,8 +71,8 @@ The caller must validate their meaning."
                                           (getf metadata :history-text)))))
     (unless (and (timeline-prefix-boundary-p (getf metadata :base-timeline)
                                              (getf metadata :base) history)
-                 (find (getf metadata :file-timeline) history
-                       :key #'timeline-history-entry-timeline))
+                 (member (getf metadata :file-timeline)
+                         (timeline-segment-candidates (getf metadata :segment) history)))
       (error "retained WAL extent has foreign base or file timeline"))
     history))
 
