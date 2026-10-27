@@ -15,7 +15,8 @@
 
 (defun physical-store-retained-directory (store)
   "Return the directory for STORE's retained inventory objects."
-  (physical-store-path store "retained/"))
+  (or (physical-store-retained-directory-value store)
+      (physical-store-path store "retained/")))
 
 (defun physical-store-check-retained-coverage (store entries)
   "Require a contiguous digest chain from the base and fixed seed to the floor."
@@ -30,6 +31,51 @@
                  (= digest (physical-store-floor-digest store)))
       (error "receive floor differs from its retained inventory endpoint"))))
 
+(defvar *physical-store-retained-owners* (make-hash-table :test #'equal))
+
+(defun physical-store-retained-owner (store)
+  (let ((key (namestring (physical-retained-root-directory (physical-store-directory store)))))
+    (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+      (or (gethash key *physical-store-retained-owners*)
+          (setf (gethash key *physical-store-retained-owners*) (gensym "RECEIVE-CONTROL"))))))
+
+(defun physical-store-retained-history (store)
+  (let* ((selection (physical-store-selection store))
+         (target (physical-store-selected-timeline store))
+         (text (if selection (getf selection :history-text)
+                   (if (= target 1) "" (bytes->string (timeline-history-bytes target))))))
+    (values (timeline-check-lineage (timeline-parse-history target text)) target text)))
+
+(defun physical-store-control-tuple (store &key
+                                             (floor (physical-store-floor-lsn store))
+                                             (floor-digest (physical-store-floor-digest store))
+                                             (root (physical-store-retained-root store)))
+  (list (physical-store-system-id store) (physical-store-timeline store)
+        (physical-store-base-lsn store) (physical-store-flushed-lsn store)
+        (physical-store-flushed-digest store) floor floor-digest
+        (getf (physical-store-selection store) :target)
+        (getf (physical-store-selection store) :digest)
+        (getf (physical-store-retained-identity store) :manifest-digest) root))
+
+(defun physical-store-read-retained-control (store expected)
+  (let ((probe (%make-physical-store :directory (physical-store-directory store)
+                                     :system-id (physical-store-system-id store)
+                                     :timeline (physical-store-timeline store)
+                                     :retained-identity (physical-store-retained-identity store)
+                                     :retained-directory-value (physical-store-retained-directory store))))
+    (physical-store-load-control probe)
+    (unless (equal expected (physical-store-control-tuple probe))
+      (error "receive control readback differs from its complete expected tuple"))
+    (physical-store-retained-root probe)))
+
+(defun physical-store-restore-retained-reference (store)
+  (when (and (physical-store-retained-identity store)
+             (uiop:directory-exists-p (physical-store-retained-directory store)))
+    (physical-retained-root-reconcile
+     (physical-store-retained-owner store) (physical-store-retained-directory store)
+     (physical-store-retained-identity store) (physical-store-retained-history store)
+     (lambda () (physical-store-read-retained-control store (physical-store-control-tuple store))))))
+
 (defun physical-store-check-retained-root (store)
   "Validate the referenced inventory and every image against the selected history.
 
@@ -43,4 +89,5 @@ checks the reference; it does not restore deletion ownership or select a new roo
                    (physical-store-retained-directory store) (physical-store-retained-root store)
                    (physical-store-retained-identity store) history)))
       (physical-store-check-retained-coverage store (getf index :entries))))
+  (physical-store-restore-retained-reference store)
   t)

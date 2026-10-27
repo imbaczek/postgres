@@ -75,6 +75,9 @@ Install the returned state only after durable control publication."
     (setf (getf candidate :replay-timeline) replay-timeline)
     (setf *physical-recovery-state* (physical-recovery-write-control candidate 2 applied next-xid))))
 
+(defun physical-recovery-retained-directory ()
+  (merge-pathnames "pg_physical_retained/" *pgdata*))
+
 (defun physical-recovery-retained-identity (&optional (state *physical-recovery-state*))
   "Build the receive inventory identity from verified recovery base state."
   (list :system-id (getf state :system-id) :base-timeline (getf state :timeline)
@@ -87,7 +90,8 @@ Install the returned state only after durable control publication."
     (physical-store-open directory (getf *physical-recovery-state* :system-id)
                          (getf *physical-recovery-state* :timeline)
                          :create create :start-lsn (getf *physical-recovery-state* :end)
-                         :retained-identity (physical-recovery-retained-identity))))
+                         :retained-identity (physical-recovery-retained-identity)
+                         :retained-directory (physical-recovery-retained-directory))))
 
 (defun physical-recovery-open-clog-redo ()
   ;; Open once when streaming starts. Keep the old stream if opening fails.

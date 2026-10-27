@@ -114,6 +114,7 @@
                    (:file "../replication/physical-retained-inventory")
                    (:file "../replication/physical-retained-roots")
                    (:file "../replication/physical-store-retained")
+                   (:file "../replication/physical-retained-seal")
                    (:file "../replication/physical-restartpoint")
                    (:file "../replication/protocol")
                    (:file "../replication/physical-stream")

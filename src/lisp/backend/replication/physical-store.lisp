@@ -14,7 +14,7 @@ from independently verified base provenance."
   directory system-id timeline base-lsn floor-lsn (floor-digest #xCBF29CE484222325)
   written-lsn flushed-lsn decoder
   (written-digest #xCBF29CE484222325) (flushed-digest #xCBF29CE484222325)
-  lock-stream stream segment segment-timeline selection retained-identity retained-root
+  lock-stream stream segment segment-timeline selection retained-identity retained-root retained-directory-value
   (failed-p nil) (closed-p nil)
   (mutex (sb-thread:make-mutex :name "physical WAL receive store")))
 
@@ -292,31 +292,37 @@ external modification."
     (fsync-directory (physical-store-directory store))))
 
 (defun physical-store-compact (store cursor publish-restartpoint)
-  "Publish a durable data restartpoint before moving the receive floor.
-PUBLISH-RESTARTPOINT runs under the store mutex with the validated cumulative
-checksum at CURSOR. It must durably publish database state before returning.
-Do not call from a mapper callback. Preserve unflushed writes and decoder state.
-A rooted store rejects floor advancement before the callback until a sealed
-replacement inventory can be published."
   (with-physical-store (store)
-    (when (and (physical-store-retained-root store)
-               (> cursor (physical-store-floor-lsn store)))
-      (error "receive compaction requires a sealed replacement inventory"))
-    (let ((digest (physical-store-prefix-digest-under-lock store cursor)))
-      (funcall publish-restartpoint digest)
-      (physical-store-test-point :after-restartpoint-publication store)
-      (physical-store-save-control store (physical-store-flushed-lsn store)
-                                   :digest (physical-store-flushed-digest store)
-                                   :floor-lsn cursor :floor-digest digest)
-      (setf (physical-store-floor-lsn store) cursor
-            (physical-store-floor-digest store) digest)
-      (physical-store-test-point :after-floor-publication store)
-      (dolist (file (physical-store-history-segment-entries store))
-        (when (< (second file) (floor cursor +wal-segment-size+))
-          (delete-file (third file))))
-      (physical-store-test-point :after-obsolete-segment-delete store)
-      (fsync-directory (physical-store-directory store))
-      cursor)))
+    (let ((finished nil))
+      (unwind-protect
+           (let ((digest (physical-store-prefix-digest-under-lock store cursor)))
+             (if (and (physical-store-retained-identity store)
+                      (> cursor (physical-store-floor-lsn store)))
+                 (physical-store-seal-and-select store cursor digest publish-restartpoint)
+                 (progn
+                   (when (and (physical-store-retained-root store)
+                              (> cursor (physical-store-floor-lsn store)))
+                     (error "receive compaction requires verified retained identity"))
+                   (funcall publish-restartpoint digest)
+                   (physical-store-test-point :after-restartpoint-publication store)
+                   (physical-store-save-control store (physical-store-flushed-lsn store)
+                                                :digest (physical-store-flushed-digest store)
+                                                :floor-lsn cursor :floor-digest digest)
+                   (sb-sys:without-interrupts
+                     (setf (physical-store-floor-lsn store) cursor
+                           (physical-store-floor-digest store) digest))))
+             (physical-store-test-point :after-floor-publication store)
+             (dolist (file (physical-store-history-segment-entries store))
+               (when (< (second file) (floor cursor +wal-segment-size+))
+                 (delete-file (third file))
+                 (physical-store-test-point :after-obsolete-segment-delete-each store)))
+             (physical-store-test-point :after-obsolete-segment-delete store)
+             (fsync-directory (physical-store-directory store))
+             (setf finished t)
+             cursor)
+        (sb-sys:without-interrupts
+          (physical-store-test-point :before-compaction-cleanup store)
+          (unless finished (setf (physical-store-failed-p store) t)))))))
 
 (defun physical-store-close (store)
   "Release local ownership without converting unacknowledged writes into flush progress."
@@ -346,7 +352,7 @@ replacement inventory can be published."
            stream)
       (unless stream (sb-posix:close fd)))))
 
-(defun physical-store-open (directory system-id timeline &key create (start-lsn 0) (discard-tail t) (create-lock t) retained-identity)
+(defun physical-store-open (directory system-id timeline &key create (start-lsn 0) (discard-tail t) (create-lock t) retained-identity retained-directory)
   "Own a native receive spool, creating only in an existing empty directory.
 CREATE never overwrites an old incarnation. Opening an existing spool validates
 its control, selected history, durable prefix and referenced inventory before
@@ -365,7 +371,7 @@ or creating a missing lock. Do not resume input in that mode."
   (let ((store (%make-physical-store :directory directory :system-id system-id
                                      :timeline timeline :base-lsn start-lsn :floor-lsn start-lsn
                                      :written-lsn start-lsn :flushed-lsn start-lsn
-                                     :retained-identity retained-identity))
+                                     :retained-identity retained-identity :retained-directory-value retained-directory))
         (success nil))
     (unwind-protect
          (progn

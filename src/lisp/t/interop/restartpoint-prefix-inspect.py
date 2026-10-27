@@ -72,7 +72,8 @@ def main(target, source):
 
 
 def storage_snapshot(root):
-    directories = {"base", "global", "pg_wal", "pg_physical_receive", "pg_physical_restartpoints"}
+    directories = {"base", "global", "pg_wal", "pg_physical_receive",
+                   "pg_physical_restartpoints", "pg_physical_retained"}
     names = {"PG_VERSION", "pg_xact", "physical-backup.manifest", "physical-recovery.control",
              "physical-restartpoint.control", "recovery.required"}
     result = {}
@@ -242,8 +243,10 @@ def damage_resume(target, change):
         data = generation_path.read_bytes()
         length = struct.unpack_from("<I", data, 8)[0]
         text = data[32:32 + length]
-        assert text.count(b":COMPLETE T") == 1
-        text = text.replace(b":COMPLETE T", b":COMPLETE NIL")
+        text, count = re.subn(
+            rb"(:SOURCE-RESERVATION\s+\([^()]*:COMPLETE\s+)T(?=[\s)])",
+            rb"\g<1>NIL", text, flags=re.I)
+        assert count == 1, "missing or ambiguous complete source allocation proof"
         image = bytearray(data[:32] + text + data[32 + length:])
         struct.pack_into("<I", image, 8, len(text))
         struct.pack_into("<I", image, 24, 0)
@@ -266,7 +269,9 @@ def damage_resume(target, change):
     elif change == "backlog":
         path = root / "pg_physical_receive" / "receive.control"
         receive = bytearray(path.read_bytes())
-        assert len(receive) == 68
+        assert len(receive) in (68, 96)
+        if len(receive) == 96:
+            assert struct.unpack_from("<I", receive, 64)[0] == 0
         flush = struct.unpack_from("<Q", receive, 32)[0]
         assert flush == fork and flush % (16 * 1024 * 1024) + 64 <= 16 * 1024 * 1024
         records = []
@@ -285,8 +290,9 @@ def damage_resume(target, change):
         segment_path.write_bytes(prefix + batch)
         struct.pack_into("<Q", receive, 32, flush + 64)
         struct.pack_into("<Q", receive, 40, value)
-        struct.pack_into("<I", receive, 64, 0)
-        struct.pack_into("<I", receive, 64, zlib.crc32(receive))
+        crc_offset = len(receive) - 4
+        struct.pack_into("<I", receive, crc_offset, 0)
+        struct.pack_into("<I", receive, crc_offset, zlib.crc32(receive))
         path.write_bytes(receive)
     elif change == "lock":
         (root / "pg_physical_receive" / "receive.lock").unlink()

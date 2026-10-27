@@ -145,6 +145,31 @@ start_target
 compare
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 5
 checked target '(assert (= 1 (count "native standby restartpoints" (sb-thread:list-all-threads) :test (function string=) :key (function sb-thread:thread-name))))' restarted-worker
+# Crash after selecting a newer restartpoint while receive control still names
+# the old floor/root, then run actual startup recovery and another compaction.
+sql "$TARGET_PORT" 'CHECKPOINT'
+checked target "(with-open-file (stream \"$TMP/old-floor\" :direction :output :if-exists :supersede) (format stream \"~d~%\" (physical-store-floor-lsn *physical-receive-store*)))" save-old-floor
+read -r old_floor <"$TMP/old-floor"
+checked target "(setf *physical-restartpoint-wal-bytes* 1 *physical-restartpoint-test-hook* (lambda (point) (when (eq point :after-pointer) (wal-atomic-write-bytes (pathname \"$TMP/pointer.marker\") (string->bytes (format nil \"~d~%\" (sb-posix:getpid)))) (loop repeat 300 do (sleep 0.1)) (error \"pointer crash was not delivered\"))))" pointer-hook
+sql "$PORT" 'INSERT INTO data VALUES (7)'
+ship
+attempt=0
+while [ ! -f "$TMP/pointer.marker" ]; do
+    kill -0 "$TARGET" 2>/dev/null || exit 1
+    attempt=$((attempt + 1)); test "$attempt" -lt 100; sleep 0.1
+done
+read -r marked_pid <"$TMP/pointer.marker"
+test "$marked_pid" = "$TARGET"
+kill -KILL "$TARGET"
+wait "$TARGET" 2>/dev/null || :
+TARGET=
+start_target
+compare
+test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 6
+checked target "(assert (= $old_floor (physical-store-floor-lsn *physical-receive-store*)))" pointer-old-floor
+sql "$TARGET_PORT" 'CHECKPOINT'
+stable=$(sql "$TARGET_PORT" 'SELECT pg_last_wal_replay_lsn()')
+wait_floor "$stable"
 python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" "$TMP/copy" "$TMP/source"
 # A CRC-valid incomplete promotion must fail before redo or a control rewrite.
 kill -INT "$TARGET"

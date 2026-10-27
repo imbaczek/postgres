@@ -546,7 +546,7 @@
          (pg::wal-atomic-write-bytes control bytes)
          (ok (signals (pg::physical-store-open root 123 1 :retained-identity identity) 'error))))))
 
-(deftest rooted-receive-compaction-cannot-advance-without-a-replacement
+(deftest rooted-receive-compaction-selects-a-covering-replacement
     (call-with-receive-retained-fixture
      (lambda (root identity id image-id prefix)
        (declare (ignore image-id prefix))
@@ -556,19 +556,20 @@
               (progn
                 (pg::physical-store-input store 96 (sample-physical-record 96))
                 (pg::physical-store-flush store)
-                (ok (signals (pg::physical-store-compact store 128
-                                                         (lambda (digest)
-                                                           (declare (ignore digest))
-                                                           (incf publications)))
-                             'error))
-                (ok (zerop publications))
-                (ok (= 96 (pg::physical-store-floor-lsn store))))
+                (pg::physical-store-compact store 128
+                                            (lambda (digest)
+                                              (declare (ignore digest))
+                                              (ok (= 96 (pg::physical-store-floor-lsn store)))
+                                              (incf publications)))
+                (ok (= 1 publications))
+                (ok (= 128 (pg::physical-store-floor-lsn store)))
+                (ng (eql id (pg::physical-store-retained-root store))))
            (pg::physical-store-close store)))
        (let ((store (pg::physical-store-open root 123 1 :retained-identity identity)))
          (unwind-protect
               (progn
-                (ok (= id (pg::physical-store-retained-root store)))
-                (ok (= 96 (pg::physical-store-floor-lsn store)))
+                (ok (typep (pg::physical-store-retained-root store) '(unsigned-byte 64)))
+                (ok (= 128 (pg::physical-store-floor-lsn store)))
                 (ok (= 128 (pg::physical-store-flushed-lsn store))))
            (pg::physical-store-close store))))))
 
@@ -582,6 +583,8 @@
                 (spool (pg::physical-recovery-spool-directory))
                 (tail (concatenate '(vector (unsigned-byte 8)) prefix (sample-physical-record 96))))
            (sb-posix:rename (namestring root) (namestring spool))
+           (sb-posix:rename (namestring (merge-pathnames "retained/" spool))
+                            (namestring (pg::physical-recovery-retained-directory)))
            (pg::wal-atomic-write-bytes (merge-pathnames "0000000000000000.wal" spool) tail)
            (let ((store (pg::physical-promotion-open-pending-store pg::*physical-recovery-state*)))
              (unwind-protect

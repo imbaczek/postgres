@@ -73,7 +73,8 @@
   (let* ((directory (physical-recovery-spool-directory))
          (probe (%make-physical-store :directory directory :system-id (getf state :system-id)
                                       :timeline (getf state :timeline)
-                                      :retained-identity (physical-recovery-retained-identity state))))
+                                      :retained-identity (physical-recovery-retained-identity state)
+                                      :retained-directory-value (physical-recovery-retained-directory))))
     (wal-namespace-file-stat (physical-store-path probe "receive.control"))
     (wal-namespace-file-stat (physical-store-path probe "receive.lock"))
     (physical-store-load-control probe)
@@ -90,7 +91,8 @@
                   unless (or stat (= segment first)) do (error "missing acknowledged pending segment")))))
     (physical-store-open directory (getf state :system-id) (getf state :timeline)
                          :discard-tail nil :create-lock nil
-                         :retained-identity (physical-recovery-retained-identity state))))
+                         :retained-identity (physical-recovery-retained-identity state)
+                         :retained-directory (physical-recovery-retained-directory))))
 
 (defun physical-promotion-validate-cold-state (state metadata prefix generation store &optional (artifact-checker #'physical-promotion-wal-plan))
   "Use the live publisher's proof checker without installing candidate globals."

@@ -43,6 +43,7 @@
                (:file "t/index-scan-detachment-tests")
                (:file "t/executor-resource-tests")
                (:file "t/physical-prefix-tests")
+               (:file "t/physical-seal-tests")
                (:file "t/promotion-intent-tests")
                (:file "t/promotion-wal-tests")
                (:file "t/promotion-resume-tests")
