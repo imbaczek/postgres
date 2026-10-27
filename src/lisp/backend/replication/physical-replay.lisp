@@ -69,6 +69,8 @@ can be ahead after a crash and never grants a missing-file exemption."
 (defun physical-recovery-save-progress (applied next-xid
                                         &key (replay-timeline (getf *physical-recovery-state* :replay-timeline
                                                                     (getf *physical-recovery-state* :timeline))))
+  "Persist the applied position and its replay timeline together.
+Install the returned state only after durable control publication."
   (let ((candidate (copy-list *physical-recovery-state*)))
     (setf (getf candidate :replay-timeline) replay-timeline)
     (setf *physical-recovery-state* (physical-recovery-write-control candidate 2 applied next-xid))))
@@ -186,7 +188,9 @@ Direct control operation; does not promote, follow a network source or coordinat
     (list :version 1 :through end :bound bound :complete complete)))
 
 (defun physical-source-reservation-next (prior record observed-next)
-  "Track source capacity separately from reader visibility; no promotion authority."
+  "Track source capacity separately from reader visibility; no promotion authority.
+EOR keeps the proven bound but clears completeness. A child checkpoint must
+restore proof before promotion; observed next XID must stay within that bound."
   (when (and prior (not (physical-source-reservation-valid-p prior)))
     (error "invalid source allocation frontier"))
   (when (and prior (> (getf prior :through) (wal-record-start record)))
@@ -223,6 +227,8 @@ Direct control operation; does not promote, follow a network source or coordinat
 ;;; This result is not published until its batch reaches an applied terminal.
 
 (defun physical-source-xids-next (prior record observed-next)
+  "Track prospective source membership independently of existing reader snapshots.
+EOR clears this proof. A later running-transaction anchor can establish it again."
   (when prior
     (running-xacts-check-state prior)
     (when (> (getf prior :through) (wal-record-start record))
@@ -272,6 +278,9 @@ all post-base storage, including empty tables, from retained catalog/page WAL."
 ;;; Copy membership so the prospective replay state remains independently owned.
 
 (defun physical-replay-publish-progress (record next-xid reservation source-xids &key replay-timeline)
+  "Make redo durable before publishing the applied terminal and visibility state.
+Source allocation capacity stays separate from the observed next XID.
+Updating source membership does not change existing snapshots."
   ;; Make redo durable before recording the applied terminal and visibility.
   (smgr-fsync-all)
   (clog-fsync)

@@ -230,7 +230,8 @@
           '("slot_name" "consistent_point" "snapshot_name" "output_plugin")))
 
 (defun identify-replication-system (stream)
-  "Return C IdentifySystem's four columns using our durable cluster identity."
+  "Return system identity and a WAL position paired with its timeline.
+On a standby, receipt ahead of replay is reported only on the replay timeline."
   (send-row-description
    stream (list (make-result-column :name "systemid" :type-oid +textoid+ :typlen -1)
                 (make-result-column :name "timeline" :type-oid +int8oid+ :typlen 8)

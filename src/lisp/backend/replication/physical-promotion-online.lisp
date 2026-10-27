@@ -50,9 +50,8 @@ An unsafe complete batch defers promotion; an unfinished tail does not."
 
 (defun physical-promotion-try-online ()
   "Attempt promotion under reload exclusion and closed admission.
-
-Enroll readers before replay.  Return :DEFERRED if a complete batch cannot
-pass them; otherwise save the fork, publish intent and complete the child."
+Recheck child initialization after worker joins and before enrolling readers.
+An unsafe complete batch defers the attempt; otherwise publish the child."
   (sb-thread:with-mutex (*reload-run-lock*)
     (with-live-operation-quiescence
       (physical-promotion-check-online)
@@ -72,7 +71,9 @@ pass them; otherwise save the fork, publish intent and complete the child."
                  (setf *physical-promotion-stopping-p* nil)))))))))
 
 (defun physical-promotion-awaiting-child-initialization-p ()
-  "Check the validated durable suffix before stopping receive and replay workers."
+  "Scan the durable suffix without applying it to check child initialization.
+Validate allocation transitions too. Promotion waits for a complete child
+checkpoint before stopping workers and rechecks after their final flush."
   (let* ((*physical-recovery-state* (copy-list *physical-recovery-state*))
          (store *physical-receive-store*)
          (timeline (physical-recovery-replay-timeline))
@@ -103,7 +104,9 @@ pass them; otherwise save the fork, publish intent and complete the child."
                        :timeline (getf *physical-recovery-state* :timeline)))))
 
 (defun physical-promotion-resume-recovery-workers (config paused restartpoint)
-  "Undo a pre-intent worker stop after finding newly received child EOR."
+  "Restore prior workers after a healthy pre-intent wait for child initialization.
+Restore pause state before clearing stopping under restartpoint-start, then
+pause lock. Acknowledged pause commands cannot be overwritten by this restore."
   (with-live-operation
     (physical-promotion-check-online)
     (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
@@ -268,7 +271,9 @@ writer admission. Cold startup also uses it to discard stale requests."
       t)))
 
 (defun physical-promotion-worker-step ()
-  "Keep an accepted request until child initialization is durable, then promote."
+  "Keep an accepted request pending while child initialization is incomplete.
+If the wait is discovered after workers stop, restore them and republish the request.
+A SQL timeout does not withdraw the accepted request."
   (when *physical-promotion-requested-p*
     (setf *physical-promotion-requested-p* nil)
     (handler-case

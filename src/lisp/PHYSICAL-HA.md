@@ -8,8 +8,9 @@ advancing source retention, explicit/automatic local restartpoints, PGDATA/PID
 ownership, a startup/reload configuration subset, client application-name settings
 and online promotion are implemented. Fresh backups from a promoted child can follow
 that same timeline. Pinned Patroni's full promotion method passes through native
-pg_ctl and pg_controldata, including its production-state wait. Existing ancestor
-spool fork crossing and rejoin, complete physical-slot interfaces, synchronous
+pg_ctl and pg_controldata, including its production-state wait. Locally selected
+ancestor-spool fork replay and later promotion now pass manual crash tests.
+Network fork following and rejoin, complete physical-slot interfaces, synchronous
 durability and remaining Patroni interfaces are unfinished. C physical WAL/disk
 compatibility remains future work. Coordination is excluded. The repository's
 original C source is the behavior oracle.
@@ -58,8 +59,9 @@ switchovers and both logical directions passed in the
 code and refactoring. Timeline definitions now load before bootstrap, fixing a
 forward structure-accessor issue hidden by a warm image.
 
-Switching an existing ancestor spool across a fork remains separate work and is
-still rejected. Rejoin and offline reseeding, full physical slots, synchronous
+Network following of an existing ancestor spool across a fork remains separate
+work and is still rejected. Local selected-history replay is described below.
+Rejoin and offline reseeding, full physical slots, synchronous
 durability and remaining Patroni interfaces are also open. C rewind and C
 physical WAL/disk compatibility remain staged; coordination is excluded.
 
@@ -116,9 +118,85 @@ bounds and a test cleanup gap; regressions and fixes passed recheck. Luna max an
 Sol high cleared the code, and Sol medium found no useful refactor. Production
 functions stay below 120 lines. Terra 6.1 drafted the source documentation and
 the primary reviewed it separately, distinguishing retained-byte checks from
-proof kept after compaction. Source onboarding, durable replay timeline and
-EOR redo, recovery/restartpoint integration and later promotion from the replayed
-child remain the next work. Operational sibling follow is not yet implemented.
+proof kept after compaction. The replay checkpoint below integrates that
+storage with recovery and subsequent local promotion. Operational sibling
+follow still needs source onboarding and historical network streaming.
+
+### Selected-history replay and recovery
+
+An existing ancestor spool can now replay a locally selected child history.
+The immutable backup timeline, applied timeline and selected target remain
+separate. Ordinary recovery control and pending promotion control bind the
+minimum recovery LSN to its timeline and reference the selected history.
+Old control images remain readable; the new ordinary and pending extensions
+are distinguished by their magic and length, without a protocol version bump.
+
+Receipt alone does not change the replay timeline. EOR replay validates the
+selected transition, publishes history and durable recovery progress, then
+advances the applied timeline. Recovery stays read-only and the immutable
+base WAL controls stay unchanged. EOR invalidates prospective source membership
+and allocation completeness. A valid child initialization checkpoint restores
+allocation proof; it does not invent running-transaction membership or change
+existing reader snapshots.
+
+Restartpoints retain the replay timeline and selected-history reference.
+Startup handles both a generation ahead of ordinary progress control and an
+older generation below a newer required recovery pair. Promotion uses the
+actual applied parent for history, EOR, checkpoint and prefix installation,
+even when the original backup belongs to an ancestor.
+
+An EOR-only standby waits for child initialization before promotion stops its
+workers. A second check after joining workers catches receipt during shutdown
+and resumes the previous workers and pause state. Pause capture, restoration
+and promotion gating share the pause mutex. An accepted SQL request remains
+pending through this wait and through a SQL timeout in the owning process;
+later initialization completes that same request. Other transition failures
+still fence recovery. Waiting for this native allocation proof is a native
+safety restriction, not a claim that C requires pg-lisp's checkpoint format.
+
+`IDENTIFY_SYSTEM` pairs its LSN with the replay timeline and exposes receipt
+ahead only on that same timeline, following C's `GetStandbyFlushRecPtr`.
+Receiver `received_tli` comes from durable receipt ownership. An inactive
+receiver still reports no active receiver state.
+
+`t/selected-replay.sh` is a manual three-peer acceptance experiment. It compares
+the new source's copied parent prefix with the sibling's retained prefix,
+selects the exact history and EOR through the private control socket, and
+injects actual source WAL records. This trusted local selector requires the
+caller to establish remote identity, common prefix and retention first.
+It does not implement network source admission or automatic following.
+The exported WAL bundle stays local for this experiment; it does not establish
+a sibling retention pin on the new source.
+
+The experiment passed EOR-only and child-restartpoint SIGKILL recovery,
+promotion from original base 1 through applied child 2 to writer 3, retained
+repeatable-read readers, and primary crash recovery with further writes.
+Crash cuts after promotion intent and committed child control passed; the
+committed case also restarted without retired spool, generations or manifest.
+The SQL-wait variant completed the same accepted request after its timeout.
+A forced receipt-during-worker-stop case and contested pause/resume mutex
+checks passed. Wire-level identity checks cover received EOR, applied EOR
+and the initialized child.
+
+Evidence is in `/tmp/pg-selected-replay-telemetry4.log`,
+`/tmp/pg-selected-replay-pause-race.log`,
+`/tmp/pg-selected-replay-pending-final.log` and
+`/tmp/pg-selected-replay-committed-final.log`.
+Validation passed 556 physical tests, 170 interop tests and 1,598 legacy checks.
+The selected-control property passed 200 trials at seed 42; no FunctionSpec
+is registered, and input coverage and rejection counts are unmeasured.
+Native SQL promotion faults, continuous follow, child bootstrap, all three
+manual logical switchovers and both C/Lisp logical directions passed in the
+`/tmp/pg-selected-replay-preserve-*.log` files. SIGKILL evidence covers process
+death, not power loss.
+
+The next C compatibility step is network onboarding of an existing sibling:
+verify remote lineage and the common prefix, establish a source retention pin,
+negotiate historical streaming and resume this existing spool. Divergent-history
+rejection and explicit rebuild/reseed must accompany rejoin. Full physical
+slots, synchronous replication durability and remaining Patroni interfaces
+remain open. C rewind and C physical WAL/disk compatibility remain staged.
+Coordination is excluded.
 
 ### Existing sibling follow intake
 
@@ -148,13 +226,12 @@ and `/tmp/pg-operation-parking.pAsykp/divergent-boundaries`. Future acceptance
 must distinguish this case from the eligible sibling: checking only applied WAL
 would miss divergence in durable received WAL.
 
-Implementation needs separate immutable base provenance, selected receive
-history and replay timeline. The current receive control, restartpoints, prefix
-proofs and promotion parent all use the base timeline. Both receive storage and
-ordinary replay reject EOR records deliberately. Relaxing the receiver identity
-comparison alone cannot implement the transition. Selected history must be bound
-to durable receive progress; replay must validate EOR at the fork; cold startup,
-restartpoint compaction and later promotion must reconstruct the same lineage.
+The local primitives now separate immutable base provenance, selected receive
+history and replay timeline. Receive control binds selected history to durable
+progress; replay validates EOR at the fork; cold startup, restartpoints and
+later promotion reconstruct that lineage. The network receiver still rejects a
+different source timeline. Relaxing its identity comparison alone cannot provide
+the missing source admission and retention guarantees.
 The new source also needs a retained, independently checked resume anchor:
 creating a pin at its current checkpoint cannot recover a sibling's older base.
 A fully received parent prefix may use an independently verified fork anchor for

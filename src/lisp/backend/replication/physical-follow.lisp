@@ -378,6 +378,10 @@ Include the verified base manifest digest when it is available."
     (physical-follow-quiesce-runtime)))
 
 (defun physical-recovery-select-history (target history-text eor-bytes)
+  "Select receive history under follow-command, reload and quiescence exclusion.
+Follow must already be stopped. The caller must independently verify remote
+system identity, exact prefix and retention before invoking this private control.
+A failure after selection work begins fences recovery; this does not admit a network source."
   (when (plusp *live-operation-depth*) (error "history selection requires its own operation admission"))
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (check-physical-recovery-worker-start)

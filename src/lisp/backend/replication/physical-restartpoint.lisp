@@ -91,6 +91,8 @@
   (values))
 
 (defun physical-restartpoint-history-fields-valid-p (metadata)
+  "Check the optional selected-history reference and replay timeline in metadata.
+Older metadata without these fields uses the base timeline."
   (let* ((base (getf metadata :timeline)) (target (getf metadata :history-target))
                                           (digest (getf metadata :history-digest))
                                           (replay (getf metadata :replay-timeline base))

@@ -18,6 +18,8 @@
   (merge-pathnames "physical-recovery.control" directory))
 
 (defun physical-recovery-selection-fields-valid-p (phase version base applied target digest)
+  "Check selected-history fields without conflating base, applied and target timelines.
+An absent selection requires the applied timeline to remain the base timeline."
   (if (or target digest)
       (and (member phase '(2 3)) (member version '(3 4))
            (typep target '(integer 1 4294967295)) (> target base)
@@ -105,6 +107,9 @@
       bytes)))
 
 (defun physical-recovery-decode-control (bytes)
+  "Decode recovery control by its magic and length.
+The old pending and selected ordinary images are both 88 bytes; their magic
+separates them. Selected pending control uses 104 bytes."
   (unless (member (length bytes) '(60 72 88 104))
     (error "invalid physical recovery control length"))
   (let* ((size (length bytes)) (magic (subseq bytes 0 8))
@@ -182,6 +187,9 @@
       (write-sequence bytes stream))))
 
 (defun physical-recovery-control-frontier (state applied)
+  "Choose the durable minimum recovery position and its timeline as a pair.
+Keep the required pair while replay is behind. Reject a replay timeline that
+disagrees at the required boundary."
   (let* ((base (getf state :timeline))
          (runtime (getf state :replay-timeline base))
          (required (getf state :required-applied))
