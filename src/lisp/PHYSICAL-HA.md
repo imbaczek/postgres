@@ -527,20 +527,18 @@ Sol and Astra design reviews identified three remaining implementation steps:
    quiescence owner to release exclusion. Reload must back off outside its mutex and
    admission gate while parked owners remain. Snapshot auditing must cover the exact
    union of retained transaction and parked statement registrations.
-2. Make suspended scans safe. B-tree callbacks currently retain shared leases, and
-   unfinished cursors cannot safely span replay or splits. Before parking, detach each
-   enclosing scan's unread TIDs into an ordered, bounded or spillable private spool.
-   Do not evaluate qualification, projection or volatile expressions while detaching.
-   Release each lease exactly once. Preserve ordinary LIMIT laziness when no parking
-   occurs, and audit heap, join and aggregate callbacks for the same safety boundary.
+2. Make suspended scans safe. SELECT index scans now detach unread TIDs into a
+   private spillable spool before releasing their leases. They preserve ordinary
+   LIMIT laziness when no parking occurs. Heap, join, aggregate, spill and output
+   callbacks still need an audit at the same safety boundary.
 3. Add SQL `pg_promote` through ordinary inline function evaluation, with its C
    signature, defaults, strict NULL behavior and named arguments. Do not replay the
    query or special-case a top-level SELECT. C normalizes named arguments into
    parameter order; it does not promise textual argument evaluation order.
 
-The parking foundation is now complete, as described below. Scan detachment and
-SQL `pg_promote` binding remain open; the broader HA goal and coordination exclusion
-are unchanged.
+The parking foundation and SELECT index detachment are now complete, as described
+below. The remaining callback resource audit and SQL `pg_promote` binding are open;
+the broader HA goal and coordination exclusion are unchanged.
 
 ### Admission parking and reload backoff
 
@@ -563,8 +561,8 @@ passed, as did fresh strict compilation. Luna and Sol code reviews and Astra's
 shutdown review cleared the change; Sol's refactoring review found no need for a new
 abstraction.
 
-Next, detach unread scan TIDs into a bounded or spillable spool and audit callback
-resources before adding C-compatible SQL `pg_promote`. The startup backend has an
+Next, audit remaining callback resources before adding C-compatible SQL
+`pg_promote`. The startup backend has an
 `application_name` slot, but `current_setting('application_name')` failed in the
 native test. Implement normal GUC support before sharing the SQL oracle, rather than
 substituting a custom setting. The full HA goal remains open; coordination remains
@@ -575,8 +573,9 @@ outside this work.
 B-tree read locks now use explicit thread-owned lease tokens. A scoped lease can
 be released early, and cleanup releases it once even when acquisition or the body
 is interrupted. Writer-reentrant leases do not add reader counts. The coarse lease
-still protects traversal because this tree has no sibling links; it does not yet
-make suspended index callbacks safe across replay or splits.
+still protects traversal because this tree has no sibling links. The lease alone
+does not make suspended index callbacks safe across replay or splits; SELECT
+detachment supplies that boundary below.
 
 Twelve focused tests cover ownership, nesting, writer handoff, deadlines and FATAL
 interrupts. Review found a repeated-FATAL gap at cleanup entry; it was fixed and
@@ -585,9 +584,28 @@ tests and 1,598 legacy checks, native index-scan, index-lock-contention and shut
 regressions, and fresh strict compilation. Luna and Sol code reviews cleared the
 change; Sol's refactoring review found no new abstraction needed.
 
-Unread TID detachment and a bounded or spillable spool remain to be implemented.
-Heap, join, aggregate and output callbacks also need a resource audit before SQL
+SELECT index detachment is now implemented as described below. Heap, join,
+aggregate, spill and output callbacks still need a resource audit before SQL
 `pg_promote` binding. The broader HA goal remains open.
+
+### SELECT index detachment
+
+Before parking, each owned SELECT index cursor copies its unread TIDs to a private
+spool and releases its lease. Nonempty tails spill to query temporary files under
+the existing quota; empty tails need no file. Detachment performs no heap fetch,
+qualification, projection or volatile evaluation. An immutable sorted index domain
+preserves lock order across nested plans; a later cursor restores coverage after
+parking. Normal scans retain lazy stopping when no park occurs. PostgreSQL C copies
+page TIDs and uses sibling links; the Lisp tree has no sibling links, so it spools
+the full unread tail.
+
+Validation passed 448 physical tests, 170 interop tests and 1,598 legacy checks.
+Twenty-eight focused Rove tests and a 200-trial cursor-clone property passed. Native
+coverage includes index parking, replay, promotion, splits, repeatable-read views,
+exact effects and HUP, along with ordinary index and join regressions. Fresh strict
+compilation passed. Luna, Sol and Astra reviews and Sol's refactoring review are
+complete. Heap, join, aggregate, spill and output resource audits and SQL promotion
+binding remain open; no coordination is added.
 
 ### Timeline-qualified native WAL namespace
 

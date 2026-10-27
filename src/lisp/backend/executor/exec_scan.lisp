@@ -872,14 +872,17 @@ registration-to-DDL handoff free of a lock-order inversion."
             (encode-index-key (list value) types))))))
 
 (defstruct select-index-scan
+  "A scoped cursor and lease, or a sealed spool of its unread TIDs."
   cursor lease spool)
 
 (defvar *select-index-scans* nil)
 
 (defstruct select-index-lease-domain
+  "The fixed, sorted index nodes available to a query and its nested plans."
   nodes)
 
 (defstruct select-index-lease-group
+  "Scoped leases for a domain, paired with their nodes in descending order."
   domain leases)
 
 (defvar *select-index-lease-domain* nil)
@@ -887,11 +890,13 @@ registration-to-DDL handoff free of a lock-order inversion."
 (defvar *select-index-lease-groups* nil)
 
 (defun select-index-lease-owner-count (lease)
+  "Count supported scan and group owners of LEASE."
   (+ (count lease *select-index-scans* :key #'select-index-scan-lease :test #'eq)
      (loop for group in *select-index-lease-groups*
            sum (count lease (select-index-lease-group-leases group) :key #'cdr :test #'eq))))
 
 (defun check-select-index-lease-groups ()
+  "Check group ownership and that held nodes form an ascending domain prefix."
   (dolist (group *select-index-lease-groups*)
     (let* ((domain (select-index-lease-group-domain group))
            (pairs (select-index-lease-group-leases group))
@@ -917,6 +922,7 @@ registration-to-DDL handoff free of a lock-order inversion."
   (values))
 
 (defun select-index-domain-covered-p (domain)
+  "Return true if one group holds every lease in DOMAIN."
   (some (lambda (group)
           (and (eq domain (select-index-lease-group-domain group))
                (= (length (select-index-lease-domain-nodes domain))
@@ -926,6 +932,9 @@ registration-to-DDL handoff free of a lock-order inversion."
         *select-index-lease-groups*))
 
 (defun call-with-select-index-lease-group (domain function)
+  "Call FUNCTION with full domain coverage, acquiring a new group if needed.
+
+Reject held ungrouped leases before reacquisition so lock order is preserved."
   (if (select-index-domain-covered-p domain)
       (funcall function)
       (progn
@@ -946,6 +955,10 @@ registration-to-DDL handoff free of a lock-order inversion."
              (funcall function)))))))
 
 (defun call-with-select-index-lease-domain (relfilenodes function)
+  "Call FUNCTION within a fixed, ordered index domain.
+
+Nested plans may reuse a subset but cannot expand the domain.  Reject held
+leases before initializing a nonempty new domain."
   (let ((nodes (btree-ordered-relfilenodes relfilenodes)))
     (if *select-index-lease-domain*
         (progn
@@ -960,6 +973,7 @@ registration-to-DDL handoff free of a lock-order inversion."
           (call-with-select-index-lease-group *select-index-lease-domain* function)))))
 
 (defun call-with-current-select-index-domain (relfilenode function)
+  "Check cursor membership and restore full domain coverage when needed."
   (if *select-index-lease-domain*
       (progn
         (unless (member relfilenode (select-index-lease-domain-nodes *select-index-lease-domain*)
@@ -969,6 +983,9 @@ registration-to-DDL handoff free of a lock-order inversion."
       (funcall function)))
 
 (defun release-select-index-lease-groups ()
+  "Release held group leases in descending node order.
+
+Use a fresh list and finish the releases after a timeout before reporting it."
   (let ((pairs (sort (loop for group in *select-index-lease-groups*
                            append (loop for pair in (select-index-lease-group-leases group)
                                         when (btree-read-lease-active-p (cdr pair))
@@ -983,6 +1000,10 @@ registration-to-DDL handoff free of a lock-order inversion."
   (values))
 
 (defun stream-select-index-cursor (scan callback)
+  "Deliver TIDs from the cursor or its detached spool.
+
+Without parking, :STOP leaves the cursor lazy.  After detachment, it stops
+spool delivery without invoking the callback for the remaining tail."
   (loop
     (when (select-index-scan-spool scan)
       (return
@@ -996,6 +1017,7 @@ registration-to-DDL handoff free of a lock-order inversion."
       (when (eq (funcall callback tid) :stop) (return :stop)))))
 
 (defun call-with-select-index-cursor (cursor lease callback)
+  "Stream CURSOR under its lease and own any detached spool until scope exit."
   (unless (and (btree-read-lease-active-p lease)
                (eq (btree-read-lease-thread lease) sb-thread:*current-thread*)
                (eq (btree-read-lease-lock-state lease)
@@ -1011,6 +1033,7 @@ registration-to-DDL handoff free of a lock-order inversion."
             (close-query-row-spool (select-index-scan-spool scan))))))))
 
 (defun check-select-index-scan-ownership ()
+  "Check that every held lease has one supported, non-writer-reentrant owner."
   (check-select-index-lease-groups)
   (dolist (lease *btree-read-leases*)
     (when (btree-read-lease-active-p lease)
@@ -1033,6 +1056,12 @@ registration-to-DDL handoff free of a lock-order inversion."
   (values))
 
 (defun detach-select-index-scan (scan)
+  "Save unread TIDs before releasing SCAN's lease.
+
+Read a cursor copy without fetching or evaluating tuples.  Publish the sealed
+spool and clear the cursor before release, which can report a deadline after
+discharging the lease.  On failure before publication, close the partial spool
+and retain the original cursor and lease.  An existing spool keeps its position."
   (unless (select-index-scan-spool scan)
     (let ((cursor (clone-btree-equal-cursor (select-index-scan-cursor scan)))
           (spool (make-query-row-spool 1))
@@ -1054,6 +1083,10 @@ registration-to-DDL handoff free of a lock-order inversion."
   (values))
 
 (defun detach-select-index-scans ()
+  "Detach owned scans and release group leases before parking.
+
+If a later scan fails, earlier completed detachments remain published for their
+scopes to clean up."
   (check-select-index-scan-ownership)
   (dolist (scan *select-index-scans*) (detach-select-index-scan scan))
   (release-select-index-lease-groups)
@@ -1062,6 +1095,10 @@ registration-to-DDL handoff free of a lock-order inversion."
   (values))
 
 (defun scan-select-index (table path snapshot callback &optional environment)
+  "Scan matching index TIDs and pass visible heap tuples to CALLBACK.
+
+Evaluate the parameter key once before restoring domain coverage; key evaluation
+can itself park.  A new cursor restores coverage if an earlier park released it."
   (let* ((idx (select-scan-path-index path))
          (relfilenode (pg-class-relfilenode table))
          (key (select-scan-index-key table path environment)))

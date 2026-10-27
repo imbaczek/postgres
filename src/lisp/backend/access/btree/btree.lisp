@@ -221,6 +221,7 @@ The coarse lease protects traversal in this tree, which has no sibling links."
              (btree-relation-lock-state-waitqueue state))))))))
 
 (defun btree-ordered-relfilenodes (relfilenodes)
+  "Return a sorted, duplicate-free copy for read and write lock ordering."
   (sort (remove-duplicates (copy-list relfilenodes) :test #'eql) #'<))
 
 (defun call-with-btree-relation-locks (relfilenodes function)
@@ -237,6 +238,9 @@ The coarse lease protects traversal in this tree, which has no sibling links."
   `(call-with-btree-relation-locks ,relfilenodes (lambda () ,@body)))
 
 (defun call-with-btree-relation-read-leases (relfilenodes function)
+  "Call FUNCTION with node and lease pairs in descending acquisition order.
+
+The nested scopes retain cleanup ownership even if a lease is released early."
   (let ((nodes (btree-ordered-relfilenodes relfilenodes))
         (leases nil))
     (labels ((lock-next (remaining)
@@ -553,12 +557,14 @@ to a single leaf."
                      (btree-cursor-push-node cursor child-level child))))))
 
 (defun clone-btree-equal-cursor (cursor)
+  "Copy the cursor's mutable frames while sharing their immutable decoded entries."
   (let ((copy (copy-btree-equal-cursor cursor)))
     (setf (btree-equal-cursor-stack copy)
           (mapcar #'copy-btree-equal-cursor-frame (btree-equal-cursor-stack cursor)))
     copy))
 
 (defun call-with-btree-equal-cursor (relfilenode key function)
+  "Call FUNCTION with an initialized cursor and its scoped read lease."
   (btree-ensure-init-before-read relfilenode)
   (call-with-btree-relation-read-lease
    relfilenode

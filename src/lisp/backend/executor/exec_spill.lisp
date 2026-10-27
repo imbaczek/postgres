@@ -821,6 +821,10 @@
   (%make-query-row-spool :memory-limit (max 1 memory-limit)))
 
 (defun query-row-spool-spill (spool)
+  "Move buffered rows to a query temporary file.
+
+Publish the pathname and stream with interrupts masked so spool cleanup owns
+both before writing can be interrupted."
   (unless (query-row-spool-output-stream spool)
     (sb-sys:without-interrupts
       (multiple-value-bind (pathname stream) (open-query-temp-output)

@@ -354,9 +354,10 @@ before signaling FATAL."
 (defun call-with-live-operation-parked (function)
   "Call FUNCTION while the current operation is parked, then restore its credit.
 
-The caller must first make suspended state safe across concurrent work.  The
+Detach owned SELECT index scans before capturing snapshots and parking admission.
+The caller must make other suspended resources safe across concurrent work.  The
 callback must not enter operation admission or access storage.  Cleanup restores
-ownership on every exit; parking itself does not make scan callbacks safe."
+ownership on every exit."
   (let ((token *live-operation-current-token*))
     (unless (and (live-operation-token-p token) (plusp *live-operation-depth*)
                  (not *live-operation-parked-p*)

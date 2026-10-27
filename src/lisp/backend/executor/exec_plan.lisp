@@ -59,10 +59,11 @@ ROW-CALLBACK."
 
 (defun execute-query-plan (plan registered-relations row-callback
                            &key (backend :interpreter))
-  "Execute PLAN under sorted read leases for all selected B-tree indexes.
+  "Execute PLAN within its fixed, sorted index lease domain.
 
-This matches insert's ordered multi-index write leases and prevents a nested
-IndexScan from requesting a lower relfilenode while retaining a higher one."
+The domain covers both executor and compiler calls.  Nested plans reuse a
+subset; parking releases the leases and a later cursor restores full coverage.
+The executor and compiler retain their existing calling conventions."
   (call-with-select-index-lease-domain
    (query-plan-index-relfilenodes plan registered-relations)
    (lambda ()
