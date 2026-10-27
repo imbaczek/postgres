@@ -71,6 +71,7 @@ syncs them; a collision is an error and leaves the existing file intact."
     id))
 
 (defun physical-retained-inventory-check-overlap (entry identity)
+  "Check an overlap descriptor against the inventory's base identity."
   (unless (and (listp entry) (= 3 (length entry))
                (typep (first entry) '(unsigned-byte 64))
                (typep (second entry) '(unsigned-byte 64))
@@ -83,6 +84,7 @@ syncs them; a collision is an error and leaves the existing file intact."
   entry)
 
 (defun physical-retained-inventory-read-overlap (directory payload)
+  "Read and validate the overlap named by an inventory, if present."
   (let ((entry (getf payload :base-overlap)))
     (when entry
       (physical-retained-inventory-check-overlap entry (getf payload :identity))
@@ -275,8 +277,9 @@ Return the freshly decoded payload."
 (defun physical-retained-inventory-publish-entries-under-lock (directory identity target text entries protect &key base-overlap)
   "Validate staged entries and publish one inventory under archive exclusion.
 
-Check identity, history, images and shared prefixes before calling PROTECT for
-the root and entries. Return the synced ID and freshly decoded payload."
+Check identity, history, images, overlap and shared prefixes before calling
+PROTECT for the root and entries. Return the synced ID and freshly decoded
+payload. The overlap does not add logical coverage."
   (unless (sb-thread:holding-mutex-p *physical-retained-inventory-publish-lock*)
     (error "retained WAL publication requires archive exclusion"))
   (let* ((image (physical-retained-inventory-image

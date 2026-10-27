@@ -2,6 +2,10 @@
 (in-package #:pg)
 
 (defun physical-recovery-read-base-overlap (state directory)
+  "Read the exact manifest-listed WAL file prefix ending at the immutable base.
+
+Recheck its length and digest. At a segment boundary the prefix is the full
+preceding segment. STATE must already have verified recovery provenance."
   (let* ((base (getf state :end)) (timeline (getf state :timeline))
                                   (namespace (getf state :wal-namespace :legacy)))
     (unless (and (typep base '(integer 32 18446744073709551615))

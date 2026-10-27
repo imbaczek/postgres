@@ -57,7 +57,10 @@
   destination)
 
 (defun physical-retained-root-make-reference (directory identity id entries &optional overlap)
-  "Build a reference protecting the inventory and its extent objects."
+  "Build a reference protecting the inventory, extents and optional overlap.
+
+Keep the overlap descriptor as the value of its object key."
+
   (let ((objects (make-hash-table :test #'equal)))
     (setf (gethash (cons :inventory id) objects) t)
     (when overlap (setf (gethash (cons :overlap (first overlap)) objects) (copy-tree overlap)))
@@ -67,6 +70,7 @@
      :root-id id :objects objects)))
 
 (defun physical-retained-root-reference-overlap (reference)
+  "Return the overlap descriptor protected by REFERENCE, if present."
   (loop for object being the hash-keys of (physical-retained-root-reference-objects reference)
           using (hash-value descriptor)
         when (eq (car object) :overlap) return descriptor))
@@ -235,6 +239,7 @@ Read control outside the archive mutex and recheck the captured owner state."
   id)
 
 (defun physical-retained-root-merge-overlap (old new)
+  "Preserve the existing overlap or require an identical replacement."
   (when (and old new (not (equal old new)))
     (error "retained base overlap cannot change within one base identity"))
   (or old new))
@@ -299,6 +304,7 @@ Publication and hold changes use archive exclusion. Return a fresh entry."
     entry))
 
 (defun physical-retained-root-stage-overlap (hold target text image)
+  "Validate an overlap and reserve its object ID under HOLD before writing it."
   (physical-retained-wal-check-budget (list image))
   (let* ((image (copy-seq image))
          (id (physical-store-update-digest #xCBF29CE484222325 image))

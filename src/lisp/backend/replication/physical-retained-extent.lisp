@@ -8,6 +8,9 @@
     :segment :file-timeline :prefix-digest))
 
 (defun physical-retained-envelope-encode (magic metadata bytes)
+  "Encode bounded metadata and bytes in a CRC-protected envelope.
+
+The caller checks their meaning; the CRC detects accidental corruption."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= (length bytes) +wal-segment-size+) (= 8 (length magic)))
     (error "invalid retained WAL envelope inputs"))
@@ -25,6 +28,9 @@
       image)))
 
 (defun physical-retained-envelope-decode (magic image)
+  "Check envelope framing, lengths and CRC, then return decoded metadata and bytes.
+
+The caller must validate their meaning."
   (unless (and (typep image '(vector (unsigned-byte 8)))
                (<= 20 (length image) +physical-retained-image-limit+)
                (= 8 (length magic)) (equalp (subseq image 0 8) magic))
