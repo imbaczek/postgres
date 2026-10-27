@@ -17,6 +17,7 @@ source_port, promoted_port, promoted_pid = map(int, sys.argv[3:])
 replica_port = promoted_port + 1
 data = root / "sibling"
 contract = runpy.run_path(str(base / "t/interop/promotion-sql-contract.py"))
+peer_parameters = {}
 
 
 def control(socket, form, expect_error=False):
@@ -72,42 +73,46 @@ def lisp_string(value):
     return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
-def start_peer():
+def start_peer(directory=None, port=None, socket_name="sibling.sock", log_name="sibling.log"):
+    directory = directory or data
+    port = replica_port if port is None else port
     registry = root / "extra-peers"
     registry.mkdir(mode=0o700, exist_ok=True)
-    with (root / "sibling.log").open("a") as output:
+    with (root / log_name).open("a") as output:
         process = subprocess.Popen([sys.executable, str(base / "t/interop/owned-peer.py"),
-                                    "start", str(registry), str(data), str(base / "pg-lisp.sh"),
-                                    "-p", str(replica_port), "-D", str(data),
-                                    "--control-socket", str(root / "sibling.sock")],
+                                    "start", str(registry), str(directory), str(base / "pg-lisp.sh"),
+                                    "-p", str(port), "-D", str(directory),
+                                    "--control-socket", str(root / socket_name)],
                                    stdout=output, stderr=subprocess.STDOUT)
+    peer_parameters[process] = (directory, socket_name)
     def ready():
-        assert process.poll() is None, (root / "sibling.log").read_text()
+        assert process.poll() is None, (root / log_name).read_text()
         try:
             owner = psutil.Process(process.pid)
-            return (any(c.status == psutil.CONN_LISTEN and c.laddr.port == replica_port
+            return (any(c.status == psutil.CONN_LISTEN and c.laddr.port == port
                         for c in owner.net_connections(kind="tcp"))
-                    and any(c.laddr == str(root / "sibling.sock")
+                    and any(c.laddr == str(root / socket_name)
                             for c in owner.net_connections(kind="unix")))
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             return False
     wait(ready)
-    assert int((data / "postmaster.pid").read_text().splitlines()[0]) == process.pid
-    node = (root / "sibling.sock").lstat()
+    assert int((directory / "postmaster.pid").read_text().splitlines()[0]) == process.pid
+    node = (root / socket_name).lstat()
     assert stat.S_ISSOCK(node.st_mode)
     return process, (node.st_dev, node.st_ino)
 
 
 def stop_peer(process, socket_identity, crash=False):
+    directory, socket_name = peer_parameters[process]
     if process.poll() is None:
         result = subprocess.run([sys.executable, str(base / "t/interop/signal-owned-server.py"),
-                                 str(process.pid), str(data), "KILL" if crash else "INT",
+                                 str(process.pid), str(directory), "KILL" if crash else "INT",
                                  "5" if crash else "20"], timeout=25)
         if result.returncode:
             subprocess.run([sys.executable, str(base / "t/interop/signal-owned-server.py"),
-                            str(process.pid), str(data), "KILL", "5"], check=True, timeout=10)
+                            str(process.pid), str(directory), "KILL", "5"], check=True, timeout=10)
     status = process.wait(timeout=10)
-    path = root / "sibling.sock"
+    path = root / socket_name
     if path.exists():
         node = path.lstat()
         assert stat.S_ISSOCK(node.st_mode) and (node.st_dev, node.st_ino) == socket_identity
@@ -119,7 +124,48 @@ def load_helper(endpoint):
     control(endpoint, f'(load {lisp_string(base / "t/selected-replay-native.lisp")})')
 
 
+def restart_promoted_source(connection):
+    directory = root / "copy"
+    path = root / "target.sock"
+    owner = psutil.Process(promoted_pid)
+    assert any(c.laddr == str(path) for c in owner.net_connections(kind="unix"))
+    assert any(c.status == psutil.CONN_LISTEN and c.laddr.port == promoted_port
+               for c in owner.net_connections(kind="tcp"))
+    original = path.lstat()
+    assert stat.S_ISSOCK(original.st_mode)
+    connection.close()
+    subprocess.run([sys.executable, str(base / "t/interop/signal-owned-server.py"),
+                    str(promoted_pid), str(directory), "KILL", "5"], check=True, timeout=10)
+    (root / "expected-target-sigkill").write_text(str(promoted_pid) + "\n")
+    if path.exists():
+        current = path.lstat()
+        assert stat.S_ISSOCK(current.st_mode)
+        assert (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino)
+        path.unlink()
+    process, identity = start_peer(directory, promoted_port, "target.sock", "target-restarted.log")
+    return process, identity, connect(promoted_port)
+
+
+def reject_bootstrap_for_anchor(system_id, fork, manifest, seed):
+    connection = contract["psycopg2"].connect(host="127.0.0.1", port=promoted_port,
+        user="postgres", dbname="postgres", replication="database", connect_timeout=3)
+    connection.autocommit = True
+    query_text = (f"START_REPLICATION SLOT selected_follow PHYSICAL {fork >> 32:X}/{fork & 0xffffffff:08X} "
+                  f"(native_format 'pg_lisp_wal_7', system_id '{system_id}', timeline '2', "
+                  f"base_lsn '{fork >> 32:X}/{fork & 0xffffffff:08X}', prefix_digest '{seed}', manifest_digest '{manifest}')")
+    try:
+        try:
+            query(connection, query_text)
+        except contract["psycopg2"].Error as error:
+            assert error.pgcode == "55000", error
+        else:
+            raise AssertionError("follow anchor admitted a bootstrap stream")
+    finally:
+        connection.close()
+
+
 peer, socket_identity = None, None
+source_peer, source_socket_identity = None, None
 connections = []
 try:
     data.mkdir(mode=0o700)
@@ -149,6 +195,30 @@ try:
     load_helper("sibling.sock")
     control("sibling.sock", f'(selected-replay-export-parent-prefix #p{lisp_string(str(bundle) + "/")})')
     assert (bundle / "source-prefix.bin").read_bytes() == (bundle / "receiver-prefix.bin").read_bytes()
+    if os.environ.get("SELECTED_REPLAY_ANCHOR") == "1":
+        control("sibling.sock", f'(selected-replay-export-follow-request #p{lisp_string(str(bundle) + "/")} 2)')
+        system_id, original_end, manifest, seed = map(int, (bundle / "follow-summary.txt").read_text().split())
+        assert system_id == identity and original_end < fork
+        control("target.sock", f'(selected-replay-bad-follow-overlap #p{lisp_string(str(bundle) + "/")})')
+        cut = os.environ.get("SELECTED_REPLAY_ANCHOR_CUT")
+        if cut:
+            assert cut in ("after-follow-retention", "after-follow-proof", "after-follow-ready")
+            control("target.sock", f'(selected-replay-install-follow-cut #p{lisp_string(str(root) + "/")} :{cut})')
+            control("target.sock", f'(selected-replay-start-follow-pin #p{lisp_string(str(bundle) + "/")})')
+            marker = root / "follow-cut-held"
+            wait(lambda: marker.exists() and int(marker.read_text()) == promoted_pid)
+        else:
+            control("target.sock", f'(selected-replay-follow-pin #p{lisp_string(str(bundle) + "/")})')
+            reject_bootstrap_for_anchor(system_id, fork, manifest, seed)
+        source_peer, source_socket_identity, promoted = restart_promoted_source(promoted)
+        connections.append(promoted)
+        load_helper("target.sock")
+        expected_stage = "retaining" if cut in ("after-follow-retention", "after-follow-proof") else "ready"
+        control("target.sock", f'(assert (eq :{expected_stage} (physical-follow-pin-stage (gethash "selected_follow" *physical-source-pins*))))')
+        control("target.sock", f'(selected-replay-follow-pin #p{lisp_string(str(bundle) + "/")})')
+        reject_bootstrap_for_anchor(system_id, fork, manifest, seed)
+        assert query(promoted, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(False, 3)]
+        print(f"follow-anchor: real sibling origin, independent overlap, refusal of bootstrap mode and source SIGKILL recovery ({cut or 'ready'}) PASS", flush=True)
     history = (bundle / "history.txt").read_text()
     eor = " ".join(map(str, (bundle / "eor.bin").read_bytes()))
     control("sibling.sock", f'(physical-recovery-select-history 2 {lisp_string(history)} ({eor}))')
@@ -280,3 +350,5 @@ finally:
         connection.close()
     if peer is not None:
         stop_peer(peer, socket_identity)
+    if source_peer is not None:
+        stop_peer(source_peer, source_socket_identity)

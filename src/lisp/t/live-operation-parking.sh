@@ -67,6 +67,15 @@ checked target "(physical-follow-start \"127.0.0.1\" $PORT \"operation_parking\"
 SBCL="$SBCL" timeout --foreground --kill-after=5 "${PARKING_DRIVER_TIMEOUT:-180}s" \
     "$PATRONI_PYTHON" "${PARKING_DRIVER:-$BASE/t/interop/live-operation-parking.py}" \
     "$BASE" "$TMP" "$PORT" "$TARGET_PORT" "$TARGET"
-signal_owned "$TARGET" "$TMP/copy" INT 20; wait "$TARGET"; TARGET=
+if [ -f "$TMP/expected-target-sigkill" ]; then
+    [ ! -L "$TMP/expected-target-sigkill" ]
+    [ "$(cat "$TMP/expected-target-sigkill")" = "$TARGET" ]
+    target_status=0
+    wait "$TARGET" || target_status=$?
+    [ "$target_status" -eq 137 ]
+    TARGET=
+else
+    signal_owned "$TARGET" "$TMP/copy" INT 20; wait "$TARGET"; TARGET=
+fi
 signal_owned "$SOURCE" "$TMP/source" INT 20; wait "$SOURCE"; SOURCE=
 echo 'live-operation-parking: driver assertions and owned peer cleanup PASS'
