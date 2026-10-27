@@ -1,0 +1,102 @@
+;;;; Private owned-server helpers for a manual selected-history replay experiment.
+(in-package #:pg)
+
+(defun selected-replay-export (directory)
+  (with-write-lock
+    (with-wal-critical
+      (let* ((timeline *wal-insert-timeline*) (history (timeline-read-history timeline))
+                                              (fork (timeline-history-entry-end (second history))) (first t))
+        (wal-atomic-write-bytes (merge-pathnames "history.txt" directory) (timeline-history-bytes timeline))
+        (let ((prefix (make-array (mod fork +wal-segment-size+) :element-type '(unsigned-byte 8))))
+          (when (plusp (length prefix))
+            (with-open-file (in (wal-segment-path (floor fork +wal-segment-size+) timeline :timeline)
+                                :element-type '(unsigned-byte 8))
+              (unless (= (length prefix) (read-sequence prefix in)) (error "short selected source prefix"))))
+          (wal-atomic-write-bytes (merge-pathnames "source-prefix.bin" directory) prefix))
+        (with-open-file (out (merge-pathnames "identity.txt" directory) :direction :output :if-exists :supersede)
+          (format out "~d ~d ~d ~d~%" (catalog-system-identifier) timeline fork *wal-durable-lsn*)
+          (fsync-stream out))
+        (with-open-file (out (merge-pathnames "frames.bin" directory) :direction :output
+                                                                      :if-exists :supersede :element-type '(unsigned-byte 8))
+          (wal-scan-lineage
+           (lambda (record owner file-timeline)
+             (declare (ignore owner))
+             (when first
+               (unless (= (wal-record-type record) +wal-record-end-of-recovery+)
+                 (error "selected source prefix does not begin with EOR")))
+             (let* ((start (wal-record-start record)) (length (- (wal-record-end record) start))
+                                                      (bytes (make-array length :element-type '(unsigned-byte 8)))
+                                                      (header (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (with-open-file (in (wal-segment-path (floor start +wal-segment-size+) file-timeline :timeline)
+                                   :element-type '(unsigned-byte 8))
+                 (file-position in (mod start +wal-segment-size+))
+                 (unless (= length (read-sequence bytes in)) (error "short selected source record")))
+               (when first
+                 (wal-atomic-write-bytes (merge-pathnames "eor.bin" directory) bytes)
+                 (setf first nil))
+               (wal-set-u64 header 0 start) (wal-set-u32 header 8 length)
+               (write-sequence header out) (write-sequence bytes out)))
+           history fork *wal-durable-lsn* :namespace :timeline)
+          (when first (error "selected source has no child WAL"))
+          (fsync-stream out))
+        (fsync-directory directory)
+        (list :timeline timeline :fork fork :end *wal-durable-lsn*)))))
+
+(defun selected-replay-export-parent-prefix (directory)
+  (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
+    (let ((prefix (physical-recovery-wal-prefix-under-lock *physical-receive-store* *last-replay-lsn*)))
+      (unless prefix (error "selected receiver lacks an authenticated fork prefix"))
+      (wal-atomic-write-bytes (merge-pathnames "receiver-prefix.bin" directory) prefix)
+      (length prefix))))
+
+(defun selected-replay-inject (directory &optional eor-only)
+  (with-open-file (in (merge-pathnames "frames.bin" directory) :element-type '(unsigned-byte 8))
+    (loop with header = (make-array 12 :element-type '(unsigned-byte 8))
+          for count = (read-sequence header in)
+          while (plusp count)
+          do (unless (= count 12) (error "short selected test frame header"))
+             (let* ((start (wal-u64 header 0)) (length (wal-u32 header 8))
+                                               (bytes (when (<= +wal-header-size+ length +wal-segment-size+)
+                                                        (make-array length :element-type '(unsigned-byte 8)))))
+               (unless (and bytes (= length (read-sequence bytes in))) (error "short selected test frame"))
+               (when (>= start (physical-store-written-lsn *physical-receive-store*))
+                 (physical-recovery-receive start bytes))
+               (when eor-only (return)))))
+  (physical-recovery-flush))
+
+(defun selected-replay-inject-eor-after-worker-join (directory)
+  (setf *physical-promotion-test-hook*
+        (lambda (point)
+          (when (eq point :after-online-worker-join)
+            (setf *physical-promotion-test-hook* nil)
+            (with-live-operation
+              (selected-replay-inject directory t))))))
+
+(defun selected-replay-pause-interleaving (name)
+  (let ((paused *physical-replay-paused-p*) (stopping *physical-promotion-stopping-p*)
+                                            (thread nil))
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex (*physical-replay-pause-lock*)
+             (setf thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (progn (physical-replay-pause-command name) :accepted)
+                        (error (condition) (princ-to-string condition))))
+                    :name "selected replay pause interleaving"))
+             (loop with deadline = (+ (get-internal-real-time) (* 5 internal-time-units-per-second))
+                   until (eq *physical-replay-pause-lock* (sb-thread::thread-waiting-for thread))
+                   do (when (> (get-internal-real-time) deadline)
+                        (error "pause command did not reach the mutex"))
+                      (sleep 0.001))
+             (setf *physical-promotion-stopping-p* t))
+           (let ((result (sb-thread:join-thread thread :timeout 5 :default :timeout)))
+             (unless (and (stringp result) (search "standby promotion is ongoing" result :test #'char-equal))
+               (error "pause command crossed promotion gate: ~s" result)))
+           (assert (eql paused *physical-replay-paused-p*))
+           t)
+      (sb-thread:with-mutex (*physical-replay-pause-lock*)
+        (setf *physical-promotion-stopping-p* stopping *physical-replay-paused-p* paused))
+      (when (and thread (sb-thread:thread-alive-p thread))
+        (sb-thread:join-thread thread :timeout 5 :default :timeout)))))
