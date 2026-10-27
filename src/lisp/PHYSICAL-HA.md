@@ -625,10 +625,57 @@ replay, promotion, splits and HUP, native JOIN, and a 30,000-row spill crash and
 quota check passed, as did fresh strict compilation. Luna, Sol and Astra code
 reviews and Sol's refactoring review cleared the change.
 
-Native promotion tests remain open for heap, join, aggregate, sort, spill and
-output paths, including optional sort arenas. Complete them before public SQL
-`pg_promote`; normal `application_name` GUC support also remains open. The broader
-HA goal remains open, and coordination remains excluded.
+The executor continuation matrix below covers these native promotion paths,
+including optional sort arenas. Public SQL `pg_promote`, normal `application_name`
+GUC support and the broader HA goal remain open. Coordination remains excluded.
+
+### Executor continuations across parking
+
+The 15-case native matrix exercises a real SQL stack through replay and promotion.
+Cases cover heap scanning with partial wire output; full JOIN loading, replay and
+unmatched rows; aggregate input and output with COUNT, SUM and text ARRAY_AGG;
+hash output; sort input and output; optional in-memory and spilling sort arenas;
+cancellation, disconnect and quota failure; and nested parameterized indexes.
+The nested case verifies the selected named inner index, its page growth and
+95 fresh lease groups after resume.
+
+Old repeatable-read results match the pinned C reference
+`9c0909b34939f2d5a37b82b9d1efc8b08e310252`; separate effect traces check exact
+evaluation counts and order. The harness waits for replay to reach the source's
+observed flush LSN before promotion, then checks parent and child writes, runtime
+object identity, GC and HUP. The small disconnect fixture executes 96 projections
+before the final flush detects the disconnected client. Cancellation and quota
+cases check exact park counts. HUP replaces the test wrappers with production
+functions after the parked query leaves admission.
+
+Validation covers all 15 cases in `/tmp/pg-executor-parking-final-matrix.log`.
+Stronger assertions for the first 11 cases passed in
+`/tmp/pg-executor-parking-reviewed-matrix.log`; the final cancellation, disconnect,
+quota and nested-index checks passed in
+`/tmp/pg-executor-parking-reviewed-fault-index.log`. Original parking and index
+regressions passed too. Luna and Sol cleared the code reviews; Sol's refactoring
+review found no useful consolidation. Terra wrote this documentation pass and the
+primary agent reviewed it separately. Production code is unchanged by this matrix.
+
+From `src/lisp`, run:
+
+```sh
+PG_C_BINDIR=/tmp/pg-lisp-c-reference/usr/local/pgsql/bin ./t/executor-parking.sh
+```
+
+`PG_C_LIBDIR` is optional. `PATRONI_PYTHON` selects Python with psycopg2 and defaults
+to `/tmp/pg-patroni-4.1.5-venv/bin/python3`. Linux pidfd and GNU timeout are required.
+Native ports default to 6680/6681 and C to 6690; override `PORT`/`REFERENCE_PORT`.
+`PARKING_DRIVER_TIMEOUT` defaults to 180 seconds for each oracle, setup and driver
+invocation. Shutdown waits 20 seconds before an ownership-checked KILL fallback.
+With `PARKING_KEEP_ON_FAILURE=1`, private controls remain available for up to
+`PARKING_DEBUG_SECONDS` seconds, default 600. Touch the printed root's
+`debug-release` file to clean up. Verify PID, PGDATA and listener ownership before
+using a control socket.
+
+These tests cover supported row-DML paths. DDL, VACUUM and pruning conflict
+handling, SQL `pg_promote` and normal `application_name` GUC support remain open.
+No coordination or C physical compatibility is added.
 
 ### Timeline-qualified native WAL namespace
 

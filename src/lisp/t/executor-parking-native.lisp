@@ -1,3 +1,7 @@
+;;;; Test-only instrumentation for executor continuations across promotion.
+;;;; The harness installs wrappers in its owned server, captures resources while
+;;;; an operation is parked, and verifies cleanup after HUP reloads the functions.
+;;;; These wrappers are not permanent production hooks.
 (in-package #:pg)
 
 (defvar *resource-parking-visits* 0)
@@ -39,9 +43,12 @@
 (defvar *resource-parking-repairs* 0)
 
 (defun resource-parking-backend-p ()
+  "Return true for the backend selected by the test harness."
   (and *backend* (equal "executor-parking" (backend-application-name *backend*))))
 
 (defun resource-parking-capture (minima)
+  "Capture the parked query's temporary resources and check the requested minima.
+Verify that index scans are detached and record paths for later cleanup checks."
   (assert (notany #'btree-read-lease-active-p *btree-read-leases*))
   (let* ((entries (when *query-temp-cleanup-owner*
                     (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*)))
@@ -83,6 +90,9 @@
               (length *resource-parking-paths*) readers writers io *resource-parking-page-prefix*))))
 
 (defun resource-parking-install (root after budget arena &rest minima)
+  "Install test-only wrappers for the selected backend and parking point.
+Record executor resources and replace the setting call used to park the query.
+A later HUP reload restores the production functions."
   (parking-native-install root)
   (let ((setting (symbol-function 'eval-setting-function))
         (plan (symbol-function 'execute-query-plan))
@@ -177,6 +187,8 @@
   t)
 
 (defun resource-parking-verify-cleanup ()
+  "Check that reload replaced the wrappers and that owned temporary resources were released.
+Clear the test hooks after verification."
   (assert (not (eq *resource-parking-plan-wrapper* (symbol-function 'execute-query-plan))))
   (assert (not (eq *resource-parking-heap-wrapper* (symbol-function 'heapam-scan))))
   (assert (not (eq *resource-parking-read-wrapper* (symbol-function 'buf-read))))
@@ -194,6 +206,7 @@
   t)
 
 (defun resource-parking-exhaust-quota ()
+  "Reduce the parked query's quota to its current usage to exercise failure on resume."
   (assert (= 1 (live-operation-parked-count)))
   (assert *resource-parking-quota*)
   (setf (query-temp-quota-limit *resource-parking-quota*)
@@ -201,6 +214,7 @@
   t)
 
 (defun resource-parking-abort-ready-p (disconnected)
+  "Check that an aborted query has left admission and, for disconnect, the backend registry."
   (let ((backend (first *parking-native-captured*)))
     (and backend (parking-native-reloaded-p) (zerop (live-operation-parked-count))
          (not (sb-thread:with-mutex (*live-operation-lock*)
@@ -208,16 +222,19 @@
          (or (not disconnected) (null (lookup-backend (backend-pid backend)))))))
 
 (defun resource-parking-verify-aborted (disconnected expected-visits)
+  "Verify the abort path's exact park and visit counts and temporary resource cleanup."
   (assert (resource-parking-abort-ready-p disconnected))
   (assert (= 1 *parking-native-calls*))
   (assert (= *resource-parking-visits* expected-visits))
   (resource-parking-verify-cleanup))
 
 (defun resource-parking-index-blocks ()
+  "Return the selected inner index's block count for the page-growth check."
   (assert *resource-parking-index-node*)
   (buf-nblocks *resource-parking-index-node*))
 
 (defun resource-parking-verify (visits minimum-pages minimum-arenas minimum-repairs)
+  "Verify resumed execution, resource use, lease repairs and cleanup after reload."
   (parking-native-verify)
   (assert (= visits *resource-parking-visits*))
   (when (plusp minimum-pages)
