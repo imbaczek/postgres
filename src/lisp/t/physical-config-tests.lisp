@@ -18,6 +18,171 @@
       (ok (intake-fails-p
            (lambda () (pg::session-set-extra-setting "extra_float_digits" "4"))))))
 
+(deftest application-name-normalization-clips-before-byte-escaping
+    (ok (equal "plain" (pg::session-normalize-application-name "plain")))
+  (ok (equal "a\\x0a\\xc3\\xa9" (pg::session-normalize-application-name (format nil "a~%é"))))
+  (ok (equal (make-string 63 :initial-element #\x)
+             (pg::session-normalize-application-name (make-string 100 :initial-element #\x))))
+  (ok (equal (make-string 62 :initial-element #\x)
+             (pg::session-normalize-application-name
+              (concatenate 'string (make-string 62 :initial-element #\x) "é"))))
+  (ok (= 248 (length (pg::session-normalize-application-name
+                      (make-string 32 :initial-element #\é))))))
+
+(deftest application-name-setting-keeps-slot-reset-and-transaction-state-together
+    (let ((pg::*backend* (pg::make-backend)) (output (make-broadcast-stream)))
+      (pg::session-apply-startup-options
+       '(("options" . "-c application_name=option") ("application_name" . "startup")))
+      (ok (equal "startup" (pg::sql-setting-value "application_name")))
+      (ok (equal "startup" (pg::backend-application-name pg::*backend*)))
+      (pg::command-begin output nil)
+      (pg::session-set-application-name "session")
+      (pg::session-set-application-name "local1" t)
+      (pg::session-set-application-name "local2" t)
+      (ok (equal "local2" (pg::backend-application-name pg::*backend*)))
+      (pg::command-commit output)
+      (ok (equal "session" (pg::sql-setting-value "application_name")))
+      (ok (equal "session" (pg::backend-application-name pg::*backend*)))
+      (pg::command-begin output nil)
+      (pg::session-set-application-name "local" t)
+      (pg::session-set-application-name "wins")
+      (pg::command-commit output)
+      (ok (equal "wins" (pg::sql-setting-value "application_name")))
+      (pg::command-begin output nil)
+      (pg::session-set-application-name "aborted")
+      (pg::abort-transaction-block)
+      (ok (equal "wins" (pg::backend-application-name pg::*backend*)))
+      (pg::command-rollback output)
+      (ok (equal "wins" (pg::sql-setting-value "application_name")))
+      (pg::session-set-application-name :default)
+      (ok (equal "startup" (pg::backend-application-name pg::*backend*)))
+      (ok (equal "client" (aref (pg::session-application-name-settings-row) 5)))
+      (pg::session-set-application-name "reset-all")
+      (pg::session-reset-all-settings)
+      (ok (equal "startup" (pg::backend-application-name pg::*backend*)))
+      (ok (getf (first (pg::parse-statements "SET LOCAL application_name='local'")) :local-p))
+      (ok (intake-fails-p (lambda () (pg::parse-statements "SET LOCAL search_path=public"))))))
+
+(deftest application-name-activity-slot-clips-the-expanded-guc
+    (let ((pg::*backend* (pg::make-backend)))
+      (pg::session-set-application-name (make-string 32 :initial-element #\é))
+      (ok (= 248 (length (pg::sql-setting-value "application_name"))))
+      (ok (= 63 (length (pg::backend-application-name pg::*backend*))))
+      (ok (equal (subseq (pg::sql-setting-value "application_name") 0 63)
+                 (pg::backend-application-name pg::*backend*)))))
+
+(deftest application-name-finalization-survives-pending-reset-boundary-interrupt
+    (dolist (commit-p '(t nil))
+      (let ((pg::*backend* (pg::make-backend))
+            (original (symbol-function 'pg::reset-backend-transaction))
+            (caught nil))
+        (pg::session-set-application-name "base")
+        (pg::command-begin (make-broadcast-stream) nil)
+        (pg::session-set-application-name "session")
+        (pg::session-set-application-name "local" t)
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'pg::reset-backend-transaction)
+                     (lambda (backend)
+                       (funcall original backend)
+                       (sb-thread:interrupt-thread
+                        sb-thread:*current-thread*
+                        (lambda () (error "application-name reset boundary")))))
+               (handler-case
+                   (if commit-p (pg::commit-transaction) (pg::abort-transaction))
+                 (simple-error (condition)
+                   (setf caught (equal "application-name reset boundary" (princ-to-string condition)))))
+               (ok caught)
+               (ok (eq :idle (pg::backend-state pg::*backend*)))
+               (ok (equal (if commit-p "session" "base")
+                          (pg::backend-application-name pg::*backend*)))
+               (ok (null (gethash :application-name-local (pg::backend-settings pg::*backend*))))
+               (when commit-p
+                 (ok (null (pg::backend-settings-transaction-start pg::*backend*)))))
+          (setf (symbol-function 'pg::reset-backend-transaction) original)))))
+
+(deftest implicit-query-block-whitelist-excludes-nontransactional-operations
+    (ok (pg::implicit-query-block-statements-p
+         (pg::parse-statements "SET LOCAL application_name='packet'; SELECT current_setting('application_name')")))
+  (dolist (sql '("SELECT 1" "CREATE TABLE x (id integer); INSERT INTO x VALUES (1)"
+                 "BEGIN; SELECT 1" "TRUNCATE x; SELECT 1" "CHECKPOINT; SELECT 1"
+                 "VACUUM x; SELECT 1" "INSERT INTO x VALUES (9); SET TRANSACTION READ ONLY; SELECT 1"
+                 "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED; SELECT 1"))
+    (ok (not (pg::implicit-query-block-statements-p (pg::parse-statements sql))) sql)))
+
+(deftest implicit-query-block-withholds-final-command-complete-on-commit-error
+    (let ((pg::*backend* (pg::make-backend))
+          (write-message (symbol-function 'pg::write-message))
+          (commit (symbol-function 'pg::commit-transaction))
+          (messages nil) (caught nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::write-message)
+                   (lambda (stream type payload)
+                     (declare (ignore stream payload))
+                     (push type messages))
+                   (symbol-function 'pg::commit-transaction)
+                   (lambda () (error "injected packet commit failure")))
+             (handler-case
+                 (pg::execute-simple-query-statements
+                  (make-broadcast-stream)
+                  (pg::parse-statements "SET application_name='uncommitted'; SHOW application_name"))
+               (simple-error (condition)
+                 (setf caught (equal "injected packet commit failure" (princ-to-string condition)))))
+             (ok caught)
+             (ok (= 1 (count #\C messages)))
+             (ok (member #\D messages))
+             (ok (eq :idle (pg::backend-state pg::*backend*)))
+             (ok (null (pg::backend-implicit-query-block pg::*backend*)))
+             (ok (equal "" (pg::backend-application-name pg::*backend*)))
+             (ok (null (pg::backend-settings-transaction-start pg::*backend*))))
+        (setf (symbol-function 'pg::write-message) write-message
+              (symbol-function 'pg::commit-transaction) commit))))
+
+(deftest implicit-query-block-restores-all-settings-before-cleanup-interrupt
+    (let ((pg::*backend* (pg::make-backend))
+          (reset (symbol-function 'pg::reset-backend-transaction))
+          (execute (symbol-function 'pg::execute-query-statements))
+          (caught nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::execute-query-statements)
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (setf (gethash "timezone" (pg::backend-settings pg::*backend*)) "Europe/Warsaw")
+                     (error "packet body failure"))
+                   (symbol-function 'pg::reset-backend-transaction)
+                   (lambda (backend)
+                     (funcall reset backend)
+                     (sb-thread:interrupt-thread
+                      sb-thread:*current-thread*
+                      (lambda () (error "packet cleanup boundary")))))
+             (handler-case
+                 (pg::execute-simple-query-statements
+                  (make-broadcast-stream) (pg::parse-statements "SHOW TimeZone; SHOW application_name"))
+               (simple-error (condition)
+                 (setf caught (equal "packet cleanup boundary" (princ-to-string condition)))))
+             (ok caught)
+             (ok (equal "UTC" (pg::sql-setting-value "timezone")))
+             (ok (eq :idle (pg::backend-state pg::*backend*)))
+             (ok (null (pg::backend-implicit-query-block pg::*backend*)))
+             (ok (null (pg::backend-settings-transaction-start pg::*backend*))))
+        (setf (symbol-function 'pg::reset-backend-transaction) reset
+              (symbol-function 'pg::execute-query-statements) execute))))
+
+(cl-spec:defproperty application-name-preserves-printable-ascii
+    ((bits (range integer 0 4611686018427387903)) (size (range integer 0 63)))
+  (:about pg::session-normalize-application-name)
+  (:trials (:normal 200))
+  (let ((name (map 'string (lambda (index) (code-char (+ 32 (mod (ash bits (- (mod index 50))) 95))))
+                   (loop for index below size collect index))))
+    (equal name (pg::session-normalize-application-name name))))
+
+(deftest generated-application-name-printable-ascii
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'application-name-preserves-printable-ascii :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (deftest session-startup-options-and-reset-preserve-client-baseline
     (let ((pg::*backend* (pg::make-backend)))
       (ok (equal '("-c" "custom.value=two words" "-cother.value=a\\b" "'literal'")

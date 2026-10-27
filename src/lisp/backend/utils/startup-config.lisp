@@ -478,7 +478,7 @@
      (when settings
        (loop for name in (sort (loop for name being the hash-keys of settings collect name) #'string<)
              collect (startup-settings-row name (gethash name settings))))
-     (list (session-timeout-settings-row)))))
+     (list (session-timeout-settings-row) (session-application-name-settings-row)))))
 
 (defun startup-setting-show-value (name)
   (when *startup-server-settings*

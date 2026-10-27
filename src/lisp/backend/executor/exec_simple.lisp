@@ -479,15 +479,13 @@ rolled back immediately."
     copy))
 
 (defun restore-session-settings (stream)
-  (let ((settings (backend-settings-transaction-start *backend*))
-        (previous-path (session-search-path)))
-    (when settings
-      (setf (backend-settings *backend*) settings
-            (backend-settings-transaction-start *backend*) nil)
-      (send-parameter-status stream "TimeZone"
-                             (or (gethash "timezone" settings) "UTC"))
-      (unless (string= previous-path (session-search-path))
-        (send-parameter-status stream "search_path" (session-search-path))))))
+  (declare (ignore stream))
+  (sb-sys:without-interrupts
+    (let ((settings (backend-settings-transaction-start *backend*)))
+      (when settings
+        (setf (backend-settings *backend*) settings
+              (backend-settings-transaction-start *backend*) nil)
+        (session-publish-application-name)))))
 
 (defun command-begin (stream ast)
   (when (and (member :read-only ast) (not (getf ast :read-only)))
@@ -519,7 +517,6 @@ rolled back immediately."
      (send-command-complete stream "ROLLBACK"))
     (:in-progress
      (commit-transaction)
-     (setf (backend-settings-transaction-start *backend*) nil)
      ;; Commit record and target progress are durable before the worker can
      ;; acknowledge the publisher, as logical/worker.c expects.
      (when (string= (or (backend-application-name *backend*) "")
@@ -606,6 +603,13 @@ rolled back immediately."
       (setf raw-value (gethash name (backend-settings-reset *backend*)) value raw-value))
     (startup-check-session-setting name)
     (cond
+      ((and (string= name "application_name") (getf ast :local-p))
+       (if (or (backend-explicit *backend*) (backend-implicit-query-block *backend*))
+           (session-set-application-name raw-value t)
+           (progn
+             (send-notice stream "SET LOCAL can only be used in transaction blocks" "WARNING" "25P01")
+             (unless (or (eq raw-value :default) (eq raw-value +null+))
+               (session-application-name-value raw-value)))))
       ((session-extra-setting-p name) (session-set-extra-setting name raw-value))
       ((string= name "search_path")
        (set-session-search-path (if (eq raw-value :default) +null+ value)))
@@ -627,9 +631,7 @@ rolled back immediately."
                         "invalid value for parameter \"TimeZone\": \"~a\""
                         value))
              (setf (gethash "timezone" (backend-settings *backend*)) value)))
-       (send-parameter-status
-        stream "TimeZone"
-        (or (gethash "timezone" (backend-settings *backend*)) "UTC")))
+       )
       ((string= name "transaction_isolation")
        (let ((isolation-level (transaction-isolation-setting-value value)))
          (if (and (backend-explicit *backend*)
@@ -701,15 +703,12 @@ rolled back immediately."
       ((string= name "all")
        (set-session-search-path +null+)
        (session-reset-all-settings)
-       (send-parameter-status stream "TimeZone"
-                              (or (gethash "timezone" (backend-settings *backend*)) "UTC"))
-       (send-parameter-status stream "search_path" (session-search-path)))
+       )
       ((string= name "timezone")
        (let ((baseline (gethash "timezone" (backend-settings-reset *backend*))))
          (if baseline (setf (gethash "timezone" (backend-settings *backend*)) baseline)
              (remhash "timezone" (backend-settings *backend*))))
-       (send-parameter-status stream "TimeZone"
-                              (or (gethash "timezone" (backend-settings *backend*)) "UTC")))
+       )
       ((member name '("transaction_isolation" "client_encoding"
                       "standard_conforming_strings")
                :test #'string=)
@@ -1408,7 +1407,8 @@ before this removal horizon is captured."
   (flush-logical-ddl-deferred-responses responses))
 
 (defun execute-in-transaction (stream ast)
-  (let ((implicit (not (backend-explicit *backend*)))
+  (let ((implicit (not (or (backend-explicit *backend*)
+                           (backend-implicit-query-block *backend*))))
         (logical-ddl-responses nil)
         (copy-row-count nil))
     (when (and (backend-transaction-read-only-p)
@@ -1495,8 +1495,7 @@ before this removal horizon is captured."
     (when implicit
       (if logical-ddl-responses
           (commit-ddl-and-flush-responses logical-ddl-responses)
-          (prog1 (commit-transaction)
-            (setf (backend-settings-transaction-start *backend*) nil))))
+          (commit-transaction)))
     (when copy-row-count
       (send-copy-command-complete stream copy-row-count))))
 
@@ -1522,6 +1521,48 @@ before this removal horizon is captured."
       (:apply-logical-event (exec-apply-logical-event stream ast))
       (otherwise (execute-in-transaction stream ast)))))
 
+(defun implicit-query-block-statements-p (statements)
+  (and (rest statements)
+       (every (lambda (statement)
+                (and (member (getf statement :type) '(:select :insert :update :delete :set :reset :show))
+                     (not (getf statement :transaction-options-p))
+                     (not (getf statement :session-characteristics-p))))
+              statements)))
+
+(defun execute-query-statements (stream statements implicit-block-p)
+  (loop for tail on statements
+        for ast = (first tail)
+        do (arm-statement-timeout)
+           (let ((*defer-command-complete-p* (and implicit-block-p (null (rest tail)))))
+             (unwind-protect
+                  (progn (check-for-interrupts) (execute-statement stream ast))
+               (clear-statement-timeout)))))
+
+(defun execute-simple-query-statements (stream statements)
+  (if (and (eq (backend-state *backend*) :idle)
+           (implicit-query-block-statements-p statements))
+      (let ((*deferred-command-completes* nil)
+            (complete-p nil))
+        (sb-sys:without-interrupts
+          (unwind-protect
+               (progn
+                 (setf (backend-settings-transaction-start *backend*)
+                       (copy-session-settings (backend-settings *backend*))
+                       (backend-implicit-query-block *backend*) t
+                       (backend-command-id *backend*) 0)
+                 (set-backend-state *backend* :in-progress)
+                 (sb-sys:with-local-interrupts
+                   (execute-query-statements stream statements t))
+                 (commit-transaction)
+                 (setf complete-p t)
+                 (sb-sys:with-local-interrupts
+                   (dolist (response (nreverse *deferred-command-completes*))
+                     (apply #'send-command-complete response))))
+            (unless complete-p
+              (unwind-protect (abort-transaction)
+                (restore-session-settings stream))))))
+      (execute-query-statements stream statements nil)))
+
 (defun exec-simple-query (stream query &key (start-execution-p t) (finish-execution-p t)
                                          (statements nil statements-p) prepare-only-p)
   (with-backend-query-execution (:start start-execution-p :finish finish-execution-p)
@@ -1538,11 +1579,7 @@ before this removal horizon is captured."
                                (prepare-only-p stmts)
                                ((null stmts) (send-empty-query-response stream))
                                (t
-                                (dolist (ast stmts)
-                                  (arm-statement-timeout)
-                                  (unwind-protect
-                                       (progn (check-for-interrupts) (execute-statement stream ast))
-                                    (clear-statement-timeout)))))
+                                (execute-simple-query-statements stream stmts)))
                            (setf completed-p t))))
                    (pg-error (e)
                      (clear-statement-timeout)

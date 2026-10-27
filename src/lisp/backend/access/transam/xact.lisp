@@ -10,9 +10,11 @@
   (database "postgres")
   (replication-mode nil)
   (application-name nil)
+  (reported-settings (make-hash-table :test #'equal))
   (xid nil)
   (state :idle)                 ; :idle | :in-progress | :aborted
   (explicit nil)
+  (implicit-query-block nil)
   (isolation-level :read-committed)
   (read-only (recovery-in-progress-p))
   (command-id 0)
@@ -1678,6 +1680,7 @@ can discard the owner of a virtual ID or its remaining relation locks."
       (release-xid (backend-virtual-reader-xid b) b))
     (setf (backend-xid b) nil
           (backend-explicit b) nil
+          (backend-implicit-query-block b) nil
           (backend-isolation-level b) :read-committed
           (backend-read-only b) (recovery-in-progress-p)
           (backend-command-id b) 0
@@ -1687,6 +1690,15 @@ can discard the owner of a virtual ID or its remaining relation locks."
           (backend-logical-changes b) '()
           (backend-logical-change-bytes b) 0)
     (set-backend-state b :idle))
+  (values))
+
+(defun finish-backend-transaction (backend commit-p)
+  (sb-sys:without-interrupts
+    (let ((*backend* backend))
+      (reset-backend-transaction backend)
+      (session-finish-application-name commit-p)
+      (when commit-p
+        (setf (backend-settings-transaction-start backend) nil))))
   (values))
 
 (defun commit-transaction ()
@@ -1705,9 +1717,9 @@ can discard the owner of a virtual ID or its remaining relation locks."
                (clog-set (backend-xid b) +clog-committed+
                          :fsync (not *wal-ready*))
                (release-xid (backend-xid b))
-               (reset-backend-transaction b))
+               (finish-backend-transaction b t))
              (reverse (backend-logical-changes b)))))
-        (reset-backend-transaction b)))
+        (finish-backend-transaction b t)))
   (values))
 
 (defun abort-transaction ()
@@ -1719,7 +1731,7 @@ can discard the owner of a virtual ID or its remaining relation locks."
         (when (= (clog-get (backend-xid b)) +clog-in-progress+)
           (clog-set (backend-xid b) +clog-aborted+ :fsync t))
         (release-xid (backend-xid b)))
-      (reset-backend-transaction b)))
+      (finish-backend-transaction b nil)))
   (values))
 
 (defun abort-transaction-block ()

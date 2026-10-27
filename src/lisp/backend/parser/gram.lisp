@@ -971,7 +971,14 @@
 (defun parse-set (p)
   (let ((session-p (match-kw p "session")))
     (when (match-kw p "local")
-      (ereport "0A000" "SET LOCAL is not supported"))
+      (when session-p (syntax-error p "SESSION and LOCAL are alternatives"))
+      (let ((name (pident p)))
+        (unless (string-equal name "application_name")
+          (ereport "0A000" "SET LOCAL is only supported for application_name"))
+        (when (eq (pkind p) :op) (pnext p))
+        (match-kw p "to")
+        (return-from parse-set
+          (list :type :set :name name :local-p t :value (parse-set-value p)))))
     (cond
       ((match-kw p "transaction")
        (when session-p

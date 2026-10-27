@@ -161,14 +161,9 @@
   "Validate, save transaction undo state, and report the new session search path."
   (let ((text (if (eq value +null+) "\"$user\", public" value)))
     (parse-sql-search-path text)
-    (when (and (eq (backend-state *backend*) :in-progress)
-               (null (backend-settings-transaction-start *backend*)))
-      (setf (backend-settings-transaction-start *backend*)
-            (copy-session-settings (backend-settings *backend*))))
+    (session-remember-settings)
     (unless (string= text (session-search-path))
-      (setf (gethash "search_path" (backend-settings *backend*)) text)
-      (when (and (backend-stream *backend*) (not *session-setting-reports-suppressed-p*))
-        (send-parameter-status (backend-stream *backend*) "search_path" text)))
+      (setf (gethash "search_path" (backend-settings *backend*)) text))
     text))
 
 (defun set-config-value (name value local-p)
@@ -176,6 +171,9 @@
   (when (eq name +null+)
     (ereport "22004" "SET requires parameter name"))
   (startup-check-session-setting (string-downcase name))
+  (when (string-equal name "application_name")
+    (return-from set-config-value
+      (session-set-application-name value (and local-p (not (eq local-p +null+))))))
   (when (session-extra-setting-p (string-downcase name))
     (when (and local-p (not (eq local-p +null+)))
       (ereport "0A000" "transaction-local settings are not supported"))

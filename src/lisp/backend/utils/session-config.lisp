@@ -38,11 +38,101 @@
     (t (princ-to-string value))))
 
 (defun session-extra-setting-p (name)
-  (or (string= name "statement_timeout")
+  (or (string= name "application_name") (string= name "statement_timeout")
       (assoc name *session-format-defaults* :test #'string=)
       (session-custom-setting-p name)))
 
+(defun session-normalize-application-name (value)
+  (let* ((text (princ-to-string value))
+         (clipped (sql-name-input text)))
+    (values
+     (with-output-to-string (output)
+       (loop for byte across (string->bytes clipped)
+             do (if (<= 32 byte 126)
+                    (write-char (code-char byte) output)
+                    (format output "\\x~(~2,'0x~)" byte))))
+     (not (equal text clipped)) clipped)))
+
+(defun session-publish-application-name ()
+  (let ((value (gethash "application_name" (backend-settings *backend*) "")))
+    (setf (backend-application-name *backend*) (sql-name-input value))
+    value))
+
+(defun session-report-parameter (stream name value)
+  (when (and *backend* (not *session-setting-reports-suppressed-p*))
+    (let ((reported (backend-reported-settings *backend*)))
+      (unless (equal value (gethash name reported))
+        (send-parameter-status stream name value)
+        (setf (gethash name reported) value)))))
+
+(defun session-report-parameters (stream)
+  (when *backend*
+    (session-report-parameter stream "TimeZone"
+                              (gethash "timezone" (backend-settings *backend*) "UTC"))
+    (session-report-parameter stream "search_path" (session-search-path))
+    (session-report-parameter stream "application_name"
+                              (gethash "application_name" (backend-settings *backend*) ""))))
+
+(defun session-remember-settings ()
+  (when (and (eq (backend-state *backend*) :in-progress)
+             (null (backend-settings-transaction-start *backend*)))
+    (setf (backend-settings-transaction-start *backend*)
+          (copy-session-settings (backend-settings *backend*)))))
+
+(defun session-application-name-value (value)
+  (multiple-value-bind (text truncated-p clipped)
+      (session-normalize-application-name value)
+    (when (and truncated-p (backend-stream *backend*))
+      (send-notice (backend-stream *backend*)
+                   (format nil "identifier ~c~a~c will be truncated to ~c~a~c"
+                           #\" value #\" #\" clipped #\")
+                   "NOTICE" "42622"))
+    text))
+
+(defun session-set-application-name (value &optional local-p)
+  (let* ((settings (backend-settings *backend*))
+         (reset (backend-settings-reset *backend*))
+         (reset-p (or (eq value :default) (eq value +null+)))
+         (text (if reset-p
+                   (gethash "application_name" reset "")
+                   (session-application-name-value value))))
+    (session-remember-settings)
+    (if local-p
+        (unless (gethash :application-name-local settings)
+          (setf (gethash :application-name-local settings)
+                (list (gethash "application_name" settings "")
+                      (gethash '(:source "application_name") settings "default"))))
+        (remhash :application-name-local settings))
+    (setf (gethash "application_name" settings) text
+          (gethash '(:source "application_name") settings)
+          (if reset-p (gethash '(:source "application_name") reset "default") "session"))
+    (session-publish-application-name)))
+
+(defun session-finish-application-name (commit-p)
+  (let* ((settings (backend-settings *backend*))
+         (start (backend-settings-transaction-start *backend*))
+         (restore (if commit-p
+                      (gethash :application-name-local settings)
+                      (when start
+                        (list (gethash "application_name" start "")
+                              (gethash '(:source "application_name") start "default"))))))
+    (when restore
+      (setf (gethash "application_name" settings) (first restore)
+            (gethash '(:source "application_name") settings) (second restore)))
+    (remhash :application-name-local settings)
+    (session-publish-application-name)))
+
+(defun session-application-name-settings-row ()
+  (vector "application_name" (if *backend* (sql-setting-value "application_name") "")
+          +null+ "user" "string"
+          (if *backend*
+              (gethash '(:source "application_name") (backend-settings *backend*) "default")
+              "default")
+          +null+ +null+ nil))
+
 (defun session-set-extra-setting (name value)
+  (when (string= name "application_name")
+    (return-from session-set-extra-setting (session-set-application-name value)))
   (let* ((settings (backend-settings *backend*))
          (reset-p (or (eq value :default) (eq value +null+)))
          (reset (backend-settings-reset *backend*)))
@@ -65,6 +155,7 @@
   (when (and *backend* (session-extra-setting-p name))
     (multiple-value-bind (value present-p) (gethash name (backend-settings *backend*))
       (cond
+        ((string= name "application_name") (values (or value "") t))
         ((string= name "statement_timeout")
          (let ((milliseconds (or value 0)))
            (values (if (zerop (mod milliseconds 1000))
@@ -122,7 +213,7 @@
                          (remove-if
                           (lambda (pair)
                             (member (car pair) '("user" "database" "replication"
-                                                 "application_name" "options")
+                                                 "options")
                                     :test #'string=))
                           params)))
           (let ((name (string-downcase (car assignment))))
@@ -135,7 +226,9 @@
       (ereport-fatal (pg-error-sqlstate condition) "~a" (pg-error-message condition)))))
 
 (defun session-reset-all-settings ()
-  (setf (backend-settings *backend*) (copy-session-settings (backend-settings-reset *backend*))))
+  (session-remember-settings)
+  (setf (backend-settings *backend*) (copy-session-settings (backend-settings-reset *backend*)))
+  (session-publish-application-name))
 
 (defun session-timeout-settings-row ()
   (let* ((settings (and *backend* (backend-settings *backend*)))

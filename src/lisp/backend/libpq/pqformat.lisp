@@ -30,13 +30,21 @@
     (payload-push-u32 p secret)))
 
 (defun send-ready-for-query (stream status)
+  (session-report-parameters stream)
   (with-backend-message (stream #\Z p)
     (payload-push-byte p (char-code status))))
 
 (defun send-empty-query-response (stream)
   (write-message stream #\I (make-payload)))
 
+(defvar *defer-command-complete-p* nil)
+
+(defvar *deferred-command-completes* nil)
+
 (defun send-command-complete (stream tag)
+  (when *defer-command-complete-p*
+    (push (list stream tag) *deferred-command-completes*)
+    (return-from send-command-complete nil))
   (if *logical-ddl-event-order-active-p*
       (push (list :command-complete stream tag)
             *logical-ddl-deferred-responses*)
@@ -69,20 +77,20 @@
           (field #\H (pg-error-hint condition))))
       (vector-push-extend 0 p))))
 
-(defun send-notice (stream message &optional (severity "NOTICE"))
+(defun send-notice (stream message &optional (severity "NOTICE")
+                                     (sqlstate (if (string= severity "NOTICE") "00000" "01000")))
   (if *logical-ddl-event-order-active-p*
-      (push (list :notice stream message severity)
+      (push (list :notice stream message severity sqlstate)
             *logical-ddl-deferred-responses*)
       (with-backend-message (stream #\N p)
-        (let ((sqlstate (if (string= severity "NOTICE") "00000" "01000")))
-          (flet ((field (code value)
-                   (payload-push-byte p (char-code code))
-                   (payload-push-cstring p value)))
-            (field #\S severity)
-            (field #\V severity)
-            (field #\C sqlstate)
-            (field #\M message))
-          (vector-push-extend 0 p)))))
+        (flet ((field (code value)
+                 (payload-push-byte p (char-code code))
+                 (payload-push-cstring p value)))
+          (field #\S severity)
+          (field #\V severity)
+          (field #\C sqlstate)
+          (field #\M message))
+        (vector-push-extend 0 p))))
 
 (defun flush-logical-ddl-deferred-responses (responses)
   (dolist (response responses)
