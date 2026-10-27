@@ -102,7 +102,8 @@
     (labels ((add (size)
                (incf count size)
                (when (> count maximum) (error "retained WAL inventory text budget exceeded")))
-             (visit (value)
+             (visit (value depth)
+               (when (> depth 16) (error "retained WAL literal nesting exceeds its bound"))
                (typecase value
                  (string
                   (add 2)
@@ -113,14 +114,17 @@
                  (cons
                   (add 2)
                   (loop for item in value for first = t then nil
-                        do (unless first (add 1)) (visit item)))
-                 (integer (add (length (format nil "~d" value))))
+                        do (unless first (add 1)) (visit item (1+ depth))))
+                 (integer
+                  (unless (typep value '(unsigned-byte 64))
+                    (error "retained WAL literal integer exceeds its bound"))
+                  (add (length (format nil "~d" value))))
                  (null (add 3))
                  (symbol
                   (unless (keywordp value) (error "unsupported retained WAL literal symbol"))
                   (add (1+ (length (symbol-name value)))))
                  (t (error "unsupported retained WAL literal value")))))
-      (visit payload))
+      (visit payload 0))
     count))
 
 (defun physical-retained-inventory-image (payload)

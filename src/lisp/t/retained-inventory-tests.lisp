@@ -130,6 +130,12 @@
         (ok (= size (pg::physical-retained-inventory-check-text-budget payload size)))
         (ok (signals (pg::physical-retained-inventory-check-text-budget payload (1- size)) 'error)))))
 
+(deftest retained-inventory-text-budget-rejects-unbounded-scalars-and-depth
+    (ok (signals (pg::physical-retained-inventory-check-text-budget (list :large (ash 1 4096))) 'error))
+  (let ((payload nil))
+    (dotimes (level 64) (setf payload (list payload)))
+    (ok (signals (pg::physical-retained-inventory-check-text-budget payload) 'error))))
+
 (deftest retained-inventory-does-not-follow-a-referenced-image-symlink
     (call-with-retained-inventory
      (lambda (root images identity history text)
