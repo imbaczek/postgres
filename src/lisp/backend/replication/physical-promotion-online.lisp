@@ -108,6 +108,81 @@ before intent.  Other failures after work starts fence the process for restart."
   (declare (ignore signal-info))
   (setf *physical-promotion-requested-p* t))
 
+(defun physical-promotion-file-sqlstate (errno)
+  (cond
+    ((member errno (list sb-posix:eperm sb-posix:eacces sb-posix:erofs)) "42501")
+    ((= errno sb-posix:enoent) "58P01")
+    ((= errno sb-posix:eexist) "58P02")
+    ((member errno (list sb-posix:enotdir sb-posix:eisdir sb-posix:enotempty)) "42809")
+    ((= errno sb-posix:enospc) "53100")
+    ((= errno sb-posix:enomem) "53200")
+    ((member errno (list sb-posix:enfile sb-posix:emfile)) "53000")
+    ((= errno sb-posix:eio) "58030")
+    ((= errno sb-posix:enametoolong) "58P03")
+    (t "XX000")))
+
+(defun physical-promotion-request-from-sql ()
+  (physical-promotion-check-online)
+  (unless (and *physical-promotion-worker*
+               (sb-thread:thread-alive-p *physical-promotion-worker*))
+    (ereport "55000" "standby promotion worker is not running"))
+  (let ((path (merge-pathnames "promote" *pgdata*))
+        (fd nil))
+    (handler-case
+        (sb-sys:without-interrupts
+          (unwind-protect
+               (progn
+                 (setf fd (sb-posix:open (namestring path)
+                                         (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-trunc
+                                                 sb-posix:o-nofollow sb-posix:o-nonblock
+                                                 +postmaster-o-cloexec+)
+                                         #o600))
+                 (unless (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:fstat fd)))
+                   (ereport "42809" "promotion signal is not a regular file"))
+                 (let ((owned fd))
+                   (setf fd nil)
+                   (sb-posix:close owned))
+                 (physical-promotion-test-point :after-sql-request-close-before-wake)
+                 (request-physical-promotion))
+            (when fd
+              (let ((owned fd))
+                (setf fd nil)
+                (sb-posix:close owned)))))
+      (sb-posix:syscall-error (condition)
+        (ereport (physical-promotion-file-sqlstate (sb-posix:syscall-errno condition))
+                 "could not create or close file ~s: ~a" "promote" condition))))
+  t)
+
+(defun physical-promotion-wait-for-sql (deadline)
+  (loop
+    (when (>= (get-internal-real-time) deadline) (return nil))
+    (when *physical-recovery-failed-p* (return nil))
+    (unless (recovery-in-progress-p) (return t))
+    (check-for-interrupts)
+    (sleep (min 0.1 (max 0.001
+                         (/ (- deadline (get-internal-real-time))
+                            (float internal-time-units-per-second 1d0)))))))
+
+(defun pg-promote (wait wait-seconds)
+  (sql-strict-let ((wait-p wait) (seconds wait-seconds))
+    (unless (recovery-in-progress-p)
+      (ereport "55000" "recovery is not in progress"
+               :hint "Recovery control functions can only be executed during recovery."))
+    (unless (plusp seconds)
+      (ereport "22003" "\"wait_seconds\" must not be negative or zero"))
+    (physical-promotion-request-from-sql)
+    (unless wait-p (return-from pg-promote t))
+    (let* ((deadline (+ (get-internal-real-time)
+                        (* seconds internal-time-units-per-second)))
+           (promoted (call-with-live-operation-parked
+                      (lambda () (physical-promotion-wait-for-sql deadline)))))
+      (check-recovery-available)
+      (if (and promoted (not (recovery-in-progress-p)))
+          t
+          (progn
+            (warning-notice "server did not promote within ~d second~:p" seconds)
+            nil)))))
+
 (defun physical-promotion-consume-signal ()
   "Remove a regular promote signal file and sync its directory; return true if found.
 This only consumes a request. It neither publishes durable intent nor grants

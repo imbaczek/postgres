@@ -64,6 +64,8 @@
 
 (defvar *physical-promotion-worker* nil)
 
+(declaim (ftype function pg-promote))
+
 (defvar *physical-shutdown-state* nil
   "Process-local native standby shutdown phase; reset only by process restart.")
 

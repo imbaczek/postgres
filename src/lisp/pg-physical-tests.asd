@@ -39,6 +39,7 @@
                (:file "t/promotion-resume-tests")
                (:file "t/promotion-commit-tests")
                (:file "t/promotion-online-tests")
+               (:file "t/promotion-sql-tests")
                (:file "t/physical-stream-tests")
                (:file "t/physical-follow-exit-tests")
                (:file "t/physical-shutdown-tests"))

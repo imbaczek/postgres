@@ -253,15 +253,78 @@ exist\" messages."
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
   (list :func name nil :type :record :typmod -1 :fields +wal-receiver-result-fields+))
 
+(defun analyze-promotion-arguments (arguments table &optional variadic)
+  (let* ((analyzed
+           (mapcar (lambda (argument)
+                     (if (eq (first argument) :named-arg)
+                         (list :named-arg (second argument) (analyze-expr (third argument) table))
+                         (analyze-expr argument table)))
+                   arguments))
+         (names nil)
+         (slots (vector (list :const t :type :bool :typmod -1)
+                        (list :const 60 :type :int4 :typmod -1)))
+         (assigned (vector nil nil))
+         (position 0)
+         (bindings nil))
+    (dolist (argument analyzed)
+      (if (eq (first argument) :named-arg)
+          (progn
+            (when (member (second argument) names :test #'equal)
+              (ereport "42601" "argument name ~s used more than once" (second argument)))
+            (push (second argument) names))
+          (when names (ereport "42601" "positional argument cannot follow named argument"))))
+    (dolist (argument analyzed)
+      (let* ((named-p (eq (first argument) :named-arg))
+             (index (if named-p (position (second argument) '("wait" "wait_seconds") :test #'equal)
+                        (prog1 position (incf position))))
+             (expression (if named-p (third argument) argument))
+             (type (if (eql index 0) :bool :int4)))
+        (unless (and index (< index 2) (not (aref assigned index))
+                     (or (in-unknown-constant-p expression)
+                         (if (eq type :bool) (eq (expr-type expression) :bool)
+                             (member (expr-type expression) '(:int2 :int4)))))
+          (ereport "42883" "function pg_promote(...) does not exist"))
+        (push (list index expression type) bindings)
+        (setf (aref assigned index) t)))
+    (when (and variadic names (/= (caar bindings) (1- (length analyzed))))
+      (ereport "42883" "function pg_promote(...) does not exist"))
+    (dolist (binding (nreverse bindings))
+      (destructuring-bind (index expression type) binding
+        (setf (aref slots index) (coerce-common-expression expression type))))
+    (coerce slots 'list)))
+
+(defun analyze-call-argument-list (name arguments table &optional variadic)
+  (if (string= name "pg_promote")
+      (analyze-promotion-arguments arguments table variadic)
+      (mapcar (lambda (argument)
+                (when (eq (first argument) :named-arg)
+                  (ereport "0A000" "named arguments are not supported for function ~a" name))
+                (analyze-expr argument table))
+              arguments)))
+
+(defun analyze-nullary-function (name args)
+  (when args
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+  (list :func name args
+        :type (cond ((member name '("pg_current_wal_lsn" "pg_current_wal_flush_lsn"
+                                    "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn")
+                             :test #'string=) :pg-lsn)
+                    ((member name '("pg_is_in_recovery" "pg_is_wal_replay_paused") :test #'string=) :bool)
+                    ((member name '("pg_wal_replay_pause" "pg_wal_replay_resume") :test #'string=) :void)
+                    ((string= name "pg_lisp_cluster_identity") :varchar)
+                    (t :text))
+        :typmod -1))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
-         (args (mapcar (lambda (arg) (analyze-expr arg table)) (third expr))))
+         (args (analyze-call-argument-list name (third expr) table (getf (cdddr expr) :variadic))))
     ;; C ParseFuncOrColumn clears explicit VARIADIC for a nonvariadic match.
     (when (string= name "pg_get_publication_tables")
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     (cond
+      ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
       ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
       ((string= name "substr") (analyze-substr-function name args))
       ((string= name "pg_wal_lsn_diff") (analyze-wal-lsn-diff name args))
@@ -280,20 +343,7 @@ exist\" messages."
                       "current_database" "current_schema"
                       "current_catalog" "current_user" "session_user" "user")
                :test #'string=)
-       (when args
-         (ereport "42883" "function ~a(~a) does not exist"
-                  name (call-signature args)))
-       (list :func name args
-             :type (cond ((member name '("pg_current_wal_lsn" "pg_current_wal_flush_lsn"
-                                         "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn")
-                                  :test #'string=) :pg-lsn)
-                         ((member name '("pg_is_in_recovery" "pg_is_wal_replay_paused")
-                                  :test #'string=) :bool)
-                         ((member name '("pg_wal_replay_pause" "pg_wal_replay_resume")
-                                  :test #'string=) :void)
-                         ((string= name "pg_lisp_cluster_identity") :varchar)
-                         (t :text))
-             :typmod -1))
+       (analyze-nullary-function name args))
       ((string= name "pg_lisp_acquire_subscription")
        (unless (and (= (length args) 1) (eq (expr-type (first args)) :text))
          (ereport "42883" "pg_lisp_acquire_subscription requires one text key"))
@@ -1301,6 +1351,8 @@ exist\" messages."
 
 (defun analyze-aggregate-input (raw scope kind)
   "Resolve the supported pg_aggregate input and result types before transition setup."
+  (when (find :named-arg (third raw) :key (lambda (argument) (and (consp argument) (first argument))))
+    (ereport "0A000" "aggregates cannot use named arguments"))
   (when (eq kind :count) (return-from analyze-aggregate-input (values nil :int8)))
   (unless (= 1 (length (third raw)))
     (ereport "42883" "function ~a requires one argument" (second raw)))
@@ -1707,8 +1759,56 @@ exist\" messages."
      (prevent-recovery-primary-operation name)
      (if (string= name "pg_current_wal_flush_lsn") *wal-durable-lsn* *wal-end-lsn*))))
 
+(defun eval-logical-helper-function (name args)
+  (cond
+    ((string= name "pg_lisp_acquire_subscription")
+     (logical-acquire-subscription-owner (first args)))
+    ((string= name "pg_lisp_replica_identity_columns")
+     (with-write-lock
+       (let* ((table-name (first args))
+              (table (and (stringp table-name) (lookup-table table-name))))
+         (unless table
+           (ereport "42P01" "relation \"~a\" does not exist" table-name))
+         (format nil "~{~d~^,~}"
+                 (sort (copy-list (logical-table-replica-identity table)) #'<)))))
+    ((string= name "pg_lisp_publication_definition")
+     (with-write-lock
+       (let* ((publication (lookup-publication (first args)))
+              (db (current-database)))
+         (unless publication
+           (ereport "42704" "publication \"~a\" does not exist" (first args)))
+         (catalog-readable-data-string
+          (publication-definition-data publication db)))))
+    ((string= name "pg_lisp_table_definition")
+     (with-write-lock
+       (let ((table (lookup-table (first args))))
+         (unless table
+           (ereport "42P01" "table \"~a\" does not exist" (first args)))
+         (catalog-table-definition-sql table))))
+    ((string= name "pg_lisp_sequence_state")
+     (with-write-lock
+       (let ((sequence (lookup-sequence (first args))))
+         (unless sequence
+           (ereport "42P01" "sequence \"~a\" does not exist" (first args)))
+         (catalog-readable-data-string
+          (list :name (pg-sequence-name sequence)
+                :oid (pg-sequence-oid sequence)
+                :start (pg-sequence-start-value sequence)
+                :increment (pg-sequence-increment sequence)
+                :min (pg-sequence-min-value sequence)
+                :max (pg-sequence-max-value sequence)
+                :last (pg-sequence-last-value sequence)
+                :called (pg-sequence-called-p sequence))))))
+    ((string= name "pg_lisp_replication_bootstrap")
+     (with-write-lock
+       (catalog-readable-data-string
+        (catalog-replication-bootstrap-data
+         (current-database) *current-snapshot*))))
+    (t (ereport "42883" "function ~a(...) does not exist" name))))
+
 (defun eval-func (name args)
   (cond
+    ((string= name "pg_promote") (pg-promote (first args) (second args)))
     ((string= name "pg_stat_get_wal_receiver") (wal-receiver-result))
     ((string= name "pg_postmaster_start_time") (postmaster-start-timestamp))
     ((string= name "substr") (eval-substr-function args))
@@ -1755,49 +1855,10 @@ exist\" messages."
                 "setval expects a sequence name, int8 value, and optional boolean"))
      (sequence-setval (first args) (second args)
                       (if (= (length args) 3) (third args) t)))
-    ((string= name "pg_lisp_acquire_subscription")
-     (logical-acquire-subscription-owner (first args)))
-    ((string= name "pg_lisp_replica_identity_columns")
-     (with-write-lock
-       (let* ((table-name (first args))
-              (table (and (stringp table-name) (lookup-table table-name))))
-         (unless table
-           (ereport "42P01" "relation \"~a\" does not exist" table-name))
-         (format nil "~{~d~^,~}"
-                 (sort (copy-list (logical-table-replica-identity table)) #'<)))))
-    ((string= name "pg_lisp_publication_definition")
-     (with-write-lock
-       (let* ((publication (lookup-publication (first args)))
-              (db (current-database)))
-         (unless publication
-           (ereport "42704" "publication \"~a\" does not exist" (first args)))
-         (catalog-readable-data-string
-          (publication-definition-data publication db)))))
-    ((string= name "pg_lisp_table_definition")
-     (with-write-lock
-       (let ((table (lookup-table (first args))))
-         (unless table
-           (ereport "42P01" "table \"~a\" does not exist" (first args)))
-         (catalog-table-definition-sql table))))
-    ((string= name "pg_lisp_sequence_state")
-     (with-write-lock
-       (let ((sequence (lookup-sequence (first args))))
-         (unless sequence
-           (ereport "42P01" "sequence \"~a\" does not exist" (first args)))
-         (catalog-readable-data-string
-          (list :name (pg-sequence-name sequence)
-                :oid (pg-sequence-oid sequence)
-                :start (pg-sequence-start-value sequence)
-                :increment (pg-sequence-increment sequence)
-                :min (pg-sequence-min-value sequence)
-                :max (pg-sequence-max-value sequence)
-                :last (pg-sequence-last-value sequence)
-                :called (pg-sequence-called-p sequence))))))
-    ((string= name "pg_lisp_replication_bootstrap")
-     (with-write-lock
-       (catalog-readable-data-string
-        (catalog-replication-bootstrap-data
-         (current-database) *current-snapshot*))))
+    ((member name '("pg_lisp_acquire_subscription" "pg_lisp_replica_identity_columns"
+                    "pg_lisp_publication_definition" "pg_lisp_table_definition"
+                    "pg_lisp_sequence_state" "pg_lisp_replication_bootstrap") :test #'string=)
+     (eval-logical-helper-function name args))
     ((string= name "current_database")
      (backend-database *backend*))
     ((string= name "current_schema") (current-schema-name))

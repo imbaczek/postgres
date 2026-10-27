@@ -1204,6 +1204,16 @@
        (if *parse-type-modifiers-p* (list :unary "+" argument) argument)))
     (t (parse-postfix-expression p))))
 
+(defun parse-call-argument (parser)
+  (let ((next (nth (1+ (sql-parser-pos parser)) (sql-parser-tokens parser))))
+    (if (and (eq (pkind parser) :ident) next
+             (eq (token-kind next) :op)
+             (member (token-value next) '("=>" ":=") :test #'string=))
+        (let ((name (pident parser)))
+          (pnext parser)
+          (list :named-arg name (parse-expr parser)))
+        (parse-expr parser))))
+
 (defun parse-call-arguments (p)
   "Read arguments after the opening parenthesis; VARIADIC may occur only last."
   (if (match-punct p #\))
@@ -1211,7 +1221,7 @@
       (with-parens (p :opening-consumed t)
         (loop with arguments = nil
               for variadic = (and (not (token-quoted-p (pcur p))) (match-kw p "variadic"))
-              do (push (parse-expr p) arguments)
+              do (push (parse-call-argument p) arguments)
               when variadic do (return (values (nreverse arguments) t))
                 unless (match-punct p #\,) do (return (values (nreverse arguments) nil))))))
 
