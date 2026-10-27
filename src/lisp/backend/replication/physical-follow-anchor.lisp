@@ -1,6 +1,7 @@
 (in-package #:pg)
 
 (defun physical-follow-pin-check-live (pin)
+  "Require a healthy primary and the same live, retained pin under the WAL lock."
   (wal-check-healthy)
   (when (recovery-in-progress-p)
     (wal-invalid-input "physical follow anchor source has entered recovery"))
@@ -10,6 +11,7 @@
   (physical-follow-pin-check-source pin))
 
 (defun physical-follow-pin-check-source-eor (pin)
+  "Compare the anchor's end-of-recovery bytes with durable source WAL."
   (multiple-value-bind (history fork expected)
       (physical-follow-anchor-check (physical-follow-pin-anchor pin))
     (declare (ignore fork))
@@ -36,6 +38,11 @@
           (close stream))))))
 
 (defun physical-source-follow-reserve (name request)
+  "Reserve source WAL for an anchor under admission, write and WAL exclusion.
+
+Validate the request before entering the WAL critical section. A malformed
+request does not poison healthy WAL. Retention is installed before saving the
+pin; an ambiguous save fences the source and keeps retention until restart."
   (unless (wal-valid-replication-slot-name-p name)
     (wal-invalid-input "invalid physical follow pin name"))
   (let* ((name (copy-seq name))
@@ -80,6 +87,10 @@
           candidate)))))
 
 (defun physical-follow-pin-proof-digest (pin)
+  "Hash the nonempty retained overlap through the anchor's receive boundary.
+
+The carried receive digest is not independently checked over recycled history.
+A second value of true means the pin was already ready."
   (with-live-operation
     (let* ((request (physical-follow-pin-anchor pin))
            (start (getf request :overlap-start)) (end (getf request :receive-lsn))
@@ -119,6 +130,11 @@
         (when stream (close stream))))))
 
 (defun physical-follow-pin-check-suffix (pin)
+  "Validate the source suffix through a captured durable endpoint.
+
+Check record continuity, rotation and end-of-recovery records. The endpoint
+may fall within an unfinished batch. Each segment scan holds its own live
+admission and runs outside the WAL lock."
   (let* ((history (physical-follow-pin-history pin))
          (cursor (physical-source-pin-consistent-lsn pin))
          (end (with-live-operation
@@ -169,6 +185,10 @@
     t))
 
 (defun physical-source-follow-ready (name request)
+  "Reserve and prove an anchor, then durably mark its pin ready.
+
+READY is eligibility for a future follow path, not network admission. Save
+before publishing the ready state in memory; a save failure fences the source."
   (let ((pin (physical-source-follow-reserve name request)))
     (unless (physical-follow-pin-ready-p pin)
       (multiple-value-bind (digest already-ready) (physical-follow-pin-proof-digest pin)

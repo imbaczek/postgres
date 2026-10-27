@@ -1,6 +1,10 @@
 (in-package #:pg)
 
 (defstruct (physical-follow-pin (:include physical-source-pin))
+  "A source pin retaining WAL for a proposed follow anchor.
+
+The included source-pin fields retain their existing layout. READY grants
+eligibility for a future follow path; bootstrap START does not accept this pin."
   anchor (stage :retaining))
 
 (defconstant +physical-follow-pin-maximum-bytes+ (* 16 1024 1024))
@@ -14,9 +18,11 @@
     :confirmed :digest :lost :stage :anchor))
 
 (defun physical-follow-pin-image-limit ()
+  "Return the maximum encoded follow-pin size."
   +physical-follow-pin-maximum-bytes+)
 
 (defun physical-follow-check-plist (value keys)
+  "Require exactly one occurrence of each expected field."
   (unless (and (listp value) (= (length value) (* 2 (length keys)))
                (every (lambda (key)
                         (= 1 (loop for name in value by #'cddr count (eq key name))))
@@ -24,6 +30,10 @@
     (error "invalid physical follow pin fields")))
 
 (defun physical-follow-anchor-check (request)
+  "Validate anchor fields, ancestry and the proposed end-of-recovery record.
+
+Return the parsed history, fork and record. This checks the request, not its
+agreement with retained source WAL."
   (physical-follow-check-plist request *physical-follow-anchor-keys*)
   (let ((source (getf request :source-timeline))
         (parent (getf request :receive-timeline))
@@ -62,6 +72,7 @@
         (values history fork record)))))
 
 (defun physical-follow-anchor-copy (request)
+  "Validate REQUEST and copy its mutable anchor values for pin ownership."
   (physical-follow-anchor-check request)
   (loop for key in *physical-follow-anchor-keys*
         for value = (getf request key)
@@ -71,9 +82,11 @@
                            (t value)))))
 
 (defun physical-follow-pin-ready-p (pin)
+  "Return whether PIN reached the ready stage; retention may since have been lost."
   (and (physical-follow-pin-p pin) (eq :ready (physical-follow-pin-stage pin))))
 
 (defun physical-follow-pin-check-fields (pin)
+  "Check that PIN's stage and progress agree with its anchor."
   (unless (physical-follow-pin-p pin) (error "not a physical follow pin"))
   (let* ((request (physical-follow-pin-anchor pin))
          (cursor (getf request :receive-lsn))
@@ -100,6 +113,7 @@
   pin)
 
 (defun physical-follow-pin-payload (pin)
+  "Build a validated payload with a copy of the anchor."
   (physical-follow-pin-check-fields pin)
   (list :version 1 :mode :follow-anchor :name (physical-source-pin-name pin)
         :system-id (physical-source-pin-system-id pin) :timeline (physical-source-pin-timeline pin)
@@ -110,11 +124,13 @@
         :anchor (physical-follow-anchor-copy (physical-follow-pin-anchor pin))))
 
 (defun physical-follow-pin-image-p (bytes)
+  "Recognize a follow-pin envelope before decoding it."
   (let ((magic (string->bytes *physical-follow-pin-magic*)))
     (and (> (length bytes) (length magic)) (= 32 (aref bytes (length magic)))
          (equalp magic (subseq bytes 0 (length magic))))))
 
 (defun physical-follow-pin-encode (pin)
+  "Encode PIN with a checksum and enforce the reopen size bound."
   (let* ((payload (physical-follow-pin-payload pin))
          (body (string->bytes (physical-bootstrap-manifest-text payload)))
          (header (string->bytes (format nil "~a ~d ~8,'0X~%"
@@ -124,6 +140,7 @@
     (concatenate '(vector (unsigned-byte 8)) header body)))
 
 (defun physical-follow-pin-read-payload (bytes)
+  "Check the bounded envelope and checksum before reading its payload."
   (unless (and (typep bytes '(vector (unsigned-byte 8)))
                (<= (length bytes) +physical-follow-pin-maximum-bytes+)
                (physical-follow-pin-image-p bytes))
@@ -140,6 +157,7 @@
       (recovery-parse-manifest-text (bytes->string body)))))
 
 (defun physical-follow-pin-decode (bytes)
+  "Decode a follow pin and validate its anchor and progress."
   (let ((payload (physical-follow-pin-read-payload bytes)))
     (physical-follow-check-plist payload *physical-follow-pin-keys*)
     (unless (and (eql 1 (getf payload :version)) (eq :follow-anchor (getf payload :mode)))
@@ -154,11 +172,13 @@
       :anchor (physical-follow-anchor-copy (getf payload :anchor))))))
 
 (defun physical-follow-pin-history (pin)
+  "Parse and validate the source history retained in PIN."
   (timeline-check-lineage
    (timeline-parse-history (physical-source-pin-timeline pin)
                            (getf (physical-follow-pin-anchor pin) :history-text))))
 
 (defun physical-follow-pin-check-source (pin)
+  "Check PIN against the current source identity, timeline and durable WAL."
   (unless (and (= (physical-source-pin-system-id pin) (catalog-system-identifier))
                (= (physical-source-pin-timeline pin) *wal-insert-timeline*)
                (eq *wal-segment-namespace* :timeline)
@@ -171,6 +191,10 @@
     (wal-invalid-input "physical follow anchor history differs from its source")))
 
 (defun physical-follow-pin-check-retained-wal (pin)
+  "Require source-timeline files for the retained range through durable WAL.
+
+The caller excludes recycling. This checks file inventory; proof scans check
+record continuity. Uncertified ancestor file prefixes are rejected."
   (let* ((history (physical-follow-pin-history pin))
          (floor (physical-source-pin-restart-lsn pin))
          (previous 0))
@@ -188,6 +212,7 @@
                  (setf previous timeline))))))
 
 (defun physical-follow-pin-check-wal (pin)
+  "Validate PIN and, unless lost, its retained source file inventory."
   (physical-follow-pin-check-fields pin)
   (physical-follow-pin-check-source pin)
   (unless (physical-source-pin-lost-p pin)

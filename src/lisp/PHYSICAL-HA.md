@@ -321,6 +321,34 @@ Patroni 4.1.5 constructs those recovery parameters in
 path does not satisfy that contract. These are backend
 contracts; they add no distributed authority or coordination.
 
+### Source-side follow anchors
+
+The source now persists a separate follow-anchor pin. Reservation retains WAL
+before proof work but grants no streaming or receipt confirmation. The source
+compares a nonempty retained overlap, checks the continuation through a captured
+durable endpoint, and saves ready state before publishing it in memory. An
+identical retry preserves later confirmed progress; lost retention requires reseeding.
+The receiver's carried digest remains distinct from the independently compared
+overlap digest. This does not verify recycled parent history.
+
+Only current-source-timeline files qualify for this proof. An ancestor backup's
+partial WAL prefix cannot establish that the historical suffix remains available.
+Record scans also reject holes disguised as rotation gaps. General historical
+follow still needs authenticated retained extents preserved before receive-spool
+compaction, including automatic restartpoints before promotion.
+
+The native `t/follow-anchor.sh` test uses owned control endpoints and a real sibling
+to check source proof, refusal of bootstrap mode, and source SIGKILL/restart.
+All three publication cuts pass: after retention, after proof, and after ready.
+Validation also passes 580 physical tests, 170 interop tests, 1,598 legacy checks,
+and strict fresh-cache compilation. The new codec property passes 200 trials;
+the existing source-pin codec property passes 100, both with seed 42.
+
+This source primitive does not implement network onboarding. Historical serving,
+receiver source-binding publication, recovery connection settings, full slot
+contracts and synchronous durability remain open. The existing bootstrap START
+path rejects follow pins. No coordination is added.
+
 ### SQL configuration reload
 
 `pg_reload_conf()` now requests SIGHUP instead of returning an unconditional

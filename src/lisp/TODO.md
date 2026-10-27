@@ -12,7 +12,8 @@
   promotion, relation reader identity selection, statement snapshot scope bookkeeping,
   temporary stream ownership, executor parking, client application-name settings,
   supported implicit query blocks, SQL promotion, fresh child backup/follow and
-  durable receive-history selection have completed this pass and its review. Keep the
+   durable receive-history selection and source-side follow anchors have completed
+   this pass and its review. Keep the
   same order for the remaining HA work.
 
 - [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker
@@ -49,6 +50,9 @@ The cold-image audit should cover:
   proclamations, especially `LET` bindings compiled before `DECLAIM SPECIAL`.
 - Macros, compiler macros, symbol macros, classes and structures whose definitions
   must exist during compilation; check `EVAL-WHEN` and ASDF dependency ordering.
+  Include forward calls to structure predicates: the follow-anchor work needed
+  local `NOTINLINE` declarations in the earlier source-pin module. A warm image
+  compiled it without exposing the missing subtype definition.
 - Entry points that work only after another system or optional feature has
   populated the image, and stale FASLs or inlined constants that conceal defects.
 - Each supported system built and loaded in a fresh SBCL process with an empty
