@@ -4,6 +4,7 @@
 (defun simplify-exists-prepared-query (prepared)
   ;; Drop output work only when it cannot alter whether EXISTS returns a row.
   (when (and (not (getf prepared :set-operation))
+             (not (getf prepared :ctes))
              (zerop (getf prepared :aggregate-count 0))
              (not (getf prepared :set-functions))
              (not (getf prepared :windows))
@@ -54,6 +55,10 @@
   (unless (gethash plan seen)
     (setf (gethash plan seen) t)
     (reset-query-plan-instrumentation (query-plan-metadata plan))
+    (dolist (reference (query-plan-cte-reference-plans plan))
+      (reset-query-plan-tree-instrumentation reference seen))
+    (dolist (definition (query-plan-cte-definitions plan))
+      (reset-query-plan-tree-instrumentation (sql-cte-plan definition) seen))
     (dolist (descriptor (query-plan-expression-subplans plan))
       (reset-query-plan-tree-instrumentation (sql-subplan-plan descriptor) seen))))
 
@@ -83,7 +88,6 @@
     (:all (sql-3val-and accumulated value))))
 
 (defun eval-subquery-expression (descriptor environment)
-  ;; Cache only at the dependency owner; correlated scans use copied outer frames.
   (let* ((cache (subquery-cache-for descriptor))
          (key (and cache descriptor)))
     (when key
@@ -93,33 +97,31 @@
            (plan (sql-subplan-plan descriptor))
            (registered (subquery-registered-relations plan))
            (caller-frames *subquery-outer-frames*)
+           (frame (cons (map 'vector #'copy-subquery-value environment) (make-hash-table :test #'eq)))
            (found nil)
-           (result (case kind (:all t) ((:scalar) +null+) (t nil)))
+           (result (case kind (:all t) (:scalar +null+) (t nil)))
            (array (when (eq kind :array) (make-array 0 :adjustable t :fill-pointer 0))))
       (reconcile-query-plan-access-paths plan registered)
-      (let ((*subquery-outer-frames*
-              (cons (cons (map 'vector #'copy-subquery-value environment) (make-hash-table :test #'eq))
-                    caller-frames)))
-        (execute-query-plan
-         plan registered
-         (lambda (row)
-           (check-for-interrupts)
-           (case kind
-             (:exists (setf result t) :stop)
-             (:scalar
-              (when found
-                (ereport "21000" "more than one row returned by a subquery used as an expression"))
-              (setf found t result (copy-subquery-value (aref (car row) 0)))
-              nil)
-             (:array
-              (vector-push-extend (copy-subquery-value (aref (car row) 0)) array)
-              nil)
-             ((:any :all)
-              (let* ((*subquery-outer-frames* caller-frames)
-                     (*subquery-output-value* (aref (car row) 0))
-                     (value (eval-expr (sql-subplan-test descriptor) environment)))
-                (setf result (subquery-quantified-step kind result value))
-                (when (if (eq kind :any) (eq result t) (null result)) :stop)))))))
+      (let ((*subquery-outer-frames* (cons frame caller-frames)))
+        (unwind-protect
+             (execute-query-plan
+              plan registered
+              (lambda (row)
+                (check-for-interrupts)
+                (case kind
+                  (:exists (setf result t) :stop)
+                  (:scalar
+                   (when found (ereport "21000" "more than one row returned by a subquery used as an expression"))
+                   (setf found t result (copy-subquery-value (aref (car row) 0)))
+                   nil)
+                  (:array (vector-push-extend (copy-subquery-value (aref (car row) 0)) array) nil)
+                  ((:any :all)
+                   (let* ((*subquery-outer-frames* caller-frames)
+                          (*subquery-output-value* (aref (car row) 0))
+                          (value (eval-expr (sql-subplan-test descriptor) environment)))
+                     (setf result (subquery-quantified-step kind result value))
+                     (when (if (eq kind :any) (eq result t) (null result)) :stop))))))
+          (close-cte-frame-cache (cdr frame))))
       (when array (setf result (coerce array 'simple-vector)))
       (when key (setf (gethash key cache) result))
       result)))

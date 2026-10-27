@@ -681,6 +681,9 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
 
 (defun prepare-select-source (source alias offset)
   "Prepare a FROM namespace entry; callers hold the catalog view lock."
+  (let ((definition (cte-source-definition source)))
+    (when definition
+      (return-from prepare-select-source (make-cte-relation-spec definition alias offset))))
   (if (sql-derived-relation-p source)
       (let* ((prepared (prepare-select-internal (sql-derived-relation-query source)
                                                 (make-select-scope)))
@@ -713,7 +716,8 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
 
 (defun prepare-union-select (ast)
   "Prepare both arms under the caller's catalog view."
-  (let* ((left (prepare-select-internal (getf ast :left)))
+  (let* ((*select-cte-level* (1- *select-cte-level*))
+         (left (prepare-select-internal (getf ast :left)))
          (right (prepare-select-internal (getf ast :right))))
     (multiple-value-bind (targets coercions)
         (analyze-union-targets (getf left :targets) (getf right :targets))
@@ -724,6 +728,8 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
 
 (defun prepare-select-internal (ast &optional (parent *select-outer-scope*))
   (let* ((*select-outer-scope* parent)
+         (*select-cte-environment* *select-cte-environment*)
+         (*select-cte-level* (1+ *select-cte-level*))
          (*select-sublinks* nil)
          (*select-window-functions* (make-array 0 :adjustable t :fill-pointer 0))
          (*select-window-specifications* (make-array 0 :adjustable t :fill-pointer 0))
@@ -741,7 +747,10 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
          (*inside-aggregate-input-p* nil)
          (*aggregate-order-mode* nil)
          (*select-set-functions-allowed-p* nil)
+         (definitions (prepare-with-definitions (getf ast :with)))
          (prepared (%prepare-select-internal ast)))
+    (setf (getf prepared :ctes) definitions
+          (getf prepared :deferred-window-folding) *cte-definition-analysis-p*)
     (setf (getf prepared :sublinks) (nreverse *select-sublinks*))
     prepared))
 
@@ -842,7 +851,11 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                targets order
                (+ width (length *select-window-functions*))
                (getf ast :distinct)))))
-      (list :window-keys (third window-analysis)
+      (list :window-validation-keys
+            (when *cte-definition-analysis-p*
+              (mapcar (lambda (target) (getf target :expr)) *window-key-targets*))
+            :window-keys (third window-analysis)
+            :window-unused-key-indices (fourth window-analysis)
             :windows (coerce *select-window-functions* 'list) :window-input-width width
             :table first-table
             :source-relations relations

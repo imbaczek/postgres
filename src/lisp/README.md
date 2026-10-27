@@ -238,6 +238,11 @@ supported clauses and types, including their metadata and type checks. See
 [the subquery design and tests](t/SUBQUERIES.md) for concurrency semantics and
 known parity limits.
 
+Nonrecursive `WITH` supports SELECT CTEs, sequential lexical bindings, nested
+shadowing, column aliases, and default, `MATERIALIZED` and `NOT MATERIALIZED`
+policies. Scalar SELECT subqueries with `WITH` also work in DML expressions.
+See [CTE behavior and limits](t/CTES.md) for materialization and planning details.
+
 Window expressions support `row_number()`, `rank()`, `dense_rank()`, `count(*)`,
 `sum` and text `array_agg`, with multiple inline or named windows and supported
 inheritance. The default is peer-aware `RANGE UNBOUNDED PRECEDING` through
@@ -351,6 +356,10 @@ compares the native server with the repository's installed C PostgreSQL and owns
 its peers and ports. It honors `SBCL` and `PYTHON` (default `python3`, standard
 library only). See [subquery tests](t/SUBQUERIES.md) for scope and the known
 concurrent semijoin boundary.
+
+From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/ctes.sh`
+compares CTE behavior with the repository's installed C PostgreSQL. See
+[CTE tests](t/CTES.md) for scope and resource checks.
 
 From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/windows.sh`
 compares window cases with the repository's installed C PostgreSQL. The harness
@@ -784,12 +793,16 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   floating point, interval and money types remain unsupported.
   Noncorrelated derived SELECTs in `FROM`, ordinary
   `DISTINCT`, `UNION ALL`, and the expression subqueries described above are
-  supported. Row-valued and MULTIEXPR subqueries, CTEs, LATERAL, `DISTINCT ON`,
+  supported. Row-valued and MULTIEXPR subqueries, LATERAL, `DISTINCT ON`,
   and `HAVING` remain unsupported. Hash subplans and subquery decorrelation are
   not implemented. Joins use nested loops;
   INNER/CROSS join order uses a greedy statistics-based choice, while outer
   joins retain source order. NATURAL JOIN
   is not supported; comma-separated `FROM` items act as cross joins.
+- Recursive CTEs and top-level `WITH` on DML are rejected. CTE producer scans
+  use sequential scans and source order. `NOT MATERIALIZED` uses per-reference
+  plans with limited safe filter pushdown, not full joint optimization; remaining
+  planning differences can affect error timing as well as performance.
 - Window support is limited to the functions and frames listed above. `lead`,
   `lag`, value functions, `ntile`, floating-point rank functions, offset frame
   bounds, `GROUPS`, exclusions, `FILTER`, `DISTINCT` and `count(expr)` windows

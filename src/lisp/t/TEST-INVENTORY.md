@@ -314,6 +314,22 @@ Final direct cl-spec verification ran 1,500 trials, in addition to Rove wrappers
 | window-ranking-peer-sequence Property | 300 | 42, 1553238518679453301 | `fnv1a64-v1:529175196b310703` | rejection-counts-unmeasured, input-coverage-unmeasured |
 | window-generated-prefix-totals Property | 150 | 42, 2279626208607443807 | `fnv1a64-v1:037354165c5b9e0c` | rejection-counts-unmeasured, input-coverage-unmeasured |
 
+## Nonrecursive CTE coverage
+
+[cte-tests.lisp](rove/cte-tests.lisp) adds six Rove cases, bringing the unit
+suite to 114. The supplied validation passed 114 unit, 170 interop and 531
+physical Rove cases. [ctes.sh](ctes.sh) passed 114 C differential cases and
+spill, error and cancellation paths for SELECT and INSERT. See [CTES.md](CTES.md)
+for the materialization and optimizer boundaries. The 168-case window regression
+and the 114-unit and 170-interop suites also passed again after the final fixes.
+
+Direct cl-spec checks of `cte-replay-readers-share-prefix` passed 300 trials
+each with seeds `42` and `20261027`, definition digest
+`fnv1a64-v1:ed029f74af8a5388`. Reported verification gaps were
+`rejection-counts-unmeasured` and `input-coverage-unmeasured`; this property
+checks generated in-memory reader interleavings, while the C harness checks
+spill and SQL behavior separately. The fresh legacy runner passed 1,131 checks.
+
 ## Running and failure behavior
 
 From `src/lisp/`, `./t/run-unit-tests.sh` loads [test-dependencies.lisp](test-dependencies.lisp),

@@ -95,7 +95,7 @@
          (otherwise nil))))
 
 (defun fold-window-key-constant (expression)
-  (if (window-constant-expression-p expression)
+  (if (and (not *cte-definition-analysis-p*) (window-constant-expression-p expression))
       (list :const (eval-expr expression #()) :type (expr-type expression)
             :typmod (expr-typmod expression))
       expression))
@@ -212,7 +212,20 @@
 (defun finalize-query-windows (targets order group-keys scope aggregate-p width)
   ;; Rewrite grouped inputs first, then assign shared pre-window key slots and
   ;; lower window references after those slots (planner.c / setrefs.c).
-  (let ((keys nil))
+  (let ((keys nil) (used nil))
+    ;; C's SQL99 target list evaluates selected expressions before independent
+    ;; junk keys. Whole selected keys share a slot; arbitrary subexpressions do not.
+    (when (and *cte-definition-analysis-p* *window-key-targets*
+               (zerop (length *select-window-functions*)))
+      (labels ((set-expression-p (form)
+                 (and (consp form)
+                      (or (member (first form) '(:set-func :single-record))
+                          (some #'set-expression-p form)))))
+        (dolist (target targets)
+          (let ((expression (getf target :expr)))
+            (unless (set-expression-p expression)
+              (unless (find expression keys :test #'analyzed-expression-identical-p)
+                (setf keys (append keys (list expression)))))))))
     (dolist (descriptor (coerce *select-window-functions* 'list))
       (when aggregate-p
         (map-window-expressions
@@ -222,9 +235,19 @@
                                   (mapcar #'car (getf descriptor :order))))
         (unless (find expression keys :test #'analyzed-expression-identical-p)
           (setf keys (append keys (list expression))))))
+    ;; Shared CTE plans retain named-window junk targets. Keep their slots
+    ;; canonical with selected expressions; inlined plans can null unused slots.
+    (when *cte-definition-analysis-p*
+      (dolist (target *window-key-targets*)
+        (let ((expression (getf target :expr)))
+          (when aggregate-p
+            (setf expression (rewrite-aggregate-columns expression group-keys scope)))
+          (unless (find expression keys :test #'analyzed-expression-identical-p)
+            (setf keys (append keys (list expression)))))))
     (labels ((key-reference (expression)
                (let ((position (position expression keys :test #'analyzed-expression-identical-p)))
                  (cond (position
+                        (pushnew position used)
                         (list :col (+ width position 1) :type (expr-type expression)
                               :typmod (expr-typmod expression)))
                        ((or (atom expression)
@@ -246,4 +269,5 @@
                        (cdr item)))
                order)
        (+ width (length keys))
-       keys))))
+       keys
+       (loop for position below (length keys) unless (member position used) collect position)))))

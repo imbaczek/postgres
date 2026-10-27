@@ -69,6 +69,8 @@
                (unless (gethash state queries)
                  (setf (gethash state queries) t)
                  (scope (getf state :scope))
+                 (dolist (definition (getf state :ctes))
+                   (query (sql-cte-prepared definition)))
                  (dolist (descriptor (getf state :sublinks))
                    (query (sql-subplan-prepared descriptor)))
                  (dolist (relation (getf state :source-relations))

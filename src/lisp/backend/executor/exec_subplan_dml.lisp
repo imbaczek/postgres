@@ -129,11 +129,14 @@
            (*current-snapshot* snapshot)
            (domain (query-plan-index-relfilenodes
                     (%make-query-plan :physical '(:result)) relations)))
-      (call-with-select-index-lease-domain
-       domain
+      (call-with-query-cte-execution
+       t
        (lambda ()
-         (detach-select-index-scans)
-         (funcall function table relfilenode xid))))))
+         (call-with-select-index-lease-domain
+          domain
+          (lambda ()
+            (detach-select-index-scans)
+            (funcall function table relfilenode xid))))))))
 
 (defun call-with-dml-expression-evaluation (function)
   ;; Release enclosing leases before evaluation; child plans acquire their own

@@ -59,27 +59,25 @@ ROW-CALLBACK."
 
 (defun execute-query-plan (plan registered-relations row-callback &key (backend :interpreter))
   "Execute a plan and its subqueries in one registered statement domain."
-  ;; Children inherit the root backend, cache, registered relations and frames.
   (let* ((root-p (not *subquery-execution-active-p*))
-         (*subquery-result-cache* (if root-p (make-hash-table :test #'eq)
-                                      *subquery-result-cache*))
-         (*subquery-registered-relations* (if root-p registered-relations
-                                              *subquery-registered-relations*))
+         (*subquery-result-cache* (if root-p (make-hash-table :test #'eq) *subquery-result-cache*))
+         (*subquery-registered-relations* (if root-p registered-relations *subquery-registered-relations*))
          (*subquery-outer-frames* (if root-p nil *subquery-outer-frames*))
-         (*subquery-backend-entry* (if root-p (query-plan-backend-entry backend)
-                                       *subquery-backend-entry*))
+         (*subquery-backend-entry* (if root-p (query-plan-backend-entry backend) *subquery-backend-entry*))
          (*subquery-execution-active-p* t)
          (entry *subquery-backend-entry*)
          (executor (and entry (query-plan-backend-executor entry))))
-    (call-with-select-index-lease-domain
-     (query-plan-index-relfilenodes plan registered-relations)
+    (call-with-query-cte-execution
+     root-p
      (lambda ()
-       (cond
-         (executor (funcall executor plan registered-relations row-callback))
-         ((and entry (query-plan-backend-compiler entry))
-          (funcall (funcall (query-plan-backend-compiler entry) plan)
-                   registered-relations row-callback))
-         (t (ereport "0A000" "query-plan backend ~a is not installed" backend)))))))
+       (call-with-select-index-lease-domain
+        (query-plan-index-relfilenodes plan registered-relations)
+        (lambda ()
+          (cond
+            (executor (funcall executor plan registered-relations row-callback))
+            ((and entry (query-plan-backend-compiler entry))
+             (funcall (funcall (query-plan-backend-compiler entry) plan) registered-relations row-callback))
+            (t (ereport "0A000" "query-plan backend ~a is not installed" backend)))))))))
 
 (defun query-plan-sexp (plan)
   "Return the inspectable logical/physical plan artifact."
@@ -187,6 +185,10 @@ reordered tree, and each parameterized path can reference only joined Vars."
 
 (defun select-plan-path-candidates (prepared)
   "Cost scan paths and retain a SeqScan-only fallback alternative."
+  (when *cte-pull-planning-p*
+    (return-from select-plan-path-candidates
+      (values (loop repeat (length (getf prepared :relations))
+                    collect (make-select-scan-path :kind :seq-scan)) nil)))
   (let* ((relations (getf prepared :relations))
          (table (getf prepared :table))
          (selected
@@ -214,6 +216,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
 (defun select-scan-plan-form (relation-index relation path physical-p)
   (let ((table (getf relation :table)))
     (cond
+      ((getf relation :cte) (list :cte-scan relation-index 0))
       ((getf relation :subquery-plan)
        (list :subquery-scan relation-index 0
              (getf relation (if physical-p :subquery-physical :subquery-logical))))
@@ -290,7 +293,10 @@ reordered tree, and each parameterized path can reference only joined Vars."
     (when (getf prepared :join-order)
       (let ((join-qual (select-reordered-join-qual prepared)))
         (when join-qual (setf input (list :filter join-qual input)))))
-    (when where (setf input (list :filter where input)))
+    (when where
+      (when (and (window-constant-expression-p where) (not (true-p (eval-expr where #()))))
+        (setf input '(:result)))
+      (setf input (list :filter where input)))
     (when aggregate-p
       (setf input
             (list (if physical-p
@@ -319,13 +325,13 @@ reordered tree, and each parameterized path can reference only joined Vars."
 (defun query-plan-relation-node-p (node)
   "Relation handles occupy slot two; rebasing must cover every such IR node."
   (and (consp node)
-       (member (first node) '(:scan :seq-scan :index-scan :subquery-scan))))
+       (member (first node) '(:scan :seq-scan :index-scan :subquery-scan :cte-scan))))
 
 (defun query-plan-operator-p (node)
   (and (consp node)
        (or (query-plan-relation-node-p node)
            (member (first node)
-                   '(:window-input :window :append :result :filter :join :nested-loop-join :project :aggregate
+                   '(:with-ctes :window-input :window :append :result :filter :join :nested-loop-join :project :aggregate
                      :sort :top-n :limit :project-set :hash-aggregate :sorted-aggregate :distinct :hash-distinct)
                    :test #'eq))))
 
@@ -371,6 +377,9 @@ reordered tree, and each parameterized path can reference only joined Vars."
   "Install one relation domain and metadata map after all child trees are rebased."
   ;; Registration IDs identify relations across local child handles; metadata
   ;; remains tied to each physical node for independent instrumentation.
+  (setf registered (append registered (query-cte-relations prepared))
+        logical (wrap-query-cte-plan logical prepared)
+        physical (wrap-query-cte-plan physical prepared))
   (setf registered
         (mapcar (lambda (relation)
                   (unless (getf relation :registration-id)
@@ -422,9 +431,22 @@ reordered tree, and each parameterized path can reference only joined Vars."
 
 (defun plan-prepared-select (prepared)
   "Build child plans without the catalog lock, then flatten their registration."
+  (when (getf prepared :deferred-window-folding)
+    (unless *cte-retain-window-junk-p*
+      (setf (getf prepared :window-keys)
+            (loop for expression in (getf prepared :window-keys) for index from 0
+                  collect (if (member index (getf prepared :window-unused-key-indices))
+                              (list :const +null+ :type (expr-type expression)
+                                    :typmod (expr-typmod expression))
+                              expression))))
+    (when *cte-retain-window-junk-p*
+      (dolist (expression (getf prepared :window-validation-keys)) (fold-window-key-constant expression)))
+    (setf (getf prepared :window-keys) (mapcar #'fold-window-key-constant (getf prepared :window-keys))))
+  (plan-query-ctes prepared)
   (when (getf prepared :set-operation)
     (return-from plan-prepared-select (plan-prepared-union prepared)))
   (plan-expression-subqueries prepared)
+  (plan-cte-reference-filters prepared)
   (dolist (relation (getf prepared :relations))
     (when (getf relation :subquery-prepared)
       (setf (getf relation :subquery-plan)
@@ -1021,6 +1043,11 @@ on an abnormal exit."
   (case (first node)
     (:result
      (funcall emit #()))
+    (:with-ctes
+        (call-with-cte-definitions (second node) (lambda () (funcall run-child (third node) emit))))
+    (:cte-scan
+     (let ((reader (make-cte-scan-iterator (physical-scan-relation node registered-relations))))
+       (unwind-protect (map-sql-iterator reader emit) (close-sql-iterator reader))))
     (:append (stream-union-all (second node) emit run-child))
     ((:seq-scan :index-scan)
      (let* ((relation (physical-scan-relation node registered-relations))
@@ -1041,12 +1068,14 @@ on an abnormal exit."
     (:subquery-scan
      (physical-scan-relation node registered-relations)
      (let* ((parent-frames *subquery-outer-frames*)
-            (*subquery-outer-frames*
-              (cons (cons #() (make-hash-table :test #'eq)) parent-frames)))
-       (funcall run-child (fourth node)
-                (lambda (row)
-                  (let ((*subquery-outer-frames* parent-frames))
-                    (funcall emit (car row)))))))
+            (frame (cons #() (make-hash-table :test #'eq)))
+            (*subquery-outer-frames* (cons frame parent-frames)))
+       (unwind-protect
+            (funcall run-child (fourth node)
+                     (lambda (row)
+                       (let ((*subquery-outer-frames* parent-frames))
+                         (funcall emit (car row)))))
+         (close-cte-frame-cache (cdr frame)))))
     (:filter
      (let ((qual (second node)))
        (funcall run-child
@@ -1221,7 +1250,7 @@ on an abnormal exit."
 (defun physical-plan-node-children (node)
   (case (first node)
     (:append (mapcar #'second (second node)))
-    ((:window-input :window :filter :project :sort :limit :hash-distinct :project-set) (list (third node)))
+    ((:with-ctes :window-input :window :filter :project :sort :limit :hash-distinct :project-set) (list (third node)))
     ((:top-n :subquery-scan) (list (fourth node)))
     (:nested-loop-join (list (third node) (fourth node)))
     ((:hash-aggregate :sorted-aggregate) (list (fourth node)))
@@ -1271,6 +1300,8 @@ on an abnormal exit."
     (:subquery-scan
      (let ((relation (physical-scan-relation node relations)))
        (format nil "Subquery Scan~@[ on ~a~]" (getf relation :alias))))
+    (:with-ctes "WITH")
+    (:cte-scan (format nil "CTE Scan on ~a" (sql-cte-name (getf (physical-scan-relation node relations) :cte))))
     (:filter "Filter")
     (:project "Project")
     (:project-set "ProjectSet")
@@ -1345,6 +1376,28 @@ on an abnormal exit."
                                   (format-query-plan child child-relations analyze-p nil t)
                                   :separator (string #\Newline)))
                      (format stream "~%    ~a" line))))
+        (let ((*subquery-registered-relations* (or *subquery-registered-relations* relations)))
+          (dolist (definition (remove-if-not #'sql-cte-shared-p (query-plan-cte-definitions plan)))
+            (format stream "~%  CTE ~a (~a)" (sql-cte-name definition)
+                    (if (sql-cte-shared-p definition) "shared" "per reference"))
+            (dolist (line (uiop:split-string
+                           (format-query-plan (sql-cte-plan definition)
+                                              (subquery-registered-relations (sql-cte-plan definition))
+                                              analyze-p nil t)
+                           :separator (string #\Newline)))
+              (format stream "~%    ~a" line))))
+        (let ((*subquery-registered-relations* (or *subquery-registered-relations* relations)))
+          (dolist (node (collect-query-plan-nodes (query-plan-physical plan)))
+            (when (eq (first node) :cte-scan)
+              (let* ((relation (physical-scan-relation node relations))
+                     (reference (getf relation :cte-reference-plan)))
+                (when reference
+                  (format stream "~%  CTE ~a (per reference)" (sql-cte-name (getf relation :cte)))
+                  (dolist (line (uiop:split-string
+                                 (format-query-plan reference (subquery-registered-relations reference)
+                                                    analyze-p nil t)
+                                 :separator (string #\Newline)))
+                    (format stream "~%    ~a" line)))))))
         (when (and analyze-p (not nested-p))
           (terpri stream)
           (format stream "Execution Time: ~,3f ms" (or execution-time 0.0d0)))))))

@@ -1,0 +1,250 @@
+;;;; exec_cursor.lisp -- resumable physical plans for demand-driven producers.
+(in-package #:pg)
+
+(defun make-mapping-sql-iterator (input function)
+  (make-sql-iterator
+   (lambda ()
+     (loop
+       (multiple-value-bind (row present) (sql-iterator-next input)
+         (unless present (return (values nil nil)))
+         (multiple-value-bind (result keep) (funcall function row)
+           (when keep (return (values result t)))))))
+   (lambda () (close-sql-iterator input))))
+
+(defun make-buffered-sql-iterator (producer &optional input)
+  (let ((store nil) (reader nil))
+    (make-sql-iterator
+     (lambda ()
+       (unless store
+         (setf store (make-query-replay-store nil))
+         (funcall producer (lambda (row)
+                             (append-query-replay-row store row)))
+         (query-row-spool-seal (query-replay-store-spool store))
+         (setf (query-replay-store-eof-p store) t
+               reader (make-query-replay-reader store)))
+       (sql-iterator-next reader))
+     (lambda ()
+       (when reader (close-sql-iterator reader))
+       (when store (close-query-replay-store store))
+       (when input (close-sql-iterator input))))))
+
+(defun make-select-scan-iterator (node relations)
+  (let* ((relation (physical-scan-relation node relations))
+         (table (getf relation :table))
+         (source (getf relation :row-source))
+         (block 0) (nblocks nil) (rows nil) (initialized nil)
+         (snapshot *current-snapshot*))
+    (unless (eq (select-scan-path-kind (physical-scan-path node relation)) :seq-scan)
+      (error "A resumable producer requires a SeqScan plan"))
+    (make-sql-iterator
+     (lambda ()
+       (unless initialized
+         (setf initialized t)
+         (if source (setf rows (funcall source))
+             (setf nblocks (buf-nblocks (pg-class-relfilenode table)))))
+       (loop
+         (when rows
+           (let ((row (pop rows)))
+             (return
+               (values (if (getf relation :join-order-base)
+                           (make-select-relation-environment relations relation row)
+                           row) t))))
+         (when (or source (>= block nblocks)) (return (values nil nil)))
+         (let ((page (buf-read (pg-class-relfilenode table) block)))
+           (when page
+             (heapam-scan-page page block (pg-class-columns table) snapshot
+                               (lambda (tuple) (push (htup-values tuple) rows)))))
+         (incf block)
+         (setf rows (nreverse rows))))
+     (lambda () (setf rows nil)))))
+
+(defun make-append-sql-iterator (arms relations)
+  (let ((remaining arms) (input nil) (coercions nil))
+    (make-sql-iterator
+     (lambda ()
+       (loop
+         (unless input
+           (unless remaining (return (values nil nil)))
+           (let ((arm (pop remaining)))
+             (setf coercions (first arm)
+                   input (make-physical-plan-iterator (second arm) relations))))
+         (multiple-value-bind (row present) (sql-iterator-next input)
+           (if present
+               (let ((values (map 'vector (lambda (expression) (eval-expr expression (car row)))
+                                  coercions)))
+                 (return (values (cons values values) t)))
+               (progn (close-sql-iterator input) (setf input nil))))))
+     (lambda () (close-sql-iterator input)))))
+
+(defun make-project-set-iterator (input calls)
+  (let ((environment nil) (sets nil))
+    (make-sql-iterator
+     (lambda ()
+       (loop
+         (unless sets
+           (multiple-value-bind (row present) (sql-iterator-next input)
+             (unless present (return (values nil nil)))
+             (setf environment row
+                   sets (mapcar (lambda (call) (make-sql-set-function-iterator call environment)) calls))))
+         (let ((values (make-array (length sets) :initial-element +null+)) (any nil))
+           (loop for iterator in sets for index from 0
+                 do (multiple-value-bind (value present) (funcall iterator)
+                      (when present (setf any t (aref values index) value))))
+           (if any (return (values (concatenate 'vector environment values) t))
+               (setf sets nil)))))
+     (lambda () (setf sets nil environment nil) (close-sql-iterator input)))))
+
+(defun make-nested-loop-iterator (join left right)
+  (let* ((store (make-query-replay-store right))
+         (reader nil) (current-left nil) (left-present nil)
+         (left-done nil) (left-seen nil) (matched nil) (right-phase nil)
+         (right-index 0)
+         (outer-p (member (getf join :type) '(:right :full)))
+         (matches (when outer-p (make-query-match-map)))
+         (null-left (make-array (getf join :left-width) :initial-element +null+))
+         (null-right (make-array (getf join :right-width) :initial-element +null+)))
+    (make-sql-iterator
+     (lambda ()
+       (loop
+         (unless (or left-present left-done)
+           (multiple-value-setq (current-left left-present) (sql-iterator-next left))
+           (unless left-present (setf left-done t))
+           (when left-present
+             (setf left-seen t matched nil right-index 0 reader (make-query-replay-reader store))))
+         (when (and left-done (not outer-p)) (return (values nil nil)))
+         (when (and left-done (not right-phase))
+           (setf right-phase t right-index 0 reader (make-query-replay-reader store))
+           (when left-seen (query-match-map-finish matches)))
+         (multiple-value-bind (row present) (sql-iterator-next reader)
+           (when (and matches present)
+             (loop while (<= (query-match-map-count matches) right-index)
+                   do (query-match-map-append matches)))
+           (cond
+             (right-phase
+              (unless present (return (values nil nil)))
+              (let ((index right-index))
+                (incf right-index)
+                (unless (and left-seen (query-match-map-matched-p matches index))
+                  (return (values (concatenate 'vector null-left row) t)))))
+             (present
+              (let ((index right-index)
+                    (joined (combine-select-join-environment current-left row join)))
+                (incf right-index)
+                (when (true-p (eval-expr (getf join :qual) joined))
+                  (setf matched t)
+                  (when matches (query-match-map-mark matches index))
+                  (return (values joined t)))))
+             (t
+              (close-sql-iterator reader)
+              (setf reader nil left-present nil)
+              (when (and (not matched) (member (getf join :type) '(:left :full)))
+                (return (values (concatenate 'vector current-left null-right) t))))))))
+     (lambda ()
+       (close-sql-iterator reader)
+       (close-sql-iterator left)
+       (close-query-replay-store store)
+       (when matches
+         (close-query-match-map matches)
+         (when (query-match-map-pathname matches)
+           (delete-query-temp-file (query-match-map-pathname matches))))
+       (setf current-left nil)))))
+
+(defun make-physical-plan-iterator (node relations)
+  (let* ((input (%make-physical-plan-iterator node relations))
+         (metadata (and *cte-active-plan* (gethash node (query-plan-metadata *cte-active-plan*))))
+         (started-p nil))
+    (if (null metadata) input
+        (make-sql-iterator
+         (lambda ()
+           (let ((started (when *query-plan-instrumentation-p* (get-internal-real-time)))
+                 (first-p (not started-p)))
+             (when started
+               (unless started-p
+                 (incf (plan-node-metadata-actual-loops metadata))
+                 (setf started-p t)))
+             (unwind-protect
+                  (multiple-value-bind (row present) (sql-iterator-next input)
+                    (when (and started present)
+                      (incf (plan-node-metadata-actual-row-count metadata))
+                      (setf (plan-node-metadata-actual-rows metadata)
+                            (/ (plan-node-metadata-actual-row-count metadata)
+                               (plan-node-metadata-actual-loops metadata))))
+                    (values row present))
+               (when started
+                 (let ((elapsed (- (get-internal-real-time) started)))
+                   (incf (plan-node-metadata-actual-total-time-ticks metadata) elapsed)
+                   (when first-p
+                     (incf (plan-node-metadata-actual-startup-time-ticks metadata) elapsed)))))))
+         (lambda () (close-sql-iterator input))))))
+
+(defun %make-physical-plan-iterator (node relations)
+  (case (first node)
+    (:result
+     (let ((done nil))
+       (make-sql-iterator (lambda () (unless done (setf done t) (values #() t))))))
+    ((:seq-scan :index-scan) (make-select-scan-iterator node relations))
+    (:cte-scan (make-cte-scan-iterator (physical-scan-relation node relations)))
+    (:with-ctes (make-with-ctes-iterator (second node) (third node) relations))
+    (:append (make-append-sql-iterator (second node) relations))
+    (:subquery-scan
+     (physical-scan-relation node relations)
+     (let* ((frames (cons (cons #() (make-hash-table :test #'eq)) *subquery-outer-frames*))
+            (input (let ((*subquery-outer-frames* frames))
+                     (make-physical-plan-iterator (fourth node) relations))))
+       (make-sql-iterator
+        (lambda ()
+          (let ((*subquery-outer-frames* frames))
+            (multiple-value-bind (row present) (sql-iterator-next input)
+              (values (car row) present))))
+        (lambda ()
+          (close-sql-iterator input)
+          (close-cte-frame-cache (cdar frames))))))
+    (:filter
+     (make-mapping-sql-iterator
+      (make-physical-plan-iterator (third node) relations)
+      (lambda (row) (values row (true-p (eval-expr (second node) row))))))
+    (:project
+     (make-mapping-sql-iterator
+      (make-physical-plan-iterator (third node) relations)
+      (lambda (row) (values (make-select-result-row row nil (second node)) t))))
+    (:window-input
+     (make-mapping-sql-iterator
+      (make-physical-plan-iterator (third node) relations)
+      (lambda (row)
+        (values (concatenate 'vector row (map 'vector (lambda (expr) (eval-expr expr row)) (second node))) t))))
+    (:window
+     (make-window-plan-iterator (make-physical-plan-iterator (third node) relations) (second node)))
+    (:project-set
+     (make-project-set-iterator (make-physical-plan-iterator (third node) relations) (second node)))
+    (:limit
+     (let ((remaining (second node)) (input nil))
+       (make-sql-iterator
+        (lambda ()
+          (when (plusp remaining)
+            (unless input (setf input (make-physical-plan-iterator (third node) relations)))
+            (decf remaining)
+            (sql-iterator-next input)))
+        (lambda () (close-sql-iterator input)))))
+    (:nested-loop-join
+     (make-nested-loop-iterator
+      (second node) (make-physical-plan-iterator (third node) relations)
+      (make-physical-plan-iterator (fourth node) relations)))
+    ((:sort :top-n :hash-aggregate :sorted-aggregate :hash-distinct)
+     (let* ((child (if (member (first node) '(:top-n :hash-aggregate :sorted-aggregate))
+                       (fourth node) (third node)))
+            (input (make-physical-plan-iterator child relations)))
+       (make-buffered-sql-iterator
+        (lambda (emit)
+          (flet ((source (callback) (map-sql-iterator input callback)))
+            (case (first node)
+              (:sort (stream-select-sort #'source (second node) emit))
+              (:top-n (dolist (row (collect-select-top-n #'source (second node) (third node)))
+                        (funcall emit row)))
+              ((:hash-aggregate :sorted-aggregate)
+               (stream-select-aggregates #'source (second node) (third node) emit))
+              (:hash-distinct
+               (stream-hash-aggregate
+                (lambda (callback) (source (lambda (row) (funcall callback (car row)))))
+                (second node) 0 (lambda (values) (funcall emit (cons values values))))))))
+        input)))
+    (otherwise (ereport "0A000" "unsupported resumable producer node ~a" (first node)))))

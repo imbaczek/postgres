@@ -43,8 +43,9 @@
 (defun subquery-expression-p (expression)
   (and (consp expression) (eq (first expression) :subplan)))
 
-(defun map-prepared-query-expressions (function prepared &optional (depth 0))
-  "Visit executable expressions with nesting depth, excluding saved raw ASTs."
+(defun map-prepared-query-expressions (function prepared &optional (depth 0) query-function)
+  "Visit executable expressions with nesting depth, excluding saved raw ASTs.
+Optional QUERY-FUNCTION visits each prepared query before its expressions."
   (labels
       ((expression (form level)
          (cond
@@ -59,6 +60,9 @@
            (t (funcall function
                        (mapcar (lambda (part) (expression part level)) form) level))))
        (query (state level)
+         (when query-function (funcall query-function state level))
+         (dolist (definition (getf state :ctes))
+           (query (sql-cte-prepared definition) (1+ level)))
          (if (getf state :set-operation)
              (progn
                (query (getf state :left) level)
@@ -89,13 +93,38 @@
   prepared)
 
 (defun prepared-query-outer-depths (prepared)
-  (let ((depths nil))
-    (map-prepared-query-expressions
-     (lambda (form level)
-       (when (and (eq (first form) :outer-ref) (> (second form) level))
-         (pushnew (- (second form) level) depths))
-       form)
-     prepared)
+  (let ((depths nil) (seen (make-hash-table :test #'eq)))
+    (labels
+        ((expression (form level)
+           (when (consp form)
+             (cond ((eq (first form) :outer-ref)
+                    (when (> (second form) level) (pushnew (- (second form) level) depths)))
+                   ((subquery-expression-p form)
+                    (expression (sql-subplan-test (second form)) level)
+                    (query (sql-subplan-prepared (second form)) (1+ level)))
+                   (t (expression (car form) level) (expression (cdr form) level)))))
+         (query (state level)
+           (unless (member level (gethash state seen))
+             (push level (gethash state seen))
+             (if (getf state :set-operation)
+                 (progn (query (getf state :left) level) (query (getf state :right) level))
+                 (progn
+                   (dolist (key '(:where :group-keys :set-functions :window-keys :order))
+                     (expression (getf state key) level))
+                   (dolist (target (getf state :targets)) (expression (getf target :expr) level))
+                   (dolist (join (getf state :joins)) (expression (getf join :qual) level))
+                   (dolist (aggregate (getf state :aggregates)) (expression (getf aggregate :input) level))
+                   (dolist (window (getf state :windows))
+                     (expression (getf window :input) level)
+                     (expression (getf window :partition) level)
+                     (expression (getf window :order) level))
+                   (dolist (relation (getf state :source-relations (getf state :relations)))
+                     (cond ((getf relation :cte)
+                            (query (sql-cte-prepared (getf relation :cte))
+                                   (+ level 1 (- (getf relation :cte-levelsup)))))
+                           ((getf relation :subquery-prepared)
+                            (query (getf relation :subquery-prepared) (1+ level))))))))))
+      (query prepared 0))
     (sort depths #'<)))
 
 (defun rewrite-subplan-group-columns (form group-keys scope)
@@ -195,6 +224,7 @@
   ;; Capture analyzed query meaning without transient scope or plan identity.
   (list
    :query
+   :ctes (mapcar #'cte-definition-semantic-key (getf prepared :ctes))
    :set-operation (getf prepared :set-operation)
    :arms (when (getf prepared :set-operation)
            (list (prepared-query-semantic-key (getf prepared :left))
@@ -208,6 +238,8 @@
    (mapcar (lambda (relation)
              (list (pg-class-oid (getf relation :table))
                    (getf relation :alias) (getf relation :offset) (getf relation :width)
+                   (when (getf relation :cte) (cte-definition-semantic-key (getf relation :cte)))
+                   (getf relation :cte-levelsup)
                    (when (getf relation :subquery-prepared)
                      (prepared-query-semantic-key (getf relation :subquery-prepared)))))
            (getf prepared :source-relations))

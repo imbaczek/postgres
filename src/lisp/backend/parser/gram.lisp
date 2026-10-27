@@ -82,7 +82,7 @@
 
 (defun clause-keyword-p (word)
   (member word
-          '("from" "where" "order" "limit" "group" "having" "union"
+          '("with" "from" "where" "order" "limit" "group" "having" "union"
             "intersect" "except" "offset" "fetch" "for" "join" "inner"
             "left" "right" "full" "outer" "cross" "on" "using"
             "natural" "asc" "desc" "window"
@@ -110,6 +110,7 @@
 (defun parse-statement (p)
   (cond
     ((match-kw p "explain") (parse-explain p))
+    ((kw-p p "with") (parse-select-expression p))
     ((match-kw p "select") (parse-select p))
     ((punct-p p #\() (parse-select-expression p))
     ((match-kw p "copy") (parse-copy-to p))
@@ -179,9 +180,9 @@
         (ereport "0A000" "EXPLAIN currently supports only the ANALYZE option"))
       (expect-punct p #\))
       (setf analyze-p t))
-    (if (match-kw p "select")
+    (if (or (kw-p p "select") (kw-p p "with") (punct-p p #\())
         (list :type :explain :analyze-p analyze-p
-              :statement (parse-select p))
+              :statement (parse-select-expression p))
         (ereport "0A000" "EXPLAIN currently supports SELECT only"))))
 
 ;;; ---- SELECT ----
@@ -210,7 +211,8 @@
       (progn (expect-kw p "select") (parse-select-core p))))
 
 (defun parse-select-expression (p)
-  (parse-select-tail p (parse-select-operand p)))
+  (if (kw-p p "with") (parse-with-select p)
+      (parse-select-tail p (parse-select-operand p))))
 
 (defun parse-select-tail (p left)
   "Set operations bind more tightly than an unparenthesized ORDER BY or LIMIT."
@@ -1057,10 +1059,10 @@
 (defun select-start-p (p)
   ;; Look through parentheses only when they form a complete query operand.
   "Recognize a complete subquery operand, preserving scalar expression continuations."
-  (when (kw-p p "select") (return-from select-start-p t))
+  (when (or (kw-p p "select") (kw-p p "with")) (return-from select-start-p t))
   (let ((lookahead (copy-sql-parser p)))
     (loop while (match-punct lookahead #\())
-    (unless (kw-p lookahead "select") (return-from select-start-p nil)))
+    (unless (or (kw-p lookahead "select") (kw-p lookahead "with")) (return-from select-start-p nil)))
   (let ((lookahead (copy-sql-parser p)))
     (handler-case
         (progn (parse-select-expression lookahead) (punct-p lookahead #\)))
@@ -1314,7 +1316,7 @@
      (list :const (token-value (pnext p))))
     ((match-punct p #\()
      (with-parens (p :opening-consumed t)
-       (if (kw-p p "select")
+       (if (or (kw-p p "select") (kw-p p "with"))
            (list :sublink :scalar (parse-select-expression p) nil nil)
            (let ((expression (parse-expr p)))
              (if (and (eq (first expression) :sublink)
