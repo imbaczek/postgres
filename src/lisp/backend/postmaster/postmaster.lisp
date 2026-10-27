@@ -429,19 +429,17 @@ are killed abruptly."
            (wait-until-termination pid timeout)
            t)))))
 
-(defun admin-reload-conf ()
-  "Reload server configuration when supported; currently a successful no-op."
-  ;; The Lisp server does not load PostgreSQL configuration files yet. Keep the
-  ;; SQL function's success result, but do not use SIGHUP here: in this server
-  ;; SIGHUP requests a code reload.
-  t)
-
-(defun admin-reload-code ()
-  "pg_reload_code(): send SIGHUP to request an in-place Lisp code reload."
+(defun admin-request-reload ()
   (handler-case
       (progn
         (sb-posix:kill (sb-posix:getpid) sb-unix:sighup)
         t)
-    (error (e)
-      (warning-notice "failed to send signal to postmaster: ~a" e)
+    (error (condition)
+      (warning-notice "failed to send signal to postmaster: ~a" condition)
       nil)))
+
+(defun admin-reload-conf ()
+  (admin-request-reload))
+
+(defun admin-reload-code ()
+  (admin-request-reload))

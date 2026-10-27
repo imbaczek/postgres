@@ -27,16 +27,7 @@ test_debug_install_traps cleanup
 test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" \
     --control-port "$CPORT" --control-socket "$SOCK"
 
-i=0
-while [ "$i" -lt 150 ]; do
-    if PGPASSWORD=x psql -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres \
-            -c '' >/dev/null 2>&1; then
-        break
-    fi
-    i=$((i + 1))
-    sleep 0.2
-done
-if [ "$i" -ge 150 ]; then
+if ! test_wait_owned_sql_server "$SRV" "$PORT" psql 300; then
     echo "control-repl: server did not start; log follows" >&2
     cat "$LOG" >&2
     exit 1
@@ -53,6 +44,9 @@ client() {
 }
 
 # ---- loopback TCP control port -------------------------------------------
+
+ss -H -ltnp "sport = :$CPORT" | grep -F "pid=$SRV," >/dev/null \
+    || fail "TCP control listener does not belong to the test server"
 
 tcp_out=$(printf '(+ 1 2)\n(list :a 1 "b")\n(reload)\n(quit)\n' \
     | client tcp "127.0.0.1:$CPORT" || true)
@@ -79,4 +73,19 @@ serving=$(PGPASSWORD=x psql -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres \
     -q -A -t -c 'select 1 as ok')
 [ "$serving" = "1" ] || fail "SQL stopped working after control-plane reload"
 
-echo "control-repl: PASS (TCP $CPORT + unix socket, reload, SQL intact)"
+# SQL requests the same asynchronous SIGHUP reload as pg_ctl reload.
+printf 'checkpoint_timeout = 61\n' > "$TMP/data/postgresql.conf"
+reload_result=$(PGPASSWORD=x timeout 20 psql -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres \
+    -q -A -t -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()')
+[ "$reload_result" = "t" ] || fail "SQL configuration reload request failed"
+i=0
+while [ "$i" -lt 100 ]; do
+    timeout_value=$(PGPASSWORD=x timeout 20 psql -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres \
+        -q -A -t -v ON_ERROR_STOP=1 -c 'SHOW checkpoint_timeout')
+    [ "$timeout_value" = "61s" ] && break
+    i=$((i + 1))
+    sleep 0.05
+done
+[ "$timeout_value" = "61s" ] || fail "SQL reload did not apply configuration"
+
+echo "control-repl: PASS (TCP $CPORT + unix socket, control and SQL reload, SQL intact)"
