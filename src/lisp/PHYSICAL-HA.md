@@ -422,6 +422,51 @@ Durable inventory publication, authenticated production before compaction, reope
 integration, promotion references and network serving remain pending. The new layer
 alone grants no serving authority and does not yet change receive-spool retention.
 
+### Immutable retained inventory publication
+
+The inventory layer publishes checked extent objects before an immutable index
+generation and returns its content ID after file and directory synchronization.
+Retries preserve identical existing objects; conflicting content is rejected.
+Selection still requires a durable control reference. No current-generation file
+or filename search selects an inventory implicitly.
+
+Full reopen validates the exact requested index and every referenced extent.
+Queries inspect the index and check candidate count and byte budgets before
+opening image files. Index encoding is bounded before printing, including scalar
+size, nesting, UTF-8 and literal escaping. The producer must still establish the
+initial prefix and digest provenance from base, receive or restartpoint evidence.
+
+All 613 physical tests, 170 interop tests and 1,598 legacy checks pass. The 18 new
+inventory cases include 14 real SIGKILL scenarios: before/after file fsync,
+rename and directory fsync for both object kinds, plus completed extent and index
+publication. They reopen by known ID and retry without selecting an older root.
+The codec property passes 200 trials with seed 42. Strict fresh-cache compilation
+passes. Luna max and Sol high cleared the code and crash-test changes; Sol medium
+found no useful refactor. A further Sol review cleared the preflight scalar/depth
+guards. Terra 6.1's source docstrings were separately reviewed by the primary agent.
+
+Astra's integration review specifies the next steps:
+
+1. Add explicit kept-entry selection for immutable replacement and a local hold
+   spanning publication through durable control selection. Serialize the control
+   owner or check its expected old root to prevent lost updates. On uncertain
+   control-write failure, retain conservative protection until reconciliation.
+2. Seal before every receive compaction and persist floor, floor digest and root ID
+   together in receive control. Validate that selected inventory before tail cleanup.
+   The restartpoint already contains its own prefix; it needs no unused root field.
+3. Carry an exact fork-bounded inventory through pending and committed primary
+   control before retiring standby dependencies. Exclude unapplied parent tail.
+4. Add explicit scoped references for old consumers and durable progress release,
+   then enable GC and use the resolver for onboarding and sending. A current full
+   inventory owns all indexed images; scoped consumers must name their required
+   range and proof dependencies explicitly.
+
+Callbacks that select control run outside the archive mutex while a local hold
+protects their objects. GC must use the same reservation/deletion exclusion and
+must not acquire store or WAL locks while holding it. Initially keeping GC disabled
+allows control integration to be reviewed independently. No coordination is added;
+bounded retention, authenticated sealing, control selection and serving remain open.
+
 ### SQL configuration reload
 
 `pg_reload_conf()` now requests SIGHUP instead of returning an unconditional

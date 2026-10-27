@@ -1,3 +1,6 @@
+;;;; Immutable extent objects and inventory generations.
+;;;; A durable control reference must select a generation before source bytes are removed.
+
 (in-package #:pg)
 
 (defconstant +physical-retained-inventory-limit+ (* 16 1024 1024))
@@ -6,10 +9,12 @@
 (defvar *physical-retained-inventory-test-hook* nil)
 
 (defun physical-retained-inventory-test-point (point id)
+  "Call the private publication test hook, if installed."
   (when *physical-retained-inventory-test-hook*
     (funcall *physical-retained-inventory-test-hook* point id)))
 
 (defun physical-retained-object-path (directory kind id)
+  "Return the path for an immutable extent or inventory object."
   (unless (and (uiop:directory-pathname-p directory) (typep id '(unsigned-byte 64)))
     (error "invalid retained WAL object location"))
   (merge-pathnames (format nil "~a-~16,'0X.~a"
@@ -18,12 +23,16 @@
                    directory))
 
 (defun physical-retained-object-read (directory kind id maximum)
+  "Read a bounded object and check its content against ID.
+
+The digest detects accidental corruption; it does not authenticate the object."
   (let ((bytes (read-bounded-regular-file (physical-retained-object-path directory kind id) maximum)))
     (unless (= id (physical-store-update-digest #xCBF29CE484222325 bytes))
       (error "retained WAL object differs from its immutable reference"))
     bytes))
 
 (defun physical-retained-object-write (directory kind id path bytes)
+  "Write and publish an object with file and directory sync test points."
   (flet ((mark (phase)
            (physical-retained-inventory-test-point (list kind phase) id)))
     (atomic-replace-file
@@ -40,6 +49,10 @@
                                  (mark :after-directory-fsync)))))
 
 (defun physical-retained-object-publish (directory kind bytes maximum)
+  "Publish immutable BYTES and return their durable content ID.
+
+The caller has exclusive publication access.  A retry compares existing bytes and
+syncs them; a collision is an error and leaves the existing file intact."
   (unless (and (typep bytes '(vector (unsigned-byte 8))) (<= (length bytes) maximum))
     (error "invalid retained WAL object size"))
   (let* ((id (physical-store-update-digest #xCBF29CE484222325 bytes))
@@ -58,6 +71,10 @@
     id))
 
 (defun physical-retained-inventory-check (payload)
+  "Check inventory identity, lineage and ordered extent metadata.
+
+The supplied anchors still require independent base, receive or restartpoint
+proof from the producer."
   (physical-follow-check-plist payload '(:version :identity :history-target :history-text :entries))
   (let* ((identity (getf payload :identity)) (target (getf payload :history-target))
                                              (text (getf payload :history-text)) (entries (getf payload :entries))
@@ -98,6 +115,8 @@
 
 (defun physical-retained-inventory-check-text-budget
     (payload &optional (maximum (- +physical-retained-inventory-limit+ 16)))
+  "Bound the encoded UTF-8 literal before semantic checks and printing.
+Reject oversized integers and excessive nesting before rendering them."
   (let ((count 0))
     (labels ((add (size)
                (incf count size)
@@ -128,6 +147,7 @@
     count))
 
 (defun physical-retained-inventory-image (payload)
+  "Validate and encode a bounded inventory with a CRC envelope."
   (physical-retained-inventory-check-text-budget payload)
   (physical-retained-inventory-check payload)
   (let* ((text (string->bytes (physical-bootstrap-manifest-text payload)))
@@ -142,6 +162,9 @@
       image)))
 
 (defun physical-retained-inventory-decode (image)
+  "Decode and validate a fresh inventory payload.
+
+The CRC detects accidental corruption; it does not authenticate the payload."
   (unless (and (typep image '(vector (unsigned-byte 8)))
                (<= 16 (length image) +physical-retained-inventory-limit+)
                (equalp (subseq image 0 8) #(80 71 82 73 78 86 48 49))
@@ -156,6 +179,7 @@
       payload)))
 
 (defun physical-retained-inventory-read-index (directory id identity history)
+  "Read exactly ID and check identity and lineage, without opening extent files."
   (physical-follow-check-plist identity '(:system-id :base-timeline :base :manifest-digest))
   (timeline-check-lineage history)
   (let ((payload (physical-retained-inventory-decode
@@ -167,6 +191,8 @@
     payload))
 
 (defun physical-retained-inventory-verify-entries (entries history loader)
+  "Validate checked, ordered entries using bounded LOADER reads.
+Keep only the current segment's shared prefix between images."
   (let ((segment nil) (prefix nil))
     (dolist (entry entries)
       (let ((image (funcall loader (first entry))))
@@ -188,6 +214,9 @@
   t)
 
 (defun physical-retained-inventory-load (directory id identity history)
+  "Read an inventory and validate all referenced extents sequentially.
+
+Return the freshly decoded payload."
   (let ((payload (physical-retained-inventory-read-index directory id identity history)))
     (physical-retained-inventory-verify-entries
      (getf payload :entries) history
@@ -196,6 +225,14 @@
     payload))
 
 (defun physical-retained-inventory-publish (directory identity target text images &key previous)
+  "Publish immutable extents and an inventory generation; return its synced ID.
+
+Copy new images after checking the candidate budget.  The caller must durably
+reference the returned ID in control before deletion can be considered.  Future
+cleanup must protect selected and scoped references and in-flight publishers
+through that control selection; this mutex alone does not cover that interval.
+This function checks supplied data but does not establish its base or receive
+anchors independently."
   (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
     (physical-retained-wal-check-budget images)
     (let* ((images (mapcar #'copy-seq images))
@@ -225,6 +262,10 @@
         id))))
 
 (defun physical-retained-inventory-plan (directory id identity history start end)
+  "Plan coverage from candidates selected by the index before image I/O.
+
+Enforce the candidate budget before loading images.  Return freshly decoded
+plan data; the plan does not grant serving authority."
   (unless (and (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64)) (< start end))
     (error "invalid retained WAL inventory request"))
   (let* ((payload (physical-retained-inventory-read-index directory id identity history))

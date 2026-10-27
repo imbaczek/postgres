@@ -12,8 +12,8 @@
   promotion, relation reader identity selection, statement snapshot scope bookkeeping,
   temporary stream ownership, executor parking, client application-name settings,
   supported implicit query blocks, SQL promotion, fresh child backup/follow and
-  durable receive-history selection, source-side follow anchors and the read-only
-  retained-extent layer have completed
+  durable receive-history selection, source-side follow anchors, the read-only
+  extent layer and immutable inventory publication have completed
   this pass and its review. Keep the same order for the remaining HA work.
 
 - [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker
