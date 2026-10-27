@@ -73,9 +73,9 @@ The returned byte vectors describe the whole allowed extent of each file."
 Do not use mutable runtime catalog counters to choose retry bytes."
   (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
     (declare (ignore metadata prefix generation))
-    (physical-promotion-checkpoint-plan state
-                                        (getf (physical-history-read-catalog catalog) :next-oid)
-                                        (load-next-xid))))
+    (values (physical-promotion-checkpoint-plan
+             state (getf (physical-history-read-catalog catalog) :next-oid) (load-next-xid))
+            catalog)))
 
 (defun physical-promotion-checkpoint-artifacts (state prefix &key allow-uninstalled)
   "Check child files without changing them, before restoring the catalog.

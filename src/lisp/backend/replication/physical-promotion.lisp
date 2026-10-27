@@ -1,7 +1,7 @@
 ;;;; Local pending-promotion publication; EOR and writer admission remain separate.
 (in-package #:pg)
 
-(defun physical-promotion-check-context (&optional (phase 2))
+(defun physical-promotion-check-context (phase &key preserve-readers)
   "The caller owns follow-command -> reload -> quiescence; no worker joins here."
   (unless (and (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*)
@@ -18,7 +18,7 @@
                *physical-receive-store* *wal-ready*
                (not *physical-follow-runtime*) (not *physical-shutdown-state*)
                (not (shutdown-in-progress-p)) (not *swank-listener-enabled-p*)
-               (not (physical-recovery-reader-conflict-p)))
+               (or preserve-readers (not (physical-recovery-reader-conflict-p))))
     (error "pending promotion requires stopped workers and no open reader transactions")))
 
 (defmacro with-physical-promotion-exclusion ((phase) &body body)
@@ -91,6 +91,8 @@
         (error "promotion must replay complete durable receive backlog")))
     (values fork next)))
 
+(declaim (ftype function physical-promotion-preflight-runtime))
+
 (defun physical-promotion-publish-intent (&optional requested-child)
   "Privately bind a chosen child to verified local recovery; never grant writer authority.
 Worker shutdown/join and rejection recovery belong to the future public orchestrator.
@@ -102,8 +104,11 @@ The caller owns PGDATA and follow-command/reload/quiescence in that order."
       (when (and requested-child (not (eql requested-child child)))
         (error "requested promotion child is not the next local timeline"))
       (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
-        (declare (ignore catalog))
+        (when (and *catalog* (not (equalp catalog (catalog-image-bytes))))
+          (error "promotion retained catalog differs from its restartpoint"))
         (multiple-value-bind (fork next) (physical-promotion-check-progress state metadata prefix generation)
+          (physical-promotion-preflight-runtime
+           next (getf (getf metadata :source-reservation) :bound) fork)
           (let* ((time (- (get-universal-time) 2208988800))
                  (bytes (physical-recovery-control-image
                          3 (getf state :system-id) (getf state :timeline)

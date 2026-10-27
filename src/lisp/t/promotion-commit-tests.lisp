@@ -35,6 +35,388 @@
        (lambda () (pg::physical-promotion-checkpoint-plan
                    (sample-promotion-checkpoint-state #xffffffffffffffc0) 20000 1003)))))
 
+(defun call-with-current-promotion-owner (function)
+  (let ((pg::*postmaster-data-lock* nil)
+        (pg::*postmaster-pid-stream* nil) (pg::*postmaster-pid-directory* nil)
+        (pg::*postmaster-start-time* nil) (pg::*postmaster-start-timestamp* nil)
+        (pg::*postmaster-pid-host* nil) (pg::*postmaster-pid-port* nil)
+        (pg::*postmaster-pid-inode* nil)
+        (saved-exit-hooks sb-ext:*exit-hooks*))
+    (sb-posix:chmod (namestring pg::*pgdata*) #o700)
+    (unwind-protect
+         (progn
+           (pg::postmaster-own-data-directory "127.0.0.1" 5439)
+           (funcall function))
+      (pg::postmaster-remove-pid-file)
+      (setf sb-ext:*exit-hooks* saved-exit-hooks)
+      (when pg::*postmaster-data-lock* (close pg::*postmaster-data-lock*)))))
+
+(deftest live-child-floor-does-not-skip-an-unfrozen-cycle
+    (let ((cycle pg::+xid-cycle+) (limit pg::+max-xid-one-past+))
+      (ok (pg::physical-promotion-live-xid-floor-valid-p 50 1003 50 1003))
+      (ok (pg::physical-promotion-live-xid-floor-valid-p 50 (+ cycle 3) 50 (+ cycle 3)))
+      (ok (not (pg::physical-promotion-live-xid-floor-valid-p 50 (+ cycle 4) 50 (+ cycle 4))))
+      (ok (not (pg::physical-promotion-live-xid-floor-valid-p 50 (+ (* 2 cycle) 3) 50 50)))
+      (ok (not (pg::physical-promotion-live-xid-floor-valid-p 50 49 50 50)))
+      (ok (not (pg::physical-promotion-live-xid-floor-valid-p 50 1003 2003 1003)))
+      (ok (not (pg::physical-promotion-live-xid-floor-valid-p 50 1003 50 2003)))
+      (ok (not (pg::physical-promotion-live-xid-floor-valid-p 50 cycle 50 50)))
+      (ok (pg::physical-promotion-live-xid-floor-valid-p (1- limit) limit (1- limit) limit))
+      (ok (pg::physical-promotion-live-xid-floor-valid-p limit limit limit limit))
+      (ok (not (pg::physical-promotion-live-xid-floor-valid-p 50 limit 50 limit)))))
+
+(cl-spec:defproperty live-child-floor-stays-before-reuse-or-at-next-epoch-gate
+    ((epoch (range integer 0 1000))
+     (low (range integer 3 4294967295))
+     (offset (range integer 0 3)))
+  (:about pg::physical-promotion-live-xid-floor-valid-p)
+  (:trials (:normal 200))
+  (let* ((actual (+ (* epoch pg::+xid-cycle+) low))
+         (next-epoch (+ (* (1+ epoch) pg::+xid-cycle+) 3))
+         (candidate (+ next-epoch offset)))
+    (eql (zerop offset)
+         (not (null (pg::physical-promotion-live-xid-floor-valid-p
+                     actual candidate actual candidate))))))
+
+(deftest generated-live-child-floor-epoch-gate
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property
+                  'live-child-floor-stays-before-reuse-or-at-next-epoch-gate :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(defun call-with-live-child-fixture (function &key (local-floor 1003) (committed-child t))
+  (with-promotion-fixture (root store :system-id
+                                (pg::catalog-system-identifier
+                                 (pg::make-catalog :cluster-identity "history-source")))
+    (let* ((pg::*catalog-identity-needs-persist-p* nil)
+           (pg::*catalog* (pg::load-catalog))
+           (pg::*active-xids* nil) (pg::*active-snapshots* 0)
+           (pg::*active-snapshot-set* (make-hash-table :test #'eq))
+           (pg::*recovery-reader-xids* (make-hash-table :test #'eql))
+           (pg::*relation-readers* (make-hash-table :test #'eql))
+           (pg::*relation-writers* (make-hash-table :test #'eql))
+           (pg::*wal-page-cache* (make-hash-table :test #'equal))
+           (pg::*wal-page-cache-xids* (make-hash-table :test #'equal))
+           (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+           (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+           (pg::*wal-replication-slots* (make-hash-table :test #'equal))
+           (pg::*physical-source-pins* (make-hash-table :test #'equal))
+           (pg::*wal-output-stream* nil) (pg::*wal-output-segment* nil)
+           (pg::*wal-new-segments* nil) (pg::*wal-pending-deletes* nil)
+           (pg::*wal-pending-btree-split* nil) (pg::*wal-page-batch* nil)
+           (pg::*wal-page-batch-xids* nil) (pg::*wal-page-batch-split* nil)
+           (pg::*wal-control-metadata* nil) (pg::*wal-checkpoint-snapshot* nil)
+           (pg::*wal-xid-reserved-through* nil) (pg::*wal-prev-timeline* 1)
+           (pg::*wal-poisoned* nil) (pg::*xid-wrap-pending* nil)
+           (pg::*xid-wrap-failure* nil) (pg::*xid-wrap-completed-through* nil)
+           (pg::*backend* (pg::make-backend :state :in-progress :explicit t
+                                            :read-only t :isolation-level :repeatable-read)))
+      (pg::clog-init)
+      (unwind-protect
+           (progn
+             (let ((pg::*xid-batch-end* local-floor)) (pg::save-next-xid))
+             (when committed-child
+               (prepare-promotion-child)
+               (call-with-promotion-exclusion #'pg::physical-promotion-publish-child-control))
+             (funcall function root store))
+        (pg::reset-backend-transaction pg::*backend*)
+        (when pg::*clog-stream* (close pg::*clog-stream*) (setf pg::*clog-stream* nil))))))
+
+(defun call-with-live-child-adoption ()
+  (call-with-current-promotion-owner
+   (lambda ()
+     (call-with-promotion-exclusion #'pg::physical-promotion-adopt-live-child-runtime))))
+
+(deftest live-child-runtime-adoption-preserves-reader-and-storage-objects
+    (call-with-live-child-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (let ((catalog pg::*catalog*)
+             (streams pg::*relation-streams*)
+             (slots pg::*wal-replication-slots*)
+             (pins pg::*wal-snapshot-retention-pins*)
+             (snapshot (pg::ensure-transaction-snapshot pg::*backend* 1))
+             (clog pg::*clog-stream*)
+             (token (pg::get-current-reader-xid)))
+         (pg::register-relation-readers '(900) token)
+         (setf (gethash snapshot pins) 152)
+         (pg::clog-set 49 pg::+clog-committed+ :fsync t)
+         (ok (= 424 (call-with-live-child-adoption)))
+         (ok (= pg::+clog-committed+ (pg::clog-get 49)))
+         (ok (eq catalog pg::*catalog*))
+         (ok (eq clog pg::*clog-stream*))
+         (ok (open-stream-p clog))
+         (ok (eq streams pg::*relation-streams*))
+         (ok (eq slots pg::*wal-replication-slots*))
+         (ok (eq pins pg::*wal-snapshot-retention-pins*))
+         (ok (= 152 (gethash snapshot pins)))
+         (ok (eq snapshot (pg::backend-transaction-snapshot pg::*backend*)))
+         (ok (= token (pg::get-current-reader-xid)))
+         (ok (equal (list token) (gethash 900 pg::*relation-readers*)))
+         (ok (= 50 (pg::snapshot-xmax snapshot)))
+         (ok (= 1003 pg::*next-xid* pg::*xid-batch-end* (pg::load-next-xid)))
+         (ok (= 1002 pg::*wal-xid-reserved-through*))
+         (ok (= 424 pg::*wal-checkpoint-lsn* pg::*wal-durable-lsn* pg::*wal-end-lsn*))
+         (ok (= 216 pg::*last-replay-lsn*))
+         (ok (= 2 pg::*wal-insert-timeline* pg::*wal-checkpoint-timeline*))
+         (ok (eq :timeline pg::*wal-segment-namespace*))
+         (ok (pg::recovery-in-progress-p))
+         (ok (pg::backend-read-only pg::*backend*))))))
+
+(deftest live-child-completion-retires-recovery-without-replacing-reader-storage
+    (call-with-live-child-fixture
+     (lambda (root store)
+       (declare (ignore store))
+       (let ((catalog pg::*catalog*) (clog pg::*clog-stream*)
+                                     (snapshot (pg::ensure-transaction-snapshot pg::*backend* 1)))
+         (call-with-current-promotion-owner
+          (lambda ()
+            (call-with-promotion-exclusion #'pg::physical-promotion-start-live-child-primary)))
+         (ok (eq catalog pg::*catalog*))
+         (ok (eq clog pg::*clog-stream*))
+         (ok (open-stream-p clog))
+         (ok (eq snapshot (pg::backend-transaction-snapshot pg::*backend*)))
+         (ok (= 50 (pg::snapshot-xmax snapshot)))
+         (ok (not (pg::recovery-in-progress-p)))
+         (ok (pg::backend-transaction-read-only-p))
+         (ok (null pg::*physical-receive-store*))
+         (ok (not (probe-file (merge-pathnames "physical-recovery.control" root))))
+         (ok (= pg::+db-in-production+ (getf (nth-value 6 (pg::wal-read-control-fields)) :db-state)))
+         (pg::commit-transaction)
+         (ok (not (pg::backend-transaction-read-only-p)))
+         (ok (pg::xid-wrap-users-empty-p))))))
+
+(deftest live-child-adoption-rejects-future-clog-without-clearing-old-status
+    (dolist (xid '(500 1003 100000))
+      (call-with-live-child-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (pg::clog-set 49 pg::+clog-committed+ :fsync t)
+         (pg::clog-set xid pg::+clog-aborted+ :fsync t)
+         (ok (intake-fails-p #'call-with-live-child-adoption))
+         (ok pg::*physical-recovery-failed-p*)
+         (ok (= 50 pg::*next-xid*))
+         (ok (= 152 pg::*wal-end-lsn*))
+         (ok (= pg::+clog-committed+ (pg::clog-get 49)))
+         (ok (= pg::+clog-aborted+ (pg::clog-get xid)))))))
+
+(deftest live-child-epoch-boundary-keeps-clog-until-readers-drain
+    (call-with-live-child-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (let ((snapshot (pg::ensure-transaction-snapshot pg::*backend* 1))
+             (boundary (+ pg::+xid-cycle+ 3)))
+         (pg::clog-set 3 pg::+clog-committed+ :fsync t)
+         (ok (= 424 (call-with-live-child-adoption)))
+         (ok (= boundary pg::*next-xid* pg::*xid-batch-end*))
+         (ok (= pg::+clog-committed+ (pg::clog-get 3)))
+         (ok (eq snapshot (pg::backend-transaction-snapshot pg::*backend*)))
+         (ok (= 50 (pg::snapshot-xmax snapshot)))
+         (ok (null pg::*xid-wrap-pending*))
+         (ok (null pg::*xid-wrap-completed-through*))))
+     :local-floor (+ pg::+xid-cycle+ 3)))
+
+(deftest live-child-adoption-rejects-a-floor-past-the-next-epoch-gate
+    (dolist (kind '(:disk :memory))
+      (call-with-live-child-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (if (eq kind :disk)
+             (let ((pg::*xid-batch-end* (+ pg::+xid-cycle+ 4))) (pg::save-next-xid))
+             (setf pg::*xid-batch-end* (+ pg::+xid-cycle+ 4)))
+         (let ((message (handler-case
+                            (progn (call-with-live-child-adoption) nil)
+                          (error (condition) (princ-to-string condition)))))
+           (ok message)
+           (when (eq kind :memory)
+             (ok (and message (search "promotion allocation floor skips its wraparound gate" message)))))
+         (ok pg::*physical-recovery-failed-p*)
+         (ok (= 50 pg::*next-xid*))
+         (ok (= 152 pg::*wal-end-lsn*))))))
+
+(deftest live-child-adoption-failures-remain-fenced-after-durable-child-control
+    (dolist (point '(:after-live-child-xid-floor :after-live-child-runtime))
+      (call-with-live-child-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (let ((snapshot (pg::ensure-transaction-snapshot pg::*backend* 1))
+               (pg::*physical-promotion-test-hook*
+                 (lambda (seen) (when (eq point seen) (throw 'live-child-fault :injected)))))
+           (ok (eq :injected (catch 'live-child-fault (call-with-live-child-adoption))))
+           (ok pg::*physical-recovery-failed-p*)
+           (ok (= 2 (nth-value 3 (pg::wal-read-control-fields))))
+           (ok (= 1003 (pg::load-next-xid)))
+           (ok (= (if (eq point :after-live-child-xid-floor) 50 1003) pg::*next-xid*))
+           (ok (eq snapshot (pg::backend-transaction-snapshot pg::*backend*))))))))
+
+(deftest live-child-adoption-rejects-unproven-retention-inventories
+    (dolist (kind '(:slot :pin :temporary :dangling :directory-link :live-slot :live-pin))
+      (call-with-live-child-fixture
+       (lambda (root store)
+         (declare (ignore store))
+         (let ((before (lineage-test-bytes (pg::wal-control-path)))
+               (slots (pg::wal-replication-slot-directory))
+               (pins (pg::physical-source-pin-directory)))
+           (case kind
+             (:directory-link
+              (let ((target (merge-pathnames "outside-slots/" root)))
+                (pg::wal-ensure-directory-durable target)
+                (sb-posix:symlink (namestring target) (namestring (merge-pathnames "pg_replslot" root)))))
+             (:live-slot (setf (gethash "old" pg::*wal-replication-slots*) :unproven))
+             (:live-pin (setf (gethash "old" pg::*physical-source-pins*) :unproven))
+             (otherwise
+              (let ((directory (if (member kind '(:pin :dangling)) pins slots)))
+                (pg::wal-ensure-directory-durable directory)
+                (if (eq kind :dangling)
+                    (sb-posix:symlink "absent-target" (namestring (merge-pathnames "hidden.tmp" directory)))
+                    (with-open-file
+                        (stream (merge-pathnames
+                                 (case kind (:slot "old.slot") (:pin "old.pin")
+                                       (otherwise ".pending.tmp"))
+                                 directory)
+                                :direction :output :if-exists :supersede
+                                :element-type '(unsigned-byte 8))
+                      (finish-output stream))))))
+           (ok (intake-fails-p #'call-with-live-child-adoption) (format nil "~a" kind))
+           (ok pg::*physical-recovery-failed-p*)
+           (ok (= 50 pg::*next-xid*))
+           (ok (= 152 pg::*wal-end-lsn*))
+           (ok (equalp before (lineage-test-bytes (pg::wal-control-path)))))))))
+
+(deftest live-child-retention-cannot-name-an-uncopied-parent-segment
+    (let ((pg::*wal-replication-slots* (make-hash-table :test #'equal))
+          (pg::*physical-source-pins* (make-hash-table :test #'equal))
+          (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq)))
+      (with-physical-store-directory (root)
+        (let ((pg::*pgdata* root)
+              (fork (+ pg::+wal-segment-size+ 216))
+              (owner (gensym "RETAINED-READER-")))
+          (setf (gethash owner pg::*wal-snapshot-retention-pins*) 32)
+          (ok (intake-fails-p (lambda () (pg::physical-promotion-check-live-retention fork))))
+          (ok (= 32 (gethash owner pg::*wal-snapshot-retention-pins*)))
+          (setf (gethash owner pg::*wal-snapshot-retention-pins*) pg::+wal-segment-size+)
+          (ok (progn (pg::physical-promotion-check-live-retention fork) t))))))
+
+(deftest live-child-adoption-rejects-pending-runtime-state
+    (dolist (kind (list :completed-wrap :pending-wrap :failed-wrap :wrap-marker :parent-output
+                                        :new-segments :page-cache :page-contributors :batch-contributors :real-xid))
+      (call-with-live-child-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (case kind
+           (:completed-wrap (setf pg::*xid-wrap-completed-through* (+ pg::+xid-cycle+ 3)))
+           (:pending-wrap (setf pg::*xid-wrap-pending* t))
+           (:failed-wrap (setf pg::*xid-wrap-failure* :failed))
+           (:wrap-marker (pg::save-xid-wrap-marker (+ pg::+xid-cycle+ 3)))
+           (:parent-output (setf pg::*wal-output-segment* 0))
+           (:new-segments (setf pg::*wal-new-segments* '(0)))
+           (:page-cache (setf (gethash '(900 0) pg::*wal-page-cache*) (pg::make-page)))
+           (:page-contributors (setf (gethash '(900 0) pg::*wal-page-cache-xids*) '(3)))
+           (:batch-contributors (setf pg::*wal-page-batch-xids* '(3)))
+           (:real-xid (setf pg::*active-xids* '(3))))
+         (ok (intake-fails-p #'call-with-live-child-adoption) (format nil "~a" kind))
+         (ok pg::*physical-recovery-failed-p*)
+         (ok (= 50 pg::*next-xid*))
+         (ok (= 152 pg::*wal-end-lsn*))))))
+
+(deftest live-child-adoption-requires-the-exact-committed-plan
+    (dolist (kind '(:larger-counter :extra-durable-end))
+      (call-with-live-child-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (multiple-value-bind (checkpoint durable original insertion checkpoint-id namespace metadata)
+             (pg::wal-read-control-fields)
+           (let ((snapshot (copy-list original)))
+             (if (eq kind :larger-counter)
+                 (let* ((start (getf snapshot :start))
+                        (path (pg::wal-segment-path (floor start pg::+wal-segment-size+) insertion namespace))
+                        (bytes (lineage-test-bytes path)))
+                   (setf (getf snapshot :next-xid) 2003
+                         (getf snapshot :xid-reserved-through) 2002
+                         (getf snapshot :oldest-active-xid) 2003)
+                   (replace bytes
+                            (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 start
+                                                   (pg::wal-encode-checkpoint-snapshot snapshot))
+                            :start1 (mod start pg::+wal-segment-size+))
+                   (pg::wal-atomic-write-bytes path bytes))
+                 (incf durable 32))
+             (pg::wal-atomic-write-bytes
+              (pg::wal-control-path)
+              (pg::wal-encode-control-image checkpoint durable snapshot :timeline insertion
+                                                                        :checkpoint-timeline checkpoint-id :namespace namespace :metadata metadata))
+             (ok (progn (pg::physical-promotion-check-child-control insertion checkpoint-id) t))
+             (ok (intake-fails-p #'call-with-live-child-adoption) (format nil "~a" kind))
+             (ok pg::*physical-recovery-failed-p*)
+             (ok (= 50 pg::*next-xid*))
+             (ok (= 152 pg::*wal-end-lsn*))))))))
+
+(deftest live-child-adoption-rejects-a-divergent-retained-catalog
+    (dolist (kind '(:next-oid :schema))
+      (call-with-live-child-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (if (eq kind :next-oid)
+             (incf (pg::catalog-next-oid pg::*catalog*))
+             (setf (pg::pg-class-name (pg::lookup-table "table_900")) "changed"))
+         (ok (intake-fails-p #'call-with-live-child-adoption))
+         (ok pg::*physical-recovery-failed-p*)
+         (ok (= 50 pg::*next-xid*))
+         (ok (= 152 pg::*wal-end-lsn*))))))
+
+(deftest promotion-preflight-rejects-unsafe-state-before-durable-intent
+    (dolist (kind '(:gap-clog :slot-file :memory-pin :bad-floor))
+      (call-with-live-child-fixture
+       (lambda (root store)
+         (declare (ignore store))
+         (let ((wal-before (lineage-test-bytes (pg::wal-control-path)))
+               (recovery-before (lineage-test-bytes (pg::physical-recovery-control-path))))
+           (case kind
+             (:gap-clog (pg::clog-set 500 pg::+clog-committed+ :fsync t))
+             (:slot-file
+              (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
+              (pg::wal-atomic-write-bytes (pg::wal-replication-slot-path "stale") (empty-octets)))
+             (:memory-pin (setf (gethash "stale" pg::*physical-source-pins*) :unproven))
+             (:bad-floor
+              (let ((pg::*xid-batch-end* (+ pg::+xid-cycle+ 4))) (pg::save-next-xid))))
+           (ok (intake-fails-p
+                (lambda () (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent))))
+           (ok (not pg::*physical-recovery-failed-p*))
+           (ok (eql 2 (getf pg::*physical-recovery-state* :phase)))
+           (ok (= 50 pg::*next-xid*))
+           (ok (equalp wal-before (lineage-test-bytes (pg::wal-control-path))))
+           (ok (equalp recovery-before (lineage-test-bytes (pg::physical-recovery-control-path))))
+           (ok (not (probe-file (pg::timeline-history-path 2 root))))
+           (when (eq kind :gap-clog)
+             (let ((fresh-rc (pg::make-snapshot 1)))
+               (ok (not (pg::heap-tuple-visible-p 500 0 0 fresh-rc nil)))))))
+       :committed-child nil)))
+
+(deftest clog-tail-preflight-preserves-the-existing-epoch-gate
+    (call-with-live-child-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (let ((boundary (+ pg::+xid-cycle+ 3)))
+         (pg::clog-set 3 pg::+clog-committed+ :fsync t)
+         (ok (progn (pg::physical-promotion-check-clog-tail boundary boundary) t))
+         (ok (= pg::+clog-committed+ (pg::clog-get 3)))
+         (ok (intake-fails-p
+              (lambda () (pg::physical-promotion-check-clog-tail boundary (+ boundary 1000)))))))))
+
+(deftest live-child-adoption-requires-a-joined-restartpoint-worker
+    (call-with-live-child-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (let* ((release (sb-thread:make-semaphore))
+              (worker (sb-thread:make-thread
+                       (lambda () (sb-thread:wait-on-semaphore release :timeout 10)))))
+         (unwind-protect
+              (let ((pg::*physical-restartpoint-worker* worker))
+                (ok (intake-fails-p #'call-with-live-child-adoption))
+                (ok pg::*physical-recovery-failed-p*)
+                (ok (= 50 pg::*next-xid*)))
+           (sb-thread:signal-semaphore release)
+           (sb-thread:join-thread worker :timeout 5 :default :timed-out))))))
+
 (deftest child-control-publication-commits-only-after-checkpoint-and-data-sync
     (with-promotion-fixture (root store)
       (declare (ignore root store))

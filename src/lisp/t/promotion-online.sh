@@ -50,6 +50,24 @@ sql "$PORT" 'CREATE TABLE data (id integer PRIMARY KEY); INSERT INTO data VALUES
 checked source "(physical-base-backup \"$TMP/copy/\" \"online_promotion\")" backup
 start_target
 checked target '(physical-recovery-enable-streaming)' streaming
+if [ "${LIVE_CHILD_ADOPTION:-0}" = 1 ]; then
+    checked target '(progn
+      (defparameter *promotion-live-test-preserved* nil)
+      (setf *physical-promotion-test-hook*
+        (let ((owned nil))
+          (lambda (point)
+            (case point
+              (:before-online-intent
+                (setf owned (list *catalog* *clog-stream* *relation-streams*
+                                 *wal-snapshot-retention-pins* *wal-replication-slots*))
+                (setf (symbol-function (quote physical-promotion-start-child-primary))
+                      (function physical-promotion-start-live-child-primary)))
+              (:after-child-primary-initialization
+                (assert (every (function eq) owned
+                               (list *catalog* *clog-stream* *relation-streams*
+                                     *wal-snapshot-retention-pins* *wal-replication-slots*)))
+                (setf *promotion-live-test-preserved* t)))))))' live-adoption-hook
+fi
 checked target "(physical-follow-start \"127.0.0.1\" $PORT \"online_promotion\")" follow
 sql "$PORT" 'INSERT INTO data VALUES (2),(3),(4),(5)'
 wait_value 'SELECT count(*) FROM data' 5
@@ -125,6 +143,10 @@ exec 3>&-
 wait_value 'SELECT pg_is_in_recovery()' f
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 12
 checked target '(assert (and (not *physical-follow-runtime*) (not *physical-restartpoint-worker*) (not *physical-promotion-stopping-p*) (not *physical-recovery-state*) (not *physical-recovery-failed-p*)))' primary
+if [ "${LIVE_CHILD_ADOPTION:-0}" = 1 ]; then
+    checked target '(assert *promotion-live-test-preserved*)' live-adoption-preserved
+    echo 'promotion-online: live child adoption preserves catalog, CLOG and runtime tables PASS'
+fi
 kill -INT "$SOURCE"; wait "$SOURCE"; SOURCE=
 sql "$TARGET_PORT" 'CREATE TABLE after_promotion (id integer); INSERT INTO after_promotion VALUES (11)'
 EXPECTED_TIMELINE=2 "$PATRONI_PYTHON" "$BASE/t/interop/patroni-tl-lsn.py" "$TARGET_PORT" primary

@@ -70,6 +70,32 @@ for point in before-online-intent after-online-intent after-child-control-rename
     stop
     echo "promotion-online-crash: $point PASS"
 done
+if [ "${LIVE_CHILD_ADOPTION:-0}" = 1 ]; then
+    for point in after-live-child-xid-floor after-live-child-runtime after-retire-pending after-child-primary-ready; do
+        clone "live-$point"
+        start
+        checked "(setf *physical-promotion-test-hook*
+          (lambda (point)
+            (when (eq point :before-online-intent)
+              (setf (symbol-function (quote physical-promotion-start-child-primary))
+                    (function physical-promotion-start-live-child-primary)))
+            (when (eq point :$point)
+              (with-open-file (stream \"$CASE/marker\" :direction :output
+                                      :if-exists :error :if-does-not-exist :create)
+                (format stream \"~d~%\" (sb-posix:getpid))
+                (finish-output stream))
+              (loop (sleep 0.05)))))" live-hook
+        "$BASE/bin/pg_ctl" promote -D "$CASE/data" -W
+        barrier
+        crash
+        start
+        test "$(sql 'SELECT pg_is_in_recovery()')" = f
+        test "$(sql 'SELECT count(*) FROM data')" = 5
+        sql 'CREATE TABLE live_crash_write (id integer); INSERT INTO live_crash_write VALUES (1)'
+        stop
+        echo "promotion-online-crash: live $point PASS"
+    done
+fi
 for kind in stale queued; do
     clone "startup-$kind"
     : >"$CASE/data/promote"
