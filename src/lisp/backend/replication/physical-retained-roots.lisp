@@ -217,6 +217,15 @@ Read control outside the archive mutex and recheck the captured owner state."
                (member (physical-retained-root-hold-state hold) '(:preparing :selecting)))
     (error "retained WAL publication hold is not active")))
 
+(defun physical-retained-root-record-candidate (hold id prepared)
+  (physical-retained-root-require-lock)
+  (unless (and prepared (= id (physical-retained-root-reference-root-id prepared)))
+    (error "retained WAL publication did not produce its prepared reference"))
+  (sb-sys:without-interrupts
+    (setf (gethash id (physical-retained-root-hold-candidates hold)) t
+          (physical-retained-root-hold-reference hold) prepared))
+  id)
+
 (defun physical-retained-root-update-publish-under-lock (hold target text images previous keep-ids keep-supplied-p)
   "Publish a candidate while HOLD protects its inputs and objects.
 
@@ -244,12 +253,46 @@ candidate for selection."
                                  (physical-retained-root-hold-objects hold)
                                  (physical-retained-root-reference-objects prepared)))
                      (when keep-supplied-p (list :keep-ids keep-ids)))))
-      (unless (and prepared (= id (physical-retained-root-reference-root-id prepared)))
-        (error "retained WAL publication did not produce its prepared reference"))
-      (sb-sys:without-interrupts
-        (setf (gethash id (physical-retained-root-hold-candidates hold)) t
-              (physical-retained-root-hold-reference hold) prepared))
-      id)))
+      (physical-retained-root-record-candidate hold id prepared))))
+
+(defun physical-retained-root-stage-image (hold target text image)
+  (physical-retained-wal-check-budget (list image))
+  (let* ((image (copy-seq image))
+         (id (physical-store-update-digest #xCBF29CE484222325 image))
+         (metadata (physical-retained-extent-decode image))
+         (entry (list id (length image) metadata)))
+    (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+      (physical-retained-root-check-hold hold)
+      (let ((history (physical-retained-inventory-check
+                      (list :version 1 :identity (physical-retained-root-hold-identity hold)
+                            :history-target target :history-text text :entries (list entry)))))
+        (multiple-value-bind (checked bytes) (physical-retained-extent-decode image)
+          (physical-retained-extent-scan checked bytes history)))
+      (setf (gethash (cons :extent id) (physical-retained-root-hold-objects hold)) t)
+      (physical-retained-object-publish (physical-retained-root-hold-directory hold)
+                                        :extent image +physical-retained-image-limit+)
+      (physical-retained-inventory-test-point :after-extent-publication id))
+    entry))
+
+(defun physical-retained-root-publish-staged-entries (hold target text entries)
+  (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+    (physical-retained-root-check-hold hold)
+    (dolist (entry entries)
+      (unless (gethash (cons :extent (first entry)) (physical-retained-root-hold-objects hold))
+        (error "retained inventory entry was not reserved before reading")))
+    (let ((prepared nil))
+      (multiple-value-bind (id payload)
+          (physical-retained-inventory-publish-entries-under-lock
+           (physical-retained-root-hold-directory hold) (physical-retained-root-hold-identity hold)
+           target text entries
+           (lambda (id entries)
+             (setf prepared (physical-retained-root-make-reference
+                             (physical-retained-root-hold-directory hold)
+                             (physical-retained-root-hold-identity hold) id entries))
+             (physical-retained-root-add-objects (physical-retained-root-hold-objects hold)
+                                                 (physical-retained-root-reference-objects prepared))))
+        (physical-retained-root-record-candidate hold id prepared)
+        (values id payload)))))
 
 (defun physical-retained-root-update-publish (hold target text images &key previous (keep-ids nil keep-supplied-p))
   "Publish another candidate under an active hold."

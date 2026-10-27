@@ -237,6 +237,21 @@ Return the freshly decoded payload."
              (setf (gethash id selected) t))
     (loop for entry in entries when (gethash (first entry) selected) collect entry)))
 
+(defun physical-retained-inventory-publish-entries-under-lock (directory identity target text entries protect)
+  (unless (sb-thread:holding-mutex-p *physical-retained-inventory-publish-lock*)
+    (error "retained WAL publication requires archive exclusion"))
+  (let* ((image (physical-retained-inventory-image
+                 (list :version 1 :identity identity :history-target target :history-text text :entries entries)))
+         (payload (physical-retained-inventory-decode image))
+         (history (physical-retained-inventory-check payload)))
+    (physical-retained-inventory-verify-entries
+     (getf payload :entries) history
+     (lambda (id) (physical-retained-object-read directory :extent id +physical-retained-image-limit+)))
+    (funcall protect (physical-store-update-digest #xCBF29CE484222325 image) (getf payload :entries))
+    (let ((id (physical-retained-object-publish directory :inventory image +physical-retained-inventory-limit+)))
+      (physical-retained-inventory-test-point :after-inventory-publication id)
+      (values id payload))))
+
 (defun physical-retained-inventory-publish-under-lock
     (directory identity target text images &key previous (keep-ids nil keep-supplied-p) protect)
   "Publish an inventory under the archive mutex.
