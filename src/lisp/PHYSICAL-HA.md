@@ -69,6 +69,57 @@ ancestry and fork position before selecting a new recovery timeline
 WAL beyond the fork as well as applied WAL. Writing recovery configuration alone
 must not authorize a divergent former primary to rejoin.
 
+### Durable receive-history storage
+
+The receive store now has a local history-selection primitive. Original system
+identity, base timeline and base LSN stay fixed. Each immutable selection binds
+that base to the descendant history, the cumulative digest at its parent fork,
+exact expected EOR bytes and its previous selection. Receive control references
+the selected object; an orphan history file alone changes nothing. Existing
+unselected control images remain readable. Child receive files include their
+timeline, allowing parent and child records in the same segment range.
+
+Selection requires the exact fully flushed parent fork, no unflushed input and
+completion of any previously selected EOR. It checks local storage proof only;
+the caller must first verify the remote system, common prefix, base history and
+retention, and reconcile the old source. This is not source admission or replay
+selection. The network receiver still rejects a different timeline, ordinary EOR
+receipt remains rejected without selection, and following never grants writer
+permission or changes primary WAL control.
+
+Selected receipt checks the expected transition bytes and hashes each raw record
+into the existing cumulative prefix. Reopen validates referenced history and
+acknowledged bytes before tail cleanup. Restartpoint publication still precedes
+floor advancement; immutable transition proof survives deletion of old receive
+segments. The local representation permits 256 successive selections and a
+16 MiB complete encoded selection object. Both publication and reopening enforce
+these bounds; they are native storage limits, not C protocol limits.
+
+Validation passed 531 physical tests, 170 interop tests and 1,598 legacy checks.
+The new cases include two successive forks, exact fork boundaries, EOR rotation,
+compaction beyond EOR, missing referenced proof, unchanged control on rejection,
+publication errors and six SIGKILL boundaries. The metadata property executed
+100 trials at seed 42; input coverage and rejection counts are unmeasured.
+Fresh-cache strict compilation and formatting passed. Native follow and the
+child-backup path through promotion to timeline 3 passed, including source crash,
+pin restore, manifest mismatch and backup publication faults. Evidence is in
+`/tmp/pg-receive-history-final-cold.log`,
+`/tmp/pg-receive-history-preserve-follow.log` and
+`/tmp/pg-receive-history-preserve-child.log`. SIGKILL tests cover process death,
+not power loss. All three manual writer switchovers and both C/Lisp logical
+replication directions passed in
+`/tmp/pg-receive-history-preserve-switchover.log` and
+`/tmp/pg-receive-history-preserve-logical.log`.
+
+Review caught selection skipping an unreceived EOR, publication exceeding reader
+bounds and a test cleanup gap; regressions and fixes passed recheck. Luna max and
+Sol high cleared the code, and Sol medium found no useful refactor. Production
+functions stay below 120 lines. Terra 6.1 drafted the source documentation and
+the primary reviewed it separately, distinguishing retained-byte checks from
+proof kept after compaction. Source onboarding, durable replay timeline and
+EOR redo, recovery/restartpoint integration and later promotion from the replayed
+child remain the next work. Operational sibling follow is not yet implemented.
+
 ### Existing sibling follow intake
 
 A three-node native probe now reproduces the next gap. Two standbys replay a

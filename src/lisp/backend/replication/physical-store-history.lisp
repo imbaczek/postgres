@@ -6,12 +6,15 @@
 (defconstant +physical-store-history-maximum-bytes+ (* 16 1024 1024))
 
 (defun physical-store-selected-timeline (store)
+  "Return the selected receive timeline, or the original base timeline."
   (or (getf (physical-store-selection store) :target) (physical-store-timeline store)))
 
 (defun physical-store-history-path (store target digest)
   (physical-store-path store (format nil "~8,'0X-~16,'0X.history" target digest)))
 
 (defun physical-store-history-image (payload)
+  "Encode a bounded receive-history payload with a CRC envelope.
+The CRC detects accidental corruption; it does not authenticate the payload."
   (let* ((text (string->bytes (physical-bootstrap-manifest-text payload)))
          (size (+ 16 (length text))))
     (unless (<= size +physical-store-history-maximum-bytes+)
@@ -24,6 +27,7 @@
       bytes)))
 
 (defun physical-store-history-payload (bytes)
+  "Check the envelope length and CRC before reading its bounded payload."
   (unless (and (<= 16 (length bytes) +physical-store-history-maximum-bytes+)
                (equalp (subseq bytes 0 8) #(80 71 80 72 83 72 48 49))
                (= (wal-u32 bytes 8) (- (length bytes) 16)))
@@ -35,6 +39,7 @@
   (recovery-parse-manifest-text (bytes->string (subseq bytes 12 (- (length bytes) 4)))))
 
 (defun physical-store-history-extends-p (previous history)
+  "Check that HISTORY preserves the intervals already fixed by PREVIOUS."
   (every (lambda (old)
            (let ((new (find (timeline-history-entry-timeline old) history
                             :key #'timeline-history-entry-timeline)))
@@ -45,6 +50,10 @@
          previous))
 
 (defun physical-store-check-history-selection (store payload digest previous)
+  "Validate base identity, lineage and the expected end-of-recovery bytes.
+Check the fork digest's representation and preserve previous history intervals.
+Comparing that digest with stored WAL is a separate prefix-validation step.
+Publication and loading enforce the same chain bound."
   (when (>= (loop for item = previous then (getf item :previous) while item count item)
             +physical-store-history-chain-limit+)
     (error "receive history chain exceeds its reopen bound"))
@@ -88,6 +97,8 @@
                           :eor-bytes raw :previous previous))))
 
 (defun physical-store-load-history-selection (store target digest &optional (depth 0))
+  "Load and validate the control-referenced history chain within its depth bound.
+The FNV reference detects accidental corruption, not malicious changes."
   (unless (and (typep target '(integer 2 4294967295))
                (typep digest '(unsigned-byte 64)) (< depth +physical-store-history-chain-limit+))
     (error "invalid or excessive receive history chain"))
@@ -105,6 +116,14 @@
        (physical-store-load-history-selection store parent previous-digest (1+ depth))))))
 
 (defun physical-store-select-history (store target history-text eor-bytes)
+  "Select a descendant receive history at the exact flushed fork.
+
+Require no unflushed input and a durable prior selected end-of-recovery record.
+The control reference is the commit point; a history blob alone is not selected.
+Before calling, stop and reconcile the old source and independently verify remote
+cluster identity, exact prefix, base history and retention. This checks local
+stored proof only. Errors latch the store; after an ambiguous control rename,
+reopen from disk to determine the durable selection."
   (with-physical-store (store)
     (physical-store-validate-prefix store)
     (unless (and (= (physical-store-written-lsn store) (physical-store-flushed-lsn store))
@@ -137,11 +156,15 @@
       target)))
 
 (defun physical-store-prefix-timeline (store boundary)
+  "Return the timeline owning the byte before a verified prefix boundary.
+The original base boundary keeps its base timeline."
   (if (or (null (physical-store-selection store)) (= boundary (physical-store-base-lsn store)))
       (physical-store-timeline store)
       (timeline-at-point (1- boundary) (getf (physical-store-selection store) :history))))
 
 (defun physical-store-history-check-record (store record raw previous)
+  "Check record placement in the selected history and require the expected EOR bytes.
+Return the timeline used for its receive segment."
   (let ((selection (physical-store-selection store)))
     (unless selection
       (wal-require-ordinary-record-type (wal-record-type record))
@@ -164,6 +187,7 @@
       owner)))
 
 (defun physical-store-history-segment-entries (store)
+  "List receive files as (timeline segment-number pathname) entries."
   (loop for path in (directory (physical-store-path store "*.wal"))
         for name = (pathname-name path)
         collect
@@ -178,6 +202,8 @@
           (t (error "invalid physical receive segment name ~a" path)))))
 
 (defun physical-store-history-read-chunk (store decoder cursor flush callback)
+  "Decode buffered bytes from CURSOR's timeline within one segment and history interval.
+Return the next scan cursor, leaving rotation-gap validation to the decoder."
   (let* ((history (getf (physical-store-selection store) :history))
          (timeline (timeline-at-point cursor history))
          (entry (find timeline history :key #'timeline-history-entry-timeline))
@@ -208,6 +234,10 @@
         (+ segment-start +wal-segment-size+))))
 
 (defun physical-store-validate-history-prefix (store &key on-record digest-cursor)
+  "Validate retained selected-history records and cumulative digests through flush.
+Compare saved fork digests when those boundaries are retained. Immutable selection
+metadata keeps EOR provenance after a restartpoint removes old records. Hash each
+raw record once per scan; return a requested digest only at a valid boundary."
   (let* ((floor (physical-store-floor-lsn store))
          (flush (physical-store-flushed-lsn store))
          (decoder (make-physical-wal-decoder :start-lsn floor))
@@ -237,6 +267,7 @@
     (values nil cursor-digest)))
 
 (defun physical-store-history-discard-tail (store)
+  "Discard bytes outside the validated selected prefix, preserving each timeline's range."
   (let* ((history (getf (physical-store-selection store) :history))
          (floor (physical-store-floor-lsn store)) (flush (physical-store-flushed-lsn store)))
     (dolist (file (physical-store-history-segment-entries store))

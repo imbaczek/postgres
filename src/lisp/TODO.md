@@ -11,8 +11,8 @@
   promotion reader-enrollment prerequisite, native online reader-preserving
   promotion, relation reader identity selection, statement snapshot scope bookkeeping,
   temporary stream ownership, executor parking, client application-name settings,
-  supported implicit query blocks, SQL promotion and fresh child backup/follow
-  have completed this pass and its review. Keep the
+  supported implicit query blocks, SQL promotion, fresh child backup/follow and
+  durable receive-history selection have completed this pass and its review. Keep the
   same order for the remaining HA work.
 
 - [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker

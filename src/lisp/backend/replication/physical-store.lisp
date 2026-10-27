@@ -5,6 +5,10 @@
   (fd sb-alien:int) (operation sb-alien:int))
 
 (defstruct (physical-store (:constructor %make-physical-store))
+  "A locally owned receive spool and its durable progress.
+
+SYSTEM-ID, TIMELINE and BASE-LSN identify the original base. SELECTION changes
+the receive history without changing that base or main WAL control."
   directory system-id timeline base-lsn floor-lsn (floor-digest #xCBF29CE484222325)
   written-lsn flushed-lsn decoder
   (written-digest #xCBF29CE484222325) (flushed-digest #xCBF29CE484222325)
@@ -22,6 +26,7 @@
   (merge-pathnames name (physical-store-directory store)))
 
 (defun physical-store-segment-path (store segment &optional (timeline (physical-store-timeline store)))
+  "Return the receive segment path, keeping base and child timeline names distinct."
   (physical-store-path store
                        (if (= timeline (physical-store-timeline store))
                            (format nil "~16,'0X.wal" segment)
@@ -60,6 +65,8 @@ This FNV-1a-64 checksum detects accidental prefix damage, not malicious tamperin
                                                         (floor-lsn (physical-store-floor-lsn store))
                                                         (floor-digest (physical-store-floor-digest store))
                                                         (selection (physical-store-selection store)))
+  "Encode receive progress with the original base identity, prefix and floor.
+Include a history reference when a selection exists."
   (let* ((size (if selection 80 68))
          (bytes (make-array size :element-type '(unsigned-byte 8) :initial-element 0)))
     (replace bytes #(80 71 80 72 89 83 48 51))
@@ -102,7 +109,9 @@ This FNV-1a-64 checksum detects accidental prefix damage, not malicious tamperin
   (physical-store-test-point :after-control-write store))
 
 (defun physical-store-load-control (store)
-  "Read v2 bootstrap-anchored or v3 restartpoint-anchored receive progress."
+  "Read receive progress and any selected-history reference.
+The control reference is the selection commit point; an unreferenced history
+blob does not select a timeline."
   (let* ((bytes (with-open-file (stream (physical-store-path store "receive.control")
                                         :element-type '(unsigned-byte 8))
                   (unless (member (file-length stream) '(52 68 80))
@@ -139,14 +148,18 @@ This FNV-1a-64 checksum detects accidental prefix damage, not malicious tamperin
             (physical-store-load-history-selection store (wal-u32 bytes 64) (wal-u64 bytes 68))))))
 
 (defun physical-store-segments (store)
+  "Return sorted segment numbers for the original base timeline.
+The history inventory also includes child timelines and file paths."
   (sort (loop for (timeline segment path) in (physical-store-history-segment-entries store)
               when (= timeline (physical-store-timeline store)) collect segment)
         #'<))
 
 (defun physical-store-validate-prefix (store &key on-record digest-cursor)
-  "Validate the durable prefix; ON-RECORD is internal and runs during validation.
-The secondary value is the cumulative digest at DIGEST-CURSOR, or NIL if it
-is not a base/record-end boundary. No value returns until all validation passes."
+  "Validate the complete durable prefix before returning.
+
+ON-RECORD is internal and runs during validation. The secondary value is the
+cumulative digest at DIGEST-CURSOR, or NIL if it is not a base or record-end
+boundary. A byte boundary alone does not establish a terminal batch."
   (when (physical-store-selection store)
     (return-from physical-store-validate-prefix
       (physical-store-validate-history-prefix store :on-record on-record :digest-cursor digest-cursor)))
@@ -224,17 +237,15 @@ This does not certify a terminal batch or a durable data restartpoint."
 
 (defun physical-store-map-durable-records (store function &key
                                                             (start-lsn (physical-store-floor-lsn store)))
-  "Resume after START-LSN, calling FUNCTION with each durable record and raw octets.
-START-LSN must be the base or a durable record end, never rotation gap padding.
-Return the captured flush boundary, without publishing replay progress. Validate
-the complete prefix and exact resume boundary before the first callback. Segment
-padding is skipped; the end of its preceding record is a valid resume boundary.
+  "Call FUNCTION with each durable record and its raw octets after START-LSN.
+
+Validate the whole prefix and exact resume boundary before the first call.
+START-LSN must be the base or a record end, never a position in rotation padding.
 Callbacks run under the store mutex and must not reenter receiver operations.
-An error latches the store; previously invoked callbacks are not rolled back.
-Two bounded scans avoid retaining the entire WAL prefix in memory. This primitive
-rescans retained WAL and blocks receipt; continuous replay needs a separate cursor
-and a lock-order audit before applying records under writer/catalog locks. The owner
-lock excludes other receivers, not privileged external filesystem modification."
+An error latches the store; earlier callbacks are not rolled back. Two bounded
+scans avoid retaining the whole prefix in memory. The caller must establish any
+required terminal batch boundary and replay authority, and own the files against
+external modification."
   (with-physical-store (store)
     (let ((flush (physical-store-flushed-lsn store)))
       (physical-store-prefix-digest-under-lock store start-lsn)
@@ -317,11 +328,12 @@ Do not call from a mapper callback. Preserve unflushed writes and decoder state.
 
 (defun physical-store-open (directory system-id timeline &key create (start-lsn 0) (discard-tail t) (create-lock t))
   "Own a native receive spool, creating only in an existing empty directory.
-CREATE never overwrites an old incarnation; opening an existing spool validates
-its acknowledged prefix before discarding tails. An OS file lock excludes other
-local receivers and is released on crash; it is not a distributed writer lease.
-With DISCARD-TAIL and CREATE-LOCK both NIL, validate pending recovery without
-changing spool bytes or creating a missing lock; do not resume input in that mode."
+CREATE never overwrites an old incarnation. Opening an existing spool validates
+its control, selected history and durable prefix before discarding tails.
+Invalid selected metadata is an error, never a fallback to an older history.
+The local file lock excludes another local receiver, not a distributed writer.
+With DISCARD-TAIL and CREATE-LOCK both NIL, validate without changing spool bytes
+or creating a missing lock. Do not resume input in that mode."
   (unless (and (typep system-id '(unsigned-byte 64))
                (typep timeline '(integer 1 4294967295))
                (typep start-lsn '(unsigned-byte 64))
@@ -382,6 +394,7 @@ changing spool bytes or creating a missing lock; do not resume input in that mod
   (physical-store-stream store))
 
 (defun physical-store-write-record (store record bytes)
+  "Write one validated record to its timeline segment and hash its raw bytes once."
   (let* ((timeline (physical-store-history-check-record
                     store record bytes (physical-store-written-lsn store)))
          (start (wal-record-start record))
