@@ -1693,6 +1693,8 @@ can discard the owner of a virtual ID or its remaining relation locks."
   (values))
 
 (defun finish-backend-transaction (backend commit-p)
+  "Reset BACKEND and finish application_name state atomically.
+On commit, retire the saved settings snapshot; abort leaves it for whole-table undo."
   (sb-sys:without-interrupts
     (let ((*backend* backend))
       (reset-backend-transaction backend)

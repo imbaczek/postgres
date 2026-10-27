@@ -3,9 +3,10 @@
 Open development audits, including cold-image/load-order correctness, are tracked
 in [TODO.md](TODO.md).
 
-Status, 2026-10-26: native intake/bootstrap/recovery, continuous receipt/reconnect,
+Status, 2026-10-27: native intake/bootstrap/recovery, continuous receipt/reconnect,
 advancing source retention, explicit/automatic local restartpoints, PGDATA/PID
-ownership, a startup/reload configuration subset and online promotion are
+ownership, a startup/reload configuration subset, client application-name settings
+and online promotion are
 implemented. Pinned Patroni's full promotion method now passes through native
 pg_ctl and pg_controldata, including its production-state wait. Child-history
 follow/rejoin, complete physical-slot interfaces, synchronous durability and
@@ -14,6 +15,65 @@ remains future work. Coordination is excluded. The repository's original C
 source is the behavior oracle.
 
 ## Verified starting points
+
+### Application name and supported implicit query messages
+
+Client startup and SQL `application_name` now share session settings, transaction
+undo and parameter reporting. Input is clipped to 63 UTF-8 bytes before bytes
+outside printable ASCII are escaped. The activity slot clips the escaped value
+again; it does not change the GUC value. Reset uses the already validated startup
+baseline. Normal SET replaces a LOCAL restoration; repeated LOCAL assignments
+preserve the session value and source to restore at commit. Abort restores the
+saved settings table.
+
+Reports for `application_name`, `TimeZone` and the existing native `search_path`
+extension are coalesced per connection before ReadyForQuery. Settings cleanup
+performs no wire I/O. Startup sends AuthenticationOk before validating settings,
+so an earlier truncation notice survives a later fatal option error. Outside a
+transaction, SET LOCAL warns and still validates without persisting the value.
+`pg_settings` exposes its existing nine-field subset; no full `pg_stat_activity`
+view is added.
+
+An idle simple-query message uses one implicit transaction for supported SELECT,
+INSERT, UPDATE, DELETE, ordinary SET, RESET and SHOW statements. Transaction options
+and session characteristics are excluded. Setup and cleanup are protected from
+interrupts; statement execution remains interruptible. Commit and its completion
+marker are protected together. The last CommandComplete follows commit, while
+earlier rows and replies can already have streamed. Final network output remains
+interruptible. DDL, TRUNCATE, maintenance and transaction-control messages retain
+their prior per-statement behavior. Their atomicity remains a C compatibility gap.
+
+Validation passed 483 physical tests, 170 interop tests and 1,598 legacy checks.
+The printable-ASCII property ran 200 trials at seed 42. The native contract against
+C `9c0909b34939f2d5a37b82b9d1efc8b08e310252`, private-control reload and post-commit
+FATAL checks pass in `/tmp/pg-application-name-final-acceptance.log`. The FATAL
+fixture wraps real transaction finalization for one backend and verifies a visible
+row, committed CLOG, no abort cleanup and an idle, unregistered backend. A terminated
+client can have an unacknowledged commit; the check does not establish synchronous
+replication durability. Follow, all three switchovers and both logical directions
+pass in `/tmp/pg-application-name-final-follow.log`,
+`/tmp/pg-application-name-final-switchover.log` and
+`/tmp/pg-application-name-final-logical-both.log`. Fresh strict compilation and
+formatting pass. Luna and Sol cleared code reviews; Sol reviewed the ownership
+refactors. Terra wrote the documentation pass and the primary reviewed it separately.
+
+From `src/lisp`, run:
+
+```sh
+PG_C_BINDIR=/tmp/pg-lisp-c-reference/usr/local/pgsql/bin ./t/application-name.sh
+```
+
+`PATRONI_PYTHON` defaults to the existing Patroni 4.1.5 virtual environment. The
+harness requires GNU timeout and Linux pidfd. Native and C ports default to 6700
+and 6701; override `PORT` and `REFERENCE_PORT`. The C baseline uses UTC.
+`PARKING_KEEP_ON_FAILURE=1` retains private controls for up to
+`PARKING_DEBUG_SECONDS`, default 600; touch the printed root's `debug-release` file
+to clean up.
+
+Server-file and command-line application-name defaults remain in the configuration
+audit. Public SQL `pg_promote`, recovery conflicts, rejoin, synchronous replication
+and the broader Patroni matrix remain open. No coordination or C physical
+compatibility is added.
 
 ### Native pg_controldata and durable primary lifecycle
 
@@ -626,8 +686,9 @@ quota check passed, as did fresh strict compilation. Luna, Sol and Astra code
 reviews and Sol's refactoring review cleared the change.
 
 The executor continuation matrix below covers these native promotion paths,
-including optional sort arenas. Public SQL `pg_promote`, normal `application_name`
-GUC support and the broader HA goal remain open. Coordination remains excluded.
+including optional sort arenas. Client `application_name` settings are implemented
+above; public SQL `pg_promote` and the broader HA goal remain open. Coordination
+remains excluded.
 
 ### Executor continuations across parking
 
@@ -674,7 +735,8 @@ With `PARKING_KEEP_ON_FAILURE=1`, private controls remain available for up to
 using a control socket.
 
 These tests cover supported row-DML paths. DDL, VACUUM and pruning conflict
-handling, SQL `pg_promote` and normal `application_name` GUC support remain open.
+handling and SQL `pg_promote` remain open. Client application-name support is
+recorded above.
 No coordination or C physical compatibility is added.
 
 ### Timeline-qualified native WAL namespace

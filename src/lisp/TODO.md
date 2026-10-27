@@ -10,7 +10,8 @@
   virtual reader lifecycle helpers, private child adoption and the private
   promotion reader-enrollment prerequisite, native online reader-preserving
   promotion, relation reader identity selection, statement snapshot scope bookkeeping,
-  and temporary stream ownership have completed this pass and its review. Keep the
+    temporary stream ownership, executor parking, client application-name settings
+    and supported implicit query blocks have completed this pass and its review. Keep the
   same order for the remaining HA work.
 
 - [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker
@@ -21,6 +22,19 @@
 - [ ] Audit cold-image compilation and ASDF load-order dependencies across `pg`
   and its test systems. A warm REPL must not conceal missing declarations or
   compile-time dependencies.
+
+- [ ] Extend implicit simple-query transactions to the remaining statement and
+  transaction-control cases, including transactional DDL and TRUNCATE, using C as
+  the reference. Those messages currently retain the prior per-statement path.
+
+- [ ] Audit server-file and command-line defaults for `application_name`; client
+  startup and SQL settings are implemented.
+
+- [ ] Fix cold test declarations in `t/promotion-intent-tests.lisp`.
+  `call-with-promotion-fixture` binds `pg::*shutdown-mode*` and
+  `pg::*shutdown-requested*` lexically before their declarations, producing four
+  style warnings. Production strict compilation passes; this remains part of the
+  open cold-load audit.
 
 - [ ] Reject target/temporary path aliasing in atomic file publication. The WAL
   byte helper derives a `.tmp` pathname; a target already ending in `.tmp` can

@@ -262,9 +262,18 @@ parentheses. Scalar functions: `version()`, `pg_lisp_runtime()`,
 
 `SET TIME ZONE` accepts installed named TZif zones, stores the value per backend,
 and returns it from `SHOW timezone`; numeric offsets and `INTERVAL` forms are
-unsupported. `RESET TIME ZONE` and `RESET ALL` restore UTC. The server supports
-only `READ COMMITTED`, UTF8 client encoding, and `standard_conforming_strings = on`.
-`SET LOCAL`, unsupported setting names, and unsupported values are rejected.
+unsupported. `RESET TIME ZONE` and `RESET ALL` restore the startup baseline, UTC
+when unspecified. Supported isolation levels are `READ COMMITTED` and
+`REPEATABLE READ`; client encoding is UTF8 and `standard_conforming_strings = on`.
+Client startup and SQL `application_name` support SET, SHOW, RESET and
+`current_setting`/`set_config`, including transaction-local values. Other LOCAL
+settings remain unsupported. Parameter reports are coalesced before ReadyForQuery.
+Unsupported setting names and values return errors.
+
+Idle simple-query messages containing only supported ordinary settings and MVCC
+statements commit or roll back together. DDL, maintenance and transaction-control
+messages retain the prior per-statement behavior; see the staged boundary in
+[the HA ledger](PHYSICAL-HA.md#application-name-and-supported-implicit-query-messages).
 Meta-commands that need `pg_catalog` and regular-expression operators (`\d`,
 `\dt`, `\l`) return an error from the server; `psql` prints it and continues.
 
@@ -803,7 +812,7 @@ auto.conf and CLI overrides. Nonempty restore commands are rejected until archiv
 recovery exists. SHOW,
 current_setting and typed pg_settings rows expose the actual installed values.
 Unknown settings fail visibly; empty or multiple listen addresses are unsupported.
-Session startup `options` accept `statement_timeout` and dotted custom GUC
+Session startup `options` accept `application_name`, `statement_timeout` and dotted custom GUC
 placeholders, including Patroni's defaults. Statement deadlines apply at safe
 interrupt points and bounded lock waits, with independent budgets for statements
 in one simple-query frame. RESET restores startup values; ordinary timeout

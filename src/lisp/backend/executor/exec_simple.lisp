@@ -479,6 +479,8 @@ rolled back immediately."
     copy))
 
 (defun restore-session-settings (stream)
+  "Restore the saved settings table after abort and republish the activity value.
+Do not perform wire I/O while restoring transaction state."
   (declare (ignore stream))
   (sb-sys:without-interrupts
     (let ((settings (backend-settings-transaction-start *backend*)))
@@ -1522,6 +1524,8 @@ before this removal horizon is captured."
       (otherwise (execute-in-transaction stream ast)))))
 
 (defun implicit-query-block-statements-p (statements)
+  "Recognize the supported multi-statement subset for an idle implicit query block.
+Transaction options and session characteristics are excluded."
   (and (rest statements)
        (every (lambda (statement)
                 (and (member (getf statement :type) '(:select :insert :update :delete :set :reset :show))
@@ -1530,6 +1534,7 @@ before this removal horizon is captured."
               statements)))
 
 (defun execute-query-statements (stream statements implicit-block-p)
+  "Execute statements in order, deferring the last command tag in an implicit block."
   (loop for tail on statements
         for ast = (first tail)
         do (arm-statement-timeout)
@@ -1539,6 +1544,10 @@ before this removal horizon is captured."
                (clear-statement-timeout)))))
 
 (defun execute-simple-query-statements (stream statements)
+  "Execute an eligible idle simple-query message as one implicit transaction.
+Protect setup, commit completion and abort cleanup from interrupts; statement
+execution and final network output remain interruptible. The last command tag
+is sent only after commit."
   (if (and (eq (backend-state *backend*) :idle)
            (implicit-query-block-statements-p statements))
       (let ((*deferred-command-completes* nil)

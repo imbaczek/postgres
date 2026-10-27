@@ -158,7 +158,8 @@
 (defvar *session-setting-reports-suppressed-p* nil)
 
 (defun set-session-search-path (value)
-  "Validate, save transaction undo state, and report the new session search path."
+  "Validate and save the session search path, retaining transaction undo state.
+A changed value is reported at the next reporting boundary."
   (let ((text (if (eq value +null+) "\"$user\", public" value)))
     (parse-sql-search-path text)
     (session-remember-settings)
@@ -167,7 +168,8 @@
     text))
 
 (defun set-config-value (name value local-p)
-  "Implement supported set_config semantics; reject unsupported GUCs and LOCAL."
+  "Set a supported session value, including transaction-local application_name.
+Reject unsupported parameters and unsupported local settings."
   (when (eq name +null+)
     (ereport "22004" "SET requires parameter name"))
   (startup-check-session-setting (string-downcase name))

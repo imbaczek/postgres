@@ -1,3 +1,6 @@
+;;;; Test-only post-commit interruption for an owned native server.
+;;;; The harness installs wrappers for one backend and restores them afterward.
+
 (in-package #:pg)
 
 (defvar *application-name-fatal-backend* nil)
@@ -7,6 +10,7 @@
 (defvar *application-name-fatal-aborts* 0)
 
 (defun application-name-install-fatal (pid)
+  "Install test-only wrappers for one backend and queue FATAL after its real commit."
   (assert (null *application-name-fatal-finish*))
   (setf *application-name-fatal-backend* (lookup-backend pid)
         *application-name-fatal-finish* (symbol-function 'finish-backend-transaction)
@@ -34,6 +38,7 @@
   t)
 
 (defun application-name-verify-fatal ()
+  "Verify committed CLOG, no abort and an idle, unregistered target backend."
   (assert *application-name-fatal-xid*)
   (assert (= +clog-committed+ (clog-get *application-name-fatal-xid*)))
   (assert (zerop *application-name-fatal-aborts*))
@@ -43,6 +48,7 @@
   t)
 
 (defun application-name-restore-fatal ()
+  "Restore the functions replaced by the post-commit interruption test."
   (when *application-name-fatal-finish*
     (setf (symbol-function 'finish-backend-transaction) *application-name-fatal-finish*
           (symbol-function 'abort-transaction) *application-name-fatal-abort*

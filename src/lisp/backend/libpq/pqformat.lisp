@@ -30,6 +30,7 @@
     (payload-push-u32 p secret)))
 
 (defun send-ready-for-query (stream status)
+  "Report changed session parameters before sending the ready status."
   (session-report-parameters stream)
   (with-backend-message (stream #\Z p)
     (payload-push-byte p (char-code status))))
@@ -42,6 +43,7 @@
 (defvar *deferred-command-completes* nil)
 
 (defun send-command-complete (stream tag)
+  "Send a command tag or defer it for the enclosing response boundary."
   (when *defer-command-complete-p*
     (push (list stream tag) *deferred-command-completes*)
     (return-from send-command-complete nil))

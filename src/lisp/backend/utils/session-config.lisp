@@ -1,3 +1,6 @@
+;;;; Session settings, transaction undo and client parameter reporting.
+;;;; Transaction cleanup changes in-memory state; wire reports are sent later.
+
 ;;;; Session startup options and USERSET values; no extension execution is implied.
 (in-package #:pg)
 
@@ -43,6 +46,8 @@
       (session-custom-setting-p name)))
 
 (defun session-normalize-application-name (value)
+  "Clip VALUE at 63 UTF-8 bytes, then escape bytes outside printable ASCII.
+Return the escaped value, whether clipping occurred, and the clipped input text."
   (let* ((text (princ-to-string value))
          (clipped (sql-name-input text)))
     (values
@@ -54,11 +59,13 @@
      (not (equal text clipped)) clipped)))
 
 (defun session-publish-application-name ()
+  "Copy the setting to the 63-byte activity slot without changing its GUC value."
   (let ((value (gethash "application_name" (backend-settings *backend*) "")))
     (setf (backend-application-name *backend*) (sql-name-input value))
     value))
 
 (defun session-report-parameter (stream name value)
+  "Report a parameter only when its value differs from the last value sent to this connection."
   (when (and *backend* (not *session-setting-reports-suppressed-p*))
     (let ((reported (backend-reported-settings *backend*)))
       (unless (equal value (gethash name reported))
@@ -66,6 +73,8 @@
         (setf (gethash name reported) value)))))
 
 (defun session-report-parameters (stream)
+  "Emit changed parameters before ReadyForQuery, using connection-wide wire history.
+Search-path reporting is an existing native extension."
   (when *backend*
     (session-report-parameter stream "TimeZone"
                               (gethash "timezone" (backend-settings *backend*) "UTC"))
@@ -74,12 +83,14 @@
                               (gethash "application_name" (backend-settings *backend*) ""))))
 
 (defun session-remember-settings ()
+  "Save the transaction's settings once so abort can restore the whole settings table."
   (when (and (eq (backend-state *backend*) :in-progress)
              (null (backend-settings-transaction-start *backend*)))
     (setf (backend-settings-transaction-start *backend*)
           (copy-session-settings (backend-settings *backend*)))))
 
 (defun session-application-name-value (value)
+  "Normalize VALUE and send its truncation notice without assigning a setting."
   (multiple-value-bind (text truncated-p clipped)
       (session-normalize-application-name value)
     (when (and truncated-p (backend-stream *backend*))
@@ -90,6 +101,10 @@
     text))
 
 (defun session-set-application-name (value &optional local-p)
+  "Set the application name and its source, retaining transaction undo state.
+Repeated LOCAL assignments preserve the value to restore at commit; a normal SET
+clears that local restoration. Reset uses the already validated baseline.
+LOCAL-P is used only within a transaction."
   (let* ((settings (backend-settings *backend*))
          (reset (backend-settings-reset *backend*))
          (reset-p (or (eq value :default) (eq value +null+)))
@@ -109,6 +124,8 @@
     (session-publish-application-name)))
 
 (defun session-finish-application-name (commit-p)
+  "Restore the masked session value at commit or the transaction-start value on abort.
+This changes in-memory state only; client reporting occurs later."
   (let* ((settings (backend-settings *backend*))
          (start (backend-settings-transaction-start *backend*))
          (restore (if commit-p
@@ -123,6 +140,7 @@
     (session-publish-application-name)))
 
 (defun session-application-name-settings-row ()
+  "Build the supported pg_settings fields for application_name."
   (vector "application_name" (if *backend* (sql-setting-value "application_name") "")
           +null+ "user" "string"
           (if *backend*
