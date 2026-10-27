@@ -10,7 +10,8 @@
 SYSTEM-ID, TIMELINE and BASE-LSN identify the original base. SELECTION changes
 the receive history without changing that base or main WAL control. A retained
 root refers to the inventory for the compacted prefix; RETAINED-IDENTITY comes
-from independently verified base provenance."
+from independently verified base provenance. RETAINED-DIRECTORY-VALUE can place
+the archive outside the receive spool; otherwise it is stored beneath the spool."
   directory system-id timeline base-lsn floor-lsn (floor-digest #xCBF29CE484222325)
   written-lsn flushed-lsn decoder
   (written-digest #xCBF29CE484222325) (flushed-digest #xCBF29CE484222325)
@@ -292,6 +293,15 @@ external modification."
     (fsync-directory (physical-store-directory store))))
 
 (defun physical-store-compact (store cursor publish-restartpoint)
+  "Publish a durable restartpoint before advancing and cleaning the receive floor.
+
+Recovery callers pin an applied terminal under admission or owned quiescence.
+This function holds the store mutex. With immutable identity, seal and protect a root, publish the data
+restartpoint, then publish and read back the complete receive control tuple
+before handing off the local reference and deleting old segments. The callback
+must durably publish data; readback does not prove its fsync. Without immutable
+identity, an unrooted standalone store keeps the earlier behavior. Preserve
+unflushed writes and decoder state. Errors and nonlocal exits fence the store."
   (with-physical-store (store)
     (let ((finished nil))
       (unwind-protect
@@ -355,10 +365,11 @@ external modification."
 (defun physical-store-open (directory system-id timeline &key create (start-lsn 0) (discard-tail t) (create-lock t) retained-identity retained-directory)
   "Own a native receive spool, creating only in an existing empty directory.
 CREATE never overwrites an old incarnation. Opening an existing spool validates
-its control, selected history, durable prefix and referenced inventory before
-discarding tails. A root-bearing control requires RETAINED-IDENTITY from
-independently verified base provenance. Invalid selected metadata is an error,
-never a fallback to an older history.
+its control, selected history, durable prefix and referenced inventory, then
+restores or reconciles local root ownership before discarding tails. A
+root-bearing control requires RETAINED-IDENTITY from independently verified base
+provenance. Invalid selected metadata is an error, never a fallback to an older
+history. RETAINED-DIRECTORY can place the archive outside the spool.
 The local file lock excludes another local receiver, not a distributed writer.
 With DISCARD-TAIL and CREATE-LOCK both NIL, validate without changing spool bytes
 or creating a missing lock. Do not resume input in that mode."

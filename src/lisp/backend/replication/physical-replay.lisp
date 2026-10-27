@@ -76,6 +76,7 @@ Install the returned state only after durable control publication."
     (setf *physical-recovery-state* (physical-recovery-write-control candidate 2 applied next-xid))))
 
 (defun physical-recovery-retained-directory ()
+  "Return the recovery archive outside the receive spool."
   (merge-pathnames "pg_physical_retained/" *pgdata*))
 
 (defun physical-recovery-retained-identity (&optional (state *physical-recovery-state*))

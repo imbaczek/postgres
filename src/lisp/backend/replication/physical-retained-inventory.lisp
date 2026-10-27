@@ -238,6 +238,10 @@ Return the freshly decoded payload."
     (loop for entry in entries when (gethash (first entry) selected) collect entry)))
 
 (defun physical-retained-inventory-publish-entries-under-lock (directory identity target text entries protect)
+  "Validate staged entries and publish one inventory under archive exclusion.
+
+Check identity, history, images and shared prefixes before calling PROTECT for
+the root and entries. Return the synced ID and freshly decoded payload."
   (unless (sb-thread:holding-mutex-p *physical-retained-inventory-publish-lock*)
     (error "retained WAL publication requires archive exclusion"))
   (let* ((image (physical-retained-inventory-image

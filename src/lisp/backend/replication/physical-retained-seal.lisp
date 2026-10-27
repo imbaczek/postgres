@@ -1,11 +1,24 @@
+;;;; Seal receive history before moving its durable floor.
+;;;; Store ownership pins WAL and history while a local hold protects staged files.
+;;;; Publish the inventory and restartpoint before selecting receive control.
+
 (in-package #:pg)
 
 (defstruct (physical-retained-seal (:constructor %make-physical-retained-seal))
+  "State for sealing a receive prefix while the caller owns the store mutex.
+
+ENTRIES are in reverse order, with the latest at the head for append and
+coalescing. The scan keeps a constant number of extent buffers and a bounded
+index; it validates the final inventory before selection."
   store hold history target text entries latest cursor digest prefix prefix-segment
   segment timeline start start-digest replacement bytes
   (entry-count 0) (entry-bytes 0) header-bytes)
 
 (defun physical-retained-seal-initial-prefix (store entries)
+  "Obtain the floor's physical prefix from the selected root or verified base.
+
+Do not reconstruct it from raw bytes below the receive floor. The caller rejects unrooted
+floors beyond the base, including empty segment boundaries."
   (let ((floor (physical-store-floor-lsn store)))
     (cond
       ((zerop (mod floor +wal-segment-size+)) (make-array 0 :element-type '(unsigned-byte 8)))
@@ -24,6 +37,7 @@
       (t (error "compacted receive history lacks retained provenance; reseed required")))))
 
 (defun physical-retained-seal-append (seal raw)
+  "Append a record to the current bounded segment image."
   (let* ((bytes (physical-retained-seal-bytes seal))
          (used (length bytes)) (needed (+ used (length raw))))
     (unless (<= needed +wal-segment-size+) (error "retained segment exceeds its bound"))
@@ -34,6 +48,7 @@
     (replace bytes raw :start1 used)))
 
 (defun physical-retained-seal-start-group (seal record timeline)
+  "Start a segment group using the verified prefix, coalescing the latest entry when possible."
   (let* ((segment (floor (wal-record-start record) +wal-segment-size+))
          (offset (mod (wal-record-start record) +wal-segment-size+))
          (prefix (if (= segment (physical-retained-seal-prefix-segment seal))
@@ -68,6 +83,7 @@
     (replace (physical-retained-seal-bytes seal) prefix)))
 
 (defun physical-retained-seal-metadata (seal)
+  "Build metadata for the current extent from the store and scan state."
   (let ((identity (physical-store-retained-identity (physical-retained-seal-store seal)))
         (selection (physical-store-selection (physical-retained-seal-store seal))))
     (list :version 1 :system-id (getf identity :system-id) :base-timeline (getf identity :base-timeline)
@@ -80,9 +96,11 @@
           :prefix-digest (physical-store-update-digest #xCBF29CE484222325 (physical-retained-seal-bytes seal)))))
 
 (defun physical-retained-seal-entry-cost (entry)
+  "Return the encoded literal cost of an inventory entry."
   (physical-retained-inventory-check-text-budget entry))
 
 (defun physical-retained-seal-initialize-budget (seal)
+  "Initialize the entry count and text estimate for incremental checks."
   (setf (physical-retained-seal-entry-count seal) (length (physical-retained-seal-entries seal))
         (physical-retained-seal-entry-bytes seal)
         (loop for entry in (physical-retained-seal-entries seal) sum (physical-retained-seal-entry-cost entry))
@@ -94,6 +112,8 @@
            3)))
 
 (defun physical-retained-seal-entry-budget (seal entry replacement)
+  "Check the budget after adding ENTRY and removing REPLACEMENT, if present.
+Return the prospective entry count and literal-byte total."
   (let* ((count (+ (physical-retained-seal-entry-count seal) (if replacement 0 1)))
          (bytes (+ (physical-retained-seal-entry-bytes seal) (physical-retained-seal-entry-cost entry)
                    (- (if replacement (physical-retained-seal-entry-cost replacement) 0)))))
@@ -104,6 +124,7 @@
     (values count bytes)))
 
 (defun physical-retained-seal-publish-group (seal)
+  "Stage the validated extent under the hold and update the reverse-ordered index."
   (when (physical-retained-seal-bytes seal)
     (let* ((metadata (physical-retained-seal-metadata seal))
            (image (physical-retained-extent-encode metadata (physical-retained-seal-bytes seal)))
@@ -124,6 +145,7 @@
               (physical-retained-seal-bytes seal) nil)))))
 
 (defun physical-retained-seal-record (seal record raw)
+  "Add a validated receive record, closing a group at a segment or timeline change."
   (let* ((store (physical-retained-seal-store seal))
          (timeline (physical-store-history-check-record store record raw (physical-retained-seal-cursor seal)))
          (segment (floor (wal-record-start record) +wal-segment-size+)))
@@ -138,6 +160,10 @@
           (physical-retained-seal-digest seal) (physical-store-update-digest (physical-retained-seal-digest seal) raw))))
 
 (defun physical-retained-seal-scan (seal cursor digest)
+  "Seal records through the exact receive boundary and publish one checked root.
+
+Validate through durable flush even when CURSOR is earlier. Incremental budget
+checks bound the index; final publication validates the full inventory and images."
   (physical-retained-seal-initialize-budget seal)
   (physical-store-validate-prefix
    (physical-retained-seal-store seal)
@@ -159,6 +185,11 @@
     (setf (physical-retained-seal-latest seal) id)))
 
 (defun physical-store-seal-and-select (store cursor digest publish-restartpoint)
+  "Seal the prefix and select its root while the caller owns STORE's mutex.
+
+Publish the restartpoint before receive control, then read back the complete
+control tuple before handing off local root ownership. The restartpoint callback
+must durably publish data; control readback does not prove that it did so."
   (physical-store-check-retained-identity store)
   (when (and (null (physical-store-retained-root store))
              (/= (physical-store-floor-lsn store) (physical-store-base-lsn store)))

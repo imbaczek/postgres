@@ -14,7 +14,7 @@
   supported implicit query blocks, SQL promotion, fresh child backup/follow and
   durable receive-history selection, source-side follow anchors, the read-only
   extent layer, immutable inventory publication, local retained-root ownership and
-  receive-control inventory validation have completed
+  receive-control inventory validation and receive-compaction sealing have completed
   this pass and its review. Keep the same order for the remaining HA work.
 
 - [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker

@@ -69,7 +69,10 @@
             (values state metadata prefix generation)))))))
 
 (defun physical-promotion-open-pending-store (state)
-  "Verify named acknowledged files, then own the spool without creating or trimming."
+  "Verify acknowledged files, then own the spool without creating or trimming.
+
+Use the verified pending base identity and the recovery retained archive."
+
   (let* ((directory (physical-recovery-spool-directory))
          (probe (%make-physical-store :directory directory :system-id (getf state :system-id)
                                       :timeline (getf state :timeline)

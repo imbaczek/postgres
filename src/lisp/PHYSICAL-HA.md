@@ -358,7 +358,7 @@ from the floor, tail cleanup removes files outside it, and later restartpoints m
 replace the only authenticated prefix for an older segment. Sealing only at final
 promotion would miss bytes discarded by earlier automatic restartpoints.
 
-The next implementation steps are:
+The implementation order is (completed stages are described below):
 
 1. Add a bounded extent descriptor, inventory and read-only coverage resolver.
    Bind system and immutable base identity, selected history, logical coverage,
@@ -372,7 +372,7 @@ The next implementation steps are:
    advance receive control and unlink old spool files. An inventory ahead of the
    restartpoint is a conservative superset; a floor ahead of required inventory is
    invalid.
-3. Validate referenced inventory before `physical-store-open` mutates storage.
+3. Validate referenced inventory before `physical-store-open` performs tail cleanup.
    Missing or corrupt referenced bytes fail closed. GC first publishes an inventory
    excluding collectible extents, then unlinks them. Keep a bounded prospective-follow
    window and preserve ranges needed by live source pins until durable progress or
@@ -393,7 +393,8 @@ publications. Cover multiple restartpoints, partial boundary ranges, rotation,
 selected-history changes, missing middle coverage, corruption and GC racing pin
 reservation. The final native acceptance must stream an older sibling through the
 fork and onto the child after source crash/restart, with the original spool removed.
-This plan has a Sol xhigh design review; implementation and acceptance remain open.
+This plan has a Sol xhigh design review. Component progress is recorded below;
+the final historical-follow acceptance remains open.
 
 ### Read-only retained extents
 
@@ -418,10 +419,10 @@ passes 200 trials with seed 42. Luna max and Sol high cleared the corrected code
 Sol medium found no useful refactor. Terra 6.1 wrote source docstrings, reviewed
 separately by the primary agent.
 
-At this checkpoint, durable inventory publication was still pending; the following
-sections describe its implementation. Authenticated production before compaction,
-receive reopen/GC integration, promotion references and network serving remain open.
-The extent layer alone grants no serving authority or change to spool retention.
+At this checkpoint, durable inventory publication and authenticated production
+before compaction were still pending; the following sections describe their
+implementation. Promotion references, scoped GC and network serving remain open.
+The extent layer alone grants no serving authority.
 
 ### Immutable retained inventory publication
 
@@ -446,8 +447,8 @@ passes. Luna max and Sol high cleared the code and crash-test changes; Sol mediu
 found no useful refactor. A further Sol review cleared the preflight scalar/depth
 guards. Terra 6.1's source docstrings were separately reviewed by the primary agent.
 
-Astra's integration review specifies this order; step 1 is now implemented in
-the local ownership layer described below:
+Astra's integration review specifies this order. The local ownership and receive
+compaction stages are implemented below:
 
 1. Add explicit kept-entry selection for immutable replacement and a local hold
    spanning publication through durable control selection. Serialize the control
@@ -465,9 +466,9 @@ the local ownership layer described below:
 
 Callbacks that select control run outside the archive mutex while a local hold
 protects their objects. GC must use the same reservation/deletion exclusion and
-must not acquire store or WAL locks while holding it. Initially keeping GC disabled
-allows control integration to be reviewed independently. No coordination is added;
-bounded retention, authenticated sealing, control selection and serving remain open.
+must not acquire store or WAL locks while holding it. GC remains disabled while
+promotion and scoped-consumer references are integrated. No coordination is added;
+bounded retention and historical serving remain open.
 
 ### Replacement inventories and local root ownership
 
@@ -499,11 +500,9 @@ Luna max and Sol high found the cleanup interrupt window; their rechecks cleared
 the correction. Sol medium found no worthwhile refactor.
 
 These references are process-local. Startup must restore every durable control
-reference before deletion starts. Receive-control references are not yet restored
-into this ownership registry, and automatic GC remains disabled. Next, seal bytes before each receive
-compaction and select floor, floor digest and inventory root together, then carry
-fork-bounded roots through promotion before adding scoped consumers and serving.
-No coordination is added.
+reference before deletion starts. Receive-control restoration and compaction
+sealing are implemented below. Promotion and scoped-consumer references remain
+open, and automatic GC remains disabled. No coordination is added.
 
 ### Receive-control inventory references
 
@@ -519,11 +518,10 @@ It also requires a contiguous digest chain from the immutable base through the
 saved floor. A matching last endpoint alone cannot hide a missing middle interval.
 The pending open preserves unacknowledged bytes for its existing validation path.
 
-Root-bearing compaction currently rejects floor advancement before publishing a
-restartpoint. This guard prevents selecting an old root with a new floor while
-sealing remains unwired. Unrooted standalone stores retain their previous behavior.
-No production path creates a retained root during compaction yet; this prerequisite
-does not implement bounded retention or restore archive ownership for GC.
+At this checkpoint, root-bearing compaction rejected floor advancement before
+publishing a restartpoint. That guard prevented selecting an old root with a new
+floor before sealing was wired. The following section describes its replacement.
+Unrooted standalone stores retain their previous behavior.
 
 All 639 physical tests, 170 interop tests and 1,598 legacy checks pass, as does
 strict fresh-cache compilation. Seven added cases cover corrupt or missing
@@ -533,15 +531,63 @@ codec property passes 200 trials with seed 42; input coverage and rejected
 generation counts remain unmeasured. Luna max and Sol high cleared the corrected
 guard; Sol medium found no worthwhile refactor.
 
-Next, wire authenticated sealing into every recovery compaction under store
-ownership. Check complete coverage before publishing the restartpoint, compare
-the complete control tuple on readback, transfer the local hold, then unlink.
-Test restartpoint-ahead-of-floor crashes in both the same and a later segment,
-rotation/EOR boundaries, repeated coalescing and uncertain in-process reopen.
-Before activating root-bearing native tests, update the backlog mutation in
-`t/interop/restartpoint-prefix-inspect.py`, which currently assumes a 68-byte
-receive control and a fixed CRC offset. Promotion handoff, scoped consumers,
-GC and historical network serving remain open. No coordination is added.
+The next implementation step was authenticated sealing, including complete
+coverage, exact control readback and handoff before unlink. It is implemented
+below. The native backlog injector now supports 96-byte control and its CRC offset.
+Promotion handoff, scoped consumers, GC and historical network serving remain open.
+
+### Sealing before receive-floor advancement
+
+Recovery compaction now seals endangered WAL under store ownership before it
+publishes a data restartpoint. Initial segment-prefix bytes come from the verified
+immutable base or the currently selected retained image, never raw pre-floor spool
+bytes. A compacted legacy store without that retained provenance requires reseeding.
+Contiguous extents in the same segment and file timeline can be replaced with a
+coalesced image; earlier generations remain immutable.
+
+Each new image is copied, checked and reserved under a local hold before writing.
+The producer accumulates bounded metadata and publishes one final inventory after
+staging the images. Entry updates and size accounting are incremental; final
+publication still validates every referenced image, history, shared prefix and
+base-to-floor digest chain. Increasing-size tests check linear extent reads and
+metadata visits. Memory holds a constant number of extent buffers and a bounded
+index; this does not imply bounded total disk retention while GC is disabled.
+
+The order is sealed inventory, data restartpoint, atomic receive control containing
+floor/digest/root, complete control-tuple readback, local reference handoff, then
+spool unlink and directory sync. The store mutex serializes its control owner.
+Archive operations never acquire store or WAL locks. Entire compaction cleanup is
+interrupt-masked and fences errors and nonlocal exits. Unflushed writes and decoder
+state survive a successful compaction.
+
+Reopen validates the exact selected root and restores its local ownership before
+tail cleanup. It also reconciles uncertain writes against the actual durable
+control tuple. Actual recovery archives live in `pg_physical_retained/`, outside
+`pg_physical_receive/`, so future retirement of the receive directory cannot erase
+their files. Standalone stores can supply an archive directory explicitly.
+
+All 651 physical tests, 170 interop tests and 1,598 legacy checks pass, along with
+strict fresh-cache compilation. The two inventory/control codec properties each
+pass 200 trials with seed 42; input coverage and rejected-generation counts remain
+unmeasured. New tests cover coalescing with corrupt pre-floor spool bytes, unflushed
+input, rotation/EOR, same/later-segment restartpoints ahead of the floor, exact
+readback, conservative reconciliation and repeated nonlocal interruption.
+
+Eleven real SIGKILL cuts cover staged and final publication, restartpoint
+generation/pointer, control rename/directory sync, handoff and partial spool
+deletion. The native automatic-restartpoint harness separately kills its owned
+server after pointer publication, checks rows and the old floor after fresh
+startup, then reseals through the recovered applied point. The full pending
+promotion recovery/rejection matrix passes with archive files included in its
+unchanged-storage checks. All three manual logical switchovers pass against the
+pinned C build. These tests do not establish C physical-format compatibility.
+
+Luna max and Sol high cleared the corrected scaling, cleanup and harness findings.
+Sol medium's refactor centralizes the masked successful-candidate handoff.
+Next, bind exact fork-bounded roots into pending and committed promotion control,
+then add scoped consumer references, GC and historical follow/sending. Preserving
+files alone does not make those bytes discoverable or grant serving authority.
+No coordination is added.
 
 ### SQL configuration reload
 

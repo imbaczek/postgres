@@ -2,6 +2,9 @@
 ;;;; The verified base identity comes from recovery, not from receive control.
 ;;;; Full coverage checks do not restore deletion ownership or select a new root.
 
+;;;; Reopen restores local ownership after those checks, before tail cleanup.
+;;;; Control I/O runs under store ownership and outside the archive mutex.
+
 (in-package #:pg)
 
 (defun physical-store-check-retained-identity (store)
@@ -34,12 +37,14 @@
 (defvar *physical-store-retained-owners* (make-hash-table :test #'equal))
 
 (defun physical-store-retained-owner (store)
+  "Return the stable local control owner for the canonical receive directory."
   (let ((key (namestring (physical-retained-root-directory (physical-store-directory store)))))
     (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
       (or (gethash key *physical-store-retained-owners*)
           (setf (gethash key *physical-store-retained-owners*) (gensym "RECEIVE-CONTROL"))))))
 
 (defun physical-store-retained-history (store)
+  "Return the parsed selected history, its target and its text."
   (let* ((selection (physical-store-selection store))
          (target (physical-store-selected-timeline store))
          (text (if selection (getf selection :history-text)
@@ -50,6 +55,7 @@
                                              (floor (physical-store-floor-lsn store))
                                              (floor-digest (physical-store-floor-digest store))
                                              (root (physical-store-retained-root store)))
+  "Build the complete receive control tuple used for readback."
   (list (physical-store-system-id store) (physical-store-timeline store)
         (physical-store-base-lsn store) (physical-store-flushed-lsn store)
         (physical-store-flushed-digest store) floor floor-digest
@@ -58,6 +64,9 @@
         (getf (physical-store-retained-identity store) :manifest-digest) root))
 
 (defun physical-store-read-retained-control (store expected)
+  "Read control under the store owner and require the complete expected tuple.
+
+The root update calls this outside the archive mutex."
   (let ((probe (%make-physical-store :directory (physical-store-directory store)
                                      :system-id (physical-store-system-id store)
                                      :timeline (physical-store-timeline store)
@@ -69,6 +78,7 @@
     (physical-store-retained-root probe)))
 
 (defun physical-store-restore-retained-reference (store)
+  "Restore or reconcile local root ownership from the store's durable control."
   (when (and (physical-store-retained-identity store)
              (uiop:directory-exists-p (physical-store-retained-directory store)))
     (physical-retained-root-reconcile
@@ -79,8 +89,8 @@
 (defun physical-store-check-retained-root (store)
   "Validate the referenced inventory and every image against the selected history.
 
-Require its coverage to reach the receive floor with the recorded digest. This
-checks the reference; it does not restore deletion ownership or select a new root."
+Require coverage from the base to the receive floor with the recorded digest,
+then restore or reconcile the process-local reference. This preserves the root selected by durable control."
   (when (physical-store-retained-root store)
     (physical-store-check-retained-identity store)
     (let* ((history (or (getf (physical-store-selection store) :history)

@@ -218,6 +218,7 @@ Read control outside the archive mutex and recheck the captured owner state."
     (error "retained WAL publication hold is not active")))
 
 (defun physical-retained-root-record-candidate (hold id prepared)
+  "Record a successfully published candidate and its prepared reference under archive exclusion."
   (physical-retained-root-require-lock)
   (unless (and prepared (= id (physical-retained-root-reference-root-id prepared)))
     (error "retained WAL publication did not produce its prepared reference"))
@@ -256,6 +257,9 @@ candidate for selection."
       (physical-retained-root-record-candidate hold id prepared))))
 
 (defun physical-retained-root-stage-image (hold target text image)
+  "Copy and validate an extent, then protect its ID before writing it.
+
+Publication and hold changes use archive exclusion. Return a fresh entry."
   (physical-retained-wal-check-budget (list image))
   (let* ((image (copy-seq image))
          (id (physical-store-update-digest #xCBF29CE484222325 image))
@@ -275,6 +279,10 @@ candidate for selection."
     entry))
 
 (defun physical-retained-root-publish-staged-entries (hold target text entries)
+  "Publish a checked root from entries reserved by HOLD.
+
+Require every extent ID to be protected before loading it. Protect the root
+before writing, and record it as a candidate only after successful publication."
   (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
     (physical-retained-root-check-hold hold)
     (dolist (entry entries)
