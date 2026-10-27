@@ -364,6 +364,7 @@ ownership on every exit; parking itself does not make scan callbacks safe."
       (error "parking requires admitted work"))
     (when (live-operation-lock-owned-p)
       (error "cannot park while owning the admission mutex"))
+    (detach-select-index-scans)
     (let ((owners (capture-live-operation-snapshot-owners)))
       (live-operation-parking-test-point :before-park token)
       (sb-sys:without-interrupts

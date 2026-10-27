@@ -521,7 +521,7 @@
                   (list :index-scan 0 93011 93021 '(:bool t :type :bool) #(1))
                   (list :index-scan 1 93012 93022 '(:bool t :type :bool) #(1)))))
          (original-ensure (symbol-function 'btree-ensure-init-before-read))
-         (original-locks (symbol-function 'call-with-btree-relation-read-locks))
+         (original-locks (symbol-function 'call-with-btree-relation-read-leases))
          (original-backend-entry (symbol-function 'query-plan-backend-entry))
          (locked-relfilenodes nil)
          (executor-ran-under-locks-p nil))
@@ -531,10 +531,10 @@
                   "nested IndexScans resolve to sorted, deduplicated relation IDs")
            (setf (symbol-function 'btree-ensure-init-before-read)
                  (lambda (relfilenode) (declare (ignore relfilenode)) (values))
-                 (symbol-function 'call-with-btree-relation-read-locks)
+                 (symbol-function 'call-with-btree-relation-read-leases)
                  (lambda (relfilenodes function)
                    (setf locked-relfilenodes relfilenodes)
-                   (funcall function))
+                   (funcall original-locks relfilenodes function))
                  (symbol-function 'query-plan-backend-entry)
                  (lambda (backend)
                    (declare (ignore backend))
@@ -548,7 +548,7 @@
            (check executor-ran-under-locks-p
                   "executor starts only after the full sorted index read-lock set"))
       (setf (symbol-function 'btree-ensure-init-before-read) original-ensure
-            (symbol-function 'call-with-btree-relation-read-locks) original-locks
+            (symbol-function 'call-with-btree-relation-read-leases) original-locks
             (symbol-function 'query-plan-backend-entry) original-backend-entry))))
 
 (defun test-index-scan-limit-stops-duplicate-candidates ()
@@ -570,7 +570,8 @@
                                       (list :filter '(:bool t :type :bool)
                                             scan-node)))))
          (registered (list (list :table table :path path)))
-         (original-btree-scan (symbol-function 'btree-scan-equal))
+         (original-btree-scan (symbol-function 'call-with-btree-equal-cursor))
+         (original-next-tid (symbol-function 'btree-cursor-next-tid))
          (original-get-tuple (symbol-function 'heapam-get-tuple))
          (original-visible (symbol-function 'htup-visible-p))
          (scan-calls 0)
@@ -579,14 +580,24 @@
          (seen 0))
     (unwind-protect
          (progn
-           (setf (symbol-function 'btree-scan-equal)
-                 (lambda (relfilenode key callback)
-                   (declare (ignore relfilenode key))
+           (setf (symbol-function 'call-with-btree-equal-cursor)
+                 (lambda (relfilenode key function)
                    (incf scan-calls)
-                   (loop for tid in '((0 . 1) (0 . 2) (0 . 3))
-                         do (incf candidate-visits)
-                            (when (eq (funcall callback tid) :stop)
-                              (return :stop))))
+                   (call-with-btree-relation-read-lease
+                    relfilenode
+                    (lambda (lease)
+                      (funcall function
+                               (make-btree-equal-cursor
+                                :relfilenode relfilenode :key key
+                                :stack (list (make-btree-equal-cursor-frame
+                                              :level 0 :end 2
+                                              :entries (loop for offset from 1 to 3
+                                                             collect (list key 0 offset)))))
+                               lease))))
+                 (symbol-function 'btree-cursor-next-tid)
+                 (lambda (cursor)
+                   (incf candidate-visits)
+                   (funcall original-next-tid cursor))
                  (symbol-function 'heapam-get-tuple)
                  (lambda (relfilenode block offnum columns)
                    (declare (ignore relfilenode block columns))
@@ -602,7 +613,8 @@
            (check (and (= seen 1) (= heap-visits 1)
                        (= candidate-visits 1) (= scan-calls 1))
                   "LIMIT stops a duplicate-key cursor after its first candidate"))
-      (setf (symbol-function 'btree-scan-equal) original-btree-scan
+      (setf (symbol-function 'call-with-btree-equal-cursor) original-btree-scan
+            (symbol-function 'btree-cursor-next-tid) original-next-tid
             (symbol-function 'heapam-get-tuple) original-get-tuple
             (symbol-function 'htup-visible-p) original-visible))
     (let* ((logical-scan

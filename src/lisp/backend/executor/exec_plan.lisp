@@ -63,21 +63,19 @@ ROW-CALLBACK."
 
 This matches insert's ordered multi-index write leases and prevents a nested
 IndexScan from requesting a lower relfilenode while retaining a higher one."
-  (let ((index-relfilenodes
-          (query-plan-index-relfilenodes plan registered-relations)))
-    (dolist (relfilenode index-relfilenodes)
-      (btree-ensure-init-before-read relfilenode))
-    (with-btree-relation-read-locks (index-relfilenodes)
-      (let* ((entry (query-plan-backend-entry backend))
-             (executor (and entry (query-plan-backend-executor entry))))
-        (cond
-          (executor
-           (funcall executor plan registered-relations row-callback))
-          ((and entry (query-plan-backend-compiler entry))
-           (funcall (funcall (query-plan-backend-compiler entry) plan)
-                    registered-relations row-callback))
-          (t
-           (ereport "0A000" "query-plan backend ~a is not installed" backend)))))))
+  (call-with-select-index-lease-domain
+   (query-plan-index-relfilenodes plan registered-relations)
+   (lambda ()
+     (let* ((entry (query-plan-backend-entry backend))
+            (executor (and entry (query-plan-backend-executor entry))))
+       (cond
+         (executor
+          (funcall executor plan registered-relations row-callback))
+         ((and entry (query-plan-backend-compiler entry))
+          (funcall (funcall (query-plan-backend-compiler entry) plan)
+                   registered-relations row-callback))
+         (t
+          (ereport "0A000" "query-plan backend ~a is not installed" backend)))))))
 
 (defun query-plan-sexp (plan)
   "Return the inspectable logical/physical plan artifact."

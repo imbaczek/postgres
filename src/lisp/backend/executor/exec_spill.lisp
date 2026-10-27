@@ -822,13 +822,14 @@
 
 (defun query-row-spool-spill (spool)
   (unless (query-row-spool-output-stream spool)
-    (multiple-value-bind (pathname stream) (open-query-temp-output)
-      (setf (query-row-spool-pathname spool) pathname
-            (query-row-spool-output-stream spool) stream)
-      (dolist (row (nreverse (query-row-spool-rows spool)))
-        (query-spill-write-record stream row))
-      (setf (query-row-spool-rows spool) nil
-            (query-row-spool-memory-bytes spool) 0)))
+    (sb-sys:without-interrupts
+      (multiple-value-bind (pathname stream) (open-query-temp-output)
+        (setf (query-row-spool-pathname spool) pathname
+              (query-row-spool-output-stream spool) stream)))
+    (dolist (row (nreverse (query-row-spool-rows spool)))
+      (query-spill-write-record (query-row-spool-output-stream spool) row))
+    (setf (query-row-spool-rows spool) nil
+          (query-row-spool-memory-bytes spool) 0))
   spool)
 
 (defun query-row-spool-append (spool row)

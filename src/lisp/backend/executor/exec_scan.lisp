@@ -871,23 +871,215 @@ registration-to-DDL handoff free of a lock-order inversion."
           (when (indexable-equality-value-p value (first types))
             (encode-index-key (list value) types))))))
 
+(defstruct select-index-scan
+  cursor lease spool)
+
+(defvar *select-index-scans* nil)
+
+(defstruct select-index-lease-domain
+  nodes)
+
+(defstruct select-index-lease-group
+  domain leases)
+
+(defvar *select-index-lease-domain* nil)
+
+(defvar *select-index-lease-groups* nil)
+
+(defun select-index-lease-owner-count (lease)
+  (+ (count lease *select-index-scans* :key #'select-index-scan-lease :test #'eq)
+     (loop for group in *select-index-lease-groups*
+           sum (count lease (select-index-lease-group-leases group) :key #'cdr :test #'eq))))
+
+(defun check-select-index-lease-groups ()
+  (dolist (group *select-index-lease-groups*)
+    (let* ((domain (select-index-lease-group-domain group))
+           (pairs (select-index-lease-group-leases group))
+           (nodes (select-index-lease-domain-nodes domain))
+           (held (reverse (loop for pair in pairs
+                                when (btree-read-lease-active-p (cdr pair))
+                                  collect (car pair)))))
+      (unless (and (eq domain *select-index-lease-domain*)
+                   (equal (mapcar #'car pairs) (reverse nodes))
+                   (equal held (subseq nodes 0 (length held))))
+        (error "index lease group is outside its ordered domain prefix"))
+      (dolist (pair pairs)
+        (let ((lease (cdr pair)))
+          (unless (and (btree-read-lease-p lease)
+                       (member lease *btree-read-leases* :test #'eq)
+                       (eq (btree-read-lease-thread lease) sb-thread:*current-thread*)
+                       (not (btree-read-lease-writer-reentrant-p lease))
+                       (member (btree-read-lease-status lease) '(:held :released))
+                       (= 1 (select-index-lease-owner-count lease))
+                       (eq (btree-read-lease-lock-state lease)
+                           (btree-relation-lock (car pair))))
+            (error "index lease group ownership mismatch"))))))
+  (values))
+
+(defun select-index-domain-covered-p (domain)
+  (some (lambda (group)
+          (and (eq domain (select-index-lease-group-domain group))
+               (= (length (select-index-lease-domain-nodes domain))
+                  (length (select-index-lease-group-leases group)))
+               (every (lambda (pair) (btree-read-lease-active-p (cdr pair)))
+                      (select-index-lease-group-leases group))))
+        *select-index-lease-groups*))
+
+(defun call-with-select-index-lease-group (domain function)
+  (if (select-index-domain-covered-p domain)
+      (funcall function)
+      (progn
+        (check-select-index-lease-groups)
+        (when (select-index-lease-domain-nodes domain)
+          (dolist (lease *btree-read-leases*)
+            (when (and (btree-read-lease-active-p lease)
+                       (/= 1 (loop for group in *select-index-lease-groups*
+                                   sum (count lease (select-index-lease-group-leases group)
+                                              :key #'cdr :test #'eq))))
+              (error "cannot reacquire an index domain under an ungrouped read lease"))))
+        (call-with-btree-relation-read-leases
+         (select-index-lease-domain-nodes domain)
+         (lambda (leases)
+           (let ((*select-index-lease-groups*
+                   (cons (make-select-index-lease-group :domain domain :leases leases)
+                         *select-index-lease-groups*)))
+             (funcall function)))))))
+
+(defun call-with-select-index-lease-domain (relfilenodes function)
+  (let ((nodes (btree-ordered-relfilenodes relfilenodes)))
+    (if *select-index-lease-domain*
+        (progn
+          (unless (subsetp nodes (select-index-lease-domain-nodes *select-index-lease-domain*)
+                           :test #'eql)
+            (error "nested query expands its enclosing index lease domain"))
+          (call-with-select-index-lease-group *select-index-lease-domain* function))
+        (let ((*select-index-lease-domain* (make-select-index-lease-domain :nodes nodes)))
+          (when (and nodes (some #'btree-read-lease-active-p *btree-read-leases*))
+            (error "cannot initialize an index domain under an existing read lease"))
+          (dolist (node nodes) (btree-ensure-init-before-read node))
+          (call-with-select-index-lease-group *select-index-lease-domain* function)))))
+
+(defun call-with-current-select-index-domain (relfilenode function)
+  (if *select-index-lease-domain*
+      (progn
+        (unless (member relfilenode (select-index-lease-domain-nodes *select-index-lease-domain*)
+                        :test #'eql)
+          (error "cursor index is outside the enclosing plan lease domain"))
+        (call-with-select-index-lease-group *select-index-lease-domain* function))
+      (funcall function)))
+
+(defun release-select-index-lease-groups ()
+  (let ((pairs (sort (loop for group in *select-index-lease-groups*
+                           append (loop for pair in (select-index-lease-group-leases group)
+                                        when (btree-read-lease-active-p (cdr pair))
+                                          collect pair))
+                     #'> :key #'car))
+        (pending nil))
+    (sb-sys:without-interrupts
+      (dolist (pair pairs)
+        (handler-case (release-btree-read-lease (cdr pair))
+          (sb-ext:timeout (condition) (unless pending (setf pending condition)))))
+      (when pending (error pending))))
+  (values))
+
+(defun stream-select-index-cursor (scan callback)
+  (loop
+    (when (select-index-scan-spool scan)
+      (return
+        (map-query-row-spool
+         (select-index-scan-spool scan)
+         (lambda (row index)
+           (declare (ignore index))
+           (funcall callback (cons (aref row 0) (aref row 1)))))))
+    (let ((tid (btree-cursor-next-tid (select-index-scan-cursor scan))))
+      (unless tid (return (values)))
+      (when (eq (funcall callback tid) :stop) (return :stop)))))
+
+(defun call-with-select-index-cursor (cursor lease callback)
+  (unless (and (btree-read-lease-active-p lease)
+               (eq (btree-read-lease-thread lease) sb-thread:*current-thread*)
+               (eq (btree-read-lease-lock-state lease)
+                   (btree-relation-lock (btree-equal-cursor-relfilenode cursor))))
+    (error "index cursor requires its owning read lease"))
+  (with-query-temp-files
+    (let ((scan (make-select-index-scan :cursor cursor :lease lease)))
+      (unwind-protect
+           (let ((*select-index-scans* (cons scan *select-index-scans*)))
+             (stream-select-index-cursor scan callback))
+        (sb-sys:without-interrupts
+          (when (select-index-scan-spool scan)
+            (close-query-row-spool (select-index-scan-spool scan))))))))
+
+(defun check-select-index-scan-ownership ()
+  (check-select-index-lease-groups)
+  (dolist (lease *btree-read-leases*)
+    (when (btree-read-lease-active-p lease)
+      (unless (and (not (btree-read-lease-writer-reentrant-p lease))
+                   (= 1 (select-index-lease-owner-count lease)))
+        (error "cannot park while owning an unsupported B-tree read lease"))))
+  (dolist (scan *select-index-scans*)
+    (let ((lease (select-index-scan-lease scan))
+          (spool (select-index-scan-spool scan)))
+      (unless (and (member lease *btree-read-leases* :test #'eq)
+                   (= 1 (select-index-lease-owner-count lease))
+                   (eq (btree-read-lease-thread lease) sb-thread:*current-thread*)
+                   (if spool
+                       (and (null (select-index-scan-cursor scan))
+                            (not (btree-read-lease-active-p lease))
+                            (query-row-spool-sealed-p spool))
+                       (and (select-index-scan-cursor scan)
+                            (btree-read-lease-active-p lease))))
+        (error "index scan ownership mismatch"))))
+  (values))
+
+(defun detach-select-index-scan (scan)
+  (unless (select-index-scan-spool scan)
+    (let ((cursor (clone-btree-equal-cursor (select-index-scan-cursor scan)))
+          (spool (make-query-row-spool 1))
+          (installed nil))
+      (unwind-protect
+           (progn
+             (loop for tid = (btree-cursor-next-tid cursor)
+                   while tid
+                   do (check-for-interrupts)
+                      (query-row-spool-append spool (vector (car tid) (cdr tid))))
+             (query-row-spool-seal spool)
+             (sb-sys:without-interrupts
+               (setf (select-index-scan-spool scan) spool
+                     (select-index-scan-cursor scan) nil
+                     installed t)
+               (release-btree-read-lease (select-index-scan-lease scan))))
+        (sb-sys:without-interrupts
+          (unless installed (close-query-row-spool spool))))))
+  (values))
+
+(defun detach-select-index-scans ()
+  (check-select-index-scan-ownership)
+  (dolist (scan *select-index-scans*) (detach-select-index-scan scan))
+  (release-select-index-lease-groups)
+  (when (some #'btree-read-lease-active-p *btree-read-leases*)
+    (error "index detachment left a held B-tree read lease"))
+  (values))
+
 (defun scan-select-index (table path snapshot callback &optional environment)
   (let* ((idx (select-scan-path-index path))
          (relfilenode (pg-class-relfilenode table))
          (key (select-scan-index-key table path environment)))
     (when key
-      ;; B-tree synchronization stays scoped to this index. The cursor streams
-      ;; one TID to the executor, so LIMIT can stop before later duplicates.
-      ;; Parameter values are evaluated for each nested-loop outer row, matching
-      ;; PostgreSQL's ExecIndexScan/ScanKey setup in nodeIndexscan.c.
-      (btree-scan-equal
-       (pg-index-relfilenode idx) key
-       (lambda (tid)
-         (check-for-interrupts)
-         (let ((tuple (heapam-get-tuple relfilenode (car tid) (cdr tid)
-                                        (pg-class-columns table))))
-           (when (and tuple (htup-visible-p tuple snapshot))
-             (funcall callback tuple))))))))
+      (call-with-current-select-index-domain
+       (pg-index-relfilenode idx)
+       (lambda ()
+         (call-with-btree-equal-cursor
+          (pg-index-relfilenode idx) key
+          (lambda (cursor lease)
+            (call-with-select-index-cursor
+             cursor lease
+             (lambda (tid)
+               (check-for-interrupts)
+               (let ((tuple (heapam-get-tuple relfilenode (car tid) (cdr tid)
+                                              (pg-class-columns table))))
+                 (when (and tuple (htup-visible-p tuple snapshot))
+                   (funcall callback tuple))))))))))))
 
 (defun scan-select-path (table relfilenode path snapshot callback
                          &optional environment)

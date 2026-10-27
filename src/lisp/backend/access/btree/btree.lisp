@@ -220,10 +220,11 @@ The coarse lease protects traversal in this tree, which has no sibling links."
             (sb-thread:condition-broadcast
              (btree-relation-lock-state-waitqueue state))))))))
 
+(defun btree-ordered-relfilenodes (relfilenodes)
+  (sort (remove-duplicates (copy-list relfilenodes) :test #'eql) #'<))
+
 (defun call-with-btree-relation-locks (relfilenodes function)
-  (let ((relfilenodes (sort (remove-duplicates (copy-list relfilenodes)
-                                               :test #'eql)
-                            #'<)))
+  (let ((relfilenodes (btree-ordered-relfilenodes relfilenodes)))
     (labels ((lock-next (remaining)
                (if (null remaining)
                    (funcall function)
@@ -235,18 +236,26 @@ The coarse lease protects traversal in this tree, which has no sibling links."
 (defmacro with-btree-relation-locks ((relfilenodes) &body body)
   `(call-with-btree-relation-locks ,relfilenodes (lambda () ,@body)))
 
-(defun call-with-btree-relation-read-locks (relfilenodes function)
-  "Hold a shared lease on each relation in writer-compatible lock order."
-  (let ((relfilenodes (sort (remove-duplicates (copy-list relfilenodes)
-                                               :test #'eql)
-                            #'<)))
+(defun call-with-btree-relation-read-leases (relfilenodes function)
+  (let ((nodes (btree-ordered-relfilenodes relfilenodes))
+        (leases nil))
     (labels ((lock-next (remaining)
                (if (null remaining)
-                   (funcall function)
-                   (call-with-btree-relation-read-lock
+                   (funcall function leases)
+                   (call-with-btree-relation-read-lease
                     (car remaining)
-                    (lambda () (lock-next (cdr remaining)))))))
-      (lock-next relfilenodes))))
+                    (lambda (lease)
+                      (push (cons (car remaining) lease) leases)
+                      (lock-next (cdr remaining)))))))
+      (lock-next nodes))))
+
+(defun call-with-btree-relation-read-locks (relfilenodes function)
+  "Hold a shared lease on each relation in writer-compatible lock order."
+  (call-with-btree-relation-read-leases
+   relfilenodes
+   (lambda (leases)
+     (declare (ignore leases))
+     (funcall function))))
 
 (defmacro with-btree-relation-read-locks ((relfilenodes) &body body)
   `(call-with-btree-relation-read-locks ,relfilenodes (lambda () ,@body)))
@@ -543,6 +552,22 @@ to a single leaf."
                      (incf (btree-equal-cursor-frame-next frame))
                      (btree-cursor-push-node cursor child-level child))))))
 
+(defun clone-btree-equal-cursor (cursor)
+  (let ((copy (copy-btree-equal-cursor cursor)))
+    (setf (btree-equal-cursor-stack copy)
+          (mapcar #'copy-btree-equal-cursor-frame (btree-equal-cursor-stack cursor)))
+    copy))
+
+(defun call-with-btree-equal-cursor (relfilenode key function)
+  (btree-ensure-init-before-read relfilenode)
+  (call-with-btree-relation-read-lease
+   relfilenode
+   (lambda (lease)
+     (multiple-value-bind (level root) (btree-read-meta relfilenode)
+       (let ((cursor (make-btree-equal-cursor :relfilenode relfilenode :key key)))
+         (btree-cursor-push-node cursor level root)
+         (funcall function cursor lease))))))
+
 (defun btree-scan-equal (relfilenode key callback)
   "Stream matching TIDs to CALLBACK until it returns :STOP.
 
@@ -552,17 +577,14 @@ uses page pins, page locks, and sibling links to survive concurrent splits; this
 tree has key-only separators and no sibling links, so hold its relation-scoped
 read lease for the scan to preserve the actual leaf traversal order. Readers can
 nest and share this lease; relation writers wait until all scans finish."
-  (btree-ensure-init-before-read relfilenode)
-  (call-with-btree-relation-read-lock
-   relfilenode
-   (lambda ()
-     (multiple-value-bind (level root) (btree-read-meta relfilenode)
-       (let ((cursor (make-btree-equal-cursor :relfilenode relfilenode :key key)))
-         (btree-cursor-push-node cursor level root)
-         (loop for tid = (btree-cursor-next-tid cursor)
-               while tid
-               do (when (eq (funcall callback tid) :stop)
-                    (return-from btree-scan-equal :stop))))))))
+  (call-with-btree-equal-cursor
+   relfilenode key
+   (lambda (cursor lease)
+     (declare (ignore lease))
+     (loop for tid = (btree-cursor-next-tid cursor)
+           while tid
+           do (when (eq (funcall callback tid) :stop)
+                (return-from btree-scan-equal :stop))))))
 
 ;;; ---- insert ----
 
