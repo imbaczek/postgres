@@ -36,6 +36,9 @@
   (cleanup-complete-p nil))
 
 (defvar *current-snapshot* nil)
+
+(defvar *statement-snapshot-registrations* nil)
+
 (defvar *exported-logical-snapshot-lock*
   (sb-thread:make-mutex :name "pg exported logical snapshots"))
 
@@ -293,7 +296,9 @@ ACQUIRE-FUNCTION is called with a registration token and must return the
 registered snapshot. The token is already protected if acquisition is
 interrupted after publication but before the function returns."
   (let ((registration (gensym "SNAPSHOT-REGISTRATION-")))
-    `(let ((,registration (make-snapshot-registration)))
+    `(let* ((,registration (make-snapshot-registration))
+            (*statement-snapshot-registrations*
+              (cons ,registration *statement-snapshot-registrations*)))
        (unwind-protect
             (let ((,snapshot (funcall ,acquire-function ,registration)))
               (declare (ignorable ,snapshot))
