@@ -12,9 +12,9 @@
   promotion, relation reader identity selection, statement snapshot scope bookkeeping,
   temporary stream ownership, executor parking, client application-name settings,
   supported implicit query blocks, SQL promotion, fresh child backup/follow and
-   durable receive-history selection and source-side follow anchors have completed
-   this pass and its review. Keep the
-  same order for the remaining HA work.
+  durable receive-history selection, source-side follow anchors and the read-only
+  retained-extent layer have completed
+  this pass and its review. Keep the same order for the remaining HA work.
 
 - [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker
   retained `*active-xids* = (3)` after 1,598 passing checks, causing later physical

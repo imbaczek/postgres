@@ -8,6 +8,7 @@
     :segment :file-timeline :prefix-digest))
 
 (defun physical-retained-extent-history (metadata)
+  "Validate extent metadata and return its parsed lineage."
   (physical-follow-check-plist metadata *physical-retained-extent-keys*)
   (unless (and (eql 1 (getf metadata :version))
                (every (lambda (key) (typep (getf metadata key) '(unsigned-byte 64)))
@@ -34,6 +35,7 @@
     history))
 
 (defun physical-retained-extent-check-record (record previous prior history file-timeline)
+  "Check record placement and require an EOR at each timeline change."
   (let* ((owner (timeline-at-point (wal-record-start record) history))
          (entry (find owner history :key #'timeline-history-entry-timeline))
          (fork (timeline-history-entry-end entry)))
@@ -52,6 +54,11 @@
     owner))
 
 (defun physical-retained-extent-scan (metadata bytes history &optional digest-cursor)
+  "Validate records against HISTORY and return the digest at DIGEST-CURSOR.
+
+Hash record bytes in order, excluding legal rotation gaps.  Each owner change
+requires an EOR. NIL means DIGEST-CURSOR is not a known boundary. The starting
+digest is an input, not independently proved here."
   (let* ((origin (* (getf metadata :segment) +wal-segment-size+))
          (cursor (getf metadata :start)) (offset (max 0 (- cursor origin)))
          (digest (getf metadata :start-digest))
@@ -80,6 +87,11 @@
     found))
 
 (defun physical-retained-extent-check (metadata bytes &key digest-cursor)
+  "Check one segment image and its logical extent against its metadata.
+Return METADATA and the requested boundary digest, or NIL when not found.
+
+Bytes before START are auxiliary prefix material, not coverage.  Checksums and
+the initial digest do not prove the image against a base or receive history."
   (let* ((history (physical-retained-extent-history metadata))
          (segment (getf metadata :segment))
          (origin (* segment +wal-segment-size+))
@@ -99,6 +111,7 @@
     (values metadata (physical-retained-extent-scan metadata bytes history digest-cursor))))
 
 (defun physical-retained-extent-encode (metadata bytes)
+  "Validate and encode one extent in a bounded checksum envelope."
   (physical-retained-extent-check metadata bytes)
   (let* ((text (string->bytes (physical-bootstrap-manifest-text metadata)))
          (size (+ 20 (length text) (length bytes))))
@@ -114,6 +127,9 @@
       image)))
 
 (defun physical-retained-extent-decode (image)
+  "Decode and validate an extent, returning fresh metadata and byte storage.
+
+The checksum detects accidental corruption; it does not authenticate the image."
   (unless (and (typep image '(vector (unsigned-byte 8)))
                (<= 20 (length image) +physical-retained-image-limit+)
                (equalp (subseq image 0 8) #(80 71 82 69 88 84 48 49)))
@@ -138,6 +154,7 @@
 (defconstant +physical-retained-plan-maximum-images+ 1024)
 
 (defun physical-retained-wal-check-budget (images &optional (maximum +physical-retained-plan-maximum-bytes+))
+  "Check the candidate image count and byte budget before decoding."
   (loop with total = 0
         for image in images for count from 1
         do (unless (and (<= count +physical-retained-plan-maximum-images+)
@@ -149,6 +166,13 @@
         finally (return total)))
 
 (defun physical-retained-wal-plan (images identity history start end)
+  "Plan exact record-boundary coverage from a preselected batch of images.
+
+Reject holes, overlaps, inconsistent shared prefixes and mismatched lineage.
+The caller owns IMAGES during the call; decoded data and the returned plan are
+fresh copies.  A future inventory must bind starting digests and prefixes to
+base, restartpoint or receive evidence and select candidates before loading
+them.  This plan grants no retention or serving authority."
   (physical-retained-wal-check-budget images)
   (physical-follow-check-plist identity '(:system-id :base-timeline :base :manifest-digest))
   (timeline-check-lineage history)

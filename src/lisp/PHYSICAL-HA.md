@@ -349,6 +349,79 @@ receiver source-binding publication, recovery connection settings, full slot
 contracts and synchronous durability remain open. The existing bootstrap START
 path rejects follow pins. No coordination is added.
 
+### Historical WAL retention implementation order
+
+Preserve the receive floor's current checksum-seed meaning. Before any compaction
+makes acknowledged bytes unprovable, seal the endangered ranges in a separate
+immutable namespace. Keeping old spool files alone is insufficient: reopen validates
+from the floor, tail cleanup removes files outside it, and later restartpoints may
+replace the only authenticated prefix for an older segment. Sealing only at final
+promotion would miss bytes discarded by earlier automatic restartpoints.
+
+The next implementation steps are:
+
+1. Add a bounded extent descriptor, inventory and read-only coverage resolver.
+   Bind system and immutable base identity, selected history, logical coverage,
+   file timeline and byte ranges, range checksums, cumulative receive-digest anchors,
+   and exact record/rotation boundaries. A filename does not establish coverage.
+   Preserve the preceding segment prefix when the requested receive LSN is exactly
+   at a segment boundary.
+2. Under `physical-store-compact`'s store ownership, validate and copy newly endangered
+   bytes, fsync their files and directories, publish the immutable descriptor, then
+   publish the durable inventory root. Only afterward publish the data restartpoint,
+   advance receive control and unlink old spool files. An inventory ahead of the
+   restartpoint is a conservative superset; a floor ahead of required inventory is
+   invalid.
+3. Validate referenced inventory before `physical-store-open` mutates storage.
+   Missing or corrupt referenced bytes fail closed. GC first publishes an inventory
+   excluding collectible extents, then unlinks them. Keep a bounded prospective-follow
+   window and preserve ranges needed by live source pins until durable progress or
+   durable loss permits release. Standby slot creation remains prohibited.
+4. Reference the retained inventory from pending and committed promotion state before
+   retiring recovery metadata. Expose ancestral coverage only through the proven
+   promotion fork, excluding acknowledged but unapplied parent tail. Use the same
+   resolver for follow overlap, suffix proof and eventual network sending.
+
+C's `CreateRestartPoint` and `KeepLogSeg` separate redo progress from retained WAL;
+`ReplicationSlotReserveWal` excludes removal while reserving required positions.
+Native WAL7 needs explicit byte provenance because its receive spool and immutable
+base prefixes differ from C's WAL storage. This inventory is local retention metadata.
+
+Required tests include crash cuts after file fsync, descriptor/root publication,
+restartpoint pointer, receive-floor control, spool deletion and both promotion
+publications. Cover multiple restartpoints, partial boundary ranges, rotation,
+selected-history changes, missing middle coverage, corruption and GC racing pin
+reservation. The final native acceptance must stream an older sibling through the
+fork and onto the child after source crash/restart, with the original spool removed.
+This plan has a Sol xhigh design review; implementation and acceptance remain open.
+
+### Read-only retained extents
+
+`physical-retained-extent.lisp` implements the image and candidate-coverage part
+of the retention plan. Each image binds native segment-prefix bytes to metadata,
+logical start/end positions, cumulative receive digests and selected history.
+The decoder checks bounded lengths and checksums before reading literal metadata,
+then validates records, legal rotation gaps and required EOR transitions.
+
+The planner checks a bounded candidate batch against the caller's immutable base
+identity and selected source history. It rejects holes, overlaps, interior record
+boundaries, digest discontinuity, old-tip bytes beyond a selected fork and conflicting
+copies of a shared segment prefix. The 64 MiB/1,024-image limit is checked before
+decoding; future inventory lookup must page or filter candidates before loading them.
+Bytes before an extent's logical start remain auxiliary overlap material. Their
+initial provenance must come from the producer and durable inventory reference.
+
+The 15 new cases include red-to-green regressions for required EOR transitions,
+old-tip history and conflicting prefixes. All 595 physical tests, 170 interop tests,
+1,598 legacy checks and strict fresh-cache compilation pass. The codec property
+passes 200 trials with seed 42. Luna max and Sol high cleared the corrected code;
+Sol medium found no useful refactor. Terra 6.1 wrote source docstrings, reviewed
+separately by the primary agent.
+
+Durable inventory publication, authenticated production before compaction, reopen/GC
+integration, promotion references and network serving remain pending. The new layer
+alone grants no serving authority and does not yet change receive-spool retention.
+
 ### SQL configuration reload
 
 `pg_reload_conf()` now requests SIGHUP instead of returning an unconditional
