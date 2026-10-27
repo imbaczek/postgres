@@ -83,10 +83,16 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
     ((eq b +null+) -1)
     (t (compare-3way a b))))
 
+(defun select-order-value (expression row)
+  ;; Reuse selected projection slots across ordinary, top-N and external sorts.
+  (if (eq (first expression) :sort-output)
+      (aref (car row) (1- (second expression)))
+      (eval-expr expression (cdr row))))
+
 (defun row-less-p (a b order)
   (loop for (expr . desc) in order
-        do (let* ((va (eval-expr expr (cdr a)))
-                  (vb (eval-expr expr (cdr b)))
+        do (let* ((va (select-order-value expr a))
+                  (vb (select-order-value expr b))
                   (c (order-compare va vb)))
              (unless (zerop c)
                (return (if desc (> c 0) (< c 0)))))
@@ -163,7 +169,7 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
                 :row row
                 :keys (map 'vector
                            (lambda (entry)
-                             (eval-expr (car entry) (cdr row)))
+                             (select-order-value (car entry) row))
                            order)
                 :sequence sequence)))
     (incf (select-top-n-collector-next-sequence collector))
@@ -676,7 +682,8 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
 (defun prepare-select-source (source alias offset)
   "Prepare a FROM namespace entry; callers hold the catalog view lock."
   (if (sql-derived-relation-p source)
-      (let* ((prepared (prepare-select-internal (sql-derived-relation-query source)))
+      (let* ((prepared (prepare-select-internal (sql-derived-relation-query source)
+                                                (make-select-scope)))
              (targets (getf prepared :targets))
              (table (make-pg-class
                      :oid 0 :name (or alias "*SELECT*")
@@ -701,7 +708,8 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
 
 (defun prepare-select (ast)
   "Resolve the complete nested query under one catalog view."
-  (with-write-lock (prepare-select-internal ast)))
+  ;; Clear transient analysis frames only after all nested ownership is resolved.
+  (with-write-lock (clear-query-analysis-contexts (prepare-select-internal ast))))
 
 (defun prepare-union-select (ast)
   "Prepare both arms under the caller's catalog view."
@@ -714,18 +722,37 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
             :order (analyze-union-order (getf ast :order-by) targets)
             :limit (getf ast :limit)))))
 
-(defun prepare-select-internal (ast)
+(defun prepare-select-internal (ast &optional (parent *select-outer-scope*))
+  (let* ((*select-outer-scope* parent)
+         (*select-sublinks* nil)
+         (*defer-group-rewrite-p* t)
+         (*select-sublinks-allowed-p* t)
+         (*select-analysis-frame*
+           (list :parent (and parent (select-scope-analysis-frame parent))
+                 :descriptors (make-array 0 :adjustable t :fill-pointer 0)
+                 :group-keys nil :kind :from :inside-input nil))
+         (*select-aggregate-analysis* *select-analysis-frame*)
+         (*inside-aggregate-input-p* nil)
+         (*aggregate-order-mode* nil)
+         (*select-set-functions-allowed-p* nil)
+         (prepared (%prepare-select-internal ast)))
+    (setf (getf prepared :sublinks) (nreverse *select-sublinks*))
+    prepared))
+
+(defun %prepare-select-internal (ast)
+  ;; Group rewrites wait for nested analysis; DISTINCT ordering uses output slots.
   (when (getf ast :set-operation)
-    (return-from prepare-select-internal (prepare-union-select ast)))
+    (return-from %prepare-select-internal (prepare-union-select ast)))
   ;; Resolve all names on one catalog view. Reader registration below protects
   ;; that view from DDL before any heap or index page is scanned.
   (let* ((from-name (getf ast :from))
          (from-alias (getf ast :from-alias))
          (first-source (when from-name (prepare-select-source from-name from-alias 0)))
          (first-table (getf first-source :table))
-         (scope (when first-source
-                  (select-relation-initial-scope
-                   (select-source-scope-relation first-source))))
+         (scope (if first-source
+                    (select-relation-initial-scope
+                     (select-source-scope-relation first-source))
+                    (make-select-scope)))
          (relations (when first-source (list first-source)))
          (joins '()))
     (dolist (join-ast (getf ast :joins))
@@ -742,11 +769,13 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                       (using-column-pairs (select-scope-columns scope)
                                           right-columns using-names)))
              (join-scope (extend-select-scope scope relation))
-             (qual (cond
-                     ((eq join-type :cross) '(:bool t))
-                     (using-names (using-join-qual pairs))
-                     (t (analyze-expr (getf join-ast :condition)
-                                      join-scope))))
+             (qual (progn
+                     (setf (getf *select-analysis-frame* :kind) :join-on)
+                     (cond
+                       ((eq join-type :cross) '(:bool t))
+                       (using-names (using-join-qual pairs))
+                       (t (coerce-boolean-expression
+                           (analyze-expr (getf join-ast :condition) join-scope) "JOIN/ON")))))
              (columns (if using-names
                           (using-output-columns
                            (select-scope-columns scope) right-columns
@@ -763,32 +792,34 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
               (append relations
                       (list source)))))
     (setf joins (nreverse joins))
-    (let* ((where (when (getf ast :where)
-                    (analyze-expr (getf ast :where) scope)))
-           (aggregate-p
-             (or (getf ast :group-by)
-                 (some (lambda (item) (contains-aggregate-p (getf item :expr)))
-                       (getf ast :order-by))
-                 (some (lambda (target)
-                         (contains-aggregate-p (getf target :expr)))
-                       (getf ast :targets))))
-           (group-keys (when (getf ast :group-by)
-                         (analyze-group-keys (getf ast :group-by) scope)))
+    (let* ((where (progn (setf (getf *select-analysis-frame* :kind) :where)
+                         (when (getf ast :where)
+                           (coerce-boolean-expression (analyze-expr (getf ast :where) scope) "WHERE"))))
+           (group-keys (progn (setf (getf *select-analysis-frame* :kind) :group-by)
+                              (when (getf ast :group-by)
+                                (analyze-group-keys (getf ast :group-by) scope))))
            (aggregate-analysis
-             (when aggregate-p
+             (progn
+               (setf (getf *select-analysis-frame* :kind) :select-target
+                     (getf *select-analysis-frame* :group-keys) group-keys)
                (multiple-value-list
                 (analyze-aggregate-targets (getf ast :targets) scope group-keys))))
-           (targets (if aggregate-p (first aggregate-analysis)
-                        (analyze-targets (getf ast :targets) scope)))
+           (targets (first aggregate-analysis))
            (aggregates (third aggregate-analysis))
-           (order (cond
-                    ((getf ast :distinct)
-                     (analyze-distinct-order
-                      (getf ast :order-by) scope targets aggregate-p group-keys aggregates))
-                    (aggregate-p
-                     (analyze-aggregate-order
-                      (getf ast :order-by) scope targets group-keys aggregates t))
-                    (t (analyze-order (getf ast :order-by) scope targets))))
+           (aggregate-p (or group-keys (plusp (length aggregates))))
+           (order (progn
+                    (setf (getf *select-analysis-frame* :kind) :order-by)
+                    (cond
+                      ((getf ast :distinct)
+                       (analyze-distinct-order
+                        (getf ast :order-by) scope targets aggregate-p group-keys aggregates))
+                      (aggregate-p
+                       (analyze-aggregate-order
+                        (getf ast :order-by) scope targets group-keys aggregates t))
+                      (t (analyze-order (getf ast :order-by) scope targets)))))
+           (aggregate-p (or aggregate-p (plusp (length aggregates))))
+           (order (if aggregate-p (finalize-query-group-expressions targets order group-keys scope (getf ast :distinct))
+                      order))
            (limit (getf ast :limit))
            (set-analysis
              (multiple-value-list
@@ -798,6 +829,7 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                    (if scope (select-scope-width scope) 0))
                (getf ast :distinct)))))
       (list :table first-table
+            :source-relations relations
             :relations relations
             :scope scope
             :targets (first set-analysis) :set-functions (third set-analysis) :distinct (getf ast :distinct)

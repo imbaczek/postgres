@@ -479,10 +479,13 @@
        (declare (ignore database))
        (let* ((sql "SELECT (pg_get_publication_tables(nextval('field_calls')::text)).* ORDER BY relid")
               (prepared (pg::query-plan-prepared
-                         (pg::plan-select-query (first (pg::parse-statements sql)))))
-              (targets (getf prepared :targets)))
+                         (pg::plan-select-query (first (pg::parse-statements sql))))))
          (ok (= 1 (length (getf prepared :set-functions))))
-         (ok (equal (getf (second targets) :expr) (caar (getf prepared :order))))))))
+         (let* ((order (caar (getf prepared :order)))
+                (values (vector 1001 2002 3003 4004))
+                (row (cons values #())))
+           (ok (= (pg::select-order-value order row) (aref values 1))
+               "ORDER reads the already projected relid without reevaluating the SRF"))))))
 
 (deftest nested-spill-scope-preserves-consumer-files
     (let* ((directory (merge-pathnames (format nil "pg-nested-spill-~a/" (gensym))

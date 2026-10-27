@@ -22,6 +22,8 @@
   (values))
 
 (defun exec-delete (stream ast)
+  (when (raw-query-sublinks-p ast)
+    (return-from exec-delete (exec-delete-subqueries stream ast)))
   (let* ((table (resolve-table-or-error (getf ast :table)))
          (where (when (getf ast :where)
                   (analyze-expr (getf ast :where) table))))
@@ -48,6 +50,8 @@
         (send-command-complete stream (format nil "DELETE ~a" count))))))
 
 (defun exec-update (stream ast)
+  (when (raw-query-sublinks-p ast)
+    (return-from exec-update (exec-update-subqueries stream ast)))
   (let* ((table (resolve-table-or-error (getf ast :table)))
          (sets (loop for s in (getf ast :sets)
                      for col = (resolve-column-or-error table (getf s :column))

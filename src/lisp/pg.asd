@@ -78,6 +78,7 @@
       :components ((:file "scan")
                    (:file "../utils/adt/varbit")
                    (:file "gram")
+                   (:file "subselect")
                    (:file "analyze")))
      (:module "executor"
       :serial t
@@ -85,9 +86,11 @@
                    (:file "exec_spill")
                    (:file "exec_scan")
                    (:file "exec_plan")
+                   (:file "exec_subplan")
                    (:file "exec_analyze")
                    (:file "exec_insert")
                    (:file "exec_delete")
+                   (:file "exec_subplan_dml")
                    (:file "exec_vacuum")
                    (:file "exec_simple")))
      (:module "tcop"

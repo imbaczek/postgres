@@ -1,0 +1,251 @@
+;;;; subselect.lisp -- expression subqueries, query boundaries and parameters.
+(in-package #:pg)
+
+(defvar *select-outer-scope* nil)
+
+(defvar *select-analysis-frame* nil)
+
+(defvar *defer-group-rewrite-p* nil)
+
+(defvar *select-sublinks* nil)
+
+(defvar *select-sublinks-allowed-p* nil)
+
+(defvar *subquery-execution-active-p* nil)
+
+(defvar *subquery-result-cache* nil)
+
+(defvar *subquery-registered-relations* nil)
+
+(defvar *subquery-outer-frames* nil)
+
+(defvar *subquery-output-value* nil)
+
+(defvar *subquery-backend-entry* nil)
+
+(defvar *subquery-instrumentation-depth* 0)
+
+(defun subquery-default-name (expression)
+  (cond ((eq (first expression) :cast) (subquery-default-name (second expression)))
+        ((subquery-expression-p expression)
+         (let ((name (getf (cddr expression) :result-name)))
+           (unless (equal name "?column?") name)))))
+
+(defstruct sql-expression-key
+  ;; Immutable signature data is opaque to walkers, not an executable expression.
+  value)
+
+(defstruct sql-subplan
+  ;; DEPTHS describes outer-frame dependencies. GROUPED-CONTEXTS records scopes
+  ;; already rewritten to group output slots, avoiding a second slot rewrite.
+  kind prepared plan test depths grouped-contexts)
+
+(defun subquery-expression-p (expression)
+  (and (consp expression) (eq (first expression) :subplan)))
+
+(defun map-prepared-query-expressions (function prepared &optional (depth 0))
+  "Visit executable expressions with nesting depth, excluding saved raw ASTs."
+  (labels
+      ((expression (form level)
+         (cond
+           ((atom form) form)
+           ((eq (first form) :outer-ref) (funcall function form level))
+           ((subquery-expression-p form)
+            (let ((descriptor (second form)))
+              (setf (sql-subplan-test descriptor)
+                    (expression (sql-subplan-test descriptor) level))
+              (query (sql-subplan-prepared descriptor) (1+ level)))
+            (funcall function form level))
+           (t (funcall function
+                       (mapcar (lambda (part) (expression part level)) form) level))))
+       (query (state level)
+         (if (getf state :set-operation)
+             (progn
+               (query (getf state :left) level)
+               (query (getf state :right) level))
+             (progn
+               (setf (getf state :where) (expression (getf state :where) level)
+                     (getf state :group-keys)
+                     (mapcar (lambda (form) (expression form level)) (getf state :group-keys))
+                     (getf state :set-functions)
+                     (mapcar (lambda (form) (expression form level)) (getf state :set-functions)))
+               (dolist (target (getf state :targets))
+                 (setf (getf target :expr) (expression (getf target :expr) level)))
+               (dolist (join (getf state :joins))
+                 (setf (getf join :qual) (expression (getf join :qual) level)))
+               (dolist (aggregate (getf state :aggregates))
+                 (setf (getf aggregate :input) (expression (getf aggregate :input) level)))
+               (dolist (relation (getf state :source-relations (getf state :relations)))
+                 (when (getf relation :subquery-prepared)
+                   (query (getf relation :subquery-prepared) (1+ level))))))
+         (setf (getf state :order)
+               (mapcar (lambda (item) (cons (expression (car item) level) (cdr item)))
+                       (getf state :order)))))
+    (query prepared depth))
+  prepared)
+
+(defun prepared-query-outer-depths (prepared)
+  (let ((depths nil))
+    (map-prepared-query-expressions
+     (lambda (form level)
+       (when (and (eq (first form) :outer-ref) (> (second form) level))
+         (pushnew (- (second form) level) depths))
+       form)
+     prepared)
+    (sort depths #'<)))
+
+(defun rewrite-subplan-group-columns (form group-keys scope)
+  (let ((descriptor (second form)))
+    (when (member scope (sql-subplan-grouped-contexts descriptor) :test #'eq)
+      (return-from rewrite-subplan-group-columns form))
+    (push scope (sql-subplan-grouped-contexts descriptor))
+    (setf (sql-subplan-test descriptor)
+          (rewrite-aggregate-columns (sql-subplan-test descriptor) group-keys scope))
+    (map-prepared-query-expressions
+     (lambda (expression level)
+       (when (and (eq (first expression) :outer-ref) (= (second expression) level))
+         (setf (third expression)
+               (rewrite-aggregate-columns (third expression) group-keys scope)))
+       expression)
+     (sql-subplan-prepared descriptor) 1))
+  form)
+
+(defun finalize-query-group-expressions (targets order group-keys scope &optional projected-order-p)
+  (let ((rewritten (make-hash-table :test #'eq)))
+    (flet ((rewrite (expression)
+             (multiple-value-bind (value found) (gethash expression rewritten)
+               (if found value
+                   (setf (gethash expression rewritten)
+                         (rewrite-aggregate-columns expression group-keys scope))))))
+      (dolist (target targets)
+        (setf (getf target :expr) (rewrite (getf target :expr))))
+      (if projected-order-p order
+          (mapcar (lambda (item) (cons (rewrite (car item)) (cdr item))) order)))))
+
+(defun aggregate-input-owner-depth (input)
+  ;; The nearest referenced query level owns the aggregate, even through sublinks.
+  (let ((minimum nil))
+    (labels ((note (depth)
+               (setf minimum (if minimum (min minimum depth) depth)))
+             (visit (form level)
+               (when (consp form)
+                 (cond
+                   ((eq (first form) :outer-ref)
+                    (when (>= (second form) level) (note (- (second form) level))))
+                   ((subquery-expression-p form)
+                    (visit (sql-subplan-test (second form)) level)
+                    (map-prepared-query-expressions
+                     (lambda (part nesting)
+                       (when (and (eq (first part) :outer-ref)
+                                  (>= (second part) nesting))
+                         (note (- (second part) nesting)))
+                       part)
+                     (sql-subplan-prepared (second form)) (1+ level)))
+                   ((eq (first form) :col) (when (zerop level) (note 0)))
+                   (t (dolist (part form) (visit part level)))))))
+      (visit input 0))
+    (or minimum 0)))
+
+(defun rebase-aggregate-input (input owner-depth)
+  (labels ((rebase (form level)
+             (cond
+               ((atom form) form)
+               ((eq (first form) :outer-ref)
+                (let ((depth (- (second form) owner-depth)))
+                  (cond ((and (zerop level) (zerop depth)) (third form))
+                        ((>= (second form) (+ level owner-depth))
+                         (list :outer-ref depth (third form)
+                               :type (expr-type form) :typmod (expr-typmod form)))
+                        (t form))))
+               ((subquery-expression-p form)
+                (let ((descriptor (second form)))
+                  (setf (sql-subplan-test descriptor)
+                        (rebase (sql-subplan-test descriptor) level))
+                  (map-prepared-query-expressions
+                   (lambda (part nesting)
+                     (if (eq (first part) :outer-ref) (rebase part nesting) part))
+                   (sql-subplan-prepared descriptor) (1+ level)))
+                form)
+               (t (mapcar (lambda (part) (rebase part level)) form)))))
+    (rebase input 0)))
+
+(defun subquery-semantic-key (form)
+  "Compare analyzed query meaning without scopes, plans or descriptor identity."
+  (cond ((sql-subplan-p form)
+         (list :subplan (sql-subplan-kind form)
+               (prepared-query-semantic-key (sql-subplan-prepared form))
+               (subquery-semantic-key (sql-subplan-test form))))
+        ((sql-record-p form)
+         (list :record (subquery-semantic-key (sql-record-fields form))
+               (subquery-semantic-key (sql-record-values form))))
+        ((and (consp form) (eq (first form) :col)
+              (getf (cddr form) :aggregate-key))
+         (sql-expression-key-value (getf (cddr form) :aggregate-key)))
+        ((consp form) (cons (subquery-semantic-key (car form))
+                            (subquery-semantic-key (cdr form))))
+        ((and (vectorp form) (not (stringp form)))
+         (list :vector (map 'list #'subquery-semantic-key form)))
+        (t form)))
+
+(defun prepared-query-semantic-key (prepared)
+  ;; Capture analyzed query meaning without transient scope or plan identity.
+  (list
+   :query
+   :set-operation (getf prepared :set-operation)
+   :arms (when (getf prepared :set-operation)
+           (list (prepared-query-semantic-key (getf prepared :left))
+                 (prepared-query-semantic-key (getf prepared :right))))
+   :coercions (subquery-semantic-key (getf prepared :coercions))
+   :targets (mapcar (lambda (target)
+                      (list (getf target :name) (getf target :type) (getf target :typmod)
+                            (subquery-semantic-key (getf target :expr))))
+                    (getf prepared :targets))
+   :relations
+   (mapcar (lambda (relation)
+             (list (pg-class-oid (getf relation :table))
+                   (getf relation :alias) (getf relation :offset) (getf relation :width)
+                   (when (getf relation :subquery-prepared)
+                     (prepared-query-semantic-key (getf relation :subquery-prepared)))))
+           (getf prepared :source-relations))
+   :where (subquery-semantic-key (getf prepared :where))
+   :joins (subquery-semantic-key (getf prepared :joins))
+   :group-keys (subquery-semantic-key (getf prepared :group-keys))
+   :aggregates (mapcar (lambda (aggregate)
+                         (list (getf aggregate :kind) (getf aggregate :type)
+                               (subquery-semantic-key (getf aggregate :input))))
+                       (getf prepared :aggregates))
+   :order (subquery-semantic-key (getf prepared :order))
+   :limit (getf prepared :limit)
+   :distinct (getf prepared :distinct)
+   :set-functions (subquery-semantic-key (getf prepared :set-functions))))
+
+(defun analyze-sublink (expression scope)
+  ;; Analyze against the enclosing scope before enforcing the output type boundary.
+  (unless *select-sublinks-allowed-p*
+    (ereport "0A000" "subqueries are not allowed in this expression"))
+  (let* ((kind (second expression))
+         (prepared (prepare-select-internal (third expression) scope))
+         (targets (getf prepared :targets))
+         (target (first targets))
+         (type (getf target :type))
+         (typmod (getf target :typmod))
+         (descriptor (make-sql-subplan :kind kind :prepared prepared)))
+    (unless (or (eq kind :exists) (= (length targets) 1))
+      (ereport "42601" "subquery must return only one column"))
+    (when (member kind '(:any :all))
+      (let* ((left (analyze-expr (fourth expression) scope))
+             (output (list :subquery-output :type type :typmod typmod))
+             (operands (analyze-comparison-operands left output)))
+        (setf (sql-subplan-test descriptor)
+              (list :binop (fifth expression) (first operands) (second operands)
+                    :type :bool :typmod -1))))
+    (when (eq kind :array)
+      (unless (eq type :text)
+        (ereport "0A000" "ARRAY subqueries currently support text elements only"))
+      (setf type :text-array typmod -1))
+    (when (member kind '(:exists :any :all))
+      (setf type :bool typmod -1))
+    (push descriptor *select-sublinks*)
+    (list :subplan descriptor :type type :typmod typmod
+          :result-name (case kind (:exists "exists") (:array "array")
+                             (:scalar (getf target :name)) (t "?column?")))))

@@ -57,26 +57,29 @@ ROW-CALLBACK."
                backend))
     (funcall compiler plan)))
 
-(defun execute-query-plan (plan registered-relations row-callback
-                           &key (backend :interpreter))
-  "Execute PLAN within its fixed, sorted index lease domain.
-
-The domain covers both executor and compiler calls.  Nested plans reuse a
-subset; parking releases the leases and a later cursor restores full coverage.
-The executor and compiler retain their existing calling conventions."
-  (call-with-select-index-lease-domain
-   (query-plan-index-relfilenodes plan registered-relations)
-   (lambda ()
-     (let* ((entry (query-plan-backend-entry backend))
-            (executor (and entry (query-plan-backend-executor entry))))
+(defun execute-query-plan (plan registered-relations row-callback &key (backend :interpreter))
+  "Execute a plan and its subqueries in one registered statement domain."
+  ;; Children inherit the root backend, cache, registered relations and frames.
+  (let* ((root-p (not *subquery-execution-active-p*))
+         (*subquery-result-cache* (if root-p (make-hash-table :test #'eq)
+                                      *subquery-result-cache*))
+         (*subquery-registered-relations* (if root-p registered-relations
+                                              *subquery-registered-relations*))
+         (*subquery-outer-frames* (if root-p nil *subquery-outer-frames*))
+         (*subquery-backend-entry* (if root-p (query-plan-backend-entry backend)
+                                       *subquery-backend-entry*))
+         (*subquery-execution-active-p* t)
+         (entry *subquery-backend-entry*)
+         (executor (and entry (query-plan-backend-executor entry))))
+    (call-with-select-index-lease-domain
+     (query-plan-index-relfilenodes plan registered-relations)
+     (lambda ()
        (cond
-         (executor
-          (funcall executor plan registered-relations row-callback))
+         (executor (funcall executor plan registered-relations row-callback))
          ((and entry (query-plan-backend-compiler entry))
           (funcall (funcall (query-plan-backend-compiler entry) plan)
                    registered-relations row-callback))
-         (t
-          (ereport "0A000" "query-plan backend ~a is not installed" backend)))))))
+         (t (ereport "0A000" "query-plan backend ~a is not installed" backend)))))))
 
 (defun query-plan-sexp (plan)
   "Return the inspectable logical/physical plan artifact."
@@ -352,7 +355,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
                   (rebase-select-plan-tree (query-plan-physical child) offset))
             (setf relations
                   (append relations (getf (query-plan-prepared child) :relations)))))))
-    relations))
+    (append relations (expression-subquery-relations prepared))))
 
 (defun plan-select-query (ast)
   "Prepare nested SELECTs together, then choose paths without holding the catalog mutex."
@@ -360,6 +363,14 @@ reordered tree, and each parameterized path can reference only joined Vars."
 
 (defun finish-query-plan (prepared registered logical physical alternatives)
   "Install one relation domain and metadata map after all child trees are rebased."
+  ;; Registration IDs identify relations across local child handles; metadata
+  ;; remains tied to each physical node for independent instrumentation.
+  (setf registered
+        (mapcar (lambda (relation)
+                  (unless (getf relation :registration-id)
+                    (setf (getf relation :registration-id) (gensym "RELATION-")))
+                  relation)
+                registered))
   (setf (getf prepared :relations) registered)
   (let ((plan (%make-query-plan :logical logical :physical physical
                                 :alternatives alternatives :prepared prepared)))
@@ -407,6 +418,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
   "Build child plans without the catalog lock, then flatten their registration."
   (when (getf prepared :set-operation)
     (return-from plan-prepared-select (plan-prepared-union prepared)))
+  (plan-expression-subqueries prepared)
   (dolist (relation (getf prepared :relations))
     (when (getf relation :subquery-prepared)
       (setf (getf relation :subquery-plan)
@@ -486,15 +498,16 @@ reordered tree, and each parameterized path can reference only joined Vars."
                               (select-scan-path-selectivity path))))))
 
 (defun query-plan-index-relfilenodes (plan registered-relations)
-  "Validate and return the selected IndexScan relations in global lock order."
+  "Validate root scan handles and include registered expression-subplan indexes."
+  (dolist (node (collect-query-plan-nodes (query-plan-physical plan)))
+    (when (eq (first node) :index-scan)
+      (physical-scan-path node (physical-scan-relation node registered-relations))))
   (sort
    (remove-duplicates
-    (loop for node in (collect-query-plan-nodes (query-plan-physical plan))
-          when (eq (first node) :index-scan)
-            collect
-            (let* ((relation (physical-scan-relation node registered-relations))
-                   (path (physical-scan-path node relation)))
-              (pg-index-relfilenode (select-scan-path-index path))))
+    (loop for relation in registered-relations
+          for path = (getf relation :path)
+          when (and path (eq (select-scan-path-kind path) :index-scan))
+            collect (pg-index-relfilenode (select-scan-path-index path)))
     :test #'eql)
    #'<))
 
@@ -589,7 +602,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
                                         (incf sequence)
                                         (list :query-sort-item sequence-number
                                               (map 'vector
-                                                   (lambda (entry) (eval-expr (car entry) (cdr row)))
+                                                   (lambda (entry) (select-order-value (car entry) row))
                                                    order)
                                               row)))
                                     (emit-run (pathname)
@@ -1021,8 +1034,13 @@ on an abnormal exit."
         outer-environment)))
     (:subquery-scan
      (physical-scan-relation node registered-relations)
-     (funcall run-child (fourth node)
-              (lambda (row) (funcall emit (car row)))))
+     (let* ((parent-frames *subquery-outer-frames*)
+            (*subquery-outer-frames*
+              (cons (cons #() (make-hash-table :test #'eq)) parent-frames)))
+       (funcall run-child (fourth node)
+                (lambda (row)
+                  (let ((*subquery-outer-frames* parent-frames))
+                    (funcall emit (car row)))))))
     (:filter
      (let ((qual (second node)))
        (funcall run-child
@@ -1094,8 +1112,9 @@ on an abnormal exit."
                   (third node)
                   (lambda (row)
                     (incf count)
-                    (funcall emit row)
-                    (when (>= count limit) :stop))))))
+                    (when (or (eq (funcall emit row) :stop)
+                              (>= count limit))
+                      :stop))))))
     ((:hash-aggregate :sorted-aggregate)
      (stream-select-aggregates
       (lambda (aggregate-callback)
@@ -1133,9 +1152,10 @@ on an abnormal exit."
 
 (defun interpret-query-plan (plan registered-relations row-callback)
   "Reference interpreter for physical S-expression plans."
-  (let ((metadata-map (query-plan-metadata plan)))
-    (when *query-plan-instrumentation-p*
-      (reset-query-plan-instrumentation metadata-map))
+  (let ((metadata-map (query-plan-metadata plan))
+        (*subquery-instrumentation-depth* (1+ *subquery-instrumentation-depth*)))
+    (when (and *query-plan-instrumentation-p* (= *subquery-instrumentation-depth* 1))
+      (reset-query-plan-tree-instrumentation plan))
     (labels ((run-node (node callback &optional outer-environment)
                (let ((metadata (gethash node metadata-map))
                      (emitted 0)
@@ -1259,7 +1279,7 @@ on an abnormal exit."
   (internal-time-ticks->milliseconds (/ ticks loops)))
 
 (defun format-query-plan (plan &optional registered-relations analyze-p
-                                 execution-time)
+                                 execution-time nested-p)
   "Format the selected physical tree for EXPLAIN, with run stats if requested."
   (let ((relations (or registered-relations
                        (getf (query-plan-prepared plan) :relations))))
@@ -1293,7 +1313,21 @@ on an abnormal exit."
                    (terpri stream)
                    (print-node child (1+ depth)))))
         (print-node (query-plan-physical plan) 0)
-        (when analyze-p
+        (let ((*subquery-registered-relations* (or *subquery-registered-relations* relations)))
+          (loop for descriptor in (query-plan-expression-subplans plan) for number from 1
+                for child = (sql-subplan-plan descriptor)
+                for child-relations = (subquery-registered-relations child)
+                do (reconcile-query-plan-access-paths child child-relations)
+                   (format stream "~%  ~a ~d (~a)"
+                           (if (and (member (sql-subplan-kind descriptor) '(:scalar :exists :array))
+                                    (not (member 1 (sql-subplan-depths descriptor))))
+                               "InitPlan" "SubPlan")
+                           number (string-downcase (symbol-name (sql-subplan-kind descriptor))))
+                   (dolist (line (uiop:split-string
+                                  (format-query-plan child child-relations analyze-p nil t)
+                                  :separator (string #\Newline)))
+                     (format stream "~%    ~a" line))))
+        (when (and analyze-p (not nested-p))
           (terpri stream)
           (format stream "Execution Time: ~,3f ms" (or execution-time 0.0d0)))))))
 

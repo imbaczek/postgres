@@ -671,6 +671,32 @@ Both wraparound waiting and coordinator selection use this test."
                                   :test #'=))))
                (first group)))))
 
+(defun relation-writer-admissible-p (relfilenode xid)
+  (let* ((token (gethash relfilenode *relation-builders*))
+         (group (gethash token *relation-build-groups*)))
+    (or (null token)
+        (member xid (gethash relfilenode *relation-writers*) :test #'=)
+        (relation-build-group-has-user-p token xid t (and group (second group))))))
+
+(defun register-relation-accesses (write-relfilenodes read-relfilenodes xid)
+  "Admit a mutation and all subquery reads atomically, with writes taking precedence."
+  ;; Admission waits under the relation mutex without publishing a partial set;
+  ;; callers must not hold the writer lock while waiting for relation gates.
+  (let* ((writes (sort (remove-duplicates (copy-list write-relfilenodes) :test #'=) #'<))
+         (reads (sort (set-difference (copy-list read-relfilenodes) writes :test #'=) #'<)))
+    (sb-thread:with-mutex (*relation-lock-mutex*)
+      (loop
+        (when (and (every (lambda (node) (relation-writer-admissible-p node xid)) writes)
+                   (every (lambda (node) (relation-reader-admissible-p node xid)) reads))
+          (dolist (node writes)
+            (pushnew xid (gethash node *relation-writers*) :test #'=))
+          (dolist (node reads)
+            (pushnew xid (gethash node *relation-readers*) :test #'=))
+          (return))
+        (check-for-interrupts)
+        (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*))))
+  (values))
+
 (defun register-relation-writer (relfilenode xid)
   "Register XID as a writer, waiting if an index build owns the relation."
   (sb-thread:with-mutex (*relation-lock-mutex*)

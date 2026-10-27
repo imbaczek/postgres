@@ -231,6 +231,13 @@ UPDATE t SET col = expr [, ...] [WHERE e];
 DELETE FROM t [WHERE e];
 ```
 
+Expression subqueries support correlated and uncorrelated `EXISTS`, scalar
+subqueries, `IN`/`NOT IN`, and comparisons with `ANY`/`SOME`/`ALL`.
+`ARRAY(SELECT ...)` supports text elements. These forms use the existing
+supported clauses and types, including their metadata and type checks. See
+[the subquery design and tests](t/SUBQUERIES.md) for concurrency semantics and
+known parity limits.
+
 Sequence expressions support `nextval('sequence')`, `currval('sequence')`, and
 `setval('sequence', value [, is_called])`. The only supported column default is
 `DEFAULT nextval('sequence')`. Sequence values use the implemented signed `int8`
@@ -332,6 +339,12 @@ Lisp→Lisp, Lisp→C and C→Lisp with an owned writer, source shutdown as the 
 durable target validation, sequence alignment and post-cutover writes.
 
 ## Testing
+
+From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/subqueries.sh`
+compares the native server with the repository's installed C PostgreSQL and owns
+its peers and ports. It honors `SBCL` and `PYTHON` (default `python3`, standard
+library only). See [subquery tests](t/SUBQUERIES.md) for scope and the known
+concurrent semijoin boundary.
 
 From `src/lisp`, `./t/child-bootstrap.sh` exercises a fresh child backup through
 grandchild promotion. Set `CHILD_BOOTSTRAP_BACKUP_FAULTS=1`,
@@ -759,8 +772,10 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   grouping with spill; mixed aggregates preserve those semantics. General decimal,
   floating point, interval and money types remain unsupported.
   Noncorrelated derived SELECTs in `FROM`, ordinary
-  `DISTINCT`, and `UNION ALL` are supported. Correlated and expression subqueries,
-  CTEs, `DISTINCT ON`, and `HAVING` remain unsupported. Joins use nested loops;
+  `DISTINCT`, `UNION ALL`, and the expression subqueries described above are
+  supported. Row-valued and MULTIEXPR subqueries, CTEs, LATERAL, `DISTINCT ON`,
+  and `HAVING` remain unsupported. Hash subplans and subquery decorrelation are
+  not implemented. Joins use nested loops;
   INNER/CROSS join order uses a greedy statistics-based choice, while outer
   joins retain source order. NATURAL JOIN
   is not supported; comma-separated `FROM` items act as cross joins.

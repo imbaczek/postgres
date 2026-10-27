@@ -381,8 +381,14 @@
          (or (>= xid (snapshot-xmax snapshot))
              (member xid (snapshot-xip snapshot) :test #'=)))))
 
+(defun heap-tuple-version-key (tuple)
+  ;; A retained statement snapshot prevents TID reuse and thus ABA. UPDATE changes TID;
+  ;; aborted xmax changes and VACUUM freezing do not change the row version.
+  (list (htup-block tuple) (htup-offnum tuple)))
+
 (defun heapam-delete-tid (relfilenode columns block offnum xid cid
-                          &optional (matches-p (constantly t)) on-delete)
+                          &optional (matches-p (constantly t)) on-delete
+                            outside-lock-recheck-p qualified-tuple)
   "Delete the latest qualifying version of TID, waiting for a writer.
 
 Under READ COMMITTED, follow a committed update's ctid chain and evaluate
@@ -391,11 +397,14 @@ return a serialization-conflict status when the row changed after the retained
 snapshot. Return T, the tuple whose xmax was set, its physical location, and a
 status keyword. ON-DELETE runs under the successful mutation\'s writer lock;
 when supplied, its result is returned as a sixth value."
+  ;; OUTSIDE-LOCK-RECHECK-P allows :QUALIFY to evaluate without the writer lock;
+  ;; QUALIFIED-TUPLE identifies an already qualified version for TID revalidation.
   (register-relation-writer relfilenode xid)
   (let ((target-block block)
         (target-offnum offnum)
         (snapshot *current-snapshot*)
         (expected-xmin nil)
+        (qualified-version (and qualified-tuple (heap-tuple-version-key qualified-tuple)))
         (visited (make-hash-table :test #'equal)))
     (loop
       (let ((key (cons target-block target-offnum)))
@@ -444,18 +453,27 @@ when supplied, its result is returned as a sixth value."
                      :skip)
                     ((or (zerop (htup-xmax tuple))
                          (xid-aborted-p (htup-xmax tuple)))
-                     (if (funcall matches-p tuple)
-                         (if (heapam-set-xmax relfilenode target-block
-                                              target-offnum xid cid)
-                             (list :done tuple (when on-delete (funcall on-delete)))
-                             :skip)
-                         :skip))
+                     (cond
+                       ((and outside-lock-recheck-p
+                             (not (equal qualified-version (heap-tuple-version-key tuple))))
+                        (list :qualify tuple))
+                       ((or outside-lock-recheck-p (funcall matches-p tuple))
+                        (if (heapam-set-xmax relfilenode target-block target-offnum xid cid)
+                            (list :done tuple (when on-delete (funcall on-delete)))
+                            :skip))
+                       (t :skip)))
                     (t :skip))))))
         (case (if (consp action) (car action) action)
           (:done (return (if on-delete
                              (values t (second action) target-block target-offnum :ok (third action))
                              (values t (second action) target-block target-offnum :ok))))
           (:skip (return (values nil nil nil nil :skip)))
+          (:qualify
+           (let ((tuple (second action)))
+             (setf qualified-version (heap-tuple-version-key tuple))
+             (unless (funcall matches-p tuple)
+               (return (values nil nil nil nil :skip)))
+             (remhash (cons target-block target-offnum) visited)))
           (:serialization-update-conflict
            (return (values nil nil nil nil :serialization-update-conflict)))
           (:serialization-delete-conflict

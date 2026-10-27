@@ -174,6 +174,8 @@ When PUBLICATION-KIND is supplied, return immutable selection as a third value."
           (wait-for-xid wait-xid))))))
 
 (defun exec-insert (stream ast)
+  (when (raw-query-sublinks-p ast)
+    (return-from exec-insert (exec-insert-subqueries stream ast)))
   (let ((table (resolve-table-or-error (getf ast :table))))
     (let* ((columns (pg-class-columns table))
            (names (getf ast :columns))

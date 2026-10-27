@@ -270,6 +270,32 @@ failures**, using the documented `CL_SOURCE_REGISTRY` for installed cl-spec.
 Strict cold `./t/compile.sh`, including deferred-warning checks, passed. The
 added shell and C acceptance harnesses were inventoried, not run standalone.
 
+## Expression subquery coverage
+
+[subquery-tests.lisp](rove/subquery-tests.lisp) adds 21 Rove cases (78 to 99
+unit cases), one Function Spec and two Properties. The original 161 deferred
+legacy cases and 1,131 checks retain their disposition. These contracts cover
+the requested feature; no existing contracts were weakened. The existing
+[join-ddl-concurrency.sh](join-ddl-concurrency.sh) baseline fixture uses one
+DROP gate and opposite-order JOINs because DDL events are globally serialized;
+its wait ID fields are read-only.
+
+Final verification passed: **99 unit**, **170 interop**, and **531 physical**
+Rove cases; **1,131 legacy checks**; strict compilation; and smoke, sort,
+index and JOIN checks. Native/C acceptance passed 108 SQL differential cases,
+seven controlled concurrent SubPlan rechecks, spill/cancel cleanup and indexed
+self-read with concurrent DDL. The separate simple-EXISTS semijoin EPQ divergence
+remains documented in [SUBQUERIES.md](SUBQUERIES.md).
+
+Final direct cl-spec verification executed 1,500 trials, in addition to the Rove
+wrappers. Each contract ran at seed 42 and the additional seed shown:
+
+| Contract | Trials per seed | Additional seed | Digest | Measurement gaps |
+| --- | ---: | ---: | --- | --- |
+| `subquery-quantified-step` Function Spec | 300 | 1959987157382440046 | `fnv1a64-v1:a8675611be5b6d63` | properties-not-run, input-coverage-unmeasured |
+| `subquery-quantified-fold-truth` Property | 300 | 1553238518679453301 | `fnv1a64-v1:f04501586e6b165d` | rejection-counts-unmeasured, input-coverage-unmeasured |
+| `subquery-generated-scalar-cardinality` Property | 150 | 2279626208607443807 | `fnv1a64-v1:270189609c6b43bd` | rejection-counts-unmeasured, input-coverage-unmeasured |
+
 ## Running and failure behavior
 
 From `src/lisp/`, `./t/run-unit-tests.sh` loads [test-dependencies.lisp](test-dependencies.lisp),
@@ -305,8 +331,9 @@ tests that replace global functions or mutate admission/ownership state.
 
 ## Generated domains and limits
 
-All Properties use `:normal 200`; the Function Spec uses 200 trials. Rove runs them
-with seed `42`. Direct cl-spec runs can use another seed; record the actual seed,
+The migrated declarations below use `:normal 200` for Properties and 200 Function
+Spec trials. Subquery declarations use the budgets in their coverage section above.
+Rove runs these declarations with seed `42`. Direct cl-spec runs can use another seed; record the actual seed,
 declaration digest and implementation revision when reporting a failure. Custom
 CL:RANDOM generators use cl-spec's dynamically seeded random state.
 

@@ -19,6 +19,8 @@
   (attnum 0))
 
 (defstruct select-scope
+  (parent *select-outer-scope*)
+  (analysis-frame *select-analysis-frame*)
   relations
   columns
   (width 0))
@@ -28,20 +30,55 @@
       (sql-relation-base-name (select-relation-name relation))))
 
 (defun resolve-select-column (scope qualifier name)
-  (let* ((relation
-           (when qualifier
-             (or (find qualifier (select-scope-relations scope)
-                       :key #'select-relation-qualifier
-                       :test (lambda (a b) (and b (string= a b))))
-                 (ereport "42P01" "missing FROM-clause entry for table \"~a\"" qualifier))))
-         (columns (if qualifier (select-relation-columns relation)
-                      (select-scope-columns scope)))
-         (matches (remove-if-not
-                   (lambda (column) (string= name (select-column-name column)))
-                   columns)))
-    (cond ((null matches) (ereport "42703" "column \"~a\" does not exist" name))
-          ((rest matches) (ereport "42702" "column reference \"~a\" is ambiguous" name))
-          (t (select-column-expr (first matches))))))
+  ;; Search one scope at a time; outer references retain their lexical depth.
+  (loop for current = scope then (select-scope-parent current)
+        for depth from 0 while current
+        for relation = (and qualifier
+                            (find qualifier (select-scope-relations current)
+                                  :key #'select-relation-qualifier
+                                  :test (lambda (a b) (and b (string= a b)))))
+        for columns = (if qualifier
+                          (and relation (select-relation-columns relation))
+                          (select-scope-columns current))
+        for matches = (remove-if-not
+                       (lambda (column) (string= name (select-column-name column))) columns)
+        do (when (rest matches)
+             (ereport "42702" "column reference \"~a\" is ambiguous" name))
+           (when matches
+             (let ((expression (select-column-expr (first matches))))
+               (return-from resolve-select-column
+                 (if (zerop depth) expression
+                     (list :outer-ref depth expression
+                           :type (expr-type expression) :typmod (expr-typmod expression))))))
+           (when relation
+             (ereport "42703" "column \"~a\" does not exist" name)))
+  (if qualifier
+      (ereport "42P01" "missing FROM-clause entry for table \"~a\"" qualifier)
+      (ereport "42703" "column \"~a\" does not exist" name)))
+
+(defun clear-query-analysis-contexts (prepared)
+  "Drop transient ownership frames after the entire statement has been analyzed."
+  (let ((queries (make-hash-table :test #'eq))
+        (scopes (make-hash-table :test #'eq)))
+    (labels ((scope (current)
+               (when (and current (not (gethash current scopes)))
+                 (setf (gethash current scopes) t
+                       (select-scope-analysis-frame current) nil)
+                 (scope (select-scope-parent current))))
+             (query (state)
+               (unless (gethash state queries)
+                 (setf (gethash state queries) t)
+                 (scope (getf state :scope))
+                 (dolist (descriptor (getf state :sublinks))
+                   (query (sql-subplan-prepared descriptor)))
+                 (dolist (relation (getf state :source-relations))
+                   (when (getf relation :subquery-prepared)
+                     (query (getf relation :subquery-prepared))))
+                 (when (getf state :set-operation)
+                   (query (getf state :left))
+                   (query (getf state :right))))))
+      (query prepared)))
+  prepared)
 
 (defmacro sql-strict-let (bindings &body body)
   "Evaluate all BINDINGS once, returning SQL NULL if any value is NULL."
@@ -1010,6 +1047,7 @@ Convert supplied expressions in source order, then return them in parameter orde
 (defun analyze-expr (expr table)
   "Resolve column references and annotate expression types."
   (case (first expr)
+    (:sublink (analyze-sublink expr table))
     (:const
      (let ((v (second expr)))
        (cond
@@ -1080,6 +1118,7 @@ Convert supplied expressions in source order, then return them in parameter orde
      (ereport "XX000" "cannot analyze expression ~a" expr))))
 
 (defun cast-target-default-name (ast)
+  ;; Preserve a stronger inner expression label before falling back to the type.
   "A cast supplies a weak type label; a column/function label takes precedence."
   (let ((argument (second ast)))
     (loop while (eq (first argument) :cast) do (setf argument (second argument)))
@@ -1094,6 +1133,7 @@ Convert supplied expressions in source order, then return them in parameter orde
     (:column
      (if (third ast) (third ast) (second ast)))
     (:coalesce "coalesce")
+    (:case "case")
     (:count-star "count")
     (:func (second ast))
     (:record-field (third ast))
@@ -1107,7 +1147,8 @@ Convert supplied expressions in source order, then return them in parameter orde
          (direct-column (and (eq (first resolved) :col) resolved))
          (type (expr-type resolved))
          (typmod (expr-typmod resolved))
-         (name (or alias (target-default-name ast))))
+         (name (or alias (subquery-default-name resolved)
+                   (target-default-name ast))))
     (list :expr resolved
           :name name
           :type type
@@ -1221,6 +1262,16 @@ Convert supplied expressions in source order, then return them in parameter orde
   (mapcar (lambda (target) (analyze-expanded-target target table))
           (expand-select-targets targets table)))
 
+(defun analyzed-expression-identical-p (left right)
+  "Compare executable expressions while preserving aggregate transition slots."
+  ;; ProjectSet sharing must not merge distinct volatile aggregate transitions.
+  (cond ((and (sql-expression-key-p left) (sql-expression-key-p right))
+         (equal (sql-expression-key-value left) (sql-expression-key-value right)))
+        ((and (consp left) (consp right))
+         (and (analyzed-expression-identical-p (car left) (car right))
+              (analyzed-expression-identical-p (cdr left) (cdr right))))
+        (t (equal left right))))
+
 (defun prepare-select-project-set (targets order input-width distinct-p)
   "Match C's intermediate ProjectSet deduplication when SRFs need projection."
   (let* ((calls (make-array 0 :adjustable t :fill-pointer 0))
@@ -1237,7 +1288,7 @@ Convert supplied expressions in source order, then return them in parameter orde
                   (let ((position
                           (and (or reuse-p share-calls-p (eq (first form) :single-record))
                                (or (position form calls :test #'eq)
-                                   (position form calls :test #'equal)))))
+                                   (position form calls :test #'analyzed-expression-identical-p)))))
                     (unless position
                       (setf position (length calls))
                       (vector-push-extend form calls))
@@ -1258,9 +1309,12 @@ Convert supplied expressions in source order, then return them in parameter orde
                                (or (position (car item) targets
                                              :key (lambda (target) (getf target :expr)) :test #'eq)
                                    (position (car item) targets
-                                             :key (lambda (target) (getf target :expr)) :test #'equal)))
+                                             :key (lambda (target) (getf target :expr))
+                                             :test #'selected-expression-equal-p)))
                              (expression (if position
-                                             (getf (nth position result-targets) :expr)
+                                             (list :sort-output (1+ position)
+                                                   :type (getf (nth position result-targets) :type)
+                                                   :typmod (getf (nth position result-targets) :typmod))
                                              (lift (car item) t))))
                         (cons expression (cdr item))))
                     order))))
@@ -1291,6 +1345,10 @@ Convert supplied expressions in source order, then return them in parameter orde
 
 (defun same-group-column-p (left right)
   "Compare resolved columns by identity, ignoring incidental nullability."
+  (when (and (eq (first left) :outer-ref) (eq (first right) :outer-ref))
+    (return-from same-group-column-p
+      (and (= (second left) (second right))
+           (same-group-column-p (third left) (third right)))))
   (and (eq (first left) :col)
        (eq (first right) :col)
        (= (second left) (second right))
@@ -1309,7 +1367,8 @@ Convert supplied expressions in source order, then return them in parameter orde
   (let ((keys '()))
     (dolist (ast group-asts)
       (let ((expr (analyze-expr ast scope)))
-        (unless (eq (first expr) :col)
+        (unless (or (eq (first expr) :col)
+                    (and (eq (first expr) :outer-ref) (eq (first ast) :column)))
           (ereport "0A000" "GROUP BY currently supports column references only"))
         (unless (group-column-position expr keys)
           (push expr keys))))
@@ -1338,14 +1397,17 @@ Convert supplied expressions in source order, then return them in parameter orde
 
 (defun contains-aggregate-p (form)
   (and (consp form)
-       (or (raw-aggregate-kind form)
-           (contains-aggregate-p (car form))
-           (contains-aggregate-p (cdr form)))))
+       (if (eq (first form) :sublink)
+           (contains-aggregate-p (fourth form))
+           (or (raw-aggregate-kind form)
+               (contains-aggregate-p (car form))
+               (contains-aggregate-p (cdr form))))))
 
 (defun analyzed-expression-volatile-p (form)
   "Only known stable/immutable builtins may share an aggregate transition."
   (and (consp form)
-       (or (and (eq (first form) :func)
+       (or (eq (first form) :subplan)
+           (and (eq (first form) :func)
                 (not (member (second form)
                              '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
@@ -1376,32 +1438,59 @@ Convert supplied expressions in source order, then return them in parameter orde
        (values argument (if (member type '(:int2 :int4)) :int8 :numeric))))))
 
 (defun analyze-aggregate-call (raw scope)
+  ;; Semantic ownership follows referenced levels, not merely the syntactic query.
   (unless *select-aggregate-analysis*
     (ereport "42803" "aggregate functions are not allowed in this expression"))
-  (when *inside-aggregate-input-p*
+  (when (and (null *select-analysis-frame*) *inside-aggregate-input-p*)
     (ereport "42803" "aggregate function calls cannot be nested"))
-  (let ((kind (raw-aggregate-kind raw)))
-    (multiple-value-bind (input type) (analyze-aggregate-input raw scope kind)
-      (let* ((descriptors (getf *select-aggregate-analysis* :descriptors))
-             (existing
-               (when (or *aggregate-order-mode* (not (analyzed-expression-volatile-p input)))
-                 (position-if (lambda (descriptor)
-                                (and (eq kind (getf descriptor :kind))
-                                     (selected-expression-equal-p input (getf descriptor :input))))
-                              descriptors)))
-             (index (or existing (length descriptors))))
-        (when (and (eq *aggregate-order-mode* :existing-only) (null existing))
-          (ereport "42803" "aggregate is not present in the SELECT list"))
-        (unless existing
-          (vector-push-extend (list :kind kind :input input :type type :source-expr raw) descriptors))
-        (append (aggregate-output-ref
-                 (+ (length (getf *select-aggregate-analysis* :group-keys)) index 1) type)
-                (list :aggregate-output t))))))
+  (let ((kind (raw-aggregate-kind raw))
+        (frame *select-analysis-frame*))
+    (multiple-value-bind (input type)
+        (let ((old (and frame (getf frame :inside-input))))
+          (unwind-protect
+               (progn
+                 (when frame (setf (getf frame :inside-input) t))
+                 (analyze-aggregate-input raw scope kind))
+            (when frame (setf (getf frame :inside-input) old))))
+      (let* ((depth (aggregate-input-owner-depth input))
+             (owner (loop with current = frame repeat depth
+                          do (setf current (getf current :parent))
+                          finally (return current)))
+             (analysis (or owner *select-aggregate-analysis*)))
+        (when (and owner (not (member (getf owner :kind) '(:select-target :order-by))))
+          (ereport "42803" "aggregate functions are not allowed in this expression"))
+        (when (and owner (getf owner :inside-input))
+          (ereport "42803" "aggregate function calls cannot be nested"))
+        (when (plusp depth)
+          (setf input (rebase-aggregate-input input depth)))
+        (let* ((descriptors (getf analysis :descriptors))
+               (existing
+                 (when (or (eq *aggregate-order-mode* :existing-only)
+                           (not (analyzed-expression-volatile-p input)))
+                   (position-if (lambda (descriptor)
+                                  (and (eq kind (getf descriptor :kind))
+                                       (selected-expression-equal-p input (getf descriptor :input))))
+                                descriptors)))
+               (index (or existing (length descriptors))))
+          (when (and (eq *aggregate-order-mode* :existing-only) (null existing))
+            (ereport "42803" "aggregate is not present in the SELECT list"))
+          (unless existing
+            (vector-push-extend (list :kind kind :input input :type type :source-expr raw) descriptors))
+          (let ((reference (append (aggregate-output-ref
+                                    (+ (length (getf analysis :group-keys)) index 1) type)
+                                   (list :aggregate-output t
+                                         :aggregate-key
+                                         (make-sql-expression-key
+                                          :value (list :aggregate kind type
+                                                       (subquery-semantic-key input)))))))
+            (if (zerop depth) reference
+                (list :outer-ref depth reference :type type :typmod -1))))))))
 
 (defun aggregate-expression-signature (form descriptors)
   "Compare semantic aggregate identities independently of their result slots."
   (cond
     ((atom form) form)
+    ((eq (first form) :outer-ref) form)
     ((and (eq (first form) :col) (getf (cddr form) :aggregate-output))
      (let* ((offset (length (getf *select-aggregate-analysis* :group-keys)))
             (descriptor (aref descriptors (- (second form) offset 1))))
@@ -1424,6 +1513,9 @@ Convert supplied expressions in source order, then return them in parameter orde
   "Rebase grouped input Vars while leaving lifted aggregate result slots intact."
   (cond
     ((atom form) form)
+    ((eq (first form) :outer-ref) form)
+    ((eq (first form) :subplan)
+     (rewrite-subplan-group-columns form group-keys scope))
     ((eq (first form) :col)
      (if (getf (cddr form) :aggregate-output)
          form
@@ -1437,15 +1529,19 @@ Convert supplied expressions in source order, then return them in parameter orde
              (rewrite-aggregate-columns (cdr form) group-keys scope)))))
 
 (defun analyze-aggregate-targets (raw-targets scope group-keys)
-  "Lift aggregates recursively and validate each remaining Var against GROUP BY."
-  (let* ((descriptors (make-array 0 :adjustable t :fill-pointer 0))
-         (*select-aggregate-analysis* (list :group-keys group-keys :descriptors descriptors))
+  "Analyze targets with query-owned descriptors, or a fresh standalone aggregate context."
+  (let* ((*select-aggregate-analysis*
+           (or *select-aggregate-analysis*
+               (list :group-keys group-keys
+                     :descriptors (make-array 0 :adjustable t :fill-pointer 0))))
+         (descriptors (getf *select-aggregate-analysis* :descriptors))
          (targets
            (loop for target in (expand-select-targets raw-targets scope)
                  for before = (length descriptors)
                  for analyzed = (analyze-expanded-target target scope)
-                 do (setf (getf analyzed :expr)
-                          (rewrite-aggregate-columns (getf analyzed :expr) group-keys scope))
+                 unless *defer-group-rewrite-p*
+                   do (setf (getf analyzed :expr)
+                            (rewrite-aggregate-columns (getf analyzed :expr) group-keys scope))
                  when (contains-aggregate-p (getf target :expr))
                    do (setf (getf analyzed :source-expr)
                             (aggregate-expression-signature (getf analyzed :expr) descriptors)
@@ -1474,30 +1570,74 @@ Convert supplied expressions in source order, then return them in parameter orde
         (values (position (first aliases) targets :test #'eq) t)))
     (values nil nil)))
 
+(defun analyze-order-expression (raw scope targets)
+  "Reuse complete selected expressions, discarding only unused probe transitions."
+  ;; A probe can add transitions to any ancestor; roll them all back only when
+  ;; the complete expression matches a target (parse_clause.c SQL99 matching).
+  (let* ((contexts (if *select-analysis-frame*
+                       (loop for frame = *select-analysis-frame* then (getf frame :parent)
+                             while frame collect frame)
+                       (list *select-aggregate-analysis*)))
+         (snapshots (loop for context in contexts
+                          for descriptors = (getf context :descriptors)
+                          when (and descriptors (array-has-fill-pointer-p descriptors))
+                            collect (cons descriptors (fill-pointer descriptors))))
+         (expression (analyze-expr raw scope))
+         (position (position expression targets
+                             :key (lambda (target) (getf target :expr))
+                             :test #'selected-expression-equal-p)))
+    (if position
+        (progn
+          (dolist (snapshot snapshots)
+            (setf (fill-pointer (car snapshot)) (cdr snapshot)))
+          (getf (nth position targets) :expr))
+        expression)))
+
 (defun analyze-aggregate-order (order scope targets group-keys &optional descriptors allow-new)
-  "Resolve output aliases first, then grouped expressions and selected aggregates."
+  "Resolve selected and earlier hidden ORDER targets before adding transitions."
+  ;; Deduplicate canonical EQ expressions, preserving distinct alias/ordinal slots.
   (let ((*select-set-functions-allowed-p* t)
         (*select-aggregate-analysis*
-          (list :group-keys group-keys :descriptors (if (vectorp descriptors) descriptors (coerce descriptors 'vector))))
-        (*aggregate-order-mode* (if allow-new :allow-new :existing-only)))
-    (loop for item in order
-          collect (cons
-                   (multiple-value-bind (position selected-p)
-                       (selected-order-target-position item targets)
-                     (if selected-p
-                         (getf (nth position targets) :expr)
-                         (rewrite-aggregate-columns (analyze-expr (getf item :expr) scope)
-                                                    group-keys scope)))
-                   (getf item :desc)))))
+          (if *defer-group-rewrite-p* *select-analysis-frame*
+              (list :group-keys group-keys :descriptors
+                    (if (vectorp descriptors) descriptors (coerce descriptors 'vector)))))
+        (*aggregate-order-mode* (if allow-new :allow-new :existing-only))
+        (seen nil)
+        (result nil))
+    (dolist (item order (nreverse result))
+      (let* ((expression
+               (multiple-value-bind (position selected-p)
+                   (selected-order-target-position item targets)
+                 (if selected-p (getf (nth position targets) :expr)
+                     (analyze-order-expression (getf item :expr) scope
+                                               (append targets seen)))))
+             (duplicate (find expression seen :key (lambda (target) (getf target :expr))
+                                              :test #'eq)))
+        (unless duplicate
+          (push (list :expr expression) seen)
+          (push (cons (if (or *defer-group-rewrite-p*
+                              (nth-value 1 (selected-order-target-position item targets)))
+                          expression
+                          (rewrite-aggregate-columns expression group-keys scope))
+                      (getf item :desc)) result))))))
 
 (defun analyze-order (order table targets)
-  (let ((*select-set-functions-allowed-p* t))
-    (loop for item in order
-          collect
-          (cons (multiple-value-bind (position selected-p) (selected-order-target-position item targets)
-                  (if selected-p (getf (nth position targets) :expr)
-                      (analyze-expr (getf item :expr) table)))
-                (getf item :desc)))))
+  ;; Earlier hidden ORDER targets also participate in SQL99 expression matching.
+  (let ((*select-set-functions-allowed-p* t)
+        (seen nil)
+        (result nil))
+    (dolist (item order (nreverse result))
+      (let* ((expression
+               (multiple-value-bind (position selected-p)
+                   (selected-order-target-position item targets)
+                 (if selected-p (getf (nth position targets) :expr)
+                     (analyze-order-expression (getf item :expr) table
+                                               (append targets seen)))))
+             (duplicate (find expression seen :key (lambda (target) (getf target :expr))
+                                              :test #'eq)))
+        (unless duplicate
+          (push (list :expr expression) seen)
+          (push (cons expression (getf item :desc)) result))))))
 
 (defun sql-type-category (type)
   (cond ((member type '(:int2 :int4 :int8 :oid)) :numeric)
@@ -1577,7 +1717,23 @@ Convert supplied expressions in source order, then return them in parameter orde
    order))
 
 (defun selected-expression-equal-p (left right)
-  (or (equal left right) (same-group-column-p left right)))
+  ;; SQL99 target matching compares meaning, independent of transition slots.
+  (cond ((equal left right) t)
+        ((and (consp left) (consp right)
+              (eq (first left) :col) (eq (first right) :col)
+              (getf (cddr left) :aggregate-key) (getf (cddr right) :aggregate-key))
+         (equal (sql-expression-key-value (getf (cddr left) :aggregate-key))
+                (sql-expression-key-value (getf (cddr right) :aggregate-key))))
+        ((and (subquery-expression-p left) (subquery-expression-p right))
+         (and (eq (expr-type left) (expr-type right))
+              (eql (expr-typmod left) (expr-typmod right))
+              (equal (subquery-semantic-key (second left))
+                     (subquery-semantic-key (second right)))))
+        ((and (consp left) (consp right))
+         (or (same-group-column-p left right)
+             (and (selected-expression-equal-p (car left) (car right))
+                  (selected-expression-equal-p (cdr left) (cdr right)))))
+        (t nil)))
 
 (defun selected-target-equal-p (left right)
   "Keep semantic aggregate identity separate from internal output slot numbers."
@@ -1953,6 +2109,15 @@ Convert supplied expressions in source order, then return them in parameter orde
 
 (defun eval-expr (expr env)
   (case (first expr)
+    (:subplan (eval-subquery-expression (second expr) env))
+    (:assignment (eval-subquery-assignment expr env))
+    (:subquery-output *subquery-output-value*)
+    (:outer-ref
+     (let* ((depth (second expr))
+            (frame (nth (1- depth) *subquery-outer-frames*))
+            (*subquery-outer-frames* (nthcdr depth *subquery-outer-frames*)))
+       (unless frame (error "Missing outer query parameter frame"))
+       (eval-expr (third expr) (car frame))))
     ((:const :scalar-array-const) (second expr))
     (:coalesce (eval-coalesce-expression expr env))
     (:case (eval-case-expression expr env))
