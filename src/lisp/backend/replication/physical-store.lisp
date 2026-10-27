@@ -8,8 +8,12 @@
   directory system-id timeline base-lsn floor-lsn (floor-digest #xCBF29CE484222325)
   written-lsn flushed-lsn decoder
   (written-digest #xCBF29CE484222325) (flushed-digest #xCBF29CE484222325)
-  lock-stream stream segment (failed-p nil) (closed-p nil)
+  lock-stream stream segment segment-timeline selection (failed-p nil) (closed-p nil)
   (mutex (sb-thread:make-mutex :name "physical WAL receive store")))
+
+(declaim (ftype function physical-store-load-history-selection physical-store-validate-history-prefix
+                physical-store-history-discard-tail physical-store-history-segment-entries
+                physical-store-history-check-record))
 
 (defvar *physical-store-test-hook* nil
   "Disabled-by-default hook for deterministic receive durability failures.")
@@ -17,8 +21,11 @@
 (defun physical-store-path (store name)
   (merge-pathnames name (physical-store-directory store)))
 
-(defun physical-store-segment-path (store segment)
-  (physical-store-path store (format nil "~16,'0X.wal" segment)))
+(defun physical-store-segment-path (store segment &optional (timeline (physical-store-timeline store)))
+  (physical-store-path store
+                       (if (= timeline (physical-store-timeline store))
+                           (format nil "~16,'0X.wal" segment)
+                           (format nil "~8,'0X-~16,'0X.wal" timeline segment))))
 
 (defun physical-store-check-live (store)
   (when (or (physical-store-closed-p store) (physical-store-failed-p store))
@@ -51,9 +58,10 @@ This FNV-1a-64 checksum detects accidental prefix damage, not malicious tamperin
 (defun physical-store-encode-control (store flush-lsn &key
                                                         (digest (physical-store-written-digest store))
                                                         (floor-lsn (physical-store-floor-lsn store))
-                                                        (floor-digest (physical-store-floor-digest store)))
-  "Encode original bootstrap identity and independently advancing local WAL floor."
-  (let ((bytes (make-array 68 :element-type '(unsigned-byte 8) :initial-element 0)))
+                                                        (floor-digest (physical-store-floor-digest store))
+                                                        (selection (physical-store-selection store)))
+  (let* ((size (if selection 80 68))
+         (bytes (make-array size :element-type '(unsigned-byte 8) :initial-element 0)))
     (replace bytes #(80 71 80 72 89 83 48 51))
     (wal-set-u64 bytes 8 (physical-store-system-id store))
     (wal-set-u32 bytes 16 (physical-store-timeline store))
@@ -62,7 +70,10 @@ This FNV-1a-64 checksum detects accidental prefix damage, not malicious tamperin
     (wal-set-u64 bytes 40 digest)
     (wal-set-u64 bytes 48 floor-lsn)
     (wal-set-u64 bytes 56 floor-digest)
-    (wal-set-u32 bytes 64 (wal-crc32 bytes))
+    (when selection
+      (wal-set-u32 bytes 64 (getf selection :target))
+      (wal-set-u64 bytes 68 (getf selection :digest)))
+    (wal-set-u32 bytes (- size 4) (wal-crc32 bytes))
     bytes))
 
 (defun physical-store-save-control (store flush-lsn &rest control-options)
@@ -94,14 +105,14 @@ This FNV-1a-64 checksum detects accidental prefix damage, not malicious tamperin
   "Read v2 bootstrap-anchored or v3 restartpoint-anchored receive progress."
   (let* ((bytes (with-open-file (stream (physical-store-path store "receive.control")
                                         :element-type '(unsigned-byte 8))
-                  (unless (member (file-length stream) '(52 68))
+                  (unless (member (file-length stream) '(52 68 80))
                     (error "invalid physical receive control length"))
                   (let ((bytes (make-array (file-length stream) :element-type '(unsigned-byte 8))))
                     (unless (= (read-sequence bytes stream) (length bytes))
                       (error "short physical receive control"))
                     bytes)))
-         (v3 (= 68 (length bytes)))
-         (crc-offset (if v3 64 48))
+         (v3 (>= (length bytes) 68))
+         (crc-offset (- (length bytes) 4))
          (crc (wal-u32 bytes crc-offset))
          (base (wal-u64 bytes 24))
          (flush (wal-u64 bytes 32))
@@ -122,21 +133,23 @@ This FNV-1a-64 checksum detects accidental prefix damage, not malicious tamperin
           (physical-store-written-lsn store) flush
           (physical-store-flushed-lsn store) flush
           (physical-store-written-digest store) (wal-u64 bytes 40)
-          (physical-store-flushed-digest store) (wal-u64 bytes 40))))
+          (physical-store-flushed-digest store) (wal-u64 bytes 40)
+          (physical-store-selection store)
+          (when (= 80 (length bytes))
+            (physical-store-load-history-selection store (wal-u32 bytes 64) (wal-u64 bytes 68))))))
 
 (defun physical-store-segments (store)
-  (sort (loop for path in (directory (physical-store-path store "*.wal"))
-              for name = (pathname-name path)
-              do (unless (and (= (length name) 16)
-                              (every (lambda (char) (digit-char-p char 16)) name))
-                   (error "invalid physical receive segment name ~a" path))
-              collect (parse-integer name :radix 16))
+  (sort (loop for (timeline segment path) in (physical-store-history-segment-entries store)
+              when (= timeline (physical-store-timeline store)) collect segment)
         #'<))
 
 (defun physical-store-validate-prefix (store &key on-record digest-cursor)
   "Validate the durable prefix; ON-RECORD is internal and runs during validation.
 The secondary value is the cumulative digest at DIGEST-CURSOR, or NIL if it
 is not a base/record-end boundary. No value returns until all validation passes."
+  (when (physical-store-selection store)
+    (return-from physical-store-validate-prefix
+      (physical-store-validate-history-prefix store :on-record on-record :digest-cursor digest-cursor)))
   (let* ((base (physical-store-floor-lsn store))
          (flush (physical-store-flushed-lsn store))
          (decoder (make-physical-wal-decoder :start-lsn base))
@@ -233,6 +246,8 @@ lock excludes other receivers, not privileged external filesystem modification."
 
 (defun physical-store-discard-tail (store)
   "Discard only WAL outside the already-validated acknowledged prefix."
+  (when (physical-store-selection store)
+    (return-from physical-store-discard-tail (physical-store-history-discard-tail store)))
   (let* ((base (physical-store-floor-lsn store))
          (flush (physical-store-flushed-lsn store))
          (first (floor base +wal-segment-size+))
@@ -265,9 +280,9 @@ Do not call from a mapper callback. Preserve unflushed writes and decoder state.
       (setf (physical-store-floor-lsn store) cursor
             (physical-store-floor-digest store) digest)
       (physical-store-test-point :after-floor-publication store)
-      (dolist (segment (physical-store-segments store))
-        (when (< segment (floor cursor +wal-segment-size+))
-          (delete-file (physical-store-segment-path store segment))))
+      (dolist (file (physical-store-history-segment-entries store))
+        (when (< (second file) (floor cursor +wal-segment-size+))
+          (delete-file (third file))))
       (physical-store-test-point :after-obsolete-segment-delete store)
       (fsync-directory (physical-store-directory store))
       cursor)))
@@ -349,8 +364,9 @@ changing spool bytes or creating a missing lock; do not resume input in that mod
            store)
       (unless success (physical-store-close store)))))
 
-(defun physical-store-open-segment (store segment)
-  (unless (eql segment (physical-store-segment store))
+(defun physical-store-open-segment (store segment &optional (timeline (physical-store-timeline store)))
+  (unless (and (eql segment (physical-store-segment store))
+               (eql timeline (physical-store-segment-timeline store)))
     (when (physical-store-stream store)
       ;; C walreceiver.c fsyncs a rotated segment before closing it. Persisting
       ;; bytes here alone never advances our acknowledged flush manifest.
@@ -358,16 +374,18 @@ changing spool bytes or creating a missing lock; do not resume input in that mod
       (close (physical-store-stream store))
       (setf (physical-store-stream store) nil))
     (setf (physical-store-stream store)
-          (open (physical-store-segment-path store segment)
+          (open (physical-store-segment-path store segment timeline)
                 :direction :io :element-type '(unsigned-byte 8)
                 :if-exists :overwrite :if-does-not-exist :create)
-          (physical-store-segment store) segment))
+          (physical-store-segment store) segment
+          (physical-store-segment-timeline store) timeline))
   (physical-store-stream store))
 
 (defun physical-store-write-record (store record bytes)
-  (wal-require-ordinary-record-type (wal-record-type record))
-  (let* ((start (wal-record-start record))
-         (stream (physical-store-open-segment store (floor start +wal-segment-size+))))
+  (let* ((timeline (physical-store-history-check-record
+                    store record bytes (physical-store-written-lsn store)))
+         (start (wal-record-start record))
+         (stream (physical-store-open-segment store (floor start +wal-segment-size+) timeline)))
     (file-position stream (mod start +wal-segment-size+))
     (write-sequence bytes stream)
     (finish-output stream)
@@ -384,7 +402,8 @@ still requires process restart; reconnect alone never clears a failure latch."
     (when (physical-store-stream store)
       (close (physical-store-stream store) :abort t))
     (setf (physical-store-stream store) nil
-          (physical-store-segment store) nil)
+          (physical-store-segment store) nil
+          (physical-store-segment-timeline store) nil)
     (physical-store-discard-tail store)
     (setf (physical-store-written-lsn store) (physical-store-flushed-lsn store)
           (physical-store-written-digest store) (physical-store-flushed-digest store)

@@ -99,6 +99,7 @@
                    (:file "../access/transam/timeline")
                    (:file "../replication/physical-bootstrap")
                    (:file "../replication/physical-recovery")
+                   (:file "../replication/physical-store-history")
                    (:file "../storage/wal-namespace")
                    (:file "../storage/wal-lineage")
                    (:file "../storage/wal-timeline")
