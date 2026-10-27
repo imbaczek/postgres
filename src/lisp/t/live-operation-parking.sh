@@ -31,12 +31,15 @@ mkdir -m 700 "$TMP/copy"
 SOURCE=$!
 test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 sql "$PORT" "CREATE TABLE promotion_sql_items (id integer PRIMARY KEY,label text); INSERT INTO promotion_sql_items VALUES (1,'before')"
+if [ -n "${PARKING_SETUP_DRIVER:-}" ]; then
+    "$PATRONI_PYTHON" "$PARKING_SETUP_DRIVER" --setup "$PORT"
+fi
 checked source "(physical-base-backup \"$TMP/copy/\" \"operation_parking\")" backup
 "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" --control-socket "$TMP/target.sock" >"$TMP/target.log" 2>&1 &
 TARGET=$!
 test_wait_owned_sql_server "$TARGET" "$TARGET_PORT" "$PSQL"
 checked target "(physical-follow-start \"127.0.0.1\" $PORT \"operation_parking\")" follow
-SBCL="$SBCL" "$PATRONI_PYTHON" "$BASE/t/interop/live-operation-parking.py" "$BASE" "$TMP" "$PORT" "$TARGET_PORT" "$TARGET"
+SBCL="$SBCL" "$PATRONI_PYTHON" "${PARKING_DRIVER:-$BASE/t/interop/live-operation-parking.py}" "$BASE" "$TMP" "$PORT" "$TARGET_PORT" "$TARGET"
 kill -INT "$TARGET"; wait "$TARGET"; TARGET=
 kill -INT "$SOURCE"; wait "$SOURCE"; SOURCE=
 echo 'live-operation-parking: inline continuation, promotion, deferred reload and retained RR PASS'
