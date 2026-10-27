@@ -59,9 +59,7 @@ if [ "${LIVE_CHILD_ADOPTION:-0}" = 1 ]; then
             (case point
               (:before-online-intent
                 (setf owned (list *catalog* *clog-stream* *relation-streams*
-                                 *wal-snapshot-retention-pins* *wal-replication-slots*))
-                (setf (symbol-function (quote physical-promotion-start-child-primary))
-                      (function physical-promotion-start-live-child-primary)))
+                                 *wal-snapshot-retention-pins* *wal-replication-slots*)))
               (:after-child-primary-initialization
                 (assert (every (function eq) owned
                                (list *catalog* *clog-stream* *relation-streams*
@@ -80,6 +78,7 @@ while [ ! -e "$TMP/reader-ready" ]; do
     attempt=$((attempt + 1)); test "$attempt" -lt 200; sleep 0.1
 done
 sql "$PORT" 'INSERT INTO data VALUES (6),(7),(8),(9),(10)'
+sql "$PORT" 'CREATE TABLE online_promotion_barrier (id integer)'
 end=$(sql "$PORT" 'SELECT pg_current_wal_flush_lsn()')
 wait_value "SELECT pg_last_wal_receive_lsn() >= '$end'::pg_lsn" t
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 5
@@ -109,7 +108,7 @@ while :; do
     attempt=$((attempt + 1)); test "$attempt" -lt 200; sleep 0.1
 done
 test "$(sql "$TARGET_PORT" 'SELECT pg_is_in_recovery()')" = t
-test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 5
+wait_value 'SELECT count(*) FROM data' 10
 if sql "$TARGET_PORT" 'SELECT pg_wal_replay_pause()' >"$TMP/pause-rejected.log" 2>&1; then exit 1; fi
 grep -q 'standby promotion is ongoing' "$TMP/pause-rejected.log"
 checked target '(reload)' promotion-reload

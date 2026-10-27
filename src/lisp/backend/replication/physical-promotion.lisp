@@ -1,6 +1,8 @@
 ;;;; Local pending-promotion publication; EOR and writer admission remain separate.
 (in-package #:pg)
 
+(defvar *physical-promotion-preserve-readers-p* nil)
+
 (defun physical-promotion-check-context (phase &key preserve-readers)
   "Check PHASE and the caller's promotion exclusion.
 
@@ -114,12 +116,39 @@ IDs, and keep retained transactions read-only."
 (defmacro with-physical-promotion-exclusion ((phase) &body body)
   "Require owned command/reload quiescence before registration/history exclusion."
   `(progn
-     (physical-promotion-check-context ,phase)
+     (physical-promotion-check-context ,phase
+                                       :preserve-readers *physical-promotion-preserve-readers-p*)
      (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
        (when (and *physical-restartpoint-worker*
                   (sb-thread:thread-alive-p *physical-restartpoint-worker*))
          (error "promotion restartpoint worker has not been joined"))
        (sb-thread:with-mutex (*timeline-history-lock*) ,@body))))
+
+(defun physical-promotion-can-yield-to-shutdown-p ()
+  (and (shutdown-in-progress-p)
+       (eql 2 (getf *physical-recovery-state* :phase))
+       (not *physical-recovery-failed-p*)))
+
+(defun call-with-physical-promotion-readers (function)
+  (physical-promotion-enroll-readers)
+  (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+    (when (and *physical-restartpoint-worker*
+               (sb-thread:thread-alive-p *physical-restartpoint-worker*))
+      (error "promotion restartpoint worker has not been joined")))
+  (let ((*physical-promotion-preserve-readers-p* t)
+        (finished nil))
+    (unwind-protect
+         (handler-case
+             (multiple-value-prog1
+                 (progn
+                   (physical-promotion-test-point :after-live-reader-enrollment)
+                   (funcall function))
+               (setf finished t))
+           (physical-promotion-shutdown (condition)
+             (when (physical-promotion-can-yield-to-shutdown-p)
+               (setf finished t))
+             (error condition)))
+      (unless finished (setf *physical-recovery-failed-p* t)))))
 
 (defun physical-promotion-select-child (parent)
   "Match C findNewestTimeLine's consecutive local history probe, then select +1."

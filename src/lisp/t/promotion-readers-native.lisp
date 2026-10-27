@@ -1,0 +1,105 @@
+(in-package #:pg)
+
+(defvar *promotion-reader-test-state* nil)
+
+(defun promotion-reader-test-marker (path)
+  (with-open-file (out path :direction :output :if-exists :error)
+    (format out "~d~%" (sb-posix:getpid))))
+
+(defun promotion-reader-test-install-single (pid &optional wrap)
+  (let* ((backend (lookup-backend pid))
+         (snapshot (backend-transaction-snapshot backend))
+         (catalog *catalog*)
+         (clog *clog-stream*))
+    (assert snapshot)
+    (release-xid (backend-virtual-reader-xid backend) backend)
+    (when wrap
+      (sb-thread:with-mutex (*xid-lock*)
+        (let ((*xid-batch-end* (xid-next-epoch-boundary *next-xid*)))
+          (save-next-xid))))
+    (setf *physical-promotion-test-hook*
+          (lambda (point)
+            (when (eq point :after-child-primary-initialization)
+              (assert (eq snapshot (backend-transaction-snapshot backend)))
+              (assert (eq catalog *catalog*))
+              (assert (eq clog *clog-stream*))
+              (assert (backend-read-only backend))
+              (assert (minusp (backend-virtual-reader-xid backend)))
+              (assert (gethash (backend-virtual-reader-xid backend) *recovery-reader-xids*))
+              (setf *physical-promotion-test-hook* nil)))))
+  t)
+
+(defun promotion-reader-test-install (pids root &optional crash-point)
+  (let* ((backends (mapcar #'lookup-backend pids))
+         (captured (mapcar (lambda (backend)
+                             (assert backend)
+                             (list backend (backend-virtual-reader-xid backend)
+                                   (backend-transaction-snapshot backend)))
+                           backends))
+         (runtime (list *catalog* *clog-stream* *relation-streams*
+                        *wal-snapshot-retention-pins* *wal-replication-slots*))
+         (eof (fourth backends))
+         (marker (merge-pathnames "enrolled" root))
+         (release (merge-pathnames "release" root))
+         (waiting (merge-pathnames "eof-waiting" root)))
+    (assert (= 4 (length backends)))
+    (assert (third (first captured)))
+    (assert (third (third captured)))
+    ;; Exercise the two old-image cases before the owning transition starts.
+    (sb-thread:with-mutex (*relation-lock-mutex*)
+      (remhash (second (first captured)) *recovery-reader-xids*))
+    (let ((snapshot-only (third backends)))
+      (release-xid (backend-virtual-reader-xid snapshot-only) snapshot-only)
+      (setf (backend-read-only snapshot-only) nil))
+    (setf *promotion-reader-test-state* captured
+          *live-operation-admission-wait-hook*
+          (lambda ()
+            (when (and (eq *backend* eof) (not (probe-file waiting)))
+              (promotion-reader-test-marker waiting)))
+          *physical-promotion-test-hook*
+          (lambda (point)
+            (when (eq point crash-point)
+              (promotion-reader-test-marker (merge-pathnames "crash" root))
+              (loop repeat 600 do (sleep 0.05))
+              (error "promotion reader crash barrier was not killed"))
+            (case point
+              (:after-live-reader-enrollment
+               (dolist (entry captured)
+                 (let ((backend (first entry)))
+                   (assert (backend-read-only backend))
+                   (assert (eq (third entry) (backend-transaction-snapshot backend)))
+                   (unless (eq backend (third backends))
+                     (assert (eql (second entry) (backend-virtual-reader-xid backend))))
+                   (setf (second entry) (backend-virtual-reader-xid backend))
+                   (assert (gethash (second entry) *recovery-reader-xids*))))
+               (promotion-reader-test-marker marker)
+               (loop repeat 600 until (probe-file release) do (sleep 0.05))
+               (assert (probe-file release)))
+              (:after-child-primary-initialization
+               (assert (every #'eq runtime
+                              (list *catalog* *clog-stream* *relation-streams*
+                                    *wal-snapshot-retention-pins* *wal-replication-slots*)))
+               (dolist (entry captured)
+                 (assert (eq (third entry) (backend-transaction-snapshot (first entry)))))
+               (assert (gethash (second (fourth captured)) *recovery-reader-xids*)))
+              (:after-child-primary-ready
+               (setf *live-operation-admission-wait-hook* nil
+                     *physical-promotion-test-hook* nil))))))
+  t)
+
+(defun promotion-reader-test-eof-gone-p ()
+  (let ((entry (fourth *promotion-reader-test-state*)))
+    (not (lookup-backend (backend-pid (first entry))))))
+
+(defun promotion-reader-test-verify ()
+  (let ((captured *promotion-reader-test-state*))
+    (assert captured)
+    (let ((eof (fourth captured)))
+      (assert (null (lookup-backend (backend-pid (first eof)))))
+      (assert (null (backend-virtual-reader-xid (first eof))))
+      (assert (not (gethash (second eof) *recovery-reader-xids*))))
+    (dolist (entry (butlast captured))
+      (assert (eql (second entry) (backend-virtual-reader-xid (first entry))))
+      (assert (gethash (second entry) *recovery-reader-xids*))
+      (assert (eq (third entry) (backend-transaction-snapshot (first entry))))))
+  (format t "promotion-readers: live ownership and EOF cleanup PASS~%"))

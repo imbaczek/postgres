@@ -76,9 +76,6 @@ if [ "${LIVE_CHILD_ADOPTION:-0}" = 1 ]; then
         start
         checked "(setf *physical-promotion-test-hook*
           (lambda (point)
-            (when (eq point :before-online-intent)
-              (setf (symbol-function (quote physical-promotion-start-child-primary))
-                    (function physical-promotion-start-live-child-primary)))
             (when (eq point :$point)
               (with-open-file (stream \"$CASE/marker\" :direction :output
                                       :if-exists :error :if-does-not-exist :create)

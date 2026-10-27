@@ -315,7 +315,9 @@ replacement. A new process must classify durable control before retrying."
   (let ((finished nil))
     (unwind-protect
          (let ((end (physical-promotion-publish-child-control)))
-           (physical-promotion-start-child-primary)
+           (if *physical-promotion-preserve-readers-p*
+               (physical-promotion-start-live-child-primary)
+               (physical-promotion-start-child-primary))
            (setf finished t)
            end)
       (unless finished (setf *physical-recovery-failed-p* t)))))

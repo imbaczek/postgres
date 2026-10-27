@@ -212,6 +212,112 @@
 (deftest promotion-reader-enrollment-requires-owned-closed-admission
     (ok (intake-fails-p #'pg::physical-promotion-enroll-readers)))
 
+(deftest online-promotion-audits-orphan-readers-before-unrestricted-replay
+    (call-with-live-child-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (let ((pg::*backend-registry* (make-hash-table :test #'eql))
+             (pg::*shutdown-abandoned-backends* nil))
+         (setf (pg::backend-state pg::*backend*) :idle
+               (gethash -90 pg::*recovery-reader-xids*) t
+               (gethash 900 pg::*relation-readers*) '(-90))
+         (let* ((start (pg::physical-store-written-lsn store))
+                (bytes (pg::wal-encode-record pg::+wal-record-batch-start+ 0 start #()))
+                (terminal (+ start (length bytes))))
+           (pg::physical-store-input store start bytes)
+           (pg::physical-store-input
+            store terminal
+            (pg::wal-encode-record pg::+wal-record-maintenance+ 0 terminal #()))
+           (pg::physical-store-flush store))
+         (call-with-current-promotion-owner
+          (lambda ()
+            (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+              (let ((message (handler-case
+                                 (progn (pg::physical-promotion-try-online) nil)
+                               (error (condition) (princ-to-string condition)))))
+                (ok (and message (search "promotion reader registry has no backend owner" message)))))))
+         (ok (= 216 pg::*last-replay-lsn*))
+         (ok (eql 2 (getf pg::*physical-recovery-state* :phase)))))
+     :committed-child nil))
+
+(deftest promotion-reader-backlog-defers-complete-barriers-but-not-unfinished-tails
+    (dolist (complete '(nil t))
+      (call-with-promotion-reader-fixture
+       (lambda ()
+         (let* ((store pg::*physical-receive-store*)
+                (start (pg::physical-store-written-lsn store))
+                (bytes (pg::wal-encode-record pg::+wal-record-batch-start+ 0 start #())))
+           (pg::ensure-transaction-snapshot pg::*backend* 1)
+           (pg::physical-store-input store start bytes)
+           (when complete
+             (let ((terminal (+ start (length bytes))))
+               (pg::physical-store-input
+                store terminal
+                (pg::wal-encode-record pg::+wal-record-maintenance+ 0 terminal #()))))
+           (ok (eql (not complete) (pg::call-with-physical-promotion-readers #'pg::physical-promotion-replay-backlog)))
+           (ok (= 216 pg::*last-replay-lsn*))
+           (ok (eql 2 (getf pg::*physical-recovery-state* :phase)))
+           (ok (not pg::*physical-recovery-failed-p*)))))))
+
+(deftest live-promotion-completes-with-readers-enrolled-before-intent
+    (call-with-live-child-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (let* ((pg::*backend-registry* (make-hash-table :test #'eql))
+              (pg::*shutdown-abandoned-backends* nil)
+              (snapshot (pg::ensure-transaction-snapshot pg::*backend* 1))
+              (token (pg::get-current-reader-xid))
+              (catalog pg::*catalog*)
+              (clog pg::*clog-stream*)
+              (streams pg::*relation-streams*))
+         (setf (gethash 1 pg::*backend-registry*) pg::*backend*
+               (pg::backend-read-only pg::*backend*) nil)
+         (call-with-current-promotion-owner
+          (lambda ()
+            (call-with-promotion-exclusion
+             (lambda ()
+               (ok (intake-fails-p #'pg::physical-promotion-publish-intent))
+               (ok (= 424
+                      (pg::call-with-physical-promotion-readers
+                       (lambda ()
+                         (pg::physical-promotion-publish-intent)
+                         (pg::physical-promotion-install-prefix)
+                         (pg::physical-promotion-complete-child)))))))))
+         (ok (eq catalog pg::*catalog*))
+         (ok (eq clog pg::*clog-stream*))
+         (ok (eq streams pg::*relation-streams*))
+         (ok (eq snapshot (pg::backend-transaction-snapshot pg::*backend*)))
+         (ok (= token (pg::backend-virtual-reader-xid pg::*backend*)))
+         (ok (gethash token pg::*recovery-reader-xids*))
+         (ok (pg::backend-transaction-read-only-p))
+         (ok (not (pg::recovery-in-progress-p)))
+         (pg::commit-transaction)
+         (ok (pg::xid-wrap-users-empty-p))
+         (ok (not (pg::backend-transaction-read-only-p)))))
+     :committed-child nil))
+
+(deftest live-promotion-reader-scope-fences-a-failed-transition
+    (call-with-promotion-reader-fixture
+     (lambda ()
+       (ok (eq :injected
+               (catch 'reader-transition-fault
+                 (pg::call-with-physical-promotion-readers
+                  (lambda () (throw 'reader-transition-fault :injected))))))
+       (ok pg::*physical-recovery-failed-p*))))
+
+(deftest live-promotion-reader-scope-yields-to-shutdown-before-intent
+    (call-with-promotion-reader-fixture
+     (lambda ()
+       (let ((pg::*shutdown* pg::+no-shutdown+))
+         (ok (handler-case
+                 (pg::call-with-physical-promotion-readers
+                  (lambda ()
+                    (setf pg::*shutdown* pg::+smart-shutdown+)
+                    (pg::physical-promotion-publish-intent)))
+               (pg::physical-promotion-shutdown () t)))
+         (ok (eql 2 (getf pg::*physical-recovery-state* :phase)))
+         (ok (not pg::*physical-recovery-failed-p*))))))
+
 (defun call-with-live-child-adoption ()
   (call-with-current-promotion-owner
    (lambda ()

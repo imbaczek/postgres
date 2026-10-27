@@ -29,26 +29,36 @@ orchestrator can yield before intent without marking recovery failed."
                (not *swank-listener-enabled-p*))
     (error "online promotion requires an owned healthy streaming standby")))
 
+(defun physical-promotion-replay-backlog ()
+  (unless *physical-promotion-preserve-readers-p*
+    (error "promotion replay requires verified reader ownership"))
+  (physical-recovery-flush)
+  (if (physical-recovery-reader-conflict-p)
+      (physical-replay-with-readers)
+      (physical-recovery-replay-core))
+  (multiple-value-bind (removed terminal)
+      (physical-recovery-proven-drops
+       *physical-receive-store* (getf *physical-recovery-state* :cluster-identity)
+       :required-lsn *last-replay-lsn*)
+    (declare (ignore removed))
+    (= terminal *last-replay-lsn*)))
+
 (defun physical-promotion-try-online ()
-  "Try to finish promotion after recovery workers have been joined.
-Own reload exclusion and admission quiescence only for this attempt. Return
-:DEFERRED if an idle transaction remains, so the caller can sleep with the gate
-open. Otherwise replay the complete durable backlog, save its restartpoint,
-publish intent and commit the child. Return its checkpoint end."
   (sb-thread:with-mutex (*reload-run-lock*)
     (with-live-operation-quiescence
       (physical-promotion-check-online)
-      (when (physical-recovery-reader-conflict-p)
-        (return-from physical-promotion-try-online :deferred))
-      (physical-recovery-flush)
-      (physical-recovery-replay-core)
-      (physical-recovery-restartpoint-core)
-      (physical-promotion-test-point :before-online-intent)
-      (physical-promotion-publish-intent)
-      (physical-promotion-test-point :after-online-intent)
-      (physical-promotion-install-prefix)
-      (prog1 (physical-promotion-complete-child)
-        (setf *physical-promotion-stopping-p* nil)))))
+      (call-with-physical-promotion-readers
+       (lambda ()
+         (if (not (physical-promotion-replay-backlog))
+             :deferred
+             (progn
+               (physical-recovery-restartpoint-core)
+               (physical-promotion-test-point :before-online-intent)
+               (physical-promotion-publish-intent)
+               (physical-promotion-test-point :after-online-intent)
+               (physical-promotion-install-prefix)
+               (prog1 (physical-promotion-complete-child)
+                 (setf *physical-promotion-stopping-p* nil)))))))))
 
 (defun physical-recovery-promote ()
   "Promote the owning live standby without restarting its postmaster.
@@ -79,9 +89,7 @@ intent. Other failures after work starts fence the process for restart."
                            do (setf finished t) (return result)
                          do (sleep 0.05)))
                (physical-promotion-shutdown (condition)
-                 (unless (and (shutdown-in-progress-p)
-                              (eql 2 (getf *physical-recovery-state* :phase))
-                              (not *physical-recovery-failed-p*))
+                 (unless (physical-promotion-can-yield-to-shutdown-p)
                    (error condition))
                  (setf finished t)
                  :shutdown))
