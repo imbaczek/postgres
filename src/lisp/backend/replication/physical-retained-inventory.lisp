@@ -225,6 +225,7 @@ Return the freshly decoded payload."
     payload))
 
 (defun physical-retained-inventory-keep-entries (entries ids)
+  "Select unique IDs from the previous inventory, preserving entry order."
   (unless (listp ids) (error "retained WAL kept IDs must be a list"))
   (let ((available (make-hash-table :test #'eql)) (selected (make-hash-table :test #'eql)))
     (dolist (entry entries) (setf (gethash (first entry) available) t))
@@ -238,6 +239,11 @@ Return the freshly decoded payload."
 
 (defun physical-retained-inventory-publish-under-lock
     (directory identity target text images &key previous (keep-ids nil keep-supplied-p) protect)
+  "Publish an inventory under the archive mutex.
+
+When KEEP-IDS is supplied, retain only those previous entries; an explicit NIL
+keeps none. Otherwise retain all previous entries. Call PROTECT with the candidate
+ID and entries before writing objects. The caller owns control selection."
   (unless (sb-thread:holding-mutex-p *physical-retained-inventory-publish-lock*)
     (error "retained WAL publication requires archive exclusion"))
   (physical-retained-wal-check-budget images)
@@ -275,12 +281,12 @@ Return the freshly decoded payload."
     (directory identity target text images &key previous (keep-ids nil keep-supplied-p))
   "Publish immutable extents and an inventory generation; return its synced ID.
 
-Copy new images after checking the candidate budget.  The caller must durably
-reference the returned ID in control before deletion can be considered.  Future
-cleanup must protect selected and scoped references and in-flight publishers
-through that control selection; this mutex alone does not cover that interval.
-This function checks supplied data but does not establish its base or receive
-anchors independently."
+Copy new images after checking the candidate budget.  If KEEP-IDS is supplied,
+retain only those entries from PREVIOUS; an explicit NIL retains none.  The
+caller must durably reference the returned ID in control before deletion can be
+considered.  Cleanup must protect selected and scoped references and in-flight
+publishers through control selection; this mutex alone does not cover that
+interval.  Supplied base and receive anchors are not independently established."
   (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
     (apply #'physical-retained-inventory-publish-under-lock directory identity target text images
            :previous previous (when keep-supplied-p (list :keep-ids keep-ids)))))

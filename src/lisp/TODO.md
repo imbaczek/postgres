@@ -13,7 +13,7 @@
   temporary stream ownership, executor parking, client application-name settings,
   supported implicit query blocks, SQL promotion, fresh child backup/follow and
   durable receive-history selection, source-side follow anchors, the read-only
-  extent layer and immutable inventory publication have completed
+  extent layer, immutable inventory publication and local retained-root ownership have completed
   this pass and its review. Keep the same order for the remaining HA work.
 
 - [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker

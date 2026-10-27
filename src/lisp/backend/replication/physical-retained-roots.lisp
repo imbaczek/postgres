@@ -1,9 +1,19 @@
+;;;; Process-local ownership of immutable retained WAL objects.
+;;;;
+;;;; Selected references protect complete inventories. Update holds protect old
+;;;; and candidate objects until durable control selection is resolved. Startup
+;;;; must restore every durable reference before deletion starts. Callers own
+;;;; control serialization; callbacks run outside the archive mutex. Never take
+;;;; store or WAL locks while holding that mutex.
+
 (in-package #:pg)
 
 (defstruct (physical-retained-root-reference (:constructor %make-physical-retained-root-reference))
+  "A process-local owner's selected root and the objects it protects."
   directory identity root-id objects)
 
 (defstruct (physical-retained-root-hold (:constructor %make-physical-retained-root-hold))
+  "Protect an update's old and candidate objects until selection is resolved."
   owner directory identity expected-root objects candidates reference (state :preparing))
 
 (defvar *physical-retained-root-references* (make-hash-table :test #'eq))
@@ -15,19 +25,23 @@
 (defvar *physical-retained-root-test-hook* nil)
 
 (defun physical-retained-root-test-point (point hold)
+  "Call the private root-ownership test hook, if installed."
   (when *physical-retained-root-test-hook* (funcall *physical-retained-root-test-hook* point hold)))
 
 (defun physical-retained-root-require-lock ()
+  "Require the archive mutex for registry and object protection changes."
   (unless (sb-thread:holding-mutex-p *physical-retained-inventory-publish-lock*)
     (error "retained WAL ownership requires archive exclusion")))
 
 (defun physical-retained-root-directory (directory)
+  "Return the existing archive directory's canonical pathname."
   (unless (uiop:directory-pathname-p directory) (error "retained WAL directory is not a directory pathname"))
   (let ((path (truename directory)))
     (unless (uiop:directory-exists-p path) (error "retained WAL directory is absent"))
     path))
 
 (defun physical-retained-root-copy-identity (identity)
+  "Validate and copy an owner's base identity."
   (let ((keys '(:system-id :base-timeline :base :manifest-digest)))
     (physical-follow-check-plist identity keys)
     (unless (and (every (lambda (key) (typep (getf identity key) '(unsigned-byte 64)))
@@ -37,11 +51,13 @@
     (loop for key in keys append (list key (getf identity key)))))
 
 (defun physical-retained-root-add-objects (destination source)
+  "Add SOURCE's protected object keys to DESTINATION."
   (when source (maphash (lambda (object value) (declare (ignore value))
                           (setf (gethash object destination) t)) source))
   destination)
 
 (defun physical-retained-root-make-reference (directory identity id entries)
+  "Build a reference protecting the inventory and its extent objects."
   (let ((objects (make-hash-table :test #'equal)))
     (setf (gethash (cons :inventory id) objects) t)
     (dolist (entry entries) (setf (gethash (cons :extent (first entry)) objects) t))
@@ -50,28 +66,36 @@
      :root-id id :objects objects)))
 
 (defun physical-retained-root-load-reference (directory identity id history)
+  "Validate the complete selected root under the archive mutex and build its reference."
   (physical-retained-root-require-lock)
   (when id
     (let ((payload (physical-retained-inventory-load directory id identity history)))
       (physical-retained-root-make-reference directory identity id (getf payload :entries)))))
 
 (defun physical-retained-root-current (owner)
+  "Return OWNER's process-local selected root ID, if any."
   (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
     (let ((reference (gethash owner *physical-retained-root-references*)))
       (and reference (physical-retained-root-reference-root-id reference)))))
 
 (defun physical-retained-root-check-context (reference directory identity)
+  "Reject a reference belonging to another archive or base."
   (when reference
     (unless (and (equal directory (physical-retained-root-reference-directory reference))
                  (equal identity (physical-retained-root-reference-identity reference)))
       (error "retained WAL control owner belongs to another archive or base"))))
 
 (defun physical-retained-root-install (owner reference)
+  "Install or remove OWNER's reference under the archive mutex."
   (physical-retained-root-require-lock)
   (if reference (setf (gethash owner *physical-retained-root-references*) reference)
       (remhash owner *physical-retained-root-references*)))
 
 (defun physical-retained-root-register (owner directory id identity history)
+  "Validate and register an owner's durable root before deletion starts.
+
+The registry is process-local.  Startup must restore every durable reference;
+this function refuses a silent change to an already registered root."
   (unless owner (error "retained WAL control owner is absent"))
   (let ((directory (physical-retained-root-directory directory))
         (identity (physical-retained-root-copy-identity identity)))
@@ -87,6 +111,7 @@
       id)))
 
 (defun physical-retained-root-drop-hold (hold state)
+  "Retire HOLD and its owner update under the archive mutex."
   (physical-retained-root-require-lock)
   (setf (physical-retained-root-hold-state hold) state)
   (remhash hold *physical-retained-root-holds*)
@@ -94,6 +119,7 @@
     (remhash (physical-retained-root-hold-owner hold) *physical-retained-root-updates*)))
 
 (defun physical-retained-root-control-snapshot (owner directory identity)
+  "Capture OWNER's reference and any uncertain hold before control readback."
   (physical-retained-root-require-lock)
   (let ((current (gethash owner *physical-retained-root-references*))
         (hold (gethash owner *physical-retained-root-updates*)))
@@ -106,6 +132,7 @@
     (values current hold)))
 
 (defun physical-retained-root-check-control-snapshot (owner current hold)
+  "Require the captured owner state to be unchanged after control readback."
   (physical-retained-root-require-lock)
   (unless (and (eq current (gethash owner *physical-retained-root-references*))
                (eq hold (gethash owner *physical-retained-root-updates*))
@@ -113,6 +140,10 @@
     (error "retained WAL control owner changed during control readback")))
 
 (defun physical-retained-root-reconcile (owner directory identity history read-selected)
+  "Reconcile an uncertain update with the root read from durable control.
+
+Read control outside the archive mutex, then recheck the captured owner state
+before validating and installing its reference."
   (unless (and owner (functionp read-selected))
     (error "retained WAL reconciliation requires an owner and durable control reader"))
   (let ((directory (physical-retained-root-directory directory))
@@ -137,6 +168,9 @@
           id)))))
 
 (defun physical-retained-root-retire (owner directory expected identity read-selected)
+  "Retire an owner's protection after control no longer selects a root.
+
+Read control outside the archive mutex and recheck the captured owner state."
   (unless (and owner (functionp read-selected))
     (error "retained WAL retirement requires an owner and durable control reader"))
   (let ((directory (physical-retained-root-directory directory))
@@ -160,6 +194,7 @@
       t)))
 
 (defun physical-retained-root-prepare-update (owner directory identity expected)
+  "Prepare a hold only if EXPECTED is the owner's current control root."
   (physical-retained-root-require-lock)
   (unless owner (error "retained WAL control owner is absent"))
   (when (gethash owner *physical-retained-root-updates*)
@@ -175,6 +210,7 @@
      :objects objects :candidates (make-hash-table :test #'eql))))
 
 (defun physical-retained-root-check-hold (hold)
+  "Require an active hold registered for its owner."
   (physical-retained-root-require-lock)
   (unless (and (eq hold (gethash hold *physical-retained-root-holds*))
                (eq hold (gethash (physical-retained-root-hold-owner hold) *physical-retained-root-updates*))
@@ -182,6 +218,11 @@
     (error "retained WAL publication hold is not active")))
 
 (defun physical-retained-root-update-publish-under-lock (hold target text images previous keep-ids keep-supplied-p)
+  "Publish a candidate while HOLD protects its inputs and objects.
+
+PREVIOUS supplies inventory entries and can differ from the expected control
+root. Successful intermediate candidates remain protected; the latest is the
+candidate for selection."
   (physical-retained-root-check-hold hold)
   (unless (or (null previous) (typep previous '(unsigned-byte 64)))
     (error "invalid retained WAL previous inventory"))
@@ -211,12 +252,20 @@
       id)))
 
 (defun physical-retained-root-update-publish (hold target text images &key previous (keep-ids nil keep-supplied-p))
+  "Publish another candidate under an active hold."
   (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
     (physical-retained-root-update-publish-under-lock hold target text images previous keep-ids keep-supplied-p)))
 
 (defun call-with-physical-retained-root-update
     (function owner directory identity target text images
      &key previous (expected-root previous) (keep-ids nil keep-supplied-p) read-selected)
+  "Publish candidates and select the latest through the caller's control owner.
+
+The caller serializes its control. FUNCTION must fsync that control and return
+the selected latest candidate ID; READ-SELECTED reads it back. Both run outside
+the archive mutex. Agreement is not independent proof that control was synced.
+An exit before FUNCTION releases the hold; an uncertain exit after it begins
+retains protection until readback reconciliation or durable retirement."
   (unless (and (functionp function) (functionp read-selected))
     (error "retained WAL update requires selection and durable control reader functions"))
   (let ((directory (physical-retained-root-directory directory))
@@ -262,6 +311,7 @@
                 (physical-retained-root-drop-hold hold :released))))))))
 
 (defun physical-retained-root-protected-under-lock (directory kind id)
+  "Check references and holds for this directory, object kind and ID."
   (physical-retained-root-require-lock)
   (unless (and (member kind '(:extent :inventory)) (typep id '(unsigned-byte 64)))
     (error "invalid retained WAL protection lookup"))
@@ -274,11 +324,16 @@
                              (gethash object (physical-retained-root-hold-objects hold)))))))
 
 (defun physical-retained-root-protected-p (directory kind id)
+  "Return whether an object is protected by a local reference or hold."
   (let ((directory (physical-retained-root-directory directory)))
     (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
       (physical-retained-root-protected-under-lock directory kind id))))
 
 (defun physical-retained-root-delete-unprotected (directory kind id)
+  "Delete an unprotected object under the archive mutex and sync its directory.
+
+Restore all durable references before deletion begins.  Do not acquire store or
+WAL locks while holding the archive mutex."
   (let ((directory (physical-retained-root-directory directory)))
     (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
       (unless (physical-retained-root-protected-under-lock directory kind id)

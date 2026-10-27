@@ -418,9 +418,10 @@ passes 200 trials with seed 42. Luna max and Sol high cleared the corrected code
 Sol medium found no useful refactor. Terra 6.1 wrote source docstrings, reviewed
 separately by the primary agent.
 
-Durable inventory publication, authenticated production before compaction, reopen/GC
-integration, promotion references and network serving remain pending. The new layer
-alone grants no serving authority and does not yet change receive-spool retention.
+At this checkpoint, durable inventory publication was still pending; the following
+sections describe its implementation. Authenticated production before compaction,
+receive reopen/GC integration, promotion references and network serving remain open.
+The extent layer alone grants no serving authority or change to spool retention.
 
 ### Immutable retained inventory publication
 
@@ -445,7 +446,8 @@ passes. Luna max and Sol high cleared the code and crash-test changes; Sol mediu
 found no useful refactor. A further Sol review cleared the preflight scalar/depth
 guards. Terra 6.1's source docstrings were separately reviewed by the primary agent.
 
-Astra's integration review specifies the next steps:
+Astra's integration review specifies this order; step 1 is now implemented in
+the local ownership layer described below:
 
 1. Add explicit kept-entry selection for immutable replacement and a local hold
    spanning publication through durable control selection. Serialize the control
@@ -466,6 +468,42 @@ protects their objects. GC must use the same reservation/deletion exclusion and
 must not acquire store or WAL locks while holding it. Initially keeping GC disabled
 allows control integration to be reviewed independently. No coordination is added;
 bounded retention, authenticated sealing, control selection and serving remain open.
+
+### Replacement inventories and local root ownership
+
+Replacement publication can now keep an explicit subset of the previous
+inventory. Omitting `keep-ids` keeps all previous entries; supplying NIL keeps
+none. The previous generation remains immutable and independently readable.
+
+The local root registry protects full selected inventories and transient update
+holds. It protects candidate and input objects before publication, then keeps the
+hold through the caller's durable control write and readback. Each owner has one
+active or uncertain update, checked against its expected old root. Callbacks run
+outside the archive mutex; the caller still serializes the actual control owner
+and performs the required fsync. Matching acknowledgement and readback do not
+independently prove that synchronization occurred.
+
+An exit before the selection callback begins releases the hold. An uncertain
+exit after it begins retains conservative protection until reconciliation or
+durable control retirement. Both operations snapshot ownership before reading
+control and reject a changed snapshot afterward. Interrupt masks cover registry
+installation, final handoff and the entire cleanup, including mutex acquisition.
+Deletion checks protection and unlinks under the same archive mutex.
+
+All 632 physical tests, 170 interop tests and 1,598 legacy checks pass, along with
+strict fresh-cache compilation. The inventory codec property passes 200 trials
+with seed 42; input coverage and rejected-generation counts remain unmeasured.
+The added tests cover replacement/coalescing, uncertain selection, stale reads,
+multiple publication batches, deletion races and repeated cleanup interruption.
+Luna max and Sol high found the cleanup interrupt window; their rechecks cleared
+the correction. Sol medium found no worthwhile refactor.
+
+These references are process-local. Startup must restore every durable control
+reference before deletion starts. The layer enables neither automatic GC nor
+receive/promotion integration. Next, seal endangered bytes before each receive
+compaction and select floor, floor digest and inventory root together, then carry
+fork-bounded roots through promotion before adding scoped consumers and serving.
+No coordination is added.
 
 ### SQL configuration reload
 
