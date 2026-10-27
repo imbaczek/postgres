@@ -12,14 +12,12 @@ SRV=
 READER_B=
 READER_C=
 DROP_B=
-DROP_C=
 . "$BASE/t/test-support.sh"
 test_debug_setup join-ddl-concurrency "$PORT" "$TMP" "$LOG"
 
 cleanup() {
     : > "$TMP/drop-b.release"
-    : > "$TMP/drop-c.release"
-    for pid in "$READER_B" "$READER_C" "$DROP_B" "$DROP_C"; do
+    for pid in "$READER_B" "$READER_C" "$DROP_B"; do
         [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
     done
     if [ -n "$SRV" ]; then
@@ -31,7 +29,7 @@ cleanup() {
         done
         kill -KILL "$SRV" 2>/dev/null || true
     fi
-    for pid in "$READER_B" "$READER_C" "$DROP_B" "$DROP_C"; do
+    for pid in "$READER_B" "$READER_C" "$DROP_B"; do
         [ -z "$pid" ] || wait "$pid" 2>/dev/null || true
     done
     [ -z "$SRV" ] || wait "$SRV" 2>/dev/null || true
@@ -85,15 +83,12 @@ done
 
 run -c "create table join_ddl_a (id int)" >/dev/null
 run -c "create table join_ddl_b (id int)" >/dev/null
-run -c "create table join_ddl_c (id int)" >/dev/null
 run -c "insert into join_ddl_a values (1), (2)" >/dev/null
 run -c "insert into join_ddl_b values (1), (2)" >/dev/null
-run -c "insert into join_ddl_c values (1), (2)" >/dev/null
 
 install_output=$(control <<EOF
 (defvar *join-ddl-heap-a* nil)
 (defvar *join-ddl-heap-b* nil)
-(defvar *join-ddl-heap-c* nil)
 (defvar *join-ddl-xid-b* nil)
 (defvar *join-ddl-xid-c* nil)
 (defvar *join-ddl-original-readers* nil)
@@ -101,19 +96,18 @@ install_output=$(control <<EOF
 (defvar *join-ddl-original-wait* nil)
 (let* ((db (gethash "postgres" (catalog-databases *catalog*)))
        (table-a (gethash "join_ddl_a" (database-tables db)))
-       (table-b (gethash "join_ddl_b" (database-tables db)))
-       (table-c (gethash "join_ddl_c" (database-tables db))))
-  (unless (and table-a table-b table-c) (error "JOIN DDL tables are missing"))
+       (table-b (gethash "join_ddl_b" (database-tables db))))
+  (unless (and table-a table-b) (error "JOIN DDL tables are missing"))
   (setf *join-ddl-heap-a* (pg-class-relfilenode table-a)
-        *join-ddl-heap-b* (pg-class-relfilenode table-b)
-        *join-ddl-heap-c* (pg-class-relfilenode table-c)))
+        *join-ddl-heap-b* (pg-class-relfilenode table-b)))
 (setf *join-ddl-original-readers* (symbol-function 'register-relation-readers)
       *join-ddl-original-build-locks* (symbol-function 'acquire-relation-build-locks)
       *join-ddl-original-wait* (symbol-function 'condition-wait-with-timeout))
 (setf (symbol-function 'register-relation-readers)
       (lambda (relfilenodes xid)
-        (let ((label (cond ((member *join-ddl-heap-b* relfilenodes :test #'=) "b")
-                           ((member *join-ddl-heap-c* relfilenodes :test #'=) "c"))))
+        (let ((label (when (and (member *join-ddl-heap-a* relfilenodes :test #'=)
+                                (member *join-ddl-heap-b* relfilenodes :test #'=))
+                       (if (= (first relfilenodes) *join-ddl-heap-a*) "b" "c"))))
           (when (and label (member *join-ddl-heap-a* relfilenodes :test #'=))
             (if (equal label "b")
                 (setf *join-ddl-xid-b* xid)
@@ -125,7 +119,8 @@ install_output=$(control <<EOF
 (setf (symbol-function 'condition-wait-with-timeout)
       (lambda (waitqueue mutex)
         (when (and *backend* (eql mutex *relation-lock-mutex*))
-          (let ((xid (backend-xid *backend*)))
+          (let ((xid (or (backend-virtual-reader-xid *backend*)
+                         (backend-xid *backend*))))
             (when (eql xid *join-ddl-xid-b*)
               (with-open-file (out "$TMP/select-b.waiting"
                                    :direction :output :if-exists :supersede)
@@ -139,8 +134,7 @@ install_output=$(control <<EOF
       (lambda (relfilenodes &optional own-xid wait-readers-p on-acquired)
         (let ((token (funcall *join-ddl-original-build-locks*
                               relfilenodes own-xid wait-readers-p on-acquired)))
-          (let ((label (cond ((member *join-ddl-heap-b* relfilenodes :test #'=) "b")
-                             ((member *join-ddl-heap-c* relfilenodes :test #'=) "c"))))
+          (let ((label (when (member *join-ddl-heap-b* relfilenodes :test #'=) "b")))
             (when label
               (with-open-file (out (format nil "$TMP/drop-~a.gated" label)
                                    :direction :output :if-exists :supersede)
@@ -158,22 +152,19 @@ echo "$install_output" | grep -Eq ';; (read )?error:' \
 (run -c "drop table join_ddl_b" > "$TMP/drop-b.out" 2>&1 \
     && : > "$TMP/drop-b.done") &
 DROP_B=$!
-(run -c "drop table join_ddl_c" > "$TMP/drop-c.out" 2>&1 \
-    && : > "$TMP/drop-c.done") &
-DROP_C=$!
 wait_for_file "$TMP/drop-b.gated"
-wait_for_file "$TMP/drop-c.gated"
 
-# A is admissible for both queries while each other heap is protected by its
-# DROP TABLE gate. An incremental reader implementation would leave an A
-# registration behind while waiting for B or C.
+# One DROP holds B's gate while opposite-order JOINs request A and B.
+# DDL event ordering serializes DROP bodies, so two paused DROPs cannot both
+# publish gates. Reader labels b/c below denote the two source orders.
+# An incremental reader would leave an A registration while waiting for B.
 (
     run -c 'select join_ddl_a.id from join_ddl_a join join_ddl_b on join_ddl_a.id = join_ddl_b.id' \
         > "$TMP/reader-b.out" 2>&1 || : > "$TMP/reader-b.failed"
 ) &
 READER_B=$!
 (
-    run -c 'select join_ddl_a.id from join_ddl_a join join_ddl_c on join_ddl_a.id = join_ddl_c.id' \
+    run -c 'select join_ddl_a.id from join_ddl_b join join_ddl_a on join_ddl_a.id = join_ddl_b.id' \
         > "$TMP/reader-c.out" 2>&1 || : > "$TMP/reader-c.failed"
 ) &
 READER_C=$!
@@ -189,8 +180,7 @@ state_output=$(control <<'EOF'
     (if (and xid-b xid-c
              (loop for xid in (list xid-b xid-c)
                    always (loop for relfilenode in
-                                (list *join-ddl-heap-a* *join-ddl-heap-b*
-                                      *join-ddl-heap-c*)
+                                (list *join-ddl-heap-a* *join-ddl-heap-b*)
                                 never (member xid (gethash relfilenode
                                                            *relation-readers*)
                                               :test #'=))))
@@ -205,14 +195,12 @@ echo "$state_output" | grep -Eq ';; (read )?error:' \
     && fail "JOIN reader admission inspection failed"
 
 : > "$TMP/drop-b.release"
-: > "$TMP/drop-c.release"
 wait_for_file "$TMP/drop-b.done"
-wait_for_file "$TMP/drop-c.done"
 wait_for_file "$TMP/reader-b.failed"
 wait_for_file "$TMP/reader-c.failed"
 grep -Fq 'relation "join_ddl_b" does not exist' "$TMP/reader-b.out" \
     || fail "JOIN B did not fail because DROP TABLE invalidated its plan"
-grep -Fq 'relation "join_ddl_c" does not exist' "$TMP/reader-c.out" \
+grep -Fq 'relation "join_ddl_b" does not exist' "$TMP/reader-c.out" \
     || fail "JOIN C did not fail because DROP TABLE invalidated its plan"
 for output in "$TMP/reader-b.out" "$TMP/reader-c.out"; do
     if awk '$0 == "1" || $0 == "2" { found = 1 } END { exit !found }' "$output"; then
@@ -226,8 +214,6 @@ wait "$READER_C" || fail "second JOIN session failed unexpectedly"
 READER_C=
 wait "$DROP_B" || fail "DROP TABLE B failed"
 DROP_B=
-wait "$DROP_C" || fail "DROP TABLE C failed"
-DROP_C=
 
 restore_output=$(control <<'EOF'
 (setf (symbol-function 'register-relation-readers) *join-ddl-original-readers*
