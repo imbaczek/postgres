@@ -13,6 +13,7 @@
                (:file "t/retained-inventory-tests")
                (:file "t/retained-root-tests")
                (:file "t/retained-overlap-tests")
+               (:file "t/retained-project-tests")
                (:file "t/physical-bootstrap-tests")
                (:file "t/physical-recovery-tests")
                (:file "t/physical-control-tests")
