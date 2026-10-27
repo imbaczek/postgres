@@ -18,8 +18,8 @@
   (unless (and (uiop:directory-pathname-p directory) (typep id '(unsigned-byte 64)))
     (error "invalid retained WAL object location"))
   (merge-pathnames (format nil "~a-~16,'0X.~a"
-                           (ecase kind (:extent "extent") (:inventory "inventory"))
-                           id (ecase kind (:extent "wal") (:inventory "index")))
+                           (ecase kind (:extent "extent") (:inventory "inventory") (:overlap "overlap"))
+                           id (ecase kind (:extent "wal") (:inventory "index") (:overlap "wal")))
                    directory))
 
 (defun physical-retained-object-read (directory kind id maximum)
@@ -70,12 +70,43 @@ syncs them; a collision is an error and leaves the existing file intact."
     (fsync-directory directory)
     id))
 
+(defun physical-retained-inventory-check-overlap (entry identity)
+  (unless (and (listp entry) (= 3 (length entry))
+               (typep (first entry) '(unsigned-byte 64))
+               (typep (second entry) '(unsigned-byte 64))
+               (<= 20 (second entry) +physical-retained-image-limit+))
+    (error "invalid retained base overlap reference"))
+  (let ((metadata (physical-retained-overlap-check-metadata (third entry))))
+    (unless (every (lambda (key) (eql (getf identity key) (getf metadata key)))
+                   '(:system-id :base-timeline :base :manifest-digest))
+      (error "retained base overlap has foreign identity")))
+  entry)
+
+(defun physical-retained-inventory-read-overlap (directory payload)
+  (let ((entry (getf payload :base-overlap)))
+    (when entry
+      (physical-retained-inventory-check-overlap entry (getf payload :identity))
+      (let ((image (physical-retained-object-read directory :overlap (first entry)
+                                                  +physical-retained-image-limit+)))
+        (unless (= (length image) (second entry))
+          (error "retained base overlap reference length differs"))
+        (multiple-value-bind (metadata bytes) (physical-retained-overlap-decode image)
+          (unless (equal metadata (third entry))
+            (error "retained base overlap differs from indexed metadata"))
+          (list metadata bytes))))))
+
+(defun physical-retained-inventory-payload (identity target text entries overlap)
+  (append (list :version 1 :identity identity :history-target target :history-text text :entries entries)
+          (when overlap (list :base-overlap overlap))))
+
 (defun physical-retained-inventory-check (payload)
   "Check inventory identity, lineage and ordered extent metadata.
 
 The supplied anchors still require independent base, receive or restartpoint
 proof from the producer."
-  (physical-follow-check-plist payload '(:version :identity :history-target :history-text :entries))
+  (physical-follow-check-plist
+   payload (append '(:version :identity :history-target :history-text :entries)
+                   (when (member :base-overlap payload) '(:base-overlap))))
   (let* ((identity (getf payload :identity)) (target (getf payload :history-target))
                                              (text (getf payload :history-text)) (entries (getf payload :entries))
                                              (previous nil) (seen (make-hash-table :test #'eql)))
@@ -88,6 +119,8 @@ proof from the producer."
                  (<= (length text) +physical-retained-metadata-limit+)
                  (listp entries) (<= (length entries) +physical-retained-inventory-count+))
       (error "invalid retained WAL inventory fields"))
+    (when (member :base-overlap payload)
+      (physical-retained-inventory-check-overlap (getf payload :base-overlap) identity))
     (let ((history (timeline-check-lineage (timeline-parse-history target text))))
       (unless (timeline-prefix-boundary-p (getf identity :base-timeline) (getf identity :base) history)
         (error "retained WAL inventory has foreign base ancestry"))
@@ -190,10 +223,11 @@ The CRC detects accidental corruption; it does not authenticate the payload."
       (error "retained WAL inventory differs from required identity or history"))
     payload))
 
-(defun physical-retained-inventory-verify-entries (entries history loader)
+(defun physical-retained-inventory-verify-entries (entries history loader &optional overlap)
   "Validate checked, ordered entries using bounded LOADER reads.
 Keep only the current segment's shared prefix between images."
-  (let ((segment nil) (prefix nil))
+  (let ((segment (when overlap (floor (1- (getf (first overlap) :base)) +wal-segment-size+)))
+        (prefix (second overlap)))
     (dolist (entry entries)
       (let ((image (funcall loader (first entry))))
         (unless (and (= (length image) (second entry))
@@ -221,7 +255,8 @@ Return the freshly decoded payload."
     (physical-retained-inventory-verify-entries
      (getf payload :entries) history
      (lambda (image-id)
-       (physical-retained-object-read directory :extent image-id +physical-retained-image-limit+)))
+       (physical-retained-object-read directory :extent image-id +physical-retained-image-limit+))
+     (physical-retained-inventory-read-overlap directory payload))
     payload))
 
 (defun physical-retained-inventory-keep-entries (entries ids)
@@ -237,7 +272,7 @@ Return the freshly decoded payload."
              (setf (gethash id selected) t))
     (loop for entry in entries when (gethash (first entry) selected) collect entry)))
 
-(defun physical-retained-inventory-publish-entries-under-lock (directory identity target text entries protect)
+(defun physical-retained-inventory-publish-entries-under-lock (directory identity target text entries protect &key base-overlap)
   "Validate staged entries and publish one inventory under archive exclusion.
 
 Check identity, history, images and shared prefixes before calling PROTECT for
@@ -245,19 +280,20 @@ the root and entries. Return the synced ID and freshly decoded payload."
   (unless (sb-thread:holding-mutex-p *physical-retained-inventory-publish-lock*)
     (error "retained WAL publication requires archive exclusion"))
   (let* ((image (physical-retained-inventory-image
-                 (list :version 1 :identity identity :history-target target :history-text text :entries entries)))
+                 (physical-retained-inventory-payload identity target text entries base-overlap)))
          (payload (physical-retained-inventory-decode image))
          (history (physical-retained-inventory-check payload)))
     (physical-retained-inventory-verify-entries
      (getf payload :entries) history
-     (lambda (id) (physical-retained-object-read directory :extent id +physical-retained-image-limit+)))
+     (lambda (id) (physical-retained-object-read directory :extent id +physical-retained-image-limit+))
+     (physical-retained-inventory-read-overlap directory payload))
     (funcall protect (physical-store-update-digest #xCBF29CE484222325 image) (getf payload :entries))
     (let ((id (physical-retained-object-publish directory :inventory image +physical-retained-inventory-limit+)))
       (physical-retained-inventory-test-point :after-inventory-publication id)
       (values id payload))))
 
 (defun physical-retained-inventory-publish-under-lock
-    (directory identity target text images &key previous (keep-ids nil keep-supplied-p) protect)
+    (directory identity target text images &key previous (keep-ids nil keep-supplied-p) protect base-overlap)
   "Publish an inventory under the archive mutex.
 
 When KEEP-IDS is supplied, retain only those previous entries; an explicit NIL
@@ -279,14 +315,20 @@ ID and entries before writing objects. The caller owns control selection."
                          collect (let ((metadata (physical-retained-extent-decode image)))
                                    (setf (gethash id new) image)
                                    (list id (length image) metadata)))))
-         (payload (list :version 1 :identity identity :history-target target :history-text text
-                        :entries (sort entries #'< :key (lambda (entry) (getf (third entry) :start)))))
+         (payload (physical-retained-inventory-payload
+                   identity target text
+                   (sort entries #'< :key (lambda (entry) (getf (third entry) :start)))
+                   (or (getf old :base-overlap) base-overlap)))
          (root-image (physical-retained-inventory-image payload)))
+    (when (and (getf old :base-overlap) base-overlap
+               (not (equal (getf old :base-overlap) base-overlap)))
+      (error "retained base overlap cannot change within one base identity"))
     (physical-retained-inventory-verify-entries
      (getf payload :entries) history
      (lambda (id)
        (or (gethash id new)
-           (physical-retained-object-read directory :extent id +physical-retained-image-limit+))))
+           (physical-retained-object-read directory :extent id +physical-retained-image-limit+)))
+     (physical-retained-inventory-read-overlap directory payload))
     (when protect
       (funcall protect (physical-store-update-digest #xCBF29CE484222325 root-image) (getf payload :entries)))
     (dolist (image images)

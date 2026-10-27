@@ -56,21 +56,28 @@
                           (setf (gethash object destination) t)) source))
   destination)
 
-(defun physical-retained-root-make-reference (directory identity id entries)
+(defun physical-retained-root-make-reference (directory identity id entries &optional overlap)
   "Build a reference protecting the inventory and its extent objects."
   (let ((objects (make-hash-table :test #'equal)))
     (setf (gethash (cons :inventory id) objects) t)
+    (when overlap (setf (gethash (cons :overlap (first overlap)) objects) (copy-tree overlap)))
     (dolist (entry entries) (setf (gethash (cons :extent (first entry)) objects) t))
     (%make-physical-retained-root-reference
      :directory directory :identity (physical-retained-root-copy-identity identity)
      :root-id id :objects objects)))
+
+(defun physical-retained-root-reference-overlap (reference)
+  (loop for object being the hash-keys of (physical-retained-root-reference-objects reference)
+          using (hash-value descriptor)
+        when (eq (car object) :overlap) return descriptor))
 
 (defun physical-retained-root-load-reference (directory identity id history)
   "Validate the complete selected root under the archive mutex and build its reference."
   (physical-retained-root-require-lock)
   (when id
     (let ((payload (physical-retained-inventory-load directory id identity history)))
-      (physical-retained-root-make-reference directory identity id (getf payload :entries)))))
+      (physical-retained-root-make-reference directory identity id (getf payload :entries)
+                                             (getf payload :base-overlap)))))
 
 (defun physical-retained-root-current (owner)
   "Return OWNER's process-local selected root ID, if any."
@@ -227,6 +234,17 @@ Read control outside the archive mutex and recheck the captured owner state."
           (physical-retained-root-hold-reference hold) prepared))
   id)
 
+(defun physical-retained-root-merge-overlap (old new)
+  (when (and old new (not (equal old new)))
+    (error "retained base overlap cannot change within one base identity"))
+  (or old new))
+
+(defun physical-retained-root-held-overlap (hold)
+  (let ((reference (or (physical-retained-root-hold-reference hold)
+                       (gethash (physical-retained-root-hold-owner hold)
+                                *physical-retained-root-references*))))
+    (when reference (physical-retained-root-reference-overlap reference))))
+
 (defun physical-retained-root-update-publish-under-lock (hold target text images previous keep-ids keep-supplied-p)
   "Publish a candidate while HOLD protects its inputs and objects.
 
@@ -239,17 +257,19 @@ candidate for selection."
   (let* ((directory (physical-retained-root-hold-directory hold))
          (identity (physical-retained-root-hold-identity hold))
          (history (timeline-check-lineage (timeline-parse-history target text)))
-         (prepared nil))
+         (prepared nil) (overlap (physical-retained-root-held-overlap hold)))
     (when previous
       (setf (gethash (cons :inventory previous) (physical-retained-root-hold-objects hold)) t)
       (let* ((index (physical-retained-inventory-read-index directory previous identity history))
-             (reference (physical-retained-root-make-reference directory identity previous (getf index :entries))))
+             (reference (physical-retained-root-make-reference directory identity previous (getf index :entries)
+                                                               (getf index :base-overlap))))
+        (setf overlap (physical-retained-root-merge-overlap overlap (getf index :base-overlap)))
         (physical-retained-root-add-objects (physical-retained-root-hold-objects hold)
                                             (physical-retained-root-reference-objects reference))))
     (let ((id (apply #'physical-retained-inventory-publish-under-lock
-                     directory identity target text images :previous previous
+                     directory identity target text images :previous previous :base-overlap overlap
                      :protect (lambda (id entries)
-                                (setf prepared (physical-retained-root-make-reference directory identity id entries))
+                                (setf prepared (physical-retained-root-make-reference directory identity id entries overlap))
                                 (physical-retained-root-add-objects
                                  (physical-retained-root-hold-objects hold)
                                  (physical-retained-root-reference-objects prepared)))
@@ -278,13 +298,35 @@ Publication and hold changes use archive exclusion. Return a fresh entry."
       (physical-retained-inventory-test-point :after-extent-publication id))
     entry))
 
-(defun physical-retained-root-publish-staged-entries (hold target text entries)
+(defun physical-retained-root-stage-overlap (hold target text image)
+  (physical-retained-wal-check-budget (list image))
+  (let* ((image (copy-seq image))
+         (id (physical-store-update-digest #xCBF29CE484222325 image))
+         (metadata (physical-retained-overlap-decode image))
+         (entry (list id (length image) metadata)))
+    (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+      (physical-retained-root-check-hold hold)
+      (physical-retained-inventory-check
+       (physical-retained-inventory-payload
+        (physical-retained-root-hold-identity hold) target text nil entry))
+      (setf (gethash (cons :overlap id) (physical-retained-root-hold-objects hold)) t)
+      (physical-retained-object-publish (physical-retained-root-hold-directory hold)
+                                        :overlap image +physical-retained-image-limit+)
+      (physical-retained-inventory-test-point :after-overlap-publication id))
+    entry))
+
+(defun physical-retained-root-publish-staged-entries (hold target text entries &key base-overlap)
   "Publish a checked root from entries reserved by HOLD.
 
 Require every extent ID to be protected before loading it. Protect the root
 before writing, and record it as a candidate only after successful publication."
   (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
     (physical-retained-root-check-hold hold)
+    (setf base-overlap (physical-retained-root-merge-overlap
+                        (physical-retained-root-held-overlap hold) base-overlap))
+    (when (and base-overlap
+               (not (gethash (cons :overlap (first base-overlap)) (physical-retained-root-hold-objects hold))))
+      (error "retained base overlap was not reserved before reading"))
     (dolist (entry entries)
       (unless (gethash (cons :extent (first entry)) (physical-retained-root-hold-objects hold))
         (error "retained inventory entry was not reserved before reading")))
@@ -296,9 +338,10 @@ before writing, and record it as a candidate only after successful publication."
            (lambda (id entries)
              (setf prepared (physical-retained-root-make-reference
                              (physical-retained-root-hold-directory hold)
-                             (physical-retained-root-hold-identity hold) id entries))
+                             (physical-retained-root-hold-identity hold) id entries base-overlap))
              (physical-retained-root-add-objects (physical-retained-root-hold-objects hold)
-                                                 (physical-retained-root-reference-objects prepared))))
+                                                 (physical-retained-root-reference-objects prepared)))
+           :base-overlap base-overlap)
         (physical-retained-root-record-candidate hold id prepared)
         (values id payload)))))
 
@@ -364,7 +407,7 @@ retains protection until readback reconciliation or durable retirement."
 (defun physical-retained-root-protected-under-lock (directory kind id)
   "Check references and holds for this directory, object kind and ID."
   (physical-retained-root-require-lock)
-  (unless (and (member kind '(:extent :inventory)) (typep id '(unsigned-byte 64)))
+  (unless (and (member kind '(:extent :inventory :overlap)) (typep id '(unsigned-byte 64)))
     (error "invalid retained WAL protection lookup"))
   (let ((object (cons kind id)))
     (or (loop for reference being the hash-values of *physical-retained-root-references*

@@ -101,15 +101,18 @@ floors beyond the base, including empty segment boundaries."
 
 (defun physical-retained-seal-initialize-budget (seal)
   "Initialize the entry count and text estimate for incremental checks."
-  (setf (physical-retained-seal-entry-count seal) (length (physical-retained-seal-entries seal))
-        (physical-retained-seal-entry-bytes seal)
-        (loop for entry in (physical-retained-seal-entries seal) sum (physical-retained-seal-entry-cost entry))
-        (physical-retained-seal-header-bytes seal)
-        (- (physical-retained-inventory-check-text-budget
-            (list :version 1 :identity (physical-store-retained-identity (physical-retained-seal-store seal))
-                  :history-target (physical-retained-seal-target seal) :history-text (physical-retained-seal-text seal)
-                  :entries nil))
-           3)))
+  (let* ((hold (physical-retained-seal-hold seal))
+         (reference (when hold (physical-retained-root-hold-reference hold))))
+    (setf (physical-retained-seal-entry-count seal) (length (physical-retained-seal-entries seal))
+          (physical-retained-seal-entry-bytes seal)
+          (loop for entry in (physical-retained-seal-entries seal) sum (physical-retained-seal-entry-cost entry))
+          (physical-retained-seal-header-bytes seal)
+          (- (physical-retained-inventory-check-text-budget
+              (physical-retained-inventory-payload
+               (physical-store-retained-identity (physical-retained-seal-store seal))
+               (physical-retained-seal-target seal) (physical-retained-seal-text seal) nil
+               (when reference (physical-retained-root-reference-overlap reference))))
+             3))))
 
 (defun physical-retained-seal-entry-budget (seal entry replacement)
   "Check the budget after adding ENTRY and removing REPLACEMENT, if present.
