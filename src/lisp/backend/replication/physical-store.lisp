@@ -12,12 +12,14 @@ the receive history without changing that base or main WAL control."
   directory system-id timeline base-lsn floor-lsn (floor-digest #xCBF29CE484222325)
   written-lsn flushed-lsn decoder
   (written-digest #xCBF29CE484222325) (flushed-digest #xCBF29CE484222325)
-  lock-stream stream segment segment-timeline selection (failed-p nil) (closed-p nil)
+  lock-stream stream segment segment-timeline selection retained-identity retained-root
+  (failed-p nil) (closed-p nil)
   (mutex (sb-thread:make-mutex :name "physical WAL receive store")))
 
 (declaim (ftype function physical-store-load-history-selection physical-store-validate-history-prefix
                 physical-store-history-discard-tail physical-store-history-segment-entries
-                physical-store-history-check-record))
+                physical-store-history-check-record physical-store-check-retained-root
+                physical-store-check-retained-identity))
 
 (defvar *physical-store-test-hook* nil
   "Disabled-by-default hook for deterministic receive durability failures.")
@@ -64,11 +66,14 @@ This FNV-1a-64 checksum detects accidental prefix damage, not malicious tamperin
                                                         (digest (physical-store-written-digest store))
                                                         (floor-lsn (physical-store-floor-lsn store))
                                                         (floor-digest (physical-store-floor-digest store))
-                                                        (selection (physical-store-selection store)))
-  "Encode receive progress with the original base identity, prefix and floor.
-Include a history reference when a selection exists."
-  (let* ((size (if selection 80 68))
+                                                        (selection (physical-store-selection store))
+                                                        (retained-root (physical-store-retained-root store)))
+  (let* ((size (cond (retained-root 96) (selection 80) (t 68)))
          (bytes (make-array size :element-type '(unsigned-byte 8) :initial-element 0)))
+    (when retained-root
+      (unless (typep retained-root '(unsigned-byte 64))
+        (error "invalid retained receive inventory ID"))
+      (physical-store-check-retained-identity store))
     (replace bytes #(80 71 80 72 89 83 48 51))
     (wal-set-u64 bytes 8 (physical-store-system-id store))
     (wal-set-u32 bytes 16 (physical-store-timeline store))
@@ -80,6 +85,9 @@ Include a history reference when a selection exists."
     (when selection
       (wal-set-u32 bytes 64 (getf selection :target))
       (wal-set-u64 bytes 68 (getf selection :digest)))
+    (when retained-root
+      (wal-set-u64 bytes 76 retained-root)
+      (wal-set-u64 bytes 84 (getf (physical-store-retained-identity store) :manifest-digest)))
     (wal-set-u32 bytes (- size 4) (wal-crc32 bytes))
     bytes))
 
@@ -109,43 +117,40 @@ Include a history reference when a selection exists."
   (physical-store-test-point :after-control-write store))
 
 (defun physical-store-load-control (store)
-  "Read receive progress and any selected-history reference.
-The control reference is the selection commit point; an unreferenced history
-blob does not select a timeline."
-  (let* ((bytes (with-open-file (stream (physical-store-path store "receive.control")
-                                        :element-type '(unsigned-byte 8))
-                  (unless (member (file-length stream) '(52 68 80))
-                    (error "invalid physical receive control length"))
-                  (let ((bytes (make-array (file-length stream) :element-type '(unsigned-byte 8))))
-                    (unless (= (read-sequence bytes stream) (length bytes))
-                      (error "short physical receive control"))
-                    bytes)))
-         (v3 (>= (length bytes) 68))
-         (crc-offset (- (length bytes) 4))
-         (crc (wal-u32 bytes crc-offset))
-         (base (wal-u64 bytes 24))
-         (flush (wal-u64 bytes 32))
-         (floor (if v3 (wal-u64 bytes 48) base))
-         (seed (if v3 (wal-u64 bytes 56) #xCBF29CE484222325)))
-    (wal-set-u32 bytes crc-offset 0)
-    (unless (and (equalp (subseq bytes 0 8)
-                         (if v3 #(80 71 80 72 89 83 48 51) #(80 71 80 72 89 83 48 50)))
-                 (zerop (wal-u32 bytes 20)) (= crc (wal-crc32 bytes))
-                 (= (wal-u64 bytes 8) (physical-store-system-id store))
-                 (= (wal-u32 bytes 16) (physical-store-timeline store))
-                 (<= base floor flush)
-                 (or (/= base floor) (= seed #xCBF29CE484222325)))
-      (error "corrupt or foreign physical receive control"))
-    (setf (physical-store-base-lsn store) base
-          (physical-store-floor-lsn store) floor
-          (physical-store-floor-digest store) seed
-          (physical-store-written-lsn store) flush
-          (physical-store-flushed-lsn store) flush
-          (physical-store-written-digest store) (wal-u64 bytes 40)
-          (physical-store-flushed-digest store) (wal-u64 bytes 40)
-          (physical-store-selection store)
-          (when (= 80 (length bytes))
-            (physical-store-load-history-selection store (wal-u32 bytes 64) (wal-u64 bytes 68))))))
+  (let* ((bytes (read-bounded-regular-file (physical-store-path store "receive.control") 96))
+         (size (length bytes)))
+    (unless (member size '(52 68 80 96))
+      (error "invalid physical receive control length"))
+    (let* ((v3 (>= size 68))
+           (crc-offset (- size 4)) (crc (wal-u32 bytes crc-offset))
+           (base (wal-u64 bytes 24)) (flush (wal-u64 bytes 32))
+           (floor (if v3 (wal-u64 bytes 48) base))
+           (seed (if v3 (wal-u64 bytes 56) #xCBF29CE484222325))
+           (history-p (or (= size 80) (and (= size 96) (plusp (wal-u32 bytes 64))))))
+      (wal-set-u32 bytes crc-offset 0)
+      (unless (and (equalp (subseq bytes 0 8)
+                           (if v3 #(80 71 80 72 89 83 48 51) #(80 71 80 72 89 83 48 50)))
+                   (zerop (wal-u32 bytes 20)) (= crc (wal-crc32 bytes))
+                   (= (wal-u64 bytes 8) (physical-store-system-id store))
+                   (= (wal-u32 bytes 16) (physical-store-timeline store))
+                   (<= base floor flush)
+                   (or (/= base floor) (= seed #xCBF29CE484222325))
+                   (or (/= size 96) history-p (zerop (wal-u64 bytes 68))))
+        (error "corrupt or foreign physical receive control"))
+      (setf (physical-store-base-lsn store) base
+            (physical-store-floor-lsn store) floor
+            (physical-store-floor-digest store) seed
+            (physical-store-written-lsn store) flush
+            (physical-store-flushed-lsn store) flush
+            (physical-store-written-digest store) (wal-u64 bytes 40)
+            (physical-store-flushed-digest store) (wal-u64 bytes 40)
+            (physical-store-selection store)
+            (when history-p (physical-store-load-history-selection store (wal-u32 bytes 64) (wal-u64 bytes 68)))
+            (physical-store-retained-root store) (when (= size 96) (wal-u64 bytes 76)))
+      (when (= size 96)
+        (physical-store-check-retained-identity store)
+        (unless (= (wal-u64 bytes 84) (getf (physical-store-retained-identity store) :manifest-digest))
+          (error "receive inventory belongs to another immutable base"))))))
 
 (defun physical-store-segments (store)
   "Return sorted segment numbers for the original base timeline.
@@ -282,6 +287,9 @@ PUBLISH-RESTARTPOINT runs under the store mutex with the validated cumulative
 checksum at CURSOR. It must durably publish database state before returning.
 Do not call from a mapper callback. Preserve unflushed writes and decoder state."
   (with-physical-store (store)
+    (when (and (physical-store-retained-root store)
+               (> cursor (physical-store-floor-lsn store)))
+      (error "receive compaction requires a sealed replacement inventory"))
     (let ((digest (physical-store-prefix-digest-under-lock store cursor)))
       (funcall publish-restartpoint digest)
       (physical-store-test-point :after-restartpoint-publication store)
@@ -326,7 +334,7 @@ Do not call from a mapper callback. Preserve unflushed writes and decoder state.
            stream)
       (unless stream (sb-posix:close fd)))))
 
-(defun physical-store-open (directory system-id timeline &key create (start-lsn 0) (discard-tail t) (create-lock t))
+(defun physical-store-open (directory system-id timeline &key create (start-lsn 0) (discard-tail t) (create-lock t) retained-identity)
   "Own a native receive spool, creating only in an existing empty directory.
 CREATE never overwrites an old incarnation. Opening an existing spool validates
 its control, selected history and durable prefix before discarding tails.
@@ -342,7 +350,8 @@ or creating a missing lock. Do not resume input in that mode."
     (error "invalid physical receive store directory or identity"))
   (let ((store (%make-physical-store :directory directory :system-id system-id
                                      :timeline timeline :base-lsn start-lsn :floor-lsn start-lsn
-                                     :written-lsn start-lsn :flushed-lsn start-lsn))
+                                     :written-lsn start-lsn :flushed-lsn start-lsn
+                                     :retained-identity retained-identity))
         (success nil))
     (unwind-protect
          (progn
@@ -369,6 +378,7 @@ or creating a missing lock. Do not resume input in that mode."
                (progn
                  (physical-store-load-control store)
                  (physical-store-validate-prefix store)
+                 (physical-store-check-retained-root store)
                  (when discard-tail (physical-store-discard-tail store))))
            (setf (physical-store-decoder store)
                  (make-physical-wal-decoder :start-lsn (physical-store-flushed-lsn store))

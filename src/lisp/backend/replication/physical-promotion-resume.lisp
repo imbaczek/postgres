@@ -72,7 +72,8 @@
   "Verify named acknowledged files, then own the spool without creating or trimming."
   (let* ((directory (physical-recovery-spool-directory))
          (probe (%make-physical-store :directory directory :system-id (getf state :system-id)
-                                      :timeline (getf state :timeline))))
+                                      :timeline (getf state :timeline)
+                                      :retained-identity (physical-recovery-retained-identity state))))
     (wal-namespace-file-stat (physical-store-path probe "receive.control"))
     (wal-namespace-file-stat (physical-store-path probe "receive.lock"))
     (physical-store-load-control probe)
@@ -88,7 +89,8 @@
                   for stat = (wal-namespace-file-stat (physical-store-segment-path probe segment) t)
                   unless (or stat (= segment first)) do (error "missing acknowledged pending segment")))))
     (physical-store-open directory (getf state :system-id) (getf state :timeline)
-                         :discard-tail nil :create-lock nil)))
+                         :discard-tail nil :create-lock nil
+                         :retained-identity (physical-recovery-retained-identity state))))
 
 (defun physical-promotion-validate-cold-state (state metadata prefix generation store &optional (artifact-checker #'physical-promotion-wal-plan))
   "Use the live publisher's proof checker without installing candidate globals."

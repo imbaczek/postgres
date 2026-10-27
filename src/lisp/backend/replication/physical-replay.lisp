@@ -75,13 +75,18 @@ Install the returned state only after durable control publication."
     (setf (getf candidate :replay-timeline) replay-timeline)
     (setf *physical-recovery-state* (physical-recovery-write-control candidate 2 applied next-xid))))
 
+(defun physical-recovery-retained-identity (&optional (state *physical-recovery-state*))
+  (list :system-id (getf state :system-id) :base-timeline (getf state :timeline)
+        :base (getf state :end) :manifest-digest (getf state :manifest-digest)))
+
 (defun physical-recovery-open-receive-store (&key create)
   (let ((directory (physical-recovery-spool-directory)))
     (when create
       (wal-ensure-directory-durable directory))
     (physical-store-open directory (getf *physical-recovery-state* :system-id)
                          (getf *physical-recovery-state* :timeline)
-                         :create create :start-lsn (getf *physical-recovery-state* :end))))
+                         :create create :start-lsn (getf *physical-recovery-state* :end)
+                         :retained-identity (physical-recovery-retained-identity))))
 
 (defun physical-recovery-open-clog-redo ()
   ;; Open once when streaming starts. Keep the old stream if opening fails.

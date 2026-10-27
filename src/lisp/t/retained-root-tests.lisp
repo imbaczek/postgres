@@ -414,3 +414,207 @@
                     (ok (zerop (hash-table-count pg::*physical-retained-root-updates*))))
                (sb-thread:signal-semaphore release)
                (when blocker (sb-thread:join-thread blocker :timeout 5))))))))
+
+(defun call-with-receive-retained-fixture (function)
+  (with-physical-store-directory (root)
+    (let* ((identity (list :system-id 123 :base-timeline 1 :base 32 :manifest-digest 77))
+           (store (pg::physical-store-open root 123 1 :create t :start-lsn 32 :retained-identity identity))
+           (archive (pg::physical-store-retained-directory store))
+           (prefix (concatenate '(vector (unsigned-byte 8))
+                                (sample-physical-record 0) (sample-physical-record 32)
+                                (sample-physical-record 64)))
+           (id nil) (image-id nil))
+      (unwind-protect
+           (progn
+             (pg::physical-store-input store 32 (subseq prefix 32))
+             (pg::physical-store-flush store)
+             (pg::wal-ensure-directory-durable archive)
+             (let* ((metadata (list :version 1 :system-id 123 :base-timeline 1 :base 32
+                                    :manifest-digest 77 :history-target 1 :history-digest nil :history-text ""
+                                    :start 32 :end 96 :start-digest #xCBF29CE484222325
+                                    :end-digest (pg::physical-store-flushed-digest store)
+                                    :segment 0 :file-timeline 1
+                                    :prefix-digest (pg::physical-store-update-digest #xCBF29CE484222325 prefix)))
+                    (image (pg::physical-retained-extent-encode metadata prefix)))
+               (setf id (pg::physical-retained-inventory-publish archive identity 1 "" (list image))
+                     image-id (pg::physical-store-update-digest #xCBF29CE484222325 image)))
+             (pg::physical-store-save-control store 96 :digest (pg::physical-store-flushed-digest store)
+                                                       :floor-lsn 96 :floor-digest (pg::physical-store-flushed-digest store)
+                                                       :retained-root id))
+        (pg::physical-store-close store))
+      (funcall function root identity id image-id prefix))))
+
+(deftest receive-control-retained-root-is-validated-before-tail-cleanup
+    (call-with-receive-retained-fixture
+     (lambda (root identity id image-id prefix)
+       (let ((reopened (pg::physical-store-open root 123 1 :retained-identity identity)))
+         (unwind-protect
+              (progn
+                (ok (= id (pg::physical-store-retained-root reopened)))
+                (ok (= 96 (pg::physical-store-floor-lsn reopened)))
+                (pg::physical-store-input reopened 96 (sample-physical-record 96))
+                (pg::physical-store-flush reopened))
+           (pg::physical-store-close reopened)))
+       (let ((reopened (pg::physical-store-open root 123 1 :retained-identity identity)))
+         (unwind-protect
+              (progn
+                (ok (= id (pg::physical-store-retained-root reopened)))
+                (ok (= 128 (pg::physical-store-flushed-lsn reopened))))
+           (pg::physical-store-close reopened)))
+       (let* ((path (merge-pathnames "0000000000000000.wal" root))
+              (tail (concatenate '(vector (unsigned-byte 8)) prefix
+                                 (sample-physical-record 96) (sample-physical-record 128))))
+         (pg::wal-atomic-write-bytes path tail)
+         (ok (signals (pg::physical-store-open root 123 1) 'error))
+         (ok (signals (pg::physical-store-open root 123 1
+                                               :retained-identity (list :system-id 123 :base-timeline 1
+                                                                        :base 32 :manifest-digest 78))
+                      'error))
+         (ok (equalp tail (pg::recovery-read-bytes path)))
+         (delete-file (pg::physical-retained-object-path (merge-pathnames "retained/" root) :extent image-id))
+         (ok (signals (pg::physical-store-open root 123 1 :retained-identity identity) 'error))
+         (ok (equalp tail (pg::recovery-read-bytes path)))))))
+
+(deftest receive-control-retained-root-must-match-the-floor-and-digest
+    (call-with-receive-retained-fixture
+     (lambda (root identity id image-id prefix)
+       (declare (ignore id image-id))
+       (let* ((path (merge-pathnames "receive.control" root))
+              (original (pg::recovery-read-bytes path))
+              (wal (merge-pathnames "0000000000000000.wal" root))
+              (tail (concatenate '(vector (unsigned-byte 8)) prefix (sample-physical-record 96))))
+         (pg::wal-atomic-write-bytes wal tail)
+         (dolist (kind '(:floor :digest :missing-root :reserved-history))
+           (let ((bytes (copy-seq original)))
+             (ecase kind
+               (:floor
+                (pg::wal-set-u64 bytes 48 64)
+                (pg::wal-set-u64 bytes 56 (pg::physical-store-update-digest #xCBF29CE484222325
+                                                                            (subseq prefix 32 64))))
+               (:digest
+                (let ((wrong (logxor 1 (pg::wal-u64 bytes 40))))
+                  (pg::wal-set-u64 bytes 40 wrong)
+                  (pg::wal-set-u64 bytes 56 wrong)))
+               (:missing-root (pg::wal-set-u64 bytes 76 (logxor 1 (pg::wal-u64 bytes 76))))
+               (:reserved-history (pg::wal-set-u64 bytes 68 1)))
+             (pg::wal-set-u32 bytes 92 0)
+             (pg::wal-set-u32 bytes 92 (pg::wal-crc32 bytes))
+             (pg::wal-atomic-write-bytes path bytes)
+             (ok (signals (pg::physical-store-open root 123 1 :retained-identity identity) 'error))
+             (ok (equalp tail (pg::recovery-read-bytes wal)))))
+         (pg::wal-atomic-write-bytes path original)))))
+
+(deftest receive-control-preserves-retained-root-through-history-selection
+    (call-with-receive-retained-fixture
+     (lambda (root identity id image-id prefix)
+       (declare (ignore image-id prefix))
+       (let ((store (pg::physical-store-open root 123 1 :retained-identity identity)))
+         (unwind-protect
+              (progn
+                (pg::physical-store-select-history store 2 (store-history-text 1 96) (store-history-eor 96 2 1))
+                (pg::physical-store-input store 96 (store-history-eor 96 2 1))
+                (pg::physical-store-flush store))
+           (pg::physical-store-close store)))
+       (let ((store (pg::physical-store-open root 123 1 :retained-identity identity)))
+         (unwind-protect
+              (progn
+                (ok (= id (pg::physical-store-retained-root store)))
+                (ok (= 2 (pg::physical-store-selected-timeline store)))
+                (ok (= 96 (pg::physical-store-floor-lsn store)))
+                (ok (= 152 (pg::physical-store-flushed-lsn store))))
+           (pg::physical-store-close store))))))
+
+(deftest receive-control-rejects-a-hole-before-a-matching-retained-endpoint
+    (call-with-receive-retained-fixture
+     (lambda (root identity id image-id prefix)
+       (declare (ignore id image-id))
+       (let* ((control (merge-pathnames "receive.control" root))
+              (bytes (pg::recovery-read-bytes control))
+              (metadata (list :version 1 :system-id 123 :base-timeline 1 :base 32
+                              :manifest-digest 77 :history-target 1 :history-digest nil :history-text ""
+                              :start 64 :end 96
+                              :start-digest (pg::physical-store-update-digest #xCBF29CE484222325
+                                                                              (subseq prefix 32 64))
+                              :end-digest (pg::wal-u64 bytes 56) :segment 0 :file-timeline 1
+                              :prefix-digest (pg::physical-store-update-digest #xCBF29CE484222325 prefix)))
+              (hole (pg::physical-retained-inventory-publish
+                     (merge-pathnames "retained/" root) identity 1 ""
+                     (list (pg::physical-retained-extent-encode metadata prefix)))))
+         (pg::wal-set-u64 bytes 76 hole)
+         (pg::wal-set-u32 bytes 92 0)
+         (pg::wal-set-u32 bytes 92 (pg::wal-crc32 bytes))
+         (pg::wal-atomic-write-bytes control bytes)
+         (ok (signals (pg::physical-store-open root 123 1 :retained-identity identity) 'error))))))
+
+(deftest rooted-receive-compaction-cannot-advance-without-a-replacement
+    (call-with-receive-retained-fixture
+     (lambda (root identity id image-id prefix)
+       (declare (ignore image-id prefix))
+       (let ((store (pg::physical-store-open root 123 1 :retained-identity identity))
+             (publications 0))
+         (unwind-protect
+              (progn
+                (pg::physical-store-input store 96 (sample-physical-record 96))
+                (pg::physical-store-flush store)
+                (ok (signals (pg::physical-store-compact store 128
+                                                         (lambda (digest)
+                                                           (declare (ignore digest))
+                                                           (incf publications)))
+                             'error))
+                (ok (zerop publications))
+                (ok (= 96 (pg::physical-store-floor-lsn store))))
+           (pg::physical-store-close store)))
+       (let ((store (pg::physical-store-open root 123 1 :retained-identity identity)))
+         (unwind-protect
+              (progn
+                (ok (= id (pg::physical-store-retained-root store)))
+                (ok (= 96 (pg::physical-store-floor-lsn store)))
+                (ok (= 128 (pg::physical-store-flushed-lsn store))))
+           (pg::physical-store-close store))))))
+
+(deftest rooted-receive-store-opens-through-recovery-and-pending-promotion
+    (call-with-receive-retained-fixture
+     (lambda (root identity id image-id prefix)
+       (declare (ignore identity image-id))
+       (with-physical-store-directory (pgdata)
+         (let* ((pg::*pgdata* pgdata)
+                (pg::*physical-recovery-state* (list :system-id 123 :timeline 1 :end 32 :manifest-digest 77))
+                (spool (pg::physical-recovery-spool-directory))
+                (tail (concatenate '(vector (unsigned-byte 8)) prefix (sample-physical-record 96))))
+           (sb-posix:rename (namestring root) (namestring spool))
+           (pg::wal-atomic-write-bytes (merge-pathnames "0000000000000000.wal" spool) tail)
+           (let ((store (pg::physical-promotion-open-pending-store pg::*physical-recovery-state*)))
+             (unwind-protect
+                  (progn
+                    (ok (= id (pg::physical-store-retained-root store)))
+                    (ok (equalp tail (pg::recovery-read-bytes (pg::physical-store-segment-path store 0)))))
+               (pg::physical-store-close store)))
+           (let ((store (pg::physical-recovery-open-receive-store)))
+             (unwind-protect
+                  (progn
+                    (ok (= id (pg::physical-store-retained-root store)))
+                    (ok (= 96 (pg::physical-store-flushed-lsn store))))
+               (pg::physical-store-close store))))))))
+
+(cl-spec:defproperty receive-control-codec-preserves-full-width-retained-references
+    ((root-id (range integer 0 18446744073709551615))
+     (manifest (range integer 0 18446744073709551615)))
+  (:about pg::physical-store-encode-control)
+  (:trials (:normal 200))
+  (with-physical-store-directory (directory)
+    (let* ((identity (list :system-id 123 :base-timeline 1 :base 32 :manifest-digest manifest))
+           (store (pg::%make-physical-store :directory directory :system-id 123 :timeline 1
+                                            :base-lsn 32 :floor-lsn 32 :retained-identity identity
+                                            :retained-root root-id))
+           (bytes (pg::physical-store-encode-control store 32 :digest #xCBF29CE484222325)))
+      (pg::wal-atomic-write-bytes (merge-pathnames "receive.control" directory) bytes)
+      (setf (pg::physical-store-retained-root store) nil)
+      (pg::physical-store-load-control store)
+      (and (= 96 (length bytes)) (= root-id (pg::physical-store-retained-root store))
+           (= manifest (getf (pg::physical-store-retained-identity store) :manifest-digest))
+           (= 32 (pg::physical-store-floor-lsn store))))))
+
+(deftest generated-receive-control-retained-reference-roundtrips
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'receive-control-codec-preserves-full-width-retained-references :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
