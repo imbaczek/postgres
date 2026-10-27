@@ -32,7 +32,7 @@ An absent selection requires the applied timeline to remain the base timeline."
   (destructuring-bind (&key phase system-id timeline manifest-digest checkpoint
                          applied next-xid db-state state-time (control-version 3)
                          (applied-timeline timeline) history-target history-digest
-                         promotion-child promotion-generation promotion-source-namespace
+                         promotion-child promotion-generation promotion-source-namespace retained-reference
                        &allow-other-keys)
       control
     (and (member phase '(0 1 2 3))
@@ -41,6 +41,13 @@ An absent selection requires the applied timeline to remain the base timeline."
          (every (lambda (value) (typep value '(unsigned-byte 64)))
                 (list system-id manifest-digest checkpoint applied))
          (member control-version '(1 2 3 4))
+         (or (null retained-reference)
+             (and (= phase 3) (= control-version 4)
+                  (wal-retained-reference-valid-p retained-reference)
+                  (eql timeline (getf retained-reference :base-timeline))
+                  (eql checkpoint (getf retained-reference :base))
+                  (eql manifest-digest (getf retained-reference :manifest-digest))
+                  (eql applied (getf retained-reference :end))))
          (physical-recovery-selection-fields-valid-p
           phase control-version timeline applied-timeline history-target history-digest)
          (integerp next-xid)
@@ -67,22 +74,35 @@ An absent selection requires the applied timeline to remain the base timeline."
                       (member db-state (list +db-in-archive-recovery+
                                              +db-shutdowned-in-recovery+))))))))
 
+(defun physical-recovery-write-retained-reference (bytes offset reference)
+  (wal-set-u64 bytes offset (getf reference :root-id))
+  (wal-set-u32 bytes (+ offset 8) (getf reference :base-timeline))
+  (loop for key in '(:base :manifest-digest :end :end-digest)
+        for position from (+ offset 12) by 8
+        do (wal-set-u64 bytes position (getf reference key))))
+
+(defun physical-recovery-read-retained-reference (bytes offset)
+  (list :root-id (wal-u64 bytes offset) :base-timeline (wal-u32 bytes (+ offset 8))
+        :base (wal-u64 bytes (+ offset 12)) :manifest-digest (wal-u64 bytes (+ offset 20))
+        :end (wal-u64 bytes (+ offset 28)) :end-digest (wal-u64 bytes (+ offset 36))))
+
 (defun physical-recovery-control-image (phase system-id timeline manifest-digest checkpoint applied next-xid
                                         &key (db-state (if (zerop phase) +db-startup+ +db-in-archive-recovery+))
                                           (state-time (- (get-universal-time) 2208988800))
                                           (applied-timeline timeline) history-target history-digest
-                                          promotion-child promotion-generation promotion-source-namespace)
+                                          promotion-child promotion-generation promotion-source-namespace retained-reference)
   (let* ((pending (= phase 3)) (version (if pending 4 3))
                                (extension-start (if pending 84 68))
                                (selected (not (null history-target)))
-                               (crc-offset (+ extension-start (if selected 16 0))))
+                               (reference-offset (+ extension-start (if selected 16 0)))
+                               (crc-offset (+ reference-offset (if retained-reference 44 0))))
     (unless (physical-recovery-control-valid-p
              (list :control-version version :phase phase :system-id system-id :timeline timeline
                    :manifest-digest manifest-digest :checkpoint checkpoint :applied applied
                    :next-xid next-xid :db-state db-state :state-time state-time
                    :applied-timeline applied-timeline :history-target history-target :history-digest history-digest
                    :promotion-child promotion-child :promotion-generation promotion-generation
-                   :promotion-source-namespace promotion-source-namespace))
+                   :promotion-source-namespace promotion-source-namespace :retained-reference retained-reference))
       (error "unrepresentable physical recovery control state"))
     (let ((bytes (make-array (+ crc-offset 4) :element-type '(unsigned-byte 8) :initial-element 0)))
       (replace bytes (if pending #(80 71 82 83 84 65 84 52) #(80 71 82 83 84 65 84 51)))
@@ -103,6 +123,8 @@ An absent selection requires the applied timeline to remain the base timeline."
         (wal-set-u32 bytes extension-start applied-timeline)
         (wal-set-u32 bytes (+ extension-start 4) history-target)
         (wal-set-u64 bytes (+ extension-start 8) history-digest))
+      (when retained-reference
+        (physical-recovery-write-retained-reference bytes reference-offset retained-reference))
       (wal-set-u32 bytes crc-offset (wal-crc32 bytes))
       bytes)))
 
@@ -110,17 +132,19 @@ An absent selection requires the applied timeline to remain the base timeline."
   "Decode recovery control by its magic and length.
 The old pending and selected ordinary images are both 88 bytes; their magic
 separates them. Selected pending control uses 104 bytes."
-  (unless (member (length bytes) '(60 72 88 104))
+  (unless (member (length bytes) '(60 72 88 104 132 148))
     (error "invalid physical recovery control length"))
   (let* ((size (length bytes)) (magic (subseq bytes 0 8))
                                (version (cond
                                           ((and (= size 60) (equalp magic #(80 71 82 83 84 65 84 69))) 1)
                                           ((and (= size 72) (equalp magic #(80 71 82 83 84 65 84 50))) 2)
                                           ((and (member size '(72 88)) (equalp magic #(80 71 82 83 84 65 84 51))) 3)
-                                          ((and (member size '(88 104)) (equalp magic #(80 71 82 83 84 65 84 52))) 4)))
+                                          ((and (member size '(88 104 132 148)) (equalp magic #(80 71 82 83 84 65 84 52))) 4)))
                                (legacy (eql version 1)) (pending (eql version 4))
                                (extension-start (if pending 84 68))
-                               (selected (and (member version '(3 4)) (= size (+ extension-start 20))))
+                               (retained (and pending (member size '(132 148))))
+                               (selected (and (member version '(3 4))
+                                              (= size (+ extension-start 20 (if retained 44 0)))))
                                (crc-offset (- size 4))
                                (copy (copy-seq bytes)) (crc (wal-u32 copy crc-offset))
                                (raw-phase (wal-u32 bytes 8))
@@ -147,13 +171,16 @@ separates them. Selected pending control uses 104 bytes."
         (setf (getf control :applied-timeline) (wal-u32 bytes extension-start)
               (getf control :history-target) (wal-u32 bytes (+ extension-start 4))
               (getf control :history-digest) (wal-u64 bytes (+ extension-start 8))))
+      (when retained
+        (setf (getf control :retained-reference)
+              (physical-recovery-read-retained-reference bytes (- crc-offset 44))))
       (unless (physical-recovery-control-valid-p control :legacy legacy)
         (error "corrupt or unsupported physical recovery control"))
       control)))
 
 (defun physical-recovery-read-control (directory)
   (physical-recovery-decode-control
-   (recovery-read-bytes (physical-recovery-control-path directory) :maximum 104)))
+   (recovery-read-bytes (physical-recovery-control-path directory) :maximum 148)))
 
 (defvar *physical-recovery-control-test-hook* nil
   "Optional deterministic hook for recovery control publication failures.")

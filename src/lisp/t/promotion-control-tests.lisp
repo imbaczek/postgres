@@ -6,6 +6,89 @@
          (append options (list :state-time 12345 :promotion-child 2
                                :promotion-generation 987 :promotion-source-namespace :legacy))))
 
+(deftest pending-control-retained-reference-is-exact-and-crc-bound
+    (dolist (root '(0 18446744073709551615))
+      (dolist (selected '(nil t))
+        (let* ((reference (list :root-id root :base-timeline 1 :base 32 :manifest-digest 77
+                                :end 96 :end-digest 18446744073709551615))
+               (bytes (apply #'pending-test-control :retained-reference reference
+                             (when selected '(:applied-timeline 1 :history-target 2 :history-digest 19))))
+               (control (pg::physical-recovery-decode-control bytes)))
+          (ok (= (if selected 148 132) (length bytes)))
+          (ok (equal reference (getf control :retained-reference)))
+          (ok (= 3 (getf control :phase)))
+          (ok (eql (if selected 2 nil) (getf control :history-target)))
+          (loop for offset from (- (length bytes) 48) below (- (length bytes) 4)
+                do (let ((bad (copy-seq bytes)))
+                     (setf (aref bad offset) (logxor 1 (aref bad offset)))
+                     (ok (intake-fails-p (lambda () (pg::physical-recovery-decode-control bad))))))))))
+
+(deftest pending-control-retained-reference-must-match-promotion
+    (let ((reference '(:root-id 0 :base-timeline 1 :base 32 :manifest-digest 77 :end 96 :end-digest 9)))
+      (dolist (change '((:base-timeline 2) (:base 33) (:manifest-digest 78) (:end 95)))
+        (let ((bad (copy-list reference)))
+          (setf (getf bad (first change)) (second change))
+          (ok (intake-fails-p (lambda () (pending-test-control :retained-reference bad))))))
+      (ok (intake-fails-p
+           (lambda () (pg::physical-recovery-control-image 2 123 1 77 32 96 50
+                                                           :retained-reference reference))))))
+
+(deftest pending-control-retained-reference-reader-and-guard
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (reference '(:root-id 0 :base-timeline 1 :base 32 :manifest-digest 77 :end 96 :end-digest 9))
+             (bytes (pending-test-control :retained-reference reference
+                                          :history-target 2 :history-digest 19))
+             (state (pg::physical-recovery-decode-control bytes)))
+        (pg::wal-atomic-write-bytes (pg::physical-recovery-control-path) bytes)
+        (ok (equal reference (getf (pg::physical-recovery-read-control root) :retained-reference)))
+        (dolist (candidate (list state (pending-test-control)))
+          (let ((candidate (if (listp candidate) candidate (pg::physical-recovery-decode-control candidate))))
+            (ok (handler-case (progn (pg::physical-promotion-check-pending candidate nil nil 987) nil)
+                  (error (condition)
+                    (search "retained pending archive validation" (princ-to-string condition)))))))
+        (ok (equalp bytes (lineage-test-bytes (pg::physical-recovery-control-path))))
+        (pg::wal-atomic-write-bytes (pg::physical-recovery-control-path) (pending-test-control))
+        (ok (handler-case (progn (pg::physical-promotion-check-pending state nil nil 987) nil)
+              (error (condition)
+                (search "retained pending archive validation" (princ-to-string condition)))))
+        (pg::wal-atomic-write-bytes
+         (pg::physical-recovery-control-path)
+         (make-array 149 :element-type '(unsigned-byte 8) :initial-element 0))
+        (ok (intake-fails-p (lambda () (pg::physical-recovery-read-control root)))))))
+
+(deftest pending-control-retained-reference-rejects-valid-crc-mismatches
+    (let ((reference '(:root-id 0 :base-timeline 1 :base 32 :manifest-digest 77 :end 96 :end-digest 9)))
+      (dolist (selected '(nil t))
+        (let* ((bytes (apply #'pending-test-control :retained-reference reference
+                             (when selected '(:history-target 2 :history-digest 19))))
+               (offset (- (length bytes) 48)))
+          (dolist (change '((8 2) (12 33) (20 78) (28 95)))
+            (let ((bad (copy-seq bytes)))
+              (if (= 8 (first change))
+                  (pg::wal-set-u32 bad (+ offset (first change)) (second change))
+                  (pg::wal-set-u64 bad (+ offset (first change)) (second change)))
+              (pg::wal-set-u32 bad (- (length bad) 4) 0)
+              (pg::wal-set-u32 bad (- (length bad) 4) (pg::wal-crc32 bad))
+              (ok (intake-fails-p (lambda () (pg::physical-recovery-decode-control bad))))))))))
+
+(cl-spec:defproperty pending-retained-references-roundtrip
+    ((root (range integer 0 18446744073709551615))
+     (digest (range integer 0 18446744073709551615))
+     (selected (range integer 0 1)))
+  (:about pg::physical-recovery-control-image)
+  (:trials (:normal 200))
+  (let* ((reference (list :root-id root :base-timeline 1 :base 32 :manifest-digest 77
+                          :end 96 :end-digest digest))
+         (bytes (apply #'pending-test-control :retained-reference reference
+                       (when (= selected 1) '(:history-target 2 :history-digest 19)))))
+    (equal reference (getf (pg::physical-recovery-decode-control bytes) :retained-reference))))
+
+(deftest generated-pending-retained-references
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'pending-retained-references-roundtrip :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (deftest pending-promotion-control-binds-source-child-and-exact-generation
     (dolist (namespace '(:legacy :timeline))
       (let* ((bytes (pending-test-control :promotion-source-namespace namespace))

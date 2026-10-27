@@ -55,6 +55,8 @@ Do not open its selected generation or receive spool."
       (let* ((control (physical-recovery-read-control *pgdata*))
              (*catalog-identity-needs-persist-p* nil)
              (catalog (unless system-id (load-catalog))))
+        (when (getf control :retained-reference)
+          (error "retained pending archive validation is not yet installed"))
         (unless (and (eql 3 (getf control :phase))
                      (= (getf control :promotion-child) (getf snapshot :timeline))
                      (= (getf control :applied-timeline (getf control :timeline)) (getf snapshot :prev-timeline))

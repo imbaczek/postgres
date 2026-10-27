@@ -331,6 +331,9 @@ and quiescence in that order; worker shutdown and join occur outside this call."
 
 (defun physical-promotion-check-pending (state metadata prefix generation &key allow-history)
   "Revalidate durable ownership; history publication ends prefix-install eligibility."
+  (when (or (getf state :retained-reference)
+            (getf (physical-recovery-read-control *pgdata*) :retained-reference))
+    (error "retained pending archive validation is not yet installed"))
   (physical-promotion-check-history state allow-history)
   (let ((control (physical-recovery-read-control *pgdata*)))
     (unless (and
