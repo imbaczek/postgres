@@ -1,11 +1,11 @@
 ;;;; Restartpoint generations bind durable data to a validated receive suffix.
 (in-package #:pg-physical-tests)
 
-(defun call-with-restartpoint-fixture (function)
+(defun call-with-restartpoint-fixture (function &key (system-id 123))
   (with-physical-store-directory (root)
     (let* ((pg::*pgdata* root)
            (pg::*physical-recovery-state*
-             (list :system-id 123 :timeline 1 :manifest-digest 77 :end 32 :checkpoint 32
+             (list :system-id system-id :timeline 1 :manifest-digest 77 :end 32 :checkpoint 32
                    :cluster-identity "history-source" :next-xid 50 :required-applied 96 :observed-next-xid 50))
            (pg::*physical-recovery-failed-p* nil)
            (pg::*last-replay-lsn* 96) (pg::*next-xid* 50) (pg::*xid-batch-end* 50)
@@ -30,7 +30,7 @@
         (setf (getf pg::*physical-recovery-state* :wal-namespace) :legacy
               (getf pg::*physical-recovery-state* :files)
               (list (list name 32 (pg::physical-store-update-digest #xCBF29CE484222325 base)))))
-      (let ((store (pg::physical-store-open spool 123 1 :create t :start-lsn 32)))
+      (let ((store (pg::physical-store-open spool system-id 1 :create t :start-lsn 32)))
         (unwind-protect
              (progn
                (pg::physical-store-input store 32 (sample-physical-record 32))

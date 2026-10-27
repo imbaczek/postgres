@@ -6,7 +6,7 @@
     (sb-thread:with-mutex (pg::*reload-run-lock*)
       (pg::with-live-operation-quiescence (funcall function)))))
 
-(defun call-with-promotion-fixture (function &key (namespace :legacy))
+(defun call-with-promotion-fixture (function &key (namespace :legacy) (system-id 123))
   (call-with-restartpoint-fixture
    (lambda (root old-store)
      (pg::physical-store-close old-store)
@@ -18,12 +18,15 @@
             (name (concatenate 'string "pg_wal/" (pg::wal-segment-filename 0 1 namespace)))
             (store (progn
                      (pg::wal-ensure-directory-durable (merge-pathnames "promotion-spool/" root))
-                     (pg::physical-store-open (merge-pathnames "promotion-spool/" root) 123 1
+                     (pg::physical-store-open (merge-pathnames "promotion-spool/" root) system-id 1
                                               :create t :start-lsn 152)))
             (pg::*physical-receive-store* store) (pg::*physical-follow-runtime* nil)
             (pg::*physical-restartpoint-worker* nil) (pg::*physical-shutdown-state* nil)
             (pg::*shutdown-mode* nil) (pg::*shutdown-requested* nil)
             (pg::*swank-listener-enabled-p* nil)
+            (pg::*wal-replication-slots* (make-hash-table :test #'equal))
+            (pg::*physical-source-pins* (make-hash-table :test #'equal))
+            (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
             (pg::*wal-ready* t) (pg::*wal-insert-timeline* 1) (pg::*wal-checkpoint-timeline* 1)
             (pg::*wal-checkpoint-lsn* 152) (pg::*wal-end-lsn* 152) (pg::*wal-durable-lsn* 152)
             (pg::*wal-segment-namespace* namespace) (pg::*last-replay-lsn* 216))
@@ -47,17 +50,18 @@
                                 (pg::physical-store-update-digest #xCBF29CE484222325 control))))
               (pg::wal-atomic-write-bytes
                (pg::physical-recovery-control-path)
-               (pg::physical-recovery-control-image 2 123 1 77 152 216 50))
+               (pg::physical-recovery-control-image 2 system-id 1 77 152 216 50))
               (pg::physical-store-input store 152 (sample-physical-record 152))
               (pg::physical-store-input store 184
                                         (pg::wal-encode-record pg::+wal-record-maintenance+ 0 184 (empty-octets)))
               (pg::physical-store-flush store)
               (pg::physical-store-compact store 216 #'pg::physical-restartpoint-publish)
               (funcall function root store))
-         (pg::physical-store-close store))))))
+         (pg::physical-store-close store))))
+   :system-id system-id))
 
-(defmacro with-promotion-fixture ((root store) &body body)
-  `(call-with-promotion-fixture (lambda (,root ,store) ,@body)))
+(defmacro with-promotion-fixture ((root store &key (system-id 123)) &body body)
+  `(call-with-promotion-fixture (lambda (,root ,store) ,@body) :system-id ,system-id))
 
 (deftest promotion-child-prefix-replaces-stale-files-without-changing-parent
     (dolist (namespace '(:legacy :timeline))
