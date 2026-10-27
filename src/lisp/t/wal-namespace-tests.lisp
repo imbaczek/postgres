@@ -1,6 +1,25 @@
 ;;;; Explicit timeline/segment identity; legacy names remain timeline one.
 (in-package #:pg-physical-tests)
 
+(deftest raw-directory-inventory-preserves-hidden-and-dangling-entries
+    (with-physical-store-directory (root)
+      (let ((directory (merge-pathnames "inventory/" root))
+            (link (merge-pathnames "inventory-link" root))
+            (expected '(".pending.tmp" "broken.wal" "valid.slot")))
+        (pg::wal-ensure-directory-durable directory)
+        (dolist (name '(".pending.tmp" "valid.slot"))
+          (with-open-file (stream (merge-pathnames name directory)
+                                  :direction :output :element-type '(unsigned-byte 8))
+            (finish-output stream)))
+        (sb-posix:symlink "missing-target" (namestring (merge-pathnames "broken.wal" directory)))
+        (ok (equal expected (sort (pg::directory-entry-names directory) #'string<)))
+        (sb-posix:symlink (namestring directory) (namestring link))
+        (ok (intake-fails-p (lambda () (pg::directory-entry-names link))))
+        (ok (equal expected (sort (pg::directory-entry-names link :follow-symlinks t) #'string<)))
+        (ok (intake-fails-p
+             (lambda () (pg::directory-entry-names (merge-pathnames "valid.slot" directory)))))
+        (ok (null (pg::directory-entry-names (merge-pathnames "absent/" root)))))))
+
 (deftest timeline-qualified-segment-names-use-c-log-and-segment-fields
     (ok (equal "000000030000000100000002.wal" (pg::wal-segment-filename 258 3 :timeline)))
   (ok (equal "0000000000000102.wal" (pg::wal-segment-filename 258 1 :legacy)))

@@ -83,6 +83,28 @@ coherent view across atomic publications must compare their control images."
          (sb-posix:fsync fd)
       (sb-posix:close fd))))
 
+(defun directory-entry-names (path &key follow-symlinks)
+  (let* ((trimmed (string-right-trim "/" (namestring path)))
+         (name (if (zerop (length trimmed)) "/" trimmed))
+         (stat (handler-case (funcall (if follow-symlinks #'sb-posix:stat #'sb-posix:lstat) name)
+                 (sb-posix:syscall-error (condition)
+                   (unless (= (sb-posix:syscall-errno condition) sb-posix:enoent)
+                     (error condition))))))
+    (when stat
+      (unless (= #o040000 (logand #o170000 (sb-posix:stat-mode stat)))
+        (error "directory inventory requires an ordinary directory: ~a" path))
+      (let ((directory (sb-posix:opendir name)))
+        (unwind-protect
+             (loop for entry = (progn (sb-alien:set-errno 0) (sb-posix:readdir directory))
+                   for errno = (sb-alien:get-errno)
+                   for item = (unless (sb-alien:null-alien entry) (sb-posix:dirent-name entry))
+                   do (when (and (sb-alien:null-alien entry) (not (zerop errno)))
+                        (error "could not read directory ~a: errno ~d" path errno))
+                   until (sb-alien:null-alien entry)
+                   unless (member item '("." "..") :test #'string=)
+                     collect item)
+          (sb-posix:closedir directory))))))
+
 (defvar *logical-test-failpoint-hook* nil)
 
 (defvar *logical-test-failpoint-lock*

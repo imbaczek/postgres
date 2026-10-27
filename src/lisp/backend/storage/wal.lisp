@@ -1214,21 +1214,9 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
 
 (defun wal-segment-entry-names ()
   "Enumerate actual WAL entries, including dangling symlinks; never accept an I/O-short list."
-  (let ((directory (handler-case (sb-posix:opendir (namestring (wal-directory)))
-                     (sb-posix:syscall-error (condition)
-                       (if (= (sb-posix:syscall-errno condition) sb-posix:enoent)
-                           nil (error condition))))))
-    (when directory
-      (unwind-protect
-           (loop for entry = (progn (sb-alien:set-errno 0) (sb-posix:readdir directory))
-                 for errno = (sb-alien:get-errno)
-                 for name = (unless (sb-alien:null-alien entry) (sb-posix:dirent-name entry))
-                 do (when (and (sb-alien:null-alien entry) (not (zerop errno)))
-                      (error "could not read WAL directory: errno ~d" errno))
-                 until (sb-alien:null-alien entry)
-                 when (and (> (length name) 4) (uiop:string-suffix-p name ".wal"))
-                   collect name)
-        (sb-posix:closedir directory)))))
+  (remove-if-not (lambda (name)
+                   (and (> (length name) 4) (uiop:string-suffix-p name ".wal")))
+                 (directory-entry-names (wal-directory) :follow-symlinks t)))
 
 (defun wal-discover-segments (&optional (timeline *wal-insert-timeline*)
                                 (namespace *wal-segment-namespace*))
