@@ -47,6 +47,22 @@
 (defvar *live-operation-count* 0)
 (defvar *live-operation-backend-counts* (make-hash-table :test #'eq))
 (defvar *live-operation-depth* 0)
+
+(defstruct live-operation-token
+  backend thread lane
+  (state :pending)
+  snapshot-owners)
+
+(defvar *live-operation-current-token* nil)
+
+(defvar *live-operation-parked-p* nil)
+
+(defvar *live-operation-parked* (make-hash-table :test #'eq))
+
+(defvar *live-operation-park-generation* 0)
+
+(defvar *live-operation-parking-test-hook* nil)
+
 (defvar *live-operation-current-lane* nil)
 (defvar *live-operation-check-cancel-p* nil)
 (defvar *live-operation-quiescence-owner* nil)
@@ -136,6 +152,8 @@ must not run inside a handler either; the reloader thread polls the flag."
     (t nil)))
 
 (defun wait-for-live-operation-admission (drain-p &optional backend)
+  (when *live-operation-parked-p*
+    (error "parked callbacks cannot enter live operations"))
   (call-with-live-operation-lock
    (lambda ()
      (loop do (when (and *live-operation-check-cancel-p*
@@ -150,11 +168,15 @@ must not run inside a handler either; the reloader thread polls the flag."
   (values))
 
 (defun enter-live-operation-locked (lane backend)
-  "Publish an admitted operation while owning the live-operation lock."
+  (when *live-operation-parked-p*
+    (error "parked callbacks cannot enter live operations"))
   (sb-sys:without-interrupts
-    (incf *live-operation-count*)
-    (when backend
-      (incf (gethash backend *live-operation-backend-counts* 0))))
+    (let ((next-count (1+ *live-operation-count*))
+          (next-backend-count
+            (when backend (1+ (gethash backend *live-operation-backend-counts* 0)))))
+      (when backend
+        (setf (gethash backend *live-operation-backend-counts*) next-backend-count))
+      (setf *live-operation-count* next-count)))
   lane)
 
 (defun try-enter-live-operation (drain-p &optional backend)
@@ -170,10 +192,22 @@ must not run inside a handler either; the reloader thread polls the flag."
          (when lane
            (enter-live-operation-locked lane backend)))))))
 
-(defun leave-live-operation (&optional backend)
-  ;; Keep termination responsive while waiting for the lock. Once acquired,
-  ;; finish the count/broadcast transition without allowing an interrupt to
-  ;; strand reload waiters. A caught termination is re-signaled afterward.
+(defun remove-live-operation-credit-under-lock (backend)
+  (unless (plusp *live-operation-count*)
+    (error "live operation count underflow"))
+  (when backend
+    (let ((count (gethash backend *live-operation-backend-counts*)))
+      (unless (and count (plusp count))
+        (error "live operation backend count underflow"))
+      (if (= count 1)
+          (remhash backend *live-operation-backend-counts*)
+          (setf (gethash backend *live-operation-backend-counts*) (1- count)))))
+  (decf *live-operation-count*)
+  (when (zerop *live-operation-count*)
+    (sb-thread:condition-broadcast *live-operation-cv*))
+  (values))
+
+(defun release-live-operation-credit (backend &optional token)
   (let ((finished-p nil)
         (lock-acquired-p nil)
         (pending-interrupt nil))
@@ -185,38 +219,151 @@ must not run inside a handler either; the reloader thread polls the flag."
                        (setf lock-acquired-p t)
                        (unwind-protect
                             (progn
-                              (unless (plusp *live-operation-count*)
-                                (error "live operation count underflow"))
-                              (when backend
-                                (let ((backend-count
-                                        (gethash backend
-                                                 *live-operation-backend-counts*)))
-                                  (unless (and backend-count
-                                               (plusp backend-count))
-                                    (error "live operation backend count underflow"))
-                                  (if (= backend-count 1)
-                                      (remhash backend
-                                               *live-operation-backend-counts*)
-                                      (setf (gethash backend
-                                                     *live-operation-backend-counts*)
-                                            (1- backend-count)))))
-                              (decf *live-operation-count*)
-                              (when (zerop *live-operation-count*)
-                                (sb-thread:condition-broadcast *live-operation-cv*))
+                              (when token
+                                (unless (and (eq :active (live-operation-token-state token))
+                                             (eq backend (live-operation-token-backend token)))
+                                  (error "live operation cleanup token mismatch")))
+                              (remove-live-operation-credit-under-lock backend)
+                              (when token (setf (live-operation-token-state token) :released))
                               (setf finished-p t))
                          (sb-thread:release-mutex *live-operation-lock*))))
                  (error (condition)
-                   (if lock-acquired-p
-                       (error condition)
+                   (if lock-acquired-p (error condition)
                        (setf pending-interrupt condition))))
                (unless finished-p
-                 (handler-case
-                     (sb-thread:thread-yield)
-                   (error (condition)
-                     (setf pending-interrupt condition))))))
-    (when pending-interrupt
-      (error pending-interrupt)))
+                 (handler-case (sb-thread:thread-yield)
+                   (error (condition) (setf pending-interrupt condition))))))
+    (when pending-interrupt (error pending-interrupt)))
   (values))
+
+(defun live-operation-parked-count ()
+  (call-with-live-operation-lock
+   (lambda () (hash-table-count *live-operation-parked*))))
+
+(defun live-operation-parked-owners-under-quiescence ()
+  (call-with-live-operation-lock
+   (lambda ()
+     (unless (and (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+                  (not *live-operation-drain-open*)
+                  (zerop *live-operation-count*))
+       (error "parked ownership census requires closed admission"))
+     (loop for token being the hash-keys of *live-operation-parked*
+           do (unless (and (eq :parked (live-operation-token-state token))
+                           (sb-thread:thread-alive-p (live-operation-token-thread token)))
+                (error "invalid parked operation owner"))
+           collect (list token (live-operation-token-backend token)
+                         (live-operation-token-thread token)
+                         (copy-tree (live-operation-token-snapshot-owners token)))))))
+
+(defun live-operation-parking-test-point (point token)
+  (when *live-operation-parking-test-hook*
+    (funcall *live-operation-parking-test-hook* point token)))
+
+(defun capture-live-operation-snapshot-owners ()
+  (sb-thread:with-mutex (*snapshot-count-lock*)
+    (loop for registration in (remove-duplicates *statement-snapshot-registrations* :test #'eq)
+          do (unless (snapshot-registration-p registration)
+               (error "invalid enclosing statement snapshot registration"))
+             (when (snapshot-registration-releasing-p registration)
+               (error "cannot park during snapshot release"))
+          when (snapshot-registration-active-p registration)
+            collect (list registration
+                          (snapshot-registration-lifecycle-generation registration)
+                          (snapshot-registration-snapshot registration)))))
+
+(defun park-live-operation-under-lock (token owners)
+  (unless (and (eq token *live-operation-current-token*)
+               (eq (live-operation-token-thread token) sb-thread:*current-thread*)
+               (eq (live-operation-token-state token) :active)
+               (plusp *live-operation-count*)
+               (let ((backend (live-operation-token-backend token)))
+                 (or (null backend) (plusp (gethash backend *live-operation-backend-counts* 0)))))
+    (error "parking requires the current active admission token"))
+  (let ((published nil))
+    (unwind-protect
+         (progn
+           (setf (gethash token *live-operation-parked*) t)
+           (remove-live-operation-credit-under-lock (live-operation-token-backend token))
+           (setf (live-operation-token-snapshot-owners token) owners
+                 (live-operation-token-state token) :parked
+                 published t)
+           (incf *live-operation-park-generation*)
+           (sb-thread:condition-broadcast *live-operation-cv*))
+      (unless published (remhash token *live-operation-parked*)))))
+
+(defun live-operation-resume-lane ()
+  (if *live-operation-terminal-shutdown*
+      (when (null *live-operation-quiescence-owner*) :terminal-cleanup)
+      (live-operation-admitted-p t)))
+
+(defun restore-live-operation-token (token)
+  (sb-sys:without-interrupts
+    (let ((restored nil) (pending nil) (lane nil))
+      (labels ((defer (condition)
+                 (when (or (null pending) (fatal-error-p condition))
+                   (setf pending condition))))
+        (loop until restored
+              do (handler-case
+                     (sb-sys:allow-with-interrupts
+                       (call-with-live-operation-lock
+                        (lambda ()
+                          (loop until (setf lane (live-operation-resume-lane))
+                                do (sb-thread:condition-wait *live-operation-cv* *live-operation-lock*))
+                          (sb-sys:without-interrupts
+                            (unless (and (eq :parked (live-operation-token-state token))
+                                         (gethash token *live-operation-parked*)
+                                         (eq (live-operation-token-thread token) sb-thread:*current-thread*))
+                              (error "parked admission ownership mismatch"))
+                            (enter-live-operation-locked lane (live-operation-token-backend token))
+                            (remhash token *live-operation-parked*)
+                            (setf (live-operation-token-state token) :active
+                                  (live-operation-token-lane token) lane
+                                  (live-operation-token-snapshot-owners token) nil
+                                  restored t)
+                            (incf *live-operation-park-generation*)
+                            (sb-thread:condition-broadcast *live-operation-cv*)))))
+                   (pg-error (condition) (defer condition))
+                   (sb-ext:timeout (condition) (defer condition)))))
+      (setf *live-operation-current-lane* lane)
+      (cond ((and pending (fatal-error-p pending)) (error pending))
+            ((eq lane :terminal-cleanup)
+             (ereport-fatal "57P01" "terminating connection due to administrator command"))
+            (pending (error pending)))))
+  (values))
+
+(defun call-with-live-operation-parked (function)
+  (let ((token *live-operation-current-token*))
+    (unless (and (live-operation-token-p token) (plusp *live-operation-depth*)
+                 (not *live-operation-parked-p*)
+                 (eq :active (live-operation-token-state token)))
+      (error "parking requires admitted work"))
+    (when (live-operation-lock-owned-p)
+      (error "cannot park while owning the admission mutex"))
+    (let ((owners (capture-live-operation-snapshot-owners)))
+      (live-operation-parking-test-point :before-park token)
+      (sb-sys:without-interrupts
+        (unwind-protect
+             (progn
+               (call-with-live-operation-lock-if-needed
+                (lambda () (park-live-operation-under-lock token owners)))
+               (sb-sys:allow-with-interrupts
+                 (let ((*live-operation-depth* 0) (*live-operation-parked-p* t))
+                   (live-operation-parking-test-point :after-park token)
+                   (funcall function))))
+          (when (eq (live-operation-token-state token) :parked)
+            (unwind-protect
+                 (live-operation-parking-test-point :before-restore token)
+              (restore-live-operation-token token))
+            (unwind-protect
+                 (live-operation-parking-test-point :after-restore token)
+              (sb-sys:allow-with-interrupts
+                (sb-sys:with-local-interrupts (values))))))))))
+
+(defun leave-live-operation (&optional backend token)
+  (unwind-protect
+       (when (and token (eq :parked (live-operation-token-state token)))
+         (restore-live-operation-token token))
+    (release-live-operation-credit backend token)))
 
 (defun finish-live-operation-drain ()
   ;; Called with *LIVE-OPERATION-LOCK* held. Drain work may finish an active
@@ -263,6 +410,8 @@ must not run inside a handler either; the reloader thread polls the flag."
 
 (defun try-enter-live-operation-cancel-request (body backend)
   "Atomically admit or defer BODY while owning the admission lock."
+  (when *live-operation-parked-p*
+    (error "parked callbacks cannot admit or defer cancel requests"))
   (call-with-live-operation-lock
    (lambda ()
      (when *live-operation-cancel-request-admission-hook*
@@ -310,16 +459,21 @@ must not run inside a handler either; the reloader thread polls the flag."
        (sb-thread:condition-broadcast *live-operation-cv*)))))
 
 (defun fence-live-operation-shutdown ()
-  "Permanently close admission and wait for admitted operations to leave.
-The caller is outside admission. Do not take over another quiescence owner's
-token; its later cleanup must also respect this terminal shutdown fence."
-  (when (plusp *live-operation-depth*) (error "shutdown fence requires an unadmitted caller"))
+  (when *live-operation-parked-p*
+    (error "parked callbacks cannot start a shutdown fence"))
+  (when (plusp *live-operation-depth*)
+    (error "shutdown fence requires an unadmitted caller"))
   (call-with-live-operation-lock
    (lambda ()
+     (when (and (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
+                (plusp (hash-table-count *live-operation-parked*)))
+       (error "release owned quiescence before draining parked shutdown cleanup"))
      (setf *live-operation-terminal-shutdown* t
            *live-operation-admission-open* nil
            *live-operation-drain-open* nil)
-     (loop while (plusp *live-operation-count*)
+     (sb-thread:condition-broadcast *live-operation-cv*)
+     (loop while (or (plusp *live-operation-count*)
+                     (plusp (hash-table-count *live-operation-parked*)))
            do (sb-thread:condition-wait *live-operation-cv* *live-operation-lock*))))
   (values))
 
@@ -384,35 +538,36 @@ token; its later cleanup must also respect this terminal shutdown fence."
   (values))
 
 (defmacro with-live-operation-internal ((drain-p &optional check-cancel-p) &body body)
-  "Run BODY under the reload gate, optionally during drain or checking cancel."
   (let ((outermost (gensym "OUTERMOST-"))
         (admitted (gensym "ADMITTED-"))
         (backend (gensym "BACKEND-"))
+        (token (gensym "TOKEN-"))
         (drain-test (gensym "DRAIN-TEST-"))
         (operation-block (gensym "LIVE-OPERATION-")))
-    `(let ((,outermost (zerop *live-operation-depth*))
-           (,backend *backend*)
-           (,drain-test ,(when drain-p `(lambda () ,drain-p)))
-           (,admitted nil)
-           (*live-operation-check-cancel-p* ,check-cancel-p))
+    `(let* ((,outermost (zerop *live-operation-depth*))
+            (,backend *backend*)
+            (,token (when ,outermost
+                      (make-live-operation-token :backend ,backend :thread sb-thread:*current-thread*)))
+            (,drain-test ,(when drain-p `(lambda () ,drain-p)))
+            (,admitted nil)
+            (*live-operation-check-cancel-p* ,check-cancel-p))
        (if ,outermost
            (block ,operation-block
              (loop
                (wait-for-live-operation-admission ,drain-test ,backend)
-               ;; Keep asynchronous termination from landing after the count
-               ;; increments but before its cleanup has been installed.
                (sb-sys:without-interrupts
-                 (setf ,admitted
-                       (try-enter-live-operation ,drain-test ,backend))
+                 (setf ,admitted (try-enter-live-operation ,drain-test ,backend))
                  (when ,admitted
+                   (setf (live-operation-token-state ,token) :active
+                         (live-operation-token-lane ,token) ,admitted)
                    (return-from ,operation-block
                      (unwind-protect
                           (sb-sys:allow-with-interrupts
-                            (let ((*live-operation-depth*
-                                    (1+ *live-operation-depth*))
-                                  (*live-operation-current-lane* ,admitted))
+                            (let ((*live-operation-depth* (1+ *live-operation-depth*))
+                                  (*live-operation-current-lane* ,admitted)
+                                  (*live-operation-current-token* ,token))
                               (progn ,@body)))
-                       (leave-live-operation ,backend)))))))
+                       (leave-live-operation ,backend ,token)))))))
            (let ((*live-operation-depth* (1+ *live-operation-depth*)))
              (progn ,@body))))))
 
@@ -518,33 +673,54 @@ lane must not run query or storage work."
               ,@body)
          (open-live-operation-admission ,owner)))))
 
+(defun try-call-with-live-operation-reload (function)
+  (sb-thread:with-mutex (*reload-run-lock*)
+    (with-live-operation-quiescence
+      (let ((generation
+              (call-with-live-operation-lock
+               (lambda ()
+                 (when (plusp (hash-table-count *live-operation-parked*))
+                   *live-operation-park-generation*)))))
+        (if generation
+            (values nil nil generation)
+            (values t (multiple-value-list (funcall function)) nil))))))
+
+(defun call-with-live-operation-reload (function)
+  (when (or (plusp *live-operation-depth*) *live-operation-parked-p*)
+    (error "reload exclusion requires an outside caller"))
+  (loop
+    (multiple-value-bind (finished values generation)
+        (try-call-with-live-operation-reload function)
+      (when finished (return (values-list values)))
+      (call-with-live-operation-lock
+       (lambda ()
+         (loop while (and (= generation *live-operation-park-generation*)
+                          (plusp (hash-table-count *live-operation-parked*)))
+               do (sb-thread:condition-wait *live-operation-cv* *live-operation-lock*)))))))
+
 (defun reload ()
-  "Recompile and reload the pg system in this image.  Returns T on success."
-  ;; A control expression such as (PROGN (RELOAD)) already holds one live
-  ;; operation. Queue it for the coordinator instead of waiting for the reload
-  ;; lock while that coordinator waits for this operation to leave.
-  (when (plusp *live-operation-depth*)
+  (when (or (plusp *live-operation-depth*) *live-operation-parked-p*)
     (request-reload)
     (return-from reload :queued))
-  (sb-thread:with-mutex (*reload-run-lock*)
-    (format t "~&pg-lisp: reloading code...~%")
+  (format t "~&pg-lisp: reloading code...~%")
+  (finish-output)
+  (let ((ok
+          (call-with-live-operation-reload
+           (lambda ()
+             (handler-case
+                 (let ((*standard-output* (or *server-output* *standard-output*))
+                       (*error-output* (or *server-error* *error-output*))
+                       (*compile-verbose* nil) (*load-verbose* nil))
+                   (asdf:load-system "pg" :force t)
+                   (startup-reload-settings)
+                   t)
+               (error (condition)
+                 (format *error-output* "~&pg-lisp: reload failed: ~a~%" condition)
+                 (finish-output *error-output*)
+                 nil))))))
+    (format t "~&pg-lisp: reload ~:[failed (see server log)~;complete~]~%" ok)
     (finish-output)
-    (let ((ok (with-live-operation-quiescence
-                (handler-case
-                    (let ((*standard-output* (or *server-output* *standard-output*))
-                          (*error-output* (or *server-error* *error-output*))
-                          (*compile-verbose* nil)
-                          (*load-verbose* nil))
-                      (asdf:load-system "pg" :force t)
-                      (startup-reload-settings)
-                      t)
-                  (error (e)
-                    (format *error-output* "~&pg-lisp: reload failed: ~a~%" e)
-                    (finish-output *error-output*)
-                    nil)))))
-      (format t "~&pg-lisp: reload ~:[failed (see server log)~;complete~]~%" ok)
-      (finish-output)
-      ok)))
+    ok))
 
 (defun reload-loop ()
   (loop

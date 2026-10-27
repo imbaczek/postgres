@@ -29,6 +29,7 @@
                (:file "t/source-xids-replay-tests")
                (:file "t/source-xids-snapshot-tests")
                (:file "t/statement-snapshot-scope-tests")
+               (:file "t/live-operation-parking-tests")
                (:file "t/physical-prefix-tests")
                (:file "t/promotion-intent-tests")
                (:file "t/promotion-wal-tests")
