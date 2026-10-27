@@ -192,6 +192,7 @@ phase-2 recovery can yield to shutdown."
   (error "no representable child timeline remains"))
 
 (defun physical-promotion-check-base-control (state)
+  "Recheck immutable base control and parent history files before promotion intent."
   (let ((entry (find "global/pg_wal_control" (getf state :files) :key #'first :test #'equal)))
     (unless entry (error "promotion lost immutable base WAL control provenance"))
     (recovery-check-manifest-files

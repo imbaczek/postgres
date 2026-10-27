@@ -11,8 +11,8 @@
   promotion reader-enrollment prerequisite, native online reader-preserving
   promotion, relation reader identity selection, statement snapshot scope bookkeeping,
   temporary stream ownership, executor parking, client application-name settings,
-  supported implicit query blocks and SQL promotion have completed this pass and
-  its review. Keep the
+  supported implicit query blocks, SQL promotion and fresh child backup/follow
+  have completed this pass and its review. Keep the
   same order for the remaining HA work.
 
 - [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker
@@ -59,6 +59,13 @@ For each finding, preserve a small cold-image regression and fix the declaration
 or dependency at its owning layer. Keep expected SBCL reload/redefinition notices
 distinct from actual compiler warnings. Live reload remains the iteration model;
 cold builds are an independent verification path.
+
+The child-base work exposed another warm-image dependency: bootstrap history
+inventory used `timeline-history-entry` accessors before that `DEFSTRUCT` was
+compiled. Warm tests passed, but a fresh strict compile and the formatter's
+fresh SLIME image failed. The ASDF order now loads timeline definitions before
+bootstrap/recovery. Preserve this cold-build check when extending those modules;
+the broader audit remains open.
 
 This remains an **open audit**. It was prompted by the receive-store lock opener
 using the close-on-exec constant before its defining file loaded: the live image

@@ -175,6 +175,8 @@
     (otherwise (physical-follow-reject "unsupported native physical message"))))
 
 (defun physical-follow-start-query (runtime cursor)
+  "Build a native stream request for the saved timeline, base and receive prefix.
+Include the verified base manifest digest when it is available."
   (with-live-operation
     (format nil
             "START_REPLICATION SLOT ~a PHYSICAL ~a (native_format '~a', system_id '~d', timeline '~d', base_lsn '~a', prefix_digest '~d'~a)"

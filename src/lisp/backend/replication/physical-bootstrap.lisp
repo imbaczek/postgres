@@ -10,15 +10,16 @@
 (declaim (ftype function physical-promotion-startup-primary-p physical-promotion-startup-pending-p))
 
 (defun physical-bootstrap-standby-control-p ()
+  "Return true when existing recovery control requires ordinary standby preparation.
+Malformed control is an error, not permission to fall back to primary startup."
   (when (wal-namespace-file-stat (physical-recovery-control-path) t)
     (member (getf (physical-recovery-read-control *pgdata*) :phase) '(0 1 2))))
 
 (defun physical-bootstrap-check-startup ()
-  "Choose primary or standby recovery before listeners or ordinary storage setup.
-Committed child control takes precedence over leftover standby triggers. A valid
-pending request completes the transition and returns :PRIMARY-READY, telling MAIN
-not to initialize storage twice. Other paths return no values and leave ordinary
-primary or standby initialization to MAIN. Invalid recovery proof is an error."
+  "Choose recovery or primary startup before listeners or ordinary storage setup.
+Nonpending standby control requires recovery validation. A pending request is
+reconciled against parent or committed child control. Return :PRIMARY-READY
+when pending completion already initialized storage. Invalid proof is an error."
   (cond
     ((physical-bootstrap-standby-control-p) (physical-recovery-prepare) (values))
     ((physical-promotion-startup-primary-p) (values))
@@ -55,6 +56,8 @@ primary or standby initialization to MAIN. Invalid recovery proof is an error."
   (fsync-directory target))
 
 (defun physical-bootstrap-history-inventory (timeline)
+  "Return the selected timeline history and available ancestor histories for a backup.
+Validate the selected lineage before constructing the inventory."
   (let ((history (timeline-check-lineage (timeline-read-history timeline))))
     (sort (loop for entry in history
                 for ancestor = (timeline-history-entry-timeline entry)

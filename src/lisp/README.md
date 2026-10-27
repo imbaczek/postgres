@@ -333,6 +333,15 @@ durable target validation, sequence alignment and post-cutover writes.
 
 ## Testing
 
+From `src/lisp`, `./t/child-bootstrap.sh` exercises a fresh child backup through
+grandchild promotion. Set `CHILD_BOOTSTRAP_BACKUP_FAULTS=1`,
+`CHILD_BOOTSTRAP_SOURCE_RESTART=1` and `CHILD_BOOTSTRAP_WRONG_MANIFEST=1` for
+the combined acceptance cases. `CHILD_BOOTSTRAP_CRASH=1` exercises crash cases;
+`CHILD_BOOTSTRAP_PROMOTION_CRASH=after-online-intent` or `after-child-control`
+selects a promotion boundary. `CHILD_BOOTSTRAP_REMOVE_RETIRED=1` applies only
+after child control. `CHILD_BOOTSTRAP_FORCE_TIMEOUT=1` is a private harness
+regression that intentionally exits 137, not a normal feature test.
+
 SQL promotion checks can be run from `src/lisp`:
 
 ```sh

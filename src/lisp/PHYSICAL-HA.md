@@ -6,15 +6,68 @@ in [TODO.md](TODO.md).
 Status, 2026-10-27: native intake/bootstrap/recovery, continuous receipt/reconnect,
 advancing source retention, explicit/automatic local restartpoints, PGDATA/PID
 ownership, a startup/reload configuration subset, client application-name settings
-and online promotion are
-implemented. Pinned Patroni's full promotion method now passes through native
-pg_ctl and pg_controldata, including its production-state wait. Child-history
-follow/rejoin, complete physical-slot interfaces, synchronous durability and
-remaining Patroni interfaces are unfinished. C physical WAL/disk compatibility
-remains future work. Coordination is excluded. The repository's original C
-source is the behavior oracle.
+and online promotion are implemented. Fresh backups from a promoted child can follow
+that same timeline. Pinned Patroni's full promotion method passes through native
+pg_ctl and pg_controldata, including its production-state wait. Existing ancestor
+spool fork crossing and rejoin, complete physical-slot interfaces, synchronous
+durability and remaining Patroni interfaces are unfinished. C physical WAL/disk
+compatibility remains future work. Coordination is excluded. The repository's
+original C source is the behavior oracle.
 
 ## Verified starting points
+
+### Child follow and rejoin intake
+
+A fresh backup from a promoted child now records its actual timeline and copies
+the selected history and available ancestor histories. Startup validates the
+manifest, history, checkpoint and control provenance before publishing active
+recovery. Unlike C's copy of all local history files, the native inventory
+is limited to the selected lineage. Native FNV digests detect corruption or
+divergence; they are not authentication.
+
+Source pins retain their timeline and optional full-manifest digest in
+`PGPHYSPIN2`, without a protocol version bump. A new backup binds its pin before
+publishing the target manifest. Bound streams require `manifest_digest` as a
+sixth option; legacy or manual unbound pins are limited to timeline 1 and can
+use the five-option request. The existing post-base prefix digest remains
+required. Before promotion intent, manifest-bound parent histories are rechecked.
+Nonpending standby control requires recovery validation with no primary fallback.
+For phase 3, parent insertion control remains pending; committed child control
+is checked and retired without requiring the old spool, generation or manifest.
+
+The native end-to-end path passed from timeline 1 promotion to timeline 2,
+child backup and same-timeline read-only follow/replay, restartpoint and restart,
+then promotion to timeline 3 and primary restart with writes. SIGKILL standby
+and primary cases, cold pending and committed-child boundaries, and committed
+restart without retired recovery files passed. Backup fault, persisted pin and
+reconnect checks, and wrong-manifest rejection before progress also passed.
+Evidence includes `/tmp/pg-child-follow-final-acceptance.log`,
+`/tmp/pg-child-follow-sigkill-final2.log`, `/tmp/pg-child-follow-intent-crash.log`,
+`/tmp/pg-child-follow-child-control-crash-final.log` and
+`/tmp/pg-child-follow-committed-no-generation.log`. The forced-timeout harness
+check produced the expected exit 137 at `/tmp/pg-child-forced-timeout.log`,
+verifying cleanup of owned peers and listeners.
+
+Validation passed 511 physical tests, 170 interop tests and 1,598 legacy checks,
+plus a fresh-cache strict compile (`/tmp/pg-child-follow-verified-cold.log`).
+Metadata and pin properties passed 200 and 100 trials at seed 42, with zero
+rejections; no FunctionSpec was registered and input coverage was not collected.
+The 45-case native promotion suite, six online crash cases, follow, three
+switchovers and both logical directions passed in the
+`/tmp/pg-child-follow-preserve-*.log` files. Reviews covered the design, startup,
+code and refactoring. Timeline definitions now load before bootstrap, fixing a
+forward structure-accessor issue hidden by a warm image.
+
+Switching an existing ancestor spool across a fork remains separate work and is
+still rejected. Rejoin and offline reseeding, full physical slots, synchronous
+durability and remaining Patroni interfaces are also open. C rewind and C
+physical WAL/disk compatibility remain staged; coordination is excluded.
+
+C includes history files in base backups (`basebackup.c:620`) and validates
+ancestry and fork position before selecting a new recovery timeline
+(`xlogrecovery.c:4154`). Fork crossing must account for durable received parent
+WAL beyond the fork as well as applied WAL. Writing recovery configuration alone
+must not authorize a divergent former primary to rejoin.
 
 ### SQL pg_promote
 

@@ -1,8 +1,12 @@
 ;;;; Durable physical bootstrap WAL pins; no leader or writer-authority coordination.
 (in-package #:pg)
 
-(defstruct physical-source-pin name system-id restart-lsn consistent-lsn
-           (timeline 1) manifest-digest confirmed-lsn (prefix-digest #xCBF29CE484222325) (lost-p nil))
+(defstruct physical-source-pin
+  "A retained source position and its timeline and optional backup manifest digest.
+The digest binds a backup to its stream request; the prefix digest separately
+checks received WAL progress. These digests detect corruption or divergence."
+  name system-id restart-lsn consistent-lsn
+  (timeline 1) manifest-digest confirmed-lsn (prefix-digest #xCBF29CE484222325) (lost-p nil))
 
 (defvar *physical-source-pins* (make-hash-table :test #'equal))
 
@@ -159,6 +163,9 @@
         pin))))
 
 (defun physical-source-pin-bind-manifest (pin digest)
+  "Durably bind an unused source pin to the completed backup manifest digest.
+Require the current timeline and checkpoint, and no confirmed progress or sender.
+Publish the in-memory binding only after saving the candidate pin."
   (with-write-lock
     (with-wal-critical
       (unless (and (typep digest '(unsigned-byte 64))

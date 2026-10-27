@@ -93,9 +93,9 @@ directories inert; they are no longer required for primary startup."
   (values))
 
 (defun physical-promotion-startup-primary-p ()
-  "Recognize committed child control before ordinary standby preparation.
-Finish interrupted trigger cleanup and return true. Return NIL for parent
-control. Invalid child control is an error; never fall back to parent recovery."
+  "Recognize committed child control and finish interrupted trigger cleanup.
+A phase-3 request whose insertion timeline still equals its parent remains pending,
+even when that parent is itself a child. Invalid committed control is an error."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline) (wal-read-control-fields)
     (declare (ignore checkpoint durable snapshot))
     (when (and insertion (> insertion 1))

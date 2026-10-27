@@ -247,6 +247,7 @@ This is local incomplete-recovery state, never child insertion or writer authori
               (physical-store-update-digest #xCBF29CE484222325 bytes)))))
 
 (defun recovery-history-file-timeline (name)
+  "Return the timeline from a canonical child history path, or NIL if it is invalid."
   (when (and (stringp name) (= (length name) 23)
              (uiop:string-prefix-p "pg_wal/" name)
              (string= name ".history" :start1 15)
@@ -256,6 +257,8 @@ This is local incomplete-recovery state, never child insertion or writer authori
       (when (> timeline 1) timeline))))
 
 (defun recovery-manifest-path-p (name &optional (timeline 1))
+  "Check that NAME is a permitted base-image path for TIMELINE.
+Child images may include history files no newer than their selected timeline."
   (and (stringp name)
        (or (member name '("PG_VERSION" "pg_xact" "global/pg_control"
                           "global/pg_catalog.dat" "global/pg_wal_control") :test #'equal)
@@ -378,7 +381,8 @@ This is local incomplete-recovery state, never child insertion or writer authori
     *catalog*))
 
 (defun physical-recovery-prepare ()
-  "Select only the CRC-bound base namespace while verifying immutable provenance."
+  "Select the base WAL namespace while verifying immutable provenance.
+A nonpending standby cannot fall back to primary startup when validation fails."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace)
       (wal-read-control-fields)
     (declare (ignore checkpoint durable snapshot))
@@ -389,7 +393,8 @@ This is local incomplete-recovery state, never child insertion or writer authori
       (setf (getf *physical-recovery-state* :wal-namespace) namespace))))
 
 (defun physical-recovery-prepare-with-namespace ()
-  "Validate provenance, then durably enter active recovery before any restoration."
+  "Validate the base image, history and checkpoint provenance before publishing active recovery.
+Pending promotion is reconciled separately."
   (physical-recovery-check-required-marker)
   (let ((control (physical-recovery-read-control *pgdata*)))
     ;; Pending control must never fall through the ordinary phase rewrite/redo path.
