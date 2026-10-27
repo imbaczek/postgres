@@ -1213,7 +1213,9 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
   (values))
 
 (defun wal-segment-entry-names ()
-  "Enumerate actual WAL entries, including dangling symlinks; never accept an I/O-short list."
+  "Return raw WAL entry names, including dangling links.
+
+Follow a symlink at the WAL directory itself. Enumeration errors are reported."
   (remove-if-not (lambda (name)
                    (and (> (length name) 4) (uiop:string-suffix-p name ".wal")))
                  (directory-entry-names (wal-directory) :follow-symlinks t)))

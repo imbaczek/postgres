@@ -6,13 +6,19 @@
   and failure behavior where they matter. A gpt-6.1-terra subagent should write
   this pass; the primary agent reviews its documentation separately.
   The child checkpoint/primary, online promotion and reader-safe row replay
-  modules, source running-transaction metadata helpers and covered standby
-  snapshots and virtual reader lifecycle helpers have completed this pass and
-  its review. Keep the same order for the remaining HA work.
+  modules, source running-transaction metadata helpers, covered standby snapshots,
+  virtual reader lifecycle helpers and private child adoption have completed this
+  pass and its review. Keep the same order for the remaining HA work.
 
 - [ ] Audit cold-image compilation and ASDF load-order dependencies across `pg`
   and its test systems. A warm REPL must not conceal missing declarations or
   compile-time dependencies.
+
+- [ ] Reject target/temporary path aliasing in atomic file publication. The WAL
+  byte helper derives a `.tmp` pathname; a target already ending in `.tmp` can
+  name that same file. A fixture exposed successful return followed by deletion
+  of the target. Audit callers and add a regression for rejection or a distinct
+  temporary name before changing the cleanup path.
 
 The audit should cover:
 

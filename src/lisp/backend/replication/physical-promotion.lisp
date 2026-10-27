@@ -2,7 +2,10 @@
 (in-package #:pg)
 
 (defun physical-promotion-check-context (phase &key preserve-readers)
-  "The caller owns follow-command -> reload -> quiescence; no worker joins here."
+  "Check PHASE and the caller's promotion exclusion.
+
+The caller owns follow-command, reload and quiescence in that order; no worker
+joins occur here.  PRESERVE-READERS is for the private live adopter."
   (unless (and (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*)
                (sb-thread:holding-mutex-p *reload-run-lock*)
@@ -94,9 +97,12 @@
 (declaim (ftype function physical-promotion-preflight-runtime))
 
 (defun physical-promotion-publish-intent (&optional requested-child)
-  "Privately bind a chosen child to verified local recovery; never grant writer authority.
-Worker shutdown/join and rejection recovery belong to the future public orchestrator.
-The caller owns PGDATA and follow-command/reload/quiescence in that order."
+  "Privately bind a chosen child to verified local recovery without granting writer authority.
+
+Before publishing intent, check the saved catalog against any live catalog and
+preflight the runtime allocation and retention state.  A preflight rejection
+leaves phase 2 unchanged.  The caller owns PGDATA and follow-command, reload
+and quiescence in that order; worker shutdown and join occur outside this call."
   (with-physical-promotion-exclusion (2)
     (let* ((state *physical-recovery-state*)
            (namespace (physical-promotion-check-base-control state))

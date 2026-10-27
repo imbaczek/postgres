@@ -84,6 +84,11 @@ coherent view across atomic publications must compare their control images."
       (sb-posix:close fd))))
 
 (defun directory-entry-names (path &key follow-symlinks)
+  "Return the raw entry names in PATH, or NIL if PATH is initially absent.
+
+Do not resolve child names; hidden entries and dangling links are included.
+FOLLOW-SYMLINKS permits the directory itself to be a symlink.  An enumeration
+error is reported rather than returning a partial inventory."
   (let* ((trimmed (string-right-trim "/" (namestring path)))
          (name (if (zerop (length trimmed)) "/" trimmed))
          (stat (handler-case (funcall (if follow-symlinks #'sb-posix:stat #'sb-posix:lstat) name)

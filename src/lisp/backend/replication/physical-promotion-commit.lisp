@@ -69,8 +69,10 @@ The returned byte vectors describe the whole allowed extent of each file."
           #'< :key #'first)))
 
 (defun physical-promotion-current-checkpoint-plan (state)
-  "Read the exact saved catalog and local XID floor, then build the child plan.
-Do not use mutable runtime catalog counters to choose retry bytes."
+  "Build the child plan from the saved catalog and local XID floor.
+
+Return the plan and the saved catalog bytes as a second value.  Do not use
+mutable runtime catalog counters to choose retry bytes."
   (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
     (declare (ignore metadata prefix generation))
     (values (physical-promotion-checkpoint-plan

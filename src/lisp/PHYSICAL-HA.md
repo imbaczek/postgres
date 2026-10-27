@@ -381,8 +381,8 @@ XIDs, survives role changes for the life of the transaction, and is released wit
 relation registrations before waiters are woken. Wraparound drains both kinds of
 identity, and transaction cleanup masks interrupts through the idle transition. This is
 a prerequisite for reader-preserving promotion; current promotion still drains old
-transactions. Reconciliation of idle or abandoned readers under quiescence and a live
-child adopter remain to be implemented. There is no protocol bump.
+transactions. Reconciliation of idle or abandoned readers under quiescence remains
+to be implemented. The private child adopter is described below.
 
 A clean worker passed 363 physical Rove tests, 170 interop tests and 1,598 legacy
 checks. Eight lifecycle regressions and an injected asynchronous interrupt regression
@@ -395,6 +395,54 @@ passed (`/tmp/pg-virtual-readers-final.log`, artifacts
 the interrupt cleanup gap, which was fixed and rereviewed without new findings.
 Snapshot-only ownership and actual wrap drain were tested separately; their combined
 scenario remains useful before promotion activation.
+
+### Private live child adoption
+
+A private adopter can install a committed child in the existing quiescent recovery
+runtime. Before durable intent, publication checks the exact saved catalog against a
+live catalog when present. Shared preflight checks the canonical allocation floor and
+wraparound gate, empty logical slot and source-pin inventories in memory and on disk,
+and ordinary snapshot WAL pins against the copied fork segment prefix. It rejects
+settled CLOG status starting at the actual next XID, including the gap below a higher
+child floor. The scan skips only
+an exhausted actual counter or an unchanged wraparound gate, where old cycle bits must
+remain until readers drain and the cycle is frozen. A direct publisher's preflight
+rejection leaves phase-2 controls unchanged.
+
+After child control is committed, the adopter verifies the child checkpoint and end,
+history, pending identity and saved catalog plan, and repeats shared preflight under the
+child namespace. It rejects open parent WAL output, pending writes, real XIDs, unjoined
+workers and unsafe wrap state. Under WAL then XID lock it persists the floor before
+installing child scalars. Catalog, CLOG stream, storage handles, snapshots, virtual IDs,
+retention tables and pins remain in place; the parent replay position is retained.
+Failure during adoption fences the process for cold restart from durable child control.
+Live completion closes the receive spool, retires recovery triggers and then declares
+the primary ready. Cold completion remains the default, and public online promotion
+still drains old transactions.
+
+This is a conservative fail-closed prerequisite. C `StartupXLOG` calls `TrimCLOG` at the
+end of recovery; equivalent CLOG repair remains open. Nonempty slots and source pins
+need child-relative continuity and pending-progress proof. The full phase-2 to phase-3
+reader-preserving wrapper, reconciliation of old idle virtual readers, replay choice and
+generic SQL `pg_promote` remain future work. The broader cold-load audit also remains
+open.
+
+A clean worker passed 380 physical Rove tests, 170 interop tests and 1,598 legacy
+checks. An additional post-review test injects an invalid in-memory batch end after a
+valid child checkpoint and confirms shared preflight rejects it. The property
+`live-child-floor-stays-before-reuse-or-at-next-epoch-gate` passed 200 trials each at
+seeds 42 and 1738034246707705, digest `fnv1a64-v1:471ffd94154cf650`; no FunctionSpec is
+registered and input coverage and rejection counts are unmeasured. Raw directory
+inventory has an independent test. The private live native run passed after refactoring
+(`/tmp/pg-live-adopt-native-refactor.log`, artifacts `/tmp/pg-promotion-online.IHVtGx`),
+including object identity, new writes, the Patroni utility request and crash restart.
+Default cold online promotion passed (`/tmp/pg-live-adopt-cold-native.log`). The
+extended live crash run passed (`/tmp/pg-live-adopt-crash-final.log`, artifacts
+`/tmp/pg-promotion-online-crash.86srEs`), including crashes at floor persistence, scalar
+installation, pending retirement and readiness. Fresh strict compilation
+(`/tmp/pg-live-adopt-compile-reviewed.log`) and formatting passed. Reviews found
+retention timing and CLOG gap issues, which were fixed and rereviewed without further
+production findings.
 
 ### Timeline-qualified native WAL namespace
 

@@ -5,9 +5,9 @@
 ;;;; must not depend on the old generation or receive spool, which may be gone.
 ;;;;
 ;;;; Only the owning postmaster, before listeners or under closed admission, may
-;;;; finish the transition. Once child control is verified, initialize storage as
-;;;; an ordinary primary and retire recovery triggers. Remove pending control last
-;;;; so an interrupted cleanup remains distinguishable from an ordinary standby.
+;;;; finish the transition. Cold completion initializes ordinary primary storage.
+;;;; A private live path can adopt verified child control while retaining readers
+;;;; and storage. Both retire recovery triggers and remove pending control last.
 ;;;; A failure after child control is saved requires restart, not parent rollback.
 
 (in-package #:pg)
@@ -121,6 +121,10 @@ Return NIL when there is no pending request; propagate any validation failure."
 (declaim (ftype function wal-note-primary-ready))
 
 (defun physical-promotion-live-xid-floor-valid-p (actual floor batch-end local-floor)
+  "Check that FLOOR covers allocation state without skipping a wraparound gate.
+
+ACTUAL is the replay visibility counter; BATCH-END and LOCAL-FLOOR bound local
+allocation. All four values must be canonical counters or the exhaustion sentinel."
   (and (every (lambda (value)
                 (and (typep value '(integer 3 18446744073709551616))
                      (= value (canonical-next-full-xid value))))
@@ -130,6 +134,10 @@ Return NIL when there is no pending request; propagate any validation failure."
            (= floor (min +max-xid-one-past+ (xid-next-epoch-boundary actual))))))
 
 (defun physical-promotion-check-live-retention (fork)
+  "Check that retained state can use the copied child prefix.
+
+Logical slot and source-pin inventories must be empty in memory and on disk.
+Each ordinary snapshot WAL pin must lie within the copied fork segment prefix."
   (unless (and (zerop (hash-table-count *wal-replication-slots*))
                (zerop (hash-table-count *physical-source-pins*))
                (null (directory-entry-names (wal-replication-slot-directory)))
@@ -143,6 +151,12 @@ Return NIL when there is no pending request; propagate any validation failure."
              *wal-snapshot-retention-pins*)))
 
 (defun physical-promotion-check-clog-tail (actual next)
+  "Reject settled status at and above ACTUAL without changing CLOG.
+
+ACTUAL is replay's next FullXID; NEXT is the planned allocation floor. At an
+unchanged wraparound gate, keep bits from the previous cycle until readers drain
+and the cycle is frozen. An exhausted ACTUAL has no future IDs to check.
+This check does not repair stale bits as C TrimCLOG does."
   (unless (or (= actual +max-xid-one-past+)
               (and (= actual next) (first-normal-xid-of-epoch-p actual)))
     (sb-thread:with-mutex (*clog-lock*)
@@ -158,6 +172,10 @@ Return NIL when there is no pending request; propagate any validation failure."
                    (error "live promotion found settled future CLOG status")))))))
 
 (defun physical-promotion-preflight-runtime (actual bound fork)
+  "Check runtime state and return the canonical child allocation floor.
+
+The floor covers actual next XID, complete source capacity and the local disk
+floor.  Use this check before intent and again under the child namespace."
   (let* ((local-floor (load-next-xid))
          (next (canonical-next-full-xid (max actual (1+ bound) local-floor))))
     (unless (physical-promotion-live-xid-floor-valid-p actual next *xid-batch-end* local-floor)
@@ -167,6 +185,13 @@ Return NIL when there is no pending request; propagate any validation failure."
     next))
 
 (defun physical-promotion-adopt-live-child-runtime ()
+  "Adopt a verified committed child in the existing recovery runtime.
+
+Require a clean, quiescent runtime and prove the checkpoint, history, pending
+identity and saved catalog plan.  Persist the allocation floor under WAL then
+XID lock before installing child scalars.  Keep catalog, CLOG, storage handles,
+readers, retention state and the parent replay position.  Any failure fences
+recovery; restart must classify durable control."
   (let ((finished nil))
     (unwind-protect
          (progn
@@ -251,6 +276,7 @@ Return NIL when there is no pending request; propagate any validation failure."
       (unless finished (setf *physical-recovery-failed-p* t)))))
 
 (defun physical-promotion-finish-child-primary ()
+  "Retire recovery triggers before clearing the recovery role and declaring readiness."
   (physical-promotion-test-point :after-child-primary-initialization)
   (physical-promotion-retire-recovery)
   (setf *physical-recovery-state* nil *physical-recovery-failed-p* nil
@@ -259,6 +285,10 @@ Return NIL when there is no pending request; propagate any validation failure."
   (physical-promotion-test-point :after-child-primary-ready))
 
 (defun physical-promotion-start-live-child-primary ()
+  "Privately adopt the child, close the receive spool and finish promotion.
+
+Keep the existing CLOG stream, storage handles and reader state. The completion
+caller must keep admission closed and fence any failure."
   (physical-promotion-adopt-live-child-runtime)
   (when *physical-receive-store* (physical-store-close *physical-receive-store*))
   (setf *physical-receive-store* nil)
