@@ -156,9 +156,14 @@ for kind in foreign-staging oversized-staging orphan-history bad-child-checkpoin
         oversized-staging) expected_error='child checkpoint prefix or extent differs' ;;
         orphan-history) expected_error='published child history has an unexplained WAL segment' ;;
         bad-child-checkpoint) expected_error='WAL checksum mismatch' ;;
-        wrong-pending|wrong-history) expected_error='committed child contradicts its pending recovery metadata' ;;
+        wrong-pending) expected_error='physical recovery file (length|checksum) mismatch: global/pg_wal_control' ;;
+        wrong-history) expected_error='committed child contradicts its pending recovery metadata' ;;
     esac
-    grep -F "$expected_error" "$CASE/startup.log" >/dev/null
+    if [ "$kind" = wrong-pending ]; then
+        grep -E "$expected_error" "$CASE/startup.log" >/dev/null
+    else
+        grep -F "$expected_error" "$CASE/startup.log" >/dev/null
+    fi
     python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --verify-pending "$CASE/data" "$CASE/before.json"
 done
 for stage in prefix wal; do

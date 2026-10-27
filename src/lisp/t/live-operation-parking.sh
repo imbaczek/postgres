@@ -27,6 +27,11 @@ cleanup() {
             remaining=$((remaining - 1))
         done
     fi
+    if [ -d "$TMP/extra-peers" ]; then
+        if ! "$PATRONI_PYTHON" "$BASE/t/interop/owned-peer.py" cleanup "$TMP/extra-peers"; then
+            [ "$status" -ne 0 ] || status=1
+        fi
+    fi
     for pid in "$TARGET" "$SOURCE"; do
         if [ -n "$pid" ]; then
             if [ "$pid" = "$TARGET" ]; then data="$TMP/copy"; else data="$TMP/source"; fi
