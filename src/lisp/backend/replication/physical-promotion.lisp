@@ -31,6 +31,10 @@ ownership must be checked by the live promotion path."
     (error "pending promotion requires stopped workers and no open reader transactions")))
 
 (defun physical-promotion-check-reader-snapshots (backends parked)
+  "Check the exact active snapshot census against transaction and parked owners.
+
+Under the snapshot lock, validate identities and parked generations.  Reject
+missing or conflicting owners instead of discarding their registrations."
   (let ((owners (make-hash-table :test #'eq))
         (parked-registrations (make-hash-table :test #'eq)))
     (sb-thread:with-mutex (*snapshot-count-lock*)
@@ -79,10 +83,11 @@ ownership must be checked by the live promotion path."
 (defun physical-promotion-enroll-readers ()
   "Check and enroll retained readers before a private promotion.
 
-The caller has closed operation admission and joined recovery workers.  The
-registry lock protects the backend census; closed admission keeps transaction
-resources stable, including while normal EOF cleanup waits.  Take the relation
-lock before the XID lock, and check snapshots separately under their lock.
+The caller has closed operation admission and joined recovery workers.  Copy
+parked ownership under the admission lock before taking the backend registry
+lock.  Closed admission keeps transaction resources stable, including while
+normal EOF cleanup waits.  Take the relation lock before the XID lock, and check
+snapshots separately under their lock.
 Reject orphaned registrations.  Repair the virtual ID counter before allocating
 IDs, and keep retained transactions read-only."
   (physical-promotion-check-context 2 :preserve-readers t)

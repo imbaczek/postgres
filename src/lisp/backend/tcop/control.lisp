@@ -49,6 +49,10 @@
 (defvar *live-operation-depth* 0)
 
 (defstruct live-operation-token
+  "Ownership of one outer operation, whether active or parked.
+
+BACKEND and THREAD identify the original owner.  SNAPSHOT-OWNERS records the
+statement registrations captured while parked."
   backend thread lane
   (state :pending)
   snapshot-owners)
@@ -57,7 +61,8 @@
 
 (defvar *live-operation-parked-p* nil)
 
-(defvar *live-operation-parked* (make-hash-table :test #'eq))
+(defvar *live-operation-parked* (make-hash-table :test #'eq)
+  "Parked operation tokens, protected by *LIVE-OPERATION-LOCK*.")
 
 (defvar *live-operation-park-generation* 0)
 
@@ -241,6 +246,9 @@ must not run inside a handler either; the reloader thread polls the flag."
    (lambda () (hash-table-count *live-operation-parked*))))
 
 (defun live-operation-parked-owners-under-quiescence ()
+  "Copy parked ownership for the caller that owns closed, drained admission.
+
+Validate each parked thread while holding the admission lock."
   (call-with-live-operation-lock
    (lambda ()
      (unless (and (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
@@ -260,6 +268,9 @@ must not run inside a handler either; the reloader thread polls the flag."
     (funcall *live-operation-parking-test-hook* point token)))
 
 (defun capture-live-operation-snapshot-owners ()
+  "Capture active enclosing registration tokens, generations and snapshots.
+
+Hold the snapshot lock while reading their lifecycle state."
   (sb-thread:with-mutex (*snapshot-count-lock*)
     (loop for registration in (remove-duplicates *statement-snapshot-registrations* :test #'eq)
           do (unless (snapshot-registration-p registration)
@@ -272,6 +283,10 @@ must not run inside a handler either; the reloader thread polls the flag."
                           (snapshot-registration-snapshot registration)))))
 
 (defun park-live-operation-under-lock (token owners)
+  "Transfer the current operation's active credit to TOKEN under the gate lock.
+
+The caller masks interrupts.  The operation retains one parked owner until its
+credit is restored."
   (unless (and (eq token *live-operation-current-token*)
                (eq (live-operation-token-thread token) sb-thread:*current-thread*)
                (eq (live-operation-token-state token) :active)
@@ -297,6 +312,11 @@ must not run inside a handler either; the reloader thread polls the flag."
       (live-operation-admitted-p t)))
 
 (defun restore-live-operation-token (token)
+  "Restore TOKEN's active credit before allowing its stack to unwind.
+
+Defer interrupts while waiting for a resume lane.  Terminal cleanup waits for
+any foreign quiescence owner to release the gate, then restores the credit
+before signaling FATAL."
   (sb-sys:without-interrupts
     (let ((restored nil) (pending nil) (lane nil))
       (labels ((defer (condition)
@@ -332,6 +352,11 @@ must not run inside a handler either; the reloader thread polls the flag."
   (values))
 
 (defun call-with-live-operation-parked (function)
+  "Call FUNCTION while the current operation is parked, then restore its credit.
+
+The caller must first make suspended state safe across concurrent work.  The
+callback must not enter operation admission or access storage.  Cleanup restores
+ownership on every exit; parking itself does not make scan callbacks safe."
   (let ((token *live-operation-current-token*))
     (unless (and (live-operation-token-p token) (plusp *live-operation-depth*)
                  (not *live-operation-parked-p*)
@@ -459,6 +484,9 @@ must not run inside a handler either; the reloader thread polls the flag."
        (sb-thread:condition-broadcast *live-operation-cv*)))))
 
 (defun fence-live-operation-shutdown ()
+  "Close admission and wait for both active and parked operations to drain.
+
+The primary finalizer separately holds reload exclusion."
   (when *live-operation-parked-p*
     (error "parked callbacks cannot start a shutdown fence"))
   (when (plusp *live-operation-depth*)
@@ -686,6 +714,10 @@ lane must not run query or storage work."
             (values t (multiple-value-list (funcall function)) nil))))))
 
 (defun call-with-live-operation-reload (function)
+  "Run FUNCTION under reload exclusion after active and parked work has drained.
+
+If parked owners remain after admission drains, reopen the gate and release the
+reload lock before waiting for a change and retrying."
   (when (or (plusp *live-operation-depth*) *live-operation-parked-p*)
     (error "reload exclusion requires an outside caller"))
   (loop

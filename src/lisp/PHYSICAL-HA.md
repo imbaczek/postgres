@@ -538,8 +538,37 @@ Sol and Astra design reviews identified three remaining implementation steps:
    query or special-case a top-level SELECT. C normalizes named arguments into
    parameter order; it does not promise textual argument evaluation order.
 
-These steps remain open. The scope bookkeeping alone does not implement SQL
-`pg_promote`, and the broader HA goal and coordination exclusion are unchanged.
+The parking foundation is now complete, as described below. Scan detachment and
+SQL `pg_promote` binding remain open; the broader HA goal and coordination exclusion
+are unchanged.
+
+### Admission parking and reload backoff
+
+A generic operation token now owns either an active credit or a parked registration.
+It retains the charged backend and thread and records the exact enclosing statement
+registration generations. Restoration returns the credit before the caller unwinds,
+including before terminal FATAL. Parked restoration waits for a foreign quiescence
+owner to release the gate. Reload reopens the gate and releases its mutex while
+waiting for parked owners; primary finalization separately serializes storage.
+
+The unchanged shutdown regression caught an overly broad wait for a foreign owner.
+The shutdown fence now waits for active or parked operations; parked restoration still
+waits for the owner to release quiescence. A native test hook exercises parking on a
+real SQL stack, but does not implement public `pg_promote` or establish that index
+callbacks are safe to suspend.
+
+Validation passed 408 physical tests, 170 interop tests and 1,598 legacy checks.
+Native parking, hot reload, shutdown, promotion-online and promotion-readers tests
+passed, as did fresh strict compilation. Luna and Sol code reviews and Astra's
+shutdown review cleared the change; Sol's refactoring review found no need for a new
+abstraction.
+
+Next, detach unread scan TIDs into a bounded or spillable spool and audit callback
+resources before adding C-compatible SQL `pg_promote`. The startup backend has an
+`application_name` slot, but `current_setting('application_name')` failed in the
+native test. Implement normal GUC support before sharing the SQL oracle, rather than
+substituting a custom setting. The full HA goal remains open; coordination remains
+outside this work.
 
 ### Timeline-qualified native WAL namespace
 

@@ -6,6 +6,10 @@
 (defvar *parking-native-root* nil)
 
 (defun parking-native-marker (name)
+  "Publish a marker at the exact requested path.
+
+Use POSIX rename because CL RENAME-FILE can merge the temporary .tmp type into
+an extensionless destination."
   (let* ((path (merge-pathnames name *parking-native-root*))
          (temporary (pathname (concatenate 'string (namestring path) ".tmp"))))
     (unwind-protect
