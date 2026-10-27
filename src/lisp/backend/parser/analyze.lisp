@@ -254,6 +254,9 @@ exist\" messages."
   (list :func name nil :type :record :typmod -1 :fields +wal-receiver-result-fields+))
 
 (defun analyze-promotion-arguments (arguments table &optional variadic)
+  "Bind pg_promote arguments in parameter order and supply defaults.
+Check the signature before coercion, including named and VARIADIC arguments.
+Convert supplied expressions in source order, then return them in parameter order."
   (let* ((analyzed
            (mapcar (lambda (argument)
                      (if (eq (first argument) :named-arg)
@@ -294,6 +297,7 @@ exist\" messages."
     (coerce slots 'list)))
 
 (defun analyze-call-argument-list (name arguments table &optional variadic)
+  "Analyze call arguments, using pg_promote's named-argument binding where applicable."
   (if (string= name "pg_promote")
       (analyze-promotion-arguments arguments table variadic)
       (mapcar (lambda (argument)
@@ -303,6 +307,7 @@ exist\" messages."
               arguments)))
 
 (defun analyze-nullary-function (name args)
+  "Check that a supported nullary function has no arguments and assign its result type."
   (when args
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
   (list :func name args
@@ -1760,6 +1765,7 @@ exist\" messages."
      (if (string= name "pg_current_wal_flush_lsn") *wal-durable-lsn* *wal-end-lsn*))))
 
 (defun eval-logical-helper-function (name args)
+  "Evaluate a supported logical helper, taking the write lock for catalog reads."
   (cond
     ((string= name "pg_lisp_acquire_subscription")
      (logical-acquire-subscription-owner (first args)))

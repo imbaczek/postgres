@@ -16,6 +16,39 @@ source is the behavior oracle.
 
 ## Verified starting points
 
+### SQL pg_promote
+
+SQL `pg_promote` now submits the native promotion request and can wait inline
+while its reader continuation is parked. Its argument binding supports the C
+signature, defaults, named arguments and strict NULL behavior. An accepted
+request survives transaction rollback, cancellation, timeout and disconnect.
+The wait callback observes in-memory state; after admission is restored, the
+caller checks recovery health before returning success.
+
+Final validation passed 492 physical tests, 170 interop tests and 1,598 legacy
+checks, plus a fresh-cache strict production compile. Nine native fault cases
+passed: asynchronous acceptance, rollback, statement error, timeout, cancel,
+disconnect, request file, handoff cancellation and unsafe batch. Seven shared
+fault cases were compared with pinned C `9c0909b34939f2d5a37b82b9d1efc8b08e310252`;
+the handoff and unsafe-batch cases are native-only. The uninstrumented common
+contract covers defaults, named arguments, strict NULLs, types, error order,
+VARIADIC signature handling and exact volatile order with retained RR views.
+
+Real SQL `sort_output` and `nested_indexes` executor cases and the original
+15-case executor matrix passed. The SQL executor mode deliberately holds the
+worker before promotion and the successful parked callback after promotion to
+observe parent replay, child index growth, GC, HUP and retained resources. Follow,
+all three manual switchovers and both logical directions passed. Evidence is in
+`/tmp/pg-sql-promote-executor-final.log`, `/tmp/pg-sql-promote-default-executor.log`,
+`/tmp/pg-sql-promote-unsafe-batch-final.log`, `/tmp/pg-sql-promote-c-signature-final.log`,
+`/tmp/pg-sql-promote-native-signature-final.log`, `/tmp/pg-sql-promote-final-follow.log`,
+`/tmp/pg-sql-promote-final-switchover.log`, `/tmp/pg-sql-promote-final-logical-both.log`
+and `/tmp/pg-sql-promote-final-cold-compile.log`. Luna and Sol code reviews cleared
+the implementation; Sol's refactoring review found no useful extraction.
+
+The broader HA goal, Patroni 4.1.5 interface matrix, synchronous durability
+and C physical compatibility remain unfinished. Coordination remains excluded.
+
 ### Application name and supported implicit query messages
 
 Client startup and SQL `application_name` now share session settings, transaction

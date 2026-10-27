@@ -333,6 +333,22 @@ durable target validation, sequence alignment and post-cutover writes.
 
 ## Testing
 
+SQL promotion checks can be run from `src/lisp`:
+
+```sh
+./t/promotion-sql.sh
+C_PG_BINDIR=... C_PG_REVISION=... LD_LIBRARY_PATH=... ./t/promotion-sql-c.sh
+./t/promotion-sql-faults.sh
+PROMOTION_SQL_CASE=timeout C_PG_BINDIR=... C_PG_REVISION=... ./t/promotion-sql-faults-c.sh
+RESOURCE_SQL_PROMOTION=1 PG_C_BINDIR=... ./t/executor-parking.sh sort_output nested_indexes
+```
+
+The native fault script defaults to all nine cases. The C fault script accepts a
+single case and uses a `recovery_end_command` barrier with matching C libraries;
+it does not use SIGSTOP. The executor SQL mode adds test-only barriers around
+promotion and callback resumption; the common SQL contract runs without them.
+See [physical HA implementation and limits](PHYSICAL-HA.md) for validation scope.
+
 The `pg-interop-tests` and `pg-physical-tests` ASDF systems depend on Rove and
 `cl-spec/check-it` for
 new executable contracts and property checks. These are test dependencies;

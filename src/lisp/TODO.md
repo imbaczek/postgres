@@ -10,8 +10,9 @@
   virtual reader lifecycle helpers, private child adoption and the private
   promotion reader-enrollment prerequisite, native online reader-preserving
   promotion, relation reader identity selection, statement snapshot scope bookkeeping,
-    temporary stream ownership, executor parking, client application-name settings
-    and supported implicit query blocks have completed this pass and its review. Keep the
+  temporary stream ownership, executor parking, client application-name settings,
+  supported implicit query blocks and SQL promotion have completed this pass and
+  its review. Keep the
   same order for the remaining HA work.
 
 - [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker

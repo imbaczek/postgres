@@ -1205,6 +1205,7 @@
     (t (parse-postfix-expression p))))
 
 (defun parse-call-argument (parser)
+  "Parse a positional argument or a named argument using => or :=."
   (let ((next (nth (1+ (sql-parser-pos parser)) (sql-parser-tokens parser))))
     (if (and (eq (pkind parser) :ident) next
              (eq (token-kind next) :op)

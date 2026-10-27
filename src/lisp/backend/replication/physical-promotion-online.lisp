@@ -109,6 +109,7 @@ before intent.  Other failures after work starts fence the process for restart."
   (setf *physical-promotion-requested-p* t))
 
 (defun physical-promotion-file-sqlstate (errno)
+  "Map a promotion signal file error to a SQLSTATE."
   (cond
     ((member errno (list sb-posix:eperm sb-posix:eacces sb-posix:erofs)) "42501")
     ((= errno sb-posix:enoent) "58P01")
@@ -122,6 +123,9 @@ before intent.  Other failures after work starts fence the process for restart."
     (t "XX000")))
 
 (defun physical-promotion-request-from-sql ()
+  "Create and close the promotion signal file, then wake the worker.
+Mask interrupts through the file and wake handoff. Once accepted, the request
+is independent of the SQL transaction and survives cancellation or disconnect."
   (physical-promotion-check-online)
   (unless (and *physical-promotion-worker*
                (sb-thread:thread-alive-p *physical-promotion-worker*))
@@ -154,6 +158,9 @@ before intent.  Other failures after work starts fence the process for restart."
   t)
 
 (defun physical-promotion-wait-for-sql (deadline)
+  "Wait until promotion, failure or DEADLINE using in-memory state only.
+This parked callback must not enter admission or inspect storage.
+Return false once the deadline expires, even if promotion finishes later."
   (loop
     (when (>= (get-internal-real-time) deadline) (return nil))
     (when *physical-recovery-failed-p* (return nil))
@@ -164,6 +171,12 @@ before intent.  Other failures after work starts fence the process for restart."
                             (float internal-time-units-per-second 1d0)))))))
 
 (defun pg-promote (wait wait-seconds)
+  "Request standby promotion and optionally wait for completion.
+NULL arguments return NULL. Check the recovery role before the wait limit.
+A waiting call parks its operation token while preserving reader snapshots.
+Check recovery health after restoring the token, and keep the callback's
+deadline result. Timeout returns false with a warning without cancelling
+the accepted request."
   (sql-strict-let ((wait-p wait) (seconds wait-seconds))
     (unless (recovery-in-progress-p)
       (ereport "55000" "recovery is not in progress"
