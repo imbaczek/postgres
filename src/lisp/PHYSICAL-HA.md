@@ -69,6 +69,75 @@ ancestry and fork position before selecting a new recovery timeline
 WAL beyond the fork as well as applied WAL. Writing recovery configuration alone
 must not authorize a divergent former primary to rejoin.
 
+### Existing sibling follow intake
+
+A three-node native probe now reproduces the next gap. Two standbys replay a
+shared parent commit. One promotes to timeline 2 and writes a child row; the
+other retains its original base, receive spool and restartpoint and changes its
+source endpoint. The receiver rejects the new source at the timeline identity
+check. Its applied position, durable flush and digest remain unchanged, it stays
+read-only, and the promoted source has no retention pin for that sibling.
+Evidence: `/tmp/pg-fork-follow-probe.log` and
+`/tmp/pg-operation-parking.gXdsy0/`.
+
+The corresponding pinned C experiment passes: after updating `primary_conninfo`
+and reloading, the existing sibling replays the child row and reports recovery
+with received timeline 2. Evidence: `/tmp/pg-fork-follow-c.log` and
+`/tmp/pg-fork-follow-c.R1XZBe/`. This is a C compatibility gap, not an optional
+native feature. Patroni 4.1.5 `Postgresql.follow` builds recovery parameters,
+writes recovery configuration, then reloads, restarts or starts the process;
+`ConfigHandler.build_recovery_params` selects `recovery_target_timeline=latest`,
+`primary_conninfo` and, when enabled, `primary_slot_name`. A private control call
+alone will not complete that interface contract.
+
+A second native probe pauses replay, receives and flushes parent WAL beyond the
+future fork, then attempts the same switch. The existing rejection preserves
+that acknowledged prefix. Evidence: `/tmp/pg-fork-follow-divergent-probe.log`
+and `/tmp/pg-operation-parking.pAsykp/divergent-boundaries`. Future acceptance
+must distinguish this case from the eligible sibling: checking only applied WAL
+would miss divergence in durable received WAL.
+
+Implementation needs separate immutable base provenance, selected receive
+history and replay timeline. The current receive control, restartpoints, prefix
+proofs and promotion parent all use the base timeline. Both receive storage and
+ordinary replay reject EOR records deliberately. Relaxing the receiver identity
+comparison alone cannot implement the transition. Selected history must be bound
+to durable receive progress; replay must validate EOR at the fork; cold startup,
+restartpoint compaction and later promotion must reconstruct the same lineage.
+The new source also needs a retained, independently checked resume anchor:
+creating a pin at its current checkpoint cannot recover a sibling's older base.
+A fully received parent prefix may use an independently verified fork anchor for
+a new suffix, while preserving its original receive proof. Otherwise the source
+must retain enough common parent WAL to verify and supply the missing prefix.
+Missing retained proof requires reseed, not an invented confirmation floor.
+
+Sol xhigh and Astra high reviewed the transition design. The selected approach
+extends one cumulative spool with timeline-qualified child files and immutable
+selected history referenced by receive control. Orphan staged files do not select
+history. Publish selection before child receipt; flush child bytes before
+acknowledgment; retain transition proof when restartpoint compaction removes EOR.
+Following EOR must leave the server in recovery. Later promotion derives its
+parent from verified replay, while base validation keeps using the original base.
+
+The first prerequisite, `timeline-follow-candidate-p`, checks both applied and
+durable received frontiers against a proposed descendant history. Its true result
+means only that source-prefix proof may proceed. It performs no I/O, changes no
+role or progress, and is not yet wired into receiver admission. The four focused
+Rove tests and 200 generated frontier trials at seed 42 pass. The complete
+physical suite passes 515 cases. Luna max and Sol high found no actionable
+findings; Sol medium found no useful refactor. These checks do not establish
+operational fork crossing. Terra 6.1 drafted the predicate documentation and the
+primary reviewed it separately, clarifying that receipt is durable and record
+boundaries still need verification.
+
+C anchors: `walreceiver.c:328-355` checks system identity and upstream timeline;
+`walreceiver.c:422-470` fetches history and streams the requested timeline;
+`walsender.c:917-970` bounds historic streams at the fork and rejects starts past
+it; `walsender.c:1044-1087` returns the next timeline after COPY;
+`xlogrecovery.c:4131-4209` checks ancestry and the replay point before changing
+the recovery target. Native prefix digests and spool publication are custom
+storage mechanisms, not new coordinator contracts.
+
 ### SQL pg_promote
 
 SQL `pg_promote` now submits the native promotion request and can wait inline

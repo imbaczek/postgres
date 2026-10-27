@@ -103,6 +103,11 @@ System identity and exact prefix digest must still be verified by the caller."
              (<= boundary (timeline-history-entry-end entry))))))
 
 (defun timeline-follow-candidate-p (timeline applied received history)
+  "Check whether a descendant history contains both standby prefix frontiers.
+APPLIED and RECEIVED belong to TIMELINE and must be ordered. RECEIVED must
+describe durable receipt. A frontier at the fork is allowed. Invalid inputs
+or lineage raise an error. The caller must still verify record boundaries,
+system identity, exact prefix and retention; this grants no stream or role authority."
   (unless (and (typep timeline '(integer 1 4294967295))
                (typep applied '(unsigned-byte 64))
                (typep received '(unsigned-byte 64))
