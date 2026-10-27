@@ -570,6 +570,25 @@ native test. Implement normal GUC support before sharing the SQL oracle, rather 
 substituting a custom setting. The full HA goal remains open; coordination remains
 outside this work.
 
+### Explicit B-tree read leases
+
+B-tree read locks now use explicit thread-owned lease tokens. A scoped lease can
+be released early, and cleanup releases it once even when acquisition or the body
+is interrupted. Writer-reentrant leases do not add reader counts. The coarse lease
+still protects traversal because this tree has no sibling links; it does not yet
+make suspended index callbacks safe across replay or splits.
+
+Twelve focused tests cover ownership, nesting, writer handoff, deadlines and FATAL
+interrupts. Review found a repeated-FATAL gap at cleanup entry; it was fixed and
+covered by a regression. Final validation passed 420 physical tests, 170 interop
+tests and 1,598 legacy checks, native index-scan, index-lock-contention and shutdown
+regressions, and fresh strict compilation. Luna and Sol code reviews cleared the
+change; Sol's refactoring review found no new abstraction needed.
+
+Unread TID detachment and a bounded or spillable spool remain to be implemented.
+Heap, join, aggregate and output callbacks also need a resource audit before SQL
+`pg_promote` binding. The broader HA goal remains open.
+
 ### Timeline-qualified native WAL namespace
 
 Filename construction/parsing now centralizes C `XLogFileName`'s TLI/log/segment

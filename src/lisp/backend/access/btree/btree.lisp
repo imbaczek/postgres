@@ -54,14 +54,23 @@
   (check-for-interrupts))
 
 (defstruct btree-read-lease
+  "A thread-owned read lease with :NEW, :HELD and :RELEASED states.
+
+A writer-reentrant lease does not add a reader count.  A held or released
+lease cannot be acquired again."
   lock-state thread (status :new) writer-reentrant-p)
 
 (defun btree-read-lease-active-p (lease)
   (eq (btree-read-lease-status lease) :held))
 
-(defvar *btree-read-leases* nil)
+(defvar *btree-read-leases* nil
+  "Leases in the enclosing dynamic scopes, including leases released early.
+Callers auditing current ownership must select the held leases.")
 
 (defun call-with-btree-read-lease-lock (state function)
+  "Call FUNCTION with STATE's mutex, releasing it only if this thread owns it.
+
+A condition wait can unwind with the mutex either held or released."
   (let ((mutex (btree-relation-lock-state-mutex state)))
     (sb-sys:without-interrupts
       (sb-thread:grab-mutex mutex)
@@ -71,6 +80,8 @@
           (sb-thread:release-mutex mutex))))))
 
 (defun acquire-btree-read-lease (lease)
+  "Acquire a new lease for its owning thread, respecting waiting writers.
+A thread already reading may nest while a writer waits."
   (unless (and (eq (btree-read-lease-thread lease) sb-thread:*current-thread*)
                (eq (btree-read-lease-status lease) :new))
     (error "B-tree read lease must be new and owned by this thread"))
@@ -99,6 +110,10 @@
   lease)
 
 (defun release-btree-read-lease (lease)
+  "Release the owner's lease; repeated release is harmless.
+
+A foreign thread cannot release it.  If a deadline interrupts the mutex wait,
+finish removing the reader credit and waking waiters before reporting it."
   (sb-sys:without-interrupts
     (unless (eq (btree-read-lease-thread lease) sb-thread:*current-thread*)
       (error "B-tree read lease belongs to another thread"))
@@ -132,6 +147,11 @@
     t))
 
 (defun call-with-btree-relation-read-lease (relfilenode function)
+  "Call FUNCTION with a thread-owned lease and release it on every exit.
+
+Install cleanup before acquisition.  Mask interrupts at the cleanup call site
+as well as inside release, so repeated FATAL interrupts cannot skip release.
+The coarse lease protects traversal in this tree, which has no sibling links."
   (let ((lease (make-btree-read-lease :lock-state (btree-relation-lock relfilenode)
                                       :thread sb-thread:*current-thread*)))
     (unwind-protect
@@ -142,6 +162,7 @@
       (sb-sys:without-interrupts (release-btree-read-lease lease)))))
 
 (defun call-with-btree-relation-read-lock (relfilenode function)
+  "Call FUNCTION under a shared lease without exposing the lease token."
   (call-with-btree-relation-read-lease
    relfilenode
    (lambda (lease)
