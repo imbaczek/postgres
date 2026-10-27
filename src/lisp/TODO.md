@@ -7,8 +7,9 @@
   this pass; the primary agent reviews its documentation separately.
   The child checkpoint/primary, online promotion and reader-safe row replay
   modules, source running-transaction metadata helpers, covered standby snapshots,
-  virtual reader lifecycle helpers and private child adoption have completed this
-  pass and its review. Keep the same order for the remaining HA work.
+  virtual reader lifecycle helpers, private child adoption and the private
+  promotion reader-enrollment prerequisite have completed this pass and its
+  review. Keep the same order for the remaining HA work.
 
 - [ ] Audit cold-image compilation and ASDF load-order dependencies across `pg`
   and its test systems. A warm REPL must not conceal missing declarations or
@@ -20,7 +21,7 @@
   of the target. Audit callers and add a regression for rejection or a distinct
   temporary name before changing the cleanup path.
 
-The audit should cover:
+The cold-image audit should cover:
 
 - Cross-file constants and specials referenced before their definitions or
   proclamations, especially `LET` bindings compiled before `DECLAIM SPECIAL`.

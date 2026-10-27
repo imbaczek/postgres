@@ -25,6 +25,11 @@ joins occur here.  PRESERVE-READERS is for the private live adopter."
     (error "pending promotion requires stopped workers and no open reader transactions")))
 
 (defun physical-promotion-check-reader-snapshots (backends)
+  "Check that every active snapshot has exactly one backend owner.
+
+The caller holds the backend registry lock and has closed operation admission.
+Check snapshot registrations under the separate snapshot lock; reject orphaned
+or inconsistent state rather than dropping it."
   (let ((owners (make-hash-table :test #'eq)))
     (sb-thread:with-mutex (*snapshot-count-lock*)
       (dolist (backend backends)
@@ -49,6 +54,14 @@ joins occur here.  PRESERVE-READERS is for the private live adopter."
   (values))
 
 (defun physical-promotion-enroll-readers ()
+  "Check and enroll retained readers before a private promotion.
+
+The caller has closed operation admission and joined recovery workers.  The
+registry lock protects the backend census; closed admission keeps transaction
+resources stable, including while normal EOF cleanup waits.  Take the relation
+lock before the XID lock, and check snapshots separately under their lock.
+Reject orphaned registrations.  Repair the virtual ID counter before allocating
+IDs, and keep retained transactions read-only."
   (physical-promotion-check-context 2 :preserve-readers t)
   (sb-thread:with-mutex (*backend-registry-lock*)
     (let ((backends (remove-duplicates

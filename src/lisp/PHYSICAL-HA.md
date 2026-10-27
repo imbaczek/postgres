@@ -423,9 +423,9 @@ still drains old transactions.
 This is a conservative fail-closed prerequisite. C `StartupXLOG` calls `TrimCLOG` at the
 end of recovery; equivalent CLOG repair remains open. Nonempty slots and source pins
 need child-relative continuity and pending-progress proof. The full phase-2 to phase-3
-reader-preserving wrapper, reconciliation of old idle virtual readers, replay choice and
-generic SQL `pg_promote` remain future work. The broader cold-load audit also remains
-open.
+reader-preserving wrapper, replay choice and generic SQL `pg_promote` remain future
+work. The private reader census described below is ready for integration. The broader
+cold-load audit also remains open.
 
 A clean worker passed 380 physical Rove tests, 170 interop tests and 1,598 legacy
 checks. An additional post-review test injects an invalid in-memory batch end after a
@@ -443,6 +443,27 @@ installation, pending retirement and readiness. Fresh strict compilation
 (`/tmp/pg-live-adopt-compile-reviewed.log`) and formatting passed. Reviews found
 retention timing and CLOG gap issues, which were fixed and rereviewed without further
 production findings.
+
+### Private promotion reader enrollment
+
+Private reader enrollment checks backend, virtual ID, relation and snapshot ownership
+under closed admission. It includes abandoned backend owners and rejects orphaned or
+duplicate state rather than dropping it. It repairs the virtual ID counter before
+enrolling missing identities, preserves cached IDs and snapshots, and keeps retained
+transactions read-only. Ordinary EOF cleanup waits for admission to reopen.
+
+Four new Rove tests cover this prerequisite, including stale counters, missing reader
+registrations, snapshot-only readers and invalid ownership. The final clean-worker run
+passed all 384 physical tests. Fresh strict compilation
+(`/tmp/pg-reader-enrollment-guard-compile.log`) and formatting passed. Luna checkpoint
+and Sol full-diff reviews passed after fixing a missing global active-XID guard; its
+regression failed before the fix and passed afterward. Sol's refactoring review
+recommended no further abstraction.
+
+Public online promotion still drains old transactions. This helper has not yet been
+tested through native promotion. The complete phase-2 to phase-3 wrapper, reader-safe
+replay selection, native disconnect/shutdown tests and the combined snapshot-only
+wraparound case remain before activation. SQL `pg_promote` also remains open.
 
 ### Timeline-qualified native WAL namespace
 
