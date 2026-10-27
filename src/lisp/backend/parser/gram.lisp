@@ -85,7 +85,7 @@
           '("with" "from" "where" "order" "limit" "group" "having" "union"
             "intersect" "except" "offset" "fetch" "for" "join" "inner"
             "left" "right" "full" "outer" "cross" "on" "using"
-            "natural" "asc" "desc" "window"
+            "natural" "asc" "desc" "window" "lateral"
             "and" "or" "when" "then" "else" "end")
           :test #'string=))
 
@@ -193,16 +193,16 @@
       (ereport "0A000" "SELECT DISTINCT ON is not supported"))
     (unless distinct (match-kw p "all"))
     (let ((targets (parse-target-list p))
-          (from nil) (from-alias nil) (joins nil) (where nil) (group-by nil))
+          (from nil) (from-alias nil) (joins nil) (where nil) (group-by nil) (having nil))
       (when (match-kw p "from")
         (multiple-value-setq (from from-alias joins) (parse-from p)))
       (when (match-kw p "where") (setf where (parse-expr p)))
       (when (match-kw p "group")
         (expect-kw p "by")
         (setf group-by (parse-expr-list p)))
-      (when (kw-p p "having") (ereport "0A000" "HAVING is not supported"))
+      (when (match-kw p "having") (setf having (parse-expr p)))
       (list :type :select :targets targets :from from :from-alias from-alias
-            :joins joins :where where :group-by group-by :distinct distinct
+            :joins joins :where where :group-by group-by :having having :distinct distinct
             :windows (when (match-kw p "window") (parse-window-clause p))))))
 
 (defun parse-select-operand (p)
@@ -262,22 +262,24 @@
     name))
 
 (defun parse-from-item (p)
-  (when (match-punct p #\()
-    (return-from parse-from-item
-      (with-parens (p :opening-consumed t)
-        (make-sql-derived-relation :query (parse-select-expression p)))))
-  (let* ((name (pident p))
-         (schema (when (match-punct p #\.)
-                   (prog1 name (setf name (pident p))))))
-    (if (match-punct p #\()
-        (let ((call (parse-function-call p name schema)))
-          ;; Noncorrelated composite functions reuse ProjectSet and the same
-          ;; derived-relation registration domain as an explicit subquery.
-          (values (make-sql-derived-relation
-                   :query (list :type :select
-                                :targets (list (list :expr (list :record-expand call :once t)))))
-                  name))
-        (if schema (make-sql-relation-name :schema schema :name name) name))))
+  (let ((lateral (match-kw p "lateral")))
+    (when (match-punct p #\()
+      (return-from parse-from-item
+        (with-parens (p :opening-consumed t)
+          (let ((query (parse-select-expression p)))
+            (setf (getf query :lateral) lateral)
+            (make-sql-derived-relation :query query)))))
+    (let* ((name (pident p))
+           (schema (when (match-punct p #\.)
+                     (prog1 name (setf name (pident p))))))
+      (if (match-punct p #\()
+          (let ((call (parse-function-call p name schema)))
+            (values (make-sql-derived-relation
+                     :query (list :type :select :lateral t :from-function t
+                                  :targets (list (list :expr (list :record-expand call :once t)))))
+                    name))
+          (if lateral (syntax-error p "LATERAL requires a subquery or function")
+              (if schema (make-sql-relation-name :schema schema :name name) name))))))
 
 (defun parse-from-relation (p)
   (multiple-value-bind (source default-alias) (parse-from-item p)
@@ -287,6 +289,11 @@
           (when (and (eq (pkind p) :ident)
                      (or (token-quoted-p (pcur p)) (not (clause-keyword-p (pval p)))))
             (setf alias (pident p))))
+      (when (and alias (match-punct p #\())
+        (unless (sql-derived-relation-p source)
+          (ereport "0A000" "column aliases for base tables are not supported"))
+        (setf (getf (sql-derived-relation-query source) :column-aliases)
+              (with-parens (p :opening-consumed t) (parse-ident-list p))))
       (values source alias))))
 
 (defun parse-join-clause (p)

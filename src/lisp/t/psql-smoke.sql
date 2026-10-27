@@ -508,5 +508,5 @@ select *, count(*) from aggregate_events group by category, label;
 select category as label, count(*) from aggregate_events
   group by category, label order by aggregate_events.label;
 select label, count(*) from aggregate_events group by category;
-select category, count(*) from aggregate_events group by category having count(*) > 1;
+select category, count(*) from aggregate_events group by category having count(*) > 1 order by category;
 drop table aggregate_events;

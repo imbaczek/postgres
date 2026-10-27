@@ -289,10 +289,17 @@ reordered tree, and each parameterized path can reference only joined Vars."
 (defun build-select-plan-tree (prepared physical-p paths)
   (let* ((input (select-plan-input-form prepared physical-p paths))
          (where (getf prepared :where))
-         (aggregate-p (getf prepared :aggregate-p)))
+         (aggregate-p (getf prepared :aggregate-p))
+         (degenerate-having-p (and (getf prepared :has-having)
+                                   (not (getf prepared :group-keys))
+                                   (zerop (getf prepared :aggregate-count 0)))))
     (when (getf prepared :join-order)
       (let ((join-qual (select-reordered-join-qual prepared)))
         (when join-qual (setf input (list :filter join-qual input)))))
+    (when degenerate-having-p
+      ;; With no transitions or grouping keys, HAVING alone generates one row;
+      ;; neither the FROM input nor its WHERE clause can change that group.
+      (setf input '(:result) where nil))
     (when where
       (when (and (window-constant-expression-p where) (not (true-p (eval-expr where #()))))
         (setf input '(:result)))
@@ -306,6 +313,8 @@ reordered tree, and each parameterized path can reference only joined Vars."
                   (if (prepared-transition-aggregate-p prepared)
                       (getf prepared :aggregates) (getf prepared :aggregate-count))
                   input)))
+    (when (getf prepared :having)
+      (setf input (list :filter (getf prepared :having) input)))
     ;; Project shared keys after grouping; window stages append their slots before
     ;; set-returning expressions and final target projection.
     (when (getf prepared :window-keys)
@@ -429,8 +438,126 @@ reordered tree, and each parameterized path can reference only joined Vars."
      (finish-select-plan-tree (list :append (nreverse physical-arms)) prepared t)
      nil)))
 
+(defun having-gate-value (expression)
+  ;; Return VALUE, KNOWN-P.  Unknown leaves never enter EVAL-EXPR.  Boolean
+  ;; absorption can nevertheless establish a constant around an opaque call.
+  (when (having-literal-expression-p expression)
+    (return-from having-gate-value (values (eval-expr expression #()) t)))
+  (labels ((constant (value source)
+             (list :const value :type (expr-type source) :typmod (expr-typmod source)))
+           (fold-children (positions)
+             (let ((copy (copy-list expression)) (known-p t))
+               (dolist (position positions)
+                 (multiple-value-bind (value known) (having-gate-value (nth position expression))
+                   (if known
+                       (setf (nth position copy) (constant value (nth position expression)))
+                       (setf known-p nil))))
+               (if known-p (values (eval-expr copy #()) t) (values nil nil)))))
+    (case (first expression)
+      (:having-opaque
+       (dolist (argument (second expression)) (having-gate-value argument))
+       (values nil nil))
+      ((:and :or)
+       (let ((and-p (eq (first expression) :and)))
+         (multiple-value-bind (left left-known) (having-gate-value (second expression))
+           (when (and left-known (if and-p (null left) (eq left t)))
+             (return-from having-gate-value (values left t)))
+           (multiple-value-bind (right right-known) (having-gate-value (third expression))
+             (cond
+               ((and right-known (if and-p (null right) (eq right t)))
+                (values right t))
+               ((and left-known right-known)
+                (values (if and-p (sql-3val-and left right) (sql-3val-or left right)) t))
+               (t (values nil nil)))))))
+      (:coalesce
+       (let ((unknown-p nil))
+         (dolist (argument (second expression) (if unknown-p (values nil nil) (values +null+ t)))
+           (multiple-value-bind (value known) (having-gate-value argument)
+             (cond ((not known) (setf unknown-p t))
+                   ((not (eq value +null+))
+                    (return-from having-gate-value
+                      (if unknown-p (values nil nil) (values value t)))))))))
+      (:case
+          (let ((unknown-p nil))
+            (dolist (branch (second expression))
+              (multiple-value-bind (condition known) (having-gate-value (first branch))
+                (cond
+                  ((not known)
+                   (setf unknown-p t)
+                   (having-gate-value (second branch)))
+                  ((true-p condition)
+                   (multiple-value-bind (value value-known) (having-gate-value (second branch))
+                     (return-from having-gate-value
+                       (if unknown-p (values nil nil) (values value value-known))))))))
+            (multiple-value-bind (value known) (having-gate-value (third expression))
+              (if unknown-p (values nil nil) (values value known)))))
+      ((:not :is-null :is-bool :cast :join-relabel) (fold-children '(1)))
+      (:unary (fold-children '(2)))
+      ((:binop :any :all) (fold-children '(2 3)))
+      ((:concat :array-length :join-coalesce) (fold-children '(1 2)))
+      (:in
+       (let ((copy (copy-list expression)) (known-p t))
+         (labels ((fold (part)
+                    (multiple-value-bind (value known) (having-gate-value part)
+                      (if known (constant value part)
+                          (progn (setf known-p nil) part)))))
+           ;; Copy the metadata tail before replacing its analyzed operands.
+           (setf (cddddr copy) (copy-list (cddddr expression))
+                 (second copy) (fold (second expression))
+                 (third copy) (mapcar #'fold (third expression))
+                 (getf (cddddr copy) :array-left)
+                 (when (getf (cddddr expression) :array-left)
+                   (fold (getf (cddddr expression) :array-left)))
+                 (getf (cddddr copy) :array-items)
+                 (mapcar #'fold (getf (cddddr expression) :array-items))
+                 (getf (cddddr copy) :comparisons)
+                 (mapcar (lambda (pair) (mapcar #'fold pair))
+                         (getf (cddddr expression) :comparisons)))
+           (if known-p (values (eval-expr copy #()) t) (values nil nil)))))
+      ((:array :func)
+       (let* ((position (if (eq (first expression) :func) 2 1))
+              (arguments (nth position expression))
+              (copy (copy-list expression))
+              (known-p t)
+              (folded nil))
+         (dolist (argument arguments)
+           (multiple-value-bind (value known) (having-gate-value argument)
+             (if known (push (constant value argument) folded)
+                 (setf known-p nil))))
+         (if known-p
+             (progn (setf (nth position copy) (nreverse folded))
+                    (values (eval-expr copy #()) t))
+             (values nil nil))))
+      (otherwise (values nil nil)))))
+
+(defun having-input-gate (clauses)
+  ;; Keep original WHERE and HAVING preprocessing separate after pushdown.
+  ;; Fold skeletons only for queries selected for planning, preserving unused
+  ;; WITH definitions.  FALSE stops an AND list; NULL does not.  The second
+  ;; value identifies a qualification whose every clause folds to TRUE.
+  (let ((gate nil) (all-true-p t))
+    (dolist (clause clauses (values gate all-true-p))
+      (multiple-value-bind (value known) (having-gate-value clause)
+        (unless (and known (true-p value)) (setf all-true-p nil))
+        (when (and known (not (true-p value)))
+          (setf gate (list :const value :type :bool :typmod -1))
+          (unless (eq value +null+)
+            (return-from having-input-gate (values gate nil))))))))
+
 (defun plan-prepared-select (prepared)
   "Build child plans without the catalog lock, then flatten their registration."
+  ;; A false or null gate suppresses input; retain it above grouping when it
+  ;; came from HAVING.  An all-true HAVING becomes a canonical true qual.
+  (when (getf prepared :has-having)
+    (let* ((where-gate (having-input-gate (getf prepared :where-gate-clauses)))
+           (having-fold (multiple-value-list
+                         (having-input-gate (getf prepared :having-gate-clauses))))
+           (having-gate (first having-fold))
+           (gate (or where-gate having-gate)))
+      (when gate (setf (getf prepared :where) gate))
+      (cond (having-gate (setf (getf prepared :having) having-gate))
+            ((second having-fold)
+             (setf (getf prepared :having) '(:bool t :type :bool :typmod -1))))))
   (when (getf prepared :deferred-window-folding)
     (unless *cte-retain-window-junk-p*
       (setf (getf prepared :window-keys)
@@ -1068,7 +1195,9 @@ on an abnormal exit."
     (:subquery-scan
      (physical-scan-relation node registered-relations)
      (let* ((parent-frames *subquery-outer-frames*)
-            (frame (cons #() (make-hash-table :test #'eq)))
+            (frame (cons (if (getf (physical-scan-relation node registered-relations) :lateral-dependent)
+                             outer-environment #())
+                         (make-hash-table :test #'eq)))
             (*subquery-outer-frames* (cons frame parent-frames)))
        (unwind-protect
             (funcall run-child (fourth node)
@@ -1093,7 +1222,8 @@ on an abnormal exit."
             (right-path
               (and right-relation
                    (physical-scan-path right right-relation))))
-       (if (and right-path (select-scan-path-parameter-expr right-path))
+       (if (or (getf join :lateral-dependent)
+               (and right-path (select-scan-path-parameter-expr right-path)))
            (stream-select-indexed-join-environments
             (lambda (left-callback)
               (funcall run-child left left-callback))

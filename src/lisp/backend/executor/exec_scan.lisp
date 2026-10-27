@@ -679,15 +679,41 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
           :virtual-p (not (null row-source))
           :row-source row-source)))
 
-(defun prepare-select-source (source alias offset)
+(defun prepared-query-lateral-reference-p (prepared)
+  ;; Include references in unused CTEs: join legality is an analysis property,
+  ;; even when the referenced producer will never execute.
+  (let ((found nil))
+    (map-prepared-query-expressions
+     (lambda (form depth)
+       (when (and (consp form) (eq (first form) :outer-ref)
+                  (= (second form) (1+ depth)))
+         (setf found t))
+       form)
+     prepared)
+    found))
+
+(defun prepare-select-source (source alias offset &optional preceding-scope)
   "Prepare a FROM namespace entry; callers hold the catalog view lock."
   (let ((definition (cte-source-definition source)))
     (when definition
       (return-from prepare-select-source (make-cte-relation-spec definition alias offset))))
   (if (sql-derived-relation-p source)
-      (let* ((prepared (prepare-select-internal (sql-derived-relation-query source)
-                                                (make-select-scope)))
-             (targets (getf prepared :targets))
+      (let* ((query (sql-derived-relation-query source))
+             (prepared (prepare-select-internal query
+                                                (if (getf query :lateral)
+                                                    (or preceding-scope (make-select-scope))
+                                                    (make-select-scope))))
+             (targets (let ((targets (getf prepared :targets))
+                            (aliases (getf query :column-aliases)))
+                        (when (> (length aliases) (length targets))
+                          (ereport "42P10" "table ~s has ~d columns available but ~d columns specified"
+                                   alias (length targets) (length aliases)))
+                        (loop for target in targets for index from 0
+                              collect (if (< index (length aliases))
+                                          (let ((copy (copy-list target)))
+                                            (setf (getf copy :name) (nth index aliases))
+                                            copy)
+                                          target))))
              (table (make-pg-class
                      :oid 0 :name (or alias "*SELECT*")
                      :columns (coerce
@@ -701,6 +727,12 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
         (list :name alias :alias alias :table table :offset offset
               :width (length targets) :columns (pg-class-columns table)
               :virtual-p t :origins targets :subquery-prepared prepared
+              ;; Legality includes unused CTEs; runtime dependencies need only
+              ;; the outer frames reached by executable expressions.
+              :lateral-reference (and (getf query :lateral)
+                                      (prepared-query-lateral-reference-p prepared))
+              :lateral-dependent (and (getf query :lateral)
+                                      (member 1 (prepared-query-outer-depths prepared)))
               :subquery-plan nil :subquery-logical nil :subquery-physical nil))
       (make-select-relation-spec source alias (select-table-or-error source) offset)))
 
@@ -754,6 +786,121 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
     (setf (getf prepared :sublinks) (nreverse *select-sublinks*))
     prepared))
 
+(defun having-immutable-function-p (name)
+  ;; Match the immutable declarations in pg_proc.dat for supported calls.
+  ;; Other calls remain opaque even when their arguments are constants.
+  (member name '("lower" "substr" "length" "char_length" "character_length"
+                 "pg_wal_lsn_diff" "pg_walfile_name")
+          :test #'string=))
+
+(defun having-literal-expression-p (expression)
+  ;; Gate folding accepts only literal inputs and immutable operators/functions.
+  ;; STABLE functions such as current_setting must still run at execution time.
+  (and (consp expression)
+       (case (first expression)
+         ((:const :bool :scalar-array-const) t)
+         ((:binop :any :all)
+          (and (having-literal-expression-p (third expression))
+               (having-literal-expression-p (fourth expression))))
+         (:unary (having-literal-expression-p (third expression)))
+         ((:cast :not :is-null :is-bool :join-relabel)
+          (having-literal-expression-p (second expression)))
+         ((:and :or :concat :array-length :join-coalesce)
+          (and (having-literal-expression-p (second expression))
+               (having-literal-expression-p (third expression))))
+         ((:array :coalesce)
+          (every #'having-literal-expression-p (second expression)))
+         (:case
+             (and (every (lambda (branch)
+                           (every #'having-literal-expression-p branch))
+                         (second expression))
+                  (having-literal-expression-p (third expression))))
+         (:in
+          (and (having-literal-expression-p (second expression))
+               (every #'having-literal-expression-p (third expression))))
+         (:func
+          (and (having-immutable-function-p (second expression))
+               (every #'having-literal-expression-p (third expression))))
+         (otherwise nil))))
+
+(defun having-gate-skeleton (expression)
+  ;; Retain only the immutable expression structure needed for gate folding.
+  ;; Opaque leaves own no Vars, scopes or subplan descriptors.  Function argument
+  ;; skeletons retain constant errors without ever invoking a nonimmutable call.
+  (when (having-literal-expression-p expression)
+    (return-from having-gate-skeleton (copy-tree expression)))
+  (labels ((children (&rest positions)
+             (let ((copy (copy-list expression)))
+               (dolist (position positions copy)
+                 (setf (nth position copy)
+                       (having-gate-skeleton (nth position expression)))))))
+    (case (first expression)
+      ((:and :or :concat :array-length :join-coalesce) (children 1 2))
+      ((:binop :any :all) (children 2 3))
+      (:unary (children 2))
+      ((:not :is-null :is-bool :cast :join-relabel) (children 1))
+      ((:array :coalesce)
+       (let ((copy (copy-list expression)))
+         (setf (second copy) (mapcar #'having-gate-skeleton (second expression)))
+         copy))
+      (:case
+          (let ((copy (copy-list expression)))
+            (setf (second copy)
+                  (mapcar (lambda (branch) (mapcar #'having-gate-skeleton branch))
+                          (second expression))
+                  (third copy) (having-gate-skeleton (third expression)))
+            copy))
+      (:in
+       (let ((copy (children 1)))
+         (setf (third copy) (mapcar #'having-gate-skeleton (third expression))
+               (getf (cddddr copy) :array-left)
+               (when (getf (cddddr expression) :array-left)
+                 (having-gate-skeleton (getf (cddddr expression) :array-left)))
+               (getf (cddddr copy) :array-items)
+               (mapcar #'having-gate-skeleton (getf (cddddr expression) :array-items))
+               (getf (cddddr copy) :comparisons)
+               (mapcar (lambda (pair) (mapcar #'having-gate-skeleton pair))
+                       (getf (cddddr expression) :comparisons)))
+         copy))
+      (:func
+       (if (having-immutable-function-p (second expression))
+           (let ((copy (copy-list expression)))
+             (setf (third copy) (mapcar #'having-gate-skeleton (third expression)))
+             copy)
+           (list :having-opaque (mapcar #'having-gate-skeleton (third expression)))))
+      (otherwise '(:having-opaque)))))
+
+(defun having-pushdown-safe-p (expression)
+  ;; planner.c keeps aggregate, volatile and subplan clauses above grouping.
+  (labels ((contains-special (form)
+             (and (consp form)
+                  (or (subquery-expression-p form)
+                      (and (eq (first form) :col) (getf (cddr form) :aggregate-output))
+                      (contains-special (car form))
+                      (contains-special (cdr form))))))
+    (and (not (contains-special expression))
+         (not (cte-expression-volatile-p expression)))))
+
+(defun prepare-having-qualifications (where having group-keys scope)
+  ;; Validate grouped references before moving clauses back to the input row.
+  ;; Without group keys retain the clause above the implicit global group too:
+  ;; filtering all input rows must not create an unwanted output group.
+  (let ((remaining nil))
+    (dolist (clause (where-conjuncts having))
+      (let ((rewritten (rewrite-aggregate-columns clause group-keys scope)))
+        (if (having-pushdown-safe-p clause)
+            (progn
+              (let ((input-clause (copy-tree clause)))
+                (setf where (if where
+                                (list :and where input-clause :type :bool :typmod -1)
+                                input-clause)))
+              (unless group-keys (push rewritten remaining)))
+            (push rewritten remaining))))
+    (values where
+            (when remaining
+              (reduce (lambda (left right) (list :and left right :type :bool :typmod -1))
+                      (nreverse remaining))))))
+
 (defun %prepare-select-internal (ast)
   ;; Group rewrites wait for nested analysis; DISTINCT ordering uses output slots.
   (when (getf ast :set-operation)
@@ -774,7 +921,7 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
       (let* ((name (getf join-ast :table))
              (alias (getf join-ast :alias))
              (offset (select-scope-width scope))
-             (source (prepare-select-source name alias offset))
+             (source (prepare-select-source name alias offset scope))
              (relation (select-source-scope-relation source))
              (right-columns (select-relation-columns relation))
              (join-type (getf join-ast :type))
@@ -785,6 +932,9 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                                           right-columns using-names)))
              (join-scope (extend-select-scope scope relation))
              (qual (progn
+                     (when (and (getf source :lateral-reference)
+                                (member join-type '(:right :full)))
+                       (ereport "42P10" "the combining JOIN type must be INNER or LEFT for a LATERAL reference"))
                      (setf (getf *select-analysis-frame* :kind) :join-on)
                      (cond
                        ((eq join-type :cross) '(:bool t))
@@ -800,7 +950,8 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                      :relations (select-scope-relations join-scope)
                      :columns columns
                      :width (select-scope-width join-scope)))
-        (push (list :type join-type :qual qual :left-width offset
+        (push (list :type join-type :qual qual :lateral-dependent (getf source :lateral-dependent)
+                    :left-width offset
                     :right-width (select-relation-width relation))
               joins)
         (setf relations
@@ -810,12 +961,15 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
     (let* ((where (progn (setf (getf *select-analysis-frame* :kind) :where)
                          (when (getf ast :where)
                            (coerce-boolean-expression (analyze-expr (getf ast :where) scope) "WHERE"))))
+           (where-gate-clauses
+             (when (getf ast :having)
+               (mapcar #'having-gate-skeleton (where-conjuncts where))))
            (group-keys (progn (setf (getf *select-analysis-frame* :kind) :group-by)
                               (when (getf ast :group-by)
                                 (analyze-group-keys (getf ast :group-by) scope))))
            (aggregate-analysis
              (progn
-               (setf (getf *select-analysis-frame* :kind) :select-target
+               (setf (getf *select-analysis-frame* :kind) (if (getf ast :from-function) :from-function :select-target)
                      (getf *select-analysis-frame* :group-keys) group-keys)
                (multiple-value-list
                 (analyze-aggregate-targets (getf ast :targets) scope group-keys))))
@@ -824,7 +978,14 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                       (resolve-query-window-specifications scope (first aggregate-analysis))
                       (first aggregate-analysis)))
            (aggregates (third aggregate-analysis))
-           (aggregate-p (or group-keys (plusp (length aggregates))))
+           (having (progn
+                     (setf (getf *select-analysis-frame* :kind) :having)
+                     (when (getf ast :having)
+                       (coerce-boolean-expression
+                        (analyze-expr (getf ast :having) scope) "HAVING"))))
+           (having-gate-clauses
+             (mapcar #'having-gate-skeleton (where-conjuncts having)))
+           (aggregate-p (or group-keys having (plusp (length aggregates))))
            (order (progn
                     (setf (getf *select-analysis-frame* :kind) :order-by)
                     (cond
@@ -838,6 +999,10 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
            (aggregate-p (or aggregate-p (plusp (length aggregates))))
            (order (if aggregate-p (finalize-query-group-expressions targets order group-keys scope (getf ast :distinct))
                       order))
+           (having-analysis (multiple-value-list
+                             (prepare-having-qualifications where having group-keys scope)))
+           (where (first having-analysis))
+           (having (second having-analysis))
            (width (if aggregate-p (+ (length group-keys) (length aggregates))
                       (select-scope-width scope)))
            (window-analysis (multiple-value-list
@@ -862,7 +1027,11 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
             :relations relations
             :scope scope
             :targets (first set-analysis) :set-functions (third set-analysis) :distinct (getf ast :distinct)
-            :where where
+            :where where :having having :has-having (not (null (getf ast :having)))
+            ;; Gate skeletons preserve the two preprocessing boundaries after
+            ;; pushdown without retaining Vars or subplan descriptors.
+            :where-gate-clauses where-gate-clauses
+            :having-gate-clauses having-gate-clauses
             :group-keys group-keys
             :aggregate-p aggregate-p
             :aggregate-count (length aggregates) :aggregates (coerce aggregates 'list)
@@ -1351,17 +1520,16 @@ inner input is exhausted and later outer rows can replay the same input."
 
 (defun stream-select-indexed-join-environments
     (left-stream parameterized-right-stream join callback)
-  "Run an INNER/LEFT nested loop with an index scan keyed by each outer row.
-
-Unlike the replayable SeqScan inner used by stream-select-join-environments,
-the right input changes with every outer row and must not be spooled once."
+  "Rescan a parameterized index or LATERAL input for each left row.
+The right input belongs to one left-row parameter epoch and cannot be replayed
+for another left row.  LEFT joins null-extend only after that input is exhausted."
   (let* ((join-type (getf join :type))
          (qual (getf join :qual))
          (right-width (getf join :right-width))
          (null-right (make-array right-width :initial-element +null+))
          (stopped nil))
-    (unless (member join-type '(:inner :left))
-      (error "Parameterized index join does not support ~a joins" join-type))
+    (unless (member join-type '(:inner :cross :left))
+      (error "Parameterized join does not support ~a joins" join-type))
     (labels ((emit (environment)
                (when (eq (funcall callback environment) :stop)
                  (setf stopped t)

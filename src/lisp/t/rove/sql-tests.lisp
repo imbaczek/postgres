@@ -216,12 +216,10 @@
                "SELECT parser represents COUNT(*) as an aggregate node")
       (rove:ok (= (length (parse-statements "select *, count(*) from events")) 1)
                "SELECT parser accepts a star mixed with other targets")
-      (let ((caught nil))
-        (handler-case
-            (parse-statements "select count(*) from events having count(*) > 1")
-          (pg-error (condition) (setf caught condition)))
-        (rove:ok (and caught (string= (pg-error-sqlstate caught) "0A000"))
-                 "HAVING remains explicitly unsupported"))
+      (rove:ok (getf (first (parse-statements
+                             "select count(*) from events having count(*) > 1"))
+                     :having)
+               "SELECT parser retains the HAVING qualification")
       (let ((plain (first (parse-statements "explain select 1")))
             (analyze (first (parse-statements "explain analyze select 1")))
             (parenthesized

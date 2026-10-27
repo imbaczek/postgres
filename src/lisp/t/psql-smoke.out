@@ -493,7 +493,8 @@ Execution Time: <timing> ms
 20|1
 10|1
 ERROR:  column "label" must appear in the GROUP BY clause or be used in an aggregate function
-ERROR:  HAVING is not supported
+10|2
+|2
 DROP TABLE
 ERROR:  duplicate key value violates unique constraint "unique_nnd_restart_idx"
 ERROR:  index "unique_using_restart_idx" is already associated with a constraint

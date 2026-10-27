@@ -791,10 +791,11 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   results. Empty or all-NULL sums return NULL. SUM and text `array_agg` use sorted
   grouping with spill; mixed aggregates preserve those semantics. General decimal,
   floating point, interval and money types remain unsupported.
-  Noncorrelated derived SELECTs in `FROM`, ordinary
+  Derived SELECTs in `FROM` support `LATERAL` references. `HAVING`, ordinary
   `DISTINCT`, `UNION ALL`, and the expression subqueries described above are
-  supported. Row-valued and MULTIEXPR subqueries, LATERAL, `DISTINCT ON`,
-  and `HAVING` remain unsupported. Hash subplans and subquery decorrelation are
+  supported; see [HAVING and LATERAL](t/HAVING-LATERAL.md) for scope and tests.
+  Row-valued and MULTIEXPR subqueries and `DISTINCT ON` remain unsupported.
+  Hash subplans, full optimizer constant folding, and subquery decorrelation are
   not implemented. Joins use nested loops;
   INNER/CROSS join order uses a greedy statistics-based choice, while outer
   joins retain source order. NATURAL JOIN

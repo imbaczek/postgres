@@ -3,8 +3,10 @@
 
 (defun simplify-exists-prepared-query (prepared)
   ;; Drop output work only when it cannot alter whether EXISTS returns a row.
+  ;; HAVING can reject even the implicit global group, so preserve its plan.
   (when (and (not (getf prepared :set-operation))
              (not (getf prepared :ctes))
+             (not (getf prepared :has-having))
              (zerop (getf prepared :aggregate-count 0))
              (not (getf prepared :set-functions))
              (not (getf prepared :windows))

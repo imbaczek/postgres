@@ -69,6 +69,7 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
                (query (getf state :right) level))
              (progn
                (setf (getf state :where) (expression (getf state :where) level)
+                     (getf state :having) (expression (getf state :having) level)
                      (getf state :group-keys)
                      (mapcar (lambda (form) (expression form level)) (getf state :group-keys))
                      (getf state :set-functions)
@@ -93,6 +94,8 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
   prepared)
 
 (defun prepared-query-outer-depths (prepared)
+  ;; Follow referenced producers only: these depths select runtime frame and
+  ;; cache ownership, unlike the broader walk used for lateral legality.
   (let ((depths nil) (seen (make-hash-table :test #'eq)))
     (labels
         ((expression (form level)
@@ -109,7 +112,7 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
              (if (getf state :set-operation)
                  (progn (query (getf state :left) level) (query (getf state :right) level))
                  (progn
-                   (dolist (key '(:where :group-keys :set-functions :window-keys :order))
+                   (dolist (key '(:where :having :group-keys :set-functions :window-keys :order))
                      (expression (getf state key) level))
                    (dolist (target (getf state :targets)) (expression (getf target :expr) level))
                    (dolist (join (getf state :joins)) (expression (getf join :qual) level))
@@ -244,6 +247,8 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
                      (prepared-query-semantic-key (getf relation :subquery-prepared)))))
            (getf prepared :source-relations))
    :where (subquery-semantic-key (getf prepared :where))
+   :having (subquery-semantic-key (getf prepared :having))
+   :has-having (getf prepared :has-having)
    :joins (subquery-semantic-key (getf prepared :joins))
    :group-keys (subquery-semantic-key (getf prepared :group-keys))
    :aggregates (mapcar (lambda (aggregate)

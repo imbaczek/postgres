@@ -94,6 +94,36 @@
                (setf sets nil)))))
      (lambda () (setf sets nil environment nil) (close-sql-iterator input)))))
 
+(defvar *lateral-outer-environment* nil)
+
+(defun make-lateral-join-iterator (join left right-factory)
+  ;; Each left row owns a fresh right iterator and parameter epoch.  Close it
+  ;; before advancing the left input, including on early exit or error.
+  (let ((right nil) (current-left nil) (left-present nil) (matched nil)
+                    (null-right (make-array (getf join :right-width) :initial-element +null+)))
+    (make-sql-iterator
+     (lambda ()
+       (loop
+         (unless left-present
+           (multiple-value-setq (current-left left-present) (sql-iterator-next left))
+           (unless left-present (return (values nil nil)))
+           (setf matched nil right (funcall right-factory current-left)))
+         (multiple-value-bind (row present) (sql-iterator-next right)
+           (if present
+               (let ((joined (combine-select-join-environment current-left row join)))
+                 (when (true-p (eval-expr (getf join :qual) joined))
+                   (setf matched t)
+                   (return (values joined t))))
+               (progn
+                 (close-sql-iterator right)
+                 (setf right nil left-present nil)
+                 (when (and (not matched) (eq (getf join :type) :left))
+                   (return (values (concatenate 'vector current-left null-right) t))))))))
+     (lambda ()
+       (close-sql-iterator right)
+       (close-sql-iterator left)
+       (setf current-left nil)))))
+
 (defun make-nested-loop-iterator (join left right)
   (let* ((store (make-query-replay-store right))
          (reader nil) (current-left nil) (left-present nil)
@@ -188,7 +218,9 @@
     (:append (make-append-sql-iterator (second node) relations))
     (:subquery-scan
      (physical-scan-relation node relations)
-     (let* ((frames (cons (cons #() (make-hash-table :test #'eq)) *subquery-outer-frames*))
+     (let* ((frames (cons (cons (if (getf (physical-scan-relation node relations) :lateral-dependent)
+                                    *lateral-outer-environment* #())
+                                (make-hash-table :test #'eq)) *subquery-outer-frames*))
             (input (let ((*subquery-outer-frames* frames))
                      (make-physical-plan-iterator (fourth node) relations))))
        (make-sql-iterator
@@ -226,9 +258,15 @@
             (sql-iterator-next input)))
         (lambda () (close-sql-iterator input)))))
     (:nested-loop-join
-     (make-nested-loop-iterator
-      (second node) (make-physical-plan-iterator (third node) relations)
-      (make-physical-plan-iterator (fourth node) relations)))
+     (if (getf (second node) :lateral-dependent)
+         (make-lateral-join-iterator
+          (second node) (make-physical-plan-iterator (third node) relations)
+          (lambda (environment)
+            (let ((*lateral-outer-environment* environment))
+              (make-physical-plan-iterator (fourth node) relations))))
+         (make-nested-loop-iterator
+          (second node) (make-physical-plan-iterator (third node) relations)
+          (make-physical-plan-iterator (fourth node) relations))))
     ((:sort :top-n :hash-aggregate :sorted-aggregate :hash-distinct)
      (let* ((child (if (member (first node) '(:top-n :hash-aggregate :sorted-aggregate))
                        (fourth node) (third node)))

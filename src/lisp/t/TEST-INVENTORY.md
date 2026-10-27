@@ -965,3 +965,13 @@ cover the comparator's Function Spec and its two Properties; no single call is
 claimed to cover both. Declaration digests do not identify implementation bodies
 or external process state. The retained shell/process harnesses and live C-peer
 apply/native systems were inventoried, not rerun as part of this unit migration.
+
+## HAVING and LATERAL coverage
+
+The feature coverage in [having-lateral.sh](having-lateral.sh) and
+[interop/having_lateral.py](interop/having_lateral.py) is retained as a process
+and C differential test, not replaced by unit tests. It covers 118 C comparison
+cases and spill, late-error, cancellation and recovery paths. The unit suite
+includes [having-tests.lisp](rove/having-tests.lisp) and
+[lateral-tests.lisp](rove/lateral-tests.lisp); see
+[HAVING-LATERAL.md](HAVING-LATERAL.md) for scope and related suites.

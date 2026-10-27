@@ -5,8 +5,9 @@ comparisons with `ANY`, `SOME` and `ALL`, and `ARRAY(SELECT ...)` for text
 elements. Correlation uses nested lexical scopes. Only the server's existing
 clauses and types are supported; analysis checks output arity, types and result
 metadata. Scalar row cardinality is checked during execution. Row-valued and
-MULTIEXPR subqueries, CTEs, LATERAL,
-hashed subplans and decorrelation are deferred.
+MULTIEXPR subqueries, hashed subplans and decorrelation are deferred.
+See [CTEs](CTES.md) and [HAVING and LATERAL](HAVING-LATERAL.md) for
+their supported scope.
 
 Analysis assigns aggregate ownership to the semantic query level and resolves
 outer references by scope. Execution uses dependency-scoped caching where safe,
