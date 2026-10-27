@@ -8,7 +8,9 @@
   "A locally owned receive spool and its durable progress.
 
 SYSTEM-ID, TIMELINE and BASE-LSN identify the original base. SELECTION changes
-the receive history without changing that base or main WAL control."
+the receive history without changing that base or main WAL control. A retained
+root refers to the inventory for the compacted prefix; RETAINED-IDENTITY comes
+from independently verified base provenance."
   directory system-id timeline base-lsn floor-lsn (floor-digest #xCBF29CE484222325)
   written-lsn flushed-lsn decoder
   (written-digest #xCBF29CE484222325) (flushed-digest #xCBF29CE484222325)
@@ -68,6 +70,10 @@ This FNV-1a-64 checksum detects accidental prefix damage, not malicious tamperin
                                                         (floor-digest (physical-store-floor-digest store))
                                                         (selection (physical-store-selection store))
                                                         (retained-root (physical-store-retained-root store)))
+  "Encode receive progress with the original base and optional history and root.
+
+The retained root defaults to the current root, including during flush and
+history selection. A root-bearing control also records the manifest digest."
   (let* ((size (cond (retained-root 96) (selection 80) (t 68)))
          (bytes (make-array size :element-type '(unsigned-byte 8) :initial-element 0)))
     (when retained-root
@@ -117,6 +123,10 @@ This FNV-1a-64 checksum detects accidental prefix damage, not malicious tamperin
   (physical-store-test-point :after-control-write store))
 
 (defun physical-store-load-control (store)
+  "Read legacy or current receive control and check its base identity.
+
+For a root-bearing control, require the supplied immutable identity and matching
+manifest digest. Control alone does not establish base provenance."
   (let* ((bytes (read-bounded-regular-file (physical-store-path store "receive.control") 96))
          (size (length bytes)))
     (unless (member size '(52 68 80 96))
@@ -285,7 +295,9 @@ external modification."
   "Publish a durable data restartpoint before moving the receive floor.
 PUBLISH-RESTARTPOINT runs under the store mutex with the validated cumulative
 checksum at CURSOR. It must durably publish database state before returning.
-Do not call from a mapper callback. Preserve unflushed writes and decoder state."
+Do not call from a mapper callback. Preserve unflushed writes and decoder state.
+A rooted store rejects floor advancement before the callback until a sealed
+replacement inventory can be published."
   (with-physical-store (store)
     (when (and (physical-store-retained-root store)
                (> cursor (physical-store-floor-lsn store)))
@@ -337,8 +349,10 @@ Do not call from a mapper callback. Preserve unflushed writes and decoder state.
 (defun physical-store-open (directory system-id timeline &key create (start-lsn 0) (discard-tail t) (create-lock t) retained-identity)
   "Own a native receive spool, creating only in an existing empty directory.
 CREATE never overwrites an old incarnation. Opening an existing spool validates
-its control, selected history and durable prefix before discarding tails.
-Invalid selected metadata is an error, never a fallback to an older history.
+its control, selected history, durable prefix and referenced inventory before
+discarding tails. A root-bearing control requires RETAINED-IDENTITY from
+independently verified base provenance. Invalid selected metadata is an error,
+never a fallback to an older history.
 The local file lock excludes another local receiver, not a distributed writer.
 With DISCARD-TAIL and CREATE-LOCK both NIL, validate without changing spool bytes
 or creating a missing lock. Do not resume input in that mode."

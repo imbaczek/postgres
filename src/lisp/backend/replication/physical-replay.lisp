@@ -76,6 +76,7 @@ Install the returned state only after durable control publication."
     (setf *physical-recovery-state* (physical-recovery-write-control candidate 2 applied next-xid))))
 
 (defun physical-recovery-retained-identity (&optional (state *physical-recovery-state*))
+  "Build the receive inventory identity from verified recovery base state."
   (list :system-id (getf state :system-id) :base-timeline (getf state :timeline)
         :base (getf state :end) :manifest-digest (getf state :manifest-digest)))
 

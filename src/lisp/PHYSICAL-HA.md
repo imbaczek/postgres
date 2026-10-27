@@ -499,11 +499,49 @@ Luna max and Sol high found the cleanup interrupt window; their rechecks cleared
 the correction. Sol medium found no worthwhile refactor.
 
 These references are process-local. Startup must restore every durable control
-reference before deletion starts. The layer enables neither automatic GC nor
-receive/promotion integration. Next, seal endangered bytes before each receive
+reference before deletion starts. Receive-control references are not yet restored
+into this ownership registry, and automatic GC remains disabled. Next, seal bytes before each receive
 compaction and select floor, floor digest and inventory root together, then carry
 fork-bounded roots through promotion before adding scoped consumers and serving.
 No coordination is added.
+
+### Receive-control inventory references
+
+Receive control can now bind a retained inventory ID and immutable manifest digest
+to its floor and floor digest. The optional 96-byte layout retains the existing
+native control marker; 52-, 68- and 80-byte controls remain readable. Flush and
+selected-history publication preserve an existing inventory reference.
+
+Recovery and pending-promotion open paths pass the verified base identity rather
+than deriving provenance from receive control. Before tail cleanup, reopen checks
+the exact inventory and all its images against that identity and selected history.
+It also requires a contiguous digest chain from the immutable base through the
+saved floor. A matching last endpoint alone cannot hide a missing middle interval.
+The pending open preserves unacknowledged bytes for its existing validation path.
+
+Root-bearing compaction currently rejects floor advancement before publishing a
+restartpoint. This guard prevents selecting an old root with a new floor while
+sealing remains unwired. Unrooted standalone stores retain their previous behavior.
+No production path creates a retained root during compaction yet; this prerequisite
+does not implement bounded retention or restore archive ownership for GC.
+
+All 639 physical tests, 170 interop tests and 1,598 legacy checks pass, as does
+strict fresh-cache compilation. Seven added cases cover corrupt or missing
+references before cleanup, holes, endpoint/digest mismatches, root preservation,
+the compaction guard and actual recovery/pending open helpers. The new control
+codec property passes 200 trials with seed 42; input coverage and rejected
+generation counts remain unmeasured. Luna max and Sol high cleared the corrected
+guard; Sol medium found no worthwhile refactor.
+
+Next, wire authenticated sealing into every recovery compaction under store
+ownership. Check complete coverage before publishing the restartpoint, compare
+the complete control tuple on readback, transfer the local hold, then unlink.
+Test restartpoint-ahead-of-floor crashes in both the same and a later segment,
+rotation/EOR boundaries, repeated coalescing and uncertain in-process reopen.
+Before activating root-bearing native tests, update the backlog mutation in
+`t/interop/restartpoint-prefix-inspect.py`, which currently assumes a 68-byte
+receive control and a fixed CRC offset. Promotion handoff, scoped consumers,
+GC and historical network serving remain open. No coordination is added.
 
 ### SQL configuration reload
 
