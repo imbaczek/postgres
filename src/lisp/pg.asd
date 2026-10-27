@@ -108,6 +108,8 @@
                    (:file "../replication/physical-replay-history")
                    (:file "../replication/physical-row-replay")
                    (:file "../replication/physical-prefix")
+                   (:file "../replication/physical-follow-pin")
+                   (:file "../replication/physical-follow-anchor")
                    (:file "../replication/physical-restartpoint")
                    (:file "../replication/protocol")
                    (:file "../replication/physical-stream")

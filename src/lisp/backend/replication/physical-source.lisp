@@ -31,8 +31,15 @@ checks received WAL progress. These digests detect corruption or divergence."
 (defun physical-source-pin-path (name)
   (merge-pathnames (format nil "~a.pin" name) (physical-source-pin-directory)))
 
+(declaim (ftype function physical-follow-pin-p physical-follow-pin-encode physical-follow-pin-decode
+                physical-follow-pin-image-p physical-follow-pin-image-limit
+                physical-follow-pin-check-wal physical-follow-pin-ready-p))
+
 (defun physical-source-pin-check-wal (pin)
   "Validate a bootstrap checkpoint or a durable confirmed receive floor."
+  (declare (notinline physical-follow-pin-p))
+  (when (physical-follow-pin-p pin)
+    (return-from physical-source-pin-check-wal (physical-follow-pin-check-wal pin)))
   (let* ((restart (physical-source-pin-restart-lsn pin))
          (consistent (physical-source-pin-consistent-lsn pin))
          (confirmed (physical-source-pin-confirmed-lsn pin))
@@ -82,6 +89,9 @@ checks received WAL progress. These digests detect corruption or divergence."
             (error "physical source pin does not name a checkpoint record")))))))
 
 (defun physical-source-pin-encode (pin)
+  (declare (notinline physical-follow-pin-p))
+  (when (physical-follow-pin-p pin)
+    (return-from physical-source-pin-encode (physical-follow-pin-encode pin)))
   (let* ((prefix (format nil "PGPHYSPIN2 ~a ~d ~d ~d ~d ~d ~d ~a"
                          (physical-source-pin-name pin) (physical-source-pin-system-id pin)
                          (physical-source-pin-timeline pin)
@@ -95,10 +105,10 @@ checks received WAL progress. These digests detect corruption or divergence."
          (crc (wal-crc32 (string->bytes prefix))))
     (string->bytes (format nil "~a ~8,'0X~%" prefix crc))))
 
-(defun physical-source-pin-read (path)
-  (with-open-file (stream path)
-    (unless (<= (file-length stream) 1024)
-      (error "corrupt or foreign physical source pin ~a" path))
+(defun physical-source-bootstrap-pin-read (path bytes)
+  (unless (<= (length bytes) 1024)
+    (error "corrupt or foreign physical source pin ~a" path))
+  (with-input-from-string (stream (bytes->string bytes))
     (let* ((line (read-line stream nil nil))
            (fields (and line (wal-split-fields line)))
            (legacy (equal (first fields) "PGPHYSPIN1"))
@@ -138,6 +148,21 @@ checks received WAL progress. These digests detect corruption or divergence."
         (physical-source-pin-check-wal pin)
         pin))))
 
+(defun physical-source-pin-read (path)
+  (let ((bytes (read-bounded-regular-file path (physical-follow-pin-image-limit))))
+    (if (physical-follow-pin-image-p bytes)
+        (let ((pin (physical-follow-pin-decode bytes)))
+          (unless (equal (physical-source-pin-name pin) (pathname-name path))
+            (error "physical follow pin pathname differs from its name"))
+          (physical-source-pin-check-wal pin)
+          pin)
+        (physical-source-bootstrap-pin-read path bytes))))
+
+(defun physical-source-pin-stream-ready-p (pin)
+  (declare (notinline physical-follow-pin-p))
+  (and (not (physical-source-pin-lost-p pin))
+       (or (not (physical-follow-pin-p pin)) (physical-follow-pin-ready-p pin))))
+
 (defun physical-source-pin-create (name)
   "Retain the bootstrap checkpoint until a verified receiver durably confirms WAL."
   (prevent-recovery-primary-operation "physical source pin creation")
@@ -166,9 +191,11 @@ checks received WAL progress. These digests detect corruption or divergence."
   "Durably bind an unused source pin to the completed backup manifest digest.
 Require the current timeline and checkpoint, and no confirmed progress or sender.
 Publish the in-memory binding only after saving the candidate pin."
+  (declare (notinline physical-follow-pin-p))
   (with-write-lock
     (with-wal-critical
-      (unless (and (typep digest '(unsigned-byte 64))
+      (unless (and (not (physical-follow-pin-p pin))
+                   (typep digest '(unsigned-byte 64))
                    (eq pin (gethash (physical-source-pin-name pin) *physical-source-pins*))
                    (= (physical-source-pin-timeline pin) *wal-insert-timeline*)
                    (= (physical-source-pin-consistent-lsn pin) *wal-checkpoint-lsn*)
@@ -213,7 +240,8 @@ Publish the in-memory binding only after saving the candidate pin."
   (with-wal-critical
     (let* ((pin (gethash name *physical-source-pins*))
            (old (and pin (physical-source-pin-confirmed-lsn pin))))
-      (unless (and pin (not (physical-source-pin-lost-p pin))
+      (unless (and pin (physical-source-pin-stream-ready-p pin)
+                   (not (physical-source-pin-lost-p pin))
                    (= (physical-source-pin-timeline pin) *wal-insert-timeline*)
                    (eq owner (gethash name *physical-source-senders*))
                    (typep digest '(unsigned-byte 64))

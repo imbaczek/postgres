@@ -8,6 +8,7 @@
                (:file "t/physical-config-tests")
                (:file "t/coalesce-tests")
                (:file "t/physical-source-tests")
+               (:file "t/follow-anchor-tests")
                (:file "t/physical-bootstrap-tests")
                (:file "t/physical-recovery-tests")
                (:file "t/physical-control-tests")
