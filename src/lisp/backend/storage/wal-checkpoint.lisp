@@ -132,6 +132,7 @@
   '(:root-id :base-timeline :base :manifest-digest :end :end-digest))
 
 (defun wal-retained-reference-valid-p (reference)
+  "Check the six named fields of a retained archive reference."
   (and (listp reference) (= 12 (length reference))
        (let ((keys (loop for (key value) on reference by #'cddr collect key)))
          (and (= 6 (length (remove-duplicates keys)))
@@ -172,8 +173,10 @@
                                  &key (timeline 1) (namespace :legacy) metadata
                                    (checkpoint-timeline (if snapshot (getf snapshot :timeline) 1)))
   "Encode a CRC-bound control image with independent insertion/checkpoint TLIs.
-Optional lifecycle metadata extends PGWAL6 from eight to eleven fields.
-NIL preserves the older representation; the CRC covers every supplied field."
+
+PGWAL6 has eight fields without metadata, eleven with lifecycle metadata and
+seventeen when a retained reference is present. Reference values follow the
+fixed key order. The CRC covers every supplied field."
   (unless (and (typep checkpoint '(unsigned-byte 64))
                (typep durable '(unsigned-byte 64)) (<= checkpoint durable)
                (typep timeline '(integer 1 4294967295))
@@ -204,8 +207,9 @@ NIL preserves the older representation; the CRC covers every supplied field."
 
 (defun wal-decode-control-line (line)
   "Return checkpoint end, durable end, snapshot, insertion TLI, checkpoint TLI,
-namespace and optional lifecycle metadata. Legacy control implies timeline 1
-and legacy names. An older image's absent lifecycle metadata is unknown state."
+namespace and optional lifecycle metadata. PGWAL6 retained-reference values use
+the fixed key order. Legacy control implies timeline 1 and legacy names. An
+older image's absent lifecycle metadata is unknown state."
   (let* ((fields (and line (wal-split-fields line)))
          (version (first fields))
          (v6 (equal version "PGWAL6"))
@@ -260,7 +264,10 @@ and legacy names. An older image's absent lifecycle metadata is unknown state."
 (declaim (ftype function physical-promotion-check-child-control))
 
 (defun wal-require-supported-timelines (insertion checkpoint)
-  "Accept children only through verified child checkpoint control before mutation."
+  "Accept children only through verified child checkpoint control before mutation.
+
+Reject retained primary references until archive startup validation is installed."
+
   (when (getf (nth-value 6 (wal-read-control-fields)) :retained-reference)
     (error "retained primary archive startup validation is not yet installed"))
   (unless (and (eql insertion 1) (eql checkpoint 1))
