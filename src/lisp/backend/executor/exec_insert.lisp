@@ -36,10 +36,10 @@
     ((eq type :varchar)
      (let ((s (if (stringp value) value (princ-to-string value)))
            (maxlen (- typmod 4)))
-       (when (> (length s) maxlen)
-         (ereport "22001"
-                  "value too long for type character varying(~a)"
-                  maxlen))
+       (when (and (>= typmod 4) (> (length s) maxlen))
+         (unless (every (lambda (character) (char= character #\Space)) (subseq s maxlen))
+           (ereport "22001" "value too long for type character varying(~a)" maxlen))
+         (setf s (subseq s 0 maxlen)))
        s))
     (t value)))
 
@@ -123,100 +123,48 @@ index's B-tree mutex."
     (let ((indexes (table-indexes table)))
       (values indexes (mapcar #'pg-index-relfilenode indexes)))))
 
-(defun insert-tuple-with-unique (table values &key exclude-tid on-success publication-kind)
-  "ON-SUCCESS runs under B-tree locks and the writer lock; it must not wait.
-When PUBLICATION-KIND is supplied, return immutable selection as a third value."
+(defun insert-tuple-with-unique (table values &key exclude-tid on-success publication-kind before-check)
+  "ON-SUCCESS and BEFORE-CHECK run under B-tree and writer locks; neither may wait.
+BEFORE-CHECK can claim an ON CONFLICT tuple or ask the released-lock loop to wait."
   (let* ((xid (get-current-xid))
          (relfilenode (pg-class-relfilenode table))
          (indexes nil)
          (index-relfilenodes nil))
     (register-relation-writer relfilenode xid)
-    ;; The writer registration excludes index DDL until this transaction ends.
-    ;; table-indexes walks the database-wide index hash, so snapshot it under
-    ;; the global writer lock. Release that lock before taking B-tree locks;
-    ;; the insertion below keeps the B-tree-before-writer lock order.
-    (multiple-value-setq (indexes index-relfilenodes)
-      (capture-insert-indexes table))
+    (multiple-value-setq (indexes index-relfilenodes) (capture-insert-indexes table))
     (loop
       (let ((wait-xid nil))
-        ;; Acquire B-tree locks before the global write mutex. A search holds
-        ;; only one B-tree lock, so a writer on another relation can continue
-        ;; while this writer waits for a scan of its own index to finish.
         (with-btree-relation-locks (index-relfilenodes)
           (with-write-lock
             (ensure-current-table table)
-            (let ((check (check-unique-indexes table values exclude-tid)))
-              (cond
-                ((eq check :ok)
-                 (let ((columns (pg-class-columns table)))
-                   (multiple-value-bind (block off)
-                       (heapam-insert relfilenode columns values xid
-                                      (backend-command-id *backend*))
-                     (dolist (idx indexes)
-                       (let* ((types (index-types idx table))
-                              (key (encode-index-key
-                                    (index-values idx values)
-                                    types)))
-                         (btree-insert-unlocked (pg-index-relfilenode idx)
-                                                key block off)))
-                     (when on-success (funcall on-success block off))
-                     (return-from insert-tuple-with-unique
-                       (if publication-kind
-                           (values block off (logical-capture-publications (list table) publication-kind))
-                           (values block off))))))
-                ((eq (car check) :violation)
-                 (ereport "23505"
-                          "duplicate key value violates unique constraint \"~a\""
-                          (cdr check)))
-                (t
-                 (setf wait-xid (cdr check)))))))
-        (when wait-xid
-          (wait-for-xid wait-xid))))))
+            (multiple-value-bind (action payload)
+                (when before-check (funcall before-check indexes))
+              (when (eq action :conflict)
+                (return-from insert-tuple-with-unique
+                  (values nil nil nil :conflict payload)))
+              (let ((check (if (eq action :wait) (cons :wait payload)
+                               (check-unique-indexes table values exclude-tid))))
+                (cond
+                  ((eq check :ok)
+                   (let ((columns (pg-class-columns table)))
+                     (multiple-value-bind (block off)
+                         (heapam-insert relfilenode columns values xid
+                                        (backend-command-id *backend*))
+                       (dolist (idx indexes)
+                         (let* ((types (index-types idx table))
+                                (key (encode-index-key (index-values idx values) types)))
+                           (btree-insert-unlocked (pg-index-relfilenode idx) key block off)))
+                       (when on-success (funcall on-success block off))
+                       (return-from insert-tuple-with-unique
+                         (if publication-kind
+                             (values block off (logical-capture-publications (list table) publication-kind))
+                             (values block off))))))
+                  ((eq (car check) :violation)
+                   (ereport "23505"
+                            "duplicate key value violates unique constraint \"~a\""
+                            (cdr check)))
+                  (t (setf wait-xid (cdr check))))))))
+        (when wait-xid (wait-for-xid wait-xid))))))
 
 (defun exec-insert (stream ast)
-  (when (raw-query-sublinks-p ast)
-    (return-from exec-insert (exec-insert-subqueries stream ast)))
-  (let ((table (resolve-table-or-error (getf ast :table))))
-    (let* ((columns (pg-class-columns table))
-           (names (getf ast :columns))
-           (attnums
-             (if names
-                 (progn
-                   (when (/= (length names)
-                             (length (remove-duplicates names :test #'string=)))
-                     (ereport "42701" "column specified more than once"))
-                   (mapcar (lambda (n)
-                             (pg-column-attnum (resolve-column-or-error table n)))
-                           names))
-                 (loop for i from 1 to (length columns) collect i)))
-           (count 0))
-      (dolist (row (getf ast :rows))
-        (check-for-interrupts)
-        (unless (= (length row) (length attnums))
-          (ereport "42601"
-                   "INSERT has more target columns than expressions"))
-        (let ((values (make-array (length columns) :initial-element +null+)))
-          (loop for expr in row
-                for attnum in attnums
-                for col = (aref columns (1- attnum))
-                do (setf (aref values (1- attnum))
-                         (coerce-value
-                          (if (eq (first expr) :default)
-                              (insert-column-default col)
-                              (eval-expr (analyze-expr expr nil) nil))
-                          (pg-column-type col)
-                          (pg-column-typmod col))))
-          (loop for col across columns
-                for index from 0
-                unless (member (1+ index) attnums :test #'=)
-                  do (setf (aref values index)
-                           (coerce-value (insert-column-default col)
-                                         (pg-column-type col)
-                                         (pg-column-typmod col))))
-          (check-not-null values columns)
-          (multiple-value-bind (block off publications)
-              (insert-tuple-with-unique table values :publication-kind :insert)
-            (declare (ignore block off))
-            (logical-note-row-change :insert table :new-values values :publication-selection publications))
-          (incf count)))
-      (send-command-complete stream (format nil "INSERT 0 ~a" count)))))
+  (exec-insert-subqueries stream ast))

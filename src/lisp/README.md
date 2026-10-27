@@ -226,9 +226,12 @@ SELECT expr [AS alias], ... | * FROM t [AS alias]
     {ON e | USING (cols)} | CROSS JOIN t [AS alias]] ...
   [WHERE e] [ORDER BY col [ASC|DESC] [, ...]] [LIMIT n];
 EXPLAIN SELECT ...;                     -- reports scans or a Nested Loop join
-INSERT INTO t [(cols)] VALUES (...)[, (...)];
-UPDATE t SET col = expr [, ...] [WHERE e];
-DELETE FROM t [WHERE e];
+INSERT INTO t [AS alias] [(cols)] {VALUES (...)[, (...)] | SELECT ... | DEFAULT VALUES}
+  [ON CONFLICT [(cols) | ON CONSTRAINT name] DO NOTHING
+   | ON CONFLICT {(cols) | ON CONSTRAINT name} DO UPDATE SET col = expr [, ...] [WHERE e]]
+  [RETURNING expr, ... | *];
+UPDATE t [AS alias] SET col = expr [, ...] [WHERE e] [RETURNING expr, ... | *];
+DELETE FROM t [AS alias] [WHERE e] [RETURNING expr, ... | *];
 ```
 
 Expression subqueries support correlated and uncorrelated `EXISTS`, scalar
@@ -237,6 +240,12 @@ subqueries, `IN`/`NOT IN`, and comparisons with `ANY`/`SOME`/`ALL`.
 supported clauses and types, including their metadata and type checks. See
 [the subquery design and tests](t/SUBQUERIES.md) for concurrency semantics and
 known parity limits.
+
+SELECT CTEs can prefix INSERT, UPDATE and DELETE. RETURNING supports scalar
+expressions, subqueries, qualified stars, OLD/NEW fields and aliases declared
+with `RETURNING WITH (OLD AS o, NEW AS n)`. Results are buffered in a spillable
+store until the statement succeeds. See [DML scope and tests](t/DML.md) for
+conflict arbitration, visibility and remaining limitations.
 
 Nonrecursive `WITH` supports SELECT CTEs, sequential lexical bindings, nested
 shadowing, column aliases, and default, `MATERIALIZED` and `NOT MATERIALIZED`
@@ -805,7 +814,7 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   INNER/CROSS join order uses a greedy statistics-based choice, while outer
   joins retain source order. NATURAL JOIN
   is not supported; comma-separated `FROM` items act as cross joins.
-- `SEARCH`/`CYCLE`, data-modifying CTEs, top-level `WITH` on DML and
+- `SEARCH`/`CYCLE`, data-modifying CTE bodies and
   mutual recursion are rejected (`0A000`). CTE producer scans
   use sequential scans and source order. Nonrecursive `NOT MATERIALIZED` uses
   per-reference plans with limited safe filter pushdown, not full joint optimization; remaining

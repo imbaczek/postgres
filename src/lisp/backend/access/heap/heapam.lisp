@@ -349,11 +349,21 @@
                (mark-dirty ,relfilenode-value))))))))
 
 (defun heapam-set-xmax (relfilenode block offnum xmax cid)
+  ;; Preserve an own insertion's cmin alongside cmax in the existing CID field.
+  ;; The infomask distinguishes the transaction-local combo ID from an ordinary CID.
   (with-heap-tuple-edit (page offset relfilenode block offnum)
-    (page-set-u32 page (+ offset +heap-tuple-xmax-off+)
-                  (xid32-of xmax))
-    (page-set-u32 page (+ offset +heap-tuple-cid-off+) cid)
-    t))
+    (let* ((mask (page-u16 page (+ offset +heap-tuple-infomask-off+)))
+           (own-insert (= (page-u32 page (+ offset +heap-tuple-xmin-off+)) (xid32-of xmax)))
+           (old-cid (page-u32 page (+ offset +heap-tuple-cid-off+)))
+           (cmin (if (and own-insert (logtest +heap-combo-cid+ mask))
+                     (combo-command-id-values xmax old-cid) old-cid))
+           (stored (if own-insert (make-combo-command-id xmax cmin cid) cid)))
+      (page-set-u32 page (+ offset +heap-tuple-xmax-off+) (xid32-of xmax))
+      (page-set-u32 page (+ offset +heap-tuple-cid-off+) stored)
+      (page-set-u16 page (+ offset +heap-tuple-infomask-off+)
+                    (if own-insert (logior mask +heap-combo-cid+)
+                        (logandc2 mask +heap-combo-cid+)))
+      t)))
 
 (defun heapam-set-ctid-unlocked (relfilenode block offnum ctid-block ctid-offnum)
   (unless (sb-thread:holding-mutex-p *write-lock*)
@@ -413,10 +423,13 @@ when supplied, its result is returned as a sixth value."
         (setf (gethash key visited) t))
       (let ((action
               (with-write-lock
-                (let ((tuple (heapam-get-tuple relfilenode target-block
-                                               target-offnum columns)))
+                (let* ((tuple (heapam-get-tuple relfilenode target-block
+                                                target-offnum columns))
+                       (lock-owner (on-conflict-row-lock-owner
+                                    relfilenode target-block target-offnum xid)))
                   (cond
                     ((null tuple) :skip)
+                    (lock-owner (list :wait lock-owner))
                     ((and expected-xmin
                           (/= (htup-xmin tuple) expected-xmin))
                      :skip)
@@ -449,7 +462,7 @@ when supplied, its result is returned as a sixth value."
                     ((not (heap-tuple-visible-p
                            (htup-xmin tuple) (htup-xmax tuple) (htup-cid tuple)
                            snapshot
-                           (and *backend* (backend-xid *backend*))))
+                           (and *backend* (backend-xid *backend*)) (htup-infomask tuple)))
                      :skip)
                     ((or (zerop (htup-xmax tuple))
                          (xid-aborted-p (htup-xmax tuple)))
@@ -508,7 +521,7 @@ when supplied, its result is returned as a sixth value."
                         (htup-xmax tuple)
                         (htup-cid tuple)
                         snapshot
-                        (and *backend* (backend-xid *backend*))))
+                        (and *backend* (backend-xid *backend*)) (htup-infomask tuple)))
 
 (defun heapam-scan-page (page block columns snapshot callback)
   (do-live-page-items (page offnum off len)
@@ -520,7 +533,7 @@ when supplied, its result is returned as a sixth value."
               (xmax (full-xid-from-32 raw-xmax)))
           (when (heap-tuple-visible-p
                  xmin xmax cid snapshot
-                 (and *backend* (backend-xid *backend*)))
+                 (and *backend* (backend-xid *backend*)) infomask)
             (let ((tuple (make-htup :block block :offnum offnum
                                     :ctid-block ctid-block
                                     :ctid-offnum ctid-offnum

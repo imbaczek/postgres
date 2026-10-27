@@ -988,3 +988,19 @@ cases and spill, late-error, cancellation and recovery paths. The unit suite
 includes [having-tests.lisp](rove/having-tests.lisp) and
 [lateral-tests.lisp](rove/lateral-tests.lisp); see
 [HAVING-LATERAL.md](HAVING-LATERAL.md) for scope and related suites.
+
+## DML source, RETURNING and conflict coverage
+
+The unit suite adds 15 Rove tests in [insert-select-tests.lisp](rove/insert-select-tests.lisp),
+[returning-tests.lisp](rove/returning-tests.lisp) and
+[on-conflict-tests.lisp](rove/on-conflict-tests.lisp). They cover parser and
+analysis rules, assignment coercion, ComboCID visibility and cleanup, arbiter
+inference and post-admission index refresh. The total unit suite is 141 tests.
+
+[dml.sh](dml.sh) and its three Python modules under `interop/` remain process
+tests: 102 C comparisons, 24 controlled concurrency scenarios, spill/quota,
+buffered output, cancellation/rollback and restart persistence. They need real
+transactions, catalog/index state and frontend protocol observation and cannot
+be replaced by pure Rove assertions. The logical interoperability workload also
+exercises INSERT SELECT, conflict update/skip and DELETE RETURNING in committed
+and rolled-back transactions. See [DML.md](DML.md) for scope and references.

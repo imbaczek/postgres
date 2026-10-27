@@ -326,21 +326,52 @@ is interrupted after publication but before it returns."
   (and (= (clog-get xid) +clog-in-progress+)
        (xid-active-p xid)))
 
-(defun heap-tuple-visible-p (xmin xmax cid snapshot my-xid)
-  "HeapTupleSatisfiesMVCC for the MVP type set."
+(defvar *combo-command-id-lock* (sb-thread:make-mutex :name "pg combo command ids"))
+
+(defvar *combo-command-ids* (make-hash-table :test #'eql))
+
+(defun make-combo-command-id (xid cmin cmax)
+  ;; An own tuple deleted in a later command needs both boundaries in its one CID
+  ;; field. This mapping is transaction-local and is discarded when XID is released.
+  (sb-thread:with-mutex (*combo-command-id-lock*)
+    (let* ((state (or (gethash xid *combo-command-ids*)
+                      (setf (gethash xid *combo-command-ids*)
+                            (cons (make-array 0 :adjustable t :fill-pointer 0)
+                                  (make-hash-table :test #'equal)))))
+           (pair (cons cmin cmax)))
+      (or (gethash pair (cdr state))
+          (let ((index (length (car state))))
+            (when (> index #xffffffff) (ereport "54000" "too many combo command IDs"))
+            (vector-push-extend pair (car state))
+            (setf (gethash pair (cdr state)) index))))))
+
+(defun combo-command-id-values (xid cid)
+  ;; Only the owning transaction can interpret a combo CID; a missing entry is
+  ;; corruption of its visibility state, not a reason to guess a boundary.
+  (sb-thread:with-mutex (*combo-command-id-lock*)
+    (let ((state (gethash xid *combo-command-ids*)))
+      (unless (and state (< -1 cid (length (car state))))
+        (ereport "XX000" "missing combo command ID for current transaction"))
+      (let ((pair (aref (car state) cid))) (values (car pair) (cdr pair))))))
+
+(defun forget-combo-command-ids (xid)
+  (sb-thread:with-mutex (*combo-command-id-lock*)
+    (remhash xid *combo-command-ids*)))
+
+(defun heap-tuple-visible-p (xmin xmax cid snapshot my-xid &optional (infomask 0))
+  "HeapTupleSatisfiesMVCC, retaining the statement's insertion/deletion CID boundary."
   (let ((curcid (snapshot-curcid snapshot)))
     (cond
-      ;; Own-xid rule first.
       ((and my-xid (= xmin my-xid))
-       (and (< cid curcid)
-            (not (= xmax my-xid))))
-      ((and my-xid (= xmax my-xid))
-       nil)
-      ;; Insert visibility.
+       (multiple-value-bind (cmin cmax)
+           (if (logtest +heap-combo-cid+ infomask)
+               (combo-command-id-values my-xid cid) (values cid cid))
+         (and (< cmin curcid)
+              (or (/= xmax my-xid) (>= cmax curcid)))))
       ((>= xmin (snapshot-xmax snapshot)) nil)
       ((member xmin (snapshot-xip snapshot) :test #'=) nil)
       ((not (xid-committed-p xmin)) nil)
-      ;; Delete visibility.
+      ((and my-xid (= xmax my-xid)) (>= cid curcid))
       ((zerop xmax) t)
       ((>= xmax (snapshot-xmax snapshot)) t)
       ((member xmax (snapshot-xip snapshot) :test #'=) t)

@@ -16,6 +16,9 @@
 (defconstant +heap-tuple-ctid-offnum-off+ 16)
 (defconstant +heap-tuple-natts-off+ 18)
 (defconstant +heap-tuple-infomask-off+ 20)
+
+(defconstant +heap-combo-cid+ #x0020)
+
 (defconstant +heap-tuple-hoff-off+ 22)
 (defconstant +namedatalen+ 64)
 (defconstant +pg-page-layout-version+ 6)

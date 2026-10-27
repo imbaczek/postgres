@@ -34,9 +34,15 @@
   (loop for current = scope then (select-scope-parent current)
         for depth from 0 while current
         for relation = (and qualifier
-                            (find qualifier (select-scope-relations current)
-                                  :key #'select-relation-qualifier
-                                  :test (lambda (a b) (and b (string= a b)))))
+                            (let ((qualified
+                                    (remove-if-not
+                                     (lambda (relation)
+                                       (let ((name (select-relation-qualifier relation)))
+                                         (and name (string= qualifier name))))
+                                     (select-scope-relations current))))
+                              (when (rest qualified)
+                                (ereport "42P09" "table reference \"~a\" is ambiguous" qualifier))
+                              (first qualified)))
         for columns = (if qualifier
                           (and relation (select-relation-columns relation))
                           (select-scope-columns current))
@@ -50,6 +56,11 @@
                  (if (zerop depth) expression
                      (list :outer-ref depth expression
                            :type (expr-type expression) :typmod (expr-typmod expression))))))
+           (when (and (null qualifier)
+                      (eq (getf (select-scope-analysis-frame current) :kind) :returning)
+                      (find name (select-scope-relations current)
+                            :key #'select-relation-qualifier :test #'equal))
+             (ereport "0A000" "whole-row RETURNING requires named composite types"))
            (when relation
              (ereport "42703" "column \"~a\" does not exist" name)))
   (if qualifier
@@ -1189,11 +1200,24 @@ Convert supplied expressions in source order, then return them in parameter orde
           ((string= name "pg_stat_get_wal_receiver") +wal-receiver-result-fields+)
           (t (ereport "42809" "expression is not a supported composite type")))))
 
+(defun qualified-star-targets (qualifier scope)
+  (loop for current = scope then (select-scope-parent current)
+        while (typep current 'select-scope)
+        for relation = (find qualifier (select-scope-relations current)
+                             :key #'select-relation-qualifier :test #'equal)
+        when relation
+          do (return-from qualified-star-targets
+               (loop for column in (select-relation-columns relation)
+                     collect (list :expr (list :column qualifier (select-column-name column))))))
+  (ereport "42P01" "missing FROM-clause entry for table ~s" qualifier))
+
 (defun expand-select-targets (targets scope)
   "Expand records before analysis, as C ExpandRowReference does with FieldSelect."
   (loop for target in targets for raw = (getf target :expr)
         append
         (cond
+          ((getf target :qualified-star)
+           (qualified-star-targets (getf target :qualified-star) scope))
           ((getf target :star)
            (cond ((typep scope 'select-scope)
                   (mapcar #'select-column-target (select-scope-columns scope)))

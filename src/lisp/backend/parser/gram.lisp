@@ -85,7 +85,7 @@
           '("with" "from" "where" "order" "limit" "group" "having" "union"
             "intersect" "except" "offset" "fetch" "for" "join" "inner"
             "left" "right" "full" "outer" "cross" "on" "using"
-            "natural" "asc" "desc" "window" "lateral"
+            "natural" "asc" "desc" "window" "lateral" "returning" "conflict"
             "and" "or" "when" "then" "else" "end")
           :test #'string=))
 
@@ -110,7 +110,7 @@
 (defun parse-statement (p)
   (cond
     ((match-kw p "explain") (parse-explain p))
-    ((kw-p p "with") (parse-select-expression p))
+    ((kw-p p "with") (parse-with-select p))
     ((match-kw p "select") (parse-select p))
     ((punct-p p #\() (parse-select-expression p))
     ((match-kw p "copy") (parse-copy-to p))
@@ -211,8 +211,11 @@
       (progn (expect-kw p "select") (parse-select-core p))))
 
 (defun parse-select-expression (p)
-  (if (kw-p p "with") (parse-with-select p)
-      (parse-select-tail p (parse-select-operand p))))
+  (let ((query (if (kw-p p "with") (parse-with-select p)
+                   (parse-select-tail p (parse-select-operand p)))))
+    (unless (eq (getf query :type) :select)
+      (ereport "0A000" "data-modifying statements are not allowed in a SELECT subquery"))
+    query))
 
 (defun parse-select-tail (p left)
   "Set operations bind more tightly than an unparenthesized ORDER BY or LIMIT."
@@ -235,9 +238,37 @@
 (defun parse-select (p)
   (parse-select-tail p (parse-select-core p)))
 
+(defun parse-qualified-target-star (p)
+  (when (eq (pkind p) :ident)
+    (let* ((probe (copy-sql-parser p))
+           (qualifier (pident probe)))
+      (when (and (match-punct probe #\.) (match-op probe "*"))
+        (pident p)
+        (expect-punct p #\.)
+        (expect-op p "*")
+        (list :qualified-star qualifier)))))
+
+(defun parse-returning-clause (p)
+  (when (match-kw p "returning")
+    (let ((options nil))
+      (when (match-kw p "with")
+        (setf options
+              (with-parens (p)
+                (let ((result nil))
+                  (loop
+                    (let ((kind (cond ((match-kw p "old") :old)
+                                      ((match-kw p "new") :new)
+                                      (t (syntax-error p "expected OLD or NEW")))))
+                      (when (getf result kind)
+                        (ereport "42601" "~a cannot be specified multiple times" kind))
+                      (expect-kw p "as")
+                      (setf result (append result (list kind (pident p)))))
+                    (unless (match-punct p #\,) (return result)))))))
+      (values (parse-target-list p) options))))
+
 (defun parse-target-list (p)
-  (loop collect (if (match-op p "*")
-                    (list :star t)
+  (loop collect (or (when (match-op p "*") (list :star t))
+                    (parse-qualified-target-star p)
                     (parse-target p))
         while (match-punct p #\,)))
 
@@ -384,16 +415,22 @@
 
 (defun parse-insert (p)
   (expect-kw p "into")
-  (let ((table (parse-mutation-relation-identifier p))
-        (columns nil))
-    (when (match-punct p #\()
-      (setf columns
-            (with-parens (p :opening-consumed t)
-              (parse-ident-list p))))
-    (expect-kw p "values")
-    (let ((rows (loop collect (parse-values-row p)
-                      while (match-punct p #\,))))
-      (list :type :insert :table table :columns columns :rows rows))))
+  (let* ((table (parse-mutation-relation-identifier p))
+         (alias (when (match-kw p "as") (pident p)))
+         (columns (when (punct-p p #\() (with-parens (p) (parse-ident-list p)))))
+    (let ((rows nil) (source nil) (default-values nil))
+      (cond ((match-kw p "default")
+             (expect-kw p "values") (setf default-values t))
+            ((match-kw p "values")
+             (setf rows (loop collect (parse-values-row p) while (match-punct p #\,))))
+            ((or (select-start-p p) (punct-p p #\())
+             (setf source (parse-select-expression p)))
+            (t (syntax-error p "expected VALUES or SELECT")))
+      (let ((conflict (parse-on-conflict p)))
+        (multiple-value-bind (returning options) (parse-returning-clause p)
+          (list :type :insert :table table :alias alias :columns columns :rows rows
+                :source source :default-values default-values :on-conflict conflict
+                :returning returning :returning-options options))))))
 
 (defun parse-values-row (p)
   (with-parens (p)
@@ -406,7 +443,9 @@
   (loop collect (parse-expr p) while (match-punct p #\,)))
 
 (defun parse-update (p)
-  (let ((table (parse-mutation-relation-identifier p)))
+  (let* ((table (parse-mutation-relation-identifier p))
+         (alias (cond ((match-kw p "as") (pident p))
+                      ((and (eq (pkind p) :ident) (not (kw-p p "set"))) (pident p)))))
     (expect-kw p "set")
     (let ((sets (loop collect (let ((col (pident p)))
                                 (expect-op p "=")
@@ -415,15 +454,24 @@
           (where nil))
       (when (match-kw p "where")
         (setf where (parse-expr p)))
-      (list :type :update :table table :sets sets :where where))))
+      (multiple-value-bind (returning options) (parse-returning-clause p)
+        (list :type :update :table table :alias alias :sets sets :where where
+              :returning returning :returning-options options)))))
 
 (defun parse-delete (p)
   (expect-kw p "from")
-  (let ((table (parse-mutation-relation-identifier p))
-        (where nil))
+  (let* ((table (parse-mutation-relation-identifier p))
+         (alias (cond ((match-kw p "as") (pident p))
+                      ((and (eq (pkind p) :ident)
+                            (or (token-quoted-p (pcur p))
+                                (not (member (pval p) '("where" "returning" "using") :test #'equal))))
+                       (pident p))))
+         (where nil))
     (when (match-kw p "where")
       (setf where (parse-expr p)))
-    (list :type :delete :table table :where where)))
+    (multiple-value-bind (returning options) (parse-returning-clause p)
+      (list :type :delete :table table :alias alias :where where
+            :returning returning :returning-options options))))
 
 (defun parse-truncate (p)
   (match-kw p "table")

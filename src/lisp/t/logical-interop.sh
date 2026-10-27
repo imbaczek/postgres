@@ -432,6 +432,14 @@ expect_standard_start_failure() {
 workload() {
     source=$1
     sql "$source" "BEGIN; INSERT INTO interop_rows VALUES (3, 30, 'third'); UPDATE interop_rows SET amount = amount + 7 WHERE id = 1; UPDATE interop_rows SET id = 4 WHERE id = 2; DELETE FROM interop_rows WHERE id = 3; COMMIT; BEGIN; INSERT INTO interop_rows VALUES (99, 99, 'abort'); ROLLBACK; INSERT INTO interop_unpublished VALUES (1, 1, 'excluded'); BEGIN; TRUNCATE TABLE interop_other; INSERT INTO interop_other VALUES (5, 50, 'after truncate'); COMMIT" >/dev/null
+    # Observe every committed action before removing the temporary row. A final
+    # unchanged row inventory would miss absent INSERT/UPDATE/DELETE events.
+    sql "$source" "INSERT INTO interop_rows SELECT 80,amount,'dml source' FROM interop_rows WHERE id=1 RETURNING id" >/dev/null
+    wait_rows "$target" "$(sql "$source" 'SELECT id,amount,label FROM interop_rows WHERE id=80')" 'SELECT id,amount,label FROM interop_rows WHERE id=80'
+    sql "$source" "INSERT INTO interop_rows VALUES(80,800,'dml update') ON CONFLICT(id) DO UPDATE SET amount=excluded.amount,label=excluded.label RETURNING old.amount,new.amount; INSERT INTO interop_rows VALUES(80,801,'dml skipped') ON CONFLICT DO NOTHING RETURNING id" >/dev/null
+    wait_rows "$target" '80|800|dml update' 'SELECT id,amount,label FROM interop_rows WHERE id=80'
+    sql "$source" "BEGIN; INSERT INTO interop_rows SELECT 81,amount,'dml rollback' FROM interop_rows WHERE id=1 RETURNING id; INSERT INTO interop_rows VALUES(80,802,'rollback update') ON CONFLICT(id) DO UPDATE SET amount=excluded.amount RETURNING id; DELETE FROM interop_rows WHERE id=80 RETURNING id; ROLLBACK; DELETE FROM interop_rows WHERE id=80 RETURNING id" >/dev/null
+    wait_rows "$target" '' 'SELECT id,amount,label FROM interop_rows WHERE id=80 OR id=81'
 }
 restart_native_publisher() {
     subscription=$(sql "$C_PORT" "SELECT oid FROM pg_subscription WHERE subname='interop_sub'")

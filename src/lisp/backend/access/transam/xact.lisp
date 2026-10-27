@@ -980,11 +980,46 @@ XID lock.  Relation waiters are notified after the registrations are removed."
     (sb-thread:condition-broadcast *relation-lock-cv*))
   (values))
 
+(defvar *on-conflict-row-lock-mutex* (sb-thread:make-mutex :name "pg conflict row locks"))
+
+(defvar *on-conflict-row-locks* (make-hash-table :test #'equal))
+
+(defvar *on-conflict-xid-row-locks* (make-hash-table :test #'eql))
+
+(defun on-conflict-row-lock-owner (relfilenode block offnum xid)
+  (sb-thread:with-mutex (*on-conflict-row-lock-mutex*)
+    (let* ((key (list relfilenode block offnum))
+           (owner (gethash key *on-conflict-row-locks*)))
+      (when (and owner (/= owner xid))
+        (if (xid-active-p owner) owner
+            (progn (remhash key *on-conflict-row-locks*) nil))))))
+
+(defun claim-on-conflict-row-lock (relfilenode block offnum xid)
+  ;; Return an active owner to wait for, or record ownership until XID release.
+  ;; The caller waits only after dropping the storage locks used for arbitration.
+  (sb-thread:with-mutex (*on-conflict-row-lock-mutex*)
+    (let* ((key (list relfilenode block offnum))
+           (owner (gethash key *on-conflict-row-locks*)))
+      (if (and owner (/= owner xid) (xid-active-p owner)) owner
+          (progn
+            (setf (gethash key *on-conflict-row-locks*) xid)
+            (pushnew key (gethash xid *on-conflict-xid-row-locks*) :test #'equal)
+            nil)))))
+
+(defun release-on-conflict-row-locks (xid)
+  (sb-thread:with-mutex (*on-conflict-row-lock-mutex*)
+    (dolist (key (gethash xid *on-conflict-xid-row-locks*))
+      (when (eql xid (gethash key *on-conflict-row-locks*))
+        (remhash key *on-conflict-row-locks*)))
+    (remhash xid *on-conflict-xid-row-locks*)))
+
 (defun release-xid (xid &optional backend)
   "Release XID and wake transaction waiters after its registrations are gone.
 
 Pass BACKEND when releasing its virtual reader ID."
   (release-relation-writer-xid xid backend)
+  (release-on-conflict-row-locks xid)
+  (forget-combo-command-ids xid)
   (broadcast-xact)
   (values))
 
