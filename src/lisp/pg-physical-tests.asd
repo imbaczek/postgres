@@ -26,6 +26,7 @@
                (:file "t/physical-history-tests")
                (:file "t/timeline-tests")
                (:file "t/timeline-publication-tests")
+               (:file "t/fork-follow-tests")
                (:file "t/physical-restartpoint-tests")
                (:file "t/source-xids-replay-tests")
                (:file "t/source-xids-snapshot-tests")

@@ -102,6 +102,17 @@ System identity and exact prefix digest must still be verified by the caller."
          (or (null (timeline-history-entry-end entry))
              (<= boundary (timeline-history-entry-end entry))))))
 
+(defun timeline-follow-candidate-p (timeline applied received history)
+  (unless (and (typep timeline '(integer 1 4294967295))
+               (typep applied '(unsigned-byte 64))
+               (typep received '(unsigned-byte 64))
+               (<= applied received))
+    (error "invalid standby timeline frontiers"))
+  (timeline-check-lineage history)
+  (and (> (timeline-history-entry-timeline (first history)) timeline)
+       (timeline-prefix-boundary-p timeline applied history)
+       (timeline-prefix-boundary-p timeline received history)))
+
 (defun timeline-check-end-of-recovery (record replay-timeline history
                                        &key (min-recovery-point 0) (min-recovery-timeline 0))
   "Check C's timeline switch before redo; return the child without changing state.
