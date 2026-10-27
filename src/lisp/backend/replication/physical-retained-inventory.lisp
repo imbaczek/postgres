@@ -224,7 +224,55 @@ Return the freshly decoded payload."
        (physical-retained-object-read directory :extent image-id +physical-retained-image-limit+)))
     payload))
 
-(defun physical-retained-inventory-publish (directory identity target text images &key previous)
+(defun physical-retained-inventory-keep-entries (entries ids)
+  (unless (listp ids) (error "retained WAL kept IDs must be a list"))
+  (let ((available (make-hash-table :test #'eql)) (selected (make-hash-table :test #'eql)))
+    (dolist (entry entries) (setf (gethash (first entry) available) t))
+    (loop for id in ids for count from 1
+          do (unless (and (<= count +physical-retained-inventory-count+)
+                          (typep id '(unsigned-byte 64))
+                          (gethash id available) (not (gethash id selected)))
+               (error "retained WAL kept ID is foreign, duplicate or exceeds its bound"))
+             (setf (gethash id selected) t))
+    (loop for entry in entries when (gethash (first entry) selected) collect entry)))
+
+(defun physical-retained-inventory-publish-under-lock
+    (directory identity target text images &key previous (keep-ids nil keep-supplied-p) protect)
+  (unless (sb-thread:holding-mutex-p *physical-retained-inventory-publish-lock*)
+    (error "retained WAL publication requires archive exclusion"))
+  (physical-retained-wal-check-budget images)
+  (let* ((images (mapcar #'copy-seq images))
+         (history (timeline-check-lineage (timeline-parse-history target text)))
+         (old (when previous (physical-retained-inventory-load directory previous identity history)))
+         (new (make-hash-table :test #'eql))
+         (entries
+           (append (if keep-supplied-p
+                       (physical-retained-inventory-keep-entries (getf old :entries) keep-ids)
+                       (copy-list (getf old :entries)))
+                   (loop for image in images
+                         for id = (physical-store-update-digest #xCBF29CE484222325 image)
+                         collect (let ((metadata (physical-retained-extent-decode image)))
+                                   (setf (gethash id new) image)
+                                   (list id (length image) metadata)))))
+         (payload (list :version 1 :identity identity :history-target target :history-text text
+                        :entries (sort entries #'< :key (lambda (entry) (getf (third entry) :start)))))
+         (root-image (physical-retained-inventory-image payload)))
+    (physical-retained-inventory-verify-entries
+     (getf payload :entries) history
+     (lambda (id)
+       (or (gethash id new)
+           (physical-retained-object-read directory :extent id +physical-retained-image-limit+))))
+    (when protect
+      (funcall protect (physical-store-update-digest #xCBF29CE484222325 root-image) (getf payload :entries)))
+    (dolist (image images)
+      (let ((id (physical-retained-object-publish directory :extent image +physical-retained-image-limit+)))
+        (physical-retained-inventory-test-point :after-extent-publication id)))
+    (let ((id (physical-retained-object-publish directory :inventory root-image +physical-retained-inventory-limit+)))
+      (physical-retained-inventory-test-point :after-inventory-publication id)
+      id)))
+
+(defun physical-retained-inventory-publish
+    (directory identity target text images &key previous (keep-ids nil keep-supplied-p))
   "Publish immutable extents and an inventory generation; return its synced ID.
 
 Copy new images after checking the candidate budget.  The caller must durably
@@ -234,32 +282,8 @@ through that control selection; this mutex alone does not cover that interval.
 This function checks supplied data but does not establish its base or receive
 anchors independently."
   (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
-    (physical-retained-wal-check-budget images)
-    (let* ((images (mapcar #'copy-seq images))
-           (history (timeline-check-lineage (timeline-parse-history target text)))
-           (old (when previous (physical-retained-inventory-load directory previous identity history)))
-           (new (make-hash-table :test #'eql))
-           (entries
-             (append (copy-list (getf old :entries))
-                     (loop for image in images
-                           for id = (physical-store-update-digest #xCBF29CE484222325 image)
-                           collect (let ((metadata (physical-retained-extent-decode image)))
-                                     (setf (gethash id new) image)
-                                     (list id (length image) metadata)))))
-           (payload (list :version 1 :identity identity :history-target target :history-text text
-                          :entries (sort entries #'< :key (lambda (entry) (getf (third entry) :start)))))
-           (root-image (physical-retained-inventory-image payload)))
-      (physical-retained-inventory-verify-entries
-       (getf payload :entries) history
-       (lambda (id)
-         (or (gethash id new)
-             (physical-retained-object-read directory :extent id +physical-retained-image-limit+))))
-      (dolist (image images)
-        (let ((id (physical-retained-object-publish directory :extent image +physical-retained-image-limit+)))
-          (physical-retained-inventory-test-point :after-extent-publication id)))
-      (let ((id (physical-retained-object-publish directory :inventory root-image +physical-retained-inventory-limit+)))
-        (physical-retained-inventory-test-point :after-inventory-publication id)
-        id))))
+    (apply #'physical-retained-inventory-publish-under-lock directory identity target text images
+           :previous previous (when keep-supplied-p (list :keep-ids keep-ids)))))
 
 (defun physical-retained-inventory-plan (directory id identity history start end)
   "Plan coverage from candidates selected by the index before image I/O.

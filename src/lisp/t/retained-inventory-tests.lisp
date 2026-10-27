@@ -26,6 +26,46 @@
          (ok (= 1 (length (getf (pg::physical-retained-inventory-load root old identity history) :entries))))
          (ok (= 2 (length (getf (pg::physical-retained-inventory-load root new identity history) :entries))))))))
 
+(deftest retained-inventory-replacement-keeps-only-explicit-old-entries
+    (call-with-retained-inventory
+     (lambda (root images identity history text)
+       (let* ((old (pg::physical-retained-inventory-publish root identity 2 text images))
+              (entries (getf (pg::physical-retained-inventory-load root old identity history) :entries))
+              (new (pg::physical-retained-inventory-publish
+                    root identity 2 text nil :previous old :keep-ids (list (first (second entries))))))
+         (ok (= 2 (length (getf (pg::physical-retained-inventory-load root old identity history) :entries))))
+         (ok (= 1 (length (getf (pg::physical-retained-inventory-load root new identity history) :entries))))
+         (ok (= 1 (length (pg::physical-retained-inventory-plan root new identity history 64 120))))
+         (ok (signals (pg::physical-retained-inventory-plan root new identity history 32 120) 'error))
+         (let ((empty (pg::physical-retained-inventory-publish
+                       root identity 2 text nil :previous new :keep-ids nil)))
+           (ok (null (getf (pg::physical-retained-inventory-load root empty identity history) :entries))))))))
+
+(deftest retained-inventory-replacement-rejects-foreign-or-duplicate-kept-ids-before-writing
+    (call-with-retained-inventory
+     (lambda (root images identity history text)
+       (let* ((old (pg::physical-retained-inventory-publish root identity 2 text images))
+              (entries (getf (pg::physical-retained-inventory-load root old identity history) :entries))
+              (first-id (first (first entries)))
+              (before (sort (pg::directory-entry-names root) #'string<)))
+         (ok (not (assoc 0 entries)))
+         (dolist (keep (list (list 0) (list first-id first-id)))
+           (ok (signals (pg::physical-retained-inventory-publish
+                         root identity 2 text nil :previous old :keep-ids keep) 'error))
+           (ok (equal before (sort (pg::directory-entry-names root) #'string<))))))))
+
+(deftest retained-inventory-replacement-coalesces-without-changing-old-images
+    (call-with-retained-inventory
+     (lambda (root images identity history text)
+       (let ((old (pg::physical-retained-inventory-publish root identity 2 text images)))
+         (multiple-value-bind (metadata bytes) (retained-extent-fixture)
+           (let* ((merged (pg::physical-retained-extent-encode metadata bytes))
+                  (new (pg::physical-retained-inventory-publish
+                        root identity 2 text (list merged) :previous old :keep-ids nil)))
+             (ok (= 1 (length (getf (pg::physical-retained-inventory-load root new identity history) :entries))))
+             (ok (= 1 (length (pg::physical-retained-inventory-plan root new identity history 32 120))))
+             (ok (= 2 (length (getf (pg::physical-retained-inventory-load root old identity history) :entries))))))))))
+
 (deftest retained-inventory-rejects-missing-or-changed-referenced-image
     (call-with-retained-inventory
      (lambda (root images identity history text)
