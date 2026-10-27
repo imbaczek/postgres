@@ -607,6 +607,29 @@ compilation passed. Luna, Sol and Astra reviews and Sol's refactoring review are
 complete. Heap, join, aggregate, spill and output resource audits and SQL promotion
 binding remain open; no coordination is added.
 
+### Temporary stream ownership
+
+Query temporary scopes now retain explicit stream and pathname ownership before
+opens and fallible registration. Normal close errors fail the query; abnormal
+cleanup uses bounded retries through the stream API and preserves the original exit.
+Unresolved owners remain reachable for retry by the same thread. New spill
+acquisition fails while that thread still has pending cleanup. Resources owned by
+dead threads have no automatic retry and stay retained until process exit. Paths
+and quota charges remain owned until relevant streams close and deletion succeeds
+or absence is verified. A configured shared temporary directory is not recursively
+removed.
+
+Validation passed 475 physical tests, 170 interop tests and 1,598 legacy checks,
+including 27 new resource and continuation Rove tests. Native index parking,
+replay, promotion, splits and HUP, native JOIN, and a 30,000-row spill crash and
+quota check passed, as did fresh strict compilation. Luna, Sol and Astra code
+reviews and Sol's refactoring review cleared the change.
+
+Native promotion tests remain open for heap, join, aggregate, sort, spill and
+output paths, including optional sort arenas. Complete them before public SQL
+`pg_promote`; normal `application_name` GUC support also remains open. The broader
+HA goal remains open, and coordination remains excluded.
+
 ### Timeline-qualified native WAL namespace
 
 Filename construction/parsing now centralizes C `XLogFileName`'s TLI/log/segment

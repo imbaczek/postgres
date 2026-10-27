@@ -37,9 +37,13 @@
   (stream-paths (make-hash-table :test #'eq)))
 
 (defstruct query-temp-stream-entry
+  "Scope ownership of a temporary stream and, when required, its pathname."
   pathname stream delete-p)
 
 (defstruct query-temp-cleanup-owner
+  "Retain a scope's streams, paths, quota and private directory through cleanup.
+
+Unresolved owners remain reachable for retry by their original thread."
   thread quota entries directory temporary-directory link state failure-path failure)
 
 (defvar *query-temp-cleanup-owner* nil)
@@ -50,6 +54,7 @@
   (sb-thread:make-mutex :name "pg pending query temp cleanup"))
 
 (defun make-query-temp-scope-owner (quota)
+  "Create the scope owner and its pending-list link before running the body."
   (let ((owner (make-query-temp-cleanup-owner
                 :thread sb-thread:*current-thread* :quota quota :state :active)))
     (setf (query-temp-cleanup-owner-link owner) (list owner))
@@ -443,10 +448,12 @@
     instance))
 
 (defun create-query-temp-scope-directory (directory)
+  "Create a private directory exclusively; do not adopt an existing name."
   (sb-posix:mkdir (namestring directory) #o700)
   directory)
 
 (defun query-temp-scope-directory ()
+  "Return the configured directory or create and publish a private scope directory."
   (or *query-temp-scope-directory*
       (if *query-temp-directory*
           (setf *query-temp-scope-directory*
@@ -481,12 +488,14 @@
   (values))
 
 (defun report-query-temp-cleanup-failure (pathname condition)
+  "Report a cleanup failure without replacing the exit being cleaned up."
   (handler-case
       (format *error-output* "pg-lisp: query temp cleanup failed for ~a: ~a~%" pathname condition)
     (serious-condition () nil))
   (values))
 
 (defun call-with-query-temp-cleanup (pathname function)
+  "Run cleanup and retain or report its failure without replacing the original exit."
   (labels ((failed (condition)
              (if *query-temp-cleanup-owner*
                  (setf (query-temp-cleanup-owner-failure-path *query-temp-cleanup-owner*) pathname
@@ -498,6 +507,7 @@
       (error (condition) (failed condition)))))
 
 (defun query-temp-file-absent-p (pathname)
+  "Return true only when lstat confirms PATHNAME is absent."
   (handler-case
       (progn (sb-posix:lstat (namestring pathname)) nil)
     (sb-posix:syscall-error (condition)
@@ -506,14 +516,17 @@
           (error condition)))))
 
 (defun query-temp-stream-open-p (stream)
+  "Treat an unknown stream state as open for cleanup."
   (handler-case (open-stream-p stream)
     (serious-condition () t)))
 
 (defun query-temp-entry-open-p (entry)
+  "Return whether ENTRY still has a stream that may be open."
   (let ((stream (query-temp-stream-entry-stream entry)))
     (and stream (query-temp-stream-open-p stream))))
 
 (defun prune-query-temp-stream-entries ()
+  "Discard entries with neither a stream nor a pathname left to delete."
   (when *query-temp-cleanup-owner*
     (setf (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*)
           (remove-if (lambda (entry)
@@ -523,6 +536,7 @@
   (values))
 
 (defun discharge-query-temp-stream (stream)
+  "Retire confirmed-closed stream references; keep paths still awaiting deletion."
   (when (and stream (not (query-temp-stream-open-p stream)))
     (when *query-temp-quota*
       (remhash stream (query-temp-quota-stream-paths *query-temp-quota*)))
@@ -534,6 +548,9 @@
   (values))
 
 (defun abort-query-temp-stream (stream pathname)
+  "Make bounded abort-close attempts without a deadline, then discharge if closed.
+
+Use the stream API; unresolved streams remain owned for later cleanup."
   (when stream
     (sb-sys:without-interrupts
       (sb-sys:with-deadline (:seconds nil :override t)
@@ -544,6 +561,7 @@
   (not (and stream (query-temp-stream-open-p stream))))
 
 (defun pending-query-temp-stream-open-p (pathname)
+  "Check other pending owners with the same quota for a possibly open stream."
   (let ((owners
           (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
             (loop for owner in *query-temp-pending-cleanups*
@@ -558,6 +576,9 @@
           owners)))
 
 (defun close-query-temp-file-streams (pathname)
+  "Close this owner's streams and check all known streams before deleting PATHNAME.
+
+A foreign pending owner can block deletion; this function does not close it."
   (when *query-temp-cleanup-owner*
     (dolist (entry (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
       (when (equal pathname (query-temp-stream-entry-pathname entry))
@@ -574,6 +595,9 @@
                  never (and (equal path pathname) (query-temp-stream-open-p stream))))))
 
 (defun delete-query-temp-file (pathname)
+  "Delete PATHNAME only after its streams close, then release its quota charge.
+
+A failed deletion retains ownership unless lstat confirms the file is absent."
   (sb-sys:without-interrupts
     (sb-sys:with-deadline (:seconds nil :override t)
       (when (and (close-query-temp-file-streams pathname)
@@ -592,6 +616,10 @@
   (values))
 
 (defun cleanup-query-temp-files ()
+  "Make bounded cleanup attempts for the current owner without a deadline.
+
+Retain unresolved files and their charges.  Do not remove a configured shared
+temporary directory."
   (sb-sys:without-interrupts
     (sb-sys:with-deadline (:seconds nil :override t)
       (loop repeat 2 do
@@ -621,6 +649,7 @@
   (values))
 
 (defun query-temp-owner-unresolved-p (owner)
+  "Return whether OWNER still holds a stream, pathname or private directory."
   (or (some (lambda (entry)
               (or (query-temp-stream-entry-delete-p entry)
                   (query-temp-entry-open-p entry)))
@@ -629,6 +658,9 @@
            (null (query-temp-cleanup-owner-temporary-directory owner)))))
 
 (defun run-query-temp-owner-cleanup (owner)
+  "Clean OWNER while it remains reachable in the pending list.
+
+The pending lock protects list and state changes, not file I/O."
   (let ((*query-temp-cleanup-owner* owner)
         (*query-temp-quota* (query-temp-cleanup-owner-quota owner))
         (*query-temp-scope-directory* (query-temp-cleanup-owner-directory owner))
@@ -653,6 +685,7 @@
   (values))
 
 (defun finish-query-temp-scope ()
+  "Publish the preallocated pending owner before cleanup or failure reporting."
   (sb-sys:without-interrupts
     (sb-sys:with-deadline (:seconds nil :override t)
       (let ((owner *query-temp-cleanup-owner*))
@@ -664,6 +697,9 @@
         (run-query-temp-owner-cleanup owner)))))
 
 (defun retry-pending-query-temp-cleanup ()
+  "Retry pending cleanup owned by this thread; leave other owners untouched.
+
+Owners of dead threads remain reachable until process exit."
   (sb-sys:without-interrupts
     (sb-sys:with-deadline (:seconds nil :override t)
       (let ((owners
@@ -680,6 +716,7 @@
   (values))
 
 (defun ensure-query-temp-acquisition-ready ()
+  "Require a scope owner and reject new files while this thread has pending cleanup."
   (when (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
           (some (lambda (owner)
                   (eq (query-temp-cleanup-owner-thread owner) sb-thread:*current-thread*))
@@ -689,6 +726,10 @@
     (error "query temporary stream requires a scope owner")))
 
 (defun query-temp-pending-cleanup-status (&optional (limit 10))
+  "Return pending counts and up to LIMIT paths.
+
+Unknown stream states count as open. Paths can repeat; TRUNCATED means some
+paths were omitted."
   (check-type limit (integer 0 1000))
   (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
     (let ((records 0) (streams 0) (paths nil) (listed 0) (truncated nil))
@@ -704,7 +745,10 @@
       (list :records records :open-streams streams :paths (nreverse paths) :truncated truncated))))
 
 (defmacro with-query-temp-files (&body body)
-  "Own spill files at the outermost scope, including allocations by callbacks."
+  "Own temporary streams and files at the outermost scope, including callbacks.
+
+Preallocate fallback ownership before BODY.  On exit, publish the owner and
+attempt bounded cleanup without replacing an error, FATAL or nonlocal exit."
   `(if *query-temp-file-scope-active-p*
        (progn ,@body)
        (let* ((*query-temp-files* nil)
@@ -738,10 +782,16 @@
   pathname)
 
 (defun register-query-temp-stream-path (stream pathname)
+  "Record the stream's path for quota accounting and lookup.
+
+The scope entry, not this mapping alone, owns the stream."
   (setf (gethash stream (query-temp-quota-stream-paths *query-temp-quota*)) pathname))
 
 (defun open-and-register-query-temp-file (pathname open-arguments)
-  "Open PATHNAME and publish it to scope cleanup as one interrupt-safe step."
+  "Open PATHNAME with ownership reserved before the open.
+
+Publish the actual stream under interrupt masking before fallible registration."
+
   (ensure-query-temp-acquisition-ready)
   (let ((entry (make-query-temp-stream-entry :pathname pathname))
         (registered-p nil))
@@ -787,6 +837,7 @@
   (error "Could not create a unique query spill file"))
 
 (defun open-query-temp-input (pathname)
+  "Reserve an entry and publish the input stream before registering its path."
   (ensure-query-temp-acquisition-ready)
   (let ((entry (make-query-temp-stream-entry :pathname pathname)))
     (push entry (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
@@ -797,6 +848,7 @@
         stream))))
 
 (defun query-temp-owned-stream-pathname (stream)
+  "Find STREAM's path in explicit ownership or the quota lookup."
   (or (when *query-temp-cleanup-owner*
         (let ((entry (find stream (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*)
                            :key #'query-temp-stream-entry-stream :test #'eq)))
@@ -805,6 +857,9 @@
         (gethash stream (query-temp-quota-stream-paths *query-temp-quota*)))))
 
 (defun finish-query-temp-stream (stream normal-p)
+  "Close normally on success, or make guarded abort cleanup on abnormal exit.
+
+Normal close errors propagate; a still-open stream remains owned."
   (when stream
     (if normal-p
         (unwind-protect (close stream) (discharge-query-temp-stream stream))
@@ -812,6 +867,7 @@
   (values))
 
 (defun call-with-query-temp-stream-cleanup (function closer)
+  "Call FUNCTION with cleanup installed and tell CLOSER whether it returned normally."
   (let ((normal-p nil))
     (sb-sys:without-interrupts
       (unwind-protect
@@ -820,6 +876,9 @@
         (funcall closer normal-p)))))
 
 (defmacro with-query-temp-input ((stream pathname) &body body)
+  "Open an owned input stream for BODY and attempt closure on every exit.
+
+The scope retains ownership if closure cannot be confirmed."
   (let ((normal (gensym "NORMAL-")))
     `(let ((,stream nil))
        (call-with-query-temp-stream-cleanup
@@ -829,7 +888,9 @@
         (lambda (,normal) (finish-query-temp-stream ,stream ,normal))))))
 
 (defmacro with-query-temp-output ((pathname stream) &body body)
-  "Own an output stream before opening it; the surrounding file scope owns PATHNAME."
+  "Own an output stream before opening it; the surrounding file scope owns PATHNAME.
+
+Normal close errors propagate; abnormal cleanup preserves the original exit."
   (let ((normal (gensym "NORMAL-")))
     `(let ((,pathname nil) (,stream nil))
        (declare (ignorable ,pathname))
@@ -1141,6 +1202,7 @@ both before writing can be interrupted."
       (incf (query-row-spool-count spool)))))
 
 (defun query-row-spool-seal (spool)
+  "Close the output successfully before marking SPOOL ready for reading."
   (unless (query-row-spool-sealed-p spool)
     (when (query-row-spool-output-stream spool)
       (finish-query-temp-stream (query-row-spool-output-stream spool) t)
@@ -1149,6 +1211,7 @@ both before writing can be interrupted."
   spool)
 
 (defun close-query-row-spool (spool)
+  "Abort any remaining spool output; the file scope retains unresolved ownership."
   (when (query-row-spool-output-stream spool)
     (abort-query-temp-stream (query-row-spool-output-stream spool)
                              (query-row-spool-pathname spool))
@@ -1265,6 +1328,7 @@ both before writing can be interrupted."
      1))
 
 (defun close-query-match-map (match-map)
+  "Abort the match-map stream; the file scope retains unresolved ownership."
   (when (query-match-map-io-stream match-map)
     (abort-query-temp-stream (query-match-map-io-stream match-map)
                              (query-match-map-pathname match-map))

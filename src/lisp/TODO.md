@@ -9,9 +9,14 @@
   modules, source running-transaction metadata helpers, covered standby snapshots,
   virtual reader lifecycle helpers, private child adoption and the private
   promotion reader-enrollment prerequisite, native online reader-preserving
-  promotion, relation reader identity selection and statement snapshot scope
-  bookkeeping have completed this pass and its review. Keep the same order for
-  the remaining HA work.
+  promotion, relation reader identity selection, statement snapshot scope bookkeeping,
+  and temporary stream ownership have completed this pass and its review. Keep the
+  same order for the remaining HA work.
+
+- [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker
+  retained `*active-xids* = (3)` after 1,598 passing checks, causing later physical
+  promotion and shutdown checks to fail. Until fixed, run physical and interop
+  suites in a fresh worker before the legacy suite. This is a test isolation issue.
 
 - [ ] Audit cold-image compilation and ASDF load-order dependencies across `pg`
   and its test systems. A warm REPL must not conceal missing declarations or

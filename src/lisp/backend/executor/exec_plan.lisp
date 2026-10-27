@@ -518,6 +518,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
     pathname))
 
 (defun merge-query-sort-runs (left-path right-path order)
+  "Merge two runs into an owned output before deleting the inputs."
   (let ((output-path nil))
     (with-query-temp-output (pathname output)
       (setf output-path pathname)
@@ -563,6 +564,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
      (stream-select-sort-with-arena streamer order callback arena on-complete))))
 
 (defun stream-select-sort-with-arena (streamer order callback arena &optional on-complete)
+  "Sort streamed rows in memory or owned temporary runs and pass them to CALLBACK."
   (with-query-temp-files ()
                          (let ((buffer '())
                                (buffer-bytes 0)
@@ -654,6 +656,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
   (concatenate 'vector (car state) (cdr state)))
 
 (defun hash-aggregate-spill-file (pathname callback)
+  "Read spill rows through an owned input stream until EOF or CALLBACK stops."
   (with-query-temp-input (stream pathname)
     (loop for row = (query-spill-read-record stream)
           until (eq row +query-spill-eof+)
@@ -666,6 +669,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
   (mod (sxhash (cons depth key)) +hash-aggregate-partition-count+))
 
 (defun hash-aggregate-partition-spill (pathname group-keys depth)
+  "Partition spill rows into owned files and close outputs before returning paths."
   (let ((paths (make-array +hash-aggregate-partition-count+ :initial-element nil))
         (streams (make-array +hash-aggregate-partition-count+ :initial-element nil))
         (counts (make-array +hash-aggregate-partition-count+ :initial-element 0)))
@@ -736,7 +740,10 @@ reordered tree, and each parameterized path can reference only joined Vars."
 
 (defun hash-aggregate-process-rows
     (source group-keys aggregate-count callback memory-limit depth)
-  "Aggregate one row stream, spilling unseen groups and recursively partitioning them."
+  "Aggregate a row stream, spilling unseen groups and recursively partitioning them.
+
+The spill stream closes normally after the source returns and is abort-cleaned
+on an abnormal exit."
   (let ((groups (make-hash-table :test #'equal))
         (group-order nil)
         (memory-used 0)
