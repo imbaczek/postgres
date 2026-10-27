@@ -427,7 +427,7 @@
               (lambda ()
                 (unwind-protect
                      (handler-case
-                         (flet ((get-current-xid () xid)
+                         (flet ((get-current-reader-xid () xid)
                                 (ensure-current-table (current-table)
                                   (unless (eq current-table table)
                                     (error "SELECT table changed")))

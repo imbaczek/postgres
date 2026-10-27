@@ -41,7 +41,7 @@ atomically; writers must register exactly one relation."
               (remove-duplicates (copy-list ,relation-expression) :test #'=))
             (,relfilenodes ,captured-relfilenodes)
             (,xid ,(if (eq mode :read)
-                       `(if (recovery-in-progress-p) (get-current-reader-xid) (get-current-xid))
+                       '(get-current-reader-xid)
                        '(get-current-xid))))
        (declare (ignorable ,relfilenodes ,xid))
        ,register-form

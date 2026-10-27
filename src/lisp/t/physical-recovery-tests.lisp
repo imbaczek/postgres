@@ -320,6 +320,27 @@
              (ok (not (pg::backend-transaction-read-only-p))))
         (pg::reset-backend-transaction pg::*backend*))))
 
+(deftest promoted-reader-registration-keeps-virtual-identity-at-wrap-gate
+    (let* ((pg::*physical-recovery-state* nil)
+           (pg::*backend* (pg::make-backend :state :in-progress :read-only t
+                                            :virtual-reader-xid -7))
+           (pg::*next-xid* (+ pg::+xid-cycle+ pg::+first-normal-xid+))
+           (pg::*wal-ready* nil)
+           (pg::*active-xids* nil)
+           (pg::*recovery-reader-xids* (make-hash-table :test #'eql))
+           (pg::*relation-readers* (make-hash-table :test #'eql))
+           (pg::*relation-writers* (make-hash-table :test #'eql))
+           (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql)))
+      (unwind-protect
+           (progn
+             (ok (= -7
+                    (pg::with-registered-relation-access (nodes xid :read)
+                        '(900) (values)
+                      xid)))
+             (ok (null (pg::backend-xid pg::*backend*)))
+             (ok (equal '(-7) (gethash 900 pg::*relation-readers*))))
+        (pg::reset-backend-transaction pg::*backend*))))
+
 (deftest virtual-reader-can-finish-during-pending-wrap
     (let* ((pg::*physical-recovery-state* nil)
            (pg::*backend* (pg::make-backend :state :in-progress :explicit t
