@@ -36,6 +36,25 @@
   (file-sizes (make-hash-table :test #'equal))
   (stream-paths (make-hash-table :test #'eq)))
 
+(defstruct query-temp-stream-entry
+  pathname stream delete-p)
+
+(defstruct query-temp-cleanup-owner
+  thread quota entries directory temporary-directory link state failure-path failure)
+
+(defvar *query-temp-cleanup-owner* nil)
+
+(defvar *query-temp-pending-cleanups* nil)
+
+(defvar *query-temp-pending-cleanup-lock*
+  (sb-thread:make-mutex :name "pg pending query temp cleanup"))
+
+(defun make-query-temp-scope-owner (quota)
+  (let ((owner (make-query-temp-cleanup-owner
+                :thread sb-thread:*current-thread* :quota quota :state :active)))
+    (setf (query-temp-cleanup-owner-link owner) (list owner))
+    owner))
+
 (defstruct query-temp-namespace-report
   pathname
   owner-state
@@ -423,21 +442,25 @@
           *query-temp-instance-directory* instance)
     instance))
 
+(defun create-query-temp-scope-directory (directory)
+  (sb-posix:mkdir (namestring directory) #o700)
+  directory)
+
 (defun query-temp-scope-directory ()
   (or *query-temp-scope-directory*
-      (setf *query-temp-scope-directory*
-            (if *query-temp-directory*
-                (uiop:ensure-directory-pathname
-                 (pathname *query-temp-directory*))
-                (let* ((instance (or *query-temp-instance-directory*
-                                     (initialize-query-temp-storage)))
-                       (scope (merge-pathnames
-                               (format nil "session-~d-query-~d/"
-                                       *query-temp-session-id*
-                                       (next-query-temp-sequence))
-                               instance)))
-                  (query-temp-private-directory instance)
-                  (query-temp-private-directory scope))))))
+      (if *query-temp-directory*
+          (setf *query-temp-scope-directory*
+                (uiop:ensure-directory-pathname (pathname *query-temp-directory*)))
+          (let* ((instance (or *query-temp-instance-directory* (initialize-query-temp-storage)))
+                 (scope (merge-pathnames
+                         (format nil "session-~d-query-~d/"
+                                 *query-temp-session-id* (next-query-temp-sequence))
+                         instance)))
+            (query-temp-private-directory instance)
+            (sb-sys:without-interrupts
+              (create-query-temp-scope-directory scope)
+              (setf *query-temp-scope-directory* scope
+                    (query-temp-cleanup-owner-directory *query-temp-cleanup-owner*) scope))))))
 
 (defun unlink-query-temp-file (pathname)
   (delete-file pathname))
@@ -457,6 +480,229 @@
           (remhash stream (query-temp-quota-stream-paths quota))))))
   (values))
 
+(defun report-query-temp-cleanup-failure (pathname condition)
+  (handler-case
+      (format *error-output* "pg-lisp: query temp cleanup failed for ~a: ~a~%" pathname condition)
+    (serious-condition () nil))
+  (values))
+
+(defun call-with-query-temp-cleanup (pathname function)
+  (labels ((failed (condition)
+             (if *query-temp-cleanup-owner*
+                 (setf (query-temp-cleanup-owner-failure-path *query-temp-cleanup-owner*) pathname
+                       (query-temp-cleanup-owner-failure *query-temp-cleanup-owner*) condition)
+                 (report-query-temp-cleanup-failure pathname condition))
+             nil))
+    (handler-case (funcall function)
+      (sb-ext:timeout (condition) (failed condition))
+      (error (condition) (failed condition)))))
+
+(defun query-temp-file-absent-p (pathname)
+  (handler-case
+      (progn (sb-posix:lstat (namestring pathname)) nil)
+    (sb-posix:syscall-error (condition)
+      (if (= (sb-posix:syscall-errno condition) sb-posix:enoent)
+          t
+          (error condition)))))
+
+(defun query-temp-stream-open-p (stream)
+  (handler-case (open-stream-p stream)
+    (serious-condition () t)))
+
+(defun query-temp-entry-open-p (entry)
+  (let ((stream (query-temp-stream-entry-stream entry)))
+    (and stream (query-temp-stream-open-p stream))))
+
+(defun prune-query-temp-stream-entries ()
+  (when *query-temp-cleanup-owner*
+    (setf (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*)
+          (remove-if (lambda (entry)
+                       (and (null (query-temp-stream-entry-stream entry))
+                            (not (query-temp-stream-entry-delete-p entry))))
+                     (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))))
+  (values))
+
+(defun discharge-query-temp-stream (stream)
+  (when (and stream (not (query-temp-stream-open-p stream)))
+    (when *query-temp-quota*
+      (remhash stream (query-temp-quota-stream-paths *query-temp-quota*)))
+    (when *query-temp-cleanup-owner*
+      (dolist (entry (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
+        (when (eq stream (query-temp-stream-entry-stream entry))
+          (setf (query-temp-stream-entry-stream entry) nil))))
+    (prune-query-temp-stream-entries))
+  (values))
+
+(defun abort-query-temp-stream (stream pathname)
+  (when stream
+    (sb-sys:without-interrupts
+      (sb-sys:with-deadline (:seconds nil :override t)
+        (loop repeat 2
+              while (query-temp-stream-open-p stream)
+              do (call-with-query-temp-cleanup pathname (lambda () (close stream :abort t)))))))
+  (discharge-query-temp-stream stream)
+  (not (and stream (query-temp-stream-open-p stream))))
+
+(defun pending-query-temp-stream-open-p (pathname)
+  (let ((owners
+          (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+            (loop for owner in *query-temp-pending-cleanups*
+                  when (and (not (eq owner *query-temp-cleanup-owner*))
+                            (eq (query-temp-cleanup-owner-quota owner) *query-temp-quota*))
+                    collect owner))))
+    (some (lambda (owner)
+            (some (lambda (entry)
+                    (and (equal pathname (query-temp-stream-entry-pathname entry))
+                         (query-temp-entry-open-p entry)))
+                  (query-temp-cleanup-owner-entries owner)))
+          owners)))
+
+(defun close-query-temp-file-streams (pathname)
+  (when *query-temp-cleanup-owner*
+    (dolist (entry (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
+      (when (equal pathname (query-temp-stream-entry-pathname entry))
+        (abort-query-temp-stream (query-temp-stream-entry-stream entry) pathname))))
+  (and (not (pending-query-temp-stream-open-p pathname))
+       (or (null *query-temp-cleanup-owner*)
+           (notany (lambda (entry)
+                     (and (equal pathname (query-temp-stream-entry-pathname entry))
+                          (query-temp-entry-open-p entry)))
+                   (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*)))
+       (or (null *query-temp-quota*)
+           (loop for stream being the hash-keys of (query-temp-quota-stream-paths *query-temp-quota*)
+                   using (hash-value path)
+                 never (and (equal path pathname) (query-temp-stream-open-p stream))))))
+
+(defun delete-query-temp-file (pathname)
+  (sb-sys:without-interrupts
+    (sb-sys:with-deadline (:seconds nil :override t)
+      (when (and (close-query-temp-file-streams pathname)
+                 (or (call-with-query-temp-cleanup
+                      pathname (lambda () (unless (query-temp-file-absent-p pathname)
+                                            (unlink-query-temp-file pathname))))
+                     (call-with-query-temp-cleanup
+                      pathname (lambda () (query-temp-file-absent-p pathname)))))
+        (setf *query-temp-files* (delete pathname *query-temp-files* :test #'equal))
+        (forget-query-temp-file-space pathname)
+        (when *query-temp-cleanup-owner*
+          (dolist (entry (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
+            (when (equal pathname (query-temp-stream-entry-pathname entry))
+              (setf (query-temp-stream-entry-delete-p entry) nil)))))))
+  (prune-query-temp-stream-entries)
+  (values))
+
+(defun cleanup-query-temp-files ()
+  (sb-sys:without-interrupts
+    (sb-sys:with-deadline (:seconds nil :override t)
+      (loop repeat 2 do
+        (dolist (entry (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
+          (when (query-temp-stream-entry-delete-p entry)
+            (let ((pathname (query-temp-stream-entry-pathname entry)))
+              (call-with-query-temp-cleanup pathname (lambda () (delete-query-temp-file pathname))))))
+        (dolist (entry (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
+          (let ((stream (query-temp-stream-entry-stream entry))
+                (path (query-temp-stream-entry-pathname entry)))
+            (when (and stream (not (query-temp-stream-entry-delete-p entry)))
+              (abort-query-temp-stream stream path)
+              (unless (query-temp-stream-open-p stream)
+                (remhash stream (query-temp-quota-stream-paths *query-temp-quota*)))))))
+      (when (and (notany #'query-temp-stream-entry-delete-p
+                         (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
+                 *query-temp-scope-directory* (null *query-temp-directory*))
+        (call-with-query-temp-cleanup
+         *query-temp-scope-directory*
+         (lambda ()
+           (uiop:delete-directory-tree *query-temp-scope-directory*
+                                       :validate t :if-does-not-exist :ignore)))
+        (when (call-with-query-temp-cleanup
+               *query-temp-scope-directory*
+               (lambda () (query-temp-file-absent-p *query-temp-scope-directory*)))
+          (setf *query-temp-scope-directory* nil)))))
+  (values))
+
+(defun query-temp-owner-unresolved-p (owner)
+  (or (some (lambda (entry)
+              (or (query-temp-stream-entry-delete-p entry)
+                  (query-temp-entry-open-p entry)))
+            (query-temp-cleanup-owner-entries owner))
+      (and (query-temp-cleanup-owner-directory owner)
+           (null (query-temp-cleanup-owner-temporary-directory owner)))))
+
+(defun run-query-temp-owner-cleanup (owner)
+  (let ((*query-temp-cleanup-owner* owner)
+        (*query-temp-quota* (query-temp-cleanup-owner-quota owner))
+        (*query-temp-scope-directory* (query-temp-cleanup-owner-directory owner))
+        (*query-temp-directory* (query-temp-cleanup-owner-temporary-directory owner))
+        (*query-temp-files* nil))
+    (setf (query-temp-cleanup-owner-failure owner) nil)
+    (unwind-protect
+         (call-with-query-temp-cleanup
+          *query-temp-scope-directory* #'cleanup-query-temp-files)
+      (setf (query-temp-cleanup-owner-directory owner) *query-temp-scope-directory*)
+      (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+        (if (query-temp-owner-unresolved-p owner)
+            (setf (query-temp-cleanup-owner-state owner) :pending)
+            (progn
+              (setf *query-temp-pending-cleanups*
+                    (delete owner *query-temp-pending-cleanups* :test #'eq))
+              (setf (cdr (query-temp-cleanup-owner-link owner)) nil
+                    (query-temp-cleanup-owner-state owner) :resolved)))))
+    (when (query-temp-cleanup-owner-failure owner)
+      (report-query-temp-cleanup-failure
+       (query-temp-cleanup-owner-failure-path owner) (query-temp-cleanup-owner-failure owner))))
+  (values))
+
+(defun finish-query-temp-scope ()
+  (sb-sys:without-interrupts
+    (sb-sys:with-deadline (:seconds nil :override t)
+      (let ((owner *query-temp-cleanup-owner*))
+        (setf (query-temp-cleanup-owner-directory owner) *query-temp-scope-directory*)
+        (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+          (setf (query-temp-cleanup-owner-state owner) :cleaning
+                (cdr (query-temp-cleanup-owner-link owner)) *query-temp-pending-cleanups*
+                *query-temp-pending-cleanups* (query-temp-cleanup-owner-link owner)))
+        (run-query-temp-owner-cleanup owner)))))
+
+(defun retry-pending-query-temp-cleanup ()
+  (sb-sys:without-interrupts
+    (sb-sys:with-deadline (:seconds nil :override t)
+      (let ((owners
+              (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+                (loop for owner in *query-temp-pending-cleanups*
+                      when (and (eq (query-temp-cleanup-owner-thread owner) sb-thread:*current-thread*)
+                                (eq (query-temp-cleanup-owner-state owner) :pending))
+                        collect owner))))
+        (dolist (owner owners)
+          (when (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+                  (when (eq (query-temp-cleanup-owner-state owner) :pending)
+                    (setf (query-temp-cleanup-owner-state owner) :cleaning)))
+            (run-query-temp-owner-cleanup owner))))))
+  (values))
+
+(defun ensure-query-temp-acquisition-ready ()
+  (when (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+          (some (lambda (owner)
+                  (eq (query-temp-cleanup-owner-thread owner) sb-thread:*current-thread*))
+                *query-temp-pending-cleanups*))
+    (ereport "58030" "previous temporary file cleanup remains incomplete"))
+  (unless *query-temp-cleanup-owner*
+    (error "query temporary stream requires a scope owner")))
+
+(defun query-temp-pending-cleanup-status (&optional (limit 10))
+  (check-type limit (integer 0 1000))
+  (sb-thread:with-mutex (*query-temp-pending-cleanup-lock*)
+    (let ((records 0) (streams 0) (paths nil) (listed 0) (truncated nil))
+      (dolist (owner *query-temp-pending-cleanups*)
+        (incf records)
+        (dolist (entry (query-temp-cleanup-owner-entries owner))
+          (let ((open (query-temp-entry-open-p entry)))
+            (when open (incf streams))
+            (when (or open (query-temp-stream-entry-delete-p entry))
+              (if (< listed limit)
+                  (progn (push (query-temp-stream-entry-pathname entry) paths) (incf listed))
+                  (setf truncated t))))))
+      (list :records records :open-streams streams :paths (nreverse paths) :truncated truncated))))
+
 (defmacro with-query-temp-files (&body body)
   "Own spill files at the outermost scope, including allocations by callbacks."
   `(if *query-temp-file-scope-active-p*
@@ -465,21 +711,16 @@
               (*query-temp-file-scope-active-p* t)
               (*query-temp-scope-directory* nil)
               (*query-temp-quota* (or *query-temp-quota*
-                                      (make-query-temp-quota
-                                       *query-temp-file-limit-bytes*))))
-         (unwind-protect
-              (progn ,@body)
-           (dolist (pathname *query-temp-files*)
-             (multiple-value-bind (deleted-p condition)
-                 (ignore-errors (unlink-query-temp-file pathname))
-               (declare (ignore condition))
-               (when deleted-p
-                 (forget-query-temp-file-space pathname))))
-           (when (and *query-temp-scope-directory* (null *query-temp-directory*))
-             (ignore-errors
-              (uiop:delete-directory-tree *query-temp-scope-directory*
-                                          :validate t
-                                          :if-does-not-exist :ignore)))))))
+                                      (make-query-temp-quota *query-temp-file-limit-bytes*)))
+              (*query-temp-cleanup-owner* (make-query-temp-scope-owner *query-temp-quota*)))
+         (setf (query-temp-cleanup-owner-temporary-directory *query-temp-cleanup-owner*)
+               *query-temp-directory*)
+         (sb-sys:without-interrupts
+           (unwind-protect
+                (progn
+                  (retry-pending-query-temp-cleanup)
+                  (sb-sys:with-local-interrupts (progn ,@body)))
+             (finish-query-temp-scope))))))
 
 (defun query-temp-file-pathname ()
   (let* ((sequence (next-query-temp-sequence))
@@ -496,23 +737,28 @@
     (setf (gethash pathname (query-temp-quota-file-sizes *query-temp-quota*)) 0))
   pathname)
 
+(defun register-query-temp-stream-path (stream pathname)
+  (setf (gethash stream (query-temp-quota-stream-paths *query-temp-quota*)) pathname))
+
 (defun open-and-register-query-temp-file (pathname open-arguments)
   "Open PATHNAME and publish it to scope cleanup as one interrupt-safe step."
-  (let ((stream nil)
+  (ensure-query-temp-acquisition-ready)
+  (let ((entry (make-query-temp-stream-entry :pathname pathname))
         (registered-p nil))
-    (unwind-protect
-         (sb-sys:without-interrupts
-           (setf stream (apply #'open pathname open-arguments))
-           (when stream
-             (register-query-temp-file pathname)
-             (setf (gethash stream
-                            (query-temp-quota-stream-paths *query-temp-quota*))
-                   pathname)
-             (setf registered-p t))
-           stream)
-      (when (and stream (not registered-p))
-        (ignore-errors (close stream :abort t))
-        (ignore-errors (delete-file pathname))))))
+    (push entry (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (let ((stream (apply #'open pathname open-arguments)))
+             (when stream
+               (setf (query-temp-stream-entry-stream entry) stream
+                     (query-temp-stream-entry-delete-p entry) t)
+               (register-query-temp-file pathname)
+               (register-query-temp-stream-path stream pathname)
+               (setf registered-p t))
+             stream)
+        (unless registered-p
+          (abort-query-temp-stream (query-temp-stream-entry-stream entry) pathname)
+          (prune-query-temp-stream-entries))))))
 
 (defun open-query-temp-output ()
   (unless *query-temp-file-scope-active-p*
@@ -540,17 +786,59 @@
           do (return-from open-query-temp-io (values pathname stream)))
   (error "Could not create a unique query spill file"))
 
+(defun open-query-temp-input (pathname)
+  (ensure-query-temp-acquisition-ready)
+  (let ((entry (make-query-temp-stream-entry :pathname pathname)))
+    (push entry (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
+    (sb-sys:without-interrupts
+      (let ((stream (open pathname :direction :input :external-format :utf-8)))
+        (setf (query-temp-stream-entry-stream entry) stream)
+        (register-query-temp-stream-path stream pathname)
+        stream))))
+
+(defun query-temp-owned-stream-pathname (stream)
+  (or (when *query-temp-cleanup-owner*
+        (let ((entry (find stream (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*)
+                           :key #'query-temp-stream-entry-stream :test #'eq)))
+          (when entry (query-temp-stream-entry-pathname entry))))
+      (when *query-temp-quota*
+        (gethash stream (query-temp-quota-stream-paths *query-temp-quota*)))))
+
+(defun finish-query-temp-stream (stream normal-p)
+  (when stream
+    (if normal-p
+        (unwind-protect (close stream) (discharge-query-temp-stream stream))
+        (abort-query-temp-stream stream (query-temp-owned-stream-pathname stream))))
+  (values))
+
+(defun call-with-query-temp-stream-cleanup (function closer)
+  (let ((normal-p nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (multiple-value-prog1 (sb-sys:with-local-interrupts (funcall function))
+             (setf normal-p t))
+        (funcall closer normal-p)))))
+
+(defmacro with-query-temp-input ((stream pathname) &body body)
+  (let ((normal (gensym "NORMAL-")))
+    `(let ((,stream nil))
+       (call-with-query-temp-stream-cleanup
+        (lambda ()
+          (sb-sys:without-interrupts (setf ,stream (open-query-temp-input ,pathname)))
+          ,@body)
+        (lambda (,normal) (finish-query-temp-stream ,stream ,normal))))))
+
 (defmacro with-query-temp-output ((pathname stream) &body body)
   "Own an output stream before opening it; the surrounding file scope owns PATHNAME."
-  `(let ((,pathname nil)
-         (,stream nil))
-     (declare (ignorable ,pathname))
-     (sb-sys:without-interrupts
-       (unwind-protect
-            (progn
-              (multiple-value-setq (,pathname ,stream) (open-query-temp-output))
-              (sb-sys:with-local-interrupts (progn ,@body)))
-         (when ,stream (close ,stream))))))
+  (let ((normal (gensym "NORMAL-")))
+    `(let ((,pathname nil) (,stream nil))
+       (declare (ignorable ,pathname))
+       (call-with-query-temp-stream-cleanup
+        (lambda ()
+          (sb-sys:without-interrupts
+            (multiple-value-setq (,pathname ,stream) (open-query-temp-output)))
+          ,@body)
+        (lambda (,normal) (finish-query-temp-stream ,stream ,normal))))))
 
 (defun query-spill-value-size (value)
   "Estimate retained row memory without building its printed representation."
@@ -855,14 +1143,15 @@ both before writing can be interrupted."
 (defun query-row-spool-seal (spool)
   (unless (query-row-spool-sealed-p spool)
     (when (query-row-spool-output-stream spool)
-      (close (query-row-spool-output-stream spool))
+      (finish-query-temp-stream (query-row-spool-output-stream spool) t)
       (setf (query-row-spool-output-stream spool) nil))
     (setf (query-row-spool-sealed-p spool) t))
   spool)
 
 (defun close-query-row-spool (spool)
   (when (query-row-spool-output-stream spool)
-    (ignore-errors (close (query-row-spool-output-stream spool)))
+    (abort-query-temp-stream (query-row-spool-output-stream spool)
+                             (query-row-spool-pathname spool))
     (setf (query-row-spool-output-stream spool) nil))
   (values))
 
@@ -889,8 +1178,7 @@ both before writing can be interrupted."
   (unless (query-row-spool-sealed-p spool)
     (error "Cannot read an unsealed query row spool"))
   (if (query-row-spool-pathname spool)
-      (with-open-file (stream (query-row-spool-pathname spool)
-                              :direction :input :external-format :utf-8)
+      (with-query-temp-input (stream (query-row-spool-pathname spool))
         (loop for index from 0
               for row = (query-spill-read-record stream)
               until (eq row +query-spill-eof+)
@@ -978,7 +1266,8 @@ both before writing can be interrupted."
 
 (defun close-query-match-map (match-map)
   (when (query-match-map-io-stream match-map)
-    (ignore-errors (close (query-match-map-io-stream match-map)))
+    (abort-query-temp-stream (query-match-map-io-stream match-map)
+                             (query-match-map-pathname match-map))
     (setf (query-match-map-io-stream match-map) nil))
   (values))
 

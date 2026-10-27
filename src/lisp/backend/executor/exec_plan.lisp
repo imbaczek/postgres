@@ -517,27 +517,13 @@ reordered tree, and each parameterized path can reference only joined Vars."
       (query-spill-write-record output item))
     pathname))
 
-(defun delete-query-temp-file (pathname)
-  (multiple-value-bind (deleted-p condition)
-      (ignore-errors (unlink-query-temp-file pathname))
-    (declare (ignore condition))
-    (when deleted-p
-      (setf *query-temp-files*
-            (delete pathname *query-temp-files* :test #'equal))
-      (forget-query-temp-file-space pathname)))
-  (values))
-
 (defun merge-query-sort-runs (left-path right-path order)
   (let ((output-path nil))
     (with-query-temp-output (pathname output)
       (setf output-path pathname)
       (progn
-        (with-open-file (left-input left-path
-                                    :direction :input
-                                    :external-format :utf-8)
-          (with-open-file (right-input right-path
-                                       :direction :input
-                                       :external-format :utf-8)
+        (with-query-temp-input (left-input left-path)
+          (with-query-temp-input (right-input right-path)
             (let ((left (query-spill-read-record left-input))
                   (right (query-spill-read-record right-input)))
               (loop until (or (eq left +query-spill-eof+)
@@ -605,8 +591,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
                                                    order)
                                               row)))
                                     (emit-run (pathname)
-                                      (with-open-file (stream pathname :direction :input
-                                                                       :external-format :utf-8)
+                                      (with-query-temp-input (stream pathname)
                                         (loop for item = (query-spill-read-record stream)
                                               until (eq item +query-spill-eof+)
                                               do (check-for-interrupts)
@@ -669,7 +654,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
   (concatenate 'vector (car state) (cdr state)))
 
 (defun hash-aggregate-spill-file (pathname callback)
-  (with-open-file (stream pathname :direction :input :external-format :utf-8)
+  (with-query-temp-input (stream pathname)
     (loop for row = (query-spill-read-record stream)
           until (eq row +query-spill-eof+)
           do (check-for-interrupts)
@@ -684,25 +669,24 @@ reordered tree, and each parameterized path can reference only joined Vars."
   (let ((paths (make-array +hash-aggregate-partition-count+ :initial-element nil))
         (streams (make-array +hash-aggregate-partition-count+ :initial-element nil))
         (counts (make-array +hash-aggregate-partition-count+ :initial-element 0)))
-    (unwind-protect
-         (hash-aggregate-spill-file
-          pathname
-          (lambda (environment)
-            (multiple-value-bind (values key)
-                (hash-aggregate-group group-keys environment)
-              (declare (ignore values))
-              (let* ((partition (hash-aggregate-partition-index key depth))
-                     (stream (or (aref streams partition)
-                                 (multiple-value-bind (path output)
-                                     (open-query-temp-output)
-                                   (setf (aref paths partition) path
-                                         (aref streams partition) output)
-                                   output))))
-                (query-spill-write-record stream environment)
-                (incf (aref counts partition))))))
-      (dotimes (index (length streams))
-        (when (aref streams index)
-          (close (aref streams index)))))
+    (call-with-query-temp-stream-cleanup
+     (lambda ()
+       (hash-aggregate-spill-file
+        pathname
+        (lambda (environment)
+          (multiple-value-bind (values key) (hash-aggregate-group group-keys environment)
+            (declare (ignore values))
+            (let* ((partition (hash-aggregate-partition-index key depth))
+                   (stream (or (aref streams partition)
+                               (multiple-value-bind (path output) (open-query-temp-output)
+                                 (setf (aref paths partition) path
+                                       (aref streams partition) output)
+                                 output))))
+              (query-spill-write-record stream environment)
+              (incf (aref counts partition)))))))
+     (lambda (normal-p)
+       (dotimes (index (length streams))
+         (finish-query-temp-stream (aref streams index) normal-p))))
     (loop for index below (length paths)
           for path = (aref paths index)
           when path collect (cons (aref counts index) path))))
@@ -798,10 +782,9 @@ reordered tree, and each parameterized path can reference only joined Vars."
       ;; COUNT(*) without GROUP BY has one state even when the child is empty.
       (unless group-keys
         (setf (gethash nil groups) (make-state nil)))
-      (unwind-protect
-           (funcall source #'consume)
-        (when spill-stream
-          (close spill-stream)))
+      (call-with-query-temp-stream-cleanup
+       (lambda () (funcall source #'consume))
+       (lambda (normal-p) (finish-query-temp-stream spill-stream normal-p)))
       (dolist (state (nreverse group-order))
         (when (eq (funcall callback (hash-aggregate-state-row state)) :stop)
           (return-from hash-aggregate-process-rows :stop)))

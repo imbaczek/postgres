@@ -32,6 +32,7 @@
                (:file "t/live-operation-parking-tests")
                (:file "t/btree-read-lease-tests")
                (:file "t/index-scan-detachment-tests")
+               (:file "t/executor-resource-tests")
                (:file "t/physical-prefix-tests")
                (:file "t/promotion-intent-tests")
                (:file "t/promotion-wal-tests")
