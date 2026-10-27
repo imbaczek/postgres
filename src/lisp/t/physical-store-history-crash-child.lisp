@@ -1,0 +1,36 @@
+;;;; Owned subprocess; terminate only this process at a durable receive boundary.
+(require :asdf)
+(push (uiop:pathname-parent-directory-pathname
+       (uiop:pathname-directory-pathname *load-truename*))
+      asdf:*central-registry*)
+(asdf:load-system "pg")
+
+(let* ((args (uiop:command-line-arguments))
+       (root (pathname (first args)))
+       (mode (second args))
+       (point (find (third args)
+                    '(:after-history-publication :after-control-rename
+                      :after-history-selection :after-segment-fsync :after-control-directory-fsync)
+                    :key #'symbol-name :test #'string-equal))
+       (store (pg::physical-store-open root 123 1))
+       (eor (pg::wal-encode-end-of-recovery-record 32 42 2 1 1)))
+  (unless (and point (member mode '("select" "flush") :test #'equal))
+    (error "unknown receive history crash mode or point"))
+  (flet ((select-history ()
+           (pg::physical-store-select-history store 2
+                                              (format nil "1~c0/00000020~creceive crash~%" #\Tab #\Tab) eor)))
+    (when (equal mode "flush")
+      (select-history)
+      (pg::physical-store-input store 32 eor))
+    (let ((pg::*physical-store-test-hook*
+            (lambda (where owner)
+              (declare (ignore owner))
+              (when (eq where point)
+                (with-open-file (out (merge-pathnames "history-crash.marker" root)
+                                     :direction :output :if-exists :supersede)
+                  (format out "~d ~a~%" (sb-posix:getpid) point)
+                  (pg::fsync-stream out))
+                (pg::fsync-directory root)
+                (sb-posix:kill (sb-posix:getpid) 9)))))
+      (if (equal mode "select") (select-history) (pg::physical-store-flush store))))
+  (error "receive history crash boundary was not reached"))
