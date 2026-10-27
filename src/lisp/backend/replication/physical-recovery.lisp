@@ -28,7 +28,11 @@ An absent selection requires the applied timeline to remain the base timeline."
       (eql applied base)))
 
 (defun physical-recovery-control-valid-p (control &key legacy)
-  "Validate recovery progress separately from a pending child's local identity."
+  "Validate recovery progress and a pending child's local identity.
+
+A retained reference is allowed only in pending control and must match its base
+timeline, checkpoint, manifest digest and applied end. This checks fields, not
+the referenced archive."
   (destructuring-bind (&key phase system-id timeline manifest-digest checkpoint
                          applied next-xid db-state state-time (control-version 3)
                          (applied-timeline timeline) history-target history-digest
@@ -75,6 +79,7 @@ An absent selection requires the applied timeline to remain the base timeline."
                                              +db-shutdowned-in-recovery+))))))))
 
 (defun physical-recovery-write-retained-reference (bytes offset reference)
+  "Write the 44-byte retained reference at OFFSET in BYTES."
   (wal-set-u64 bytes offset (getf reference :root-id))
   (wal-set-u32 bytes (+ offset 8) (getf reference :base-timeline))
   (loop for key in '(:base :manifest-digest :end :end-digest)
@@ -82,6 +87,7 @@ An absent selection requires the applied timeline to remain the base timeline."
         do (wal-set-u64 bytes position (getf reference key))))
 
 (defun physical-recovery-read-retained-reference (bytes offset)
+  "Read a 44-byte retained reference from BYTES at OFFSET."
   (list :root-id (wal-u64 bytes offset) :base-timeline (wal-u32 bytes (+ offset 8))
         :base (wal-u64 bytes (+ offset 12)) :manifest-digest (wal-u64 bytes (+ offset 20))
         :end (wal-u64 bytes (+ offset 28)) :end-digest (wal-u64 bytes (+ offset 36))))
@@ -130,8 +136,11 @@ An absent selection requires the applied timeline to remain the base timeline."
 
 (defun physical-recovery-decode-control (bytes)
   "Decode recovery control by its magic and length.
+
 The old pending and selected ordinary images are both 88 bytes; their magic
-separates them. Selected pending control uses 104 bytes."
+separates them. Selected pending control uses 104 bytes. A pending retained
+reference adds 44 bytes, giving 132 or 148 bytes."
+
   (unless (member (length bytes) '(60 72 88 104 132 148))
     (error "invalid physical recovery control length"))
   (let* ((size (length bytes)) (magic (subseq bytes 0 8))
