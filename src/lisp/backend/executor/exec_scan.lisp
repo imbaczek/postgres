@@ -850,7 +850,7 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
   (member name '("lower" "substr" "length" "char_length" "character_length"
                  "pg_wal_lsn_diff" "pg_walfile_name"
                  "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
-                 "sqrt" "numeric_sqrt")
+                 "sqrt" "numeric_sqrt" "exp" "numeric_exp")
           :test #'string=))
 
 (defun having-literal-expression-p (expression)

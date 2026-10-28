@@ -204,12 +204,18 @@ type and operator catalog, not a promise that every input spelling or function
 is implemented.
 
 Basic numeric functions include `abs`, `numeric_abs`, `sign`, `round`,
-`trunc`, `ceil`/`ceiling`, `floor`, `sqrt`, and `numeric_sqrt`. `round` and `trunc` accept an optional
+`trunc`, `ceil`/`ceiling`, `floor`, `sqrt`, `numeric_sqrt`, `exp`, and
+`numeric_exp`. `round` and `trunc` accept an optional
 integer scale for numeric values; negative scales act before the decimal point.
 Numeric rounding breaks ties away from zero, while floating-point rounding uses
 ties to even. Square root rejects negative inputs; `numeric_sqrt` uses numeric
-arithmetic, while `sqrt` also supports floating-point inputs. These functions
-return NULL when an argument is NULL.
+arithmetic, while `sqrt` also supports floating-point inputs. `numeric_exp`
+uses numeric arithmetic and `exp` also supports floating-point inputs. For both
+exponential functions, NaN and positive infinity pass through and negative
+infinity returns zero. Numeric exponential reports overflow for large positive
+inputs and returns scaled zero for large negative inputs; floating exponential
+reports overflow or underflow when a finite input yields infinity or zero.
+These functions return NULL when an argument is NULL.
 
 DDL:
 

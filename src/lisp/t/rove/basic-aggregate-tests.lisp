@@ -221,6 +221,40 @@
   (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-sqrt-perfect-squares :seed 42))))
     (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
+(cl-spec:defproperty numeric-exp-zero-scale
+    ((scale (range integer 0 32)))
+  (:about sql-numeric-exp)
+  (:trials (:normal 100))
+  (let ((result (sql-numeric-exp (make-sql-decimal 0 scale))))
+    (and (= (sql-numeric-rational result) 1)
+         (= (sql-numeric-scale result) (max 16 scale)))))
+
+(cl-spec:defproperty numeric-exp-reciprocal
+    ((coefficient (range integer -5000 5000)))
+  (:about sql-numeric-exp)
+  (:trials (:normal 150))
+  (let* ((input (make-sql-decimal coefficient 3))
+         (positive (sql-numeric-rational (sql-numeric-exp input)))
+         (negative (sql-numeric-rational (sql-numeric-exp (sql-numeric-negate input)))))
+    (< (abs (- (* positive negative) 1)) 1/10000000000000)))
+
+(rove:deftest numeric-exp-reciprocal-property
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'numeric-exp-reciprocal :seed 42))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(rove:deftest numeric-exp-expressions
+    (dolist (case '(("SELECT exp(0::numeric)::text" "1.0000000000000000")
+                    ("SELECT exp(1::numeric)::text" "2.7182818284590452")
+                    ("SELECT exp((-1)::numeric)::text" "0.3678794411714423")
+                    ("SELECT exp('-Infinity'::numeric)::text" "0")
+                    ("SELECT exp('Infinity'::numeric)::text" "Infinity")
+                    ("SELECT exp('NaN'::numeric)::text" "NaN")
+                    ("SELECT exp(0::float8)::text" "1")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case)))
+  (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-exp-zero-scale :seed 42))))
+    (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (cl-spec:defproperty numeric-rounding-is-symmetric
     ((coefficient (range integer -10000000 10000000))
      (input-scale (range integer 0 6))

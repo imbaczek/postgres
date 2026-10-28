@@ -216,6 +216,70 @@ exact.  Negative values signal an error; NaN and positive infinity pass through.
           (incf root))
         (sql-numeric-result root scale)))))
 
+(defun sql-numeric-round-rational (number scale)
+  "Round a rational to SCALE decimal places, with ties away from zero."
+  (let* ((factor (expt 10 scale))
+         (scaled (* number factor)))
+    (/ (* (signum scaled) (floor (+ (abs scaled) 1/2))) factor)))
+
+(defun sql-numeric-rational-weight (value)
+  "Return the normalized base-10000 weight of a positive rational."
+  (when (zerop value) (return-from sql-numeric-rational-weight 0))
+  (let* ((numerator (numerator value))
+         (denominator (denominator value))
+         (decimal-weight (- (length (format nil "~d" numerator))
+                            (length (format nil "~d" denominator)))))
+    (when (< value (expt 10 decimal-weight))
+      (decf decimal-weight))
+    (floor decimal-weight 4)))
+
+(defun sql-numeric-exp (value)
+  "Compute numeric exp using numeric.c's scale and intermediate rounding strategy.
+Reduce the argument by powers of two, sum a rounded Taylor series, then square
+back and round to the result scale.  NaN and positive infinity pass through;
+negative infinity returns zero.  Large positive inputs overflow and large
+negative inputs return scaled zero."
+  (case value
+    (:numeric-negative-infinity (return-from sql-numeric-exp 0))
+    ((:numeric-positive-infinity :numeric-nan) (return-from sql-numeric-exp value)))
+  (let* ((x (sql-numeric-rational value))
+         (estimate (cond ((> x 6000) 6000d0)
+                         ((< x -6000) -6000d0)
+                         (t (sb-int:with-float-traps-masked (:underflow :inexact)
+                              (coerce x 'double-float)))))
+         (decimal-estimate (* estimate 0.434294481903252d0))
+         (scale (min 1000 (max 0 (sql-numeric-scale value)
+                               (- 16 (truncate (max -2000d0 (min 2000d0 decimal-estimate))))))))
+    (when (>= (abs estimate) 6000d0)
+      (if (plusp estimate) (ereport "22003" "value overflows numeric format")
+          (return-from sql-numeric-exp (make-sql-decimal 0 scale))))
+    (let ((divisions 0) (reduced estimate))
+      (loop while (> (abs reduced) 0.01d0)
+            do (setf reduced (/ reduced 2d0))
+               (incf divisions))
+      (let* ((y (/ x (expt 2 divisions)))
+             (weight (truncate decimal-estimate))
+             (significant (+ 8 (max 0 (+ 1 weight scale
+                                         (truncate (* divisions 0.301029995663981d0))))))
+             (working-scale (1- significant))
+             (sum (+ 1 y))
+             (term (sql-numeric-round-rational (* y y) working-scale))
+             (index 2))
+        (setf term (sql-numeric-round-rational (/ term index) working-scale))
+        (loop until (zerop term)
+              do (incf sum term)
+                 (setf term (sql-numeric-round-rational (* term y) working-scale))
+                 (incf index)
+                 (setf term (sql-numeric-round-rational (/ term index) working-scale)))
+        (dotimes (i divisions)
+          (declare (ignorable i))
+          (let* ((base-weight (sql-numeric-rational-weight sum))
+                 (product-scale (max 0 (- significant (* 8 base-weight)))))
+            (setf sum (sql-numeric-round-rational (* sum sum) product-scale))))
+        (let* ((rounded (sql-numeric-round-rational sum scale))
+               (coefficient (* rounded (expt 10 scale))))
+          (sql-numeric-result coefficient scale))))))
+
 (defun sql-numeric-round-or-trunc (value scale round-p)
   "Round or truncate a numeric at SCALE, retaining PostgreSQL display scale.
 Negative scales operate before the decimal point and produce display scale zero.

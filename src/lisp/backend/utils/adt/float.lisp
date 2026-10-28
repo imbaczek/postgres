@@ -214,6 +214,19 @@ NaN and positive infinity pass through, and negative zero retains its sign."
   (sb-int:with-float-traps-masked (:invalid :inexact :underflow :overflow)
     (sqrt value)))
 
+(defun sql-float-exp (value)
+  "Evaluate float8 exponential using float.c's special-value handling.
+NaN and positive infinity pass through; negative infinity returns zero.  For
+finite inputs, an infinite or zero result signals overflow or underflow."
+  (when (sb-ext:float-nan-p value) (return-from sql-float-exp value))
+  (when (sb-ext:float-infinity-p value)
+    (return-from sql-float-exp (if (minusp value) 0d0 value)))
+  (let ((result (sb-int:with-float-traps-masked (:overflow :underflow :inexact)
+                  (exp value))))
+    (cond ((sb-ext:float-infinity-p result) (ereport "22003" "value out of range: overflow"))
+          ((zerop result) (ereport "22003" "value out of range: underflow"))
+          (t result))))
+
 (defun sql-float-basic-function (name value)
   "Apply float.c's unary rounding and sign functions.
 Round uses ties to even, and zero results retain the input's sign.  Like
