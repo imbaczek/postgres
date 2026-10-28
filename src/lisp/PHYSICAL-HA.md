@@ -429,12 +429,37 @@ resume, and live REPL reload (`/tmp/pg-follow-wire-accepted.log`, artifacts
 matching replay, and a run with seed `3385497690757192689`. There is no function
 spec; rejection and input coverage are unmeasured.
 
-Future receiver onboarding must reconcile a pending local follow binding before
-`physical-recovery-open-storage` performs redo. If applied and required floors
-are at or before the fork, atomically publish the receive-control rewind and
-history selection before truncating; otherwise require reseeding. This sender
-milestone does not establish the full onboarding path or synchronous
-acknowledgment-loss behavior.
+The private receive-store rewind and history-selection prerequisite is now
+implemented, with no production caller. It checks the full expected control
+tuple and old acknowledged prefix, including the tail to discard, and derives
+the fork digest locally. It validates applied and required LSN/timeline pairs,
+the candidate history and retained root before publishing one control image
+with the lower flush, digest and selection. Full control readback precedes
+in-memory installation, root reconciliation and tail cleanup. The base, floor,
+manifest and immutable root remain unchanged. This is not `pg_rewind` and is
+not exposed to follow or reconnect.
+
+Future receiver onboarding must establish source proof and quiescence, preserve
+a durable pending binding across stop, and reconcile it before selected-history
+attachment, restartpoint selection and redo. It must validate restartpoint,
+clean-batch, observed-XID and required floors before calling the helper. A
+required frontier below the retained floor is checked for ancestry only and must
+come from verified durable recovery state. The client CopyDone/timeline-switch
+loop remains open; this prerequisite does not establish full onboarding or
+synchronous acknowledgment-loss behavior. It adds no format version or
+coordination protocol.
+
+The full run passed 758 physical tests with no failures or pending tests and
+170 interop tests, plus a fresh strict compile. The physical result was recovered
+from the same idle worker's suite report after the 300-second transport timeout.
+Seven rootless and two rooted SIGKILL cuts passed; the rooted fresh-SBCL check
+opened without discarding the tail and proved root GC rejection before explicit
+cleanup. Existing native PREPARE, follow, promotion and SIGKILL acceptance also
+passed (`/tmp/pg-receive-rewind-native.log`, artifacts
+`/tmp/pg-operation-parking.NvnAa7`). The exact-ancestry property failed its
+baseline and passed 200 trials each with seeds 42 and `1397983632957994830`;
+the seed 42 replay matched digest `fnv1a64-v1:2bc44affd9033239`. There is no
+function spec; rejection counts and input coverage are unmeasured.
 
 ### Historical WAL retention implementation order
 

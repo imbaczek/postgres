@@ -39,7 +39,9 @@ The CRC detects accidental corruption; it does not authenticate the payload."
   (recovery-parse-manifest-text (bytes->string (subseq bytes 12 (- (length bytes) 4)))))
 
 (defun physical-store-history-extends-p (previous history)
-  "Check that HISTORY preserves the intervals already fixed by PREVIOUS."
+  "Preserve PREVIOUS as the exact oldest ancestry of HISTORY.
+Keep every fixed interval and allow only the old open tip to close. Genuinely
+new descendants may have zero-width intervals, but cannot replace an older entry."
   (if (null previous)
       t
       (let ((suffix (member (timeline-history-entry-timeline (first previous)) history
@@ -125,6 +127,8 @@ The FNV reference detects accidental corruption, not malicious changes."
                 physical-retained-inventory-load physical-store-check-retained-identity))
 
 (defun physical-store-history-candidate (store target history-text eor-bytes fork-digest)
+  "Build and validate a history selection and its immutable encoded blob.
+Bind it to STORE's base, prior selection and the locally supplied fork digest."
   (let* ((payload (list :version 1 :system-id (physical-store-system-id store)
                         :base-timeline (physical-store-timeline store) :base (physical-store-base-lsn store)
                         :target target :history-text history-text :fork-digest fork-digest
@@ -136,6 +140,8 @@ The FNV reference detects accidental corruption, not malicious changes."
              store payload digest (physical-store-selection store)) bytes)))
 
 (defun physical-store-publish-history (store selection bytes)
+  "Durably publish the immutable selection blob, or verify an existing copy.
+The blob alone does not select history; control publication is the commit point."
   (let ((path (physical-store-history-path store (getf selection :target) (getf selection :digest))))
     (physical-store-test-point :before-history-publication store)
     (if (probe-file path)
@@ -146,6 +152,7 @@ The FNV reference detects accidental corruption, not malicious changes."
     (physical-store-test-point :after-history-publication store)))
 
 (defun physical-store-check-complete-input (store)
+  "Require all input flushed and the decoder at a complete record boundary."
   (unless (and (= (physical-store-written-lsn store) (physical-store-flushed-lsn store))
                (zerop (physical-wal-decoder-used (physical-store-decoder store))))
     (error "receive history selection requires no unflushed input")))
@@ -306,6 +313,10 @@ raw record once per scan; return a requested digest only at a valid boundary."
     (fsync-directory (physical-store-directory store))))
 
 (defun physical-store-check-follow-frontier (store pair history fork &key applied)
+  "Check an (LSN timeline) frontier against both histories through FORK.
+An applied frontier must be at or above the retained floor. At or above the
+floor, prove the local prefix and its timeline; a required frontier below the
+floor gets an ancestry check only and must come from verified durable recovery."
   (unless (and (listp pair) (= (length pair) 2)
                (typep (first pair) '(unsigned-byte 64))
                (typep (second pair) '(integer 1 4294967295))
@@ -321,6 +332,12 @@ raw record once per scan; return a requested digest only at a valid boundary."
       (error "follow frontier timeline differs from its durable prefix"))))
 
 (defun physical-store-follow-candidate (store expected applied required target history-text eor-bytes)
+  "Validate a proposed rewind against the full EXPECTED control tuple.
+Validate the entire old acknowledged prefix, including the discarded tail, and
+derive the fork digest locally. Require floor <= fork <= flush and check APPLIED
+and REQUIRED as (LSN timeline) pairs. The caller supplies verified durable
+recovery frontiers. The copied candidate owns no streams or lock; it validates
+the same retained root under the candidate history without reconciling ownership."
   (unless (equal expected (physical-store-control-tuple store))
     (error "receive store changed since follow preparation"))
   (physical-store-read-retained-control store expected)
@@ -357,6 +374,14 @@ raw record once per scan; return a requested digest only at a valid boundary."
 
 (defun physical-store-rewind-select-history
     (store expected applied required target history-text eor-bytes)
+  "Rewind a private receive store to a fork and select its descendant history.
+The caller must establish source proof, recovery and reload quiescence, and a
+durable pending binding, and validate restartpoint, clean-batch, observed-XID
+and required floors before production use. Publish one control with lower flush,
+local digest and selection, preserving base, floor, manifest and retained root.
+Read it back fully before installing memory and decoder state, reconciling root
+ownership or discarding the tail. An ambiguous failure latches the store; reopen
+to determine the durable state. This operation is not pg_rewind."
   (with-physical-store (store)
     (multiple-value-bind (candidate bytes)
         (physical-store-follow-candidate store expected applied required target history-text eor-bytes)
