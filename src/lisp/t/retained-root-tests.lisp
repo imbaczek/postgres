@@ -605,6 +605,68 @@
                 (ok (= 152 (pg::physical-store-flushed-lsn store))))
            (pg::physical-store-close store))))))
 
+(deftest receive-history-rewind-preserves-compacted-root-and-earlier-required-floor
+    (call-with-receive-retained-fixture
+     (lambda (root identity id image-id prefix)
+       (declare (ignore image-id prefix))
+       (let ((store (pg::physical-store-open root 123 1 :retained-identity identity)))
+         (unwind-protect
+              (let* ((archive (pg::physical-store-retained-directory store))
+                     (index-before (pg::physical-retained-inventory-load
+                                    archive id identity (pg::timeline-parse-history 1 "")))
+                     (floor-digest (pg::physical-store-floor-digest store)))
+                (pg::physical-store-input store 96 (sample-physical-record 96))
+                (pg::physical-store-input store 128 (sample-physical-record 128))
+                (pg::physical-store-flush store)
+                (ng (pg::physical-retained-root-delete-unprotected archive :inventory id))
+                (pg::physical-store-rewind-select-history
+                 store (pg::physical-store-control-tuple store) '(96 1) '(64 1)
+                 2 (store-history-text 1 128) (store-history-eor 128 2 1))
+                (ok (= 128 (pg::physical-store-flushed-lsn store)))
+                (ok (= 96 (pg::physical-store-floor-lsn store)))
+                (ok (= floor-digest (pg::physical-store-floor-digest store)))
+                (ok (= id (pg::physical-store-retained-root store)))
+                (ng (pg::physical-retained-root-delete-unprotected archive :inventory id))
+                (let ((index-after (pg::physical-retained-inventory-load
+                                    archive id identity (getf (pg::physical-store-selection store) :history))))
+                  (ok (equalp (getf index-before :entries) (getf index-after :entries))))
+                (pg::physical-store-close store)
+                (let ((reopened (pg::physical-store-open root 123 1 :retained-identity identity)))
+                  (unwind-protect
+                       (progn
+                         (ok (= id (pg::physical-store-retained-root reopened)))
+                         (ok (= 96 (pg::physical-store-floor-lsn reopened)))
+                         (ok (= 128 (pg::physical-store-flushed-lsn reopened))))
+                    (pg::physical-store-close reopened))))
+           (pg::physical-store-close store))))))
+
+(deftest receive-history-rooted-rewind-sigkill-restores-protection-before-tail-cleanup
+    (dolist (point '(:after-control-rename :before-follow-tail-cleanup))
+      (call-with-receive-retained-fixture
+       (lambda (root identity id image-id prefix)
+         (declare (ignore image-id prefix))
+         (let ((store (pg::physical-store-open root 123 1 :retained-identity identity)))
+           (unwind-protect
+                (progn
+                  (pg::physical-store-input store 96 (sample-physical-record 96))
+                  (pg::physical-store-input store 128 (sample-physical-record 128))
+                  (pg::physical-store-flush store))
+             (pg::physical-store-close store)))
+         (let* ((script (namestring (asdf:system-relative-pathname "pg" "t/physical-store-rewind-crash-child.lisp")))
+                (command (list (or (uiop:getenv "SBCL") "sbcl") "--noinform" "--no-sysinit"
+                               "--no-userinit" "--script" script (namestring root))))
+           (multiple-value-bind (output errors status)
+               (uiop:run-program (append command (list (symbol-name point) "rooted"))
+                                 :output :string :error-output :string :ignore-error-status t)
+             (ok (not (zerop status)))
+             (ok (probe-file (merge-pathnames "rewind-crash.marker" root))
+                 (format nil "~a ~a" output errors)))
+           (multiple-value-bind (output errors status)
+               (uiop:run-program (append command (list "VERIFY" "rooted" (format nil "~d" id)))
+                                 :output :string :error-output :string :ignore-error-status t)
+             (ok (zerop status) (format nil "~a ~a" output errors))
+             (ok (search "rooted rewind cold verification PASS" output))))))))
+
 (deftest receive-control-rejects-a-hole-before-a-matching-retained-endpoint
     (call-with-receive-retained-fixture
      (lambda (root identity id image-id prefix)

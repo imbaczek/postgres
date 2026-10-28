@@ -40,14 +40,18 @@ The CRC detects accidental corruption; it does not authenticate the payload."
 
 (defun physical-store-history-extends-p (previous history)
   "Check that HISTORY preserves the intervals already fixed by PREVIOUS."
-  (every (lambda (old)
-           (let ((new (find (timeline-history-entry-timeline old) history
+  (if (null previous)
+      t
+      (let ((suffix (member (timeline-history-entry-timeline (first previous)) history
                             :key #'timeline-history-entry-timeline)))
-             (and new
-                  (= (timeline-history-entry-begin old) (timeline-history-entry-begin new))
-                  (or (null (timeline-history-entry-end old))
-                      (eql (timeline-history-entry-end old) (timeline-history-entry-end new))))))
-         previous))
+        (and (= (length previous) (length suffix))
+             (every (lambda (old new)
+                      (and (= (timeline-history-entry-timeline old)
+                              (timeline-history-entry-timeline new))
+                           (= (timeline-history-entry-begin old) (timeline-history-entry-begin new))
+                           (or (null (timeline-history-entry-end old))
+                               (eql (timeline-history-entry-end old) (timeline-history-entry-end new)))))
+                    previous suffix)))))
 
 (defun physical-store-check-history-selection (store payload digest previous)
   "Validate base identity, lineage and the expected end-of-recovery bytes.
@@ -115,6 +119,37 @@ The FNV reference detects accidental corruption, not malicious changes."
      (when previous-digest
        (physical-store-load-history-selection store parent previous-digest (1+ depth))))))
 
+(declaim (ftype function physical-store-control-tuple physical-store-read-retained-control
+                physical-store-check-retained-coverage physical-store-retained-directory
+                physical-store-retained-history physical-store-check-retained-root
+                physical-retained-inventory-load physical-store-check-retained-identity))
+
+(defun physical-store-history-candidate (store target history-text eor-bytes fork-digest)
+  (let* ((payload (list :version 1 :system-id (physical-store-system-id store)
+                        :base-timeline (physical-store-timeline store) :base (physical-store-base-lsn store)
+                        :target target :history-text history-text :fork-digest fork-digest
+                        :previous-digest (getf (physical-store-selection store) :digest)
+                        :eor-octets (coerce eor-bytes 'list)))
+         (bytes (physical-store-history-image payload))
+         (digest (physical-store-update-digest #xCBF29CE484222325 bytes)))
+    (values (physical-store-check-history-selection
+             store payload digest (physical-store-selection store)) bytes)))
+
+(defun physical-store-publish-history (store selection bytes)
+  (let ((path (physical-store-history-path store (getf selection :target) (getf selection :digest))))
+    (physical-store-test-point :before-history-publication store)
+    (if (probe-file path)
+        (progn
+          (unless (equalp bytes (recovery-read-bytes path)) (error "receive history path changed"))
+          (fsync-directory (physical-store-directory store)))
+        (timeline-publish-history-bytes path bytes))
+    (physical-store-test-point :after-history-publication store)))
+
+(defun physical-store-check-complete-input (store)
+  (unless (and (= (physical-store-written-lsn store) (physical-store-flushed-lsn store))
+               (zerop (physical-wal-decoder-used (physical-store-decoder store))))
+    (error "receive history selection requires no unflushed input")))
+
 (defun physical-store-select-history (store target history-text eor-bytes)
   "Select a descendant receive history at the exact flushed fork.
 
@@ -126,29 +161,13 @@ stored proof only. Errors latch the store; after an ambiguous control rename,
 reopen from disk to determine the durable selection."
   (with-physical-store (store)
     (physical-store-validate-prefix store)
-    (unless (and (= (physical-store-written-lsn store) (physical-store-flushed-lsn store))
-                 (zerop (physical-wal-decoder-used (physical-store-decoder store))))
-      (error "receive history selection requires no unflushed input"))
-    (let* ((payload (list :version 1 :system-id (physical-store-system-id store)
-                          :base-timeline (physical-store-timeline store) :base (physical-store-base-lsn store)
-                          :target target :history-text history-text
-                          :fork-digest (physical-store-flushed-digest store)
-                          :previous-digest (getf (physical-store-selection store) :digest)
-                          :eor-octets (coerce eor-bytes 'list)))
-           (bytes (physical-store-history-image payload))
-           (digest (physical-store-update-digest #xCBF29CE484222325 bytes))
-           (selection (physical-store-check-history-selection
-                       store payload digest (physical-store-selection store)))
-           (path (physical-store-history-path store target digest)))
+    (physical-store-check-complete-input store)
+    (multiple-value-bind (selection bytes)
+        (physical-store-history-candidate store target history-text eor-bytes
+                                          (physical-store-flushed-digest store))
       (unless (= (getf selection :fork) (physical-store-flushed-lsn store))
         (error "receive history requires the complete parent prefix through its fork"))
-      (physical-store-test-point :before-history-publication store)
-      (if (probe-file path)
-          (progn
-            (unless (equalp bytes (recovery-read-bytes path)) (error "receive history path changed"))
-            (fsync-directory (physical-store-directory store)))
-          (timeline-publish-history-bytes path bytes))
-      (physical-store-test-point :after-history-publication store)
+      (physical-store-publish-history store selection bytes)
       (physical-store-save-control store (physical-store-flushed-lsn store)
                                    :digest (physical-store-flushed-digest store) :selection selection)
       (setf (physical-store-selection store) selection)
@@ -285,3 +304,82 @@ raw record once per scan; return a requested digest only at a valid boundary."
                   (sb-posix:ftruncate (sb-sys:fd-stream-fd stream) (- upper start))
                   (fsync-stream stream)))))))
     (fsync-directory (physical-store-directory store))))
+
+(defun physical-store-check-follow-frontier (store pair history fork &key applied)
+  (unless (and (listp pair) (= (length pair) 2)
+               (typep (first pair) '(unsigned-byte 64))
+               (typep (second pair) '(integer 1 4294967295))
+               (<= (first pair) fork)
+               (or (not applied) (<= (physical-store-floor-lsn store) (first pair)))
+               (timeline-prefix-boundary-p (second pair) (first pair) history)
+               (timeline-prefix-boundary-p
+                (second pair) (first pair) (physical-store-retained-history store)))
+    (error "follow frontier is outside the retained common ancestry"))
+  (when (>= (first pair) (physical-store-floor-lsn store))
+    (physical-store-prefix-digest-under-lock store (first pair))
+    (unless (= (second pair) (physical-store-prefix-timeline store (first pair)))
+      (error "follow frontier timeline differs from its durable prefix"))))
+
+(defun physical-store-follow-candidate (store expected applied required target history-text eor-bytes)
+  (unless (equal expected (physical-store-control-tuple store))
+    (error "receive store changed since follow preparation"))
+  (physical-store-read-retained-control store expected)
+  (physical-store-check-complete-input store)
+  (let* ((history (timeline-check-lineage (timeline-parse-history target history-text)))
+         (fork (and (second history) (timeline-history-entry-end (second history)))))
+    (unless (and fork (<= (physical-store-floor-lsn store) fork
+                          (physical-store-flushed-lsn store)))
+      (error "follow fork is outside the retained durable prefix"))
+    (unless (physical-store-history-extends-p (physical-store-retained-history store) history)
+      (error "follow history rewrites existing base ancestry"))
+    (let ((digest (physical-store-prefix-digest-under-lock store fork)))
+      (physical-store-check-follow-frontier store applied history fork :applied t)
+      (physical-store-check-follow-frontier store required history fork)
+      (multiple-value-bind (selection bytes)
+          (physical-store-history-candidate store target history-text eor-bytes digest)
+        (let ((candidate (copy-physical-store store)))
+          (setf (physical-store-flushed-lsn candidate) fork
+                (physical-store-written-lsn candidate) fork
+                (physical-store-flushed-digest candidate) digest
+                (physical-store-written-digest candidate) digest
+                (physical-store-selection candidate) selection
+                (physical-store-stream candidate) nil
+                (physical-store-lock-stream candidate) nil)
+          (physical-store-validate-prefix candidate)
+          (when (physical-store-retained-root candidate)
+            (physical-store-check-retained-identity candidate)
+            (let ((index (physical-retained-inventory-load
+                          (physical-store-retained-directory candidate)
+                          (physical-store-retained-root candidate)
+                          (physical-store-retained-identity candidate) history)))
+              (physical-store-check-retained-coverage candidate (getf index :entries))))
+          (values candidate bytes))))))
+
+(defun physical-store-rewind-select-history
+    (store expected applied required target history-text eor-bytes)
+  (with-physical-store (store)
+    (multiple-value-bind (candidate bytes)
+        (physical-store-follow-candidate store expected applied required target history-text eor-bytes)
+      (let ((fork (physical-store-flushed-lsn candidate))
+            (digest (physical-store-flushed-digest candidate))
+            (selection (physical-store-selection candidate)))
+        (when (physical-store-stream store)
+          (close (physical-store-stream store) :abort t))
+        (setf (physical-store-stream store) nil
+              (physical-store-segment store) nil
+              (physical-store-segment-timeline store) nil)
+        (physical-store-publish-history store selection bytes)
+        (physical-store-save-control store fork :digest digest :selection selection)
+        (physical-store-read-retained-control store (physical-store-control-tuple candidate))
+        (physical-store-test-point :after-follow-control-readback store)
+        (setf (physical-store-flushed-lsn store) fork
+              (physical-store-written-lsn store) fork
+              (physical-store-flushed-digest store) digest
+              (physical-store-written-digest store) digest
+              (physical-store-selection store) selection
+              (physical-store-decoder store) (make-physical-wal-decoder :start-lsn fork))
+        (physical-store-check-retained-root store)
+        (physical-store-test-point :before-follow-tail-cleanup store)
+        (physical-store-discard-tail store)
+        (physical-store-test-point :after-follow-tail-cleanup store)
+        target))))

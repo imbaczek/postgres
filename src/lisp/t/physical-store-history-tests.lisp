@@ -12,6 +12,270 @@
        fork (* (1+ (floor fork pg::+wal-segment-size+)) pg::+wal-segment-size+))
    42 child parent 1))
 
+(defun call-with-rewind-history-store (function)
+  (with-physical-store-directory (root)
+    (let ((store (pg::physical-store-open root 123 1 :create t)))
+      (unwind-protect
+           (progn
+             (dotimes (index 3)
+               (pg::physical-store-input store (* index 32) (sample-physical-record (* index 32))))
+             (pg::physical-store-flush store)
+             (funcall function root store))
+        (pg::physical-store-close store)))))
+
+(deftest receive-history-rewind-selects-before-discarding-unapplied-parent-tail
+    (call-with-rewind-history-store
+     (lambda (root store)
+       (let* ((expected (pg::physical-store-control-tuple store))
+              (digest (pg::physical-store-prefix-digest store 32))
+              (eor (store-history-eor 32 2 1)))
+         (ok (= 2 (pg::physical-store-rewind-select-history
+                   store expected '(32 1) '(32 1) 2 (store-history-text 1 32) eor)))
+         (ok (= 32 (pg::physical-store-flushed-lsn store) (pg::physical-store-written-lsn store)
+                (pg::physical-wal-decoder-next-lsn (pg::physical-store-decoder store))))
+         (ok (= digest (pg::physical-store-flushed-digest store)
+                (pg::physical-store-written-digest store)))
+         (ok (= 0 (pg::physical-store-floor-lsn store) (pg::physical-store-base-lsn store)))
+         (with-open-file (in (pg::physical-store-segment-path store 0 1)
+                             :element-type '(unsigned-byte 8))
+           (ok (= 32 (file-length in))))
+         (pg::physical-store-close store)
+         (let ((reopened (pg::physical-store-open root 123 1)))
+           (unwind-protect
+                (progn
+                  (ok (= 32 (pg::physical-store-flushed-lsn reopened)))
+                  (ok (= 2 (pg::physical-store-selected-timeline reopened)))
+                  (pg::physical-store-input reopened 32 eor)
+                  (pg::physical-store-flush reopened)
+                  (ok (= 88 (pg::physical-store-flushed-lsn reopened))))
+             (pg::physical-store-close reopened)))))))
+
+(deftest receive-history-rewind-sigkill-preserves-control-before-tail-cleanup
+    (dolist (point '(:after-history-publication :before-control-rename :after-control-rename
+                     :after-control-directory-fsync :after-follow-control-readback
+                     :before-follow-tail-cleanup :after-follow-tail-cleanup))
+      (call-with-rewind-history-store
+       (lambda (root store)
+         (pg::physical-store-close store)
+         (multiple-value-bind (output errors status)
+             (uiop:run-program
+              (list (or (uiop:getenv "SBCL") "sbcl") "--noinform" "--no-sysinit" "--no-userinit" "--script"
+                    (namestring (asdf:system-relative-pathname "pg" "t/physical-store-rewind-crash-child.lisp"))
+                    (namestring root) (symbol-name point))
+              :output :string :error-output :string :ignore-error-status t)
+           (ok (not (zerop status)))
+           (ok (probe-file (merge-pathnames "rewind-crash.marker" root))
+               (format nil "~a: ~a ~a" point output errors)))
+         (with-open-file (in (pg::physical-store-segment-path store 0 1)
+                             :element-type '(unsigned-byte 8))
+           (ok (= (if (eq point :after-follow-tail-cleanup) 32 96) (file-length in))))
+         (let* ((committed (not (member point '(:after-history-publication :before-control-rename))))
+                (flush (if committed 32 96))
+                (reopened (pg::physical-store-open root 123 1))
+                (records nil))
+           (unwind-protect
+                (progn
+                  (ok (= flush (pg::physical-store-flushed-lsn reopened)))
+                  (ok (= (if committed 2 1) (pg::physical-store-selected-timeline reopened)))
+                  (pg::physical-store-map-durable-records
+                   reopened (lambda (record raw) (declare (ignore raw))
+                              (push (pg::wal-record-start record) records)))
+                  (ok (equal (if committed '(0) '(64 32 0)) records)))
+             (pg::physical-store-close reopened)))))))
+
+(deftest receive-history-rewind-allows-exact-fork-and-whole-segment-eor-rotation
+    (call-with-rewind-history-store
+     (lambda (root store)
+       (declare (ignore root))
+       (ok (= 2 (pg::physical-store-rewind-select-history
+                 store (pg::physical-store-control-tuple store) '(64 1) '(32 1)
+                 2 (store-history-text 1 96) (store-history-eor 96 2 1))))
+       (ok (= 96 (pg::physical-store-flushed-lsn store)))))
+  (with-physical-store-directory (root)
+    (let* ((segment pg::+wal-segment-size+) (base (- segment 72)) (fork (- segment 40))
+                                            (store (pg::physical-store-open root 123 1 :create t :start-lsn base))
+                                            (eor (store-history-eor fork 2 1)))
+      (unwind-protect
+           (progn
+             (pg::physical-store-input store base (sample-physical-record base))
+             (pg::physical-store-input store fork (sample-physical-record fork))
+             (pg::physical-store-input store segment (sample-physical-record segment))
+             (pg::physical-store-flush store)
+             (pg::physical-store-rewind-select-history
+              store (pg::physical-store-control-tuple store) (list fork 1) (list base 1)
+              2 (store-history-text 1 fork) eor)
+             (ok (= fork (pg::physical-store-flushed-lsn store)))
+             (ng (probe-file (pg::physical-store-segment-path store 1 1)))
+             (pg::physical-store-input store segment eor)
+             (pg::physical-store-flush store)
+             (ok (= (+ segment 56) (pg::physical-store-flushed-lsn store))))
+        (pg::physical-store-close store)))))
+
+(deftest receive-history-rewind-rejects-stale-or-diverged-frontiers-without-publication
+    (dolist (case '(:stale :applied-past :required-past :wrong-applied :wrong-required :interior))
+      (call-with-rewind-history-store
+       (lambda (root store)
+         (declare (ignore root))
+         (let ((expected (pg::physical-store-control-tuple store))
+               (applied '(32 1)) (required '(32 1))
+               (before (lineage-test-bytes (pg::physical-store-path store "receive.control"))))
+           (ecase case
+             (:stale (incf (fourth expected)))
+             (:applied-past (setf applied '(64 1)))
+             (:required-past (setf required '(64 1)))
+             (:wrong-applied (setf applied '(32 2)))
+             (:wrong-required (setf required '(32 2)))
+             (:interior (setf applied '(31 1))))
+           (ok (signals (pg::physical-store-rewind-select-history
+                         store expected applied required 2 (store-history-text 1 32)
+                         (store-history-eor 32 2 1)) 'error))
+           (ok (equalp before (lineage-test-bytes (pg::physical-store-path store "receive.control"))))
+           (with-open-file (in (pg::physical-store-segment-path store 0 1)
+                               :element-type '(unsigned-byte 8))
+             (ok (= 96 (file-length in)))))))))
+
+(deftest receive-history-rewind-rechecks-durable-tuple-even-when-memory-is-unchanged
+    (call-with-rewind-history-store
+     (lambda (root store)
+       (declare (ignore root))
+       (let ((expected (pg::physical-store-control-tuple store)))
+         (pg::physical-store-save-control store 96 :digest (pg::physical-store-flushed-digest store)
+                                                   :floor-lsn 32 :floor-digest (pg::physical-store-prefix-digest store 32))
+         (let ((before (lineage-test-bytes (pg::physical-store-path store "receive.control"))))
+           (ok (signals (pg::physical-store-rewind-select-history
+                         store expected '(32 1) '(32 1) 2 (store-history-text 1 32)
+                         (store-history-eor 32 2 1)) 'error))
+           (ok (equalp before (lineage-test-bytes (pg::physical-store-path store "receive.control"))))
+           (with-open-file (in (pg::physical-store-segment-path store 0 1)
+                               :element-type '(unsigned-byte 8))
+             (ok (= 96 (file-length in)))))))))
+
+(deftest receive-history-rewind-rejects-corrupt-discarded-tail-and-unflushed-input
+    (dolist (kind '(:corrupt :unflushed :partial :floor))
+      (call-with-rewind-history-store
+       (lambda (root store)
+         (declare (ignore root))
+         (ecase kind
+           (:corrupt
+            (let* ((path (pg::physical-store-segment-path store 0 1))
+                   (bytes (lineage-test-bytes path)))
+              (setf (aref bytes 80) (logxor 1 (aref bytes 80)))
+              (pg::wal-atomic-write-bytes path bytes)))
+           (:unflushed (pg::physical-store-input store 96 (sample-physical-record 96)))
+           (:partial (pg::physical-store-input store 96 (subseq (sample-physical-record 96) 0 16)))
+           (:floor (pg::physical-store-compact store 64 (lambda (digest) (declare (ignore digest))))))
+         (let ((before (lineage-test-bytes (pg::physical-store-path store "receive.control"))))
+           (ok (signals (pg::physical-store-rewind-select-history
+                         store (pg::physical-store-control-tuple store) '(32 1) '(32 1)
+                         2 (store-history-text 1 32) (store-history-eor 32 2 1)) 'error))
+           (ok (equalp before (lineage-test-bytes (pg::physical-store-path store "receive.control")))))))))
+
+(deftest receive-history-rewind-extends-selected-parent-and-rejects-siblings
+    (dolist (sibling '(nil t))
+      (with-physical-store-directory (root)
+        (let ((store (pg::physical-store-open root 123 1 :create t))
+              (first-history (store-history-text 1 32)))
+          (unwind-protect
+               (progn
+                 (pg::physical-store-input store 0 (sample-physical-record))
+                 (pg::physical-store-flush store)
+                 (pg::physical-store-select-history store 2 first-history (store-history-eor 32 2 1))
+                 (pg::physical-store-input store 32 (store-history-eor 32 2 1))
+                 (pg::physical-store-input store 88 (sample-physical-record 88))
+                 (pg::physical-store-input store 120 (sample-physical-record 120))
+                 (pg::physical-store-flush store)
+                 (let ((expected (pg::physical-store-control-tuple store))
+                       (old-digest (getf (pg::physical-store-selection store) :digest)))
+                   (if sibling
+                       (ok (signals
+                            (pg::physical-store-rewind-select-history
+                             store expected '(32 1) '(32 1) 3 first-history (store-history-eor 32 3 1)) 'error))
+                       (progn
+                         (ok (= 5 (pg::physical-store-rewind-select-history
+                                   store expected '(88 2) '(32 1) 5
+                                   (store-history-text 2 120 first-history) (store-history-eor 120 5 2))))
+                         (ok (= 120 (pg::physical-store-flushed-lsn store)))
+                         (ok (= old-digest (getf (getf (pg::physical-store-selection store) :previous) :digest)))))))
+            (pg::physical-store-close store))))))
+
+(deftest receive-history-rewind-preserves-ancestors-of-a-child-timeline-base
+    (dolist (rewrite '(nil t))
+      (with-physical-store-directory (root)
+        (let* ((pg::*pgdata* root)
+               (store (pg::physical-store-open root 123 2 :create t :start-lsn 64)))
+          (unwind-protect
+               (progn
+                 (pg::wal-ensure-directory-durable (pg::wal-directory))
+                 (pg::timeline-write-history 2 1 32 "base history")
+                 (pg::physical-store-input store 64 (sample-physical-record 64))
+                 (pg::physical-store-input store 96 (sample-physical-record 96))
+                 (pg::physical-store-input store 128 (sample-physical-record 128))
+                 (pg::physical-store-flush store)
+                 (let ((before (lineage-test-bytes (pg::physical-store-path store "receive.control")))
+                       (history (store-history-text 2 96 (store-history-text 1 (if rewrite 16 32)))))
+                   (if rewrite
+                       (progn
+                         (ok (signals
+                              (pg::physical-store-rewind-select-history
+                               store (pg::physical-store-control-tuple store) '(64 2) '(64 2)
+                               3 history (store-history-eor 96 3 2)) 'error))
+                         (ok (equalp before (lineage-test-bytes
+                                             (pg::physical-store-path store "receive.control")))))
+                       (progn
+                         (ok (= 3 (pg::physical-store-rewind-select-history
+                                   store (pg::physical-store-control-tuple store) '(64 2) '(64 2)
+                                   3 history (store-history-eor 96 3 2))))
+                         (ok (= 96 (pg::physical-store-flushed-lsn store)))
+                         (ok (= 2 (pg::physical-store-timeline store)))))))
+            (pg::physical-store-close store))))))
+
+(deftest receive-history-rewind-rejects-unrecorded-zero-length-base-ancestor
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (store (pg::physical-store-open root 123 5 :create t :start-lsn 64)))
+        (unwind-protect
+             (progn
+               (pg::wal-ensure-directory-durable (pg::wal-directory))
+               (pg::timeline-write-history 5 1 32 "skipped timelines")
+               (pg::physical-store-input store 64 (sample-physical-record 64))
+               (pg::physical-store-input store 96 (sample-physical-record 96))
+               (pg::physical-store-input store 128 (sample-physical-record 128))
+               (pg::physical-store-flush store)
+               (let ((before (lineage-test-bytes (pg::physical-store-path store "receive.control"))))
+                 (ok (signals
+                      (pg::physical-store-rewind-select-history
+                       store (pg::physical-store-control-tuple store) '(64 5) '(64 5) 6
+                       (store-history-text 5 96 (store-history-text 3 32 (store-history-text 1 32)))
+                       (store-history-eor 96 6 5)) 'error))
+                 (ok (equalp before (lineage-test-bytes (pg::physical-store-path store "receive.control"))))))
+          (pg::physical-store-close store)))))
+
+(cl-spec:defproperty receive-history-extension-keeps-exact-old-ancestry
+    ((base (range integer 3 4294967293))
+     (begin (range integer 0 18446744073708551615))
+     (distance (range integer 0 1000000)))
+  (:about pg::physical-store-history-extends-p)
+  (:trials (:normal 200))
+  (let* ((fork (+ begin distance))
+         (old-text (store-history-text 1 begin))
+         (old (pg::timeline-parse-history base old-text))
+         (child-text (store-history-text base fork old-text))
+         (child (pg::timeline-parse-history (1+ base) child-text))
+         (zero-child (pg::timeline-parse-history
+                      (+ base 2) (store-history-text (1+ base) fork child-text)))
+         (forged (pg::timeline-parse-history
+                  (1+ base) (store-history-text base fork
+                                                (store-history-text 2 begin old-text)))))
+    (and (pg::physical-store-history-extends-p old old)
+         (pg::physical-store-history-extends-p old child)
+         (pg::physical-store-history-extends-p old zero-child)
+         (not (pg::physical-store-history-extends-p old forged)))))
+
+(deftest generated-receive-history-exact-ancestry-extension
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'receive-history-extension-keeps-exact-old-ancestry :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (deftest receive-history-selection-preserves-base-and-flush-on-reopen
     (with-physical-store-directory (root)
       (let ((store (pg::physical-store-open root 123 1 :create t)))
