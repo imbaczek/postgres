@@ -77,7 +77,9 @@ pin; an ambiguous save fences the source and keeps retention until restart."
           candidate)))))
 
 (defun physical-follow-pin-proof-digest (pin)
-  "Hash the nonempty retained overlap independently of the carried receive seed."
+  "Hash the nonempty physical overlap independently of the carried receive digest.
+Neither the source archive endpoint digest nor its base overlap substitutes for
+the receiver's digest or the independently compared overlap."
   (with-live-operation
     (let* ((request (physical-follow-pin-anchor pin))
            (start (getf request :overlap-start)) (end (getf request :receive-lsn))
@@ -100,7 +102,9 @@ pin; an ambiguous save fences the source and keeps retention until restart."
        #xCBF29CE484222325 (subseq bytes 0 (- end start))))))
 
 (defun physical-follow-pin-check-suffix (pin)
-  "Validate selected ancestry and child WAL through a captured durable endpoint."
+  "Validate selected ancestry and child WAL through a captured durable endpoint.
+Use the source root and live segments independently of the receiver's base;
+require complete records and the end-of-recovery transition at the fork."
   (let* ((history (physical-follow-pin-history pin))
          (cursor (physical-source-pin-consistent-lsn pin))
          (end (with-live-operation

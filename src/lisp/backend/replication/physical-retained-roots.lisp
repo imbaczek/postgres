@@ -122,6 +122,10 @@ this function refuses a silent change to an already registered root."
       id)))
 
 (defun call-with-physical-retained-root-reader (function owner directory identity expected)
+  "Protect OWNER's selected root while FUNCTION reads its immutable objects.
+Under the archive mutex, verify the directory, identity and expected root, then
+install a reader reference atomically. Run FUNCTION outside the mutex and release
+that reference on every exit. Reject an active or uncertain owner update."
   (unless (and (functionp function) owner (typep expected '(unsigned-byte 64)))
     (error "retained WAL reader requires an owner and selected root"))
   (let ((directory (physical-retained-root-directory directory))

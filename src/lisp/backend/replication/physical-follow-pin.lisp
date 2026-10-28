@@ -33,7 +33,8 @@ eligibility for a future follow path; bootstrap START does not accept this pin."
   "Validate anchor fields, ancestry and the proposed end-of-recovery record.
 
 Return the parsed history, fork and record. This checks the request, not its
-agreement with retained source WAL."
+agreement with retained source WAL. Its base and manifest describe the receiver,
+which may differ from the source's retained archive base and manifest."
   (physical-follow-check-plist request *physical-follow-anchor-keys*)
   (let ((source (getf request :source-timeline))
         (parent (getf request :receive-timeline))
@@ -191,7 +192,8 @@ agreement with retained source WAL."
     (wal-invalid-input "physical follow anchor history differs from its source")))
 
 (defun physical-follow-pin-check-retained-wal (pin)
-  "Require retained ancestry or current-source WAL through the durable endpoint."
+  "Require retained ancestry or current-source WAL through the durable endpoint.
+For a ready pin, scan its confirmed suffix; startup performs this before listeners."
   (when (physical-follow-pin-ready-p pin)
     (return-from physical-follow-pin-check-retained-wal
       (physical-follow-source-check-ready-range pin)))

@@ -93,7 +93,9 @@
               (physical-source-pin-prefix-digest pin)))))
 
 (defun physical-source-read-next (name owner cursor)
-  "Read one immutable validated record, never truncating live source WAL."
+  "Read one immutable validated record, never truncating live source WAL.
+A follow pin dispatches to the historical source reader after ownership checks.
+The existing bootstrap START admission does not acquire follow pins."
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
     (unless (and (eq owner (gethash name *physical-source-senders*))
@@ -209,6 +211,8 @@
   (sb-ext:with-timeout 10 (send-logical-keepalive stream durable)))
 
 (defun physical-stream-send-loop (stream command owner)
+  "Send records with one dynamically scoped historical source prefix cache.
+The cache belongs to this sender loop; reuse requires the same source selection."
   (let* ((*physical-follow-source-read-cache* (list nil))
          (name (logical-replication-command-slot-name command))
          (cursor (logical-replication-command-requested-lsn command))

@@ -31,7 +31,9 @@
   (error "missing lineage WAL segment ~d" segment))
 
 (defun wal-lineage-read-record (source segment offset size)
-  "Decode one record from a bounded file or copied segment prefix without repair."
+  "Decode one record from a bounded file or copied segment prefix without repair.
+SIZE bounds both the header and record; a vector must contain that prefix. The
+returned record uses SEGMENT and OFFSET for its logical WAL location."
   (let ((header (make-array +wal-header-size+ :element-type '(unsigned-byte 8)))
         (lsn (+ (* segment +wal-segment-size+) offset))
         (memory (typep source '(vector (unsigned-byte 8)))))

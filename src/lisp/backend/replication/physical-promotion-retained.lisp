@@ -170,6 +170,9 @@ Return the complete control tuple for the subsequent retirement check."
          nil)))))
 
 (defun physical-follow-retained-segment (reference identity history segment)
+  "Read SEGMENT from the selected source root and verify its inventory.
+The base overlap supplies physical prefix bytes, not logical coverage before
+base. In the base segment, compare the extent prefix with the immutable overlap."
   (let* ((directory (physical-recovery-retained-directory))
          (index (physical-retained-inventory-read-index
                  directory (getf reference :root-id) identity history))
@@ -208,6 +211,8 @@ Return the complete control tuple for the subsequent retirement check."
                         (getf identity :base-timeline))))))
 
 (defun physical-follow-source-live-segment (pin segment history)
+  "Copy a current-source timeline segment for PIN, bounded by durable WAL.
+An older candidate does not establish current-source coverage."
   (multiple-value-bind (stream timeline size)
       (wal-lineage-open-segment segment history 0 :timeline)
     (unwind-protect
@@ -223,6 +228,12 @@ Return the complete control tuple for the subsequent retirement check."
       (close stream))))
 
 (defun physical-follow-source-segment (pin segment &optional logical-start)
+  "Select a validated source segment under WAL exclusion.
+The source root is bound to its own base, identity, control reference, projected
+parent history and fixed fork; those need not equal the receiver's base or
+manifest. Retained logical coverage runs from base to fork. A logical read before
+base requires a current-source file eligible in the selected lineage. At the fork,
+compare the child prefix with retained ancestry before returning the child bytes."
   (unless (sb-thread:holding-mutex-p *wal-lock*)
     (error "historical source segment requires WAL exclusion"))
   (when (recovery-in-progress-p)
@@ -266,6 +277,10 @@ Return the complete control tuple for the subsequent retirement check."
              (physical-recovery-retained-directory) identity (getf reference :root-id)))))))
 
 (defun physical-follow-source-cached-segment (pin segment cursor)
+  "Return one cached source prefix, refreshing when its selection changes.
+The key binds PIN, segment, runtime and control identity, timeline, root and
+whether CURSOR is before the retained base. At the old end, refresh if durable
+WAL advanced; crossing the base changes the key."
   (let* ((fields (multiple-value-list (wal-read-control-fields)))
          (reference (getf (seventh fields) :retained-reference))
          (key (list pin segment *wal-insert-timeline* (catalog-system-identifier)
@@ -285,6 +300,9 @@ Return the complete control tuple for the subsequent retirement check."
           (values bytes timeline)))))
 
 (defun physical-follow-source-read-next (pin cursor)
+  "Read the next complete record within PIN's confirmed-to-durable range.
+Recheck source identity and ready state, lineage, rotation gaps and durability;
+return the record, its bytes and the durable endpoint under WAL exclusion."
   (when (recovery-in-progress-p)
     (wal-invalid-input "historical sender cannot continue during recovery"))
   (physical-follow-pin-check-source pin)
@@ -317,6 +335,9 @@ Return the complete control tuple for the subsequent retirement check."
               *wal-durable-lsn*))))
 
 (defun physical-follow-source-check-ready-range (pin)
+  "Scan a ready PIN's confirmed suffix through durable WAL under WAL ownership.
+Startup uses this full check before listeners. Future follow admission must avoid
+placing an unbounded scan in a writer critical section."
   (let ((cursor (physical-source-pin-confirmed-lsn pin))
         (*physical-follow-source-read-cache* (list nil)))
     (loop while (< cursor *wal-durable-lsn*)

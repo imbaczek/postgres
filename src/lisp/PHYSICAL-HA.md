@@ -329,25 +329,55 @@ compares a nonempty retained overlap, checks the continuation through a captured
 durable endpoint, and saves ready state before publishing it in memory. An
 identical retry preserves later confirmed progress; lost retention requires reseeding.
 The receiver's carried digest remains distinct from the independently compared
-overlap digest. This does not verify recycled parent history.
+overlap digest. The overlap alone does not prove an older suffix.
 
-Only current-source-timeline files qualify for this proof. An ancestor backup's
-partial WAL prefix cannot establish that the historical suffix remains available.
-Record scans also reject holes disguised as rotation gaps. General historical
-follow still needs authenticated retained extents preserved before receive-spool
-compaction, including automatic restartpoints before promotion.
+The source reader now uses the committed source's authenticated retained root
+for logical coverage from its base through its fixed fork, and current-source WAL
+where required. The source root has its own base and manifest identity; these can
+differ from a valid receiver anchor. Its immutable base overlap supplies physical
+prefix bytes, not logical coverage before the base. A logical read before that
+base requires an eligible current-source file, so it is possible only in the fork
+segment. At the fork the reader compares the child prefix with retained ancestry.
+It checks record boundaries and rotation gaps, and protects the selected root with
+a scoped reader reference while reading. The receiver's carried digest remains
+independent of the archive endpoint and the compared physical overlap.
 
-The native `t/follow-anchor.sh` test uses owned control endpoints and a real sibling
+Ready-pin reload scans the confirmed suffix through durable WAL under WAL
+ownership at startup before listeners. The existing bootstrap START path rejects
+follow pins, so this does not yet admit a historical network follow. Future follow
+admission must stage lengthy proof outside writer critical sections. Reservation
+preflight currently resolves each segment under WAL exclusion; this milestone
+makes no throughput claim. C's `StartReplication` checks timeline eligibility
+and its fork, while `ReplicationSlotReserveWal` excludes concurrent removal during
+reservation; native retained roots provide their own local protection.
+
+The full suite passed 725 physical tests with no failures or pending tests and
+170 interop tests. The physical result was recovered from the same worker's last
+suite report after the tool transport timed out; the suite was not rerun. Cold
+compile and native follow-anchor passed. The native run exercised source timeline
+2 to 3, crash/restart and rows using the fork segment, current source and selected
+root (`/tmp/pg-historical-native-final.log`); it does not prove older archive-only
+network follow. A three-segment, 32 MiB structural test reads and advances across
+the fork with child WAL filenames for segments 0 and 1 absent; it is not a bootable
+fixture. All three
+logical switchovers passed (`/tmp/pg-historical-switchovers.log`) with C pinned at
+`9c0909b34939f2d5a37b82b9d1efc8b08e310252`. The root lease property passed 100
+trials with seed 42 and digest `fnv1a64-v1:1bea06bab5801c35`, and a second run
+with seed `313279911328282926`. There is no function spec; rejection and input
+coverage are unmeasured.
+
+The original native `t/follow-anchor.sh` checkpoint used owned control endpoints
+and a real sibling
 to check source proof, refusal of bootstrap mode, and source SIGKILL/restart.
 All three publication cuts pass: after retention, after proof, and after ready.
-Validation also passes 580 physical tests, 170 interop tests, 1,598 legacy checks,
+Validation then passed 580 physical tests, 170 interop tests, 1,598 legacy checks,
 and strict fresh-cache compilation. The new codec property passes 200 trials;
 the existing source-pin codec property passes 100, both with seed 42.
 
-This source primitive does not implement network onboarding. Historical serving,
-receiver source-binding publication, recovery connection settings, full slot
-contracts and synchronous durability remain open. The existing bootstrap START
-path rejects follow pins. No coordination is added.
+Historical network onboarding, receiver source-binding publication, recovery
+connection settings, full slot contracts and synchronous durability remain open.
+An acknowledgment-loss oracle and garbage collection also remain open; C physical
+compatibility remains separately staged. Coordination is outside this goal.
 
 ### Historical WAL retention implementation order
 
