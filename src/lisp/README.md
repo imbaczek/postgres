@@ -216,15 +216,25 @@ expression types do not imply support for array-valued table columns.
 Typed array input accepts brace-delimited values, quoted and backslash-escaped
 elements, unquoted `NULL`, rectangular nested arrays, and explicit bounds such
 as `[0:1]={10,20}`. Elements go through the target type's input conversion.
-Empty arrays have no dimensions; absent explicit bounds, lower bounds are 1.
+Ordinary empty arrays have no dimensions; absent explicit bounds, lower bounds are 1.
 The legacy untyped literal path for scalar `ANY`/`ALL` accepts only
 one-dimensional input without explicit bounds.
+
+`int2vector` text input accepts space-separated decimal smallints. Its input
+representation uses one dimension with lower bound 0, even when empty. A direct
+`ARRAY[...]::int2vector` constructor instead constructs an int2 array in context,
+retaining the constructor's dimensions, bounds, and NULL elements. A general
+cast from an existing array to `int2vector` is not supported. Casting an
+`int2vector` to `int2[]` preserves its dimensions and bounds, including the
+zero-length dimension; casting to a different supported array element type
+converts the elements and produces a dimensionless empty array when empty.
 
 Internally, `sql-array` stores an element type ID, a flat row-major element
 vector (including SQL NULL markers), dimension lengths, and lower bounds.
 The dimension and lower-bound lists have equal length, and the dimension
-product matches the element count for nonempty arrays; empty arrays use an
-empty vector and no dimensions or bounds. Sort-arena copying recursively copies
+product matches the element count for nonempty arrays; ordinary empty arrays use an
+empty vector and no dimensions or bounds, with the `int2vector` cast exception
+described above. Sort-arena copying recursively copies
 the array and its compound values, and query spill preserves all four fields
 and restores them on replay. This is an executor representation, not the C
 server's on-disk array format.
@@ -295,6 +305,14 @@ corresponding `abs` implementation and return their argument type. The
 `dlog10` each take one `float8` and return `float8`; they share execution with
 `round`, `trunc`, `sqrt`, `exp`, `ln`, and `log10`, respectively. These
 catalog names remain distinct function identities during expression analysis.
+
+The integer catalog functions `int2mod`, `int4mod`, and `int8mod` each take two
+arguments of the named integer type (or arguments implicitly coercible to it)
+and return that type. They are strict and immutable. Like integer `%`, they
+return the remainder after division truncated toward zero; a nonzero remainder
+has the dividend's sign. A zero divisor raises SQLSTATE `22012`, while the
+minimum value divided by -1 has remainder zero. Their names remain distinct
+function identities during expression analysis, including DISTINCT ordering.
 
 The numeric catalog helpers `numeric_eq`, `numeric_ne`, `numeric_gt`,
 `numeric_ge`, `numeric_lt`, and `numeric_le` compare two numeric arguments and

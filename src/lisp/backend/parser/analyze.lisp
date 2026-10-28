@@ -863,7 +863,7 @@ The declared operand types are resolved during analysis; execution shares the
 corresponding operator implementation without rewriting the analyzed call."
   (and (>= (length name) 5)
        (member (subseq name 0 4) '("int2" "int4" "int8") :test #'string=)
-       (member (subseq name 4) '("and" "or" "xor" "not" "shl" "shr" "abs") :test #'string=)))
+       (member (subseq name 4) '("and" "or" "xor" "not" "shl" "shr" "abs" "mod") :test #'string=)))
 
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
@@ -1155,6 +1155,8 @@ corresponding operator implementation without rewriting the analyzed call."
 (defun sql-cast-allowed-p (source target)
   "Supported explicit casts from pg_cast and CoerceViaIO's string rules."
   (or (eq source target)
+      (and (eq source :int2vector) (sql-array-element-type target)
+           (sql-cast-allowed-p :int2 (sql-array-element-type target)))
       (and (sql-array-element-type source) (sql-array-element-type target)
            (sql-cast-allowed-p (sql-array-element-type source)
                                (sql-array-element-type target)))
@@ -1476,13 +1478,37 @@ are supported."
 
 (defun sql-cast-value (value source target typmod &optional interval-literal-p)
   (when (eq value +null+) (return-from sql-cast-value +null+))
+  ;; A directly cast ARRAY constructor has already been analyzed as int2[].
+  ;; Keep its shape and nulls; a general array-to-int2vector cast is rejected
+  ;; by analysis before this function is reached.
+  (when (and (eq target :int2vector) (sql-array-p value))
+    (return-from sql-cast-value value))
+  ;; A binary-compatible int2[] cast retains even a zero-length dimension.
+  ;; Element conversion uses array mapping, which normalizes an empty result
+  ;; to zero dimensions, as in the C array coercion path.
+  (when (and (eq source :int2vector) (sql-array-p value) (sql-array-element-type target))
+    (return-from sql-cast-value
+      (make-sql-array :element-type-id (sql-array-element-type target)
+                      :elements (map 'vector (lambda (element)
+                                               (sql-cast-value element :int2 (sql-array-element-type target) typmod))
+                                     (sql-array-elements value))
+                      :dimensions (unless (and (zerop (length (sql-array-elements value)))
+                                               (not (eq (sql-array-element-type target) :int2)))
+                                    (sql-array-dimensions value))
+                      :lower-bounds (unless (and (zerop (length (sql-array-elements value)))
+                                                 (not (eq (sql-array-element-type target) :int2)))
+                                      (sql-array-lower-bounds value)))))
   (when (and (eq source :int2vector) (sql-array-element-type target))
     (return-from sql-cast-value
       (make-sql-array :element-type-id (sql-array-element-type target)
                       :elements (map 'vector (lambda (element)
                                                (sql-cast-value element :int2 (sql-array-element-type target) typmod)) value)
-                      :dimensions (and (plusp (length value)) (list (length value)))
-                      :lower-bounds (and (plusp (length value)) (list 0)))))
+                      :dimensions (unless (and (zerop (length value))
+                                               (not (eq (sql-array-element-type target) :int2)))
+                                    (list (length value)))
+                      :lower-bounds (unless (and (zerop (length value))
+                                                 (not (eq (sql-array-element-type target) :int2)))
+                                      (list 0)))))
   (when (sql-array-element-type target)
     (let ((element-type (sql-array-element-type target)))
       (return-from sql-cast-value
@@ -1491,8 +1517,12 @@ are supported."
                             :elements (map 'vector (lambda (element)
                                                      (sql-cast-value element (sql-array-element-type source) element-type typmod))
                                            (sql-array-elements value))
-                            :dimensions (sql-array-dimensions value)
-                            :lower-bounds (sql-array-lower-bounds value))
+                            :dimensions (unless (and (zerop (length (sql-array-elements value)))
+                                                     (not (eq (sql-array-element-type source) element-type)))
+                                          (sql-array-dimensions value))
+                            :lower-bounds (unless (and (zerop (length (sql-array-elements value)))
+                                                       (not (eq (sql-array-element-type source) element-type)))
+                                            (sql-array-lower-bounds value)))
             (sql-array-input value element-type typmod)))))
   (when (member target '(:float4 :float8))
     (return-from sql-cast-value
@@ -1629,14 +1659,18 @@ are supported."
   (let* ((raw (second expression))
          (target (third expression)) (typmod (fourth expression))
          (argument
-           (if (and (sql-array-element-type target) (eq (first raw) :array-literal))
-               (analyze-array-literal raw scope (sql-array-element-type target))
+           (if (and (or (sql-array-element-type target) (eq target :int2vector))
+                    (eq (first raw) :array-literal))
+               (analyze-array-literal raw scope (if (eq target :int2vector) :int2
+                                                    (sql-array-element-type target)))
                (analyze-expr raw scope)))
          (source (expr-type argument))
          (unknown-literal (and (eq (first raw) :const)
                                (or (stringp (second raw)) (eq (second raw) +null+)))))
     (sql-expression-type-description target)
-    (unless (or unknown-literal (sql-cast-allowed-p source target))
+    (unless (or unknown-literal
+                (and (eq target :int2vector) (eq (first raw) :array-literal))
+                (sql-cast-allowed-p source target))
       (ereport "42846" "cannot cast type ~a to ~a" source target))
     (cond
       (unknown-literal
@@ -2617,6 +2651,8 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
 (defun sql-implicit-coercion-p (source target)
   "The supported implicit pg_cast edges; explicit I/O casts are broader."
   (or (eq source target)
+      (and (eq source :int2vector) (sql-array-element-type target)
+           (sql-implicit-coercion-p :int2 (sql-array-element-type target)))
       (and (sql-array-element-type source) (sql-array-element-type target)
            (sql-implicit-coercion-p (sql-array-element-type source)
                                     (sql-array-element-type target)))
@@ -2800,6 +2836,12 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
                     (mapcar #'second (sql-record-fields b)))
        (ereport "42804" "cannot compare dissimilar record types"))
      (compare-sql-array-values (sql-record-values a) (sql-record-values b)))
+    ((and (sql-array-p a) (vectorp b) (not (stringp b)))
+     (compare-3way a (make-sql-array :element-type-id :int2 :elements b
+                                     :dimensions (list (length b)) :lower-bounds '(0))))
+    ((and (vectorp a) (not (stringp a)) (sql-array-p b))
+     (compare-3way (make-sql-array :element-type-id :int2 :elements a
+                                   :dimensions (list (length a)) :lower-bounds '(0)) b))
     ((and (sql-array-p a) (sql-array-p b))
      (let ((comparison (compare-sql-array-values (sql-array-elements a) (sql-array-elements b))))
        (if (zerop comparison)
@@ -3258,6 +3300,8 @@ expression identity has been resolved."
          (let ((suffix (subseq name 4)))
            (cond ((string= suffix "abs") (eval-analyzed-function "abs" arguments type))
                  ((string= suffix "not") (lognot (first arguments)))
+                 ;; Share remainder and zero-divisor semantics after preserving call identity.
+                 ((string= suffix "mod") (sql-arith "%" (first arguments) (second arguments)))
                  (t (sql-integer-bitwise
                      (cdr (assoc suffix '(("and" . "&") ("or" . "|") ("xor" . "#") ("shl" . "<<") ("shr" . ">>")) :test #'string=))
                      (first arguments) (second arguments) type))))))
@@ -3472,7 +3516,8 @@ truncate and interpret the result at TYPE's signed width."
         (bounds (sql-array-lower-bounds array))
         (position 0))
     (with-output-to-string (stream)
-      (when (some (lambda (bound) (/= bound 1)) bounds)
+      (when (and (plusp (length elements))
+                 (some (lambda (bound) (/= bound 1)) bounds))
         (loop for bound in bounds for dimension in dimensions
               do (format stream "[~d:~d]" bound (+ bound dimension -1)))
         (write-char #\= stream))
@@ -3514,7 +3559,12 @@ truncate and interpret the result at TYPE's signed width."
     ((eq type :record) (sql-record-output v))
     ((sql-array-element-type type) (sql-array-output v))
     ((eq type :char) (sql-char-output v))
-    ((eq type :int2vector) (format nil "~{~d~^ ~}" (coerce v 'list)))
+    ((eq type :int2vector)
+     (when (and (sql-array-p v)
+                (or (some (lambda (x) (eq x +null+)) (sql-array-elements v))
+                    (/= (length (sql-array-dimensions v)) 1)))
+       (ereport "42804" "array is not a valid int2vector"))
+     (format nil "~{~d~^ ~}" (coerce (if (sql-array-p v) (sql-array-elements v) v) 'list)))
     ((or (sql-decimal-p v) (and (eq type :numeric) (sql-numeric-special-p v)))
      (sql-numeric-output v))
     ((stringp v) v)

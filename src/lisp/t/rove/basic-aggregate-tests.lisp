@@ -198,6 +198,13 @@
                     ("SELECT width_bucket('0/10'::pg_lsn, ARRAY['0/01'::pg_lsn,'0/10'::pg_lsn])::text" "2")
                     ("SELECT width_bucket(2::oid, ARRAY[1,2,3])::text" "2")
                     ("SELECT width_bucket(2, '1 2 3'::int2vector)::text" "2")
+                    ("SELECT '1 2'::int2vector::int2[]::text" "[0:1]={1,2}")
+                    ("SELECT '1 2'::int2vector::int4[]::text" "[0:1]={1,2}")
+                    ("SELECT ARRAY[1,2]::int2vector::int2[]::text" "{1,2}")
+                    ("SELECT ARRAY[1,2]::int2vector::text" "1 2")
+                    ("SELECT (ARRAY[1,2]::int2vector = '1 2'::int2vector)::text" "false")
+                    ("SELECT (ARRAY[1,2]::int2vector > '1 2'::int2vector)::text" "true")
+                    ("SELECT (ARRAY[]::int2vector = ''::int2vector)::text" "false")
                     ("SELECT width_bucket('12:00+00'::timetz, ARRAY['09:00+00'::timetz,'12:00+00'::timetz])::text" "1")
                     ("SELECT width_bucket('2020-01-02'::timestamp, ARRAY['2020-01-01'::timestamp,'2020-01-02'::timestamp])::text" "2")
                     ("SELECT width_bucket('2020-01-02 00:00+00'::timestamptz, ARRAY['2020-01-01 00:00+00'::timestamptz,'2020-01-02 00:00+00'::timestamptz])::text" "2")
@@ -532,6 +539,53 @@
                     ("SELECT numeric_div(1::numeric,2::numeric)::text" "0.50000000000000000000")))
       (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case)))
   (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-div-rem-identity :seed 42))))
+    (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(cl-spec:defproperty integer-mod-alias-remainder
+    ((left (range integer -32768 32767))
+     (right (range integer -32768 32767))
+     (width (range integer 0 2)))
+  (:about eval-analyzed-function)
+  (:trials (:normal 250))
+  (let* ((name (nth width '("int2mod" "int4mod" "int8mod")))
+         (type (nth width '(:int2 :int4 :int8)))
+         (divisor (if (zerop right) 1 right))
+         (result (eval-analyzed-function name (list left divisor) type)))
+    (and (= left (+ (* (truncate left divisor) divisor) result))
+         (< (abs result) (abs divisor))
+         (or (zerop result) (= (signum result) (signum left))))))
+
+(rove:deftest integer-mod-catalog-aliases
+    (dolist (case '(("int2mod" :int2 "-32768")
+                    ("int4mod" :int4 "-2147483648")
+                    ("int8mod" :int8 "-9223372036854775808")))
+      (destructuring-bind (name type minimum) case
+        (let* ((sql (format nil
+                            "SELECT ~a('-7','3')::text, ~a('7','-3')::text, ~a('~a','-1')::text, ~a(NULL,'0')::text"
+                            name name name minimum name))
+               (statement (first (parse-statements (format nil "SELECT ~a('7','2')" name))))
+               (call (analyze-expr (getf (first (getf statement :targets)) :expr) nil)))
+          (rove:ok (equal (list (list "-1" "1" "0" +null+)) (subquery-test-rows sql)) name)
+          (rove:ok (string= name (second call)) name)
+          (rove:ok (eq type (expr-type call)) name)
+          (rove:ok (not (analyzed-expression-volatile-p call)) name)
+          (rove:ok (having-immutable-function-p name) name)
+          (rove:ok (equal (list :const 1 :type type :typmod -1) (fold-column-default call)) name))
+        (let ((condition (handler-case
+                             (progn (subquery-test-rows (format nil "SELECT ~a('1','0')" name)) nil)
+                           (pg-error (error) error))))
+          (rove:ok (and condition (string= (pg-error-sqlstate condition) "22012")) name))))
+  (dolist (case '(("SELECT int2mod(7,2)" "42883")
+                  ("SELECT int4mod(7::int8,2)" "42883")
+                  ("SELECT int8mod(7.0,2)" "42883")
+                  ("SELECT int4mod(1)" "42883")
+                  ("SELECT DISTINCT int4mod(x,2) FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY mod(x,2)" "42P10")
+                  ("SELECT DISTINCT mod(x,2) FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY int4mod(x,2)" "42P10")))
+    (let ((condition (handler-case (progn (subquery-test-rows (first case)) nil)
+                       (pg-error (error) error))))
+      (rove:ok (and condition (string= (pg-error-sqlstate condition) (second case))) (first case))))
+  (let ((data (cl-spec:result-data
+               (cl-spec:run-property 'integer-mod-alias-remainder :seed 42))))
     (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
 (cl-spec:defproperty numeric-gcd-divides-inputs
