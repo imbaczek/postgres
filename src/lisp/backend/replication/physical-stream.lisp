@@ -7,7 +7,8 @@
 
 (defvar *physical-follow-source-read-cache* nil)
 
-(define-condition physical-stream-copy-done (condition) ())
+(define-condition physical-stream-copy-done (condition) ()
+  (:documentation "An exact frontend CopyDone ended a physical stream normally."))
 
 (defun physical-stream-option (command name)
   (let ((value (cdr (assoc name (logical-replication-command-options command) :test #'equal))))
@@ -22,12 +23,17 @@
     value))
 
 (defun physical-stream-mode (command)
+  "Select explicit follow mode or the default bootstrap mode; reject others."
   (let ((mode (or (physical-stream-option command "mode") "bootstrap")))
     (unless (member mode '("bootstrap" "follow") :test #'equal)
       (ereport "0A000" "unsupported native physical stream mode"))
     mode))
 
 (defun physical-follow-stream-boundary (command pin)
+  "Return the requested timeline's fork limit and next timeline from PIN.
+Allow the segment containing the timeline's beginning, as C does, but reject
+starts before that segment or beyond its fork. The pin names the current writer;
+the requested timeline may be an ancestor."
   (let* ((history (physical-follow-pin-history pin))
          (timeline (physical-stream-u64 (physical-stream-option command "timeline")))
          (position (position timeline history :key #'timeline-history-entry-timeline))
@@ -43,6 +49,8 @@
                     (timeline-history-entry-timeline (nth (1- position) history))))))
 
 (defun parse-native-physical-start (words)
+  "Parse the explicitly negotiated native physical START and validate its options.
+Follow mode is explicit; a failed bootstrap request never falls back to it."
   (unless (and (>= (length words) 5) (string-equal (second words) "SLOT")
                (string-equal (fourth words) "PHYSICAL"))
     (ereport "0A000" "native physical replication requires an explicit format negotiation"))
@@ -72,6 +80,10 @@
       command)))
 
 (defun physical-source-acquire-sender (command)
+  "Validate the requested mode and claim its pin under WAL exclusion.
+A follow pin must be ready and bound to the current writer timeline; START may
+request an eligible ancestor. In follow mode base_lsn is the receiver's immutable
+base and bounds apply feedback, not the anchor cursor."
   (prevent-recovery-primary-operation "native physical walsender")
   (sb-thread:with-mutex (*wal-lock*)
     (let* ((name (logical-replication-command-slot-name command))
@@ -130,7 +142,7 @@
 (defun physical-source-read-next (name owner cursor)
   "Read one immutable validated record, never truncating live source WAL.
 A follow pin dispatches to the historical source reader after ownership checks.
-The existing bootstrap START admission does not acquire follow pins."
+Explicit follow START admission acquires a ready follow pin."
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
     (unless (and (eq owner (gethash name *physical-source-senders*))
@@ -247,6 +259,8 @@ The existing bootstrap START admission does not acquire follow pins."
   (sb-ext:with-timeout 10 (send-logical-keepalive stream durable)))
 
 (defun physical-stream-complete (stream command owner next limit)
+  "Release the sender before the completion result and ReadyForQuery.
+Captured-backend cleanup also permits release when admission has closed."
   (with-live-operation-captured-backend-cleanup
     (physical-source-release-sender (logical-replication-command-slot-name command) owner))
   (if next
@@ -256,6 +270,7 @@ The existing bootstrap START admission does not acquire follow pins."
         (send-ready-for-query stream (transaction-status-char)))))
 
 (defun physical-stream-switch-result (stream next limit)
+  "Return C's next-timeline result: an INT8 timeline and text fork position."
   (send-row-description
    stream (list (make-result-column :name "next_tli" :type-oid +int8oid+ :typlen 8)
                 (make-result-column :name "next_tli_startpos" :type-oid +textoid+ :typlen -1)))
@@ -264,6 +279,8 @@ The existing bootstrap START admission does not acquire follow pins."
   (send-ready-for-query stream (transaction-status-char)))
 
 (defun physical-stream-finish-historic (stream command owner limit previous)
+  "Finish the server's CopyBoth side and await frontend CopyDone.
+Validate and confirm any status messages received before that completion."
   (write-message stream #\c (make-payload))
   (loop
     (multiple-value-bind (status done)
@@ -278,7 +295,8 @@ The existing bootstrap START admission does not acquire follow pins."
 
 (defun physical-stream-send-loop (stream command owner &optional limit)
   "Send records with one dynamically scoped historical source prefix cache.
-The cache belongs to this sender loop; reuse requires the same source selection."
+The cache belongs to this sender loop; reuse requires the same source selection.
+A historic stream stops at its fork before sending child end-of-recovery WAL."
   (let* ((*physical-follow-source-read-cache* (list nil))
          (name (logical-replication-command-slot-name command))
          (cursor (logical-replication-command-requested-lsn command))
@@ -313,6 +331,11 @@ The cache belongs to this sender loop; reuse requires the same source selection.
         (when record (setf cursor (wal-record-end record)))))))
 
 (defun start-native-physical-replication (stream command)
+  "Serve a negotiated native physical stream with bounded timeline completion.
+Prove the resume prefix before WalData, outside the writer critical section.
+If the request starts at a historic fork, complete without CopyBoth; otherwise
+finish CopyBoth before the switch result. Early exact CopyDone ends normally
+without confirming an unproved receipt. Always release the sender on exit."
   (multiple-value-bind (owner limit next)
       (with-live-operation (physical-source-acquire-sender command))
     (let ((name (logical-replication-command-slot-name command))

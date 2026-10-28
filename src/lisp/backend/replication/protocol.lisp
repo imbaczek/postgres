@@ -280,6 +280,9 @@ On a standby, receipt ahead of replay is reported only on the replay timeline."
         finally (return value)))
 
 (defun replication-standby-status (stream &optional allow-copy-done)
+  "Read a standby status, or NIL at EOF.
+When ALLOW-COPY-DONE is true, accept an empty CopyDone as a second true value
+and an empty Terminate as EOF. Other malformed messages remain protocol errors."
   (multiple-value-bind (type length-bytes payload) (read-message-frame stream)
     (declare (ignore length-bytes))
     (when (null type)

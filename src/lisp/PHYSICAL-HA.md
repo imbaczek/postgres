@@ -268,22 +268,13 @@ storage mechanisms, not new coordinator contracts.
 
 ### Network onboarding contract audit
 
-The next source-admission change needs more than a new receiver identity check.
-The current pin reader and validator require the pin timeline to equal the
-writer timeline. An unused pin starts at the writer's bootstrap checkpoint.
-Sender acquisition also requires the receiver's immutable base end to equal
-the pin's consistent LSN. A new checkpoint pin therefore cannot resume an
-ancestor sibling at an older fork. These checks live in
-`physical-source-pin-check-wal`, `physical-source-pin-read` and
-`physical-source-acquire-sender`.
-
-The sender currently reads only the pin's current timeline and rejects EOR as
-an ordinary transport record. Its retention confirmation and reconnect proof
-share one cumulative digest starting at the backup end. Historical streaming
-needs an explicit requested timeline and fork limit, separate from the current
-writer timeline. The receiver must fetch history and finish any retained
-parent suffix before publishing child selection. Source admission must not
-wait for network I/O while holding replay quiescence.
+Bootstrap pins use the writer timeline and require the receiver's immutable base
+end to equal the pin's consistent LSN. Their ordinary reader rejects EOR; those
+rules do not describe explicit follow pins. A follow pin is bound to the current
+writer but can serve a requested ancestor timeline up to its fork. The receiver
+still needs to fetch history and finish any retained parent suffix before
+publishing child selection. Source admission must not wait for network I/O while
+holding replay quiescence.
 
 A resume anchor must distinguish evidence independently verified by the new
 source from a cumulative digest carried by the receiver. Comparing the copied
@@ -294,7 +285,7 @@ result, rather than an invented confirmation floor or a claim of full-prefix
 verification. The source must persist retention before returning anchor proof
 and must restore it before startup recycling can run.
 
-The planned follow-anchor mode is separate from bootstrap-pin verification.
+Follow-anchor mode is separate from bootstrap-pin verification.
 It preserves the receiver's existing provenance and cumulative digest, binds
 the compatible history and independently compared overlap, and checks later
 source bytes as a continuation from that seed. The carried digest is not a
@@ -343,9 +334,9 @@ a scoped reader reference while reading. The receiver's carried digest remains
 independent of the archive endpoint and the compared physical overlap.
 
 Ready-pin reload scans the confirmed suffix through durable WAL under WAL
-ownership at startup before listeners. The existing bootstrap START path rejects
-follow pins, so this does not yet admit a historical network follow. Future follow
-admission must stage lengthy proof outside writer critical sections. Reservation
+ownership at startup before listeners. Bootstrap START rejects follow pins;
+explicit follow START now accepts a ready pin and stages resume proof outside the
+writer critical section before sending WAL. Reservation
 preflight currently resolves each segment under WAL exclusion; this milestone
 makes no throughput claim. C's `StartReplication` checks timeline eligibility
 and its fork, while `ReplicationSlotReserveWal` excludes concurrent removal during
@@ -374,10 +365,48 @@ Validation then passed 580 physical tests, 170 interop tests, 1,598 legacy check
 and strict fresh-cache compilation. The new codec property passes 200 trials;
 the existing source-pin codec property passes 100, both with seed 42.
 
-Historical network onboarding, receiver source-binding publication, recovery
-connection settings, full slot contracts and synchronous durability remain open.
+Source preparation remains a private control operation. A network
+`PREPARE_FOLLOW` command, receiver source-binding publication, and a client
+CopyDone/timeline-switch loop remain open, as do recovery connection settings,
+full slot contracts and synchronous durability.
 An acknowledgment-loss oracle and garbage collection also remain open; C physical
 compatibility remains separately staged. Coordination is outside this goal.
+
+### Bounded native follow sender
+
+Explicit `mode 'follow'` admits a ready follow pin; it is never a fallback from
+bootstrap. The pin identifies the current writer timeline while START names the
+requested timeline. The requested start may precede that timeline's beginning
+within its first segment, following C's fork-segment rule, but cannot precede
+that segment or pass the timeline's fork. The sender stops the parent at the
+fork before child end-of-recovery WAL. Starting exactly at the fork returns the
+next timeline without entering CopyBoth. The switch result uses C's INT8
+`next_tli` and text `next_tli_startpos` columns.
+
+The receiver's immutable `base_lsn` bounds apply feedback; it is not the anchor
+cursor. Resume prefix proof precedes WalData and runs outside the writer critical
+section. An exact early frontend CopyDone ends the stream normally without
+confirming an unproved receipt. Sender ownership is released before the result and
+ReadyForQuery, including cleanup after admission closes. Bootstrap behavior and
+native WAL format 7 remain unchanged; this is not C physical WAL compatibility.
+
+The full run passed 732 physical tests and 170 interop tests, with a fresh cold
+compile. Native wire acceptance covered positive and negative cases, early
+CopyDone, malformed input, removal of retained spool and GEN files, SIGKILL and
+resume, and live REPL reload (`/tmp/pg-follow-wire-accepted.log`, artifacts
+`/tmp/pg-operation-parking.jpe25p`). Three logical switchovers passed
+(`/tmp/pg-follow-wire-switchovers.log`) against C pin
+`9c0909b34939f2d5a37b82b9d1efc8b08e310252`. Timeline-bounds property checks passed
+200 trials with seed 42 and digest `fnv1a64-v1:5e3e0b015b14e0d4`, including a
+matching replay, and a run with seed `3385497690757192689`. There is no function
+spec; rejection and input coverage are unmeasured.
+
+Future receiver onboarding must reconcile a pending local follow binding before
+`physical-recovery-open-storage` performs redo. If applied and required floors
+are at or before the fork, atomically publish the receive-control rewind and
+history selection before truncating; otherwise require reseeding. This sender
+milestone does not establish the full onboarding path or synchronous
+acknowledgment-loss behavior.
 
 ### Historical WAL retention implementation order
 
