@@ -24,6 +24,14 @@ test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
 big=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "a" }')
 other=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "b" }')
+binary_hex=$(awk 'BEGIN { for (i=0;i<1500;i++) printf "00ff" }')
+run -c 'create table toast_bytes (id int primary key, v bytea)' >/dev/null
+run -c "insert into toast_bytes values (1, '\\x$binary_hex')" >/dev/null
+[ "$(run -c 'select length(v) from toast_bytes where id = 1')" = 3000 ]
+[ "$(run -c "select v = '\\x$binary_hex' from toast_bytes where id = 1")" = t ]
+run -c 'create index toast_bytes_v_idx on toast_bytes (v)' >/dev/null
+[ "$(run -c "select id from toast_bytes where v = '\\x$binary_hex'")" = 1 ]
+[ "$(run -c "delete from toast_bytes where id = 1 returning v")" = "\\x$binary_hex" ]
 run -c 'create table toast_text (id int primary key, v text)' >/dev/null
 run -c "insert into toast_text values (1, '$big')" >/dev/null
 [ "$(run -c 'select length(v) from toast_text where id = 1')" = 3000 ]

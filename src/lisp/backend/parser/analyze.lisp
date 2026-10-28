@@ -166,7 +166,7 @@
          (progn ,@body))))
 
 (defparameter +sql-expression-types+
-  '((:bool 16 1) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
+  '((:bytea 17 -1) (:bool 16 1) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
     (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1)
     (:text-array 1009 -1) (:int2-array 1005 -1) (:int2vector-array 1006 -1) (:int4-array 1007 -1) (:int8-array 1016 -1)
     (:numeric-array 1231 -1) (:float4-array 1021 -1) (:float8-array 1022 -1)
@@ -1165,9 +1165,11 @@ so a nested argument error keeps its own diagnostics."
          (ereport "42883" "function ~a(~a) does not exist"
                   name (call-signature args)))
        (list :func name args :type :int8 :typmod -1))
-      ((member name '("length" "char_length" "character_length") :test #'string=)
+      ((member name '("length" "char_length" "character_length" "octet_length") :test #'string=)
        (unless (and (= (length args) 1)
-                    (member (expr-type (first args)) '(:text :varchar :name :char)))
+                    (or (member (expr-type (first args)) '(:text :varchar :name :char))
+                        (and (member name '("length" "octet_length") :test #'string=)
+                             (eq (expr-type (first args)) :bytea))))
          (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
        (when (eq (expr-type (first args)) :char)
          (setf args (list (list :cast (first args) :type :text :typmod -1))))
@@ -1328,6 +1330,8 @@ so a nested argument error keeps its own diagnostics."
 (defun sql-cast-allowed-p (source target)
   "Supported explicit casts from pg_cast and CoerceViaIO's string rules."
   (or (eq source target)
+      (and (eq source :bytea) (member target '(:int2 :int4 :int8)))
+      (and (eq target :bytea) (member source '(:int2 :int4 :int8)))
       (and (eq source :int2vector) (sql-array-element-type target)
            (sql-cast-allowed-p :int2 (sql-array-element-type target)))
       (and (sql-array-element-type source) (sql-array-element-type target)
@@ -1656,8 +1660,90 @@ are supported."
 (defun sql-session-local-microseconds ()
   (sql-current-local-microseconds (sql-session-timezone) (sql-session-unix-microseconds)))
 
+(defun sql-bytea-input (text)
+  "Decode hex or traditional escaped bytea input into fresh octets. Hex whitespace is accepted between byte pairs; escape input accepts doubled backslashes and three-digit octal bytes."
+  (let* ((input (string->bytes text))
+         (length (length input))
+         (out (make-array 0 :element-type '(unsigned-byte 8)
+                            :adjustable t :fill-pointer 0)))
+    (labels ((digit (byte base)
+               (digit-char-p (code-char byte) base))
+             (put (byte) (vector-push-extend byte out)))
+      (if (and (>= length 2) (= (aref input 0) 92) (= (aref input 1) 120))
+          (loop with i = 2
+                while (< i length)
+                for byte = (aref input i)
+                do (if (member byte '(32 9 10 13))
+                       (incf i)
+                       (let ((high (digit byte 16)))
+                         (unless high (ereport "22023" "invalid hexadecimal digit"))
+                         (incf i)
+                         (when (= i length)
+                           (ereport "22023" "invalid hexadecimal data: odd number of digits"))
+                         (let ((low (digit (aref input i) 16)))
+                           (unless low (ereport "22023" "invalid hexadecimal digit"))
+                           (put (+ (* 16 high) low))
+                           (incf i)))))
+          (loop with i = 0
+                while (< i length)
+                for byte = (aref input i)
+                do (cond
+                     ((/= byte 92) (put byte) (incf i))
+                     ((and (< (+ i 3) length)
+                           (<= 48 (aref input (1+ i)) 51)
+                           (<= 48 (aref input (+ i 2)) 55)
+                           (<= 48 (aref input (+ i 3)) 55))
+                      (put (+ (* 64 (- (aref input (1+ i)) 48))
+                              (* 8 (- (aref input (+ i 2)) 48))
+                              (- (aref input (+ i 3)) 48)))
+                      (incf i 4))
+                     ((and (< (1+ i) length) (= (aref input (1+ i)) 92))
+                      (put 92) (incf i 2))
+                     (t (ereport "22P02" "invalid input syntax for type bytea")))))
+      (coerce out '(simple-array (unsigned-byte 8) (*))))))
+
+(defun sql-bytea-output (bytes)
+  "Render BYTES as lowercase hex bytea output; escape output is not supported."
+  (check-type bytes (vector (unsigned-byte 8)))
+  (let* ((digits "0123456789abcdef")
+         (result (make-string (+ 2 (* 2 (length bytes))))))
+    (setf (aref result 0) (code-char 92) (aref result 1) #\x)
+    (loop for byte across bytes
+          for i from 2 by 2
+          do (setf (aref result i) (aref digits (ash byte -4))
+                   (aref result (1+ i)) (aref digits (logand byte 15))))
+    result))
+
+(defun sql-integer-to-bytea (value type)
+  "Encode a signed SQL integer as its fixed-width network byte representation."
+  (let* ((size (ecase type (:int2 2) (:int4 4) (:int8 8)))
+         (out (make-array size :element-type '(unsigned-byte 8))))
+    (dotimes (i size out)
+      (setf (aref out i) (ldb (byte 8 (* 8 (- size i 1))) value)))))
+
+(defun sql-bytea-to-integer (value type)
+  "Decode up to the target width in big-endian order, matching bytea_intN. Short inputs are zero-extended; only a full-width high bit makes the result negative. Longer inputs signal an out-of-range error."
+  (let* ((size (ecase type (:int2 2) (:int4 4) (:int8 8)))
+         (bits (* size 8)))
+    (when (> (length value) size)
+      (ereport "22003" "~a out of range"
+               (ecase type (:int2 "smallint") (:int4 "integer") (:int8 "bigint"))))
+    (let ((number (loop for byte across value for n = byte then (+ (ash n 8) byte)
+                        finally (return (or n 0)))))
+      (if (logbitp (1- bits) number) (- number (ash 1 bits)) number))))
+
 (defun sql-cast-value (value source target typmod &optional interval-literal-p)
   (when (eq value +null+) (return-from sql-cast-value +null+))
+  (when (eq target :bytea)
+    (return-from sql-cast-value
+      (cond ((eq source :bytea) value)
+            ((member source '(:int2 :int4 :int8)) (sql-integer-to-bytea value source))
+            (t (sql-bytea-input (value->text value source))))))
+  (when (and (eq source :bytea) (member target '(:int2 :int4 :int8)))
+    (return-from sql-cast-value (sql-bytea-to-integer value target)))
+  (when (and (eq source :bytea) (member target '(:text :varchar :name)))
+    (return-from sql-cast-value
+      (sql-cast-value (sql-bytea-output value) :text target typmod)))
   ;; A directly cast ARRAY constructor has already been analyzed as int2[].
   ;; Keep its shape and nulls; a general array-to-int2vector cast is rejected
   ;; by analysis before this function is reached.
@@ -2657,7 +2743,7 @@ candidate selection."
                          (member (second form)
                                  '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                    "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
-                                   "substr" "length" "char_length" "character_length" "pg_backend_pid"
+                                   "substr" "length" "char_length" "character_length" "octet_length" "pg_backend_pid"
                                    "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                                    "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                                    "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
@@ -3404,10 +3490,12 @@ aliases share the corresponding numeric operator implementation."
      (admin-reload-conf))
     ((string= name "pg_reload_code")
      (admin-reload-code))
-    ((member name '("length" "char_length" "character_length")
+    ((member name '("length" "char_length" "character_length" "octet_length")
              :test #'string=)
      (sql-strict-let ((value (first args)))
-       (length value)))
+       (if (and (string= name "octet_length") (stringp value))
+           (length (string->bytes value))
+           (length value))))
     (t
      (ereport "42883" "function ~a(...) does not exist" name))))
 
@@ -3810,6 +3898,7 @@ truncate and interpret the result at TYPE's signed width."
   (cond
     ((eq v +null+) nil)
     ((eq type :void) "")
+    ((eq type :bytea) (sql-bytea-output v))
     ((member type '(:float4 :float8))
      (sql-float-output v type (if *backend* (parse-integer (session-extra-setting-value "extra_float_digits")) 1)))
     ((eq type :bool) (if v "t" "f"))

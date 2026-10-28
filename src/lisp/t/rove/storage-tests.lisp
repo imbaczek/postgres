@@ -137,6 +137,58 @@
                      (encode-index-key (list #x80000000 0) '(:oid :int4)))
                "TOAST OID index order is unsigned")))
 
+(rove:deftest test-sql-bytea-input-output
+    (let ((octets (make-array 256 :element-type '(unsigned-byte 8)
+                                  :initial-contents (loop for i below 256 collect i))))
+      (rove:ok (equalp octets (sql-bytea-input (sql-bytea-output octets)))
+               "hex bytea round-trips all octets"))
+  (rove:ok (equalp #(0 255 92 65) (sql-bytea-input "\\000\\377\\\\A"))
+           "traditional octal and escaped backslashes decode")
+  (rove:ok (equalp #(0 255) (sql-bytea-input "\\x00 ff"))
+           "hex whitespace between bytes is accepted")
+  (rove:ok (string= (format nil "~cx0" (code-char 92))
+                    (sql-cast-value (make-array 2 :element-type '(unsigned-byte 8)
+                                                  :initial-contents '(0 1))
+                                    :bytea :varchar 7))
+           "bytea to varchar applies destination typmod")
+  (dolist (input '("\\x0" "\\x0 0" "\\400" "\\q"))
+    (rove:ok (handler-case (progn (sql-bytea-input input) nil) (error () t))
+             "malformed bytea input signals an error")))
+
+(rove:deftest test-sql-bytea-integer-casts
+    (dolist (case '((:int2 -32768) (:int2 32767) (:int4 -2147483648)
+                    (:int4 2147483647) (:int8 -9223372036854775808)
+                    (:int8 9223372036854775807)))
+      (let* ((type (first case))
+             (value (second case))
+             (bytes (sql-cast-value value type :bytea -1)))
+        (rove:ok (= value (sql-cast-value bytes :bytea type -1))
+                 "integer casts round-trip in network byte order")))
+  (let ((empty (make-array 0 :element-type '(unsigned-byte 8)))
+        (octet (make-array 1 :element-type '(unsigned-byte 8) :initial-element 255)))
+    (rove:ok (= 0 (sql-cast-value empty :bytea :int2 -1)) "empty input casts to zero")
+    (rove:ok (= 255 (sql-cast-value octet :bytea :int2 -1)) "short input is zero extended")
+    (rove:ok (handler-case
+                 (progn (sql-cast-value (make-array 3 :element-type '(unsigned-byte 8)
+                                                      :initial-element 0)
+                                        :bytea :int2 -1)
+                        nil)
+               (error () t))
+             "oversized bytea fails integer conversion")))
+
+(rove:deftest test-bytea-index-key-order
+    (let ((values (mapcar (lambda (items)
+                            (make-array (length items) :element-type '(unsigned-byte 8)
+                                                       :initial-contents items))
+                          '(() (0) (0 0) (0 1) (1) (1 0) (255)))))
+      (loop for (left right) on values while right
+            do (rove:ok (key< (encode-index-key (list left) '(:bytea))
+                              (encode-index-key (list right) '(:bytea)))
+                        "bytea index keys preserve lexicographic octet order"))
+      (let ((left (encode-index-key (list (first values) 100) '(:bytea :int4)))
+            (right (encode-index-key (list (second values) 0) '(:bytea :int4))))
+        (rove:ok (key< left right) "bytea index terminator preserves composite boundaries"))))
+
 (rove:deftest test-bytea-tuple-storage
     (let ((columns (vector (make-pg-column :name "a" :type :int2 :typmod -1 :attnum 1)
                            (make-pg-column :name "bytes" :type :bytea :typmod -1 :attnum 2)

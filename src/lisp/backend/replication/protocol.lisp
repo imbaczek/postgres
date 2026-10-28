@@ -6,7 +6,7 @@
   type slot-name plugin snapshot-action requested-lsn protocol-version options)
 
 (defparameter +logical-replication-type-oids+
-  '((:int2 . 21) (:int4 . 23) (:int8 . 20) (:varchar . 1043) (:text . 25) (:numeric . 1700) (:float4 . 700) (:float8 . 701) (:date . 1082) (:time . 1083) (:timestamp . 1114) (:timestamptz . 1184) (:interval . 1186) (:timetz . 1266)))
+  '((:int2 . 21) (:int4 . 23) (:int8 . 20) (:varchar . 1043) (:text . 25) (:bytea . 17) (:numeric . 1700) (:float4 . 700) (:float8 . 701) (:date . 1082) (:time . 1083) (:timestamp . 1114) (:timestamptz . 1184) (:interval . 1186) (:timetz . 1266)))
 
 (defun replication-command-words (query)
   "Tokenize repl_scanner-style quoted words, C whitespace and command punctuation."
@@ -355,11 +355,13 @@ On a standby, receipt ahead of replay is reported only on the replay timeline."
     payload))
 
 (defun pgoutput-value-text (value type)
+  "Format pgoutput text values; bytea uses lowercase hex, and NULL has no text."
   (if (eq value +null+)
       nil
       (case type
         ((:int2 :int4 :int8) (princ-to-string value))
         ((:varchar :text) value)
+        (:bytea (sql-bytea-output value))
         (:numeric (sql-numeric-output value))
         (:date (sql-date-output value))
         (:time (sql-time-output value))

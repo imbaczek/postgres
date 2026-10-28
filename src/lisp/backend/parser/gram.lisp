@@ -828,6 +828,7 @@
               ((string= name "numeric") (values :numeric (parse-numeric-typmod p)))
               ((string= name "varchar") (values :varchar (parse-varchar-typmod p)))
               ((string= name "text") (values :text -1))
+              ((string= name "bytea") (values :bytea -1))
               (t (ereport "0A000" "unsupported storage type \"~a\"" name))))))
   (cond
     ((match-kw p "date") (values :date -1))
@@ -853,6 +854,7 @@
      (expect-kw p "varying")
      (values :varchar (parse-varchar-typmod p)))
     ((match-kw p "text") (values :text -1))
+    ((match-kw p "bytea") (values :bytea -1))
     ((match-kw p "serial")
      (ereport "0A000" "type serial is not supported"))
     (t
@@ -1467,6 +1469,7 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
       ((string= name "timestamp") (parse-timestamp-type p))
       ((string= name "timestamptz") (parse-timestamp-type p t))
       ((string= name "text") (values :text -1))
+      ((string= name "bytea") (values :bytea -1))
       ((string= name "name") (values :name -1))
       ((string= name "oid") (values :oid -1))
       ((string= name "pg_lsn") (values :pg-lsn -1))

@@ -56,6 +56,22 @@
       (rove:ok (= 25 (pgoutput-type-oid :text)) "pgoutput advertises text OID 25")
       (rove:ok (logical-type-supported-p 25) "subscriber accepts text OID 25")))
 
+(rove:deftest test-logical-bytea-row-change
+    (let* ((value (make-array 256 :element-type '(unsigned-byte 8)
+                                  :initial-contents (loop for i below 256 collect i)))
+           (event (logical-test-change :insert 7 701 :new-values (vector 10 120 value))))
+      (setf (getf (third (logical-change-columns event)) :type) :bytea
+            (getf (third (logical-change-columns event)) :typmod) -1)
+      (let ((decoded (logical-decode-change (logical-encode-change event))))
+        (rove:ok (eq :bytea (getf (third (logical-change-columns decoded)) :type))
+                 "logical WAL preserves bytea type")
+        (rove:ok (equalp value (aref (logical-change-new-values decoded) 2))
+                 "logical WAL preserves arbitrary octets"))
+      (rove:ok (= 17 (pgoutput-type-oid :bytea)) "pgoutput advertises bytea OID 17")
+      (rove:ok (logical-type-supported-p 17) "subscriber accepts bytea OID 17")
+      (rove:ok (equal (sql-bytea-output value) (pgoutput-value-text value :bytea))
+               "pgoutput uses text-format bytea output")))
+
 (rove:deftest test-logical-pgoutput-v2-codec
     ;; Compare the v2 message shapes with pgoutput.c's Relation/Begin/Commit and
     ;; logicalrep_write_insert/update/delete in src/backend/replication/.

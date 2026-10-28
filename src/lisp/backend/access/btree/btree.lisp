@@ -789,7 +789,9 @@ nest and share this lease; relation writers wait until all scans finish."
 
 (defun encode-index-key (values types)
   "Encode index column values so that byte-wise order matches SQL order for
-the MVP types. Null sorts before any non-null value; ints are sign-flipped."
+supported types. Null sorts before any non-null value; ints are sign-flipped.
+Bytea escapes zero octets and uses a zero terminator to preserve lexicographic
+order, including prefixes, in composite keys."
   (let ((out (make-array 0 :adjustable t :fill-pointer 0
                            :element-type '(unsigned-byte 8))))
     (labels ((push-byte (b) (vector-push-extend b out))
@@ -861,6 +863,15 @@ the MVP types. Null sorts before any non-null value; ints are sign-flipped."
                                       (loop for i below end
                                             do (ordered-byte (1+ (digit-char-p (char digits i)))))
                                       (ordered-byte 0)))))))))
+                 ((eq ty :bytea)
+                  (check-type v (vector (unsigned-byte 8)))
+                  (push-byte 15)
+                  (loop for byte across v
+                        do (if (zerop byte)
+                               (progn (push-byte 0) (push-byte 255))
+                               (push-byte byte)))
+                  (push-byte 0)
+                  (push-byte 0))
                  ((member ty '(:varchar :text))
                   (push-byte 3)
                   (let ((data (string->bytes v)))

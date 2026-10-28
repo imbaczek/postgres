@@ -240,6 +240,7 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
           (values (second right) value t))))))
 
 (defun indexable-equality-value-p (value type)
+  "Check whether VALUE has a supported representation for an equality index probe."
   (and (not (eq value +null+))
        (case type
          ((:int2 :int4 :int8 :date :time :timestamp :timestamptz) (integerp value))
@@ -249,6 +250,7 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
          (:float4 (typep value 'single-float))
          (:float8 (typep value 'double-float))
          ((:varchar :text) (stringp value))
+         (:bytea (typep value '(vector (unsigned-byte 8))))
          (t nil))))
 
 (defun table-statistics-column (table attnum)
@@ -852,7 +854,7 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
       (trig-function-p name)
       (numeric-arithmetic-function-p name)
       (numeric-helper-function-p name)
-      (member name '("lower" "substr" "length" "char_length" "character_length"
+      (member name '("lower" "substr" "length" "char_length" "character_length" "octet_length"
                      "pg_wal_lsn_diff" "pg_walfile_name"
                      "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"

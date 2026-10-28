@@ -997,7 +997,7 @@ from advancing the shared WAL generation between a failed save and rollback."
                             (- (logxor (logand packed #x7ff) #x400) #x400)))))
     (:varchar (if (< typmod 4) "varchar" (format nil "varchar(~d)" (- typmod 4))))
     (:int2 "smallint") (:int4 "integer") (:int8 "bigint") (:float4 "real")
-    (:float8 "double precision") (:bool "boolean") (:text "text") (:name "name")
+    (:float8 "double precision") (:bool "boolean") (:text "text") (:bytea "bytea") (:name "name")
     (:oid "oid") (:pg-lsn "pg_lsn") (:bit (if (minusp typmod) "\"bit\"" (format nil "bit(~d)" typmod)))
     (:char "\"char\"") (:int2vector "int2vector") (:text-array "text[]")
     (otherwise (ereport "0A000" "cannot serialize stored expression type ~a" type))))
@@ -1127,7 +1127,7 @@ from advancing the shared WAL generation between a failed save and rollback."
                                      (precision (ldb (byte 16 16) packed))
                                      (scale (- (logxor (logand packed #x7ff) #x400) #x400)))
                                 (format nil "numeric(~d,~d)" precision scale)))))
-              (:text "text")
+              (:text "text") (:bytea "bytea")
               (:varchar (if (< (pg-column-typmod column) 4) "varchar"
                             (format nil "varchar(~a)" (- (pg-column-typmod column) 4))))
               (otherwise (error "cannot publish unsupported type ~a" (pg-column-type column)))))
