@@ -205,7 +205,14 @@ is implemented.
 
 Basic numeric functions include `abs`, `numeric_abs`, `sign`, `round`,
 `trunc`, `ceil`/`ceiling`, `floor`, `sqrt`, `numeric_sqrt`, `exp`,
-`numeric_exp`, `ln`, `numeric_ln`, `log`, `log10`, and `numeric_log`.
+`numeric_exp`, `ln`, `numeric_ln`, `log`, `log10`, `numeric_log`, `scale`,
+`min_scale`, and `trim_scale`.
+`scale` returns the stored number of fractional digits; `min_scale` returns
+the fewest fractional digits needed to preserve the value, and `trim_scale`
+returns the value at that minimum scale. For example, `scale(1.2300)` is 4,
+`min_scale(1.2300)` is 2, and `trim_scale(1.2300)` is 1.23. For NaN and
+infinities, `scale` and `min_scale` return NULL and `trim_scale` returns the
+input. All three return NULL for a NULL argument.
 `round` and `trunc` accept an optional
 integer scale for numeric values; negative scales act before the decimal point.
 Numeric rounding breaks ties away from zero, while floating-point rounding uses

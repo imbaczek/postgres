@@ -419,6 +419,15 @@ including unknown literals."
                         (rest args)))
           :type type :typmod -1)))
 
+(defun analyze-numeric-scale-function (name args)
+  "Resolve numeric scale inspection and trimming functions."
+  (unless (and (= (length args) 1)
+               (or (in-unknown-constant-p (first args))
+                   (sql-implicit-coercion-p (expr-type (first args)) :numeric)))
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+  (list :func name (list (coerce-common-expression (first args) :numeric))
+        :type (if (string= name "trim_scale") :numeric :int4) :typmod -1))
+
 (defun analyze-log-function (name args)
   "Resolve one-argument or numeric two-argument logarithm overloads."
   (cond
@@ -474,6 +483,8 @@ including unknown literals."
        (analyze-log-function name args))
       ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
        (analyze-power-function name args))
+      ((member name '("scale" "min_scale" "trim_scale") :test #'string=)
+       (analyze-numeric-scale-function name args))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
       ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
       ((string= name "substr") (analyze-substr-function name args))
@@ -1724,7 +1735,8 @@ including unknown literals."
                                "substr" "length" "char_length" "character_length" "pg_backend_pid"
                                "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                                "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
-                               "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow")
+                               "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
+                               "scale" "min_scale" "trim_scale")
                              :test #'string=)))
            (analyzed-expression-volatile-p (car form))
            (analyzed-expression-volatile-p (cdr form)))))
@@ -2576,6 +2588,13 @@ including unknown literals."
             (cond ((eq value +null+) +null+)
                   ((eq type :numeric) (sql-numeric-sqrt value))
                   (t (sql-float-sqrt value)))))
+         ((member name '("scale" "min_scale" "trim_scale") :test #'string=)
+          (let ((value (first arguments)))
+            (cond ((eq value +null+) +null+)
+                  ((string= name "trim_scale") (sql-numeric-trim-scale value))
+                  ((sql-numeric-special-p value) +null+)
+                  ((string= name "scale") (sql-numeric-scale value))
+                  (t (sql-numeric-min-scale value)))))
          ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
           (cond ((member +null+ arguments) +null+)
                 ((eq type :numeric) (sql-numeric-power (first arguments) (second arguments)))

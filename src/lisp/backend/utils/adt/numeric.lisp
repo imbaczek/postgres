@@ -36,7 +36,30 @@
   (if (integerp value) value (sql-decimal-coefficient value)))
 
 (defun sql-numeric-scale (value)
+  "Return the stored fractional digit count of finite VALUE; integers have scale zero."
   (if (integerp value) 0 (sql-decimal-scale value)))
+
+(defun sql-numeric-min-scale (value)
+  "Return the least nonnegative scale that preserves finite VALUE without loss.
+Zero and values with no significant fractional digits have minimum scale zero."
+  (let ((coefficient (sql-numeric-coefficient value))
+        (scale (sql-numeric-scale value)))
+    (when (or (zerop coefficient) (zerop scale))
+      (return-from sql-numeric-min-scale 0))
+    (let ((digits (format nil "~d" (abs coefficient))))
+      (loop for index downfrom (1- (length digits))
+            while (and (plusp scale) (>= index 0) (char= (char digits index) #\0))
+            do (decf scale)))
+    scale))
+
+(defun sql-numeric-trim-scale (value)
+  "Return VALUE at its minimum scale, removing insignificant fractional zeroes.
+Finite values become SQL decimals; NaN and infinities pass through unchanged."
+  (when (sql-numeric-special-p value) (return-from sql-numeric-trim-scale value))
+  (let* ((scale (sql-numeric-min-scale value))
+         (coefficient (truncate (sql-numeric-coefficient value)
+                                (expt 10 (- (sql-numeric-scale value) scale)))))
+    (make-sql-decimal coefficient scale)))
 
 (defun sql-numeric-rational (value)
   (/ (sql-numeric-coefficient value) (expt 10 (sql-numeric-scale value))))

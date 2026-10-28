@@ -314,6 +314,30 @@
   (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-power-small-integers :seed 42))))
     (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
+(cl-spec:defproperty numeric-trim-scale-preserves-value
+    ((coefficient (range integer -10000000 10000000))
+     (scale (range integer 0 10)))
+  (:about sql-numeric-trim-scale)
+  (:trials (:normal 250))
+  (let* ((input (make-sql-decimal coefficient scale))
+         (trimmed (sql-numeric-trim-scale input)))
+    (and (= (sql-numeric-rational input) (sql-numeric-rational trimmed))
+         (<= (sql-numeric-scale trimmed) scale)
+         (or (zerop (sql-numeric-scale trimmed))
+             (not (zerop (mod (sql-numeric-coefficient trimmed) 10)))))))
+
+(rove:deftest numeric-scale-functions
+    (dolist (case '(("SELECT scale(1.2300::numeric)::text" "4")
+                    ("SELECT min_scale(1.2300::numeric)::text" "2")
+                    ("SELECT trim_scale(1.2300::numeric)::text" "1.23")
+                    ("SELECT min_scale(0.0000::numeric)::text" "0")
+                    ("SELECT trim_scale(12.000::numeric)::text" "12")
+                    ("SELECT trim_scale('NaN'::numeric)::text" "NaN")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case)))
+  (let ((data (cl-spec:result-data
+               (cl-spec:run-property 'numeric-trim-scale-preserves-value :seed 42))))
+    (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (cl-spec:defproperty numeric-rounding-is-symmetric
     ((coefficient (range integer -10000000 10000000))
      (input-scale (range integer 0 6))
