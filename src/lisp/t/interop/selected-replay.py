@@ -228,7 +228,18 @@ try:
         control("target.sock", f'(selected-replay-follow-pin #p{lisp_string(str(bundle) + "/")})')
         reject_bootstrap_for_anchor(system_id, fork, manifest, seed)
         control("target.sock", '(reload)')
-        control("target.sock", f'(selected-replay-follow-behind-pin #p{lisp_string(str(bundle) + "/")})')
+        source_prefix = (bundle / "source-prefix.bin").read_bytes()
+        source_history = (bundle / "history.txt").read_text()
+        source_eor = (bundle / "eor.bin").read_bytes()
+        follow_stream_wire.prepare_rejections(
+            promoted_port, system_id, original_end, fork, manifest, seed, source_prefix)
+        control("target.sock", '(assert (null (gethash "wire_rejected" *physical-source-pins*)))')
+        wire_anchor = follow_stream_wire.prepare(
+            promoted_port, "wire_follow", system_id, original_end, fork, fork,
+            manifest, seed, source_prefix, source_history, source_eor)
+        follow_stream_wire.prepare(
+            promoted_port, "selected_behind", system_id, original_end, original_end, fork,
+            manifest, 14695981039346656037, source_prefix, source_history, source_eor)
         follow_stream_wire.at_fork(promoted_port, system_id, original_end, fork, manifest, seed)
         follow_stream_wire.rejects_unbound_requests(
             promoted_port, system_id, original_end, fork, manifest, seed)
@@ -249,6 +260,12 @@ try:
         wait(lambda: ":DONE" in control("target.sock", '(if (gethash "selected_follow" *physical-source-senders*) :waiting :done)'))
         source_peer, source_socket_identity, promoted = restart_promoted_source(promoted, source_peer.pid)
         connections.append(promoted)
+        assert follow_stream_wire.prepare(
+            promoted_port, "wire_follow", system_id, original_end, fork, fork,
+            manifest, seed, source_prefix, source_history, source_eor) == wire_anchor
+        follow_stream_wire.at_fork(promoted_port, system_id, original_end, fork, manifest,
+                                   seed, slot="wire_follow")
+        print("follow-prepare: source-owned proof, exact retry and durable READY after SIGKILL PASS", flush=True)
         follow_stream_wire.at_fork(promoted_port, system_id, original_end, fork, manifest,
                                    behind_digest, slot="selected_behind")
         print("follow-stream: bounded parent suffix, CopyDone, next timeline, child EOR and source crash/resume PASS", flush=True)

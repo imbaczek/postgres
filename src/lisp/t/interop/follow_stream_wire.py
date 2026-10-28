@@ -20,6 +20,93 @@ def send_query(client, query):
     client.socket.sendall(b"Q" + struct.pack("!I", len(body) + 4) + body)
 
 
+def prepare_query(slot, system_id, base, cursor, manifest, seed, prefix):
+    digest = 14695981039346656037
+    overlap = ((cursor - 1) // 16777216) * 16777216
+    for byte in prefix[overlap:cursor]:
+        digest = ((digest ^ byte) * 1099511628211) & ((1 << 64) - 1)
+    return (f"PREPARE_FOLLOW SLOT {slot} (native_format 'pg_lisp_wal_7', "
+            f"system_id '{system_id}', base_timeline '1', base_lsn '{lsn(base)}', "
+            f"manifest_digest '{manifest}', source_timeline '2', receive_timeline '1', "
+            f"receive_lsn '{lsn(cursor)}', prefix_digest '{seed}', "
+            f"overlap_start '{lsn(overlap)}', overlap_digest '{digest}')")
+
+
+def prepare(port, slot, system_id, base, cursor, fork, manifest, seed, prefix,
+            history, eor):
+    client = RawConnection(port, "follow-prepare", replication=True)
+    client.socket.settimeout(15)
+    try:
+        query = prepare_query(slot, system_id, base, cursor, manifest, seed, prefix)
+        send_query(client, query)
+        kind, body = client.receive()
+        assert kind == b"T", (kind, body[:100])
+        count = struct.unpack_from("!H", body)[0]
+        assert count == 15
+        offset, columns = 2, []
+        for _ in range(count):
+            end = body.index(0, offset)
+            _, _, oid, width, _, _ = struct.unpack_from("!IhIhih", body, end + 1)
+            columns.append((body[offset:end].decode(), oid, width))
+            offset = end + 19
+        assert offset == len(body)
+        names = ["slot_name", "system_id", "base_timeline", "base_lsn", "manifest_digest",
+                 "source_timeline", "receive_timeline", "receive_lsn", "prefix_digest",
+                 "overlap_start", "overlap_digest", "history", "next_tli",
+                 "next_tli_startpos", "eor_hex"]
+        assert columns == [(name, 20, 8) if index in (2, 5, 6, 12) else (name, 25, -1)
+                           for index, name in enumerate(names)], columns
+        kind, body = client.receive()
+        assert kind == b"D", (kind, body[:100])
+        values = client.data_row(body)
+        assert len(values) == len(names)
+        row = dict(zip(names, values))
+        assert row["slot_name"] == slot and row["system_id"] == str(system_id)
+        assert row["base_lsn"] == lsn(base) and row["receive_lsn"] == lsn(cursor)
+        assert row["prefix_digest"] == str(seed) and row["manifest_digest"] == str(manifest)
+        overlap = ((cursor - 1) // 16777216) * 16777216
+        overlap_digest = 14695981039346656037
+        for byte in prefix[overlap:cursor]:
+            overlap_digest = ((overlap_digest ^ byte) * 1099511628211) & ((1 << 64) - 1)
+        assert row["overlap_start"] == lsn(overlap)
+        assert row["overlap_digest"] == str(overlap_digest)
+        assert [row[name] for name in ("base_timeline", "source_timeline", "receive_timeline", "next_tli")] == ["1", "2", "1", "2"]
+        assert row["next_tli_startpos"] == lsn(fork) and row["history"] == history
+        assert bytes.fromhex(row["eor_hex"]) == eor
+        assert client.receive() == (b"C", b"PREPARE_FOLLOW\0")
+        assert client.receive() == (b"Z", b"I")
+        assert client.query(query) == [list(row.values())]  # Exact retry, same connection.
+        assert client.query("IDENTIFY_SYSTEM")[0][:2] == [str(system_id), "2"]
+        return row
+    finally:
+        client.close()
+
+
+def prepare_rejections(port, system_id, base, fork, manifest, seed, prefix):
+    query = prepare_query("wire_rejected", system_id, base, fork, manifest, seed, prefix)
+    cases = [(query[:-1] + ", history 'forged')", "0A000"),
+             (query[:-1] + ", eor_hex '00')", "0A000"),
+             (query[:-1] + f", system_id '{system_id}')", "0A000"),
+             (query.replace("pg_lisp_wal_7", "wrong_format"), "0A000"),
+             (query.replace(f"system_id '{system_id}'", f"system_id '{system_id ^ 1}'"), "55000"),
+             (query.replace("source_timeline '2'", "source_timeline '3'"), "55000"),
+             (query.replace("receive_timeline '1'", "receive_timeline '2'"), "55000"),
+             (query.replace(f"receive_lsn '{lsn(fork)}'", f"receive_lsn '{lsn(fork + 1)}'"), "55000"),
+             (query.replace(f"prefix_digest '{seed}'", "prefix_digest '-1'"), "22023")]
+    client = RawConnection(port, "follow-prepare-rejected", replication=True)
+    client.socket.settimeout(15)
+    try:
+        for rejected, state in cases:
+            send_query(client, rejected)
+            kind, body = client.receive()
+            assert kind == b"E", (kind, body[:100])  # No result or CopyBoth before error.
+            assert client.error_fields(body)["C"] == state, client.error_fields(body)
+            assert client.receive() == (b"Z", b"I")
+            assert client.query("IDENTIFY_SYSTEM")[0][:2] == [str(system_id), "2"]
+    finally:
+        client.close()
+
+
 def status(client, written, flushed, applied):
     body = b"r" + struct.pack("!QQQqB", written, flushed, applied, 0, 0)
     client.socket.sendall(b"d" + struct.pack("!I", len(body) + 4) + body)
