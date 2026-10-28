@@ -265,6 +265,9 @@ try:
             manifest, seed, source_prefix, source_history, source_eor) == wire_anchor
         follow_stream_wire.at_fork(promoted_port, system_id, original_end, fork, manifest,
                                    seed, slot="wire_follow")
+        load_helper("target.sock")
+        control("target.sock", f'(selected-replay-probe-native-client #p{lisp_string(str(bundle) + "/")} {promoted_port})')
+        print("native-client: typed PREPARE/history, exact-fork START and fsynced parent CopyDone PASS", flush=True)
         print("follow-prepare: source-owned proof, exact retry and durable READY after SIGKILL PASS", flush=True)
         follow_stream_wire.at_fork(promoted_port, system_id, original_end, fork, manifest,
                                    behind_digest, slot="selected_behind")

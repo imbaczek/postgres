@@ -198,3 +198,84 @@
              (error (condition) (princ-to-string condition)))))
    :name "selected follow pin experiment")
   t)
+
+(defun selected-replay-native-client-start-query (slot request cursor digest)
+  (format nil
+          "START_REPLICATION SLOT ~a PHYSICAL ~a (native_format '~a', mode 'follow', system_id '~d', timeline '~d', base_lsn '~a', prefix_digest '~d', manifest_digest '~d')"
+          slot (wal-format-lsn cursor) +physical-native-format+ (getf request :system-id)
+          (getf request :receive-timeline) (wal-format-lsn (getf request :base))
+          digest (getf request :manifest-digest)))
+
+(defun selected-replay-native-client-feedback (client store base)
+  (let ((payload (make-payload)))
+    (payload-push-byte payload (char-code #\r))
+    (pg-client-push-u64 payload (physical-store-written-lsn store))
+    (pg-client-push-u64 payload (physical-store-flushed-lsn store))
+    (pg-client-push-u64 payload base)
+    (pg-client-push-u64 payload (postgres-current-timestamp))
+    (payload-push-byte payload 0)
+    (sb-ext:with-timeout 10 (write-message (pg-client-stream client) #\d payload))))
+
+(defun selected-replay-native-client-parent (client store base fork)
+  (loop
+    (multiple-value-bind (type payload)
+        (sb-ext:with-timeout 10 (pg-client-native-frame client (+ 65536 29)))
+      (case type
+        (#\d
+         (case (code-char (aref payload 0))
+           (#\w (physical-store-input store (pg-client-u64 payload 1) (subseq payload 25)))
+           (#\k (assert (= 18 (length payload))))
+           (otherwise (error "unexpected native parent payload"))))
+        (#\c
+         (assert (zerop (length payload)))
+         (physical-store-flush store)
+         (assert (= fork (physical-store-flushed-lsn store)))
+         (selected-replay-native-client-feedback client store base)
+         (return (sb-ext:with-timeout 10 (pg-client-native-finish client 2 fork))))
+        (#\E (pg-client-native-source-error payload))
+        (otherwise (error "unexpected native parent frame"))))
+    (physical-store-flush store)
+    (selected-replay-native-client-feedback client store base)))
+
+(defun selected-replay-probe-native-client (directory port)
+  (let* ((request (selected-replay-follow-request directory))
+         (coordinates (loop for (key value) on request by #'cddr
+                            unless (member key '(:history-text :eor-octets)) append (list key value)))
+         (base (getf request :base)) (fork (getf request :receive-lsn))
+         (client (sb-ext:with-timeout 10
+                   (pg-client-connect "127.0.0.1" port "postgres" :replication-p t)))
+         (store nil))
+    (unwind-protect
+         (progn
+           (assert (equal request (sb-ext:with-timeout 10 (pg-client-native-prepare client "wire_follow" coordinates))))
+           (assert (equalp (string->bytes (getf request :history-text))
+                           (sb-ext:with-timeout 10 (pg-client-native-history client 2))))
+           (assert (equal (list :switch 2 fork)
+                          (sb-ext:with-timeout 10
+                            (pg-client-native-start
+                             client (selected-replay-native-client-start-query
+                                     "wire_follow" request fork (getf request :receive-digest))))))
+           (let* ((prefix (read-bounded-regular-file (merge-pathnames "source-prefix.bin" directory)
+                                                     +wal-segment-size+))
+                  (behind (copy-tree coordinates))
+                  (spool (merge-pathnames "native-client-receive/" directory)))
+             (setf (getf behind :receive-lsn) base
+                   (getf behind :receive-digest) #xCBF29CE484222325
+                   (getf behind :overlap-digest)
+                   (physical-store-update-digest
+                    #xCBF29CE484222325 (subseq prefix 0 (- base (getf request :overlap-start)))))
+             (sb-ext:with-timeout 10 (pg-client-native-prepare client "native_client_parent" behind))
+             (wal-ensure-directory-durable spool)
+             (setf store (physical-store-open spool (getf request :system-id) 1 :create t :start-lsn base))
+             (assert (eq :copy-both
+                         (sb-ext:with-timeout 10
+                           (pg-client-native-start
+                            client (selected-replay-native-client-start-query
+                                    "native_client_parent" behind base #xCBF29CE484222325)))))
+             (assert (equal (list :switch 2 fork)
+                            (selected-replay-native-client-parent client store base fork)))
+             (assert (= (getf request :receive-digest) (physical-store-flushed-digest store))))
+           (physical-source-pin-release "native_client_parent")
+           t)
+      (pg-client-close client)
+      (when store (physical-store-close store)))))
