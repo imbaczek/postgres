@@ -79,7 +79,7 @@ Finite values become SQL decimals; NaN and infinities pass through unchanged."
                 (if (zerop scale) "" (concatenate 'string "." (subseq digits point)))))))
 
 (defun sql-numeric-input (text)
-  "Read finite decimal input without invoking the Lisp reader."
+  "Read decimal or radix-prefixed integer input and numeric special values without the Lisp reader."
   (let* ((input (string-trim (mapcar #'code-char '(9 10 11 12 13 32)) text))
          (length (length input)) (position 0) (sign 1) (coefficient 0)
          (digits 0) (fractional 0) (exponent 0))
@@ -101,6 +101,38 @@ Finite values become SQL decimals; NaN and infinities pass through unchanged."
                           (incf position) (unless (digit) (bad))))))
       (when (and (peek) (find (peek) "+-"))
         (when (char= (peek) #\-) (setf sign -1)) (incf position))
+      ;; Non-decimal input is an integer.  As in numeric_in, one underscore
+      ;; may follow the base prefix or a digit, and must precede a digit.
+      (when (and (< (+ position 1) length) (eql (peek) #\0))
+        (let ((base (case (char-downcase (char input (1+ position)))
+                      (#\x 16) (#\o 8) (#\b 2))))
+          (when base
+            (incf position 2)
+            ;; Accumulate groups that fit in int64, checking the numeric weight
+            ;; after each group as the C input function does.
+            (let ((group 0) (multiplier 1) (limit (expt 10 131072)))
+              (labels ((flush-group ()
+                         (setf coefficient (+ (* coefficient multiplier) group))
+                         (when (>= coefficient limit)
+                           (ereport "22003" "value overflows numeric format"))
+                         (setf group 0 multiplier 1)))
+                (loop while (< position length)
+                      for char = (peek)
+                      for value = (sql-number-digit-p char base)
+                      do (cond (value
+                                (when (> multiplier (floor +int8-max+ base))
+                                  (flush-group))
+                                (setf group (+ (* group base) value)
+                                      multiplier (* multiplier base))
+                                (incf digits) (incf position))
+                               ((eql char #\_)
+                                (incf position)
+                                (unless (sql-number-digit-p (peek) base) (bad)))
+                               (t (return))))
+                (when (zerop digits) (bad))
+                (flush-group)
+                (unless (= position length) (bad))
+                (return-from sql-numeric-input (make-sql-decimal (* sign coefficient) 0)))))))
       (read-digits nil)
       (when (eql (peek) #\.) (incf position) (read-digits t))
       (when (zerop digits) (bad))

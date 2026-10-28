@@ -195,7 +195,8 @@ semantics and OIDs are a TODO.
 `varchar` without a length is also treated as 126.
 
 Decimal literals and numeric casts support finite values; numeric casts also
-accept NaN and infinities. Precision-constrained numeric values are rounded and range checked. Floating
+accept NaN, infinities, and signed hexadecimal, octal, and binary integer input
+with PostgreSQL's underscore rules. Precision-constrained numeric values are rounded and range checked. Floating
 types use IEEE values, including NaN and infinities. Date/time and interval
 types support casts, comparisons, and the implemented arithmetic operators;
 time and timestamp precision is at most six fractional digits. Interval field
@@ -203,8 +204,9 @@ and precision modifiers are supported. These are subsets of PostgreSQL's full
 type and operator catalog, not a promise that every input spelling or function
 is implemented.
 
-SQL array expressions support text, int2, int4, int8, numeric, float4 and
-float8 elements. `ARRAY[...]` chooses a common element type; an empty
+SQL array expressions support text, varchar, name, internal `"char"`, bool,
+int2, int4, int8, numeric, float4, float8, oid, date, time, timetz, timestamp,
+timestamptz, interval, pg_lsn and bit elements. `ARRAY[...]` chooses a common element type; an empty
 constructor needs a type supplied by context or a cast. Nested constructors
 must have matching dimensions and lower bounds, and support up to six
 dimensions. `array_length`, comparisons, scalar `ANY`/`ALL`, and text
@@ -232,6 +234,10 @@ equal to the value, using a binary search. Thresholds must be one-dimensional
 and contain no NULLs; an empty array returns zero. The caller must supply
 ascending thresholds: their order is assumed, not checked. The supported
 threshold element types are the array expression types listed above.
+For `timetz` thresholds, compatibility follows the tested little-endian 64-bit
+C peer: its fixed-width search uses a 12-byte stride over 16-byte aligned
+elements. Results for multiple thresholds can therefore differ from a logical
+`timetz` comparison and from C builds with a different layout.
 `width_bucket(value, bound1, bound2, count)` supports numeric and float8
 arithmetic, ascending or descending bounds, and a positive int4 count. Values
 outside the range return 0 or count + 1; the first bound is included and the
@@ -550,6 +556,11 @@ From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/random-sql.sh`
 compares seeded sequences and mixed overloads with the repository's C PostgreSQL,
 including session isolation, rollback, void wire output, NULLs and errors. It
 starts both servers and honors `SBCL`, `PYTHON`, `PORT`, and `REFERENCE_PORT`.
+
+From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/array-types.sh`
+compares scalar-array and `width_bucket` cases, result metadata and errors with
+an isolated C peer. It honors `PYTHON`, `PORT`, `REFERENCE_PORT`, `PG_C_LIBDIR`
+and `PSQL`; its `timetz` comparisons cover the local C build's layout.
 
 From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/subqueries.sh`
 compares the native server with the repository's installed C PostgreSQL and owns

@@ -189,6 +189,41 @@
                        (pg-error (error) error))))
       (rove:ok (and condition (string= (pg-error-sqlstate condition) (second case))) (first case)))))
 
+(rove:deftest width-bucket-array-scalar-expressions
+    (dolist (case '(("SELECT width_bucket(true, ARRAY[false,true])::text" "2")
+                    ("SELECT width_bucket('b'::varchar, '{a,b,c}'::varchar[])::text" "2")
+                    ("SELECT width_bucket(NULL::name, ARRAY['a'::name])::text" nil)
+                    ("SELECT width_bucket('2020-01-02'::date, ARRAY['2020-01-01'::date,'2020-01-02'::date])::text" "2")
+                    ("SELECT width_bucket('12:00'::time, ARRAY['09:00'::time,'12:00'::time])::text" "2")
+                    ("SELECT width_bucket('0/10'::pg_lsn, ARRAY['0/01'::pg_lsn,'0/10'::pg_lsn])::text" "2")
+                    ("SELECT width_bucket(2::oid, ARRAY[1,2,3])::text" "2")
+                    ("SELECT width_bucket(2, '1 2 3'::int2vector)::text" "2")
+                    ("SELECT width_bucket('12:00+00'::timetz, ARRAY['09:00+00'::timetz,'12:00+00'::timetz])::text" "1")
+                    ("SELECT width_bucket('2020-01-02'::timestamp, ARRAY['2020-01-01'::timestamp,'2020-01-02'::timestamp])::text" "2")
+                    ("SELECT width_bucket('2020-01-02 00:00+00'::timestamptz, ARRAY['2020-01-01 00:00+00'::timestamptz,'2020-01-02 00:00+00'::timestamptz])::text" "2")
+                    ("SELECT width_bucket('2 days'::interval, ARRAY['1 day'::interval,'2 days'::interval])::text" "2")
+                    ("SELECT width_bucket(B'10', ARRAY[B'01',B'10'])::text" "2")
+                    ("SELECT ARRAY[false,true]::text" "{f,t}")))
+      (rove:ok (equal (list (list (or (second case) +null+))) (subquery-test-rows (first case))) (first case))))
+
+(rove:deftest temporal-array-sort-and-group-spill
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-array-spill-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*query-work-memory-bytes* 128))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (rove:ok (equal (subquery-test-rows
+                              "SELECT x::text,count(*)::text FROM (SELECT ARRAY['2 days'::interval] AS x UNION ALL SELECT ARRAY['1 day'::interval] UNION ALL SELECT ARRAY['1 day'::interval]) q GROUP BY x ORDER BY x")
+                             '(("{\"1 day\"}" "2") ("{\"2 days\"}" "1"))))
+             (rove:ok (equal (subquery-test-rows
+                              "SELECT x::text,count(*)::text FROM (SELECT ARRAY['13:00+00'::timetz] AS x UNION ALL SELECT ARRAY['12:00+00'::timetz] UNION ALL SELECT ARRAY['12:00+00'::timetz]) q GROUP BY x ORDER BY x")
+                             '(("{12:00:00+00}" "2") ("{13:00:00+00}" "1"))))
+             (rove:ok (null (uiop:directory-files directory))))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest numeric-basic-functions
     (dolist (case '(("SELECT abs(-12.030)::text" "12.030")
                     ("SELECT numeric_abs('-Infinity'::numeric)::text" "Infinity")

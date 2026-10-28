@@ -20,7 +20,11 @@
 (defparameter +sql-array-types+
   '((:text . :text-array) (:int2 . :int2-array) (:int4 . :int4-array)
     (:int8 . :int8-array) (:numeric . :numeric-array) (:float4 . :float4-array)
-    (:float8 . :float8-array)))
+    (:float8 . :float8-array) (:bool . :bool-array) (:char . :char-array)
+    (:name . :name-array) (:varchar . :varchar-array) (:oid . :oid-array)
+    (:date . :date-array) (:time . :time-array) (:timetz . :timetz-array)
+    (:timestamp . :timestamp-array) (:timestamptz . :timestamptz-array)
+    (:interval . :interval-array) (:pg-lsn . :pg-lsn-array) (:bit . :bit-array)))
 
 (defun sql-array-type (element-type)
   (cdr (assoc element-type +sql-array-types+)))

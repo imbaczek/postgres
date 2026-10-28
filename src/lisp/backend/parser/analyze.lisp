@@ -167,7 +167,17 @@
 
 (defparameter +sql-expression-types+
   '((:bool 16 1) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
-    (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1) (:text-array 1009 -1) (:int2-array 1005 -1) (:int4-array 1007 -1) (:int8-array 1016 -1) (:numeric-array 1231 -1) (:float4-array 1021 -1) (:float8-array 1022 -1) (:oid 26 4) (:pg-node-tree 194 -1) (:record 2249 -1) (:void 2278 4) (:pg-lsn 3220 8) (:numeric 1700 -1) (:float4 700 4) (:float8 701 8) (:date 1082 4) (:time 1083 8) (:timetz 1266 12) (:timestamp 1114 8) (:interval 1186 16) (:bit 1560 -1)))
+    (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1)
+    (:text-array 1009 -1) (:int2-array 1005 -1) (:int4-array 1007 -1) (:int8-array 1016 -1)
+    (:numeric-array 1231 -1) (:float4-array 1021 -1) (:float8-array 1022 -1)
+    (:bool-array 1000 -1) (:char-array 1002 -1) (:name-array 1003 -1)
+    (:varchar-array 1015 -1) (:oid-array 1028 -1) (:date-array 1182 -1)
+    (:time-array 1183 -1) (:timetz-array 1270 -1) (:timestamp-array 1115 -1)
+    (:timestamptz-array 1185 -1) (:interval-array 1187 -1) (:pg-lsn-array 3221 -1)
+    (:bit-array 1561 -1) (:oid 26 4) (:pg-node-tree 194 -1) (:record 2249 -1)
+    (:void 2278 4) (:pg-lsn 3220 8) (:numeric 1700 -1) (:float4 700 4)
+    (:float8 701 8) (:date 1082 4) (:time 1083 8) (:timetz 1266 12)
+    (:timestamp 1114 8) (:interval 1186 16) (:bit 1560 -1)))
 
 (defun sql-expression-type-description (type)
   (or (assoc type +sql-expression-types+)
@@ -189,6 +199,9 @@
 (defun typed-arg-name (expr)
   "PostgreSQL-style name for an argument's type, for \"function ... does not
 exist\" messages."
+  (when (sql-array-element-type (expr-type expr))
+    (return-from typed-arg-name
+      (concatenate 'string (typed-arg-name (list :col 0 :type (sql-array-element-type (expr-type expr)))) "[]")))
   (case (expr-type expr)
     (:int2 "smallint")
     (:int4 "integer")
@@ -198,6 +211,11 @@ exist\" messages."
     (:void "void")
     (:record "record")
     (:pg-node-tree "pg_node_tree")
+    (:date "date")
+    (:time "time without time zone")
+    (:timetz "time with time zone")
+    (:timestamp "timestamp without time zone")
+    (:interval "interval")
     (:timestamptz "timestamp with time zone")
     (:numeric "numeric")
     (:float4 "real")
@@ -592,24 +610,32 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
     (list :func name arguments :type type :typmod -1)))
 
 (defun analyze-width-bucket (args)
-  ;; Resolve the text/text[] threshold form or numeric/float8 range form to int4.
+  ;; Resolve compatible scalar/array thresholds or numeric/float8 ranges to int4.
   (cond
     ((= (length args) 2)
      (let* ((operand (first args)) (array (second args))
-                                   (element (sql-array-element-type (expr-type array))))
+                                   (element (if (eq (expr-type array) :int2vector) :int2
+                                                (sql-array-element-type (expr-type array)))))
        (unless (or element (in-unknown-constant-p array))
          (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))
        (when (and element (not (in-unknown-constant-p operand))
                   (not (eq (sql-type-category element) (sql-type-category (expr-type operand)))))
          (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))
        (let* ((probe (and element (list :col 0 :type element :typmod -1)))
-              (type (common-expression-type (if probe (list probe operand) (list operand)) "width_bucket"))
+              (type (handler-case
+                        (common-expression-type (if probe (list probe operand) (list operand)) "width_bucket")
+                      (pg-error (error)
+                        (if (member (pg-error-sqlstate error) '("42804" "42846") :test #'string=)
+                            (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args))
+                            (error error)))))
               (array-type (sql-array-type type)))
          (unless array-type
            (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))
          (list :func "width_bucket"
                (list (coerce-common-expression operand type)
-                     (coerce-common-expression array array-type))
+                     (if (eq (expr-type array) :int2vector)
+                         (list :cast array :type array-type :typmod -1)
+                         (coerce-common-expression array array-type)))
                :type :int4 :typmod -1))))
     ((= (length args) 4)
      (let* ((values (subseq args 0 3))
@@ -628,20 +654,60 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
              :type :int4 :typmod -1)))
     (t (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))))
 
+(defun sql-width-bucket-timetz-bytes (elements)
+  "Serialize non-NULL timetz elements in the tested C peer's little-endian 16-byte aligned layout.
+The 12-byte payload contains an int64 time and int32 zone followed by padding."
+  (let ((bytes (make-array (* 16 (length elements)) :element-type '(unsigned-byte 8) :initial-element 0)))
+    (loop for value across elements for offset from 0 by 16 do
+      (dotimes (i 8)
+        (setf (aref bytes (+ offset i)) (ldb (byte 8 (* i 8)) (sql-timetz-microseconds value))))
+      (dotimes (i 4)
+        (setf (aref bytes (+ offset 8 i)) (ldb (byte 8 (* i 8)) (sql-timetz-zone-west value)))))
+    bytes))
+
+(defun sql-width-bucket-timetz-at (bytes index)
+  "Decode a timetz at INDEX using C width_bucket_array_fixed's 12-byte typlen stride.
+The tested peer stores aligned 16-byte elements, so later reads can span elements;
+this models that platform-specific behavior rather than a portable C layout."
+  (let ((offset (* 12 index)))
+    (labels ((signed-word (start count)
+               (let ((word (loop for i below count
+                                 sum (ash (aref bytes (+ offset start i)) (* i 8)))))
+                 (if (logbitp (1- (* count 8)) word) (- word (ash 1 (* count 8))) word))))
+      (make-sql-timetz (signed-word 0 8) (signed-word 8 4)))))
+
+(defun sql-width-bucket-timetz-compare (left right)
+  "Compare the decoded fields using the tested C peer's wrapping int64 time arithmetic.
+Zone-west breaks ties after comparing time plus zone-west in microseconds."
+  (labels ((wrap64 (number)
+             (let ((value (logand number #xffffffffffffffff)))
+               (if (logbitp 63 value) (- value (ash 1 64)) value)))
+           (key (value)
+             (wrap64 (+ (sql-timetz-microseconds value)
+                        (* (sql-timetz-zone-west value) 1000000)))))
+    (let ((a (key left)) (b (key right)))
+      (cond ((< a b) -1) ((> a b) 1)
+            ((< (sql-timetz-zone-west left) (sql-timetz-zone-west right)) -1)
+            ((> (sql-timetz-zone-west left) (sql-timetz-zone-west right)) 1)
+            (t 0)))))
+
 (defun sql-width-bucket-array (value array)
-  ;; C width_bucket_array: search ascending thresholds for the first greater value.
-  ;; Empty arrays yield zero; NULL elements are rejected, and sorting is assumed.
+  ;; C width_bucket_array searches ascending thresholds for the first greater value.
   (when (> (length (sql-array-dimensions array)) 1)
     (ereport "2202E" "thresholds must be one-dimensional array"))
-  (setf array (sql-array-elements array))
-  (when (find +null+ array)
-    (ereport "22004" "thresholds array must not contain NULLs"))
-  (let ((left 0) (right (length array)))
-    (loop while (< left right)
-          for mid = (floor (+ left right) 2)
-          do (if (< (compare-3way value (aref array mid)) 0)
-                 (setf right mid) (setf left (1+ mid))))
-    left))
+  (let* ((timetz-p (eq (sql-array-element-type-id array) :timetz))
+         (elements (sql-array-elements array)))
+    (when (find +null+ elements)
+      (ereport "22004" "thresholds array must not contain NULLs"))
+    (let ((left 0) (right (length elements))
+                   (bytes (and timetz-p (sql-width-bucket-timetz-bytes elements))))
+      (loop while (< left right)
+            for mid = (floor (+ left right) 2)
+            for comparison = (if timetz-p
+                                 (sql-width-bucket-timetz-compare value (sql-width-bucket-timetz-at bytes mid))
+                                 (compare-3way value (aref elements mid)))
+            do (if (< comparison 0) (setf right mid) (setf left (1+ mid))))
+      left)))
 
 (defun sql-width-bucket-range (args)
   ;; C width_bucket_float8/width_bucket_numeric: equal-width ascending or
@@ -1024,7 +1090,8 @@ so expression identity remains distinct from the corresponding SQL function."
            (member target '(:int2 :int4 :int8 :numeric :float4 :float8)))
       (and (member source '(:date :timestamp :timestamptz))
            (member target '(:date :timestamp :timestamptz)))
-      (and (member source '(:timestamp :timestamptz)) (eq target :time))
+      (and (member source '(:timestamp :timestamptz :timetz)) (eq target :time))
+      (and (eq source :time) (eq target :timetz))
       (and (eq source :bit) (member target '(:int4 :int8)))
       (and (eq target :bit) (member source '(:int4 :int8)))
       (and (eq source :numeric) (member target '(:int2 :int4 :int8)))
@@ -1333,6 +1400,13 @@ are supported."
 
 (defun sql-cast-value (value source target typmod &optional interval-literal-p)
   (when (eq value +null+) (return-from sql-cast-value +null+))
+  (when (and (eq source :int2vector) (sql-array-element-type target))
+    (return-from sql-cast-value
+      (make-sql-array :element-type-id (sql-array-element-type target)
+                      :elements (map 'vector (lambda (element)
+                                               (sql-cast-value element :int2 (sql-array-element-type target) typmod)) value)
+                      :dimensions (and (plusp (length value)) (list (length value)))
+                      :lower-bounds (and (plusp (length value)) (list 0)))))
   (when (sql-array-element-type target)
     (let ((element-type (sql-array-element-type target)))
       (return-from sql-cast-value
@@ -1383,6 +1457,12 @@ are supported."
               (ereport "22008" "timestamp out of range"))
             (if (member timestamp '(#x7fffffffffffffff -9223372036854775808)) timestamp
                 (sql-time-adjust-typmod timestamp typmod))))))
+  (when (and (eq source :time) (eq target :timetz))
+    (return-from sql-cast-value
+      (sql-timetz-input (sql-time-output value) typmod (sql-session-timezone)
+                        nil (sql-session-unix-microseconds))))
+  (when (and (eq source :timetz) (eq target :time))
+    (return-from sql-cast-value (sql-time-adjust-typmod (sql-timetz-microseconds value) typmod)))
   (when (eq target :timetz)
     (return-from sql-cast-value
       (if (member source '(:text :varchar :name)) (sql-timetz-input value typmod (sql-session-timezone)
@@ -2440,7 +2520,7 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
 
 (defun sql-type-category (type)
   (cond ((member type '(:int2 :int4 :int8 :oid :numeric :float4 :float8)) :numeric)
-        ((member type '(:date :timestamp :timestamptz)) :datetime)
+        ((member type '(:date :time :timetz :timestamp :timestamptz)) :datetime)
         ((member type '(:text :varchar :name)) :string)
         ((or (eq type :int2vector) (sql-array-element-type type)) :array)
         ((member type '(:char :pg-node-tree)) :internal)
@@ -2458,7 +2538,7 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
                 (:int2 :float4) (:int4 :float4) (:int8 :float4) (:numeric :float4)
                 (:int2 :float8) (:int4 :float8) (:int8 :float8) (:numeric :float8)
                 (:float4 :float8)
-                (:date :timestamp) (:date :timestamptz) (:timestamp :timestamptz)
+                (:date :timestamp) (:date :timestamptz) (:timestamp :timestamptz) (:time :timetz)
                 (:name :text) (:text :name) (:text :varchar)
                 (:varchar :text) (:varchar :name)
                 (:char :text) (:pg-node-tree :text))
