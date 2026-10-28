@@ -174,7 +174,7 @@
         (let ((before (mapcar #'lineage-test-bytes
                               (list (pg::wal-control-path) (pg::physical-recovery-control-path))))
               (capture (pg::native-control-capture)))
-          (ok (every #'identity (subseq capture 2)))
+          (ok (every #'identity (subseq capture 2 5)))
           (unwind-protect
                (progn
                  (setf (symbol-function 'pg::native-control-recovery-checkpoint)
@@ -535,12 +535,19 @@
            store 5 (concatenate 'string text (store-history-text 2 424))
            (store-history-eor 424 5 2))
           (let* ((future-digest (getf (pg::physical-store-selection store) :digest))
+                 (count-before (hash-table-count pg::*physical-retained-root-references*))
+                 (recovery-facts (pg::native-control-read pg::*pgdata*))
+                 (count-after (hash-table-count pg::*physical-retained-root-references*))
                  (pending (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent))
                  (reference (getf pending :retained-reference))
                  (index (pg::physical-retained-inventory-load
                          (pg::physical-recovery-retained-directory) (getf reference :root-id)
                          (pg::physical-promotion-retained-identity (getf pending :system-id) reference)
                          (pg::timeline-parse-history 2 text))))
+            (ok (= count-before count-after))
+            (ok (= 2 (getf recovery-facts :checkpoint-timeline) (getf recovery-facts :recovery-timeline)))
+            (ok (= 304 (getf recovery-facts :checkpoint)))
+            (ok (= 424 (getf recovery-facts :recovery-lsn)))
             (ok (= 3 (getf pending :promotion-child)))
             (ok (= 2 (getf pending :applied-timeline)))
             (ok (/= parent-digest future-digest))
@@ -669,3 +676,200 @@
           (ok (equalp before bytes))
           (ok (equal entry (list "global/pg_wal_control" (length bytes)
                                  (pg::physical-store-update-digest #xCBF29CE484222325 bytes))))))))
+
+(defun call-with-child-inspection-fixture (function)
+  (handoff-test-committed
+   (lambda (source store reference)
+     (declare (ignore source store reference))
+     (with-physical-store-directory (target)
+       (let* ((fields (multiple-value-list (pg::wal-read-control-fields)))
+              (snapshot (third fields))
+              (timeline (fourth fields))
+              (files (mapcar
+                      (lambda (name) (pg::physical-bootstrap-copy-file name target))
+                      (list "global/pg_wal_control"
+                            (concatenate 'string "pg_wal/" (pg::wal-segment-filename 0 timeline :timeline))
+                            (concatenate 'string "pg_wal/" (pg::timeline-history-filename timeline)))))
+              (manifest (list :version 3 :system-id (getf (seventh fields) :system-id)
+                              :cluster-identity "history-source" :timeline timeline
+                              :checkpoint (first fields) :checkpoint-start (getf snapshot :start)
+                              :end (second fields) :next-xid (getf snapshot :next-xid)
+                              :source-pin "inspect" :files files)))
+         (write-recovery-manifest-text target (pg::physical-bootstrap-manifest-text manifest))
+         (pg::wal-atomic-write-bytes
+          (merge-pathnames "recovery.required" target) (pg::physical-recovery-marker-bytes))
+         (let ((pg::*pgdata* target))
+           (funcall function target manifest (nth-value 1 (pg::recovery-read-manifest target)))))))))
+
+(deftest native-control-inspects-ordinary-child-recovery-without-mutation
+    (call-with-child-inspection-fixture
+     (lambda (target manifest digest)
+       (let ((counts (list (hash-table-count pg::*physical-retained-root-references*)
+                           (hash-table-count pg::*physical-retained-root-holds*)
+                           (hash-table-count pg::*physical-retained-root-updates*))))
+         (dolist (phase '(0 1 2))
+           (pg::wal-atomic-write-bytes
+            (pg::physical-recovery-control-path)
+            (pg::physical-recovery-control-image
+             phase (getf manifest :system-id) 2 (if (zerop phase) 0 digest)
+             (getf manifest :checkpoint) (getf manifest :end) (getf manifest :next-xid)
+             :state-time 42))
+           (let* ((before (pg::native-control-capture))
+                  (facts (pg::native-control-read target)))
+             (ok (= (if (zerop phase) pg::+db-startup+ pg::+db-in-archive-recovery+)
+                    (getf facts :db-state)))
+             (ok (= 2 (getf facts :checkpoint-timeline) (getf facts :recovery-timeline)))
+             (ok (= (getf manifest :checkpoint-start) (getf facts :checkpoint)))
+             (ok (= (getf manifest :end) (getf facts :recovery-lsn)))
+             (ok (equalp before (pg::native-control-capture)))))
+         (ok (equal counts
+                    (list (hash-table-count pg::*physical-retained-root-references*)
+                          (hash-table-count pg::*physical-retained-root-holds*)
+                          (hash-table-count pg::*physical-retained-root-updates*)))))
+       (ok (null (probe-file (merge-pathnames "postmaster.pid" target)))))))
+
+(deftest missing-child-recovery-control-cannot-select-primary
+    (call-with-child-inspection-fixture
+     (lambda (target manifest digest)
+       (declare (ignore manifest digest))
+       (let* ((names '("recovery.required" "physical-backup.manifest"
+                       "physical-restartpoint.control" "physical-follow.control"))
+              (paths (mapcar (lambda (name) (merge-pathnames name target)) names))
+              (saved (mapcar (lambda (path)
+                               (cons path (when (probe-file path) (lineage-test-bytes path))))
+                             paths))
+              (stray-bytes (make-array 3 :element-type '(unsigned-byte 8)
+                                         :initial-contents '(1 2 3)))
+              (artifacts (list (list (first paths) (lineage-test-bytes (first paths)) 2)
+                               (list (second paths) (lineage-test-bytes (second paths)) 3)
+                               (list (third paths) stray-bytes 4)
+                               (list (fourth paths) stray-bytes 6)))
+              (primary (symbol-function 'pg::physical-promotion-startup-primary-p))
+              (calls 0))
+         (unwind-protect
+              (progn
+                (dolist (path paths)
+                  (when (probe-file path) (delete-file path)))
+                (setf (symbol-function 'pg::physical-promotion-startup-primary-p)
+                      (lambda () (incf calls) t))
+                (dolist (artifact artifacts)
+                  (destructuring-bind (path bytes expected-slot) artifact
+                    (pg::wal-atomic-write-bytes path bytes)
+                    (let ((before (pg::native-control-capture)))
+                      (ok (null (second before)))
+                      (dolist (slot '(2 3 4 6))
+                        (ok (equalp (if (= slot expected-slot) bytes nil)
+                                    (nth slot before))))
+                      (ok (signals (pg::native-control-read target) 'error))
+                      (ok (signals (pg::physical-bootstrap-check-startup) 'error))
+                      (ok (zerop calls))
+                      (ok (equalp before (pg::native-control-capture))))
+                    (delete-file path))))
+           (setf (symbol-function 'pg::physical-promotion-startup-primary-p) primary)
+           (dolist (entry saved)
+             (if (cdr entry)
+                 (pg::wal-atomic-write-bytes (car entry) (cdr entry))
+                 (when (probe-file (car entry)) (delete-file (car entry))))))))))
+
+(deftest native-control-rechecks-child-history-after-validation
+    (call-with-child-inspection-fixture
+     (lambda (target manifest digest)
+       (pg::wal-atomic-write-bytes
+        (pg::physical-recovery-control-path)
+        (pg::physical-recovery-control-image
+         2 (getf manifest :system-id) 2 digest (getf manifest :checkpoint)
+         (getf manifest :end) (getf manifest :next-xid)))
+       (let* ((path (pg::timeline-history-path 2 target))
+              (bytes (lineage-test-bytes path))
+              (checker (symbol-function 'pg::physical-promotion-check-child-control))
+              (calls 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-promotion-check-child-control)
+                      (lambda (&rest arguments)
+                        (multiple-value-prog1 (apply checker arguments)
+                          (when (= 1 (incf calls))
+                            (pg::wal-atomic-write-bytes
+                             path (pg::string->bytes (store-history-text 1 215)))))))
+                (ok (signals (pg::native-control-read target) 'error))
+                (ok (= 1 calls)))
+           (setf (symbol-function 'pg::physical-promotion-check-child-control) checker)
+           (pg::wal-atomic-write-bytes path bytes))))))
+
+(cl-spec:defproperty native-control-recovery-role-matches-startup-selection
+    ((timeline (range integer 1 4294967294)) (phase (range integer 0 3))
+                                             (committed (range integer 0 1)) (present (range integer 0 1)))
+  (:about pg::native-control-recovery-role-p)
+  (:trials (:normal 200))
+  (let ((control (when (= present 1) (list :phase phase :timeline timeline))))
+    (eql (and (= present 1) (or (< phase 3) (zerop committed)))
+         (not (null (pg::native-control-recovery-role-p control (+ timeline committed)))))))
+
+(deftest generated-native-control-recovery-role-selection
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'native-control-recovery-role-matches-startup-selection :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest native-control-rejects-mutated-child-base-control-and-history
+    (call-with-child-inspection-fixture
+     (lambda (target manifest digest)
+       (declare (ignore target))
+       (pg::wal-atomic-write-bytes
+        (pg::physical-recovery-control-path)
+        (pg::physical-recovery-control-image
+         2 (getf manifest :system-id) 2 digest (getf manifest :checkpoint)
+         (getf manifest :end) (getf manifest :next-xid)))
+       (dolist (kind '(:control :history :marker))
+         (let* ((path (ecase kind
+                        (:control (pg::wal-control-path))
+                        (:history (pg::timeline-history-path 2 pg::*pgdata*))
+                        (:marker (merge-pathnames "recovery.required" pg::*pgdata*))))
+                (original (lineage-test-bytes path)))
+           (unwind-protect
+                (progn
+                  (ecase kind
+                    (:control
+                     (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-id namespace metadata)
+                         (pg::wal-read-control-fields)
+                       (setf (getf metadata :state-time) (1+ (getf metadata :state-time)))
+                       (pg::wal-atomic-write-bytes
+                        path (pg::wal-encode-control-image checkpoint durable snapshot
+                                                           :timeline insertion :checkpoint-timeline checkpoint-id
+                                                           :namespace namespace :metadata metadata))))
+                    (:history
+                     (pg::wal-atomic-write-bytes path (pg::string->bytes (store-history-text 1 215))))
+                    (:marker (delete-file path)))
+                  (let ((before (pg::native-control-capture)))
+                    (ok (intake-fails-p (lambda () (pg::native-control-facts before))))
+                    (ok (equalp before (pg::native-control-capture)))))
+             (pg::wal-atomic-write-bytes path original)))))))
+
+(deftest native-control-cannot-reclassify-rooted-primary-as-ordinary-recovery
+    (handoff-test-committed
+     (lambda (root store reference)
+       (declare (ignore store reference))
+       (let* ((fields (multiple-value-list (pg::wal-read-control-fields)))
+              (snapshot (third fields))
+              (files (mapcar
+                      (lambda (name)
+                        (let ((bytes (lineage-test-bytes (merge-pathnames name root))))
+                          (list name (length bytes) (pg::physical-store-update-digest #xCBF29CE484222325 bytes))))
+                      (list "global/pg_wal_control" "pg_wal/00000002.history"
+                            "pg_wal/000000020000000000000000.wal")))
+              (manifest (list :version 3 :system-id (getf (seventh fields) :system-id)
+                              :cluster-identity "history-source" :timeline 2
+                              :checkpoint (first fields) :checkpoint-start (getf snapshot :start)
+                              :end (second fields) :next-xid (getf snapshot :next-xid)
+                              :source-pin "inspect" :files files)))
+         (write-recovery-manifest-text root (pg::physical-bootstrap-manifest-text manifest))
+         (delete-file (pg::physical-restartpoint-pointer-path))
+         (pg::wal-atomic-write-bytes
+          (pg::physical-recovery-control-path)
+          (pg::physical-recovery-control-image
+           2 (getf manifest :system-id) 2 (nth-value 1 (pg::recovery-read-manifest root))
+           (first fields) (second fields) (getf snapshot :next-xid)))
+         (let ((before (pg::native-control-capture)))
+           (ok (handler-case (progn (pg::native-control-facts before) nil)
+                 (error (condition)
+                   (search "immutable base checkpoint" (princ-to-string condition)))))
+           (ok (equalp before (pg::native-control-capture))))))))

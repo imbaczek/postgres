@@ -88,6 +88,12 @@ A present file with invalid type, size or access permissions is an error."
     (sb-posix:syscall-error (condition)
       (unless (= sb-posix:enoent (sb-posix:syscall-errno condition)) (error condition)))))
 
+(defun native-control-recovery-role-p (control insertion)
+  (and control
+       (or (member (getf control :phase) '(0 1 2))
+           (and (eql 3 (getf control :phase))
+                (eql insertion (getf control :timeline))))))
+
 (defun native-control-capture ()
   "Read the controls that select the current native role and checkpoint.
 Keep their bytes for the stability check. A committed child no longer depends
@@ -96,15 +102,18 @@ on the old base manifest or restartpoint pointer."
          (insertion (and wal (nth-value 3 (wal-decode-control-line (bytes->string wal)))))
          (recovery (native-control-optional-bytes (physical-recovery-control-path)))
          (control (when recovery (physical-recovery-decode-control recovery)))
-         (pending (and control (eql 3 (getf control :phase))
-                       (eql insertion (getf control :timeline))))
-         (parent (or pending (and insertion (= insertion 1)))))
+         (pending (native-control-recovery-role-p control insertion))
+         (parent (or pending (null control) (and insertion (= insertion 1)))))
     (unless wal (error "native WAL control file is missing"))
     (list wal recovery
           (when parent (native-control-optional-bytes (merge-pathnames "recovery.required" *pgdata*)))
           (when parent (native-control-optional-bytes (merge-pathnames "physical-backup.manifest" *pgdata*)))
-          (when (and parent recovery)
-            (native-control-optional-bytes (physical-restartpoint-pointer-path))))))
+          (when parent
+            (native-control-optional-bytes (physical-restartpoint-pointer-path)))
+          (when (> insertion 1)
+            (native-control-optional-bytes (timeline-history-path insertion *pgdata*)))
+          (when parent
+            (native-control-optional-bytes (merge-pathnames "physical-follow.control" *pgdata*))))))
 
 (defun native-control-catalog-system-id ()
   "Recover a legacy primary's identifier from its saved catalog identity.
@@ -117,6 +126,34 @@ matches the supported restartpoint generation bound rather than a WAL segment."
       (error "native catalog lacks a durable system identity"))
     (catalog-system-identifier (make-catalog :cluster-identity identity))))
 
+(defun native-control-manifest-file (manifest name maximum)
+  (let* ((entry (find name (getf manifest :files) :key #'first :test #'equal))
+         (bytes (read-bounded-regular-file (merge-pathnames name *pgdata*) maximum)))
+    (unless (and entry (= (second entry) (length bytes))
+                 (= (third entry) (physical-store-update-digest #xCBF29CE484222325 bytes)))
+      (error "native base file differs from its manifest: ~a" name))
+    bytes))
+
+(defun native-control-check-recovery-base (control manifest snapshot)
+  (let ((bytes (native-control-manifest-file manifest "global/pg_wal_control" 513)))
+    (multiple-value-bind (checkpoint durable actual insertion checkpoint-timeline namespace metadata)
+        (wal-decode-control-line (bytes->string bytes))
+      (unless (and (= checkpoint (getf manifest :checkpoint))
+                   (= durable (getf manifest :end))
+                   (= insertion checkpoint-timeline (getf manifest :timeline))
+                   (or (= insertion 1) (eq namespace :timeline))
+                   (equal snapshot actual)
+                   (= (physical-manifest-checkpoint-start manifest)
+                      (if actual (getf actual :start) (- checkpoint +wal-header-size+)))
+                   (or (eql 3 (getf control :phase)) (null (getf metadata :retained-reference))))
+        (error "native recovery control differs from its immutable base checkpoint"))
+      (when (> insertion 1)
+        (native-control-manifest-file
+         manifest (concatenate 'string "pg_wal/" (timeline-history-filename insertion))
+         (* 16 1024 1024))
+        (physical-promotion-check-child-control insertion checkpoint-timeline))))
+  (values))
+
 (defun native-control-recovery-checkpoint (control snapshot)
   "Select the authenticated source checkpoint for recovery control.
 Ordinary recovery may use the base copy. Pending promotion requires its exact
@@ -126,8 +163,9 @@ archive without registering it or changing files."
     (recovery-check-manifest-schema manifest)
     (unless (and (every (lambda (key) (eql (getf control key) (getf manifest key)))
                         '(:system-id :timeline :checkpoint))
-                 (= digest (getf control :manifest-digest)))
+                 (or (eql 0 (getf control :phase)) (= digest (getf control :manifest-digest))))
       (error "recovery control differs from its base manifest"))
+    (native-control-check-recovery-base control manifest snapshot)
     (setf (getf manifest :manifest-digest) digest)
     (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read manifest)
       (declare (ignore catalog prefix))
@@ -158,10 +196,12 @@ from recovery control. Report checkpoint starts, though WAL control stores ends.
            (state (getf metadata :db-state))
            (time (getf metadata :state-time))
            (recovery-lsn 0) (recovery-timeline 0))
+      (when (and (null control)
+                 (or (third capture) (fourth capture) (fifth capture) (seventh capture)))
+        (error "native recovery metadata is incomplete: recovery control is missing"))
       (cond
         ((and (or (> insertion 1) (getf metadata :retained-reference))
-              (not (and control (eql 3 (getf control :phase))
-                        (eql insertion (getf control :timeline)))))
+              (not (native-control-recovery-role-p control insertion)))
          (multiple-value-bind (checked history)
              (physical-promotion-check-child-control insertion checkpoint-id)
            (declare (ignore checked))
@@ -176,13 +216,11 @@ from recovery control. Report checkpoint starts, though WAL control stores ends.
                state (getf control :db-state) time (getf control :state-time)
                system-id (getf control :system-id)
                recovery-lsn (getf control :applied)
-               recovery-timeline (getf control :timeline)))
-        ((or (third capture) (fourth capture))
-         (error "native recovery metadata is incomplete")))
+               recovery-timeline (getf control :applied-timeline (getf control :timeline)))))
       (list :system-id system-id :db-state state :state-time time
             :checkpoint (if snapshot (getf snapshot :start)
                             (max 0 (- checkpoint +wal-header-size+)))
-            :checkpoint-timeline checkpoint-id :snapshot snapshot
+            :checkpoint-timeline (if snapshot (getf snapshot :timeline) checkpoint-id) :snapshot snapshot
             :recovery-lsn recovery-lsn :recovery-timeline recovery-timeline))))
 
 (defun native-control-read (directory)

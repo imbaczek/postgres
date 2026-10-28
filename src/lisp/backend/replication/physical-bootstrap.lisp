@@ -20,6 +20,12 @@ Malformed control is an error, not permission to fall back to primary startup."
 Nonpending standby control requires recovery validation. A pending request is
 reconciled against parent or committed child control. Return :PRIMARY-READY
 when pending completion already initialized storage. Invalid proof is an error."
+  (when (and (not (wal-namespace-file-stat (physical-recovery-control-path) t))
+             (or (wal-namespace-file-stat (merge-pathnames "recovery.required" *pgdata*) t)
+                 (wal-namespace-file-stat (merge-pathnames "physical-backup.manifest" *pgdata*) t)
+                 (wal-namespace-file-stat (merge-pathnames "physical-follow.control" *pgdata*) t)
+                 (wal-namespace-file-stat (merge-pathnames "physical-restartpoint.control" *pgdata*) t)))
+    (error "recovery metadata is incomplete: recovery control is missing"))
   (cond
     ((physical-bootstrap-standby-control-p) (physical-recovery-prepare) (values))
     ((physical-promotion-startup-primary-p) (values))
