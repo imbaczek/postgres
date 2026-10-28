@@ -82,11 +82,11 @@ A malformed response or transport failure requires the caller to close the clien
   "Signal a streaming source error immediately; the caller must close the client."
   (error (pg-client-native-error-condition payload)))
 
-(defun pg-client-native-read-row (client schema tag &key (maximum 4096) first-frame)
-  "Read one non-null typed row in description, data, completion, ready order.
+(defun pg-client-native-read-result (client schema tag &key (maximum 4096) first-frame command-only)
+  "Read one checked native result, optionally without a row.
 Allow notices and parameter status between frames. Reject extra or malformed
 results; a protocol or transport failure requires the caller to close the client."
-  (let ((state :description) (columns nil) (row nil))
+  (let ((state (if command-only :complete :description)) (columns nil) (row nil))
     (loop
       (multiple-value-bind (type payload)
           (if first-frame (values-list (prog1 first-frame (setf first-frame nil)))
@@ -125,10 +125,10 @@ results; a protocol or transport failure requires the caller to close the client
 
 (defun pg-client-native-switch (client &optional first-frame)
   "Read a typed next-child and fork result at START or after streaming."
-  (let* ((row (pg-client-native-read-row client
-                                         (list (list "next_tli" +int8oid+)
-                                               (list "next_tli_startpos" +textoid+))
-                                         "START_STREAMING" :first-frame first-frame))
+  (let* ((row (pg-client-native-read-result client
+                                            (list (list "next_tli" +int8oid+)
+                                                  (list "next_tli_startpos" +textoid+))
+                                            "START_STREAMING" :first-frame first-frame))
          (next (pg-client-native-u64 (aref row 0) t))
          (fork (pg-client-native-lsn (aref row 1))))
     (unless (> next 1) (pg-client-native-reject "native switch does not name a child timeline"))
@@ -176,7 +176,7 @@ must compare the history with the source anchor."
   (unless (typep timeline '(integer 2 4294967295))
     (error "native history request requires a child timeline"))
   (pg-client-send-query client (format nil "TIMELINE_HISTORY ~d" timeline))
-  (let* ((row (pg-client-native-read-row
+  (let* ((row (pg-client-native-read-result
                client (list (list "filename" +textoid+) (list "content" +textoid+))
                "TIMELINE_HISTORY" :maximum +physical-client-proof-frame-maximum+))
          (bytes (string->bytes (aref row 1))))
@@ -225,8 +225,8 @@ perform network I/O under recovery quiescence."
                                collect (list name (if (eq kind :timeline) +int8oid+ +textoid+)))
                          (list (list "history" +textoid+) (list "next_tli" +int8oid+)
                                (list "next_tli_startpos" +textoid+) (list "eor_hex" +textoid+))))
-         (row (pg-client-native-read-row client schema "PREPARE_FOLLOW"
-                                         :maximum +physical-client-proof-frame-maximum+))
+         (row (pg-client-native-read-result client schema "PREPARE_FOLLOW"
+                                            :maximum +physical-client-proof-frame-maximum+))
          (anchor (append (copy-tree coordinates)
                          (list :history-text (aref row 11) :eor-octets (pg-client-native-eor (aref row 14))))))
     (unless (<= 1 (length (string->bytes (aref row 11))) +physical-store-history-maximum-bytes+)
@@ -246,3 +246,13 @@ perform network I/O under recovery quiescence."
       (pg-client-error (condition) (error condition))
       (error () (pg-client-native-reject "native preparation returned an invalid source anchor")))
     anchor))
+
+(defun pg-client-native-release (client slot expected-digest)
+  (unless (and (wal-valid-replication-slot-name-p slot)
+               (typep expected-digest '(unsigned-byte 64)))
+    (error "invalid native follow retirement identity"))
+  (pg-client-send-query
+   client (format nil "RELEASE_FOLLOW SLOT ~a (native_format '~a', anchor_digest '~d')"
+                  slot +physical-native-format+ expected-digest))
+  (pg-client-native-read-result client nil "RELEASE_FOLLOW" :command-only t)
+  t)

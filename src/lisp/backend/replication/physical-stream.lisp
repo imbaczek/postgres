@@ -124,6 +124,38 @@ Reject unknown, duplicate or missing options before preparing a pin."
       (physical-follow-prepare-request command)
       command)))
 
+(defun parse-native-physical-release (words)
+  (unless (and (>= (length words) 4) (string-equal (second words) "SLOT"))
+    (ereport "42601" "expected RELEASE_FOLLOW SLOT name (native options)"))
+  (let* ((name (replication-command-identifier (third words)))
+         (options (parse-replication-generic-options (nthcdr 3 words))))
+    (unless (wal-valid-replication-slot-name-p name)
+      (ereport "42602" "invalid physical follow pin name"))
+    (unless (and (= 2 (length options))
+                 (every (lambda (key) (= 1 (count key options :key #'car :test #'equal)))
+                        '("native_format" "anchor_digest")))
+      (ereport "0A000" "RELEASE_FOLLOW requires exactly the negotiated anchor identity"))
+    (let ((command (make-logical-replication-command
+                    :type :physical-release :slot-name name :options options)))
+      (unless (equal +physical-native-format+ (physical-stream-option command "native_format"))
+        (ereport "0A000" "unsupported native physical WAL format"))
+      (physical-stream-u64 (physical-stream-option command "anchor_digest"))
+      command)))
+
+(defun release-native-physical-follow (stream command)
+  (handler-case
+      (progn
+        (with-live-operation
+          (physical-source-follow-release
+           (logical-replication-command-slot-name command)
+           (physical-stream-u64 (physical-stream-option command "anchor_digest"))))
+        (with-live-operation
+          (send-command-complete stream "RELEASE_FOLLOW")
+          (send-ready-for-query stream (transaction-status-char))))
+    (wal-input-validation-error (condition) (ereport "55000" "~a" condition))
+    (pg-error (condition) (error condition))
+    (error (condition) (ereport "XX000" "physical follow release failed: ~a" condition))))
+
 (defun physical-follow-prepare-row (command)
   "Prepare and recheck a live ready pin, then copy its source-owned result.
 WAL input validation errors report 55000; preserve PostgreSQL errors and report

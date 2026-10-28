@@ -282,7 +282,7 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
 Database walsenders fall back to SQL for a leading comment or empty statement."
   (simple-query-payload-starts-with-word-p
    payload '("IDENTIFY_SYSTEM" "CREATE_REPLICATION_SLOT" "DROP_REPLICATION_SLOT"
-             "START_REPLICATION" "READ_REPLICATION_SLOT" "TIMELINE_HISTORY" "PREPARE_FOLLOW"
+             "START_REPLICATION" "READ_REPLICATION_SLOT" "TIMELINE_HISTORY" "PREPARE_FOLLOW" "RELEASE_FOLLOW"
              "BASE_BACKUP" "UPLOAD_MANIFEST" "ALTER_REPLICATION_SLOT" "SHOW")
    (and payload (or (position 0 payload) (length payload))) nil))
 

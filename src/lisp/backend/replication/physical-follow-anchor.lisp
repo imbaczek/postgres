@@ -267,3 +267,43 @@ ambiguous READY save is not reported as a reseed request."
                            "physical follow source WAL is unavailable; reseed is required: ~a"
                            condition))))))))
     (physical-source-follow-ready name anchor)))
+
+(defun physical-source-follow-release (name expected-digest)
+  (prevent-recovery-primary-operation "physical follow pin release")
+  (unless (wal-valid-replication-slot-name-p name)
+    (ereport "42602" "invalid physical follow pin name"))
+  (unless (typep expected-digest '(unsigned-byte 64))
+    (ereport "22023" "invalid physical follow anchor digest"))
+  (let ((result
+          (with-write-lock
+            (with-wal-critical
+              (let* ((pin (gethash name *physical-source-pins*))
+                     (path (physical-source-pin-path name))
+                     (present (wal-namespace-file-stat path t)))
+                (cond
+                  ((and (null pin) (null present))
+                   (when (uiop:directory-exists-p (physical-source-pin-directory))
+                     (fsync-directory (physical-source-pin-directory)))
+                   :absent)
+                  ((or (null pin) (null present))
+                   (wal-invalid-input "physical follow registry and durable pin disagree"))
+                  ((gethash name *physical-source-senders*) :busy)
+                  ((not (and (physical-follow-pin-p pin) (physical-follow-pin-ready-p pin)))
+                   (wal-invalid-input "release requires a ready physical follow pin"))
+                  (t
+                   (let* ((bytes (read-bounded-regular-file path (physical-follow-pin-image-limit)))
+                          (disk (progn
+                                  (unless (physical-follow-pin-image-p bytes)
+                                    (wal-invalid-input "durable pin is not a physical follow pin"))
+                                  (physical-follow-pin-decode bytes))))
+                     (unless (and (physical-follow-pin-p disk) (physical-follow-pin-ready-p disk)
+                                  (equal name (physical-source-pin-name pin))
+                                  (= expected-digest
+                                     (physical-follow-anchor-digest (physical-follow-pin-anchor pin))
+                                     (physical-follow-anchor-digest (physical-follow-pin-anchor disk)))
+                                  (equal (physical-follow-pin-payload pin) (physical-follow-pin-payload disk)))
+                       (wal-invalid-input "physical follow release differs from the saved anchor or durable pin"))
+                     (physical-source-pin-unlink pin)
+                     :released))))))))
+    (when (eq result :busy) (ereport "55006" "physical follow pin has an active sender"))
+    result))

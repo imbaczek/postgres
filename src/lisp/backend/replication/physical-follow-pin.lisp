@@ -82,6 +82,11 @@ which may differ from the source's retained archive base and manifest."
                            (cons (copy-list value))
                            (t value)))))
 
+(defun physical-follow-anchor-digest (anchor)
+  (physical-store-update-digest
+   #xCBF29CE484222325
+   (string->bytes (physical-bootstrap-manifest-text (physical-follow-anchor-copy anchor)))))
+
 (defun physical-follow-pin-ready-p (pin)
   "Return whether PIN reached the ready stage; retention may since have been lost."
   (and (physical-follow-pin-p pin) (eq :ready (physical-follow-pin-stage pin))))

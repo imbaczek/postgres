@@ -180,6 +180,8 @@
 
 (declaim (ftype function parse-native-physical-prepare prepare-native-physical-follow))
 
+(declaim (ftype function parse-native-physical-release release-native-physical-follow))
+
 (defun parse-timeline-history-command (words)
   (unless (and (= (length words) 2) (plusp (length (second words)))
                (every (lambda (character) (find character "0123456789")) (second words)))
@@ -203,6 +205,7 @@
         :type :show :options (list (cons "name" (replication-command-identifier (second words))))))
       ((equal verb "TIMELINE_HISTORY") (parse-timeline-history-command words))
       ((equal verb "PREPARE_FOLLOW") (parse-native-physical-prepare words))
+      ((equal verb "RELEASE_FOLLOW") (parse-native-physical-release words))
       ((equal verb "CREATE_REPLICATION_SLOT") (parse-create-replication-slot words))
       ((equal verb "DROP_REPLICATION_SLOT")
        (unless (or (= (length words) 2)
@@ -990,12 +993,13 @@ keepalive's WAL-end field, which may include changes not yet applied."
              (eq (logical-replication-command-snapshot-action command) :export)
              (backend-explicit *backend*))
     (ereport "25001" "EXPORT_SNAPSHOT cannot run inside a transaction block"))
-  (when (and (member (logical-replication-command-type command) '(:start :physical-start :physical-prepare :timeline-history))
+  (when (and (member (logical-replication-command-type command) '(:start :physical-start :physical-prepare :physical-release :timeline-history))
              (backend-explicit *backend*))
     (ereport "25001" "~a cannot run inside a transaction block"
              (case (logical-replication-command-type command)
                (:timeline-history "TIMELINE_HISTORY")
                (:physical-prepare "PREPARE_FOLLOW")
+               (:physical-release "RELEASE_FOLLOW")
                (otherwise "START_REPLICATION")))))
 
 (defun handle-replication-query-frame (stream type-byte length-bytes payload)
@@ -1031,6 +1035,7 @@ keepalive's WAL-end field, which may include changes not yet applied."
             (:drop (drop-replication-slot-command stream command))
             (:physical-start (start-native-physical-replication stream command))
             (:physical-prepare (prepare-native-physical-follow stream command))
+            (:physical-release (release-native-physical-follow stream command))
             (:start
              (start-logical-replication
               stream (logical-replication-command-slot-name command)

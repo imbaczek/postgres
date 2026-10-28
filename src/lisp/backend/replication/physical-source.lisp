@@ -281,6 +281,17 @@ Publish the in-memory binding only after saving the candidate pin."
      *physical-source-pins*))
   (values))
 
+(defun physical-source-pin-unlink (pin)
+  (let ((name (physical-source-pin-name pin)))
+    (let ((path (physical-source-pin-path name)))
+      (physical-source-pin-test-point :before-release-unlink pin)
+      (when (probe-file path) (delete-file path))
+      (physical-source-pin-test-point :after-release-unlink pin)
+      (fsync-directory (physical-source-pin-directory))
+      (physical-source-pin-test-point :after-release-directory-fsync pin))
+    (remhash pin *wal-snapshot-retention-pins*)
+    (remhash name *physical-source-pins*)))
+
 (defun physical-source-pin-release (name)
   "Durably remove a source pin before allowing checkpoint WAL recycling."
   (prevent-recovery-primary-operation "physical source pin release")
@@ -292,9 +303,5 @@ Publish the in-memory binding only after saving the candidate pin."
         (unless pin (wal-invalid-input "physical source pin ~a does not exist" name))
         (when (gethash name *physical-source-senders*)
           (wal-invalid-input "physical source pin ~a has an active sender" name))
-        (let ((path (physical-source-pin-path name)))
-          (when (probe-file path) (delete-file path))
-          (fsync-directory (physical-source-pin-directory)))
-        (remhash pin *wal-snapshot-retention-pins*)
-        (remhash name *physical-source-pins*))))
+        (physical-source-pin-unlink pin))))
   (values))
