@@ -272,12 +272,13 @@ PGDATA and root protection and supplies independently verified base and binding.
 The caller must own PGDATA and a root lease, hold recovery quiescence, and supply
 an independently verified immutable base and durable binding. CANDIDATE is a
 disposable store copy with no streams; it shares the original store's mutex, so
-do not hold that mutex while calling. This has no production caller.
+do not hold that mutex while calling. The private pending reconciler uses it.
 
-Read and validate the actual restartpoint before scanning. Check clean required,
-applied and fork boundaries, selected EOR, initialization, allocation and source
-membership. The XID value at required may differ from that at the fork. When the
-required point precedes the seed, durable provenance must establish it and the
+Read and validate the actual restartpoint before scanning. Check clean required
+and applied boundaries, selected EOR, initialization, allocation and source
+membership. A completed fork must be clean; catch-up before the fork may end
+with an open batch. The XID value at required may differ from that at the fork.
+When the required point precedes the seed, durable provenance must establish it and the
 seed's next XID must be at least the witness value. The scan performs no writes,
 redo or publication. An error may latch CANDIDATE failed, not the original store."
   (physical-follow-binding-check binding)
@@ -352,6 +353,9 @@ redo or publication. An error may latch CANDIDATE failed, not the original store
             :required-next-xid required-next :reservation reservation :source-xids source-xids))))
 
 (defun physical-follow-pending-recovery-position (base binding control)
+  "Match durable recovery provenance, required pair and XID to the witness.
+Return whether the history reference is the saved old or proposed post state;
+reject any other state."
   (let* ((witness (getf binding :recovery))
          (required (getf binding :required))
          (before (getf binding :before))
@@ -374,12 +378,19 @@ redo or publication. An error may latch CANDIDATE failed, not the original store
           (t (error "pending follow has an unrelated recovery history reference")))))
 
 (defun physical-follow-copy-replay-candidate (store)
+  "Copy STORE for validation without taking ownership of its streams or lock.
+The copy shares STORE's mutex and may be latched failed independently."
   (let ((candidate (copy-physical-store store)))
     (setf (physical-store-stream candidate) nil
           (physical-store-lock-stream candidate) nil)
     candidate))
 
 (defun physical-follow-check-pending-state (store verified-base config)
+  "Validate a saved pending binding against durable recovery and receive state.
+Accept only the saved old or post receive tuple; post recovery with old receive
+is invalid. Check the actual restartpoint and scan a disposable candidate
+outside the store mutex, then recheck control and config for changes.
+The caller must exclude recovery and reload and protect the selected root."
   (physical-follow-check-config config)
   (unless (and (= 5 (length config)) (eq :pending (getf (fifth config) :phase))
                (equal config (physical-follow-read-config)))
@@ -415,12 +426,16 @@ redo or publication. An error may latch CANDIDATE failed, not the original store
       (error "pending follow durable witnesses changed during validation"))
     (values candidate position control)))
 
-(defvar *physical-follow-test-hook* nil)
+(defvar *physical-follow-test-hook* nil
+  "Optional test hook for reconciliation and config publication cuts.")
 
 (defun physical-follow-test-point (point)
+  "Invoke the optional test hook at a reconciliation or config publication cut."
   (when *physical-follow-test-hook* (funcall *physical-follow-test-hook* point)))
 
 (defun physical-follow-check-history-files (store binding)
+  "Preflight published history files, including the proposed immediate child.
+Reject conflicting bytes or changes to immutable base ancestry before mutation."
   (labels ((check-file (target text)
              (let ((path (timeline-history-path target *pgdata*)))
                (when (wal-namespace-file-stat path t)
@@ -439,6 +454,8 @@ redo or publication. An error may latch CANDIDATE failed, not the original store
                   (getf binding :child-history)))))
 
 (defun physical-follow-publish-pending-recovery (base binding)
+  "Publish the required recovery pair and witnessed XID with the selected history.
+Read control back and verify the resulting history and recovery provenance."
   (let* ((state (copy-tree base)) (required (getf binding :required))
                                   (witness (getf binding :recovery)) (after (getf binding :after))
                                   (rewind (not (equal (getf binding :before) after)))
@@ -459,6 +476,12 @@ redo or publication. An error may latch CANDIDATE failed, not the original store
       control)))
 
 (defun physical-follow-reconcile-pending-store (store verified-base config)
+  "Reconcile a pending binding under caller-owned recovery and reload exclusion.
+Protect a retained root with a reader lease. Preflight the candidate and history
+before mutation, then publish receive state, history files, recovery control and
+active config in order, with readbacks.
+A failure after mutation begins latches STORE failed; reopen to resolve durable
+state. The active config is not yet admitted by startup or a bound client."
   (labels ((reconcile ()
              (let ((started nil) (finished nil))
                (unwind-protect
@@ -504,6 +527,10 @@ redo or publication. An error may latch CANDIDATE failed, not the original store
         (reconcile))))
 
 (defun physical-follow-reconcile-pending-offline ()
+  "Reconcile a saved pending binding privately before storage or workers start.
+Require owned PGDATA and exclude reload and live operations. Open and close a
+temporary store without contacting the source, running redo or installing runtime
+state. An active result does not yet make a bound service restartable."
   (unless (and *postmaster-data-lock* (postmaster-pid-owned-p)
                (zerop *live-operation-depth*) (not *wal-ready*)
                (not *physical-receive-store*) (not *physical-follow-runtime*)
@@ -548,7 +575,8 @@ A valid binding does not authorize starting a bound receiver."
     bytes))
 
 (defun physical-follow-save-config (config)
-  "Atomically write a checked config image."
+  "Atomically write a checked config image.
+Optional test hooks mark fsync, rename and directory-sync cuts."
   (let ((path (physical-follow-config-path)) (bytes (physical-follow-config-image config)))
     (with-atomic-output
         (stream path (make-pathname :type "tmp" :defaults path) *pgdata*

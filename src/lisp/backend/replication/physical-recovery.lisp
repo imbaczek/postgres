@@ -474,7 +474,8 @@ A nonpending standby cannot fall back to primary startup when validation fails."
 (declaim (ftype function physical-follow-check-startup-config))
 
 (defun physical-recovery-verify-base-with-namespace ()
-  "Verify recovery base provenance and return state and durable control without publication."
+  "Verify base provenance in the selected namespace without publishing control.
+Return the reconstructed state and durable control; do not install runtime state."
   (physical-recovery-check-required-marker)
   (let ((control (physical-recovery-read-control *pgdata*)))
     ;; Pending control must never fall through the ordinary phase rewrite/redo path.
@@ -526,6 +527,7 @@ A nonpending standby cannot fall back to primary startup when validation fails."
       (values manifest control))))
 
 (defun physical-recovery-verify-base-state ()
+  "Read the WAL namespace and verify the base without changing recovery state."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace)
       (wal-read-control-fields)
     (declare (ignore checkpoint durable snapshot))
@@ -537,6 +539,8 @@ A nonpending standby cannot fall back to primary startup when validation fails."
         (values state control)))))
 
 (defun physical-recovery-prepare-with-namespace ()
+  "Reject a follow binding and verify the base before ordinary startup.
+Publish dirty recovery control before installing state and allowing redo."
   (physical-recovery-check-required-marker)
   (physical-follow-check-startup-config)
   (let ((manifest (physical-recovery-verify-base-with-namespace)))
@@ -564,8 +568,8 @@ A nonpending standby cannot fall back to primary startup when validation fails."
 
 (defun physical-recovery-open-storage ()
   "Open verified recovery; phase 2 redoes its entire retained prefix before SQL.
-Reject a saved follow binding before storage changes, attachment or redo; its
-reconciler and bound receiver are not yet implemented."
+Reject both saved follow binding phases before storage changes, attachment or
+redo; startup integration and the bound receiver remain unavailable."
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
   (physical-follow-check-startup-config)
   (let ((streaming (= 2 (getf *physical-recovery-state* :phase))))
