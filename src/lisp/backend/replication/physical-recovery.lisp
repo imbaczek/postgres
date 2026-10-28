@@ -621,5 +621,6 @@ redo; startup integration and the bound receiver remain unavailable."
     (unless streaming
       (setf *clog-stream* (open (clog-path) :element-type '(unsigned-byte 8)
                                             :direction :input :if-does-not-exist :error)))
+    (wal-load-replication-slots)
     (catalog-refresh-oldest-relfrozenxid))
   (values))

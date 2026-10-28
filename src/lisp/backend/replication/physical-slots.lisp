@@ -24,11 +24,7 @@ restart LSN and timeline. A null restart or lost slot does not retain WAL."
          (member (wal-replication-slot-temporary-p slot) '(nil t))
          (typep (wal-replication-slot-inactive-since slot) '(signed-byte 64)))))
 
-(defun physical-slot-check-retained-range (slot system-id history frontier read-segment)
-  "Check exact system identity and restart position against source history.
-A reserved restart may be inside a segment; require coverage through FRONTIER
-and validate native record placement across segment gaps. Null or lost slots
-need no WAL read. READ-SEGMENT supplies the selected lineage."
+(defun physical-slot-check-position (slot system-id history frontier)
   (unless (and (physical-slot-state-valid-p slot)
                (eql system-id (wal-replication-slot-system-id slot))
                (typep frontier '(unsigned-byte 64)))
@@ -40,6 +36,15 @@ need no WAL read. READ-SEGMENT supplies the selected lineage."
                    (timeline-prefix-boundary-p
                     (wal-replication-slot-restart-timeline slot) restart history))
         (error "physical slot restart is outside durable source history"))
+      restart)))
+
+(defun physical-slot-check-retained-range (slot system-id history frontier read-segment)
+  "Check exact system identity and restart position against source history.
+A reserved restart may be inside a segment; require coverage through FRONTIER
+and validate native record placement across segment gaps. Null or lost slots
+need no WAL read. READ-SEGMENT supplies the selected lineage."
+  (let ((restart (physical-slot-check-position slot system-id history frontier)))
+    (when restart
       (when (< restart frontier)
         (let ((previous-end nil)
               (previous-bytes nil)
@@ -81,6 +86,120 @@ Eligible ancestor segments may satisfy a public physical slot."
        (lambda (segment cursor)
          (physical-source-lineage-segment system-id timeline history segment cursor t))))))
 
+(defun physical-slot-check-receive-chain (store index replay)
+  (let* ((history (physical-store-retained-history store))
+         (cursor (physical-store-base-lsn store))
+         (digest #xCBF29CE484222325)
+         (floor (physical-store-floor-lsn store))
+         (floor-seen (= cursor floor))
+         (replay-seen (= cursor replay)))
+    (when (and floor-seen (/= digest (physical-store-floor-digest store)))
+      (error "physical slot receive floor has an invalid base digest"))
+    (physical-follow-map-active-prefix
+     store index
+     (lambda (record raw)
+       (unless (= cursor (wal-record-start record))
+         (wal-lineage-check-gap cursor record history))
+       (setf cursor (wal-record-end record)
+             digest (physical-store-update-digest digest raw))
+       (when (= cursor replay) (setf replay-seen t))
+       (when (= cursor floor)
+         (unless (= digest (physical-store-floor-digest store))
+           (error "physical slot archive and receive floor digests differ"))
+         (setf floor-seen t))
+       (when (and (> cursor floor) (not floor-seen))
+         (error "physical slot archive skipped the receive floor")))
+     (physical-store-base-lsn store))
+    (unless (and floor-seen replay-seen
+                 (= cursor (physical-store-flushed-lsn store))
+                 (= digest (physical-store-flushed-digest store)))
+      (error "physical slot WAL does not reach its replay and durable receive boundaries"))
+    t))
+
+(defun physical-slot-check-standby-control (state system-id replay)
+  (let ((control (physical-recovery-read-control *pgdata*)))
+    (unless (and (member (getf state :phase) '(1 2))
+                 (eql (getf state :phase) (getf control :phase))
+                 (eql system-id (getf state :system-id))
+                 (every (lambda (key) (eql (getf state key) (getf control key)))
+                        '(:system-id :timeline :manifest-digest :checkpoint))
+                 (typep replay '(unsigned-byte 64))
+                 (<= (getf state :end) replay)
+                 (<= (getf control :applied) replay))
+      (error "physical slot standby identity or replay differs from durable recovery"))
+    control))
+
+(defun physical-slot-check-standby-overlap (state restarts)
+  (multiple-value-bind (bytes entry)
+      (physical-recovery-read-base-overlap state *pgdata*)
+    (declare (ignore entry))
+    (let ((origin (- (getf state :end) (length bytes))))
+      (unless (every (lambda (restart) (>= restart origin)) restarts)
+        (error "physical slot restart precedes the immutable standby overlap")))))
+
+(defun physical-slot-check-standby-receive (store state replay)
+  (unless (and (eql (physical-store-system-id store) (getf state :system-id))
+               (eql (physical-store-timeline store) (getf state :timeline))
+               (eql (physical-store-base-lsn store) (getf state :end))
+               (equal (physical-store-retained-identity store)
+                      (physical-recovery-retained-identity state))
+               (<= replay (physical-store-flushed-lsn store)))
+    (error "physical slot receive store differs from its immutable recovery base"))
+  (let* ((tuple (physical-store-control-tuple store))
+         (candidate (physical-follow-copy-checked-store store))
+         (index (physical-follow-controller-index candidate)))
+    (physical-recovery-check-store-point candidate replay (physical-recovery-replay-timeline state))
+    (physical-slot-check-receive-chain candidate index replay)
+    (unless (equal tuple (physical-store-control-tuple store))
+      (error "physical slot receive state changed during validation"))
+    (physical-store-read-retained-control store tuple))
+  t)
+
+(defun physical-slot-check-standby-slots (slots system-id)
+  (unless (recovery-in-progress-p)
+    (error "physical slot standby validation requires verified recovery"))
+  (let* ((state (copy-tree *physical-recovery-state*))
+         (replay *last-replay-lsn*)
+         (control (physical-slot-check-standby-control state system-id replay))
+         (store *physical-receive-store*)
+         (history (if store (physical-store-retained-history store)
+                      (timeline-check-lineage
+                       (timeline-parse-history
+                        (getf state :timeline)
+                        (if (= 1 (getf state :timeline)) ""
+                            (bytes->string (timeline-history-bytes (getf state :timeline))))))))
+         (restarts (remove nil (mapcar
+                                (lambda (slot)
+                                  (physical-slot-check-position slot system-id history replay))
+                                slots))))
+    (unless (eq (not (null store)) (= 2 (getf state :phase)))
+      (error "physical slot recovery phase differs from receive storage"))
+    (unless
+        (if store
+            (and (<= (physical-store-base-lsn store) (getf control :applied)
+                     replay (physical-store-flushed-lsn store))
+                 (eql (physical-recovery-replay-timeline state)
+                      (physical-store-prefix-timeline store replay))
+                 (eql (getf control :applied-timeline (getf control :timeline))
+                      (physical-store-prefix-timeline store (getf control :applied))))
+            (and (= replay (getf state :end))
+                 (eql (physical-recovery-replay-timeline state) (getf state :timeline))
+                 (eql (getf control :applied-timeline (getf control :timeline))
+                      (getf state :timeline))))
+      (error "physical slot standby replay pair differs from its durable receive history"))
+    (when restarts
+      (physical-slot-check-standby-overlap state restarts)
+      (if store
+          (physical-follow-call-with-receive-root
+           store (lambda () (physical-slot-check-standby-receive store state replay)))
+          (unless (= replay (getf state :end))
+            (error "physical slot recovery beyond base requires a durable receive store"))))
+    (unless (and (equalp state *physical-recovery-state*)
+                 (= replay *last-replay-lsn*)
+                 (equalp control (physical-recovery-read-control *pgdata*)))
+      (error "physical slot recovery witnesses changed during validation")))
+  t)
+
 (defun physical-slot-startup-system-id ()
   "Read the durable catalog identity for slot restoration. Primary slot loading
 precedes catalog initialization, so startup must not invent an identity."
@@ -92,7 +211,7 @@ precedes catalog initialization, so startup must not invent an identity."
       (error "physical slot startup cannot invent a missing cluster identity"))
     (catalog-system-identifier catalog)))
 
-(defun physical-slot-restore-primary (slot inactive-since)
+(defun physical-slot-restore (slot inactive-since)
   "Remove temporary slots at startup; validate persistent slots before admitting
 retention and set their new inactive timestamp."
   (cond
@@ -100,7 +219,8 @@ retention and set their new inactive timestamp."
      (wal-delete-replication-slot-file (wal-replication-slot-name slot))
      nil)
     (t
-     (physical-slot-check-primary-wal slot (physical-slot-startup-system-id))
+     (unless (recovery-in-progress-p)
+       (physical-slot-check-primary-wal slot (physical-slot-startup-system-id)))
      (setf (wal-replication-slot-inactive-since slot) inactive-since)
      slot)))
 

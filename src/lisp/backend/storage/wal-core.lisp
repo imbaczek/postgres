@@ -2465,7 +2465,7 @@ src/backend/access/transam/xlogreader.c."
                   (wal-replication-slot-plugin slot)
                   (or (wal-replication-slot-database-oid slot) +null+)))))
 
-(declaim (ftype function physical-slot-restore-primary))
+(declaim (ftype function physical-slot-restore physical-slot-check-standby-slots physical-slot-startup-system-id))
 
 (defun wal-load-replication-slots ()
   "Load durable slots before any checkpoint can recycle WAL.
@@ -2481,9 +2481,16 @@ Dispatch physical slots to their primary restoration and identity checks."
         (when (gethash name *wal-replication-slots*)
           (error "duplicate WAL replication slot ~a" name))
         (when (if (wal-physical-slot-p slot)
-                  (physical-slot-restore-primary slot inactive-since)
-                  (wal-validate-replication-slot-wal slot segments))
+                  (physical-slot-restore slot inactive-since)
+                  (progn
+                    (when (recovery-in-progress-p)
+                      (error "logical slot restoration during native recovery is unsupported"))
+                    (wal-validate-replication-slot-wal slot segments)))
           (setf (gethash name *wal-replication-slots*) slot))))
+    (when (and (recovery-in-progress-p) (plusp (hash-table-count *wal-replication-slots*)))
+      (physical-slot-check-standby-slots
+       (loop for slot being the hash-values of *wal-replication-slots* collect slot)
+       (physical-slot-startup-system-id)))
     (maphash (lambda (name slot)
                (declare (ignore name))
                (wal-slot-rebuild-progress slot))

@@ -187,10 +187,43 @@ sql "$PORT" "UPDATE data SET label='durable-paused-before-crash' WHERE id=1"
 restart_flush=$(sql "$PORT" 'SELECT pg_current_wal_flush_lsn()')
 wait_target "SELECT pg_last_wal_receive_lsn() >= '$restart_flush'::pg_lsn" t
 test "$(sql "$TARGET_PORT" 'SELECT label FROM data WHERE id=1')" = after-source-crash
+# Seed internal slot state to exercise cold standby restoration. Public SQL slot
+# creation is covered separately; this fixture tests the storage/startup path.
+sql "$TARGET_PORT" 'CHECKPOINT' >/dev/null
+checked target '(let* ((state *physical-recovery-state*)
+                       (identity (catalog-system-identifier))
+                       (owner (gensym "TEMPORARY-SLOT-FIXTURE"))
+                       (slot (make-wal-replication-slot
+                              :name "standby_startup_slot" :kind :physical
+                              :system-id identity :restart-lsn (getf state :end)
+                              :restart-timeline (getf state :timeline)
+                              :consistent-lsn nil :confirmed-flush-lsn nil :plugin nil))
+                       (temporary (make-wal-replication-slot
+                                   :name "standby_startup_temp" :kind :physical
+                                   :system-id identity :temporary-p t :temporary-owner owner
+                                   :active-owner owner :restart-lsn nil :restart-timeline nil
+                                   :consistent-lsn nil :confirmed-flush-lsn nil :plugin nil)))
+                  (assert (physical-store-retained-root *physical-receive-store*))
+                  (wal-ensure-directory-durable (wal-replication-slot-directory))
+                  (sb-thread:with-mutex (*wal-lock*)
+                    (wal-save-replication-slot slot)
+                    (wal-save-replication-slot temporary)
+                    (setf (gethash "standby_startup_slot" *wal-replication-slots*) slot
+                          (gethash "standby_startup_temp" *wal-replication-slots*) temporary)))' slot-fixtures
 kill -KILL "$TARGET"
 wait "$TARGET" 2>/dev/null || :
 TARGET=
 start_target
+checked target '(let ((slot (gethash "standby_startup_slot" *wal-replication-slots*)))
+                  (assert (wal-physical-slot-p slot))
+                  (assert (= (wal-replication-slot-restart-lsn slot)
+                             (getf *physical-recovery-state* :end)))
+                  (assert (= (wal-replication-slot-restart-timeline slot)
+                             (getf *physical-recovery-state* :timeline)))
+                  (assert (null (wal-replication-slot-active-owner slot)))
+                  (assert (plusp (wal-replication-slot-inactive-since slot)))
+                  (assert (null (gethash "standby_startup_temp" *wal-replication-slots*)))
+                  (assert (not (probe-file (wal-replication-slot-path "standby_startup_temp")))))' restored-slots
 test "$(sql "$TARGET_PORT" 'SELECT pg_get_wal_replay_pause_state()')" = 'not paused'
 wait_target "SELECT label FROM data WHERE id=1" durable-paused-before-crash
 sql "$PORT" "DELETE FROM data WHERE id=2; INSERT INTO data VALUES (4,'target-restart')"
