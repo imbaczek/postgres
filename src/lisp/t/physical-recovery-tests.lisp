@@ -358,6 +358,8 @@
              (pg::*relation-streams* (make-hash-table :test #'equal))
              (pg::*wal-page-cache* (make-hash-table :test #'equal))
              (pg::*wal-ready* nil)
+             (pg::*clog-stream* nil)
+             (pg::*active-xids* nil)
              (pg::*catalog* (pg::make-catalog))
              (pg::*backend* (pg::make-backend))
              (database (pg::make-database :name "postgres"))
@@ -385,6 +387,23 @@
                (ok (intake-fails-p (lambda () (pg::toast-fetch-value toast pointer snapshot))))
                (pg::register-active-snapshot snapshot registration)
                (ok (equalp bytes (pg::toast-fetch-value toast pointer snapshot)))
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (pg::with-write-lock
+                   (pg::toast-delete-value-unlocked toast pointer 43 1)
+                   (pg::toast-delete-value-unlocked toast pointer 43 1)
+                   (dolist (entry (pg::btree-prefix-entries-unlocked
+                                   (pg::pg-toast-index-relfilenode toast)
+                                   (pg::encode-index-key (list #xffffffff) '(:oid))))
+                     (let ((tuple (pg::heapam-get-tuple
+                                   (pg::pg-toast-relfilenode toast) (second entry) (third entry)
+                                   pg::*toast-chunk-columns* t)))
+                       (ok (= 43 (pg::htup-xmax tuple)))))))
+               (ok (equalp bytes (pg::toast-fetch-value toast pointer snapshot)))
+               (pg::clog-set 43 pg::+clog-aborted+)
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (pg::with-write-lock
+                   (pg::toast-delete-value-unlocked toast pointer 44 2)))
+               (ok (equalp bytes (pg::toast-fetch-value toast pointer snapshot)))
                (ok (intake-fails-p
                     (lambda ()
                       (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
@@ -409,6 +428,7 @@
                         (pg::with-write-lock
                           (pg::toast-store-value-unlocked toast bytes 44 43 0)))))))
           (pg::release-snapshot-registration registration)
+          (when pg::*clog-stream* (close pg::*clog-stream*))
           (pg::smgr-close-all)))))
 
 (deftest toast-fetch-skips-invalid-tuple-before-decoding

@@ -324,18 +324,12 @@ validating TOAST semantics. The result does not retain or own BYTES."
              :id-width width)
             end)))
 
-(defun toast-assemble-chunks (chunks size chunk-size &key (offset 0) (length (- size offset)))
-  "Copy a slice of a TOAST value from its selected, ordered CHUNKS.
-SIZE is the full value size in bytes, and CHUNK-SIZE is the full chunk
-capacity. CHUNKS is a proper list of (sequence . octet-vector) pairs covering
-exactly the chunks intersecting [OFFSET, OFFSET + LENGTH), in sequence order;
-a zero-length slice requires no chunks. OFFSET and LENGTH must be nonnegative
-and the slice must fit within SIZE. LENGTH defaults to the remainder of SIZE.
-Each chunk must have its full expected size, including the possibly shorter
-final chunk of the full value. Invalid bounds signal an error; malformed,
-missing, extra, out-of-order, or incorrectly sized chunks signal data corruption
-(SQLSTATE XX001). Return a fresh octet vector without modifying or retaining
-CHUNKS or its data vectors."
+(defun toast-assemble-chunks (chunks size chunk-size &key (offset 0) (length (- size offset))
+                                                       validate-only)
+  "Validate the selected TOAST chunks and return a fresh copy of the requested slice.
+CHUNKS contains ordered (sequence . octet-vector) pairs covering the slice.
+VALIDATE-ONLY performs the same bounds, sequence, octet and length checks,
+returns NIL, and does not allocate the result vector."
   (unless (and (typep size '(integer 0 1073741823))
                (typep chunk-size '(integer 1 *))
                (typep offset '(integer 0 *))
@@ -366,15 +360,16 @@ CHUNKS or its data vectors."
         (incf expected)))
     (unless (= expected (1+ last))
       (ereport "XX001" "missing TOAST chunk ~a" expected))
-    (let ((result (make-array length :element-type '(unsigned-byte 8))))
-      (dolist (chunk chunks)
-        (let* ((chunk-start (* (car chunk) chunk-size))
-               (copy-start (max offset chunk-start))
-               (copy-end (min (+ offset length) (+ chunk-start (length (cdr chunk))))))
-          (replace result (cdr chunk) :start1 (- copy-start offset)
-                                      :start2 (- copy-start chunk-start)
-                                      :end2 (- copy-end chunk-start))))
-      result)))
+    (unless validate-only
+      (let ((result (make-array length :element-type '(unsigned-byte 8))))
+        (dolist (chunk chunks)
+          (let* ((chunk-start (* (car chunk) chunk-size))
+                 (copy-start (max offset chunk-start))
+                 (copy-end (min (+ offset length) (+ chunk-start (length (cdr chunk))))))
+            (replace result (cdr chunk) :start1 (- copy-start offset)
+                                        :start2 (- copy-start chunk-start)
+                                        :end2 (- copy-end chunk-start))))
+        result))))
 
 (defun heap-inline-varlena-range (bytes offset)
   "Return inclusive start and exclusive end offsets into BYTES, without copying.

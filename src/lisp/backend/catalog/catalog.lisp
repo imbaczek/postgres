@@ -1562,6 +1562,53 @@ accepted; missing, misordered, or malformed chunks signal corruption."
                  (push (cons sequence (aref values 2)) chunks)))))
          (toast-assemble-chunks (nreverse chunks) size +toast-oid-chunk-size+))))))
 
+(defun toast-delete-value-unlocked (toast pointer xid cid)
+  "Mark the chunks referenced by POINTER deleted by XID and CID.
+The caller must own the parent tuple and hold the TOAST index writer lock,
+then the global write lock, throughout this call.  Readers must keep the
+parent tuple's snapshot active while fetching its external value; that snapshot
+protects the value's lifetime even after deletion.
+
+Validate the complete chunk sequence before marking any tuple.  An existing
+aborted XMAX is replaced; this XID's own XMAX is left unchanged, making a
+repeat deletion idempotent.  Any other nonzero XMAX signals a conflict.  If an
+error occurs after marking begins, the caller must abort the transaction so a
+partial deletion cannot commit."
+  (let* ((size (heap-external-varlena-external-info pointer))
+         (id (heap-external-varlena-value-id pointer))
+         (index-node (pg-toast-index-relfilenode toast))
+         (heap-node (pg-toast-relfilenode toast))
+         (chunks nil)
+         (tids nil))
+    (unless (and (= (heap-external-varlena-id-width pointer) 4)
+                 (= (heap-external-varlena-relation-id pointer) (pg-toast-oid toast))
+                 (typep size '(integer 1 1073741819))
+                 (= (heap-external-varlena-raw-size pointer) (+ size 4)))
+      (ereport "XX001" "invalid or compressed TOAST pointer"))
+    (when (< (buf-nblocks index-node) 2)
+      (ereport "XX001" "TOAST index is missing"))
+    (dolist (entry (btree-prefix-entries-unlocked
+                    index-node (encode-index-key (list id) '(:oid))))
+      (let ((tuple (heapam-get-tuple heap-node (second entry) (third entry)
+                                     *toast-chunk-columns* t)))
+        (when tuple
+          (let* ((values (htup-values tuple))
+                 (chunk-id (aref values 0))
+                 (sequence (aref values 1))
+                 (old-xmax (htup-xmax tuple)))
+            (unless (and (= chunk-id id)
+                         (equalp (first entry) (toast-chunk-key chunk-id sequence)))
+              (ereport "XX001" "TOAST index points to the wrong chunk"))
+            (unless (or (zerop old-xmax) (= old-xmax xid) (xid-aborted-p old-xmax))
+              (error "TOAST chunk is already being deleted"))
+            (push (cons sequence (aref values 2)) chunks)
+            (unless (= old-xmax xid) (push (cons (second entry) (third entry)) tids))))))
+    (toast-assemble-chunks (nreverse chunks) size +toast-oid-chunk-size+ :validate-only t)
+    (dolist (tid tids)
+      (unless (heapam-set-xmax heap-node (car tid) (cdr tid) xid cid)
+        (ereport "XX001" "TOAST chunk disappeared during deletion")))
+    (values)))
+
 (defun create-table* (db name columns)
   "COLUMNS is a list of plists with :name :type :typmod :notnull :primary,
 :unique, and :nulls-not-distinct. Returns the new pg-class."
