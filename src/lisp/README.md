@@ -248,6 +248,13 @@ also accept floating-point inputs; the explicitly numeric forms use numeric
 arithmetic. Logarithms reject zero and negative arguments, and a base of one,
 with SQLSTATE `2201E`. These functions return NULL when an argument is NULL.
 
+The catalog functions `float4abs(float4)` and `float8abs(float8)` share the
+corresponding `abs` implementation and return their argument type. The
+`float8` functions `dround`, `dtrunc`, `dsqrt`, `dexp`, `dlog1`, and
+`dlog10` each take one `float8` and return `float8`; they share execution with
+`round`, `trunc`, `sqrt`, `exp`, `ln`, and `log10`, respectively. These
+catalog names remain distinct function identities during expression analysis.
+
 Floating-point math also includes `pi`, `degrees`, `radians`, `cbrt`/`dcbrt`,
 `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`, and `atan2`; the
 degree-based variants are `sind`, `cosd`, `tand`, `cotd`, `asind`, `acosd`,

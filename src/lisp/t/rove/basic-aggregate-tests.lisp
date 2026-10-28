@@ -192,6 +192,29 @@
                     ("SELECT sign('NaN'::float8)::text" "0")))
       (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case))))
 
+(rove:deftest float-catalog-aliases
+    (dolist (case '(("SELECT float4abs('-2.5')::text" "2.5")
+                    ("SELECT float8abs(-2)::text" "2")
+                    ("SELECT dround(2.5)::text" "2")
+                    ("SELECT dtrunc(-1.9)::text" "-1")
+                    ("SELECT dsqrt(9)::text" "3")
+                    ("SELECT dexp(0)::text" "1")
+                    ("SELECT dlog1(1)::text" "0")
+                    ("SELECT dlog10(100)::text" "2")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case)))
+               (first case)))
+  (rove:ok (equal (list (list +null+)) (subquery-test-rows "SELECT dsqrt(NULL)")))
+  (dolist (case '(("SELECT float4abs(1::float8)" "42883")
+                  ("SELECT dsqrt(true)" "42883")
+                  ("SELECT dsqrt(-1)" "2201F")
+                  ("SELECT dlog1(0)" "2201E")
+                  ("SELECT DISTINCT dround(x) FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY round(x)" "42P10")
+                  ("SELECT DISTINCT round(x) FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY dround(x)" "42P10")))
+    (let ((condition (handler-case (progn (subquery-test-rows (first case)) nil)
+                       (pg-error (error) error))))
+      (rove:ok (and condition (string= (pg-error-sqlstate condition) (second case)))
+               (first case)))))
+
 (rove:deftest numeric-basic-function-errors
     (dolist (case '(("SELECT abs('-9223372036854775808'::bigint)"
                      "22003" "bigint out of range")

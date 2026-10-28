@@ -699,6 +699,21 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
              :type type :typmod -1)))
     (t (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))))
 
+(defun float-catalog-alias (name)
+  "Return the declared argument type and execution name for a float catalog function.
+Each listed function takes one argument and returns the same float type.  The
+execution name selects a shared implementation; analysis keeps the catalog name
+so expression identity remains distinct from the corresponding SQL function."
+  (cdr (assoc name '(("float4abs" :float4 "abs")
+                     ("float8abs" :float8 "abs")
+                     ("dround" :float8 "round")
+                     ("dtrunc" :float8 "trunc")
+                     ("dsqrt" :float8 "sqrt")
+                     ("dexp" :float8 "exp")
+                     ("dlog1" :float8 "ln")
+                     ("dlog10" :float8 "log10"))
+              :test #'string=)))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
@@ -730,6 +745,18 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
                   ((string= suffix "not") (list :unary "~" (first coerced) :type type :typmod -1))
                   (t (list :binop (cdr (assoc suffix '(("and" . "&") ("or" . "|") ("xor" . "#") ("shl" . "<<") ("shr" . ">>")) :test #'string=))
                            (first coerced) (second coerced) :type type :typmod -1)))))))
+    ;; These catalog names expose the same implementation as the SQL names,
+    ;; but each has a single declared float argument type.
+    (let ((alias (float-catalog-alias name)))
+      (when alias
+        (let ((type (first alias)))
+          (unless (and (= (length args) 1)
+                       (or (in-unknown-constant-p (first args))
+                           (sql-implicit-coercion-p (expr-type (first args)) type)))
+            (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+          (return-from analyze-function-expression
+            (list :func name (list (coerce-common-expression (first args) type))
+                  :type type :typmod -1)))))
     (cond
       ((member name '("random" "setseed") :test #'string=) (analyze-random-function name args))
       ((trig-function-p name) (analyze-trig-function name args))
@@ -2047,7 +2074,8 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
   (and (consp form)
        (or (eq (first form) :subplan)
            (and (eq (first form) :func)
-                (not (or (trig-function-p (second form))
+                (not (or (float-catalog-alias (second form))
+                         (trig-function-p (second form))
                          (numeric-arithmetic-function-p (second form))
                          (member (second form)
                                  '("version" "pg_lisp_runtime" "current_database" "current_schema"
@@ -2893,7 +2921,9 @@ aliases share the corresponding numeric operator implementation."
 
 (defun eval-analyzed-function (name arguments type)
   "Evaluate a resolved call using its coerced argument values and result type.
-Arguments have already been evaluated in order, including for strict calls."
+Arguments have already been evaluated in order, including for strict calls.
+Map float catalog names only here, after expression identity has been resolved."
+  (setf name (or (second (float-catalog-alias name)) name))
   (cond
     ((member name '("random" "setseed") :test #'string=)
      (eval-random-function name arguments type))
