@@ -203,6 +203,12 @@ and precision modifiers are supported. These are subsets of PostgreSQL's full
 type and operator catalog, not a promise that every input spelling or function
 is implemented.
 
+Basic numeric functions include `abs`, `numeric_abs`, `sign`, `round`,
+`trunc`, `ceil`/`ceiling`, and `floor`. `round` and `trunc` accept an optional
+integer scale for numeric values; negative scales act before the decimal point.
+Numeric rounding breaks ties away from zero, while floating-point rounding uses
+ties to even. These functions return NULL when an argument is NULL.
+
 DDL:
 
 ```sql

@@ -194,6 +194,53 @@
     (ereport "22003" "value overflows numeric format"))
   (make-sql-decimal coefficient scale))
 
+(defun sql-numeric-round-or-trunc (value scale round-p)
+  "Round or truncate a numeric at SCALE, retaining PostgreSQL display scale.
+Negative scales operate before the decimal point and produce display scale zero.
+Rounding ties go away from zero.  Clamp the scale as numeric.c does, with one
+extra integer digit allowed for rounding; special values pass through."
+  (when (sql-numeric-special-p value)
+    (return-from sql-numeric-round-or-trunc value))
+  (let* ((scale (max (if round-p -131073 -131072) (min scale 16383)))
+         (coefficient (sql-numeric-coefficient value))
+         (integer-digits (- (length (format nil "~d" (abs coefficient)))
+                            (sql-numeric-scale value))))
+    ;; A scale beyond all significant digits cannot round up.
+    (when (and (minusp scale) (> (- scale) integer-digits))
+      (return-from sql-numeric-round-or-trunc (sql-numeric-result 0 0))))
+  (let* ((scale (max (if round-p -131073 -131072) (min scale 16383)))
+         (scaled (* (sql-numeric-rational value) (expt 10 scale)))
+         (coefficient (if round-p
+                          (* (signum scaled) (floor (+ (abs scaled) 1/2)))
+                          (truncate scaled))))
+    (if (minusp scale)
+        (sql-numeric-result (* coefficient (expt 10 (- scale))) 0)
+        (sql-numeric-result coefficient scale))))
+
+(defun sql-numeric-basic-function (name value &optional (scale 0))
+  "Apply a basic numeric function to VALUE, using SCALE for round and trunc.
+Special values pass through except for abs of negative infinity and sign of
+infinity.  Numeric sign preserves NaN, unlike the floating-point version."
+  (cond ((member name '("abs" "numeric_abs") :test #'string=)
+         (if (eq value :numeric-negative-infinity) :numeric-positive-infinity
+             (if (or (sql-numeric-special-p value)
+                     (not (minusp (sql-numeric-coefficient value))))
+                 value (sql-numeric-negate value))))
+        ((string= name "sign")
+         (case value
+           (:numeric-nan :numeric-nan)
+           (:numeric-positive-infinity 1)
+           (:numeric-negative-infinity -1)
+           (otherwise (signum (sql-numeric-coefficient value)))))
+        ((member name '("round" "trunc") :test #'string=)
+         (sql-numeric-round-or-trunc value scale (string= name "round")))
+        ((sql-numeric-special-p value) value)
+        ((member name '("ceil" "ceiling") :test #'string=)
+         (sql-numeric-result (ceiling (sql-numeric-rational value)) 0))
+        ((string= name "floor")
+         (sql-numeric-result (floor (sql-numeric-rational value)) 0))
+        (t (ereport "XX000" "unknown numeric function ~a" name))))
+
 (defun sql-numeric-division (left right)
   ;; Follow numeric.c select_div_scale using normalized base-10000 leading digits,
   ;; input display scales and the display cap; round ties away from zero.

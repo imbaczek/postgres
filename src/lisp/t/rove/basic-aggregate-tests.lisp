@@ -154,6 +154,56 @@
   (rove:ok (equal '((t t t))
                   (subquery-test-rows "SELECT '-Infinity'::numeric<0, 'Infinity'::numeric<'NaN'::numeric, 'NaN'::numeric='NaN'::numeric"))))
 
+(rove:deftest numeric-basic-functions
+    (dolist (case '(("SELECT abs(-12.030)::text" "12.030")
+                    ("SELECT numeric_abs('-Infinity'::numeric)::text" "Infinity")
+                    ("SELECT sign('-Infinity'::numeric)::text" "-1")
+                    ("SELECT round(-1.25::numeric,1)::text" "-1.3")
+                    ("SELECT round(1450::numeric,-2)::text" "1500")
+                    ("SELECT trunc(-1.29::numeric,1)::text" "-1.2")
+                    ("SELECT ceil(-1.2::numeric)::text" "-1")
+                    ("SELECT ceiling(1.2::numeric)::text" "2")
+                    ("SELECT floor(-1.2::numeric)::text" "-2")
+                    ("SELECT round('NaN'::numeric)::text" "NaN")
+                    ("SELECT abs((-3)::integer)::text" "3")
+                    ("SELECT round(2.5::float8)::text" "2")
+                    ("SELECT round(3.5::float8)::text" "4")
+                    ("SELECT trunc((-1.9)::float8)::text" "-1")
+                    ("SELECT sign('NaN'::float8)::text" "0")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case))))
+
+(rove:deftest numeric-basic-function-errors
+    (dolist (case '(("SELECT abs('-9223372036854775808'::bigint)"
+                     "22003" "bigint out of range")
+                    ("SELECT round(1::float8, 2)"
+                     "42883" "function round(double precision, integer) does not exist")))
+      (let ((condition (handler-case (progn (subquery-test-rows (first case)) nil)
+                         (pg-error (error) error))))
+        (rove:ok (and condition
+                      (string= (pg-error-sqlstate condition) (second case))
+                      (string= (pg-error-message condition) (third case)))
+                 (first case)))))
+
+(cl-spec:defproperty numeric-rounding-is-symmetric
+    ((coefficient (range integer -10000000 10000000))
+     (input-scale (range integer 0 6))
+     (target-scale (range integer -4 6)))
+  (:about sql-numeric-round-or-trunc)
+  (:trials (:normal 250))
+  (let* ((positive (make-sql-decimal (abs coefficient) input-scale))
+         (negative (sql-numeric-negate positive)))
+    (every (lambda (round-p)
+             (let ((a (sql-numeric-round-or-trunc positive target-scale round-p))
+                   (b (sql-numeric-round-or-trunc negative target-scale round-p)))
+               (and (= (sql-numeric-rational a) (- (sql-numeric-rational b)))
+                    (= (sql-numeric-scale a) (max 0 target-scale)))))
+           '(t nil))))
+
+(rove:deftest numeric-rounding-property
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'numeric-rounding-is-symmetric :seed 42))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (rove:deftest numeric-special-properties-and-indexes
     (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-special-total-order :seed 42)))
           (values (list :numeric-negative-infinity -1 0 1 :numeric-positive-infinity :numeric-nan)))

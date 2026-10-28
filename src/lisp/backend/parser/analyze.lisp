@@ -152,6 +152,8 @@ exist\" messages."
     (:pg-node-tree "pg_node_tree")
     (:timestamptz "timestamp with time zone")
     (:numeric "numeric")
+    (:float4 "real")
+    (:float8 "double precision")
     (:bit "bit")
     (:varchar "character varying")
     (:bool "boolean")
@@ -385,6 +387,37 @@ Convert supplied expressions in source order, then return them in parameter orde
                     (t :text))
         :typmod -1))
 
+(defun analyze-basic-numeric-function (name args)
+  "Resolve the supported basic numeric overload and coerce its arguments.
+Two-argument round and trunc use numeric and an int4 scale.  Unary abs
+preserves a known input type; the other unary calls choose numeric for numeric
+inputs and float8 otherwise, including unknown literals."
+  (unless (and (if (member name '("round" "trunc") :test #'string=)
+                   (member (length args) '(1 2))
+                   (= (length args) 1))
+               (or (in-unknown-constant-p (first args))
+                   (member (expr-type (first args)) '(:int2 :int4 :int8 :numeric :float4 :float8)))
+               (or (= (length args) 1)
+                   (in-unknown-constant-p (second args))
+                   (member (expr-type (second args)) '(:int2 :int4))))
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+  (let* ((argument (first args))
+         (type (cond ((or (= (length args) 2) (string= name "numeric_abs")) :numeric)
+                     ((and (string= name "abs")
+                           (not (in-unknown-constant-p argument)))
+                      (expr-type argument))
+                     ((eq (expr-type argument) :numeric)
+                      (if (in-unknown-constant-p argument) :float8 :numeric))
+                     (t :float8))))
+    (unless (or (in-unknown-constant-p argument)
+                (sql-implicit-coercion-p (expr-type argument) type))
+      (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+    (list :func name
+          (cons (coerce-common-expression argument type)
+                (mapcar (lambda (arg) (coerce-common-expression arg :int4))
+                        (rest args)))
+          :type type :typmod -1)))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
@@ -397,6 +430,9 @@ Convert supplied expressions in source order, then return them in parameter orde
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     (cond
+      ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
+               :test #'string=)
+       (analyze-basic-numeric-function name args))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
       ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
       ((string= name "substr") (analyze-substr-function name args))
@@ -1636,7 +1672,8 @@ Convert supplied expressions in source order, then return them in parameter orde
                 (not (member (second form)
                              '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
-                               "substr" "length" "char_length" "character_length" "pg_backend_pid")
+                               "substr" "length" "char_length" "character_length" "pg_backend_pid"
+                               "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
                              :test #'string=)))
            (analyzed-expression-volatile-p (car form))
            (analyzed-expression-volatile-p (cdr form)))))
@@ -2234,6 +2271,10 @@ Convert supplied expressions in source order, then return them in parameter orde
     ((and (member name '("nextval" "currval" "setval") :test #'string=)
           (member +null+ args))
      +null+)
+    ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
+             :test #'string=)
+     (if (member +null+ args) +null+
+         (sql-numeric-basic-function name (first args) (if (rest args) (second args) 0))))
     ((string= name "pg_promote") (pg-promote (first args) (second args)))
     ((string= name "pg_stat_get_wal_receiver") (wal-receiver-result))
     ((string= name "pg_postmaster_start_time") (postmaster-start-timestamp))
@@ -2464,9 +2505,24 @@ Convert supplied expressions in source order, then return them in parameter orde
                            (t (eq want nil)))))
          (if neg (not result) result))))
     (:func
-     (eval-func (second expr)
-                (mapcar (lambda (a) (eval-expr a env))
-                        (third expr))))
+     (let* ((name (second expr))
+            (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr)))
+            (type (expr-type expr)))
+       (cond
+         ((and (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
+                       :test #'string=)
+               (member +null+ arguments))
+          +null+)
+         ((and (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
+                       :test #'string=)
+               (member type '(:float4 :float8)))
+          (sql-float-basic-function name (first arguments)))
+         ((and (string= name "abs") (member type '(:int2 :int4 :int8)))
+          (let ((value (abs (first arguments))))
+            (when (and (eq type :int8) (> value +int8-max+))
+              (ereport "22003" "bigint out of range"))
+            (sql-cast-value value type type -1)))
+         (t (eval-func name arguments)))))
     (t
      (ereport "XX000" "cannot evaluate expression ~a" expr))))
 

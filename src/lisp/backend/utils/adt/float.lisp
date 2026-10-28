@@ -206,6 +206,32 @@
         ((sb-ext:float-nan-p right) -1)
         ((< left right) -1) ((> left right) 1) (t 0)))
 
+(defun sql-float-basic-function (name value)
+  "Apply float.c's unary rounding and sign functions.
+Round uses ties to even, and zero results retain the input's sign.  Like
+float.c, sign returns zero for NaN; abs clears the sign bit even for NaN."
+  (when (string= name "abs")
+    (let* ((type (if (typep value 'single-float) :float4 :float8))
+           (sign-bit (if (eq type :float4) 31 63)))
+      (return-from sql-float-basic-function
+        (sql-float-from-bits (logandc2 (sql-float-bits value type) (ash 1 sign-bit)) type))))
+  (when (string= name "sign")
+    (return-from sql-float-basic-function
+      (cond ((sb-ext:float-nan-p value) 0d0)
+            ((plusp value) 1d0)
+            ((minusp value) -1d0)
+            (t 0d0))))
+  (when (or (sb-ext:float-nan-p value) (sb-ext:float-infinity-p value) (zerop value))
+    (return-from sql-float-basic-function value))
+  (let ((result (cond ((string= name "round") (round value))
+                      ((string= name "trunc") (truncate value))
+                      ((member name '("ceil" "ceiling") :test #'string=) (ceiling value))
+                      ((string= name "floor") (floor value))
+                      (t (ereport "XX000" "unknown float function ~a" name)))))
+    (if (zerop result)
+        (if (minusp value) -0d0 0d0)
+        (coerce result 'double-float))))
+
 (defun sql-float-arithmetic (operator left right)
   "Apply an IEEE operation and PostgreSQL's overflow and underflow checks."
   (when (and (string= operator "/") (not (sb-ext:float-nan-p right))
