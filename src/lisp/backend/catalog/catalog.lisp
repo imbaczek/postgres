@@ -1522,13 +1522,15 @@ not choose an ID, externalize a parent tuple, or clean up partial writes on erro
                                 :external-info (length bytes) :value-id value-id
                                 :relation-id (pg-toast-oid toast) :id-width 4)))
 
-(defun toast-fetch-value (toast pointer snapshot)
+(defun toast-fetch-value (toast pointer snapshot &key (index-reader #'call-with-btree-relation-read-lock))
   "Return the uncompressed bytes named by POINTER in the owning TOAST storage.
 SNAPSHOT must remain active for the entire call, protecting the parent value's
 lifetime; chunk visibility is parent-driven, not evaluated against SNAPSHOT.
-The index read lock is held while reading and assembling chunks. Only matching
-32-bit relation pointers with uncompressed sizes from 1 to 1073741819 are
-accepted; missing, misordered, or malformed chunks signal corruption."
+INDEX-READER is called with the index relfilenode and a zero-argument function;
+it must call that function under a read lease on the index and return its result.
+The lease covers reading and assembling chunks. Only matching 32-bit relation
+pointers with uncompressed sizes from 1 to 1073741819 are accepted; missing,
+misordered, or malformed chunks signal corruption."
   (unless (and snapshot
                (sb-thread:with-mutex (*snapshot-count-lock*)
                  (gethash snapshot *active-snapshot-set*)))
@@ -1544,23 +1546,23 @@ accepted; missing, misordered, or malformed chunks signal corruption."
       (ereport "XX001" "invalid or compressed TOAST pointer"))
     (when (< (buf-nblocks index-node) 2)
       (ereport "XX001" "TOAST index is missing"))
-    (call-with-btree-relation-read-lock
-     index-node
-     (lambda ()
-       (let ((chunks nil))
-         (dolist (entry (btree-prefix-entries-unlocked
-                         index-node (encode-index-key (list id) '(:oid))))
-           (let ((tuple (heapam-get-tuple heap-node (second entry) (third entry)
-                                          *toast-chunk-columns* t)))
-             (when tuple
-               (let* ((values (htup-values tuple))
-                      (chunk-id (aref values 0))
-                      (sequence (aref values 1)))
-                 (unless (and (= chunk-id id)
-                              (equalp (first entry) (toast-chunk-key chunk-id sequence)))
-                   (ereport "XX001" "TOAST index points to the wrong chunk"))
-                 (push (cons sequence (aref values 2)) chunks)))))
-         (toast-assemble-chunks (nreverse chunks) size +toast-oid-chunk-size+))))))
+    (funcall index-reader
+             index-node
+             (lambda ()
+               (let ((chunks nil))
+                 (dolist (entry (btree-prefix-entries-unlocked
+                                 index-node (encode-index-key (list id) '(:oid))))
+                   (let ((tuple (heapam-get-tuple heap-node (second entry) (third entry)
+                                                  *toast-chunk-columns* t)))
+                     (when tuple
+                       (let* ((values (htup-values tuple))
+                              (chunk-id (aref values 0))
+                              (sequence (aref values 1)))
+                         (unless (and (= chunk-id id)
+                                      (equalp (first entry) (toast-chunk-key chunk-id sequence)))
+                           (ereport "XX001" "TOAST index points to the wrong chunk"))
+                         (push (cons sequence (aref values 2)) chunks)))))
+                 (toast-assemble-chunks (nreverse chunks) size +toast-oid-chunk-size+))))))
 
 (defun toast-delete-value-unlocked (toast pointer xid cid)
   "Mark the chunks referenced by POINTER deleted by XID and CID.

@@ -78,7 +78,8 @@
          (let ((page (buf-read (pg-class-relfilenode table) block)))
            (when page
              (heapam-scan-page page block (pg-class-columns table) snapshot
-                               (lambda (tuple) (push (htup-values tuple) rows)))))
+                               (lambda (tuple)
+                                 (push (htup-values (materialize-select-tuple table tuple snapshot)) rows)))))
          (incf block)
          (setf rows (nreverse rows))))
      (lambda () (setf rows nil)))))

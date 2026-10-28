@@ -371,9 +371,11 @@
         (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
         (unwind-protect
              (let* ((table (pg::create-table* database "big"
-                                              (list (list :name "n" :type :numeric :typmod -1))))
+                                              (list (list :name "v" :type :bytea :typmod -1))))
                     (toast (pg::pg-class-toast table))
-                    (pointer nil))
+                    (pointer nil)
+                    (parent-block nil)
+                    (parent-offset nil))
                (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
                  (pg::with-write-lock
                    (setf pointer (pg::toast-store-value-unlocked toast bytes #xffffffff 42 0))))
@@ -387,6 +389,66 @@
                (ok (intake-fails-p (lambda () (pg::toast-fetch-value toast pointer snapshot))))
                (pg::register-active-snapshot snapshot registration)
                (ok (equalp bytes (pg::toast-fetch-value toast pointer snapshot)))
+               (pg::clog-set 42 pg::+clog-committed+)
+               (pg::with-write-lock
+                 (multiple-value-setq (parent-block parent-offset)
+                   (pg::heapam-insert (pg::pg-class-relfilenode table)
+                                      (pg::pg-class-columns table) (vector pointer) 42 0))
+                 (let ((invisible-pointer (pg::copy-heap-external-varlena pointer)))
+                   (incf (pg::heap-external-varlena-relation-id invisible-pointer))
+                   (pg::heapam-insert (pg::pg-class-relfilenode table)
+                                      (pg::pg-class-columns table)
+                                      (vector invisible-pointer) 60 0)))
+               (let ((result nil))
+                 (pg::call-with-select-index-lease-domain
+                  (list (pg::pg-toast-index-relfilenode toast))
+                  (lambda ()
+                    (pg::scan-select-path
+                     table (pg::pg-class-relfilenode table)
+                     (pg::make-select-scan-path :kind :seq-scan) snapshot
+                     (lambda (tuple) (push (aref (pg::htup-values tuple) 0) result)))))
+                 (ok (equalp (list bytes) result)))
+               (let* ((pg::*current-snapshot* snapshot)
+                      (relation (list :table table :path (pg::make-select-scan-path :kind :seq-scan)))
+                      (node (list :seq-scan 0 (pg::pg-class-oid table))))
+                 (pg::call-with-select-index-lease-domain
+                  (list (pg::pg-toast-index-relfilenode toast))
+                  (lambda ()
+                    (let ((iterator (pg::make-select-scan-iterator node (list relation))))
+                      (pg::detach-select-index-scans)
+                      (unwind-protect
+                           (multiple-value-bind (row present) (pg::sql-iterator-next iterator)
+                             (ok present)
+                             (ok (equalp bytes (aref row 0)))
+                             (ok (not (nth-value 1 (pg::sql-iterator-next iterator)))))
+                        (pg::close-sql-iterator iterator))))))
+               (let* ((index-node 99999)
+                      (key (make-array 1 :element-type '(unsigned-byte 8) :initial-element 7))
+                      (index (pg::make-pg-index :relfilenode index-node))
+                      (path (pg::make-select-scan-path :kind :index-scan :index index :key key))
+                      (result nil))
+                 (pg::btree-init index-node)
+                 (pg::btree-insert index-node key parent-block parent-offset)
+                 (pg::call-with-select-index-lease-domain
+                  (list index-node (pg::pg-toast-index-relfilenode toast))
+                  (lambda ()
+                    (pg::scan-select-index table path snapshot
+                                           (lambda (tuple)
+                                             (push (aref (pg::htup-values tuple) 0) result)))))
+                 (ok (equalp (list bytes) result)))
+               (let* ((text-value "Zażółć gęślą jaźń")
+                      (text-pointer
+                        (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                          (pg::with-write-lock
+                            (pg::toast-store-value-unlocked toast (pg::string->bytes text-value) 77 42 0))))
+                      (text-table (pg::make-pg-class :toast toast
+                                                     :columns (vector (pg::make-pg-column :type :varchar))))
+                      (tuple (pg::make-htup :values (vector text-pointer))))
+                 (pg::call-with-select-index-lease-domain
+                  (list (pg::pg-toast-index-relfilenode toast))
+                  (lambda ()
+                    (pg::materialize-select-tuple text-table tuple snapshot)))
+                 (ok (equal text-value (aref (pg::htup-values tuple) 0))))
                (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
                  (pg::with-write-lock
                    (pg::toast-delete-value-unlocked toast pointer 43 1)

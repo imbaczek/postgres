@@ -1410,6 +1410,36 @@ scopes to clean up."
     (error "index detachment left a held B-tree read lease"))
   (values))
 
+(defun select-toast-index-reader (relfilenode function)
+  "Run a TOAST lookup under the SELECT domain, or a standalone index lease."
+  (if *select-index-lease-domain*
+      (call-with-current-select-index-domain relfilenode function)
+      (call-with-btree-relation-read-lock relfilenode function)))
+
+(defun materialize-select-tuple (table tuple snapshot)
+  "Replace external attributes of a visible parent TUPLE with SQL values.
+The caller must have checked the parent against SNAPSHOT and keep that snapshot
+active through the fetch. TOAST chunk visibility follows the parent, so the
+chunks are not independently filtered by the snapshot. This modifies TUPLE's
+values in place before they reach qualifications or projections."
+  (let ((values (htup-values tuple))
+        (columns (pg-class-columns table)))
+    (loop for i below (length values)
+          for value = (aref values i)
+          when (heap-external-varlena-p value)
+            do (let* ((toast (pg-class-toast table))
+                      (type (pg-column-type (aref columns i))))
+                 (unless toast
+                   (ereport "XX001" "external value has no owning TOAST relation"))
+                 (let ((bytes (toast-fetch-value toast value snapshot
+                                                 :index-reader #'select-toast-index-reader)))
+                   (setf (aref values i)
+                         (case type
+                           (:varchar (bytes->string bytes))
+                           (:bytea bytes)
+                           (otherwise (ereport "XX001" "external value has unsupported type")))))))
+    tuple))
+
 (defun scan-select-index (table path snapshot callback &optional environment)
   "Scan matching index TIDs and pass visible heap tuples to CALLBACK.
 
@@ -1432,13 +1462,15 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
                (let ((tuple (heapam-get-tuple relfilenode (car tid) (cdr tid)
                                               (pg-class-columns table))))
                  (when (and tuple (htup-visible-p tuple snapshot))
-                   (funcall callback tuple))))))))))))
+                   (funcall callback (materialize-select-tuple table tuple snapshot)))))))))))))
 
 (defun scan-select-path (table relfilenode path snapshot callback
                          &optional environment)
   (ecase (select-scan-path-kind path)
     (:seq-scan
-     (heapam-scan relfilenode (pg-class-columns table) snapshot callback))
+     (heapam-scan relfilenode (pg-class-columns table) snapshot
+                  (lambda (tuple)
+                    (funcall callback (materialize-select-tuple table tuple snapshot)))))
     (:index-scan
      (scan-select-index table path snapshot callback environment))))
 
