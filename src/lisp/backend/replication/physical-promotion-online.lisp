@@ -120,7 +120,8 @@ pause lock. Acknowledged pause commands cannot be overwritten by this restore."
 (defun physical-recovery-promote ()
   "Promote the owning live standby without restarting its postmaster.
 
-Run outside operation admission.  Hold shutdown and follow-command exclusion,
+Run outside operation admission. Cancel and join any follow transition before
+holding shutdown and follow-command exclusion,
 stop worker starts, unpause replay and join workers before closing admission.
 Retry unsafe complete replay barriers outside the gates, allowing readers to
 finish.  Return the child checkpoint end, or :SHUTDOWN if shutdown takes over

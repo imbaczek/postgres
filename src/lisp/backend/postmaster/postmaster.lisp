@@ -248,7 +248,7 @@ command (idle) is ignored; the connection and its transaction state survive."
 (declaim (ftype function physical-promotion-start-worker))
 
 (defun start-postmaster-recovery-workers ()
-  "Start recovery services, tolerating only a concurrent process shutdown."
+  "Start admitted recovery services and cleanup, tolerating concurrent shutdown."
   (handler-case
       (progn
         (physical-follow-autostart)
@@ -265,7 +265,7 @@ command (idle) is ignored; the connection and its transaction state survive."
 (declaim (ftype function prepare-primary-shutdown call-with-live-operation))
 
 (defun prepare-postmaster-shutdown ()
-  "Finalize storage from MAIN after SERVE returns, outside live admission."
+  "Stop controller work and finalize storage from MAIN outside live admission."
   (when (plusp *live-operation-depth*)
     (error "postmaster shutdown finalization requires an unadmitted main thread"))
   (unless *shutdown-finalizing-p*

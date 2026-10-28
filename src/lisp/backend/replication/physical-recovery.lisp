@@ -542,7 +542,7 @@ Return the reconstructed state and durable control; do not install runtime state
                 physical-follow-check-startup-admission))
 
 (defun physical-recovery-prepare-with-namespace ()
-  "Reject a follow binding and verify the base before ordinary startup.
+  "Verify the base and reconcile saved follow state before ordinary startup.
 Publish dirty recovery control before installing state and allowing redo."
   (physical-recovery-check-required-marker)
   (physical-follow-startup-owner-check)

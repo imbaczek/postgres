@@ -282,6 +282,12 @@ ambiguous READY save is not reported as a reseed request."
     (physical-source-follow-ready name anchor)))
 
 (defun physical-source-follow-release-checked (name expected-digest request)
+  "Retire a matching follow pin under WAL exclusion, including on a standby.
+An exact request can retire retaining, ready or lost pins without old WAL; a
+checksum requires a ready pin. Neither form authenticates the endpoint. Both
+fence an absent or released attempt name against delayed preparation. Uncertain
+I/O fences WAL; a mismatch or busy sender does not. A new name at the canceled-name
+limit fails before acknowledgment, unlink or retention release."
   (check-recovery-available)
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid physical follow pin name"))
@@ -332,6 +338,10 @@ A retaining or ready pin, including a lost pin, needs no old WAL for release."
 (declaim (ftype function physical-follow-bootstrap-request-copy))
 
 (defun physical-source-bootstrap-release (name request)
+  "Retire a matching bootstrap pin under WAL exclusion, including on a standby.
+Check the immutable tuple and durable pin; reject a busy sender or follow pin.
+The tuple is not authentication. Use attempt-specific backup names while
+cleanup is outstanding, since an absent bootstrap name is not fenced."
   (check-recovery-available)
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid physical bootstrap pin name"))

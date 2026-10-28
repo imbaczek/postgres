@@ -1,6 +1,11 @@
 (in-package #:pg)
 
+;;; Native follow transitions and asynchronous source retirement.
+;;; Save preparation before remote proof and reconcile pending state before use.
+;;; Cancel sockets and join operations outside command, reload and admission locks.
+
 (defstruct physical-follow-operation
+  "One transition and its socket, thread, saved intent and failure context."
   host port prefix runtime config client thread cancelled-p result error context)
 
 (defvar *physical-follow-operation* nil)
@@ -11,6 +16,10 @@
 (defvar *physical-follow-controller-errors* (make-hash-table :test #'equal))
 
 (defun physical-follow-overlap-bytes-under-lock (store base index cursor)
+  "Reconstruct bytes from the start of the segment containing CURSOR - 1 to CURSOR.
+Use the base or checked retained floor prefix and durable spool records. The
+caller holds the store mutex and protects the root. The caller hashes these
+bytes independently of the carried receive digest."
   (let* ((size +wal-segment-size+) (segment (floor (1- cursor) size))
                                    (start (* segment size)) (length (- cursor start))
                                    (floor (physical-store-floor-lsn store))
@@ -57,10 +66,14 @@
       index)))
 
 (defun physical-follow-controller-snapshot (view)
+  "Capture a checked snapshot under a root lease. The caller owns command and
+reload exclusion and live-operation quiescence."
   (physical-follow-call-with-receive-root
    *physical-receive-store* (lambda () (physical-follow-controller-snapshot-under-lease view))))
 
 (defun physical-follow-controller-check-current (config)
+  "Validate the current recovery and receive state before restoring its receiver.
+The caller excludes concurrent mutation and protects the selected store."
   (let ((base (physical-recovery-verify-base-state)))
     (if (fifth config)
         (physical-follow-check-active-state *physical-receive-store* base config)
@@ -83,6 +96,8 @@
               required control (physical-follow-controller-index candidate) nil)))))))
 
 (defun physical-follow-controller-snapshot-under-lease (view)
+  "Capture the receive, replay and durable recovery witnesses under root protection.
+The receive timeline can differ from the applied replay timeline."
   (let* ((base (physical-recovery-verify-base-state))
          (control (physical-recovery-read-control *pgdata*))
          (store (physical-follow-copy-checked-store *physical-receive-store*))
@@ -139,6 +154,10 @@
     binding))
 
 (defun physical-follow-controller-source-view (client)
+  "Read source identity and validated remote history; select receipt's next child.
+The later snapshot checks exact local ancestry. System identifier and timeline
+cannot distinguish endpoint remaps or clones; the direct endpoint must continue
+to identify the same PGDATA."
   (multiple-value-bind (system-id source) (physical-follow-client-identity client)
     (let ((parent (with-live-operation
                     (unless (= system-id (getf *physical-recovery-state* :system-id))
@@ -160,6 +179,7 @@
                 :fork (timeline-history-entry-end (nth position history))))))))
 
 (defun physical-follow-current-retirement (config base)
+  "Copy the current source identity for later asynchronous retirement."
   (let* ((binding (fifth config))
          (request
            (if binding
@@ -173,7 +193,9 @@
            :pin (fourth config) :request request))))
 
 (defun physical-follow-promotion-cleanup-config ()
-  "Build the post-promotion cleanup image before retiring base provenance."
+  "Build the post-promotion cleanup image before retiring base provenance.
+The caller must save it durably before removing recovery artifacts. Remote
+retirement may finish later."
   (when (probe-file (physical-follow-config-path))
     (let* ((config (physical-follow-read-config))
            (state (physical-follow-controller-state config)))
@@ -219,6 +241,8 @@
     (unwind-protect (funcall function store) (physical-store-close store))))
 
 (defun physical-follow-prepare-startup (base)
+  "Under cold PGDATA ownership, queue unfinished preparation and reconcile pending
+state before validating an active binding. Protect the store and retained root."
   (when (probe-file (physical-follow-config-path))
     (let ((config (physical-follow-read-config)))
       (when (= 4 (length config)) (return-from physical-follow-prepare-startup config))
@@ -284,6 +308,7 @@
   config)
 
 (defun physical-follow-operation-initial-config (operation)
+  "Check the current receiver and cleanup capacity before disturbing it or PREPARE."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (with-live-operation
       (physical-follow-operation-check operation)
@@ -321,6 +346,7 @@
       (unless accepted (pg-client-close client)))))
 
 (defun physical-follow-fresh-attempt-name (prefix config)
+  "Generate an attempt-specific pin name distinct from current and queued names."
   (unless (and (wal-valid-replication-slot-name-p prefix) (<= (length prefix) 30))
     (error "follow pin prefix must be a valid name of at most 30 characters"))
   (loop for name = (format nil "~a_~(~32,'0x~)" prefix (random (ash 1 128) (make-random-state t)))
@@ -330,6 +356,8 @@
           return name))
 
 (defun physical-follow-operation-intent (operation view)
+  "Stop the old runtime and save preparation intent before contacting PREPARE.
+Hold command exclusion; snapshot under reload and live-operation quiescence."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (physical-follow-operation-check operation)
     (let* ((current (physical-follow-read-config))
@@ -364,6 +392,9 @@
             (values entry snapshot)))))))
 
 (defun physical-follow-operation-publish (operation view entry anchor)
+  "Recheck a fresh snapshot and publish pending then active binding under quiescence.
+A restartpoint can advance during the RPC; use the final durable witness. Queue
+the old source before publication; its remote acknowledgment is not required."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (sb-thread:with-mutex (*reload-run-lock*)
       (with-live-operation-quiescence
@@ -411,6 +442,8 @@
             active))))))
 
 (defun physical-follow-operation-recover (operation)
+  "Queue a saved preparation and restore the old receiver when safe. Ambiguous
+publication failures fence recovery for restart reconciliation."
   (let ((context (physical-follow-operation-context operation)))
     (cond
       ((getf context :committed) nil)
@@ -510,6 +543,8 @@
     operation))
 
 (defun physical-follow-controller-cancel-join ()
+  "Cancel the operation socket and join its thread outside command, reload and
+live-operation admission locks. A failed join fences recovery."
   (let ((operation nil) (client nil))
     (sb-thread:with-mutex (*physical-follow-lock*)
       (setf operation *physical-follow-operation*)
@@ -528,6 +563,8 @@
   :stopped)
 
 (defun physical-follow-call-with-controller-blocked (function)
+  "Block new transitions, cancel and join the current operation, then run FUNCTION.
+The caller must not hold command, reload or live-operation admission locks."
   (let ((nested nil))
     (sb-thread:with-mutex (*physical-follow-lock*)
       (cond ((eq *physical-follow-controller-block-owner* sb-thread:*current-thread*)
@@ -544,6 +581,7 @@
                     *physical-follow-controller-block-owner* nil)))))))
 
 (defun physical-follow-retarget (host port &optional (prefix "follow"))
+  "Synchronously request a transition to the direct endpoint on a fresh pin."
   (when (plusp *live-operation-depth*) (error "follow retarget requires its own operation admission"))
   (physical-follow-controller-start-worker :force t)
   (let ((operation (physical-follow-start-operation host port prefix)))
@@ -565,6 +603,8 @@
   nil)
 
 (defun physical-follow-controller-cleanup (entry)
+  "Retry exact remote retirement outside command exclusion. Remove the durable
+queue entry only after acknowledgment and a fresh local state check."
   (let ((client nil))
     (unwind-protect
          (handler-case
@@ -644,6 +684,8 @@
   *physical-follow-controller-worker*)
 
 (defun physical-follow-controller-stop-worker ()
+  "Stop cleanup and transitions, cancel sockets and join their workers.
+Call outside command, reload and live-operation admission locks."
   (let ((worker nil) (client nil))
     (sb-thread:with-mutex (*physical-follow-lock*)
       (setf *physical-follow-controller-stopping-p* t
@@ -682,6 +724,8 @@
                                          :last-error (gethash entry *physical-follow-controller-errors*)))))))
 
 (defun physical-follow-controller-step ()
+  "Start an eligible automatic transition or retry one queued retirement.
+An empty cleanup-only configuration stops the worker but remains on disk."
   (let ((config (with-live-operation
                   (check-recovery-available)
                   (when (probe-file (physical-follow-config-path)) (physical-follow-read-config))))

@@ -207,11 +207,15 @@ Coordination is excluded.
 
 ### Existing sibling follow intake
 
-A three-node native probe now reproduces the next gap. Two standbys replay a
+This records the original failure and its design requirements. The native follow
+controller described below now handles the eligible sibling cases through a
+private control command. Patroni's recovery-configuration interface remains open.
+
+A three-node native probe initially reproduced this gap. Two standbys replay a
 shared parent commit. One promotes to timeline 2 and writes a child row; the
 other retains its original base, receive spool and restartpoint and changes its
-source endpoint. The receiver rejects the new source at the timeline identity
-check. Its applied position, durable flush and digest remain unchanged, it stays
+source endpoint. At that stage, the receiver rejected the new source at the
+timeline identity check. Its applied position, durable flush and digest remain unchanged, it stays
 read-only, and the promoted source has no retention pin for that sibling.
 Evidence: `/tmp/pg-fork-follow-probe.log` and
 `/tmp/pg-operation-parking.gXdsy0/`.
@@ -233,10 +237,10 @@ and `/tmp/pg-operation-parking.pAsykp/divergent-boundaries`. Future acceptance
 must distinguish this case from the eligible sibling: checking only applied WAL
 would miss divergence in durable received WAL.
 
-The local primitives now separate immutable base provenance, selected receive
+The local primitives already separated immutable base provenance, selected receive
 history and replay timeline. Receive control binds selected history to durable
 progress; replay validates EOR at the fork; cold startup, restartpoints and
-later promotion reconstruct that lineage. The network receiver still rejects a
+later promotion reconstruct that lineage. The network receiver then still rejected a
 different source timeline. Relaxing its identity comparison alone cannot provide
 the missing source admission and retention guarantees.
 The new source also needs a retained, independently checked resume anchor:
@@ -437,6 +441,9 @@ compatibility remains separately staged. Coordination is outside this goal.
 
 ### Bounded native follow sender
 
+This section records the sender, rewind and binding prerequisites as they were
+completed. The native follow controller below connects them to the receiver.
+
 Explicit `mode 'follow'` admits a ready follow pin; it is never a fallback from
 bootstrap. The pin identifies the current writer timeline while START names the
 requested timeline. The requested start may precede that timeline's beginning
@@ -464,23 +471,23 @@ resume, and live REPL reload (`/tmp/pg-follow-wire-accepted.log`, artifacts
 matching replay, and a run with seed `3385497690757192689`. There is no function
 spec; rejection and input coverage are unmeasured.
 
-The private receive-store rewind and history-selection prerequisite is now
-implemented, with no production caller. It checks the full expected control
+The private receive-store rewind and history-selection prerequisite was first
+implemented without a production caller. It checks the full expected control
 tuple and old acknowledged prefix, including the tail to discard, and derives
 the fork digest locally. It validates applied and required LSN/timeline pairs,
 the candidate history and retained root before publishing one control image
 with the lower flush, digest and selection. Full control readback precedes
 in-memory installation, root reconciliation and tail cleanup. The base, floor,
-manifest and immutable root remain unchanged. This is not `pg_rewind` and is
-not exposed to follow or reconnect.
+manifest and immutable root remain unchanged. This is not `pg_rewind`. At that
+stage, it was not yet exposed to follow or reconnect.
 
-Future receiver onboarding must establish source proof and quiescence, preserve
+Receiver onboarding still needed to establish source proof and quiescence, preserve
 a durable pending binding across stop, and reconcile it before selected-history
 attachment, restartpoint selection and redo. It must validate restartpoint,
 clean-batch, observed-XID and required floors before calling the helper. A
 required frontier below the retained floor is checked for ancestry only and must
 come from verified durable recovery state. The client CopyDone/timeline-switch
-loop remains open; this prerequisite does not establish full onboarding or
+loop remained open; this prerequisite alone did not establish full onboarding or
 synchronous acknowledgment-loss behavior. It adds no format version or
 coordination protocol.
 
@@ -496,7 +503,7 @@ baseline and passed 200 trials each with seeds 42 and `1397983632957994830`;
 the seed 42 replay matched digest `fnv1a64-v1:2bc44affd9033239`. There is no
 function spec; rejection counts and input coverage are unmeasured.
 
-The private binding codec and admission guards are now in place. The existing
+The private binding codec and admission guards were added next. The existing
 `PGPHYSICALFOLLOW1` envelope still accepts the four-field bootstrap config; an
 optional fifth field carries a strict version 1 binding. It contains the anchor,
 supplied immediate-child history whose parsed ancestry must match the source-history
@@ -509,13 +516,14 @@ prove source data, compare witnesses to durable state or reconcile a binding.
 The whole file is bounded to 64 MiB plus 64 KiB before parsing; each history is
 bounded to 16 MiB.
 
-Both `:pending` and `:active` binding phases are inert. Start, stop, launch and
-cold storage startup reject any fifth field before replacing or deleting the
-config, creating workers, publishing control, changing storage or redoing WAL.
-There is no production binding creator or disabled phase, and no format version
+At that checkpoint, both `:pending` and `:active` binding phases were inert.
+Start, stop, launch and cold storage startup rejected any fifth field before
+replacing or deleting the config, creating workers, publishing control, changing
+storage or redoing WAL. There was no production binding creator or disabled phase,
+and no format version
 bump or coordination protocol.
 
-The next reconciler must compare the witnesses with fresh durable control,
+The next reconciler needed to compare the witnesses with fresh durable control,
 provenance and restartpoint state, without treating cold runtime reset to base
 LSN/timeline or housekeeping normalization as durable progress. A read-only
 fork candidate scan must prove clean applied and fork boundaries and prior EOR
@@ -525,7 +533,7 @@ restartpoint seed, preserve the observed floor N and require the seed at least N
 do not require equality. Run the scan outside the held store mutex because the
 candidate shares it. Pending validation needs exact R, N, restartpoint and allowed
 old/post control combinations; active validation must allow legitimate later
-progress. The bound client and parent/CopyDone loop remain unimplemented.
+progress. The bound client and parent/CopyDone loop were not yet implemented.
 
 The full run passed 768 physical tests with no failures or pending tests, 170
 interop tests and a fresh strict compile. The physical result was recovered from
@@ -536,6 +544,82 @@ The full-width proof/root property passed 200 trials each with seeds 42 and
 `964605004439559528`, with seed 42 replay matching digest
 `fnv1a64-v1:abbede08427eaa38`. There is no function spec; rejection counts and
 input coverage are unmeasured.
+
+### Native follow controller
+
+The native receiver can now retarget an existing streaming standby to a promoted
+sibling without replacing its base image. The control command is
+`(physical-follow-retarget "127.0.0.1" PORT "attempt_prefix")`. It runs outside
+ordinary control admission because it must join workers and own quiescence.
+It requires healthy phase-2 streaming recovery and an existing follow config.
+The prefix produces a fresh pin name for each source preparation.
+
+The operation first checks cleanup capacity and discovers the source's identity
+and history. After stopping receipt and replay, it saves preparation intent with
+the exact receiver coordinates before issuing PREPARE. Source RPCs run outside
+command, reload, admission and storage locks. A restartpoint may advance during
+the RPC; publication takes a fresh snapshot and requires the prepared coordinates
+to remain unchanged. Pending and active bindings preserve the applied and required
+LSN/timeline pairs and observed XID. Full local ancestry must extend into source
+history, including forks older than the independently compared overlap segment.
+
+A receiver behind the fork streams the bounded parent suffix. It flushes and
+checks the fork before completing the typed CopyDone exchange. The local worker
+then prepares a distinct pin at the fork, reconciles a new binding, and starts
+child receipt. The selected receive timeline can lead applied replay. Replay
+pause remains in force; retarget does not promote the standby.
+
+The existing `PGPHYSICALFOLLOW1` envelope accepts an optional sixth controller
+field. It records enable state, one unfinished preparation, and up to 64 exact
+cleanup descriptors. Preparation reserves a queue slot before stopping the
+current receiver or contacting PREPARE. Cleanup retries independently; an old
+source's acknowledgment is not required for the next handoff. Exhausting the
+bounded queue rejects another transition without disturbing the current receiver.
+Cold startup queues an unfinished preparation for abort, reconciles pending
+publication, and validates active state before dirty control, storage and redo.
+Stop disables an accepted binding while preserving its queue.
+
+Checked follow abort and bootstrap retirement work on a former writer that is
+now a standby, using its durable pin metadata without reopening obsolete WAL.
+They do not enable standby streaming or pin creation. Promotion saves the current
+upstream descriptor and queued work in cleanup-only state before deleting base
+provenance. Primary startup resumes that queue. An empty cleanup-only file remains
+valid, and its worker exits after the queue drains.
+
+Endpoints must continue to identify the same PGDATA. Shared system IDs and
+timeline numbers cannot distinguish a remapped endpoint or cloned sibling, and
+the exact cleanup tuple or anchor checksum is not authentication. Use fresh
+backup attempt names while cleanup is outstanding. This is a local native WAL7
+controller, with no election, routing, DCS or C physical-WAL compatibility.
+
+The reviewed code is split into `f05d794b8a2` (source retirement) and
+`f7e64d11131` (receiver/controller integration). The source-retirement commit also
+passes strict compilation in an isolated checkout. The full physical run passed
+857 tests with zero failures or pending tests; the subsequently added bootstrap
+mismatch/busy-pin regression and six focused checks also passed. Interop passed
+170 tests. Strict fresh-process compilation and formatting passed. The cleanup
+envelope property passed 200 trials at seed 42, digest
+`fnv1a64-v1:25fee6bc8eb91184`; rejection counts and input coverage are unmeasured.
+
+Native acceptance covers direct retarget, unreachable-source rejection without
+stopping the old receiver, early phase rejection, parent catch-up with two fresh
+pins, automatic child receipt and replay, active-binding SIGKILL restart,
+asynchronous retirement, and promotion cleanup transfer. SIGKILL immediately
+after the transfer, while recovery artifacts still exist, passes cold completion.
+A cleanup-only primary also restarts and accepts writes. Evidence:
+`/tmp/pg-controller-rejections.log`, `/tmp/pg-operation-parking.aoTDpT/`,
+`/tmp/pg-follow-controller-suite-final.log`
+and `/tmp/pg-controller-code-cold.log`. Luna max and Sol high code reviews are
+clear; Sol medium's shared root lease and checked snapshot consolidation is applied.
+
+C references remain `walreceiver.c:691-819` for historic stream completion and
+startup instructions, `walsender.c:906-970` for timeline bounds, and
+`slot.c:1075-1101,1129-1164` for durable pin retirement before memory release.
+Standard `primary_conninfo`, `primary_slot_name` and
+`recovery_target_timeline` configuration/reload still need to use this admission
+path before claiming Patroni `follow` support. Synchronous commit waits and an
+independent acknowledgment-loss oracle remain separate required work; these
+tests do not establish zero-loss failover.
 
 ### Historical WAL retention implementation order
 

@@ -2,8 +2,11 @@
 (in-package #:pg)
 
 (define-condition physical-follow-terminal-error (simple-error) ())
-(defstruct physical-follow-runtime host port pin config transition limit next-timeline
-           (stopped-p nil) (connected-p nil) last-error client receiver-thread replay-thread)
+(defstruct physical-follow-runtime
+  "CONFIG is the runtime's private saved configuration; TRANSITION requests a
+controller handoff. Lifecycle and client ownership use the follow lock."
+  host port pin config transition limit next-timeline
+  (stopped-p nil) (connected-p nil) last-error client receiver-thread replay-thread)
 (defvar *physical-follow-runtime* nil)
 (defvar *physical-follow-lock* (sb-thread:make-mutex :name "native physical follow lifecycle"))
 
@@ -540,6 +543,8 @@ The caller supplies the checked current inventory and keeps its root protected."
            t)))))
 
 (defun physical-follow-call-with-receive-root (store function)
+  "Call FUNCTION with a reader lease on STORE's retained root when present.
+The caller must keep the selected store and root stable while acquiring it."
   (if (physical-store-retained-root store)
       (call-with-physical-retained-root-reader
        function (physical-store-retained-owner store) (physical-store-retained-directory store)
@@ -547,6 +552,8 @@ The caller supplies the checked current inventory and keeps its root protected."
       (funcall function)))
 
 (defun physical-follow-copy-checked-store (store)
+  "Check live, complete input and retained control under the store mutex.
+Return a private read-only candidate; the caller keeps input and root stable."
   (sb-thread:with-mutex ((physical-store-mutex store))
     (physical-store-check-live store)
     (physical-store-check-complete-input store)
@@ -557,8 +564,8 @@ The caller supplies the checked current inventory and keeps its root protected."
   "Validate an active binding without publication, redo or source contact.
 The caller must exclude concurrent recovery, reload and receive changes. This
 function copies a read-only candidate, holds a root reader lease when needed,
-and rechecks durable witnesses and the receive tuple after the scan. It does not
-enable the bound startup or receiver pipeline."
+and rechecks durable witnesses and the receive tuple after the scan. Startup
+and receiver launch call this before admitting a bound configuration."
   (physical-follow-check-config config)
   (unless (and (member (length config) '(5 6)) (eq :active (getf (fifth config) :phase))
                (equal config (physical-follow-read-config)))
@@ -831,14 +838,14 @@ Validation checks coherence, not durable state or source proof."
    (recovery-read-bytes (physical-follow-config-path) :maximum +physical-follow-config-maximum-bytes+)))
 
 (defun physical-follow-require-bootstrap-config (config)
-  "Reject either binding phase until reconciliation and bound receiving exist."
+  "Require the legacy four-field bootstrap configuration for this helper."
   (physical-follow-check-config config)
   (unless (= 4 (length config))
     (error "native follow binding requires reconciliation and bound receiver support"))
   config)
 
 (defun physical-follow-check-startup-config ()
-  "Reject a saved binding before startup can mutate storage or begin redo."
+  "Check a saved configuration using the legacy bootstrap-only guard."
   (when (probe-file (physical-follow-config-path))
     (physical-follow-require-bootstrap-config (physical-follow-read-config))))
 
@@ -900,6 +907,7 @@ Validation checks coherence, not durable state or source proof."
   (fifth (physical-follow-runtime-config runtime)))
 
 (defun physical-follow-runtime-receive-timeline (runtime)
+  "Return the selected receive timeline, which can differ from applied replay."
   (let ((binding (physical-follow-runtime-binding runtime)))
     (if binding
         (let ((after (getf binding :after))) (or (eighth after) (second after)))
@@ -1004,6 +1012,7 @@ Validation checks coherence, not durable state or source proof."
         (pg-client-close client)))))
 
 (defun physical-follow-finish-bound-stream (client runtime)
+  "Flush and verify the parent fork before accepting the source's timeline switch."
   (let ((limit (physical-follow-runtime-limit runtime))
         (next (physical-follow-runtime-next-timeline runtime)))
     (unless (and limit next)
@@ -1120,6 +1129,8 @@ Validation checks coherence, not durable state or source proof."
            (sleep 0.05)))
 
 (defun physical-follow-check-launch (config)
+  "Admit a bootstrap or reconciled active binding; validate bound state under
+reload exclusion and quiescence before workers can read it."
   (physical-follow-check-config config)
   (when (or (physical-follow-cleanup-only-p config)
             (getf (physical-follow-controller-state config) :preparing)
@@ -1137,8 +1148,8 @@ Validation checks coherence, not durable state or source proof."
   config)
 
 (defun physical-follow-launch (config)
-  "Launch a four-field bootstrap config with the command mutex held.
-Reject bindings before creating workers; publish only a complete worker pair."
+  "Launch an admitted bootstrap or active bound config with the command mutex held.
+Validate before creating workers and publish only a complete worker pair."
   (check-physical-recovery-worker-start)
   (physical-follow-check-launch config)
   (sb-thread:with-mutex (*physical-follow-lock*)
@@ -1282,6 +1293,7 @@ A failure after selection work begins fences recovery; this does not admit a net
             (unless finished (setf *physical-recovery-failed-p* t))))))))
 
 (defun physical-follow-autostart ()
+  "Launch an enabled, admitted receiver after startup validation."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (check-physical-recovery-worker-start)
     (when (probe-file (physical-follow-config-path))

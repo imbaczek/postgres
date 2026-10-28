@@ -189,6 +189,8 @@ checks received WAL progress. These digests detect corruption or divergence."
     pin))
 
 (defun physical-source-retirement-pins (name)
+  "Read and compare registered and durable pins under caller-owned WAL exclusion.
+A standby may have only the durable pin; a primary requires registry agreement."
   (declare (notinline physical-follow-pin-p))
   (let ((pin (gethash name *physical-source-pins*))
         (present (wal-namespace-file-stat (physical-source-pin-path name) t)))

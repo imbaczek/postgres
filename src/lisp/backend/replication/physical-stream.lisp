@@ -177,6 +177,7 @@ and report unexpected failures as XX000."
           :manifest-digest (physical-stream-u64 (physical-stream-option command "manifest_digest")))))
 
 (defun parse-native-physical-bootstrap-release (words)
+  "Parse exactly the native format and four bootstrap identity options."
   (unless (and (>= (length words) 4) (string-equal (second words) "SLOT"))
     (ereport "42601" "expected RELEASE_BOOTSTRAP SLOT name (native options)"))
   (let* ((name (replication-command-identifier (third words)))
@@ -195,6 +196,7 @@ and report unexpected failures as XX000."
       command)))
 
 (defun release-native-physical-bootstrap (stream command)
+  "Retire the checked bootstrap pin and return command completion without a row."
   (handler-case
       (progn
         (with-live-operation

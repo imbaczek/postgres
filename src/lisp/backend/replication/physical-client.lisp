@@ -282,6 +282,7 @@ The caller must retain cleanup intent if completion is uncertain."
             (wal-format-lsn (getf request :base)) (getf request :manifest-digest))))
 
 (defun pg-client-native-release-bootstrap (client slot coordinates)
+  "Request checked bootstrap retirement and wait for command completion."
   (pg-client-send-query client (pg-client-native-release-bootstrap-query slot coordinates))
   (pg-client-native-read-result client nil "RELEASE_BOOTSTRAP" :command-only t)
   t)

@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+;;; Durable controller configuration and bounded source retirement queue.
+;;; Cleanup entries preserve the direct endpoint and exact pin identity across
+;;; restart; they do not authenticate the remote server.
+
 (defconstant +physical-follow-cleanup-capacity+ 64)
 
 (defun physical-follow-endpoint-check (host port pin)
@@ -10,6 +14,8 @@
     (error "invalid native physical follow endpoint")))
 
 (defun physical-follow-cleanup-copy (entry)
+  "Check and copy a cleanup endpoint and its immutable request.
+The tuple identifies a pin; it does not authenticate the remote endpoint."
   (physical-follow-check-plist entry '(:kind :host :port :pin :request))
   (physical-follow-endpoint-check (getf entry :host) (getf entry :port) (getf entry :pin))
   (let ((kind (getf entry :kind)))
@@ -21,6 +27,7 @@
                      (:bootstrap (physical-follow-bootstrap-request-copy (getf entry :request)))))))
 
 (defun physical-follow-controller-copy (state)
+  "Check and copy durable controller state. A preparation reserves one queue slot."
   (physical-follow-check-plist state '(:version :enabled :preparing :cleanup))
   (unless (and (eql 1 (getf state :version)) (member (getf state :enabled) '(nil t))
                (listp (getf state :cleanup)))
@@ -57,6 +64,7 @@
           (list (physical-follow-controller-copy state))))
 
 (defun physical-follow-enqueue-cleanup (state entry)
+  "Add a checked cleanup entry once, rejecting a queue above its fixed capacity."
   (let* ((copy (physical-follow-controller-copy state))
          (entry (physical-follow-cleanup-copy entry)))
     (unless (member entry (getf copy :cleanup) :test #'equal)
@@ -64,6 +72,7 @@
     (physical-follow-controller-copy copy)))
 
 (defun physical-follow-abandon-preparation-config (config)
+  "Move an unfinished preparation into cleanup without losing its exact request."
   (let* ((state (physical-follow-controller-state config))
          (preparing (getf state :preparing)))
     (unless preparing (return-from physical-follow-abandon-preparation-config (copy-tree config)))

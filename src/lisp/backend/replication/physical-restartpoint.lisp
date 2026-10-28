@@ -448,7 +448,8 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
           (setf *physical-restartpoint-worker* nil))))))
 
 (defun physical-recovery-prepare-shutdown ()
-  "Quiesce native recovery and publish its applied terminal; do not exit the process."
+  "Cancel transitions, quiesce recovery and publish its applied terminal.
+Join workers before taking reload or admission gates; do not exit the process."
   (when (plusp *live-operation-depth*) (error "standby shutdown requires its own admission gate"))
   (check-recovery-available)
   (unless (recovery-in-progress-p)

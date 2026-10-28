@@ -72,7 +72,8 @@ Do not open its selected generation or receive spool."
   "Remove recovery triggers after verifying committed child control.
 Require the owning cold postmaster or closed admission under quiescence.
 Check every name before deleting any, then unlink and sync the PGDATA directory
-for each step. Register primary archive protection before unlinking anything.
+for each step. Register primary archive protection and save source cleanup before
+unlinking recovery provenance.
 Remove pending control last, then retire its owner after primary control readback
 and a check that pending control is absent. Old generation and receive directories
 are no longer required for primary startup."
