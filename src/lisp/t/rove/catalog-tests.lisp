@@ -41,6 +41,22 @@
       (rove:ok (= 101 (pg-toast-relfilenode (pg-class-toast class)))
                "rollback restores independent TOAST ownership metadata")))
 
+(rove:deftest test-toast-relation-eligibility
+    (flet ((column (type &optional (typmod -1))
+             (make-pg-column :name "x" :type type :typmod typmod :attnum 1)))
+      (rove:ok (not (toast-table-needed-p (vector (column :int4))))
+               "fixed-width-only tables need no TOAST table")
+      (rove:ok (not (toast-table-needed-p (vector (column :varchar 24))))
+               "bounded small varchar fits without TOAST")
+      (rove:ok (toast-table-needed-p (vector (column :varchar -1)))
+               "unlimited varchar needs TOAST")
+      (rove:ok (toast-table-needed-p (vector (column :numeric -1)))
+               "unbounded numeric needs TOAST")
+      (rove:ok (not (toast-table-needed-p (vector (column :numeric (+ 4 (ash 10 16))))))
+               "bounded small numeric fits without TOAST")
+      (rove:ok (toast-table-needed-p (make-array 5 :initial-element (column :varchar 130)))
+               "combined maximum tuple width can require TOAST")))
+
 (rove:deftest test-toast-relation-inventory
     (let* ((*catalog* (make-catalog))
            (db (make-database :name "db"))

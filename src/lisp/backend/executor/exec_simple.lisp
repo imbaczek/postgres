@@ -848,9 +848,13 @@ before this removal horizon is captured."
       (with-write-catalog-locks
         (let* ((*catalog-save-error-after-durable-p* nil)
                (class (create-table* db name cols))
-               (durable-generation *catalog-durable-generation*))
+               (durable-generation *catalog-durable-generation*)
+               (terminal-appended nil))
+          ;; Once the terminal catalog WAL record is appended, recovery owns the
+          ;; outcome even if a later flush or catalog image write fails. Do not
+          ;; drop the table or its owned relations after that point.
           (with-error-cleanup
-              (e (unless (or *catalog-save-error-after-durable-p*
+              (e (unless (or terminal-appended *catalog-save-error-after-durable-p*
                              (> *catalog-durable-generation* durable-generation))
                    (progn
                      ;; CREATE TABLE is one statement. A failed constraint
@@ -893,7 +897,8 @@ before this removal horizon is captured."
               (setf (pg-index-valid-p idx) t)
               (fsync-index idx))
             (save-catalog :logical-event
-                          (logical-catalog-event-for-ast ast)))))
+                          (logical-catalog-event-for-ast ast)
+                          :on-record-appended (lambda () (setf terminal-appended t))))))
       (send-command-complete stream "CREATE TABLE"))))
 
 (defun exec-drop-table (stream ast)

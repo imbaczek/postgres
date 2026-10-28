@@ -323,6 +323,35 @@
                (ok (not (probe-file (pg::relation-file-path 903 :visibility)))))
           (pg::smgr-close-all)))))
 
+(deftest create-table-initializes-owned-toast-storage
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*relation-streams* (make-hash-table :test #'equal))
+             (pg::*wal-page-cache* (make-hash-table :test #'equal))
+             (pg::*wal-ready* nil)
+             (pg::*catalog* (pg::make-catalog))
+             (pg::*backend* (pg::make-backend))
+             (database (pg::make-database :name "postgres")))
+        (setf (gethash "postgres" (pg::catalog-databases pg::*catalog*)) database)
+        (ensure-directories-exist (pg::catalog-path))
+        (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
+        (unwind-protect
+             (let* ((table (pg::create-table* database "big"
+                                              (list (list :name "n" :type :numeric :typmod -1))))
+                    (toast (pg::pg-class-toast table))
+                    (small (pg::create-table* database "small"
+                                              (list (list :name "n" :type :int4 :typmod -1)))))
+               (ok toast)
+               (ok (not (pg::pg-class-toast small)))
+               (ok (probe-file (pg::relation-file-path (pg::pg-toast-relfilenode toast))))
+               (ok (= 2 (pg::buf-nblocks (pg::pg-toast-index-relfilenode toast))))
+               (pg::save-catalog)
+               (let* ((restored (pg::load-catalog))
+                      (db (gethash "postgres" (pg::catalog-databases restored)))
+                      (saved (gethash "big" (pg::database-tables db))))
+                 (ok (equalp toast (pg::pg-class-toast saved)))))
+          (pg::smgr-close-all)))))
+
 (deftest vacuum-toast-advances-owned-horizon
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)

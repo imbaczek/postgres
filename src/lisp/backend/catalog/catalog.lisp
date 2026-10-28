@@ -1413,6 +1413,68 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
             (gethash new-name (database-indexes db)) idx))
     idx))
 
+(defun toast-table-needed-p (columns)
+  "Estimate whether COLUMNS need TOAST storage, as heapam_relation_needs_toast_table does.
+A toastable column is required; an unknown maximum size or an aligned maximum
+heap tuple exceeding the four-tuples-per-page threshold then warrants TOAST."
+  (let ((data-length 0)
+        (has-toastable nil)
+        (unknown nil))
+    (loop for column across columns
+          for type = (pg-column-type column)
+          for typmod = (pg-column-typmod column)
+          do (setf data-length (align-up data-length
+                                         (if (member type '(:varchar :numeric :text :bytea :json :jsonb))
+                                             4 (column-align column))))
+             (let ((size
+                     (case type
+                       (:varchar
+                        (setf has-toastable t)
+                        (and (>= typmod 4) (+ 4 (* 4 (- typmod 4)))))
+                       (:numeric
+                        (setf has-toastable t)
+                        (and (>= typmod 4)
+                             (+ 8 (* 2 (floor (+ (ldb (byte 16 16) (- typmod 4)) 6) 4)))))
+                       ((:text :bytea :json :jsonb)
+                        (setf has-toastable t)
+                        nil)
+                       (otherwise (column-fixed-size column)))))
+               (if size (incf data-length size) (setf unknown t))))
+    (let* ((per-page 4)
+           (space (floor (- +blcksz+ (maxalign (+ +size-of-page-header+
+                                                  (* per-page +size-of-item-id+))))
+                         per-page))
+           (threshold (- space (mod space +maxalign+)))
+           (tuple-length (+ (maxalign (+ +size-of-heap-tuple-header+
+                                         (ceiling (length columns) 8)))
+                            (maxalign data-length))))
+      (and has-toastable (or unknown (> tuple-length threshold))))))
+
+(defun create-table-toast-storage (table)
+  "Create eligible TABLE's owned TOAST heap and index before publishing them.
+Until both are initialized and the index is fsynced, this function owns their
+cleanup. Once attached, TABLE owns both nodes and catalog save makes that
+ownership durable; table rollback or drop handles their eventual removal."
+  (when (toast-table-needed-p (pg-class-columns table))
+    (let* ((heap-oid (allocate-oid))
+           (index-oid (allocate-oid))
+           (toast (make-pg-toast :oid heap-oid :relfilenode heap-oid
+                                 :index-oid index-oid :index-relfilenode index-oid
+                                 :relfrozenxid (next-full-xid)))
+           (completed nil))
+      (unwind-protect
+           (progn
+             (smgr-create heap-oid)
+             (btree-init index-oid)
+             (wal-commit-maintenance)
+             (smgr-fsync index-oid)
+             (setf (pg-class-toast table) toast
+                   completed t))
+        (unless completed
+          (ignore-errors (wal-discard-relation-pages (list heap-oid index-oid)))
+          (ignore-errors (smgr-forget heap-oid :delete t))
+          (ignore-errors (smgr-forget index-oid :delete t)))))))
+
 (defun create-table* (db name columns)
   "COLUMNS is a list of plists with :name :type :typmod :notnull :primary,
 :unique, and :nulls-not-distinct. Returns the new pg-class."
@@ -1447,6 +1509,7 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
     (handler-case
         (progn
           (smgr-create (pg-class-relfilenode class))
+          (create-table-toast-storage class)
           ;; Per-column PRIMARY KEY / UNIQUE.
           (loop for def in columns
                 for col across cols
