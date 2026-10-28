@@ -79,7 +79,7 @@ Validate the selected lineage before constructing the inventory."
   "Return only durable cluster state and catalog-referenced relation forks."
   (let ((files (list "PG_VERSION" "pg_xact" "global/pg_control"
                      "global/pg_catalog.dat" "global/pg_wal_control")))
-    (dolist (relfilenode (remove-duplicates (wal-relation-filennodes)))
+    (dolist (relfilenode (remove-duplicates (catalog-physical-relfilenodes)))
       (push (format nil "base/~d" relfilenode) files)
       (when (probe-file (relation-file-path relfilenode :visibility))
         (push (format nil "base/~d.vm" relfilenode) files)))

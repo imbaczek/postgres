@@ -41,6 +41,18 @@
       (rove:ok (= 101 (pg-toast-relfilenode (pg-class-toast class)))
                "rollback restores independent TOAST ownership metadata")))
 
+(rove:deftest test-toast-relation-inventory
+    (let* ((*catalog* (make-catalog))
+           (db (make-database :name "db"))
+           (table (make-pg-class :name "parent" :relfilenode 51
+                                 :toast (make-pg-toast :oid 100 :relfilenode 101
+                                                       :index-oid 102 :index-relfilenode 103))))
+      (setf (gethash "db" (catalog-databases *catalog*)) db
+            (gethash "parent" (database-tables db)) table)
+      (let ((nodes (catalog-physical-relfilenodes)))
+        (rove:ok (and (member 51 nodes) (member 101 nodes) (member 103 nodes))
+                 "inventory retains parent, TOAST heap, and TOAST index"))))
+
 (rove:deftest test-toast-catalog-physical-history
     (let* ((toast (make-pg-toast :oid 100 :relfilenode 101 :index-oid 102
                                  :index-relfilenode 103 :relfrozenxid 20))

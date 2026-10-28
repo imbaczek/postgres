@@ -1,6 +1,17 @@
 ;;;; snapshot-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(rove:deftest test-toast-visibility-is-parent-driven
+    (rove:ok (heap-toast-tuple-visible-p 42 0) "uncommitted chunk remains accessible to its parent")
+  (rove:ok (heap-toast-tuple-visible-p 42 +heap-xmin-committed+) "committed chunk is accessible")
+  (rove:ok (heap-toast-tuple-visible-p +frozen-xid+
+                                       (logior +heap-xmin-committed+ +heap-xmin-invalid+))
+           "frozen marker is not an invalid insertion")
+  (rove:ok (not (heap-toast-tuple-visible-p 42 +heap-xmin-invalid+))
+           "invalid insertion is excluded")
+  (rove:ok (not (heap-toast-tuple-visible-p +invalid-xid+ 0))
+           "invalid transaction ID is excluded"))
+
 (rove:deftest test-make-snapshot-rejects-unowned-registration
     (let ((*next-xid* 7303)
           (*active-xids* '())

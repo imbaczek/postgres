@@ -654,7 +654,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
   (wal-load-replication-slots)
   (catalog-init)
   (physical-source-pin-load)
-  (wal-remove-orphan-relations)
+  (catalog-remove-orphan-relations)
   (complete-xid-wraparound))
 
 (defun main ()

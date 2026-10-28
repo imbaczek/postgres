@@ -274,8 +274,7 @@ During streaming replay a missing previously seen heap is an error, not a new
 empty fork.  Full restart resets seen history to the base inventory and replays
 retained catalog/page WAL from the base; missing seen forks are tolerated during
 that reconstruction, and the final live-file check must still reject any missing
-referenced fork. TOAST file creation must remain disabled until that check's
-catalog inventory includes both TOAST files."
+referenced fork."
   (unless *physical-replay-seen-relfilenodes* (error "missing physical replay relation history"))
   (labels ((replay-heap (relfilenode)
              (let ((seen (gethash relfilenode *physical-replay-seen-relfilenodes*)))
@@ -335,7 +334,7 @@ Updating source membership does not change existing snapshots."
                   (list +wal-record-catalog+ +wal-record-catalog-commit+))
       (physical-replay-create-heap-forks catalog)
       (let ((*catalog* catalog))
-        (dolist (node (wal-relation-filennodes))
+        (dolist (node (catalog-physical-relfilenodes))
           (setf (gethash node *physical-replay-seen-relfilenodes*) t))))
     (unless *physical-replay-restarting-p*
       (let ((*catalog* catalog)) (physical-recovery-check-live-files)))

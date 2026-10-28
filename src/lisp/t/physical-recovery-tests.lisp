@@ -296,6 +296,33 @@
                (ok (not (probe-file (pg::relation-file-path 901)))))
           (pg::smgr-close-all)))))
 
+(deftest catalog-orphan-cleanup-retains-toast-storage
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*relation-streams* (make-hash-table :test #'equal))
+             (pg::*catalog* (pg::make-catalog))
+             (database (pg::make-database :name "postgres"))
+             (toast (pg::make-pg-toast :oid 901 :relfilenode 901 :index-oid 902
+                                       :index-relfilenode 902 :relfrozenxid 3))
+             (table (pg::make-pg-class :oid 900 :relfilenode 900 :name "parent" :toast toast)))
+        (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
+        (setf (gethash "postgres" (pg::catalog-databases pg::*catalog*)) database
+              (gethash "parent" (pg::database-tables database)) table)
+        (unwind-protect
+             (progn
+               (dolist (node '(900 901 902 903)) (pg::smgr-create node))
+               (dolist (node '(901 903))
+                 (with-open-file (stream (pg::relation-file-path node :visibility)
+                                         :direction :output :if-does-not-exist :create)
+                   (declare (ignore stream))))
+               (pg::catalog-remove-orphan-relations)
+               (dolist (node '(900 901 902))
+                 (ok (probe-file (pg::relation-file-path node))))
+               (ok (probe-file (pg::relation-file-path 901 :visibility)))
+               (ok (not (probe-file (pg::relation-file-path 903))))
+               (ok (not (probe-file (pg::relation-file-path 903 :visibility)))))
+          (pg::smgr-close-all)))))
+
 (deftest recovery-readers-use-virtual-lock-identities
     (let* ((pg::*physical-recovery-state* (sample-recovery-manifest))
            (pg::*backend* (pg::make-backend))

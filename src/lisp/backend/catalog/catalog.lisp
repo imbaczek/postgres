@@ -375,6 +375,43 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
     ;; durable, so a crash cannot leave the catalog name missing.
     (write-sequence bytes stream)))
 
+(defun catalog-physical-relfilenodes ()
+  "Return catalog-referenced physical nodes, including owned TOAST heap and index.
+The legacy WAL inventory supplies table and ordinary index nodes; this adds the
+TOAST nodes owned by each table.  The result may contain duplicates."
+  (let ((nodes (wal-relation-filennodes)))
+    (maphash
+     (lambda (name database)
+       (declare (ignore name))
+       (maphash
+        (lambda (name table)
+          (declare (ignore name))
+          (let ((toast (pg-class-toast table)))
+            (when toast
+              (push (pg-toast-relfilenode toast) nodes)
+              (push (pg-toast-index-relfilenode toast) nodes))))
+        (database-tables database)))
+     (catalog-databases *catalog*))
+    nodes))
+
+(defun catalog-remove-orphan-relations ()
+  "Remove unreferenced numeric main and visibility relation files at startup.
+Use the complete catalog inventory, including table-owned TOAST nodes.  Forget
+each unknown node through storage manager deletion, and sync base/ if any were
+removed.  Other names and fork types are not selected by this scan."
+  (let ((known (catalog-physical-relfilenodes))
+        (base (merge-pathnames "base/" *pgdata*))
+        (removed nil))
+    (dolist (path (directory (merge-pathnames "*" base)))
+      (let ((relfilenode (ignore-errors
+                          (and (member (pathname-type path) '(nil "vm") :test #'equal)
+                               (parse-integer (pathname-name path))))))
+        (when (and relfilenode (not (member relfilenode known :test #'eql)))
+          (smgr-forget relfilenode :delete t)
+          (setf removed t))))
+    (when removed (fsync-directory base)))
+  (values))
+
 (defun catalog-compute-oldest-relfrozenxid ()
   (let ((oldest nil))
     (when *catalog*

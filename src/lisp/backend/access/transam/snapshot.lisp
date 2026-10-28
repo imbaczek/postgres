@@ -358,6 +358,17 @@ is interrupted after publication but before it returns."
   (sb-thread:with-mutex (*combo-command-id-lock*)
     (remhash xid *combo-command-ids*)))
 
+(defun heap-toast-tuple-visible-p (xmin infomask)
+  "Preparatory TOAST chunk predicate; currently used only by tests.
+The owning parent tuple determines visibility, so an uncommitted insertion may
+be read.  A committed hint accepts the chunk, including the frozen encoding
+that also sets the invalid bit; otherwise reject invalid xmin or insertion.
+Unlike PostgreSQL's HeapTupleSatisfiesToast, this does not handle moved tuples
+or perform buffer hint-bit cleanup."
+  (or (logtest +heap-xmin-committed+ infomask)
+      (and (not (logtest +heap-xmin-invalid+ infomask))
+           (/= xmin +invalid-xid+))))
+
 (defun heap-tuple-visible-p (xmin xmax cid snapshot my-xid &optional (infomask 0))
   "HeapTupleSatisfiesMVCC, retaining the statement's insertion/deletion CID boundary."
   (let ((curcid (snapshot-curcid snapshot)))

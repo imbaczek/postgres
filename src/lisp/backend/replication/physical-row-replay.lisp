@@ -87,7 +87,7 @@ A violation is an error; the outer replay path fences recovery."
 (defun physical-row-replay-preflight-images (images)
   ;; Validate the whole batch before applying any image: known relation,
   ;; allowed fork, no duplicate pages and only contiguous extension.
-  (let ((nodes (wal-relation-filennodes))
+  (let ((nodes (catalog-physical-relfilenodes))
         (sizes (make-hash-table :test #'equal))
         (seen (make-hash-table :test #'equal)))
     (dolist (image images)
