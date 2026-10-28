@@ -230,8 +230,9 @@ INSERT INTO t [AS alias] [(cols)] {VALUES (...)[, (...)] | SELECT ... | DEFAULT 
   [ON CONFLICT [(cols) | ON CONSTRAINT name] DO NOTHING
    | ON CONFLICT {(cols) | ON CONSTRAINT name} DO UPDATE SET col = expr [, ...] [WHERE e]]
   [RETURNING expr, ... | *];
-UPDATE t [AS alias] SET col = expr [, ...] [WHERE e] [RETURNING expr, ... | *];
-DELETE FROM t [AS alias] [WHERE e] [RETURNING expr, ... | *];
+UPDATE t [AS alias] SET col = expr [, ...] [FROM source [, ...]]
+  [WHERE e] [RETURNING expr, ... | *];
+DELETE FROM t [AS alias] [USING source [, ...]] [WHERE e] [RETURNING expr, ... | *];
 ```
 
 Expression subqueries support correlated and uncorrelated `EXISTS`, scalar
@@ -246,6 +247,12 @@ expressions, subqueries, qualified stars, OLD/NEW fields and aliases declared
 with `RETURNING WITH (OLD AS o, NEW AS n)`. Results are buffered in a spillable
 store until the statement succeeds. See [DML scope and tests](t/DML.md) for
 conflict arbitration, visibility and remaining limitations.
+
+UPDATE FROM and DELETE USING accept the supported SELECT source forms,
+including joins, derived queries, CTE references and LATERAL between sources.
+WHERE, SET and RETURNING can reference source columns; bare RETURNING * includes
+the target and visible source columns. See [joined DML](t/JOINED-DML.md) for
+duplicate matches, concurrent rechecks and the target-reference boundary.
 
 Nonrecursive `WITH` supports SELECT CTEs, sequential lexical bindings, nested
 shadowing, column aliases, and default, `MATERIALIZED` and `NOT MATERIALIZED`

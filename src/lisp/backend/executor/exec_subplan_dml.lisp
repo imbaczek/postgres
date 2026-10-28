@@ -37,12 +37,12 @@
           (setf value (subseq value 0 maximum)))))
     value))
 
-(defun prepare-dml-returning (ast table)
+(defun prepare-dml-returning (ast table &optional source)
   (when (getf ast :returning)
     (let* ((base (make-base-select-scope (getf ast :table) (getf ast :alias) table))
-           (columns (select-scope-columns base))
-           (scope base)
            (width (length (pg-class-columns table)))
+           (scope (extend-dml-source-scope base source (* 3 width)))
+           (columns (select-scope-columns scope))
            (options (getf ast :returning-options))
            (old-kind (getf *select-analysis-frame* :kind)))
       (loop for kind in '(:old :new)
@@ -60,9 +60,9 @@
                         scope (make-select-relation
                                :name (getf ast :table) :alias name :table table
                                :offset offset :width width)))))
-      ;; Bare * and unqualified names select only the default current row.
+      ;; OLD/NEW remain qualified-only; the current row and sources expand bare *.
       (setf (select-scope-columns scope) columns
-            (select-scope-width scope) (* 3 width))
+            (select-scope-width scope) (+ (* 3 width) (if source (select-scope-width (getf source :scope)) 0)))
       (unwind-protect
            (progn
              (setf (getf *select-analysis-frame* :kind) :returning)
@@ -80,13 +80,13 @@
   (when (and targets (not *dml-returning-spool*))
     (send-row-description stream (mapcar #'target->result-column targets))))
 
-(defun emit-dml-returning (stream targets values &key old-values (new-values values))
+(defun emit-dml-returning (stream targets values &key old-values (new-values values) (source-values #()))
   ;; Evaluate against the mutation's row now, while its original snapshot is active.
   ;; The spool owns a copy until the entire command succeeds.
   (when targets
     (let* ((width (length values))
            (nulls (make-array width :initial-element +null+))
-           (environment (concatenate 'vector values (or old-values nulls) (or new-values nulls)))
+           (environment (concatenate 'vector values (or old-values nulls) (or new-values nulls) source-values))
            (row (call-with-dml-expression-evaluation
                  (lambda () (make-select-result-row environment nil targets)))))
       (if *dml-returning-spool*
@@ -125,8 +125,11 @@
                    (*select-set-functions-allowed-p* nil)
                    (*inside-aggregate-input-p* nil)
                    (*aggregate-order-mode* nil)
-                   (scope (if (eq (getf ast :type) :insert) (make-select-scope)
-                              (make-base-select-scope (getf ast :table) (getf ast :alias) table)))
+                   (base-scope (if (eq (getf ast :type) :insert) (make-select-scope)
+                                   (make-base-select-scope (getf ast :table) (getf ast :alias) table)))
+                   (dml-source (when (getf ast :dml-source)
+                                 (prepare-dml-source (getf ast :dml-source) base-scope)))
+                   (scope (extend-dml-source-scope base-scope dml-source (length columns)))
                    (rows nil) (sets nil) (attnums nil) (targets nil)
                    (source nil) (source-assignments nil)
                    (where (when (getf ast :where)
@@ -185,21 +188,25 @@
               (let* ((conflict (when (getf ast :on-conflict)
                                  (progn (setf (getf *select-analysis-frame* :kind) :on-conflict)
                                         (prepare-on-conflict table (getf ast :on-conflict) (getf ast :alias)))))
-                     (returning (prepare-dml-returning ast table)))
+                     (returning (prepare-dml-returning ast table dml-source)))
                 (list :ctes definitions :sublinks (nreverse *select-sublinks*) :table table :columns columns :scope scope
-                      :source-relations (when source (list (list :subquery-prepared source)))
+                      :source-relations (loop for child in (list source dml-source)
+                                              when child collect (list :subquery-prepared child))
                       :relations nil :where where
                       :targets (append (nreverse targets) (getf conflict :targets) returning)
                       :returning returning :conflict conflict
                       :rows rows :sets (sort sets #'< :key (lambda (item) (pg-column-attnum (car item)))) :attnums attnums
-                      :insert-source source :insert-source-plan nil :source-assignments source-assignments))))))
+                      :insert-source source :insert-source-plan nil :source-assignments source-assignments
+                      :dml-source dml-source :dml-source-plan nil :dml-one-time-quals nil :dml-row-where nil))))))
     (clear-query-analysis-contexts prepared)
     (plan-query-ctes prepared)
     (when (getf prepared :insert-source)
       (setf (getf prepared :insert-source-plan)
             (plan-prepared-select (getf prepared :insert-source))))
+    (when (getf prepared :dml-source)
+      (setf (getf prepared :dml-source-plan) (plan-prepared-select (getf prepared :dml-source))))
     (plan-expression-subqueries prepared)
-    prepared))
+    (prepare-joined-dml-qualifications prepared)))
 
 (defun revalidate-subquery-relations (relations)
   (dolist (relation relations)
@@ -224,6 +231,8 @@
          (relations (mapcar #'copy-list
                             (append (when (getf prepared :insert-source-plan)
                                       (getf (query-plan-prepared (getf prepared :insert-source-plan)) :relations))
+                                    (when (getf prepared :dml-source-plan)
+                                      (getf (query-plan-prepared (getf prepared :dml-source-plan)) :relations))
                                     (expression-subquery-relations prepared)
                                     (query-cte-relations prepared))))
          (xid (get-current-xid))
@@ -265,21 +274,13 @@
   (unwind-protect (funcall function)
     (detach-select-index-scans)))
 
-(defun stream-subquery-dml-candidates (table where function)
-  ;; Evaluate each candidate as it arrives, preserving volatile expression cadence.
-  (do-table-tuples (tuple table)
-    (when (or (null where)
-              (call-with-dml-expression-evaluation
-               (lambda () (true-p (eval-expr where (htup-values tuple))))))
-      (funcall function tuple))))
-
 (defun coerce-dml-column-default (column)
   (let ((value (insert-column-default column)))
     (if (eq value +null+) value
         (eval-subquery-assignment
          (analyze-subquery-assignment (list :const value :type :int8 :typmod -1) column) #()))))
 
-(defun subquery-update-values (table sets old)
+(defun subquery-update-values (table sets old &optional (environment old))
   ;; Analysis orders SET assignments by physical attribute; evaluate each against
   ;; the same old row, including volatile expressions and defaults.
   (let* ((columns (pg-class-columns table))
@@ -288,7 +289,7 @@
       (let* ((column (car assignment))
              (expression (cdr assignment))
              (value (if (eq expression :default) (coerce-dml-column-default column)
-                        (eval-expr expression old))))
+                        (eval-expr expression environment))))
         (setf (aref new (1- (pg-column-attnum column)))
               (coerce-value value (pg-column-type column) (pg-column-typmod column)))))
     (check-not-null new columns)
@@ -363,76 +364,90 @@
 
 (defun exec-delete-subqueries (stream ast)
   (let* ((prepared (prepare-dml-subqueries ast))
-         (where (getf prepared :where)))
+         (where (or (getf prepared :dml-row-where) (getf prepared :where))))
     (call-with-dml-subqueries
      prepared
      (lambda (table rel xid)
        (let ((columns (getf prepared :columns)) (count 0))
          (send-dml-returning-description stream (getf prepared :returning))
-         (stream-subquery-dml-candidates
-          table where
-          (lambda (candidate)
+         (stream-joined-dml-candidates
+          prepared table
+          (lambda (candidate source environment modified-p)
+            (declare (ignore environment))
             (check-for-interrupts)
             (detach-select-index-scans)
-            (multiple-value-bind (deleted tuple block off status publications)
-                (heapam-delete-tid
-                 rel columns (htup-block candidate) (htup-offnum candidate) xid
-                 (backend-command-id *backend*)
-                 (lambda (tuple)
-                   (call-with-dml-expression-evaluation
-                    (lambda () (or (null where) (true-p (eval-expr where (htup-values tuple)))))))
-                 (lambda () (logical-capture-publications (list table) :delete))
-                 t candidate)
-              (declare (ignore block off))
-              (check-heapam-write-status status)
-              (when deleted
-                (logical-note-row-change :delete table :old-values (htup-values tuple)
-                                         :publication-selection publications)
-                (emit-dml-returning stream (getf prepared :returning) (htup-values tuple)
-                                    :old-values (htup-values tuple) :new-values nil)
-                (incf count)))))
+            (unless modified-p
+              (multiple-value-bind (deleted tuple block off status publications)
+                  (heapam-delete-tid
+                   rel columns (htup-block candidate) (htup-offnum candidate) xid
+                   (backend-command-id *backend*)
+                   ;; Recheck the latest target with the original matched source, like
+                   ;; EPQ's nonlocking source rowmarks.
+                   (lambda (tuple)
+                     (call-with-dml-expression-evaluation
+                      (lambda ()
+                        (or (null where)
+                            (true-p (eval-expr where (concatenate 'vector (htup-values tuple) source)))))))
+                   (lambda () (logical-capture-publications (list table) :delete))
+                   t candidate)
+                (declare (ignore block off))
+                (check-heapam-write-status status)
+                (when deleted
+                  (logical-note-row-change :delete table :old-values (htup-values tuple)
+                                           :publication-selection publications)
+                  (emit-dml-returning stream (getf prepared :returning) (htup-values tuple)
+                                      :old-values (htup-values tuple) :new-values nil :source-values source)
+                  (incf count))
+                deleted))))
          (finish-dml-command stream (getf prepared :returning) (format nil "DELETE ~a" count)))))))
 
 (defun exec-update-subqueries (stream ast)
   (let* ((prepared (prepare-dml-subqueries ast))
-         (where (getf prepared :where))
+         (where (or (getf prepared :dml-row-where) (getf prepared :where)))
          (sets (getf prepared :sets)))
     (call-with-dml-subqueries
      prepared
      (lambda (table rel xid)
        (let ((columns (getf prepared :columns)) (count 0))
          (send-dml-returning-description stream (getf prepared :returning))
-         (stream-subquery-dml-candidates
-          table where
-          (lambda (candidate)
+         (stream-joined-dml-candidates
+          prepared table
+          (lambda (candidate source environment modified-p)
             (check-for-interrupts)
+            ;; Project every qualifying match before suppressing duplicate mutations,
+            ;; as C evaluates the plan output before TM_SelfModified handling.
             (let ((new (call-with-dml-expression-evaluation
-                        (lambda () (subquery-update-values table sets (htup-values candidate))))))
-              (multiple-value-bind (deleted tuple old-block old-offnum status)
-                  (heapam-delete-tid
-                   rel columns (htup-block candidate) (htup-offnum candidate) xid
-                   (backend-command-id *backend*)
-                   (lambda (tuple)
-                     (call-with-dml-expression-evaluation
-                      (lambda ()
-                        (when (or (null where) (true-p (eval-expr where (htup-values tuple))))
-                          (setf new (subquery-update-values table sets (htup-values tuple)))
-                          t))))
-                   nil t candidate)
-                (check-heapam-write-status status)
-                (when deleted
-                  (multiple-value-bind (block off publications)
-                      (insert-tuple-with-unique
-                       table new :exclude-tid (cons old-block old-offnum)
-                       :publication-kind :update
-                       :on-success
-                       (lambda (block off)
-                         (unless (heapam-set-ctid-unlocked rel old-block old-offnum block off)
-                           (ereport "XX000" "could not link updated heap tuple"))))
-                    (declare (ignore block off))
-                    (logical-note-row-change :update table :old-values (htup-values tuple)
-                                             :new-values new :publication-selection publications)
-                    (emit-dml-returning stream (getf prepared :returning) new
-                                        :old-values (htup-values tuple) :new-values new))
-                  (incf count))))))
+                        (lambda () (subquery-update-values table sets (htup-values candidate) environment)))))
+              (unless modified-p
+                (multiple-value-bind (deleted tuple old-block old-offnum status)
+                    (heapam-delete-tid
+                     rel columns (htup-block candidate) (htup-offnum candidate) xid
+                     (backend-command-id *backend*)
+                     (lambda (tuple)
+                       (call-with-dml-expression-evaluation
+                        (lambda ()
+                          ;; EPQ replaces only the target version; the matched source values
+                          ;; remain those captured by the original candidate.
+                          (let ((environment (concatenate 'vector (htup-values tuple) source)))
+                            (when (or (null where) (true-p (eval-expr where environment)))
+                              (setf new (subquery-update-values table sets (htup-values tuple) environment))
+                              t)))))
+                     nil t candidate)
+                  (check-heapam-write-status status)
+                  (when deleted
+                    (multiple-value-bind (block off publications)
+                        (insert-tuple-with-unique
+                         table new :exclude-tid (cons old-block old-offnum)
+                         :publication-kind :update
+                         :on-success
+                         (lambda (block off)
+                           (unless (heapam-set-ctid-unlocked rel old-block old-offnum block off)
+                             (ereport "XX000" "could not link updated heap tuple"))))
+                      (declare (ignore block off))
+                      (logical-note-row-change :update table :old-values (htup-values tuple)
+                                               :new-values new :publication-selection publications)
+                      (emit-dml-returning stream (getf prepared :returning) new
+                                          :old-values (htup-values tuple) :new-values new :source-values source))
+                    (incf count))
+                  deleted)))))
          (finish-dml-command stream (getf prepared :returning) (format nil "UPDATE ~a" count)))))))

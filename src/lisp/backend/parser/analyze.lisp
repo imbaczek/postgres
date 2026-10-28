@@ -7,6 +7,7 @@
   alias
   table
   origins
+  lateral-forbidden-p
   (offset 0)
   (width 0))
 
@@ -29,8 +30,12 @@
   (or (select-relation-alias relation)
       (sql-relation-base-name (select-relation-name relation))))
 
+(defvar *dml-source-target-scope* nil)
+
 (defun resolve-select-column (scope qualifier name)
   ;; Search one scope at a time; outer references retain their lexical depth.
+  ;; A forbidden matching entry raises 42P10 before ambiguity, matching C's
+  ;; per-entry LATERAL check instead of treating the target as invisible.
   (loop for current = scope then (select-scope-parent current)
         for depth from 0 while current
         for relation = (and qualifier
@@ -40,6 +45,8 @@
                                        (let ((name (select-relation-qualifier relation)))
                                          (and name (string= qualifier name))))
                                      (select-scope-relations current))))
+                              (when (and (first qualified) (select-relation-lateral-forbidden-p (first qualified)))
+                                (ereport "42P10" "invalid reference to the target table in a FROM subquery"))
                               (when (rest qualified)
                                 (ereport "42P09" "table reference \"~a\" is ambiguous" qualifier))
                               (first qualified)))
@@ -48,7 +55,15 @@
                           (select-scope-columns current))
         for matches = (remove-if-not
                        (lambda (column) (string= name (select-column-name column))) columns)
-        do (when (rest matches)
+        do (when (if qualifier
+                     (and relation (select-relation-lateral-forbidden-p relation))
+                     (some (lambda (item)
+                             (and (select-relation-lateral-forbidden-p item)
+                                  (find name (select-relation-columns item)
+                                        :key #'select-column-name :test #'equal)))
+                           (select-scope-relations current)))
+             (ereport "42P10" "invalid reference to the target table in a FROM subquery"))
+           (when (rest matches)
              (ereport "42702" "column reference \"~a\" is ambiguous" name))
            (when matches
              (let ((expression (select-column-expr (first matches))))

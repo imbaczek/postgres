@@ -701,7 +701,21 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
       (let* ((query (sql-derived-relation-query source))
              (prepared (prepare-select-internal query
                                                 (if (getf query :lateral)
-                                                    (or preceding-scope (make-select-scope))
+                                                    (let ((scope (copy-select-scope (or preceding-scope (make-select-scope)))))
+                                                      ;; At the source's own lexical level, retain the target as a
+                                                      ;; forbidden namespace entry for C-compatible 42P10 errors.
+                                                      ;; Nested scopes still resolve their own names first.
+                                                      (when (and *dml-source-target-scope*
+                                                                 (= (car *dml-source-target-scope*) *select-cte-level*))
+                                                        (setf (select-scope-relations scope)
+                                                              (append
+                                                               (mapcar (lambda (relation)
+                                                                         (let ((copy (copy-select-relation relation)))
+                                                                           (setf (select-relation-lateral-forbidden-p copy) t)
+                                                                           copy))
+                                                                       (select-scope-relations (cdr *dml-source-target-scope*)))
+                                                               (select-scope-relations scope))))
+                                                      scope)
                                                     (make-select-scope))))
              (targets (let ((targets (getf prepared :targets))
                             (aliases (getf query :column-aliases)))

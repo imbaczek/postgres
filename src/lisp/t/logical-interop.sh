@@ -438,7 +438,9 @@ workload() {
     wait_rows "$target" "$(sql "$source" 'SELECT id,amount,label FROM interop_rows WHERE id=80')" 'SELECT id,amount,label FROM interop_rows WHERE id=80'
     sql "$source" "INSERT INTO interop_rows VALUES(80,800,'dml update') ON CONFLICT(id) DO UPDATE SET amount=excluded.amount,label=excluded.label RETURNING old.amount,new.amount; INSERT INTO interop_rows VALUES(80,801,'dml skipped') ON CONFLICT DO NOTHING RETURNING id" >/dev/null
     wait_rows "$target" '80|800|dml update' 'SELECT id,amount,label FROM interop_rows WHERE id=80'
-    sql "$source" "BEGIN; INSERT INTO interop_rows SELECT 81,amount,'dml rollback' FROM interop_rows WHERE id=1 RETURNING id; INSERT INTO interop_rows VALUES(80,802,'rollback update') ON CONFLICT(id) DO UPDATE SET amount=excluded.amount RETURNING id; DELETE FROM interop_rows WHERE id=80 RETURNING id; ROLLBACK; DELETE FROM interop_rows WHERE id=80 RETURNING id" >/dev/null
+    sql "$source" "UPDATE interop_rows t SET amount=s.amount FROM (SELECT 850::bigint AS amount) s WHERE t.id=80 RETURNING t.id,s.amount" >/dev/null
+    wait_rows "$target" '80|850|dml update' 'SELECT id,amount,label FROM interop_rows WHERE id=80'
+    sql "$source" "BEGIN; INSERT INTO interop_rows SELECT 81,amount,'dml rollback' FROM interop_rows WHERE id=1 RETURNING id; INSERT INTO interop_rows VALUES(80,802,'rollback update') ON CONFLICT(id) DO UPDATE SET amount=excluded.amount RETURNING id; DELETE FROM interop_rows WHERE id=80 RETURNING id; ROLLBACK; DELETE FROM interop_rows t USING (SELECT 80 AS id) s WHERE t.id=s.id RETURNING t.id,s.id" >/dev/null
     wait_rows "$target" '' 'SELECT id,amount,label FROM interop_rows WHERE id=80 OR id=81'
 }
 restart_native_publisher() {

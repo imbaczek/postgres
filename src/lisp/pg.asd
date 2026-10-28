@@ -98,6 +98,7 @@
                    (:file "exec_insert")
                    (:file "exec_delete")
                    (:file "exec_subplan_dml")
+                   (:file "exec_joined_dml")
                    (:file "exec_on_conflict")
                    (:file "exec_vacuum")
                    (:file "exec_simple")))

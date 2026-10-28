@@ -442,6 +442,12 @@
 (defun parse-expr-list (p)
   (loop collect (parse-expr p) while (match-punct p #\,)))
 
+(defun parse-dml-source (p)
+  ;; Reuse SELECT source planning while keeping the mutation target separate;
+  ;; name analysis later applies the stricter FROM/USING target visibility.
+  (multiple-value-bind (from alias joins) (parse-from p)
+    (list :type :select :from from :from-alias alias :joins joins :targets '((:star t)))))
+
 (defun parse-update (p)
   (let* ((table (parse-mutation-relation-identifier p))
          (alias (cond ((match-kw p "as") (pident p))
@@ -451,11 +457,12 @@
                                 (expect-op p "=")
                                 (list :column col :expr (parse-expr p)))
                       while (match-punct p #\,)))
-          (where nil))
+          (source nil) (where nil))
+      (when (match-kw p "from") (setf source (parse-dml-source p)))
       (when (match-kw p "where")
         (setf where (parse-expr p)))
       (multiple-value-bind (returning options) (parse-returning-clause p)
-        (list :type :update :table table :alias alias :sets sets :where where
+        (list :type :update :table table :alias alias :sets sets :where where :dml-source source
               :returning returning :returning-options options)))))
 
 (defun parse-delete (p)
@@ -466,11 +473,12 @@
                             (or (token-quoted-p (pcur p))
                                 (not (member (pval p) '("where" "returning" "using") :test #'equal))))
                        (pident p))))
-         (where nil))
+         (source nil) (where nil))
+    (when (match-kw p "using") (setf source (parse-dml-source p)))
     (when (match-kw p "where")
       (setf where (parse-expr p)))
     (multiple-value-bind (returning options) (parse-returning-clause p)
-      (list :type :delete :table table :alias alias :where where
+      (list :type :delete :table table :alias alias :where where :dml-source source
             :returning returning :returning-options options))))
 
 (defun parse-truncate (p)

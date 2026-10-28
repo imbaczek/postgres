@@ -995,7 +995,8 @@ The unit suite adds 15 Rove tests in [insert-select-tests.lisp](rove/insert-sele
 [returning-tests.lisp](rove/returning-tests.lisp) and
 [on-conflict-tests.lisp](rove/on-conflict-tests.lisp). They cover parser and
 analysis rules, assignment coercion, ComboCID visibility and cleanup, arbiter
-inference and post-admission index refresh. The total unit suite is 141 tests.
+inference and post-admission index refresh. That milestone brought the unit suite
+to 141 tests.
 
 [dml.sh](dml.sh) and its three Python modules under `interop/` remain process
 tests: 102 C comparisons, 24 controlled concurrency scenarios, spill/quota,
@@ -1004,3 +1005,21 @@ transactions, catalog/index state and frontend protocol observation and cannot
 be replaced by pure Rove assertions. The logical interoperability workload also
 exercises INSERT SELECT, conflict update/skip and DELETE RETURNING in committed
 and rolled-back transactions. See [DML.md](DML.md) for scope and references.
+
+## UPDATE FROM and DELETE USING coverage
+
+Four Rove tests in [joined-dml-tests.lisp](rove/joined-dml-tests.lisp) cover
+parsing, target/source/OLD/NEW namespace slots, merged-column rebasing,
+ambiguous names and forbidden target references. The unit suite now has
+145 tests.
+
+[joined-dml.sh](joined-dml.sh) and its three Python modules under `interop/`
+remain process tests: 62 C SQL comparisons and 14 controlled concurrency
+comparisons, plus bounded source replay spill, late-error/temporary-quota
+rollback, cancellation, indexed self-sources and resource cleanup. They need
+real tuple identities, concurrent sessions and frontend protocol observations.
+The logical interoperability workload observes joined UPDATE and DELETE
+separately on the subscriber. See [JOINED-DML.md](JOINED-DML.md) for scope.
+The task-owned [joined-dml-native.lisp](interop/joined-dml-native.lisp) fixture
+pauses after planning so the process test can drop a selected source index
+before admission and verify execution-path reconciliation.

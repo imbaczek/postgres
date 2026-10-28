@@ -28,13 +28,38 @@
        (when store (close-query-replay-store store))
        (when input (close-sql-iterator input))))))
 
+(defvar *lateral-outer-environment* nil)
+
 (defun make-select-scan-iterator (node relations)
+  ;; Capture the parameter environment and statement snapshot for this scan's
+  ;; lifetime; later outer rows must not change its index key or visibility.
   (let* ((relation (physical-scan-relation node relations))
          (table (getf relation :table))
+         (path (physical-scan-path node relation))
+         (environment (copy-query-sort-value *lateral-outer-environment*))
          (source (getf relation :row-source))
          (block 0) (nblocks nil) (rows nil) (initialized nil)
          (snapshot *current-snapshot*))
-    (unless (eq (select-scan-path-kind (physical-scan-path node relation)) :seq-scan)
+    ;; Buffer base heap values for the complete key before yielding. The bounded
+    ;; store can spill even under a small upper LIMIT; filters and projections
+    ;; remain above it and evaluate lazily as rows are consumed.
+    (when (eq (select-scan-path-kind path) :index-scan)
+      (return-from make-select-scan-iterator
+        (make-buffered-sql-iterator
+         (lambda (emit)
+           (scan-select-index
+            table path snapshot
+            (lambda (tuple)
+              (let ((row (htup-values tuple)))
+                ;; Reordered joins still require values in source-order slots.
+                (funcall emit (if (getf relation :join-order-base)
+                                  (make-select-relation-environment relations relation row)
+                                  row))))
+            environment)
+           ;; A scan can reuse leases held by an outer domain. Detach those too
+           ;; before yielding to SQL filters, projections, or mutation.
+           (detach-select-index-scans)))))
+    (unless (eq (select-scan-path-kind path) :seq-scan)
       (error "A resumable producer requires a SeqScan plan"))
     (make-sql-iterator
      (lambda ()
@@ -93,8 +118,6 @@
            (if any (return (values (concatenate 'vector environment values) t))
                (setf sets nil)))))
      (lambda () (setf sets nil environment nil) (close-sql-iterator input)))))
-
-(defvar *lateral-outer-environment* nil)
 
 (defun make-lateral-join-iterator (join left right-factory)
   ;; Each left row owns a fresh right iterator and parameter epoch.  Close it
@@ -260,7 +283,12 @@
             (sql-iterator-next input)))
         (lambda () (close-sql-iterator input)))))
     (:nested-loop-join
-     (if (getf (second node) :lateral-dependent)
+     ;; A parameterized index scan needs a new key and iterator for each left
+     ;; row, just as a LATERAL input does (cf. ExecReScanIndexScan).
+     (if (or (getf (second node) :lateral-dependent)
+             (and (eq (first (fourth node)) :index-scan)
+                  (select-scan-path-parameter-expr
+                   (physical-scan-path (fourth node) (physical-scan-relation (fourth node) relations)))))
          (make-lateral-join-iterator
           (second node) (make-physical-plan-iterator (third node) relations)
           (lambda (environment)

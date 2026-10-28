@@ -55,8 +55,9 @@ skipped and rolled-back effects absent.
 
 ## Remaining limits
 
-Data-modifying CTE bodies, UPDATE FROM, DELETE USING and MERGE remain outside
-this implementation. Whole-row RETURNING values require named composite types,
+UPDATE FROM and DELETE USING are covered by the subsequent
+[joined DML milestone](JOINED-DML.md). Data-modifying CTE bodies and MERGE remain
+outside this implementation. Whole-row RETURNING values require named composite types,
 which the current catalog does not provide; they fail explicitly with 0A000.
 General DEFAULT expressions, expression/partial unique indexes and the existing
 broader type/optimizer gaps are not added here. There is no general deadlock
