@@ -178,6 +178,8 @@
 
 (declaim (ftype function parse-native-physical-start start-native-physical-replication))
 
+(declaim (ftype function parse-native-physical-prepare prepare-native-physical-follow))
+
 (defun parse-timeline-history-command (words)
   (unless (and (= (length words) 2) (plusp (length (second words)))
                (every (lambda (character) (find character "0123456789")) (second words)))
@@ -200,6 +202,7 @@
        (make-logical-replication-command
         :type :show :options (list (cons "name" (replication-command-identifier (second words))))))
       ((equal verb "TIMELINE_HISTORY") (parse-timeline-history-command words))
+      ((equal verb "PREPARE_FOLLOW") (parse-native-physical-prepare words))
       ((equal verb "CREATE_REPLICATION_SLOT") (parse-create-replication-slot words))
       ((equal verb "DROP_REPLICATION_SLOT")
        (unless (or (= (length words) 2)
@@ -987,11 +990,13 @@ keepalive's WAL-end field, which may include changes not yet applied."
              (eq (logical-replication-command-snapshot-action command) :export)
              (backend-explicit *backend*))
     (ereport "25001" "EXPORT_SNAPSHOT cannot run inside a transaction block"))
-  (when (and (member (logical-replication-command-type command) '(:start :physical-start :timeline-history))
+  (when (and (member (logical-replication-command-type command) '(:start :physical-start :physical-prepare :timeline-history))
              (backend-explicit *backend*))
     (ereport "25001" "~a cannot run inside a transaction block"
-             (if (eq (logical-replication-command-type command) :timeline-history)
-                 "TIMELINE_HISTORY" "START_REPLICATION"))))
+             (case (logical-replication-command-type command)
+               (:timeline-history "TIMELINE_HISTORY")
+               (:physical-prepare "PREPARE_FOLLOW")
+               (otherwise "START_REPLICATION")))))
 
 (defun handle-replication-query-frame (stream type-byte length-bytes payload)
   (with-backend-query-execution (:backend *backend* :cleanup :query-state)
@@ -1025,6 +1030,7 @@ keepalive's WAL-end field, which may include changes not yet applied."
                (create-replication-slot-command stream command)))
             (:drop (drop-replication-slot-command stream command))
             (:physical-start (start-native-physical-replication stream command))
+            (:physical-prepare (prepare-native-physical-follow stream command))
             (:start
              (start-logical-replication
               stream (logical-replication-command-slot-name command)

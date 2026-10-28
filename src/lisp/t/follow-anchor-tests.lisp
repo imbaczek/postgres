@@ -108,6 +108,132 @@
         unless (member key '(:history-text :eor-octets))
           append (list key value)))
 
+(defun follow-prepare-query (request &optional (name "wire_prepare"))
+  (format nil "PREPARE_FOLLOW SLOT ~a (native_format '~a', system_id '~d', base_timeline '~d', base_lsn '~a', manifest_digest '~d', source_timeline '~d', receive_timeline '~d', receive_lsn '~a', prefix_digest '~d', overlap_start '~a', overlap_digest '~d')"
+          name pg::+physical-native-format+ (getf request :system-id)
+          (getf request :base-timeline) (pg::wal-format-lsn (getf request :base))
+          (getf request :manifest-digest) (getf request :source-timeline)
+          (getf request :receive-timeline) (pg::wal-format-lsn (getf request :receive-lsn))
+          (getf request :receive-digest) (pg::wal-format-lsn (getf request :overlap-start))
+          (getf request :overlap-digest)))
+
+(deftest follow-prepare-wire-parser-preserves-receiver-coordinates
+    (let* ((request (follow-anchor-request 18446744073709551615 456))
+           (command (pg::parse-replication-command (follow-prepare-query request))))
+      (ok (eq :physical-prepare (pg::logical-replication-command-type command)))
+      (ok (equal "wire_prepare" (pg::logical-replication-command-slot-name command)))
+      (ok (equal (follow-anchor-receiver-request request)
+                 (pg::physical-follow-prepare-request command)))
+      (ok (pg::replication-query-payload-p
+           (pg::string->bytes (concatenate 'string (follow-prepare-query request) (string (code-char 0))))))))
+
+(deftest follow-prepare-wire-obeys-transaction-and-recovery-context
+    (let ((pg::*physical-recovery-state* nil)
+          (pg::*physical-recovery-failed-p* nil)
+          (pg::*backend* (pg::make-backend :explicit t :state :in-progress))
+          (command (pg::parse-replication-command
+                    (follow-prepare-query (follow-anchor-request 123 456)))))
+      (ok (equal "25001" (recovery-state-of
+                          (lambda () (pg::validate-replication-command-context command)))))
+      (setf (pg::backend-explicit pg::*backend*) nil
+            pg::*physical-recovery-state* (list :phase 2))
+      (ok (equal "25006" (recovery-state-of
+                          (lambda () (pg::validate-replication-command-context command)))))
+      (setf (pg::backend-state pg::*backend*) :aborted)
+      (ok (equal "25P02" (recovery-state-of
+                          (lambda () (pg::validate-replication-command-context command)))))))
+
+(deftest follow-prepare-wire-result-requires-durable-ready-and-returns-anchor
+    (call-with-follow-anchor-source
+     (lambda (root request eor)
+       (declare (ignore root))
+       (let* ((command (pg::parse-replication-command (follow-prepare-query request)))
+              (row (pg::physical-follow-prepare-row command))
+              (pin (gethash "wire_prepare" pg::*physical-source-pins*)))
+         (ok (pg::physical-follow-pin-ready-p pin))
+         (ok (pg::physical-follow-pin-ready-p
+              (pg::physical-follow-pin-decode
+               (lineage-test-bytes (pg::physical-source-pin-path "wire_prepare")))))
+         (ok (equal (list "wire_prepare" (format nil "~d" (getf request :system-id))
+                          "1" "0/00000020" "77" "2" "1" "0/00000040"
+                          (format nil "~d" (getf request :receive-digest))
+                          "0/00000000" (format nil "~d" (getf request :overlap-digest))
+                          (getf request :history-text) "2" "0/00000040"
+                          (format nil "~(~{~2,'0X~}~)" (coerce eor 'list)))
+                    row))))))
+
+(deftest follow-prepare-wire-parser-rejects-extra-missing-and-invalid-options
+    (let ((query (follow-prepare-query (follow-anchor-request 123 456))))
+      (dolist (case
+                  (list (list "native_format '[^']+'" "native_format 'wrong'" "0A000")
+                        (list ", system_id '[^']+'" "" "0A000")
+                        (list "source_timeline '2'" "source_timeline '0'" "22023")
+                        (list "receive_timeline '1'" "receive_timeline '4294967296'" "22023")
+                        (list "prefix_digest '123'" "prefix_digest '-1'" "22023")
+                        (list "prefix_digest '123'" "prefix_digest '18446744073709551616'" "22023")
+                        (list "base_lsn '[^']+'" "base_lsn 'bad'" "22P02")
+                        (list "\\)$" ", system_id '42')" "0A000")
+                        (list "\\)$" ", history 'forged')" "0A000")
+                        (list "\\)$" ", eor_hex '00')" "0A000")))
+        (destructuring-bind (pattern replacement state) case
+          (ok (equal state
+                     (handler-case
+                         (progn (pg::parse-replication-command
+                                 (cl-ppcre:regex-replace pattern query replacement)) nil)
+                       (pg::pg-error (condition) (pg::pg-error-sqlstate condition)))))))))
+
+(deftest follow-prepare-wire-does-not-return-a-row-after-failed-proof
+    (call-with-follow-anchor-source
+     (lambda (root request eor)
+       (declare (ignore root eor))
+       (incf (getf request :overlap-digest))
+       (let ((command (pg::parse-replication-command (follow-prepare-query request))))
+         (ok (equal "55000"
+                    (handler-case (progn (pg::physical-follow-prepare-row command) nil)
+                      (pg::pg-error (condition) (pg::pg-error-sqlstate condition)))))
+         (let ((pin (gethash "wire_prepare" pg::*physical-source-pins*)))
+           (ok pin)
+           (ng (pg::physical-follow-pin-ready-p pin))
+           (ng (pg::physical-source-pin-confirmed-lsn pin)))))))
+
+(deftest follow-prepare-wire-returns-no-row-on-ambiguous-ready-publication
+    (call-with-follow-anchor-source
+     (lambda (root request eor)
+       (declare (ignore root eor))
+       (let ((pg::*physical-source-test-hook*
+               (lambda (point pin)
+                 (when (and (eq point :after-save)
+                            (pg::physical-follow-pin-ready-p pin))
+                   (error "ambiguous ready publication")))))
+         (ok (equal "XX000"
+                    (recovery-state-of
+                     (lambda () (pg::physical-follow-prepare-row
+                                 (pg::parse-replication-command (follow-prepare-query request)))))))
+         (ok pg::*wal-poisoned*)
+         (ng (pg::physical-follow-pin-ready-p
+              (gethash "wire_prepare" pg::*physical-source-pins*)))))))
+
+(deftest follow-prepare-wire-reports-unavailable-source-eor-as-object-state
+    (dolist (kind '(:missing :truncated :corrupt))
+      (call-with-follow-anchor-source
+       (lambda (root request eor)
+         (declare (ignore root))
+         (let ((path (pg::wal-segment-path 0)))
+           (ecase kind
+             (:missing (delete-file path))
+             (:truncated (pg::wal-atomic-write-bytes
+                          path (make-array (+ 64 (1- (length eor)))
+                                           :element-type '(unsigned-byte 8) :initial-element 0)))
+             (:corrupt (pg::wal-atomic-write-bytes
+                        path (make-array (+ 64 (length eor))
+                                         :element-type '(unsigned-byte 8) :initial-element 0)))))
+         (ok (equal "55000"
+                    (recovery-state-of
+                     (lambda () (pg::physical-follow-prepare-row
+                                 (pg::parse-replication-command (follow-prepare-query request)))))))
+         (ok (zerop (hash-table-count pg::*physical-source-pins*)))
+         (ng pg::*wal-poisoned*)))))
+
 (deftest follow-preparation-builds-source-owned-history-and-eor
     (call-with-follow-anchor-source
      (lambda (root request eor)

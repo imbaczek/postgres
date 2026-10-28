@@ -79,6 +79,88 @@ Follow mode is explicit; a failed bootstrap request never falls back to it."
       (physical-stream-mode command)
       command)))
 
+(defparameter *physical-follow-wire-fields*
+  '(("system_id" :system-id :u64) ("base_timeline" :base-timeline :timeline)
+    ("base_lsn" :base :lsn) ("manifest_digest" :manifest-digest :u64)
+    ("source_timeline" :source-timeline :timeline)
+    ("receive_timeline" :receive-timeline :timeline) ("receive_lsn" :receive-lsn :lsn)
+    ("prefix_digest" :receive-digest :u64) ("overlap_start" :overlap-start :lsn)
+    ("overlap_digest" :overlap-digest :u64)))
+
+(defun physical-follow-prepare-request (command)
+  (cons :version
+        (cons 1
+              (loop for (name key kind) in *physical-follow-wire-fields*
+                    for text = (physical-stream-option command name)
+                    for value = (if (eq kind :lsn) (parse-replication-lsn text)
+                                    (physical-stream-u64 text))
+                    do (when (and (eq kind :timeline)
+                                  (not (typep value '(integer 1 4294967295))))
+                         (ereport "22023" "invalid native physical timeline"))
+                    append (list key value)))))
+
+(defun parse-native-physical-prepare (words)
+  (unless (and (>= (length words) 4) (string-equal (second words) "SLOT"))
+    (ereport "42601" "expected PREPARE_FOLLOW SLOT name (native options)"))
+  (let* ((name (replication-command-identifier (third words)))
+         (options (parse-replication-generic-options (nthcdr 3 words)))
+         (keys (cons "native_format" (mapcar #'first *physical-follow-wire-fields*))))
+    (unless (wal-valid-replication-slot-name-p name)
+      (ereport "42602" "invalid physical follow pin name"))
+    (unless (and (= (length keys) (length options))
+                 (every (lambda (key) (= 1 (count key options :key #'car :test #'equal))) keys))
+      (ereport "0A000" "PREPARE_FOLLOW requires exactly the negotiated receiver coordinates"))
+    (let ((command (make-logical-replication-command
+                    :type :physical-prepare :slot-name name :options options)))
+      (unless (equal +physical-native-format+ (physical-stream-option command "native_format"))
+        (ereport "0A000" "unsupported native physical WAL format"))
+      (physical-follow-prepare-request command)
+      command)))
+
+(defun physical-follow-prepare-row (command)
+  (handler-case
+      (let ((pin (physical-source-follow-prepare
+                  (logical-replication-command-slot-name command)
+                  (physical-follow-prepare-request command))))
+        (with-live-operation
+          (sb-thread:with-mutex (*wal-lock*)
+            (physical-follow-pin-check-live pin)
+            (unless (physical-follow-pin-ready-p pin)
+              (wal-invalid-input "physical follow pin is not ready"))
+            (let ((anchor (physical-follow-anchor-copy (physical-follow-pin-anchor pin))))
+              (multiple-value-bind (history fork eor) (physical-follow-anchor-check anchor)
+                (declare (ignore eor))
+                (let* ((position (position (getf anchor :receive-timeline) history
+                                           :key #'timeline-history-entry-timeline))
+                       (next (timeline-history-entry-timeline (nth (1- position) history))))
+                  (append
+                   (list (copy-seq (physical-source-pin-name pin)))
+                   (loop for (name key kind) in *physical-follow-wire-fields*
+                         for value = (getf anchor key)
+                         collect (if (eq kind :lsn) (wal-format-lsn value)
+                                     (format nil "~d" value)))
+                   (list (copy-seq (getf anchor :history-text)) (format nil "~d" next)
+                         (wal-format-lsn fork)
+                         (format nil "~(~{~2,'0X~}~)" (getf anchor :eor-octets))))))))))
+    (wal-input-validation-error (condition) (ereport "55000" "~a" condition))
+    (pg-error (condition) (error condition))
+    (error (condition) (ereport "XX000" "physical follow preparation failed: ~a" condition))))
+
+(defun prepare-native-physical-follow (stream command)
+  (let* ((row (physical-follow-prepare-row command))
+         (fields (append '(("slot_name" nil :text)) *physical-follow-wire-fields*
+                         '(("history" nil :text) ("next_tli" nil :timeline)
+                           ("next_tli_startpos" nil :lsn) ("eor_hex" nil :text))))
+         (columns (loop for (name key kind) in fields
+                        collect (make-result-column
+                                 :name name :type-oid (if (eq kind :timeline) +int8oid+ +textoid+)
+                                 :typlen (if (eq kind :timeline) 8 -1)))))
+    (with-live-operation
+      (send-row-description stream columns)
+      (send-data-row-text stream row)
+      (send-command-complete stream "PREPARE_FOLLOW")
+      (send-ready-for-query stream (transaction-status-char)))))
+
 (defun physical-source-acquire-sender (command)
   "Validate the requested mode and claim its pin under WAL exclusion.
 A follow pin must be ready and bound to the current writer timeline; START may

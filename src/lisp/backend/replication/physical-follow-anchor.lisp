@@ -257,5 +257,10 @@ Reservation and proof check retention again after capture."
               (handler-case (physical-source-follow-anchor request)
                 (error (condition)
                   (or (physical-source-follow-existing-anchor name request)
-                      (error condition)))))))
+                      (if (or *wal-poisoned* (typep condition 'pg-error)
+                              (typep condition 'wal-input-validation-error))
+                          (error condition)
+                          (wal-invalid-input
+                           "physical follow source WAL is unavailable; reseed is required: ~a"
+                           condition))))))))
     (physical-source-follow-ready name anchor)))
