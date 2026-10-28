@@ -223,7 +223,7 @@ Neither binding phase is admitted by the current receiver."
         (error "follow recovery history witness is ahead of the old receive selection"))))
   binding)
 
-(defun physical-follow-replay-seed (store base binding)
+(defun physical-follow-replay-seed (store base applied restartpoint)
   "Read the durable restartpoint and choose a replay seed for BINDING.
 Check its pointer and generation against the witness and receive prefix. Use a
 version 3 or later restartpoint; for an older generation, fall back to the
@@ -231,7 +231,7 @@ verified base and require the full prefix to remain available. The caller owns
 PGDATA and root protection and supplies independently verified base and binding."
   (multiple-value-bind (metadata catalog prefix digest) (physical-restartpoint-read base)
     (declare (ignore catalog prefix))
-    (unless (equal (getf (getf binding :recovery) :restartpoint)
+    (unless (equal restartpoint
                    (when metadata (list (getf metadata :lsn) digest)))
       (error "follow restartpoint witness differs from its durable pointer"))
     (when (and metadata (< (getf metadata :version) 3))
@@ -243,7 +243,7 @@ PGDATA and root protection and supplies independently verified base and binding.
            (snapshot (copy-tree (getf (or metadata base) :source-checkpoint)))
            (reservation (copy-tree (getf (or metadata base) :source-reservation))))
       (unless (and (<= (physical-store-floor-lsn store) start
-                       (first (getf binding :applied)))
+                       (first applied))
                    (typep next '(integer 3 18446744073709551616))
                    (or metadata (= start (physical-store-base-lsn store))))
         (error "follow replay lacks a usable base or restartpoint"))
@@ -267,41 +267,14 @@ PGDATA and root protection and supplies independently verified base and binding.
       (values start timeline next snapshot reservation
               (when metadata (copy-tree (getf metadata :source-xids)))))))
 
-(defun physical-follow-validate-candidate-replay (candidate verified-base binding)
-  "Validate a private candidate's replay through its proposed fork without redo.
-The caller must own PGDATA and a root lease, hold recovery quiescence, and supply
-an independently verified immutable base and durable binding. CANDIDATE is a
-disposable store copy with no streams; it shares the original store's mutex, so
-do not hold that mutex while calling. The private pending reconciler uses it.
-
-Read and validate the actual restartpoint before scanning. Check clean required
-and applied boundaries, selected EOR, initialization, allocation and source
-membership. A completed fork must be clean; catch-up before the fork may end
-with an open batch. The XID value at required may differ from that at the fork.
-When the required point precedes the seed, durable provenance must establish it and the
-seed's next XID must be at least the witness value. The scan performs no writes,
-redo or publication. An error may latch CANDIDATE failed, not the original store."
-  (physical-follow-binding-check binding)
-  (unless (and (equal (physical-store-control-tuple candidate) (getf binding :after))
-               (eql (getf verified-base :system-id) (physical-store-system-id candidate))
-               (eql (getf verified-base :timeline) (physical-store-timeline candidate))
-               (eql (getf verified-base :end) (physical-store-base-lsn candidate))
-               (eql (getf verified-base :manifest-digest) (nth 9 (getf binding :after)))
-               (equal (getf verified-base :cluster-identity)
-                      (getf (getf binding :recovery) :cluster-identity)))
-    (error "follow replay candidate differs from its verified base or binding"))
-  (multiple-value-bind (start timeline next snapshot reservation source-xids)
-      (physical-follow-replay-seed candidate verified-base binding)
+(defun physical-follow-scan-replay-from-seed
+    (candidate verified-base applied required observed seed map-records allow-open-tail &optional witness)
+  "Check semantic replay and clean recovery frontiers using a verified read-only seed."
+  (destructuring-bind (start timeline next snapshot reservation source-xids) seed
     (let* ((*physical-recovery-state* (copy-tree verified-base))
            (*physical-receive-store* candidate)
-           (applied (getf binding :applied))
-           (required (getf binding :required))
-           (observed (getf (getf binding :recovery) :observed-next-xid))
-           (terminal start)
-           (catching-up (and (equal (getf binding :before) (getf binding :after))
-                             (< (physical-store-flushed-lsn candidate)
-                                (nth-value 1 (physical-follow-anchor-check (getf binding :anchor))))))
-           (applied-seen nil) (required-seen nil) (required-next nil)
+           (terminal start) (applied-seen nil) (required-seen nil) (required-next nil)
+           (witness-seen (null witness))
            (removed (make-hash-table :test #'eql)))
       (setf (getf *physical-recovery-state* :replay-timeline) timeline
             (getf *physical-recovery-state* :source-checkpoint) snapshot
@@ -313,6 +286,10 @@ redo or publication. An error may latch CANDIDATE failed, not the original store
           (error "follow restartpoint loses required XID visibility"))
         (setf required-seen t required-next observed))
       (labels ((note-boundary ()
+                 (when (and witness (= terminal (first witness)))
+                   (unless (equal witness (list terminal timeline next))
+                     (error "follow replay differs from its restartpoint visibility"))
+                   (setf witness-seen t))
                  (when (equal applied (list terminal timeline))
                    (setf applied-seen t))
                  (when (equal required (list terminal timeline))
@@ -321,8 +298,8 @@ redo or publication. An error may latch CANDIDATE failed, not the original store
                    (setf required-seen t required-next next))))
         (note-boundary)
         (with-physical-replay-staging ()
-          (physical-store-map-durable-records
-           candidate
+          (funcall
+           map-records
            (lambda (record raw)
              (if (= (wal-record-type record) +wal-record-end-of-recovery+)
                  (setf timeline (physical-replay-check-selected-eor
@@ -343,14 +320,44 @@ redo or publication. An error may latch CANDIDATE failed, not the original store
              (unless *wal-recovery-group-active*
                (setf terminal (wal-record-end record))
                (note-boundary)))
-           :start-lsn start)
-          (unless (and applied-seen required-seen
-                       (or (and catching-up *wal-recovery-group-active*)
+           start)
+          (unless (and applied-seen required-seen witness-seen
+                       (or (and allow-open-tail *wal-recovery-group-active*)
                            (and (not *wal-recovery-group-active*)
                                 (= terminal (physical-store-flushed-lsn candidate)))))
-            (error "follow replay does not reach clean applied, required and fork boundaries"))))
+            (error "follow replay does not reach clean recovery boundaries"))))
       (list :start start :terminal terminal :timeline timeline :next-xid next
             :required-next-xid required-next :reservation reservation :source-xids source-xids))))
+
+(defun physical-follow-scan-replay (candidate verified-base applied required observed restartpoint
+                                    &key allow-open-tail)
+  "Validate the durable seed and scan its retained suffix without redo."
+  (physical-follow-scan-replay-from-seed
+   candidate verified-base applied required observed
+   (multiple-value-list (physical-follow-replay-seed candidate verified-base applied restartpoint))
+   (lambda (function start)
+     (physical-store-map-durable-records candidate function :start-lsn start))
+   allow-open-tail))
+
+(defun physical-follow-validate-candidate-replay (candidate verified-base binding)
+  "Validate a private pending candidate without redo or publication."
+  (physical-follow-binding-check binding)
+  (unless (and (equal (physical-store-control-tuple candidate) (getf binding :after))
+               (eql (getf verified-base :system-id) (physical-store-system-id candidate))
+               (eql (getf verified-base :timeline) (physical-store-timeline candidate))
+               (eql (getf verified-base :end) (physical-store-base-lsn candidate))
+               (eql (getf verified-base :manifest-digest) (nth 9 (getf binding :after)))
+               (equal (getf verified-base :cluster-identity)
+                      (getf (getf binding :recovery) :cluster-identity)))
+    (error "follow replay candidate differs from its verified base or binding"))
+  (physical-follow-scan-replay
+   candidate verified-base (getf binding :applied) (getf binding :required)
+   (getf (getf binding :recovery) :observed-next-xid)
+   (getf (getf binding :recovery) :restartpoint)
+   :allow-open-tail
+   (and (equal (getf binding :before) (getf binding :after))
+        (< (physical-store-flushed-lsn candidate)
+           (nth-value 1 (physical-follow-anchor-check (getf binding :anchor)))))))
 
 (defun physical-follow-pending-recovery-position (base binding control)
   "Match durable recovery provenance, required pair and XID to the witness.
@@ -384,6 +391,173 @@ The copy shares STORE's mutex and may be latched failed independently."
     (setf (physical-store-stream candidate) nil
           (physical-store-lock-stream candidate) nil)
     candidate))
+
+(defun physical-follow-check-active-control (store base binding control)
+  "Check immutable recovery identity and monotone durable recovery progress."
+  (let* ((after (getf binding :after)) (witness (getf binding :recovery))
+                                       (required (list (getf control :applied)
+                                                       (getf control :applied-timeline (getf control :timeline)))))
+    (unless (and (eql 2 (getf control :phase)) (eql 3 (getf control :control-version))
+                 (= (getf control :system-id) (getf base :system-id) (first after))
+                 (= (getf control :timeline) (getf base :timeline) (second after))
+                 (= (getf control :manifest-digest) (getf base :manifest-digest) (nth 9 after))
+                 (= (getf control :checkpoint) (getf base :checkpoint) (getf witness :checkpoint))
+                 (equal (getf base :cluster-identity) (getf witness :cluster-identity))
+                 (equal (list (getf control :history-target) (getf control :history-digest))
+                        (list (eighth after) (ninth after)))
+                 (<= (first (getf binding :required)) (first required))
+                 (<= (getf witness :observed-next-xid) (getf control :next-xid)))
+      (error "active follow differs from durable recovery provenance or progress"))
+    (dolist (pair (list required (getf binding :required) (getf binding :applied)))
+      (physical-recovery-check-store-point store (first pair) (second pair)))
+    required))
+
+(defun physical-follow-active-prefix-digest (store cursor index)
+  "Derive a saved boundary from the current spool or its checked retained root."
+  (when (<= (physical-store-floor-lsn store) cursor)
+    (return-from physical-follow-active-prefix-digest (physical-store-prefix-digest store cursor)))
+  (unless index (error "active follow lacks retained proof of an older boundary"))
+  (when (= cursor (physical-store-base-lsn store))
+    (return-from physical-follow-active-prefix-digest #xCBF29CE484222325))
+  (dolist (entry (getf index :entries))
+    (let ((metadata (third entry)))
+      (when (<= (getf metadata :start) cursor (getf metadata :end))
+        (multiple-value-bind (actual bytes)
+            (physical-retained-extent-decode
+             (physical-retained-object-read (physical-store-retained-directory store)
+                                            :extent (first entry) +physical-retained-image-limit+))
+          (let ((digest (physical-retained-extent-scan
+                         actual bytes (physical-store-retained-history store) cursor)))
+            (when digest (return-from physical-follow-active-prefix-digest digest)))))))
+  (error "active follow retained root omits a saved boundary"))
+
+(defun physical-follow-check-active-receive (store base binding)
+  "Check the saved receive selection and any later retained prefix."
+  (let* ((saved (getf binding :after)) (current (physical-store-control-tuple store))
+                                       (anchor (getf binding :anchor)) (cursor (getf anchor :receive-lsn)))
+    (unless (and (every (lambda (index) (eql (nth index saved) (nth index current)))
+                        '(0 1 2 7 8 9))
+                 (= (getf base :end) (third current))
+                 (<= (fourth saved) (fourth current))
+                 (<= (sixth saved) (sixth current))
+                 (or (/= (sixth saved) (sixth current))
+                     (= (seventh saved) (seventh current))))
+      (error "active follow receive identity, selection or floor regressed"))
+    (when (equal (getf binding :before) saved)
+      (unless (<= (fourth current)
+                  (nth-value 1 (physical-follow-anchor-check anchor)))
+        (error "active parent receipt crossed its unselected child fork")))
+    (when (physical-store-selection store)
+      (unless (equalp (physical-store-selection store)
+                      (physical-store-load-history-selection store (eighth current) (ninth current)))
+        (error "active follow in-memory history differs from its durable selection")))
+    (physical-store-validate-prefix store)
+    (when (or (> (sixth current) (third current)) (nth 10 saved))
+      (unless (physical-store-retained-root store)
+        (error "active follow lost its retained root")))
+    (let ((index
+            (when (physical-store-retained-root store)
+              (physical-store-check-retained-identity store)
+              (let ((index (physical-retained-inventory-load
+                            (physical-store-retained-directory store) (physical-store-retained-root store)
+                            (physical-store-retained-identity store) (physical-store-retained-history store))))
+                (physical-store-check-retained-coverage store (getf index :entries))
+                index))))
+      (unless (and (= (getf anchor :receive-digest)
+                      (physical-follow-active-prefix-digest store cursor index))
+                   (= (seventh saved)
+                      (physical-follow-active-prefix-digest store (sixth saved) index)))
+        (error "active follow lost its source-verified prefix or saved floor"))
+      (values current index))))
+
+(defun physical-follow-check-active-restartpoint (store base binding)
+  "Accept a later valid restartpoint, preserving an equal-position generation."
+  (multiple-value-bind (metadata catalog prefix digest) (physical-restartpoint-read base)
+    (declare (ignore catalog prefix))
+    (let* ((old (getf (getf binding :recovery) :restartpoint))
+           (token (when metadata (list (getf metadata :lsn) digest))))
+      (when old
+        (unless (and token (<= (first old) (first token))
+                     (or (/= (first old) (first token)) (equal old token)))
+          (error "active follow restartpoint regressed or changed at its saved boundary")))
+      (when (> (physical-store-floor-lsn store) (getf base :end))
+        (unless (and metadata (>= (getf metadata :version) 3)
+                     (<= (physical-store-floor-lsn store) (getf metadata :lsn)))
+          (error "active follow compaction lacks a usable durable restartpoint")))
+      (values metadata token))))
+
+(defun physical-follow-map-active-prefix (store index function start)
+  "Map checked retained extents and the durable spool once, starting at the base."
+  (unless (= start (physical-store-base-lsn store))
+    (error "active historical scan must start at the verified base"))
+  (when (> (physical-store-floor-lsn store) start)
+    (unless index (error "active historical replay lacks retained WAL"))
+    (dolist (entry (getf index :entries))
+      (multiple-value-bind (metadata bytes)
+          (physical-retained-extent-decode
+           (physical-retained-object-read (physical-store-retained-directory store)
+                                          :extent (first entry) +physical-retained-image-limit+))
+        (physical-retained-extent-scan metadata bytes (physical-store-retained-history store)
+                                       nil function))))
+  (physical-store-map-durable-records store function :start-lsn (physical-store-floor-lsn store)))
+
+(defun physical-follow-scan-active-state (candidate base binding control required index)
+  "Check current visibility at its own boundary, including before a newer restartpoint."
+  (multiple-value-bind (metadata token)
+      (physical-follow-check-active-restartpoint candidate base binding)
+    (let* ((applied (max (first (getf binding :applied)) (first required)
+                         (if (and metadata (>= (getf metadata :version) 3))
+                             (getf metadata :lsn) (getf base :end))))
+           (pair (list applied (physical-store-prefix-timeline candidate applied)))
+           (seed (multiple-value-list (physical-follow-replay-seed candidate base pair token))))
+      (if (< (first required) (first seed))
+          (physical-follow-scan-replay-from-seed
+           candidate base pair required (getf control :next-xid)
+           (list (getf base :end) (getf base :timeline) (getf base :next-xid)
+                 (copy-tree (getf base :source-checkpoint))
+                 (copy-tree (getf base :source-reservation)) nil)
+           (lambda (function start) (physical-follow-map-active-prefix candidate index function start))
+           t (subseq seed 0 3))
+          (physical-follow-scan-replay-from-seed
+           candidate base pair required (getf control :next-xid) seed
+           (lambda (function start)
+             (physical-store-map-durable-records candidate function :start-lsn start))
+           t)))))
+
+(defun physical-follow-check-active-state (store verified-base config)
+  "Validate an active binding without publication, redo or source contact."
+  (physical-follow-check-config config)
+  (unless (and (= 5 (length config)) (eq :active (getf (fifth config) :phase))
+               (equal config (physical-follow-read-config)))
+    (error "active follow config is absent, pending or changed"))
+  (labels ((validate ()
+             (let* ((binding (fifth config))
+                    (control (physical-recovery-read-control *pgdata*))
+                    (candidate
+                      (sb-thread:with-mutex ((physical-store-mutex store))
+                        (physical-store-check-live store)
+                        (physical-store-check-complete-input store)
+                        (physical-store-read-retained-control store (physical-store-control-tuple store))
+                        (physical-follow-copy-replay-candidate store))))
+               (multiple-value-bind (tuple index)
+                   (physical-follow-check-active-receive candidate verified-base binding)
+                 (let ((required (physical-follow-check-active-control candidate verified-base binding control)))
+                   (physical-follow-check-history-files candidate binding)
+                   (let ((result (physical-follow-scan-active-state
+                                  candidate verified-base binding control required index)))
+                     (unless (and (equal control (physical-recovery-read-control *pgdata*))
+                                  (equal config (physical-follow-read-config)))
+                       (error "active follow durable witnesses changed during validation"))
+                     (sb-thread:with-mutex ((physical-store-mutex store))
+                       (unless (equal tuple (physical-store-control-tuple store))
+                         (error "active follow receive state changed during validation"))
+                       (physical-store-read-retained-control store tuple))
+                     result))))))
+    (if (physical-store-retained-root store)
+        (call-with-physical-retained-root-reader
+         #'validate (physical-store-retained-owner store) (physical-store-retained-directory store)
+         (physical-store-retained-identity store) (physical-store-retained-root store))
+        (validate))))
 
 (defun physical-follow-check-pending-state (store verified-base config)
   "Validate a saved pending binding against durable recovery and receive state.

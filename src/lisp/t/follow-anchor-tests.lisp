@@ -225,8 +225,9 @@
 (defun follow-replay-proof-write-restartpoint (store base lsn next &optional (version 3) (prefix-delta 0) overrides)
   (multiple-value-bind (deletes catalog) (pg::wal-decode-catalog-payload (history-catalog-payload nil nil))
     (declare (ignore deletes))
-    (let* ((metadata (list :version version :system-id 42 :cluster-identity "history-source"
-                           :timeline 1 :manifest-digest 77 :base (getf base :end)
+    (let* ((metadata (list :version version :system-id (getf base :system-id)
+                           :cluster-identity (getf base :cluster-identity)
+                           :timeline (getf base :timeline) :manifest-digest (getf base :manifest-digest) :base (getf base :end)
                            :lsn lsn :prefix-digest (+ prefix-delta (pg::physical-store-prefix-digest store lsn))
                            :next-xid next :forks nil :seen nil :source-checkpoint nil))
            (pointer (make-array 28 :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -351,7 +352,9 @@
 (defun follow-pending-proof-control (binding &key post (next 11) (required '(136 1)))
   (let ((tuple (getf binding :after)))
     (pg::physical-recovery-control-image
-     2 42 1 77 64 (first required) next :applied-timeline (second required)
+     2 (first tuple) (second tuple) (nth 9 tuple)
+     (getf (getf binding :recovery) :checkpoint)
+     (first required) next :applied-timeline (second required)
      :history-target (when post (eighth tuple))
      :history-digest (when post (ninth tuple)))))
 
@@ -512,6 +515,210 @@
            (ok (= 999 pg::*next-xid* pg::*last-replay-lsn*))
            (ok (signals (pg::physical-follow-check-startup-config) 'error)))))))
 
+(deftest follow-active-proof-allows-receipt-required-and-restartpoint-progress
+    (dolist (progress '(:unchanged :receipt :required :restartpoint))
+      (call-with-follow-pending-proof
+       (lambda (root store candidate base config)
+         (declare (ignore root candidate))
+         (let* ((active (pg::physical-follow-reconcile-pending-store store base config))
+                (binding (fifth active))
+                (fork (pg::physical-store-flushed-lsn store))
+                (end fork))
+           (unless (eq progress :unchanged)
+             (let ((raw (coerce (getf (getf binding :anchor) :eor-octets)
+                                '(vector (unsigned-byte 8)))))
+               (pg::physical-store-input store fork raw)
+               (incf end (length raw))
+               (pg::physical-store-flush store)))
+           (when (eq progress :required)
+             (pg::wal-atomic-write-bytes
+              (pg::physical-recovery-control-path)
+              (follow-pending-proof-control binding :post t :next 21 :required (list end 2))))
+           (when (eq progress :restartpoint)
+             (follow-replay-proof-write-restartpoint
+              store base end 21 4 0
+              (list :replay-timeline 2 :history-target 2
+                    :history-digest (ninth (getf binding :after))))
+             )
+           (let ((tuple (pg::physical-store-control-tuple store))
+                 (control (pg::physical-recovery-read-control pg::*pgdata*)))
+             (let ((result (pg::physical-follow-check-active-state store base active)))
+               (ok (= end (getf result :terminal)))
+               (ok (= (if (eq progress :unchanged) 1 2) (getf result :timeline))))
+             (ok (equal active (pg::physical-follow-read-config)))
+             (ok (equal tuple (pg::physical-store-control-tuple store)))
+             (ok (equal control (pg::physical-recovery-read-control pg::*pgdata*)))
+             (ok (not (pg::physical-store-failed-p store)))))))))
+
+(deftest follow-active-proof-rejects-progress-and-provenance-regression
+    (dolist (kind '(:required :visibility :timeline :manifest :selection :config))
+      (call-with-follow-pending-proof
+       (lambda (root store candidate base config)
+         (declare (ignore root candidate))
+         (let* ((active (pg::physical-follow-reconcile-pending-store store base config))
+                (binding (fifth active)))
+           (case kind
+             (:required
+              (pg::wal-atomic-write-bytes (pg::physical-recovery-control-path)
+                                          (follow-pending-proof-control binding :post t :next 3 :required '(64 1))))
+             (:visibility
+              (pg::wal-atomic-write-bytes (pg::physical-recovery-control-path)
+                                          (follow-pending-proof-control binding :post t :next 10)))
+             (:timeline
+              (pg::wal-atomic-write-bytes (pg::physical-recovery-control-path)
+                                          (follow-pending-proof-control binding :post t :required '(136 2))))
+             (:manifest (incf (getf base :manifest-digest)))
+             (:selection (setf (pg::physical-store-selection store) nil))
+             (:config (setf (second active) "changed.example")))
+           (ok (signals (pg::physical-follow-check-active-state store base active) 'error)))))))
+
+(deftest follow-active-proof-checks-compacted-anchor-through-the-current-root
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((base (pg::physical-recovery-verify-base-state))
+              (config (follow-pending-proof-config-for-store store base)))
+         (pg::physical-follow-save-config config)
+         (let* ((active (pg::physical-follow-reconcile-pending-store store base config))
+                (binding (fifth active))
+                (fork (pg::physical-store-flushed-lsn store))
+                (raw (coerce (getf (getf binding :anchor) :eor-octets)
+                             '(vector (unsigned-byte 8))))
+                (end (+ fork (length raw))))
+           (pg::physical-store-input store fork raw)
+           (pg::physical-store-flush store)
+           (follow-replay-proof-write-restartpoint
+            store base end 50 4 0
+            (list :replay-timeline 2 :history-target 2
+                  :history-digest (ninth (getf binding :after))))
+           (pg::physical-store-compact store end (lambda (digest) (declare (ignore digest))))
+           (let ((result (pg::physical-follow-check-active-state store base active)))
+             (ok (= (getf base :end) (getf result :start)))
+             (ok (= end (getf result :terminal)))
+             (ok (= 2 (getf result :timeline))))
+           (ok (> (pg::physical-store-floor-lsn store) fork))
+           (let* ((index (pg::physical-retained-inventory-load
+                          (pg::physical-store-retained-directory store)
+                          (pg::physical-store-retained-root store)
+                          (pg::physical-store-retained-identity store)
+                          (pg::physical-store-retained-history store)))
+                  (anchor (getf binding :anchor))
+                  (expected (getf anchor :receive-digest)))
+             (ok (= expected (pg::physical-follow-active-prefix-digest store fork index)))
+             (incf (getf anchor :receive-digest))
+             (ok (signals (pg::physical-follow-check-active-receive store base binding) 'error))
+             (setf (getf anchor :receive-digest) expected)
+             (ok (signals (pg::physical-follow-active-prefix-digest store fork nil) 'error)))
+           (ok (not (pg::physical-store-failed-p store)))))) :system-id 42))
+
+(deftest follow-active-proof-reconstructs-new-required-visibility-before-a-newer-restartpoint
+    (dolist (next '(20 21 22))
+      (call-with-follow-pending-proof
+       (lambda (root store candidate base config)
+         (declare (ignore root candidate))
+         (let* ((active (pg::physical-follow-reconcile-pending-store store base config))
+                (binding (fifth active))
+                (fork (pg::physical-store-flushed-lsn store))
+                (raw (coerce (getf (getf binding :anchor) :eor-octets)
+                             '(vector (unsigned-byte 8))))
+                (end (+ fork (length raw))))
+           (pg::physical-store-input store fork raw)
+           (pg::physical-store-flush store)
+           (follow-replay-proof-write-restartpoint
+            store base end 21 4 0
+            (list :replay-timeline 2 :history-target 2
+                  :history-digest (ninth (getf binding :after))))
+           (pg::wal-atomic-write-bytes (pg::physical-recovery-control-path)
+                                       (follow-pending-proof-control binding :post t :next next :required (list fork 1)))
+           (if (= next 21)
+               (let ((result (pg::physical-follow-check-active-state store base active)))
+                 (ok (= 64 (getf result :start)))
+                 (ok (= 21 (getf result :required-next-xid))))
+               (ok (signals (pg::physical-follow-check-active-state store base active) 'error)))
+           (ok (not (pg::physical-store-failed-p store))))))))
+
+(deftest follow-active-proof-allows-an-open-receive-batch-with-clean-required-progress
+    (call-with-follow-pending-proof
+     (lambda (root store candidate base config)
+       (declare (ignore root candidate))
+       (let* ((active (pg::physical-follow-reconcile-pending-store store base config))
+              (fork (pg::physical-store-flushed-lsn store))
+              (raw (coerce (getf (getf (fifth active) :anchor) :eor-octets)
+                           '(vector (unsigned-byte 8))))
+              (end (+ fork (length raw))))
+         (pg::physical-store-input store fork raw)
+         (pg::physical-store-input store end
+                                   (pg::wal-encode-record pg::+wal-record-batch-start+ 0 end (empty-octets)))
+         (pg::physical-store-flush store)
+         (let ((result (pg::physical-follow-check-active-state store base active)))
+           (ok (= end (getf result :terminal)))
+           (ok (< (getf result :terminal) (pg::physical-store-flushed-lsn store))))
+         (ok (not (pg::physical-store-failed-p store)))))))
+
+(deftest follow-active-proof-compares-historical-replay-with-the-newer-restartpoint-counter
+    (dolist (next '(20 21 22))
+      (call-with-follow-pending-proof
+       (lambda (root store candidate base config)
+         (declare (ignore root candidate))
+         (let* ((active (pg::physical-follow-reconcile-pending-store store base config))
+                (binding (fifth active)) (fork (pg::physical-store-flushed-lsn store))
+                (raw (coerce (getf (getf binding :anchor) :eor-octets)
+                             '(vector (unsigned-byte 8))))
+                (end (+ fork (length raw))))
+           (pg::physical-store-input store fork raw)
+           (pg::physical-store-flush store)
+           (follow-replay-proof-write-restartpoint
+            store base end next 4 0
+            (list :replay-timeline 2 :history-target 2
+                  :history-digest (ninth (getf binding :after))))
+           (pg::wal-atomic-write-bytes (pg::physical-recovery-control-path)
+                                       (follow-pending-proof-control binding :post t :next 21 :required (list fork 1)))
+           (if (= next 21)
+               (ok (= 21 (getf (pg::physical-follow-check-active-state store base active) :next-xid)))
+               (ok (signals (pg::physical-follow-check-active-state store base active) 'error)))
+           (ok (not (pg::physical-store-failed-p store))))))))
+
+(deftest follow-active-proof-reconstructs-required-visibility-through-compacted-xid-records
+    (dolist (next '(70 71 72))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root))
+         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+         (let ((cursor (pg::physical-store-flushed-lsn store)))
+           (dolist (type (list pg::+wal-record-batch-start+ pg::+wal-record-commit+))
+             (let ((raw (pg::wal-encode-record
+                         type (if (= type pg::+wal-record-commit+) 70 0) cursor
+                         (if (= type pg::+wal-record-commit+)
+                             (pg::wal-encode-commit-timestamp 42) (empty-octets)))))
+               (pg::physical-store-input store cursor raw) (incf cursor (length raw)))))
+         (pg::physical-store-flush store)
+         (let* ((base (pg::physical-recovery-verify-base-state))
+                (config (follow-pending-proof-config-for-store store base)))
+           (pg::physical-follow-save-config config)
+           (let* ((active (pg::physical-follow-reconcile-pending-store store base config))
+                  (binding (fifth active)) (fork (pg::physical-store-flushed-lsn store))
+                  (raw (coerce (getf (getf binding :anchor) :eor-octets)
+                               '(vector (unsigned-byte 8))))
+                  (end (+ fork (length raw))))
+             (pg::physical-store-input store fork raw)
+             (pg::physical-store-flush store)
+             (follow-replay-proof-write-restartpoint
+              store base end 71 4 0
+              (list :replay-timeline 2 :history-target 2
+                    :history-digest (ninth (getf binding :after))))
+             (pg::physical-store-compact store end (lambda (digest) (declare (ignore digest))))
+             (pg::wal-atomic-write-bytes (pg::physical-recovery-control-path)
+                                         (follow-pending-proof-control binding :post t :next next :required (list fork 1)))
+             (if (= next 71)
+                 (let ((result (pg::physical-follow-check-active-state store base active)))
+                   (ok (= (getf base :end) (getf result :start)))
+                   (ok (= 71 (getf result :required-next-xid))))
+                 (ok (signals (pg::physical-follow-check-active-state store base active) 'error)))
+             (ok (> (pg::physical-store-floor-lsn store) fork))
+             (ok (not (pg::physical-store-failed-p store))))))
+       :system-id 42)))
+
 (deftest follow-pending-history-conflict-is-rejected-before-receive-publication
     (call-with-follow-pending-proof
      (lambda (root store candidate base config)
@@ -559,33 +766,34 @@
                                 :history-digest (getf control :history-digest) :restartpoint restartpoint)))))
 
 (deftest follow-pending-offline-entry-owns-rooted-spool-without-starting-storage
-    (with-promotion-fixture (root store :system-id 42)
-      (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
-      (let* ((base (pg::physical-recovery-verify-base-state))
-             (config (follow-pending-proof-config-for-store store base))
-             (pg::*postmaster-data-lock* nil) (pg::*postmaster-pid-stream* nil)
-             (pg::*postmaster-pid-directory* nil) (pg::*postmaster-start-time* nil)
-             (pg::*postmaster-start-timestamp* nil) (pg::*postmaster-pid-host* nil)
-             (pg::*postmaster-pid-port* nil) (pg::*postmaster-pid-inode* nil)
-             (saved-exit-hooks sb-ext:*exit-hooks*))
-        (pg::physical-follow-save-config config)
-        (pg::physical-store-close store)
-        (sb-posix:rename (namestring (pg::physical-store-directory store))
-                         (namestring (pg::physical-recovery-spool-directory)))
-        (sb-posix:chmod (namestring root) #o700)
-        (unwind-protect
-             (let ((pg::*wal-ready* nil) (pg::*physical-receive-store* nil))
-               (pg::postmaster-own-data-directory "127.0.0.1" 5439)
-               (let ((active (pg::physical-follow-reconcile-pending-offline)))
-                 (ok (eq :active (getf (fifth active) :phase)))
-                 (ok (equal active (pg::physical-follow-read-config)))
-                 (ok (null pg::*wal-ready*))
-                 (ok (null pg::*physical-receive-store*))
-                 (ok (null pg::*physical-follow-runtime*))
-                 (ok (signals (pg::physical-follow-check-startup-config) 'error))))
-          (pg::postmaster-remove-pid-file)
-          (setf sb-ext:*exit-hooks* saved-exit-hooks)
-          (when pg::*postmaster-data-lock* (close pg::*postmaster-data-lock*))))))
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((base (pg::physical-recovery-verify-base-state))
+              (config (follow-pending-proof-config-for-store store base))
+              (pg::*postmaster-data-lock* nil) (pg::*postmaster-pid-stream* nil)
+              (pg::*postmaster-pid-directory* nil) (pg::*postmaster-start-time* nil)
+              (pg::*postmaster-start-timestamp* nil) (pg::*postmaster-pid-host* nil)
+              (pg::*postmaster-pid-port* nil) (pg::*postmaster-pid-inode* nil)
+              (saved-exit-hooks sb-ext:*exit-hooks*))
+         (pg::physical-follow-save-config config)
+         (pg::physical-store-close store)
+         (sb-posix:rename (namestring (pg::physical-store-directory store))
+                          (namestring (pg::physical-recovery-spool-directory)))
+         (sb-posix:chmod (namestring root) #o700)
+         (unwind-protect
+              (let ((pg::*wal-ready* nil) (pg::*physical-receive-store* nil))
+                (pg::postmaster-own-data-directory "127.0.0.1" 5439)
+                (let ((active (pg::physical-follow-reconcile-pending-offline)))
+                  (ok (eq :active (getf (fifth active) :phase)))
+                  (ok (equal active (pg::physical-follow-read-config)))
+                  (ok (null pg::*wal-ready*))
+                  (ok (null pg::*physical-receive-store*))
+                  (ok (null pg::*physical-follow-runtime*))
+                  (ok (signals (pg::physical-follow-check-startup-config) 'error))))
+           (pg::postmaster-remove-pid-file)
+           (setf sb-ext:*exit-hooks* saved-exit-hooks)
+           (when pg::*postmaster-data-lock* (close pg::*postmaster-data-lock*))))) :system-id 42))
 
 (defun follow-pending-proof-run-crash (root store base point &optional rooted)
   (pg::wal-atomic-write-bytes
@@ -638,21 +846,22 @@
 
 (deftest follow-pending-rooted-sigkill-restores-protection-in-a-fresh-image
     (dolist (point '(:after-control-rename :after-pending-receive :after-pending-recovery))
-      (with-promotion-fixture (root store :system-id 42)
-        (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
-        (let* ((base (pg::physical-recovery-verify-base-state))
-               (config (follow-pending-proof-config-for-store store base)))
-          (pg::physical-follow-save-config config)
-          (follow-pending-proof-run-crash root store base point t)
-          (multiple-value-bind (output errors status)
-              (uiop:run-program
-               (list (or (uiop:getenv "SBCL") "sbcl") "--noinform" "--no-sysinit" "--no-userinit" "--script"
-                     (namestring (asdf:system-relative-pathname "pg" "t/follow-pending-crash-child.lisp"))
-                     (namestring root) (namestring (pg::physical-store-directory store)) "VERIFY" "rooted")
-               :output :string :error-output :string :ignore-error-status t)
-            (ok (zerop status) (format nil "~a ~a" output errors))
-            (ok (search "pending rooted cold verification PASS" output)))
-          (ok (eq :active (getf (fifth (pg::physical-follow-read-config)) :phase)))))))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+         (let* ((base (pg::physical-recovery-verify-base-state))
+                (config (follow-pending-proof-config-for-store store base)))
+           (pg::physical-follow-save-config config)
+           (follow-pending-proof-run-crash root store base point t)
+           (multiple-value-bind (output errors status)
+               (uiop:run-program
+                (list (or (uiop:getenv "SBCL") "sbcl") "--noinform" "--no-sysinit" "--no-userinit" "--script"
+                      (namestring (asdf:system-relative-pathname "pg" "t/follow-pending-crash-child.lisp"))
+                      (namestring root) (namestring (pg::physical-store-directory store)) "VERIFY" "rooted")
+                :output :string :error-output :string :ignore-error-status t)
+             (ok (zerop status) (format nil "~a ~a" output errors))
+             (ok (search "pending rooted cold verification PASS" output)))
+           (ok (eq :active (getf (fifth (pg::physical-follow-read-config)) :phase)))))) :system-id 42))
 
 (cl-spec:defproperty follow-pending-recovery-witness-keeps-full-width-visibility
     ((next (range integer 3 18446744073709551616))

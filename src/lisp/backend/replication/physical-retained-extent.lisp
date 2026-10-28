@@ -97,7 +97,7 @@ The file timeline must be an eligible carrier for the segment in that lineage."
           (timeline-check-end-of-recovery record parent history)))
     owner))
 
-(defun physical-retained-extent-scan (metadata bytes history &optional digest-cursor)
+(defun physical-retained-extent-scan (metadata bytes history &optional digest-cursor on-record)
   "Validate records against HISTORY and return the digest at DIGEST-CURSOR.
 
 Hash record bytes in order, excluding legal rotation gaps.  Each owner change
@@ -124,6 +124,7 @@ digest is an input, not independently proved here."
                  (setf digest (physical-store-update-digest digest raw)
                        cursor (wal-record-end record))
                  (when (eql cursor digest-cursor) (setf found digest))
+                 (when on-record (funcall on-record record raw))
                  (incf offset size))))
     (unless (and (= cursor (getf metadata :end))
                  (= digest (getf metadata :end-digest)))
