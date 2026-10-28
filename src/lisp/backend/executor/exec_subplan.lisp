@@ -76,6 +76,9 @@
   "Keep the complete SQL value, including composite field metadata."
   (copy-query-sort-value value))
 
+;; Scalar, EXISTS and ARRAY results can be cached at the frame owning their
+;; dependencies.  A depth-one dependency has no reusable owner cache here;
+;; worktable-dependent results are additionally scoped to its generation.
 (defun subquery-cache-for (descriptor)
   "Return the dependency owner's cache, additionally scoped by worktable generation."
   (when (member (sql-subplan-kind descriptor) '(:scalar :exists :array))

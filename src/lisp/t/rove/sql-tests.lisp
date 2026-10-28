@@ -18,6 +18,38 @@
              "strict let returns body result for non-NULL bindings")
     (rove:ok (= evaluations 2) "strict let bindings run once each")))
 
+(rove:deftest test-analyzed-function-evaluation-order
+    (let ((*backend* (make-backend)))
+      (flet ((evaluate (sql)
+               (let* ((statement (first (parse-statements sql)))
+                      (target (first (getf statement :targets))))
+                 (eval-expr (analyze-expr (getf target :expr) nil) nil))))
+        (dolist (type '("numeric" "float8"))
+          (session-set-application-name "trace")
+          (rove:ok
+           (eq +null+
+               (evaluate
+                (format nil
+                        "SELECT power(
+ CASE WHEN set_config('application_name',
+   current_setting('application_name')||':left',false) IS NOT NULL
+ THEN NULL::~a END,
+ CASE WHEN set_config('application_name',
+   current_setting('application_name')||':right',false) IS NOT NULL
+ THEN 2::~a END)"
+                        type type)))
+           "a strict typed call returns NULL")
+          (rove:ok (equal "trace:left:right" (sql-setting-value "application_name"))
+                   "all arguments run once in order before the strict NULL check"))
+        (rove:ok
+         (equal "trace:left:right:fallback"
+                (evaluate
+                 "SELECT set_config('application_name',current_setting('application_name')||':fallback',false)"))
+         "ordinary calls retain their side effects and accept SQL false")
+        (rove:ok (equal "trace:left:right:fallback"
+                        (evaluate "SELECT current_setting('application_name')"))
+                 "ordinary calls use the existing function evaluator"))))
+
 (rove:deftest test-sql-current-wal-lsn
     (let* ((*wal-end-lsn* #x123456789)
            (statement (first (parse-statements "SELECT pg_current_wal_lsn()")))

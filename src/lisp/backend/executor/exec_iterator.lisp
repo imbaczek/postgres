@@ -3,6 +3,11 @@
 
 (defvar *sql-open-iterators* nil)
 
+;; NEXT returns (values row present-p); a false PRESENT-P means exhaustion,
+;; including when ROW itself can be NIL.  Exhaustion does not close the iterator:
+;; its owner must close it on normal completion, early stop, or error.  CLOSE is
+;; idempotent, releases the captured callbacks, and unregisters the iterator.
+;; When dynamically bound, *SQL-OPEN-ITERATORS* tracks live iterators for cleanup.
 (defstruct (sql-iterator (:constructor %make-sql-iterator))
   next-function close-function closed-p)
 
@@ -35,6 +40,14 @@
       (unless present (return))
       (when (eq (funcall callback row) :stop) (return :stop)))))
 
+;; A store owns its producer, spool, and all readers.  Each reader has an
+;; independent position; only a reader at the shared frontier advances the
+;; producer, appending a copied row for the others.  EOF closes the producer
+;; and seals the spool.  Rows are copied both into and out of the store.
+;; Closing a reader releases only that reader; closing the store closes every
+;; reader and the producer, then releases the spool and any temporary file.
+;; The spool can spill while readers are active, so readers open and seek their
+;; own input streams when disk storage first becomes necessary.
 (defstruct (query-replay-store (:constructor %make-query-replay-store))
   producer spool eof-p readers closed-p
   (memory-rows (make-array 0 :adjustable t :fill-pointer 0)))

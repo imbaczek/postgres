@@ -2,6 +2,14 @@
 
 (in-package #:pg)
 
+;; Scanner tokens retain a zero-based source character position, converted to
+;; one-based diagnostics by SYNTAX-ERROR.  Their quoted flag prevents quoted
+;; identifiers from matching keywords; numeric token values preserve spelling.
+
+;; TOKENS is the scanner's list, terminated by an :EOF token.  POS is a
+;; zero-based cursor into that list.  Parser routines normally leave it at
+;; the next unconsumed token; advancing beyond :EOF makes PCUR return NIL,
+;; which PKIND, PVAL, and SYNTAX-ERROR do not accept.
 (defstruct sql-parser
   tokens
   (pos 0))
@@ -9,11 +17,27 @@
 (defvar *parse-type-modifiers-p* nil
   "Preserve unary plus when parsing type modifier expressions.")
 
-(defun pcur (p) (nth (sql-parser-pos p) (sql-parser-tokens p)))
-(defun pnext (p) (prog1 (pcur p) (incf (sql-parser-pos p))))
-(defun pkind (p) (token-kind (pcur p)))
-(defun pval (p) (token-value (pcur p)))
-(defun at-eof-p (p) (eq (pkind p) :eof))
+(defun pcur (p)
+  "Return the current token, or NIL past the token list."
+  (declare (type sql-parser p))
+  (nth (sql-parser-pos p) (sql-parser-tokens p)))
+
+(defun pnext (p)
+  "Return the current token and advance the parser."
+  (declare (type sql-parser p))
+  (prog1 (pcur p) (incf (sql-parser-pos p))))
+
+(defun pkind (p)
+  (declare (type sql-parser p))
+  (token-kind (pcur p)))
+
+(defun pval (p)
+  (declare (type sql-parser p))
+  (token-value (pcur p)))
+
+(defun at-eof-p (p)
+  (declare (type sql-parser p))
+  (eq (pkind p) :eof))
 
 (defun syntax-error (p &optional message)
   (let ((tok (pcur p)))

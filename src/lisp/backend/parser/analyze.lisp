@@ -2,6 +2,9 @@
 
 (in-package #:pg)
 
+;; A relation supplies a qualifier and a slice of the input row at OFFSET
+;; with WIDTH entries.  ORIGINS carries source metadata; LATERAL-FORBIDDEN-P
+;; retains an entry for lookup so an invalid reference can be diagnosed.
 (defstruct select-relation
   name
   alias
@@ -11,6 +14,9 @@
   (offset 0)
   (width 0))
 
+;; A visible column pairs its name and executable expression with type,
+;; typmod, and source table/attribute metadata used for result descriptions.
+;; Its expression need not be a simple attribute (e.g. JOIN USING output).
 (defstruct select-column
   name
   expr
@@ -19,6 +25,10 @@
   (table-oid 0)
   (attnum 0))
 
+;; RELATIONS provides qualified lookup while COLUMNS is the unqualified
+;; visible output, including merged JOIN USING columns.  PARENT links lexical
+;; scopes; WIDTH is the input row width.  ANALYSIS-FRAME is transient statement
+;; analysis ownership and is cleared after the complete statement is analyzed.
 (defstruct select-scope
   (parent *select-outer-scope*)
   (analysis-frame *select-analysis-frame*)
@@ -2671,6 +2681,64 @@ aliases share the corresponding numeric operator implementation."
                  (plusp (length array))))
         (length array) +null+)))
 
+(defun eval-analyzed-function (name arguments type)
+  "Evaluate a resolved call using its coerced argument values and result type.
+Arguments have already been evaluated in order, including for strict calls."
+  (cond
+    ((and (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
+                  :test #'string=)
+          (member +null+ arguments))
+     +null+)
+    ((and (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
+                  :test #'string=)
+          (member type '(:float4 :float8)))
+     (sql-float-basic-function name (first arguments)))
+    ((member name '("sqrt" "numeric_sqrt") :test #'string=)
+     (let ((value (first arguments)))
+       (cond ((eq value +null+) +null+)
+             ((eq type :numeric) (sql-numeric-sqrt value))
+             (t (sql-float-sqrt value)))))
+    ((trig-function-p name)
+     (cond ((string= name "pi") pi)
+           ((member +null+ arguments) +null+)
+           (t (sql-float-trig name arguments))))
+    ((numeric-arithmetic-function-p name)
+     (eval-numeric-arithmetic-function name arguments type))
+    ((member name '("scale" "min_scale" "trim_scale") :test #'string=)
+     (let ((value (first arguments)))
+       (cond ((eq value +null+) +null+)
+             ((string= name "trim_scale") (sql-numeric-trim-scale value))
+             ((sql-numeric-special-p value) +null+)
+             ((string= name "scale") (sql-numeric-scale value))
+             (t (sql-numeric-min-scale value)))))
+    ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
+     (cond ((member +null+ arguments) +null+)
+           ((eq type :numeric) (sql-numeric-power (first arguments) (second arguments)))
+           (t (sql-float-power (first arguments) (second arguments)))))
+    ((member name '("log" "log10" "numeric_log") :test #'string=)
+     (cond ((member +null+ arguments) +null+)
+           ((eq type :numeric)
+            (if (rest arguments)
+                (sql-numeric-log (first arguments) (second arguments))
+                (sql-numeric-log 10 (first arguments))))
+           (t (sql-float-log10 (first arguments)))))
+    ((member name '("ln" "numeric_ln") :test #'string=)
+     (let ((value (first arguments)))
+       (cond ((eq value +null+) +null+)
+             ((eq type :numeric) (sql-numeric-ln value))
+             (t (sql-float-ln value)))))
+    ((member name '("exp" "numeric_exp") :test #'string=)
+     (let ((value (first arguments)))
+       (cond ((eq value +null+) +null+)
+             ((eq type :numeric) (sql-numeric-exp value))
+             (t (sql-float-exp value)))))
+    ((and (string= name "abs") (member type '(:int2 :int4 :int8)))
+     (let ((value (abs (first arguments))))
+       (when (and (eq type :int8) (> value +int8-max+))
+         (ereport "22003" "bigint out of range"))
+       (sql-cast-value value type type -1)))
+    (t (eval-func name arguments))))
+
 (defun eval-expr (expr env)
   (case (first expr)
     (:subplan (eval-subquery-expression (second expr) env))
@@ -2770,60 +2838,7 @@ aliases share the corresponding numeric operator implementation."
      (let* ((name (second expr))
             (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr)))
             (type (expr-type expr)))
-       (cond
-         ((and (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
-                       :test #'string=)
-               (member +null+ arguments))
-          +null+)
-         ((and (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
-                       :test #'string=)
-               (member type '(:float4 :float8)))
-          (sql-float-basic-function name (first arguments)))
-         ((member name '("sqrt" "numeric_sqrt") :test #'string=)
-          (let ((value (first arguments)))
-            (cond ((eq value +null+) +null+)
-                  ((eq type :numeric) (sql-numeric-sqrt value))
-                  (t (sql-float-sqrt value)))))
-         ((trig-function-p name)
-          (cond ((string= name "pi") pi)
-                ((member +null+ arguments) +null+)
-                (t (sql-float-trig name arguments))))
-         ((numeric-arithmetic-function-p name)
-          (eval-numeric-arithmetic-function name arguments type))
-         ((member name '("scale" "min_scale" "trim_scale") :test #'string=)
-          (let ((value (first arguments)))
-            (cond ((eq value +null+) +null+)
-                  ((string= name "trim_scale") (sql-numeric-trim-scale value))
-                  ((sql-numeric-special-p value) +null+)
-                  ((string= name "scale") (sql-numeric-scale value))
-                  (t (sql-numeric-min-scale value)))))
-         ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
-          (cond ((member +null+ arguments) +null+)
-                ((eq type :numeric) (sql-numeric-power (first arguments) (second arguments)))
-                (t (sql-float-power (first arguments) (second arguments)))))
-         ((member name '("log" "log10" "numeric_log") :test #'string=)
-          (cond ((member +null+ arguments) +null+)
-                ((eq type :numeric)
-                 (if (rest arguments)
-                     (sql-numeric-log (first arguments) (second arguments))
-                     (sql-numeric-log 10 (first arguments))))
-                (t (sql-float-log10 (first arguments)))))
-         ((member name '("ln" "numeric_ln") :test #'string=)
-          (let ((value (first arguments)))
-            (cond ((eq value +null+) +null+)
-                  ((eq type :numeric) (sql-numeric-ln value))
-                  (t (sql-float-ln value)))))
-         ((member name '("exp" "numeric_exp") :test #'string=)
-          (let ((value (first arguments)))
-            (cond ((eq value +null+) +null+)
-                  ((eq type :numeric) (sql-numeric-exp value))
-                  (t (sql-float-exp value)))))
-         ((and (string= name "abs") (member type '(:int2 :int4 :int8)))
-          (let ((value (abs (first arguments))))
-            (when (and (eq type :int8) (> value +int8-max+))
-              (ereport "22003" "bigint out of range"))
-            (sql-cast-value value type type -1)))
-         (t (eval-func name arguments)))))
+       (eval-analyzed-function name arguments type)))
     (t
      (ereport "XX000" "cannot evaluate expression ~a" expr))))
 

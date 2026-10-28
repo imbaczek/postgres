@@ -147,6 +147,9 @@
        (close-sql-iterator left)
        (setf current-left nil)))))
 
+;; The join owns LEFT and a replay store owning RIGHT.  A fresh reader scans
+;; RIGHT for each left row; right/full joins make one final pass for unmatched
+;; rows.  Closing the join closes the active reader, both inputs and match map.
 (defun make-nested-loop-iterator (join left right)
   (let* ((store (make-query-replay-store right))
          (reader nil) (current-left nil) (left-present nil)

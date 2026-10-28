@@ -428,13 +428,11 @@
                 (unwind-protect
                      (handler-case
                          (flet ((get-current-reader-xid () xid)
-                                (ensure-current-table (current-table)
-                                  (unless (eq current-table table)
-                                    (error "SELECT table changed")))
-                                (select-index-current-p (current-table current-index)
-                                  (declare (ignore current-table current-index))
+                                (revalidate-select-relations (relations)
+                                  (unless (eq (getf (first relations) :table) table)
+                                    (error "SELECT table changed"))
                                   ;; Pause after the atomic heap+index reader
-                                  ;; registration, before catalog revalidation.
+                                  ;; registration, at catalog revalidation.
                                   (sb-thread:with-mutex (test-lock)
                                     (setf query-paused t)
                                     (sb-thread:condition-broadcast test-cv)

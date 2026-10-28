@@ -1120,6 +1120,22 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                         (list (pg-index-relfilenode index)))))))
           relations))
 
+(defun revalidate-select-relations (relations)
+  "Revalidate registered RELATIONS under the caller's write lock.
+Replace stale index paths in the copied relation specifications with SeqScans."
+  (dolist (spec relations)
+    (unless (getf spec :virtual-p)
+      (let* ((table (getf spec :table))
+             (path (getf spec :path))
+             (index (and (eq (select-scan-path-kind path) :index-scan)
+                         (select-scan-path-index path))))
+        (ensure-current-table table)
+        (unless (eq (getf spec :columns) (pg-class-columns table))
+          (ereport "0A000" "table definition changed during query planning"))
+        (when (and index (not (select-index-current-p table index)))
+          ;; The old index reader remains registered until transaction end.
+          (setf (getf spec :path) (make-select-scan-path :kind :seq-scan)))))))
+
 (defmacro with-registered-select-relations ((registered-relations relations)
                                             &body body)
   "Protect every relation and access path before evaluating BODY.
@@ -1129,30 +1145,12 @@ to revalidate the planned table and index identities.  This keeps the
 registration-to-DDL handoff free of a lock-order inversion."
   (let ((relation-list (gensym "RELATIONS-"))
         (xid (gensym "XID-"))
-        (spec (gensym "SPEC-"))
-        (table (gensym "TABLE-"))
-        (path (gensym "PATH-"))
-        (index (gensym "INDEX-"))
         (registered-relfilenodes (gensym "REGISTERED-RELFILENODES-")))
     `(let ((,relation-list (mapcar #'copy-list ,relations)))
        (with-registered-relation-access
            (,registered-relfilenodes ,xid :read)
            (select-relation-reader-relfilenodes ,relation-list)
-           (dolist (,spec ,relation-list)
-             (unless (getf ,spec :virtual-p)
-               (let* ((,table (getf ,spec :table))
-                      (,path (getf ,spec :path))
-                      (,index (and (eq (select-scan-path-kind ,path) :index-scan)
-                                   (select-scan-path-index ,path))))
-                 (ensure-current-table ,table)
-                 (unless (eq (getf ,spec :columns) (pg-class-columns ,table))
-                   (ereport "0A000"
-                            "table definition changed during query planning"))
-                 (when (and ,index (not (select-index-current-p ,table ,index)))
-                   ;; DDL completed after planning. The old index reader remains
-                   ;; registered until transaction end; use SeqScan for this query.
-                   (setf (getf ,spec :path)
-                         (make-select-scan-path :kind :seq-scan))))))
+           (revalidate-select-relations ,relation-list)
          (let ((,registered-relations ,relation-list))
            ,@body)))))
 
