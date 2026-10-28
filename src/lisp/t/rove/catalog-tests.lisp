@@ -53,6 +53,24 @@
         (rove:ok (and (member 51 nodes) (member 101 nodes) (member 103 nodes))
                  "inventory retains parent, TOAST heap, and TOAST index"))))
 
+(rove:deftest test-toast-ownership-horizon-and-drop
+    (let* ((*catalog* (make-catalog))
+           (*wal-ready* t)
+           (*wal-pending-deletes* nil)
+           (db (make-database :name "db"))
+           (toast (make-pg-toast :oid 100 :relfilenode 101 :index-oid 102
+                                 :index-relfilenode 103 :relfrozenxid 10))
+           (table (make-pg-class :name "parent" :relfilenode 51 :relfrozenxid 20 :toast toast)))
+      (setf (gethash "db" (catalog-databases *catalog*)) db
+            (gethash "parent" (database-tables db)) table)
+      (rove:ok (= 10 (catalog-compute-oldest-relfrozenxid))
+               "TOAST heap constrains the cluster freeze horizon")
+      (drop-table* db "parent")
+      (rove:ok (and (member 51 *wal-pending-deletes*)
+                    (member 101 *wal-pending-deletes*)
+                    (member 103 *wal-pending-deletes*))
+               "parent drop defers deletion of both owned TOAST relations")))
+
 (rove:deftest test-toast-catalog-physical-history
     (let* ((toast (make-pg-toast :oid 100 :relfilenode 101 :index-oid 102
                                  :index-relfilenode 103 :relfrozenxid 20))

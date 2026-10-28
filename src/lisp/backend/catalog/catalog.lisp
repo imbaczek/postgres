@@ -413,6 +413,11 @@ removed.  Other names and fork types are not selected by this scan."
   (values))
 
 (defun catalog-compute-oldest-relfrozenxid ()
+  "Return the oldest recorded heap horizon across all databases, or NIL.
+Include each owned TOAST heap because its tuples can retain transaction IDs
+independently of the parent heap.  Like PostgreSQL's vac_update_datfrozenxid,
+the minimum covers both ordinary and TOAST relations; this catalog computes a
+cluster-wide minimum directly and skips missing horizons."
   (let ((oldest nil))
     (when *catalog*
       (maphash
@@ -421,7 +426,9 @@ removed.  Other names and fork types are not selected by this scan."
          (maphash
           (lambda (table-name table)
             (declare (ignore table-name))
-            (let ((relfrozenxid (pg-class-relfrozenxid table)))
+            (dolist (relfrozenxid (list (pg-class-relfrozenxid table)
+                                        (and (pg-class-toast table)
+                                             (pg-toast-relfrozenxid (pg-class-toast table)))))
               (when (and relfrozenxid
                          (or (null oldest) (< relfrozenxid oldest)))
                 (setf oldest relfrozenxid))))
@@ -1475,6 +1482,11 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
         (error e)))))
 
 (defun drop-table* (db name)
+  "Remove NAME and its owned metadata, deferring physical relation deletion.
+The owned TOAST heap and its index are deleted with the table, just as the
+internal dependency registered by PostgreSQL's create_toast_table makes the
+TOAST relation follow its parent.  Deferred deletion lets the surrounding WAL
+and catalog durability machinery handle commit or rollback."
   (let ((class (gethash name (database-tables db))))
     (unless class
       (ereport "42P01" "table \"~a\" does not exist" name))
@@ -1496,6 +1508,10 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
              (setf (pg-publication-tables publication) remaining)
              (incf (pg-publication-generation publication))))))
      (database-publications db))
+    (let ((toast (pg-class-toast class)))
+      (when toast
+        (wal-defer-relation-delete (pg-toast-relfilenode toast))
+        (wal-defer-relation-delete (pg-toast-index-relfilenode toast))))
     (remhash name (database-tables db))
     (wal-defer-relation-delete (pg-class-relfilenode class))
     (values)))
