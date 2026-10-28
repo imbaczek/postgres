@@ -103,6 +103,138 @@
       (pg::timeline-write-history 2 1 64 "promotion")
       (funcall function root request eor))))
 
+(defun follow-anchor-receiver-request (request)
+  (loop for (key value) on request by #'cddr
+        unless (member key '(:history-text :eor-octets))
+          append (list key value)))
+
+(deftest follow-preparation-builds-source-owned-history-and-eor
+    (call-with-follow-anchor-source
+     (lambda (root request eor)
+       (declare (ignore root))
+       (let* ((receiver (follow-anchor-receiver-request request))
+              (pin (pg::physical-source-follow-prepare "prepared" receiver)))
+         (ok (equal request (pg::physical-follow-pin-anchor pin)))
+         (ok (equal (coerce eor 'list)
+                    (getf (pg::physical-follow-pin-anchor pin) :eor-octets)))
+         (ok (pg::physical-follow-pin-ready-p pin))
+         (ok (eq pin (pg::physical-source-follow-prepare "prepared" receiver)))
+         (ok (pg::physical-follow-pin-ready-p
+              (pg::physical-follow-pin-decode
+               (pg::physical-follow-pin-encode pin)))))
+       (ok (= 1 (hash-table-count pg::*physical-source-pins*))))))
+
+(deftest follow-preparation-selects-immediate-successor-with-fresh-pins
+    (call-with-follow-anchor-source
+     (lambda (root request first-eor)
+       (declare (ignore root))
+       (let* ((fork pg::*wal-durable-lsn*)
+              (last-eor (pg::wal-encode-end-of-recovery-record fork 43 3 2 1))
+              (prefix (lineage-test-bytes (pg::wal-segment-path 0)))
+              (pg::*wal-insert-timeline* 3)
+              (pg::*wal-checkpoint-timeline* 3)
+              (pg::*wal-durable-lsn* (+ fork (length last-eor))))
+         (pg::timeline-write-history 3 2 fork "second promotion")
+         (pg::wal-atomic-write-bytes
+          (pg::wal-segment-path 0)
+          (concatenate '(vector (unsigned-byte 8)) prefix last-eor))
+         (let ((receiver (follow-anchor-receiver-request request)))
+           (setf (getf receiver :source-timeline) 3)
+           (let ((first (pg::physical-source-follow-prepare "first_fork" receiver)))
+             (ok (equal (coerce first-eor 'list)
+                        (getf (pg::physical-follow-pin-anchor first) :eor-octets))))
+           (setf (getf receiver :receive-timeline) 2
+                 (getf receiver :receive-lsn) fork
+                 (getf receiver :receive-digest)
+                 (pg::physical-store-update-digest (getf request :receive-digest) first-eor)
+                 (getf receiver :overlap-digest)
+                 (pg::physical-store-update-digest #xCBF29CE484222325 prefix))
+           (let ((second (pg::physical-source-follow-prepare "second_fork" receiver)))
+             (ok (equal (coerce last-eor 'list)
+                        (getf (pg::physical-follow-pin-anchor second) :eor-octets))))
+           (ok (= 2 (hash-table-count pg::*physical-source-pins*))))))))
+
+(deftest follow-preparation-rejects-client-descriptors-and-foreign-coordinates
+    (call-with-follow-anchor-source
+     (lambda (root request eor)
+       (declare (ignore root eor))
+       (dolist (change
+                (list (lambda (r) (append r (list :history-text "")))
+                      (lambda (r) (append r (list :eor-octets nil)))
+                      (lambda (r) (setf (getf r :source-timeline) 3) r)
+                      (lambda (r) (setf (getf r :receive-timeline) 2) r)
+                      (lambda (r) (setf (getf r :receive-lsn) 65) r)
+                      (lambda (r) (setf (getf r :system-id) 0) r)
+                      (lambda (r) (setf (getf r :receive-lsn) "64") r)))
+         (ok (signals
+              (pg::physical-source-follow-prepare
+               "rejected" (funcall change (follow-anchor-receiver-request request)))
+              'error))
+         (ok (zerop (hash-table-count pg::*physical-source-pins*)))
+         (ng (probe-file (pg::physical-source-pin-path "rejected")))))))
+
+(deftest follow-preparation-ready-retry-does-not-reread-released-anchor-bytes
+    (call-with-follow-anchor-source
+     (lambda (root request eor)
+       (declare (ignore root))
+       (let* ((receiver (follow-anchor-receiver-request request))
+              (pin (pg::physical-source-follow-prepare "retry" receiver))
+              (owner (gensym))
+              (digest (pg::physical-store-update-digest (getf request :receive-digest) eor)))
+         (setf (gethash "retry" pg::*physical-source-senders*) owner)
+         (pg::physical-source-confirm-receipt "retry" owner pg::*wal-durable-lsn* digest)
+         (remhash "retry" pg::*physical-source-senders*)
+         (let ((read-segment (symbol-function 'pg::physical-follow-source-segment)))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-source-segment)
+                        (lambda (&rest args) (declare (ignore args))
+                          (error "released original anchor bytes must not be reread")))
+                  (ok (eq pin (pg::physical-source-follow-prepare "retry" receiver)))
+                  (ok (= pg::*wal-durable-lsn* (pg::physical-source-pin-confirmed-lsn pin)))
+                  (ok (= digest (pg::physical-source-pin-prefix-digest pin)))
+                  (setf (getf receiver :receive-digest) (1+ (getf receiver :receive-digest)))
+                  (ok (signals (pg::physical-source-follow-prepare "retry" receiver)
+                               'pg::wal-input-validation-error)))
+             (setf (symbol-function 'pg::physical-follow-source-segment) read-segment)))))))
+
+(deftest follow-preparation-rechecks-concurrently-published-ready-pin
+    (call-with-follow-anchor-source
+     (lambda (root request eor)
+       (declare (ignore root eor))
+       (let ((receiver (follow-anchor-receiver-request request))
+             (construct (symbol-function 'pg::physical-source-follow-anchor))
+             (published nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-source-follow-anchor)
+                      (lambda (ignored)
+                        (declare (ignore ignored))
+                        (setf published (pg::physical-source-follow-ready "concurrent" request))
+                        (error "original EOR was released before delayed descriptor read")))
+                (ok (eq (pg::physical-source-follow-prepare "concurrent" receiver) published))
+                (ok (pg::physical-follow-pin-ready-p published)))
+           (setf (symbol-function 'pg::physical-source-follow-anchor) construct))))))
+
+(deftest follow-preparation-rejects-missing-truncated-or-corrupt-source-eor
+    (dolist (kind '(:missing :truncated :corrupt))
+      (call-with-follow-anchor-source
+       (lambda (root request eor)
+         (declare (ignore root))
+         (let ((path (pg::wal-segment-path 0)))
+           (ecase kind
+             (:missing (delete-file path))
+             (:truncated (pg::wal-atomic-write-bytes
+                          path (make-array (+ 64 (1- (length eor)))
+                                           :element-type '(unsigned-byte 8) :initial-element 0)))
+             (:corrupt (pg::wal-atomic-write-bytes
+                        path (make-array (+ 64 (length eor))
+                                         :element-type '(unsigned-byte 8) :initial-element 0)))))
+         (ok (signals (pg::physical-source-follow-prepare
+                       "bad_eor" (follow-anchor-receiver-request request)) 'error))
+         (ok (zerop (hash-table-count pg::*physical-source-pins*)))
+         (ng (probe-file (pg::physical-source-pin-path "bad_eor")))))))
+
 (deftest follow-anchor-source-publishes-proof-before-ready-and-reloads
     (call-with-follow-anchor-source
      (lambda (root request eor)
@@ -581,6 +713,8 @@
                                :direction :output :element-type '(unsigned-byte 8))
             (file-position out (mod start pg::+wal-segment-size+))
             (write-sequence raw out) (pg::fsync-stream out))
+          (ok (equal request (pg::physical-source-follow-anchor
+                              (follow-anchor-receiver-request request))))
           (let ((pin (pg::make-physical-follow-pin
                       :name "boundary" :system-id system-id :timeline 2 :manifest-digest 77
                       :restart-lsn 0 :consistent-lsn fork :prefix-digest 123 :anchor request)))

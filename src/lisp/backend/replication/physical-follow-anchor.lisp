@@ -177,3 +177,74 @@ before publishing the ready state in memory; a save failure fences the source."
                       (gethash pin *wal-snapshot-retention-pins*) cursor)
                 (physical-source-pin-test-point :after-follow-ready pin)))))))
     pin))
+
+(defun physical-source-follow-anchor (request)
+  (physical-follow-check-plist
+   request (remove-if (lambda (key) (member key '(:history-text :eor-octets)))
+                      *physical-follow-anchor-keys*))
+  (unless (and (eql 1 (getf request :version))
+               (every (lambda (key) (typep (getf request key) '(unsigned-byte 64)))
+                      '(:system-id :base :manifest-digest :receive-lsn :receive-digest
+                        :overlap-start :overlap-digest))
+               (every (lambda (key) (typep (getf request key) '(integer 1 4294967295)))
+                      '(:base-timeline :source-timeline :receive-timeline)))
+    (wal-invalid-input "invalid receiver follow coordinates"))
+  (with-live-operation
+    (prevent-recovery-primary-operation "physical follow source descriptor")
+    (sb-thread:with-mutex (*wal-lock*)
+      (wal-check-healthy)
+      (unless (and (= (getf request :system-id) (catalog-system-identifier))
+                   (= (getf request :source-timeline) *wal-insert-timeline*)
+                   (> *wal-insert-timeline* 1))
+        (wal-invalid-input "physical follow descriptor belongs to another source"))
+      (let* ((text (bytes->string (timeline-history-bytes *wal-insert-timeline*)))
+             (history (timeline-check-lineage (timeline-parse-history *wal-insert-timeline* text)))
+             (position (position (getf request :receive-timeline) history
+                                 :key #'timeline-history-entry-timeline))
+             (entry (and position (nth position history)))
+             (fork (and entry (timeline-history-entry-end entry))))
+        (unless (and fork position (plusp position)
+                     (plusp (getf request :receive-lsn))
+                     (<= (getf request :receive-lsn) fork))
+          (wal-invalid-input "physical follow receiver is outside source ancestry"))
+        (let* ((anchor (append (copy-list request) (list :history-text text)))
+               (pin (make-physical-follow-pin
+                     :system-id (getf request :system-id) :timeline *wal-insert-timeline*
+                     :consistent-lsn (getf request :receive-lsn) :anchor anchor))
+               (start (wal-record-start-after fork +wal-end-of-recovery-record-size+))
+               (offset (mod start +wal-segment-size+))
+               (bytes (physical-follow-source-segment pin (floor start +wal-segment-size+) start))
+               (end (+ offset +wal-end-of-recovery-record-size+)))
+          (unless (and (<= end (length bytes))
+                       (<= (+ start +wal-end-of-recovery-record-size+) *wal-durable-lsn*))
+            (wal-invalid-input "physical follow source end-of-recovery is unavailable"))
+          (setf (getf anchor :eor-octets) (coerce (subseq bytes offset end) 'list))
+          (physical-follow-anchor-copy anchor))))))
+
+(defun physical-source-follow-existing-anchor (name request)
+  (with-live-operation
+    (prevent-recovery-primary-operation "physical follow preparation")
+    (sb-thread:with-mutex (*wal-lock*)
+      (wal-check-healthy)
+      (let ((pin (gethash name *physical-source-pins*)))
+        (when pin
+          (unless (and (physical-follow-pin-p pin)
+                       (loop for (key value) on request by #'cddr
+                             always (equal value (getf (physical-follow-pin-anchor pin) key))))
+            (wal-invalid-input "physical follow pin name is already bound to another request"))
+          (physical-follow-pin-check-live pin)
+          (physical-follow-anchor-copy (physical-follow-pin-anchor pin)))))))
+
+(defun physical-source-follow-prepare (name request)
+  (unless (wal-valid-replication-slot-name-p name)
+    (wal-invalid-input "invalid physical follow pin name"))
+  (physical-follow-check-plist
+   request (remove-if (lambda (key) (member key '(:history-text :eor-octets)))
+                      *physical-follow-anchor-keys*))
+  (let ((anchor
+          (or (physical-source-follow-existing-anchor name request)
+              (handler-case (physical-source-follow-anchor request)
+                (error (condition)
+                  (or (physical-source-follow-existing-anchor name request)
+                      (error condition)))))))
+    (physical-source-follow-ready name anchor)))

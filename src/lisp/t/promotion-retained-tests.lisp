@@ -273,6 +273,16 @@
                     (ng pg::*wal-poisoned*))
                (pg::wal-atomic-write-bytes path original))))))))
 
+(deftest historical-follow-preparation-uses-selected-source-archive
+    (call-with-historical-follow-source
+     (lambda (root reference prefix eor)
+       (declare (ignore root))
+       (let* ((request (historical-follow-request reference prefix eor 184))
+              (pin (pg::physical-source-follow-prepare
+                    "source_owned" (follow-anchor-receiver-request request))))
+         (ok (pg::physical-follow-pin-ready-p pin))
+         (ok (equal request (pg::physical-follow-pin-anchor pin)))))))
+
 (deftest historical-follow-anchor-proves-selected-root-and-live-child
     (call-with-historical-follow-source
      (lambda (root reference prefix eor)
