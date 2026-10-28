@@ -9,6 +9,7 @@
      (lambda (name slot)
        (declare (ignore name))
        (when (and (eq (wal-replication-slot-wal-status slot) :reserved)
+                  (wal-replication-slot-restart-lsn slot)
                   (> (- *wal-durable-lsn*
                         (wal-replication-slot-restart-lsn slot))
                      *max-slot-wal-keep-bytes*))
@@ -22,7 +23,7 @@
            (setf (wal-replication-slot-wal-status slot) :lost
                  (wal-replication-slot-pending-xids slot)
                  (wal-replication-slot-pending-xids candidate))
-           (when *wal-replication-slot-loss-collector*
+           (when (and (wal-logical-slot-p slot) *wal-replication-slot-loss-collector*)
              (push slot (car *wal-replication-slot-loss-collector*))))))
      *wal-replication-slots*))
   (wal-refresh-logical-capture-slot-mirror-under-wal-lock)
@@ -33,7 +34,7 @@
   "Return current lost generations so a later maintenance pass can retry cleanup."
   (sb-thread:with-mutex (*wal-lock*)
     (loop for slot being the hash-values of *wal-replication-slots*
-          when (eq (wal-replication-slot-wal-status slot) :lost)
+          when (and (wal-logical-slot-p slot) (eq (wal-replication-slot-wal-status slot) :lost))
             collect slot)))
 
 (defun call-with-invalidated-slot-cleanup (function)

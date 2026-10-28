@@ -210,24 +210,28 @@ base. In the base segment, compare the extent prefix with the immutable overlap.
       (values bytes (if entry (getf metadata :file-timeline)
                         (getf identity :base-timeline))))))
 
-(defun physical-follow-source-live-segment (pin segment history)
+(defun physical-source-lineage-live-segment (source-timeline segment history &optional (namespace :timeline) allow-ancestor)
   "Copy a current-source timeline segment for PIN, bounded by durable WAL.
 An older candidate does not establish current-source coverage."
   (multiple-value-bind (stream timeline size)
-      (wal-lineage-open-segment segment history 0 :timeline)
+      (wal-lineage-open-segment segment history 0 namespace)
     (unwind-protect
          (progn
-           (unless (= timeline (physical-source-pin-timeline pin))
+           (unless (or allow-ancestor (= timeline source-timeline))
              (error "physical follow requires a complete source WAL extent; reseed is required"))
            (let ((bytes (make-array
-                         (min size (max 0 (- *wal-durable-lsn* (* segment +wal-segment-size+))))
+                         (min (wal-lineage-effective-size size segment timeline history)
+                              (max 0 (- *wal-durable-lsn* (* segment +wal-segment-size+))))
                          :element-type '(unsigned-byte 8))))
              (unless (= (length bytes) (read-sequence bytes stream))
                (error "historical source live prefix is truncated"))
              (values bytes timeline)))
       (close stream))))
 
-(defun physical-follow-source-segment (pin segment &optional logical-start)
+(defun physical-follow-source-live-segment (pin segment history)
+  (physical-source-lineage-live-segment (physical-source-pin-timeline pin) segment history))
+
+(defun physical-source-lineage-segment (system-id source-timeline history segment &optional logical-start allow-ancestor)
   "Select a validated source segment under WAL exclusion.
 The source root is bound to its own base, identity, control reference, projected
 parent history and fixed fork; those need not equal the receiver's base or
@@ -238,19 +242,18 @@ compare the child prefix with retained ancestry before returning the child bytes
     (error "historical source segment requires WAL exclusion"))
   (when (recovery-in-progress-p)
     (error "historical source cannot read as a primary during recovery"))
-  (physical-follow-pin-check-source pin)
-  (let* ((history (physical-follow-pin-history pin))
-         (fields (multiple-value-list (wal-read-control-fields)))
+  (let* ((fields (multiple-value-list (wal-read-control-fields)))
          (metadata (seventh fields))
          (reference (getf metadata :retained-reference))
          (origin (* segment +wal-segment-size+)))
     (if (or (null reference) (>= origin (getf reference :end))
             (< segment (floor (1- (getf reference :base)) +wal-segment-size+)))
-        (physical-follow-source-live-segment pin segment history)
+        (physical-source-lineage-live-segment
+         source-timeline segment history *wal-segment-namespace* allow-ancestor)
         (let ((identity (physical-promotion-retained-identity
-                         (physical-source-pin-system-id pin) reference)))
+                         system-id reference)))
           (unless (and (eql (getf metadata :system-id) (getf identity :system-id))
-                       (eql (fourth fields) (physical-source-pin-timeline pin)))
+                       (eql (fourth fields) source-timeline))
             (error "historical source root differs from the follow base or source"))
           (multiple-value-bind (parent fork projected)
               (physical-promotion-retained-parent-history history)
@@ -265,7 +268,8 @@ compare the child prefix with retained ancestry before returning the child bytes
                  (if (or (< fork (+ origin +wal-segment-size+))
                          (and logical-start (< logical-start (getf reference :base))))
                      (multiple-value-bind (live child)
-                         (physical-follow-source-live-segment pin segment history)
+                         (physical-source-lineage-live-segment
+                          source-timeline segment history *wal-segment-namespace* allow-ancestor)
                        (unless (and (<= (length bytes) (length live))
                                     (equalp bytes (subseq live 0 (length bytes))))
                          (error "historical source child prefix differs from retained ancestry"))
@@ -275,6 +279,12 @@ compare the child prefix with retained ancestry before returning the child bytes
                      (values bytes timeline))))
              (physical-promotion-retained-owner :primary)
              (physical-recovery-retained-directory) identity (getf reference :root-id)))))))
+
+(defun physical-follow-source-segment (pin segment &optional logical-start)
+  (physical-follow-pin-check-source pin)
+  (physical-source-lineage-segment
+   (physical-source-pin-system-id pin) (physical-source-pin-timeline pin)
+   (physical-follow-pin-history pin) segment logical-start))
 
 (defun physical-follow-source-cached-segment (pin segment cursor)
   "Return one cached source prefix, refreshing when its selection changes.

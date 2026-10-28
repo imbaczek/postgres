@@ -234,6 +234,22 @@
         :history-text (pg::bytes->string (pg::timeline-history-bytes 2))
         :eor-octets (coerce eor 'list)))
 
+(deftest physical-slot-primary-validation-uses-committed-archive
+    (call-with-historical-follow-source
+     (lambda (root reference prefix eor)
+       (declare (ignore root prefix eor))
+       (let* ((system-id (pg::catalog-system-identifier))
+              (slot (physical-slot-test-object
+                     :restart (getf reference :base) :timeline 1 :system-id system-id)))
+         (ok (eq slot (pg::physical-slot-check-primary-wal slot system-id)))
+         (setf (pg::wal-replication-slot-restart-lsn slot) (getf reference :end))
+         (ok (eq slot (pg::physical-slot-check-primary-wal slot system-id)))
+         (setf (pg::wal-replication-slot-restart-lsn slot) (1+ pg::*wal-durable-lsn*))
+         (ok (signals (pg::physical-slot-check-primary-wal slot system-id) 'error))
+         (setf (pg::wal-replication-slot-restart-lsn slot) (getf reference :base))
+         (uiop:delete-directory-tree (pg::physical-recovery-retained-directory) :validate t)
+         (ok (signals (pg::physical-slot-check-primary-wal slot system-id) 'error))))))
+
 (deftest historical-source-proof-does-not-confuse-receiver-and-archive-bases
     (call-with-historical-follow-source
      (lambda (root reference prefix eor)
@@ -494,6 +510,35 @@
                (pg::physical-promotion-retained-owner :primary) directory id identity
                (pg::timeline-parse-history 1 ""))
               (ok (null (probe-file (pg::wal-segment-path 0))))
+              (let ((slot (physical-slot-test-object
+                           :restart 33 :timeline 1
+                           :system-id (pg::catalog-system-identifier)))
+                    (parent-path (pg::wal-segment-path 0 1 :timeline)))
+                (pg::wal-atomic-write-bytes parent-path first)
+                (unwind-protect
+                     (progn
+                       (ok (eq slot (pg::physical-slot-check-primary-wal
+                                     slot (pg::catalog-system-identifier))))
+                       (pg::wal-atomic-write-bytes parent-path (subseq first 0 95))
+                       (ok (signals (pg::physical-slot-check-primary-wal
+                                     slot (pg::catalog-system-identifier)) 'error))
+                       (let ((changed (copy-seq first)))
+                         (setf (aref changed 0) (logxor 1 (aref changed 0)))
+                         (pg::wal-atomic-write-bytes parent-path changed))
+                       (ok (signals (pg::physical-slot-check-primary-wal
+                                     slot (pg::catalog-system-identifier)) 'error))
+                       (pg::wal-atomic-write-bytes parent-path first)
+                       (let ((ancestor-tail (pg::wal-segment-path 2 1 :timeline))
+                             (child-path (pg::wal-segment-path 2)))
+                         (pg::wal-atomic-write-bytes ancestor-tail child)
+                         (unwind-protect
+                              (progn
+                                (delete-file child-path)
+                                (ok (signals (pg::physical-slot-check-primary-wal
+                                              slot (pg::catalog-system-identifier)) 'error)))
+                           (pg::wal-atomic-write-bytes child-path child)
+                           (delete-file ancestor-tail))))
+                  (delete-file parent-path)))
               (let* ((pin (pg::physical-source-follow-ready "old_sibling" request))
                      (owner (gensym)))
                 (let ((command

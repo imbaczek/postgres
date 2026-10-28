@@ -7,6 +7,7 @@
                (:file "t/physical-pid-tests")
                (:file "t/physical-config-tests")
                (:file "t/coalesce-tests")
+               (:file "t/physical-slot-tests")
                (:file "t/physical-source-tests")
                (:file "t/follow-anchor-tests")
                (:file "t/follow-controller-tests")

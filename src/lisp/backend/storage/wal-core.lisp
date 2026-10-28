@@ -60,6 +60,8 @@
   active-owner-backend
   ;; PGSLOT1-3 were the private protocol even though the old wire name was pgoutput.
   (plugin "pg_lisp")
+  (kind :logical) system-id restart-timeline (temporary-p nil) temporary-owner
+  (inactive-since 0)
   (pending-xids (make-hash-table :test #'eql))
   (wal-status :reserved))
 
@@ -91,6 +93,12 @@
     (unless (eq (wal-slot-profile slot) :text)
       (wal-slot-set-initial-profile copy (wal-slot-profile slot)))
     copy))
+
+(defun wal-logical-slot-p (slot)
+  (eq :logical (wal-replication-slot-kind slot)))
+
+(defun wal-physical-slot-p (slot)
+  (eq :physical (wal-replication-slot-kind slot)))
 
 (defun wal-valid-slot-plugin-state-p (plugin database-oid confirmed-flush-lsn)
   "A standard slot must be database-bound and confirmed in its first durable image."
@@ -1046,7 +1054,7 @@ Legacy 16-hex segment names always belong to timeline 1."
 (defun wal-slot-record-xid-batch-under-wal-lock (xid first-lsn)
   (maphash (lambda (name slot)
              (declare (ignore name))
-             (unless (eq (wal-replication-slot-wal-status slot) :lost)
+             (when (and (wal-logical-slot-p slot) (not (eq (wal-replication-slot-wal-status slot) :lost)))
                (let ((pending (wal-replication-slot-pending-xids slot)))
                  (unless (gethash xid pending)
                    (setf (gethash xid pending) (cons first-lsn nil))))))
@@ -1054,6 +1062,7 @@ Legacy 16-hex segment names always belong to timeline 1."
   (values))
 
 (defun wal-slot-seed-active-xids-under-wal-lock (slot active-xids)
+  (unless (wal-logical-slot-p slot) (return-from wal-slot-seed-active-xids-under-wal-lock (values)))
   (sb-thread:with-mutex (*xid-lock*)
     (dolist (xid active-xids)
       (let ((first-lsn (gethash xid *wal-xid-first-lsn*)))
@@ -1065,10 +1074,9 @@ Legacy 16-hex segment names always belong to timeline 1."
 (defun wal-slot-record-xid-commit-under-wal-lock (xid commit-lsn)
   (maphash (lambda (name slot)
              (declare (ignore name))
-             (let ((entry (gethash xid
-                                   (wal-replication-slot-pending-xids slot))))
-               (when entry
-                 (setf (cdr entry) commit-lsn))))
+             (when (wal-logical-slot-p slot)
+               (let ((entry (gethash xid (wal-replication-slot-pending-xids slot))))
+                 (when entry (setf (cdr entry) commit-lsn)))))
            *wal-replication-slots*)
   (values))
 
@@ -1446,8 +1454,8 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
             *wal-logical-catalog-event-interests*
               thereis (= database-oid interested-database))
       (loop for slot being the hash-values of *wal-replication-slots*
-              thereis (and (= database-oid
-                              (or (wal-replication-slot-database-oid slot) -1))
+              thereis (and (wal-logical-slot-p slot) (= database-oid
+                                                        (or (wal-replication-slot-database-oid slot) -1))
                            (not (eq (wal-replication-slot-wal-status slot)
                                     :lost))))))
 
@@ -2100,7 +2108,13 @@ src/backend/access/transam/xlogreader.c."
                     (char= char #\_)))
               name)))
 
+(declaim (ftype function physical-slot-encode physical-slot-decode physical-slot-image-p))
+
 (defun wal-encode-replication-slot (slot)
+  (when (eq :physical (wal-replication-slot-kind slot))
+    (return-from wal-encode-replication-slot (physical-slot-encode slot)))
+  (unless (wal-logical-slot-p slot)
+    (error "unknown WAL replication slot kind ~s" (wal-replication-slot-kind slot)))
   (let* ((name (wal-replication-slot-name slot))
          (database-oid (wal-replication-slot-database-oid slot))
          (restart-lsn (wal-replication-slot-restart-lsn slot))
@@ -2162,7 +2176,11 @@ src/backend/access/transam/xlogreader.c."
         do (setf start (1+ end))))
 
 (defun wal-read-replication-slot (path)
-  (with-open-file (stream path :direction :input)
+  (let ((bytes (read-bounded-regular-file path 2048)))
+    (when (physical-slot-image-p bytes)
+      (return-from wal-read-replication-slot
+        (physical-slot-decode bytes (pathname-name path))))
+    (with-input-from-string (stream (bytes->string bytes))
     (let* ((line (read-line stream nil nil))
            (fields (and line (wal-split-fields line)))
            (version (first fields))
@@ -2220,7 +2238,7 @@ src/backend/access/transam/xlogreader.c."
                      :consistent-lsn consistent-lsn :confirmed-flush-lsn confirmed-flush-lsn
                      :wal-status wal-status :plugin plugin)))
           (when v5-p (wal-slot-set-initial-profile slot :binary-bytea))
-          slot)))))
+          slot))))))
 
 (defun wal-validate-replication-slot-wal (slot segments)
   (let ((restart-lsn (wal-replication-slot-restart-lsn slot)))
@@ -2270,6 +2288,7 @@ src/backend/access/transam/xlogreader.c."
 
 (defun wal-slot-rebuild-progress (slot)
   "Rebuild pending transaction WAL from retained records after restart."
+  (unless (wal-logical-slot-p slot) (return-from wal-slot-rebuild-progress slot))
   (let ((first-lsns (make-hash-table :test #'eql))
         (committed (make-hash-table :test #'eql))
         (legacy-first-lsn nil)
@@ -2422,6 +2441,7 @@ src/backend/access/transam/xlogreader.c."
 (defun wal-replication-slot-rows ()
   (sb-thread:with-mutex (*wal-lock*)
     (loop for slot being the hash-values of *wal-replication-slots*
+          when (wal-logical-slot-p slot)
           collect
           (vector (wal-replication-slot-name slot)
                   (if (wal-replication-slot-active-owner slot) t nil)
@@ -2439,9 +2459,12 @@ src/backend/access/transam/xlogreader.c."
                   (wal-replication-slot-plugin slot)
                   (or (wal-replication-slot-database-oid slot) +null+)))))
 
+(declaim (ftype function physical-slot-restore-primary))
+
 (defun wal-load-replication-slots ()
   "Load durable WAL restart points before any checkpoint can recycle WAL."
-  (let ((segments (wal-discover-segments)))
+  (let ((segments (wal-discover-segments))
+        (inactive-since (postgres-current-timestamp)))
     (clrhash *wal-replication-slots*)
     (dolist (path (directory
                    (merge-pathnames "*.slot"
@@ -2450,8 +2473,10 @@ src/backend/access/transam/xlogreader.c."
              (name (wal-replication-slot-name slot)))
         (when (gethash name *wal-replication-slots*)
           (error "duplicate WAL replication slot ~a" name))
-        (wal-validate-replication-slot-wal slot segments)
-        (setf (gethash name *wal-replication-slots*) slot)))
+        (when (if (wal-physical-slot-p slot)
+                  (physical-slot-restore-primary slot inactive-since)
+                  (wal-validate-replication-slot-wal slot segments))
+          (setf (gethash name *wal-replication-slots*) slot))))
     (maphash (lambda (name slot)
                (declare (ignore name))
                (wal-slot-rebuild-progress slot))
@@ -2707,7 +2732,8 @@ PostgreSQL's checkpoint-time invalidation policy."
          (oldest-slot-restart-lsn
            (let ((positions
                    (loop for slot being the hash-values of *wal-replication-slots*
-                         when (eq (wal-replication-slot-wal-status slot) :reserved)
+                         when (and (eq (wal-replication-slot-wal-status slot) :reserved)
+                                   (wal-replication-slot-restart-lsn slot))
                            collect
                            (wal-replication-slot-restart-lsn slot))))
              (and positions (reduce #'min positions))))
