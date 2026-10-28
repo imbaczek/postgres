@@ -5,12 +5,16 @@
 (defvar *physical-follow-aborted-attempt-limit* 65536)
 
 (defun physical-follow-check-attempt-name (name)
-  "Reject an attempt canceled earlier in this source process. Caller owns WAL exclusion."
+  "Reject a canceled attempt name under WAL exclusion.
+Names canceled by either release form are single-use until source restart."
   (when (gethash name *physical-follow-aborted-attempts*)
     (wal-invalid-input "physical follow attempt was canceled; use a new pin name")))
 
 (defun physical-follow-abort-attempt-name (name)
-  "Fence delayed reservations without evicting an older fence. Caller owns the WAL lock."
+  "Fence delayed reservations under the WAL lock without evicting older names.
+The process-local set defaults to a limit of 65536 names. A new name at the limit fails
+before acknowledgment, unlink or retention release. Restart ends all earlier
+requests, so the set need not survive it."
   (unless (gethash name *physical-follow-aborted-attempts*)
     (unless (< (hash-table-count *physical-follow-aborted-attempts*)
                *physical-follow-aborted-attempt-limit*)
@@ -278,7 +282,16 @@ ambiguous READY save is not reported as a reseed request."
     (physical-source-follow-ready name anchor)))
 
 (defun physical-source-follow-release-checked (name expected-digest request)
-  "Delete the matching pin durably and fence late preparations of its attempt name."
+  "Release a matching pin durably and fence late preparations under the WAL lock.
+REQUEST identifies retaining or ready pins, including lost pins, by exact receiver coordinates
+without reading old WAL; otherwise EXPECTED-DIGEST identifies a ready pin. For
+absence, check REQUEST's system identifier, or fence by name when only the
+digest is available and cannot be checked. Both forms fence the name even on
+absence, preventing a delayed PREPARE from reserving it.
+
+Expected mismatches and busy senders do not fence WAL. Uncertain release I/O
+fences WAL; a full canceled-name set fails before unlink or retention release.
+The receiver must preserve cleanup intent until it can complete the release."
   (prevent-recovery-primary-operation "physical follow pin release")
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid physical follow pin name"))
@@ -330,7 +343,8 @@ ambiguous READY save is not reported as a reseed request."
     result))
 
 (defun physical-source-follow-abort (name request)
-  "Cancel a prepared or unacknowledged attempt using its exact receiver coordinates."
+  "Cancel an attempt using its exact saved receiver coordinates.
+A retaining or ready pin, including a lost pin, needs no old WAL for release."
   (physical-source-follow-release-checked name nil request))
 
 (defun physical-source-follow-release (name expected-digest)

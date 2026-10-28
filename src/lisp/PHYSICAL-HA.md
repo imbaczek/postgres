@@ -393,7 +393,35 @@ LSNs, history and hexadecimal end-of-recovery bytes use text. Generic options an
 the timeline result follow C conventions, but the command and WAL format are
 native; there is no format version bump or C physical compatibility.
 
-The full run passed 746 physical tests with no failures or pending tests and 170
+Native `RELEASE_FOLLOW` has two exact option forms. The original ready-pin
+form takes `native_format` and `anchor_digest`; the new cancellation form
+takes `native_format` and the same ten receiver fields as `PREPARE_FOLLOW`.
+The latter matches retaining or ready pins, including lost pins, without reading
+old WAL, so it can clean up after a lost preparation response. The shared request check
+validates field shape and bounds; it is not proof or authentication. For an
+absent pin the exact-request form still checks the system identifier. The
+checksum form cannot check a checksum against an absent pin, but still fences
+the name.
+
+Both forms record canceled names under the WAL lock, including on absence, so a
+delayed preparation cannot recreate an attempt after release. Use a fresh name
+for every attempt until source process restart. The in-memory set has a default limit of
+65,536 and never evicts names: at capacity cancellation for a new name fails with 55000
+before acknowledgment, unlink or retention release. A future receiver must keep
+cleanup intent until release succeeds. Restart ends preexisting requests, so the
+set need not persist across restart. Uncertain release I/O fences WAL; expected
+mismatches and busy senders do not. C's slot removal uses its own allocation lock
+and crash-safe directory synchronization (`slot.c:1075`, `slot.c:1129`); these
+native follow commands are not a C follow protocol.
+
+Validation passed 835 physical tests with no failures or pending tests, 170
+interop tests, a fresh strict compile and owned-server native acceptance. The
+new wire property passed 200 trials at seed 42 with no rejections; input coverage
+was not collected. Runtime guards still block bound startup and the bound receiver.
+The full controller, durable intents and queue, standby cleanup and bootstrap
+retirement remain to be implemented, including bounded asynchronous cleanup.
+
+An earlier run passed 746 physical tests with no failures or pending tests and 170
 interop tests, plus a fresh private-cache strict compile. The physical result was
 recovered from the same idle worker's suite report after the 300-second transport
 timeout. Native acceptance checked typed rows, independent overlap, EOR and

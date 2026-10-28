@@ -189,7 +189,8 @@ must compare the history with the source anchor."
     bytes))
 
 (defun pg-client-native-request-query (verb slot coordinates)
-  "Build a preparation or cancellation command from the same receiver request."
+  "Build PREPARE_FOLLOW or exact RELEASE_FOLLOW from the same receiver request.
+The copied fields are shape-checked, not proof of source identity or history."
   (unless (member verb '("PREPARE_FOLLOW" "RELEASE_FOLLOW") :test #'equal)
     (error "invalid native follow request command"))
   (unless (wal-valid-replication-slot-name-p slot) (error "invalid native follow pin name"))
@@ -264,7 +265,8 @@ explicit operator action; automated handoff and retirement are not integrated."
   t)
 
 (defun pg-client-native-abort (client slot coordinates)
-  "Cancel an attempt by its saved request, even if PREPARE returned no anchor."
+  "Cancel an attempt by its saved request, even if PREPARE returned no anchor.
+The caller must retain cleanup intent if completion is uncertain."
   (pg-client-send-query client (pg-client-native-request-query "RELEASE_FOLLOW" slot coordinates))
   (pg-client-native-read-result client nil "RELEASE_FOLLOW" :command-only t)
   t)

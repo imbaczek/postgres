@@ -30,7 +30,9 @@ eligibility for a future follow path; bootstrap START does not accept this pin."
     (error "invalid physical follow pin fields")))
 
 (defun physical-follow-request-copy (request)
-  "Check and copy the receiver coordinates without requiring source history or WAL."
+  "Check and copy the shape and bounds of receiver coordinates.
+This does not prove their contents or authenticate the source; it needs no
+source history or WAL."
   (let ((keys (remove-if (lambda (key) (member key '(:history-text :eor-octets)))
                          *physical-follow-anchor-keys*)))
     (physical-follow-check-plist request keys)

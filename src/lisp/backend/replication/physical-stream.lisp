@@ -125,7 +125,9 @@ Reject unknown, duplicate or missing options before preparing a pin."
       command)))
 
 (defun parse-native-physical-release (words)
-  "Parse checked release by an anchor checksum or the complete receiver request."
+  "Parse RELEASE_FOLLOW with exactly one of two native option forms.
+The ready-pin form has native_format and anchor_digest; the cancellation form
+has native_format and all ten receiver coordinates used for PREPARE_FOLLOW."
   (unless (and (>= (length words) 4) (string-equal (second words) "SLOT"))
     (ereport "42601" "expected RELEASE_FOLLOW SLOT name (native options)"))
   (let* ((name (replication-command-identifier (third words)))
