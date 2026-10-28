@@ -488,6 +488,14 @@ or named windows and supported inheritance. The default is peer-aware
 `CURRENT ROW`; explicit `ROWS` or `RANGE` supports that prefix or an unbounded
 following end. See [window functions](t/WINDOWS.md) for boundaries and tests.
 
+Function calls accept `ALL` before their arguments; it has the same effect as
+omitting it, including for scalar functions. `DISTINCT` and an `ORDER BY`
+inside the argument list are parsed as aggregate decorations. Function lookup
+uses the ordinary arguments first, so an unknown signature fails lookup; after
+a scalar function is selected, these decorations are rejected before argument
+coercion. Aggregate `DISTINCT` and argument-level `ORDER BY` remain unsupported,
+as do these modifiers on window calls.
+
 Sequence expressions support `nextval('sequence')`, `currval('sequence')`, and
 `setval('sequence', value [, is_called])`. Supported scalar expressions can be
 stored as column defaults and CHECK constraints. Sequence names in stored

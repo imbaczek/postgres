@@ -46,6 +46,27 @@
                           (handler-case (progn (cook-column-default raw column) nil)
                             (pg-error (e) (pg-error-sqlstate e)))) (first case))))))
 
+(rove:deftest stored-call-order-diagnostics
+    (let ((column (make-pg-column :name "a" :type :int4 :typmod -1 :attnum 1))
+          (table (make-pg-class :name "d" :oid 42
+                                :columns (vector (make-pg-column :name "a" :type :int4 :typmod -1 :attnum 1)))))
+      (dolist (case '(("sin(1 ORDER BY missing_column)" "42809")
+                      ("sin(missing_column ORDER BY 1)" "0A000")
+                      ("sin(1, 2 ORDER BY missing_column)" "42883")
+                      ("sin(DISTINCT 1 ORDER BY missing_column)" "42809")
+                      ("sin(sin(1 ORDER BY missing_column))" "42809")))
+        (let* ((ast (first (parse-statements (format nil "CREATE TABLE d(a integer DEFAULT ~a)" (first case)))))
+               (raw (getf (first (getf ast :columns)) :default-expression)))
+          (rove:ok (equal (second case)
+                          (handler-case (progn (cook-column-default raw column) nil)
+                            (pg-error (e) (pg-error-sqlstate e))))
+                   (first case))))
+      (let* ((ast (first (parse-statements "CREATE TABLE d(a int, CHECK(sin(1 ORDER BY missing.column) > 0))")))
+             (raw (first (getf ast :constraints))))
+        (rove:ok (equal "42809"
+                        (handler-case (progn (cook-check-constraint table raw) nil)
+                          (pg-error (e) (pg-error-sqlstate e))))))))
+
 (rove:deftest demanded-default-folding-is-statement-local
     (with-joined-dml-test-catalog
         (let* ((table (lookup-table "dst"))

@@ -20,7 +20,14 @@
 (rove:deftest basic-aggregate-nested-and-window
     (dolist (case '(("WITH q AS MATERIALIZED (SELECT avg(d.x) AS a FROM (SELECT 1 AS x UNION ALL SELECT 2) d) SELECT a::text,(a+a)::text FROM q" (("1.5000000000000000" "3.0000000000000000")))
                     ("SELECT count(d.x) OVER(), min(d.x) OVER(),max(d.x) OVER(),avg(d.x) OVER()::text FROM (SELECT 1 AS x UNION ALL SELECT 2) d LIMIT 1" ((2 1 2 "1.5000000000000000")))))
-      (rove:ok (equalp (second case) (subquery-test-rows (first case))) (first case))))
+      (rove:ok (equalp (second case) (subquery-test-rows (first case))) (first case)))
+  (dolist (sql '("SELECT row_number(x => 1) OVER ()"
+                 "SELECT sum(DISTINCT no_such_numeric_argument()) OVER ()"
+                 "SELECT sum(DISTINCT 1, 2) OVER ()"
+                 "SELECT row_number(DISTINCT 1) OVER ()"))
+    (let ((condition (handler-case (progn (subquery-test-rows sql) nil)
+                       (pg-error (error) error))))
+      (rove:ok (and condition (string= (pg-error-sqlstate condition) "42883")) sql))))
 
 (cl-spec:defproperty numeric-text-retains-coefficient-and-scale
     ((coefficient (range integer -1000000000 1000000000))
@@ -275,7 +282,8 @@
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (rove:deftest numeric-basic-functions
-    (dolist (case '(("SELECT abs(-12.030)::text" "12.030")
+    (dolist (case '(("SELECT abs(ALL -3)::text" "3")
+                    ("SELECT abs(-12.030)::text" "12.030")
                     ("SELECT numeric_abs('-Infinity'::numeric)::text" "Infinity")
                     ("SELECT sign('-Infinity'::numeric)::text" "-1")
                     ("SELECT round(-1.25::numeric,1)::text" "-1.3")
@@ -316,7 +324,23 @@
                (first case)))))
 
 (rove:deftest numeric-basic-function-errors
-    (dolist (case '(("SELECT abs('-9223372036854775808'::bigint)"
+    (dolist (case '(("SELECT sin(1 ORDER BY 1 USING OPERATOR(<))" "42809" "ORDER BY specified, but sin is not an aggregate function")
+                    ("SELECT sin(1 ORDER BY 1 USING OPERATOR(a.b.<))" "42809" "ORDER BY specified, but sin is not an aggregate function")
+                    ("SELECT width_bucket(DISTINCT ARRAY[1], NULL)" "42809" "DISTINCT specified, but width_bucket is not an aggregate function")
+                    ("SELECT sin(1 ORDER BY 1 USING OPERATOR(pg_catalog.<))" "42809" "ORDER BY specified, but sin is not an aggregate function")
+                    ("SELECT sin(1 ORDER BY 1 NULLS FIRST)" "42809" "ORDER BY specified, but sin is not an aggregate function")
+                    ("SELECT sin(1 ORDER BY 1 USING <)" "42809" "ORDER BY specified, but sin is not an aggregate function")
+                    ("SELECT sin(DISTINCT 'bad')" "42809" "DISTINCT specified, but sin is not an aggregate function")
+                    ("SELECT sin('bad' ORDER BY 1)" "42809" "ORDER BY specified, but sin is not an aggregate function")
+                    ("SELECT trunc(DISTINCT 'bad')" "42725" "function trunc(unknown) is not unique")
+                    ("SELECT sum(DISTINCT 1) OVER ()" "0A000" "DISTINCT is not implemented for window functions")
+                    ("SELECT sum(1 ORDER BY 1) OVER ()" "0A000" "aggregate ORDER BY is not implemented for window functions")
+                    ("SELECT abs(DISTINCT NULL) OVER ()" "42809" "DISTINCT specified, but abs is not an aggregate function")
+                    ("SELECT abs(DISTINCT NULL)" "42809" "DISTINCT specified, but abs is not an aggregate function")
+                    ("SELECT abs(NULL ORDER BY NULL)" "42809" "ORDER BY specified, but abs is not an aggregate function")
+                    ("SELECT abs(DISTINCT NULL ORDER BY NULL)" "42809" "DISTINCT specified, but abs is not an aggregate function")
+                    ("SELECT abs(DISTINCT 1, 2)" "42883" "function abs(integer, integer) does not exist")
+                    ("SELECT abs('-9223372036854775808'::bigint)"
                      "22003" "bigint out of range")
                     ("SELECT round(1::float8, 2)"
                      "42883" "function round(double precision, integer) does not exist")))

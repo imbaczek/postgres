@@ -11,7 +11,11 @@
                             (ereport "0A000" "cannot use column reference in DEFAULT expression"))))
                (when (raw-aggregate-kind node)
                  (ereport "42803" "aggregate functions are not allowed in ~a" context))
-               (walk (car node)) (walk (cdr node)))))
+               ;; Scalar call ORDER BY is rejected after argument resolution, before
+               ;; its expressions are transformed.  Aggregate calls were rejected above.
+               (if (eq (first node) :func)
+                   (walk (third node))
+                   (progn (walk (car node)) (walk (cdr node)))))))
     (walk form)))
 
 (defun stored-expression-sequences (form)
@@ -198,7 +202,9 @@ those arguments therefore occur before any row execution or sequence effects."
                (when (and (eq (first node) :column) (third node)
                           (not (string= (second node) (pg-class-name table))))
                  (ereport "42P01" "missing FROM-clause entry for table ~s" (second node)))
-               (check-qualifier (car node)) (check-qualifier (cdr node)))))
+               (if (eq (first node) :func)
+                   (check-qualifier (third node))
+                   (progn (check-qualifier (car node)) (check-qualifier (cdr node)))))))
     (check-qualifier (getf raw :expression)))
   (let* ((*select-set-functions-allowed-p* nil)
          (expression (coerce-boolean-expression (analyze-expr (getf raw :expression) table) "CHECK"))

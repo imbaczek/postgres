@@ -260,6 +260,9 @@ exist\" messages."
 
 (defvar *inside-aggregate-input-p* nil)
 
+(defvar *defer-function-constant-coercion-p* nil
+  "Defer input conversion while checking decorated scalar calls.")
+
 (defun coerce-catalog-oid-argument (argument name)
   (unless (or (in-unknown-constant-p argument)
               (member (expr-type argument) '(:int2 :int4 :int8 :oid)))
@@ -789,6 +792,10 @@ and numeric_power select their declared types."
                             (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args))
                             (error error)))))
               (array-type (sql-array-type type)))
+         ;; Candidate compatibility is already checked; array type materialization
+         ;; follows the aggregate decoration check in ParseFuncOrColumn.
+         (when *defer-function-constant-coercion-p*
+           (return-from analyze-width-bucket (list :func "width_bucket" args :type :int4 :typmod -1)))
          ;; Like get_array_type in polymorphic resolution, this lookup happens
          ;; before argument coercion or strict NULL evaluation. Ordinary array
          ;; types have no array type of their own; int2vector is exceptional
@@ -1050,7 +1057,12 @@ so a nested argument error keeps its own diagnostics."
     (cond
       ((or (numeric-function-p name)
            (member name '("random" "setseed") :test #'string=))
-       (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature))
+       ;; ParseFuncOrColumn selects the candidate before rejecting decorations,
+       ;; then coerces arguments. Defer constant input conversion until that check.
+       (let ((*defer-function-constant-coercion-p*
+               (or (getf (cdddr expr) :call-distinct)
+                   (getf (cdddr expr) :call-order))))
+         (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature)))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
       ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
       ((string= name "substr") (analyze-substr-function name args))
@@ -2022,7 +2034,10 @@ candidate selection."
 
 (defun coerce-common-expression (expression type)
   (cond
-    ((in-unknown-constant-p expression) (coerce-in-constant expression type))
+    ((in-unknown-constant-p expression)
+     (if *defer-function-constant-coercion-p*
+         (list :cast expression :type type :typmod -1)
+         (coerce-in-constant expression type)))
     ((eq type (expr-type expression)) expression)
     ((sql-implicit-coercion-p (expr-type expression) type)
      (list :cast expression :type type :typmod -1))
@@ -2257,8 +2272,25 @@ candidate selection."
      (list :is-bool (analyze-expr (second expr) table) (third expr)
            (fourth expr) :type :bool :typmod -1))
     (:func (if (raw-aggregate-kind expr)
-               (analyze-aggregate-call expr table)
-               (analyze-function-expression expr table)))
+               (progn
+                 (when (getf (cdddr expr) :call-distinct)
+                   (ereport "0A000" "DISTINCT function arguments are not supported"))
+                 (when (getf (cdddr expr) :call-order)
+                   (ereport "0A000" "aggregate ORDER BY is not supported"))
+                 (analyze-aggregate-call expr table))
+               ;; Lookup must fail before rejecting decorations on a scalar match.
+               (let ((result (analyze-function-expression expr table)))
+                 (when (getf (cdddr expr) :call-distinct)
+                   (ereport "42809" "DISTINCT specified, but ~a is not an aggregate function"
+                            (if (getf (cdddr expr) :schema)
+                                (format nil "~a.~a" (getf (cdddr expr) :schema) (second expr))
+                                (second expr))))
+                 (when (getf (cdddr expr) :call-order)
+                   (ereport "42809" "ORDER BY specified, but ~a is not an aggregate function"
+                            (if (getf (cdddr expr) :schema)
+                                (format nil "~a.~a" (getf (cdddr expr) :schema) (second expr))
+                                (second expr))))
+                 result)))
     (:count-star
      (analyze-aggregate-call expr table))
     (t
@@ -2567,6 +2599,7 @@ candidate selection."
                ((string= (second form) "avg") :avg)))))
 
 (defun contains-aggregate-p (form)
+  ;; Walk the full call, including ORDER BY expressions stored in its plist.
   (and (consp form)
        (if (member (first form) '(:sublink :window))
            (contains-aggregate-p (fourth form))
