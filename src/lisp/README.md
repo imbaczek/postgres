@@ -252,6 +252,16 @@ are ambiguous. `factorial(x)` accepts a bigint-coercible argument and returns
 numeric; negative arguments and arguments above 32177 raise `22003`. These
 functions return NULL when any argument is NULL.
 
+`width_bucket(value, bound1, bound2, count)` supports numeric and float8
+range overloads and returns an integer bucket number. The bounds must be
+distinct and finite, and count must be positive. Buckets can run in ascending
+or descending order; values beyond the first and second bounds return 0 and
+count + 1 respectively. `width_bucket(value, thresholds)` supports text,
+varchar, and name operands with one-dimensional text arrays. Thresholds must
+be sorted ascending and contain no NULLs; the result is the number of
+thresholds less than or equal to the value (zero for an empty array). Both
+forms return NULL if any argument is NULL.
+
 Exponentiation is available as `base ^ exponent`, `power(base, exponent)`,
 `pow(base, exponent)`, `numeric_power(base, exponent)`, and `dpow(base, exponent)`.
 `^` associates left to right and binds more tightly than multiplication and

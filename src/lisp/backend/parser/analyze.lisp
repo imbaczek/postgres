@@ -500,6 +500,94 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
   (multiple-value-bind (arguments type) (resolve-power-operands name args)
     (list :func name arguments :type type :typmod -1)))
 
+(defun analyze-width-bucket (args)
+  ;; Resolve the text/text[] threshold form or numeric/float8 range form to int4.
+  (cond
+    ((= (length args) 2)
+     (let ((operand (first args)) (array (second args)))
+       (unless (and (or (eq (expr-type array) :text-array)
+                        (and (in-unknown-constant-p array)
+                             (or (in-unknown-constant-p operand)
+                                 (member (expr-type operand) '(:text :varchar :name)))))
+                    (or (in-unknown-constant-p operand)
+                        (member (expr-type operand) '(:text :varchar :name))))
+         (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))
+       (list :func "width_bucket"
+             (list (coerce-common-expression operand :text)
+                   (coerce-common-expression array :text-array))
+             :type :int4 :typmod -1)))
+    ((= (length args) 4)
+     (let* ((values (subseq args 0 3))
+            (type (if (and (some (lambda (a) (and (not (in-unknown-constant-p a))
+                                                  (eq (expr-type a) :numeric))) values)
+                           (notany (lambda (a) (member (expr-type a) '(:float4 :float8))) values))
+                      :numeric :float8)))
+       (unless (and (every (lambda (a) (or (in-unknown-constant-p a)
+                                           (sql-implicit-coercion-p (expr-type a) type))) values)
+                    (or (in-unknown-constant-p (fourth args))
+                        (sql-implicit-coercion-p (expr-type (fourth args)) :int4)))
+         (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))
+       (list :func "width_bucket"
+             (append (mapcar (lambda (a) (coerce-common-expression a type)) values)
+                     (list (coerce-common-expression (fourth args) :int4)))
+             :type :int4 :typmod -1)))
+    (t (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))))
+
+(defun sql-width-bucket-array (value array)
+  ;; C width_bucket_array: search ascending thresholds for the first greater value.
+  ;; Empty arrays yield zero; NULL elements are rejected, and sorting is assumed.
+  (when (find +null+ array)
+    (ereport "22004" "thresholds array must not contain NULLs"))
+  (let ((left 0) (right (length array)))
+    (loop while (< left right)
+          for mid = (floor (+ left right) 2)
+          do (if (< (compare-3way value (aref array mid)) 0)
+                 (setf right mid) (setf left (1+ mid))))
+    left))
+
+(defun sql-width-bucket-range (args)
+  ;; C width_bucket_float8/width_bucket_numeric: equal-width ascending or
+  ;; descending buckets, with exterior buckets 0 and COUNT+1.
+  (destructuring-bind (operand bound1 bound2 count) args
+    (when (<= count 0) (ereport "2201G" "count must be greater than zero"))
+    (let* ((float-p (floatp bound1))
+           (nan-p (lambda (v) (if float-p (sb-ext:float-nan-p v) (eq v :numeric-nan))))
+           (infinite-p (lambda (v) (if float-p (sb-ext:float-infinity-p v)
+                                       (member v '(:numeric-positive-infinity :numeric-negative-infinity)))))
+           (compare (if float-p #'sql-float-compare #'sql-numeric-compare)))
+      (when (or (funcall nan-p bound1) (funcall nan-p bound2))
+        (ereport "2201G" "lower and upper bounds cannot be NaN"))
+      (when (or (funcall infinite-p bound1) (funcall infinite-p bound2))
+        (ereport "2201G" "lower and upper bounds must be finite"))
+      (let ((direction (funcall compare bound1 bound2)))
+        (when (zerop direction) (ereport "2201G" "lower bound cannot equal upper bound"))
+        (let ((first-cmp (funcall compare operand bound1))
+              (second-cmp (funcall compare operand bound2)))
+          (cond ((if (minusp direction) (< first-cmp 0) (> first-cmp 0)) 0)
+                ((if (minusp direction) (>= second-cmp 0) (<= second-cmp 0))
+                 (when (= count +int4-max+) (ereport "22003" "integer out of range"))
+                 (1+ count))
+                (float-p
+                 (let* ((a (if (minusp direction) operand bound1))
+                        (b (if (minusp direction) bound1 operand))
+                        (upper (if (minusp direction) bound2 bound1))
+                        (lower (if (minusp direction) bound1 bound2))
+                        (wide (> (- (rational upper) (rational lower)) (rational most-positive-double-float)))
+                        (fraction (if wide
+                                      (/ (- (/ a 2d0) (/ b 2d0)) (- (/ upper 2d0) (/ lower 2d0)))
+                                      (/ (- a b) (- upper lower)))))
+                   (1+ (min (1- count) (truncate (* count fraction))))))
+                (t (1+ (floor (* count (- (sql-numeric-rational operand)
+                                          (sql-numeric-rational bound1)))
+                              (- (sql-numeric-rational bound2)
+                                 (sql-numeric-rational bound1)))))))))))
+
+(defun sql-width-bucket (args)
+  ;; Both overloads are strict; dispatch already-coerced arguments by arity.
+  (cond ((member +null+ args) +null+)
+        ((= (length args) 2) (sql-width-bucket-array (first args) (second args)))
+        (t (sql-width-bucket-range args))))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
@@ -512,6 +600,7 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     (cond
+      ((string= name "width_bucket") (analyze-width-bucket args))
       ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
                :test #'string=)
        (analyze-basic-numeric-function name args))
@@ -1778,7 +1867,7 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
                                    "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                                    "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                                    "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
-                                   "scale" "min_scale" "trim_scale")
+                                   "scale" "min_scale" "trim_scale" "width_bucket")
                                  :test #'string=))))
            (analyzed-expression-volatile-p (car form))
            (analyzed-expression-volatile-p (cdr form)))))
@@ -2416,6 +2505,7 @@ aliases share the corresponding numeric operator implementation."
 
 (defun eval-func (name args)
   (cond
+    ((string= name "width_bucket") (sql-width-bucket args))
     ((and (member name '("nextval" "currval" "setval") :test #'string=)
           (member +null+ args))
      +null+)

@@ -154,6 +154,26 @@
   (rove:ok (equal '((t t t))
                   (subquery-test-rows "SELECT '-Infinity'::numeric<0, 'Infinity'::numeric<'NaN'::numeric, 'NaN'::numeric='NaN'::numeric"))))
 
+(rove:deftest width-bucket-expressions
+    (dolist (case '(("SELECT width_bucket(2,0,10,5)::text" "2")
+                    ("SELECT width_bucket(8,10,0,5)::text" "2")
+                    ("SELECT width_bucket(0.3::numeric,0,1,10)::text" "4")
+                    ("SELECT width_bucket(0::float8,'-1e308'::float8,'1e308'::float8,10)::text" "6")
+                    ("SELECT width_bucket('b'::text,ARRAY['a','b','b','c'])::text" "3")
+                    ("SELECT width_bucket('b'::varchar,ARRAY['a','b'])::text" "2")
+                    ("SELECT width_bucket('b'::name,ARRAY['a','b'])::text" "2")
+                    ("SELECT width_bucket('b'::text,'{a,b}')::text" "2")
+                    ("SELECT width_bucket('b','{a,b}')::text" "2")
+                    ("SELECT (width_bucket(NULL,NULL) IS NULL)::text" "true")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case)))
+  (dolist (case '(("SELECT width_bucket(1,0,1,0)" "2201G")
+                  ("SELECT width_bucket(1,1,1,2)" "2201G")
+                  ("SELECT width_bucket(1,0,1,2147483647)" "22003")
+                  ("SELECT width_bucket('a'::text,ARRAY['a',NULL])" "22004")))
+    (let ((condition (handler-case (progn (subquery-test-rows (first case)) nil)
+                       (pg-error (error) error))))
+      (rove:ok (and condition (string= (pg-error-sqlstate condition) (second case))) (first case)))))
+
 (rove:deftest numeric-basic-functions
     (dolist (case '(("SELECT abs(-12.030)::text" "12.030")
                     ("SELECT numeric_abs('-Infinity'::numeric)::text" "Infinity")
