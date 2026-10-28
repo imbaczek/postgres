@@ -471,10 +471,13 @@ A nonpending standby cannot fall back to primary startup when validation fails."
       (physical-recovery-prepare-with-namespace)
       (setf (getf *physical-recovery-state* :wal-namespace) namespace))))
 
+(declaim (ftype function physical-follow-check-startup-config))
+
 (defun physical-recovery-prepare-with-namespace ()
   "Validate the base image, history and checkpoint provenance before publishing active recovery.
 Pending promotion is reconciled separately."
   (physical-recovery-check-required-marker)
+  (physical-follow-check-startup-config)
   (let ((control (physical-recovery-read-control *pgdata*)))
     ;; Pending control must never fall through the ordinary phase rewrite/redo path.
     ;; A later milestone will verify and reconcile this exact generation before SQL.
@@ -550,6 +553,7 @@ Pending promotion is reconciled separately."
 (defun physical-recovery-open-storage ()
   "Open verified recovery; phase 2 redoes its entire retained prefix before SQL."
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
+  (physical-follow-check-startup-config)
   (let ((streaming (= 2 (getf *physical-recovery-state* :phase))))
     (setf (getf *physical-recovery-state* :replay-timeline) (getf *physical-recovery-state* :timeline)
           *wal-segment-namespace* (getf *physical-recovery-state* :wal-namespace :legacy)

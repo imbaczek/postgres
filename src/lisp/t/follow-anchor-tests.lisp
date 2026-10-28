@@ -14,6 +14,183 @@
    :confirmed-lsn (when ready 96) :prefix-digest seed
    :stage (if ready :ready :retaining) :anchor (follow-anchor-request seed overlap)))
 
+(defun follow-binding-test-config (&optional padding)
+  (let* ((anchor (follow-anchor-request 123 456))
+         (history (getf anchor :history-text))
+         (before (list 42 1 64 128 555 64 #xCBF29CE484222325 nil nil 77 nil))
+         (store (pg::%make-physical-store :system-id 42 :timeline 1 :base-lsn 64)))
+    (when padding
+      (setf history (with-output-to-string (out)
+                      (write-string history out)
+                      (dotimes (index (ceiling padding 10))
+                        (declare (ignore index))
+                        (write-line "# padding" out)))
+            (getf anchor :history-text) history))
+    (let* ((selection (pg::physical-store-history-candidate
+                       store 2 history (getf anchor :eor-octets) 123))
+           (after (copy-list before)))
+      (setf (fourth after) 96 (fifth after) 123
+            (eighth after) 2 (ninth after) (getf selection :digest))
+      (list 1 "127.0.0.1" 5433 "binding_probe"
+            (list :version 1 :phase :pending :anchor anchor :child-history history
+                  :before before :after after :applied '(96 1) :required '(96 1)
+                  :recovery '(:phase 2 :cluster-identity "binding-probe" :checkpoint 64
+                              :observed-next-xid 9 :history-target nil :history-digest nil
+                              :restartpoint nil))))))
+
+(deftest follow-binding-config-roundtrips-pending-proof-with-existing-envelope
+    (dolist (padding '(nil 8192))
+      (let* ((config (follow-binding-test-config padding))
+             (bytes (pg::physical-follow-config-image config)))
+        (ok (equal config (pg::physical-follow-decode-config bytes)))
+        (ok (search "PGPHYSICALFOLLOW1 " (pg::bytes->string bytes)))
+        (when padding (ok (> (length bytes) 4096))))))
+
+(cl-spec:defproperty follow-binding-envelope-preserves-full-width-proof-and-root
+    ((carried (range integer 0 18446744073709551615))
+     (overlap (range integer 0 18446744073709551615))
+     (root (range integer 0 18446744073709551615))
+     (active (range integer 0 1)))
+  (:about pg::physical-follow-decode-config)
+  (:trials (:normal 200))
+  (let* ((config (follow-binding-test-config)) (binding (fifth config))
+                                               (anchor (getf binding :anchor)) (before (getf binding :before))
+                                               (after (getf binding :after))
+                                               (store (pg::%make-physical-store :system-id 42 :timeline 1 :base-lsn 64)))
+    (setf (getf binding :phase) (if (zerop active) :pending :active)
+          (getf anchor :receive-digest) carried (getf anchor :overlap-digest) overlap
+          (nth 10 before) root (nth 10 after) root (fifth after) carried
+          (ninth after) (getf (pg::physical-store-history-candidate
+                               store 2 (getf binding :child-history) (getf anchor :eor-octets) carried)
+                              :digest))
+    (equal config (pg::physical-follow-decode-config (pg::physical-follow-config-image config)))))
+
+(deftest generated-follow-binding-full-width-proof-and-root
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'follow-binding-envelope-preserves-full-width-proof-and-root :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest follow-binding-config-rejects-null-or-incomplete-fifth-field
+    (dolist (binding '(nil (:version 1) (:phase :pending)))
+      (ok (signals (pg::physical-follow-check-config
+                    (list 1 "127.0.0.1" 5433 "binding_probe" binding)) 'error))))
+
+(deftest follow-binding-config-preserves-local-proof-and-transition-fields
+    (dolist (kind '(:phase :identity :seed :floor :root :selection :eor :history :required :applied :recovery))
+      (let* ((config (follow-binding-test-config))
+             (binding (fifth config)))
+        (ecase kind
+          (:phase (setf (getf binding :phase) :unknown))
+          (:identity (incf (first (getf binding :before))))
+          (:seed (incf (fifth (getf binding :after))))
+          (:floor (incf (sixth (getf binding :after))))
+          (:root (setf (nth 10 (getf binding :after)) 0))
+          (:selection (incf (ninth (getf binding :after))))
+          (:eor (setf (getf (getf binding :anchor) :eor-octets) '(0)))
+          (:history (setf (getf binding :child-history) (store-history-text 1 95)))
+          (:required (setf (getf binding :required) '(128 1)))
+          (:applied (setf (getf binding :applied) '(96 2)))
+          (:recovery (setf (getf binding :recovery) '(:phase 2 :cluster-identity "binding-probe" :checkpoint 64
+                                                      :observed-next-xid 9 :history-target 2 :history-digest nil
+                                                      :restartpoint nil))))
+        (ok (signals (pg::physical-follow-check-config config) 'error)))))
+
+(deftest follow-binding-config-is-preserved-by-stop-start-and-cold-storage-guards
+    (dolist (phase '(:pending :active))
+      (with-physical-store-directory (root)
+        (let* ((pg::*pgdata* root)
+               (pg::*physical-recovery-state* (list :phase 2))
+               (pg::*physical-recovery-failed-p* nil)
+               (pg::*physical-follow-runtime* nil)
+               (config (follow-binding-test-config)))
+          (setf (getf (fifth config) :phase) phase)
+          (pg::physical-follow-save-config config)
+          (let ((before (lineage-test-bytes (pg::physical-follow-config-path))))
+            (ok (signals (pg::physical-follow-stop) 'error))
+            (ok (equalp before (lineage-test-bytes (pg::physical-follow-config-path))))
+            (ok (signals (pg::physical-follow-start "127.0.0.1" 5434 "replacement") 'error))
+            (ok (equalp before (lineage-test-bytes (pg::physical-follow-config-path))))
+            (ok (signals (pg::physical-recovery-open-storage) 'error))
+            (ok (equalp before (lineage-test-bytes (pg::physical-follow-config-path))))
+            (ok (null pg::*physical-follow-runtime*)))))))
+
+(deftest follow-binding-config-supports-parent-catchup-and-zero-root-witnesses
+    (let* ((config (follow-binding-test-config)) (binding (fifth config))
+                                                 (anchor (getf binding :anchor)) (before (getf binding :before)))
+      (setf (getf anchor :receive-lsn) 64 (getf anchor :receive-digest) #xCBF29CE484222325
+            (fourth before) 64 (fifth before) #xCBF29CE484222325
+            (getf binding :after) (copy-list before)
+            (getf binding :applied) '(64 1) (getf binding :required) '(64 1))
+      (ok (equal config (pg::physical-follow-decode-config (pg::physical-follow-config-image config)))))
+  (let* ((config (follow-binding-test-config)) (binding (fifth config))
+                                               (before (getf binding :before)) (after (getf binding :after)))
+    (setf (sixth before) 80 (seventh before) 999 (nth 10 before) 0
+          (sixth after) 80 (seventh after) 999 (nth 10 after) 0
+          (getf binding :required) '(64 1)
+          (getf binding :recovery) '(:phase 2 :cluster-identity "binding-probe" :checkpoint 64
+                                     :observed-next-xid 9 :history-target nil :history-digest nil
+                                     :restartpoint (80 4242)))
+    (ok (equal config (pg::physical-follow-decode-config (pg::physical-follow-config-image config))))))
+
+(deftest follow-binding-config-projects-immediate-child-history-from-newer-source
+    (let* ((config (follow-binding-test-config))
+           (binding (fifth config)) (anchor (getf binding :anchor)))
+      (setf (getf anchor :source-timeline) 3
+            (getf anchor :history-text) (store-history-text 2 160 (getf binding :child-history)))
+      (ok (equal config (pg::physical-follow-decode-config (pg::physical-follow-config-image config))))
+      (setf (getf binding :child-history) (getf anchor :history-text))
+      (ok (signals (pg::physical-follow-check-config config) 'error))))
+
+(deftest follow-binding-startup-guard-precedes-storage-or-recovery-control-work
+    (with-physical-store-directory (root)
+      (let ((pg::*pgdata* root) (pg::*physical-recovery-state* (list :phase 2))
+                                (pg::*physical-recovery-failed-p* nil) (pg::*last-replay-lsn* 999)
+                                (pg::*wal-ready* :untouched) (pg::*catalog* :untouched))
+        (pg::physical-follow-save-config (follow-binding-test-config))
+        (ok (signals (pg::physical-recovery-open-storage) 'error))
+        (ok (= 999 pg::*last-replay-lsn*))
+        (ok (eq :untouched pg::*wal-ready*))
+        (ok (eq :untouched pg::*catalog*))
+        (pg::wal-atomic-write-bytes
+         (merge-pathnames "recovery.required" root) (pg::physical-recovery-marker-bytes))
+        (let ((read-control (symbol-function 'pg::physical-recovery-read-control)) (called nil))
+          (unwind-protect
+               (progn
+                 (setf (symbol-function 'pg::physical-recovery-read-control)
+                       (lambda (&rest args) (declare (ignore args))
+                         (setf called t) (error "recovery control was reached")))
+                 (ok (signals (pg::physical-recovery-prepare-with-namespace) 'error))
+                 (ng called))
+            (setf (symbol-function 'pg::physical-recovery-read-control) read-control))))))
+
+(deftest follow-binding-config-decode-refuses-valid-crc-invalid-schema-and-extra-forms
+    (dolist (bad (list (append '(1 "127.0.0.1" 5433 "binding_probe") '(nil))
+                       (append '(1 "127.0.0.1" 5433 "binding_probe") '((:version 1 :phase :pending)))))
+      (let* ((text (pg::physical-bootstrap-manifest-text bad))
+             (crc (pg::wal-crc32 (pg::string->bytes text)))
+             (bytes (pg::string->bytes (format nil "PGPHYSICALFOLLOW1 ~8,'0X~%~a~%" crc text))))
+        (ok (signals (pg::physical-follow-decode-config bytes) 'error))))
+  (let* ((text (concatenate 'string
+                            (pg::physical-bootstrap-manifest-text (follow-binding-test-config)) " nil"))
+         (bytes (pg::string->bytes
+                 (format nil "PGPHYSICALFOLLOW1 ~8,'0X~%~a~%"
+                         (pg::wal-crc32 (pg::string->bytes text)) text))))
+    (ok (signals (pg::physical-follow-decode-config bytes) 'error))))
+
+(deftest follow-binding-config-bounds-history-and-file-before-parsing
+    (let* ((config (follow-binding-test-config))
+           (binding (fifth config)))
+      (setf (getf binding :child-history)
+            (make-string (1+ pg::+physical-store-history-maximum-bytes+) :initial-element #\a))
+      (ok (signals (pg::physical-follow-check-config config) 'error)))
+  (with-physical-store-directory (root)
+    (let ((pg::*pgdata* root))
+      (with-open-file (out (pg::physical-follow-config-path) :direction :output
+                                                             :element-type '(unsigned-byte 8))
+        (file-position out pg::+physical-follow-config-maximum-bytes+)
+        (write-byte 0 out) (pg::fsync-stream out))
+      (ok (signals (pg::physical-follow-read-config) 'error)))))
+
 (deftest follow-anchor-format-keeps-carried-seed-separate-from-overlap
     (let* ((pin (follow-anchor-pin 123 456))
            (loaded (pg::physical-follow-pin-decode (pg::physical-follow-pin-encode pin))))
