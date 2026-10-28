@@ -433,6 +433,26 @@ including unknown literals."
            :type :numeric :typmod -1))
     (t (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))))
 
+(defun resolve-power-operands (name args)
+  "Resolve and coerce the two operands of a power function or operator."
+  (unless (= (length args) 2)
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+  (let* ((numeric (and (not (string= name "dpow"))
+                       (or (string= name "numeric_power")
+                           (and (some (lambda (arg) (and (not (in-unknown-constant-p arg))
+                                                         (eq (expr-type arg) :numeric))) args)
+                                (notany (lambda (arg) (member (expr-type arg) '(:float4 :float8))) args)))))
+         (type (if numeric :numeric :float8)))
+    (unless (every (lambda (arg) (or (in-unknown-constant-p arg)
+                                     (sql-implicit-coercion-p (expr-type arg) type))) args)
+      (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+    (values (mapcar (lambda (arg) (coerce-common-expression arg type)) args) type)))
+
+(defun analyze-power-function (name args)
+  "Analyze a numeric or float8 power function call."
+  (multiple-value-bind (arguments type) (resolve-power-operands name args)
+    (list :func name arguments :type type :typmod -1)))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
@@ -452,6 +472,8 @@ including unknown literals."
        (analyze-basic-numeric-function name args))
       ((member name '("log" "log10" "numeric_log") :test #'string=)
        (analyze-log-function name args))
+      ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
+       (analyze-power-function name args))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
       ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
       ((string= name "substr") (analyze-substr-function name args))
@@ -1096,6 +1118,14 @@ including unknown literals."
   (let* ((operator (second expression))
          (left (analyze-expr (third expression) scope))
          (right (analyze-expr (fourth expression) scope)))
+    (when (and (> (length operator) 1) (char= (char operator 0) #\^))
+      (ereport "42883" "operator does not exist: ~a ~a ~a"
+               (typed-arg-name left) operator (typed-arg-name right)))
+    (when (string= operator "^")
+      (multiple-value-bind (arguments type) (resolve-power-operands "power" (list left right))
+        (return-from analyze-binop-expression
+          (list :binop operator (first arguments) (second arguments)
+                :type type :typmod -1))))
     (when (string= operator "||")
       (return-from analyze-binop-expression (analyze-text-concatenation left right)))
     (if (member operator '("=" "<>" "<" "<=" ">" ">=") :test #'string=)
@@ -1694,7 +1724,7 @@ including unknown literals."
                                "substr" "length" "char_length" "character_length" "pg_backend_pid"
                                "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                                "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
-                               "log" "log10" "numeric_log")
+                               "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow")
                              :test #'string=)))
            (analyzed-expression-volatile-p (car form))
            (analyzed-expression-volatile-p (cdr form)))))
@@ -2486,6 +2516,9 @@ including unknown literals."
                                                           (sql-session-timezone))))
                               ((or (eq (expr-type (third expr)) :date) (eq (expr-type (fourth expr)) :date))
                                (sql-date-arithmetic op l r (expr-type (third expr)) (expr-type (fourth expr))))
+                              ((string= op "^")
+                               (if (eq (expr-type expr) :numeric)
+                                   (sql-numeric-power l r) (sql-float-power l r)))
                               ((eq (expr-type expr) :numeric) (sql-numeric-arithmetic op l r))
                               ((member (expr-type expr) '(:float4 :float8)) (sql-float-arithmetic op l r))
                               (t (sql-arith op l r)))))
@@ -2543,6 +2576,10 @@ including unknown literals."
             (cond ((eq value +null+) +null+)
                   ((eq type :numeric) (sql-numeric-sqrt value))
                   (t (sql-float-sqrt value)))))
+         ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
+          (cond ((member +null+ arguments) +null+)
+                ((eq type :numeric) (sql-numeric-power (first arguments) (second arguments)))
+                (t (sql-float-power (first arguments) (second arguments)))))
          ((member name '("log" "log10" "numeric_log") :test #'string=)
           (cond ((member +null+ arguments) +null+)
                 ((eq type :numeric)

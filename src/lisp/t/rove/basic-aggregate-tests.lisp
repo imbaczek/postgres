@@ -295,6 +295,25 @@
                     ("SELECT log(2::numeric,'Infinity'::numeric)::text" "Infinity")))
       (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case))))
 
+(cl-spec:defproperty numeric-power-small-integers
+    ((base (range integer -10 10))
+     (exponent (range integer 0 8)))
+  (:about sql-numeric-power)
+  (:trials (:normal 250))
+  (= (sql-numeric-rational (sql-numeric-power base exponent))
+     (expt base exponent)))
+
+(rove:deftest numeric-power-expressions
+    (dolist (case '(("SELECT (2^3)::text" "8")
+                    ("SELECT (2^3^2)::text" "64")
+                    ("SELECT power(2::numeric,3::numeric)::text" "8.0000000000000000")
+                    ("SELECT pow(9::numeric,0.5::numeric)::text" "3.0000000000000000")
+                    ("SELECT power('NaN'::numeric,0::numeric)::text" "1")
+                    ("SELECT power(1::numeric,'NaN'::numeric)::text" "1")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case)))
+  (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-power-small-integers :seed 42))))
+    (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (cl-spec:defproperty numeric-rounding-is-symmetric
     ((coefficient (range integer -10000000 10000000))
      (input-scale (range integer 0 6))

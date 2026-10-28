@@ -224,6 +224,20 @@ also accept floating-point inputs; the explicitly numeric forms use numeric
 arithmetic. Logarithms reject zero and negative arguments, and a base of one,
 with SQLSTATE `2201E`. These functions return NULL when an argument is NULL.
 
+Exponentiation is available as `base ^ exponent`, `power(base, exponent)`,
+`pow(base, exponent)`, `numeric_power(base, exponent)`, and `dpow(base, exponent)`.
+`^` associates left to right and binds more tightly than multiplication and
+less tightly than unary signs: `2 ^ 3 ^ 2` is `(2 ^ 3) ^ 2`, and `-2 ^ 2`
+is `(-2) ^ 2`. Parentheses can change this grouping. `^`, `power`, and `pow`
+return numeric when an argument is numeric and neither argument is floating
+point; otherwise they return float8. Thus two integer arguments use float8.
+`numeric_power` selects numeric and `dpow` selects float8, subject to implicit
+argument coercions. A NULL argument yields NULL. Zero raised to a negative
+power and a negative base raised to a non-integer power raise SQLSTATE `2201F`.
+NaNs and infinities follow PostgreSQL's power rules, including `NaN ^ 0 = 1`
+and `1 ^ NaN = 1`. Numeric powers use decimal result scales; finite float8
+overflow and underflow raise SQLSTATE `22003`.
+
 Constant target expressions are evaluated during execution rather than folded
 during planning. Consequently, `WHERE false` or `LIMIT 0` can suppress errors
 from constant SELECT targets that PostgreSQL would raise while planning.
@@ -334,7 +348,7 @@ SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
 CHECKPOINT;
 ```
 
-Expressions: column references, integer, decimal and string literals, `+ - * / %`,
+Expressions: column references, integer, decimal and string literals, `+ - * / % ^`,
 comparisons, `AND` / `OR` / `NOT`, `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE`, and
 parentheses. Scalar functions: `version()`, `pg_lisp_runtime()`,
 `current_database()`, `current_schema()`, `current_catalog()`, `current_user`,

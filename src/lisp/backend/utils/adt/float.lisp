@@ -227,6 +227,44 @@ finite inputs, an infinite or zero result signals overflow or underflow."
           ((zerop result) (ereport "22003" "value out of range: underflow"))
           (t result))))
 
+(defun sql-float-power (base exponent)
+  "Compute float8 power following float.c's dpow special and domain rules.
+NaNs, infinities and signed zeros are handled explicitly; finite overflow and
+underflow signal SQLSTATE 22003, and invalid power arguments signal 2201F."
+  (when (sb-ext:float-nan-p base)
+    (return-from sql-float-power (if (and (not (sb-ext:float-nan-p exponent))
+                                          (zerop exponent)) 1d0 base)))
+  (when (sb-ext:float-nan-p exponent)
+    (return-from sql-float-power (if (= base 1d0) 1d0 exponent)))
+  (when (and (zerop base) (minusp exponent))
+    (ereport "2201F" "zero raised to a negative power is undefined"))
+  (when (and (minusp base) (not (sb-ext:float-infinity-p exponent))
+             (not (integerp (rational exponent))))
+    (ereport "2201F" "a negative number raised to a non-integer power yields a complex result"))
+  (let* ((inf (sql-float-from-bits #x7ff0000000000000 :float8))
+         (negative-odd (and (minusp (float-sign base))
+                            (not (sb-ext:float-infinity-p exponent))
+                            (integerp (rational exponent))
+                            (oddp (rational exponent)))))
+    (when (sb-ext:float-infinity-p exponent)
+      (return-from sql-float-power
+        (cond ((= (abs base) 1d0) 1d0)
+              ((eq (> (abs base) 1d0) (plusp exponent)) inf)
+              (t 0d0))))
+    (when (sb-ext:float-infinity-p base)
+      (return-from sql-float-power
+        (if (plusp exponent)
+            (if negative-odd (- inf) inf)
+            (if (zerop exponent) 1d0 (if negative-odd -0d0 0d0)))))
+    (when (zerop base)
+      (return-from sql-float-power
+        (if (zerop exponent) 1d0 (if negative-odd -0d0 0d0))))
+    (let ((result (sb-int:with-float-traps-masked (:invalid :overflow :underflow :inexact)
+                    (expt (abs base) exponent))))
+      (when (sb-ext:float-infinity-p result) (ereport "22003" "value out of range: overflow"))
+      (when (zerop result) (ereport "22003" "value out of range: underflow"))
+      (if negative-odd (- result) result))))
+
 (defun sql-float-ln (value)
   "Evaluate the float8 natural logarithm with SQL domain errors."
   (when (sb-ext:float-nan-p value) (return-from sql-float-ln value))

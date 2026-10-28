@@ -1323,7 +1323,18 @@
   (parse-binary-level p '("+" "-") #'parse-multiplicative))
 
 (defun parse-multiplicative (p)
-  (parse-binary-level p '("*" "/" "%") #'parse-unary))
+  (parse-binary-level p '("*" "/" "%") #'parse-power))
+
+(defun parse-power (p)
+  "Parse left-associative power between unary and multiplicative precedence."
+  (let ((left (parse-unary p)))
+    (loop while (and (eq (pkind p) :op)
+                     (plusp (length (pval p)))
+                     (char= (char (pval p) 0) #\^))
+          do (let ((operator (pval p)))
+               (pnext p)
+               (setf left (list :binop operator left (parse-unary p)))))
+    left))
 
 (defun parse-expression-varchar-typmod (p)
   (if (match-punct p #\()
