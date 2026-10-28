@@ -128,7 +128,7 @@
   (case (pg-column-type col)
     ((:int8 :float8 :time :timestamp :timestamptz :interval :timetz) 8)
     (:int2 2)
-    ((:int4 :numeric :float4 :date) 4)
+    ((:int4 :numeric :varchar :float4 :date) 4)
     (t 1)))
 
 (defun column-fixed-size (col)
@@ -140,18 +140,19 @@
     ((:int8 :float8 :time :timestamp :timestamptz) 8)
     (t nil)))
 
-(defun varchar-byte-length (string)
-  (length (string->bytes string)))
-
 (defun form-heap-tuple (values columns xmin xmax cid block off)
   "Build a HeapTupleHeaderData + null bitmap + attribute data byte vector."
   (let* ((natts (length columns))
          (bitmap-len (ceiling natts 8))
          (hoff (maxalign (+ +size-of-heap-tuple-header+ bitmap-len)))
          (offsets (make-array natts :initial-element nil))
+         (varlena-data (make-array natts :initial-element nil))
          (cursor hoff)
          (infomask 0)
          (has-null nil))
+    ;; Encode varchar once: both the layout and write passes use these bytes.
+    ;; Short headers include their own byte in the 127-byte limit and need no
+    ;; alignment; four-byte headers are aligned and include their header size.
     (loop for i from 0 below natts
           for v = (aref values i)
           for col = (aref columns i)
@@ -160,11 +161,16 @@
                 (setf has-null t))
                (t
                 (let ((al (column-align col)))
-                  (setf cursor (align-up cursor al))
+                  (when (eq (pg-column-type col) :varchar)
+                    (setf (aref varlena-data i) (string->bytes v)))
+                  (unless (and (eq (pg-column-type col) :varchar)
+                               (<= (length (aref varlena-data i)) 126))
+                    (setf cursor (align-up cursor al)))
                   (setf (aref offsets i) cursor)
                   (incf cursor
                         (case (pg-column-type col)
-                          (:varchar (1+ (varchar-byte-length v)))
+                          (:varchar (let ((size (length (aref varlena-data i))))
+                                      (+ size (if (<= size 126) 1 4))))
                           (:numeric (+ 4 (length (sql-numeric-output v))))
                           (otherwise (column-fixed-size col))))))))
     (when has-null (setf infomask (logior infomask +heap-hasnull+)))
@@ -218,14 +224,35 @@
                       (page-set-u32 bytes off size)
                       (replace bytes data :start1 (+ off 4))))
                    (:varchar
-                    (let ((data (string->bytes v)))
-                      (when (> (length data) 126)
-                        (ereport "22001"
-                                 "value too long for type character varying(126)"))
-                      (setf (aref bytes off)
-                            (logior (ash (1+ (length data)) 1) 1))
-                      (replace bytes data :start1 (1+ off)))))))
+                    (let ((data (aref varlena-data i)))
+                      (if (<= (length data) 126)
+                          (progn
+                            (setf (aref bytes off)
+                                  (logior (ash (1+ (length data)) 1) 1))
+                            (replace bytes data :start1 (1+ off)))
+                          (progn
+                            (page-set-u32 bytes off (ash (+ 4 (length data)) 2))
+                            (replace bytes data :start1 (+ off 4)))))))))
       bytes)))
+
+(defun heap-inline-varlena-range (bytes offset)
+  "Return inclusive start and exclusive end offsets into BYTES, without copying.
+Accept only little-endian inline short or uncompressed four-byte headers;
+reject external and compressed datums and lengths outside BYTES."
+  (when (>= offset (length bytes))
+    (error "Truncated varlena header"))
+  (let* ((header (aref bytes offset))
+         (shortp (oddp header)))
+    (when (or (= header 1) (and (not shortp) (logbitp 1 header)))
+      (error "Unsupported external or compressed varlena datum"))
+    (unless (or shortp (<= (+ offset 4) (length bytes)))
+      (error "Truncated varlena header"))
+    (let* ((header-size (if shortp 1 4))
+           (total (if shortp (ash header -1) (ash (page-u32 bytes offset) -2)))
+           (end (+ offset total)))
+      (unless (and (>= total header-size) (<= end (length bytes)))
+        (error "Invalid varlena length"))
+      (values (+ offset header-size) end))))
 
 (defun deform-heap-tuple (bytes columns)
   "Return values, XIDs, command ID, infomask, and successor TID."
@@ -248,7 +275,9 @@
                                                   (floor i 8)))))))
                (unless is-null
                  (let ((al (column-align col)))
-                   (setf cursor (align-up cursor al))
+                   (unless (and (eq (pg-column-type col) :varchar)
+                                (not (zerop (aref bytes cursor))))
+                     (setf cursor (align-up cursor al)))
                    (case (pg-column-type col)
                      (:timetz
                       (let ((micros (page-u64 bytes cursor)) (zone (page-u32 bytes (+ cursor 8))))
@@ -294,18 +323,10 @@
                                                                       :end (+ cursor size))))
                         (incf cursor size)))
                      (:varchar
-                      (let* ((header (aref bytes cursor))
-                             (shortp (oddp header))
-                             (total (if shortp
-                                        (ash header -1)
-                                        (ash (page-u32 bytes cursor) -2)))
-                             (data-start (if shortp (1+ cursor) (+ cursor 4)))
-                             (data-len (- total (if shortp 1 4))))
-                        (setf (aref values i)
-                              (bytes->string bytes
-                                             :start data-start
-                                             :end (+ data-start data-len)))
-                        (incf cursor total))))))))
+                      (multiple-value-bind (start end)
+                          (heap-inline-varlena-range bytes cursor)
+                        (setf (aref values i) (bytes->string bytes :start start :end end)
+                              cursor end))))))))
     (values values xmin xmax cid infomask ctid-block ctid-offnum)))
 
 (defun heapam-get-tuple (relfilenode block offnum columns)

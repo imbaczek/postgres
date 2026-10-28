@@ -271,17 +271,53 @@
     (rove:ok (= target (vacuum-compute-freeze-cutoff next target next))
              "a horizon exactly at the minimum-age target is inclusive")))
 
+(cl-spec:defproperty unit-varlena-packing-boundaries
+    ((n (range integer 0 2048)))
+  (:about form-heap-tuple deform-heap-tuple)
+  (:trials (:normal 200))
+  (let* ((columns (vector (make-pg-column :name "n" :type :int2 :typmod -1 :attnum 1)
+                          (make-pg-column :name "s" :type :varchar :typmod -1 :attnum 2)))
+         (value (make-string n :initial-element #\x))
+         (bytes (form-heap-tuple (vector 7 value) columns 3 0 0 0 0))
+         (start (+ (aref bytes +heap-tuple-hoff-off+) 2))
+         (datum (if (<= n 126) start (align-up start 4))))
+    (and (equalp (vector 7 value) (deform-heap-tuple bytes columns))
+         (if (<= n 126)
+             (= (aref bytes datum) (logior 1 (ash (1+ n) 1)))
+             (and (loop for i from start below datum always (zerop (aref bytes i)))
+                  (= (page-u32 bytes datum) (ash (+ n 4) 2)))))))
+
+(rove:deftest generated-unit-varlena-packing
+    (unit-check-property 'unit-varlena-packing-boundaries))
+
 (rove:deftest unit-tuple-varchar-byte-boundaries
-    (let ((columns (vector (make-pg-column :name "text" :type :varchar :typmod -1 :attnum 1))))
-      (dolist (text (list (make-string 126 :initial-element #\a)
-                          (make-string 63 :initial-element #\ą)))
-        (rove:ok (equalp (vector text)
-                         (deform-heap-tuple (form-heap-tuple (vector text) columns 7 0 1 0 0)
-                           columns))
-                 "126 UTF8 bytes fit the tuple's short varlena representation"))
+    (let ((columns (vector (make-pg-column :name "n" :type :int2 :typmod -1 :attnum 1)
+                           (make-pg-column :name "text" :type :varchar :typmod -1 :attnum 2)
+                           (make-pg-column :name "tail" :type :int4 :typmod -1 :attnum 3))))
+      (dolist (text (list "" (make-string 126 :initial-element #\a)
+                          (make-string 127 :initial-element #\a)
+                          (make-string 64 :initial-element #\ą)
+                          (make-string 1024 :initial-element #\z)))
+        (let ((values (vector 5 text 42)))
+          (rove:ok (equalp values
+                           (deform-heap-tuple
+                               (form-heap-tuple values columns 7 0 1 0 0) columns))
+                   "short and four-byte varlena preserve UTF-8 and alignment")))))
+
+(rove:deftest unit-tuple-rejects-invalid-varlena
+    (let* ((columns (vector (make-pg-column :name "s" :type :varchar :typmod -1 :attnum 1)))
+           (tuple (form-heap-tuple (vector "hello") columns 3 0 0 0 0))
+           (start (aref tuple +heap-tuple-hoff-off+)))
+      (dolist (header '(1 2 255))
+        (let ((invalid (copy-seq tuple)))
+          (setf (aref invalid start) header)
+          (rove:ok (handler-case (progn (deform-heap-tuple invalid columns) nil)
+                     (error () t))
+                   "external, compressed and truncated datums must not decode as text")))))
+
+(rove:deftest unit-inline-varlena-invalid-lengths
+    (dolist (bytes (list #(0) #(0 0 0 0) #(8 0 0 0) #(40 0 0 0 1)))
       (rove:ok (handler-case
-                   (progn (form-heap-tuple (vector (make-string 127 :initial-element #\a))
-                                           columns 7 0 1 0 0)
-                          nil)
-                 (pg-error (condition) (string= (pg-error-sqlstate condition) "22001")))
-               "127 UTF8 bytes exceed the supported tuple varchar width")))
+                   (progn (heap-inline-varlena-range bytes 0) nil)
+                 (error () t))
+               "truncated and invalid four-byte varlena lengths are rejected")))
