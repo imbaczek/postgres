@@ -220,6 +220,10 @@
   ;; a source reader. Admission also excludes target index DDL during revalidation.
   (let* ((table (getf prepared :table))
          (relfilenode (pg-class-relfilenode table))
+         (target-toast (pg-class-toast table))
+         (target-toast-nodes (when target-toast
+                               (list (pg-toast-relfilenode target-toast)
+                                     (pg-toast-index-relfilenode target-toast))))
          (relations (mapcar #'copy-list
                             (append (when (getf prepared :insert-source-plan)
                                       (getf (query-plan-prepared (getf prepared :insert-source-plan)) :relations))
@@ -230,13 +234,22 @@
          (xid (get-current-xid))
          (snapshot *current-snapshot*))
     (register-relation-accesses (list relfilenode)
-                                (select-relation-reader-relfilenodes relations) xid)
+                                (append target-toast-nodes
+                                        (select-relation-reader-relfilenodes relations)) xid)
     (with-write-lock
       (ensure-current-table table)
+      (unless (and (eq target-toast (pg-class-toast table))
+                   (equal target-toast-nodes
+                          (when target-toast
+                            (list (pg-toast-relfilenode target-toast)
+                                  (pg-toast-index-relfilenode target-toast)))))
+        (ereport "0A000" "TOAST storage changed during query planning"))
       (unless (eq (getf prepared :columns) (pg-class-columns table))
         (ereport "0A000" "table definition changed during query planning"))
       (refresh-on-conflict-arbiters table (getf prepared :conflict))
       (revalidate-subquery-relations relations))
+    (when (and target-toast-nodes (< (buf-nblocks (second target-toast-nodes)) 2))
+      (ereport "XX001" "TOAST index is missing"))
     (let* ((*dml-column-defaults* (getf prepared :column-defaults))
            (*subquery-execution-active-p* t)
            (*subquery-result-cache* (make-hash-table :test #'eq))
@@ -244,8 +257,9 @@
            (*subquery-outer-frames* nil)
            (*subquery-backend-entry* (query-plan-backend-entry :interpreter))
            (*current-snapshot* snapshot)
-           (domain (query-plan-index-relfilenodes
-                    (%make-query-plan :physical '(:result)) relations)))
+           (domain (append (when target-toast-nodes (list (second target-toast-nodes)))
+                           (query-plan-index-relfilenodes
+                            (%make-query-plan :physical '(:result)) relations))))
       (call-with-query-cte-execution
        t
        (lambda ()
@@ -382,6 +396,7 @@
                    ;; Recheck the latest target with the original matched source, like
                    ;; EPQ's nonlocking source rowmarks.
                    (lambda (tuple)
+                     (materialize-select-tuple table tuple *current-snapshot*)
                      (call-with-dml-expression-evaluation
                       (lambda ()
                         (or (null where)
@@ -391,6 +406,8 @@
                 (declare (ignore block off))
                 (check-heapam-write-status status)
                 (when deleted
+                  (delete-tuple-toast-values table tuple xid (backend-command-id *backend*))
+                  (materialize-select-tuple table tuple *current-snapshot*)
                   (logical-note-row-change :delete table :old-values (htup-values tuple)
                                            :publication-selection publications)
                   (emit-dml-returning stream (getf prepared :returning) (htup-values tuple)
@@ -422,6 +439,7 @@
                      rel columns (htup-block candidate) (htup-offnum candidate) xid
                      (backend-command-id *backend*)
                      (lambda (tuple)
+                       (materialize-select-tuple table tuple *current-snapshot*)
                        (call-with-dml-expression-evaluation
                         (lambda ()
                           ;; EPQ replaces only the target version; the matched source values
@@ -433,6 +451,8 @@
                      nil t candidate)
                   (check-heapam-write-status status)
                   (when deleted
+                    (delete-tuple-toast-values table tuple xid (backend-command-id *backend*))
+                    (materialize-select-tuple table tuple *current-snapshot*)
                     (multiple-value-bind (block off publications)
                         (insert-tuple-with-unique
                          table new :exclude-tid (cons old-block old-offnum)

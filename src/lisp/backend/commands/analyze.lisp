@@ -116,6 +116,7 @@ exact SBCL heap cap and does not include transient decode allocations."
     (heapam-scan relfilenode (pg-class-columns table) snapshot
                  (lambda (tuple)
                    (incf row-count)
+                   (materialize-select-tuple table tuple snapshot)
                    (let* ((values (htup-values tuple))
                           (row-bytes (analyze-row-memory-estimate values)))
                      (when (<= row-bytes +analyze-sample-memory-bytes+)

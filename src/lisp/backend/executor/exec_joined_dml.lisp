@@ -105,6 +105,7 @@
          (where (or (getf prepared :dml-row-where) (getf prepared :where))))
     (unwind-protect
          (do-table-tuples (tuple table)
+           (materialize-select-tuple table tuple *current-snapshot*)
            (let ((modified-p nil))
              (flet ((offer (source)
                       (let ((environment (concatenate 'vector (htup-values tuple) source)))

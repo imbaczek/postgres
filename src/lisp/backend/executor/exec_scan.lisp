@@ -1416,12 +1416,19 @@ scopes to clean up."
       (call-with-current-select-index-domain relfilenode function)
       (call-with-btree-relation-read-lock relfilenode function)))
 
-(defun materialize-select-tuple (table tuple snapshot)
-  "Replace external attributes of a visible parent TUPLE with SQL values.
-The caller must have checked the parent against SNAPSHOT and keep that snapshot
-active through the fetch. TOAST chunk visibility follows the parent, so the
-chunks are not independently filtered by the snapshot. This modifies TUPLE's
-values in place before they reach qualifications or projections."
+(defun statement-protection-snapshot (&optional (fallback *current-snapshot*))
+  "Return an enclosing active statement snapshot that protects tuple lifetimes."
+  (or (loop for registration in *statement-snapshot-registrations*
+            when (snapshot-registration-active-p registration)
+              return (snapshot-registration-snapshot registration))
+      fallback))
+
+(defun materialize-select-tuple (table tuple snapshot &key (index-reader #'select-toast-index-reader))
+  "Replace external attributes of parent TUPLE with SQL values in place.
+For a normal scan the caller checks parent visibility and keeps SNAPSHOT active
+through the fetch. An index build may also fetch retained dead versions; its
+removal horizon and the active protection snapshot keep their chunks available.
+TOAST chunk visibility follows the parent and is not independently filtered."
   (let ((values (htup-values tuple))
         (columns (pg-class-columns table)))
     (loop for i below (length values)
@@ -1432,13 +1439,30 @@ values in place before they reach qualifications or projections."
                  (unless toast
                    (ereport "XX001" "external value has no owning TOAST relation"))
                  (let ((bytes (toast-fetch-value toast value snapshot
-                                                 :index-reader #'select-toast-index-reader)))
+                                                 :index-reader index-reader)))
                    (setf (aref values i)
                          (case type
                            (:varchar (bytes->string bytes))
                            (:bytea bytes)
                            (otherwise (ereport "XX001" "external value has unsupported type")))))))
     tuple))
+
+(defun delete-tuple-toast-values (table tuple xid cid)
+  "Mark the physical external attributes of a claimed parent tuple deleted.
+TUPLE must still contain its physical pointers: materialization replaces them
+with SQL values. Detach scan leases before taking the TOAST index lock, and take
+that lock before the write lock. The transaction must abort on partial failure."
+  (let ((pointers (remove-if-not #'heap-external-varlena-p (htup-values tuple))))
+    (when (plusp (length pointers))
+      (let ((toast (pg-class-toast table)))
+        (unless toast
+          (ereport "XX001" "external value has no owning TOAST relation"))
+        (detach-select-index-scans)
+        (with-btree-relation-locks ((list (pg-toast-index-relfilenode toast)))
+          (with-write-lock
+            (ensure-current-table table)
+            (loop for pointer across pointers
+                  do (toast-delete-value-unlocked toast pointer xid cid))))))))
 
 (defun scan-select-index (table path snapshot callback &optional environment)
   "Scan matching index TIDs and pass visible heap tuples to CALLBACK.

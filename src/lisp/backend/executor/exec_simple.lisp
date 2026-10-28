@@ -55,8 +55,10 @@
                   (heapam-delete-tid
                    rel columns (car tid) (cdr tid) xid
                    (backend-command-id *backend*))
-                (declare (ignore tuple block offnum))
+                (declare (ignore block offnum))
                 (check-heapam-write-status status)
+                (when deleted
+                  (delete-tuple-toast-values table tuple xid (backend-command-id *backend*)))
                 (unless deleted
                   (ereport "40001"
                            "could not truncate relation after concurrent update"))))))))
@@ -752,6 +754,15 @@ Do not perform wire I/O while restoring transaction state."
 (defun fsync-index (idx)
   (smgr-fsync (pg-index-relfilenode idx)))
 
+(defun index-build-toast-reader (relfilenode function)
+  "Read TOAST under the parent build gate and, when needed, an index lease.
+The gate has drained writers, so a build already holding the write lock can read
+without acquiring the TOAST index lock in the wrong order. Otherwise acquire a
+read lease to protect the index lookup."
+  (if (sb-thread:holding-mutex-p *write-lock*)
+      (funcall function)
+      (call-with-btree-relation-read-lock relfilenode function)))
+
 (defun build-index-entries (idx table &key unique name)
   "Populate IDX from every heap version that an active snapshot may need.
 
@@ -774,6 +785,10 @@ before this removal horizon is captured."
                               (not (tuple-prunable-p (htup-xmin tuple)
                                                      (htup-xmax tuple)
                                                      removal-horizon)))
+                     (materialize-select-tuple
+                      table tuple
+                      (statement-protection-snapshot snapshot)
+                      :index-reader #'index-build-toast-reader)
                      (let* ((vals (index-values idx (htup-values tuple)))
                             (key (encode-index-key vals types)))
                        ;; Retain recently dead versions for old snapshots, but

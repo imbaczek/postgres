@@ -293,6 +293,7 @@ snapshot is scanned. Expression evaluation holds no global write/catalog mutex."
         (when (or (and (eq action :add-check) (getf check :validated))
                   (and (eq action :validate-constraint) (not (getf check :validated))))
           (do-table-tuples (tuple table)
+            (materialize-select-tuple table tuple (statement-protection-snapshot))
             (check-for-interrupts)
             (check-table-constraints table (htup-values tuple) (list check))))
         (with-write-catalog-locks

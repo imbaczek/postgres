@@ -198,6 +198,7 @@
         (return (values :nothing nil nil)))
       ;; The row is claimed, but B-tree and writer locks have been released;
       ;; SQL evaluation and any subsequent waits must remain outside those locks.
+      (materialize-select-tuple table tuple *current-snapshot*)
       (let* ((old (htup-values tuple))
              (environment (concatenate 'vector old values))
              (where (getf (getf conflict :where-target) :expr))
@@ -207,7 +208,8 @@
         (let ((new (call-with-dml-expression-evaluation
                     (lambda () (on-conflict-update-values table conflict old values))))
               (rel (pg-class-relfilenode table))
-              (xid (backend-xid *backend*)))
+              (xid (backend-xid *backend*))
+              (protected-snapshot *current-snapshot*))
           ;; READ COMMITTED refreshes only the heap claim snapshot. WHERE and SET
           ;; subqueries above retain the original statement snapshot.
           (let ((*current-snapshot* (if (eq (backend-isolation-level *backend*) :read-committed)
@@ -217,6 +219,8 @@
                                    xid (backend-command-id *backend*))
               (check-heapam-write-status write-status)
               (when deleted
+                (delete-tuple-toast-values table actual xid (backend-command-id *backend*))
+                (materialize-select-tuple table actual protected-snapshot)
                 (multiple-value-bind (new-block new-offnum selection)
                     (insert-tuple-with-unique
                      table new :exclude-tid (cons old-block old-offnum) :publication-kind :update

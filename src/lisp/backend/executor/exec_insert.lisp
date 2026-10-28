@@ -147,14 +147,18 @@ B-tree relation locks, then reacquires it and checks the TOAST identity."
               toast toast-node))))
 
 (defun insert-tuple-with-unique (table values &key exclude-tid on-success publication-kind before-check)
-  "ON-SUCCESS and BEFORE-CHECK run under B-tree and writer locks; neither may wait.
-BEFORE-CHECK can claim an ON CONFLICT tuple or ask the released-lock loop to wait."
+  "Insert logical VALUES, externalizing them only after uniqueness succeeds.
+Index keys use the logical values; the heap receives the physical tuple. B-tree
+locks precede the write lock, and transaction waits happen after both are released.
+ON-SUCCESS and BEFORE-CHECK run under those locks and must not wait. BEFORE-CHECK
+can claim an ON CONFLICT tuple or ask the released-lock loop to wait."
   (let* ((xid (get-current-xid))
          (relfilenode (pg-class-relfilenode table))
          (indexes nil)
          (index-relfilenodes nil)
          (toast nil)
          (toast-node nil))
+    (detach-select-index-scans)
     (register-relation-writer relfilenode xid)
     (multiple-value-setq (indexes index-relfilenodes toast toast-node)
       (capture-insert-indexes table))
@@ -175,10 +179,13 @@ BEFORE-CHECK can claim an ON CONFLICT tuple or ask the released-lock loop to wai
                                (check-unique-indexes table values exclude-tid))))
                 (cond
                   ((eq check :ok)
-                   (let ((columns (pg-class-columns table)))
+                   (let* ((columns (pg-class-columns table))
+                          (cid (backend-command-id *backend*))
+                          (physical (if toast
+                                        (toast-externalize-tuple-unlocked toast values columns xid cid)
+                                        values)))
                      (multiple-value-bind (block off)
-                         (heapam-insert relfilenode columns values xid
-                                        (backend-command-id *backend*))
+                         (heapam-insert relfilenode columns physical xid cid)
                        (dolist (idx indexes)
                          (let* ((types (index-types idx table))
                                 (key (encode-index-key (index-values idx values) types)))
