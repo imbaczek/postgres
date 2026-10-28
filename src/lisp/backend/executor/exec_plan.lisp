@@ -859,6 +859,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
   (let ((paths (make-array +hash-aggregate-partition-count+ :initial-element nil))
         (streams (make-array +hash-aggregate-partition-count+ :initial-element nil))
         (counts (make-array +hash-aggregate-partition-count+ :initial-element 0)))
+    (declare (type simple-vector paths streams counts))
     (call-with-query-temp-stream-cleanup
      (lambda ()
        (hash-aggregate-spill-file
@@ -1259,6 +1260,7 @@ on an abnormal exit."
   (loop
     (let ((any-row-p nil)
           (values (make-array (length iterators) :initial-element +null+)))
+      (declare (type simple-vector values))
       (loop for iterator in iterators for position from 0
             do (check-for-interrupts)
                (multiple-value-bind (value present-p) (funcall iterator)

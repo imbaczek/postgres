@@ -76,6 +76,27 @@
                      (scalar-aggregate-transition-result state)))
        states))
 
+(defun window-aggregate-inputs (aggregates environment)
+  ;; Copy evaluated inputs before transition state can retain them across rows.
+  ;; Aggregates without an input receive +NULL+ as a placeholder.
+  (map 'vector (lambda (descriptor)
+                 (if (getf descriptor :input)
+                     (copy-query-sort-value
+                      (eval-expr (getf descriptor :input) environment))
+                     +null+))
+       aggregates))
+
+(defun window-project-row (environment width functions results position rank dense)
+  ;; Copy the outer row vector and each aggregate result; base-column values
+  ;; remain shared with ENVIRONMENT and are not deep-copied here.
+  (let ((result (subseq environment 0 width)) (aggregate-index 0))
+    (dolist (function functions result)
+      (setf (aref result (getf function :slot))
+            (case (getf function :kind)
+              (:row-number position) (:rank rank) (:dense-rank dense)
+              (otherwise (prog1 (copy-query-sort-value (aref results aggregate-index))
+                           (incf aggregate-index))))))))
+
 (defun stream-window-stage (source stage emit)
   ;; Ranking streams independently of the frame. Aggregate ROWS prefixes emit
   ;; per row; RANGE peers and whole partitions buffer until their result is known.
@@ -103,22 +124,11 @@
                                       (delete-query-temp-file (query-row-spool-pathname buffer)))
                                     (setf buffer nil)))
                                 (advance-states (environment)
-                                  (let ((inputs (map 'vector
-                                                     (lambda (descriptor)
-                                                       (if (getf descriptor :input)
-                                                           (copy-query-sort-value (eval-expr (getf descriptor :input) environment))
-                                                           +null+))
-                                                     aggregates)))
+                                  (let ((inputs (window-aggregate-inputs aggregates environment)))
                                     (step-aggregate-transition-states states aggregates inputs 0)))
                                 (output (environment results row-position row-rank row-dense)
-                                  (let ((result (subseq environment 0 width)) (aggregate-index 0))
-                                    (dolist (function functions)
-                                      (setf (aref result (getf function :slot))
-                                            (case (getf function :kind)
-                                              (:row-number row-position) (:rank row-rank) (:dense-rank row-dense)
-                                              (otherwise (prog1 (copy-query-sort-value (aref results aggregate-index))
-                                                           (incf aggregate-index))))))
-                                    (funcall emit result)))
+                                  (funcall emit (window-project-row environment width functions results
+                                                                    row-position row-rank row-dense)))
                                 (flush-buffer ()
                                   (when buffer
                                     (query-row-spool-seal buffer)

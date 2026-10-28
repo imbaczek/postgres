@@ -2,6 +2,9 @@
 (in-package #:pg)
 
 (defun make-window-plan-iterator (input stage)
+  ;; ROWS prefixes can be returned immediately. RANGE peers and whole
+  ;; partitions must be accumulated before their rows can share a result;
+  ;; PENDING holds the first row of the next group across iterator calls.
   (let* ((partition (getf stage :partition))
          (order (getf stage :order))
          (keys (append partition (mapcar #'car order)))
@@ -58,23 +61,12 @@
                    (window-rank-step position rank dense same-peer)
                  (setf rank new-rank dense new-dense)))
              (setf peer-key (copy-query-sort-value new-peer))
-             (let ((inputs (map 'vector (lambda (descriptor)
-                                          (if (getf descriptor :input)
-                                              (copy-query-sort-value
-                                               (eval-expr (getf descriptor :input) environment))
-                                              +null+))
-                                aggregates)))
+             (let ((inputs (window-aggregate-inputs aggregates environment)))
                (step-aggregate-transition-states states aggregates inputs 0))
              (list environment position rank dense)))
          (project (row values)
-           (let ((result (subseq (first row) 0 (getf stage :width)))
-                 (aggregate-index 0))
-             (dolist (function functions result)
-               (setf (aref result (getf function :slot))
-                     (case (getf function :kind)
-                       (:row-number (second row)) (:rank (third row)) (:dense-rank (fourth row))
-                       (otherwise (prog1 (copy-query-sort-value (aref values aggregate-index))
-                                    (incf aggregate-index)))))))))
+           (window-project-row (first row) (getf stage :width) functions values
+                               (second row) (third row) (fourth row))))
       (make-sql-iterator
        (lambda ()
          (loop

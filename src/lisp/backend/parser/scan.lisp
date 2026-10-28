@@ -83,6 +83,8 @@
   (let ((i 0)
         (n (length sql))
         (out '()))
+    (declare (type (integer 0 *) i n)
+             (type list out))
     (labels ((peek (&optional (k 0))
                (let ((j (+ i k)))
                  (and (< j n) (char sql j))))
