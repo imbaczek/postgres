@@ -805,6 +805,160 @@
                       (equal (pg-error-message condition) (third case)))
                  (first case)))))
 
+(rove:deftest numeric-function-resolution-diagnostics
+    ;; C ParseFuncOrColumn: SQLSTATE, primary message, detail and hint.
+    (dolist (case '(("SELECT gcd('2','4')" "42725" "gcd(unknown, unknown)" "ambiguous")
+                    ("SELECT pg_catalog.lcm(NULL,1::int2)" "42725" "pg_catalog.lcm(unknown, smallint)" "ambiguous")
+                    ("SELECT mod('x'::text,1)" "42883" "mod(text, integer)" "types")
+                    ("SELECT scale('x'::text)" "42883" "scale(text)" "types")
+                    ("SELECT pg_catalog.sin('x'::text)" "42883" "pg_catalog.sin(text)" "types")
+                    ("SELECT atan2('x',true)" "42883" "atan2(unknown, boolean)" "types")
+                    ("SELECT factorial(1.0)" "42883" "factorial(numeric)" "types")
+                    ("SELECT div('x',true)" "42883" "div(unknown, boolean)" "types")
+                    ("SELECT pg_catalog.numeric_eq('x',true)" "42883" "pg_catalog.numeric_eq(unknown, boolean)" "types")
+                    ("SELECT width_bucket('x',true)" "42883" "width_bucket(unknown, boolean)" "types")
+                    ("SELECT width_bucket(1,true,3,4)" "42883" "width_bucket(integer, boolean, integer, integer)" "types")
+                    ("SELECT dsqrt(true)" "42883" "dsqrt(boolean)" "types")
+                    ("SELECT pg_catalog.int4and('x',true)" "42883" "pg_catalog.int4and(unknown, boolean)" "types")
+                    ("SELECT pi(1)" "42883" "pi(integer)" "count")
+                    ("SELECT numeric_eq(1)" "42883" "numeric_eq(integer)" "count")
+                    ("SELECT width_bucket(1)" "42883" "width_bucket(integer)" "count")
+                    ("SELECT pg_catalog.cbrt()" "42883" "pg_catalog.cbrt()" "count")
+                    ("SELECT round(x=>1)" "42883" "round(x => integer)" "names")
+                    ("SELECT pg_catalog.random(min=>'x',max=>true)" "42883" "pg_catalog.random(min => unknown, max => boolean)" "types")
+                    ("SELECT random(min=>'2',max=>'4')" "42725" "random(min => unknown, max => unknown)" "ambiguous")
+                    ("SELECT pg_catalog.random(x=>1)" "42883" "pg_catalog.random(x => integer)" "count")
+                    ("SELECT random(x=>1,y=>2)" "42883" "random(x => integer, y => integer)" "names")
+                    ("SELECT random(1,min=>2)" "42883" "random(integer, min => integer)" "overlap")
+                    ("SELECT pg_catalog.random(1,min=>2)" "42883" "pg_catalog.random(integer, min => integer)" "overlap")
+                    ("SELECT random(1,min=>2,max=>3)" "42883" "random(integer, min => integer, max => integer)" "count")
+                    ("SELECT setseed(x=>1)" "42883" "setseed(x => integer)" "names")
+                    ("SELECT pg_catalog.setseed('x'::text)" "42883" "pg_catalog.setseed(text)" "types")))
+      (destructuring-bind (sql state signature reason) case
+        (let* ((condition (handler-case (progn (subquery-test-rows sql) nil)
+                            (pg-error (error) error)))
+               (ambiguous (equal reason "ambiguous"))
+               (detail (cond (ambiguous "Could not choose a best candidate function.")
+                             ((equal reason "count") "No function of that name accepts the given number of arguments.")
+                             ((equal reason "names") "No function of that name accepts the given argument names.")
+                             ((equal reason "overlap") "In the closest available match, an argument was specified both positionally and by name.")
+                             (t "No function of that name accepts the given argument types.")))
+               (hint (when (or ambiguous (equal reason "types"))
+                       "You might need to add explicit type casts.")))
+          (rove:ok (and condition
+                        (equal (pg-error-sqlstate condition) state)
+                        (equal (pg-error-message condition)
+                               (format nil "function ~a ~a" signature
+                                       (if ambiguous "is not unique" "does not exist")))
+                        (equal (pg-error-detail condition) detail)
+                        (equal (pg-error-hint condition) hint))
+                   sql)))))
+
+(rove:deftest numeric-resolution-preserves-argument-errors
+    (dolist (case '(("SELECT pg_catalog.sin(no_such_numeric_argument())"
+                     "42883" "function no_such_numeric_argument() does not exist")
+                    ("SELECT pg_catalog.sin('x')" "22P02"
+                     "invalid input syntax for type double precision: \"x\"")
+                    ("SELECT pg_catalog.sin(sqrt(-1))" "2201F"
+                     "cannot take square root of a negative number")
+                    ("SELECT pg_catalog.random(min=>1,max=>no_such_numeric_argument())"
+                     "42883" "function no_such_numeric_argument() does not exist")
+                    ("SELECT pg_catalog.random(min=>no_such_numeric_argument(),1)"
+                     "42883" "function no_such_numeric_argument() does not exist")))
+      (let ((condition (handler-case (progn (subquery-test-rows (first case)) nil)
+                         (pg-error (error) error))))
+        (rove:ok (and condition
+                      (equal (pg-error-sqlstate condition) (second case))
+                      (equal (pg-error-message condition) (third case)))
+                 (first case)))))
+
+(rove:deftest numeric-float-input-diagnostics
+    ;; float.c reports range errors for the recognized prefix before checking
+    ;; trailing junk; syntax errors instead retain the complete original input.
+    (dolist (case '(("SELECT float4abs('x')" "22P02" "real" "x")
+                    ("SELECT float8abs('x')" "22P02" "double precision" "x")
+                    ("SELECT float4abs('')" "22P02" "real" "")
+                    ("SELECT float4abs(' 0x? ')" "22P02" "real" " 0x? ")
+                    ("SELECT sin(' 1_2 ')" "22P02" "double precision" " 1_2 ")
+                    ("SELECT sin('  x  ')" "22P02" "double precision" "  x  ")
+                    ("SELECT float4abs('1e1000')" "22003" "real" "1e1000")
+                    ("SELECT float8abs('1e1000')" "22003" "double precision" "1e1000")
+                    ("SELECT sin('1e-1000')" "22003" "double precision" "1e-1000")
+                    ("SELECT sin(' 1e1000 ')" "22003" "double precision" "1e1000")
+                    ("SELECT sin(' 1e-1000 ')" "22003" "double precision" "1e-1000")
+                    ("SELECT float4abs(' 1e1000 ')" "22003" "real" "1e1000")
+                    ("SELECT float4abs(' 1e-1000 ')" "22003" "real" "1e-1000")
+                    ("SELECT sin('a\"b')" "22P02" "double precision" "a\"b")
+                    ("SELECT sin('1e1000junk')" "22003" "double precision" "1e1000")
+                    ("SELECT float4abs('1e1000_')" "22003" "real" "1e1000")
+                    ("SELECT sin('0x1p99999?')" "22003" "double precision" "0x1p99999")
+                    ("SELECT float4abs(' 0x1p-99999? ')" "22003" "real" "0x1p-99999")
+                    ("SELECT sin(' 1e-1000junk ')" "22003" "double precision" "1e-1000")
+                    ("SELECT sin('12junk')" "22P02" "double precision" "12junk")
+                    ("SELECT sin('1e+')" "22P02" "double precision" "1e+")
+                    ("SELECT float4abs('0x1p-')" "22P02" "real" "0x1p-")
+                    ("SELECT float4abs('0x1p2junk')" "22P02" "real" "0x1p2junk")
+                    ("SELECT sin('1_2')" "22P02" "double precision" "1_2")
+                    ("SELECT float4abs(' 1e40junk ')" "22003" "real" "1e40")))
+      (destructuring-bind (sql state type input) case
+        (let ((condition (handler-case (progn (subquery-test-rows sql) nil)
+                           (pg-error (error) error))))
+          (rove:ok (and condition
+                        (equal (pg-error-sqlstate condition) state)
+                        (equal (pg-error-message condition)
+                               (if (equal state "22P02")
+                                   (format nil "invalid input syntax for type ~a: \"~a\"" type input)
+                                   (format nil "\"~a\" is out of range for type ~a" input type)))
+                        (null (pg-error-detail condition)) (null (pg-error-hint condition)))
+                   sql)))))
+
+(rove:deftest numeric-float-incomplete-exponent-range-errors
+    ;; strtod checks an overflowing mantissa even when the exponent is incomplete.
+    (dolist (prefix '("" "0x"))
+      (dolist (function '("sin" "float4abs"))
+        (let* ((mantissa (concatenate 'string prefix "1"
+                                      (make-string 400 :initial-element #\0)))
+               (input (concatenate 'string mantissa (if (equal prefix "") "e+" "p+")))
+               (sql (format nil "SELECT ~a('~a')" function input))
+               (condition (handler-case (progn (subquery-test-rows sql) nil)
+                            (pg-error (error) error))))
+          (rove:ok (and condition
+                        (equal (pg-error-sqlstate condition) "22003")
+                        (equal (pg-error-message condition)
+                               (format nil "\"~a\" is out of range for type ~a"
+                                       mantissa (if (equal function "sin") "double precision" "real")))
+                        (null (pg-error-detail condition)) (null (pg-error-hint condition)))
+                   sql)))))
+
+(cl-spec:defproperty numeric-resolution-diagnostic-fields
+    ((qualified (member nil t))
+     (reason (member :types :count :names :ambiguous)))
+  (:about report-numeric-function-resolution-error)
+  (:trials (:normal 50))
+  (let* ((count-p (eq reason :count))
+         (ambiguous-p (eq reason :ambiguous))
+         (args (unless count-p (list (list :const "x" :type :text :typmod -1 :explicit-cast t))))
+         (condition (handler-case
+                        (report-numeric-function-resolution-error
+                         "sin" args :schema (when qualified "pg_catalog")
+                         :ambiguous-p ambiguous-p :named-p (eq reason :names))
+                      (pg-error (error) error))))
+    (and condition
+         (equal (pg-error-sqlstate condition) (if ambiguous-p "42725" "42883"))
+         (equal (pg-error-message condition)
+                (format nil "function ~asin(~a) ~a"
+                        (if qualified "pg_catalog." "") (if count-p "" "text")
+                        (if ambiguous-p "is not unique" "does not exist")))
+         (equal (pg-error-detail condition)
+                (case reason
+                  (:ambiguous "Could not choose a best candidate function.")
+                  (:count "No function of that name accepts the given number of arguments.")
+                  (:names "No function of that name accepts the given argument names.")
+                  (t "No function of that name accepts the given argument types.")))
+         (equal (pg-error-hint condition)
+                (when (member reason '(:types :ambiguous))
+                  "You might need to add explicit type casts.")))))
+
 (rove:deftest integer-mod-catalog-aliases
     (dolist (case '(("int2mod" :int2 "-32768")
                     ("int4mod" :int4 "-2147483648")

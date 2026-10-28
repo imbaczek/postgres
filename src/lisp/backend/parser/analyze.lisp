@@ -449,7 +449,7 @@ NAMES keeps named notation in its original order, before min/max reordering."
                                "unknown" (typed-arg-name argument))
                 collect (if name (format nil "~a => ~a" name type) type))))
 
-(defun analyze-random-arguments (arguments table &optional (name "random"))
+(defun analyze-random-arguments (arguments table &optional (name "random") schema)
   "Analyze random/setseed arguments in caller order, then bind random's min/max.
 Return the original signature separately so resolution errors retain argument
 names and unknown types.  setseed has no catalog argument names."
@@ -459,7 +459,7 @@ names and unknown types.  setseed has no catalog argument names."
                           arguments))
         (argument-names nil) (names nil)
         (slots (make-array 2 :initial-element nil))
-        (position 0) (invalid nil))
+        (position 0) (invalid nil) (overlapping nil))
     ;; transformFuncCall transforms every argument before ParseFuncOrColumn
     ;; checks named notation; an invalid expression takes precedence.
     (loop for argument in arguments
@@ -472,6 +472,7 @@ names and unknown types.  setseed has no catalog argument names."
                  (ereport "42601" "positional argument cannot follow named argument"))
                (when (and named (member arg-name names :test #'equal))
                  (ereport "42601" "argument name ~s used more than once" arg-name))
+               (when (and named index (< index position)) (setf overlapping t))
                (when named (push arg-name names))
                (push arg-name argument-names)
                (if (and index (< index 2) (not (aref slots index)))
@@ -481,7 +482,8 @@ names and unknown types.  setseed has no catalog argument names."
       (when (and names
                  (or (string= name "setseed") invalid
                      (not (every #'identity slots))))
-        (ereport "42883" "function ~a(~a) does not exist" name signature))
+        (report-numeric-function-resolution-error
+         name analyzed :schema schema :signature signature :named-p t :overlapping-p overlapping))
       (values (if names (coerce slots 'list) analyzed) signature))))
 
 (defun numeric-function-p (name)
@@ -498,7 +500,8 @@ names and unknown types.  setseed has no catalog argument names."
 
 (defun numeric-function-argument-count-p (name count)
   "Match the supported numeric pg_proc overloads before checking argument names."
-  (cond ((string= name "pi") (zerop count))
+  (cond ((member name '("pi" "random") :test #'string=)
+         (if (string= name "random") (member count '(0 2)) (zerop count)))
         ((string= name "width_bucket") (member count '(2 4)))
         ((member name '("round" "trunc" "log") :test #'string=) (member count '(1 2)))
         ((integer-catalog-alias-p name)
@@ -511,6 +514,25 @@ names and unknown types.  setseed has no catalog argument names."
                             "atan2" "atan2d") :test #'string=))
          (= count 2))
         (t (= count 1))))
+
+(defun report-numeric-function-resolution-error
+    (name args &key schema signature ambiguous-p named-p overlapping-p)
+  "Report supported numeric lookup failures using the caller's uncoerced types.
+Like ParseFuncOrColumn, distinguish ambiguous candidates from missing functions;
+for missing functions, count takes precedence over overlapping or unknown names,
+then argument types. Only ambiguity and type failures carry the cast hint."
+  (let ((wrong-count (not (numeric-function-argument-count-p name (length args)))))
+    (ereport (if ambiguous-p "42725" "42883") "function ~a(~a) ~a"
+             (if schema (format nil "~a.~a" schema name) name)
+             (or signature (call-signature args))
+             (if ambiguous-p "is not unique" "does not exist")
+             :detail (cond (ambiguous-p "Could not choose a best candidate function.")
+                           (wrong-count "No function of that name accepts the given number of arguments.")
+                           (overlapping-p "In the closest available match, an argument was specified both positionally and by name.")
+                           (named-p "No function of that name accepts the given argument names.")
+                           (t "No function of that name accepts the given argument types."))
+             :hint (when (or ambiguous-p (and (not wrong-count) (not named-p) (not overlapping-p)))
+                     "You might need to add explicit type casts."))))
 
 (defun analyze-numeric-call-arguments (name arguments table &optional schema)
   "Match ParseFuncOrColumn's errors for numeric calls using named notation."
@@ -532,19 +554,16 @@ names and unknown types.  setseed has no catalog argument names."
         (push arg-name argument-names)))
     ;; Lookup rejects these names regardless of types; arity determines which
     ;; ParseFuncOrColumn detail is reported, using the uncoerced signature.
-    (ereport "42883" "function ~a(~a) does not exist"
-             (if schema (format nil "~a.~a" schema name) name)
-             (random-call-signature analyzed (nreverse argument-names))
-             :detail (if (numeric-function-argument-count-p name (length arguments))
-                         "No function of that name accepts the given argument names."
-                         "No function of that name accepts the given number of arguments."))))
+    (report-numeric-function-resolution-error
+     name analyzed :schema schema :named-p t
+     :signature (random-call-signature analyzed (nreverse argument-names)))))
 
 (defun analyze-call-argument-list (name arguments table &optional variadic schema)
   "Analyze call arguments, binding supported named arguments."
   (cond ((string= name "pg_promote")
          (analyze-promotion-arguments arguments table variadic))
         ((member name '("random" "setseed") :test #'string=)
-         (analyze-random-arguments arguments table name))
+         (analyze-random-arguments arguments table name schema))
         ((and (numeric-function-p name)
               (some (lambda (argument) (eq (first argument) :named-arg)) arguments))
          (analyze-numeric-call-arguments name arguments table schema))
@@ -959,6 +978,45 @@ errors precede input errors."
     (list :func name (mapcar #'coerce-common-expression args types)
           :type type :typmod -1)))
 
+(defun analyze-numeric-function (name args schema &optional signature)
+  "Resolve a numeric catalog call, retaining its original diagnostic signature.
+Argument transformation and named-notation validation happen before this call,
+so a nested argument error keeps its own diagnostics."
+  (handler-case
+      (cond
+        ((integer-catalog-alias-p name) (analyze-integer-catalog-function name args schema))
+        ((float-catalog-alias name)
+         (let ((type (first (float-catalog-alias name))))
+           (unless (and (= (length args) 1)
+                        (or (in-unknown-constant-p (first args))
+                            (sql-implicit-coercion-p (expr-type (first args)) type)))
+             (report-numeric-function-resolution-error name args :schema schema))
+           (list :func name (list (coerce-common-expression (first args) type))
+                 :type type :typmod -1)))
+        ((member name '("random" "setseed") :test #'string=)
+         (analyze-random-function name args signature))
+        ((trig-function-p name) (analyze-trig-function name args))
+        ((string= name "width_bucket") (analyze-width-bucket args))
+        ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
+                        "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln")
+                 :test #'string=)
+         (analyze-basic-numeric-function name args))
+        ((member name '("log" "log10" "numeric_log") :test #'string=)
+         (analyze-log-function name args))
+        ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
+         (analyze-power-function name args))
+        ((member name '("scale" "min_scale" "trim_scale") :test #'string=)
+         (analyze-numeric-scale-function name args))
+        ((string= name "factorial") (analyze-factorial-function name args))
+        ((numeric-helper-function-p name) (analyze-numeric-helper-function name args))
+        ((numeric-arithmetic-function-p name) (analyze-numeric-arithmetic-function name args)))
+    (pg-error (condition)
+      (if (member (pg-error-sqlstate condition) '("42883" "42725") :test #'string=)
+          (report-numeric-function-resolution-error
+           name args :schema schema :signature signature
+                     :ambiguous-p (string= (pg-error-sqlstate condition) "42725"))
+          (error condition)))))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
@@ -975,40 +1033,10 @@ errors precede input errors."
     (when (string= name "pg_get_publication_tables")
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
-    (when (integer-catalog-alias-p name)
-      (return-from analyze-function-expression
-        (analyze-integer-catalog-function name args (getf (cdddr expr) :schema))))
-    ;; These catalog names expose the same implementation as the SQL names,
-    ;; but each has a single declared float argument type.
-    (let ((alias (float-catalog-alias name)))
-      (when alias
-        (let ((type (first alias)))
-          (unless (and (= (length args) 1)
-                       (or (in-unknown-constant-p (first args))
-                           (sql-implicit-coercion-p (expr-type (first args)) type)))
-            (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-          (return-from analyze-function-expression
-            (list :func name (list (coerce-common-expression (first args) type))
-                  :type type :typmod -1)))))
     (cond
-      ((member name '("random" "setseed") :test #'string=) (analyze-random-function name args random-signature))
-      ((trig-function-p name) (analyze-trig-function name args))
-      ((string= name "width_bucket") (analyze-width-bucket args))
-      ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
-               :test #'string=)
-       (analyze-basic-numeric-function name args))
-      ((member name '("sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln") :test #'string=)
-       (analyze-basic-numeric-function name args))
-      ((member name '("log" "log10" "numeric_log") :test #'string=)
-       (analyze-log-function name args))
-      ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
-       (analyze-power-function name args))
-      ((member name '("scale" "min_scale" "trim_scale") :test #'string=)
-       (analyze-numeric-scale-function name args))
-      ((string= name "factorial") (analyze-factorial-function name args))
-      ((numeric-helper-function-p name) (analyze-numeric-helper-function name args))
-      ((numeric-arithmetic-function-p name)
-       (analyze-numeric-arithmetic-function name args))
+      ((or (numeric-function-p name)
+           (member name '("random" "setseed") :test #'string=))
+       (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
       ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
       ((string= name "substr") (analyze-substr-function name args))
