@@ -90,8 +90,11 @@ Receipt may advance the position only when its durable owner is the replay timel
         (values (max replay (or (getf *physical-recovery-state* :receive-lsn) 0)) timeline))))
 
 (defun physical-replay-check-child-initialization (record next-xid)
-  "Require the selected child's initialization checkpoint before later child work.
-This native allocation-safety requirement permits its empty batch start first."
+  "Check native checkpoint timeline and selected child initialization during replay.
+A checkpoint cannot switch the replay timeline; only a validated selected EOR
+does that. After EOR, require the child's initialization checkpoint before later
+child work. Its empty batch start may come first. Used by replay and private
+candidate validation; this is a native allocation-safety rule."
   (let* ((state *physical-recovery-state*) (timeline (physical-recovery-replay-timeline state))
                                            (snapshot (getf state :source-checkpoint)) (type (wal-record-type record)))
     (when (= type +wal-record-checkpoint+)

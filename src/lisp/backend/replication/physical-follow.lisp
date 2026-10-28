@@ -224,6 +224,11 @@ Neither binding phase is admitted by the current receiver."
   binding)
 
 (defun physical-follow-replay-seed (store base binding)
+  "Read the durable restartpoint and choose a replay seed for BINDING.
+Check its pointer and generation against the witness and receive prefix. Use a
+version 3 or later restartpoint; for an older generation, fall back to the
+verified base and require the full prefix to remain available. The caller owns
+PGDATA and root protection and supplies independently verified base and binding."
   (multiple-value-bind (metadata catalog prefix digest) (physical-restartpoint-read base)
     (declare (ignore catalog prefix))
     (unless (equal (getf (getf binding :recovery) :restartpoint)
@@ -263,6 +268,18 @@ Neither binding phase is admitted by the current receiver."
               (when metadata (copy-tree (getf metadata :source-xids)))))))
 
 (defun physical-follow-validate-candidate-replay (candidate verified-base binding)
+  "Validate a private candidate's replay through its proposed fork without redo.
+The caller must own PGDATA and a root lease, hold recovery quiescence, and supply
+an independently verified immutable base and durable binding. CANDIDATE is a
+disposable store copy with no streams; it shares the original store's mutex, so
+do not hold that mutex while calling. This has no production caller.
+
+Read and validate the actual restartpoint before scanning. Check clean required,
+applied and fork boundaries, selected EOR, initialization, allocation and source
+membership. The XID value at required may differ from that at the fork. When the
+required point precedes the seed, durable provenance must establish it and the
+seed's next XID must be at least the witness value. The scan performs no writes,
+redo or publication. An error may latch CANDIDATE failed, not the original store."
   (physical-follow-binding-check binding)
   (unless (and (equal (physical-store-control-tuple candidate) (getf binding :after))
                (eql (getf verified-base :system-id) (physical-store-system-id candidate))
