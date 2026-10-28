@@ -849,7 +849,8 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
   ;; Other calls remain opaque even when their arguments are constants.
   (member name '("lower" "substr" "length" "char_length" "character_length"
                  "pg_wal_lsn_diff" "pg_walfile_name"
-                 "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
+                 "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
+                 "sqrt" "numeric_sqrt")
           :test #'string=))
 
 (defun having-literal-expression-p (expression)

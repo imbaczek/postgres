@@ -206,6 +206,14 @@
         ((sb-ext:float-nan-p right) -1)
         ((< left right) -1) ((> left right) 1) (t 0)))
 
+(defun sql-float-sqrt (value)
+  "Return the float8 square root, rejecting negative values as float.c does.
+NaN and positive infinity pass through, and negative zero retains its sign."
+  (when (and (not (sb-ext:float-nan-p value)) (minusp value))
+    (ereport "2201F" "cannot take square root of a negative number"))
+  (sb-int:with-float-traps-masked (:invalid :inexact :underflow :overflow)
+    (sqrt value)))
+
 (defun sql-float-basic-function (name value)
   "Apply float.c's unary rounding and sign functions.
 Round uses ties to even, and zero results retain the input's sign.  Like

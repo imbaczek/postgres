@@ -184,6 +184,43 @@
                       (string= (pg-error-message condition) (third case)))
                  (first case)))))
 
+(cl-spec:defproperty numeric-sqrt-perfect-squares
+    ((root (range integer 0 1000000))
+     (scale (range integer 0 5)))
+  (:about sql-numeric-sqrt)
+  (:trials (:normal 250))
+  (let* ((input (make-sql-decimal (* root root) (* 2 scale)))
+         (result (sql-numeric-sqrt input)))
+    (= (sql-numeric-rational result) (/ root (expt 10 scale)))))
+
+(cl-spec:defproperty numeric-sqrt-rounding-bound
+    ((coefficient (range integer 1 1000000000))
+     (scale (range integer 0 9)))
+  (:about sql-numeric-sqrt)
+  (:trials (:normal 500))
+  (let* ((input (make-sql-decimal coefficient scale))
+         (result (sql-numeric-sqrt input))
+         (value (sql-numeric-rational result))
+         (half-unit (/ 1 (* 2 (expt 10 (sql-numeric-scale result)))))
+         (original (sql-numeric-rational input)))
+    (and (<= (expt (max 0 (- value half-unit)) 2) original)
+         (< original (expt (+ value half-unit) 2)))))
+
+(rove:deftest numeric-sqrt-rounding-property
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'numeric-sqrt-rounding-bound :seed 42))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(rove:deftest numeric-sqrt-expressions
+    (dolist (case '(("SELECT sqrt(2::numeric)::text" "1.414213562373095")
+                    ("SELECT sqrt(4.00::numeric)::text" "2.000000000000000")
+                    ("SELECT sqrt('Infinity'::numeric)::text" "Infinity")
+                    ("SELECT sqrt('NaN'::numeric)::text" "NaN")
+                    ("SELECT sqrt(4::float8)::text" "2")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case)))
+  (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-sqrt-perfect-squares :seed 42))))
+    (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (cl-spec:defproperty numeric-rounding-is-symmetric
     ((coefficient (range integer -10000000 10000000))
      (input-scale (range integer 0 6))

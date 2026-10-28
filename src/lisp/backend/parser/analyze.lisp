@@ -390,8 +390,9 @@ Convert supplied expressions in source order, then return them in parameter orde
 (defun analyze-basic-numeric-function (name args)
   "Resolve the supported basic numeric overload and coerce its arguments.
 Two-argument round and trunc use numeric and an int4 scale.  Unary abs
-preserves a known input type; the other unary calls choose numeric for numeric
-inputs and float8 otherwise, including unknown literals."
+preserves a known input type.  numeric_abs and numeric_sqrt choose numeric;
+the other unary calls choose numeric for numeric inputs and float8 otherwise,
+including unknown literals."
   (unless (and (if (member name '("round" "trunc") :test #'string=)
                    (member (length args) '(1 2))
                    (= (length args) 1))
@@ -402,7 +403,7 @@ inputs and float8 otherwise, including unknown literals."
                    (member (expr-type (second args)) '(:int2 :int4))))
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
   (let* ((argument (first args))
-         (type (cond ((or (= (length args) 2) (string= name "numeric_abs")) :numeric)
+         (type (cond ((or (= (length args) 2) (member name '("numeric_abs" "numeric_sqrt") :test #'string=)) :numeric)
                      ((and (string= name "abs")
                            (not (in-unknown-constant-p argument)))
                       (expr-type argument))
@@ -432,6 +433,8 @@ inputs and float8 otherwise, including unknown literals."
     (cond
       ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
                :test #'string=)
+       (analyze-basic-numeric-function name args))
+      ((member name '("sqrt" "numeric_sqrt") :test #'string=)
        (analyze-basic-numeric-function name args))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
       ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
@@ -1673,7 +1676,8 @@ inputs and float8 otherwise, including unknown literals."
                              '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
                                "substr" "length" "char_length" "character_length" "pg_backend_pid"
-                               "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
+                               "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
+                               "sqrt" "numeric_sqrt")
                              :test #'string=)))
            (analyzed-expression-volatile-p (car form))
            (analyzed-expression-volatile-p (cdr form)))))
@@ -2517,6 +2521,11 @@ inputs and float8 otherwise, including unknown literals."
                        :test #'string=)
                (member type '(:float4 :float8)))
           (sql-float-basic-function name (first arguments)))
+         ((member name '("sqrt" "numeric_sqrt") :test #'string=)
+          (let ((value (first arguments)))
+            (cond ((eq value +null+) +null+)
+                  ((eq type :numeric) (sql-numeric-sqrt value))
+                  (t (sql-float-sqrt value)))))
          ((and (string= name "abs") (member type '(:int2 :int4 :int8)))
           (let ((value (abs (first arguments))))
             (when (and (eq type :int8) (> value +int8-max+))

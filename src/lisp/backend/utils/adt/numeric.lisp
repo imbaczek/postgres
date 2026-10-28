@@ -194,6 +194,28 @@
     (ereport "22003" "value overflows numeric format"))
   (make-sql-decimal coefficient scale))
 
+(defun sql-numeric-sqrt (value)
+  "Return the square root using numeric.c's result scale and decimal rounding.
+The scale preserves the input display scale and supplies significant digits,
+subject to the numeric display limit.  Integer arithmetic keeps the rounding
+exact.  Negative values signal an error; NaN and positive infinity pass through."
+  (when (eq value :numeric-negative-infinity)
+    (ereport "2201F" "cannot take square root of a negative number"))
+  (when (sql-numeric-special-p value) (return-from sql-numeric-sqrt value))
+  (let ((coefficient (sql-numeric-coefficient value)))
+    (when (minusp coefficient)
+      (ereport "2201F" "cannot take square root of a negative number"))
+    (multiple-value-bind (weight digit) (sql-numeric-leading-digit value)
+      (declare (ignore digit))
+      (let* ((scale (min 1000 (max 0 (sql-numeric-scale value) (- 15 (* 2 weight)))))
+             (shift (- (* 2 scale) (sql-numeric-scale value)))
+             (numerator (if (minusp shift) coefficient (* coefficient (expt 10 shift))))
+             (denominator (if (minusp shift) (expt 10 (- shift)) 1))
+             (root (isqrt (floor numerator denominator))))
+        (when (>= (* 4 numerator) (* denominator (expt (1+ (* 2 root)) 2)))
+          (incf root))
+        (sql-numeric-result root scale)))))
+
 (defun sql-numeric-round-or-trunc (value scale round-p)
   "Round or truncate a numeric at SCALE, retaining PostgreSQL display scale.
 Negative scales operate before the decimal point and produce display scale zero.
