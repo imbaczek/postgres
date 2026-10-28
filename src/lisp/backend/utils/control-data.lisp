@@ -89,6 +89,9 @@ A present file with invalid type, size or access permissions is an error."
       (unless (= sb-posix:enoent (sb-posix:syscall-errno condition)) (error condition)))))
 
 (defun native-control-recovery-role-p (control insertion)
+  "Return true when CONTROL still selects recovery on INSERTION's timeline.
+Phases 0 through 2 are ordinary recovery; phase 3 remains pending only while
+insertion is on the recorded parent timeline."
   (and control
        (or (member (getf control :phase) '(0 1 2))
            (and (eql 3 (getf control :phase))
@@ -96,8 +99,12 @@ A present file with invalid type, size or access permissions is an error."
 
 (defun native-control-capture ()
   "Read the controls that select the current native role and checkpoint.
-Keep their bytes for the stability check. A committed child no longer depends
-on the old base manifest or restartpoint pointer."
+Keep their bytes for the stability check. Capture recovery artifacts for an
+ordinary standby, including one on a child timeline, or a pending promotion.
+With no recovery control, capture artifacts so incomplete recovery is rejected.
+A committed child with pending control ignores retired recovery artifacts.
+Return WAL control, recovery control, marker, manifest, restartpoint pointer,
+current child history and follow control, in that order."
   (let* ((wal (native-control-optional-bytes (wal-control-path)))
          (insertion (and wal (nth-value 3 (wal-decode-control-line (bytes->string wal)))))
          (recovery (native-control-optional-bytes (physical-recovery-control-path)))
@@ -127,6 +134,8 @@ matches the supported restartpoint generation bound rather than a WAL segment."
     (catalog-system-identifier (make-catalog :cluster-identity identity))))
 
 (defun native-control-manifest-file (manifest name maximum)
+  "Read NAME from the immutable base after checking its manifest entry.
+Reject a missing entry or a length or digest mismatch; bound the read by MAXIMUM."
   (let* ((entry (find name (getf manifest :files) :key #'first :test #'equal))
          (bytes (read-bounded-regular-file (merge-pathnames name *pgdata*) maximum)))
     (unless (and entry (= (second entry) (length bytes))
@@ -135,6 +144,10 @@ matches the supported restartpoint generation bound rather than a WAL segment."
     bytes))
 
 (defun native-control-check-recovery-base (control manifest snapshot)
+  "Check that the immutable base control and SNAPSHOT agree with MANIFEST.
+For a child base, also authenticate its history file and check child control
+against that history. An ordinary base cannot carry an old primary's retained
+archive reference; pending promotion may retain one."
   (let ((bytes (native-control-manifest-file manifest "global/pg_wal_control" 513)))
     (multiple-value-bind (checkpoint durable actual insertion checkpoint-timeline namespace metadata)
         (wal-decode-control-line (bytes->string bytes))
@@ -182,10 +195,12 @@ archive without registering it or changing files."
 
 (defun native-control-facts (capture)
   "Validate CAPTURE and return the facts used by native pg_controldata.
-A verified child control wins over obsolete recovery metadata. A phase-3
-request remains pending when insertion equals its parent timeline, even when
-that timeline is greater than one. A standby takes its state and applied floor
-from recovery control. Report checkpoint starts, though WAL control stores ends."
+Captured recovery artifacts without recovery control are an error. A standby
+uses recovery control for its state and applied floor, even on a child timeline.
+Phase 0 has not yet bound the manifest digest. A phase-3 request remains pending
+when insertion equals its parent timeline. A committed child must agree with its
+history and ignores retired recovery files. Report checkpoint starts, though WAL
+control stores ends."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-id namespace metadata)
       (wal-decode-control-line (bytes->string (first capture)))
     (declare (ignore durable namespace))
@@ -225,8 +240,10 @@ from recovery control. Report checkpoint starts, though WAL control stores ends.
 
 (defun native-control-read (directory)
   "Read coherent control facts without starting storage or changing PGDATA.
-Compare controls before and after validation, retrying when publication changed
-them. Immutable generations are bound by the selected pointer and digest."
+Compare role controls and child history before and after validation, retrying
+when publication changed them. Immutable generations are bound by the selected
+pointer and digest. Phase 0 may leave the control's manifest digest unbound;
+the base files are still checked against the manifest read from disk."
   (let ((*pgdata* (uiop:ensure-directory-pathname (truename directory))))
     (loop repeat 8
           for capture = (native-control-capture)

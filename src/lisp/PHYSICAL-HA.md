@@ -846,6 +846,27 @@ selected pointer and digest. Shared readers check descriptor type/size before
 allocation, reject final symlinks and open nonblocking to reject FIFOs. Startup's
 WAL-control read uses the same rule.
 
+Native inspection also handles an ordinary standby based on a child timeline.
+It validates the immutable base control and child history against the manifest;
+phase 0 has not yet bound the manifest digest. Startup rejects missing recovery
+control with a recovery marker, manifest, follow control or restartpoint pointer.
+Inspection also rejects those captured artifacts when control is missing.
+Cleanup removes pending control last, so missing control with one of those
+artifacts is not a valid interrupted cleanup state.
+Once child control is committed, inspection checks its history and does not
+require retired recovery files. This is a native format and validation scheme:
+C `pg_controldata` reads C control
+files, and C recovery uses `backup_label` to select a backup checkpoint. Matching
+the reported field names does not make these on-disk formats compatible.
+
+The current recovery-control pass exercised normal and crash recovery from child
+timeline 2 to 3, including SIGKILL after child-control publication and removal
+of retired spool, generation, manifest and parent-history files. The crash run
+also checked a missing-control clone, cold restart, later checkpoint and rows
+(`/tmp/pg-child-control-commit-crash.log`). The full run passed 714 physical and
+170 interop tests before a small follow-control and pointer guard expansion;
+eight focused cases, two additional cases and a cold compile passed afterward.
+
 Pinned Patroni 4.1.5's unchanged `Postgresql.promote`, `pg_ctl`, `controldata`,
 `_wait_promote`, `sysid` and `pg_control_timeline` methods pass with an isolated
 native-node fixture and no DCS. At child-control publication and pending-control

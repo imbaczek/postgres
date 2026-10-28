@@ -17,9 +17,11 @@ Malformed control is an error, not permission to fall back to primary startup."
 
 (defun physical-bootstrap-check-startup ()
   "Choose recovery or primary startup before listeners or ordinary storage setup.
-Nonpending standby control requires recovery validation. A pending request is
-reconciled against parent or committed child control. Return :PRIMARY-READY
-when pending completion already initialized storage. Invalid proof is an error."
+Recovery artifacts without recovery control are an error: pending control is
+retired last, so their presence cannot safely select primary startup. Nonpending
+standby control requires recovery validation. A pending request is reconciled
+against parent or committed child control. Return :PRIMARY-READY when pending
+completion already initialized storage. Invalid proof is an error."
   (when (and (not (wal-namespace-file-stat (physical-recovery-control-path) t))
              (or (wal-namespace-file-stat (merge-pathnames "recovery.required" *pgdata*) t)
                  (wal-namespace-file-stat (merge-pathnames "physical-backup.manifest" *pgdata*) t)
