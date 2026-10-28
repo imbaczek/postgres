@@ -323,6 +323,68 @@
                (ok (not (probe-file (pg::relation-file-path 903 :visibility)))))
           (pg::smgr-close-all)))))
 
+(deftest vacuum-toast-advances-owned-horizon
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*relation-streams* (make-hash-table :test #'equal))
+             (pg::*wal-ready* nil)
+             (pg::*clog-stream* nil)
+             (pg::*wal-page-cache* (make-hash-table :test #'equal))
+             (pg::*backend* (pg::make-backend))
+             (pg::*catalog* (pg::make-catalog))
+             (pg::*catalog-oldest-relfrozenxid* nil)
+             (pg::*next-xid* 100)
+             (columns (vector (pg::make-pg-column :name "chunk" :type :int4 :typmod -1 :attnum 1)))
+             (tid nil)
+             (database (pg::make-database :name "postgres"))
+             (toast (pg::make-pg-toast :oid 901 :relfilenode 901 :index-oid 902
+                                       :index-relfilenode 902 :relfrozenxid 3))
+             (table (pg::make-pg-class :oid 900 :relfilenode 900 :name "parent"
+                                       :relfrozenxid 60 :columns #() :toast toast)))
+        (setf (gethash "postgres" (pg::catalog-databases pg::*catalog*)) database
+              (gethash "parent" (pg::database-tables database)) table)
+        (ensure-directories-exist (pg::catalog-path))
+        (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
+        (unwind-protect
+             (progn
+               (pg::smgr-create 900)
+               (pg::smgr-create 901)
+               (pg::btree-init 902)
+               (pg::clog-set 10 pg::+clog-committed+)
+               (multiple-value-bind (block offset)
+                   (pg::heapam-insert 901 columns #(7) 10 0)
+                 (setf tid (cons block offset))
+                 (pg::btree-insert 902 (pg::encode-index-key '(7) '(:int4)) block offset))
+               (let ((pg::*catalog-rename-function*
+                       (lambda (&rest arguments)
+                         (declare (ignore arguments))
+                         (error "injected catalog rename failure"))))
+                 (ok (intake-fails-p
+                      (lambda ()
+                        (pg::vacuum-toast-relation
+                         table (lambda () t) :forced-oldest-xmin 30
+                         :forced-freeze-cutoff 30))))
+                 (ok (= 3 (pg::pg-toast-relfrozenxid toast))))
+               (pg::vacuum-toast-relation table (lambda () t)
+                                          :forced-oldest-xmin 50 :forced-freeze-cutoff 50)
+               (ok (= 50 (pg::pg-toast-relfrozenxid toast)))
+               (ok (= pg::+frozen-xid+
+                      (pg::htup-xmin (pg::heapam-get-tuple 901 (car tid) (cdr tid) columns))))
+               (ok (equal (list tid) (pg::btree-search 902 (pg::encode-index-key '(7) '(:int4)))))
+               (ok (= 50 (pg::catalog-oldest-relfrozenxid)))
+               (let ((synced nil))
+                 (pg::vacuum-all-relations-for-xid-wraparound
+                  70 :fsync-function (lambda (node) (push node synced)))
+                 (ok (and (member 900 synced) (member 901 synced)))
+                 (ok (= 70 (pg::pg-class-relfrozenxid table)))
+                 (ok (= 70 (pg::pg-toast-relfrozenxid toast))))
+               (let* ((restored (pg::load-catalog))
+                      (db (gethash "postgres" (pg::catalog-databases restored)))
+                      (saved (gethash "parent" (pg::database-tables db))))
+                 (ok (= 70 (pg::pg-toast-relfrozenxid (pg::pg-class-toast saved))))))
+          (when pg::*clog-stream* (close pg::*clog-stream*))
+          (pg::smgr-close-all)))))
+
 (deftest recovery-readers-use-virtual-lock-identities
     (let* ((pg::*physical-recovery-state* (sample-recovery-manifest))
            (pg::*backend* (pg::make-backend))

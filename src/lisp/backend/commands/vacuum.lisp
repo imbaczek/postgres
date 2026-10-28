@@ -92,12 +92,59 @@ requested relations and an ownership callback, published atomically with gates."
          (funcall fsync-function (pg-class-relfilenode table)))
        (pg-class-relfrozenxid table)))))
 
+(defun vacuum-toast-relation
+    (table verify-function
+     &key forced-oldest-xmin forced-freeze-cutoff after-page-function fsync-function)
+  "Vacuum TABLE's owned TOAST heap and index, advancing its own freeze horizon.
+Capture the ownership and relfilenodes under the write lock, then lock the parent,
+TOAST heap, and index and revalidate them before work and catalog publication.
+The parent lock protects ownership while TOAST is processed, as in vacuum.c's
+parent session lock.  A pre-durable catalog save failure restores the old TOAST horizon; the
+optional fsync runs after publication.  Forced horizons and callbacks are passed
+to the TOAST pass independently of the main relation."
+  (let (toast parent-node heap-node index-node)
+    (with-write-lock
+      (when verify-function (funcall verify-function))
+      (setf toast (pg-class-toast table))
+      (when toast
+        (setf parent-node (pg-class-relfilenode table)
+              heap-node (pg-toast-relfilenode toast)
+              index-node (pg-toast-index-relfilenode toast))))
+    (when toast
+      (labels ((verify-ownership ()
+                 (when verify-function (funcall verify-function))
+                 (unless (and (eq toast (pg-class-toast table))
+                              (= parent-node (pg-class-relfilenode table))
+                              (= heap-node (pg-toast-relfilenode toast))
+                              (= index-node (pg-toast-index-relfilenode toast)))
+                   (ereport "55000" "TOAST relation changed while waiting for lock"))))
+        (with-relation-maintenance-locks ((list parent-node heap-node index-node))
+          (with-write-lock (verify-ownership))
+          (let* ((oldest-xmin (or forced-oldest-xmin (oldest-xmin *current-snapshot*)))
+                 (old-xid (or (pg-toast-relfrozenxid toast) +first-normal-xid+))
+                 (cutoff (vacuum-compute-freeze-cutoff
+                          old-xid oldest-xmin (next-full-xid)
+                          :forced-freeze-cutoff forced-freeze-cutoff)))
+            (heap-vacuum-relation-locked heap-node (list index-node)
+                                         oldest-xmin cutoff
+                                         :after-page-function after-page-function)
+            (with-write-catalog-locks
+              (verify-ownership)
+              (call-with-catalog-durability-rollback-under-lock
+               (lambda () (setf (pg-toast-relfrozenxid toast) old-xid))
+               (lambda ()
+                 (setf (pg-toast-relfrozenxid toast) (max old-xid cutoff))
+                 (save-catalog))))
+            (when fsync-function (funcall fsync-function heap-node))
+            (pg-toast-relfrozenxid toast)))))))
+
 (defun vacuum-table (table)
-  "Run a plain manual VACUUM for TABLE in the current database."
-  (vacuum-catalog-relation
-   table
-   (lambda () (current-table-index-relfilenodes table))
-   (lambda () (ensure-current-table table))))
+  "Run a plain manual VACUUM for TABLE, then its owned TOAST relation.
+Each relation computes and publishes its own freeze horizon."
+  (let ((verify (lambda () (ensure-current-table table))))
+    (prog1 (vacuum-catalog-relation
+            table (lambda () (current-table-index-relfilenodes table)) verify)
+      (vacuum-toast-relation table verify))))
 
 (defun same-index-object-set-p (left right)
   "Compare index membership and metadata identity without depending on order."
@@ -338,7 +385,9 @@ implementation's replacement metadata transition atomic as well."
 
 (defun vacuum-all-relations-for-xid-wraparound
     (boundary &key fsync-function after-page-function)
-  "Freeze each catalog relation to BOUNDARY, skipping all-frozen VM pages."
+  "Freeze each catalog relation and its owned TOAST relation to BOUNDARY.
+Both passes use the forced horizon and callbacks, skipping all-frozen VM pages;
+each publishes its own horizon after its heap pass."
   (maphash
    (lambda (database-name database)
      (declare (ignore database-name))
@@ -362,6 +411,10 @@ implementation's replacement metadata transition atomic as well."
            :forced-oldest-xmin boundary
            :forced-freeze-cutoff boundary
            :after-page-function after-page-function
+           :fsync-function fsync-function)
+          (vacuum-toast-relation
+           table verify-function :forced-oldest-xmin boundary
+           :forced-freeze-cutoff boundary :after-page-function after-page-function
            :fsync-function fsync-function)))
       (database-tables database)))
    (catalog-databases *catalog*))
