@@ -852,6 +852,32 @@ def check_numeric_prefix_errors(reference, native):
             peer.close()
 
 
+def check_numeric_input_errors(reference, native):
+    peers = [NumericErrorConnection(port, "numeric-input-errors")
+             for port in (reference, native)]
+    try:
+        overflow_inputs = ("1e131072", "1e-16384", "0e-16384", "-1e-16384",
+                           "1e1073741824", "0e1073741824", "1e-1073741824",
+                           "1e1073741824junk", "1e1073741824_")
+        syntax_inputs = ("1e131072junk", "1e-16384junk", "0e-16384junk",
+                         "1e1073741823junk", "1e131072_")
+        for input_text in overflow_inputs + syntax_inputs:
+            sql = f"SELECT '{input_text}'::numeric"
+            expected = (("22003", "value overflows numeric format", None, None)
+                        if input_text in overflow_inputs else
+                        ("22P02", f'invalid input syntax for type numeric: "{input_text}"',
+                         None, None))
+            outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+            assert outcomes == [expected, expected], (sql, outcomes)
+        sql = "SELECT '0e1073741823'::numeric::text, scale('1e-16383'::numeric)::text"
+        outcomes = [peer.observe(sql) for peer in peers]
+        assert outcomes[0] == outcomes[1], (sql, outcomes)
+        print("numeric-input: exact SQLSTATE/message/detail/hint and error order PASS", flush=True)
+    finally:
+        for peer in peers:
+            peer.close()
+
+
 def check(reference, native):
     peers = [QueryConnection(port, "defaults-checks-aggregates") for port in (reference, native)]
     failures = []
@@ -949,6 +975,7 @@ if __name__ == "__main__":
     else:
         check(int(sys.argv[1]), int(sys.argv[2]))
         check_numeric_prefix_errors(int(sys.argv[1]), int(sys.argv[2]))
+        check_numeric_input_errors(int(sys.argv[1]), int(sys.argv[2]))
         check_datestyle_sessions(int(sys.argv[1]), int(sys.argv[2]))
         check_transaction_time(int(sys.argv[1]), int(sys.argv[2]))
         if len(sys.argv) >= 5:

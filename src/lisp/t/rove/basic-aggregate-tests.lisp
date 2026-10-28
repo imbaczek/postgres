@@ -872,6 +872,35 @@
                       (equal (pg-error-message condition) (third case)))
                  (first case)))))
 
+(rove:deftest numeric-input-overflow-diagnostics
+    ;; Storage bounds follow trailing-junk validation; exponent accumulation
+    ;; overflows immediately, as set_var_from_str does in numeric.c.
+    (dolist (input '("1e131072" "1e-16384" "0e-16384" "-1e-16384"
+                     "1e1073741824" "0e1073741824" "1e-1073741824"
+                     "1e1073741824junk" "1e1073741824_"))
+      (let* ((sql (format nil "SELECT '~a'::numeric" input))
+             (condition (handler-case (progn (subquery-test-rows sql) nil)
+                          (pg-error (error) error))))
+        (rove:ok (and condition
+                      (equal (pg-error-sqlstate condition) "22003")
+                      (equal (pg-error-message condition) "value overflows numeric format")
+                      (null (pg-error-detail condition)) (null (pg-error-hint condition)))
+                 sql)))
+  (dolist (input '("1e131072junk" "1e-16384junk" "0e-16384junk"
+                   "1e1073741823junk" "1e131072_"))
+    (let* ((sql (format nil "SELECT '~a'::numeric" input))
+           (condition (handler-case (progn (subquery-test-rows sql) nil)
+                        (pg-error (error) error))))
+      (rove:ok (and condition
+                    (equal (pg-error-sqlstate condition) "22P02")
+                    (equal (pg-error-message condition)
+                           (format nil "invalid input syntax for type numeric: \"~a\"" input))
+                    (null (pg-error-detail condition)) (null (pg-error-hint condition)))
+               sql)))
+  (rove:ok (equal '(("0" "16383"))
+                  (subquery-test-rows
+                   "SELECT '0e1073741823'::numeric::text, scale('1e-16383'::numeric)::text"))))
+
 (rove:deftest numeric-float-input-diagnostics
     ;; float.c reports range errors for the recognized prefix before checking
     ;; trailing junk; syntax errors instead retain the complete original input.

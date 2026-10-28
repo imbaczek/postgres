@@ -136,6 +136,9 @@ Finite values become SQL decimals; NaN and infinities pass through unchanged."
       (read-digits nil)
       (when (eql (peek) #\.) (incf position) (read-digits t))
       (when (zerop digits) (bad))
+      ;; set_var_from_str rejects an excessive exponent while scanning it,
+      ;; before trailing syntax is checked.  Storage bounds are checked later,
+      ;; after numeric_in has checked the remaining input for junk.
       (when (and (peek) (find (peek) "eE"))
         (incf position)
         (let ((exponent-sign 1) (exponent-digits 0))
@@ -144,7 +147,8 @@ Finite values become SQL decimals; NaN and infinities pass through unchanged."
           (loop while (digit)
                 do (setf exponent (+ (* exponent 10) (digit)))
                    (incf position) (incf exponent-digits)
-                   (when (> exponent (floor +int4-max+ 2)) (ereport "22003" "numeric value out of range"))
+                   (when (> exponent (floor +int4-max+ 2))
+                     (ereport "22003" "value overflows numeric format"))
                    (when (eql (peek) #\_) (incf position) (unless (digit) (bad))))
           (when (zerop exponent-digits) (bad))
           (setf exponent (* exponent-sign exponent))))
@@ -152,7 +156,7 @@ Finite values become SQL decimals; NaN and infinities pass through unchanged."
       (let ((scale (- fractional exponent)))
         (when (or (> scale 16383) (and (not (zerop coefficient))
                                        (> (- (length (format nil "~d" coefficient)) scale) 131072)))
-          (ereport "22003" "numeric value out of range"))
+          (ereport "22003" "value overflows numeric format"))
         (if (minusp scale)
             (make-sql-decimal (if (zerop coefficient) 0 (* sign coefficient (expt 10 (- scale)))) 0)
             (make-sql-decimal (* sign coefficient) scale))))))
