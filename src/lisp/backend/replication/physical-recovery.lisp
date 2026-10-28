@@ -573,9 +573,9 @@ Publish dirty recovery control before installing state and allowing redo."
 (declaim (ftype function physical-recovery-publish-selected-history))
 
 (defun physical-recovery-open-storage ()
-  "Open verified recovery; phase 2 redoes its entire retained prefix before SQL.
-Reject both saved follow binding phases before storage changes, attachment or
-redo; startup integration and the bound receiver remain unavailable."
+  "Open verified recovery after follow startup admission. In phase 2, attach the
+receive store and redo its retained prefix before loading slots and serving SQL.
+A saved binding must have been reconciled and admitted before this point."
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
   (physical-follow-check-startup-admission *physical-recovery-state*)
   (let ((streaming (= 2 (getf *physical-recovery-state* :phase))))

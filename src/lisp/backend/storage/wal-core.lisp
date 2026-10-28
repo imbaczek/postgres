@@ -2468,8 +2468,10 @@ src/backend/access/transam/xlogreader.c."
 (declaim (ftype function physical-slot-restore physical-slot-check-standby-slots physical-slot-startup-system-id))
 
 (defun wal-load-replication-slots ()
-  "Load durable slots before any checkpoint can recycle WAL.
-Dispatch physical slots to their primary restoration and identity checks."
+  "Load durable slots before checkpoints can recycle WAL.
+Remove temporary physical slots and validate persistent physical slots using
+primary WAL or a standby batch proof. Logical slot restoration during native
+recovery is unsupported. Standby loading requires startup quiescence."
   (let ((segments (wal-discover-segments))
         (inactive-since (postgres-current-timestamp)))
     (clrhash *wal-replication-slots*)

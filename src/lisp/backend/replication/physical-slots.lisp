@@ -25,6 +25,8 @@ restart LSN and timeline. A null restart or lost slot does not retain WAL."
          (typep (wal-replication-slot-inactive-since slot) '(signed-byte 64)))))
 
 (defun physical-slot-check-position (slot system-id history frontier)
+  "Check slot identity and lineage against FRONTIER; return a reserved restart.
+A null or lost restart needs no WAL coverage."
   (unless (and (physical-slot-state-valid-p slot)
                (eql system-id (wal-replication-slot-system-id slot))
                (typep frontier '(unsigned-byte 64)))
@@ -86,7 +88,13 @@ Eligible ancestor segments may satisfy a public physical slot."
        (lambda (segment cursor)
          (physical-source-lineage-segment system-id timeline history segment cursor t))))))
 
+;;; Standby startup validates the slot batch against retained and received WAL.
+;;; Startup isolation or exclusive quiescence keeps the mutable spool stable.
+
 (defun physical-slot-check-receive-chain (store index replay)
+  "Scan retained extents and spool once from base through floor to durable flush.
+Check native gaps, the FNV floor and flush digests, and a replay record boundary.
+The caller protects the root and excludes changes to the receive spool."
   (let* ((history (physical-store-retained-history store))
          (cursor (physical-store-base-lsn store))
          (digest #xCBF29CE484222325)
@@ -117,6 +125,8 @@ Eligible ancestor segments may satisfy a public physical slot."
     t))
 
 (defun physical-slot-check-standby-control (state system-id replay)
+  "Match recovery phase, system identity and base provenance to durable control;
+require replay to cover both the base and durable applied position."
   (let ((control (physical-recovery-read-control *pgdata*)))
     (unless (and (member (getf state :phase) '(1 2))
                  (eql (getf state :phase) (getf control :phase))
@@ -130,6 +140,7 @@ Eligible ancestor segments may satisfy a public physical slot."
     control))
 
 (defun physical-slot-check-standby-overlap (state restarts)
+  "Verify the manifest-bound base overlap and reject restarts before its segment."
   (multiple-value-bind (bytes entry)
       (physical-recovery-read-base-overlap state *pgdata*)
     (declare (ignore entry))
@@ -138,6 +149,9 @@ Eligible ancestor segments may satisfy a public physical slot."
         (error "physical slot restart precedes the immutable standby overlap")))))
 
 (defun physical-slot-check-standby-receive (store state replay)
+  "Check receive identity and replay against a checked candidate, then recheck
+its control tuple. The caller holds a root lease and excludes spool mutation;
+the candidate and tuple recheck alone do not protect the spool."
   (unless (and (eql (physical-store-system-id store) (getf state :system-id))
                (eql (physical-store-timeline store) (getf state :timeline))
                (eql (physical-store-base-lsn store) (getf state :end))
@@ -156,6 +170,14 @@ Eligible ancestor segments may satisfy a public physical slot."
   t)
 
 (defun physical-slot-check-standby-slots (slots system-id)
+  "Validate a batch against durable recovery identity and applied and replay pairs.
+For reserved restarts, check base overlap and scan the protected receive chain
+once, regardless of slot count. Null and lost slots require no WAL reads.
+
+Call only during owned startup or equivalent exclusive quiescence: the caller
+must exclude receive, replay, compaction and other spool changes for the entire
+proof. The root lease protects retained objects, not the mutable spool. There
+are only startup calls in production."
   (unless (recovery-in-progress-p)
     (error "physical slot standby validation requires verified recovery"))
   (let* ((state (copy-tree *physical-recovery-state*))
@@ -212,8 +234,8 @@ precedes catalog initialization, so startup must not invent an identity."
     (catalog-system-identifier catalog)))
 
 (defun physical-slot-restore (slot inactive-since)
-  "Remove temporary slots at startup; validate persistent slots before admitting
-retention and set their new inactive timestamp."
+  "Remove temporary slots at startup and set the persistent inactive timestamp.
+Validate primary WAL here; standby slots are checked together after loading."
   (cond
     ((wal-replication-slot-temporary-p slot)
      (wal-delete-replication-slot-file (wal-replication-slot-name slot))

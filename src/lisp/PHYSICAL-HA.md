@@ -689,7 +689,8 @@ time as C does. Reserved positions use checked retained ancestry and eligible
 live timeline files. Physical slot validation permits parent files before the
 fork; private follow pins retain their stricter source-file requirement. Native
 rotation gaps need a complete predecessor record and a following record that
-could not fit. Standby loading and promotion carryover remain open. A decoder's
+could not fit. Standby loading is described below; promotion carryover remains
+open. A decoder's
 numeric validity alone does not prove WAL availability. The full physical suite
 passed 869 tests before the final predecessor-record and archive-prefix fixes.
 All 14 focused tests passed on the final source, as did 170 interop tests and
@@ -698,6 +699,41 @@ to the logical encoder; a failing regression now verifies their rejection.
 The owned baseline peers remain at ports 6960
 (pinned C) and 6961 (native), with private artifacts under the directory above;
 the native peer must restart after the shared structure layout change.
+
+Commit `6b47ca0ae5b` adds standby slot restoration after restartpoint recovery and
+redo, before startup returns. Scalar slot identity and position checks are shared
+with the primary path. A reserved standby slot is bounded by replay, even when
+receipt is ahead. The slot batch shares a bounded validation of the complete
+retained base-to-floor chain and durable spool suffix. It checks record continuity,
+legal rotation gaps, the floor and flush digests, and the exact replay boundary.
+Pre-base positions require the manifest-bound base overlap. Null and lost slots
+need no WAL reads; temporary physical slots are removed before identity checks.
+Persistent logical slots remain unsupported during native standby restoration.
+
+The validator requires startup isolation or equivalent exclusive quiescence.
+It protects the selected retained root while reading and rechecks recovery,
+receive and runtime witnesses. A copied store and final tuple comparison alone
+cannot protect mutable spool files from a concurrent receiver or compactor.
+The helper validates availability; physical-slot byte positions do not become
+native receiver resume boundaries or grant streaming authority.
+
+Verification passed 879 physical tests, 170 interop tests and strict cold
+compilation. The extended `t/physical-follow.sh` creates internal persistent and
+temporary slot fixtures after a standby checkpoint, kills the standby, and
+checks restored slot fields, temporary deletion and continued streaming. It
+passed on owned ports 6990/6991; evidence is in
+`/tmp/pg-physical-slot-standby-follow.log` and
+`/tmp/pg-physical-follow.JTthy4/restored-slots.log`.
+The new position property passed 200 seed-42 trials, digest
+`fnv1a64-v1:6e6d73aa674ca235`; verification gaps are
+`rejection-counts-unmeasured` and `input-coverage-unmeasured`.
+
+A separate pinned C standby probe confirms the replay bound with replay paused
+and newer WAL already received. Reservation remained below replay, an interior
+byte advance succeeded, and a future target clamped to replay. Evidence:
+`/tmp/pg-config-slot-probe.nWMDyQ/standby-slot-contract.log`.
+This completes internal standby loading. Public slot SQL, named-slot streaming,
+promotion carryover and standard Patroni follow configuration remain open.
 
 ### Historical WAL retention implementation order
 
