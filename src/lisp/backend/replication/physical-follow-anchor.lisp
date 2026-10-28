@@ -179,6 +179,10 @@ before publishing the ready state in memory; a save failure fences the source."
     pin))
 
 (defun physical-source-follow-anchor (request)
+  "Build an anchor from receiver coordinates and the current source's history.
+Read the exact end-of-recovery record for the receiver's immediate next timeline
+under WAL exclusion. The provisional pin is only a read context; it is never
+registered or serialized. Reservation and proof revalidate retention afterward."
   (physical-follow-check-plist
    request (remove-if (lambda (key) (member key '(:history-text :eor-octets)))
                       *physical-follow-anchor-keys*))
@@ -222,6 +226,9 @@ before publishing the ready state in memory; a save failure fences the source."
           (physical-follow-anchor-copy anchor))))))
 
 (defun physical-source-follow-existing-anchor (name request)
+  "Return a copy of the live saved anchor for an exact request retry.
+Reject a name bound to different coordinates or a pin that has lost retention.
+The existing pin keeps any confirmation already advanced."
   (with-live-operation
     (prevent-recovery-primary-operation "physical follow preparation")
     (sb-thread:with-mutex (*wal-lock*)
@@ -236,6 +243,10 @@ before publishing the ready state in memory; a save failure fences the source."
           (physical-follow-anchor-copy (physical-follow-pin-anchor pin)))))))
 
 (defun physical-source-follow-prepare (name request)
+  "Prepare a ready source pin from receiver coordinates.
+Reuse an exact live anchor when present. If descriptor capture fails, retry the
+lookup to handle a concurrent preparation; otherwise propagate the failure.
+Reservation and proof check retention again after capture."
   (unless (wal-valid-replication-slot-name-p name)
     (wal-invalid-input "invalid physical follow pin name"))
   (physical-follow-check-plist

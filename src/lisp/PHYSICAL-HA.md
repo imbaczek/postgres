@@ -322,6 +322,20 @@ identical retry preserves later confirmed progress; lost retention requires rese
 The receiver's carried digest remains distinct from the independently compared
 overlap digest. The overlap alone does not prove an older suffix.
 
+The private source preparation helper now builds that anchor from receiver
+coordinates and source-owned history and end-of-recovery bytes. Its provisional
+pin is only a read context, never registered or serialized; reservation and proof
+revalidate retention after capture. An exact retry reuses the live saved anchor
+and preserves advanced confirmation. If a descriptor read fails during a
+concurrent preparation, the helper retries the exact saved-anchor lookup.
+Tests cover a source on timeline 3 preparing the immediate 1-to-2 transition,
+then a fresh pin for 2-to-3. The full run passed 739 physical tests with no
+failures or pending tests and 170 interop tests; the physical result was recovered
+from the same worker's suite report after the tool transport timed out. A fresh
+private-cache strict compile also passed. This helper does not yet provide native
+`PREPARE_FOLLOW` on the wire, receiver binding or startup reconciliation, and does
+not establish general multi-fork onboarding.
+
 The source reader now uses the committed source's authenticated retained root
 for logical coverage from its base through its fixed fork, and current-source WAL
 where required. The source root has its own base and manifest identity; these can
