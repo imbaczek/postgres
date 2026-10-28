@@ -263,26 +263,38 @@ EOR clears this proof. A later running-transaction anchor can establish it again
          next)))))
 
 (defun physical-replay-create-heap-forks (catalog)
-  "Native catalog terminals redo a heap's first appearance in catalog history.
-Never recreate a previously established live heap or synthesize index contents.
-Full restart replay resets history to the base inventory before reconstructing
-all post-base storage, including empty tables, from retained catalog/page WAL."
+  "Redo first appearances of parent and TOAST heap main forks at catalog terminals.
+The TOAST heap is a separate relation, as is its index (see PostgreSQL's
+catalog/toasting.c).  This catalog-driven replay creates heap forks only; it
+must not synthesize an index or its contents.  PostgreSQL's catalog/storage.c
+logs main-fork creation separately; here catalog history supplies the heap's
+first-appearance evidence, including for an empty heap with no page WAL.
+
+During streaming replay a missing previously seen heap is an error, not a new
+empty fork.  Full restart resets seen history to the base inventory and replays
+retained catalog/page WAL from the base; missing seen forks are tolerated during
+that reconstruction, and the final live-file check must still reject any missing
+referenced fork. TOAST file creation must remain disabled until that check's
+catalog inventory includes both TOAST files."
   (unless *physical-replay-seen-relfilenodes* (error "missing physical replay relation history"))
-  (maphash
-   (lambda (name database)
-     (declare (ignore name))
-     (maphash
-      (lambda (name table)
-        (declare (ignore name))
-        (let* ((relfilenode (pg-class-relfilenode table))
-               (seen (gethash relfilenode *physical-replay-seen-relfilenodes*)))
-          (unless (probe-file (relation-file-path relfilenode))
-            (cond ((not seen) (smgr-create relfilenode :redo t))
-                  ((not *physical-replay-restarting-p*)
-                   (error "previously replayed heap storage is missing: ~d" relfilenode))))
-          (setf (gethash relfilenode *physical-replay-seen-relfilenodes*) t)))
-      (database-tables database)))
-   (catalog-databases catalog)))
+  (labels ((replay-heap (relfilenode)
+             (let ((seen (gethash relfilenode *physical-replay-seen-relfilenodes*)))
+               (unless (probe-file (relation-file-path relfilenode))
+                 (cond ((not seen) (smgr-create relfilenode :redo t))
+                       ((not *physical-replay-restarting-p*)
+                        (error "previously replayed heap storage is missing: ~d" relfilenode))))
+               (setf (gethash relfilenode *physical-replay-seen-relfilenodes*) t))))
+    (maphash
+     (lambda (name database)
+       (declare (ignore name))
+       (maphash
+        (lambda (name table)
+          (declare (ignore name))
+          (replay-heap (pg-class-relfilenode table))
+          (let ((toast (pg-class-toast table)))
+            (when toast (replay-heap (pg-toast-relfilenode toast)))))
+        (database-tables database)))
+     (catalog-databases catalog))))
 
 ;;; Publish the terminal's source membership together with actual next XID and
 ;;; replay LSN under the XID lock, after data and control progress are durable.

@@ -269,6 +269,33 @@
                (ok (not (probe-file (pg::relation-file-path 900)))))
           (pg::smgr-close-all)))))
 
+(deftest streaming-catalog-replays-toast-heap-without-masking-loss
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*relation-streams* (make-hash-table :test #'equal))
+             (pg::*physical-recovery-state* (list :files nil))
+             (pg::*physical-replay-seen-relfilenodes* (make-hash-table :test #'eql))
+             (pg::*physical-replay-restarting-p* nil)
+             (catalog (pg::make-catalog))
+             (database (pg::make-database :name "postgres"))
+             (toast (pg::make-pg-toast :oid 901 :relfilenode 901 :index-oid 902
+                                       :index-relfilenode 902 :relfrozenxid 3))
+             (table (pg::make-pg-class :oid 900 :relfilenode 900 :name "parent" :toast toast)))
+        (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
+        (setf (gethash "postgres" (pg::catalog-databases catalog)) database
+              (gethash "parent" (pg::database-tables database)) table)
+        (unwind-protect
+             (progn
+               (pg::physical-replay-create-heap-forks catalog)
+               (ok (probe-file (pg::relation-file-path 900)))
+               (ok (probe-file (pg::relation-file-path 901)))
+               (ok (not (probe-file (pg::relation-file-path 902))))
+               (pg::smgr-forget 901 :delete t)
+               (ok (intake-fails-p
+                    (lambda () (pg::physical-replay-create-heap-forks catalog))))
+               (ok (not (probe-file (pg::relation-file-path 901)))))
+          (pg::smgr-close-all)))))
+
 (deftest recovery-readers-use-virtual-lock-identities
     (let* ((pg::*physical-recovery-state* (sample-recovery-manifest))
            (pg::*backend* (pg::make-backend))
