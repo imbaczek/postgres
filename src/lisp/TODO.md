@@ -51,6 +51,9 @@ The cold-image audit should cover:
   proclamations, especially `LET` bindings compiled before `DECLAIM SPECIAL`.
 - Macros, compiler macros, symbol macros, classes and structures whose definitions
   must exist during compilation; check `EVAL-WHEN` and ASDF dependency ordering.
+  The active-follow tests exposed fixture macros used before their test module
+  loads. Those calls now use the fixture function directly; audit other test
+  modules for the same dependency hidden by a warm image.
   Include forward calls to structure predicates: the follow-anchor work needed
   local `NOTINLINE` declarations in the earlier source-pin module. A warm image
   compiled it without exposing the missing subtype definition.

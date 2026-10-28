@@ -224,11 +224,11 @@ Neither binding phase is admitted by the current receiver."
   binding)
 
 (defun physical-follow-replay-seed (store base applied restartpoint)
-  "Read the durable restartpoint and choose a replay seed for BINDING.
-Check its pointer and generation against the witness and receive prefix. Use a
-version 3 or later restartpoint; for an older generation, fall back to the
-verified base and require the full prefix to remain available. The caller owns
-PGDATA and root protection and supplies independently verified base and binding."
+  "Check RESTARTPOINT against the durable pointer and choose a replay seed.
+A version 3 or later generation supplies the seed; an older generation falls
+back to BASE and requires the full prefix. Check its timeline, history and
+prefix digest against STORE, and require the seed not to pass APPLIED. The
+caller supplies a verified BASE and protects PGDATA and the retained root."
   (multiple-value-bind (metadata catalog prefix digest) (physical-restartpoint-read base)
     (declare (ignore catalog prefix))
     (unless (equal restartpoint
@@ -269,7 +269,12 @@ PGDATA and root protection and supplies independently verified base and binding.
 
 (defun physical-follow-scan-replay-from-seed
     (candidate verified-base applied required observed seed map-records allow-open-tail &optional witness)
-  "Check semantic replay and clean recovery frontiers using a verified read-only seed."
+  "Scan a read-only candidate from SEED without redo or publication.
+APPLIED and REQUIRED are semantic recovery frontiers, observed at clean
+recovery group boundaries rather than arbitrary record ends. A REQUIRED point
+before SEED relies on the seed's visibility. WITNESS, when supplied, is a
+historical (LSN timeline next-XID) triple checked at a clean boundary. The
+caller owns the candidate and keeps its input stable during the scan."
   (destructuring-bind (start timeline next snapshot reservation source-xids) seed
     (let* ((*physical-recovery-state* (copy-tree verified-base))
            (*physical-receive-store* candidate)
@@ -385,8 +390,9 @@ reject any other state."
           (t (error "pending follow has an unrelated recovery history reference")))))
 
 (defun physical-follow-copy-replay-candidate (store)
-  "Copy STORE for validation without taking ownership of its streams or lock.
-The copy shares STORE's mutex and may be latched failed independently."
+  "Copy STORE for read-only validation without owning its streams or lock.
+The copy shares STORE's mutex and may be latched failed independently. The
+caller must keep STORE quiescent and protect its retained root while it is read."
   (let ((candidate (copy-physical-store store)))
     (setf (physical-store-stream candidate) nil
           (physical-store-lock-stream candidate) nil)
@@ -413,7 +419,8 @@ The copy shares STORE's mutex and may be latched failed independently."
     required))
 
 (defun physical-follow-active-prefix-digest (store cursor index)
-  "Derive a saved boundary from the current spool or its checked retained root."
+  "Derive a saved boundary digest from the spool or checked retained root.
+This preserves proof of the saved anchor and floor after spool compaction."
   (when (<= (physical-store-floor-lsn store) cursor)
     (return-from physical-follow-active-prefix-digest (physical-store-prefix-digest store cursor)))
   (unless index (error "active follow lacks retained proof of an older boundary"))
@@ -432,7 +439,9 @@ The copy shares STORE's mutex and may be latched failed independently."
   (error "active follow retained root omits a saved boundary"))
 
 (defun physical-follow-check-active-receive (store base binding)
-  "Check the saved receive selection and any later retained prefix."
+  "Check the exact saved receive selection and any later retained prefix.
+A different child selection needs a new binding. Check the saved anchor and
+floor digests even when compaction has moved them into retained extents."
   (let* ((saved (getf binding :after)) (current (physical-store-control-tuple store))
                                        (anchor (getf binding :anchor)) (cursor (getf anchor :receive-lsn)))
     (unless (and (every (lambda (index) (eql (nth index saved) (nth index current)))
@@ -487,7 +496,8 @@ The copy shares STORE's mutex and may be latched failed independently."
       (values metadata token))))
 
 (defun physical-follow-map-active-prefix (store index function start)
-  "Map checked retained extents and the durable spool once, starting at the base."
+  "Map retained WAL from the base to the current floor, then the spool.
+The caller supplies the checked current inventory and keeps its root protected."
   (unless (= start (physical-store-base-lsn store))
     (error "active historical scan must start at the verified base"))
   (when (> (physical-store-floor-lsn store) start)
@@ -502,7 +512,11 @@ The copy shares STORE's mutex and may be latched failed independently."
   (physical-store-map-durable-records store function :start-lsn (physical-store-floor-lsn store)))
 
 (defun physical-follow-scan-active-state (candidate base binding control required index)
-  "Check current visibility at its own boundary, including before a newer restartpoint."
+  "Check current visibility at its own boundary.
+If REQUIRED precedes the modern restartpoint, reconstruct from the verified
+base through any current retained root and the spool, checking the restartpoint's
+LSN, timeline and next-XID as a historical witness. Otherwise scan from the
+usable restartpoint or legacy base fallback."
   (multiple-value-bind (metadata token)
       (physical-follow-check-active-restartpoint candidate base binding)
     (let* ((applied (max (first (getf binding :applied)) (first required)
@@ -525,7 +539,11 @@ The copy shares STORE's mutex and may be latched failed independently."
            t)))))
 
 (defun physical-follow-check-active-state (store verified-base config)
-  "Validate an active binding without publication, redo or source contact."
+  "Validate an active binding without publication, redo or source contact.
+The caller must exclude concurrent recovery, reload and receive changes. This
+function copies a read-only candidate, holds a root reader lease when needed,
+and rechecks durable witnesses and the receive tuple after the scan. It does not
+enable the bound startup or receiver pipeline."
   (physical-follow-check-config config)
   (unless (and (= 5 (length config)) (eq :active (getf (fifth config) :phase))
                (equal config (physical-follow-read-config)))

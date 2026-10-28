@@ -59,6 +59,13 @@ switchovers and both logical directions passed in the
 code and refactoring. Timeline definitions now load before bootstrap, fixing a
 forward structure-accessor issue hidden by a warm image.
 
+The active-binding validator now checks durable recovery and receive state
+read-only, including retained history after compaction. Validation passed 825
+physical tests, 170 interop tests, a fresh strict compile and native acceptance.
+Startup and receiver guards still reject bound configurations. Integrating the
+validator into that pipeline and durable preparation and retirement bookkeeping
+remain pending.
+
 Network following of an existing ancestor spool across a fork remains separate
 work and is still rejected. Local selected-history replay is described below.
 Rejoin and offline reseeding, full physical slots, synchronous

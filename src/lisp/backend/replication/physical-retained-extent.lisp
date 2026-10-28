@@ -102,7 +102,12 @@ The file timeline must be an eligible carrier for the segment in that lineage."
 
 Hash record bytes in order, excluding legal rotation gaps.  Each owner change
 requires an EOR. NIL means DIGEST-CURSOR is not a known boundary. The starting
-digest is an input, not independently proved here."
+digest is an input, not independently proved here.
+
+ON-RECORD, when supplied, receives each record and its raw bytes after its
+placement is checked and the digest updated, but before the final extent check.
+It can run even if the extent is later rejected. Use it only to update private
+validation state, without external or durable side effects or store-lock reentry."
   (let* ((origin (* (getf metadata :segment) +wal-segment-size+))
          (cursor (getf metadata :start)) (offset (max 0 (- cursor origin)))
          (digest (getf metadata :start-digest))
