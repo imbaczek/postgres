@@ -850,6 +850,7 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
   (or (float-catalog-alias name)
       (trig-function-p name)
       (numeric-arithmetic-function-p name)
+      (numeric-helper-function-p name)
       (member name '("lower" "substr" "length" "char_length" "character_length"
                      "pg_wal_lsn_diff" "pg_walfile_name"
                      "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"

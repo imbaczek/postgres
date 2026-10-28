@@ -537,6 +537,46 @@ including unknown literals."
   (list :func name (list (coerce-common-expression (first args) :numeric))
         :type (if (string= name "trim_scale") :numeric :int4) :typmod -1))
 
+(defun numeric-helper-function-p (name)
+  (member name '("numeric_eq" "numeric_ne" "numeric_gt" "numeric_ge"
+                 "numeric_lt" "numeric_le" "numeric_cmp" "numeric_inc"
+                 "numeric_smaller" "numeric_larger" "numeric_uminus" "numeric_uplus")
+          :test #'string=))
+
+(defun analyze-numeric-helper-function (name args)
+  (let ((arity (if (member name '("numeric_inc" "numeric_uminus" "numeric_uplus")
+                           :test #'string=) 1 2)))
+    (unless (and (= (length args) arity)
+                 (every (lambda (arg)
+                          (or (in-unknown-constant-p arg)
+                              (sql-implicit-coercion-p (expr-type arg) :numeric))) args))
+      (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+    (list :func name (mapcar (lambda (arg) (coerce-common-expression arg :numeric)) args)
+          :type (cond ((member name '("numeric_eq" "numeric_ne" "numeric_gt" "numeric_ge"
+                                      "numeric_lt" "numeric_le") :test #'string=) :bool)
+                      ((string= name "numeric_cmp") :int4)
+                      (t :numeric))
+          :typmod -1)))
+
+(defun eval-numeric-helper-function (name args)
+  "Evaluate strict numeric helpers; equal extrema select the second argument.
+Selecting the argument itself preserves its display scale."
+  (when (member +null+ args) (return-from eval-numeric-helper-function +null+))
+  (let ((left (first args)) (right (second args)))
+    (cond ((string= name "numeric_inc") (sql-numeric-arithmetic "+" left 1))
+          ((string= name "numeric_uminus") (sql-numeric-negate left))
+          ((string= name "numeric_uplus") left)
+          (t (let ((cmp (sql-numeric-compare left right)))
+               (cond ((string= name "numeric_cmp") cmp)
+                     ((string= name "numeric_eq") (zerop cmp))
+                     ((string= name "numeric_ne") (not (zerop cmp)))
+                     ((string= name "numeric_gt") (plusp cmp))
+                     ((string= name "numeric_ge") (not (minusp cmp)))
+                     ((string= name "numeric_lt") (minusp cmp))
+                     ((string= name "numeric_le") (not (plusp cmp)))
+                     ((string= name "numeric_smaller") (if (minusp cmp) left right))
+                     (t (if (plusp cmp) left right))))))))
+
 (defun numeric-arithmetic-function-p (name)
   "Recognize immutable numeric arithmetic function names."
   (member name '("div" "mod" "numeric_div_trunc" "numeric_mod"
@@ -849,6 +889,7 @@ so expression identity remains distinct from the corresponding SQL function."
       ((member name '("scale" "min_scale" "trim_scale") :test #'string=)
        (analyze-numeric-scale-function name args))
       ((string= name "factorial") (analyze-factorial-function name args))
+      ((numeric-helper-function-p name) (analyze-numeric-helper-function name args))
       ((numeric-arithmetic-function-p name)
        (analyze-numeric-arithmetic-function name args))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
@@ -2270,6 +2311,7 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
                 (not (or (float-catalog-alias (second form))
                          (trig-function-p (second form))
                          (numeric-arithmetic-function-p (second form))
+                         (numeric-helper-function-p (second form))
                          (member (second form)
                                  '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                    "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
@@ -3183,6 +3225,7 @@ Map float catalog names only here, after expression identity has been resolved."
      (cond ((string= name "pi") pi)
            ((member +null+ arguments) +null+)
            (t (sql-float-trig name arguments))))
+    ((numeric-helper-function-p name) (eval-numeric-helper-function name arguments))
     ((numeric-arithmetic-function-p name)
      (eval-numeric-arithmetic-function name arguments type))
     ((member name '("scale" "min_scale" "trim_scale") :test #'string=)

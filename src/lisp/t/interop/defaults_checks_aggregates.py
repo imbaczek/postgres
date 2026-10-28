@@ -311,6 +311,11 @@ CASES = (
     "SELECT mod('7','3')",
     "SELECT mod('7',3),mod(7,'3'),mod(7.50::numeric,2),numeric_mod(7.50,2)",
     "SELECT numeric_add(1.20,2),numeric_sub(1,2),numeric_mul(1.20,2),numeric_div(1,2)",
+    "SELECT numeric_eq('NaN','NaN'),numeric_ne(1,2),numeric_gt('Infinity',1),numeric_ge(1,1),numeric_lt('-Infinity','NaN'),numeric_le(1,1),numeric_cmp('NaN','Infinity')",
+    "SELECT numeric_inc(1.20),numeric_inc('Infinity'),numeric_uminus('-Infinity'),numeric_uplus(1.00)",
+    "SELECT numeric_smaller(1.0,1.000),numeric_larger(1.0,1.000),numeric_smaller('NaN','Infinity'),numeric_larger('-Infinity',0)",
+    "SELECT numeric_eq(NULL,1),numeric_cmp(1,NULL),numeric_inc(NULL),numeric_smaller(NULL,1),numeric_uminus(NULL)",
+    "SELECT numeric_eq(1::float8,1),numeric_inc(1::float8)",
     # PostgreSQL numeric.sql division and carry/borrow regression cases.
     "SELECT 999999999999999999999::numeric/1000000000000000000000,div(999999999999999999999::numeric,1000000000000000000000),mod(999999999999999999999::numeric,1000000000000000000000)",
     "SELECT div(-9999999999999999999999::numeric,1000000000000000000000),mod(-9999999999999999999999::numeric,1000000000000000000000),div(-9999999999999999999999::numeric,1000000000000000000000)*1000000000000000000000+mod(-9999999999999999999999::numeric,1000000000000000000000)",

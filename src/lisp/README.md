@@ -296,6 +296,18 @@ corresponding `abs` implementation and return their argument type. The
 `round`, `trunc`, `sqrt`, `exp`, `ln`, and `log10`, respectively. These
 catalog names remain distinct function identities during expression analysis.
 
+The numeric catalog helpers `numeric_eq`, `numeric_ne`, `numeric_gt`,
+`numeric_ge`, `numeric_lt`, and `numeric_le` compare two numeric arguments and
+return boolean; `numeric_cmp` returns -1, 0, or 1. Their ordering places
+negative infinity below finite values, positive infinity above them, and NaN
+above positive infinity; NaN compares equal to NaN. `numeric_smaller` and
+`numeric_larger` return the selected numeric argument. On equality they return
+the second argument, preserving its display scale: for example,
+`numeric_smaller(1.0, 1.000)` displays `1.000`. `numeric_inc` adds one,
+`numeric_uminus` negates, and `numeric_uplus` returns its argument. These
+helpers accept arguments implicitly coercible to numeric, are strict (a NULL
+argument yields NULL), and are treated as immutable.
+
 Floating-point math also includes `pi`, `degrees`, `radians`, `cbrt`/`dcbrt`,
 `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`, and `atan2`; the
 degree-based variants are `sind`, `cosd`, `tand`, `cotd`, `asind`, `acosd`,
