@@ -121,6 +121,26 @@ this function refuses a silent change to an already registered root."
         (sb-sys:without-interrupts (physical-retained-root-install owner reference)))
       id)))
 
+(defun call-with-physical-retained-root-reader (function owner directory identity expected)
+  (unless (and (functionp function) owner (typep expected '(unsigned-byte 64)))
+    (error "retained WAL reader requires an owner and selected root"))
+  (let ((directory (physical-retained-root-directory directory))
+        (identity (physical-retained-root-copy-identity identity))
+        (reader (gensym "ARCHIVE-READER")))
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+             (let ((current (gethash owner *physical-retained-root-references*)))
+               (physical-retained-root-check-context current directory identity)
+               (unless (and current
+                            (eql expected (physical-retained-root-reference-root-id current))
+                            (not (gethash owner *physical-retained-root-updates*)))
+                 (error "retained WAL reader selection is absent, stale or uncertain"))
+               (sb-sys:without-interrupts (physical-retained-root-install reader current))))
+           (funcall function))
+      (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+        (physical-retained-root-install reader nil)))))
+
 (defun physical-retained-root-drop-hold (hold state)
   "Retire HOLD and its owner update under the archive mutex."
   (physical-retained-root-require-lock)

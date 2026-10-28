@@ -24,6 +24,87 @@
         (unless (member (length bytes) '(0 8)) (error "invalid test control length"))
         (unless (zerop (length bytes)) (pg::wal-u64 bytes 0))))))
 
+(deftest retained-root-reader-protects-retired-control-until-unwind
+    (with-retained-root-registry
+        (call-with-retained-inventory
+         (lambda (root images identity history text)
+           (let* ((owner (gensym "CONTROL"))
+                  (id (pg::physical-retained-inventory-publish root identity 2 text images)))
+             (retained-root-save-control root id)
+             (pg::physical-retained-root-register owner root id identity history)
+             (ok (eq :left
+                     (catch 'leave
+                       (pg::call-with-physical-retained-root-reader
+                        (lambda ()
+                          (ng (sb-thread:holding-mutex-p pg::*physical-retained-inventory-publish-lock*))
+                          (retained-root-save-control root nil)
+                          (pg::physical-retained-root-retire
+                           owner root id identity (lambda () (retained-root-read-control root)))
+                          (ng (pg::physical-retained-root-delete-unprotected root :inventory id))
+                          (let ((index (pg::physical-retained-inventory-load root id identity history)))
+                            (dolist (entry (getf index :entries))
+                              (ng (pg::physical-retained-root-delete-unprotected root :extent (first entry)))))
+                          (throw 'leave :left))
+                        owner root identity id))))
+             (ok (zerop (hash-table-count pg::*physical-retained-root-references*)))
+             (ok (pg::physical-retained-root-delete-unprotected root :inventory id)))))))
+
+(cl-spec:defproperty retained-reader-preserves-root-zero-and-releases-on-exit
+    ((id (range integer 0 18446744073709551615)) (abort boolean))
+  (:about pg::call-with-physical-retained-root-reader)
+  (:trials (:normal 100))
+  (with-retained-root-registry
+      (with-physical-store-directory (root)
+        (let* ((owner (gensym))
+               (identity (list :system-id 42 :base-timeline 1 :base 32 :manifest-digest 7))
+               (reference (pg::physical-retained-root-make-reference
+                           (pg::physical-retained-root-directory root) identity id nil))
+               (seen nil))
+          (setf (gethash owner pg::*physical-retained-root-references*) reference)
+          (handler-case
+              (pg::call-with-physical-retained-root-reader
+               (lambda ()
+                 (setf seen
+                       (and (= 2 (hash-table-count pg::*physical-retained-root-references*))
+                            (pg::physical-retained-root-protected-p root :inventory id)))
+                 (when abort (error "reader exit"))
+                 (values :read id))
+               owner root identity id)
+            (error () nil))
+          (and seen (= 1 (hash-table-count pg::*physical-retained-root-references*))
+               (eq reference (gethash owner pg::*physical-retained-root-references*)))))))
+
+(deftest generated-retained-reader-lifetime
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'retained-reader-preserves-root-zero-and-releases-on-exit :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest retained-root-reader-rejects-stale-foreign-and-uncertain-selection
+    (with-retained-root-registry
+        (call-with-retained-inventory
+         (lambda (root images identity history text)
+           (let* ((owner (gensym))
+                  (id (pg::physical-retained-inventory-publish root identity 2 text images))
+                  (calls 0)
+                  (read (lambda () (incf calls))))
+             (ok (signals (pg::call-with-physical-retained-root-reader
+                           read owner root identity id) 'error))
+             (pg::physical-retained-root-register owner root id identity history)
+             (ok (signals (pg::call-with-physical-retained-root-reader
+                           read owner root identity (logxor id 1)) 'error))
+             (let ((foreign (copy-list identity)))
+               (incf (getf foreign :manifest-digest))
+               (ok (signals (pg::call-with-physical-retained-root-reader
+                             read owner root foreign id) 'error)))
+             (unwind-protect
+                  (progn
+                    (setf (gethash owner pg::*physical-retained-root-updates*) t)
+                    (ok (signals (pg::call-with-physical-retained-root-reader
+                                  read owner root identity id) 'error)))
+               (remhash owner pg::*physical-retained-root-updates*))
+             (ok (zerop calls))
+             (ok (= 1 (hash-table-count pg::*physical-retained-root-references*))))))))
+
 (deftest retained-root-hold-transfers-to-selected-reference
     (with-retained-root-registry
         (call-with-retained-inventory
