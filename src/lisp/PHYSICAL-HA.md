@@ -332,9 +332,8 @@ Tests cover a source on timeline 3 preparing the immediate 1-to-2 transition,
 then a fresh pin for 2-to-3. The full run passed 739 physical tests with no
 failures or pending tests and 170 interop tests; the physical result was recovered
 from the same worker's suite report after the tool transport timed out. A fresh
-private-cache strict compile also passed. This helper does not yet provide native
-`PREPARE_FOLLOW` on the wire, receiver binding or startup reconciliation, and does
-not establish general multi-fork onboarding.
+private-cache strict compile also passed. This helper alone does not establish
+general multi-fork onboarding.
 
 The source reader now uses the committed source's authenticated retained root
 for logical coverage from its base through its fixed fork, and current-source WAL
@@ -379,9 +378,24 @@ Validation then passed 580 physical tests, 170 interop tests, 1,598 legacy check
 and strict fresh-cache compilation. The new codec property passes 200 trials;
 the existing source-pin codec property passes 100, both with seed 42.
 
-Source preparation remains a private control operation. A network
-`PREPARE_FOLLOW` command, receiver source-binding publication, and a client
-CopyDone/timeline-switch loop remain open, as do recovery connection settings,
+Native `PREPARE_FOLLOW SLOT name` now accepts exactly the negotiated native
+format and ten receiver coordinate fields. The source supplies its own history
+and immediate end-of-recovery bytes, then returns one 15-column row after the
+pin is durably ready. Timeline columns use INT8; identifiers, unsigned values,
+LSNs, history and hexadecimal end-of-recovery bytes use text. Generic options and
+the timeline result follow C conventions, but the command and WAL format are
+native; there is no format version bump or C physical compatibility.
+
+The full run passed 746 physical tests with no failures or pending tests and 170
+interop tests, plus a fresh private-cache strict compile. The physical result was
+recovered from the same idle worker's suite report after the 300-second transport
+timeout. Native acceptance checked typed rows, independent overlap, EOR and
+history, nine rejections without a pin, actual reload, new pins and SIGKILL retry
+(`/tmp/pg-prepare-wire-oracle-native.log`, artifacts
+`/tmp/pg-operation-parking.POuxIX`).
+
+Receiver source-binding publication, the client CopyDone/timeline-switch loop
+and startup reconciliation remain open, as do recovery connection settings,
 full slot contracts and synchronous durability.
 An acknowledgment-loss oracle and garbage collection also remain open; C physical
 compatibility remains separately staged. Coordination is outside this goal.

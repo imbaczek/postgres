@@ -244,9 +244,12 @@ The existing pin keeps any confirmation already advanced."
 
 (defun physical-source-follow-prepare (name request)
   "Prepare a ready source pin from receiver coordinates.
-Reuse an exact live anchor when present. If descriptor capture fails, retry the
-lookup to handle a concurrent preparation; otherwise propagate the failure.
-Reservation and proof check retention again after capture."
+Reuse an exact live anchor when present. After descriptor capture fails, retry
+the lookup for a concurrent preparation. If there is no match, translate a generic
+capture failure to invalid input only while WAL is healthy; preserve PostgreSQL
+and WAL validation errors and poisoned WAL failures. Reservation and proof
+revalidate retention after capture and remain outside that error mapping, so an
+ambiguous READY save is not reported as a reseed request."
   (unless (wal-valid-replication-slot-name-p name)
     (wal-invalid-input "invalid physical follow pin name"))
   (physical-follow-check-plist

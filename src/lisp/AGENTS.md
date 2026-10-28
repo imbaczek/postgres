@@ -200,6 +200,12 @@ appropriate instead of replacing the native C peer or adding a message relay.
   `readtable: "standard"` override for both reading and structural patching.
   This allowed edits without rewriting existing reader forms. It does not solve
   the separate `#.` restriction when reader evaluation is disabled.
+- Valid SBCL `#\Null` can be rejected by Eclector. A parent `standard` or
+  `cl-mcp-syntax-only` read also failed when the PG package was absent there,
+  despite being loaded in the worker. A proven recovery is to load
+  `cl-mcp/src/lisp-patch-form` in the PG worker and call its exported structural
+  `lisp-patch-form` with `:readtable :standard`, first as a dry run and then for
+  the edit. It retains structural validation and locking; do not use a raw writer.
 - Balanced parentheses do not establish the intended top-level structure. After
   inserting multiple definitions, inspect the collapsed outline and test names;
   a misplaced close once nested a `deftest` inside another form in this session.

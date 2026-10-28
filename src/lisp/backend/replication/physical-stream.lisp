@@ -85,9 +85,14 @@ Follow mode is explicit; a failed bootstrap request never falls back to it."
     ("source_timeline" :source-timeline :timeline)
     ("receive_timeline" :receive-timeline :timeline) ("receive_lsn" :receive-lsn :lsn)
     ("prefix_digest" :receive-digest :u64) ("overlap_start" :overlap-start :lsn)
-    ("overlap_digest" :overlap-digest :u64)))
+    ("overlap_digest" :overlap-digest :u64))
+  "Ordered receiver option names, anchor keys and wire value kinds for preparation.
+The same order defines the receiver fields in the result row.")
 
 (defun physical-follow-prepare-request (command)
+  "Decode receiver coordinates and check their wire types.
+Timelines must fit a nonzero unsigned 32-bit value; LSNs and other fields use
+their respective wire parsers. Source preparation checks ancestry and proof."
   (cons :version
         (cons 1
               (loop for (name key kind) in *physical-follow-wire-fields*
@@ -100,6 +105,8 @@ Follow mode is explicit; a failed bootstrap request never falls back to it."
                     append (list key value)))))
 
 (defun parse-native-physical-prepare (words)
+  "Parse PREPARE_FOLLOW and require the native format and each receiver field once.
+Reject unknown, duplicate or missing options before preparing a pin."
   (unless (and (>= (length words) 4) (string-equal (second words) "SLOT"))
     (ereport "42601" "expected PREPARE_FOLLOW SLOT name (native options)"))
   (let* ((name (replication-command-identifier (third words)))
@@ -118,6 +125,9 @@ Follow mode is explicit; a failed bootstrap request never falls back to it."
       command)))
 
 (defun physical-follow-prepare-row (command)
+  "Prepare and recheck a live ready pin, then copy its source-owned result.
+WAL input validation errors report 55000; preserve PostgreSQL errors and report
+other preparation failures as XX000."
   (handler-case
       (let ((pin (physical-source-follow-prepare
                   (logical-replication-command-slot-name command)
@@ -147,6 +157,9 @@ Follow mode is explicit; a failed bootstrap request never falls back to it."
     (error (condition) (ereport "XX000" "physical follow preparation failed: ~a" condition))))
 
 (defun prepare-native-physical-follow (stream command)
+  "Return the prepared anchor as one typed row after durable READY.
+Timelines use INT8; identifiers, unsigned values, LSNs, history and hexadecimal
+end-of-recovery bytes use text."
   (let* ((row (physical-follow-prepare-row command))
          (fields (append '(("slot_name" nil :text)) *physical-follow-wire-fields*
                          '(("history" nil :text) ("next_tli" nil :timeline)
