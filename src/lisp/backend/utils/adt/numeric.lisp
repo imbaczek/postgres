@@ -217,6 +217,28 @@ Finite values become SQL decimals; NaN and infinities pass through unchanged."
     (ereport "22003" "value overflows numeric format"))
   (make-sql-decimal coefficient scale))
 
+;; Defined later in backend/access/transam/xact.lisp.
+(declaim (ftype (function () t) check-for-interrupts))
+
+(defun sql-numeric-gcd-lcm (left right lcm-p)
+  "Compute numeric GCD or LCM at the maximum input display scale."
+  (when (or (sql-numeric-special-p left) (sql-numeric-special-p right))
+    (return-from sql-numeric-gcd-lcm :numeric-nan))
+  (let* ((scale (max (sql-numeric-scale left) (sql-numeric-scale right)))
+         (a (* (sql-numeric-coefficient left) (expt 10 (- scale (sql-numeric-scale left)))))
+         (b (* (sql-numeric-coefficient right) (expt 10 (- scale (sql-numeric-scale right)))))
+         (divisor (let ((x (abs a)) (y (abs b)))
+                    (when (< x y) (rotatef x y))
+                    (unless (or (= x y) (zerop y))
+                      (loop while (not (zerop y))
+                            do (check-for-interrupts)
+                               (psetf x y y (rem x y))))
+                    x))
+         (coefficient (if lcm-p
+                          (if (zerop divisor) 0 (abs (* (truncate a divisor) b)))
+                          divisor)))
+    (sql-numeric-result coefficient scale)))
+
 (defun sql-numeric-sqrt (value)
   "Return the square root using numeric.c's result scale and decimal rounding.
 The scale preserves the input display scale and supplies significant digits,

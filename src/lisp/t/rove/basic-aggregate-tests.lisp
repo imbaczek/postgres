@@ -381,6 +381,49 @@
   (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-div-rem-identity :seed 42))))
     (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
+(cl-spec:defproperty numeric-gcd-divides-inputs
+    ((left (range integer -1000000 1000000))
+     (right (range integer -1000000 1000000))
+     (scale (range integer 0 5)))
+  (:about sql-numeric-gcd-lcm)
+  (:trials (:normal 250))
+  (let* ((a (make-sql-decimal left scale))
+         (b (make-sql-decimal right scale))
+         (result (sql-numeric-gcd-lcm a b nil))
+         (multiple (sql-numeric-gcd-lcm a b t))
+         (divisor (sql-numeric-coefficient result)))
+    (and (= (sql-numeric-scale result) scale)
+         (= (sql-numeric-scale multiple) scale)
+         (not (minusp divisor))
+         (= divisor (gcd left right))
+         (= (* divisor (sql-numeric-coefficient multiple)) (abs (* left right)))
+         (if (zerop divisor) (and (zerop left) (zerop right))
+             (and (zerop (rem left divisor)) (zerop (rem right divisor)))))))
+
+(rove:deftest numeric-gcd-lcm-factorial
+    (dolist (case '(("SELECT gcd(24,18)::text" "6")
+                    ("SELECT lcm(-24,18)::text" "72")
+                    ("SELECT gcd(1.20::numeric,0.45::numeric)::text" "0.15")
+                    ("SELECT lcm(1.20::numeric,0.45::numeric)::text" "3.60")
+                    ("SELECT factorial(10)::text" "3628800")
+                    ("SELECT factorial(0)::text" "1")
+                    ("SELECT gcd('Infinity'::numeric,1)::text" "NaN")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case)))
+  (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-gcd-divides-inputs :seed 42))))
+    (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(rove:deftest numeric-gcd-lcm-cancellation
+    (dolist (lcm-p '(nil t))
+      (let ((*backend* (make-backend)))
+        (setf (backend-cancel-pending *backend*) t)
+        (let ((condition (handler-case
+                             (progn (sql-numeric-gcd-lcm (make-sql-decimal 55 0)
+                                                         (make-sql-decimal 34 0) lcm-p)
+                                    nil)
+                           (pg-error (error) error))))
+          (rove:ok (and condition (string= (pg-error-sqlstate condition) "57014")))
+          (rove:ok (null (backend-cancel-pending *backend*)))))))
+
 (cl-spec:defproperty numeric-rounding-is-symmetric
     ((coefficient (range integer -10000000 10000000))
      (input-scale (range integer 0 6))

@@ -244,6 +244,14 @@ for division, infinity divided by infinity is NaN and a finite value divided
 by infinity is zero. For remainder, infinity modulo a nonzero value is NaN,
 and a finite value modulo infinity is the finite value.
 
+`gcd(x, y)` and `lcm(x, y)` accept integer or numeric inputs and return a
+nonnegative result. Integer results retain the resolved integer type and report
+`22003` on overflow. Numeric results retain the larger input scale; a NaN or
+infinity input produces NaN. Two unknown arguments, or two smallint arguments,
+are ambiguous. `factorial(x)` accepts a bigint-coercible argument and returns
+numeric; negative arguments and arguments above 32177 raise `22003`. These
+functions return NULL when any argument is NULL.
+
 Exponentiation is available as `base ^ exponent`, `power(base, exponent)`,
 `pow(base, exponent)`, `numeric_power(base, exponent)`, and `dpow(base, exponent)`.
 `^` associates left to right and binds more tightly than multiplication and

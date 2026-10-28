@@ -431,27 +431,40 @@ including unknown literals."
 (defun numeric-arithmetic-function-p (name)
   "Recognize immutable numeric arithmetic function names."
   (member name '("div" "mod" "numeric_div_trunc" "numeric_mod"
-                 "numeric_add" "numeric_sub" "numeric_mul" "numeric_div")
+                 "numeric_add" "numeric_sub" "numeric_mul" "numeric_div" "gcd" "lcm" "factorial")
           :test #'string=))
 
 (defun analyze-numeric-arithmetic-function (name args)
   "Resolve two-argument arithmetic functions using the supported catalog overloads.
-MOD selects numeric or the widest known integer type; two unknown arguments are
+MOD, GCD and LCM select numeric or the widest known integer type; two unknown
+arguments are ambiguous. GCD and LCM also reject two smallint arguments as
 ambiguous. The other names resolve to numeric, subject to implicit coercion."
   (unless (= (length args) 2)
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
   (let* ((known (remove-if #'in-unknown-constant-p args))
-         (type (cond ((not (string= name "mod")) :numeric)
+         (type (cond ((not (member name '("mod" "gcd" "lcm") :test #'string=)) :numeric)
                      ((null known) (ereport "42725" "function ~a(~a) is not unique" name (call-signature args)))
                      ((some (lambda (arg) (eq (expr-type arg) :numeric)) known) :numeric)
                      ((some (lambda (arg) (eq (expr-type arg) :int8)) known) :int8)
                      ((some (lambda (arg) (eq (expr-type arg) :int4)) known) :int4)
+                     ((and (not (string= name "mod"))
+                           (every (lambda (arg) (eq (expr-type arg) :int2)) known))
+                      (ereport "42725" "function ~a(~a) is not unique" name (call-signature args)))
                      (t :int2))))
     (unless (every (lambda (arg) (or (in-unknown-constant-p arg)
                                      (sql-implicit-coercion-p (expr-type arg) type))) args)
       (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
     (list :func name (mapcar (lambda (arg) (coerce-common-expression arg type)) args)
           :type type :typmod -1)))
+
+(defun analyze-factorial-function (name args)
+  "Resolve factorial's single bigint argument and numeric result."
+  (unless (and (= (length args) 1)
+               (or (in-unknown-constant-p (first args))
+                   (sql-implicit-coercion-p (expr-type (first args)) :int8)))
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+  (list :func name (list (coerce-common-expression (first args) :int8))
+        :type :numeric :typmod -1))
 
 (defun analyze-log-function (name args)
   "Resolve one-argument or numeric two-argument logarithm overloads."
@@ -510,6 +523,7 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
        (analyze-power-function name args))
       ((member name '("scale" "min_scale" "trim_scale") :test #'string=)
        (analyze-numeric-scale-function name args))
+      ((string= name "factorial") (analyze-factorial-function name args))
       ((numeric-arithmetic-function-p name)
        (analyze-numeric-arithmetic-function name args))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
@@ -2357,13 +2371,39 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
          (current-database) *current-snapshot*))))
     (t (ereport "42883" "function ~a(...) does not exist" name))))
 
+(defun sql-integer-gcd-lcm (left right type lcm-p)
+  "Compute integer GCD or LCM, checking the result against TYPE's range."
+  (let* ((divisor (gcd left right))
+         (result (if lcm-p
+                     (if (zerop divisor) 0 (abs (* (truncate left divisor) right)))
+                     divisor))
+         (maximum (if (eq type :int4) +int4-max+ +int8-max+)))
+    (when (> result maximum)
+      (ereport "22003" "~a out of range" (if (eq type :int4) "integer" "bigint")))
+    result))
+
+(defun sql-factorial (number)
+  "Compute PostgreSQL's numeric factorial, checking for interrupts."
+  (when (minusp number) (ereport "22003" "factorial of a negative number is undefined"))
+  (when (> number 32177) (ereport "22003" "value overflows numeric format"))
+  (let ((result 1))
+    (loop for factor from 2 to number
+          do (check-for-interrupts)
+             (setf result (* result factor)))
+    (sql-numeric-result result 0)))
+
 (defun eval-numeric-arithmetic-function (name args type)
   "Evaluate strict arithmetic calls on already evaluated, coerced arguments.
 DIV truncates toward zero, integer MOD uses integer remainder, and the numeric
 aliases share the corresponding numeric operator implementation."
   (when (member +null+ args) (return-from eval-numeric-arithmetic-function +null+))
   (let ((left (first args)) (right (second args)))
-    (cond ((member name '("div" "numeric_div_trunc") :test #'string=)
+    (cond ((string= name "factorial") (sql-factorial left))
+          ((member name '("gcd" "lcm") :test #'string=)
+           (if (eq type :numeric)
+               (sql-numeric-gcd-lcm left right (string= name "lcm"))
+               (sql-integer-gcd-lcm left right type (string= name "lcm"))))
+          ((member name '("div" "numeric_div_trunc") :test #'string=)
            (sql-numeric-div-trunc left right))
           ((and (string= name "mod") (member type '(:int2 :int4 :int8)))
            (sql-arith "%" left right))
