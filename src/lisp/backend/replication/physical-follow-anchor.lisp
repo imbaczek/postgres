@@ -282,17 +282,7 @@ ambiguous READY save is not reported as a reseed request."
     (physical-source-follow-ready name anchor)))
 
 (defun physical-source-follow-release-checked (name expected-digest request)
-  "Release a matching pin durably and fence late preparations under the WAL lock.
-REQUEST identifies retaining or ready pins, including lost pins, by exact receiver coordinates
-without reading old WAL; otherwise EXPECTED-DIGEST identifies a ready pin. For
-absence, check REQUEST's system identifier, or fence by name when only the
-digest is available and cannot be checked. Both forms fence the name even on
-absence, preventing a delayed PREPARE from reserving it.
-
-Expected mismatches and busy senders do not fence WAL. Uncertain release I/O
-fences WAL; a full canceled-name set fails before unlink or retention release.
-The receiver must preserve cleanup intent until it can complete the release."
-  (prevent-recovery-primary-operation "physical follow pin release")
+  (check-recovery-available)
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid physical follow pin name"))
   (if request
@@ -304,41 +294,29 @@ The receiver must preserve cleanup intent until it can complete the release."
             (with-wal-critical
               (when (and request (/= (getf request :system-id) (catalog-system-identifier)))
                 (wal-invalid-input "physical follow cleanup belongs to another source"))
-              (let* ((pin (gethash name *physical-source-pins*))
-                     (path (physical-source-pin-path name))
-                     (present (wal-namespace-file-stat path t)))
-                (cond
-                  ((and (null pin) (null present))
-                   (physical-follow-abort-attempt-name name)
-                   (when (uiop:directory-exists-p (physical-source-pin-directory))
-                     (fsync-directory (physical-source-pin-directory)))
-                   :absent)
-                  ((or (null pin) (null present))
-                   (wal-invalid-input "physical follow registry and durable pin disagree"))
-                  ((gethash name *physical-source-senders*) :busy)
-                  ((not (and (physical-follow-pin-p pin)
-                             (or request (physical-follow-pin-ready-p pin))))
-                   (wal-invalid-input "release requires the matching physical follow pin"))
-                  (t
-                   (let* ((bytes (read-bounded-regular-file path (physical-follow-pin-image-limit)))
-                          (disk (progn
-                                  (unless (physical-follow-pin-image-p bytes)
-                                    (wal-invalid-input "durable pin is not a physical follow pin"))
-                                  (physical-follow-pin-decode bytes))))
-                     (unless (and (physical-follow-pin-p disk)
-                                  (or request (physical-follow-pin-ready-p disk))
-                                  (equal name (physical-source-pin-name pin))
-                                  (equal (physical-follow-pin-payload pin) (physical-follow-pin-payload disk))
-                                  (if request
-                                      (loop for (key value) on request by #'cddr
-                                            always (equal value (getf (physical-follow-pin-anchor pin) key)))
-                                      (= expected-digest
-                                         (physical-follow-anchor-digest (physical-follow-pin-anchor pin))
-                                         (physical-follow-anchor-digest (physical-follow-pin-anchor disk)))))
-                       (wal-invalid-input "physical follow release differs from the saved request or durable pin"))
-                     (physical-follow-abort-attempt-name name)
-                     (physical-source-pin-unlink pin)
-                     :released))))))))
+              (let ((registered (gethash name *physical-source-pins*)))
+                (when (and registered (not (physical-follow-pin-p registered)))
+                  (wal-invalid-input "follow cleanup cannot retire a bootstrap pin")))
+              (if (gethash name *physical-source-senders*) :busy
+                  (multiple-value-bind (pin disk) (physical-source-retirement-pins name)
+                    (cond
+                      ((null pin)
+                       (physical-follow-abort-attempt-name name)
+                       (when (uiop:directory-exists-p (physical-source-pin-directory))
+                         (fsync-directory (physical-source-pin-directory)))
+                       :absent)
+                      (t
+                       (unless (and (physical-follow-pin-p pin) (physical-follow-pin-p disk)
+                                    (or request (physical-follow-pin-ready-p pin))
+                                    (if request
+                                        (loop for (key value) on request by #'cddr
+                                              always (equal value (getf (physical-follow-pin-anchor pin) key)))
+                                        (= expected-digest
+                                           (physical-follow-anchor-digest (physical-follow-pin-anchor pin)))))
+                         (wal-invalid-input "physical follow release differs from its immutable identity"))
+                       (physical-follow-abort-attempt-name name)
+                       (physical-source-pin-unlink pin)
+                       :released))))))))
     (when (eq result :busy) (ereport "55006" "physical follow pin has an active sender"))
     result))
 
@@ -350,3 +328,34 @@ A retaining or ready pin, including a lost pin, needs no old WAL for release."
 (defun physical-source-follow-release (name expected-digest)
   "Release a ready follow pin by its canonical immutable anchor checksum."
   (physical-source-follow-release-checked name expected-digest nil))
+
+(declaim (ftype function physical-follow-bootstrap-request-copy))
+
+(defun physical-source-bootstrap-release (name request)
+  (check-recovery-available)
+  (unless (wal-valid-replication-slot-name-p name)
+    (ereport "42602" "invalid physical bootstrap pin name"))
+  (setf request (physical-follow-bootstrap-request-copy request))
+  (let ((result
+          (with-write-lock
+            (with-wal-critical
+              (unless (= (getf request :system-id) (catalog-system-identifier))
+                (wal-invalid-input "bootstrap retirement belongs to another source"))
+              (if (gethash name *physical-source-senders*) :busy
+                  (multiple-value-bind (pin disk) (physical-source-retirement-pins name)
+                    (cond
+                      ((null pin)
+                       (when (uiop:directory-exists-p (physical-source-pin-directory))
+                         (fsync-directory (physical-source-pin-directory)))
+                       :absent)
+                      (t
+                       (when (or (physical-follow-pin-p pin) (physical-follow-pin-p disk))
+                         (wal-invalid-input "bootstrap release cannot delete a follow pin"))
+                       (unless (and (= (getf request :source-timeline) (physical-source-pin-timeline pin))
+                                    (= (getf request :base) (physical-source-pin-consistent-lsn pin))
+                                    (eql (getf request :manifest-digest) (physical-source-pin-manifest-digest pin)))
+                         (wal-invalid-input "bootstrap release differs from its immutable identity"))
+                       (physical-source-pin-unlink pin)
+                       :released))))))))
+    (when (eq result :busy) (ereport "55006" "physical bootstrap pin has an active sender"))
+    result))

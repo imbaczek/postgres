@@ -45,6 +45,16 @@ source history or WAL."
       (wal-invalid-input "invalid receiver follow coordinates"))
     (loop for key in keys append (list key (getf request key)))))
 
+(defun physical-follow-bootstrap-request-copy (request)
+  (let ((keys '(:version :system-id :source-timeline :base :manifest-digest)))
+    (physical-follow-check-plist request keys)
+    (unless (and (eql 1 (getf request :version))
+                 (typep (getf request :source-timeline) '(integer 1 4294967295))
+                 (every (lambda (key) (typep (getf request key) '(unsigned-byte 64)))
+                        '(:system-id :base :manifest-digest)))
+      (error "invalid native bootstrap retirement identity"))
+    (loop for key in keys append (list key (getf request key)))))
+
 (defun physical-follow-anchor-check (request)
   "Validate anchor fields, ancestry and the proposed end-of-recovery record.
 

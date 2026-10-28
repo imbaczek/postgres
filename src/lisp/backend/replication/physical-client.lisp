@@ -270,3 +270,18 @@ The caller must retain cleanup intent if completion is uncertain."
   (pg-client-send-query client (pg-client-native-request-query "RELEASE_FOLLOW" slot coordinates))
   (pg-client-native-read-result client nil "RELEASE_FOLLOW" :command-only t)
   t)
+
+(declaim (ftype function physical-follow-bootstrap-request-copy))
+
+(defun pg-client-native-release-bootstrap-query (slot coordinates)
+  (unless (wal-valid-replication-slot-name-p slot) (error "invalid native bootstrap pin name"))
+  (let ((request (physical-follow-bootstrap-request-copy coordinates)))
+    (format nil
+            "RELEASE_BOOTSTRAP SLOT ~a (native_format '~a', system_id '~d', source_timeline '~d', base_lsn '~a', manifest_digest '~d')"
+            slot +physical-native-format+ (getf request :system-id) (getf request :source-timeline)
+            (wal-format-lsn (getf request :base)) (getf request :manifest-digest))))
+
+(defun pg-client-native-release-bootstrap (client slot coordinates)
+  (pg-client-send-query client (pg-client-native-release-bootstrap-query slot coordinates))
+  (pg-client-native-read-result client nil "RELEASE_BOOTSTRAP" :command-only t)
+  t)

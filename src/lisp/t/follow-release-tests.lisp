@@ -1,5 +1,96 @@
 (in-package #:pg-physical-tests)
 
+(defun bootstrap-retirement-test-pin (name)
+  (pg::make-physical-source-pin
+   :name name :system-id (pg::catalog-system-identifier) :timeline 1 :restart-lsn 0
+   :consistent-lsn 32 :prefix-digest #xCBF29CE484222325 :manifest-digest 77))
+
+(defun bootstrap-retirement-test-request (pin)
+  (list :version 1 :system-id (pg::physical-source-pin-system-id pin)
+        :source-timeline (pg::physical-source-pin-timeline pin)
+        :base (pg::physical-source-pin-consistent-lsn pin)
+        :manifest-digest (pg::physical-source-pin-manifest-digest pin)))
+
+(deftest checked-follow-retirement-works-with-disk-only-pins-on-a-standby
+    (call-with-follow-release-proof
+     (lambda (root anchor pin)
+       (declare (ignore root pin))
+       (let ((pg::*physical-recovery-state* (list :phase 2))
+             (pg::*physical-source-pins* (make-hash-table :test #'equal))
+             (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+             (pg::*wal-insert-timeline* 3)
+             (request (follow-anchor-receiver-request anchor)))
+         (ok (eq (pg::physical-source-follow-abort "release_follow" request) :released))
+         (ok (eq (pg::physical-source-follow-abort "release_follow" request) :absent))
+         (ok (zerop (hash-table-count pg::*physical-source-pins*)))
+         (ng pg::*wal-poisoned*)))))
+
+(deftest checked-bootstrap-retirement-does-not-require-obsolete-wal-or-a-live-registry
+    (call-with-follow-anchor-source
+     (lambda (root anchor eor)
+       (declare (ignore root anchor eor))
+       (let* ((pin (bootstrap-retirement-test-pin "bootstrap_retire"))
+              (request (bootstrap-retirement-test-request pin)))
+         (pg::wal-ensure-directory-durable (pg::physical-source-pin-directory))
+         (pg::physical-source-pin-save pin)
+         (ok (signals (pg::physical-source-bootstrap-release "bootstrap_retire" request) 'error))
+         (ok (probe-file (pg::physical-source-pin-path "bootstrap_retire")))
+         (let ((pg::*physical-recovery-state* (list :phase 2))
+               (pg::*wal-insert-timeline* 3))
+           (ok (eq (pg::physical-source-bootstrap-release "bootstrap_retire" request) :released))
+           (ok (eq (pg::physical-source-bootstrap-release "bootstrap_retire" request) :absent))
+           (ok (null (probe-file (pg::physical-source-pin-path "bootstrap_retire")))))
+         (ng pg::*wal-poisoned*)))))
+
+(deftest checked-bootstrap-retirement-refuses-follow-pins-and-mismatched-identities
+    (call-with-follow-release-proof
+     (lambda (root anchor pin)
+       (declare (ignore root))
+       (let ((request (list :version 1 :system-id (getf anchor :system-id)
+                            :source-timeline (getf anchor :source-timeline) :base (getf anchor :receive-lsn)
+                            :manifest-digest (getf anchor :manifest-digest))))
+         (ok (signals (pg::physical-source-bootstrap-release "release_follow" request) 'error))
+         (ok (eq pin (gethash "release_follow" pg::*physical-source-pins*)))
+         (ng pg::*wal-poisoned*)))))
+
+(deftest checked-bootstrap-retirement-preserves-mismatched-or-busy-pins
+    (dolist (kind '(:system-id :source-timeline :base :manifest-digest :sender))
+      (call-with-follow-anchor-source
+       (lambda (root anchor eor)
+         (declare (ignore root anchor eor))
+         (let* ((pin (bootstrap-retirement-test-pin "bootstrap_checked"))
+                (request (bootstrap-retirement-test-request pin)))
+           (pg::wal-ensure-directory-durable (pg::physical-source-pin-directory))
+           (pg::physical-source-pin-save pin)
+           (setf (gethash "bootstrap_checked" pg::*physical-source-pins*) pin
+                 (gethash pin pg::*wal-snapshot-retention-pins*) 0)
+           (if (eq kind :sender)
+               (setf (gethash "bootstrap_checked" pg::*physical-source-senders*) :active)
+               (incf (getf request kind)))
+           (let ((before (lineage-test-bytes (pg::physical-source-pin-path "bootstrap_checked"))))
+             (ok (signals (pg::physical-source-bootstrap-release "bootstrap_checked" request) 'error))
+             (ok (equalp before (lineage-test-bytes (pg::physical-source-pin-path "bootstrap_checked"))))
+             (ok (eq pin (gethash "bootstrap_checked" pg::*physical-source-pins*)))
+             (ok (eql 0 (gethash pin pg::*wal-snapshot-retention-pins*)))
+             (ng pg::*wal-poisoned*)))))))
+
+(deftest checked-bootstrap-wire-is-typed-and-retirement-is-the-only-new-standby-command
+    (let* ((request '(:version 1 :system-id 42 :source-timeline 1 :base 32 :manifest-digest 77))
+           (query (pg::pg-client-native-release-bootstrap-query "bootstrap_retire" request))
+           (command (pg::parse-replication-command query))
+           (pg::*physical-recovery-state* (list :phase 2))
+           (pg::*physical-recovery-failed-p* nil)
+           (pg::*backend* (pg::make-backend :state :in-progress)))
+      (ok (eq (pg::logical-replication-command-type command) :physical-bootstrap-release))
+      (ok (equal request (pg::physical-bootstrap-release-request command)))
+      (ok (null (pg::validate-replication-command-context command)))
+      (dolist (type '(:physical-start :physical-prepare :create :drop))
+        (ok (equal "25006" (recovery-state-of
+                            (lambda () (pg::validate-replication-command-context
+                                        (pg::make-logical-replication-command :type type)))))))
+      (setf (pg::backend-explicit pg::*backend*) t)
+      (ok (equal "25001" (recovery-state-of (lambda () (pg::validate-replication-command-context command)))))))
+
 (defun call-with-follow-release-proof (function)
   (call-with-follow-anchor-source
    (lambda (root request eor)
@@ -206,6 +297,8 @@
          (let* ((digest (format nil "~d" (pg::physical-follow-anchor-digest request)))
                 (script (namestring (asdf:system-relative-pathname "pg" "t/follow-release-crash-child.lisp")))
                 (argv (list (or (uiop:getenv "SBCL") "sbcl") "--noinform" "--no-sysinit" "--no-userinit" "--script" script)))
+           (pg::wal-ensure-directory-durable (uiop:pathname-directory-pathname (pg::catalog-path)))
+           (pg::wal-atomic-write-bytes (pg::catalog-path) (pg::catalog-image-bytes))
            (multiple-value-bind (output errors status)
                (uiop:run-program (append argv (list (namestring root) (symbol-name point) digest))
                                  :output :string :error-output :string :ignore-error-status t)
@@ -361,7 +454,7 @@
            (pg::*backend* (pg::make-backend :explicit t :state :in-progress)))
       (ok (equal "25001" (recovery-state-of (lambda () (pg::validate-replication-command-context command)))))
       (setf (pg::backend-explicit pg::*backend*) nil pg::*physical-recovery-state* (list :phase 2))
-      (ok (equal "25006" (recovery-state-of (lambda () (pg::validate-replication-command-context command)))))
+      (ok (null (pg::validate-replication-command-context command)))
       (setf (pg::backend-state pg::*backend*) :aborted)
       (ok (equal "25P02" (recovery-state-of (lambda () (pg::validate-replication-command-context command)))))))
 

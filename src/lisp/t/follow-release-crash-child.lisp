@@ -8,6 +8,7 @@
 (defun follow-release-crash-main ()
   (let* ((args (uiop:command-line-arguments))
          (pg::*pgdata* (pathname (first args)))
+         (pg::*catalog* (pg::load-catalog))
          (point (second args))
          (digest (parse-integer (third args)))
          (path (pg::physical-source-pin-path "release_follow"))

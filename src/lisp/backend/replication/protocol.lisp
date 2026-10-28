@@ -182,6 +182,8 @@
 
 (declaim (ftype function parse-native-physical-release release-native-physical-follow))
 
+(declaim (ftype function parse-native-physical-bootstrap-release release-native-physical-bootstrap))
+
 (defun parse-timeline-history-command (words)
   (unless (and (= (length words) 2) (plusp (length (second words)))
                (every (lambda (character) (find character "0123456789")) (second words)))
@@ -206,6 +208,7 @@
       ((equal verb "TIMELINE_HISTORY") (parse-timeline-history-command words))
       ((equal verb "PREPARE_FOLLOW") (parse-native-physical-prepare words))
       ((equal verb "RELEASE_FOLLOW") (parse-native-physical-release words))
+      ((equal verb "RELEASE_BOOTSTRAP") (parse-native-physical-bootstrap-release words))
       ((equal verb "CREATE_REPLICATION_SLOT") (parse-create-replication-slot words))
       ((equal verb "DROP_REPLICATION_SLOT")
        (unless (or (= (length words) 2)
@@ -987,19 +990,20 @@ keepalive's WAL-end field, which may include changes not yet applied."
              (member (logical-replication-command-type command) '(:create :start)))
     (ereport "55000" "logical decoding requires a database connection"))
   ;; All non-read-only commands retain their recovery write guard.
-  (unless (member (logical-replication-command-type command) '(:identify :timeline-history :show))
+  (unless (member (logical-replication-command-type command) '(:identify :timeline-history :show :physical-release :physical-bootstrap-release))
     (prevent-recovery-write "logical replication state change"))
   (when (and (eq (logical-replication-command-type command) :create)
              (eq (logical-replication-command-snapshot-action command) :export)
              (backend-explicit *backend*))
     (ereport "25001" "EXPORT_SNAPSHOT cannot run inside a transaction block"))
-  (when (and (member (logical-replication-command-type command) '(:start :physical-start :physical-prepare :physical-release :timeline-history))
+  (when (and (member (logical-replication-command-type command) '(:start :physical-start :physical-prepare :physical-release :physical-bootstrap-release :timeline-history))
              (backend-explicit *backend*))
     (ereport "25001" "~a cannot run inside a transaction block"
              (case (logical-replication-command-type command)
                (:timeline-history "TIMELINE_HISTORY")
                (:physical-prepare "PREPARE_FOLLOW")
                (:physical-release "RELEASE_FOLLOW")
+               (:physical-bootstrap-release "RELEASE_BOOTSTRAP")
                (otherwise "START_REPLICATION")))))
 
 (defun handle-replication-query-frame (stream type-byte length-bytes payload)
@@ -1036,6 +1040,7 @@ keepalive's WAL-end field, which may include changes not yet applied."
             (:physical-start (start-native-physical-replication stream command))
             (:physical-prepare (prepare-native-physical-follow stream command))
             (:physical-release (release-native-physical-follow stream command))
+            (:physical-bootstrap-release (release-native-physical-bootstrap stream command))
             (:start
              (start-logical-replication
               stream (logical-replication-command-slot-name command)

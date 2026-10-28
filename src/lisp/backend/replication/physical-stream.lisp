@@ -168,6 +168,45 @@ and report unexpected failures as XX000."
     (pg-error (condition) (error condition))
     (error (condition) (ereport "XX000" "physical follow release failed: ~a" condition))))
 
+(defun physical-bootstrap-release-request (command)
+  (let ((timeline (physical-stream-u64 (physical-stream-option command "source_timeline"))))
+    (unless (typep timeline '(integer 1 4294967295))
+      (ereport "22023" "invalid bootstrap source timeline"))
+    (list :version 1 :system-id (physical-stream-u64 (physical-stream-option command "system_id"))
+          :source-timeline timeline :base (parse-replication-lsn (physical-stream-option command "base_lsn"))
+          :manifest-digest (physical-stream-u64 (physical-stream-option command "manifest_digest")))))
+
+(defun parse-native-physical-bootstrap-release (words)
+  (unless (and (>= (length words) 4) (string-equal (second words) "SLOT"))
+    (ereport "42601" "expected RELEASE_BOOTSTRAP SLOT name (native options)"))
+  (let* ((name (replication-command-identifier (third words)))
+         (options (parse-replication-generic-options (nthcdr 3 words)))
+         (keys '("native_format" "system_id" "source_timeline" "base_lsn" "manifest_digest")))
+    (unless (wal-valid-replication-slot-name-p name)
+      (ereport "42602" "invalid physical bootstrap pin name"))
+    (unless (and (= (length keys) (length options))
+                 (every (lambda (key) (= 1 (count key options :key #'car :test #'equal))) keys))
+      (ereport "0A000" "RELEASE_BOOTSTRAP requires exactly the native bootstrap identity"))
+    (let ((command (make-logical-replication-command
+                    :type :physical-bootstrap-release :slot-name name :options options)))
+      (unless (equal +physical-native-format+ (physical-stream-option command "native_format"))
+        (ereport "0A000" "unsupported native physical WAL format"))
+      (physical-bootstrap-release-request command)
+      command)))
+
+(defun release-native-physical-bootstrap (stream command)
+  (handler-case
+      (progn
+        (with-live-operation
+          (physical-source-bootstrap-release
+           (logical-replication-command-slot-name command) (physical-bootstrap-release-request command)))
+        (with-live-operation
+          (send-command-complete stream "RELEASE_BOOTSTRAP")
+          (send-ready-for-query stream (transaction-status-char))))
+    (wal-input-validation-error (condition) (ereport "55000" "~a" condition))
+    (pg-error (condition) (error condition))
+    (error (condition) (ereport "XX000" "physical bootstrap release failed: ~a" condition))))
+
 (defun physical-follow-prepare-row (command)
   "Prepare and recheck a live ready pin, then copy its source-owned result.
 WAL input validation errors report 55000; preserve PostgreSQL errors and report
