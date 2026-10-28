@@ -785,7 +785,7 @@ def check_numeric_prefix_errors(reference, native):
                 sql = f"SELECT {operator} {operand}"
                 outcomes = [peer.observe_numeric_error(sql) for peer in peers]
                 assert all(error is not None and error[0] == state for error in outcomes), (sql, outcomes)
-        for operator in ("&", "|", "#", "<<", ">>"):
+        for operator in ("&", "|", "#", "<<", ">>", "^"):
             for left, right, signature in (("true", "1", f"boolean {operator} integer"),
                                            ("'1'", "true", f"unknown {operator} boolean"),
                                            ("'x'::text", "1", f"text {operator} integer")):
@@ -795,6 +795,37 @@ def check_numeric_prefix_errors(reference, native):
                             "You might need to add explicit type casts.")
                 outcomes = [peer.observe_numeric_error(sql) for peer in peers]
                 assert outcomes == [expected, expected], (sql, outcomes)
+        for left, right, signature in (
+                ("NULL::text", "NULL", "text ^ unknown"),
+                ("NULL", "NULL::boolean", "unknown ^ boolean"),
+                ("true", "'bad'", "boolean ^ unknown"),
+                ("1::oid", "2", "oid ^ integer"),
+                ("1", "ARRAY[2]", "integer ^ integer[]")):
+            sql = f"SELECT {left} ^ {right}"
+            expected = ("42883", f"operator does not exist: {signature}",
+                        "No operator of that name accepts the given argument types.",
+                        "You might need to add explicit type casts.")
+            outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+            assert outcomes == [expected, expected], (sql, outcomes)
+        for name in ("trunc", "pg_catalog.trunc"):
+            for argument in ("'2'", "'bad'", "NULL"):
+                sql = f"SELECT {name}({argument})"
+                expected = ("42725", f"function {name}(unknown) is not unique",
+                            "Could not choose a best candidate function.",
+                            "You might need to add explicit type casts.")
+                outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+                assert outcomes == [expected, expected], (sql, outcomes)
+        for sql, state, message in (
+                ("SELECT missing_power_operand ^ true", "42703",
+                 'column "missing_power_operand" does not exist'),
+                ("SELECT 'bad'::numeric ^ true", "22P02",
+                 'invalid input syntax for type numeric: "bad"'),
+                ("SELECT 'bad' ^ '2'", "22P02",
+                 'invalid input syntax for type double precision: "bad"'),
+                ("SELECT 0 ^ (-1)", "2201F",
+                 "zero raised to a negative power is undefined")):
+            outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+            assert outcomes == [(state, message, None, None)] * 2, (sql, outcomes)
         ambiguous = [("SELECT ~ '1'", "~ unknown"), ("SELECT ~ NULL", "~ unknown")]
         ambiguous.extend((f"SELECT '1' {operator} '2'", f"unknown {operator} unknown")
                          for operator in ("&", "|", "#", "<<", ">>"))
@@ -847,6 +878,36 @@ def check_numeric_prefix_errors(reference, native):
             outcomes = [peer.observe_numeric_error(sql) for peer in peers]
             assert outcomes == [expected, expected], (sql, outcomes)
         print("numeric-operators: exact SQLSTATE/message/detail/hint and coercion order PASS", flush=True)
+    finally:
+        for peer in peers:
+            peer.close()
+
+
+def check_smallint_casts(reference, native):
+    peers = [NumericErrorConnection(port, "smallint-casts") for port in (reference, native)]
+    try:
+        for sql in ("SELECT 32767::bigint::smallint, (-32768)::bigint::smallint",
+                    "SELECT 32766.5::float8::smallint, (-32768.5)::float4::smallint",
+                    "SELECT 32766.5::numeric::smallint, (-32768.4)::numeric::smallint"):
+            outcomes = [peer.observe(sql) for peer in peers]
+            assert outcomes[0] == outcomes[1], (sql, outcomes)
+        for sql, state, message in (
+                ("SELECT 9223372036854775807::bigint::smallint", "22003", "smallint out of range"),
+                ("SELECT (-9223372036854775808)::bigint::smallint", "22003", "smallint out of range"),
+                ("SELECT 1e30::numeric::smallint", "22003", "smallint out of range"),
+                ("SELECT 32767.5::numeric::smallint", "22003", "smallint out of range"),
+                ("SELECT (-32768.5)::numeric::smallint", "22003", "smallint out of range"),
+                ("SELECT 32767.5::float8::smallint", "22003", "smallint out of range"),
+                ("SELECT (-32769)::float4::smallint", "22003", "smallint out of range"),
+                ("SELECT 1e30::float8::smallint", "22003", "smallint out of range"),
+                ("SELECT 1e30::float4::smallint", "22003", "smallint out of range"),
+                ("SELECT 'NaN'::numeric::smallint", "0A000", "cannot convert NaN to smallint"),
+                ("SELECT '-Infinity'::numeric::smallint", "0A000", "cannot convert infinity to smallint"),
+                ("SELECT 'NaN'::float8::smallint", "22003", "smallint out of range"),
+                ("SELECT 'Infinity'::float4::smallint", "22003", "smallint out of range")):
+            outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+            assert outcomes == [(state, message, None, None)] * 2, (sql, outcomes)
+        print("smallint-casts: values and exact errors PASS", flush=True)
     finally:
         for peer in peers:
             peer.close()
@@ -1011,6 +1072,7 @@ if __name__ == "__main__":
     else:
         check(int(sys.argv[1]), int(sys.argv[2]))
         check_numeric_prefix_errors(int(sys.argv[1]), int(sys.argv[2]))
+        check_smallint_casts(int(sys.argv[1]), int(sys.argv[2]))
         check_integer_input_errors(int(sys.argv[1]), int(sys.argv[2]))
         check_numeric_input_errors(int(sys.argv[1]), int(sys.argv[2]))
         check_datestyle_sessions(int(sys.argv[1]), int(sys.argv[2]))

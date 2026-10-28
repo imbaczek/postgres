@@ -608,9 +608,15 @@ then argument types. Only ambiguity and type failures carry the cast hint."
 (defun analyze-basic-numeric-function (name args)
   "Resolve the supported basic numeric overload and coerce its arguments.
 Two-argument round and trunc use numeric and an int4 scale.  Unary abs
-preserves a known input type.  numeric_abs and numeric_sqrt choose numeric;
-the other unary calls choose numeric for numeric inputs and float8 otherwise,
-including unknown literals."
+preserves a known input type.  The numeric_ aliases choose numeric; other
+unary calls choose numeric for numeric inputs and float8 otherwise.  An
+unknown unary trunc argument is ambiguous because its catalog overloads
+include different type categories."
+  ;; trunc also has macaddr/macaddr8 overloads. An unknown unary argument
+  ;; cannot choose a type category even though float8 is preferred numeric.
+  (when (and (string= name "trunc") (= (length args) 1)
+             (in-unknown-constant-p (first args)))
+    (ereport "42725" "function ~a(~a) is not unique" name (call-signature args)))
   (unless (and (if (member name '("round" "trunc") :test #'string=)
                    (member (length args) '(1 2))
                    (= (length args) 1))
@@ -739,7 +745,10 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
     (t (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))))
 
 (defun resolve-power-operands (name args)
-  "Resolve and coerce the two operands of a power function or operator."
+  "Resolve and coerce the two operands of a power function or operator.
+A known numeric operand selects numeric unless a float operand is present;
+otherwise the preferred float8 overload is used.  The catalog aliases dpow
+and numeric_power select their declared types."
   (unless (= (length args) 2)
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
   (let* ((numeric (and (not (string= name "dpow"))
@@ -1648,7 +1657,7 @@ are supported."
             (t (sql-float-from-number value target)))))
   (when (and (member source '(:float4 :float8)) (member target '(:int2 :int4 :int8)))
     (when (or (sb-ext:float-nan-p value) (sb-ext:float-infinity-p value))
-      (ereport "22003" "integer out of range"))
+      (ereport "22003" "~a out of range" (case target (:int2 "smallint") (:int8 "bigint") (t "integer"))))
     (return-from sql-cast-value (sql-cast-value (round value) :int8 target typmod)))
   (when (and (eq source :timestamptz) (member target '(:date :time :timestamp)))
     (setf value (sql-timezone-instant-to-local (sql-session-timezone) value))
@@ -1717,10 +1726,18 @@ are supported."
             (t (ereport "42846" "cannot cast type ~a to bit" source)))))
   (when (and (eq source :bit) (member target '(:int4 :int8)))
     (return-from sql-cast-value (sql-bit-to-integer value (if (eq target :int4) 32 64))))
+  ;; Numeric casts round before checking int2 range; float casts above round
+  ;; through int8, while integer casts check their value directly.  Text uses
+  ;; the int2 input function and its own syntax and range diagnostics.
   (when (eq target :int2)
     (when (member source '(:text :varchar :name))
       (return-from sql-cast-value (sql-cast-integer-input value :int2)))
-    (let ((number (sql-cast-value value source :int4 -1)))
+    (let ((number (cond ((eq source :numeric)
+                         (when (sql-numeric-special-p value)
+                           (ereport "0A000" "cannot convert ~a to smallint"
+                                    (if (eq value :numeric-nan) "NaN" "infinity")))
+                         (sql-numeric-rounded-coefficient value 0))
+                        (t value))))
       (unless (<= -32768 number 32767)
         (ereport "22003" "smallint out of range"))
       (return-from sql-cast-value number)))
@@ -1895,6 +1912,14 @@ candidate selection."
       (ereport "42883" "operator does not exist: ~a ~a ~a"
                (typed-arg-name left) operator (typed-arg-name right)))
     (when (string= operator "^")
+      ;; Resolve the operator before coercing unknowns; retain op_error's
+      ;; diagnostics rather than reporting the corresponding power function.
+      (unless (every (lambda (argument)
+                       (or (in-unknown-constant-p argument)
+                           (member (expr-type argument)
+                                   '(:int2 :int4 :int8 :numeric :float4 :float8))))
+                     (list left right))
+        (report-operator-resolution-error operator (list left right)))
       (multiple-value-bind (arguments type) (resolve-power-operands "power" (list left right))
         (return-from analyze-binop-expression
           (list :binop operator (first arguments) (second arguments)

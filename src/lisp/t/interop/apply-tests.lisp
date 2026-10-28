@@ -151,6 +151,22 @@ ORDER BY 1,2"
                     (observed-query-wire client sql))
             sql))))
 
+(deftest smallint-casts-match-c-reference
+    (with-reference-clients (client reference)
+      (dolist (sql '("SELECT 32767::bigint::smallint, (-32768)::bigint::smallint"
+                     "SELECT 9223372036854775807::bigint::smallint"
+                     "SELECT (-9223372036854775808)::bigint::smallint"
+                     "SELECT 32766.5::float8::smallint, (-32768.5)::float4::smallint"
+                     "SELECT 32766.5::numeric::smallint"
+                     "SELECT 32767.5::numeric::smallint"
+                     "SELECT 1e30::numeric::smallint"
+                     "SELECT 'NaN'::numeric::smallint"
+                     "SELECT 'Infinity'::numeric::smallint"
+                     "SELECT 'NaN'::float8::smallint"
+                     "SELECT '-Infinity'::float4::smallint"))
+        (ok (equalp (observed-query-wire reference sql)
+                    (observed-query-wire client sql)) sql))))
+
 (deftest array-aggregates-match-c-wire
     (with-reference-clients (client reference)
       (progn

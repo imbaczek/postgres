@@ -32,6 +32,33 @@
                       (pg::pg-error-message condition))))))
   (ok (equal "record" (pg::typed-arg-name '(:func "record_probe" nil :type :record)))))
 
+(deftest smallint-casts-check-destination-range
+    (dolist (example '(("SELECT 32767::bigint::smallint" 32767)
+                       ("SELECT (-32768)::bigint::smallint" -32768)
+                       ("SELECT 32766.5::float8::smallint" 32766)
+                       ("SELECT 32766.5::numeric::smallint" 32767)
+                       ("SELECT (-32768.5)::float8::smallint" -32768)))
+      (ok (equalp (list (vector (second example))) (derived-query-rows (first example)))))
+  (dolist (example '(("SELECT 9223372036854775807::bigint::smallint" "22003" "smallint out of range")
+                     ("SELECT (-9223372036854775808)::bigint::smallint" "22003" "smallint out of range")
+                     ("SELECT 1e30::numeric::smallint" "22003" "smallint out of range")
+                     ("SELECT 32767.5::numeric::smallint" "22003" "smallint out of range")
+                     ("SELECT (-32768.5)::numeric::smallint" "22003" "smallint out of range")
+                     ("SELECT 32767.5::float8::smallint" "22003" "smallint out of range")
+                     ("SELECT (-32769)::float4::smallint" "22003" "smallint out of range")
+                     ("SELECT 1e30::float8::smallint" "22003" "smallint out of range")
+                     ("SELECT 1e30::float4::smallint" "22003" "smallint out of range")
+                     ("SELECT 'NaN'::numeric::smallint" "0A000" "cannot convert NaN to smallint")
+                     ("SELECT '-Infinity'::numeric::smallint" "0A000" "cannot convert infinity to smallint")
+                     ("SELECT 'NaN'::float8::smallint" "22003" "smallint out of range")
+                     ("SELECT 'Infinity'::float4::smallint" "22003" "smallint out of range")))
+    (let ((condition (handler-case (derived-query-rows (first example))
+                       (pg::pg-error (condition) condition))))
+      (ok (typep condition 'pg::pg-error))
+      (when (typep condition 'pg::pg-error)
+        (ok (equal (second example) (pg::pg-error-sqlstate condition)))
+        (ok (equal (third example) (pg::pg-error-message condition)))))))
+
 (deftest boolean-short-circuit-skips-recovery-only-function
     ;; On a primary this function raises 55000 if evaluated.
     (let ((pg::*physical-recovery-state* nil))

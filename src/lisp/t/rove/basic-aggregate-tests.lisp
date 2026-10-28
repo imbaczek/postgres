@@ -633,6 +633,86 @@
   (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-power-small-integers :seed 42))))
     (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
+(cl-spec:defproperty power-operator-resolution-diagnostic-fields
+    ((invalid (member "true" "'x'::text" "NULL::text" "1::oid" "ARRAY[1]"))
+     (invalid-left (member nil t))
+     (other (member "2" "'bad'" "NULL")))
+  (:about analyze-binop-expression)
+  (:trials (:normal 50))
+  (let* ((left (if invalid-left invalid other))
+         (right (if invalid-left other invalid))
+         (sql (format nil "SELECT ~a ^ ~a" left right))
+         (statement (first (parse-statements sql)))
+         (raw (getf (first (getf statement :targets)) :expr))
+         (arguments (list (analyze-expr (third raw) nil)
+                          (analyze-expr (fourth raw) nil)))
+         (condition (handler-case (progn (subquery-test-rows sql) nil)
+                      (pg-error (error) error))))
+    (and condition
+         (equal (pg-error-sqlstate condition) "42883")
+         (equal (pg-error-message condition)
+                (format nil "operator does not exist: ~a ^ ~a"
+                        (if (in-unknown-constant-p (first arguments))
+                            "unknown" (typed-arg-name (first arguments)))
+                        (if (in-unknown-constant-p (second arguments))
+                            "unknown" (typed-arg-name (second arguments)))))
+         (equal (pg-error-detail condition)
+                "No operator of that name accepts the given argument types.")
+         (equal (pg-error-hint condition)
+                "You might need to add explicit type casts."))))
+
+(rove:deftest power-operator-resolution-diagnostics
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'power-operator-resolution-diagnostic-fields :seed 42))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data)))
+  ;; Analyze operands first; coerce unknowns only after a candidate resolves.
+  (dolist (case '(("SELECT missing_power_operand ^ true" "42703"
+                   "column \"missing_power_operand\" does not exist")
+                  ("SELECT 'bad'::numeric ^ true" "22P02"
+                   "invalid input syntax for type numeric: \"bad\"")
+                  ("SELECT 'bad' ^ '2'" "22P02"
+                   "invalid input syntax for type double precision: \"bad\"")
+                  ("SELECT 0 ^ (-1)" "2201F"
+                   "zero raised to a negative power is undefined")))
+    (let ((condition (handler-case (progn (subquery-test-rows (first case)) nil)
+                       (pg-error (error) error))))
+      (rove:ok (and condition
+                    (equal (pg-error-sqlstate condition) (second case))
+                    (equal (pg-error-message condition) (third case)))
+               (first case))))
+  (dolist (sql '("SELECT DISTINCT x ^ 2 FROM (SELECT 4 AS x) s ORDER BY power(x,2)"
+                 "SELECT DISTINCT power(x,2) FROM (SELECT 4 AS x) s ORDER BY x ^ 2"))
+    (let ((condition (handler-case (progn (subquery-test-rows sql) nil)
+                       (pg-error (error) error))))
+      (rove:ok (and condition (equal (pg-error-sqlstate condition) "42P10")) sql))))
+
+(cl-spec:defproperty trunc-unknown-resolution-ambiguity
+    ((argument (member "'2'" "'bad'" "NULL"))
+     (qualified (member nil t)))
+  (:about analyze-basic-numeric-function)
+  (:trials (:normal 20))
+  (let* ((name (if qualified "pg_catalog.trunc" "trunc"))
+         (sql (format nil "SELECT ~a(~a)" name argument))
+         (condition (handler-case (progn (subquery-test-rows sql) nil)
+                      (pg-error (error) error))))
+    (and condition
+         (equal (pg-error-sqlstate condition) "42725")
+         (equal (pg-error-message condition)
+                (format nil "function ~a(unknown) is not unique" name))
+         (equal (pg-error-detail condition) "Could not choose a best candidate function.")
+         (equal (pg-error-hint condition) "You might need to add explicit type casts."))))
+
+(rove:deftest trunc-unknown-resolution
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'trunc-unknown-resolution-ambiguity :seed 42))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data)))
+  (dolist (case '(("SELECT trunc('2',1)::text" "2.0")
+                  ("SELECT trunc('2'::float8)::text" "2")
+                  ("SELECT trunc('2'::numeric)::text" "2")
+                  ("SELECT round('2')::text" "2")))
+    (rove:ok (equal (subquery-test-rows (first case)) (list (list (second case))))
+             (first case))))
+
 (cl-spec:defproperty numeric-trim-scale-preserves-value
     ((coefficient (range integer -10000000 10000000))
      (scale (range integer 0 10)))
