@@ -895,6 +895,28 @@ def check_numeric_prefix_errors(reference, native):
                         None if wrong_count else "You might need to add explicit type casts.")
             outcomes = [peer.observe_numeric_error(sql) for peer in peers]
             assert outcomes == [expected, expected], (sql, outcomes)
+        for sql, state, message in (
+                ("SELECT nonexistent.abs(NULL)", "3F000", 'schema "nonexistent" does not exist'),
+                ("SELECT public.abs(NULL)", "42883", "function public.abs(unknown) does not exist"),
+                ("SELECT public.random(min=>1,max=>2)", "42883", "function public.random(min => integer, max => integer) does not exist"),
+                ("SELECT public.abs(DISTINCT NULL)", "42883", "function public.abs(unknown) does not exist"),
+                ("SELECT nonexistent.random(x=>1,2)", "42601", "positional argument cannot follow named argument"),
+                ("SELECT public.abs(x=>1,x=>2)", "42601", 'argument name "x" used more than once')):
+            outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+            assert outcomes == [(state, message, None, None)] * 2, (sql, outcomes)
+        sql = "SELECT nonexistent.abs(x=>1,x=>no_such_numeric_argument())"
+        outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+        assert all(error[:2] == ("42883", "function no_such_numeric_argument() does not exist")
+                   for error in outcomes), (sql, outcomes)
+        sql = "SELECT public.abs(1 ORDER BY 1,2)"
+        expected = ("42883", "function public.abs(integer) does not exist",
+                    "No aggregate function matches the given name and argument types.",
+                    "Perhaps you misplaced ORDER BY; ORDER BY must appear after all regular arguments of the aggregate.")
+        outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+        assert outcomes == [expected, expected], (sql, outcomes)
+        sql = "SELECT nonexistent.abs(1 ORDER BY 1,2)"
+        outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+        assert outcomes == [("3F000", 'schema "nonexistent" does not exist', None, None)] * 2, (sql, outcomes)
         print("numeric-operators: exact SQLSTATE/message/detail/hint and coercion order PASS", flush=True)
     finally:
         for peer in peers:

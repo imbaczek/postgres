@@ -984,6 +984,39 @@
                         (equal (pg-error-hint condition) hint))
                    sql)))))
 
+(rove:deftest qualified-numeric-resolution-errors
+    (dolist (case '(("SELECT nonexistent.abs(NULL)" "3F000" "schema \"nonexistent\" does not exist")
+                    ("SELECT public.abs(NULL)" "42883" "function public.abs(unknown) does not exist")
+                    ("SELECT public.random(min=>1,max=>2)" "42883" "function public.random(min => integer, max => integer) does not exist")
+                    ("SELECT public.abs(DISTINCT NULL)" "42883" "function public.abs(unknown) does not exist")
+                    ("SELECT nonexistent.random(x=>1,2)" "42601" "positional argument cannot follow named argument")
+                    ("SELECT public.abs(x=>1,x=>2)" "42601" "argument name \"x\" used more than once")
+                    ("SELECT nonexistent.abs(x=>1,x=>no_such_numeric_argument())" "42883" "function no_such_numeric_argument() does not exist")))
+      (let ((condition (handler-case (progn (subquery-test-rows (first case)) nil)
+                         (pg-error (error) error))))
+        (rove:ok (and condition
+                      (equal (pg-error-sqlstate condition) (second case))
+                      (equal (pg-error-message condition) (third case))
+                      (null (pg-error-detail condition))
+                      (null (pg-error-hint condition)))
+                 (first case)))))
+
+(rove:deftest qualified-numeric-order-diagnostics
+    (let ((condition (handler-case
+                         (progn (subquery-test-rows "SELECT public.abs(1 ORDER BY 1,2)") nil)
+                       (pg-error (error) error))))
+      (rove:ok (and condition
+                    (equal (pg-error-sqlstate condition) "42883")
+                    (equal (pg-error-message condition) "function public.abs(integer) does not exist")
+                    (equal (pg-error-detail condition) "No aggregate function matches the given name and argument types.")
+                    (equal (pg-error-hint condition) "Perhaps you misplaced ORDER BY; ORDER BY must appear after all regular arguments of the aggregate."))))
+  (let ((condition (handler-case
+                       (progn (subquery-test-rows "SELECT nonexistent.abs(1 ORDER BY 1,2)") nil)
+                     (pg-error (error) error))))
+    (rove:ok (and condition (equal (pg-error-sqlstate condition) "3F000")
+                  (equal (pg-error-message condition) "schema \"nonexistent\" does not exist")
+                  (null (pg-error-detail condition)) (null (pg-error-hint condition))))))
+
 (rove:deftest numeric-resolution-preserves-argument-errors
     (dolist (case '(("SELECT pg_catalog.sin(no_such_numeric_argument())"
                      "42883" "function no_such_numeric_argument() does not exist")

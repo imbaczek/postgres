@@ -1038,8 +1038,45 @@ so a nested argument error keeps its own diagnostics."
                      :ambiguous-p (string= (pg-error-sqlstate condition) "42725"))
           (error condition)))))
 
+(defun report-qualified-numeric-call-error (name schema arguments table order)
+  "Report lookup failure for a supported numeric name outside pg_catalog."
+  ;; C transformFuncCall transforms every argument before ParseFuncOrColumn
+  ;; checks named notation; FuncnameGetCandidates then resolves the explicit
+  ;; schema.  Preserve that order even when the schema cannot contain the
+  ;; supported builtin, and retain the uncoerced types for the signature.
+  (let ((args (mapcar (lambda (argument)
+                        (analyze-expr (if (eq (first argument) :named-arg)
+                                          (third argument) argument) table))
+                      arguments))
+        (names nil)
+        (argument-names nil))
+    (dolist (argument arguments)
+      (let ((arg-name (and (eq (first argument) :named-arg) (second argument))))
+        (when (and (null arg-name) names)
+          (ereport "42601" "positional argument cannot follow named argument"))
+        (when (and arg-name (member arg-name names :test #'equal))
+          (ereport "42601" "argument name \"~a\" used more than once" arg-name))
+        (when arg-name (push arg-name names))
+        (push arg-name argument-names)))
+    (unless (member schema '("public" "pg_catalog") :test #'string=)
+      (ereport "3F000" "schema \"~a\" does not exist" schema))
+    ;; ParseFuncOrColumn adds this aggregate hint only for multiple sort keys.
+    (ereport "42883" "function ~a.~a(~a) does not exist"
+             schema name (random-call-signature args (nreverse argument-names))
+             :detail (when (> (length order) 1)
+                       "No aggregate function matches the given name and argument types.")
+             :hint (when (> (length order) 1)
+                     "Perhaps you misplaced ORDER BY; ORDER BY must appear after all regular arguments of the aggregate."))))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
+  (let ((schema (getf (cdddr expr) :schema))
+        (name (second expr)))
+    (when (and schema (not (string= schema "pg_catalog"))
+               (or (numeric-function-p name)
+                   (member name '("random" "setseed") :test #'string=)))
+      (report-qualified-numeric-call-error name schema (third expr) table
+                                           (getf (cdddr expr) :call-order))))
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
          (random-signature nil)
          (args (multiple-value-bind (arguments signature)
