@@ -1,5 +1,22 @@
 (in-package #:pg)
 
+(defvar *physical-follow-aborted-attempts* (make-hash-table :test #'equal))
+
+(defvar *physical-follow-aborted-attempt-limit* 65536)
+
+(defun physical-follow-check-attempt-name (name)
+  "Reject an attempt canceled earlier in this source process. Caller owns WAL exclusion."
+  (when (gethash name *physical-follow-aborted-attempts*)
+    (wal-invalid-input "physical follow attempt was canceled; use a new pin name")))
+
+(defun physical-follow-abort-attempt-name (name)
+  "Fence delayed reservations without evicting an older fence. Caller owns the WAL lock."
+  (unless (gethash name *physical-follow-aborted-attempts*)
+    (unless (< (hash-table-count *physical-follow-aborted-attempts*)
+               *physical-follow-aborted-attempt-limit*)
+      (wal-invalid-input "physical follow canceled-attempt limit reached; source restart is required"))
+    (setf (gethash (copy-seq name) *physical-follow-aborted-attempts*) t)))
+
 (defun physical-follow-pin-check-live (pin)
   "Require a healthy primary and the same live, retained pin under the WAL lock."
   (wal-check-healthy)
@@ -48,6 +65,7 @@ pin; an ambiguous save fences the source and keeps retention until restart."
       (prevent-recovery-primary-operation "physical follow anchor reservation")
       (with-write-lock
         (with-wal-critical
+          (physical-follow-check-attempt-name name)
           (let ((existing (gethash name *physical-source-pins*)))
             (when existing
               (unless (and (physical-follow-pin-p existing)
@@ -183,16 +201,7 @@ before publishing the ready state in memory; a save failure fences the source."
 Read the exact end-of-recovery record for the receiver's immediate next timeline
 under WAL exclusion. The provisional pin is only a read context; it is never
 registered or serialized. Reservation and proof revalidate retention afterward."
-  (physical-follow-check-plist
-   request (remove-if (lambda (key) (member key '(:history-text :eor-octets)))
-                      *physical-follow-anchor-keys*))
-  (unless (and (eql 1 (getf request :version))
-               (every (lambda (key) (typep (getf request key) '(unsigned-byte 64)))
-                      '(:system-id :base :manifest-digest :receive-lsn :receive-digest
-                        :overlap-start :overlap-digest))
-               (every (lambda (key) (typep (getf request key) '(integer 1 4294967295)))
-                      '(:base-timeline :source-timeline :receive-timeline)))
-    (wal-invalid-input "invalid receiver follow coordinates"))
+  (setf request (physical-follow-request-copy request))
   (with-live-operation
     (prevent-recovery-primary-operation "physical follow source descriptor")
     (sb-thread:with-mutex (*wal-lock*)
@@ -233,6 +242,7 @@ The existing pin keeps any confirmation already advanced."
     (prevent-recovery-primary-operation "physical follow preparation")
     (sb-thread:with-mutex (*wal-lock*)
       (wal-check-healthy)
+      (physical-follow-check-attempt-name name)
       (let ((pin (gethash name *physical-source-pins*)))
         (when pin
           (unless (and (physical-follow-pin-p pin)
@@ -252,9 +262,7 @@ revalidate retention after capture and remain outside that error mapping, so an
 ambiguous READY save is not reported as a reseed request."
   (unless (wal-valid-replication-slot-name-p name)
     (wal-invalid-input "invalid physical follow pin name"))
-  (physical-follow-check-plist
-   request (remove-if (lambda (key) (member key '(:history-text :eor-octets)))
-                      *physical-follow-anchor-keys*))
+  (setf request (physical-follow-request-copy request))
   (let ((anchor
           (or (physical-source-follow-existing-anchor name request)
               (handler-case (physical-source-follow-anchor request)
@@ -266,51 +274,65 @@ ambiguous READY save is not reported as a reseed request."
                           (wal-invalid-input
                            "physical follow source WAL is unavailable; reseed is required: ~a"
                            condition))))))))
+    (physical-source-pin-test-point :after-follow-anchor-capture nil)
     (physical-source-follow-ready name anchor)))
 
-(defun physical-source-follow-release (name expected-digest)
-  "Release the ready follow pin named by NAME and EXPECTED-DIGEST.
-Require matching registered and durable pins, their complete payloads and no
-sender. A lost ready pin can be released without reading WAL. If both the registry entry and file
-are absent, sync the existing directory and succeed; a one-sided absence fails.
-Expected identity and state mismatches do not poison WAL. Corrupt or unreadable
-durable metadata fences the source. Report a busy sender after releasing locks.
-The caller decides when retirement is safe; automated handoff is not integrated."
+(defun physical-source-follow-release-checked (name expected-digest request)
+  "Delete the matching pin durably and fence late preparations of its attempt name."
   (prevent-recovery-primary-operation "physical follow pin release")
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid physical follow pin name"))
-  (unless (typep expected-digest '(unsigned-byte 64))
-    (ereport "22023" "invalid physical follow anchor digest"))
+  (if request
+      (setf request (physical-follow-request-copy request))
+      (unless (typep expected-digest '(unsigned-byte 64))
+        (ereport "22023" "invalid physical follow anchor digest")))
   (let ((result
           (with-write-lock
             (with-wal-critical
+              (when (and request (/= (getf request :system-id) (catalog-system-identifier)))
+                (wal-invalid-input "physical follow cleanup belongs to another source"))
               (let* ((pin (gethash name *physical-source-pins*))
                      (path (physical-source-pin-path name))
                      (present (wal-namespace-file-stat path t)))
                 (cond
                   ((and (null pin) (null present))
+                   (physical-follow-abort-attempt-name name)
                    (when (uiop:directory-exists-p (physical-source-pin-directory))
                      (fsync-directory (physical-source-pin-directory)))
                    :absent)
                   ((or (null pin) (null present))
                    (wal-invalid-input "physical follow registry and durable pin disagree"))
                   ((gethash name *physical-source-senders*) :busy)
-                  ((not (and (physical-follow-pin-p pin) (physical-follow-pin-ready-p pin)))
-                   (wal-invalid-input "release requires a ready physical follow pin"))
+                  ((not (and (physical-follow-pin-p pin)
+                             (or request (physical-follow-pin-ready-p pin))))
+                   (wal-invalid-input "release requires the matching physical follow pin"))
                   (t
                    (let* ((bytes (read-bounded-regular-file path (physical-follow-pin-image-limit)))
                           (disk (progn
                                   (unless (physical-follow-pin-image-p bytes)
                                     (wal-invalid-input "durable pin is not a physical follow pin"))
                                   (physical-follow-pin-decode bytes))))
-                     (unless (and (physical-follow-pin-p disk) (physical-follow-pin-ready-p disk)
+                     (unless (and (physical-follow-pin-p disk)
+                                  (or request (physical-follow-pin-ready-p disk))
                                   (equal name (physical-source-pin-name pin))
-                                  (= expected-digest
-                                     (physical-follow-anchor-digest (physical-follow-pin-anchor pin))
-                                     (physical-follow-anchor-digest (physical-follow-pin-anchor disk)))
-                                  (equal (physical-follow-pin-payload pin) (physical-follow-pin-payload disk)))
-                       (wal-invalid-input "physical follow release differs from the saved anchor or durable pin"))
+                                  (equal (physical-follow-pin-payload pin) (physical-follow-pin-payload disk))
+                                  (if request
+                                      (loop for (key value) on request by #'cddr
+                                            always (equal value (getf (physical-follow-pin-anchor pin) key)))
+                                      (= expected-digest
+                                         (physical-follow-anchor-digest (physical-follow-pin-anchor pin))
+                                         (physical-follow-anchor-digest (physical-follow-pin-anchor disk)))))
+                       (wal-invalid-input "physical follow release differs from the saved request or durable pin"))
+                     (physical-follow-abort-attempt-name name)
                      (physical-source-pin-unlink pin)
                      :released))))))))
     (when (eq result :busy) (ereport "55006" "physical follow pin has an active sender"))
     result))
+
+(defun physical-source-follow-abort (name request)
+  "Cancel a prepared or unacknowledged attempt using its exact receiver coordinates."
+  (physical-source-follow-release-checked name nil request))
+
+(defun physical-source-follow-release (name expected-digest)
+  "Release a ready follow pin by its canonical immutable anchor checksum."
+  (physical-source-follow-release-checked name expected-digest nil))

@@ -29,6 +29,20 @@ eligibility for a future follow path; bootstrap START does not accept this pin."
                       keys))
     (error "invalid physical follow pin fields")))
 
+(defun physical-follow-request-copy (request)
+  "Check and copy the receiver coordinates without requiring source history or WAL."
+  (let ((keys (remove-if (lambda (key) (member key '(:history-text :eor-octets)))
+                         *physical-follow-anchor-keys*)))
+    (physical-follow-check-plist request keys)
+    (unless (and (eql 1 (getf request :version))
+                 (every (lambda (key) (typep (getf request key) '(unsigned-byte 64)))
+                        '(:system-id :base :manifest-digest :receive-lsn :receive-digest
+                          :overlap-start :overlap-digest))
+                 (every (lambda (key) (typep (getf request key) '(integer 1 4294967295)))
+                        '(:base-timeline :source-timeline :receive-timeline)))
+      (wal-invalid-input "invalid receiver follow coordinates"))
+    (loop for key in keys append (list key (getf request key)))))
+
 (defun physical-follow-anchor-check (request)
   "Validate anchor fields, ancestry and the proposed end-of-recovery record.
 

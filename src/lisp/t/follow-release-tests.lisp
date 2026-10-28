@@ -4,8 +4,176 @@
   (call-with-follow-anchor-source
    (lambda (root request eor)
      (declare (ignore eor))
-     (let ((pin (pg::physical-source-follow-ready "release_follow" request)))
+     (let* ((pg::*physical-follow-aborted-attempts* (make-hash-table :test #'equal))
+            (pin (pg::physical-source-follow-ready "release_follow" request)))
        (funcall function root request pin)))))
+
+(deftest follow-abort-removes-unacknowledged-retaining-or-ready-proof-by-exact-request
+    (dolist (stage '(:retaining :ready))
+      (call-with-follow-release-proof
+       (lambda (root anchor pin)
+         (declare (ignore root))
+         (let ((request (follow-anchor-receiver-request anchor)))
+           (setf (pg::physical-follow-pin-stage pin) stage)
+           (when (eq stage :retaining)
+             (setf (pg::physical-source-pin-confirmed-lsn pin) nil
+                   (pg::physical-source-pin-restart-lsn pin) (getf anchor :overlap-start)))
+           (pg::physical-source-pin-save pin)
+           (ok (eq :released (pg::physical-source-follow-abort "release_follow" request)))
+           (ok (null (gethash pin pg::*wal-snapshot-retention-pins*)))
+           (ok (eq :absent (pg::physical-source-follow-abort "release_follow" request)))
+           (ok (signals (pg::physical-source-follow-prepare "release_follow" request) 'error))
+           (ok (null (gethash "release_follow" pg::*physical-source-pins*)))
+           (ng pg::*wal-poisoned*))))))
+
+(deftest follow-abort-absence-fences-an-older-prepare-before-it-reserves-wal
+    (call-with-follow-anchor-source
+     (lambda (root anchor eor)
+       (declare (ignore root eor))
+       (let ((pg::*physical-follow-aborted-attempts* (make-hash-table :test #'equal))
+             (request (follow-anchor-receiver-request anchor)))
+         (ok (eq :absent (pg::physical-source-follow-abort "aborted_before_prepare" request)))
+         (ok (signals (pg::physical-source-follow-prepare "aborted_before_prepare" request) 'error))
+         (ok (null (gethash "aborted_before_prepare" pg::*physical-source-pins*)))
+         (ng pg::*wal-poisoned*)))))
+
+(deftest follow-abort-mismatch-and-busy-sender-preserve-the-preparation
+    (dolist (kind '(:request :sender))
+      (call-with-follow-release-proof
+       (lambda (root anchor pin)
+         (declare (ignore root))
+         (let ((request (follow-anchor-receiver-request anchor)))
+           (if (eq kind :request) (incf (getf request :overlap-digest))
+               (setf (gethash "release_follow" pg::*physical-source-senders*) :active))
+           (ok (signals (pg::physical-source-follow-abort "release_follow" request) 'error))
+           (ok (eq pin (gethash "release_follow" pg::*physical-source-pins*)))
+           (ok (null (gethash "release_follow" pg::*physical-follow-aborted-attempts*)))
+           (ng pg::*wal-poisoned*))))))
+
+(deftest follow-abort-limit-does-not-evict-an-older-aborted-name
+    (call-with-follow-release-proof
+     (lambda (root anchor pin)
+       (declare (ignore root))
+       (let ((pg::*physical-follow-aborted-attempt-limit* 1)
+             (request (follow-anchor-receiver-request anchor)))
+         (ok (eq :absent (pg::physical-source-follow-abort "already_aborted" request)))
+         (ok (signals (pg::physical-source-follow-abort "release_follow" request) 'error))
+         (ok (eq pin (gethash "release_follow" pg::*physical-source-pins*)))
+         (ok (gethash "already_aborted" pg::*physical-follow-aborted-attempts*))
+         (ok (eq :absent (pg::physical-source-follow-abort "already_aborted" request)))
+         (ng pg::*wal-poisoned*)))))
+
+(deftest follow-abort-cancels-prepare-before-reservation-and-before-ready-publication
+    (dolist (point '(:after-follow-anchor-capture :after-follow-proof))
+      (call-with-follow-anchor-source
+       (lambda (root anchor eor)
+         (declare (ignore root eor))
+         (let* ((pg::*physical-follow-aborted-attempts* (make-hash-table :test #'equal))
+                (request (follow-anchor-receiver-request anchor))
+                (aborted nil)
+                (pg::*physical-source-test-hook*
+                  (lambda (observed pin)
+                    (declare (ignore pin))
+                    (when (and (eq point observed) (not aborted))
+                      (setf aborted (pg::physical-source-follow-abort "cancel_inflight" request))))))
+           (ok (signals (pg::physical-source-follow-prepare "cancel_inflight" request) 'error))
+           (ok (eq aborted (if (eq point :after-follow-anchor-capture) :absent :released)))
+           (ok (null (gethash "cancel_inflight" pg::*physical-source-pins*)))
+           (ok (null (probe-file (pg::physical-source-pin-path "cancel_inflight"))))
+           (ok (gethash "cancel_inflight" pg::*physical-follow-aborted-attempts*))
+           (ng pg::*wal-poisoned*))))))
+
+(deftest follow-abort-checks-every-immutable-receiver-coordinate
+    (dolist (key '(:system-id :base-timeline :base :manifest-digest :source-timeline
+                   :receive-timeline :receive-lsn :receive-digest :overlap-start :overlap-digest))
+      (call-with-follow-release-proof
+       (lambda (root anchor pin)
+         (declare (ignore root))
+         (let ((request (follow-anchor-receiver-request anchor)))
+           (incf (getf request key))
+           (ok (signals (pg::physical-source-follow-abort "release_follow" request) 'error))
+           (ok (eq pin (gethash "release_follow" pg::*physical-source-pins*)))
+           (ok (null (gethash "release_follow" pg::*physical-follow-aborted-attempts*)))
+           (ng pg::*wal-poisoned*))))))
+
+(deftest follow-abort-wire-and-client-use-the-exact-preparation-coordinates
+    (let* ((request (follow-anchor-receiver-request (follow-anchor-request 123 456)))
+           (query (pg::pg-client-native-request-query "RELEASE_FOLLOW" "cancel_request" request))
+           (command (pg::parse-replication-command query)))
+      (ok (eq :physical-release (pg::logical-replication-command-type command)))
+      (ok (equal request (pg::physical-follow-prepare-request command)))
+      (dolist (case (list (list ", overlap_digest '[^']+'" "" "0A000")
+                          (list "overlap_digest '[^']+'" "overlap_digest '-1'" "22023")
+                          (list "\\)$" ", anchor_digest '1')" "0A000")
+                          (list "\\)$" ", overlap_digest '1')" "0A000")))
+        (destructuring-bind (pattern replacement state) case
+          (ok (equal state (recovery-state-of
+                            (lambda () (pg::parse-replication-command
+                                        (cl-ppcre:regex-replace pattern query replacement))))))))
+      (call-with-physical-client-wire
+       (lambda (client request-path)
+         (ok (equal "55000"
+                    (handler-case
+                        (progn (pg::pg-client-native-abort client "cancel_request" request) nil)
+                      (pg::pg-client-error (condition) (pg::pg-client-error-sqlstate condition)))))
+         (ok (pg::pg-client-native-abort client "cancel_request" request))
+         (with-open-file (in request-path :element-type '(unsigned-byte 8))
+           (dotimes (index 2)
+             (declare (ignorable index))
+             (multiple-value-bind (type payload) (pg::pg-client-frame in)
+               (ok (eql #\Q type))
+               (ok (equal request (pg::physical-follow-prepare-request
+                                   (pg::parse-replication-command (pg::pg-client-cstring payload 0)))))))))
+       (lambda (out)
+         (physical-client-test-error-response out :valid)
+         (pg::send-command-complete out "RELEASE_FOLLOW")
+         (pg::send-ready-for-query out #\I)))))
+
+(deftest follow-abort-absence-does-not-acknowledge-a-foreign-source-identity
+    (call-with-follow-anchor-source
+     (lambda (root anchor eor)
+       (declare (ignore root eor))
+       (let* ((pg::*physical-follow-aborted-attempts* (make-hash-table :test #'equal))
+              (request (follow-anchor-receiver-request anchor)) (wrong (copy-list request)))
+         (setf (getf wrong :system-id) (logxor 1 (getf wrong :system-id)))
+         (ok (signals (pg::physical-source-follow-abort "foreign_abort" wrong) 'error))
+         (ok (null (gethash "foreign_abort" pg::*physical-follow-aborted-attempts*)))
+         (ok (pg::physical-follow-pin-ready-p (pg::physical-source-follow-prepare "foreign_abort" request)))
+         (ok (eq :released (pg::physical-source-follow-abort "foreign_abort" request)))
+         (ng pg::*wal-poisoned*)))))
+
+(deftest follow-abort-can-remove-a-lost-retaining-pin
+    (call-with-follow-release-proof
+     (lambda (root anchor pin)
+       (declare (ignore root))
+       (setf (pg::physical-follow-pin-stage pin) :retaining
+             (pg::physical-source-pin-confirmed-lsn pin) nil
+             (pg::physical-source-pin-restart-lsn pin) (getf anchor :overlap-start)
+             (pg::physical-source-pin-lost-p pin) t)
+       (pg::physical-source-pin-save pin)
+       (ok (eq :released
+               (pg::physical-source-follow-abort "release_follow" (follow-anchor-receiver-request anchor))))
+       (ok (null (gethash pin pg::*wal-snapshot-retention-pins*)))
+       (ng pg::*wal-poisoned*))))
+
+(cl-spec:defproperty follow-abort-wire-preserves-full-width-request-coordinates
+    ((system-id (range integer 0 18446744073709551615))
+     (manifest (range integer 0 18446744073709551615))
+     (prefix (range integer 0 18446744073709551615))
+     (overlap (range integer 0 18446744073709551615)))
+  (:about pg::pg-client-native-request-query)
+  (:trials (:normal 200))
+  (let ((request (follow-anchor-receiver-request (follow-anchor-request prefix overlap))))
+    (setf (getf request :system-id) system-id (getf request :manifest-digest) manifest)
+    (equal request
+           (pg::physical-follow-prepare-request
+            (pg::parse-replication-command
+             (pg::pg-client-native-request-query "RELEASE_FOLLOW" "full_width_abort" request))))))
+
+(deftest generated-follow-abort-wire-preserves-full-width-request-coordinates
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'follow-abort-wire-preserves-full-width-request-coordinates :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
 (deftest follow-release-directory-sync-failure-fences-with-retention-intact
     (call-with-follow-release-proof

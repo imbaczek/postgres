@@ -244,6 +244,34 @@
             (handler-case (progn (pg-client-native-release client slot digest) nil)
               (pg-client-error (condition) (pg-client-error-sqlstate condition)))))))
 
+(defun selected-replay-probe-native-abort (client coordinates)
+  (let ((bad (copy-list coordinates)) (slot "native_client_abort"))
+    (setf (getf bad :overlap-digest) (logxor 1 (getf bad :overlap-digest)))
+    (assert (equal "55000"
+                   (handler-case
+                       (sb-ext:with-timeout 10 (pg-client-native-prepare client slot bad))
+                     (pg-client-error (condition) (pg-client-error-sqlstate condition)))))
+    (assert (eq :retaining (physical-follow-pin-stage (gethash slot *physical-source-pins*))))
+    (let ((wrong (copy-list bad)))
+      (incf (getf wrong :receive-digest))
+      (assert (equal "55000"
+                     (handler-case
+                         (sb-ext:with-timeout 10 (pg-client-native-abort client slot wrong))
+                       (pg-client-error (condition) (pg-client-error-sqlstate condition))))))
+    (assert (sb-ext:with-timeout 10 (pg-client-native-abort client slot bad)))
+    (assert (sb-ext:with-timeout 10 (pg-client-native-abort client slot bad)))
+    (assert (equal "55000"
+                   (handler-case
+                       (sb-ext:with-timeout 10 (pg-client-native-prepare client slot bad))
+                     (pg-client-error (condition) (pg-client-error-sqlstate condition)))))
+    (assert (null (gethash slot *physical-source-pins*)))
+    (let* ((fresh "native_client_after_abort")
+           (anchor (sb-ext:with-timeout 10 (pg-client-native-prepare client fresh coordinates))))
+      (assert (sb-ext:with-timeout 10
+                (pg-client-native-release client fresh (physical-follow-anchor-digest anchor)))))
+    (assert (not *wal-poisoned*))
+    t))
+
 (defun selected-replay-probe-native-client (directory port)
   (let* ((request (selected-replay-follow-request directory))
          (coordinates (loop for (key value) on request by #'cddr
@@ -294,6 +322,7 @@
                (selected-replay-native-client-reject-release client "native_client_parent" (logxor 1 digest) "55000")
                (assert (sb-ext:with-timeout 10 (pg-client-native-release client "native_client_parent" digest)))
                (assert (sb-ext:with-timeout 10 (pg-client-native-release client "native_client_parent" digest)))))
+           (selected-replay-probe-native-abort client coordinates)
            (assert (not *wal-poisoned*))
            (assert (not (gethash "native_client_parent" *physical-source-pins*)))
            t)

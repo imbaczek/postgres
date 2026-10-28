@@ -188,21 +188,23 @@ must compare the history with the source anchor."
       (error () (pg-client-native-reject "native source returned invalid timeline history")))
     bytes))
 
+(defun pg-client-native-request-query (verb slot coordinates)
+  "Build a preparation or cancellation command from the same receiver request."
+  (unless (member verb '("PREPARE_FOLLOW" "RELEASE_FOLLOW") :test #'equal)
+    (error "invalid native follow request command"))
+  (unless (wal-valid-replication-slot-name-p slot) (error "invalid native follow pin name"))
+  (let ((request (physical-follow-request-copy coordinates)))
+    (with-output-to-string (out)
+      (format out "~a SLOT ~a (native_format '~a'" verb slot +physical-native-format+)
+      (loop for (name key kind) in *physical-follow-wire-fields*
+            for value = (getf request key)
+            do (format out ", ~a '~a'" name (if (eq kind :lsn) (wal-format-lsn value)
+                                                (format nil "~d" value))))
+      (write-char #\) out))))
+
 (defun pg-client-native-prepare-query (slot coordinates)
   "Build a native PREPARE_FOLLOW query from checked receiver coordinates."
-  (unless (wal-valid-replication-slot-name-p slot) (error "invalid native follow pin name"))
-  (physical-follow-check-plist coordinates (cons :version (mapcar #'second *physical-follow-wire-fields*)))
-  (unless (eql 1 (getf coordinates :version)) (error "invalid native follow request version"))
-  (with-output-to-string (out)
-    (format out "PREPARE_FOLLOW SLOT ~a (native_format '~a'" slot +physical-native-format+)
-    (loop for (name key kind) in *physical-follow-wire-fields*
-          for value = (getf coordinates key)
-          do (unless (typep value '(unsigned-byte 64)) (error "invalid native follow coordinate"))
-             (when (and (eq kind :timeline) (not (<= 1 value #xFFFFFFFF)))
-               (error "invalid native follow coordinate timeline"))
-             (format out ", ~a '~a'" name (if (eq kind :lsn) (wal-format-lsn value)
-                                              (format nil "~d" value))))
-    (write-char #\) out)))
+  (pg-client-native-request-query "PREPARE_FOLLOW" slot coordinates))
 
 (defun pg-client-native-eor (text)
   "Decode the fixed-size hexadecimal end-of-recovery record."
@@ -258,5 +260,11 @@ explicit operator action; automated handoff and retirement are not integrated."
   (pg-client-send-query
    client (format nil "RELEASE_FOLLOW SLOT ~a (native_format '~a', anchor_digest '~d')"
                   slot +physical-native-format+ expected-digest))
+  (pg-client-native-read-result client nil "RELEASE_FOLLOW" :command-only t)
+  t)
+
+(defun pg-client-native-abort (client slot coordinates)
+  "Cancel an attempt by its saved request, even if PREPARE returned no anchor."
+  (pg-client-send-query client (pg-client-native-request-query "RELEASE_FOLLOW" slot coordinates))
   (pg-client-native-read-result client nil "RELEASE_FOLLOW" :command-only t)
   t)

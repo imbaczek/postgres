@@ -125,22 +125,26 @@ Reject unknown, duplicate or missing options before preparing a pin."
       command)))
 
 (defun parse-native-physical-release (words)
-  "Parse RELEASE_FOLLOW with exactly the native format and anchor digest."
+  "Parse checked release by an anchor checksum or the complete receiver request."
   (unless (and (>= (length words) 4) (string-equal (second words) "SLOT"))
     (ereport "42601" "expected RELEASE_FOLLOW SLOT name (native options)"))
   (let* ((name (replication-command-identifier (third words)))
-         (options (parse-replication-generic-options (nthcdr 3 words))))
+         (options (parse-replication-generic-options (nthcdr 3 words)))
+         (digest-p (assoc "anchor_digest" options :test #'equal))
+         (keys (if digest-p '("native_format" "anchor_digest")
+                   (cons "native_format" (mapcar #'first *physical-follow-wire-fields*)))))
     (unless (wal-valid-replication-slot-name-p name)
       (ereport "42602" "invalid physical follow pin name"))
-    (unless (and (= 2 (length options))
-                 (every (lambda (key) (= 1 (count key options :key #'car :test #'equal)))
-                        '("native_format" "anchor_digest")))
-      (ereport "0A000" "RELEASE_FOLLOW requires exactly the negotiated anchor identity"))
+    (unless (and (= (length keys) (length options))
+                 (every (lambda (key) (= 1 (count key options :key #'car :test #'equal))) keys))
+      (ereport "0A000" "RELEASE_FOLLOW requires exactly an anchor digest or receiver coordinates"))
     (let ((command (make-logical-replication-command
                     :type :physical-release :slot-name name :options options)))
       (unless (equal +physical-native-format+ (physical-stream-option command "native_format"))
         (ereport "0A000" "unsupported native physical WAL format"))
-      (physical-stream-u64 (physical-stream-option command "anchor_digest"))
+      (if digest-p
+          (physical-stream-u64 (physical-stream-option command "anchor_digest"))
+          (physical-follow-prepare-request command))
       command)))
 
 (defun release-native-physical-follow (stream command)
@@ -150,9 +154,11 @@ and report unexpected failures as XX000."
   (handler-case
       (progn
         (with-live-operation
-          (physical-source-follow-release
-           (logical-replication-command-slot-name command)
-           (physical-stream-u64 (physical-stream-option command "anchor_digest"))))
+          (let ((name (logical-replication-command-slot-name command))
+                (digest (physical-stream-option command "anchor_digest")))
+            (if digest
+                (physical-source-follow-release name (physical-stream-u64 digest))
+                (physical-source-follow-abort name (physical-follow-prepare-request command)))))
         (with-live-operation
           (send-command-complete stream "RELEASE_FOLLOW")
           (send-ready-for-query stream (transaction-status-char))))
