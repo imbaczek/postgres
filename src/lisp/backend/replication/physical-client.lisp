@@ -83,9 +83,10 @@ A malformed response or transport failure requires the caller to close the clien
   (error (pg-client-native-error-condition payload)))
 
 (defun pg-client-native-read-result (client schema tag &key (maximum 4096) first-frame command-only)
-  "Read one checked native result, optionally without a row.
-Allow notices and parameter status between frames. Reject extra or malformed
-results; a protocol or transport failure requires the caller to close the client."
+  "Read one checked native result in protocol order.
+A row result requires T, D, C and Z; COMMAND-ONLY requires C and Z with no row.
+Allow notices and parameter status between frames. A normal error drains through
+Z before signalling; protocol or transport failure requires the caller to close."
   (let ((state (if command-only :complete :description)) (columns nil) (row nil))
     (loop
       (multiple-value-bind (type payload)
@@ -248,6 +249,9 @@ perform network I/O under recovery quiescence."
     anchor))
 
 (defun pg-client-native-release (client slot expected-digest)
+  "Request checked release of SLOT using its canonical anchor digest.
+The caller decides when retirement is safe, after replacement is durable or by
+explicit operator action; automated handoff and retirement are not integrated."
   (unless (and (wal-valid-replication-slot-name-p slot)
                (typep expected-digest '(unsigned-byte 64)))
     (error "invalid native follow retirement identity"))

@@ -125,6 +125,7 @@ Reject unknown, duplicate or missing options before preparing a pin."
       command)))
 
 (defun parse-native-physical-release (words)
+  "Parse RELEASE_FOLLOW with exactly the native format and anchor digest."
   (unless (and (>= (length words) 4) (string-equal (second words) "SLOT"))
     (ereport "42601" "expected RELEASE_FOLLOW SLOT name (native options)"))
   (let* ((name (replication-command-identifier (third words)))
@@ -143,6 +144,9 @@ Reject unknown, duplicate or missing options before preparing a pin."
       command)))
 
 (defun release-native-physical-follow (stream command)
+  "Release the checked follow pin and return command completion without a row.
+Map validation failures to 55000, preserve PostgreSQL errors including busy,
+and report unexpected failures as XX000."
   (handler-case
       (progn
         (with-live-operation

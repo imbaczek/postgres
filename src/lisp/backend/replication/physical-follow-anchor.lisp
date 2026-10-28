@@ -269,6 +269,13 @@ ambiguous READY save is not reported as a reseed request."
     (physical-source-follow-ready name anchor)))
 
 (defun physical-source-follow-release (name expected-digest)
+  "Release the ready follow pin named by NAME and EXPECTED-DIGEST.
+Require matching registered and durable pins, their complete payloads and no
+sender. A lost ready pin can be released without reading WAL. If both the registry entry and file
+are absent, sync the existing directory and succeed; a one-sided absence fails.
+Expected identity and state mismatches do not poison WAL. Corrupt or unreadable
+durable metadata fences the source. Report a busy sender after releasing locks.
+The caller decides when retirement is safe; automated handoff is not integrated."
   (prevent-recovery-primary-operation "physical follow pin release")
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid physical follow pin name"))

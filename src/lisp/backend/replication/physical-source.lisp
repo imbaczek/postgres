@@ -282,6 +282,9 @@ Publish the in-memory binding only after saving the candidate pin."
   (values))
 
 (defun physical-source-pin-unlink (pin)
+  "Unlink PIN and sync its directory before removing in-memory retention.
+The caller owns the write and WAL critical section. An I/O failure fences WAL;
+restart must resolve an ambiguous deletion before recycling."
   (let ((name (physical-source-pin-name pin)))
     (let ((path (physical-source-pin-path name)))
       (physical-source-pin-test-point :before-release-unlink pin)
@@ -293,7 +296,9 @@ Publish the in-memory binding only after saving the candidate pin."
     (remhash name *physical-source-pins*)))
 
 (defun physical-source-pin-release (name)
-  "Durably remove a source pin before allowing checkpoint WAL recycling."
+  "Durably remove a source pin before allowing checkpoint WAL recycling.
+This local wrapper requires an existing pin without an active sender. Physical
+pins use their own namespace, separate from logical replication slots."
   (prevent-recovery-primary-operation "physical source pin release")
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid physical source pin name ~s" name))

@@ -83,6 +83,11 @@ which may differ from the source's retained archive base and manifest."
                            (t value)))))
 
 (defun physical-follow-anchor-digest (anchor)
+  "Return the canonical immutable anchor identity checksum.
+Apply FNV-1a 64 with seed #xCBF29CE484222325 to the UTF-8 bytes of
+physical-bootstrap-manifest-text of physical-follow-anchor-copy of ANCHOR.
+The full history and EOR are included; mutable stage, progress and lost state
+are not. This checksum identifies an anchor; it is not authentication."
   (physical-store-update-digest
    #xCBF29CE484222325
    (string->bytes (physical-bootstrap-manifest-text (physical-follow-anchor-copy anchor)))))
