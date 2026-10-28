@@ -7,6 +7,8 @@
 
 (defvar *physical-follow-source-read-cache* nil)
 
+(define-condition physical-stream-copy-done (condition) ())
+
 (defun physical-stream-option (command name)
   (let ((value (cdr (assoc name (logical-replication-command-options command) :test #'equal))))
     (when value (replication-command-value value))))
@@ -19,6 +21,27 @@
     (unless (typep value '(unsigned-byte 64)) (ereport "22023" "physical integer out of range"))
     value))
 
+(defun physical-stream-mode (command)
+  (let ((mode (or (physical-stream-option command "mode") "bootstrap")))
+    (unless (member mode '("bootstrap" "follow") :test #'equal)
+      (ereport "0A000" "unsupported native physical stream mode"))
+    mode))
+
+(defun physical-follow-stream-boundary (command pin)
+  (let* ((history (physical-follow-pin-history pin))
+         (timeline (physical-stream-u64 (physical-stream-option command "timeline")))
+         (position (position timeline history :key #'timeline-history-entry-timeline))
+         (entry (when position (nth position history)))
+         (limit (when entry (timeline-history-entry-end entry))))
+    (unless (and entry
+                 (<= (* (floor (timeline-history-entry-begin entry) +wal-segment-size+)
+                        +wal-segment-size+)
+                     (logical-replication-command-requested-lsn command))
+                 (or (null limit) (<= (logical-replication-command-requested-lsn command) limit)))
+      (ereport "55000" "requested physical timeline or start is outside source ancestry"))
+    (values limit (when (and position (plusp position))
+                    (timeline-history-entry-timeline (nth (1- position) history))))))
+
 (defun parse-native-physical-start (words)
   (unless (and (>= (length words) 5) (string-equal (second words) "SLOT")
                (string-equal (fourth words) "PHYSICAL"))
@@ -27,10 +50,11 @@
          (options (parse-replication-generic-options (nthcdr 5 words)))
          (keys '("native_format" "system_id" "timeline" "base_lsn" "prefix_digest")))
     (when (assoc "manifest_digest" options :test #'equal) (push "manifest_digest" keys))
+    (when (assoc "mode" options :test #'equal) (push "mode" keys))
     (unless (wal-valid-replication-slot-name-p name) (ereport "42602" "invalid source pin name"))
     (unless (and (= (length keys) (length options))
                  (every (lambda (key) (= 1 (count key options :key #'car :test #'equal))) keys))
-      (ereport "0A000" "native physical stream requires native_format, system_id, timeline, base_lsn, prefix_digest and optional manifest_digest"))
+      (ereport "0A000" "native physical stream requires native_format, system_id, timeline, base_lsn, prefix_digest and optional manifest_digest and mode"))
     (let ((command (make-logical-replication-command
                     :type :physical-start :slot-name name :options options
                     :requested-lsn (parse-replication-lsn (fifth words)))))
@@ -44,6 +68,7 @@
                      '(integer 1 4294967295))
         (ereport "22023" "invalid native physical timeline"))
       (parse-replication-lsn (physical-stream-option command "base_lsn"))
+      (physical-stream-mode command)
       command)))
 
 (defun physical-source-acquire-sender (command)
@@ -51,14 +76,18 @@
   (sb-thread:with-mutex (*wal-lock*)
     (let* ((name (logical-replication-command-slot-name command))
            (pin (gethash name *physical-source-pins*))
+           (follow (equal "follow" (physical-stream-mode command)))
            (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
            (cursor (logical-replication-command-requested-lsn command)))
       (when (and pin (physical-source-pin-lost-p pin))
         (ereport "55000" "native physical source retention is lost; reseed is required"))
-      (unless (and pin (not (physical-follow-pin-p pin))
+      (unless (and pin (eq follow (physical-follow-pin-p pin))
                    (not (physical-source-pin-lost-p pin))
-                   (= (physical-source-pin-timeline pin) *wal-insert-timeline*
-                      (physical-stream-u64 (physical-stream-option command "timeline")))
+                   (or (not follow) (physical-follow-pin-ready-p pin))
+                   (= (physical-source-pin-timeline pin) *wal-insert-timeline*)
+                   (or follow
+                       (= *wal-insert-timeline*
+                          (physical-stream-u64 (physical-stream-option command "timeline"))))
                    (= (physical-source-pin-system-id pin)
                       (physical-stream-u64 (physical-stream-option command "system_id"))
                       (catalog-system-identifier))
@@ -67,14 +96,20 @@
                      (if expected
                          (and supplied (= expected (physical-stream-u64 supplied)))
                          (and (= *wal-insert-timeline* 1) (null supplied))))
-                   (= base (physical-source-pin-consistent-lsn pin))
-                   (<= (or (physical-source-pin-confirmed-lsn pin) base) cursor *wal-durable-lsn*))
-        (ereport "55000" "native source identity, retained base or resume boundary mismatch"))
-      (when (gethash name *physical-source-senders*) (ereport "55006" "source pin already has a sender"))
-      (physical-source-pin-check-wal pin)
-      (let ((owner (gensym "PHYSICAL-SENDER-")))
-        (setf (gethash name *physical-source-senders*) owner)
-        owner))))
+                   (= base (if follow (getf (physical-follow-pin-anchor pin) :base)
+                               (physical-source-pin-consistent-lsn pin)))
+                   (<= (or (physical-source-pin-confirmed-lsn pin)
+                           (physical-source-pin-consistent-lsn pin))
+                       cursor *wal-durable-lsn*))
+        (ereport "55000" "native source mode, identity, retained base or resume boundary mismatch"))
+      (when (gethash name *physical-source-senders*)
+        (ereport "55006" "source pin already has a sender"))
+      (if follow (physical-follow-pin-check-live pin) (physical-source-pin-check-wal pin))
+      (multiple-value-bind (limit next)
+          (if follow (physical-follow-stream-boundary command pin) (values))
+        (let ((owner (gensym "PHYSICAL-SENDER-")))
+          (setf (gethash name *physical-source-senders*) owner)
+          (values owner limit next))))))
 
 (defun physical-source-release-sender (name owner)
   (sb-thread:with-mutex (*wal-lock*)
@@ -195,11 +230,12 @@ The existing bootstrap START admission does not acquire follow pins."
   status)
 
 (defun physical-stream-feedback (stream)
-  (sb-ext:with-timeout 10 (replication-standby-status stream)))
+  (sb-ext:with-timeout 10 (replication-standby-status stream t)))
 
 (defun physical-stream-read-status (stream previous sent base)
   "Read outside admission; validate monotonic progress under short admission."
-  (let ((reply (physical-stream-feedback stream)))
+  (multiple-value-bind (reply done) (physical-stream-feedback stream)
+    (when done (signal 'physical-stream-copy-done))
     (when reply
       (with-live-operation
         (physical-stream-validate-status reply previous sent base)))))
@@ -210,7 +246,37 @@ The existing bootstrap START admission does not acquire follow pins."
 (defun physical-stream-send-keepalive (stream durable)
   (sb-ext:with-timeout 10 (send-logical-keepalive stream durable)))
 
-(defun physical-stream-send-loop (stream command owner)
+(defun physical-stream-complete (stream command owner next limit)
+  (with-live-operation-captured-backend-cleanup
+    (physical-source-release-sender (logical-replication-command-slot-name command) owner))
+  (if next
+      (physical-stream-switch-result stream next limit)
+      (progn
+        (send-command-complete stream "START_STREAMING")
+        (send-ready-for-query stream (transaction-status-char)))))
+
+(defun physical-stream-switch-result (stream next limit)
+  (send-row-description
+   stream (list (make-result-column :name "next_tli" :type-oid +int8oid+ :typlen 8)
+                (make-result-column :name "next_tli_startpos" :type-oid +textoid+ :typlen -1)))
+  (send-data-row-text stream (list (format nil "~d" next) (wal-format-lsn limit)))
+  (send-command-complete stream "START_STREAMING")
+  (send-ready-for-query stream (transaction-status-char)))
+
+(defun physical-stream-finish-historic (stream command owner limit previous)
+  (write-message stream #\c (make-payload))
+  (loop
+    (multiple-value-bind (status done)
+        (sb-ext:with-timeout 10 (replication-standby-status stream t))
+      (when done (return t))
+      (unless status (return nil))
+      (setf previous
+            (with-live-operation
+              (physical-stream-validate-status
+               status previous limit (parse-replication-lsn (physical-stream-option command "base_lsn")))))
+      (physical-source-confirm-status command owner status))))
+
+(defun physical-stream-send-loop (stream command owner &optional limit)
   "Send records with one dynamically scoped historical source prefix cache.
 The cache belongs to this sender loop; reuse requires the same source selection."
   (let* ((*physical-follow-source-read-cache* (list nil))
@@ -219,8 +285,14 @@ The cache belongs to this sender loop; reuse requires the same source selection.
          (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
          (status (list :write cursor :flush cursor :apply base)))
     (loop
+      (when (and limit (= cursor limit))
+        (return (values :switch status)))
       (multiple-value-bind (record raw durable)
           (with-live-operation (physical-source-read-next name owner cursor))
+        (when limit
+          (setf durable (min durable limit))
+          (when (and record (> (wal-record-end record) limit))
+            (ereport "55000" "physical record crosses the requested timeline fork")))
         (if record
             (loop for offset from 0 below (length raw) by 65536
                   for end = (min (length raw) (+ offset 65536))
@@ -241,41 +313,53 @@ The cache belongs to this sender loop; reuse requires the same source selection.
         (when record (setf cursor (wal-record-end record)))))))
 
 (defun start-native-physical-replication (stream command)
-  (let ((owner (with-live-operation (physical-source-acquire-sender command)))
-        (name (logical-replication-command-slot-name command))
-        (cursor (logical-replication-command-requested-lsn command))
-        (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
-        (copy-mode nil))
-    (unwind-protect
-         (handler-case
-             (progn
-               ;; No WAL bytes are sent until the exact prefix proof succeeds.
-               (sb-ext:with-timeout 10 (send-copy-both-response stream))
-               (setf copy-mode t)
-               (let ((status (list :write cursor :flush cursor :apply base)))
-                 (physical-source-validate-resume
-                  command owner
-                  (lambda (durable)
-                    (physical-stream-send-keepalive stream durable)
-                    (setf status (physical-stream-read-status stream status cursor base))
-                    (unless status (error 'end-of-file :stream stream)))))
-               ;; Proof feedback is staged above. Only the completed, matched
-               ;; prefix may release source retention.
-               (with-live-operation
-                 (physical-source-confirm-receipt
-                  name owner cursor (physical-stream-u64 (physical-stream-option command "prefix_digest"))))
-               (physical-stream-send-loop stream command owner))
-           ;; Retry transport failures without converting them to terminal XX000.
-           (sb-ext:timeout () (ignore-errors (close stream :abort t)))
-           (stream-error () (ignore-errors (close stream :abort t)))
-           (sb-bsd-sockets:socket-error () (ignore-errors (close stream :abort t)))
-           (error (condition)
-             (unless copy-mode (error condition))
-             (ignore-errors
-              (send-error-response stream
-                                   (if (typep condition 'pg-error) condition
-                                       (make-condition 'pg-error :sqlstate "XX000"
-                                                                 :message (princ-to-string condition)))))
-             (ignore-errors (close stream :abort t))))
-      (with-live-operation-captured-backend-cleanup
-        (physical-source-release-sender name owner)))))
+  (multiple-value-bind (owner limit next)
+      (with-live-operation (physical-source-acquire-sender command))
+    (let ((name (logical-replication-command-slot-name command))
+          (cursor (logical-replication-command-requested-lsn command))
+          (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
+          (copy-mode nil))
+      (unwind-protect
+           (handler-case
+               (if (and limit (= cursor limit))
+                   (progn
+                     (physical-source-validate-resume command owner)
+                     (with-live-operation
+                       (physical-source-confirm-receipt
+                        name owner cursor (physical-stream-u64 (physical-stream-option command "prefix_digest"))))
+                     (physical-stream-complete stream command owner next limit))
+                   (progn
+                     ;; CopyBoth permits heartbeats during proof, but no WAL bytes.
+                     (sb-ext:with-timeout 10 (send-copy-both-response stream))
+                     (setf copy-mode t)
+                     (let ((status (list :write cursor :flush cursor :apply base)))
+                       (physical-source-validate-resume
+                        command owner
+                        (lambda (durable)
+                          (physical-stream-send-keepalive stream (if limit (min durable limit) durable))
+                          (setf status (physical-stream-read-status stream status cursor base))
+                          (unless status (error 'end-of-file :stream stream)))))
+                     (with-live-operation
+                       (physical-source-confirm-receipt
+                        name owner cursor (physical-stream-u64 (physical-stream-option command "prefix_digest"))))
+                     (multiple-value-bind (result status)
+                         (physical-stream-send-loop stream command owner limit)
+                       (when (and (eq result :switch)
+                                  (physical-stream-finish-historic stream command owner limit status))
+                         (physical-stream-complete stream command owner next limit)))))
+             (physical-stream-copy-done ()
+               (write-message stream #\c (make-payload))
+               (physical-stream-complete stream command owner next limit))
+             (sb-ext:timeout () (ignore-errors (close stream :abort t)))
+             (stream-error () (ignore-errors (close stream :abort t)))
+             (sb-bsd-sockets:socket-error () (ignore-errors (close stream :abort t)))
+             (error (condition)
+               (unless copy-mode (error condition))
+               (ignore-errors
+                (send-error-response stream
+                                     (if (typep condition 'pg-error) condition
+                                         (make-condition 'pg-error :sqlstate "XX000"
+                                                                   :message (princ-to-string condition)))))
+               (ignore-errors (close stream :abort t))))
+        (with-live-operation-captured-backend-cleanup
+          (physical-source-release-sender name owner))))))

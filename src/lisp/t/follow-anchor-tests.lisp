@@ -223,6 +223,221 @@
          (ok (signals (pg::physical-source-acquire-sender command) 'error))
          (ok (zerop (hash-table-count pg::*physical-source-senders*)))))))
 
+(defun follow-anchor-start-command (request &optional mode)
+  (pg::parse-replication-command
+   (format nil
+           "START_REPLICATION SLOT sibling PHYSICAL ~a (native_format '~a', system_id '~d', timeline '2', base_lsn '~a', prefix_digest '~d', manifest_digest '77'~a)"
+           (pg::wal-format-lsn (getf request :receive-lsn))
+           pg::+physical-native-format+ (getf request :system-id)
+           (pg::wal-format-lsn (if (equal mode "follow") (getf request :base) 64))
+           (getf request :receive-digest)
+           (if mode (format nil ", mode '~a'" mode) ""))))
+
+(deftest follow-anchor-stream-requires-explicit-ready-mode-and-exclusive-owner
+    (call-with-follow-anchor-source
+     (lambda (root request eor)
+       (declare (ignore root))
+       (let* ((pin (pg::physical-source-follow-reserve "sibling" request))
+              (command (follow-anchor-start-command request "follow")))
+         (ok (signals (pg::physical-source-acquire-sender command) 'error))
+         (ok (zerop (hash-table-count pg::*physical-source-senders*)))
+         (pg::physical-source-follow-ready "sibling" request)
+         (let ((owner (pg::physical-source-acquire-sender command)))
+           (unwind-protect
+                (progn
+                  (ok (eq owner (gethash "sibling" pg::*physical-source-senders*)))
+                  (ok (signals (pg::physical-source-acquire-sender command) 'error))
+                  (ok (= 64 (pg::physical-source-validate-resume command owner)))
+                  (ok (= 64 (pg::physical-source-pin-confirmed-lsn pin)))
+                  (multiple-value-bind (record raw durable)
+                      (pg::physical-source-read-next "sibling" owner 64)
+                    (ok (= pg::+wal-record-end-of-recovery+ (pg::wal-record-type record)))
+                    (ok (equalp raw eor))
+                    (ok (= 120 durable))))
+             (pg::physical-source-release-sender "sibling" owner)))
+         (ok (zerop (hash-table-count pg::*physical-source-senders*)))))))
+
+(deftest follow-stream-timeline-is-requested-ancestry-with-an-exact-fork-limit
+    (call-with-follow-anchor-source
+     (lambda (root request eor)
+       (declare (ignore root eor))
+       (pg::physical-source-follow-ready "sibling" request)
+       (let ((command (follow-anchor-start-command request "follow")))
+         (setf (cdr (assoc "timeline" (pg::logical-replication-command-options command) :test #'equal)) "1")
+         (multiple-value-bind (owner limit next) (pg::physical-source-acquire-sender command)
+           (unwind-protect (progn (ok (= 64 limit)) (ok (= 2 next)))
+             (pg::physical-source-release-sender "sibling" owner)))
+         (setf (pg::logical-replication-command-requested-lsn command) 65)
+         (ok (signals (pg::physical-source-acquire-sender command) 'error))
+         (ok (zerop (hash-table-count pg::*physical-source-senders*)))
+         (setf (pg::logical-replication-command-requested-lsn command) 64
+               (cdr (assoc "timeline" (pg::logical-replication-command-options command) :test #'equal)) "3")
+         (ok (signals (pg::physical-source-acquire-sender command) 'error))
+         (ok (zerop (hash-table-count pg::*physical-source-senders*)))))))
+
+(cl-spec:defproperty follow-stream-boundaries-preserve-c-parent-limit-and-child-prefix
+    ((fork (range integer 16777216 18446744073709551614))
+     (child (range integer 2 4294967295))
+     (case-number (range integer 0 5)))
+  (:about pg::physical-follow-stream-boundary)
+  (:trials (:normal 200))
+  (let* ((parent-request (< case-number 3))
+         (origin (* (floor fork pg::+wal-segment-size+) pg::+wal-segment-size+))
+         (cursor (ecase case-number
+                   (0 (1- fork)) (1 fork) (2 (1+ fork))
+                   (3 fork) (4 origin) (5 (1- origin))))
+         (accepted (member case-number '(0 1 3 4)))
+         (pin (pg::make-physical-follow-pin
+               :timeline child :anchor (list :history-text (store-history-text 1 fork))))
+         (command (pg::make-logical-replication-command
+                   :requested-lsn cursor
+                   :options (list (cons "timeline" (format nil "~d" (if parent-request 1 child)))))))
+    (handler-case
+        (multiple-value-bind (limit next) (pg::physical-follow-stream-boundary command pin)
+          (and accepted (if parent-request (and (= fork limit) (= child next))
+                            (and (null limit) (null next)))))
+      (pg::pg-error (condition)
+        (and (not accepted) (equal "55000" (pg::pg-error-sqlstate condition)))))))
+
+(deftest generated-follow-stream-timeline-boundaries
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property
+                  'follow-stream-boundaries-preserve-c-parent-limit-and-child-prefix :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest historical-stream-stops-before-eor-and-reports-next-timeline-without-copy-at-fork
+    (call-with-follow-anchor-source
+     (lambda (root request eor)
+       (declare (ignore root eor))
+       (setf (getf request :receive-lsn) 32
+             (getf request :receive-digest) #xCBF29CE484222325
+             (getf request :overlap-digest)
+             (pg::physical-store-update-digest #xCBF29CE484222325 (legacy-checkpoint-record 0)))
+       (let* ((pin (pg::physical-source-follow-ready "sibling" request))
+              (command (follow-anchor-start-command request "follow"))
+              (names '(pg::physical-stream-send-data pg::physical-stream-feedback
+                       pg::send-copy-both-response pg::physical-stream-switch-result
+                       pg::physical-source-read-next))
+              (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+              (reads 0) (sent nil) (switched nil))
+         (setf (cdr (assoc "timeline" (pg::logical-replication-command-options command) :test #'equal)) "1")
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-stream-send-data)
+                      (lambda (stream start end bytes)
+                        (declare (ignore stream))
+                        (push (list start end bytes) sent))
+                      (symbol-function 'pg::physical-stream-feedback)
+                      (lambda (stream) (declare (ignore stream))
+                        (list :write 64 :flush 64 :apply 32))
+                      (symbol-function 'pg::physical-source-read-next)
+                      (lambda (name owner cursor)
+                        (incf reads)
+                        (when (>= cursor 64) (error "historical stream attempted child WAL"))
+                        (funcall (cdr (assoc 'pg::physical-source-read-next saved)) name owner cursor)))
+                (multiple-value-bind (owner limit next) (pg::physical-source-acquire-sender command)
+                  (unwind-protect
+                       (progn
+                         (ok (= 64 limit)) (ok (= 2 next))
+                         (ok (eq :switch (pg::physical-stream-send-loop nil command owner limit))))
+                    (pg::physical-source-release-sender "sibling" owner)))
+                (ok (= 2 reads))
+                (ok (= 1 (length sent)))
+                (ok (= 32 (first (first sent))))
+                (ok (= 64 (second (first sent))))
+                (ok (equalp (third (first sent)) (legacy-checkpoint-record 32)))
+                (ok (= 64 (pg::physical-source-pin-confirmed-lsn pin)))
+                (setf (pg::logical-replication-command-requested-lsn command) 64
+                      (cdr (assoc "prefix_digest" (pg::logical-replication-command-options command)
+                                  :test #'equal))
+                      (format nil "~d" (pg::physical-source-pin-prefix-digest pin))
+                      (symbol-function 'pg::send-copy-both-response)
+                      (lambda (stream) (declare (ignore stream)) (error "unexpected CopyBoth at fork"))
+                      (symbol-function 'pg::physical-stream-switch-result)
+                      (lambda (stream next limit) (declare (ignore stream)) (setf switched (list next limit))))
+                (pg::start-native-physical-replication nil command)
+                (ok (equal '(2 64) switched))
+                (ok (= 2 reads))
+                (ok (zerop (hash-table-count pg::*physical-source-senders*))))
+           (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry))))))))
+
+(deftest physical-follow-copy-done-during-proof-finishes-without-prefix-confirmation
+    (dolist (timeline '("1" "2"))
+      (call-with-follow-anchor-source
+       (lambda (root request eor)
+         (declare (ignore root eor))
+         (setf (getf request :receive-lsn) 32
+               (getf request :receive-digest) #xCBF29CE484222325
+               (getf request :overlap-digest)
+               (pg::physical-store-update-digest #xCBF29CE484222325 (legacy-checkpoint-record 0)))
+         (let* ((pin (pg::physical-source-follow-ready "sibling" request))
+                (command (follow-anchor-start-command request "follow"))
+                (pg::*backend* (pg::make-backend :state :idle))
+                (names '(pg::send-copy-both-response pg::physical-stream-feedback
+                         pg::physical-stream-send-keepalive pg::physical-stream-send-data
+                         pg::write-message pg::physical-stream-switch-result
+                         pg::send-command-complete pg::send-ready-for-query))
+                (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+                (events nil))
+           (setf (cdr (assoc "timeline" (pg::logical-replication-command-options command) :test #'equal)) timeline
+                 (cdr (assoc "prefix_digest" (pg::logical-replication-command-options command) :test #'equal)) "0")
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::send-copy-both-response)
+                        (lambda (stream) (declare (ignore stream)) (push :copy events))
+                        (symbol-function 'pg::physical-stream-feedback)
+                        (lambda (stream) (declare (ignore stream)) (values nil t))
+                        (symbol-function 'pg::physical-stream-send-keepalive)
+                        (lambda (stream end) (declare (ignore stream end)))
+                        (symbol-function 'pg::physical-stream-send-data)
+                        (lambda (&rest arguments) (declare (ignore arguments)) (error "sent unproved WAL"))
+                        (symbol-function 'pg::write-message)
+                        (lambda (stream kind bytes)
+                          (declare (ignore stream))
+                          (ok (zerop (length bytes))) (push kind events))
+                        (symbol-function 'pg::physical-stream-switch-result)
+                        (lambda (stream next limit)
+                          (declare (ignore stream))
+                          (ok (zerop (hash-table-count pg::*physical-source-senders*)))
+                          (push (list next limit) events))
+                        (symbol-function 'pg::send-command-complete)
+                        (lambda (stream tag) (declare (ignore stream)) (push tag events))
+                        (symbol-function 'pg::send-ready-for-query)
+                        (lambda (stream state) (declare (ignore stream))
+                          (ok (zerop (hash-table-count pg::*physical-source-senders*)))
+                          (push state events)))
+                  (pg::start-native-physical-replication nil command)
+                  (ok (equal (reverse events)
+                             (if (equal timeline "1") '(:copy #\c (2 64))
+                                 '(:copy #\c "START_STREAMING" #\I))))
+                  (ok (= 32 (pg::physical-source-pin-confirmed-lsn pin)))
+                  (ok (= #xCBF29CE484222325 (pg::physical-source-pin-prefix-digest pin))))
+             (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry)))))))))
+
+(deftest follow-stream-mode-cannot-acquire-a-bootstrap-pin
+    (call-with-follow-anchor-source
+     (lambda (root request eor)
+       (declare (ignore root eor))
+       (let ((pin (pg::make-physical-source-pin
+                   :name "sibling" :system-id (getf request :system-id) :timeline 2
+                   :manifest-digest 77 :consistent-lsn 64 :restart-lsn 32
+                   :prefix-digest #xCBF29CE484222325)))
+         (setf (gethash "sibling" pg::*physical-source-pins*) pin)
+         (ok (signals (pg::physical-source-acquire-sender
+                       (follow-anchor-start-command request "follow")) 'error))
+         (ok (zerop (hash-table-count pg::*physical-source-senders*)))
+         (let ((owner (pg::physical-source-acquire-sender (follow-anchor-start-command request))))
+           (pg::physical-source-release-sender "sibling" owner))))))
+
+(deftest physical-stream-mode-rejects-unknown-and-duplicate-values
+    (let ((request (follow-anchor-request 123 456)))
+      (dolist (mode '("" "other" "FOLLOW" "bootstrap follow"))
+        (ok (signals (follow-anchor-start-command request mode) 'error)))
+      (let* ((query (format nil
+                            "START_REPLICATION SLOT sibling PHYSICAL 0/40 (native_format '~a', system_id '42', timeline '2', base_lsn '0/40', prefix_digest '123', manifest_digest '77', mode 'follow', mode 'follow')"
+                            pg::+physical-native-format+)))
+        (ok (signals (pg::parse-replication-command query) 'error)))))
+
 (deftest follow-anchor-unproved-retention-cannot-confirm-receipt
     (call-with-follow-anchor-source
      (lambda (root request eor)

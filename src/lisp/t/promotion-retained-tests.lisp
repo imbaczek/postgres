@@ -486,6 +486,17 @@
               (ok (null (probe-file (pg::wal-segment-path 0))))
               (let* ((pin (pg::physical-source-follow-ready "old_sibling" request))
                      (owner (gensym)))
+                (let ((command
+                        (pg::parse-replication-command
+                         (format nil
+                                 "START_REPLICATION SLOT old_sibling PHYSICAL 0/00000060 (native_format '~a', mode 'follow', system_id '~d', timeline '2', base_lsn '0/00000020', prefix_digest '91', manifest_digest '88')"
+                                 pg::+physical-native-format+ (pg::catalog-system-identifier)))))
+                  (ok (equal "55000" (recovery-state-of (lambda () (pg::physical-source-acquire-sender command)))))
+                  (ok (null (gethash "old_sibling" pg::*physical-source-senders*)))
+                  (setf (pg::logical-replication-command-requested-lsn command) fork)
+                  (multiple-value-bind (child-owner limit next) (pg::physical-source-acquire-sender command)
+                    (unwind-protect (progn (ok (null limit)) (ok (null next)))
+                      (pg::physical-source-release-sender "old_sibling" child-owner))))
                 (setf (gethash "old_sibling" pg::*physical-source-senders*) owner)
                 (ok (pg::physical-follow-pin-ready-p pin))
                 (multiple-value-bind (record raw durable)
