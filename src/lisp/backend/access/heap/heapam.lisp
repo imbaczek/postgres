@@ -321,6 +321,58 @@ validating TOAST semantics. The result does not retain or own BYTES."
              :id-width width)
             end)))
 
+(defun toast-assemble-chunks (chunks size chunk-size &key (offset 0) (length (- size offset)))
+  "Copy a slice of a TOAST value from its selected, ordered CHUNKS.
+SIZE is the full value size in bytes, and CHUNK-SIZE is the full chunk
+capacity. CHUNKS is a proper list of (sequence . octet-vector) pairs covering
+exactly the chunks intersecting [OFFSET, OFFSET + LENGTH), in sequence order;
+a zero-length slice requires no chunks. OFFSET and LENGTH must be nonnegative
+and the slice must fit within SIZE. LENGTH defaults to the remainder of SIZE.
+Each chunk must have its full expected size, including the possibly shorter
+final chunk of the full value. Invalid bounds signal an error; malformed,
+missing, extra, out-of-order, or incorrectly sized chunks signal data corruption
+(SQLSTATE XX001). Return a fresh octet vector without modifying or retaining
+CHUNKS or its data vectors."
+  (unless (and (typep size '(integer 0 1073741823))
+               (typep chunk-size '(integer 1 *))
+               (typep offset '(integer 0 *))
+               (typep length '(integer 0 *))
+               (<= (+ offset length) size))
+    (error "Invalid TOAST slice bounds"))
+  (unless (and (listp chunks)
+               (or (null chunks)
+                   (handler-case (list-length chunks) (type-error () nil))))
+    (ereport "XX001" "invalid TOAST chunk list"))
+  (let* ((total (ceiling size chunk-size))
+         (first (floor offset chunk-size))
+         (last (if (zerop length) (1- first) (floor (1- (+ offset length)) chunk-size)))
+         (expected first))
+    (dolist (chunk chunks)
+      (unless (consp chunk)
+        (ereport "XX001" "invalid TOAST chunk"))
+      (let* ((sequence (car chunk))
+             (data (cdr chunk))
+             (expected-size (if (= expected (1- total))
+                                (- size (* expected chunk-size))
+                                chunk-size)))
+        (unless (and (eql sequence expected) (<= expected last)
+                     (vectorp data)
+                     (every (lambda (octet) (typep octet '(unsigned-byte 8))) data)
+                     (= (length data) expected-size))
+          (ereport "XX001" "invalid TOAST chunk ~a" sequence))
+        (incf expected)))
+    (unless (= expected (1+ last))
+      (ereport "XX001" "missing TOAST chunk ~a" expected))
+    (let ((result (make-array length :element-type '(unsigned-byte 8))))
+      (dolist (chunk chunks)
+        (let* ((chunk-start (* (car chunk) chunk-size))
+               (copy-start (max offset chunk-start))
+               (copy-end (min (+ offset length) (+ chunk-start (length (cdr chunk))))))
+          (replace result (cdr chunk) :start1 (- copy-start offset)
+                                      :start2 (- copy-start chunk-start)
+                                      :end2 (- copy-end chunk-start))))
+      result)))
+
 (defun heap-inline-varlena-range (bytes offset)
   "Return inclusive start and exclusive end offsets into BYTES, without copying.
 Accept only little-endian inline short or uncompressed four-byte headers;

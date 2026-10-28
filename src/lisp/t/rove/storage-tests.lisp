@@ -88,6 +88,44 @@
                         (lambda (tuple) (push (aref (htup-values tuple) 0) seen)))
       (rove:ok (equal seen '("visible")) "invisible tuple attributes are not read")))
 
+(rove:deftest test-toast-chunk-assembly
+    (let ((chunks (list (cons 0 (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(0 1 2 3)))
+                        (cons 1 #(4 5 6 7))
+                        (cons 2 #(8 9)))))
+      (rove:ok (equalp #(0 1 2 3 4 5 6 7 8 9)
+                       (toast-assemble-chunks chunks 10 4))
+               "ordered chunks reconstruct the full value")
+      (rove:ok (equalp #(3 4 5 6 7 8)
+                       (toast-assemble-chunks chunks 10 4 :offset 3 :length 6))
+               "slice crosses chunk boundaries")
+      (dolist (bad (list (cdr chunks) (list (first chunks) (third chunks))
+                         (append chunks (list (third chunks)))
+                         (list (cons 0 #(0 1)) (second chunks) (third chunks))))
+        (rove:ok (handler-case (progn (toast-assemble-chunks bad 10 4) nil)
+                   (pg-error (e) (string= (pg-error-sqlstate e) "XX001")))
+                 "missing, repeated and incorrectly sized chunks signal corruption"))))
+
+(rove:deftest test-toast-chunk-slice-and-boundaries
+    (let ((chunks (list (cons 1 #(4 5 6 7)) (cons 2 #(8 9 10 11)))))
+      (rove:ok (equalp #(5 6 7 8 9)
+                       (toast-assemble-chunks chunks 12 4 :offset 5 :length 5))
+               "slices accept only the selected chunk range")
+      (rove:ok (equalp #() (toast-assemble-chunks nil 12 4 :offset 12 :length 0))
+               "empty slices require no chunks")
+      (rove:ok (handler-case
+                   (progn (toast-assemble-chunks (list (cons 0 #(0 1 2 3))
+                                                       (cons 1 #(4 5 6)))
+                                                 8 4)
+                          nil)
+                 (pg-error (e) (string= (pg-error-sqlstate e) "XX001")))
+               "a final chunk is full when size is an exact multiple")))
+
+(rove:deftest test-toast-chunk-invalid-list
+    (dolist (chunks (list '(0) (cons (cons 0 #(1)) 7)))
+      (rove:ok (handler-case (progn (toast-assemble-chunks chunks 1 1) nil)
+                 (pg-error (e) (string= (pg-error-sqlstate e) "XX001")))
+               "invalid chunk containers signal corruption")))
+
 (rove:deftest test-bytea-tuple-storage
     (let ((columns (vector (make-pg-column :name "a" :type :int2 :typmod -1 :attnum 1)
                            (make-pg-column :name "bytes" :type :bytea :typmod -1 :attnum 2)

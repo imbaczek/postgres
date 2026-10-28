@@ -271,6 +271,21 @@
     (rove:ok (= target (vacuum-compute-freeze-cutoff next target next))
              "a horizon exactly at the minimum-age target is inclusive")))
 
+(cl-spec:defproperty unit-toast-chunks-roundtrip
+    ((payload unit-octet-vector)
+     (chunk-size (range integer 1 24)))
+  (:about toast-assemble-chunks)
+  (:trials (:normal 200))
+  (let ((chunks
+          (loop for start from 0 below (length payload) by chunk-size
+                for sequence from 0
+                collect (cons sequence (subseq payload start (min (length payload)
+                                                                  (+ start chunk-size)))))))
+    (equalp payload (toast-assemble-chunks chunks (length payload) chunk-size))))
+
+(rove:deftest generated-unit-toast-chunks
+    (unit-check-property 'unit-toast-chunks-roundtrip))
+
 (cl-spec:defproperty unit-bytea-tuple-roundtrip
     ((payload unit-octet-vector))
   (:about form-heap-tuple deform-heap-tuple)
