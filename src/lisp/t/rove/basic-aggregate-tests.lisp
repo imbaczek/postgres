@@ -812,6 +812,49 @@
       (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case)))
   (rove:ok (equal '((t t)) (subquery-test-rows "SELECT 'NaN'::float8='NaN'::float8, 'NaN'::float8>'Infinity'::float8"))))
 
+(cl-spec:defproperty numeric-operator-unknown-coercion
+    ((n (range integer -100 100)))
+  (:about analyze-binop-expression)
+  (:trials (:normal 100))
+  (equal (subquery-test-rows (format nil "SELECT (1.20 + '~d')::text" n))
+         (subquery-test-rows (format nil "SELECT (1.20 + ~d::numeric)::text" n))))
+
+(rove:deftest numeric-operator-unknown-literals
+    (dolist (case '(("SELECT (1.2 + '3')::text" "4.2")
+                    ("SELECT ('3' - 1.2)::text" "1.8")
+                    ("SELECT (1.2 * '3')::text" "3.6")
+                    ("SELECT (1.2 / '3')::text" "0.40000000000000000000")
+                    ("SELECT (1.2 % '3')::text" "1.2")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case)))
+  (rove:ok (equal (list (list +null+ +null+)) (subquery-test-rows "SELECT NULL + 1.2, 1.2 + NULL")))
+  (dolist (sql '("SELECT 1.2 + 'bad'" "SELECT 'bad' + 1.2"))
+    (let ((condition (handler-case (progn (subquery-test-rows sql) nil)
+                       (pg-error (error) error))))
+      (rove:ok (and condition (string= (pg-error-sqlstate condition) "22P02")) sql)))
+  (rove:ok (equal '((t)) (subquery-test-rows "SELECT 1.2 = '1.2'")))
+  (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-operator-unknown-coercion :seed 42))))
+    (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(rove:deftest numeric-operator-function-identity
+    (dolist (sql '("SELECT DISTINCT @ x FROM (SELECT 4 AS x) s ORDER BY abs(x)"
+                   "SELECT DISTINCT abs(x) FROM (SELECT 4 AS x) s ORDER BY @ x"
+                   "SELECT DISTINCT |/ x FROM (SELECT 4 AS x) s ORDER BY sqrt(x)"
+                   "SELECT DISTINCT sqrt(x) FROM (SELECT 4 AS x) s ORDER BY |/ x"
+                   "SELECT DISTINCT ||/ x FROM (SELECT 8 AS x) s ORDER BY cbrt(x)"
+                   "SELECT DISTINCT cbrt(x) FROM (SELECT 8 AS x) s ORDER BY ||/ x"
+                   "SELECT DISTINCT int4and(x, 1) FROM (SELECT 4 AS x) s ORDER BY x & 1"
+                   "SELECT DISTINCT x & 1 FROM (SELECT 4 AS x) s ORDER BY int4and(x, 1)"))
+      (let ((condition (handler-case (progn (subquery-test-rows sql) nil)
+                         (pg-error (error) error))))
+        (rove:ok (and condition (string= (pg-error-sqlstate condition) "42P10")) sql)))
+  (dolist (case '(("SELECT (@ -4)::text" "4")
+                  ("SELECT (|/ 4)::text" "2")
+                  ("SELECT (||/ 8)::text" "2")
+                  ("SELECT int4and(7, 3)::text" "3")
+                  ("SELECT int4not(1)::text" "-2")
+                  ("SELECT int4abs(-4)::text" "4")))
+    (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case))))
+
 (rove:deftest numeric-literal-expressions
     (dolist (case '(("SELECT 1.50::text" "1.50")
                     ("SELECT (-1.25 + 2.00)::text" "0.75")

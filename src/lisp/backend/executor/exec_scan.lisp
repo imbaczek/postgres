@@ -847,7 +847,8 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
 (defun having-immutable-function-p (name)
   ;; Match the immutable declarations in pg_proc.dat for supported calls.
   ;; Other calls remain opaque even when their arguments are constants.
-  (or (float-catalog-alias name)
+  (or (integer-catalog-alias-p name)
+      (float-catalog-alias name)
       (trig-function-p name)
       (numeric-arithmetic-function-p name)
       (numeric-helper-function-p name)

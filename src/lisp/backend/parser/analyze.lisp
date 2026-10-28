@@ -432,32 +432,59 @@ Convert supplied expressions in source order, then return them in parameter orde
         (setf (aref slots index) (coerce-common-expression expression type))))
     (coerce slots 'list)))
 
-(defun analyze-random-arguments (arguments table)
-  (let ((slots (make-array 2 :initial-element nil))
-        (position 0) (names nil))
-    (dolist (argument arguments)
-      (let* ((named (eq (first argument) :named-arg))
-             (arg-name (and named (second argument)))
-             (index (if named (position arg-name '("min" "max") :test #'equal)
-                        (prog1 position (incf position)))))
-        (when (and (not named) names)
-          (ereport "42601" "positional argument cannot follow named argument"))
-        (when (and named (member arg-name names :test #'equal))
-          (ereport "42601" "argument name ~s used more than once" arg-name))
-        (when named (push arg-name names))
-        (unless (and index (< index 2) (not (aref slots index)))
-          (ereport "42883" "function random(...) does not exist"))
-        (setf (aref slots index) (analyze-expr (if named (third argument) argument) table))))
-    (unless (every #'identity slots) (ereport "42883" "function random(...) does not exist"))
-    (coerce slots 'list)))
+(defun random-call-signature (arguments &optional names)
+  "Describe the caller's argument types before overload coercion.
+Unknown literals retain PostgreSQL's unknown type in random/setseed errors;
+NAMES keeps named notation in its original order, before min/max reordering."
+  (format nil "~{~a~^, ~}"
+          (loop for argument in arguments
+                for index from 0
+                for name = (nth index names)
+                for type = (if (in-unknown-constant-p argument)
+                               "unknown" (typed-arg-name argument))
+                collect (if name (format nil "~a => ~a" name type) type))))
+
+(defun analyze-random-arguments (arguments table &optional (name "random"))
+  "Analyze random/setseed arguments in caller order, then bind random's min/max.
+Return the original signature separately so resolution errors retain argument
+names and unknown types.  setseed has no catalog argument names."
+  (let ((analyzed (mapcar (lambda (argument)
+                            (analyze-expr (if (eq (first argument) :named-arg)
+                                              (third argument) argument) table))
+                          arguments))
+        (argument-names nil) (names nil)
+        (slots (make-array 2 :initial-element nil))
+        (position 0) (invalid nil))
+    ;; transformFuncCall transforms every argument before ParseFuncOrColumn
+    ;; checks named notation; an invalid expression takes precedence.
+    (loop for argument in arguments
+          for value in analyzed
+          do (let* ((named (eq (first argument) :named-arg))
+                    (arg-name (and named (second argument)))
+                    (index (if named (position arg-name '("min" "max") :test #'equal)
+                               (prog1 position (incf position)))))
+               (when (and (not named) names)
+                 (ereport "42601" "positional argument cannot follow named argument"))
+               (when (and named (member arg-name names :test #'equal))
+                 (ereport "42601" "argument name ~s used more than once" arg-name))
+               (when named (push arg-name names))
+               (push arg-name argument-names)
+               (if (and index (< index 2) (not (aref slots index)))
+                   (setf (aref slots index) value)
+                   (setf invalid t))))
+    (let ((signature (random-call-signature analyzed (nreverse argument-names))))
+      (when (and names
+                 (or (string= name "setseed") invalid
+                     (not (every #'identity slots))))
+        (ereport "42883" "function ~a(~a) does not exist" name signature))
+      (values (if names (coerce slots 'list) analyzed) signature))))
 
 (defun analyze-call-argument-list (name arguments table &optional variadic)
   "Analyze call arguments, binding supported named arguments."
   (cond ((string= name "pg_promote")
          (analyze-promotion-arguments arguments table variadic))
-        ((and (string= name "random")
-              (some (lambda (argument) (eq (first argument) :named-arg)) arguments))
-         (analyze-random-arguments arguments table))
+        ((member name '("random" "setseed") :test #'string=)
+         (analyze-random-arguments arguments table name))
         (t (mapcar (lambda (argument)
                      (when (eq (first argument) :named-arg)
                        (ereport "0A000" "named arguments are not supported for function ~a" name))
@@ -792,7 +819,7 @@ Zone-west breaks ties after comparing time plus zone-west in microseconds."
         ((= (length args) 2) (sql-width-bucket-array (first args) (second args)))
         (t (sql-width-bucket-range args))))
 
-(defun analyze-random-function (name args)
+(defun analyze-random-function (name args &optional (signature (random-call-signature args)))
   (cond
     ((and (string= name "random") (null args))
      (list :func name args :type :float8 :typmod -1))
@@ -803,17 +830,17 @@ Zone-west breaks ties after comparing time plus zone-west in microseconds."
     ((and (string= name "random") (= (length args) 2))
      (when (every (lambda (arg) (or (in-unknown-constant-p arg)
                                     (eq (expr-type arg) :int2))) args)
-       (ereport "42725" "function random(~a) is not unique" (call-signature args)))
+       (ereport "42725" "function random(~a) is not unique" signature))
      (let* ((types (mapcar #'expr-type args))
             (type (cond ((member :numeric types) :numeric)
                         ((member :int8 types) :int8)
                         (t :int4))))
        (unless (every (lambda (arg) (or (in-unknown-constant-p arg)
                                         (sql-implicit-coercion-p (expr-type arg) type))) args)
-         (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+         (ereport "42883" "function ~a(~a) does not exist" name signature))
        (list :func name (mapcar (lambda (arg) (coerce-common-expression arg type)) args)
              :type type :typmod -1)))
-    (t (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))))
+    (t (ereport "42883" "function ~a(~a) does not exist" name signature))))
 
 (defun float-catalog-alias (name)
   "Return the declared argument type and execution name for a float catalog function.
@@ -830,10 +857,22 @@ so expression identity remains distinct from the corresponding SQL function."
                      ("dlog10" :float8 "log10"))
               :test #'string=)))
 
+(defun integer-catalog-alias-p (name)
+  "Recognize supported integer catalog function names, retaining call identity.
+The declared operand types are resolved during analysis; execution shares the
+corresponding operator implementation without rewriting the analyzed call."
+  (and (>= (length name) 5)
+       (member (subseq name 0 4) '("int2" "int4" "int8") :test #'string=)
+       (member (subseq name 4) '("and" "or" "xor" "not" "shl" "shr" "abs") :test #'string=)))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
-         (args (analyze-call-argument-list name (third expr) table (getf (cdddr expr) :variadic))))
+         (random-signature nil)
+         (args (multiple-value-bind (arguments signature)
+                   (analyze-call-argument-list name (third expr) table (getf (cdddr expr) :variadic))
+                 (setf random-signature signature)
+                 arguments)))
     (when (member name '("row_number" "rank" "dense_rank") :test #'string=)
       (when args (ereport "42883" "function ~a with these arguments does not exist" name))
       (ereport "42809" "window function ~a requires an OVER clause" name))
@@ -843,8 +882,7 @@ so expression identity remains distinct from the corresponding SQL function."
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     ;; The catalog's integer helper functions use the same execution paths as
     ;; their operators, but resolve their declared argument types by name.
-    (when (and (>= (length name) 5) (member (subseq name 0 4) '("int2" "int4" "int8") :test #'string=)
-               (member (subseq name 4) '("and" "or" "xor" "not" "shl" "shr" "abs") :test #'string=))
+    (when (integer-catalog-alias-p name)
       (let* ((type (cdr (assoc (subseq name 0 4) '(("int2" . :int2) ("int4" . :int4) ("int8" . :int8)) :test #'string=)))
              (suffix (subseq name 4))
              (unary (member suffix '("not" "abs") :test #'string=))
@@ -857,10 +895,7 @@ so expression identity remains distinct from the corresponding SQL function."
           (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
         (let ((coerced (mapcar #'coerce-common-expression args types)))
           (return-from analyze-function-expression
-            (cond ((string= suffix "abs") (list :func "abs" coerced :type type :typmod -1))
-                  ((string= suffix "not") (list :unary "~" (first coerced) :type type :typmod -1))
-                  (t (list :binop (cdr (assoc suffix '(("and" . "&") ("or" . "|") ("xor" . "#") ("shl" . "<<") ("shr" . ">>")) :test #'string=))
-                           (first coerced) (second coerced) :type type :typmod -1)))))))
+            (list :func name coerced :type type :typmod -1)))))
     ;; These catalog names expose the same implementation as the SQL names,
     ;; but each has a single declared float argument type.
     (let ((alias (float-catalog-alias name)))
@@ -874,7 +909,7 @@ so expression identity remains distinct from the corresponding SQL function."
             (list :func name (list (coerce-common-expression (first args) type))
                   :type type :typmod -1)))))
     (cond
-      ((member name '("random" "setseed") :test #'string=) (analyze-random-function name args))
+      ((member name '("random" "setseed") :test #'string=) (analyze-random-function name args random-signature))
       ((trig-function-p name) (analyze-trig-function name args))
       ((string= name "width_bucket") (analyze-width-bucket args))
       ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
@@ -1738,6 +1773,12 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
               (return-from analyze-binop-expression
                 (list :binop operator left right :type type :typmod -1))))
           (when (or (eq (expr-type left) :numeric) (eq (expr-type right) :numeric))
+            ;; Like binary_oper_exact, use the known numeric operand's type for
+            ;; an unknown literal before applying the supported numeric operator.
+            (when (and (in-unknown-constant-p left) (eq (expr-type right) :numeric))
+              (setf left (coerce-in-constant left :numeric)))
+            (when (and (in-unknown-constant-p right) (eq (expr-type left) :numeric))
+              (setf right (coerce-in-constant right :numeric)))
             (unless (and (member (expr-type left) '(:int2 :int4 :int8 :numeric))
                          (member (expr-type right) '(:int2 :int4 :int8 :numeric)))
               (ereport "42883" "numeric operator requires numeric operands"))
@@ -1957,12 +1998,16 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
     (:unary
      (let ((e (analyze-expr (third expr) table)))
        (when (member (second expr) '("@" "|/" "||/") :test #'string=)
-         (return-from analyze-expr
-           (cond ((string= (second expr) "||/")
-                  (analyze-trig-function "cbrt" (list e)))
-                 ((string= (second expr) "|/")
-                  (analyze-trig-function "sqrt" (list e)))
-                 (t (analyze-basic-numeric-function "abs" (list e))))))
+         ;; Reuse function overload resolution while retaining operator identity
+         ;; for grouping and expression comparisons.
+         (let ((resolved (cond ((string= (second expr) "||/")
+                                (analyze-trig-function "cbrt" (list e)))
+                               ((string= (second expr) "|/")
+                                (analyze-trig-function "sqrt" (list e)))
+                               (t (analyze-basic-numeric-function "abs" (list e))))))
+           (return-from analyze-expr
+             (list :unary (second expr) (first (third resolved))
+                   :type (expr-type resolved) :typmod -1))))
        (when (string= (second expr) "~")
          (when (in-unknown-constant-p e)
            (ereport "42725" "operator is not unique: ~a unknown" "~"))
@@ -2308,7 +2353,8 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
   (and (consp form)
        (or (eq (first form) :subplan)
            (and (eq (first form) :func)
-                (not (or (float-catalog-alias (second form))
+                (not (or (integer-catalog-alias-p (second form))
+                         (float-catalog-alias (second form))
                          (trig-function-p (second form))
                          (numeric-arithmetic-function-p (second form))
                          (numeric-helper-function-p (second form))
@@ -3203,9 +3249,18 @@ aliases share the corresponding numeric operator implementation."
 (defun eval-analyzed-function (name arguments type)
   "Evaluate a resolved call using its coerced argument values and result type.
 Arguments have already been evaluated in order, including for strict calls.
-Map float catalog names only here, after expression identity has been resolved."
+Map float catalog names and dispatch integer catalog names only here, after
+expression identity has been resolved."
   (setf name (or (second (float-catalog-alias name)) name))
   (cond
+    ((integer-catalog-alias-p name)
+     (if (member +null+ arguments) +null+
+         (let ((suffix (subseq name 4)))
+           (cond ((string= suffix "abs") (eval-analyzed-function "abs" arguments type))
+                 ((string= suffix "not") (lognot (first arguments)))
+                 (t (sql-integer-bitwise
+                     (cdr (assoc suffix '(("and" . "&") ("or" . "|") ("xor" . "#") ("shl" . "<<") ("shr" . ">>")) :test #'string=))
+                     (first arguments) (second arguments) type))))))
     ((member name '("random" "setseed") :test #'string=)
      (eval-random-function name arguments type))
     ((and (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
@@ -3345,6 +3400,11 @@ truncate and interpret the result at TYPE's signed width."
      (sql-strict-let ((value (eval-expr (third expr) env)))
        (cond
          ((string= (second expr) "~") (lognot value))
+         ((member (second expr) '("@" "|/" "||/") :test #'string=)
+          (eval-analyzed-function (cond ((string= (second expr) "@") "abs")
+                                        ((string= (second expr) "|/") "sqrt")
+                                        (t "cbrt"))
+                                  (list value) (expr-type expr)))
          ((string= (second expr) "-")
           (let ((result (cond ((sql-interval-p value) (sql-interval-add (make-sql-interval 0 0 0) value t))
                               ((sql-numeric-p value) (sql-numeric-negate value))

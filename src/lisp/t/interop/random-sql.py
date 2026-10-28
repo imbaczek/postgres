@@ -35,12 +35,29 @@ def run(port):
                      'random(1::smallint,2::int)']:
             values.append(a.observe('select ' + expr))
         diagnostics = []
-        for expr in ['2', '1.23456789', '12345678', "'NaN'::float8", "'Infinity'::float8", "'-Infinity'::float8"]:
+        diagnostic_expressions = [
+            'setseed(' + expr + ')' for expr in
+            ['2', '1.23456789', '12345678', "'NaN'::float8",
+             "'Infinity'::float8", "'-Infinity'::float8"]]
+        diagnostic_expressions += [
+            'setseed(seed=>0.5)', 'setseed(foo=>NULL)',
+            'setseed(foo=>0.5,foo=>0.5)', 'setseed(foo=>0.5,0.5)',
+            'random(min=>1)', 'random(foo=>1,max=>2)',
+            'random(1,min=>2)', 'random(min=>1,min=>2)',
+            'random(min=>1,min=>missing)', 'random(min=>1,missing)',
+            'random(max=>2,1)', 'random(min=>1,max=>2,extra=>3)',
+            'random(NULL,NULL)', "random('1','2')",
+            'random(NULL,1::smallint)',
+            'random(max=>1::smallint,min=>NULL)',
+            'random(max=>2::float8,min=>1)',
+            'random(NULL)', 'setseed(NULL,NULL)',
+            'random(NULL::text,NULL::text)']
+        for expr in diagnostic_expressions:
             try:
-                a.query('select setseed(' + expr + ')')
+                a.query('select ' + expr)
                 raise AssertionError(expr)
             except WireError as error:
-                diagnostics.append(str(error))
+                diagnostics.append((expr, str(error)))
         return values, after, diagnostics
     finally:
         a.close()
