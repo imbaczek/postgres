@@ -56,6 +56,7 @@
      (:module "postmaster"
       :serial t
       :components ((:file "postmaster")))
+     (:file "utils/adt/numeric")
      (:module "catalog"
       :serial t
       :components ((:file "catalog")
@@ -100,6 +101,7 @@
                    (:file "exec_subplan_dml")
                    (:file "exec_joined_dml")
                    (:file "exec_on_conflict")
+                   (:file "exec_constraints")
                    (:file "exec_vacuum")
                    (:file "exec_simple")))
      (:module "tcop"

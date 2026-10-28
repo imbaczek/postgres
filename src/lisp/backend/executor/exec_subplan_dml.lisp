@@ -199,6 +199,7 @@
                       :insert-source source :insert-source-plan nil :source-assignments source-assignments
                       :dml-source dml-source :dml-source-plan nil :dml-one-time-quals nil :dml-row-where nil))))))
     (clear-query-analysis-contexts prepared)
+    (setf prepared (prepare-dml-column-defaults prepared ast))
     (plan-query-ctes prepared)
     (when (getf prepared :insert-source)
       (setf (getf prepared :insert-source-plan)
@@ -245,7 +246,8 @@
         (ereport "0A000" "table definition changed during query planning"))
       (refresh-on-conflict-arbiters table (getf prepared :conflict))
       (revalidate-subquery-relations relations))
-    (let* ((*subquery-execution-active-p* t)
+    (let* ((*dml-column-defaults* (getf prepared :column-defaults))
+           (*subquery-execution-active-p* t)
            (*subquery-result-cache* (make-hash-table :test #'eq))
            (*subquery-registered-relations* relations)
            (*subquery-outer-frames* nil)
@@ -275,10 +277,13 @@
     (detach-select-index-scans)))
 
 (defun coerce-dml-column-default (column)
-  (let ((value (insert-column-default column)))
-    (if (eq value +null+) value
-        (eval-subquery-assignment
-         (analyze-subquery-assignment (list :const value :type :int8 :typmod -1) column) #()))))
+  (cond ((and *dml-column-defaults* (gethash column *dml-column-defaults*))
+         (eval-expr (gethash column *dml-column-defaults*) #()))
+        ((pg-column-default-expression column) (insert-column-default column))
+        (t (let ((value (insert-column-default column)))
+             (if (eq value +null+) value
+                 (eval-subquery-assignment
+                  (analyze-subquery-assignment (list :const value :type :int8 :typmod -1) column) #()))))))
 
 (defun subquery-update-values (table sets old &optional (environment old))
   ;; Analysis orders SET assignments by physical attribute; evaluate each against
@@ -293,6 +298,7 @@
         (setf (aref new (1- (pg-column-attnum column)))
               (coerce-value value (pg-column-type column) (pg-column-typmod column)))))
     (check-not-null new columns)
+    (check-table-constraints table new)
     new))
 
 (defun exec-insert-subqueries (stream ast)
@@ -335,6 +341,7 @@
                                                    (coerce-dml-column-default column))
                                                   (t (eval-expr expression environment)))))
                              (check-not-null values columns)
+                             (check-table-constraints table values)
                              values)))))
                   (detach-select-index-scans)
                   (multiple-value-bind (action actual old)

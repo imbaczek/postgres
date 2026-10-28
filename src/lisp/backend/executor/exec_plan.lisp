@@ -610,7 +610,10 @@ reordered tree, and each parameterized path can reference only joined Vars."
       (finish-query-plan prepared registered logical physical alternative-plans))))
 
 (defun sql-group-value-payload (value)
+  ;; Equal numeric values group together regardless of their display scale,
+  ;; including when nested in records or arrays.
   (cond
+    ((sql-decimal-p value) (sql-numeric-rational value))
     ((sql-record-p value)
      (list :record (mapcar #'second (sql-record-fields value))
            (map 'list #'sql-group-value-payload (sql-record-values value))))
@@ -1020,12 +1023,35 @@ on an abnormal exit."
                          (hash-aggregate-process-rows source group-keys aggregate-count callback
                                                       (max 1 *query-work-memory-bytes*) 0)))
 
+(defstruct average-transition (sum 0) (count 0))
+
+(defstruct sum-transition (value +null+) type)
+
+(defun scalar-aggregate-transition-result (state)
+  ;; Grouped and window aggregates share finalization: empty SUM/AVG is NULL,
+  ;; exact totals are bounded at output, and AVG uses numeric division scale.
+  (cond ((average-transition-p state)
+         (if (zerop (average-transition-count state)) +null+
+             (let ((sum (average-transition-sum state)))
+               (sql-numeric-division
+                (sql-numeric-result (sql-numeric-coefficient sum) (sql-numeric-scale sum))
+                (average-transition-count state)))))
+        ((sum-transition-p state)
+         (let ((value (sum-transition-value state)))
+           (if (and (eq (sum-transition-type state) :numeric) (not (eq value +null+)))
+               (let ((result (sql-numeric-result (sql-numeric-coefficient value) (sql-numeric-scale value))))
+                 (if (integerp value) (sql-decimal-coefficient result) result))
+               value)))
+        (t state)))
+
 (defun make-aggregate-transition-states (descriptors)
   (let ((budget (max 1 (floor *query-work-memory-bytes* (max 1 (length descriptors))))))
     (map 'vector (lambda (descriptor)
                    (ecase (getf descriptor :kind)
-                     (:count 0)
-                     (:sum +null+)
+                     ((:count :count-expr) 0)
+                     ((:min :max) +null+)
+                     (:sum (make-sum-transition :type (getf descriptor :type)))
+                     (:avg (make-average-transition))
                      (:array-agg (make-query-row-spool budget))))
          descriptors)))
 
@@ -1040,7 +1066,7 @@ on an abnormal exit."
 (defun sum-aggregate-transition (state value result-type)
   "Match C's NULL start, int64 int2/int4 accumulator, and exact numeric totals."
   (if (eq value +null+) state
-      (let ((total (if (eq state +null+) value (+ state value))))
+      (let ((total (if (eq state +null+) value (sql-numeric-accumulate state value))))
         (if (eq result-type :int8)
             ;; numeric.c:int2_sum/int4_sum use plain int64 addition, which the
             ;; pinned C build wraps; SUM(int8/numeric) retains a wider total.
@@ -1050,29 +1076,39 @@ on an abnormal exit."
 
 (defun step-aggregate-transition-states (states descriptors inputs offset)
   (loop for descriptor in descriptors for index from 0
+        for state = (aref states index)
+        for value = (aref inputs (+ offset index))
         do (ecase (getf descriptor :kind)
              (:count (incf (aref states index)))
-             (:sum
-              (setf (aref states index)
-                    (sum-aggregate-transition (aref states index)
-                                              (aref inputs (+ offset index))
-                                              (getf descriptor :type))))
-             (:array-agg
-              (query-row-spool-append (aref states index) (aref inputs (+ offset index)))))))
+             (:count-expr (unless (eq value +null+) (incf (aref states index))))
+             (:sum (setf (sum-transition-value state)
+                         (sum-aggregate-transition (sum-transition-value state) value (getf descriptor :type))))
+             ((:min :max)
+              (unless (eq value +null+)
+                (when (or (eq state +null+)
+                          (if (eq (getf descriptor :kind) :min)
+                              (not (plusp (compare-3way value state)))
+                              (not (minusp (compare-3way value state)))))
+                  (setf (aref states index) value))))
+             (:avg
+              (unless (eq value +null+)
+                (setf (average-transition-sum state)
+                      (sql-numeric-accumulate (average-transition-sum state) value))
+                (incf (average-transition-count state))))
+             (:array-agg (query-row-spool-append state value)))))
 
 (defun finalize-aggregate-transition-states (states)
   (map 'vector
        (lambda (state)
          (if (query-row-spool-p state)
-             (if (zerop (query-row-spool-count state))
-                 +null+
+             (if (zerop (query-row-spool-count state)) +null+
                  (let ((result (make-array (query-row-spool-count state))))
                    (query-row-spool-seal state)
                    (map-query-row-spool state (lambda (value index)
                                                 (check-for-interrupts)
                                                 (setf (aref result index) value)))
                    result))
-             state))
+             (scalar-aggregate-transition-result state)))
        states))
 
 (defun aggregate-input-row (environment group-keys descriptors)

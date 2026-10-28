@@ -904,6 +904,7 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
 (defun query-spill-value-size (value)
   "Estimate retained row memory without building its printed representation."
   (cond
+    ((sql-decimal-p value) (+ 32 (query-spill-value-size (sql-decimal-coefficient value))))
     ((sql-record-p value)
      (+ 64 (query-spill-value-size (sql-record-fields value))
         (query-spill-value-size (sql-record-values value))))
@@ -933,6 +934,8 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
 
 (defun query-spill-decode (value)
   (cond
+    ((and (consp value) (eq (first value) :pg-query-spill-numeric))
+     (make-sql-decimal (second value) (third value)))
     ((and (consp value) (eq (first value) :pg-query-spill-record))
      (make-sql-record :fields (query-spill-decode (second value))
                       :values (query-spill-decode (third value))))
@@ -958,7 +961,11 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
   (+ 64 (query-spill-value-size value)))
 
 (defun query-spill-write-value (stream value)
+  ;; Preserve coefficient and display scale across spill and replay, including
+  ;; decimals nested in composite rows, without evaluating reader forms.
   (cond
+    ((sql-decimal-p value)
+     (format stream "(:pg-query-spill-numeric ~d ~d)" (sql-decimal-coefficient value) (sql-decimal-scale value)))
     ((sql-record-p value)
      (write-string "(:pg-query-spill-record " stream)
      (query-spill-write-value stream (sql-record-fields value))

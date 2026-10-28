@@ -52,11 +52,14 @@
                       "null value in column \"~a\" violates not-null constraint"
                       (pg-column-name col))))
 
+(defvar *dml-column-defaults* nil)
+
 (defun insert-column-default (column)
-  (let ((sequence-name (pg-column-default-sequence-name column)))
-    (if sequence-name
-        (sequence-nextval sequence-name)
-        +null+)))
+  (cond ((pg-column-default-expression column)
+         (eval-expr (pg-column-default-expression column) #()))
+        ((pg-column-default-sequence-name column)
+         (sequence-nextval (pg-column-default-sequence-name column)))
+        (t +null+)))
 
 (defun unique-conflict-status (tuple my-xid)
   "Classify a heap tuple found in a unique index."

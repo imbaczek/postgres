@@ -9,7 +9,9 @@
   typmod            ; n+4 for varchar(n), else -1
   attnum
   notnull
-  default-sequence-name)
+  default-sequence-name
+  default-expression
+  default-sql)
 
 (defstruct pg-class
   oid
@@ -18,7 +20,8 @@
   (relfrozenxid +first-normal-xid+)
   columns           ; simple-vector of pg-column, attnum order
   indexes           ; list of index OIDs
-  statistics)       ; derived ANALYZE estimates; raw samples remain transient
+  statistics
+  checks)       ; derived ANALYZE estimates; raw samples remain transient
 
 (defstruct pg-index
   oid
@@ -141,13 +144,34 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
                            `(funcall ,decode (getf sexp ,key ,default))
                            `(getf sexp ,key ,default))))))))))
 
+(defun catalog-expression-to-sexp (expression)
+  ;; Encode decimals explicitly so persisted expression trees round-trip without
+  ;; relying on a Lisp structure reader or losing their display scale.
+  (cond ((sql-decimal-p expression)
+         (list :pg-catalog-numeric (sql-decimal-coefficient expression) (sql-decimal-scale expression)))
+        ((consp expression)
+         (cons (catalog-expression-to-sexp (car expression))
+               (catalog-expression-to-sexp (cdr expression))))
+        (t expression)))
+
+(defun catalog-expression-from-sexp (expression)
+  (cond ((and (consp expression) (eq (first expression) :pg-catalog-numeric))
+         (make-sql-decimal (second expression) (third expression)))
+        ((consp expression)
+         (cons (catalog-expression-from-sexp (car expression))
+               (catalog-expression-from-sexp (cdr expression))))
+        (t expression)))
+
 (define-catalog-codec column make-pg-column
   (:name pg-column-name :name)
   (:type pg-column-type :type)
   (:typmod pg-column-typmod :typmod)
   (:attnum pg-column-attnum :attnum)
   (:notnull pg-column-notnull :notnull)
-  (:default-sequence pg-column-default-sequence-name :default-sequence-name))
+  (:default-sequence pg-column-default-sequence-name :default-sequence-name)
+  (:default-expression pg-column-default-expression :default-expression
+                       :encode #'catalog-expression-to-sexp :decode #'catalog-expression-from-sexp)
+  (:default-sql pg-column-default-sql :default-sql))
 
 (define-catalog-codec sequence make-pg-sequence
   (:oid pg-sequence-oid :oid)
@@ -197,6 +221,8 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
             :decode (lambda (columns)
                       (coerce (mapcar #'column-from-sexp columns) 'vector)))
   (:indexes pg-class-indexes :indexes)
+  (:checks pg-class-checks :checks
+           :encode #'catalog-expression-to-sexp :decode #'catalog-expression-from-sexp)
   (:statistics pg-class-statistics :statistics
                :encode (lambda (statistics)
                          (and statistics (table-statistics-to-sexp statistics)))
@@ -508,10 +534,18 @@ longer contain transaction-status references."
         collect (cons key value)))
 
 (defun catalog-mutation-copy-class (class)
+  ;; Rollback owns independent column and CHECK trees, so a failed pre-durable
+  ;; catalog mutation cannot leave partially changed expressions in the table.
   (let ((copy (copy-pg-class class)))
     (setf (pg-class-columns copy)
-          (map 'vector #'copy-pg-column (pg-class-columns class))
-          (pg-class-indexes copy) (copy-list (pg-class-indexes class)))
+          (map 'vector (lambda (column)
+                         (let ((copy (copy-pg-column column)))
+                           (setf (pg-column-default-expression copy)
+                                 (copy-tree (pg-column-default-expression column)))
+                           copy))
+               (pg-class-columns class))
+          (pg-class-indexes copy) (copy-list (pg-class-indexes class))
+          (pg-class-checks copy) (copy-tree (pg-class-checks class)))
     copy))
 
 (defun catalog-mutation-copy-index (index)
@@ -577,7 +611,8 @@ longer contain transaction-status references."
         (pg-class-relfrozenxid class) (pg-class-relfrozenxid saved)
         (pg-class-columns class) (pg-class-columns saved)
         (pg-class-indexes class) (pg-class-indexes saved)
-        (pg-class-statistics class) (pg-class-statistics saved)))
+        (pg-class-statistics class) (pg-class-statistics saved)
+        (pg-class-checks class) (pg-class-checks saved)))
 
 (defun catalog-mutation-restore-index (index saved)
   (setf (pg-index-oid index) (pg-index-oid saved)
@@ -796,19 +831,40 @@ from advancing the shared WAL generation between a failed save and rollback."
                    (and table (or (null oid) (= oid (pg-class-oid table))))))
                (pg-publication-tables publication)))))
 
+(defun catalog-expression-sequence-names (expression)
+  ;; Stored expressions admit only constant sequence names, making their
+  ;; dependencies available to publication and bootstrap inventory.
+  (let ((names nil))
+    (labels ((walk (node)
+               (when (consp node)
+                 (when (and (eq (first node) :func)
+                            (member (second node) '("nextval" "currval" "setval") :test #'string=))
+                   (let ((argument (first (third node))))
+                     (when (and (eq (first argument) :const) (stringp (second argument)))
+                       (pushnew (strip-schema (second argument)) names :test #'string=))))
+                 (walk (car node)) (walk (cdr node)))))
+      (walk expression))
+    names))
+
+(defun catalog-table-sequence-names (table)
+  (remove-duplicates
+   (append (loop for column across (pg-class-columns table)
+                 append (append (when (pg-column-default-sequence-name column)
+                                  (list (pg-column-default-sequence-name column)))
+                                (catalog-expression-sequence-names (pg-column-default-expression column))))
+           (loop for check in (pg-class-checks table)
+                 append (catalog-expression-sequence-names (getf check :expression))))
+   :test #'string=))
+
 (defun publication-sequence-names (publication db)
-  (let ((selected
-          (if (eq (pg-publication-sequences publication) :all)
-              (loop for name being the hash-keys of (database-sequences db)
-                    collect name)
-              (copy-list (pg-publication-sequences publication)))))
+  (let ((selected (if (eq (pg-publication-sequences publication) :all)
+                      (loop for name being the hash-keys of (database-sequences db) collect name)
+                      (copy-list (pg-publication-sequences publication)))))
     (dolist (table-name (publication-selected-table-names publication db))
       (let ((table (gethash table-name (database-tables db))))
         (when table
-          (loop for column across (pg-class-columns table)
-                for sequence-name = (pg-column-default-sequence-name column)
-                when sequence-name
-                  do (pushnew sequence-name selected :test #'string=)))))
+          (dolist (name (catalog-table-sequence-names table))
+            (pushnew name selected :test #'string=)))))
     (sort selected #'string<)))
 
 (defun catalog-sql-quote-ident (name)
@@ -832,20 +888,13 @@ from advancing the shared WAL generation between a failed save and rollback."
     (format stream "~a ~a"
             (catalog-sql-quote-ident (pg-column-name column))
             (case (pg-column-type column)
-              (:int4 "integer")
-              (:int8 "bigint")
-              (:varchar
-               (format nil "varchar(~a)"
-                       (- (pg-column-typmod column) 4)))
-              (otherwise
-               (error "cannot publish unsupported type ~a"
-                      (pg-column-type column)))))
-    (when (pg-column-notnull column)
-      (write-string " NOT NULL" stream))
-    (when (pg-column-default-sequence-name column)
-      (format stream " DEFAULT nextval(~a)"
-              (catalog-sql-literal
-               (pg-column-default-sequence-name column))))))
+              (:int4 "integer") (:int8 "bigint")
+              (:varchar (format nil "varchar(~a)" (- (pg-column-typmod column) 4)))
+              (otherwise (error "cannot publish unsupported type ~a" (pg-column-type column)))))
+    (when (pg-column-notnull column) (write-string " NOT NULL" stream))
+    (cond ((pg-column-default-sql column) (format stream " DEFAULT ~a" (pg-column-default-sql column)))
+          ((pg-column-default-sequence-name column)
+           (format stream " DEFAULT nextval(~a)" (catalog-sql-literal (pg-column-default-sequence-name column)))))))
 
 (defun catalog-table-constraint-sql (index table)
   (let ((columns (mapcar (lambda (attnum)
@@ -862,19 +911,26 @@ from advancing the shared WAL generation between a failed save and rollback."
             columns)))
 
 (defun catalog-table-definition-sql (table)
-  (let* ((indexes (table-indexes table))
-         ;; Constraint-owned indexes are push-built; sort by name so the
-         ;; pg_dump-style schema representation is independent of insertion order.
-         (constraints (mapcar (lambda (index)
-                                (catalog-table-constraint-sql index table))
-                              (sort (remove-if-not #'pg-index-constraint-owned-p indexes)
+  (let* ((checks (sort (copy-list (pg-class-checks table)) #'string< :key (lambda (check) (getf check :name))))
+         (constraints (mapcar (lambda (index) (catalog-table-constraint-sql index table))
+                              (sort (remove-if-not #'pg-index-constraint-owned-p (table-indexes table))
                                     #'string< :key #'pg-index-name)))
-         (definitions
-           (append (loop for column across (pg-class-columns table)
-                         collect (catalog-column-definition-sql column))
-                   constraints)))
-    (format nil "CREATE TABLE ~a (~{~a~^, ~})"
-            (catalog-sql-quote-ident (pg-class-name table)) definitions)))
+         (name (catalog-sql-quote-ident (pg-class-name table)))
+         (definitions (append (loop for column across (pg-class-columns table)
+                                    collect (catalog-column-definition-sql column))
+                              constraints
+                              (loop for check in checks when (getf check :validated)
+                                    collect (format nil "CONSTRAINT ~a CHECK (~a)"
+                                                    (catalog-sql-quote-ident (getf check :name))
+                                                    (getf check :sql))))))
+    (with-output-to-string (stream)
+      (format stream "CREATE TABLE ~a (~{~a~^, ~})" name definitions)
+      ;; CREATE TABLE cannot mark checks NOT VALID. Preserve their state with
+      ;; separate ALTERs while the bootstrap target is still empty.
+      (dolist (check checks)
+        (unless (getf check :validated)
+          (format stream "; ALTER TABLE ~a ADD CONSTRAINT ~a CHECK (~a) NOT VALID"
+                  name (catalog-sql-quote-ident (getf check :name)) (getf check :sql)))))))
 
 (defun catalog-standalone-index-definition-sql (index table)
   (format nil "CREATE ~aINDEX IF NOT EXISTS ~a ON ~a (~{~a~^, ~})~a"
@@ -1078,6 +1134,9 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
 
 (defun create-index* (db name table cols
                       &key unique primary constraint nulls-not-distinct)
+  (when (and constraint (find name (pg-class-checks table)
+                              :key (lambda (check) (getf check :name)) :test #'string=))
+    (ereport "42710" "constraint ~s for relation ~s already exists" name (pg-class-name table)))
   (check-new-relation-name db name)
   (let* ((oid (allocate-oid))
          (idx (make-index-object oid name table cols
@@ -1091,9 +1150,14 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
 (defun rename-index* (db old-name new-name)
   "Rename an index relation, retaining its OID and physical index file."
   (let ((idx (gethash old-name (database-indexes db))))
-    (unless idx
-      (ereport "42704" "index \"~a\" does not exist" old-name))
+    (unless idx (ereport "42704" "index ~s does not exist" old-name))
     (unless (string= old-name new-name)
+      (let ((table (loop for table being the hash-values of (database-tables db)
+                         when (= (pg-class-oid table) (pg-index-table-oid idx)) return table)))
+        (when (and (pg-index-constraint-owned-p idx) table
+                   (find new-name (pg-class-checks table)
+                         :key (lambda (check) (getf check :name)) :test #'string=))
+          (ereport "42710" "constraint ~s already exists" new-name)))
       (check-new-relation-name db new-name)
       (remhash old-name (database-indexes db))
       (setf (pg-index-name idx) new-name
@@ -1143,7 +1207,7 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
                       (setf (pg-index-valid-p
                              (create-index*
                               db
-                              (generate-index-name db name "pkey")
+                              (or (getf def :primary-name) (generate-index-name db name "pkey"))
                               class (list (pg-column-attnum col))
                               :unique t :primary t :constraint t))
                             t))
@@ -1151,10 +1215,9 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
                       (setf (pg-index-valid-p
                              (create-index*
                               db
-                              (generate-index-name
-                               db name
-                               (format nil "~a_key"
-                                       (pg-column-name col)))
+                              (or (getf def :unique-name)
+                                  (generate-index-name db name
+                                                       (format nil "~a_key" (pg-column-name col))))
                               class (list (pg-column-attnum col))
                               :unique t
                               :constraint t

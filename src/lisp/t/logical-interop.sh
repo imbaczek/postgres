@@ -220,6 +220,9 @@ setup_tables() {
         else
             sql "$port" 'CREATE TABLE interop_rows (id integer PRIMARY KEY, amount bigint, label varchar(100)); CREATE TABLE interop_other (id integer PRIMARY KEY, amount bigint, label varchar(100)); CREATE TABLE interop_unpublished (id integer PRIMARY KEY, amount bigint, label varchar(100))' >/dev/null
         fi
+        for table in interop_rows interop_other interop_unpublished; do
+            sql "$port" "ALTER TABLE $table ALTER amount SET DEFAULT 40+2; ALTER TABLE $table ADD CONSTRAINT ${table}_amount_check CHECK(amount IS NULL OR amount >= '-9223372036854775808'::bigint)" >/dev/null
+        done
     done
 }
 start_standard_worker() {

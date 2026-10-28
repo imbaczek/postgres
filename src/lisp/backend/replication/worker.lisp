@@ -383,13 +383,16 @@
 (defun logical-find-bootstrap-object (name objects key-function)
   (find name objects :key key-function :test #'string=))
 
-(defun logical-bootstrap-create-schema (target bootstrap-view)
-  "Apply schema definitions from the validated subscriber-visible bootstrap."
-  ;; Sequences precede tables because supported DEFAULT expressions call nextval.
+(defun logical-bootstrap-create-schema (target bootstrap-view &optional existing-view)
+  "Apply missing table definitions from the validated bootstrap.
+Existing tables were validated for compatibility; skip their full definitions,
+including appended NOT VALID ALTERs, rather than reinstalling constraints."
   (dolist (entry (getf bootstrap-view :sequences))
     (logical-target-query target (getf entry :definition)))
   (dolist (entry (getf bootstrap-view :tables))
-    (logical-target-query target (getf entry :sql)))
+    (unless (find (getf entry :name) (getf existing-view :tables)
+                  :key (lambda (table) (getf table :name)) :test #'string=)
+      (logical-target-query target (getf entry :sql))))
   (dolist (entry (getf bootstrap-view :indexes))
     (logical-target-query target (getf entry :sql))))
 
@@ -611,7 +614,7 @@
                  ;; schema creation or any sequence/data mutation.
                  (logical-validate-existing-replication-bootstrap
                   source target source-bootstrap target-bootstrap options)
-                 (logical-bootstrap-create-schema target source-bootstrap)
+                 (logical-bootstrap-create-schema target source-bootstrap target-bootstrap)
                  (logical-validate-replication-bootstrap
                   source target source-bootstrap
                   (logical-read-replication-bootstrap target) options))

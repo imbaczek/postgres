@@ -197,6 +197,7 @@ DDL:
 CREATE TABLE t (a int, b varchar(20), PRIMARY KEY (a));
 CREATE TABLE t (a int UNIQUE, b varchar(20));
 CREATE TABLE t (id bigint DEFAULT nextval('t_id_seq'));
+CREATE TABLE t (a int DEFAULT 3, CONSTRAINT positive CHECK (a > 0));
 DROP TABLE [IF EXISTS] t;
 TRUNCATE TABLE t [, ...];
 CREATE UNIQUE INDEX name ON t (cols);
@@ -212,8 +213,12 @@ ALTER TABLE t ADD PRIMARY KEY (cols);
 ALTER TABLE t ADD PRIMARY KEY USING INDEX name;
 ALTER TABLE t ADD UNIQUE [NULLS NOT DISTINCT] (cols);
 ALTER TABLE t ADD UNIQUE USING INDEX name;
+ALTER TABLE t ALTER COLUMN a SET DEFAULT expression;
+ALTER TABLE t ALTER COLUMN a DROP DEFAULT;
+ALTER TABLE t ADD CONSTRAINT positive CHECK (a > 0) [NOT VALID];
+ALTER TABLE t VALIDATE CONSTRAINT positive;
 ALTER TABLE t RENAME CONSTRAINT old_name TO new_name;
-ALTER TABLE t DROP CONSTRAINT name;     -- UNIQUE and PRIMARY KEY constraints
+ALTER TABLE t DROP CONSTRAINT name;     -- CHECK, UNIQUE and PRIMARY KEY constraints
 ALTER TABLE t DROP CONSTRAINT old_name,
   ADD CONSTRAINT new_name PRIMARY KEY USING INDEX index_name;
 ```
@@ -263,15 +268,19 @@ also supported. See [nonrecursive CTEs](t/CTES.md) and [recursive CTEs](t/RECURS
 for behavior and limits.
 
 Window expressions support `row_number()`, `rank()`, `dense_rank()`, `count(*)`,
-`sum` and text `array_agg`, with multiple inline or named windows and supported
-inheritance. The default is peer-aware `RANGE UNBOUNDED PRECEDING` through
+`count(expr)`, `min`, `max`, `sum`, `avg` and text `array_agg`, with multiple inline
+or named windows and supported inheritance. The default is peer-aware
+`RANGE UNBOUNDED PRECEDING` through
 `CURRENT ROW`; explicit `ROWS` or `RANGE` supports that prefix or an unbounded
 following end. See [window functions](t/WINDOWS.md) for boundaries and tests.
 
 Sequence expressions support `nextval('sequence')`, `currval('sequence')`, and
-`setval('sequence', value [, is_called])`. The only supported column default is
-`DEFAULT nextval('sequence')`. Sequence values use the implemented signed `int8`
+`setval('sequence', value [, is_called])`. Supported scalar expressions can be
+stored as column defaults and CHECK constraints. Sequence names in stored
+expressions must be literal strings or NULL. Sequence values use the signed `int8`
 range and are persisted separately from transaction rollback, as in PostgreSQL.
+See [defaults, checks and aggregates](t/DEFAULTS-CHECKS-AGGREGATES.md) for scope,
+validation and replication limits.
 
 Joins use a nested-loop executor over sequential scans. `ON` predicates can
 reference both join operands; `USING` merges columns with a common type (equal
@@ -805,13 +814,18 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   after `2^64 - 1`.
 - DDL and `ANALYZE` inside an explicit transaction block are rejected (`0A000`)
   because catalog changes and statistics have no rollback log.
-- `COUNT(*)` and `GROUP BY` are supported. Hash aggregation is bounded by query
+- `COUNT(*)`, `COUNT(expr)`, `MIN`, `MAX` and `GROUP BY` are supported.
+  `COUNT(expr)` counts non-NULL values, including false and zero; `MIN` and `MAX`
+  ignore NULLs and support numeric and text inputs, plus implemented name, OID,
+  LSN and timestamp expression types. Hash aggregation is bounded by query
   work memory and spills through recursive hash partitions, with external sort
   as the skew/depth fallback. `SUM` supports smallint/integer inputs with bigint
-  results, and bigint/existing integral numeric expressions with exact numeric
-  results. Empty or all-NULL sums return NULL. SUM and text `array_agg` use sorted
-  grouping with spill; mixed aggregates preserve those semantics. General decimal,
-  floating point, interval and money types remain unsupported.
+  results, and bigint/finite numeric expressions with exact numeric
+  results. `AVG` supports integer and finite numeric expressions, returning exact
+  numeric results. Empty or all-NULL sums and averages return NULL. SUM, AVG and
+  text `array_agg` use sorted grouping with spill. Finite numeric expression casts
+  and arithmetic are supported; decimal literals, numeric typmods and numeric heap
+  columns are not. Floating point, interval and money types remain unsupported.
   Derived SELECTs in `FROM` support `LATERAL` references. `HAVING`, ordinary
   `DISTINCT`, `UNION`/`UNION ALL`, and the expression subqueries described above are
   supported; see [HAVING and LATERAL](t/HAVING-LATERAL.md) for scope and tests.
@@ -832,8 +846,7 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   are deferred.
 - No `OFFSET`/`FETCH`. `ORDER BY` accepts multiple keys with `ASC`/`DESC` and
   uses bounded in-memory runs with external merge when needed.
-- No general `DEFAULT` expressions (only `DEFAULT nextval('sequence')`), `CHECK`,
-  foreign keys, or `NOT NULL`/`UNIQUE` beyond what is listed above.
+- Foreign keys and `NOT NULL`/`UNIQUE` beyond what is listed above are unsupported.
 - `ANALYZE table` scans visible heap rows to count them exactly and keeps a
   transient reservoir capped at 300 rows and about 4 MiB. It persists row count,
   NULL fraction, distinct-count estimate, and up to ten most-common values per

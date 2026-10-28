@@ -614,6 +614,8 @@ Convert supplied expressions in source order, then return them in parameter orde
       (member source '(:text :varchar :name))
       (and (member source '(:int2 :int4 :int8 :oid))
            (member target '(:int2 :int4 :int8 :oid)))
+      (and (member source '(:int2 :int4 :int8 :numeric))
+           (member target '(:int2 :int4 :int8 :numeric)))
       (and (eq source :bit) (member target '(:int4 :int8)))
       (and (eq target :bit) (member source '(:int4 :int8)))
       (and (eq source :numeric) (member target '(:int2 :int4 :int8)))
@@ -841,9 +843,7 @@ Convert supplied expressions in source order, then return them in parameter orde
         (ereport "22003" "smallint out of range"))
       (return-from sql-cast-value number)))
   (when (and (eq source :numeric) (member target '(:int4 :int8)))
-    ;; Current numeric producers retain exact integral values.
-    (unless (integerp value)
-      (ereport "0A000" "nonintegral numeric conversion is not implemented"))
+    (setf value (sql-numeric-rounded-coefficient value 0))
     (unless (if (eq target :int4) (<= +int4-min+ value +int4-max+)
                 (<= +int8-min+ value +int8-max+))
       (ereport "22003" "~a out of range" (if (eq target :int4) "integer" "bigint"))))
@@ -868,6 +868,7 @@ Convert supplied expressions in source order, then return them in parameter orde
      (case target
        ((:int4 :int8) (sql-cast-integer-input value target))
        (:bool (sql-cast-boolean-input value))
+       (:numeric (sql-numeric-input value))
        (:char (sql-char-input value))
        (:int2vector (sql-int2vector-input value))
        (:text-array (sql-text-array-input value))
@@ -936,7 +937,11 @@ Convert supplied expressions in source order, then return them in parameter orde
           (list :binop operator (first operands) (second operands) :type :bool :typmod -1))
         (progn
           (when (or (eq (expr-type left) :numeric) (eq (expr-type right) :numeric))
-            (ereport "0A000" "numeric arithmetic is not implemented"))
+            (unless (and (member (expr-type left) '(:int2 :int4 :int8 :numeric))
+                         (member (expr-type right) '(:int2 :int4 :int8 :numeric)))
+              (ereport "42883" "numeric operator requires numeric operands"))
+            (return-from analyze-binop-expression
+              (list :binop operator left right :type :numeric :typmod -1)))
           (when (or (eq (expr-type left) :pg-lsn) (eq (expr-type right) :pg-lsn))
             (ereport "0A000" "pg_lsn arithmetic is not implemented"))
           (when (or (member (expr-type left) '(:char :int2vector :text-array :oid :bit :timestamptz))
@@ -1313,7 +1318,10 @@ Convert supplied expressions in source order, then return them in parameter orde
 (defun analyzed-expression-identical-p (left right)
   "Compare executable expressions while preserving aggregate transition slots."
   ;; ProjectSet sharing must not merge distinct volatile aggregate transitions.
-  (cond ((and (sql-expression-key-p left) (sql-expression-key-p right))
+  (cond ((and (sql-decimal-p left) (sql-decimal-p right))
+         (and (= (sql-decimal-scale left) (sql-decimal-scale right))
+              (= (sql-decimal-coefficient left) (sql-decimal-coefficient right))))
+        ((and (sql-expression-key-p left) (sql-expression-key-p right))
          (equal (sql-expression-key-value left) (sql-expression-key-value right)))
         ((and (consp left) (consp right))
          (and (analyzed-expression-identical-p (car left) (car right))
@@ -1441,7 +1449,11 @@ Convert supplied expressions in source order, then return them in parameter orde
               (or (null (getf (cdddr form) :schema))
                   (string= (getf (cdddr form) :schema) "pg_catalog")))
          (cond ((string= (second form) "array_agg") :array-agg)
-               ((string= (second form) "sum") :sum)))))
+               ((string= (second form) "sum") :sum)
+               ((string= (second form) "count") :count-expr)
+               ((string= (second form) "min") :min)
+               ((string= (second form) "max") :max)
+               ((string= (second form) "avg") :avg)))))
 
 (defun contains-aggregate-p (form)
   (and (consp form)
@@ -1465,7 +1477,7 @@ Convert supplied expressions in source order, then return them in parameter orde
            (analyzed-expression-volatile-p (cdr form)))))
 
 (defun analyze-aggregate-input (raw scope kind)
-  "Resolve the supported pg_aggregate input and result types before transition setup."
+  "Resolve supported pg_aggregate signatures before transition setup."
   (when (find :named-arg (third raw) :key (lambda (argument) (and (consp argument) (first argument))))
     (ereport "0A000" "aggregates cannot use named arguments"))
   (when (eq kind :count) (return-from analyze-aggregate-input (values nil :int8)))
@@ -1474,16 +1486,21 @@ Convert supplied expressions in source order, then return them in parameter orde
   (let* ((*inside-aggregate-input-p* t)
          (argument (analyze-expr (first (third raw)) scope))
          (type (expr-type argument)))
-    (when (in-unknown-constant-p argument)
+    (when (and (member kind '(:sum :avg :array-agg)) (in-unknown-constant-p argument))
       (ereport "42725" "function ~a(unknown) is not unique" (second raw)))
     (ecase kind
+      (:count-expr (values argument :int8))
+      ((:min :max)
+       (unless (member type '(:int2 :int4 :int8 :numeric :text :varchar :name :oid :pg-lsn :timestamptz))
+         (ereport "42883" "function ~a(~a) does not exist" (second raw) (typed-arg-name argument)))
+       (values argument (if (member type '(:varchar :name)) :text type)))
       (:array-agg
        (unless (eq type :text) (ereport "0A000" "array_agg currently supports text input"))
        (values argument :text-array))
-      (:sum
+      ((:sum :avg)
        (unless (member type '(:int2 :int4 :int8 :numeric))
-         (ereport "42883" "function sum(~a) does not exist" (typed-arg-name argument)))
-       (values argument (if (member type '(:int2 :int4)) :int8 :numeric))))))
+         (ereport "42883" "function ~a(~a) does not exist" (second raw) (typed-arg-name argument)))
+       (values argument (if (and (eq kind :sum) (member type '(:int2 :int4))) :int8 :numeric))))))
 
 (defun analyze-aggregate-call (raw scope)
   ;; Semantic ownership follows referenced levels, not merely the syntactic query.
@@ -1771,6 +1788,9 @@ Convert supplied expressions in source order, then return them in parameter orde
 (defun selected-expression-equal-p (left right)
   ;; SQL99 target matching compares meaning, independent of transition slots.
   (cond ((equal left right) t)
+        ((and (sql-decimal-p left) (sql-decimal-p right))
+         (and (= (sql-decimal-coefficient left) (sql-decimal-coefficient right))
+              (= (sql-decimal-scale left) (sql-decimal-scale right))))
         ((and (sql-expression-key-p left) (sql-expression-key-p right))
          (equal (sql-expression-key-value left) (sql-expression-key-value right)))
         ((and (consp left) (consp right)
@@ -1855,6 +1875,9 @@ Convert supplied expressions in source order, then return them in parameter orde
   (cond
     ((and (member a '(t nil)) (member b '(t nil)))
      (cond ((eq a b) 0) (a 1) (t -1)))
+    ((and (sql-numeric-p a) (sql-numeric-p b))
+     (let ((left (sql-numeric-rational a)) (right (sql-numeric-rational b)))
+       (cond ((< left right) -1) ((> left right) 1) (t 0))))
     ((and (numberp a) (numberp b))
      (cond ((< a b) -1) ((> a b) 1) (t 0)))
     ((and (stringp a) (stringp b))
@@ -2030,6 +2053,9 @@ Convert supplied expressions in source order, then return them in parameter orde
 
 (defun eval-func (name args)
   (cond
+    ((and (member name '("nextval" "currval" "setval") :test #'string=)
+          (member +null+ args))
+     +null+)
     ((string= name "pg_promote") (pg-promote (first args) (second args)))
     ((string= name "pg_stat_get_wal_receiver") (wal-receiver-result))
     ((string= name "pg_postmaster_start_time") (postmaster-start-timestamp))
@@ -2211,14 +2237,17 @@ Convert supplied expressions in source order, then return them in parameter orde
            (r (eval-expr (fourth expr) env)))
        (if (member op '("=" "<>" "<" "<=" ">" ">=") :test #'string=)
            (sql-compare op l r)
-           (let ((value (sql-arith op l r)))
+           (let ((value (if (and (eq (expr-type expr) :numeric) (not (or (eq l +null+) (eq r +null+))))
+                            (sql-numeric-arithmetic op l r) (sql-arith op l r))))
              (if (member (expr-type expr) '(:int2 :int4 :int8))
                  (sql-cast-value value (expr-type expr) (expr-type expr) -1) value)))))
     (:unary
      (sql-strict-let ((value (eval-expr (third expr) env)))
        (cond
          ((string= (second expr) "-")
-          (let ((result (- value)))
+          (let ((result (if (sql-decimal-p value)
+                            (make-sql-decimal (- (sql-decimal-coefficient value)) (sql-decimal-scale value))
+                            (- value))))
             (if (member (expr-type expr) '(:int2 :int4 :int8))
                 (sql-cast-value result (expr-type expr) (expr-type expr) -1) result)))
          (t (ereport "42883" "unsupported unary operator ~a"
@@ -2299,5 +2328,6 @@ Convert supplied expressions in source order, then return them in parameter orde
     ((eq type :text-array) (sql-text-array-output v))
     ((eq type :char) (sql-char-output v))
     ((eq type :int2vector) (format nil "~{~d~^ ~}" (coerce v 'list)))
+    ((sql-decimal-p v) (sql-numeric-output v))
     ((stringp v) v)
     (t (princ-to-string v))))

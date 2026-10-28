@@ -292,13 +292,15 @@ start_server "$REPLICA_TWO_PORT" "$TMP/replica-two-data" "$TMP/replica-two.log"
 REPLICA_TWO_PID=$SERVER_PID
 
 seed_copy_stress_table
-sql "$SOURCE_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label varchar(64)); CREATE TABLE bootstrap_constraint_order (a integer, b integer, c integer, CONSTRAINT bootstrap_constraint_order_pkey PRIMARY KEY (a), CONSTRAINT bootstrap_constraint_order_b_key UNIQUE (b), CONSTRAINT bootstrap_constraint_order_c_key UNIQUE (c)); CREATE TABLE nullable_rows (nullable_key integer, label varchar(64)); CREATE UNIQUE INDEX nullable_rows_key_idx ON nullable_rows (nullable_key) NULLS NOT DISTINCT; CREATE TABLE ignored_rows (id integer PRIMARY KEY, label varchar(64)); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; ALTER SEQUENCE bootstrap_counter INCREMENT BY -2; SELECT setval('bootstrap_counter', 100, true); INSERT INTO replicated_rows VALUES (1, 10, 'initial'), (9, 90, 'remove'); INSERT INTO nullable_rows VALUES (NULL, 'initial-null'), (2, 'two'); INSERT INTO ignored_rows VALUES (1, 'before')"
+sql "$SOURCE_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label varchar(64)); CREATE TABLE bootstrap_constraint_order (a integer DEFAULT '1.5'::numeric CHECK(a > '0.25'::numeric), b integer, c integer, CONSTRAINT bootstrap_constraint_order_pkey PRIMARY KEY (a), CONSTRAINT bootstrap_constraint_order_b_key UNIQUE (b), CONSTRAINT bootstrap_constraint_order_c_key UNIQUE (c)); CREATE TABLE nullable_rows (nullable_key integer, label varchar(64)); CREATE UNIQUE INDEX nullable_rows_key_idx ON nullable_rows (nullable_key) NULLS NOT DISTINCT; CREATE TABLE ignored_rows (id integer PRIMARY KEY, label varchar(64)); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; ALTER SEQUENCE bootstrap_counter INCREMENT BY -2; SELECT setval('bootstrap_counter', 100, true); INSERT INTO replicated_rows VALUES (1, 10, 'initial'), (9, 90, 'remove'); INSERT INTO nullable_rows VALUES (NULL, 'initial-null'), (2, 'two'); INSERT INTO ignored_rows VALUES (1, 'before')"
 
 # Isolate the failed initial-copy slot on a disposable publisher. Its exported
 # snapshot intentionally remains available for retry, so it must not hold the
 # schema lease used by the main publisher's later DDL regression.
 start_server "$SOURCE_DRIFT_PORT" "$TMP/source-drift-data" "$TMP/source-drift.log"
 SOURCE_DRIFT_PID=$SERVER_PID
+sql "$SOURCE_PORT" "ALTER TABLE bootstrap_constraint_order ADD CONSTRAINT bootstrap_later CHECK(b IS NULL OR b>0) NOT VALID" >/dev/null
+
 sql "$SOURCE_DRIFT_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label varchar(64)); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; SELECT setval('bootstrap_counter', 100, true)"
 
 # A fresh subscriber with a pre-existing incompatible table and sequence must
@@ -899,5 +901,14 @@ if [ -n "$(replicated_rows "$SOURCE_PORT")" ] \
     echo "logical-replication: committed TRUNCATE did not clear selected tables" >&2
     exit 1
 fi
+
+# Persist expression ASTs and replay each new CHECK/default catalog action.
+sql "$SOURCE_PORT" "ALTER TABLE bootstrap_constraint_order ALTER a SET DEFAULT '4.5'::numeric; ALTER TABLE bootstrap_constraint_order ADD CONSTRAINT streamed_check CHECK(a<100) NOT VALID; ALTER TABLE bootstrap_constraint_order VALIDATE CONSTRAINT streamed_check; ALTER TABLE bootstrap_constraint_order RENAME CONSTRAINT streamed_check TO renamed_check; ALTER TABLE bootstrap_constraint_order DROP CONSTRAINT renamed_check" >/dev/null
+expression_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
+wait_for_lsn_barrier "$REPLICA_ONE_PORT" logical_replica_one "$expression_barrier"
+wait_for_lsn_barrier "$REPLICA_TWO_PORT" logical_replica_two "$expression_barrier"
+for port in "$SOURCE_PORT" "$REPLICA_ONE_PORT" "$REPLICA_TWO_PORT"; do
+    test "$(sql "$port" 'BEGIN; INSERT INTO bootstrap_constraint_order DEFAULT VALUES RETURNING a; ROLLBACK')" = 5
+done
 
 echo "logical-replication: PASS"

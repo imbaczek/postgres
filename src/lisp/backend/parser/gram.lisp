@@ -626,7 +626,7 @@
         (constraints '()))
     (expect-punct p #\()
     (loop
-      (if (or (kw-p p "primary") (kw-p p "unique") (kw-p p "constraint"))
+      (if (or (kw-p p "primary") (kw-p p "unique") (kw-p p "constraint") (kw-p p "check"))
           (push (parse-table-constraint p) constraints)
           (push (parse-column-def p) columns))
       (unless (match-punct p #\,)
@@ -638,48 +638,74 @@
           :columns (nreverse columns)
           :constraints (nreverse constraints))))
 
+(defun parser-expression-sql (p start)
+  "Render a consumed token span without retaining the original statement."
+  (format nil "~{~a~^ ~}"
+          (loop for token in (subseq (sql-parser-tokens p) start (sql-parser-pos p))
+                collect (case (token-kind token)
+                          (:ident (if (token-quoted-p token)
+                                      (catalog-sql-quote-ident (token-value token))
+                                      (token-value token)))
+                          (:string (catalog-sql-literal (token-value token)))
+                          (:integer (format nil "~d" (token-value token)))
+                          (:bit-string (concatenate 'string (subseq (token-value token) 0 1)
+                                                    (catalog-sql-literal (subseq (token-value token) 1))))
+                          (otherwise (token-value token))))))
+
+(defun parse-stored-expression (p &optional column-default-p)
+  (let* ((start (sql-parser-pos p))
+         ;; CREATE column DEFAULT uses gram.y's b_expr, so the following NOT
+         ;; NULL belongs to the column. Parentheses still admit a full a_expr.
+         (expression (if column-default-p
+                         (let ((left (parse-concatenation p)))
+                           (if (and (eq (pkind p) :op)
+                                    (member (pval p) '("=" "<>" "!=" "<" "<=" ">" ">=") :test #'string=))
+                               (let ((operator (pval p)))
+                                 (pnext p)
+                                 (list :binop (if (string= operator "!=") "<>" operator)
+                                       left (parse-concatenation p)))
+                               left))
+                         (parse-expr p))))
+    (values expression (parser-expression-sql p start))))
+
+(defun parse-check-body (p &optional name)
+  (expect-punct p #\()
+  (multiple-value-bind (expression sql) (parse-stored-expression p)
+    (expect-punct p #\))
+    (list :kind :check :name name :expression expression :sql sql)))
+
 (defun parse-column-def (p)
-  (let* ((name (pident p))
-         (type nil)
-         (typmod -1))
+  (let* ((name (pident p)) (type nil) (typmod -1))
     (multiple-value-setq (type typmod) (parse-type p))
-    (let ((notnull nil)
-          (primary nil)
-          (unique nil)
-          (nulls-not-distinct nil)
-          (default-sequence nil))
+    (let ((notnull nil) (primary nil) (unique nil) (nulls-not-distinct nil)
+                        (default-expression nil) (default-sql nil) (checks nil) (constraint-name nil)
+                        (primary-name nil) (unique-name nil))
       (loop
         (cond
+          ((match-kw p "constraint")
+           (when constraint-name (syntax-error p))
+           (setf constraint-name (pident p)))
           ((match-kw p "not")
-           (expect-kw p "null")
-           (setf notnull t))
-          ((match-kw p "null") nil)
+           (expect-kw p "null") (setf notnull t constraint-name nil))
+          ((match-kw p "null") (setf constraint-name nil))
           ((match-kw p "primary")
-           (expect-kw p "key")
-           (setf primary t notnull t))
+           (expect-kw p "key") (setf primary t notnull t primary-name constraint-name constraint-name nil))
           ((match-kw p "unique")
-           (setf unique t
-                 nulls-not-distinct (parse-unique-null-treatment p)))
+           (setf unique t nulls-not-distinct (parse-unique-null-treatment p) unique-name constraint-name constraint-name nil))
           ((match-kw p "default")
-           (let ((expression (parse-expr p)))
-             (unless (and (eq (first expression) :func)
-                          (string= (second expression) "nextval")
-                          (= (length (third expression)) 1)
-                          (eq (first (first (third expression))) :const)
-                          (stringp (second (first (third expression)))))
-               (ereport "0A000"
-                        "only DEFAULT nextval('sequence') is supported"))
-             (setf default-sequence
-                   (strip-schema (second (first (third expression)))))))
+           (when default-expression (ereport "42601" "multiple default values specified"))
+           (multiple-value-setq (default-expression default-sql) (parse-stored-expression p t))
+           (setf constraint-name nil))
           ((match-kw p "check")
-           (ereport "0A000" "CHECK is not supported"))
-          ((match-kw p "references")
-           (ereport "0A000" "foreign keys are not supported"))
-          (t (return))))
+           (push (parse-check-body p constraint-name) checks)
+           (setf constraint-name nil))
+          ((match-kw p "references") (ereport "0A000" "foreign keys are not supported"))
+          (t (when constraint-name (syntax-error p)) (return))))
       (list :name name :type type :typmod typmod
-            :notnull notnull :primary primary :unique unique
+            :notnull notnull :primary primary :unique unique :primary-name primary-name :unique-name unique-name
             :nulls-not-distinct nulls-not-distinct
-            :default-sequence-name default-sequence))))
+            :default-expression default-expression :default-sql default-sql
+            :checks (nreverse checks)))))
 
 (defun parse-type (p)
   (when (token-quoted-p (pcur p))
@@ -734,6 +760,7 @@
     (when (match-kw p "constraint")
       (setf cname (pident p)))
     (cond
+      ((match-kw p "check") (parse-check-body p cname))
       ((match-kw p "primary")
        (expect-kw p "key")
        (list :kind :primary :name cname
@@ -903,6 +930,19 @@
 
 (defun parse-alter-table-action (p)
   (cond
+    ((match-kw p "alter")
+     (match-kw p "column")
+     (let ((column (pident p)))
+       (cond ((match-kw p "set")
+              (expect-kw p "default")
+              (multiple-value-bind (expression sql) (parse-stored-expression p)
+                (list :action :set-default :column column :expression expression :sql sql)))
+             ((match-kw p "drop")
+              (expect-kw p "default") (list :action :drop-default :column column))
+             (t (syntax-error p)))))
+    ((match-kw p "validate")
+     (expect-kw p "constraint")
+     (list :action :validate-constraint :constraint-name (pident p)))
     ((match-kw p "rename")
      (expect-kw p "constraint")
      (let ((constraint-name (pident p)))
@@ -926,6 +966,10 @@
        (when (match-kw p "constraint")
          (setf cname (pident p)))
        (cond
+         ((match-kw p "check")
+          (let ((check (parse-check-body p cname)))
+            (when (match-kw p "not") (expect-kw p "valid") (setf (getf check :not-valid) t))
+            (list :action :add-check :check check)))
          ((match-kw p "primary")
           (expect-kw p "key")
           (if (match-kw p "using")
@@ -1228,6 +1272,11 @@
         (ereport "42704" "type \"~a.~a\" does not exist" name (pval p)))
       (setf quoted (token-quoted-p (pcur p)) name (pident p)))
     (cond
+      ((or (string= name "numeric")
+           (and (not quoted) (not qualified) (string= name "decimal")))
+       (when (and (eq (pkind p) :punct) (string= (pval p) "("))
+         (ereport "0A000" "numeric type modifiers are not implemented"))
+       (values :numeric -1))
       ((string= name "text") (values :text -1))
       ((string= name "name") (values :name -1))
       ((string= name "oid") (values :oid -1))

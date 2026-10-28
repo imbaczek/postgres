@@ -161,6 +161,7 @@
         (setf (aref new (1- (pg-column-attnum column)))
               (coerce-value value (pg-column-type column) (pg-column-typmod column)))))
     (check-not-null new (pg-class-columns table))
+    (check-table-constraints table new)
     new))
 
 (defun claim-on-conflict-candidate (table values conflict indexes)

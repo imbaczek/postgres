@@ -233,11 +233,8 @@
 
 (defun sequence-default-references (db sequence-name)
   (loop for table being the hash-values of (database-tables db)
-        append (loop for column across (pg-class-columns table)
-                     when (equal (pg-column-default-sequence-name column)
-                                 sequence-name)
-                       collect (list (pg-class-name table)
-                                     (pg-column-name column)))))
+        when (member sequence-name (catalog-table-sequence-names table) :test #'string=)
+          collect (list (pg-class-name table) sequence-name)))
 
 (defun exec-drop-sequence (stream ast)
   (let ((db (current-database))
@@ -875,7 +872,8 @@ before this removal horizon is captured."
                      (when (eq class (lookup-table name))
                        (drop-table* db name))
                      (save-catalog :applied-logical-event-id nil))))
-            (dolist (c constraints)
+            (install-table-expressions class cols constraints)
+            (dolist (c (remove-if (lambda (c) (eq (getf c :kind) :check)) constraints))
               (let ((attnums (resolve-attnums class (getf c :columns))))
                 (case (getf c :kind)
                   (:primary
@@ -1189,6 +1187,8 @@ before this removal horizon is captured."
                                  (getf ast :constraint-name)))
       (let* ((new-name (or (getf ast :constraint-name)
                            (pg-index-name idx))))
+        (when (table-constraint-name-used-p table new-name)
+          (ereport "23505" "constraint ~s already exists" new-name))
         (unless (string= new-name (pg-index-name idx))
           (check-new-relation-name db new-name))
         (with-catalog-mutation-rollback (db)
@@ -1309,6 +1309,8 @@ before this removal horizon is captured."
                          (not (eq named old-constraint))
                          (not (eq named new-idx)))))
           (ereport "42P07" "relation \"~a\" already exists" new-name))
+        (when (find new-name (pg-class-checks table) :key (lambda (check) (getf check :name)) :test #'string=)
+          (ereport "42710" "constraint ~s already exists" new-name))
         (with-catalog-mutation-rollback (db)
           (when old-constraint
             (drop-index* db old-name))
@@ -1341,6 +1343,11 @@ before this removal horizon is captured."
             (return-from exec-alter-table nil))
           (ereport "42P01" "relation \"~a\" does not exist" name)))
     (cond
+      ((or (member (getf ast :action) '(:set-default :drop-default :add-check :validate-constraint))
+           (and (member (getf ast :action) '(:rename-constraint :drop-constraint))
+                (find (getf ast :constraint-name) (pg-class-checks table)
+                      :key (lambda (check) (getf check :name)) :test #'string=)))
+       (exec-alter-stored-expression stream db table ast))
       ((getf ast :actions)
        (exec-alter-table-replace-primary
         stream db table (getf ast :actions) ast))

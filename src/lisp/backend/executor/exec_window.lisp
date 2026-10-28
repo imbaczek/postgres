@@ -72,7 +72,8 @@
 
 (defun window-transition-results (states)
   (map 'vector (lambda (state)
-                 (if (query-row-spool-p state) (window-array-snapshot state) state))
+                 (if (query-row-spool-p state) (window-array-snapshot state)
+                     (scalar-aggregate-transition-result state)))
        states))
 
 (defun stream-window-stage (source stage emit)

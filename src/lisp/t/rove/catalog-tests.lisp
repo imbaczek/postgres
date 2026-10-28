@@ -52,8 +52,9 @@
                     `(:oid 50 :name "codec" :relfilenode 51
                       :relfrozenxid ,+first-normal-xid+
                       :columns ((:name "value" :type :int4 :typmod -1
-                                 :attnum 1 :notnull t :default-sequence nil))
-                      :indexes (52)
+                                 :attnum 1 :notnull t :default-sequence nil
+                                 :default-expression nil :default-sql nil))
+                      :indexes (52) :checks nil
                       :statistics nil))
              "class and column codecs use compatible flat plists")
     (rove:ok (vectorp (pg-class-columns copy))
