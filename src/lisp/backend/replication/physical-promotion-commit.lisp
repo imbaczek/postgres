@@ -192,7 +192,11 @@ Once this image survives, startup must recover the child even if later cleanup
 fails. Do not restore parent control on an error after the rename.
 Use crash-recovery state until primary initialization and trigger retirement
 finish; a durable child is not yet a production-ready postmaster."
-  (let ((snapshot (getf plan :snapshot)) (child (getf plan :child)) (end (getf plan :end)))
+  (let* ((snapshot (getf plan :snapshot)) (child (getf plan :child)) (end (getf plan :end))
+                                          (metadata (make-wal-control-metadata (getf *physical-recovery-state* :system-id)
+                                                                               +db-in-crash-recovery+))
+                                          (reference (getf *physical-recovery-state* :retained-reference)))
+    (when reference (setf (getf metadata :retained-reference) (copy-list reference)))
     (with-atomic-output
         (stream (wal-control-path) (merge-pathnames "global/pg_wal_control.tmp" *pgdata*)
                 (merge-pathnames "global/" *pgdata*) :element-type '(unsigned-byte 8)
@@ -203,11 +207,7 @@ finish; a durable child is not yet a production-ready postmaster."
                 (lambda (directory) (fsync-directory directory)
                   (physical-promotion-test-point :after-child-control-directory-fsync)))
       (write-sequence (wal-encode-control-image end end snapshot :timeline child
-                                                                 :checkpoint-timeline child :namespace :timeline
-                                                                 :metadata
-                                                                 (make-wal-control-metadata
-                                                                  (getf *physical-recovery-state* :system-id)
-                                                                  +db-in-crash-recovery+))
+                                                                 :checkpoint-timeline child :namespace :timeline :metadata metadata)
                       stream))))
 
 (defun physical-promotion-publish-child-control ()
@@ -224,6 +224,7 @@ must determine from durable control whether parent or child is authoritative."
       (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
         (declare (ignore catalog))
         (physical-promotion-check-pending state metadata prefix generation :allow-history t)
+        (physical-promotion-ensure-pending-retained state metadata)
         (let* ((plan (physical-promotion-checkpoint-artifacts state prefix))
                (files (physical-promotion-checkpoint-files plan prefix))
                (child (getf state :promotion-child))

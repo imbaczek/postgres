@@ -119,6 +119,8 @@
         (ok (equal reference (getf (nth-value 6 (pg::wal-read-control-fields)) :retained-reference)))
         (let ((before (pg::read-bounded-regular-file (pg::wal-control-path) 513)))
           (ok (signals (pg::wal-mark-primary-startup) 'error))
+          (ok (intake-fails-p
+               (lambda () (pg::native-control-facts (pg::native-control-capture)))))
           (ok (equalp before (pg::read-bounded-regular-file (pg::wal-control-path) 513)))))))
 
 (deftest wal-control-state-writer-retains-reference

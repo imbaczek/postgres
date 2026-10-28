@@ -17,7 +17,7 @@
 Return the checkpoint snapshot and parsed history. This check must precede WAL
 scanning or tail repair. It deliberately needs no old generation, receive spool
 or backup manifest: child control is now the recovery authority."
-  (multiple-value-bind (checkpoint durable snapshot timeline checkpoint-id namespace) (wal-read-control-fields)
+  (multiple-value-bind (checkpoint durable snapshot timeline checkpoint-id namespace metadata) (wal-read-control-fields)
     (unless (and (typep insertion '(integer 2 4294967295))
                  (= insertion checkpoint-timeline timeline checkpoint-id)
                  (eq namespace :timeline) snapshot (wal-checkpoint-snapshot-valid-p snapshot)
@@ -43,6 +43,7 @@ or backup manifest: child control is now the recovery authority."
                             (equal snapshot (wal-checkpoint-record-snapshot (wal-decode-record bytes start))))
                  (error "child checkpoint differs from durable control")))
           (close stream)))
+      (physical-promotion-check-primary-retained snapshot history metadata)
       (values snapshot history))))
 
 (defun physical-promotion-check-retiring-control (snapshot history &optional system-id)
@@ -55,8 +56,9 @@ Do not open its selected generation or receive spool."
       (let* ((control (physical-recovery-read-control *pgdata*))
              (*catalog-identity-needs-persist-p* nil)
              (catalog (unless system-id (load-catalog))))
-        (when (getf control :retained-reference)
-          (error "retained pending archive validation is not yet installed"))
+        (unless (equal (getf control :retained-reference)
+                       (getf (nth-value 6 (wal-read-control-fields)) :retained-reference))
+          (error "committed child differs from pending retained reference"))
         (unless (and (eql 3 (getf control :phase))
                      (= (getf control :promotion-child) (getf snapshot :timeline))
                      (= (getf control :applied-timeline (getf control :timeline)) (getf snapshot :prev-timeline))
@@ -81,17 +83,21 @@ directories inert; they are no longer required for primary startup."
                         (not *live-operation-drain-open*))
                    (and (zerop *n-backends*) (not *wal-ready*))))
     (error "committed cleanup requires owned cold startup or quiescence"))
-  (let ((names '(("recovery.required" :after-retire-required)
+  (let ((fields (physical-promotion-restore-primary-retained))
+        (names '(("recovery.required" :after-retire-required)
                  ("physical-backup.manifest" :after-retire-manifest)
                  ("physical-follow.control" :after-retire-follow)
                  ("physical-restartpoint.control" :after-retire-pointer)
                  ("physical-recovery.control" :after-retire-pending))))
+    (physical-promotion-test-point :after-primary-retained-registration)
     (dolist (entry names) (wal-namespace-file-stat (merge-pathnames (first entry) *pgdata*) t))
     (dolist (entry names)
       (let ((path (merge-pathnames (first entry) *pgdata*)))
         (when (wal-namespace-file-stat path t) (sb-posix:unlink (namestring path)))
         (physical-promotion-test-point (second entry))
-        (fsync-directory *pgdata*))))
+        (fsync-directory *pgdata*)))
+    (physical-promotion-retire-pending-retained fields)
+    (physical-promotion-test-point :after-pending-retained-retirement))
   (values))
 
 (defun physical-promotion-startup-primary-p ()
@@ -226,6 +232,7 @@ recovery; restart must classify durable control."
                (unless (equal snapshot checked) (error "child control changed during adoption"))
                (physical-promotion-check-retiring-control
                 snapshot history (catalog-system-identifier)))
+             (physical-promotion-restore-primary-retained)
              (let* ((next (getf snapshot :next-xid))
                     (proof (multiple-value-list
                             (physical-promotion-current-checkpoint-plan *physical-recovery-state*)))

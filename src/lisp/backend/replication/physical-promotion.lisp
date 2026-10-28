@@ -331,11 +331,12 @@ and quiescence in that order; worker shutdown and join occur outside this call."
 
 (defun physical-promotion-check-pending (state metadata prefix generation &key allow-history)
   "Revalidate durable ownership; history publication ends prefix-install eligibility."
-  (when (or (getf state :retained-reference)
-            (getf (physical-recovery-read-control *pgdata*) :retained-reference))
-    (error "retained pending archive validation is not yet installed"))
-  (physical-promotion-check-history state allow-history)
   (let ((control (physical-recovery-read-control *pgdata*)))
+    (unless (equal (getf state :retained-reference) (getf control :retained-reference))
+      (error "retained promotion archive pending reference changed"))
+    (physical-promotion-check-pending-retained
+     control metadata (when *physical-receive-store* (physical-store-retained-history *physical-receive-store*)))
+    (physical-promotion-check-history state allow-history)
     (unless (and
              (every (lambda (key) (eql (getf state key) (getf control key)))
                     '(:control-version :phase :system-id :timeline :manifest-digest
@@ -360,6 +361,7 @@ history/EOR instead of calling this helper and overwriting child WAL."
       (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
         (declare (ignore catalog))
         (physical-promotion-check-pending state metadata prefix generation)
+        (physical-promotion-ensure-pending-retained state metadata)
         (let ((fork (getf state :applied)) (child (getf state :promotion-child)) (finished nil))
           (wal-namespace-file-stat (wal-segment-path (floor fork +wal-segment-size+) child :timeline) t)
           (unwind-protect

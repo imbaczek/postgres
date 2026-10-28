@@ -268,9 +268,8 @@ older image's absent lifecycle metadata is unknown state."
 
 Reject retained primary references until archive startup validation is installed."
 
-  (when (getf (nth-value 6 (wal-read-control-fields)) :retained-reference)
-    (error "retained primary archive startup validation is not yet installed"))
-  (unless (and (eql insertion 1) (eql checkpoint 1))
+  (unless (and (eql insertion 1) (eql checkpoint 1)
+               (null (getf (nth-value 6 (wal-read-control-fields)) :retained-reference)))
     (handler-case (physical-promotion-check-child-control insertion checkpoint)
       (error (condition)
         (error "native timeline-keyed WAL is not yet supported without a verified child checkpoint: ~a"

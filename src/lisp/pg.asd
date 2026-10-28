@@ -125,6 +125,7 @@
                    (:file "../replication/physical-promotion-wal")
                    (:file "../replication/physical-promotion-resume")
                    (:file "../replication/physical-promotion-commit")
+                   (:file "../replication/physical-promotion-retained")
                    (:file "../replication/physical-promotion-primary")
                    (:file "../utils/control-data")
                    (:file "../replication/physical-promotion-online")

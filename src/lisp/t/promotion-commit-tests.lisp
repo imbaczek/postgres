@@ -655,7 +655,7 @@
         (ok (equal reference (getf (pg::physical-recovery-read-control pg::*pgdata*) :retained-reference)))
         (ok (handler-case (progn (pg::physical-promotion-startup-primary-p) nil)
               (error (condition)
-                (search "retained pending archive validation" (princ-to-string condition)))))
+                (search "committed child differs from pending retained reference" (princ-to-string condition)))))
         (ok (equalp bytes (lineage-test-bytes path)))
         (ok (equalp marker (lineage-test-bytes marker-path))))))
 

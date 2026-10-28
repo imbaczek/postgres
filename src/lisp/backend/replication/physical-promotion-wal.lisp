@@ -98,6 +98,7 @@ A failed process remains fenced. Startup reconciliation is a separate transition
       (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read state)
         (declare (ignore catalog))
         (physical-promotion-check-pending state metadata prefix generation :allow-history t)
+        (physical-promotion-ensure-pending-retained state metadata)
         (multiple-value-bind (target target-prefix eor start rotated history-p)
             (physical-promotion-wal-plan state prefix)
           (let ((finished nil))

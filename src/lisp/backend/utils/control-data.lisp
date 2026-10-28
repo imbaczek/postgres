@@ -95,7 +95,10 @@ on the old base manifest or restartpoint pointer."
   (let* ((wal (native-control-optional-bytes (wal-control-path)))
          (insertion (and wal (nth-value 3 (wal-decode-control-line (bytes->string wal)))))
          (recovery (native-control-optional-bytes (physical-recovery-control-path)))
-         (parent (and insertion (= insertion 1))))
+         (control (when recovery (physical-recovery-decode-control recovery)))
+         (pending (and control (eql 3 (getf control :phase))
+                       (eql insertion (getf control :timeline))))
+         (parent (or pending (and insertion (= insertion 1)))))
     (unless wal (error "native WAL control file is missing"))
     (list wal recovery
           (when parent (native-control-optional-bytes (merge-pathnames "recovery.required" *pgdata*)))
@@ -115,9 +118,9 @@ matches the supported restartpoint generation bound rather than a WAL segment."
     (catalog-system-identifier (make-catalog :cluster-identity identity))))
 
 (defun native-control-recovery-checkpoint (control snapshot)
-  "Select the latest authenticated source checkpoint for a standby.
-Verify the base manifest and selected generation, and reject a restartpoint
-ahead of durable applied progress. Use the base copy when no newer copy exists."
+  "Select the authenticated source checkpoint for recovery control.
+Ordinary recovery may use the base copy. Pending promotion requires its exact
+selected generation and validates any retained archive without registering it."
   (multiple-value-bind (manifest digest) (recovery-read-manifest *pgdata*)
     (recovery-check-manifest-schema manifest)
     (unless (and (every (lambda (key) (eql (getf control key) (getf manifest key)))
@@ -125,7 +128,15 @@ ahead of durable applied progress. Use the base copy when no newer copy exists."
                  (= digest (getf control :manifest-digest)))
       (error "recovery control differs from its base manifest"))
     (setf (getf manifest :manifest-digest) digest)
-    (let ((metadata (physical-restartpoint-read manifest)))
+    (multiple-value-bind (metadata catalog prefix generation) (physical-restartpoint-read manifest)
+      (declare (ignore catalog prefix))
+      (when (eql 3 (getf control :phase))
+        (unless (and metadata (eql 4 (getf metadata :version))
+                     (eql generation (getf control :promotion-generation))
+                     (eql (getf metadata :lsn) (getf control :applied))
+                     (eql (getf metadata :next-xid) (getf control :next-xid)))
+          (error "pending control differs from its selected restartpoint"))
+        (physical-promotion-check-pending-retained control metadata))
       (when (and metadata (> (getf metadata :lsn) (getf control :applied)))
         (error "restartpoint is ahead of durable recovery control"))
       (or (getf metadata :source-checkpoint) snapshot))))
@@ -146,7 +157,9 @@ although native WAL control stores checkpoint ends."
            (time (getf metadata :state-time))
            (recovery-lsn 0) (recovery-timeline 0))
       (cond
-        ((> insertion 1)
+        ((and (or (> insertion 1) (getf metadata :retained-reference))
+              (not (and control (eql 3 (getf control :phase))
+                        (eql insertion (getf control :timeline)))))
          (multiple-value-bind (checked history)
              (physical-promotion-check-child-control insertion checkpoint-id)
            (declare (ignore checked))

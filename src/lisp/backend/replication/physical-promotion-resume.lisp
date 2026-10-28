@@ -66,6 +66,7 @@
                   (getf state :source-checkpoint) (copy-list (getf metadata :source-checkpoint))
                   (getf state :source-reservation) (copy-list (getf metadata :source-reservation))
                   (getf state :source-xids) (copy-tree (getf metadata :source-xids)))
+            (physical-promotion-check-pending-retained control metadata)
             (values state metadata prefix generation)))))))
 
 (defun physical-promotion-open-pending-store (state)
@@ -148,6 +149,7 @@ reuse partially restored state."
                (multiple-value-bind (state metadata prefix generation) (physical-promotion-read-pending-state)
                  (setf store (physical-promotion-open-pending-store state))
                  (physical-promotion-validate-cold-state state metadata prefix generation store artifact-checker)
+                 (physical-promotion-ensure-pending-retained state metadata store)
                  (physical-promotion-test-point :before-pending-restore)
                  (physical-promotion-restore-cold-state state store)
                  (physical-promotion-test-point :after-pending-restore))))
