@@ -82,6 +82,21 @@
 (defmacro with-promotion-fixture ((root store &key (system-id 123)) &body body)
   `(call-with-promotion-fixture (lambda (,root ,store) ,@body) :system-id ,system-id))
 
+(deftest recovery-base-verification-does-not-publish-or-install-runtime-state
+    (with-promotion-fixture (root store)
+      (declare (ignore store))
+      (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+      (let ((before (lineage-test-bytes (pg::physical-recovery-control-path)))
+            (runtime pg::*physical-recovery-state*))
+        (multiple-value-bind (base control) (pg::physical-recovery-verify-base-state)
+          (ok (= 152 (getf base :end)))
+          (ok (= 50 (getf base :next-xid)))
+          (ok (= 216 (getf control :applied)))
+          (ok (= 216 (getf base :required-applied)))
+          (ok (= 152 (getf (getf base :source-reservation) :through))))
+        (ok (eq runtime pg::*physical-recovery-state*))
+        (ok (equalp before (lineage-test-bytes (pg::physical-recovery-control-path root)))))))
+
 (deftest promotion-child-prefix-replaces-stale-files-without-changing-parent
     (dolist (namespace '(:legacy :timeline))
       (call-with-promotion-fixture

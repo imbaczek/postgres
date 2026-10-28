@@ -473,12 +473,9 @@ A nonpending standby cannot fall back to primary startup when validation fails."
 
 (declaim (ftype function physical-follow-check-startup-config))
 
-(defun physical-recovery-prepare-with-namespace ()
-  "Reject a saved follow binding, then validate base image, history and checkpoint
-provenance before publishing active recovery.
-Pending promotion is reconciled separately."
+(defun physical-recovery-verify-base-with-namespace ()
+  "Verify recovery base provenance and return state and durable control without publication."
   (physical-recovery-check-required-marker)
-  (physical-follow-check-startup-config)
   (let ((control (physical-recovery-read-control *pgdata*)))
     ;; Pending control must never fall through the ordinary phase rewrite/redo path.
     ;; A later milestone will verify and reconcile this exact generation before SQL.
@@ -526,13 +523,27 @@ Pending promotion is reconciled separately."
                 (getf control :next-xid) (getf manifest :next-xid))
             (getf manifest :previous-db-state) (getf control :db-state)
             (getf manifest :previous-state-time) (getf control :state-time))
-      ;; Includes phase 0 -> 1 and legacy migration. A clean previous run never
-      ;; allows catalog restoration or redo to start with a clean control file.
-      (setf manifest
-            (physical-recovery-write-control
-             manifest (getf manifest :phase) (getf manifest :end)
-             (getf manifest :observed-next-xid)))
-      (setf *physical-recovery-state* manifest))))
+      (values manifest control))))
+
+(defun physical-recovery-verify-base-state ()
+  (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace)
+      (wal-read-control-fields)
+    (declare (ignore checkpoint durable snapshot))
+    (let ((*wal-segment-namespace* namespace)
+          (*wal-insert-timeline* insertion)
+          (*wal-checkpoint-timeline* checkpoint-timeline))
+      (multiple-value-bind (state control) (physical-recovery-verify-base-with-namespace)
+        (setf (getf state :wal-namespace) namespace)
+        (values state control)))))
+
+(defun physical-recovery-prepare-with-namespace ()
+  (physical-recovery-check-required-marker)
+  (physical-follow-check-startup-config)
+  (let ((manifest (physical-recovery-verify-base-with-namespace)))
+    (setf *physical-recovery-state*
+          (physical-recovery-write-control
+           manifest (getf manifest :phase) (getf manifest :end)
+           (getf manifest :observed-next-xid)))))
 
 (defun note-primary-startup-replay ()
   "Report the last applied terminal, excluding complete records in an unfinished batch."
