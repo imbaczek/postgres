@@ -872,6 +872,52 @@
                       (equal (pg-error-message condition) (third case)))
                  (first case)))))
 
+(rove:deftest integer-input-diagnostic-fields
+    (dolist (width '(("int2" "smallint" -32768 32767)
+                     ("int4" "integer" -2147483648 2147483647)
+                     ("int8" "bigint" -9223372036854775808 9223372036854775807)))
+      (destructuring-bind (type type-name minimum maximum) width
+        (let* ((overflow (write-to-string (1+ maximum)))
+               (inputs (append
+                        (loop for input in (list "bad" "  bad  " "a\"b\\c"
+                                                 (format nil "bad~%value") "" "1_"
+                                                 (concatenate 'string overflow "x"))
+                              collect (list input "22P02"))
+                        (loop for input in (list overflow (write-to-string (1- minimum))
+                                                 (format nil "  ~a  " overflow)
+                                                 (concatenate 'string overflow "0x"))
+                              collect (list input "22003")))))
+          (dolist (input inputs)
+            (destructuring-bind (text state) input
+              (dolist (sql (list (format nil "SELECT '~a'::~a" text type)
+                                 (format nil "SELECT ~aand('~a', 1::int2)" type text)
+                                 (format nil "SELECT 1::~a & '~a'" type text)))
+                (let ((condition (handler-case (progn (subquery-test-rows sql) nil)
+                                   (pg-error (error) error))))
+                  (rove:ok
+                   (and condition
+                        (equal (pg-error-sqlstate condition) state)
+                        (equal (pg-error-message condition)
+                               (if (equal state "22P02")
+                                   (format nil "invalid input syntax for type ~a: \"~a\"" type-name text)
+                                   (format nil "value \"~a\" is out of range for type ~a" text type-name)))
+                        (null (pg-error-detail condition))
+                        (null (pg-error-hint condition)))
+                   sql)))))
+          (rove:ok (equal (list (list (write-to-string minimum) (write-to-string maximum)))
+                          (subquery-test-rows
+                           (format nil "SELECT '~a'::~a::text, '~a'::~a::text"
+                                   minimum type maximum type)))))))
+  ;; Shift counts always use integer input, including smallint and bigint shifts.
+  (dolist (sql '("SELECT 1::int2 << 'bad'" "SELECT int8shr(1, 'bad')"))
+    (let ((condition (handler-case (progn (subquery-test-rows sql) nil)
+                       (pg-error (error) error))))
+      (rove:ok (and condition
+                    (equal (pg-error-sqlstate condition) "22P02")
+                    (equal (pg-error-message condition)
+                           "invalid input syntax for type integer: \"bad\""))
+               sql))))
+
 (rove:deftest numeric-input-overflow-diagnostics
     ;; Storage bounds follow trailing-junk validation; exponent accumulation
     ;; overflows immediately, as set_var_from_str does in numeric.c.

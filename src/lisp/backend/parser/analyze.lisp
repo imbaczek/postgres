@@ -1287,11 +1287,20 @@ so a nested argument error keeps its own diagnostics."
       (and (eq target :int4) (member source '(:bool :char)))))
 
 (defun sql-cast-integer-input (text type)
-  "Read signed integer input with C pg_strtoint's radix and underscore rules."
+  "Read signed integer input with C pg_strtoint's radix and underscore rules.
+Diagnostics retain the original TEXT, including surrounding whitespace.  As in
+numutils.c, accumulation can report range before later invalid syntax, while
+syntax is checked before the final signed-width range check for TYPE."
   (let* ((input (string-trim (mapcar #'code-char '(9 10 11 12 13 32)) text))
          (size (length input)) (position 0) (sign 1) (radix 10)
-         (prefixed nil) (digits 0) (number 0))
-    (labels ((invalid () (ereport "22P02" "invalid input syntax for integer: ~s" text))
+         (prefixed nil) (digits 0) (number 0)
+         (minimum (ecase type (:int2 -32768) (:int4 +int4-min+) (:int8 +int8-min+)))
+         (maximum (ecase type (:int2 32767) (:int4 +int4-max+) (:int8 +int8-max+)))
+         (type-name (ecase type (:int2 "smallint") (:int4 "integer") (:int8 "bigint"))))
+    (labels ((invalid ()
+               (ereport "22P02" "invalid input syntax for type ~a: \"~a\"" type-name text))
+             (out-of-range ()
+               (ereport "22003" "value \"~a\" is out of range for type ~a" text type-name))
              (digit-at (index)
                (when (< index size)
                  (let ((character (char input index)))
@@ -1309,9 +1318,8 @@ so a nested argument error keeps its own diagnostics."
             for digit = (digit-at position)
             do (cond
                  (digit
-                  (when (> number (floor (if (eq type :int4)
-                                             (- +int4-min+) (- +int8-min+)) radix))
-                    (ereport "22003" "integer out of range"))
+                  (when (> number (floor (- minimum) radix))
+                    (out-of-range))
                   (setf number (+ (* number radix) digit))
                   (incf digits))
                  ((char= character #\_)
@@ -1322,9 +1330,8 @@ so a nested argument error keeps its own diagnostics."
                (incf position))
       (when (zerop digits) (invalid))
       (setf number (* sign number))
-      (unless (if (eq type :int4) (<= +int4-min+ number +int4-max+)
-                  (<= +int8-min+ number +int8-max+))
-        (ereport "22003" "integer out of range"))
+      (unless (<= minimum number maximum)
+        (out-of-range))
       number)))
 
 (defun sql-cast-boolean-input (text)
@@ -1711,6 +1718,8 @@ are supported."
   (when (and (eq source :bit) (member target '(:int4 :int8)))
     (return-from sql-cast-value (sql-bit-to-integer value (if (eq target :int4) 32 64))))
   (when (eq target :int2)
+    (when (member source '(:text :varchar :name))
+      (return-from sql-cast-value (sql-cast-integer-input value :int2)))
     (let ((number (sql-cast-value value source :int4 -1)))
       (unless (<= -32768 number 32767)
         (ereport "22003" "smallint out of range"))

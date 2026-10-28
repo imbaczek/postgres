@@ -852,6 +852,42 @@ def check_numeric_prefix_errors(reference, native):
             peer.close()
 
 
+def check_integer_input_errors(reference, native):
+    peers = [NumericErrorConnection(port, "integer-input-errors")
+             for port in (reference, native)]
+    try:
+        for type_name, sql_type, minimum, maximum in (
+                ("smallint", "int2", -(2 ** 15), 2 ** 15 - 1),
+                ("integer", "int4", -(2 ** 31), 2 ** 31 - 1),
+                ("bigint", "int8", -(2 ** 63), 2 ** 63 - 1)):
+            overflow = str(maximum + 1)
+            syntax_inputs = ("bad", "  bad  ", 'a"b\\c', "bad\nvalue", "", "1_",
+                             overflow + "x")
+            range_inputs = (overflow, str(minimum - 1), f"  {overflow}  ",
+                            overflow + "0x")
+            for input_text in syntax_inputs + range_inputs:
+                expected = (("22P02", f'invalid input syntax for type {type_name}: "{input_text}"',
+                             None, None) if input_text in syntax_inputs else
+                            ("22003", f'value "{input_text}" is out of range for type {type_name}',
+                             None, None))
+                for sql in (f"SELECT '{input_text}'::{sql_type}",
+                            f"SELECT {sql_type}and('{input_text}', 1::int2)",
+                            f"SELECT 1::{sql_type} & '{input_text}'"):
+                    outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+                    assert outcomes == [expected, expected], (sql, outcomes)
+            sql = f"SELECT '{minimum}'::{sql_type}, '{maximum}'::{sql_type}"
+            outcomes = [peer.observe(sql) for peer in peers]
+            assert outcomes[0] == outcomes[1], (sql, outcomes)
+        for sql in ("SELECT 1::int2 << 'bad'", "SELECT int8shr(1, 'bad')"):
+            expected = ("22P02", 'invalid input syntax for type integer: "bad"', None, None)
+            outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+            assert outcomes == [expected, expected], (sql, outcomes)
+        print("integer-input: exact SQLSTATE/message/detail/hint and error order PASS", flush=True)
+    finally:
+        for peer in peers:
+            peer.close()
+
+
 def check_numeric_input_errors(reference, native):
     peers = [NumericErrorConnection(port, "numeric-input-errors")
              for port in (reference, native)]
@@ -975,6 +1011,7 @@ if __name__ == "__main__":
     else:
         check(int(sys.argv[1]), int(sys.argv[2]))
         check_numeric_prefix_errors(int(sys.argv[1]), int(sys.argv[2]))
+        check_integer_input_errors(int(sys.argv[1]), int(sys.argv[2]))
         check_numeric_input_errors(int(sys.argv[1]), int(sys.argv[2]))
         check_datestyle_sessions(int(sys.argv[1]), int(sys.argv[2]))
         check_transaction_time(int(sys.argv[1]), int(sys.argv[2]))
