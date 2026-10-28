@@ -7,8 +7,30 @@
   (coefficient 0 :type integer :read-only t)
   (scale 0 :type (integer 0 *) :read-only t))
 
+(defun sql-numeric-special-p (value)
+  (member value '(:numeric-nan :numeric-positive-infinity :numeric-negative-infinity)))
+
+(defun sql-numeric-compare (left right)
+  "Compare finite and special numeric values in PostgreSQL's total order."
+  (labels ((rank (value)
+             (case value (:numeric-negative-infinity 0) (:numeric-positive-infinity 2)
+                   (:numeric-nan 3) (otherwise 1))))
+    (let ((a (rank left)) (b (rank right)))
+      (cond ((< a b) -1) ((> a b) 1) ((/= a 1) 0)
+            (t (let ((x (sql-numeric-rational left)) (y (sql-numeric-rational right)))
+                 (cond ((< x y) -1) ((> x y) 1) (t 0))))))))
+
+(defun sql-numeric-negate (value)
+  (case value
+    (:numeric-nan :numeric-nan)
+    (:numeric-positive-infinity :numeric-negative-infinity)
+    (:numeric-negative-infinity :numeric-positive-infinity)
+    (otherwise (if (integerp value) (- value)
+                   (make-sql-decimal (- (sql-decimal-coefficient value))
+                                     (sql-decimal-scale value))))))
+
 (defun sql-numeric-p (value)
-  (or (integerp value) (sql-decimal-p value)))
+  (or (integerp value) (sql-decimal-p value) (sql-numeric-special-p value)))
 
 (defun sql-numeric-coefficient (value)
   (if (integerp value) value (sql-decimal-coefficient value)))
@@ -20,6 +42,10 @@
   (/ (sql-numeric-coefficient value) (expt 10 (sql-numeric-scale value))))
 
 (defun sql-numeric-output (value)
+  (case value
+    (:numeric-nan (return-from sql-numeric-output "NaN"))
+    (:numeric-positive-infinity (return-from sql-numeric-output "Infinity"))
+    (:numeric-negative-infinity (return-from sql-numeric-output "-Infinity")))
   (if (integerp value) (format nil "~d" value)
       (let* ((coefficient (sql-decimal-coefficient value))
              (scale (sql-decimal-scale value))
@@ -34,8 +60,12 @@
   (let* ((input (string-trim (mapcar #'code-char '(9 10 11 12 13 32)) text))
          (length (length input)) (position 0) (sign 1) (coefficient 0)
          (digits 0) (fractional 0) (exponent 0))
-    (when (member (string-downcase input) '("nan" "infinity" "+infinity" "-infinity" "inf" "+inf" "-inf") :test #'string=)
-      (ereport "0A000" "nonfinite numeric values are not implemented"))
+    (let ((special (string-downcase input)))
+      (cond ((string= special "nan") (return-from sql-numeric-input :numeric-nan))
+            ((member special '("infinity" "+infinity" "inf" "+inf") :test #'string=)
+             (return-from sql-numeric-input :numeric-positive-infinity))
+            ((member special '("-infinity" "-inf") :test #'string=)
+             (return-from sql-numeric-input :numeric-negative-infinity))))
     (labels ((peek () (when (< position length) (char input position)))
              (bad () (ereport "22P02" "invalid input syntax for type numeric: ~s" text))
              (digit () (sql-number-digit-p (peek) 10))
@@ -77,6 +107,23 @@
   (let ((scaled (* (sql-numeric-rational value) (expt 10 scale))))
     (* (signum scaled) (floor (+ (abs scaled) 1/2)))))
 
+(defun sql-numeric-apply-typmod (value typmod)
+  "Round and check a finite numeric value using PostgreSQL's packed typmod."
+  (when (and (>= typmod 4) (sql-numeric-special-p value))
+    (if (eq value :numeric-nan) (return-from sql-numeric-apply-typmod value)
+        (ereport "22003" "numeric field overflow")))
+  (if (< typmod 4) value
+      (let* ((packed (- typmod 4))
+             (precision (ldb (byte 16 16) packed))
+             (bits (logand packed #x7ff))
+             (scale (- (logxor bits #x400) #x400))
+             (rounded (sql-numeric-rounded-coefficient value scale)))
+        (when (>= (abs rounded) (expt 10 precision))
+          (ereport "22003" "numeric field overflow"))
+        (if (minusp scale)
+            (make-sql-decimal (* rounded (expt 10 (- scale))) 0)
+            (make-sql-decimal rounded scale)))))
+
 (defun sql-numeric-leading-digit (value)
   "Return numeric.c's normalized base-10000 weight and first digit."
   (let ((coefficient (abs (sql-numeric-coefficient value)))
@@ -89,8 +136,46 @@
                              (* coefficient (expt 10 (- shift)))
                              (floor coefficient (expt 10 shift))))))))
 
+(defun sql-numeric-special-arithmetic (operator left right)
+  "Evaluate a binary numeric operation when at least one argument is special."
+  (when (or (eq left :numeric-nan) (eq right :numeric-nan))
+    (return-from sql-numeric-special-arithmetic :numeric-nan))
+  (when (string= operator "-")
+    (return-from sql-numeric-special-arithmetic
+      (sql-numeric-special-arithmetic "+" left (sql-numeric-negate right))))
+  (when (string= operator "+")
+    (return-from sql-numeric-special-arithmetic
+      (cond ((not (sql-numeric-special-p left)) right)
+            ((not (sql-numeric-special-p right)) left)
+            ((eq left right) left)
+            (t :numeric-nan))))
+  (when (and (member operator '("/" "%") :test #'string=)
+             (not (sql-numeric-special-p right))
+             (zerop (sql-numeric-coefficient right)))
+    (ereport "22012" "division by zero"))
+  (when (string= operator "%")
+    (return-from sql-numeric-special-arithmetic
+      (if (sql-numeric-special-p left) :numeric-nan left)))
+  (when (string= operator "/")
+    (return-from sql-numeric-special-arithmetic
+      (cond ((and (sql-numeric-special-p left) (sql-numeric-special-p right)) :numeric-nan)
+            ((not (sql-numeric-special-p left)) (make-sql-decimal 0 0))
+            (t (if (minusp (sql-numeric-coefficient right)) (sql-numeric-negate left) left)))))
+  (when (string= operator "*")
+    (let* ((finite (if (sql-numeric-special-p left) right left))
+           (infinite (if (sql-numeric-special-p left) left right)))
+      (return-from sql-numeric-special-arithmetic
+        (cond ((sql-numeric-special-p finite)
+               (if (eq finite infinite) :numeric-positive-infinity :numeric-negative-infinity))
+              ((zerop (sql-numeric-coefficient finite)) :numeric-nan)
+              ((minusp (sql-numeric-coefficient finite)) (sql-numeric-negate infinite))
+              (t infinite)))))
+  (ereport "XX000" "unknown numeric operator"))
+
 (defun sql-numeric-accumulate (left right)
   "Retain an unbounded exact total; only the aggregate's final result is bounded."
+  (when (or (sql-numeric-special-p left) (sql-numeric-special-p right))
+    (return-from sql-numeric-accumulate (sql-numeric-special-arithmetic "+" left right)))
   (if (and (integerp left) (integerp right)) (+ left right)
       (let ((scale (max (sql-numeric-scale left) (sql-numeric-scale right))))
         (make-sql-decimal (+ (* (sql-numeric-coefficient left) (expt 10 (- scale (sql-numeric-scale left))))
@@ -112,6 +197,8 @@
 (defun sql-numeric-division (left right)
   ;; Follow numeric.c select_div_scale using normalized base-10000 leading digits,
   ;; input display scales and the display cap; round ties away from zero.
+  (when (or (sql-numeric-special-p left) (sql-numeric-special-p right))
+    (return-from sql-numeric-division (sql-numeric-special-arithmetic "/" left right)))
   (when (zerop (sql-numeric-coefficient right))
     (ereport "22012" "division by zero"))
   (multiple-value-bind (weight1 digit1) (sql-numeric-leading-digit left)
@@ -126,6 +213,8 @@
 (defun sql-numeric-arithmetic (operator left right)
   (unless (and (sql-numeric-p left) (sql-numeric-p right))
     (ereport "42883" "numeric operator requires numeric operands"))
+  (when (or (sql-numeric-special-p left) (sql-numeric-special-p right))
+    (return-from sql-numeric-arithmetic (sql-numeric-special-arithmetic operator left right)))
   (when (string= operator "/") (return-from sql-numeric-arithmetic (sql-numeric-division left right)))
   (let* ((scale (if (string= operator "*")
                     (+ (sql-numeric-scale left) (sql-numeric-scale right))

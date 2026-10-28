@@ -934,6 +934,12 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
 
 (defun query-spill-decode (value)
   (cond
+    ((and (consp value) (eq (first value) :pg-query-spill-timetz))
+     (make-sql-timetz (second value) (third value)))
+    ((and (consp value) (eq (first value) :pg-query-spill-interval))
+     (make-sql-interval (second value) (third value) (fourth value)))
+    ((and (consp value) (eq (first value) :pg-query-spill-float))
+     (sql-float-from-bits (third value) (second value)))
     ((and (consp value) (eq (first value) :pg-query-spill-numeric))
      (make-sql-decimal (second value) (third value)))
     ((and (consp value) (eq (first value) :pg-query-spill-record))
@@ -964,6 +970,14 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
   ;; Preserve coefficient and display scale across spill and replay, including
   ;; decimals nested in composite rows, without evaluating reader forms.
   (cond
+    ((sql-timetz-p value)
+     (format stream "(:pg-query-spill-timetz ~d ~d)" (sql-timetz-microseconds value) (sql-timetz-zone-west value)))
+    ((sql-interval-p value)
+     (format stream "(:pg-query-spill-interval ~d ~d ~d)" (sql-interval-months value)
+             (sql-interval-days value) (sql-interval-microseconds value)))
+    ((floatp value)
+     (let ((type (if (typep value 'single-float) :float4 :float8)))
+       (format stream "(:pg-query-spill-float ~s ~d)" type (sql-float-bits value type))))
     ((sql-decimal-p value)
      (format stream "(:pg-query-spill-numeric ~d ~d)" (sql-decimal-coefficient value) (sql-decimal-scale value)))
     ((sql-record-p value)

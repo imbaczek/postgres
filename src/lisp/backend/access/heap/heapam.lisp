@@ -126,14 +126,18 @@
 
 (defun column-align (col)
   (case (pg-column-type col)
-    (:int8 8)
-    (:int4 4)
+    ((:int8 :float8 :time :timestamp :timestamptz :interval :timetz) 8)
+    (:int2 2)
+    ((:int4 :numeric :float4 :date) 4)
     (t 1)))
 
 (defun column-fixed-size (col)
   (case (pg-column-type col)
-    (:int4 4)
-    (:int8 8)
+    (:interval 16)
+    (:timetz 12)
+    (:int2 2)
+    ((:int4 :float4 :date) 4)
+    ((:int8 :float8 :time :timestamp :timestamptz) 8)
     (t nil)))
 
 (defun varchar-byte-length (string)
@@ -159,11 +163,12 @@
                   (setf cursor (align-up cursor al))
                   (setf (aref offsets i) cursor)
                   (incf cursor
-                        (if (eq (pg-column-type col) :varchar)
-                            (1+ (varchar-byte-length v))
-                            (column-fixed-size col)))))))
+                        (case (pg-column-type col)
+                          (:varchar (1+ (varchar-byte-length v)))
+                          (:numeric (+ 4 (length (sql-numeric-output v))))
+                          (otherwise (column-fixed-size col))))))))
     (when has-null (setf infomask (logior infomask +heap-hasnull+)))
-    (when (some (lambda (c) (eq (pg-column-type c) :varchar)) columns)
+    (when (some (lambda (c) (member (pg-column-type c) '(:varchar :numeric))) columns)
       (setf infomask (logior infomask +heap-hasvarwidth+)))
     (let ((bytes (make-array cursor :element-type '(unsigned-byte 8)
                                     :initial-element 0)))
@@ -192,10 +197,26 @@
             for col = (aref columns i)
             do (unless (eq v +null+)
                  (case (pg-column-type col)
-                   (:int4
+                   (:timetz
+                    (page-set-u64 bytes off (logand (sql-timetz-microseconds v) #xffffffffffffffff))
+                    (page-set-u32 bytes (+ off 8) (logand (sql-timetz-zone-west v) #xffffffff)))
+                   (:interval
+                    (page-set-u64 bytes off (logand (sql-interval-microseconds v) #xffffffffffffffff))
+                    (page-set-u32 bytes (+ off 8) (logand (sql-interval-days v) #xffffffff))
+                    (page-set-u32 bytes (+ off 12) (logand (sql-interval-months v) #xffffffff)))
+                   (:float4 (page-set-u32 bytes off (sql-float-bits v :float4)))
+                   (:float8 (page-set-u64 bytes off (sql-float-bits v :float8)))
+                   (:int2
+                    (page-set-u16 bytes off (logand v #xffff)))
+                   ((:int4 :date)
                     (page-set-u32 bytes off (logand v #xFFFFFFFF)))
-                   (:int8
+                   ((:int8 :time :timestamp :timestamptz)
                     (page-set-u64 bytes off (logand v #xFFFFFFFFFFFFFFFF)))
+                   (:numeric
+                    (let* ((data (string->bytes (sql-numeric-output v)))
+                           (size (+ 4 (length data))))
+                      (page-set-u32 bytes off size)
+                      (replace bytes data :start1 (+ off 4))))
                    (:varchar
                     (let ((data (string->bytes v)))
                       (when (> (length data) 126)
@@ -229,18 +250,49 @@
                  (let ((al (column-align col)))
                    (setf cursor (align-up cursor al))
                    (case (pg-column-type col)
-                     (:int4
+                     (:timetz
+                      (let ((micros (page-u64 bytes cursor)) (zone (page-u32 bytes (+ cursor 8))))
+                        (when (logbitp 63 micros) (decf micros #x10000000000000000))
+                        (when (logbitp 31 zone) (decf zone #x100000000))
+                        (setf (aref values i) (make-sql-timetz micros zone)))
+                      (incf cursor 12))
+                     (:interval
+                      (let ((micros (page-u64 bytes cursor)) (days (page-u32 bytes (+ cursor 8)))
+                                                             (months (page-u32 bytes (+ cursor 12))))
+                        (when (logbitp 63 micros) (decf micros #x10000000000000000))
+                        (when (logbitp 31 days) (decf days #x100000000))
+                        (when (logbitp 31 months) (decf months #x100000000))
+                        (setf (aref values i) (make-sql-interval months days micros)))
+                      (incf cursor 16))
+                     (:float4
+                      (setf (aref values i) (sql-float-from-bits (page-u32 bytes cursor) :float4))
+                      (incf cursor 4))
+                     (:float8
+                      (setf (aref values i) (sql-float-from-bits (page-u64 bytes cursor) :float8))
+                      (incf cursor 8))
+                     (:int2
+                      (let ((v (page-u16 bytes cursor)))
+                        (when (>= v #x8000) (decf v #x10000))
+                        (setf (aref values i) v))
+                      (incf cursor 2))
+                     ((:int4 :date)
                       (let ((v (page-u32 bytes cursor)))
                         (when (>= v #x80000000)
                           (decf v #x100000000))
                         (setf (aref values i) v))
                       (incf cursor 4))
-                     (:int8
+                     ((:int8 :time :timestamp :timestamptz)
                       (let ((v (page-u64 bytes cursor)))
                         (when (>= v #x8000000000000000)
                           (decf v #x10000000000000000))
                         (setf (aref values i) v))
                       (incf cursor 8))
+                     (:numeric
+                      (let ((size (page-u32 bytes cursor)))
+                        (setf (aref values i)
+                              (sql-numeric-input (bytes->string bytes :start (+ cursor 4)
+                                                                      :end (+ cursor size))))
+                        (incf cursor size)))
                      (:varchar
                       (let* ((header (aref bytes cursor))
                              (shortp (oddp header))

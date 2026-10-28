@@ -58,7 +58,7 @@
     (make-condition 'pg-client-error :sqlstate sqlstate :message message)))
 
 (defun pg-client-connect (host port database &key (user "postgres")
-                                               application-name replication-p)
+                                               application-name replication-p options)
   (let* ((socket (make-instance 'sb-bsd-sockets:inet-socket
                                 :type :stream :protocol :tcp))
          (stream nil)
@@ -73,14 +73,14 @@
                   socket :input t :output t
                   :element-type '(unsigned-byte 8) :buffering :none)
                  client (make-pg-client :socket socket :stream stream))
-           (pg-client-send-startup stream user database application-name replication-p)
+           (pg-client-send-startup stream user database application-name replication-p options)
            (pg-client-read-startup stream)
            (setf socket nil stream nil)
            client)
       (when stream (ignore-errors (close stream :abort t)))
       (when socket (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
-(defun pg-client-send-startup (stream user database application-name replication-p)
+(defun pg-client-send-startup (stream user database application-name replication-p &optional options)
   (let ((body (make-payload)))
     (payload-push-u32 body +protocol-version-3-0+)
     (payload-push-cstring body "user")
@@ -90,6 +90,9 @@
     (when application-name
       (payload-push-cstring body "application_name")
       (payload-push-cstring body application-name))
+    (when options
+      (payload-push-cstring body "options")
+      (payload-push-cstring body options))
     (when replication-p
       (payload-push-cstring body "replication")
       (payload-push-cstring body "database"))

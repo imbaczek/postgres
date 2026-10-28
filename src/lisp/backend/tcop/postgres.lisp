@@ -179,7 +179,7 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
                                (princ-to-string *server-version-num*))
         (send-parameter-status stream "server_encoding" "UTF8")
         (send-parameter-status stream "client_encoding" "UTF8")
-        (send-parameter-status stream "DateStyle" "ISO, MDY")
+        (session-report-parameter stream "DateStyle" (session-extra-setting-value "datestyle"))
         (session-report-parameter stream "TimeZone"
                                   (or (gethash "timezone" (backend-settings *backend*)) "UTC"))
         (send-parameter-status stream "integer_datetimes" "on")

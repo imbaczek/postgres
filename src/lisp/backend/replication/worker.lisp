@@ -246,19 +246,24 @@
   (logical-target-query client (logical-progress-table-ddl))
   (logical-target-query client (logical-subscription-config-ddl)))
 
+(defparameter +logical-replication-format-options+
+  "-c DateStyle=ISO,MDY -c IntervalStyle=postgres -c extra_float_digits=3 -c TimeZone=UTC")
+
 (defun logical-startup-replication-client (options)
   (pg-client-connect
    (logical-subscription-options-source-host options)
    (logical-subscription-options-source-port options)
    (logical-subscription-options-source-database options)
-   :replication-p t :application-name "pg-lisp-subscribe"))
+   :replication-p t :application-name "pg-lisp-subscribe"
+   :options +logical-replication-format-options+))
 
 (defun logical-startup-source-client (options)
   (pg-client-connect
    (logical-subscription-options-source-host options)
    (logical-subscription-options-source-port options)
    (logical-subscription-options-source-database options)
-   :application-name "pg-lisp-subscribe-copy"))
+   :application-name "pg-lisp-subscribe-copy"
+   :options +logical-replication-format-options+))
 
 (defun logical-read-source-identity (options)
   (when (eq (logical-subscription-options-mode options) :standard)
@@ -277,7 +282,8 @@
    (logical-subscription-options-target-host options)
    (logical-subscription-options-target-port options)
    (logical-subscription-options-target-database options)
-   :application-name "pg-lisp-subscribe-apply"))
+   :application-name "pg-lisp-subscribe-apply"
+   :options +logical-replication-format-options+))
 
 (defun logical-drop-source-slot-if-present (options)
   (let ((client (logical-startup-replication-client options)))
@@ -317,7 +323,7 @@
         (/ value 1000.0)))))
 
 (defun logical-type-supported-p (type-oid)
-  (member type-oid '(20 23 1043)))
+  (member type-oid '(20 21 23 700 701 1043 1082 1083 1114 1184 1186 1266 1700)))
 
 (defun logical-validate-client-schema (table source-columns target-columns)
   (unless (= (length source-columns) (length target-columns))
@@ -497,13 +503,13 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (error "unknown logical value conversion context ~s" context))
   (cond
     ((null value) "NULL")
-    ((member type-oid '(20 23))
+    ((member type-oid '(20 21 23))
      (unless (ignore-errors (parse-integer value :junk-allowed nil))
        (if (eq context :copy)
            (error "source returned a malformed integer value")
            (error "pgoutput integer value is malformed")))
      value)
-    ((= type-oid 1043) (logical-sql-literal value))
+    ((member type-oid '(700 701 1043 1082 1083 1114 1184 1186 1266 1700)) (logical-sql-literal value))
     (t (error "unsupported ~a type OID ~a"
               (if (eq context :copy) "logical copy" "pgoutput") type-oid))))
 

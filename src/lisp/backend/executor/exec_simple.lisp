@@ -552,22 +552,8 @@ Do not perform wire I/O while restoring transaction state."
           :test #'string=))
 
 (defun valid-timezone-value-p (value)
-  (and (stringp value)
-       (plusp (length value))
-       (not (char= (char value 0) #\/))
-       (every (lambda (char)
-                (or (and (char>= char #\A) (char<= char #\Z))
-                    (and (char>= char #\a) (char<= char #\z))
-                    (and (char>= char #\0) (char<= char #\9))
-                    (find char "/_+-")))
-              value)
-       (handler-case
-           (with-open-file (stream (merge-pathnames
-                                    value #p"/usr/share/zoneinfo/")
-                                   :direction :input
-                                   :element-type '(unsigned-byte 8))
-             (and (loop for expected across #(84 90 105 102)
-                        always (= (read-byte stream) expected))))
+  (and (sql-timezone-name-valid-p value)
+       (handler-case (progn (sql-load-timezone value) t)
          (error () nil))))
 
 (defun transaction-isolation-setting-value (value)

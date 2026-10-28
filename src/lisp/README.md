@@ -186,10 +186,22 @@ smart/fast/immediate shutdown and escalation.
 
 ## Supported SQL
 
-Types: `int`/`integer`/`int4`, `bigint`/`int8`, `varchar(n)` / `character
-varying(n)` with `n <= 126`, and `text`. For now, `text` is an alias for
-`varchar(126)`; distinct text/varchar type semantics and OIDs are a TODO.
+Table columns support `smallint`/`int2`, `int`/`integer`/`int4`, `bigint`/`int8`,
+`numeric`/`decimal` (including precision and scale), `real`/`float4`,
+`double precision`/`float8`, `date`, `time` and `timestamp` with or without time
+zone, `interval`, and `varchar(n)` / `character varying(n)` with `n <= 126`.
+For now, `text` is an alias for `varchar(126)`; distinct text/varchar type
+semantics and OIDs are a TODO.
 `varchar` without a length is also treated as 126.
+
+Decimal literals and numeric casts support finite values; numeric casts also
+accept NaN and infinities. Precision-constrained numeric values are rounded and range checked. Floating
+types use IEEE values, including NaN and infinities. Date/time and interval
+types support casts, comparisons, and the implemented arithmetic operators;
+time and timestamp precision is at most six fractional digits. Interval field
+and precision modifiers are supported. These are subsets of PostgreSQL's full
+type and operator catalog, not a promise that every input spelling or function
+is implemented.
 
 DDL:
 
@@ -297,7 +309,7 @@ SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
 CHECKPOINT;
 ```
 
-Expressions: column references, integer and string literals, `+ - * / %`,
+Expressions: column references, integer, decimal and string literals, `+ - * / %`,
 comparisons, `AND` / `OR` / `NOT`, `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE`, and
 parentheses. Scalar functions: `version()`, `pg_lisp_runtime()`,
 `current_database()`, `current_schema()`, `current_catalog()`, `current_user`,
@@ -309,8 +321,11 @@ parentheses. Scalar functions: `version()`, `pg_lisp_runtime()`,
 `SET TIME ZONE` accepts installed named TZif zones, stores the value per backend,
 and returns it from `SHOW timezone`; numeric offsets and `INTERVAL` forms are
 unsupported. `RESET TIME ZONE` and `RESET ALL` restore the startup baseline, UTC
-when unspecified. Supported isolation levels are `READ COMMITTED` and
-`REPEATABLE READ`; client encoding is UTF8 and `standard_conforming_strings = on`.
+when unspecified. `DateStyle` supports ISO, SQL, Postgres and German output and
+MDY, DMY and YMD input order; `IntervalStyle` supports only `postgres`.
+`extra_float_digits` controls floating-point output. Supported isolation levels
+are `READ COMMITTED` and `REPEATABLE READ`; client encoding is UTF8 and
+`standard_conforming_strings = on`.
 Client startup and SQL `application_name` support SET, SHOW, RESET and
 `current_setting`/`set_config`, including transaction-local values. Other LOCAL
 settings remain unsupported. Parameter reports are coalesced before ReadyForQuery.
@@ -357,8 +372,10 @@ and the bundled worker subscribes to a C publication:
 ```
 
 Precreate matching ordinary `public` tables with non-null primary keys. The
-supported types are `int4`, `int8`, and bounded `varchar`; supported operations
-are INSERT, UPDATE including key changes, DELETE, and plain transactional
+supported types are `int2`, `int4`, `int8`, `numeric`, `float4`, `float8`,
+bounded `varchar`, `date`, `time`, `timetz`, `timestamp`, `timestamptz` and
+`interval`. Supported operations are INSERT, UPDATE including key changes,
+DELETE, and plain transactional
 TRUNCATE. Initial copy and concurrent writes use a consistent snapshot/WAL
 handoff. Target effects and source progress commit together before feedback.
 `--slot` identifies the target subscription; standard mode records a random
@@ -816,16 +833,15 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   because catalog changes and statistics have no rollback log.
 - `COUNT(*)`, `COUNT(expr)`, `MIN`, `MAX` and `GROUP BY` are supported.
   `COUNT(expr)` counts non-NULL values, including false and zero; `MIN` and `MAX`
-  ignore NULLs and support numeric and text inputs, plus implemented name, OID,
-  LSN and timestamp expression types. Hash aggregation is bounded by query
-  work memory and spills through recursive hash partitions, with external sort
+  ignore NULLs and support numeric, floating, text, date/time and interval inputs,
+  plus implemented name, OID and LSN expression types. Hash aggregation is bounded
+  by query work memory and spills through recursive hash partitions, with external sort
   as the skew/depth fallback. `SUM` supports smallint/integer inputs with bigint
   results, and bigint/finite numeric expressions with exact numeric
-  results. `AVG` supports integer and finite numeric expressions, returning exact
-  numeric results. Empty or all-NULL sums and averages return NULL. SUM, AVG and
-  text `array_agg` use sorted grouping with spill. Finite numeric expression casts
-  and arithmetic are supported; decimal literals, numeric typmods and numeric heap
-  columns are not. Floating point, interval and money types remain unsupported.
+  results. `SUM` and `AVG` also support floating and interval inputs; integer
+  and numeric averages return numeric. Empty or all-NULL sums and averages return
+  NULL. SUM, AVG and text `array_agg` use sorted grouping with spill. Money remains
+  unsupported.
   Derived SELECTs in `FROM` support `LATERAL` references. `HAVING`, ordinary
   `DISTINCT`, `UNION`/`UNION ALL`, and the expression subqueries described above are
   supported; see [HAVING and LATERAL](t/HAVING-LATERAL.md) for scope and tests.
@@ -865,9 +881,8 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
 - Byte-wise comparison only, i.e. C-like collation for ASCII. Index key
   encoding is length-first and is safe for equality lookups; text range ordering
   and ordered index iteration are not implemented.
-- Numeric/float, date/time, boolean, and other types are unsupported. `text` is
-  temporarily treated as `varchar(126)`; full text/varchar semantics remain a
-  TODO.
+- Boolean and other unlisted table column types are unsupported. `text` is
+  temporarily treated as `varchar(126)`; full text/varchar semantics remain a TODO.
 - Extended query protocol (Parse/Bind/Describe/Execute/Sync) is not
   implemented; `psql` is unaffected, other drivers are.
 - `pg_terminate_backend` (and fast/immediate shutdown) unwinds the target with

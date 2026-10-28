@@ -143,6 +143,23 @@ those arguments therefore occur before any row execution or sequence effects."
     (setf (getf prepared :column-defaults) defaults)
     prepared))
 
+(defun canonical-stored-expression (expression original raw table)
+  "Return replay SQL and raw AST, preserving cooked temporal constants."
+  (if (not (catalog-temporal-constant-p expression))
+      (values original raw)
+      (let* ((sql (catalog-canonical-expression-sql expression table))
+             (statements (parse-statements (concatenate 'string "SELECT " sql)))
+             (target (and (= (length statements) 1) (first (getf (first statements) :targets))))
+             (parsed (and target (getf target :expr))))
+        (unless parsed (ereport "0A000" "cannot replay stored expression"))
+        (let* ((*select-aggregate-analysis* nil)
+               (*select-set-functions-allowed-p* nil)
+               (reanalyzed (analyze-expr parsed table))
+               (replayed-sql (catalog-canonical-expression-sql reanalyzed table)))
+          (unless (string= sql replayed-sql)
+            (ereport "0A000" "stored expression cannot be replayed faithfully")))
+        (values sql parsed))))
+
 (defun cook-column-default (raw column)
   (validate-stored-expression raw :default)
   (let* ((*select-aggregate-analysis* nil)
@@ -191,8 +208,11 @@ those arguments therefore occur before any row execution or sequence effects."
     (when (table-constraint-name-used-p table name)
       (ereport "42710" "constraint ~a for relation ~a already exists" name (pg-class-name table)))
     (stored-expression-sequences expression)
-    (list :name name :expression expression :sql (getf raw :sql)
-          :validated (not (getf raw :not-valid)))))
+    (multiple-value-bind (sql parsed)
+        (canonical-stored-expression expression (getf raw :sql) (getf raw :expression) table)
+      (setf (getf raw :sql) sql (getf raw :expression) parsed)
+      (list :name name :expression expression :sql sql
+            :validated (not (getf raw :not-valid))))))
 
 (defun check-table-constraints (table values &optional (checks (pg-class-checks table)))
   "Like ExecCheck, NULL passes. Check names determine evaluation order.
@@ -205,9 +225,14 @@ NOT VALID checks still apply to new row versions, after their NOT NULL checks."
 (defun install-table-expressions (table column-definitions constraints)
   (loop for column across (pg-class-columns table) for definition in column-definitions
         when (getf definition :default-expression)
-          do (setf (pg-column-default-expression column)
-                   (cook-column-default (getf definition :default-expression) column)
-                   (pg-column-default-sql column) (getf definition :default-sql)))
+          do (let ((cooked (cook-column-default (getf definition :default-expression) column)))
+               (multiple-value-bind (sql raw)
+                   (canonical-stored-expression cooked (getf definition :default-sql)
+                                                (getf definition :default-expression) table)
+                 (setf (pg-column-default-expression column) cooked
+                       (pg-column-default-sql column) sql
+                       (getf definition :default-expression) raw
+                       (getf definition :default-sql) sql))))
   (dolist (raw (append (loop for definition in column-definitions append (getf definition :checks))
                        (remove-if-not (lambda (raw) (eq (getf raw :kind) :check)) constraints)))
     (push (cook-check-constraint table raw) (pg-class-checks table))))
@@ -240,7 +265,10 @@ snapshot is scanned. Expression evaluation holds no global write/catalog mutex."
              (setf column (find-column table (getf ast :column)))
              (unless column (ereport "42703" "column ~s does not exist" (getf ast :column)))
              (when (eq action :set-default)
-               (setf expression (cook-column-default (getf ast :expression) column))))
+               (setf expression (cook-column-default (getf ast :expression) column))
+               (multiple-value-bind (sql parsed)
+                   (canonical-stored-expression expression (getf ast :sql) (getf ast :expression) table)
+                 (setf (getf ast :sql) sql (getf ast :expression) parsed))))
             (:add-check (setf check (cook-check-constraint table (getf ast :check))))
             (otherwise
              (setf check (find name (pg-class-checks table)

@@ -29,6 +29,8 @@
   (sequence-currvals (make-hash-table :test #'eql))
   (settings (make-hash-table :test #'equal))
   (settings-transaction-start nil)
+  (transaction-start-unix nil)
+  (transaction-start-unix-microseconds nil)
   (settings-reset (make-hash-table :test #'equal))
   (statement-deadline nil)
   ;; Interrupt state: the equivalents of QueryCancelPending and the
@@ -52,6 +54,13 @@
 (defun set-backend-state (backend state)
   "Publish transaction state atomically with reload admission."
   (sb-thread:with-mutex (*live-operation-lock*)
+    (when (and (eq state :in-progress) (eq (backend-state backend) :idle))
+      (multiple-value-bind (seconds microseconds) (sb-ext:get-time-of-day)
+        (setf (backend-transaction-start-unix backend) seconds
+              (backend-transaction-start-unix-microseconds backend) (+ (* seconds 1000000) microseconds))))
+    (when (eq state :idle)
+      (setf (backend-transaction-start-unix backend) nil
+            (backend-transaction-start-unix-microseconds backend) nil))
     (setf (backend-state backend) state)
     (sb-thread:condition-broadcast *live-operation-cv*))
   state)

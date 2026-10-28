@@ -213,12 +213,12 @@ setup_tables() {
     for port in "$LISP_PORT" "$C_PORT"; do
         if [ "$DIRECTION" = c-to-lisp ] && [ "$port" = "$C_PORT" ]; then
             # INCLUDE attributes must not become replica-identity key columns.
-            sql "$port" 'CREATE TABLE interop_rows (id integer NOT NULL, amount bigint, label varchar(100), PRIMARY KEY(id) INCLUDE(label)); CREATE TABLE interop_other (id integer NOT NULL, amount bigint, label varchar(100), PRIMARY KEY(id) INCLUDE(label)); CREATE TABLE interop_unpublished (id integer PRIMARY KEY, amount bigint, label varchar(100))' >/dev/null
+            sql "$port" 'CREATE TABLE interop_rows (id integer NOT NULL, amount bigint, label varchar(100), price numeric, rate double precision, units smallint, workday date, at_time time, stamp timestamp, span interval day to second(2), zoned_time timetz, PRIMARY KEY(id) INCLUDE(label)); CREATE TABLE interop_other (id integer NOT NULL, amount bigint, label varchar(100), PRIMARY KEY(id) INCLUDE(label)); CREATE TABLE interop_unpublished (id integer PRIMARY KEY, amount bigint, label varchar(100))' >/dev/null
             # Worker connections inherit a path that shadows public tables.
             # Harness SQL explicitly selects public through PGOPTIONS above.
             sql "$port" "CREATE SCHEMA shadow; CREATE TABLE shadow.interop_rows (id integer PRIMARY KEY, amount bigint, label varchar(100)); INSERT INTO shadow.interop_rows VALUES (404,404,'wrong namespace'); ALTER ROLE postgres SET search_path=shadow,public" >/dev/null
         else
-            sql "$port" 'CREATE TABLE interop_rows (id integer PRIMARY KEY, amount bigint, label varchar(100)); CREATE TABLE interop_other (id integer PRIMARY KEY, amount bigint, label varchar(100)); CREATE TABLE interop_unpublished (id integer PRIMARY KEY, amount bigint, label varchar(100))' >/dev/null
+            sql "$port" 'CREATE TABLE interop_rows (id integer PRIMARY KEY, amount bigint, label varchar(100), price numeric, rate double precision, units smallint, workday date, at_time time, stamp timestamp, span interval day to second(2), zoned_time timetz); CREATE TABLE interop_other (id integer PRIMARY KEY, amount bigint, label varchar(100)); CREATE TABLE interop_unpublished (id integer PRIMARY KEY, amount bigint, label varchar(100))' >/dev/null
         fi
         for table in interop_rows interop_other interop_unpublished; do
             sql "$port" "ALTER TABLE $table ALTER amount SET DEFAULT 40+2; ALTER TABLE $table ADD CONSTRAINT ${table}_amount_check CHECK(amount IS NULL OR amount >= '-9223372036854775808'::bigint)" >/dev/null
@@ -434,6 +434,8 @@ expect_standard_start_failure() {
 }
 workload() {
     source=$1
+    sql "$source" "UPDATE interop_rows SET price=12.0300,rate='NaN',units=-32768,workday='2024-02-29',at_time='12:34:56.12',stamp='2000-01-01 12:34:56',span='1 mon 2 days 00:00:01.125',zoned_time='12:34:56+01:23' WHERE id=1" >/dev/null
+    wait_rows "$target" '1|12.0300|NaN|-32768|2024-02-29|12:34:56.12|2000-01-01 12:34:56|1 mon 2 days 00:00:01.13|12:34:56+01:23' 'SELECT id,price,rate,units,workday,at_time,stamp,span,zoned_time FROM interop_rows WHERE id=1'
     sql "$source" "BEGIN; INSERT INTO interop_rows VALUES (3, 30, 'third'); UPDATE interop_rows SET amount = amount + 7 WHERE id = 1; UPDATE interop_rows SET id = 4 WHERE id = 2; DELETE FROM interop_rows WHERE id = 3; COMMIT; BEGIN; INSERT INTO interop_rows VALUES (99, 99, 'abort'); ROLLBACK; INSERT INTO interop_unpublished VALUES (1, 1, 'excluded'); BEGIN; TRUNCATE TABLE interop_other; INSERT INTO interop_other VALUES (5, 50, 'after truncate'); COMMIT" >/dev/null
     # Observe every committed action before removing the temporary row. A final
     # unchanged row inventory would miss absent INSERT/UPDATE/DELETE events.

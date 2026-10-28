@@ -33,6 +33,10 @@
                    (:file "wal-eor")
                    (:file "wal-checkpoint")
                    (:file "bufmgr")))
+     (:file "utils/adt/numeric")
+     (:file "utils/adt/float")
+     (:file "utils/adt/timezone")
+     (:file "utils/adt/datetime")
      (:module "access"
       :serial t
       :components
@@ -56,7 +60,6 @@
      (:module "postmaster"
       :serial t
       :components ((:file "postmaster")))
-     (:file "utils/adt/numeric")
      (:module "catalog"
       :serial t
       :components ((:file "catalog")

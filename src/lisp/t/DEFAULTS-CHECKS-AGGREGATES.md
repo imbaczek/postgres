@@ -18,12 +18,13 @@ ADD, default changes, DROP and RENAME wait for table writers. DDL in explicit
 transactions and additional multi-action ALTER forms remain unsupported.
 
 COUNT(expr) counts non-NULL values, including false and zero. MIN and MAX ignore
-NULLs and return NULL for empty or all-NULL inputs. They support numeric and text
-inputs, plus implemented name, OID, LSN and timestamp expression types.
+NULLs and return NULL for empty or all-NULL inputs. They support numeric, float,
+text, date/time and interval inputs, plus implemented name, OID and LSN types.
 
-Finite numeric casts and arithmetic support exact SUM and AVG results, including
-window aggregates. Decimal literals, numeric typmods, numeric heap columns and
-nonfinite values remain unsupported; heap storage remains int4, int8 and varchar.
+Numeric casts, arithmetic and aggregates support finite values and special
+values, including NaN and infinities. Numeric columns and precision/scale
+modifiers are supported. SUM and AVG also accept floating and interval inputs,
+including in window aggregates; floating results are approximate.
 Stored expressions use the existing supported function set. Sequence arguments
 in persisted expressions must be literal names or NULL; dynamic names are
 rejected with `0A000` so dependencies can be tracked.

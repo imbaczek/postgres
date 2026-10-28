@@ -1,5 +1,8 @@
 """Defaults, CHECKs, and basic aggregate behavior against the owned C peer."""
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from pathlib import Path
 from subqueries import QueryConnection
 
@@ -159,6 +162,301 @@ CASES = (
     "INSERT INTO dc_admin_fold DEFAULT VALUES RETURNING *",
     "CREATE TABLE dc_checknull(a int CHECK(setval('dc_seq',NULL::bigint)>0))",
     "INSERT INTO dc_checknull VALUES(1)",
+    "SELECT .5,1.,1_0.2_0e-1,-0.00,1.5+2,1.5::integer",
+    "SELECT 1.245::numeric(5,2),(-1.245)::numeric(5,2),1500::numeric(2,-3),0.00123::numeric(2,4)",
+    "SELECT 9.995::numeric(3,2)",
+    "SELECT 99500::numeric(2,-3)",
+    "SELECT 0.00999::numeric(2,4)",
+    "CREATE TABLE dc_numeric(id int PRIMARY KEY,n numeric(6,2) DEFAULT 1.25 UNIQUE)",
+    "INSERT INTO dc_numeric(id,n) VALUES(1,2.345),(2,-1.1),(3,10) RETURNING *",
+    "INSERT INTO dc_numeric(id) VALUES(4) RETURNING *",
+    "UPDATE dc_numeric SET n=8.765 WHERE id=4 RETURNING *",
+    "INSERT INTO dc_numeric VALUES(5,2.350)",
+    "SELECT n FROM dc_numeric WHERE n=2.350",
+    "CREATE TABLE dc_numeric_raw(n numeric)",
+    "INSERT INTO dc_numeric_raw VALUES(1.00),(1.0),(2.50)",
+    "ANALYZE dc_numeric_raw",
+    "CREATE INDEX dc_numeric_raw_idx ON dc_numeric_raw(n)",
+    "SELECT n,count(*) FROM dc_numeric_raw GROUP BY n ORDER BY n",
+    "SELECT 'NaN'::numeric, 'inf'::numeric, '-Infinity'::numeric",
+    "SELECT '+NaN'::numeric",
+    "SELECT 'Infinity'::numeric(2)",
+    "SELECT 'NaN'::numeric(2)",
+    "SELECT 'NaN'::numeric/0, 'NaN'::numeric%0, 'Infinity'::numeric-'Infinity'::numeric",
+    "SELECT 1.230/'Infinity'::numeric,1.230%'Infinity'::numeric,'Infinity'::numeric*0",
+    "SELECT '-Infinity'::numeric<0,'Infinity'::numeric<'NaN'::numeric,'NaN'::numeric='NaN'::numeric",
+    "SELECT 'Infinity'::numeric/0",
+    "SELECT 'NaN'::numeric::integer",
+    "CREATE TABLE dc_numeric_special(n numeric UNIQUE)",
+    "INSERT INTO dc_numeric_special VALUES('-Infinity'),(0),('Infinity'),('NaN')",
+    "INSERT INTO dc_numeric_special VALUES('NaN')",
+    "SELECT n FROM dc_numeric_special ORDER BY n",
+    "SELECT min(n),max(n),sum(n),avg(n) FROM dc_numeric_special",
+    "CREATE TABLE dc_smallint(id int PRIMARY KEY,n smallint UNIQUE)",
+    "INSERT INTO dc_smallint VALUES(1,-32768),(2,32767),(3,0) RETURNING *",
+    "INSERT INTO dc_smallint VALUES(4,32768)",
+    "INSERT INTO dc_smallint VALUES(4,0)",
+    "SELECT n FROM dc_smallint WHERE n=32767",
+    "UPDATE dc_smallint SET n=-1 WHERE id=3 RETURNING *",
+    "SELECT sum(n),avg(n),min(n),max(n) FROM dc_smallint",
+    "SELECT '1.25'::real,'-0'::double precision,'Infinity'::float8,'NaN'::float4",
+    "SELECT 2.5::float8::int,3.5::float8::int,(-2.5)::float8::int",
+    "SELECT '0.0001'::float8,'0.00001'::float8,'1000000'::float4,'1000000000000000'::float8",
+    "SELECT '1e-50'::float4",
+    "SELECT '1.25'::real+'2.5'::real,'NaN'::float8/0::float8,'Infinity'::float8-'Infinity'::float8",
+    "SELECT 'NaN'::float8='NaN'::float8,'NaN'::float8>'Infinity'::float8",
+    "SELECT 1::float8/0::float8",
+    "CREATE TABLE dc_float(id int PRIMARY KEY,f real,g double precision)",
+    "INSERT INTO dc_float VALUES(1,'1.25','2.50'),(2,'-0','Infinity'),(3,'NaN','-Infinity') RETURNING *",
+    "SELECT id,f,g FROM dc_float ORDER BY id",
+    "SELECT '1.23456789'::real::numeric,'1.2345678901234567'::float8::numeric,'NaN'::float8::numeric",
+    "SELECT DISTINCT x FROM (SELECT 'NaN'::float8 AS x UNION ALL SELECT 'NaN'::float8 UNION ALL SELECT '-0'::float8 UNION ALL SELECT '0'::float8) d ORDER BY x",
+    "SELECT '1'::float4+16777217,'1'::float4+1.125,'16777216'::float4=16777217",
+    "SELECT coalesce('1'::float4,2::float8),x FROM (SELECT '1'::float4 AS x UNION ALL SELECT 2::float8) d ORDER BY x",
+    "SELECT min(f),max(f),sum(f),avg(f),min(g),max(g),sum(g),avg(g) FROM dc_float",
+    "SET extra_float_digits=0",
+    "SELECT '1.23456789'::real,'1.2345678901234567'::float8,'1e20'::float8",
+    "SET extra_float_digits=-3",
+    "SELECT '1.23456789'::real,'1.2345678901234567'::float8",
+    "RESET extra_float_digits",
+    "SELECT '1e-45'::float4,'1e-320'::float8,'-0e-10000'::float8",
+    "SELECT '0x1.8p+1'::float8",
+    "SELECT 'NaN'::float8%1::float8 WHERE false",
+    "SELECT 1::float,1::float(24),1::float(25),1::float(53)",
+    "SELECT 1::float(0)",
+    "SELECT 1::float(54)",
+    "SELECT '0e-999999'::float8,'-0e999999'::float4",
+    "SELECT '1e-999999'::float8",
+    "SELECT x FROM (SELECT 1::int AS x) a JOIN (SELECT 1::float4 AS x) b USING (x)",
+    "SELECT x FROM (SELECT 1::float4 AS x) a FULL JOIN (SELECT 1::float8 AS x) b USING (x)",
+    "SELECT 1::real+'2',1::real+NULL",
+    "SELECT '2000-01-01'::date,'1970-01-01'::date,'0001-01-01 BC'::date,'infinity'::date",
+    "SELECT '01/02/2003'::date,'03/04/05'::date,'01/02/69'::date,'01/02/70'::date",
+    "SELECT '19990108'::date,'990108'::date,'Jan 8 1999'::date,'08-Jan-1999'::date,'1999-Jan-08'::date",
+    "SELECT '2000-060'::date,'2001.366'::date,'2000-060 04:05:06'::timestamp",
+    "SELECT 'JanXYZ 1 2024'::date",
+    "SELECT '-2024-01-01'::date",
+    "SELECT '2024-01-01-'::date",
+    "SELECT 'Jan 8 1999 04:05:06'::timestamp,'01/02/2003 04:05:06+02'::timestamptz",
+    "SELECT '2024-01-01 12:00:00 AD'::timestamp,'2024-01-01 12:00:00+00 AD'::timestamptz",
+    "SET DateStyle TO 'ISO, DMY'",
+    "CREATE TABLE dc_date_defaults(id int PRIMARY KEY,d date DEFAULT '01/02/2024' CHECK (d >= '01/02/2024'))",
+    "CREATE TABLE dc_date_complex(d date CHECK(d >= DATE '2024-01-01' AND array_length(ARRAY['a'],1)>0))",
+    "CREATE TABLE dc_date_empty_array(d date CHECK(d >= DATE '2024-01-01' AND array_length(ARRAY[]::text[],1) IS NULL))",
+    "CREATE TABLE dc_date_node(d date CHECK(d >= DATE '2024-01-01' AND pg_get_expr(NULL,0) IS NULL))",
+    "CREATE TABLE dc_date_any(d date, i int, CHECK(d >= DATE '2024-01-01' AND i=ANY('{1,2}')), CHECK(DATE '2024-01-01'=ANY(NULL)))",
+    "SELECT '01/02/2003'::date,'03/04/05'::date,'2003-01-02'::date",
+    "SELECT '08/01/1999 04:05:06'::timestamp,'08-Jan-1999 04:05:06'::timestamp",
+    "SET DateStyle TO 'ISO'",
+    "SELECT current_setting('DateStyle')",
+    "SET DateStyle TO 'YMD'",
+    "SELECT '03/04/05'::date,'03-Jan-04'::date",
+    "SET DateStyle TO 'ISO, DEFAULT'",
+    "SELECT current_setting('DateStyle')",
+    "SET DateStyle TO 'DEFAULT, DMY'",
+    "SELECT current_setting('DateStyle')",
+    "SET DateStyle TO 'DMY, DEFAULT'",
+    "SELECT current_setting('DateStyle')",
+    "SET DateStyle TO 'ISO, MDY'",
+    "INSERT INTO dc_date_defaults(id) VALUES(1) RETURNING *",
+    "INSERT INTO dc_date_defaults VALUES(2,DATE '2024-01-31')",
+    "SET TimeZone TO 'Europe/Warsaw'",
+    "SET DateStyle TO 'SQL, DMY'",
+    "SELECT DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05.123', TIMESTAMPTZ '2024-01-02 03:04:05+00'",
+    "SELECT TIMESTAMPTZ '2050-07-02 03:04:05+00', TIME '12:34:56', '12:34:56+02'::timetz",
+    "SELECT (TIMESTAMPTZ '2024-01-02 03:04:05+00'::text)::timestamptz, (TIMESTAMPTZ '2024-07-02 03:04:05+00'::text)::timestamptz",
+    "SET DateStyle TO 'SQL, YMD'",
+    "SELECT DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05'",
+    "SET DateStyle TO 'German'",
+    "SELECT current_setting('DateStyle'), DATE '2024-01-02', TIMESTAMPTZ '2024-01-02 03:04:05+00'",
+    "SET DateStyle TO 'Postgres, DMY'",
+    "SELECT DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05', TIMESTAMPTZ '2024-07-02 03:04:05+00'",
+    "SELECT TIMESTAMP '0001-01-01 01:02:03 BC', TIMESTAMP '10000-01-01 01:02:03'",
+    "SELECT (TIMESTAMP '2024-01-02 03:04:05'::text)::timestamp, (TIMESTAMPTZ '2024-07-02 03:04:05+00'::text)::timestamptz",
+    "SET DateStyle TO 'Postgres, MDY'",
+    "SELECT DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05'",
+    "SET DateStyle TO 'ISO, MDY'",
+    "SET TimeZone TO 'UTC'",
+    "SELECT '2024-07-01 12:00 EST'::timestamptz, '2024-07-01 12:00 EDT'::timestamptz, '2024-07-01 12:00 CST'::timestamptz, '2024-07-01 12:00 IST'::timestamptz",
+    "SELECT '12:34:56 EST'::timetz, '12:34:56 EDT'::timetz, '12:34:56 CST'::timetz, '12:34:56 IST'::timetz",
+    "SELECT '12:00 MEZ'::timetz, '12:00 MESZ'::timetz, '12:00 Z'::timetz",
+    "SELECT 'allballs CET'::timetz",
+    "SELECT '2024-01-01 12:00+02 CET'::timestamptz",
+    "SELECT '2024-01-01 12:00Z CET'::timestamptz",
+    "SELECT '1900-01-01 12:00 MSK'::timestamptz, '2010-01-01 12:00 MSK'::timestamptz, '2024-01-01 12:00 MSK'::timestamptz",
+    "SET TimeZone TO 'Asia/Shanghai'",
+    "SELECT '2024-07-01 12:00 CST'::timestamptz",
+    "SET TimeZone TO 'America/New_York'",
+    "SELECT '2024-11-03 01:30 EST'::timestamptz, '2024-11-03 01:30 EDT'::timestamptz, '2024-07-01 12:00 EST'::timestamptz",
+    "SET TimeZone TO 'UTC'",
+    "SELECT '2024-02-29'::date,'1900-02-29'::date",
+    "CREATE TABLE dc_dates(id integer PRIMARY KEY,d date UNIQUE)",
+    "INSERT INTO dc_dates VALUES(1,'2024-02-29'),(2,'0001-01-01 BC'),(3,'infinity') RETURNING *",
+    "SELECT d FROM dc_dates ORDER BY d",
+    "SELECT min(d),max(d) FROM dc_dates",
+    "SELECT '2000-01-01'::date+1,'2000-01-01'::date-1,'2000-01-02'::date-'2000-01-01'::date",
+    "SELECT 'infinity'::date+1,'infinity'::date-'2000-01-01'::date",
+    "SELECT DATE '2000-02-29'+1,DATE '2000-03-01'-DATE '2000-02-29'",
+    "SELECT '23:59:59.999999'::time,'24:00:00'::time,'12:34'::time,'12:34:56.555'::time(2)",
+    "SELECT '24:00:01'::time",
+    "SELECT '12:00:00+02'::timetz,'10:00:00+00'::time with time zone",
+    "SELECT '12:00:00'::timetz",
+    "SELECT '12:00:00+123'::timetz,'2000-01-01 12:00:00+123'::timestamptz",
+    "SELECT '12:00:00+123456'::timetz",
+    "SELECT '12:00:00+02'::timetz='10:00:00+00'::timetz,'12:00:00+02'::timetz<'10:00:00+00'::timetz",
+    "CREATE TABLE dc_timetz(id integer PRIMARY KEY,t timetz UNIQUE)",
+    "INSERT INTO dc_timetz VALUES (1,'12:00:00+02'),(2,'10:00:00+00'),(3,'09:00:00-01') RETURNING *",
+    "SELECT id,t FROM dc_timetz ORDER BY t",
+    "SELECT '00:00:60.5'::time,'24:00:00.0000001'::time",
+    "SELECT '00:00:00.0001255'::time,'00:00:00.0001265'::time",
+    "SELECT '12:34:56.'::time",
+    "CREATE TABLE dc_times(id int PRIMARY KEY,t time(2) UNIQUE)",
+    "INSERT INTO dc_times VALUES(1,'12:34:56.555'),(2,'24:00:00'),(3,'00:00:00') RETURNING *",
+    "SELECT t FROM dc_times ORDER BY t",
+    "SELECT TIME '12:34:56.5'",
+    "SELECT '2000-01-01 12:34:56.123456'::timestamp,'2000-01-01 12:34:56+02'::timestamptz",
+    "SELECT '1999-12-31 23:59:59.75'::timestamp(0),'infinity'::timestamp",
+    "CREATE TABLE dc_stamps(id int PRIMARY KEY, t timestamp(2),z timestamptz)",
+    "INSERT INTO dc_stamps VALUES(1,'1999-12-31 23:59:59.125','2000-01-01 12:34:56+02'),(2,'infinity','-infinity') RETURNING *",
+    "SELECT id,t,z FROM dc_stamps ORDER BY id",
+    "SELECT TIMESTAMP '2000-01-01 00:00:00'",
+    "SELECT '4714-11-23 23:00:00-01 BC'::timestamptz",
+    "SELECT '4714-11-24 00:00:59.999999+00:01 BC'::timestamptz(0)",
+    "SELECT '2000-01-01T00:00:00 +02'::timestamptz",
+    "SELECT '2000-01-01 12:00:00+0230'::timestamptz",
+    "SELECT '2024-07-15 12:00:00 Europe/Warsaw'::timestamptz,'2024-01-15 12:00:00 America/New_York'::timestamptz",
+    "SELECT '2024-01-15 12:00:00 america/new_york'::timestamptz",
+    "SELECT '2050-03-27 02:30:00 Europe/Warsaw'::timestamptz,'2050-10-30 02:30:00 Europe/Warsaw'::timestamptz",
+    "SET TIME ZONE 'Europe/Warsaw'",
+    "SET TIME ZONE 'europe/warsaw'",
+    "SELECT '12:00:00'::timetz",
+    "SELECT '2024-01-15 12:00:00'::timestamptz,'2024-07-15 12:00:00'::timestamptz",
+    "SELECT 'epoch'::timestamp,'epoch'::timestamptz",
+    "SELECT 'today'::date='now'::date,'tomorrow'::date-'today'::date,'today'::date-'yesterday'::date",
+    "SELECT 'today 12:34:56'::timestamp::date='today'::date,'today 12:34:56'::timestamp::time=TIME '12:34:56'",
+    "SELECT 'now'::timestamp='now'::timestamp,'now'::timestamptz='now'::timestamptz,'now'::time='now'::time,'now'::timetz='now'::timetz",
+    "SELECT 'now+02'::timetz IS NOT NULL",
+    "SELECT 'nowZ'::timetz IS NOT NULL",
+    "SELECT 'allballs'::time,'allballs'::timetz,'2000-01-01 allballs'::timestamptz",
+    "SELECT 'allballs +02'::timetz",
+    "SELECT 'allballs Z'::timetz",
+    "SELECT 'today'::time",
+    "SELECT 'allballs'::timestamp",
+    "SELECT '2024-03-31 02:30:00'::timestamptz,'2024-10-27 02:30:00'::timestamptz",
+    "SELECT '2024-03-30 12:00:00'::timestamptz+INTERVAL '1 day','2024-03-30 12:00:00'::timestamptz+INTERVAL '24 hours'",
+    "SELECT '2024-10-26 12:00:00'::timestamptz+INTERVAL '1 day','2024-10-28 12:00:00'::timestamptz-INTERVAL '1 day'",
+    "SELECT '2024-02-29 02:30:00'::timestamptz+INTERVAL '1 month 1 day',INTERVAL '1 day'+'2024-03-30 12:00:00'::timestamptz",
+    "SELECT '2024-03-31 12:00:00'::timestamptz-'2024-03-30 12:00:00'::timestamptz",
+    "SELECT 'infinity'::timestamptz+INTERVAL '-infinity'",
+    "SELECT '2024-01-01 23:30:00+00'::timestamptz::date,'2024-07-01 23:30:00+00'::timestamptz::time",
+    "SELECT '2024-01-15 12:00:00'::timestamp::timestamptz,'2024-07-15'::date::timestamptz",
+    "SELECT '2050-01-15 12:00:00'::timestamptz,'2050-07-15 12:00:00'::timestamptz",
+    "SELECT '2050-03-27 02:30:00'::timestamptz,'2050-10-30 02:30:00'::timestamptz",
+    "SELECT '2100-01-15 12:00:00'::timestamptz,'2100-07-15 12:00:00'::timestamptz",
+    "SET TIME ZONE 'Australia/Lord_Howe'",
+    "SELECT '2050-01-15 12:00:00'::timestamptz,'2050-07-15 12:00:00'::timestamptz",
+    "SET TIME ZONE 'Europe/Warsaw'",
+    "SELECT 'infinity'::timestamptz,'-infinity'::timestamptz",
+    "SET TIME ZONE 'Etc/GMT+12'",
+    "SELECT TIMESTAMP '294276-12-31 23:59:59'::timestamptz",
+    "SET TIME ZONE 'Etc/GMT-12'",
+    "SELECT '294276-12-31 23:59:59+00'::timestamptz::timestamp",
+    "SET TIME ZONE 'Etc/GMT-14'",
+    "SELECT TIMESTAMPTZ '294276-12-30 23:00:00+00' + INTERVAL '1 day'",
+    "SET TIME ZONE 'UTC'",
+    "BEGIN",
+    "SET TIME ZONE 'Europe/Warsaw'",
+    "SELECT '2024-07-15 12:00:00+00'::timestamptz",
+    "ROLLBACK",
+    "SELECT '2024-07-15 12:00:00+00'::timestamptz",
+    "SET TIME ZONE 'right/America/New_York'",
+    "SELECT DATE '2000-01-01'::timestamp, TIMESTAMP '2000-01-01 12:00:00'::date, TIMESTAMP '2000-01-01 12:00:00'::time",
+    "SELECT DATE '2000-01-01'=TIMESTAMP '2000-01-01 00:00:00'",
+    "SELECT '1 year 2 mons 3 days 04:05:06.7'::interval,'-1 mon 2 days -03:00:00'::interval",
+    "SELECT 'P1Y2M3DT4H5M6.7S'::interval,'P1.5Y'::interval,'P2W'::interval",
+    "SELECT 'P00010203T040506'::interval,'P1-2-3T4:05:06.7'::interval",
+    "SELECT 'PT1e2S'::interval,'PT1H1H'::interval,'PT'::interval",
+    "SELECT 'P00010203T040506.5'::interval",
+    "SELECT 'PT0.0000005S'::interval,'PT0.0000015S'::interval,'P0.25M'::interval,'P-1.5Y'::interval",
+    "SELECT 'P1-2T04:05'::interval,'PT123456'::interval,'P2024'::interval",
+    "SELECT 'P1Y2D3Y'::interval,'P1DT2DT3H'::interval",
+    "SELECT 'P178956971Y-2147483647M'::interval,'P178956971Y'::interval",
+    "SELECT 'P0x1Y'::interval,'PT0x1.8p1S'::interval",
+    "SELECT 'PT1e-310S'::interval",
+    "SELECT 'PT0x1p-1023S'::interval,'PT0x1p-1074S'::interval",
+    "SELECT 'PT0x1.0000000000001p-1023S'::interval",
+    f"SELECT 'PT{5 ** 1074}e-1074S'::interval",
+    "SELECT 'PT-NaNS'::interval",
+    "SELECT ' P1D'::interval",
+    "SELECT 'P1D '::interval",
+    "SELECT 'P2147483647M2147483647DT9223372036854S0.775807S'::interval",
+    "SELECT INTERVAL '1' YEAR, INTERVAL '1' YEAR TO MONTH, INTERVAL '1' DAY TO HOUR",
+    "SELECT '1'::interval, '1'::interval day, '1'::interval::interval day",
+    "SELECT ('2'::text)::interval minute, '2'::interval minute",
+    "SELECT INTERVAL '1 year 2 mons 3 days 04:05:06' DAY, INTERVAL '-1 year -11 mons' YEAR",
+    "SELECT INTERVAL '-00:59:59' HOUR, INTERVAL '23:59:59.999999' SECOND(0)",
+    "SELECT INTERVAL '1.25 seconds' SECOND(1), INTERVAL '-1.25 seconds' SECOND(1), INTERVAL(1) '1.25 seconds'",
+    "SELECT INTERVAL 'infinity' DAY, 'infinity'::interval(1)",
+    "SELECT INTERVAL '1 mon 2 days 03:04:05' * 1.5, 2 * INTERVAL '1 day', INTERVAL '1 mon' / 2",
+    "SELECT INTERVAL '-1 mon -1 day -03:00:00' * 0.5, INTERVAL '1 mon 2 days' / 3.0",
+    "SELECT INTERVAL '1 day' * 'Infinity'::float8, INTERVAL '1 day' / 'Infinity'::float8",
+    "SELECT INTERVAL 'infinity' * -2, INTERVAL '-infinity' / -2",
+    "SELECT INTERVAL '1 day' / 0",
+    "SELECT INTERVAL '0' * 'Infinity'::float8",
+    "SELECT INTERVAL 'infinity' * 0",
+    "SELECT INTERVAL 'infinity' / 'Infinity'::float8",
+    "SELECT INTERVAL '1 day' * 'NaN'::float8",
+    "SELECT INTERVAL '1 microsecond' * 0.5, INTERVAL '3 microseconds' / 2, INTERVAL '24 hours' * 2",
+    "SELECT INTERVAL '5849 months 1570 days' * 65.59506384011272",
+    "SELECT INTERVAL '1.0000015 seconds', INTERVAL '-1.0000015 seconds', INTERVAL '1.5 milliseconds', INTERVAL '2 microseconds'",
+    "SELECT INTERVAL '1 mon -30 days' * 'Infinity'::float8",
+    "CREATE TABLE dc_interval_agg(id int PRIMARY KEY, i interval)",
+    "INSERT INTO dc_interval_agg VALUES (1,INTERVAL '1 mon'),(2,INTERVAL '0'),(3,NULL)",
+    "SELECT sum(i),avg(i) FROM dc_interval_agg",
+    "SELECT sum(i),avg(i) FROM dc_interval_agg WHERE id>2",
+    "SELECT id,sum(i) OVER (ORDER BY id),avg(i) OVER (ORDER BY id) FROM dc_interval_agg ORDER BY id",
+    "INSERT INTO dc_interval_agg VALUES (4,INTERVAL 'infinity'),(5,INTERVAL '-infinity')",
+    "SELECT sum(i),avg(i) FROM dc_interval_agg WHERE id<5",
+    "SELECT sum(i) FROM dc_interval_agg",
+    "CREATE TABLE dc_interval_overflow(id int PRIMARY KEY, i interval)",
+    "INSERT INTO dc_interval_overflow VALUES (1,INTERVAL 'infinity'),(2,INTERVAL '2147483647 months'),(3,INTERVAL '1 month'),(4,INTERVAL '-1 month')",
+    "SELECT sum(i) FROM dc_interval_overflow",
+    "SELECT avg(i) FROM dc_interval_overflow",
+    "SELECT INTERVAL '12:34' HOUR TO MINUTE, INTERVAL '12:34' MINUTE TO SECOND, INTERVAL '12:34.5'",
+    "SELECT INTERVAL '1 02:03' DAY TO MINUTE, INTERVAL '-1 -02:03:04' DAY TO SECOND",
+    "SELECT INTERVAL '1-2' YEAR TO MONTH, INTERVAL '-1-2' YEAR TO MONTH, INTERVAL '1-2 3 04:05:06'",
+    "SELECT INTERVAL '2 days 1-2' YEAR TO MONTH",
+    "SELECT INTERVAL '1-12' YEAR TO MONTH",
+    "SELECT INTERVAL '1' YEAR TO YEAR",
+    "SELECT '1 year 2 mons'::\"interval\"(4), '1.25 seconds'::pg_catalog.interval(32767,1)",
+    "SELECT '1'::\"interval\"(1000)",
+    "CREATE TABLE dc_interval_mods(id int PRIMARY KEY, a interval year to month, b interval day to second(2), c interval(0))",
+    "INSERT INTO dc_interval_mods VALUES (1,'1 year 3 mons 7 days','1 day 02:03:04.125','-1.5 seconds') RETURNING *",
+    "SELECT id,a,b,c FROM dc_interval_mods ORDER BY id",
+    "CREATE TABLE dc_interval_minute(id int PRIMARY KEY, m interval minute)",
+    "CREATE TABLE dc_interval_generic(id int PRIMARY KEY, i \"interval\"(4,3))",
+    "INSERT INTO dc_interval_generic VALUES(1,'1 year 2 mons') RETURNING *",
+    "INSERT INTO dc_interval_minute SELECT 1,'2' RETURNING *",
+    "UPDATE dc_interval_minute SET m = (SELECT '3') WHERE id=1 RETURNING *",
+    "SELECT '1_0 days'::interval",
+    "SELECT '1e2 days'::interval",
+    "SELECT '1 month'::interval='30 days'::interval,'0'::interval",
+    "CREATE TABLE dc_intervals(id int PRIMARY KEY,v interval UNIQUE)",
+    "INSERT INTO dc_intervals VALUES(1,'1 month'),(2,'2 days'),(3,'-03:04:05') RETURNING *",
+    "INSERT INTO dc_intervals VALUES(4,'30 days')",
+    "SELECT id,v FROM dc_intervals ORDER BY v",
+    "SELECT TIMESTAMP '2024-01-31 12:00:00'+INTERVAL '1 month',DATE '2024-02-29'+INTERVAL '1 year'",
+    "SELECT TIMESTAMP '2000-01-02 01:00:00'-TIMESTAMP '2000-01-01 00:00:00', TIME '00:00:00'-TIME '01:00:00'",
+    "SELECT INTERVAL '1 month 2 days'+INTERVAL '3 days', TIME '23:30:00'+INTERVAL '2 hours'",
+    "SELECT INTERVAL '0.1 year', INTERVAL '0.01 year', INTERVAL '0.0001255 seconds'",
+    "SELECT INTERVAL '1 day 2 days'",
+    "SELECT INTERVAL 'NaN days'",
+    "SELECT INTERVAL 'infinity', INTERVAL '-infinity', -INTERVAL 'infinity'",
+    "SELECT INTERVAL 'infinity'+INTERVAL '1 day'",
+    "SELECT INTERVAL 'infinity'+INTERVAL '-infinity'",
+    "SELECT TIMESTAMP 'infinity'-TIMESTAMP '2000-01-01'",
+    "SELECT TIME '12:00:00'+INTERVAL 'infinity'",
+    "SELECT TIMESTAMP '294276-12-31 12:00:00'+INTERVAL '1 day -24 hours'",
 )
 
 
@@ -167,6 +465,7 @@ def check(reference, native):
     failures = []
     try:
         for peer in peers:
+            peer.observe("SET TIME ZONE 'UTC'")
             for sql in CASES:
                 if sql.startswith("CREATE TABLE "):
                     peer.observe("DROP TABLE IF EXISTS " + sql.split("(")[0].split()[2])
@@ -184,15 +483,66 @@ def check(reference, native):
             peer.close()
 
 
+def check_datestyle_sessions(reference, native):
+    barrier = Barrier(4)
+
+    def worker(port, order):
+        peer = QueryConnection(port, "datestyle-isolation")
+        try:
+            peer.observe("SET DateStyle TO 'ISO, " + order + "'")
+            barrier.wait(timeout=10)
+            return [peer.observe("SELECT '01/02/2003'::date") for _ in range(10)]
+        finally:
+            peer.close()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        tasks = [pool.submit(worker, port, order)
+                 for port in (reference, native) for order in ("MDY", "DMY")]
+        results = [task.result() for task in tasks]
+    assert results[0] == results[2] and results[1] == results[3], results
+    assert results[0] != results[1], results
+    print("datestyle: concurrent session isolation PASS", flush=True)
+
+
+def check_transaction_time(reference, native):
+    def worker(port):
+        peer = QueryConnection(port, "transaction-time")
+        try:
+            peer.observe("SET TimeZone TO 'UTC'")
+            peer.observe("BEGIN")
+            sql = "SELECT 'now'::date,'now'::time,'now'::timetz,'now'::timestamp,'now'::timestamptz"
+            first = peer.observe(sql)
+            time.sleep(1.1)
+            peer.observe("SET TimeZone TO 'Europe/Warsaw'")
+            peer.observe("SET TimeZone TO 'UTC'")
+            second = peer.observe(sql)
+            assert first == second, (first, second)
+            peer.observe("ROLLBACK")
+        finally:
+            peer.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        tasks = [pool.submit(worker, port) for port in (reference, native)]
+        for task in tasks:
+            task.result()
+    print("datetime: transaction-start stability PASS", flush=True)
+
+
 def check_restart(reference, native):
     peers = [QueryConnection(port, "default-check-restart") for port in (reference, native)]
     try:
+        for peer in peers:
+            peer.observe("SET TIME ZONE 'UTC'")
         for sql in ("INSERT INTO dc_decimal DEFAULT VALUES RETURNING a",
                     "INSERT INTO dc_decimal VALUES(0)",
                     "INSERT INTO dc_decimal VALUES(5)",
                     "ALTER TABLE dc_decimal VALIDATE CONSTRAINT decimal_later",
                     "SELECT avg(a) FROM dc_decimal",
-                    "INSERT INTO dc_rows(id) VALUES(9) RETURNING *"):
+                     "INSERT INTO dc_rows(id) VALUES(9) RETURNING *",
+                     "SELECT id,n FROM dc_numeric ORDER BY id",
+                     "SELECT n,count(*) FROM dc_numeric_raw GROUP BY n ORDER BY n",
+                     "SELECT n FROM dc_numeric_special ORDER BY n",
+                     "SELECT n FROM dc_smallint ORDER BY n"):
             outcomes = [peer.observe(sql) for peer in peers]
             assert outcomes[0] == outcomes[1], (sql, outcomes)
         print("defaults-checks: fresh-image defaults/decimal AST/CHECK/NOT VALID/sequence state PASS", flush=True)
@@ -206,6 +556,8 @@ if __name__ == "__main__":
         check_restart(int(sys.argv[1]), int(sys.argv[2]))
     else:
         check(int(sys.argv[1]), int(sys.argv[2]))
+        check_datestyle_sessions(int(sys.argv[1]), int(sys.argv[2]))
+        check_transaction_time(int(sys.argv[1]), int(sys.argv[2]))
         if len(sys.argv) >= 5:
             from default_check_concurrency import check as concurrency
             from basic_aggregate_resources import check as resources

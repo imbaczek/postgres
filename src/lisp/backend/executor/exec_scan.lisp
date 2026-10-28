@@ -242,7 +242,12 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
 (defun indexable-equality-value-p (value type)
   (and (not (eq value +null+))
        (case type
-         ((:int4 :int8) (integerp value))
+         ((:int2 :int4 :int8 :date :time :timestamp :timestamptz) (integerp value))
+         (:numeric (sql-numeric-p value))
+         (:interval (sql-interval-p value))
+         (:timetz (sql-timetz-p value))
+         (:float4 (typep value 'single-float))
+         (:float8 (typep value 'double-float))
          (:varchar (stringp value))
          (t nil))))
 
@@ -297,8 +302,16 @@ BYTEA vectors match the byte-content values stored in the MCV list."
             (let* ((types (index-types index table))
                    (type (first types))
                    (constant-p (null parameter-expr)))
-              (when (or (not constant-p)
-                        (indexable-equality-value-p value type))
+              (when (if constant-p
+                        (indexable-equality-value-p value type)
+                        (case type
+                          ((:int2 :int4 :int8)
+                           (member (expr-type parameter-expr) '(:int2 :int4 :int8)))
+                          ((:date :time :timestamp :timestamptz :interval :timetz) (eq (expr-type parameter-expr) type))
+                          (:numeric
+                           (member (expr-type parameter-expr) '(:int2 :int4 :int8 :numeric)))
+                          ((:float4 :float8) (eq type (expr-type parameter-expr)))
+                          (otherwise t)))
                 (list
                  (make-select-scan-path
                   :kind :index-scan
@@ -573,9 +586,17 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
 (defun common-using-type (left-type right-type name)
   (cond
     ((eq left-type right-type) left-type)
-    ((and (member left-type '(:int4 :int8))
-          (member right-type '(:int4 :int8)))
-     :int8)
+    ((and (member left-type '(:int2 :int4 :int8 :numeric :float4 :float8))
+          (member right-type '(:int2 :int4 :int8 :numeric :float4 :float8))
+          (or (member left-type '(:float4 :float8)) (member right-type '(:float4 :float8))))
+     (if (or (eq left-type :float8) (eq right-type :float8)) :float8 :float4))
+    ((and (member left-type '(:int2 :int4 :int8 :numeric))
+          (member right-type '(:int2 :int4 :int8 :numeric))
+          (or (eq left-type :numeric) (eq right-type :numeric)))
+     :numeric)
+    ((and (member left-type '(:int2 :int4 :int8))
+          (member right-type '(:int2 :int4 :int8)))
+     (if (or (eq left-type :int8) (eq right-type :int8)) :int8 :int4))
     (t
      (ereport "42804" "JOIN/USING types ~a and ~a cannot be matched for column ~a"
               left-type right-type name))))
@@ -592,7 +613,9 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
     (if (and (eq (select-column-type column) type)
              (= (select-column-typmod column) typmod))
         expr
-        (list :join-relabel expr :type type :typmod typmod))))
+        (if (and (member type '(:float4 :float8)) (not (eq (select-column-type column) type)))
+            (list :cast expr :type type :typmod typmod)
+            (list :join-relabel expr :type type :typmod typmod)))))
 
 (defun using-column-pairs (left-columns right-columns names)
   (when (null names)
@@ -616,10 +639,10 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
 (defun using-join-qual (pairs)
   (let ((equalities
           (mapcar (lambda (pair)
-                    (list :binop "="
-                          (select-column-expr (getf pair :left))
-                          (select-column-expr (getf pair :right))
-                          :type :bool :typmod -1))
+                    (let ((operands (analyze-comparison-operands
+                                     (select-column-expr (getf pair :left))
+                                     (select-column-expr (getf pair :right)))))
+                      (list :binop "=" (first operands) (second operands) :type :bool :typmod -1)))
                   pairs)))
     (reduce (lambda (left right)
               (list :and left right :type :bool :typmod -1))

@@ -38,6 +38,8 @@
      (+ 48
         (analyze-value-memory-estimate (car value))
         (analyze-value-memory-estimate (cdr value))))
+    ((sql-decimal-p value)
+     (+ 32 (analyze-value-memory-estimate (sql-decimal-coefficient value))))
     ((integerp value)
      (if (typep value 'fixnum)
          0
@@ -161,15 +163,24 @@ exact SBCL heap cap and does not include transient decode allocations."
   ;; PostgreSQL's analyze.c:compute_distinct_stats calls the column's equality
   ;; operator; bytea's byteaeq compares length and contents (bytea.c:814-844).
   ;; Keep EQUAL for other values so text remains case-sensitive.
-  (if (and (analyze-byte-vector-p left)
-           (analyze-byte-vector-p right))
-      (equalp left right)
-      (equal left right)))
+  (cond ((and (sql-timetz-p left) (sql-timetz-p right)) (zerop (sql-timetz-compare left right)))
+        ((and (sql-interval-p left) (sql-interval-p right))
+         (= (sql-interval-comparison-value left) (sql-interval-comparison-value right)))
+        ((and (floatp left) (floatp right)) (zerop (sql-float-compare left right)))
+        ((and (sql-numeric-p left) (sql-numeric-p right))
+         (zerop (sql-numeric-compare left right)))
+        ((and (analyze-byte-vector-p left) (analyze-byte-vector-p right))
+         (equalp left right))
+        (t (equal left right))))
 
 (defun analyze-statistics-value-hash (value)
-  (if (analyze-byte-vector-p value)
-      (analyze-byte-vector-content-hash value)
-      (sxhash value)))
+  (cond ((sql-timetz-p value) (sxhash (multiple-value-list (sql-timetz-comparison-values value))))
+        ((sql-interval-p value) (sxhash (sql-interval-comparison-value value)))
+        ((floatp value) (sxhash (sql-float-group-key value)))
+        ((sql-numeric-special-p value) (sxhash value))
+        ((sql-numeric-p value) (sxhash (sql-numeric-rational value)))
+        ((analyze-byte-vector-p value) (analyze-byte-vector-content-hash value))
+        (t (sxhash value))))
 
 (defun analyze-column-statistics (sample column-index row-count
                                   &key

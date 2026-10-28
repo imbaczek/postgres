@@ -6,7 +6,7 @@
   type slot-name plugin snapshot-action requested-lsn protocol-version options)
 
 (defparameter +logical-replication-type-oids+
-  '((:int4 . 23) (:int8 . 20) (:varchar . 1043)))
+  '((:int2 . 21) (:int4 . 23) (:int8 . 20) (:varchar . 1043) (:numeric . 1700) (:float4 . 700) (:float8 . 701) (:date . 1082) (:time . 1083) (:timestamp . 1114) (:timestamptz . 1184) (:interval . 1186) (:timetz . 1266)))
 
 (defun replication-command-words (query)
   "Tokenize repl_scanner-style quoted words, C whitespace and command punctuation."
@@ -358,8 +358,16 @@ On a standby, receipt ahead of replay is reported only on the replay timeline."
   (if (eq value +null+)
       nil
       (case type
-        ((:int4 :int8) (princ-to-string value))
+        ((:int2 :int4 :int8) (princ-to-string value))
         (:varchar value)
+        (:numeric (sql-numeric-output value))
+        (:date (sql-date-output value))
+        (:time (sql-time-output value))
+        (:interval (sql-interval-output value))
+        (:timetz (sql-timetz-output value))
+        (:timestamp (sql-timestamp-output value nil))
+        (:timestamptz (sql-timestamp-output value t))
+        ((:float4 :float8) (sql-float-output value type))
         (otherwise (error "unsupported pgoutput value type ~a" type)))))
 
 (defun pgoutput-build-tuple (columns values &optional key-attnums)

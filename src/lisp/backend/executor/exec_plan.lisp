@@ -614,6 +614,9 @@ reordered tree, and each parameterized path can reference only joined Vars."
   ;; including when nested in records or arrays.
   (cond
     ((sql-decimal-p value) (sql-numeric-rational value))
+    ((floatp value) (sql-float-group-key value))
+    ((sql-interval-p value) (sql-interval-comparison-value value))
+    ((sql-timetz-p value) (multiple-value-list (sql-timetz-comparison-values value)))
     ((sql-record-p value)
      (list :record (mapcar #'second (sql-record-fields value))
            (map 'list #'sql-group-value-payload (sql-record-values value))))
@@ -1025,20 +1028,82 @@ on an abnormal exit."
 
 (defstruct average-transition (sum 0) (count 0))
 
+(defstruct interval-aggregate-transition
+  (sum (make-sql-interval 0 0 0))
+  (count 0)
+  (positive-infinities 0)
+  (negative-infinities 0)
+  kind)
+
+(defun interval-aggregate-accumulate (state value)
+  "Accumulate finite intervals with checked storage arithmetic and count infinities."
+  (let ((sign (sql-interval-infinity-sign value)))
+    (cond ((eql sign 1) (incf (interval-aggregate-transition-positive-infinities state)))
+          ((eql sign -1) (incf (interval-aggregate-transition-negative-infinities state)))
+          (t (setf (interval-aggregate-transition-sum state)
+                   (sql-interval-add (interval-aggregate-transition-sum state) value nil))
+             (incf (interval-aggregate-transition-count state))))))
+
+(defun interval-aggregate-result (state)
+  (let ((positive (interval-aggregate-transition-positive-infinities state))
+        (negative (interval-aggregate-transition-negative-infinities state))
+        (count (interval-aggregate-transition-count state)))
+    (cond ((and (plusp positive) (plusp negative)) (ereport "22008" "interval out of range"))
+          ((plusp positive) (sql-interval-infinity 1))
+          ((plusp negative) (sql-interval-infinity -1))
+          ((zerop count) +null+)
+          ((eq (interval-aggregate-transition-kind state) :avg)
+           (sql-interval-scale (interval-aggregate-transition-sum state) (float count 1d0) t))
+          (t (interval-aggregate-transition-sum state)))))
+
+(defstruct float-average-transition
+  (count 0.0d0) (sum 0.0d0) (squares 0.0d0))
+
+(defun float-average-accumulate (state input)
+  "Update the Youngs-Cramer transition used by PostgreSQL float averages."
+  (let* ((value (float input 1.0d0))
+         (old-count (float-average-transition-count state))
+         (old-sum (float-average-transition-sum state))
+         (count (+ old-count 1.0d0))
+         (sum nil)
+         (squares nil))
+    (sb-int:with-float-traps-masked (:overflow :underflow :invalid :divide-by-zero :inexact)
+      (setf sum (+ old-sum value))
+      (if (plusp old-count)
+          (let ((delta (- (* value count) sum)))
+            (setf squares (+ (float-average-transition-squares state)
+                             (/ (* delta delta) (* count old-count))))
+            (when (or (sb-ext:float-infinity-p sum) (sb-ext:float-infinity-p squares))
+              (unless (or (sb-ext:float-infinity-p old-sum) (sb-ext:float-infinity-p value))
+                (ereport "22003" "value out of range: overflow"))
+              (setf squares (sb-kernel:make-double-float #x7ff80000 0))))
+          (setf squares (if (or (sb-ext:float-nan-p value) (sb-ext:float-infinity-p value))
+                            (sb-kernel:make-double-float #x7ff80000 0) 0.0d0))))
+    (setf (float-average-transition-count state) count
+          (float-average-transition-sum state) sum
+          (float-average-transition-squares state) squares)))
+
 (defstruct sum-transition (value +null+) type)
 
 (defun scalar-aggregate-transition-result (state)
   ;; Grouped and window aggregates share finalization: empty SUM/AVG is NULL,
   ;; exact totals are bounded at output, and AVG uses numeric division scale.
-  (cond ((average-transition-p state)
+  (cond ((interval-aggregate-transition-p state) (interval-aggregate-result state))
+        ((float-average-transition-p state)
+         (if (zerop (float-average-transition-count state)) +null+
+             (sb-int:with-float-traps-masked (:invalid :divide-by-zero :overflow :underflow :inexact)
+               (/ (float-average-transition-sum state) (float-average-transition-count state)))))
+        ((average-transition-p state)
          (if (zerop (average-transition-count state)) +null+
              (let ((sum (average-transition-sum state)))
-               (sql-numeric-division
-                (sql-numeric-result (sql-numeric-coefficient sum) (sql-numeric-scale sum))
-                (average-transition-count state)))))
+               (if (sql-numeric-special-p sum) sum
+                   (sql-numeric-division
+                    (sql-numeric-result (sql-numeric-coefficient sum) (sql-numeric-scale sum))
+                    (average-transition-count state))))))
         ((sum-transition-p state)
          (let ((value (sum-transition-value state)))
-           (if (and (eq (sum-transition-type state) :numeric) (not (eq value +null+)))
+           (if (and (eq (sum-transition-type state) :numeric) (not (eq value +null+))
+                    (not (sql-numeric-special-p value)))
                (let ((result (sql-numeric-result (sql-numeric-coefficient value) (sql-numeric-scale value))))
                  (if (integerp value) (sql-decimal-coefficient result) result))
                value)))
@@ -1050,8 +1115,13 @@ on an abnormal exit."
                    (ecase (getf descriptor :kind)
                      ((:count :count-expr) 0)
                      ((:min :max) +null+)
-                     (:sum (make-sum-transition :type (getf descriptor :type)))
-                     (:avg (make-average-transition))
+                     (:sum (if (eq (getf descriptor :type) :interval)
+                               (make-interval-aggregate-transition :kind :sum)
+                               (make-sum-transition :type (getf descriptor :type))))
+                     (:avg (case (getf descriptor :type)
+                             (:interval (make-interval-aggregate-transition :kind :avg))
+                             (:float8 (make-float-average-transition))
+                             (otherwise (make-average-transition))))
                      (:array-agg (make-query-row-spool budget))))
          descriptors)))
 
@@ -1066,7 +1136,9 @@ on an abnormal exit."
 (defun sum-aggregate-transition (state value result-type)
   "Match C's NULL start, int64 int2/int4 accumulator, and exact numeric totals."
   (if (eq value +null+) state
-      (let ((total (if (eq state +null+) value (sql-numeric-accumulate state value))))
+      (let ((total (cond ((eq state +null+) value)
+                         ((member result-type '(:float4 :float8)) (sql-float-arithmetic "+" state value))
+                         (t (sql-numeric-accumulate state value)))))
         (if (eq result-type :int8)
             ;; numeric.c:int2_sum/int4_sum use plain int64 addition, which the
             ;; pinned C build wraps; SUM(int8/numeric) retains a wider total.
@@ -1081,8 +1153,10 @@ on an abnormal exit."
         do (ecase (getf descriptor :kind)
              (:count (incf (aref states index)))
              (:count-expr (unless (eq value +null+) (incf (aref states index))))
-             (:sum (setf (sum-transition-value state)
-                         (sum-aggregate-transition (sum-transition-value state) value (getf descriptor :type))))
+             (:sum (if (interval-aggregate-transition-p state)
+                       (unless (eq value +null+) (interval-aggregate-accumulate state value))
+                       (setf (sum-transition-value state)
+                             (sum-aggregate-transition (sum-transition-value state) value (getf descriptor :type)))))
              ((:min :max)
               (unless (eq value +null+)
                 (when (or (eq state +null+)
@@ -1092,9 +1166,11 @@ on an abnormal exit."
                   (setf (aref states index) value))))
              (:avg
               (unless (eq value +null+)
-                (setf (average-transition-sum state)
-                      (sql-numeric-accumulate (average-transition-sum state) value))
-                (incf (average-transition-count state))))
+                (cond ((interval-aggregate-transition-p state) (interval-aggregate-accumulate state value))
+                      ((float-average-transition-p state) (float-average-accumulate state value))
+                      (t (setf (average-transition-sum state)
+                               (sql-numeric-accumulate (average-transition-sum state) value))
+                         (incf (average-transition-count state))))))
              (:array-agg (query-row-spool-append state value)))))
 
 (defun finalize-aggregate-transition-states (states)
