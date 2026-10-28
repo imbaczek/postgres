@@ -343,6 +343,22 @@
 (rove:deftest generated-unit-external-varlena
     (unit-check-property 'unit-external-varlena-roundtrip))
 
+(cl-spec:defproperty unit-toast-catalog-metadata-roundtrip
+    ((oid (range integer 1 4294967295))
+     (heap-node (range integer 1 4294967295))
+     (index-oid (range integer 1 4294967295))
+     (index-node (range integer 1 4294967295))
+     (frozen-xid (range integer 3 4294967295)))
+  (:about toast-to-sexp toast-from-sexp)
+  (:trials (:normal 200))
+  (let ((toast (make-pg-toast :oid oid :relfilenode heap-node
+                              :index-oid index-oid :index-relfilenode index-node
+                              :relfrozenxid frozen-xid)))
+    (equalp toast (toast-from-sexp (toast-to-sexp toast)))))
+
+(rove:deftest generated-unit-toast-catalog-metadata
+    (unit-check-property 'unit-toast-catalog-metadata-roundtrip))
+
 (rove:deftest unit-external-varlena-reference-layout
     (let* ((bytes (make-array 23 :element-type '(unsigned-byte 8) :initial-element 0))
            (oid8 (make-heap-external-varlena :raw-size 2048 :external-info 2000

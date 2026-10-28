@@ -27,6 +27,48 @@
       (rove:ok (minusp (key-compare (k "b" :varchar) (k "aa" :varchar)))
                "varchar key encoding is length-first")))
 
+(rove:deftest test-toast-catalog-ownership-roundtrip
+    (let* ((toast (make-pg-toast :oid 100 :relfilenode 101 :index-oid 102
+                                 :index-relfilenode 103 :relfrozenxid 20))
+           (class (make-pg-class :oid 50 :name "parent" :relfilenode 51
+                                 :relfrozenxid 25 :columns #() :indexes nil
+                                 :toast toast))
+           (decoded (class-from-sexp (class-to-sexp class)))
+           (snapshot (catalog-mutation-copy-class class)))
+      (rove:ok (equalp toast (pg-class-toast decoded)) "TOAST metadata survives catalog encoding")
+      (setf (pg-toast-relfilenode toast) 500)
+      (catalog-mutation-restore-class class snapshot)
+      (rove:ok (= 101 (pg-toast-relfilenode (pg-class-toast class)))
+               "rollback restores independent TOAST ownership metadata")))
+
+(rove:deftest test-toast-catalog-physical-history
+    (let* ((toast (make-pg-toast :oid 100 :relfilenode 101 :index-oid 102
+                                 :index-relfilenode 103 :relfrozenxid 20))
+           (class (make-pg-class :oid 50 :name "parent" :relfilenode 51
+                                 :relfrozenxid 25 :columns #() :toast toast))
+           (image (list :cluster-identity "toast-test" :next-oid 104
+                        :databases (list (list :name "db"
+                                               :tables (list (class-to-sexp class))
+                                               :indexes nil))))
+           (bytes (string->bytes (catalog-readable-data-string image)))
+           (live (physical-history-catalog-relfilenodes bytes "toast-test")))
+      (rove:ok (and (gethash 51 live) (gethash 101 live) (gethash 103 live))
+               "physical history retains both TOAST storage files")))
+
+(rove:deftest test-toast-catalog-history-rejects-ambiguous-ownership
+    (labels ((read-live (toast)
+               (let* ((table (list :name "parent" :relfilenode 51 :toast toast))
+                      (image (list :cluster-identity "toast-test" :next-oid 104
+                                   :databases (list (list :name "db" :tables (list table)
+                                                          :indexes nil)))))
+                 (physical-history-catalog-relfilenodes
+                  (string->bytes (catalog-readable-data-string image)) "toast-test"))))
+      (dolist (toast (list '(:relfilenode 101 :index-relfilenode 0)
+                           '(:relfilenode 101 :index-relfilenode 103 :relfilenode 102)
+                           '(:relfilenode 101)))
+        (rove:ok (handler-case (progn (read-live toast) nil) (error () t))
+                 "malformed or ambiguous TOAST ownership is rejected"))))
+
 (rove:deftest test-index-catalog-roundtrip
     (let* ((catalog (make-catalog))
            (identity (catalog-cluster-identity catalog))
@@ -65,7 +107,7 @@
                       :columns ((:name "value" :type :int4 :typmod -1
                                  :attnum 1 :notnull t :default-sequence nil
                                  :default-expression nil :default-sql nil))
-                      :indexes (52) :checks nil
+                      :indexes (52) :toast nil :checks nil
                       :statistics nil))
              "class and column codecs use compatible flat plists")
     (rove:ok (vectorp (pg-class-columns copy))

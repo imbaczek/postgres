@@ -13,6 +13,14 @@
   default-expression
   default-sql)
 
+;; Optional metadata owned by one pg-class, modeling the TOAST table and its
+;; index identities (as in catalog/toasting.c).  This scaffold does not create
+;; relations or implement external-value storage; the OIDs and relfilenodes are
+;; distinct identities, and relfrozenxid belongs to the TOAST heap.
+
+(defstruct pg-toast
+  oid relfilenode index-oid index-relfilenode relfrozenxid)
+
 (defstruct pg-class
   oid
   name
@@ -21,7 +29,8 @@
   columns           ; simple-vector of pg-column, attnum order
   indexes           ; list of index OIDs
   statistics
-  checks)       ; derived ANALYZE estimates; raw samples remain transient
+  checks
+  toast)       ; derived ANALYZE estimates; raw samples remain transient
 
 (defstruct pg-index
   oid
@@ -223,6 +232,13 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
             :decode (lambda (columns)
                       (map 'vector #'column-statistics-from-sexp columns))))
 
+(define-catalog-codec toast make-pg-toast
+  (:oid pg-toast-oid :oid)
+  (:relfilenode pg-toast-relfilenode :relfilenode)
+  (:index-oid pg-toast-index-oid :index-oid)
+  (:index-relfilenode pg-toast-index-relfilenode :index-relfilenode)
+  (:relfrozenxid pg-toast-relfrozenxid :relfrozenxid))
+
 (define-catalog-codec class make-pg-class
   (:oid pg-class-oid :oid)
   (:name pg-class-name :name)
@@ -236,6 +252,9 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
             :decode (lambda (columns)
                       (coerce (mapcar #'column-from-sexp columns) 'vector)))
   (:indexes pg-class-indexes :indexes)
+  (:toast pg-class-toast :toast
+          :encode (lambda (toast) (and toast (toast-to-sexp toast)))
+          :decode (lambda (toast) (and toast (toast-from-sexp toast))))
   (:checks pg-class-checks :checks
            :encode #'catalog-expression-to-sexp :decode #'catalog-expression-from-sexp)
   (:statistics pg-class-statistics :statistics
@@ -549,8 +568,8 @@ longer contain transaction-status references."
         collect (cons key value)))
 
 (defun catalog-mutation-copy-class (class)
-  ;; Rollback owns independent column and CHECK trees, so a failed pre-durable
-  ;; catalog mutation cannot leave partially changed expressions in the table.
+  ;; Rollback owns independent column and CHECK trees and TOAST metadata, so a
+  ;; failed pre-durable mutation cannot leave partial changes in the table.
   (let ((copy (copy-pg-class class)))
     (setf (pg-class-columns copy)
           (map 'vector (lambda (column)
@@ -559,6 +578,8 @@ longer contain transaction-status references."
                                  (copy-tree (pg-column-default-expression column)))
                            copy))
                (pg-class-columns class))
+          (pg-class-toast copy) (and (pg-class-toast class)
+                                     (copy-pg-toast (pg-class-toast class)))
           (pg-class-indexes copy) (copy-list (pg-class-indexes class))
           (pg-class-checks copy) (copy-tree (pg-class-checks class)))
     copy))
@@ -624,6 +645,7 @@ longer contain transaction-status references."
         (pg-class-name class) (pg-class-name saved)
         (pg-class-relfilenode class) (pg-class-relfilenode saved)
         (pg-class-relfrozenxid class) (pg-class-relfrozenxid saved)
+        (pg-class-toast class) (pg-class-toast saved)
         (pg-class-columns class) (pg-class-columns saved)
         (pg-class-indexes class) (pg-class-indexes saved)
         (pg-class-statistics class) (pg-class-statistics saved)

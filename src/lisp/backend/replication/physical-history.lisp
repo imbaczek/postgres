@@ -47,21 +47,31 @@ Native readable array syntax remains accepted, including SBCL string arrays."
 (defun physical-history-catalog-relfilenodes (bytes identity)
   "Read exactly one source catalog and retain every serialized fork reference.
 Do not round-trip through catalog hash tables: duplicate names must not hide
-a still-referenced relfilenode when checking a terminal's delete list."
+a still-referenced relfilenode when checking a terminal's delete list.
+A table's optional TOAST heap and index are references too; retaining both
+prevents a terminal from certifying either file as dropped while referenced.
+Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
   (let ((image (physical-history-read-catalog bytes))
         (live (make-hash-table :test #'eql)))
-    (physical-history-check-plist image '(:cluster-identity :next-oid :databases))
-    (unless (and (equal identity (getf image :cluster-identity))
-                 (typep (getf image :next-oid) '(unsigned-byte 32)))
-      (error "catalog history has a foreign or invalid identity"))
-    (dolist (database (getf image :databases))
-      (physical-history-check-plist database '(:name :tables :indexes))
-      (dolist (relation (append (getf database :tables) (getf database :indexes)))
-        (physical-history-check-plist relation '(:name :relfilenode))
-        (let ((node (getf relation :relfilenode)))
-          (unless (typep node '(integer 1 4294967295))
-            (error "catalog history has an invalid relfilenode"))
-          (setf (gethash node live) t))))
+    (labels ((retain-node (node)
+               (unless (typep node '(integer 1 4294967295))
+                 (error "catalog history has an invalid relfilenode"))
+               (setf (gethash node live) t)))
+      (physical-history-check-plist image '(:cluster-identity :next-oid :databases))
+      (unless (and (equal identity (getf image :cluster-identity))
+                   (typep (getf image :next-oid) '(unsigned-byte 32)))
+        (error "catalog history has a foreign or invalid identity"))
+      (dolist (database (getf image :databases))
+        (physical-history-check-plist database '(:name :tables :indexes))
+        (dolist (relation (append (getf database :tables) (getf database :indexes)))
+          (physical-history-check-plist relation '(:name :relfilenode))
+          (retain-node (getf relation :relfilenode)))
+        (dolist (table (getf database :tables))
+          (let ((toast (getf table :toast)))
+            (when toast
+              (physical-history-check-plist toast '(:relfilenode :index-relfilenode))
+              (retain-node (getf toast :relfilenode))
+              (retain-node (getf toast :index-relfilenode)))))))
     live))
 
 (defun physical-history-accept-catalog (payload identity removed)
