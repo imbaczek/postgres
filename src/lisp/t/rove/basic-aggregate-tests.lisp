@@ -174,6 +174,21 @@
                        (pg-error (error) error))))
       (rove:ok (and condition (string= (pg-error-sqlstate condition) (second case))) (first case)))))
 
+(rove:deftest width-bucket-array-numeric-expressions
+    (dolist (case '(("SELECT width_bucket(2, ARRAY[1,2,2,4])::text" "3")
+                    ("SELECT width_bucket(2.5, ARRAY[1,2,3])::text" "2")
+                    ("SELECT width_bucket(1, ARRAY[]::int4[])::text" "0")
+                    ("SELECT width_bucket(2, '[0:2]={1,2,3}'::int4[])::text" "2")
+                    ("SELECT ARRAY[1,2.5]::text" "{1,2.5}")
+                    ("SELECT array_length('{{1,2},{3,4}}'::int4[],2)::text" "2")
+                    ("SELECT '{{1,2},{3,4}}'::int4[]::text" "{{1,2},{3,4}}")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case)))
+  (dolist (case '(("SELECT width_bucket(1, ARRAY[1,NULL])" "22004")
+                  ("SELECT width_bucket(1, '{{1,2},{3,4}}'::int4[])" "2202E")))
+    (let ((condition (handler-case (progn (subquery-test-rows (first case)) nil)
+                       (pg-error (error) error))))
+      (rove:ok (and condition (string= (pg-error-sqlstate condition) (second case))) (first case)))))
+
 (rove:deftest numeric-basic-functions
     (dolist (case '(("SELECT abs(-12.030)::text" "12.030")
                     ("SELECT numeric_abs('-Infinity'::numeric)::text" "Infinity")

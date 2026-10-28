@@ -132,7 +132,7 @@
                     ("SELECT (SELECT count(*) FROM (SELECT 1 AS x) q)" ((1)))
                     ("SELECT sum((SELECT sum(i.x) FROM (SELECT 1 AS x) i))" ((1)))
                     ("SELECT d.x, (SELECT d.x) FROM (SELECT 4 AS x) d GROUP BY d.x" ((4 4)))
-                    ("SELECT ARRAY(SELECT 'x' UNION ALL SELECT NULL)" ((#("x" :null))))))
+                    ("SELECT ARRAY(SELECT 'x' UNION ALL SELECT NULL)::text" (("{x,NULL}")))))
       (let ((expected (subquery-test-expected (second case))))
         (rove:ok (equalp (subquery-test-rows (first case)) expected) (first case)))))
 

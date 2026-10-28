@@ -603,6 +603,73 @@
        (uiop:delete-directory-tree directory :validate t
                                              :if-does-not-exist :ignore)))))
 
+(defun test-query-array-group-keys ()
+  (let* ((a (make-sql-array :element-type-id :numeric
+                            :elements (vector (make-sql-decimal 10 1) +null+)
+                            :dimensions (list 2) :lower-bounds (list 1)))
+         (b (make-sql-array :element-type-id :numeric
+                            :elements (vector (make-sql-decimal 100 2) +null+)
+                            :dimensions (list 2) :lower-bounds (list 1)))
+         (different-bound (make-sql-array :element-type-id :numeric
+                                          :elements (sql-array-elements b)
+                                          :dimensions (list 2) :lower-bounds (list 0)))
+         (different-shape (make-sql-array :element-type-id :numeric
+                                          :elements (sql-array-elements b)
+                                          :dimensions (list 1 2) :lower-bounds (list 1 1)))
+         (different-type (make-sql-array :element-type-id :other
+                                         :elements (sql-array-elements b)
+                                         :dimensions (list 2) :lower-bounds (list 1)))
+         (key (sql-group-value-key a :numeric-array))
+         (targets (list (list :type :numeric-array))))
+    (check (equal key (sql-group-value-key b :numeric-array))
+           "group keys compare array numeric values by value and NULLs equally")
+    (dolist (other (list different-bound different-shape different-type))
+      (check (not (equal key (sql-group-value-key other :numeric-array)))
+             "group keys distinguish array bounds, dimensions, and element type"))
+    (check (equal (recursive-cte-seen-key (vector a) targets)
+                  (recursive-cte-seen-key (vector b) targets))
+           "recursive UNION deduplicates equal array values")
+    (check (not (equal (recursive-cte-seen-key (vector a) targets)
+                       (recursive-cte-seen-key (vector different-bound) targets)))
+           "recursive UNION distinguishes array lower bounds")))
+
+(defun test-query-array-copy-and-spill ()
+  (let* ((array (make-sql-array :element-type-id :text
+                                :elements (vector (copy-seq "oak") +null+
+                                                  (copy-seq "elm") (copy-seq "fir"))
+                                :dimensions (list 2 2)
+                                :lower-bounds (list -1 3)))
+         (copy (copy-query-sort-value array))
+         (empty (make-sql-array :element-type-id :text :elements #()
+                                :dimensions nil :lower-bounds nil))
+         (encoded (with-output-to-string (stream)
+                    (query-spill-write-value stream (vector array empty))))
+         (restored (with-input-from-string (stream encoded)
+                     (query-spill-read-record stream)))
+         (decoded (aref restored 0))
+         (decoded-empty (aref restored 1)))
+    (setf (char (aref (sql-array-elements copy) 0) 0) #\X
+          (first (sql-array-dimensions copy)) 9
+          (first (sql-array-lower-bounds copy)) 9)
+    (check (and (string= (aref (sql-array-elements array) 0) "oak")
+                (equal (sql-array-dimensions array) '(2 2))
+                (equal (sql-array-lower-bounds array) '(-1 3)))
+           "array copy owns elements, dimensions, and lower bounds")
+    (check (and (eq (sql-array-element-type-id decoded) :text)
+                (equal (sql-array-dimensions decoded) '(2 2))
+                (equal (sql-array-lower-bounds decoded) '(-1 3))
+                (string= (aref (sql-array-elements decoded) 0) "oak")
+                (eq (aref (sql-array-elements decoded) 1) +null+)
+                (string= (aref (sql-array-elements decoded) 3) "fir"))
+           "spilled array preserves element type, values, bounds, and NULL")
+    (check (and (null (sql-array-dimensions decoded-empty))
+                (null (sql-array-lower-bounds decoded-empty))
+                (zerop (length (sql-array-elements decoded-empty))))
+           "spilled empty array preserves canonical shape")
+    (check (> (query-spill-value-size array)
+              (query-spill-value-size empty))
+           "array spill estimate accounts for retained contents")))
+
 (defun test-query-row-spool-spills-bytea-without-expanded-list ()
   (let* ((directory (make-query-spill-test-directory))
          (byte-length 65536)

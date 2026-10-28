@@ -167,7 +167,7 @@
 
 (defparameter +sql-expression-types+
   '((:bool 16 1) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
-    (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1) (:text-array 1009 -1) (:oid 26 4) (:pg-node-tree 194 -1) (:record 2249 -1) (:void 2278 4) (:pg-lsn 3220 8) (:numeric 1700 -1) (:float4 700 4) (:float8 701 8) (:date 1082 4) (:time 1083 8) (:timetz 1266 12) (:timestamp 1114 8) (:interval 1186 16) (:bit 1560 -1)))
+    (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1) (:text-array 1009 -1) (:int2-array 1005 -1) (:int4-array 1007 -1) (:int8-array 1016 -1) (:numeric-array 1231 -1) (:float4-array 1021 -1) (:float8-array 1022 -1) (:oid 26 4) (:pg-node-tree 194 -1) (:record 2249 -1) (:void 2278 4) (:pg-lsn 3220 8) (:numeric 1700 -1) (:float4 700 4) (:float8 701 8) (:date 1082 4) (:time 1083 8) (:timetz 1266 12) (:timestamp 1114 8) (:interval 1186 16) (:bit 1560 -1)))
 
 (defun sql-expression-type-description (type)
   (or (assoc type +sql-expression-types+)
@@ -206,6 +206,8 @@ exist\" messages."
     (:varchar "character varying")
     (:bool "boolean")
     (:text-array "text[]")
+    (:int2-array "smallint[]") (:int4-array "integer[]") (:int8-array "bigint[]")
+    (:numeric-array "numeric[]") (:float4-array "real[]") (:float8-array "double precision[]")
     (:int2vector "int2vector")
     (:char "\"char\"")
     (:name "name")
@@ -249,7 +251,8 @@ exist\" messages."
      (list :func name nil :type :timestamptz :typmod -1))
     ((string= name "array_length")
      (unless (and (= 2 (length arguments))
-                  (member (expr-type (first arguments)) '(:int2vector :text-array)))
+                  (or (eq (expr-type (first arguments)) :int2vector)
+                      (sql-array-element-type (expr-type (first arguments)))))
        (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
      (let ((dimension (coerce-in-constant (second arguments) :int4)))
        (unless (member (expr-type dimension) '(:int2 :int4))
@@ -592,18 +595,22 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
   ;; Resolve the text/text[] threshold form or numeric/float8 range form to int4.
   (cond
     ((= (length args) 2)
-     (let ((operand (first args)) (array (second args)))
-       (unless (and (or (eq (expr-type array) :text-array)
-                        (and (in-unknown-constant-p array)
-                             (or (in-unknown-constant-p operand)
-                                 (member (expr-type operand) '(:text :varchar :name)))))
-                    (or (in-unknown-constant-p operand)
-                        (member (expr-type operand) '(:text :varchar :name))))
+     (let* ((operand (first args)) (array (second args))
+                                   (element (sql-array-element-type (expr-type array))))
+       (unless (or element (in-unknown-constant-p array))
          (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))
-       (list :func "width_bucket"
-             (list (coerce-common-expression operand :text)
-                   (coerce-common-expression array :text-array))
-             :type :int4 :typmod -1)))
+       (when (and element (not (in-unknown-constant-p operand))
+                  (not (eq (sql-type-category element) (sql-type-category (expr-type operand)))))
+         (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))
+       (let* ((probe (and element (list :col 0 :type element :typmod -1)))
+              (type (common-expression-type (if probe (list probe operand) (list operand)) "width_bucket"))
+              (array-type (sql-array-type type)))
+         (unless array-type
+           (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))
+         (list :func "width_bucket"
+               (list (coerce-common-expression operand type)
+                     (coerce-common-expression array array-type))
+               :type :int4 :typmod -1))))
     ((= (length args) 4)
      (let* ((values (subseq args 0 3))
             (type (if (and (some (lambda (a) (and (not (in-unknown-constant-p a))
@@ -624,6 +631,9 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
 (defun sql-width-bucket-array (value array)
   ;; C width_bucket_array: search ascending thresholds for the first greater value.
   ;; Empty arrays yield zero; NULL elements are rejected, and sorting is assumed.
+  (when (> (length (sql-array-dimensions array)) 1)
+    (ereport "2202E" "thresholds must be one-dimensional array"))
+  (setf array (sql-array-elements array))
   (when (find +null+ array)
     (ereport "22004" "thresholds array must not contain NULLs"))
   (let ((left 0) (right (length array)))
@@ -1003,6 +1013,9 @@ so expression identity remains distinct from the corresponding SQL function."
 (defun sql-cast-allowed-p (source target)
   "Supported explicit casts from pg_cast and CoerceViaIO's string rules."
   (or (eq source target)
+      (and (sql-array-element-type source) (sql-array-element-type target)
+           (sql-cast-allowed-p (sql-array-element-type source)
+                               (sql-array-element-type target)))
       (member target '(:text :varchar :name))
       (member source '(:text :varchar :name))
       (and (member source '(:int2 :int4 :int8 :oid))
@@ -1222,6 +1235,74 @@ so expression identity remains distinct from the corresponding SQL function."
       (unless (= position length) (fail))
       (coerce (nreverse values) 'vector))))
 
+(defun sql-array-input (text element-type &optional (typmod -1))
+  "Read a rectangular array literal, retaining dimensions and lower bounds.
+Convert each element using ELEMENT-TYPE and TYPMOD. Explicit bounds must
+match the contents; empty arrays have no dimensions. At most six dimensions
+are supported."
+  (let ((position 0) (size (length text)) (bounds nil) (values nil))
+    (labels ((space () (loop while (and (< position size) (sql-array-space-p (char text position)))
+                             do (incf position)))
+             (peek () (and (< position size) (char text position)))
+             (fail () (ereport "22P02" "malformed array literal: ~s" text))
+             (integer-part ()
+               (let ((start position))
+                 (when (member (peek) '(#\+ #\-)) (incf position))
+                 (loop while (and (peek) (digit-char-p (peek))) do (incf position))
+                 (or (ignore-errors (parse-integer text :start start :end position)) (fail))))
+             (read-level (depth)
+               (when (> depth 6)
+                 (ereport "54000" "number of array dimensions exceeds the maximum allowed"))
+               (unless (eql (peek) #\{) (fail))
+               (incf position) (space)
+               (when (eql (peek) #\}) (incf position) (return-from read-level nil))
+               (let ((count 0) (child-shape nil) (nested (eql (peek) #\{)))
+                 (loop
+                   (if nested
+                       (let ((shape (read-level (1+ depth))))
+                         (when (and (plusp count) (not (equal shape child-shape))) (fail))
+                         (setf child-shape shape))
+                       (progn
+                         (when (eql (peek) #\{) (fail))
+                         (multiple-value-bind (value next) (sql-text-array-element text position)
+                           (push (sql-cast-value value :text element-type typmod) values)
+                           (setf position next))))
+                   (incf count) (space)
+                   (cond ((eql (peek) #\}) (incf position) (return))
+                         ((eql (peek) #\,) (incf position) (space))
+                         (t (fail))))
+                 (cons count child-shape))))
+      (space)
+      (loop while (eql (peek) #\[) do
+        (incf position)
+        (let ((first (integer-part)))
+          (multiple-value-bind (lower upper)
+              (if (eql (peek) #\:)
+                  (progn (incf position) (values first (integer-part)))
+                  (values 1 first))
+            (unless (eql (peek) #\]) (fail)) (incf position) (space)
+            (unless (and (<= +int4-min+ lower +int4-max+)
+                         (<= +int4-min+ upper (1- +int4-max+))
+                         (<= (1+ (- upper lower)) +int4-max+))
+              (ereport "54000" "array dimensions exceed the maximum allowed"))
+            (unless (<= lower upper) (ereport "2202E" "invalid array dimensions"))
+            (push (cons lower upper) bounds)
+            (when (> (length bounds) 6) (ereport "54000" "number of array dimensions exceeds the maximum allowed")))))
+      (when bounds (unless (eql (peek) #\=) (fail)) (incf position))
+      (space)
+      (let* ((dimensions (read-level 1)) (declared (nreverse bounds)))
+        (space) (unless (= position size) (fail))
+        (when (> (length dimensions) 6)
+          (ereport "54000" "number of array dimensions exceeds the maximum allowed"))
+        (when (null values) (setf dimensions nil))
+        (when declared
+          (unless (equal dimensions (mapcar (lambda (bound) (1+ (- (cdr bound) (car bound)))) declared))
+            (fail)))
+        (make-sql-array :element-type-id element-type :elements (coerce (nreverse values) 'vector)
+                        :dimensions dimensions
+                        :lower-bounds (if declared (mapcar #'car declared)
+                                          (make-list (length dimensions) :initial-element 1)))))))
+
 (defun sql-session-date-order ()
   "Return the current DateStyle input field order."
   (let ((setting (if *backend* (sql-setting-value "datestyle") "ISO, MDY")))
@@ -1252,6 +1333,17 @@ so expression identity remains distinct from the corresponding SQL function."
 
 (defun sql-cast-value (value source target typmod &optional interval-literal-p)
   (when (eq value +null+) (return-from sql-cast-value +null+))
+  (when (sql-array-element-type target)
+    (let ((element-type (sql-array-element-type target)))
+      (return-from sql-cast-value
+        (if (sql-array-p value)
+            (make-sql-array :element-type-id element-type
+                            :elements (map 'vector (lambda (element)
+                                                     (sql-cast-value element (sql-array-element-type source) element-type typmod))
+                                           (sql-array-elements value))
+                            :dimensions (sql-array-dimensions value)
+                            :lower-bounds (sql-array-lower-bounds value))
+            (sql-array-input value element-type typmod)))))
   (when (member target '(:float4 :float8))
     (return-from sql-cast-value
       (cond ((member source '(:text :varchar :name)) (sql-float-input value target))
@@ -1381,9 +1473,8 @@ so expression identity remains distinct from the corresponding SQL function."
   (let* ((raw (second expression))
          (target (third expression)) (typmod (fourth expression))
          (argument
-           (if (and (eq target :text-array) (eq (first raw) :array-literal)
-                    (null (second raw)))
-               (list :array nil :type :text-array :typmod -1)
+           (if (and (sql-array-element-type target) (eq (first raw) :array-literal))
+               (analyze-array-literal raw scope (sql-array-element-type target))
                (analyze-expr raw scope)))
          (source (expr-type argument))
          (unknown-literal (and (eq (first raw) :const)
@@ -1405,7 +1496,8 @@ so expression identity remains distinct from the corresponding SQL function."
   "Resolve textcat and text/anynonarray overloads without treating arrays as text."
   (when (and (eq (expr-type left) :bit) (eq (expr-type right) :bit))
     (ereport "0A000" "bit concatenation is not implemented"))
-  (when (some (lambda (argument) (member (expr-type argument) '(:text-array :int2vector)))
+  (when (some (lambda (argument) (or (eq (expr-type argument) :int2vector)
+                                     (sql-array-element-type (expr-type argument))))
               (list left right))
     (ereport "0A000" "array concatenation is not implemented"))
   (unless (some (lambda (argument) (sql-implicit-coercion-p (expr-type argument) :text))
@@ -1532,8 +1624,10 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
               (list :binop operator left right :type :numeric :typmod -1)))
           (when (or (eq (expr-type left) :pg-lsn) (eq (expr-type right) :pg-lsn))
             (ereport "0A000" "pg_lsn arithmetic is not implemented"))
-          (when (or (member (expr-type left) '(:char :int2vector :text-array :oid :bit :timestamptz))
-                    (member (expr-type right) '(:char :int2vector :text-array :oid :bit :timestamptz)))
+          (when (or (sql-array-element-type (expr-type left))
+                    (sql-array-element-type (expr-type right))
+                    (member (expr-type left) '(:char :int2vector :oid :bit :timestamptz))
+                    (member (expr-type right) '(:char :int2vector :oid :bit :timestamptz)))
             (ereport "42883" "operator ~a does not exist for ~a and ~a"
                      operator (expr-type left) (expr-type right)))
           (list :binop operator left right
@@ -1628,12 +1722,29 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
           (first coerced) :type type
           :typmod (common-expression-typmod coerced))))
 
-(defun analyze-array-literal (expression scope)
-  (let ((items (mapcar (lambda (item) (analyze-expr item scope)) (second expression))))
-    (unless items (ereport "42P18" "cannot determine type of empty array"))
-    (unless (every (lambda (item) (eq (expr-type item) :text)) items)
-      (ereport "0A000" "ARRAY constructors currently support text elements"))
-    (list :array items :type :text-array :typmod -1)))
+(defun analyze-array-literal (expression scope &optional target-element)
+  (let* ((raw-items (second expression))
+         (items (mapcar (lambda (item)
+                          (if (and target-element (eq (first item) :array-literal))
+                              (analyze-array-literal item scope target-element)
+                              (analyze-expr item scope))) raw-items)))
+    (unless (or items target-element) (ereport "42P18" "cannot determine type of empty array"))
+    (let* ((multidims (some (lambda (item) (sql-array-element-type (expr-type item))) items))
+           (type (if target-element
+                     (if multidims (sql-array-type target-element) target-element)
+                     (common-expression-type items "ARRAY")))
+           (array-type (or (and (sql-array-element-type type) type) (sql-array-type type))))
+      (unless array-type (ereport "0A000" "ARRAY element type ~a is not supported" type))
+      (list :array
+            (mapcar (lambda (item)
+                      (if (or (not target-element) (in-unknown-constant-p item)
+                              (eq (expr-type item) type))
+                          (coerce-common-expression item type)
+                          (if (sql-cast-allowed-p (expr-type item) type)
+                              (list :cast item :type type :typmod -1)
+                              (ereport "42846" "cannot cast type ~a to ~a" (expr-type item) type))))
+                    items)
+            :type array-type :typmod -1 :multidims multidims))))
 
 (defun analyze-scalar-array-argument (raw scope)
   (let ((array (analyze-expr raw scope)))
@@ -1645,8 +1756,8 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
 (defun analyze-any-expression (expression scope)
   (let* ((left (analyze-expr (third expression) scope))
          (array (analyze-scalar-array-argument (fourth expression) scope))
-         (element (case (expr-type array)
-                    (:text-array :text) (:int2vector :int2))))
+         (element (or (sql-array-element-type (expr-type array))
+                      (and (eq (expr-type array) :int2vector) :int2))))
     (when (and (in-unknown-constant-p array) (eq (second array) +null+))
       (return-from analyze-any-expression
         (list (first expression) (second expression) left array :type :bool :typmod -1)))
@@ -1740,7 +1851,8 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
            (list :unary "~" e :type (expr-type e) :typmod -1)))
        (unless (string= (second expr) "-")
          (ereport "42883" "operator does not exist: ~a ~a" (second expr) (typed-arg-name e)))
-       (when (member (expr-type e) '(:char :int2vector :text-array :oid :pg-lsn :bit :timestamptz :timestamp :date :time :timetz))
+       (when (or (sql-array-element-type (expr-type e))
+                 (member (expr-type e) '(:char :int2vector :oid :pg-lsn :bit :timestamptz :timestamp :date :time :timetz)))
          (ereport "42883" "unary operator does not exist for ~a" (expr-type e)))
        (list :unary (second expr) e
              :type (expr-type e) :typmod (expr-typmod e))))
@@ -1767,15 +1879,16 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
     (loop while (eq (first argument) :cast) do (setf argument (second argument)))
     (case (first argument)
       (:func (second argument))
-      ((:column :count-star :coalesce :window) (target-default-name argument))
+      ((:column :count-star :coalesce :window :array-literal) (target-default-name argument))
       (t (if (eq (third ast) :pg-lsn) "pg_lsn"
-             (string-downcase (symbol-name (third ast))))))))
+             (string-downcase (symbol-name (or (sql-array-element-type (third ast)) (third ast)))))))))
 
 (defun target-default-name (ast)
   (case (first ast)
     (:window (target-default-name (second ast)))
     (:column
      (if (third ast) (third ast) (second ast)))
+    (:array-literal "array")
     (:coalesce "coalesce")
     (:case "case")
     (:count-star "count")
@@ -2329,13 +2442,16 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
   (cond ((member type '(:int2 :int4 :int8 :oid :numeric :float4 :float8)) :numeric)
         ((member type '(:date :timestamp :timestamptz)) :datetime)
         ((member type '(:text :varchar :name)) :string)
-        ((member type '(:int2vector :text-array)) :array)
+        ((or (eq type :int2vector) (sql-array-element-type type)) :array)
         ((member type '(:char :pg-node-tree)) :internal)
         (t type)))
 
 (defun sql-implicit-coercion-p (source target)
   "The supported implicit pg_cast edges; explicit I/O casts are broader."
   (or (eq source target)
+      (and (sql-array-element-type source) (sql-array-element-type target)
+           (sql-implicit-coercion-p (sql-array-element-type source)
+                                    (sql-array-element-type target)))
       (member (list source target)
               '((:int2 :int4) (:int2 :int8) (:int2 :oid) (:int4 :int8) (:int4 :oid) (:int8 :oid)
                 (:int2 :numeric) (:int4 :numeric) (:int8 :numeric)
@@ -2516,6 +2632,19 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
                     (mapcar #'second (sql-record-fields b)))
        (ereport "42804" "cannot compare dissimilar record types"))
      (compare-sql-array-values (sql-record-values a) (sql-record-values b)))
+    ((and (sql-array-p a) (sql-array-p b))
+     (let ((comparison (compare-sql-array-values (sql-array-elements a) (sql-array-elements b))))
+       (if (zerop comparison)
+           (let ((rank-comparison (- (length (sql-array-dimensions a)) (length (sql-array-dimensions b)))))
+             (if (zerop rank-comparison)
+                 (let ((dimensions (compare-integer-vectors (coerce (sql-array-dimensions a) 'vector)
+                                                            (coerce (sql-array-dimensions b) 'vector))))
+                   (if (zerop dimensions)
+                       (compare-integer-vectors (coerce (sql-array-lower-bounds a) 'vector)
+                                                (coerce (sql-array-lower-bounds b) 'vector))
+                       dimensions))
+                 rank-comparison))
+           comparison)))
     ((and (vectorp a) (vectorp b)) (compare-sql-array-values a b))
     (t
      (ereport "42883" "operator does not exist: ~a and ~a"
@@ -2846,6 +2975,7 @@ aliases share the corresponding numeric operator implementation."
         (all-p (eq (first expression) :all))
         (null-seen nil))
     (when (eq array +null+) (return-from eval-any-expression +null+))
+    (when (sql-array-p array) (setf array (sql-array-elements array)))
     ;; Convert the complete array before comparison, as C's array input does:
     ;; a decisive first element cannot hide an invalid later input value.
     (setf array (map 'vector
@@ -2859,13 +2989,42 @@ aliases share the corresponding numeric operator implementation."
              (when (eq result +null+) (setf null-seen t)))
     (if null-seen +null+ all-p)))
 
+(defun eval-array-constructor (expression environment)
+  (let* ((values (map 'vector (lambda (argument) (eval-expr argument environment))
+                      (second expression)))
+         (element-type (sql-array-element-type (expr-type expression))))
+    (if (getf (cddr expression) :multidims)
+        (let ((shape nil) (bounds nil) (nonempty nil) (empty nil))
+          (loop for value across values do
+            (when (and (not nonempty) (sql-array-p value)
+                       (>= (length (sql-array-dimensions value)) 6))
+              (ereport "54000" "number of array dimensions exceeds the maximum allowed"))
+            (if (or (eq value +null+) (null (sql-array-dimensions value)))
+                (setf empty t)
+                (if nonempty
+                    (unless (and (equal shape (sql-array-dimensions value))
+                                 (equal bounds (sql-array-lower-bounds value)))
+                      (ereport "2202E" "multidimensional arrays must have array expressions with matching dimensions"))
+                    (setf nonempty t shape (sql-array-dimensions value)
+                          bounds (sql-array-lower-bounds value)))))
+          (when (and empty nonempty)
+            (ereport "2202E" "multidimensional arrays must have array expressions with matching dimensions"))
+          (if nonempty
+              (make-sql-array :element-type-id element-type
+                              :elements (apply #'concatenate 'vector (map 'list #'sql-array-elements values))
+                              :dimensions (cons (length values) shape) :lower-bounds (cons 1 bounds))
+              (make-sql-array :element-type-id element-type :elements #() :dimensions nil :lower-bounds nil)))
+        (make-sql-array :element-type-id element-type :elements values
+                        :dimensions (and (plusp (length values)) (list (length values)))
+                        :lower-bounds (and (plusp (length values)) (list 1))))))
+
 (defun eval-array-length (expression environment)
   (sql-strict-let ((array (eval-expr (second expression) environment))
                    (dimension (eval-expr (third expression) environment)))
-    (if (and (= dimension 1)
-             (or (eq (expr-type (second expression)) :int2vector)
-                 (plusp (length array))))
-        (length array) +null+)))
+    (if (sql-array-p array)
+        (if (<= 1 dimension (length (sql-array-dimensions array)))
+            (nth (1- dimension) (sql-array-dimensions array)) +null+)
+        (if (= dimension 1) (length array) +null+))))
 
 (defun sql-random-numeric (minimum maximum)
   (when (sql-numeric-special-p minimum)
@@ -3015,7 +3174,7 @@ truncate and interpret the result at TYPE's signed width."
     (:cast (sql-cast-value (eval-expr (second expr) env)
                            (expr-type (second expr)) (expr-type expr) (expr-typmod expr)))
     (:bool (second expr))
-    (:array (map 'vector (lambda (argument) (eval-expr argument env)) (second expr)))
+    (:array (eval-array-constructor expr env))
     (:record-field
      (let ((record (eval-expr (second expr) env)))
        (if (eq record +null+) +null+ (aref (sql-record-values record) (third expr)))))
@@ -3123,6 +3282,33 @@ truncate and interpret the result at TYPE's signed width."
                    (when quote-p (write-char (code-char 34) stream)))))
     (write-char #\} stream)))
 
+(defun sql-array-output (array)
+  (let ((elements (sql-array-elements array))
+        (element-type (sql-array-element-type-id array))
+        (dimensions (sql-array-dimensions array))
+        (bounds (sql-array-lower-bounds array))
+        (position 0))
+    (with-output-to-string (stream)
+      (when (some (lambda (bound) (/= bound 1)) bounds)
+        (loop for bound in bounds for dimension in dimensions
+              do (format stream "[~d:~d]" bound (+ bound dimension -1)))
+        (write-char #\= stream))
+      (labels ((emit-level (shape)
+                 (write-char #\{ stream)
+                 (when shape
+                   (dotimes (index (first shape))
+                     (when (plusp index) (write-char #\, stream))
+                     (if (rest shape)
+                         (emit-level (rest shape))
+                         (let* ((value (aref elements position))
+                                (rendered (sql-text-array-output
+                                           (vector (if (eq value +null+) value
+                                                       (value->text value element-type))))))
+                           (write-string rendered stream :start 1 :end (1- (length rendered)))
+                           (incf position)))))
+                 (write-char #\} stream)))
+        (emit-level dimensions)))))
+
 (defun sql-timestamptz-output (timestamp)
   "Format an instant in the current session time zone."
   (sql-timestamp-output timestamp t (sql-session-timezone)
@@ -3143,7 +3329,7 @@ truncate and interpret the result at TYPE's signed width."
     ((eq type :pg-lsn) (wal-format-lsn v))
     ((eq type :timestamptz) (sql-timestamptz-output v))
     ((eq type :record) (sql-record-output v))
-    ((eq type :text-array) (sql-text-array-output v))
+    ((sql-array-element-type type) (sql-array-output v))
     ((eq type :char) (sql-char-output v))
     ((eq type :int2vector) (format nil "~{~d~^ ~}" (coerce v 'list)))
     ((or (sql-decimal-p v) (and (eq type :numeric) (sql-numeric-special-p v)))

@@ -617,6 +617,10 @@ reordered tree, and each parameterized path can reference only joined Vars."
     ((floatp value) (sql-float-group-key value))
     ((sql-interval-p value) (sql-interval-comparison-value value))
     ((sql-timetz-p value) (multiple-value-list (sql-timetz-comparison-values value)))
+    ((sql-array-p value)
+     (list :array (sql-array-element-type-id value)
+           (sql-array-dimensions value) (sql-array-lower-bounds value)
+           (map 'list #'sql-group-value-payload (sql-array-elements value))))
     ((sql-record-p value)
      (list :record (mapcar #'second (sql-record-fields value))
            (map 'list #'sql-group-value-payload (sql-record-values value))))
@@ -1184,7 +1188,8 @@ on an abnormal exit."
                    (map-query-row-spool state (lambda (value index)
                                                 (check-for-interrupts)
                                                 (setf (aref result index) value)))
-                   result))
+                   (make-sql-array :element-type-id :text :elements result
+                                   :dimensions (list (length result)) :lower-bounds (list 1))))
              (scalar-aggregate-transition-result state)))
        states))
 

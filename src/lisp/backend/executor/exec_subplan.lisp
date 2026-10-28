@@ -129,6 +129,12 @@
                      (setf result (subquery-quantified-step kind result value))
                      (when (if (eq kind :any) (eq result t) (null result)) :stop))))))
           (close-cte-frame-cache (cdr frame))))
-      (when array (setf result (coerce array 'simple-vector)))
+      (when array
+        (let ((elements (coerce array 'simple-vector)))
+          (setf result (make-sql-array
+                        :element-type-id (getf (first (getf (sql-subplan-prepared descriptor) :targets)) :type)
+                        :elements elements
+                        :dimensions (and (plusp (length elements)) (list (length elements)))
+                        :lower-bounds (and (plusp (length elements)) (list 1))))))
       (when key (setf (gethash key cache) result))
       result)))

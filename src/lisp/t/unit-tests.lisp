@@ -62,6 +62,8 @@
   (test-query-temp-open-registration-failure-cleans-up)
   (test-query-temp-delete-failure-retains-cleanup-registration)
   (test-full-join-spool-spills-typed-bytea-and-match-state)
+  (test-query-array-group-keys)
+  (test-query-array-copy-and-spill)
   (test-query-row-spool-spills-bytea-without-expanded-list)
   (test-query-plan-external-sort-spills-stably)
   (test-hash-aggregate-partitioned-spill)

@@ -8,6 +8,26 @@
 
 (defstruct sql-record fields values)
 
+(defstruct sql-array
+  ;; Elements are flat in row-major order and may contain +null+. Dimensions
+  ;; and lower bounds have equal lengths; their dimension product is the element
+  ;; count. Empty arrays use an empty vector and NIL for both lists.
+  element-type-id
+  elements
+  dimensions
+  lower-bounds)
+
+(defparameter +sql-array-types+
+  '((:text . :text-array) (:int2 . :int2-array) (:int4 . :int4-array)
+    (:int8 . :int8-array) (:numeric . :numeric-array) (:float4 . :float4-array)
+    (:float8 . :float8-array)))
+
+(defun sql-array-type (element-type)
+  (cdr (assoc element-type +sql-array-types+)))
+
+(defun sql-array-element-type (array-type)
+  (car (rassoc array-type +sql-array-types+)))
+
 (defparameter +publication-table-result-fields+
   '(("pubid" :oid) ("relid" :oid) ("attrs" :int2vector) ("qual" :pg-node-tree)))
 

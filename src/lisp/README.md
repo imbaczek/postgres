@@ -203,6 +203,41 @@ and precision modifiers are supported. These are subsets of PostgreSQL's full
 type and operator catalog, not a promise that every input spelling or function
 is implemented.
 
+SQL array expressions support text, int2, int4, int8, numeric, float4 and
+float8 elements. `ARRAY[...]` chooses a common element type; an empty
+constructor needs a type supplied by context or a cast. Nested constructors
+must have matching dimensions and lower bounds, and support up to six
+dimensions. `array_length`, comparisons, scalar `ANY`/`ALL`, and text
+`array_agg` are supported in the implemented expression subset. These array
+expression types do not imply support for array-valued table columns.
+
+Typed array input accepts brace-delimited values, quoted and backslash-escaped
+elements, unquoted `NULL`, rectangular nested arrays, and explicit bounds such
+as `[0:1]={10,20}`. Elements go through the target type's input conversion.
+Empty arrays have no dimensions; absent explicit bounds, lower bounds are 1.
+The legacy untyped literal path for scalar `ANY`/`ALL` accepts only
+one-dimensional input without explicit bounds.
+
+Internally, `sql-array` stores an element type ID, a flat row-major element
+vector (including SQL NULL markers), dimension lengths, and lower bounds.
+The dimension and lower-bound lists have equal length, and the dimension
+product matches the element count for nonempty arrays; empty arrays use an
+empty vector and no dimensions or bounds. Sort-arena copying recursively copies
+the array and its compound values, and query spill preserves all four fields
+and restores them on replay. This is an executor representation, not the C
+server's on-disk array format.
+
+`width_bucket(value, thresholds)` returns the number of thresholds less than or
+equal to the value, using a binary search. Thresholds must be one-dimensional
+and contain no NULLs; an empty array returns zero. The caller must supply
+ascending thresholds: their order is assumed, not checked. The supported
+threshold element types are the array expression types listed above.
+`width_bucket(value, bound1, bound2, count)` supports numeric and float8
+arithmetic, ascending or descending bounds, and a positive int4 count. Values
+outside the range return 0 or count + 1; the first bound is included and the
+second excluded. Bounds must be finite, unequal and not NaN. Both forms return
+NULL when an argument is NULL.
+
 `random()` returns a float8 uniformly in [0, 1). `random(min, max)` supports
 integer, bigint, and numeric bounds, inclusive at both ends; numeric results
 use the greater input scale. Bounds must be ordered, and numeric bounds must
@@ -287,16 +322,6 @@ infinity input produces NaN. Two unknown arguments, or two smallint arguments,
 are ambiguous. `factorial(x)` accepts a bigint-coercible argument and returns
 numeric; negative arguments and arguments above 32177 raise `22003`. These
 functions return NULL when any argument is NULL.
-
-`width_bucket(value, bound1, bound2, count)` supports numeric and float8
-range overloads and returns an integer bucket number. The bounds must be
-distinct and finite, and count must be positive. Buckets can run in ascending
-or descending order; values beyond the first and second bounds return 0 and
-count + 1 respectively. `width_bucket(value, thresholds)` supports text,
-varchar, and name operands with one-dimensional text arrays. Thresholds must
-be sorted ascending and contain no NULLs; the result is the number of
-thresholds less than or equal to the value (zero for an empty array). Both
-forms return NULL if any argument is NULL.
 
 Exponentiation is available as `base ^ exponent`, `power(base, exponent)`,
 `pow(base, exponent)`, `numeric_power(base, exponent)`, and `dpow(base, exponent)`.

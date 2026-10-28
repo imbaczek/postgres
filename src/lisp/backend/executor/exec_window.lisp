@@ -68,7 +68,9 @@
               (setf (aref result index) (query-spill-read-record stream)))))
         (loop for value in (reverse (query-row-spool-rows spool)) for index from 0
               do (setf (aref result index) (copy-query-sort-value value))))
-    (if (zerop (length result)) +null+ result)))
+    (if (zerop (length result)) +null+
+        (make-sql-array :element-type-id :text :elements result
+                        :dimensions (list (length result)) :lower-bounds (list 1)))))
 
 (defun window-transition-results (states)
   (map 'vector (lambda (state)

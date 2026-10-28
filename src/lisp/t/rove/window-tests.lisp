@@ -58,9 +58,10 @@
 (rove:deftest window-array-results-are-owned
     (let ((rows (subquery-test-rows
                  "SELECT array_agg(d.x) OVER (ORDER BY d.x ROWS UNBOUNDED PRECEDING) FROM (SELECT 'a' AS x UNION ALL SELECT 'b' UNION ALL SELECT 'c') d ORDER BY d.x")))
-      (rove:ok (equalp rows '((#("a")) (#("a" "b")) (#("a" "b" "c")))))
-      (setf (aref (caar (last rows)) 0) "changed")
-      (rove:ok (equalp (caar rows) #("a")))))
+      (rove:ok (equalp (mapcar (lambda (row) (sql-array-elements (first row))) rows)
+                       '(#("a") #("a" "b") #("a" "b" "c"))))
+      (setf (aref (sql-array-elements (caar (last rows))) 0) "changed")
+      (rove:ok (equalp (sql-array-elements (caar rows)) #("a")))))
 
 (rove:deftest window-streaming-limit
     (dolist (frame '("ROWS UNBOUNDED PRECEDING" ""))
@@ -87,9 +88,10 @@
       (unwind-protect
            (progn
              (rove:ok
-              (equalp (subquery-test-rows
-                       "SELECT array_agg(d.x) OVER (ORDER BY d.x) FROM (SELECT 'b' AS x UNION ALL SELECT 'a' UNION ALL SELECT 'b') d ORDER BY d.x")
-                      '((#("a")) (#("a" "b" "b")) (#("a" "b" "b")))))
+              (equalp (mapcar (lambda (row) (sql-array-elements (first row)))
+                              (subquery-test-rows
+                               "SELECT array_agg(d.x) OVER (ORDER BY d.x) FROM (SELECT 'b' AS x UNION ALL SELECT 'a' UNION ALL SELECT 'b') d ORDER BY d.x"))
+                      '(#("a") #("a" "b" "b") #("a" "b" "b"))))
              (rove:ok (null (uiop:directory-files directory))))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 

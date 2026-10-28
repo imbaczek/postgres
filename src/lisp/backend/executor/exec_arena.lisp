@@ -123,6 +123,11 @@ is used only for heap-produced SQL rows and copies of those same rows;
 expression evaluation must never run in the arena. Arenas remain visible to
 SBCL's GC so borrowed heap scalars remain live and their pointers are updated."
   (cond
+    ((sql-array-p value)
+     (make-sql-array :element-type-id (copy-query-sort-value (sql-array-element-type-id value))
+                     :elements (copy-query-sort-value (sql-array-elements value))
+                     :dimensions (copy-query-sort-value (sql-array-dimensions value))
+                     :lower-bounds (copy-query-sort-value (sql-array-lower-bounds value))))
     ((sql-record-p value)
      (make-sql-record :fields (copy-query-sort-value (sql-record-fields value))
                       :values (copy-query-sort-value (sql-record-values value))))
