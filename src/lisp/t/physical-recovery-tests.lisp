@@ -386,6 +386,18 @@
                       toast (make-array 1 :element-type '(unsigned-byte 8) :initial-element 17)
                       (+ i 1000) 42 0))))
                (ok (> (nth-value 0 (pg::btree-read-meta (pg::pg-toast-index-relfilenode toast))) 0))
+               (let ((pg::*toast-next-value-id* #xffffffff)
+                     (one-byte (make-array 1 :element-type '(unsigned-byte 8) :initial-element 42)))
+                 (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                   (pg::with-write-lock
+                     (let ((first (pg::toast-store-value-unlocked toast one-byte nil 43 0)))
+                       (ok (= 1 (pg::heap-external-varlena-value-id first))))
+                     ;; Aborted chunks remain indexed and reserve their ID.
+                     (pg::clog-set 43 pg::+clog-aborted+)
+                     ;; Simulate restart: the hint resets but the index retains IDs.
+                     (setf pg::*toast-next-value-id* #xffffffff)
+                     (let ((second (pg::toast-store-value-unlocked toast one-byte nil 42 0)))
+                       (ok (= 2 (pg::heap-external-varlena-value-id second)))))))
                (ok (intake-fails-p (lambda () (pg::toast-fetch-value toast pointer snapshot))))
                (pg::register-active-snapshot snapshot registration)
                (ok (equalp bytes (pg::toast-fetch-value toast pointer snapshot)))

@@ -1492,14 +1492,39 @@ ownership durable; table rollback or drop handles their eventual removal."
 The OID encoding alone is a byte prefix of every key for that value."
   (encode-index-key (list value-id sequence) '(:oid :int4)))
 
+(defvar *toast-next-value-id* 1
+  "Next candidate TOAST value ID; the index is authoritative after restart.")
+
+(defun toast-allocate-value-id-unlocked (toast)
+  "Choose an unused nonzero OID in TOAST while its index and *WRITE-LOCK* are held.
+Index entries, including dead or aborted entries, reserve their ID until vacuum
+removes them. The in-memory candidate is only a hint and need not survive restart."
+  (let* ((index-node (pg-toast-index-relfilenode toast))
+         (start *toast-next-value-id*)
+         (candidate start))
+    (unless (typep start '(integer 1 4294967295))
+      (error "Invalid TOAST value ID candidate"))
+    (when (< (buf-nblocks index-node) 2)
+      (ereport "XX001" "TOAST index is missing"))
+    (loop
+      (setf *toast-next-value-id* (if (= candidate #xffffffff) 1 (1+ candidate)))
+      (unless (btree-prefix-entries-unlocked index-node
+                                             (encode-index-key (list candidate) '(:oid)))
+        (return candidate))
+      (setf candidate *toast-next-value-id*)
+      (when (= candidate start)
+        (ereport "54000" "TOAST value ID space is exhausted")))))
+
 (defun toast-store-value-unlocked (toast bytes value-id xid cid)
   "Store nonempty uncompressed BYTES in TOAST and return an external pointer.
-The caller owns TOAST, chooses an unused nonzero 32-bit VALUE-ID, and holds
-*WRITE-LOCK* and the TOAST index's exclusive relation lock throughout this call.
-XID and CID identify the inserting transaction and command. BYTES may contain
-1 through 1073741819 octets; chunks are copied. This low-level operation does
-not choose an ID, externalize a parent tuple, or clean up partial writes on error."
+The caller owns TOAST and holds its index's exclusive relation lock and
+*WRITE-LOCK* throughout this call, in that order. VALUE-ID is an unused nonzero
+32-bit ID, or NIL to allocate one from the TOAST index. XID and CID identify the
+inserting transaction and command. BYTES may contain 1 through 1073741819 octets;
+chunks are copied. This low-level operation does not externalize a parent tuple
+or clean up partial writes on error."
   (check-type bytes (vector (unsigned-byte 8)))
+  (unless value-id (setf value-id (toast-allocate-value-id-unlocked toast)))
   (unless (and (typep value-id '(integer 1 4294967295))
                (<= 1 (length bytes) 1073741819))
     (error "Invalid TOAST value or ID"))

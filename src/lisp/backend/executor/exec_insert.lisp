@@ -134,10 +134,17 @@ index's B-tree mutex."
           (t :ok))))
 
 (defun capture-insert-indexes (table)
-  "Snapshot TABLE's index metadata while protecting the shared catalog hash."
+  "Capture ordinary indexes, their lock nodes, and owned TOAST identity.
+Take *WRITE-LOCK* only for the snapshot; the caller releases it before acquiring
+B-tree relation locks, then reacquires it and checks the TOAST identity."
   (with-write-lock
-    (let ((indexes (table-indexes table)))
-      (values indexes (mapcar #'pg-index-relfilenode indexes)))))
+    (let* ((indexes (table-indexes table))
+           (toast (pg-class-toast table))
+           (toast-node (and toast (pg-toast-index-relfilenode toast))))
+      (values indexes
+              (append (mapcar #'pg-index-relfilenode indexes)
+                      (when toast-node (list toast-node)))
+              toast toast-node))))
 
 (defun insert-tuple-with-unique (table values &key exclude-tid on-success publication-kind before-check)
   "ON-SUCCESS and BEFORE-CHECK run under B-tree and writer locks; neither may wait.
@@ -145,14 +152,20 @@ BEFORE-CHECK can claim an ON CONFLICT tuple or ask the released-lock loop to wai
   (let* ((xid (get-current-xid))
          (relfilenode (pg-class-relfilenode table))
          (indexes nil)
-         (index-relfilenodes nil))
+         (index-relfilenodes nil)
+         (toast nil)
+         (toast-node nil))
     (register-relation-writer relfilenode xid)
-    (multiple-value-setq (indexes index-relfilenodes) (capture-insert-indexes table))
+    (multiple-value-setq (indexes index-relfilenodes toast toast-node)
+      (capture-insert-indexes table))
     (loop
       (let ((wait-xid nil))
         (with-btree-relation-locks (index-relfilenodes)
           (with-write-lock
             (ensure-current-table table)
+            (unless (and (eq toast (pg-class-toast table))
+                         (eql toast-node (and toast (pg-toast-index-relfilenode toast))))
+              (ereport "0A000" "TOAST storage changed during INSERT"))
             (multiple-value-bind (action payload)
                 (when before-check (funcall before-check indexes))
               (when (eq action :conflict)

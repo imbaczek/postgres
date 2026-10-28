@@ -6,6 +6,7 @@
   (let ((original-table-indexes (symbol-function 'table-indexes))
         (first-index (make-pg-index :relfilenode 91001))
         (second-index (make-pg-index :relfilenode 91002))
+        (table (make-pg-class :toast (make-pg-toast :index-relfilenode 91003)))
         (lock-held nil))
     (unwind-protect
          (progn
@@ -14,14 +15,16 @@
                    (declare (ignore table))
                    (setf lock-held (sb-thread:holding-mutex-p *write-lock*))
                    (list first-index second-index)))
-           (multiple-value-bind (indexes relfilenodes)
-               (capture-insert-indexes nil)
+           (multiple-value-bind (indexes relfilenodes toast toast-node)
+               (capture-insert-indexes table)
              (check lock-held
                     "INSERT snapshots the shared index catalog under write lock")
              (check (equal indexes (list first-index second-index))
                     "INSERT snapshot preserves the table's index objects")
-             (check (equal relfilenodes '(91001 91002))
-                    "INSERT snapshot preserves index relation file nodes")))
+             (check (equal relfilenodes '(91001 91002 91003))
+                    "INSERT snapshot includes the owned TOAST index")
+             (check (and (eq toast (pg-class-toast table)) (= toast-node 91003))
+                    "INSERT captures TOAST identity and node for revalidation")))
       (setf (symbol-function 'table-indexes) original-table-indexes))))
 
 (defun test-replication-slots-catalog-view ()
