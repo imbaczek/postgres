@@ -1475,6 +1475,93 @@ ownership durable; table rollback or drop handles their eventual removal."
           (ignore-errors (smgr-forget heap-oid :delete t))
           (ignore-errors (smgr-forget index-oid :delete t)))))))
 
+(defconstant +toast-oid-chunk-size+
+  (- (let* ((space (floor (- +blcksz+ (maxalign (+ +size-of-page-header+
+                                                   (* 4 +size-of-item-id+))))
+                          4)))
+       (- space (mod space +maxalign+)))
+     (maxalign +size-of-heap-tuple-header+) 4 4 4))
+
+(defparameter *toast-chunk-columns*
+  (vector (make-pg-column :name "chunk_id" :type :oid :typmod -1 :attnum 1)
+          (make-pg-column :name "chunk_seq" :type :int4 :typmod -1 :attnum 2)
+          (make-pg-column :name "chunk_data" :type :bytea :typmod -1 :attnum 3)))
+
+(defun toast-chunk-key (value-id sequence)
+  "Encode the unsigned 32-bit OID and signed int4 sequence as an ordered key.
+The OID encoding alone is a byte prefix of every key for that value."
+  (encode-index-key (list value-id sequence) '(:oid :int4)))
+
+(defun toast-store-value-unlocked (toast bytes value-id xid cid)
+  "Store nonempty uncompressed BYTES in TOAST and return an external pointer.
+The caller owns TOAST, chooses an unused nonzero 32-bit VALUE-ID, and holds
+*WRITE-LOCK* and the TOAST index's exclusive relation lock throughout this call.
+XID and CID identify the inserting transaction and command. BYTES may contain
+1 through 1073741819 octets; chunks are copied. This low-level operation does
+not choose an ID, externalize a parent tuple, or clean up partial writes on error."
+  (check-type bytes (vector (unsigned-byte 8)))
+  (unless (and (typep value-id '(integer 1 4294967295))
+               (<= 1 (length bytes) 1073741819))
+    (error "Invalid TOAST value or ID"))
+  (let ((index-node (pg-toast-index-relfilenode toast))
+        (heap-node (pg-toast-relfilenode toast)))
+    (when (< (buf-nblocks index-node) 2)
+      (ereport "XX001" "TOAST index is missing"))
+    (when (btree-prefix-entries-unlocked index-node
+                                         (encode-index-key (list value-id) '(:oid)))
+      (error "TOAST value ID is already in use"))
+    (loop for start from 0 below (length bytes) by +toast-oid-chunk-size+
+          for sequence from 0
+          for end = (min (length bytes) (+ start +toast-oid-chunk-size+))
+          do (multiple-value-bind (block offset)
+                 (heapam-insert heap-node *toast-chunk-columns*
+                                (vector value-id sequence (subseq bytes start end)) xid cid)
+               (btree-insert-unlocked index-node (toast-chunk-key value-id sequence)
+                                      block offset)))
+    (make-heap-external-varlena :raw-size (+ 4 (length bytes))
+                                :external-info (length bytes) :value-id value-id
+                                :relation-id (pg-toast-oid toast) :id-width 4)))
+
+(defun toast-fetch-value (toast pointer snapshot)
+  "Return the uncompressed bytes named by POINTER in the owning TOAST storage.
+SNAPSHOT must remain active for the entire call, protecting the parent value's
+lifetime; chunk visibility is parent-driven, not evaluated against SNAPSHOT.
+The index read lock is held while reading and assembling chunks. Only matching
+32-bit relation pointers with uncompressed sizes from 1 to 1073741819 are
+accepted; missing, misordered, or malformed chunks signal corruption."
+  (unless (and snapshot
+               (sb-thread:with-mutex (*snapshot-count-lock*)
+                 (gethash snapshot *active-snapshot-set*)))
+    (error "TOAST fetch requires an active snapshot"))
+  (let* ((size (heap-external-varlena-external-info pointer))
+         (id (heap-external-varlena-value-id pointer))
+         (index-node (pg-toast-index-relfilenode toast))
+         (heap-node (pg-toast-relfilenode toast)))
+    (unless (and (= (heap-external-varlena-id-width pointer) 4)
+                 (= (heap-external-varlena-relation-id pointer) (pg-toast-oid toast))
+                 (typep size '(integer 1 1073741819))
+                 (= (heap-external-varlena-raw-size pointer) (+ size 4)))
+      (ereport "XX001" "invalid or compressed TOAST pointer"))
+    (when (< (buf-nblocks index-node) 2)
+      (ereport "XX001" "TOAST index is missing"))
+    (call-with-btree-relation-read-lock
+     index-node
+     (lambda ()
+       (let ((chunks nil))
+         (dolist (entry (btree-prefix-entries-unlocked
+                         index-node (encode-index-key (list id) '(:oid))))
+           (let ((tuple (heapam-get-tuple heap-node (second entry) (third entry)
+                                          *toast-chunk-columns* t)))
+             (when tuple
+               (let* ((values (htup-values tuple))
+                      (chunk-id (aref values 0))
+                      (sequence (aref values 1)))
+                 (unless (and (= chunk-id id)
+                              (equalp (first entry) (toast-chunk-key chunk-id sequence)))
+                   (ereport "XX001" "TOAST index points to the wrong chunk"))
+                 (push (cons sequence (aref values 2)) chunks)))))
+         (toast-assemble-chunks (nreverse chunks) size +toast-oid-chunk-size+))))))
+
 (defun create-table* (db name columns)
   "COLUMNS is a list of plists with :name :type :typmod :notnull :primary,
 :unique, and :nulls-not-distinct. Returns the new pg-class."

@@ -128,7 +128,7 @@
   (case (pg-column-type col)
     ((:int8 :float8 :time :timestamp :timestamptz :interval :timetz) 8)
     (:int2 2)
-    ((:int4 :numeric :varchar :bytea :float4 :date) 4)
+    ((:int4 :oid :numeric :varchar :bytea :float4 :date) 4)
     (t 1)))
 
 (defun column-fixed-size (col)
@@ -136,7 +136,7 @@
     (:interval 16)
     (:timetz 12)
     (:int2 2)
-    ((:int4 :float4 :date) 4)
+    ((:int4 :oid :float4 :date) 4)
     ((:int8 :float8 :time :timestamp :timestamptz) 8)
     (t nil)))
 
@@ -247,6 +247,9 @@ This codec does not create or fetch TOAST data."
                    (:float8 (page-set-u64 bytes off (sql-float-bits v :float8)))
                    (:int2
                     (page-set-u16 bytes off (logand v #xffff)))
+                   (:oid
+                    (check-type v (unsigned-byte 32))
+                    (page-set-u32 bytes off v))
                    ((:int4 :date)
                     (page-set-u32 bytes off (logand v #xFFFFFFFF)))
                    ((:int8 :time :timestamp :timestamptz)
@@ -445,6 +448,9 @@ fetching, decompression, and SQL-level materialization are not done here."
                         (when (>= v #x8000) (decf v #x10000))
                         (setf (aref values i) v))
                       (incf cursor 2))
+                     (:oid
+                      (setf (aref values i) (page-u32 bytes cursor))
+                      (incf cursor 4))
                      ((:int4 :date)
                       (let ((v (page-u32 bytes cursor)))
                         (when (>= v #x80000000)
@@ -476,10 +482,21 @@ fetching, decompression, and SQL-level materialization are not done here."
                                   cursor end)))))))))
     (values values xmin xmax cid infomask ctid-block ctid-offnum)))
 
-(defun heapam-get-tuple (relfilenode block offnum columns)
+(defun heapam-get-tuple (relfilenode block offnum columns &optional toast-visibility-p)
+  "Fetch and deform the live tuple at BLOCK and OFFNUM, or return NIL if absent.
+When TOAST-VISIBILITY-P is true, apply the parent-driven TOAST insertion
+visibility predicate to the tuple header before decoding its attributes; return
+NIL if it fails. This is not an MVCC snapshot check: the caller must establish
+visibility and protect the lifetime of the owning parent separately. With the
+option false, no visibility check is performed."
   (let ((page (buf-read relfilenode block)))
     (when page
       (with-live-page-item (page offnum off len)
+        (when (and toast-visibility-p
+                   (not (heap-toast-tuple-visible-p
+                         (full-xid-from-32 (page-u32 page (+ off +heap-tuple-xmin-off+)))
+                         (page-u16 page (+ off +heap-tuple-infomask-off+)))))
+          (return-from heapam-get-tuple nil))
         (let ((bytes (subseq page off (+ off len))))
           (multiple-value-bind (values xmin xmax cid infomask
                                 ctid-block ctid-offnum)

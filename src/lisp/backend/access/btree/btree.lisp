@@ -479,6 +479,41 @@ to a single leaf."
                               key acc))))
             acc)))))
 
+(defun btree-prefix-entries-unlocked (relfilenode prefix)
+  "Return leaf entries whose encoded keys start with PREFIX, in index order.
+The caller must hold the relation read or write lock and ensure the index is
+initialized. The search visits the bytewise range [PREFIX, upper), where upper
+is the shortest successor of PREFIX, or unbounded when none exists. Equal
+separator boundaries are included so duplicate keys spanning pages are found."
+  (multiple-value-bind (level root) (btree-read-meta relfilenode)
+    (let ((matches nil)
+          (upper (copy-seq prefix)))
+      (loop for i downfrom (1- (length upper)) to 0
+            when (< (aref upper i) 255)
+              do (incf (aref upper i))
+                 (setf upper (subseq upper 0 (1+ i)))
+                 (return)
+            finally (setf upper nil))
+      (labels ((walk (depth block)
+                 (let ((page (buf-read relfilenode block)))
+                   (unless page (ereport "XX001" "index page ~a is missing" block))
+                   (if (zerop depth)
+                       (dolist (entry (btree-page-entries page nil))
+                         (let ((key (first entry)))
+                           (when (and (<= (length prefix) (length key))
+                                      (loop for i below (length prefix)
+                                            always (= (aref prefix i) (aref key i))))
+                             (push entry matches))))
+                       (let ((entries (btree-page-entries page t)))
+                         (loop for remaining on entries
+                               for entry = (first remaining)
+                               for next = (second remaining)
+                               when (and (or (null next) (not (key< (car next) prefix)))
+                                         (or (null upper) (key< (car entry) upper)))
+                                 do (walk (1- depth) (cdr entry))))))))
+        (walk level root))
+      (nreverse matches))))
+
 (defun btree-search-unlocked (relfilenode key)
   "Return a list of (block . off) heap TIDs for entries whose key equals KEY."
   (btree-ensure-init relfilenode)
@@ -790,6 +825,10 @@ the MVP types. Null sorts before any non-null value; ints are sign-flipped."
                  ((eq ty :date)
                   (push-byte 8)
                   (push-int-be (logxor (logand v #xffffffff) #x80000000) 4))
+                 ((eq ty :oid)
+                  (check-type v (unsigned-byte 32))
+                  (push-byte 14)
+                  (push-int-be v 4))
                  ((eq ty :int4)
                   (push-byte 1)
                   (push-int-be (logxor (logand v #xFFFFFFFF) #x80000000) 4))

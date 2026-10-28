@@ -359,7 +359,7 @@ is interrupted after publication but before it returns."
     (remhash xid *combo-command-ids*)))
 
 (defun heap-toast-tuple-visible-p (xmin infomask)
-  "Preparatory TOAST chunk predicate; currently used only by tests.
+  "TOAST chunk visibility predicate for a visible owning parent.
 The owning parent tuple determines visibility, so an uncommitted insertion may
 be read.  A committed hint accepts the chunk, including the frozen encoding
 that also sets the invalid bit; otherwise reject invalid xmin or insertion.

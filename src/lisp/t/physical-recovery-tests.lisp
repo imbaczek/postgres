@@ -352,6 +352,88 @@
                  (ok (equalp toast (pg::pg-class-toast saved)))))
           (pg::smgr-close-all)))))
 
+(deftest toast-stores-and-fetches-binary-chunks
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*relation-streams* (make-hash-table :test #'equal))
+             (pg::*wal-page-cache* (make-hash-table :test #'equal))
+             (pg::*wal-ready* nil)
+             (pg::*catalog* (pg::make-catalog))
+             (pg::*backend* (pg::make-backend))
+             (database (pg::make-database :name "postgres"))
+             (snapshot (pg::make-snapshot-struct :xmin 3 :xmax 50 :xip nil :curcid 0))
+             (registration (pg::make-snapshot-registration))
+             (bytes (make-array 5000 :element-type '(unsigned-byte 8)
+                                     :initial-contents (loop for i below 5000 collect (mod i 256)))))
+        (setf (gethash "postgres" (pg::catalog-databases pg::*catalog*)) database)
+        (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
+        (unwind-protect
+             (let* ((table (pg::create-table* database "big"
+                                              (list (list :name "n" :type :numeric :typmod -1))))
+                    (toast (pg::pg-class-toast table))
+                    (pointer nil))
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (pg::with-write-lock
+                   (setf pointer (pg::toast-store-value-unlocked toast bytes #xffffffff 42 0))))
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (pg::with-write-lock
+                   (dotimes (i 600)
+                     (pg::toast-store-value-unlocked
+                      toast (make-array 1 :element-type '(unsigned-byte 8) :initial-element 17)
+                      (+ i 1000) 42 0))))
+               (ok (> (nth-value 0 (pg::btree-read-meta (pg::pg-toast-index-relfilenode toast))) 0))
+               (ok (intake-fails-p (lambda () (pg::toast-fetch-value toast pointer snapshot))))
+               (pg::register-active-snapshot snapshot registration)
+               (ok (equalp bytes (pg::toast-fetch-value toast pointer snapshot)))
+               (ok (intake-fails-p
+                    (lambda ()
+                      (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                        (pg::with-write-lock
+                          (pg::toast-store-value-unlocked toast bytes #xffffffff 43 0))))))
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (pg::with-write-lock
+                   (dolist (entry (list (list #xffffffff 99) (list 44 7)))
+                     (multiple-value-bind (block offset)
+                         (pg::heapam-insert
+                          (pg::pg-toast-relfilenode toast) pg::*toast-chunk-columns*
+                          (vector (first entry) (second entry)
+                                  (make-array 1 :element-type '(unsigned-byte 8) :initial-element 1))
+                          42 0)
+                       (pg::btree-insert-unlocked
+                        (pg::pg-toast-index-relfilenode toast)
+                        (pg::toast-chunk-key (first entry) (second entry)) block offset)))))
+               (ok (equal "XX001" (recovery-state-of (lambda () (pg::toast-fetch-value toast pointer snapshot)))))
+               (ok (intake-fails-p
+                    (lambda ()
+                      (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                        (pg::with-write-lock
+                          (pg::toast-store-value-unlocked toast bytes 44 43 0)))))))
+          (pg::release-snapshot-registration registration)
+          (pg::smgr-close-all)))))
+
+(deftest toast-fetch-skips-invalid-tuple-before-decoding
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*relation-streams* (make-hash-table :test #'equal))
+             (pg::*wal-page-cache* (make-hash-table :test #'equal))
+             (pg::*wal-ready* nil)
+             (pg::*backend* (pg::make-backend))
+             (tuple (pg::form-heap-tuple
+                     (vector 42 0 (make-array 1 :element-type '(unsigned-byte 8) :initial-element 5))
+                     pg::*toast-chunk-columns* 42 0 0 0 0))
+             (page (pg::page-init (pg::make-page))))
+        (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
+        (pg::page-set-u16 tuple pg::+heap-tuple-infomask-off+ pg::+heap-xmin-invalid+)
+        (setf (aref tuple (+ (aref tuple pg::+heap-tuple-hoff-off+) 8)) 1)
+        (pg::page-add-item page tuple)
+        (unwind-protect
+             (progn
+               (pg::buf-extend 991 page)
+               (ok (not (pg::heapam-get-tuple 991 0 1 pg::*toast-chunk-columns* t)))
+               (ok (intake-fails-p (lambda ()
+                                     (pg::heapam-get-tuple 991 0 1 pg::*toast-chunk-columns*)))))
+          (pg::smgr-close-all)))))
+
 (deftest vacuum-toast-advances-owned-horizon
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)

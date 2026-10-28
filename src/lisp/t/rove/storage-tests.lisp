@@ -126,6 +126,17 @@
                  (pg-error (e) (string= (pg-error-sqlstate e) "XX001")))
                "invalid chunk containers signal corruption")))
 
+(rove:deftest test-toast-oid-storage-and-index-order
+    (let* ((columns (vector (make-pg-column :name "id" :type :oid :typmod -1 :attnum 1)))
+           (values (vector #xffffffff)))
+      (rove:ok (equalp values
+                       (deform-heap-tuple (form-heap-tuple values columns 3 0 0 0 0)
+                         columns))
+               "TOAST OID preserves all 32 unsigned bits")
+      (rove:ok (key< (encode-index-key (list #x7fffffff 0) '(:oid :int4))
+                     (encode-index-key (list #x80000000 0) '(:oid :int4)))
+               "TOAST OID index order is unsigned")))
+
 (rove:deftest test-bytea-tuple-storage
     (let ((columns (vector (make-pg-column :name "a" :type :int2 :typmod -1 :attnum 1)
                            (make-pg-column :name "bytes" :type :bytea :typmod -1 :attnum 2)

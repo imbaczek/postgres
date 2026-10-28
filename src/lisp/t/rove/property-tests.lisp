@@ -286,6 +286,17 @@
 (rove:deftest generated-unit-toast-chunks
     (unit-check-property 'unit-toast-chunks-roundtrip))
 
+(cl-spec:defproperty unit-toast-oid-preserves-value
+    ((value (range integer 0 4294967295)))
+  (:about form-heap-tuple deform-heap-tuple encode-index-key)
+  (:trials (:normal 200))
+  (let* ((columns (vector (make-pg-column :name "id" :type :oid :typmod -1 :attnum 1)))
+         (bytes (form-heap-tuple (vector value) columns 3 0 0 0 0)))
+    (= value (aref (deform-heap-tuple bytes columns) 0))))
+
+(rove:deftest generated-unit-toast-oid
+    (unit-check-property 'unit-toast-oid-preserves-value))
+
 (cl-spec:defproperty unit-bytea-tuple-roundtrip
     ((payload unit-octet-vector))
   (:about form-heap-tuple deform-heap-tuple)
