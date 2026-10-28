@@ -170,6 +170,9 @@ Return the complete control tuple for the subsequent retirement check."
          nil)))))
 
 (defun physical-promotion-retained-parent-selection (state store)
+  "Select the replay parent and its digest from the receive history chain.
+Use NIL for the base timeline.  A later selected target does not supply the
+parent's digest.  The caller holds the receive-store mutex."
   (let* ((parent (physical-recovery-replay-timeline state))
          (text (if (= parent 1) "" (bytes->string (timeline-history-bytes parent))))
          (selection (unless (= parent (physical-store-timeline store))
@@ -181,6 +184,12 @@ Return the complete control tuple for the subsequent retirement check."
     (values parent text (getf selection :digest))))
 
 (defun physical-promotion-retained-source (state metadata fork store)
+  "Check receive provenance and prepare any missing base overlap.
+The caller holds the store mutex.  Check identity, archive path, floor and
+digest, full source control and the proven prefix, then restore source ownership.
+If the source root lacks overlap, capture the manifest-bound base WAL prefix;
+missing or corrupt base bytes fail.  At the base, the source root may be absent.  Beyond
+the base, an unrooted source requires reseeding."
   (physical-store-check-retained-identity store)
   (wal-ensure-directory-durable (physical-recovery-retained-directory))
   (let* ((identity (physical-store-retained-identity store))
@@ -210,6 +219,12 @@ Return the complete control tuple for the subsequent retirement check."
                   (physical-retained-overlap-encode overlap bytes)))))))
 
 (defun physical-promotion-publish-retained-intent (state metadata fork make-pending)
+  "Publish a fork-bounded root and durable pending control under store ownership.
+Hold the receive-store mutex through source validation, overlap capture, history
+projection, control publication, full receive and pending control readback, and
+pending owner handoff.  Keep the source owner.  At the base fork, the projected
+root has protected overlap and the fixed seed but no extents.  An uncertain
+control write retains its hold; the caller fences recovery on failure."
   (let ((store *physical-receive-store*))
     (with-physical-store (store)
       (multiple-value-bind (identity source-control history overlap-image)

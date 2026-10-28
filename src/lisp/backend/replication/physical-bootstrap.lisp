@@ -83,6 +83,13 @@ Validate the selected lineage before constructing the inventory."
     (sort (append files (physical-bootstrap-history-inventory *wal-insert-timeline*)) #'string<)))
 
 (defun physical-bootstrap-derived-wal-control (target)
+  "Derive target control when the source has a historical archive reference.
+Validate child control and require a checkpoint beyond the old fork.  Remove only
+the old reference from the target, preserving positions, snapshot, timelines,
+namespace and other metadata.  Atomically write and read back the complete tuple,
+then hash the actual target bytes.  Leave source control unchanged.  With no
+reference, return NIL so the ordinary copy preserves source bytes exactly.
+The new base receives its own archive; the old primary archive is not copied."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace metadata)
       (wal-read-control-fields)
     (let ((reference (getf metadata :retained-reference)))

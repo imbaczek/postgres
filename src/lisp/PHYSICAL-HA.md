@@ -628,9 +628,72 @@ resolved that mismatch without a production change. Luna max and Sol high cleare
 the code; Sol medium found no worthwhile refactor. Terra 6.1 wrote the source
 documentation, which received separate primary and Sol high reviews.
 
-The default producer remains rootless. Native rooted producer, cold restart and
-nested timeline 2-to-3 acceptance are the next milestone. Receive-owner retirement,
-scoped consumers and historical serving remain open; automatic GC remains disabled.
+At this checkpoint the default producer was still rootless. The next section
+records the rooted producer and native acceptance work completed since then.
+
+### Retained promotion producer and child base backup
+
+Promotion now projects the receive archive through the applied parent fork and
+publishes it with pending control. Under the receive-store mutex it checks source
+identity, archive path, floor, digest, full control and proven prefix; restores
+source ownership; captures missing manifest-bound base overlap; then projects the
+parent history, writes pending control and reads back both complete control tuples
+before handoff. The source owner remains protected. The parent's digest comes from
+its own receive selection, not a later target. At the base fork the root has overlap
+and the fixed seed but no extents; beyond the base, an unrooted source requires
+reseeding. The receive sealer itself does not create overlap. Missing or corrupt base
+bytes fail capture. Uncertain control failures retain the hold and fence recovery;
+pending runtime state is installed after handoff.
+
+A base backup from a child with a historical reference validates child control and
+a new checkpoint beyond the old fork. It removes that reference only in derived
+target control, preserving the remaining control tuple, then reads it back and
+hashes the actual target bytes. A rootless control is copied byte for byte; source
+control is unchanged. The new base identity gets a fresh receive archive rather than
+a copy of the old primary archive. This adapts a custom native field: C's base backup
+copies `pg_control` and WAL from its new checkpoint, rather than performing this
+native control rewrite. It does not establish C physical-format compatibility.
+
+All 708 physical tests and 170 interop tests pass, as does fresh private-cache
+compilation (`/tmp/pg-producer-final-cold.log`). The intent property passes 50 trials
+with seed 42 and matching digest `fnv1a64-v1:62e65d7f2ed89d2c`, and 50 with seed
+614527561962805442. The projector property passes 200 trials with seed 42 and
+matching digest `fnv1a64-v1:52839f1416fbe591`. No Function Spec is registered for
+publish intent; rejection counts and input coverage remain unmeasured.
+
+Native rooted resume passes its full matrix and three corrupt inventory, extent and
+overlap rejections (`/tmp/pg-producer-resume-final.log`,
+`/tmp/pg-promotion-resume.OY5yZu`). The commit matrix covers 20 points, including 19
+SIGKILL cuts, retired restartpoints and spool, a later checkpoint and recycling, and
+Patroni LSN fragments (`/tmp/pg-producer-commit-final.log`,
+`/tmp/pg-promotion-commit.yiP1p3`). Producer intent covers eight cases including
+seven SIGKILL cuts, three at root publication, control and handoff
+(`/tmp/pg-producer-intent-crash.log`, `/tmp/pg-promotion-intent.c8ppQG`).
+
+Native acceptance also covers a timeline-2 backup, receive/replay restart, a
+timeline-3 child control SIGKILL, removal of restartpoints, spool, manifest and the
+original timeline-2 history, cold primary startup, then a later checkpoint and
+crash restart with rows and writes (`/tmp/pg-producer-child-verified.log`,
+`/tmp/pg-operation-parking.yo9kgr`). Unit tests check a non-base parent selection
+against a later target, six error or throw cuts with ownership and reconciliation,
+non-root control readback mismatch, and the empty base-fork case. Independent Python
+oracles check hashes, CRCs, identity, source prefix, base-to-fork chain, history,
+selection digest, record boundaries, EOR and checkpoint timelines; seven rotation
+integrity fixtures pass. All three manual logical switchovers against C pass
+(`/tmp/pg-producer-switchover.log`); they are not physical compatibility tests.
+Luna max and Sol high cleared the code; Sol xhigh provided design advice, and Sol
+medium found no worthwhile LOC refactor. Terra 6.1 wrote the documentation, which
+received separate primary and Sol high reviews.
+
+Receive-owner retirement, scoped consumers, automatic GC and historical follow
+serving remain open. No coordination is added. A pre-existing native control utility
+issue remains: ordinary phase 0, 1 or 2 standby control on a timeline greater than
+one is misclassified by `native-control-capture`/`native-control-facts`; phase 3,
+startup and SQL classification are correct. Audit and test offline `pg_controldata`
+on a child standby before promotion next. The actual utility reproduces the error
+on the stopped standby in `/tmp/pg-operation-parking.P9FmuB/child-copy`, exits 1,
+and leaves all 22 captured storage files unchanged
+(`/tmp/pg-child-utility-before.log`, `/tmp/pg-child-utility-before.json`).
 
 ### SQL configuration reload
 

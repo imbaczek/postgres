@@ -262,6 +262,8 @@ phase-2 recovery can yield to shutdown."
 (declaim (ftype function physical-promotion-publish-retained-intent))
 
 (defun physical-promotion-make-pending (state metadata prefix generation namespace child time reference)
+  "Build pending control bytes and runtime state for the selected archive.
+The caller publishes the bytes and installs the state after owner handoff."
   (let* ((fork (getf metadata :lsn))
          (next (getf metadata :next-xid))
          (bytes (physical-recovery-control-image
@@ -286,7 +288,10 @@ phase-2 recovery can yield to shutdown."
 Before publishing intent, check the saved catalog against any live catalog and
 preflight the runtime allocation and retention state. A preflight rejection
 leaves phase 2 unchanged. The caller owns PGDATA and follow-command, reload
-and quiescence in that order; worker shutdown and join occur outside this call."
+and quiescence in that order; worker shutdown and join occur outside this call.
+Publish the retained parent prefix and pending control under the receive-store
+mutex.  Install pending runtime state only after control readback and owner
+handoff.  Failure during publication fences recovery."
   (with-physical-promotion-exclusion (2)
     (physical-recovery-publish-selected-history *physical-receive-store*)
     (let* ((state *physical-recovery-state*)
