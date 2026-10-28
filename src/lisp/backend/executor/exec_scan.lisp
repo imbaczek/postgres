@@ -248,7 +248,7 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
          (:timetz (sql-timetz-p value))
          (:float4 (typep value 'single-float))
          (:float8 (typep value 'double-float))
-         (:varchar (stringp value))
+         ((:varchar :text) (stringp value))
          (t nil))))
 
 (defun table-statistics-column (table attnum)
@@ -1425,6 +1425,7 @@ scopes to clean up."
 
 (defun materialize-select-tuple (table tuple snapshot &key (index-reader #'select-toast-index-reader))
   "Replace external attributes of parent TUPLE with SQL values in place.
+Varchar and text payloads become strings; bytea payloads remain octet vectors.
 For a normal scan the caller checks parent visibility and keeps SNAPSHOT active
 through the fetch. An index build may also fetch retained dead versions; its
 removal horizon and the active protection snapshot keep their chunks available.
@@ -1442,7 +1443,7 @@ TOAST chunk visibility follows the parent and is not independently filtered."
                                                  :index-reader index-reader)))
                    (setf (aref values i)
                          (case type
-                           (:varchar (bytes->string bytes))
+                           ((:varchar :text) (bytes->string bytes))
                            (:bytea bytes)
                            (otherwise (ereport "XX001" "external value has unsupported type")))))))
     tuple))

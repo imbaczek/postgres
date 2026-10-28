@@ -30,6 +30,7 @@
   (change-bytes 0) (changes '()) (transactions '()))
 
 (defun logical-type-code (type)
+  "Map a column type to its logical schema code; text and varchar are distinct."
   (case type
     (:int4 1)
     (:int8 2)
@@ -44,6 +45,7 @@
     (:timestamptz 11)
     (:interval 12)
     (:timetz 13)
+    (:text 14)
     (otherwise (error "logical replication does not support type ~a" type))))
 
 (defun logical-type-from-code (code)
@@ -61,6 +63,7 @@
     (11 :timestamptz)
     (12 :interval)
     (13 :timetz)
+    (14 :text)
     (otherwise (error "invalid logical column type code ~a" code))))
 
 (defun logical-kind-code (kind)
@@ -116,6 +119,7 @@
     (logical-write-octets buffer octets)))
 
 (defun logical-write-value (buffer type value)
+  "Encode a value; text and varchar share the UTF-8 value tag 3."
   (cond
     ((eq value +null+)
      (logical-write-u8 buffer 0))
@@ -162,7 +166,7 @@
      (unless (sql-numeric-p value) (error "invalid numeric logical row value ~s" value))
      (logical-write-u8 buffer 4)
      (logical-write-string-u32 buffer (sql-numeric-output value)))
-    ((eq type :varchar)
+    ((member type '(:varchar :text))
      (unless (stringp value)
        (error "invalid varchar logical row value ~s" value))
      (let ((octets (sb-ext:string-to-octets value :external-format :utf-8)))
@@ -364,6 +368,7 @@
   (if (logbitp 63 value) (- value #x10000000000000000) value))
 
 (defun logical-read-value (cursor type)
+  "Decode a value, accepting string tag 3 for either text or varchar."
   (let ((tag (logical-read-u8 cursor)))
     (case tag
       (0 +null+)
@@ -373,7 +378,7 @@
       (2 (unless (eq type :int8)
            (error "logical value tag does not match its column type"))
        (logical-u64-signed (logical-read-u64 cursor)))
-      (3 (unless (eq type :varchar)
+      (3 (unless (member type '(:varchar :text))
            (error "logical value tag does not match its column type"))
        (sb-ext:octets-to-string
         (logical-read-octets cursor (logical-read-u32 cursor))

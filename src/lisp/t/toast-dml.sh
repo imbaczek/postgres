@@ -24,6 +24,14 @@ test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
 big=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "a" }')
 other=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "b" }')
+run -c 'create table toast_text (id int primary key, v text)' >/dev/null
+run -c "insert into toast_text values (1, '$big')" >/dev/null
+[ "$(run -c 'select length(v) from toast_text where id = 1')" = 3000 ]
+[ "$(run -c "select v = '$big' from toast_text where id = 1")" = t ]
+run -c 'create index toast_text_v_idx on toast_text (v)' >/dev/null
+[ "$(run -c "select id from toast_text where v = '$big'")" = 1 ]
+[ "$(run -c "update toast_text set v = '$other' where id = 1 returning length(v)")" = 3000 ]
+[ "$(run -c 'delete from toast_text where id = 1 returning length(v)')" = 3000 ]
 run -c 'create table toast_dml (id int primary key, v varchar)' >/dev/null
 run -c "insert into toast_dml values (1, '$big')" >/dev/null
 run -c 'create index toast_dml_v_idx on toast_dml (v)' >/dev/null

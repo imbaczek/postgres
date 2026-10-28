@@ -293,7 +293,10 @@ REPLICA_TWO_PID=$SERVER_PID
 
 seed_copy_stress_table
 sql "$SOURCE_PORT" "SET DateStyle TO 'ISO, DMY'; SET TimeZone TO 'Europe/Warsaw'; CREATE TABLE bootstrap_temporal (id integer PRIMARY KEY, d date DEFAULT '01/02/2024' CHECK(d >= '01/02/2024') CHECK(d = ANY('{01/02/2024,04/03/2024}')), z timestamptz DEFAULT '01/02/2024 12:00:00', created timestamp DEFAULT 'now')" >/dev/null
-sql "$SOURCE_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label varchar(64)); CREATE TABLE bootstrap_constraint_order (a integer DEFAULT '1.5'::numeric CHECK(a > '0.25'::numeric), b integer, c integer, CONSTRAINT bootstrap_constraint_order_pkey PRIMARY KEY (a), CONSTRAINT bootstrap_constraint_order_b_key UNIQUE (b), CONSTRAINT bootstrap_constraint_order_c_key UNIQUE (c)); CREATE TABLE nullable_rows (nullable_key integer, label varchar(64)); CREATE UNIQUE INDEX nullable_rows_key_idx ON nullable_rows (nullable_key) NULLS NOT DISTINCT; CREATE TABLE ignored_rows (id integer PRIMARY KEY, label varchar(64)); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; ALTER SEQUENCE bootstrap_counter INCREMENT BY -2; SELECT setval('bootstrap_counter', 100, true); INSERT INTO replicated_rows VALUES (1, 10, 'initial'), (9, 90, 'remove'); INSERT INTO nullable_rows VALUES (NULL, 'initial-null'), (2, 'two'); INSERT INTO ignored_rows VALUES (1, 'before')"
+sql "$SOURCE_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label text); CREATE TABLE bootstrap_constraint_order (a integer DEFAULT '1.5'::numeric CHECK(a > '0.25'::numeric), b integer, c integer, CONSTRAINT bootstrap_constraint_order_pkey PRIMARY KEY (a), CONSTRAINT bootstrap_constraint_order_b_key UNIQUE (b), CONSTRAINT bootstrap_constraint_order_c_key UNIQUE (c)); CREATE TABLE nullable_rows (nullable_key integer, label varchar(64)); CREATE UNIQUE INDEX nullable_rows_key_idx ON nullable_rows (nullable_key) NULLS NOT DISTINCT; CREATE TABLE ignored_rows (id integer PRIMARY KEY, label varchar(64)); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; ALTER SEQUENCE bootstrap_counter INCREMENT BY -2; SELECT setval('bootstrap_counter', 100, true); INSERT INTO replicated_rows VALUES (1, 10, 'initial'), (9, 90, 'remove'); INSERT INTO nullable_rows VALUES (NULL, 'initial-null'), (2, 'two'); INSERT INTO ignored_rows VALUES (1, 'before')"
+
+long_text=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "x" }')
+sql "$SOURCE_PORT" "UPDATE replicated_rows SET label = '$long_text' WHERE id = 1" >/dev/null
 
 # Isolate the failed initial-copy slot on a disposable publisher. Its exported
 # snapshot intentionally remains available for retry, so it must not hold the
@@ -302,7 +305,7 @@ start_server "$SOURCE_DRIFT_PORT" "$TMP/source-drift-data" "$TMP/source-drift.lo
 SOURCE_DRIFT_PID=$SERVER_PID
 sql "$SOURCE_PORT" "ALTER TABLE bootstrap_constraint_order ADD CONSTRAINT bootstrap_later CHECK(b IS NULL OR b>0) NOT VALID" >/dev/null
 
-sql "$SOURCE_DRIFT_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label varchar(64)); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; SELECT setval('bootstrap_counter', 100, true)"
+sql "$SOURCE_DRIFT_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label text); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; SELECT setval('bootstrap_counter', 100, true)"
 
 # A fresh subscriber with a pre-existing incompatible table and sequence must
 # fail before initial-copy reset or sequence-state bootstrap changes either one.
@@ -526,6 +529,8 @@ sql "$SOURCE_PORT" "BEGIN; INSERT INTO replicated_rows VALUES (77, 770, 'aborted
 # its target's durable marker without duplicating the transaction applied above.
 sql "$SOURCE_PORT" "BEGIN; UPDATE replicated_rows SET amount = 22, label = 'resumed' WHERE id = 2; INSERT INTO replicated_rows VALUES (4, 40, 'later'); DELETE FROM nullable_rows WHERE nullable_key IS NULL; COMMIT"
 sql "$SOURCE_PORT" "ALTER TABLE replicated_rows ADD CONSTRAINT replicated_rows_amount_key UNIQUE (amount); CREATE INDEX replicated_rows_id_amount_idx ON replicated_rows (id, amount); CREATE INDEX ignored_rows_label_idx ON ignored_rows (label); CREATE SEQUENCE streaming_counter START WITH 10 INCREMENT BY 5; SELECT nextval('streaming_counter'); ALTER SEQUENCE streaming_counter INCREMENT BY -3; SELECT nextval('streaming_counter')"
+long_text_stream=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "y" }')
+sql "$SOURCE_PORT" "UPDATE replicated_rows SET label = '$long_text_stream' WHERE id = 1" >/dev/null
 disconnected_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
 expected_final=$(sql "$SOURCE_PORT" "SELECT id, amount, label FROM replicated_rows ORDER BY id")
 "$BASE/pg-lisp-subscribe" --slot logical_replica_two \

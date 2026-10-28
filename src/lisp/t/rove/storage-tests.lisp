@@ -236,6 +236,18 @@
         (rove:ok (equal (mapcar #'car plan) (if (= length 24) '(1) nil))
                  "candidate size is strictly larger than aligned external pointer")))))
 
+(rove:deftest test-text-storage-and-metadata
+    (let* ((column (make-pg-column :name "t" :type :text :typmod -1 :attnum 1))
+           (columns (vector column))
+           (value (format nil "Zażółć ~a" (make-string 300 :initial-element #\x)))
+           (values (vector value))
+           (tuple (form-heap-tuple values columns 3 0 0 0 0)))
+      (rove:ok (equalp values (deform-heap-tuple tuple columns))
+               "inline text uses UTF-8 varlena storage")
+      (rove:ok (= 25 (type-oid :text)) "text has PostgreSQL OID 25")
+      (rove:ok (string= "\"t\" text" (catalog-column-definition-sql column))
+               "bootstrap schema retains the text type")))
+
 (rove:deftest test-tuple-roundtrip
     (let* ((cols (coerce
                   (list (make-pg-column :name "a" :type :int4 :typmod -1

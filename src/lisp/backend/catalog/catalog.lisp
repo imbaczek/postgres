@@ -1127,7 +1127,9 @@ from advancing the shared WAL generation between a failed save and rollback."
                                      (precision (ldb (byte 16 16) packed))
                                      (scale (- (logxor (logand packed #x7ff) #x400) #x400)))
                                 (format nil "numeric(~d,~d)" precision scale)))))
-              (:varchar (format nil "varchar(~a)" (- (pg-column-typmod column) 4)))
+              (:text "text")
+              (:varchar (if (< (pg-column-typmod column) 4) "varchar"
+                            (format nil "varchar(~a)" (- (pg-column-typmod column) 4))))
               (otherwise (error "cannot publish unsupported type ~a" (pg-column-type column)))))
     (when (pg-column-notnull column) (write-string " NOT NULL" stream))
     (cond ((pg-column-default-sql column)
@@ -1504,7 +1506,7 @@ The OID encoding alone is a byte prefix of every key for that value."
   "Default target heap tuple size, based on four tuples per page.")
 
 (defun toast-externalization-plan (values columns &optional (target +toast-tuple-target+))
-  "Select inline varchar and bytea attributes to externalize without compression.
+  "Select inline varchar, text and bytea attributes to externalize without compression.
 Return (index . payload) pairs in largest-first order; VALUES and COLUMNS are
 unchanged. Payloads may alias inline bytea values and must remain stable until
 used. The target is a goal, not a guarantee: selection stops when the tuple fits
@@ -1525,7 +1527,7 @@ and externalization of other variable-width types are not implemented."
           (loop for i below (length columns)
                 for value = (aref physical i)
                 for type = (pg-column-type (aref columns i))
-                when (and (member type '(:varchar :bytea))
+                when (and (member type '(:varchar :text :bytea))
                           (not (eq value +null+))
                           (not (heap-external-varlena-p value)))
                   do (let* ((payload (aref encoded i))

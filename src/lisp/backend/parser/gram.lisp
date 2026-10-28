@@ -827,7 +827,7 @@
               ((string= name "float8") (values :float8 -1))
               ((string= name "numeric") (values :numeric (parse-numeric-typmod p)))
               ((string= name "varchar") (values :varchar (parse-varchar-typmod p)))
-              ((string= name "text") (values :varchar 130))
+              ((string= name "text") (values :text -1))
               (t (ereport "0A000" "unsupported storage type \"~a\"" name))))))
   (cond
     ((match-kw p "date") (values :date -1))
@@ -852,11 +852,7 @@
     ((match-kw p "character")
      (expect-kw p "varying")
      (values :varchar (parse-varchar-typmod p)))
-    ((match-kw p "text")
-     ;; Temporary compatibility alias: text currently has varchar(126)
-     ;; storage and length semantics.  Keep the real type distinction as a
-     ;; TODO; PostgreSQL assigns text a distinct type OID and no typmod.
-     (values :varchar (+ 126 4)))
+    ((match-kw p "text") (values :text -1))
     ((match-kw p "serial")
      (ereport "0A000" "type serial is not supported"))
     (t

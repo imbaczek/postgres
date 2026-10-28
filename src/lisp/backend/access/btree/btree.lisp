@@ -861,7 +861,7 @@ the MVP types. Null sorts before any non-null value; ints are sign-flipped."
                                       (loop for i below end
                                             do (ordered-byte (1+ (digit-char-p (char digits i)))))
                                       (ordered-byte 0)))))))))
-                 ((eq ty :varchar)
+                 ((member ty '(:varchar :text))
                   (push-byte 3)
                   (let ((data (string->bytes v)))
                     (push-byte (ldb (byte 8 8) (length data)))

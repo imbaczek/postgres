@@ -43,6 +43,19 @@
                            (logical-decode-change (logical-encode-change event))))
                  "logical schema names use lengths large enough for valid identifiers"))))
 
+(rove:deftest test-logical-text-row-change
+    (let* ((value (format nil "~a~a" "Zażółć " (make-string 3000 :initial-element #\x)))
+           (event (logical-test-change :insert 7 701 :new-values (vector 10 120 value))))
+      (setf (getf (third (logical-change-columns event)) :type) :text
+            (getf (third (logical-change-columns event)) :typmod) -1)
+      (let ((decoded (logical-decode-change (logical-encode-change event))))
+        (rove:ok (eq :text (getf (third (logical-change-columns decoded)) :type))
+                 "logical WAL retains the distinct text type")
+        (rove:ok (equal value (aref (logical-change-new-values decoded) 2))
+                 "logical WAL retains long UTF-8 text"))
+      (rove:ok (= 25 (pgoutput-type-oid :text)) "pgoutput advertises text OID 25")
+      (rove:ok (logical-type-supported-p 25) "subscriber accepts text OID 25")))
+
 (rove:deftest test-logical-pgoutput-v2-codec
     ;; Compare the v2 message shapes with pgoutput.c's Relation/Begin/Commit and
     ;; logicalrep_write_insert/update/delete in src/backend/replication/.
