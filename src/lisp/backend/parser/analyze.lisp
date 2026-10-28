@@ -387,6 +387,25 @@ Convert supplied expressions in source order, then return them in parameter orde
                     (t :text))
         :typmod -1))
 
+(defun analyze-trig-function (name args)
+  "Resolve the float8-only mathematical functions."
+  (unless (and (= (length args) (cond ((string= name "pi") 0)
+                                      ((member name '("atan2" "atan2d") :test #'string=) 2)
+                                      (t 1)))
+               (every (lambda (arg)
+                        (or (in-unknown-constant-p arg)
+                            (sql-implicit-coercion-p (expr-type arg) :float8)))
+                      args))
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+  (list :func name (mapcar (lambda (arg) (coerce-common-expression arg :float8)) args)
+        :type :float8 :typmod -1))
+
+(defun trig-function-p (name)
+  (member name '("pi" "cbrt" "dcbrt" "degrees" "radians" "sin" "cos" "tan" "cot"
+                 "asin" "acos" "atan" "atan2" "sind" "cosd" "tand" "cotd"
+                 "asind" "acosd" "atand" "atan2d" "sinh" "cosh" "tanh"
+                 "asinh" "acosh" "atanh") :test #'string=))
+
 (defun analyze-basic-numeric-function (name args)
   "Resolve the supported basic numeric overload and coerce its arguments.
 Two-argument round and trunc use numeric and an int4 scale.  Unary abs
@@ -600,6 +619,7 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     (cond
+      ((trig-function-p name) (analyze-trig-function name args))
       ((string= name "width_bucket") (analyze-width-bucket args))
       ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
                :test #'string=)
@@ -1859,7 +1879,8 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
   (and (consp form)
        (or (eq (first form) :subplan)
            (and (eq (first form) :func)
-                (not (or (numeric-arithmetic-function-p (second form))
+                (not (or (trig-function-p (second form))
+                         (numeric-arithmetic-function-p (second form))
                          (member (second form)
                                  '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                    "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
@@ -2763,6 +2784,10 @@ aliases share the corresponding numeric operator implementation."
             (cond ((eq value +null+) +null+)
                   ((eq type :numeric) (sql-numeric-sqrt value))
                   (t (sql-float-sqrt value)))))
+         ((trig-function-p name)
+          (cond ((string= name "pi") pi)
+                ((member +null+ arguments) +null+)
+                (t (sql-float-trig name arguments))))
          ((numeric-arithmetic-function-p name)
           (eval-numeric-arithmetic-function name arguments type))
          ((member name '("scale" "min_scale" "trim_scale") :test #'string=)

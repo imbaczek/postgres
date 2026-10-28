@@ -206,6 +206,122 @@
         ((sb-ext:float-nan-p right) -1)
         ((< left right) -1) ((> left right) 1) (t 0)))
 
+(sb-alien:define-alien-routine ("acos" sql-libm-acos) sb-alien:double (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("asin" sql-libm-asin) sb-alien:double (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("atan" sql-libm-atan) sb-alien:double (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("atan2" sql-libm-atan2) sb-alien:double (y sb-alien:double) (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("sin" sql-libm-sin) sb-alien:double (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("cos" sql-libm-cos) sb-alien:double (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("tan" sql-libm-tan) sb-alien:double (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("sinh" sql-libm-sinh) sb-alien:double (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("cosh" sql-libm-cosh) sb-alien:double (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("tanh" sql-libm-tanh) sb-alien:double (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("asinh" sql-libm-asinh) sb-alien:double (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("acosh" sql-libm-acosh) sb-alien:double (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("atanh" sql-libm-atanh) sb-alien:double (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("cbrt" sql-libm-cbrt) sb-alien:double (x sb-alien:double))
+
+(sb-alien:define-alien-routine ("fmod" sql-libm-fmod) sb-alien:double (x sb-alien:double) (y sb-alien:double))
+
+(defun sql-sind-q1 (x)
+  (if (<= x 30d0)
+      (/ (/ (sql-libm-sin (* x (/ pi 180d0)))
+            (sql-libm-sin (* 30d0 (/ pi 180d0)))) 2d0)
+      (- 1d0 (/ (/ (- 1d0 (sql-libm-cos (* (- 90d0 x) (/ pi 180d0))))
+                   (- 1d0 (sql-libm-cos (* 60d0 (/ pi 180d0))))) 2d0))))
+
+(defun sql-cosd-q1 (x)
+  (if (<= x 60d0)
+      (- 1d0 (/ (/ (- 1d0 (sql-libm-cos (* x (/ pi 180d0))))
+                   (- 1d0 (sql-libm-cos (* 60d0 (/ pi 180d0))))) 2d0))
+      (/ (/ (sql-libm-sin (* (- 90d0 x) (/ pi 180d0)))
+            (sql-libm-sin (* 30d0 (/ pi 180d0)))) 2d0)))
+
+(defun sql-asind-q1 (x)
+  (if (<= x 0.5d0)
+      (* (/ (sql-libm-asin x) (sql-libm-asin 0.5d0)) 30d0)
+      (- 90d0 (* (/ (sql-libm-acos x) (sql-libm-acos 0.5d0)) 60d0))))
+
+(defun sql-acosd-q1 (x)
+  (if (<= x 0.5d0)
+      (- 90d0 (* (/ (sql-libm-asin x) (sql-libm-asin 0.5d0)) 30d0))
+      (* (/ (sql-libm-acos x) (sql-libm-acos 0.5d0)) 60d0)))
+
+(defun sql-float-trig (name args)
+  "Evaluate float.c's trigonometric and hyperbolic functions using libm.
+ARGS contains float8 arguments in SQL order; callers handle NULLs.  NaN
+propagates, invalid domains signal 22003, and poles can return infinity.
+Degree functions reduce angles to the first quadrant and use the normalized
+special-angle formulas from float.c, preserving its exact results at those angles."
+  (let ((x (first args)) (y (second args)))
+    (when (or (sb-ext:float-nan-p x) (and y (sb-ext:float-nan-p y)))
+      (return-from sql-float-trig (sql-float-from-bits #x7ff8000000000000 :float8)))
+    (when (and (member name '("asin" "acos" "asind" "acosd" "atanh") :test #'string=)
+               (or (< x -1d0) (> x 1d0)))
+      (ereport "22003" "input is out of range"))
+    (when (and (string= name "acosh") (< x 1d0))
+      (ereport "22003" "input is out of range"))
+    (when (and (member name '("sin" "cos" "tan" "cot" "sind" "cosd" "tand" "cotd") :test #'string=)
+               (sb-ext:float-infinity-p x))
+      (ereport "22003" "input is out of range"))
+    (sb-int:with-float-traps-masked (:invalid :inexact :underflow :overflow :divide-by-zero)
+      (cond
+        ((string= name "asin") (sql-libm-asin x))
+        ((string= name "acos") (sql-libm-acos x))
+        ((string= name "atan") (sql-libm-atan x))
+        ((string= name "atan2") (sql-libm-atan2 x y))
+        ((string= name "sin") (sql-libm-sin x))
+        ((string= name "cos") (sql-libm-cos x))
+        ((string= name "tan") (sql-libm-tan x))
+        ((string= name "cot") (/ 1d0 (sql-libm-tan x)))
+        ((string= name "sinh") (sql-libm-sinh x))
+        ((string= name "cosh") (sql-libm-cosh x))
+        ((string= name "tanh") (sql-libm-tanh x))
+        ((string= name "asinh") (sql-libm-asinh x))
+        ((string= name "acosh") (sql-libm-acosh x))
+        ((string= name "atanh") (sql-libm-atanh x))
+        ((member name '("cbrt" "dcbrt") :test #'string=) (sql-libm-cbrt x))
+        ((string= name "degrees") (sql-float-arithmetic "/" x (/ pi 180d0)))
+        ((string= name "radians") (sql-float-arithmetic "*" x (/ pi 180d0)))
+        ((string= name "asind") (if (>= x 0d0) (sql-asind-q1 x) (- (sql-asind-q1 (- x)))))
+        ((string= name "acosd") (if (>= x 0d0) (sql-acosd-q1 x) (+ 90d0 (sql-asind-q1 (- x)))))
+        ((string= name "atand") (* (/ (sql-libm-atan x) (sql-libm-atan 1d0)) 45d0))
+        ((string= name "atan2d") (* (/ (sql-libm-atan2 x y) (sql-libm-atan 1d0)) 45d0))
+        (t
+         (let ((angle (sql-libm-fmod x 360d0)) (sign 1d0))
+           (when (< angle 0d0)
+             (setf angle (- angle))
+             (unless (string= name "cosd") (setf sign (- sign))))
+           (when (> angle 180d0)
+             (setf angle (- 360d0 angle))
+             (unless (string= name "cosd") (setf sign (- sign))))
+           (when (> angle 90d0)
+             (setf angle (- 180d0 angle))
+             (unless (string= name "sind") (setf sign (- sign))))
+           (let* ((s (sql-sind-q1 angle))
+                  (c (sql-cosd-q1 angle))
+                  (result (* sign
+                             (cond ((string= name "sind") s)
+                                   ((string= name "cosd") c)
+                                   ((string= name "tand")
+                                    (/ (/ s c) (/ (sql-sind-q1 45d0) (sql-cosd-q1 45d0))))
+                                   (t (/ (/ c s) (/ (sql-cosd-q1 45d0) (sql-sind-q1 45d0))))))))
+             (if (and (member name '("tand" "cotd") :test #'string=) (zerop result))
+                 0d0 result))))))))
+
 (defun sql-float-sqrt (value)
   "Return the float8 square root, rejecting negative values as float.c does.
 NaN and positive infinity pass through, and negative zero retains its sign."

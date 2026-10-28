@@ -231,6 +231,18 @@ also accept floating-point inputs; the explicitly numeric forms use numeric
 arithmetic. Logarithms reject zero and negative arguments, and a base of one,
 with SQLSTATE `2201E`. These functions return NULL when an argument is NULL.
 
+Floating-point math also includes `pi`, `degrees`, `radians`, `cbrt`/`dcbrt`,
+`sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`, and `atan2`; the
+degree-based variants are `sind`, `cosd`, `tand`, `cotd`, `asind`, `acosd`,
+`atand`, and `atan2d`. Hyperbolic functions include `sinh`, `cosh`, `tanh`,
+`asinh`, `acosh`, and `atanh`. These accept arguments coercible to float8 and
+return float8; a NULL argument yields NULL. The trigonometric functions use
+radians unless their names end in `d`. Degree-based functions reduce angles
+and use PostgreSQL's special-angle formulas. NaN propagates, infinite inputs
+to sine, cosine, tangent, and cotangent raise `22003`, and out-of-domain
+inverse functions raise `22003`. Poles such as `cotd(0)` and `atanh(1)`
+return infinity. Results depend on the host math library for general inputs.
+
 `div(x, y)` and `numeric_div_trunc(x, y)` return a numeric quotient truncated
 toward zero. `mod(x, y)` supports numeric and integer overloads; `numeric_mod`
 uses numeric. The remainder has the dividend's sign, so `mod(-5, 2)` is -1.
