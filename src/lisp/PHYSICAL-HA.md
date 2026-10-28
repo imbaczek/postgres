@@ -461,6 +461,47 @@ baseline and passed 200 trials each with seeds 42 and `1397983632957994830`;
 the seed 42 replay matched digest `fnv1a64-v1:2bc44affd9033239`. There is no
 function spec; rejection counts and input coverage are unmeasured.
 
+The private binding codec and admission guards are now in place. The existing
+`PGPHYSICALFOLLOW1` envelope still accepts the four-field bootstrap config; an
+optional fifth field carries a strict version 1 binding. It contains the anchor,
+supplied immediate-child history whose parsed ancestry must match the source-history
+projection, before and after 11-field receive-control tuples,
+applied and required LSN/timeline pairs, and a named phase-2 recovery witness
+with cluster identity, checkpoint, observed next XID, old history reference and
+restartpoint token. The codec checks representation, ancestry, selection digest and
+preservation of root, base and floor for catch-up or rewind plans. It does not
+prove source data, compare witnesses to durable state or reconcile a binding.
+The whole file is bounded to 64 MiB plus 64 KiB before parsing; each history is
+bounded to 16 MiB.
+
+Both `:pending` and `:active` binding phases are inert. Start, stop, launch and
+cold storage startup reject any fifth field before replacing or deleting the
+config, creating workers, publishing control, changing storage or redoing WAL.
+There is no production binding creator or disabled phase, and no format version
+bump or coordination protocol.
+
+The next reconciler must compare the witnesses with fresh durable control,
+provenance and restartpoint state, without treating cold runtime reset to base
+LSN/timeline or housekeeping normalization as durable progress. A read-only
+fork candidate scan must prove clean applied and fork boundaries and prior EOR
+initialization, allocation and membership. The observed XID belongs to the
+required frontier R, not the fork, which may advance it. If R precedes the
+restartpoint seed, preserve the observed floor N and require the seed at least N;
+do not require equality. Run the scan outside the held store mutex because the
+candidate shares it. Pending validation needs exact R, N, restartpoint and allowed
+old/post control combinations; active validation must allow legitimate later
+progress. The bound client and parent/CopyDone loop remain unimplemented.
+
+The full run passed 768 physical tests with no failures or pending tests, 170
+interop tests and a fresh strict compile. The physical result was recovered from
+the same idle worker's suite report after the 300-second transport timeout. Native
+PREPARE, follow, promotion and SIGKILL acceptance passed
+(`/tmp/pg-follow-binding-native.log`, artifacts `/tmp/pg-operation-parking.LblnQQ`).
+The full-width proof/root property passed 200 trials each with seeds 42 and
+`964605004439559528`, with seed 42 replay matching digest
+`fnv1a64-v1:abbede08427eaa38`. There is no function spec; rejection counts and
+input coverage are unmeasured.
+
 ### Historical WAL retention implementation order
 
 Preserve the receive floor's current checksum-seed meaning. Before any compaction

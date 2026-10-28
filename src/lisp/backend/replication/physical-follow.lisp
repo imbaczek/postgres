@@ -95,22 +95,28 @@
   (merge-pathnames "physical-follow.control" *pgdata*))
 
 (defconstant +physical-follow-config-maximum-bytes+
-  (+ (* 4 +physical-store-history-maximum-bytes+) 65536))
+  (+ (* 4 +physical-store-history-maximum-bytes+) 65536)
+  "Maximum config envelope size before parsing, including bounded histories.")
 
 (defparameter *physical-follow-binding-keys*
-  '(:version :phase :anchor :child-history :before :after :applied :required :recovery))
+  '(:version :phase :anchor :child-history :before :after :applied :required :recovery)
+  "Exact keys of the optional version 1 binding.")
 
 (defun physical-follow-binding-pair-p (pair)
+  "Recognize a bounded (LSN timeline) pair."
   (and (listp pair) (= 2 (length pair))
        (typep (first pair) '(unsigned-byte 64))
        (typep (second pair) '(integer 1 4294967295))))
 
 (defun physical-follow-binding-reference-p (timeline digest)
+  "Recognize an absent or complete selected-history reference."
   (or (and (null timeline) (null digest))
       (and (typep timeline '(integer 2 4294967295))
            (typep digest '(unsigned-byte 64)))))
 
 (defun physical-follow-binding-control-check (tuple)
+  "Check the representation and internal bounds of a receive-control tuple.
+Use PHYSICAL-STORE-CONTROL-TUPLE's field order; no durable file is read here."
   (unless (and (listp tuple) (= 11 (length tuple))
                (every (lambda (index) (typep (nth index tuple) '(unsigned-byte 64)))
                       '(0 2 3 4 5 6 9))
@@ -123,6 +129,9 @@
   tuple)
 
 (defun physical-follow-binding-recovery-check (witness before applied)
+  "Check the named phase-2 recovery witness against the saved tuple and applied pair.
+Identity, checkpoint, observed XID, old history reference and restartpoint token
+still require comparison with durable recovery state."
   (physical-follow-check-plist
    witness '(:phase :cluster-identity :checkpoint :observed-next-xid
              :history-target :history-digest :restartpoint))
@@ -144,6 +153,7 @@
       (error "invalid follow recovery witness"))))
 
 (defun physical-follow-binding-selection-digest (anchor child history before digest)
+  "Derive the candidate selection digest from the anchor and immediate child history."
   (physical-store-update-digest
    #xCBF29CE484222325
    (physical-store-history-image
@@ -153,6 +163,9 @@
           :previous-digest (ninth before) :eor-octets (getf anchor :eor-octets)))))
 
 (defun physical-follow-binding-transition-check (anchor text before after)
+  "Check the catch-up or rewind plan and its immediate child history.
+The source history can extend beyond that child. Preserve the base, floor,
+manifest and root fields, and validate the proposed selection digest."
   (multiple-value-bind (history fork eor) (physical-follow-anchor-check anchor)
     (let* ((child (timeline-check-end-of-recovery eor (getf anchor :receive-timeline) history))
            (child-history (timeline-check-lineage (timeline-parse-history child text))))
@@ -174,6 +187,10 @@
       child-history)))
 
 (defun physical-follow-binding-check (binding)
+  "Validate the shape and internal coherence of a version 1 follow binding.
+The anchor, immediate child history, before and after control tuples, applied and
+required pairs and recovery witness describe a plan, not durable proof.
+Neither binding phase is admitted by the current receiver."
   (physical-follow-check-plist binding *physical-follow-binding-keys*)
   (let* ((anchor (getf binding :anchor)) (text (getf binding :child-history))
                                          (before (physical-follow-binding-control-check (getf binding :before)))
@@ -207,6 +224,8 @@
   binding)
 
 (defun physical-follow-check-config (config)
+  "Check a version 1 bootstrap config or its optional fifth binding field.
+A valid binding does not authorize starting a bound receiver."
   (unless (and (listp config) (member (length config) '(4 5)) (eql 1 (first config))
                (stringp (second config)) (<= 1 (length (second config)) 255)
                (notany (lambda (char) (< (char-code char) 32)) (second config))
@@ -217,6 +236,7 @@
   config)
 
 (defun physical-follow-config-image (config)
+  "Encode a checked config in the existing bounded PGPHYSICALFOLLOW1 envelope."
   (physical-follow-check-config config)
   (let* ((text (physical-bootstrap-manifest-text config))
          (crc (wal-crc32 (string->bytes text)))
@@ -226,9 +246,12 @@
     bytes))
 
 (defun physical-follow-save-config (config)
+  "Atomically write a checked config image."
   (wal-atomic-write-bytes (physical-follow-config-path) (physical-follow-config-image config)))
 
 (defun physical-follow-decode-config (bytes)
+  "Check the bounded envelope and checksum, then validate its literal payload.
+Validation checks coherence, not durable state or source proof."
   (unless (<= (length bytes) +physical-follow-config-maximum-bytes+)
     (error "native physical follow configuration exceeds its reopen bound"))
   (let* ((text (bytes->string bytes)) (newline (position #\Newline text))
@@ -243,16 +266,19 @@
       (physical-follow-check-config (recovery-parse-manifest-text body)))))
 
 (defun physical-follow-read-config ()
+  "Read the whole bounded config file before decoding it."
   (physical-follow-decode-config
    (recovery-read-bytes (physical-follow-config-path) :maximum +physical-follow-config-maximum-bytes+)))
 
 (defun physical-follow-require-bootstrap-config (config)
+  "Reject either binding phase until reconciliation and bound receiving exist."
   (physical-follow-check-config config)
   (when (= 5 (length config))
     (error "native follow binding requires reconciliation and bound receiver support"))
   config)
 
 (defun physical-follow-check-startup-config ()
+  "Reject a saved binding before startup can mutate storage or begin redo."
   (when (probe-file (physical-follow-config-path))
     (physical-follow-require-bootstrap-config (physical-follow-read-config))))
 
@@ -436,7 +462,8 @@ Include the verified base manifest digest when it is available."
            (sleep 0.05)))
 
 (defun physical-follow-launch (config)
-  "Called with the command mutex held; publish only a complete worker pair."
+  "Launch a four-field bootstrap config with the command mutex held.
+Reject bindings before creating workers; publish only a complete worker pair."
   (check-physical-recovery-worker-start)
   (physical-follow-require-bootstrap-config config)
   (sb-thread:with-mutex (*physical-follow-lock*)
@@ -462,7 +489,8 @@ Include the verified base manifest digest when it is available."
           (setf (physical-follow-runtime-stopped-p runtime) t ready t))))))
 
 (defun physical-follow-start (host port pin)
-  "Persist a native source endpoint and run receipt/replay; never authorize a writer."
+  "Persist a four-field bootstrap endpoint and run receipt and replay.
+Reject a saved binding before replacing its config; never authorize a writer."
   (when (plusp *live-operation-depth*) (error "follow start requires its own operation admission"))
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (check-physical-recovery-worker-start)
@@ -498,7 +526,8 @@ Include the verified base manifest digest when it is available."
   :stopped)
 
 (defun physical-follow-stop ()
-  "Disable automatic receipt durably; keep recovery role, spool and applied data."
+  "Disable bootstrap receipt durably; keep recovery role, spool and applied data.
+Reject a saved binding before deleting its config or stopping workers."
   (when (plusp *live-operation-depth*) (error "follow stop must join outside operation admission"))
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (with-live-operation

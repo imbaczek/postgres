@@ -474,7 +474,8 @@ A nonpending standby cannot fall back to primary startup when validation fails."
 (declaim (ftype function physical-follow-check-startup-config))
 
 (defun physical-recovery-prepare-with-namespace ()
-  "Validate the base image, history and checkpoint provenance before publishing active recovery.
+  "Reject a saved follow binding, then validate base image, history and checkpoint
+provenance before publishing active recovery.
 Pending promotion is reconciled separately."
   (physical-recovery-check-required-marker)
   (physical-follow-check-startup-config)
@@ -551,7 +552,9 @@ Pending promotion is reconciled separately."
 (declaim (ftype function physical-recovery-publish-selected-history))
 
 (defun physical-recovery-open-storage ()
-  "Open verified recovery; phase 2 redoes its entire retained prefix before SQL."
+  "Open verified recovery; phase 2 redoes its entire retained prefix before SQL.
+Reject a saved follow binding before storage changes, attachment or redo; its
+reconciler and bound receiver are not yet implemented."
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
   (physical-follow-check-startup-config)
   (let ((streaming (= 2 (getf *physical-recovery-state* :phase))))
