@@ -259,12 +259,33 @@ phase-2 recovery can yield to shutdown."
 
 (declaim (ftype function physical-promotion-preflight-runtime))
 
+(declaim (ftype function physical-promotion-publish-retained-intent))
+
+(defun physical-promotion-make-pending (state metadata prefix generation namespace child time reference)
+  (let* ((fork (getf metadata :lsn))
+         (next (getf metadata :next-xid))
+         (bytes (physical-recovery-control-image
+                 3 (getf state :system-id) (getf state :timeline)
+                 (getf state :manifest-digest) (getf state :checkpoint) fork next
+                 :state-time time :promotion-child child :promotion-generation generation
+                 :applied-timeline (physical-recovery-replay-timeline state)
+                 :history-target (getf state :history-target) :history-digest (getf state :history-digest)
+                 :promotion-source-namespace namespace :retained-reference reference))
+         (pending (copy-list state)))
+    (loop for (key value) on (physical-recovery-decode-control bytes) by #'cddr
+          do (setf (getf pending key) value))
+    (setf (getf pending :required-applied) fork (getf pending :observed-next-xid) next
+          (getf pending :wal-prefix-lsn) fork (getf pending :wal-prefix-bytes) prefix
+          (getf pending :source-checkpoint) (copy-list (getf metadata :source-checkpoint))
+          (getf pending :source-reservation) (copy-list (getf metadata :source-reservation)))
+    (values bytes pending)))
+
 (defun physical-promotion-publish-intent (&optional requested-child)
   "Privately bind a chosen child to verified local recovery without granting writer authority.
 
 Before publishing intent, check the saved catalog against any live catalog and
-preflight the runtime allocation and retention state.  A preflight rejection
-leaves phase 2 unchanged.  The caller owns PGDATA and follow-command, reload
+preflight the runtime allocation and retention state. A preflight rejection
+leaves phase 2 unchanged. The caller owns PGDATA and follow-command, reload
 and quiescence in that order; worker shutdown and join occur outside this call."
   (with-physical-promotion-exclusion (2)
     (physical-recovery-publish-selected-history *physical-receive-store*)
@@ -279,24 +300,14 @@ and quiescence in that order; worker shutdown and join occur outside this call."
         (multiple-value-bind (fork next) (physical-promotion-check-progress state metadata prefix generation)
           (physical-promotion-preflight-runtime
            next (getf (getf metadata :source-reservation) :bound) fork)
-          (let* ((time (- (get-universal-time) 2208988800))
-                 (bytes (physical-recovery-control-image
-                         3 (getf state :system-id) (getf state :timeline)
-                         (getf state :manifest-digest) (getf state :checkpoint) fork next
-                         :state-time time :promotion-child child :promotion-generation generation
-                         :applied-timeline (physical-recovery-replay-timeline state)
-                         :history-target (getf state :history-target) :history-digest (getf state :history-digest)
-                         :promotion-source-namespace namespace))
-                 (pending (copy-list state)) (finished nil))
-            (loop for (key value) on (physical-recovery-decode-control bytes) by #'cddr
-                  do (setf (getf pending key) value))
-            (setf (getf pending :required-applied) fork (getf pending :observed-next-xid) next
-                  (getf pending :wal-prefix-lsn) fork (getf pending :wal-prefix-bytes) prefix
-                  (getf pending :source-checkpoint) (copy-list (getf metadata :source-checkpoint))
-                  (getf pending :source-reservation) (copy-list (getf metadata :source-reservation)))
+          (let ((time (- (get-universal-time) 2208988800)) (finished nil))
             (unwind-protect
-                 (progn
-                   (physical-recovery-persist-control-bytes bytes +db-in-archive-recovery+)
+                 (let ((pending
+                         (physical-promotion-publish-retained-intent
+                          state metadata fork
+                          (lambda (reference)
+                            (physical-promotion-make-pending
+                             state metadata prefix generation namespace child time reference)))))
                    (setf *physical-recovery-state* pending)
                    (physical-recovery-control-test-point :after-write +db-in-archive-recovery+)
                    (setf finished t)

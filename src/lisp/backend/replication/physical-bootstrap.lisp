@@ -82,8 +82,37 @@ Validate the selected lineage before constructing the inventory."
               do (push (concatenate 'string "pg_wal/" (file-namestring (wal-segment-path segment))) files))))
     (sort (append files (physical-bootstrap-history-inventory *wal-insert-timeline*)) #'string<)))
 
+(defun physical-bootstrap-derived-wal-control (target)
+  (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace metadata)
+      (wal-read-control-fields)
+    (let ((reference (getf metadata :retained-reference)))
+      (when reference
+        (wal-require-supported-timelines insertion checkpoint-timeline)
+        (unless (and snapshot (> checkpoint (getf reference :end)))
+          (error "base backup checkpoint does not supersede its historical archive"))
+        (let ((copied (copy-list metadata))
+              (path (merge-pathnames "global/pg_wal_control" target)))
+          (remf copied :retained-reference)
+          (let ((bytes (wal-encode-control-image
+                        checkpoint durable snapshot :timeline insertion
+                        :checkpoint-timeline checkpoint-timeline :namespace namespace :metadata copied)))
+            (wal-ensure-directory-durable (uiop:pathname-directory-pathname path))
+            (wal-atomic-write-bytes path bytes)
+            (let ((actual (recovery-read-bytes path :maximum 513)))
+              (unless (and (equalp bytes actual)
+                           (equal (multiple-value-list (wal-decode-control-line (bytes->string actual)))
+                                  (list checkpoint durable snapshot insertion checkpoint-timeline namespace copied)))
+                (error "base backup control readback differs from its new checkpoint"))
+              (list "global/pg_wal_control" (length actual)
+                    (physical-store-update-digest #xCBF29CE484222325 actual)))))))))
+
 (defun physical-bootstrap-copy-file (relative target &key limit)
   "Copy and fsync a stable source file or exact prefix, returning its length and checksum."
+  (when (equal relative "global/pg_wal_control")
+    (let ((derived (physical-bootstrap-derived-wal-control target)))
+      (when derived
+        (physical-bootstrap-test-point :after-file target)
+        (return-from physical-bootstrap-copy-file derived))))
   (let* ((source (merge-pathnames relative *pgdata*))
          (destination (merge-pathnames relative target))
          (parent (uiop:pathname-directory-pathname destination))

@@ -42,7 +42,8 @@ start() {
     SERVER=$!
     test_wait_owned_sql_server "$SERVER" "$PORT" "$PSQL"
     test "$(sql 'SELECT pg_is_in_recovery()')" = f
-    test "$(sql 'SELECT count(*) FROM data')" = 5
+    sql 'SELECT id FROM data ORDER BY id' >"$CASE/data.rows"
+    diff -u "$SEED/source.rows" "$CASE/data.rows"
     identity=$(PGCONNECT_TIMEOUT=2 "$PSQL" -X "host=127.0.0.1 port=$PORT user=postgres dbname=postgres replication=true" -qAt -v ON_ERROR_STOP=1 -c IDENTIFY_SYSTEM)
     test "$(printf '%s\n' "$identity" | cut -d '|' -f 2)" = 2
 }
@@ -73,7 +74,7 @@ cycle() {
     inspect check "$CASE/data" "$CASE/expected.json" later
     stop
 }
-points='normal after-child-history-sync after-child-eor-write after-child-eor-flush after-child-batch-write after-child-checkpoint-write after-child-checkpoint-flush after-child-data-sync after-child-control-rename after-child-control-directory-fsync after-child-primary-initialization after-retire-required after-retire-manifest after-retire-follow after-retire-pointer after-retire-pending after-child-primary-ready'
+points='normal after-pending-retained-registration after-child-history-sync after-child-eor-write after-child-eor-flush after-child-batch-write after-child-checkpoint-write after-child-checkpoint-flush after-child-data-sync after-child-control-rename after-child-control-directory-fsync after-child-primary-initialization after-primary-retained-registration after-retire-required after-retire-manifest after-retire-follow after-retire-pointer after-retire-pending after-pending-retained-retirement after-child-primary-ready'
 for point in $points; do
     CASE=$TMP/$point
     mkdir -m 700 "$CASE"
@@ -101,7 +102,7 @@ for point in $points; do
         after-child-checkpoint-write|after-child-control-rename) cp -a "$CASE/data" "$CASE/crash-data" ;;
     esac
     case "$point" in
-        after-child-control-*|after-child-primary-*|after-retire-*)
+        after-child-control-*|after-child-primary-*|after-retire-*|after-primary-retained-registration|after-pending-retained-retirement)
             # Child control alone must survive retirement of all obsolete GEN/spool authorities.
             inspect drop-retired "$CASE/data" ;;
     esac
@@ -157,7 +158,7 @@ for kind in foreign-staging oversized-staging orphan-history bad-child-checkpoin
         orphan-history) expected_error='published child history has an unexplained WAL segment' ;;
         bad-child-checkpoint) expected_error='WAL checksum mismatch' ;;
         wrong-pending) expected_error='physical recovery file (length|checksum) mismatch: global/pg_wal_control' ;;
-        wrong-history) expected_error='committed child contradicts its pending recovery metadata' ;;
+        wrong-history) expected_error='invalid retained promotion archive: reference differs from its parent or applied endpoint' ;;
     esac
     if [ "$kind" = wrong-pending ]; then
         grep -E "$expected_error" "$CASE/startup.log" >/dev/null

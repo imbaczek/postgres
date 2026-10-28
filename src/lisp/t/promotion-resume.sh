@@ -34,6 +34,7 @@ else
     WAL_SEED=$(sed -n 's/^promotion-prefix: artifacts=//p' "$TMP/wal.log")
 fi
 inspect() { python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" "$@"; }
+inspect --check-oracle-fixtures
 resume() {
     timeout -k 2 20 env PG_PROMOTION_DATA="$CASE/data" PG_PROMOTION_PORT="$PORT" \
         "$SBCL" --script "$BASE/t/promotion-resume-native.lisp" >"$CASE/resume.log" 2>&1
@@ -73,7 +74,7 @@ for damage in torn-1 torn-17 torn-55 torn-56 unacknowledged ahead-catalog; do
     verify
     if [ "$damage" = unacknowledged ]; then inspect --verify-pending "$CASE/data" "$CASE/before.json"; fi
 done
-for damage in marker pointer generation allocation receive backlog lock child missing-child history base-control fork system valid-tail oversized-tail; do
+for damage in marker pointer generation allocation receive backlog lock child missing-child history base-control fork system valid-tail oversized-tail retained-inventory retained-extent retained-overlap; do
     CASE=$TMP/reject-$damage
     mkdir -m 700 "$CASE"
     cp -a "$WAL_SEED/normal/data" "$CASE/data"
@@ -93,6 +94,7 @@ for damage in marker pointer generation allocation receive backlog lock child mi
         fork) grep -q 'still-live base relation fork is missing' "$CASE/resume.log" ;;
         valid-tail) grep -q 'pending child contains a different complete record' "$CASE/resume.log" ;;
         oversized-tail) grep -q 'pending child prefix or EOR extent differs' "$CASE/resume.log" ;;
+        retained-*) grep -q 'invalid retained promotion archive' "$CASE/resume.log" ;;
     esac
     inspect --verify-pending "$CASE/data" "$CASE/before.json"
     echo "promotion-resume: reject $damage PASS"

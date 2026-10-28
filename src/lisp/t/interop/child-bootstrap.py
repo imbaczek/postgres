@@ -4,9 +4,11 @@ import runpy
 import signal
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 
 import psutil
@@ -18,6 +20,22 @@ child_port, data = parent_port + 1, root / "child-copy"
 socket_owners = {}
 peer_parameters = {}
 contract = runpy.run_path(str(base / "t/interop/promotion-sql-contract.py"))
+archive = runpy.run_path(str(base / "t/interop/restartpoint-prefix-inspect.py"))
+
+
+def check_committed_archive(pending):
+    fields = (data / "global/pg_wal_control").read_bytes().split()
+    assert len(fields) == 17 and zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    assert [int(value) for value in fields[10:16]] == list(archive["retained_reference"](pending))
+    history = (data / "pg_wal/00000003.history").read_text()
+    parsed = archive["parsed_history"](3, history)
+    assert parsed[-2][0] == 2 and parsed[-1][1] == int(fields[14])
+    parent_bytes = "".join(history.splitlines(keepends=True)[:-1])
+    assert parent_bytes.endswith("\n")
+    parent_history = parent_bytes[:-1]  # C appends one separator before the new line.
+    archive["check_retained_archive"](
+        data, root / "copy", pending, f"(:PREFIX-DIGEST {int(fields[15])})",
+        parent_history=parent_history, parent_digest=None)
 
 
 def interrupted(number, frame):
@@ -234,6 +252,13 @@ try:
     (root / "child-backup.log").write_text(output)
     assert ":TIMELINE 2" in output
     assert (data / "pg_wal/00000002.history").read_bytes() == (root / "copy/pg_wal/00000002.history").read_bytes()
+    source_control = (root / "copy/global/pg_wal_control").read_bytes().split()
+    target_control = (data / "global/pg_wal_control").read_bytes().split()
+    assert len(source_control) == 17 and len(target_control) == 11
+    for fields in (source_control, target_control):
+        assert zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    assert source_control[:10] == target_control[:10]
+    assert not (data / "pg_physical_retained").exists()
     child = start_child()
     ready_child(child)
     child_connection = connect(child_port)
@@ -251,6 +276,16 @@ try:
     wait_until(lambda: scalar(child_connection, "SELECT count(*) FROM promotion_sql_items") == 4)
     assert query(child_connection, "SELECT receive_start_tli,received_tli FROM pg_catalog.pg_stat_get_wal_receiver()") == [(2, 2)]
     query(child_connection, "CHECKPOINT")
+    receive = (data / "pg_physical_receive/receive.control").read_bytes()
+    assert len(receive) == 96
+    archive["checked_crc"](receive, 92)
+    manifest = (data / "physical-backup.manifest").read_bytes()
+    manifest_digest = archive["fnv"](manifest)
+    assert struct.unpack_from("<I", receive, 16)[0] == 2
+    assert struct.unpack_from("<Q", receive, 84)[0] == manifest_digest
+    retained_id = struct.unpack_from("<Q", receive, 76)[0]
+    retained = archive["archive_object"](data, "inventory", retained_id)[2]
+    assert archive["plist"](retained[":IDENTITY"])[":BASE-TIMELINE"] == 2
     child_connection.close()
     child_connection = None
     assert stop_child(child, crash=os.environ.get("CHILD_BOOTSTRAP_CRASH") == "1") == (-signal.SIGKILL if os.environ.get("CHILD_BOOTSTRAP_CRASH") == "1" else 0)
@@ -265,6 +300,7 @@ try:
     print("child-bootstrap: timeline-2 backup, receive/replay, restartpoint and reconnect PASS", flush=True)
     if os.environ.get("CHILD_BOOTSTRAP_PROMOTE") == "1":
         point = os.environ.get("CHILD_BOOTSTRAP_PROMOTION_CRASH")
+        pending_archive = None
         if point:
             assert point in ("after-online-intent", "after-child-control")
             control("child.sock", f'(load "{base}/t/child-bootstrap-native.lisp")')
@@ -273,6 +309,13 @@ try:
             assert scalar(child_connection, "SELECT pg_promote(false,30)") is True
             marker = root / "promotion-crash-held"
             wait_until(lambda: marker.exists() and int(marker.read_text()) == child.pid)
+            pending_archive = archive["checked_pending_control"](data)
+            (root / "pending-archive.control").write_bytes(pending_archive)
+            fork, generation = archive["main"](data, root / "copy")
+            image = (data / "pg_physical_restartpoints" / f"{fork:016X}-{generation:016X}.rp").read_bytes()
+            text_length = struct.unpack_from("<I", image, 8)[0]
+            archive["check_retained_archive"](data, root / "copy", pending_archive,
+                                             image[32:32 + text_length].decode("ascii"))
             child_connection.close()
             child_connection = None
             assert stop_child(child, crash=True) == -signal.SIGKILL
@@ -283,7 +326,8 @@ try:
                     assert directory.is_dir() and not directory.is_symlink()
                     shutil.rmtree(directory)
                 (data / "physical-backup.manifest").unlink()
-                print("child-bootstrap: removed retired spool, generations and manifest after commit", flush=True)
+                (data / "pg_wal/00000002.history").unlink()
+                print("child-bootstrap: removed retired spool, generations, manifest and parent history after commit", flush=True)
             child = start_child()
             ready_child(child)
             child_connection = connect(child_port)
@@ -293,6 +337,9 @@ try:
             assert scalar(child_connection, "SELECT pg_promote(true,30)") is True
         assert scalar(child_connection, "SELECT substr(pg_walfile_name(pg_current_wal_lsn()),1,8)") == "00000003"
         query(child_connection, "INSERT INTO promotion_sql_items VALUES (6,'child3')")
+        query(child_connection, "CHECKPOINT")
+        if pending_archive is not None:
+            check_committed_archive(pending_archive)
         child_connection.close()
         child_connection = None
         assert stop_child(child, crash=os.environ.get("CHILD_BOOTSTRAP_CRASH") == "1") == (-signal.SIGKILL if os.environ.get("CHILD_BOOTSTRAP_CRASH") == "1" else 0)
@@ -302,6 +349,8 @@ try:
         assert scalar(child_connection, "SELECT pg_is_in_recovery()") is False
         assert scalar(child_connection, "SELECT substr(pg_walfile_name(pg_current_wal_lsn()),1,8)") == "00000003"
         assert scalar(child_connection, "SELECT count(*) FROM promotion_sql_items") == 6
+        if pending_archive is not None:
+            check_committed_archive(pending_archive)
         query(child_connection, "INSERT INTO promotion_sql_items VALUES (7,'restart3')")
         print("child-bootstrap: promotion to timeline 3, primary restart and child writes PASS", flush=True)
         if os.environ.get("CHILD_BOOTSTRAP_SOURCE_RESTART") == "1":

@@ -80,43 +80,12 @@
                  (cl-spec:run-property 'retained-parent-history-derivation-preserves-ancestry :seed 42))))
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
-(defun handoff-test-authenticate-manifest ()
-  (multiple-value-bind (metadata catalog prefix) (pg::physical-restartpoint-read pg::*physical-recovery-state*)
-    (let* ((state pg::*physical-recovery-state*)
-           (manifest (list :version 3 :system-id (getf state :system-id)
-                           :cluster-identity "history-source" :timeline (getf state :timeline)
-                           :checkpoint (getf state :checkpoint)
-                           :checkpoint-start (getf state :checkpoint-start)
-                           :end (getf state :end) :next-xid 50 :source-pin "copy"
-                           :files (getf state :files))))
-      (write-recovery-manifest-text pg::*pgdata* (pg::physical-bootstrap-manifest-text manifest))
-      (let ((digest (nth-value 1 (pg::recovery-read-manifest pg::*pgdata*))))
-        (setf (getf state :manifest-digest) digest
-              (getf state :version) 3
-              (getf metadata :manifest-digest) digest)
-        (let* ((bytes (pg::physical-restartpoint-encode metadata catalog prefix))
-               (generation (pg::physical-store-update-digest #xCBF29CE484222325 bytes))
-               (pointer (make-array 28 :element-type '(unsigned-byte 8) :initial-element 0)))
-          (pg::wal-atomic-write-bytes
-           (pg::physical-restartpoint-generation-path (getf metadata :lsn) generation) bytes)
-          (replace pointer #(80 71 82 80 80 84 82 49))
-          (pg::wal-set-u64 pointer 8 (getf metadata :lsn))
-          (pg::wal-set-u64 pointer 16 generation)
-          (pg::wal-set-u32 pointer 24 (pg::wal-crc32 pointer))
-          (pg::wal-atomic-write-bytes (pg::physical-restartpoint-pointer-path) pointer))
-        (pg::wal-atomic-write-bytes
-         (pg::physical-recovery-control-path)
-         (pg::physical-recovery-control-image
-          2 (getf state :system-id) (getf state :timeline) digest
-          (getf state :checkpoint) (getf metadata :lsn) (getf metadata :next-xid)))
-        (pg::wal-atomic-write-bytes
-         (merge-pathnames "recovery.required" pg::*pgdata*) (pg::physical-recovery-marker-bytes))))))
-
 (deftest pending-archive-inspection-requires-exact-generation-and-valid-objects
     (with-promotion-fixture (root store)
       (declare (ignore root store))
       (with-retained-root-registry
-          (handoff-test-authenticate-manifest)
+          (ok (= (getf pg::*physical-recovery-state* :manifest-digest)
+                 (nth-value 1 (pg::recovery-read-manifest pg::*pgdata*))))
         (prepare-promotion-child)
         (let* ((reference (handoff-test-reference))
                (directory (pg::physical-recovery-retained-directory))
@@ -471,3 +440,232 @@
               (ok (equalp pending (lineage-test-bytes (pg::physical-recovery-control-path))))
               (ok (equalp wal (lineage-test-bytes wal-path)))
               (ok (null (probe-file (pg::timeline-history-path child pg::*pgdata*))))))))))
+
+(deftest promotion-intent-produces-and-selects-fork-bounded-retained-root
+    (with-promotion-fixture (root store)
+      (declare (ignore root))
+      (let ((parent (lineage-test-bytes (pg::wal-control-path)))
+            (source (pg::physical-store-control-tuple store)))
+        (let* ((pending (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent))
+               (reference (getf pending :retained-reference)))
+          (ok (pg::wal-retained-reference-valid-p reference))
+          (ok (equal source (pg::physical-store-control-tuple store)))
+          (ok (equalp parent (lineage-test-bytes (pg::wal-control-path))))
+          (when reference
+            (ok (eql (getf reference :root-id)
+                     (pg::physical-retained-root-current
+                      (pg::physical-promotion-retained-owner :pending))))
+            (ok (equal reference (getf (pg::physical-recovery-read-control pg::*pgdata*)
+                                       :retained-reference)))
+            (multiple-value-bind (metadata) (pg::physical-restartpoint-read pending)
+              (ok (= (getf reference :end) (getf metadata :lsn)))
+              (ok (= (getf reference :end-digest) (getf metadata :prefix-digest)))
+              (ok (pg::physical-promotion-check-pending-retained pending metadata))))))))
+
+(deftest promotion-intent-at-base-publishes-overlap-without-logical-extents
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (ok (null (pg::physical-store-retained-root store)))
+       (ok (null (probe-file (pg::physical-recovery-retained-directory))))
+       (let* ((pending (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent))
+              (reference (getf pending :retained-reference)))
+         (ok (= 152 (getf reference :base) (getf reference :end)))
+         (ok (= #xCBF29CE484222325 (getf reference :end-digest)))
+         (multiple-value-bind (metadata) (pg::physical-restartpoint-read pending)
+           (let ((index (pg::physical-promotion-check-pending-retained pending metadata)))
+             (ok (null (getf index :entries)))
+             (ok (getf index :base-overlap))))
+         (ok (eql (getf reference :root-id)
+                  (pg::physical-retained-root-current (pg::physical-promotion-retained-owner :pending))))))
+     :applied 152))
+
+(deftest promotion-intent-projects-applied-parent-with-later-selected-history
+    (with-promotion-fixture (root store)
+      (declare (ignore root))
+      (let* ((fork pg::*last-replay-lsn*)
+             (selection (pg::physical-store-select-history
+                         store 5 (store-history-text 1 fork) (store-history-eor fork 5 1)))
+             (source (pg::physical-store-control-tuple store))
+             (pending (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent))
+             (reference (getf pending :retained-reference)))
+        (declare (ignore selection))
+        (ok (= 2 (getf pending :promotion-child)))
+        (ok (= 1 (getf pending :applied-timeline (getf pending :timeline))))
+        (ok (equal source (pg::physical-store-control-tuple store)))
+        (multiple-value-bind (metadata) (pg::physical-restartpoint-read pending)
+          (let ((index (pg::physical-promotion-check-pending-retained
+                        pending metadata (pg::physical-store-retained-history store))))
+            (ok (= 1 (getf index :history-target)))
+            (ok (= fork (getf reference :end)))
+            (ok (every (lambda (entry) (= 1 (getf (third entry) :history-target)))
+                       (getf index :entries)))))
+        (call-with-promotion-exclusion #'pg::physical-promotion-install-prefix)
+        (call-with-promotion-exclusion #'pg::physical-promotion-publish-child-control)
+        (ok (pg::physical-promotion-check-child-control 2 2)))))
+
+(deftest promotion-intent-uses-applied-child-selection-digest-before-future-target
+    (with-promotion-fixture (root store)
+      (declare (ignore root))
+      (let* ((text (store-history-text 1 216))
+             (snapshot (sample-checkpoint-snapshot
+                        :version 2 :start 304 :end 424 :redo 304
+                        :timeline 2 :prev-timeline 1 :next-xid 50 :oldest-active-xid 50)))
+        (pg::physical-store-select-history store 2 text (store-history-eor 216 2 1))
+        (let ((parent-digest (getf (pg::physical-store-selection store) :digest)))
+          (pg::physical-store-input store 216 (store-history-eor 216 2 1))
+          (pg::physical-store-input store 272 (sample-physical-record 272))
+          (pg::physical-store-input
+           store 304 (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 304
+                                            (pg::wal-encode-checkpoint-snapshot snapshot)))
+          (pg::physical-store-flush store)
+          (setf pg::*last-replay-lsn* 424
+                (getf pg::*physical-recovery-state* :replay-timeline) 2
+                (getf pg::*physical-recovery-state* :history-target) 2
+                (getf pg::*physical-recovery-state* :history-digest) parent-digest
+                (getf pg::*physical-recovery-state* :required-applied) 424
+                (getf pg::*physical-recovery-state* :required-timeline) 2
+                (getf pg::*physical-recovery-state* :source-checkpoint) snapshot
+                (getf pg::*physical-recovery-state* :source-reservation)
+                (list :version 1 :through 424 :bound 1002 :complete t))
+          (setf pg::*physical-recovery-state*
+                (pg::physical-recovery-write-control pg::*physical-recovery-state* 2 424 50))
+          (pg::physical-store-compact store 424 #'pg::physical-restartpoint-publish)
+          (pg::physical-store-select-history
+           store 5 (concatenate 'string text (store-history-text 2 424))
+           (store-history-eor 424 5 2))
+          (let* ((future-digest (getf (pg::physical-store-selection store) :digest))
+                 (pending (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent))
+                 (reference (getf pending :retained-reference))
+                 (index (pg::physical-retained-inventory-load
+                         (pg::physical-recovery-retained-directory) (getf reference :root-id)
+                         (pg::physical-promotion-retained-identity (getf pending :system-id) reference)
+                         (pg::timeline-parse-history 2 text))))
+            (ok (= 3 (getf pending :promotion-child)))
+            (ok (= 2 (getf pending :applied-timeline)))
+            (ok (/= parent-digest future-digest))
+            (ok (= 2 (getf index :history-target)))
+            (ok (string= text (getf index :history-text)))
+            (ok (every (lambda (entry)
+                         (let ((metadata (third entry)))
+                           (and (= 2 (getf metadata :history-target))
+                                (= parent-digest (getf metadata :history-digest))
+                                (string= text (getf metadata :history-text)))))
+                       (getf index :entries))))))))
+
+(deftest retained-intent-interruptions-protect-and-reconcile-the-durable-selection
+    (dolist (cut '(:after-retained-intent-publication :after-retained-intent-control
+                   :after-retained-intent-handoff))
+      (dolist (nonlocal '(nil t))
+        (with-promotion-fixture (root store)
+          (declare (ignore root))
+          (let* ((owner (pg::physical-promotion-retained-owner :pending))
+                 (source-owner (pg::physical-store-retained-owner store))
+                 (source-id (pg::physical-store-retained-root store))
+                 (directory (pg::physical-recovery-retained-directory))
+                 (source (lineage-test-bytes (pg::physical-store-path store "receive.control")))
+                 (candidate nil))
+            (let ((pg::*physical-promotion-test-hook*
+                    (lambda (point)
+                      (when (eq point cut)
+                        (setf candidate
+                              (or (pg::physical-retained-root-current owner)
+                                  (sb-thread:with-mutex (pg::*physical-retained-inventory-publish-lock*)
+                                    (let ((hold (gethash owner pg::*physical-retained-root-updates*)))
+                                      (pg::physical-retained-root-reference-root-id
+                                       (pg::physical-retained-root-hold-reference hold))))))
+                        (if nonlocal (throw 'intent-cut :interrupted)
+                            (error "retained intent interruption"))))))
+              (if nonlocal
+                  (ok (eq :interrupted
+                          (catch 'intent-cut
+                            (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent))))
+                  (ok (intake-fails-p
+                       (lambda () (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent))))))
+            (ok pg::*physical-recovery-failed-p*)
+            (ok (= 2 (getf pg::*physical-recovery-state* :phase)))
+            (ok (pg::physical-retained-root-protected-p directory :inventory candidate))
+            (ok (eql source-id (pg::physical-retained-root-current source-owner)))
+            (ok (equalp source (lineage-test-bytes (pg::physical-store-path store "receive.control"))))
+            (let* ((control (pg::physical-recovery-read-control pg::*pgdata*))
+                   (phase (getf control :phase))
+                   (history (pg::physical-store-retained-history store)))
+              (ok (= (if (eq cut :after-retained-intent-publication) 2 3) phase))
+              (if (= phase 3)
+                  (multiple-value-bind (metadata) (pg::physical-restartpoint-read pg::*physical-recovery-state*)
+                    (ok (eql candidate (getf (getf control :retained-reference) :root-id)))
+                    (pg::physical-promotion-restore-pending-retained control metadata history)
+                    (ok (eql candidate (pg::physical-retained-root-current owner))))
+                  (progn
+                    (pg::physical-retained-root-reconcile
+                     owner directory (pg::physical-store-retained-identity store) history
+                     (lambda () (pg::physical-promotion-pending-root-selection control)))
+                    (ok (null (pg::physical-retained-root-current owner)))))
+              (ok (zerop (hash-table-count pg::*physical-retained-root-holds*)))
+              (ok (zerop (hash-table-count pg::*physical-retained-root-updates*))))
+            (ok (eql source-id (pg::physical-retained-root-current source-owner))))))))
+
+(deftest retained-intent-rejects-changed-nonroot-control-fields-before-handoff
+    (dolist (kind '(:pending :receive))
+      (with-promotion-fixture (root store)
+        (declare (ignore root))
+        (let* ((owner (pg::physical-promotion-retained-owner :pending))
+               (path (if (eq kind :pending) (pg::physical-recovery-control-path)
+                         (pg::physical-store-path store "receive.control")))
+               (original nil)
+               (pg::*physical-promotion-test-hook*
+                 (lambda (point)
+                   (when (eq point :after-retained-intent-control)
+                     (setf original (lineage-test-bytes path))
+                     (let ((bad (copy-seq original)))
+                       (if (eq kind :pending)
+                           (pg::wal-set-i64 bad 60 (1+ (pg::wal-i64 bad 60)))
+                           (pg::wal-set-u64 bad 32 (+ 32 (pg::wal-u64 bad 32))))
+                       (pg::wal-set-u32 bad (- (length bad) 4) 0)
+                       (pg::wal-set-u32 bad (- (length bad) 4) (pg::wal-crc32 bad))
+                       (pg::wal-atomic-write-bytes path bad))))))
+          (unwind-protect
+               (progn
+                 (ok (intake-fails-p
+                      (lambda () (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent))))
+                 (ok pg::*physical-recovery-failed-p*)
+                 (ok (= 2 (getf pg::*physical-recovery-state* :phase)))
+                 (ok (null (pg::physical-retained-root-current owner)))
+                 (let* ((control (pg::physical-recovery-read-control pg::*pgdata*))
+                        (id (getf (getf control :retained-reference) :root-id)))
+                   (ok (= 3 (getf control :phase)))
+                   (ok (pg::physical-retained-root-protected-p
+                        (pg::physical-recovery-retained-directory) :inventory id))
+                   (ok (= 1 (hash-table-count pg::*physical-retained-root-holds*)))))
+            (when original (pg::wal-atomic-write-bytes path original)))))))
+
+(deftest child-base-backup-control-starts-new-archive-identity-without-changing-source
+    (handoff-test-committed
+     (lambda (root store reference)
+       (declare (ignore root store))
+       (with-physical-store-directory (target)
+         (let* ((before (lineage-test-bytes (pg::wal-control-path)))
+                (fields (multiple-value-list (pg::wal-read-control-fields)))
+                (entry (pg::physical-bootstrap-copy-file "global/pg_wal_control" target))
+                (bytes (lineage-test-bytes (merge-pathnames "global/pg_wal_control" target)))
+                (copied (multiple-value-list (pg::wal-decode-control-line (pg::bytes->string bytes))))
+                (metadata (copy-list (seventh fields))))
+           (remf metadata :retained-reference)
+           (ok (equal (subseq fields 0 6) (subseq copied 0 6)))
+           (ok (equal metadata (seventh copied)))
+           (ok (null (getf (seventh copied) :retained-reference)))
+           (ok (equal reference (getf (seventh fields) :retained-reference)))
+           (ok (equalp before (lineage-test-bytes (pg::wal-control-path))))
+           (ok (equal entry (list "global/pg_wal_control" (length bytes)
+                                  (pg::physical-store-update-digest #xCBF29CE484222325 bytes)))))))))
+
+(deftest base-backup-without-historical-reference-keeps-exact-control-bytes
+    (with-promotion-fixture (root store)
+      (declare (ignore root store))
+      (with-physical-store-directory (target)
+        (let* ((before (lineage-test-bytes (pg::wal-control-path)))
+               (entry (pg::physical-bootstrap-copy-file "global/pg_wal_control" target))
+               (bytes (lineage-test-bytes (merge-pathnames "global/pg_wal_control" target))))
+          (ok (equalp before bytes))
+          (ok (equal entry (list "global/pg_wal_control" (length bytes)
+                                 (pg::physical-store-update-digest #xCBF29CE484222325 bytes))))))))

@@ -6,11 +6,14 @@
     (sb-thread:with-mutex (pg::*reload-run-lock*)
       (pg::with-live-operation-quiescence (funcall function)))))
 
-(defun call-with-promotion-fixture (function &key (namespace :legacy) (system-id 123))
+(defun call-with-promotion-fixture (function &key (namespace :legacy) (system-id 123) (applied 216))
   (call-with-restartpoint-fixture
    (lambda (root old-store)
      (pg::physical-store-close old-store)
-     (let* ((snapshot (sample-checkpoint-snapshot :version 2 :next-xid 50 :oldest-active-xid 0))
+     (let* ((pg::*physical-retained-root-references* (make-hash-table :test #'eq))
+            (pg::*physical-retained-root-holds* (make-hash-table :test #'eq))
+            (pg::*physical-retained-root-updates* (make-hash-table :test #'eq))
+            (snapshot (sample-checkpoint-snapshot :version 2 :next-xid 50 :oldest-active-xid 0))
             (base (concatenate '(vector (unsigned-byte 8)) (sample-physical-record 0)
                                (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 32
                                                       (pg::wal-encode-checkpoint-snapshot snapshot))))
@@ -29,33 +32,49 @@
             (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
             (pg::*wal-ready* t) (pg::*wal-insert-timeline* 1) (pg::*wal-checkpoint-timeline* 1)
             (pg::*wal-checkpoint-lsn* 152) (pg::*wal-end-lsn* 152) (pg::*wal-durable-lsn* 152)
-            (pg::*wal-segment-namespace* namespace) (pg::*last-replay-lsn* 216))
+            (pg::*wal-segment-namespace* namespace) (pg::*last-replay-lsn* applied))
        (unwind-protect
             (progn
               (when (eq namespace :timeline) (delete-file (pg::wal-segment-path 0 1 :legacy)))
               (pg::wal-atomic-write-bytes (merge-pathnames name root) base)
               (pg::wal-atomic-write-bytes (pg::wal-control-path) control)
-              (setf (getf pg::*physical-recovery-state* :phase) 2
+              (setf (getf pg::*physical-recovery-state* :version) 3
+                    (getf pg::*physical-recovery-state* :phase) 2
                     (getf pg::*physical-recovery-state* :checkpoint) 152
                     (getf pg::*physical-recovery-state* :checkpoint-start) 32
                     (getf pg::*physical-recovery-state* :end) 152
-                    (getf pg::*physical-recovery-state* :required-applied) 216
+                    (getf pg::*physical-recovery-state* :required-applied) applied
                     (getf pg::*physical-recovery-state* :wal-namespace) namespace
                     (getf pg::*physical-recovery-state* :source-checkpoint) snapshot
                     (getf pg::*physical-recovery-state* :source-reservation)
-                    (list :version 1 :through 216 :bound 1002 :complete t)
+                    (list :version 1 :through applied :bound 1002 :complete t)
                     (getf pg::*physical-recovery-state* :files)
                     (list (list name (length base) (pg::physical-store-update-digest #xCBF29CE484222325 base))
                           (list "global/pg_wal_control" (length control)
                                 (pg::physical-store-update-digest #xCBF29CE484222325 control))))
               (pg::wal-atomic-write-bytes
                (pg::physical-recovery-control-path)
-               (pg::physical-recovery-control-image 2 system-id 1 77 152 216 50))
-              (pg::physical-store-input store 152 (sample-physical-record 152))
-              (pg::physical-store-input store 184
-                                        (pg::wal-encode-record pg::+wal-record-maintenance+ 0 184 (empty-octets)))
+               (let* ((manifest (list :version 3 :system-id system-id :cluster-identity "history-source"
+                                      :timeline 1 :checkpoint 152 :checkpoint-start 32
+                                      :end 152 :next-xid 50 :source-pin "copy"
+                                      :files (getf pg::*physical-recovery-state* :files)))
+                      (text (pg::physical-bootstrap-manifest-text manifest)))
+                 (write-recovery-manifest-text root text)
+                 (let ((digest (nth-value 1 (pg::recovery-read-manifest root))))
+                   (setf (getf pg::*physical-recovery-state* :manifest-digest) digest
+                         (pg::physical-store-retained-identity store)
+                         (list :system-id system-id :base-timeline 1 :base 152 :manifest-digest digest)
+                         (pg::physical-store-retained-directory-value store)
+                         (pg::physical-recovery-retained-directory))
+                   (pg::physical-recovery-control-image 2 system-id 1 digest 152 applied 50))))
+              (pg::wal-atomic-write-bytes
+               (merge-pathnames "recovery.required" root) (pg::physical-recovery-marker-bytes))
+              (when (> applied 152)
+                (pg::physical-store-input store 152 (sample-physical-record 152))
+                (pg::physical-store-input store 184
+                                          (pg::wal-encode-record pg::+wal-record-maintenance+ 0 184 (empty-octets))))
               (pg::physical-store-flush store)
-              (pg::physical-store-compact store 216 #'pg::physical-restartpoint-publish)
+              (pg::physical-store-compact store applied #'pg::physical-restartpoint-publish)
               (funcall function root store))
          (pg::physical-store-close store))))
    :system-id system-id))

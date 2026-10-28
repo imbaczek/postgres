@@ -4,12 +4,14 @@ import hashlib
 import json
 import pathlib
 import re
+import runpy
 import shutil
 import struct
 import sys
 import zlib
 
 SIZE = 16 * 1024 * 1024
+ARCHIVE = runpy.run_path(str(pathlib.Path(__file__).with_name("restartpoint-prefix-inspect.py")))
 
 
 def crc(data, offset):
@@ -21,7 +23,7 @@ def crc(data, offset):
 
 def control(root):
     fields = (root / "global/pg_wal_control").read_bytes().split()
-    assert fields[0] == b"PGWAL6" and len(fields) in (8, 11)
+    assert fields[0] == b"PGWAL6" and len(fields) in (8, 11, 17)
     assert zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
     return int(fields[1]), int(fields[2]), int(fields[3]), int(fields[4]), fields[5], bytes.fromhex(fields[6].decode())
 
@@ -39,14 +41,18 @@ def path_for(root, child, start):
 
 def save_expected(target, output):
     root = pathlib.Path(target)
-    state = (root / "physical-recovery.control").read_bytes()
-    crc(state, 84)
+    state = ARCHIVE["checked_pending_control"](root)
     fork = struct.unpack_from("<Q", state, 40)[0]
     actual = (1 << 64) if struct.unpack_from("<I", state, 8)[0] & (1 << 31) else struct.unpack_from("<Q", state, 48)[0]
     generation = struct.unpack_from("<Q", state, 76)[0]
     image = (root / "pg_physical_restartpoints" / f"{fork:016X}-{generation:016X}.rp").read_bytes()
+    crc(image, 24)
+    assert ARCHIVE["fnv"](image) == generation
     text_size, catalog_size = struct.unpack_from("<IQ", image, 8)
     text = image[32:32 + text_size]
+    parent_history, parent_digest = ARCHIVE["pending_parent_history"](root, state)
+    ARCHIVE["check_retained_archive"](root, None, state, text.decode("ascii"),
+                                     parent_history=parent_history, parent_digest=parent_digest)
     catalog = image[32 + text_size:32 + text_size + catalog_size]
     bounds = re.findall(rb":BOUND\s+([0-9]+)", text)
     oids = re.findall(rb":NEXT-OID\s+([0-9]+)", catalog)
@@ -57,8 +63,11 @@ def save_expected(target, output):
     expected = {"fork": fork, "actual": actual, "floor": floor, "oid": int(oids[0]),
                 "system_id": struct.unpack_from("<Q", state, 16)[0],
                 "child": struct.unpack_from("<I", state, 68)[0],
-                "parent": struct.unpack_from("<I", state, 12)[0],
-                "time": struct.unpack_from("<q", state, 60)[0], "parents": parents(root)}
+                "parent": struct.unpack_from("<I", state, 84 if len(state) == 148 else 12)[0],
+                "time": struct.unpack_from("<q", state, 60)[0], "parents": parents(root),
+                "parent_history": parent_history, "parent_digest": parent_digest,
+                "pending_control": state.hex(),
+                "retained_reference": ARCHIVE["retained_reference"](state)}
     pathlib.Path(output).write_text(json.dumps(expected, sort_keys=True))
 
 
@@ -79,8 +88,9 @@ def check_primary(target, expected_path, initial):
     expected = json.loads(pathlib.Path(expected_path).read_text())
     checkpoint, durable, child, checkpoint_child, namespace, snapshot = control(root)
     fields = (root / "global/pg_wal_control").read_bytes().split()
-    if len(fields) == 11:
-        assert int(fields[7]) == expected["system_id"] and int(fields[8]) == 6
+    assert len(fields) == 17, "committed child lost its retained reference"
+    assert int(fields[7]) == expected["system_id"] and int(fields[8]) == 6
+    assert [int(value) for value in fields[10:16]] == expected["retained_reference"]
     assert child == checkpoint_child == expected["child"] and namespace == b"timeline"
     assert len(snapshot) == 88 and snapshot[:8] == b"PGCKPT02"
     start, end, redo = struct.unpack_from("<QQQ", snapshot, 8)
@@ -89,7 +99,20 @@ def check_primary(target, expected_path, initial):
     assert read_record(root, child, start, 120, 4)[32:] == snapshot
     assert parents(root) == expected["parents"], "parent WAL changed"
     history = (root / "pg_wal" / f"{child:08X}.history").read_bytes()
-    assert history == f'{expected["parent"]}\t{expected["fork"] >> 32:X}/{expected["fork"] & 0xFFFFFFFF:08X}\tpg-lisp promotion\n'.encode()
+    parsed = ARCHIVE["parsed_history"](child, history.decode("ascii"))
+    assert (parsed[-2][0], parsed[-1][1]) == (expected["parent"], expected["fork"])
+    lines = history.splitlines(keepends=True)
+    parent_bytes = b"".join(lines[:-1])
+    if expected["parent"] > 1:
+        assert parent_bytes.endswith(b"\n")
+        parent_bytes = parent_bytes[:-1]  # C adds one separator after parent bytes.
+    parent_history = parent_bytes.decode("ascii")
+    assert parent_history == expected["parent_history"]
+    assert lines[-1] == f'{expected["parent"]}\t{expected["fork"] >> 32:X}/{expected["fork"] & 0xFFFFFFFF:08X}\tpg-lisp promotion\n'.encode()
+    state = bytes.fromhex(expected["pending_control"])
+    digest = expected["retained_reference"][-1]
+    ARCHIVE["check_retained_archive"](root, None, state, f"(:PREFIX-DIGEST {digest})",
+                                     parent_history=parent_history, parent_digest=expected["parent_digest"])
     if initial == "initial":
         eor_start = after(expected["fork"], 56)
         batch_start = after(eor_start + 56, 32)
