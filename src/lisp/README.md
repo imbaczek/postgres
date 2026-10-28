@@ -204,8 +204,9 @@ type and operator catalog, not a promise that every input spelling or function
 is implemented.
 
 Basic numeric functions include `abs`, `numeric_abs`, `sign`, `round`,
-`trunc`, `ceil`/`ceiling`, `floor`, `sqrt`, `numeric_sqrt`, `exp`, and
-`numeric_exp`. `round` and `trunc` accept an optional
+`trunc`, `ceil`/`ceiling`, `floor`, `sqrt`, `numeric_sqrt`, `exp`,
+`numeric_exp`, `ln`, `numeric_ln`, `log`, `log10`, and `numeric_log`.
+`round` and `trunc` accept an optional
 integer scale for numeric values; negative scales act before the decimal point.
 Numeric rounding breaks ties away from zero, while floating-point rounding uses
 ties to even. Square root rejects negative inputs; `numeric_sqrt` uses numeric
@@ -215,7 +216,17 @@ exponential functions, NaN and positive infinity pass through and negative
 infinity returns zero. Numeric exponential reports overflow for large positive
 inputs and returns scaled zero for large negative inputs; floating exponential
 reports overflow or underflow when a finite input yields infinity or zero.
-These functions return NULL when an argument is NULL.
+`ln` and `numeric_ln` compute natural logarithms; one-argument `log` and
+`log10` use base ten, and two-argument `log(base, value)` and
+`numeric_log(base, value)` use the supplied numeric base. `ln`, one-argument
+`log`, and `log10`
+also accept floating-point inputs; the explicitly numeric forms use numeric
+arithmetic. Logarithms reject zero and negative arguments, and a base of one,
+with SQLSTATE `2201E`. These functions return NULL when an argument is NULL.
+
+Constant target expressions are evaluated during execution rather than folded
+during planning. Consequently, `WHERE false` or `LIMIT 0` can suppress errors
+from constant SELECT targets that PostgreSQL would raise while planning.
 
 DDL:
 

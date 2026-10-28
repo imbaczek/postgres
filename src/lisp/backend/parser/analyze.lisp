@@ -403,7 +403,7 @@ including unknown literals."
                    (member (expr-type (second args)) '(:int2 :int4))))
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
   (let* ((argument (first args))
-         (type (cond ((or (= (length args) 2) (member name '("numeric_abs" "numeric_sqrt" "numeric_exp") :test #'string=)) :numeric)
+         (type (cond ((or (= (length args) 2) (member name '("numeric_abs" "numeric_sqrt" "numeric_exp" "numeric_ln") :test #'string=)) :numeric)
                      ((and (string= name "abs")
                            (not (in-unknown-constant-p argument)))
                       (expr-type argument))
@@ -418,6 +418,20 @@ including unknown literals."
                 (mapcar (lambda (arg) (coerce-common-expression arg :int4))
                         (rest args)))
           :type type :typmod -1)))
+
+(defun analyze-log-function (name args)
+  "Resolve one-argument or numeric two-argument logarithm overloads."
+  (cond
+    ((and (= (length args) 1) (not (string= name "numeric_log")))
+     (analyze-basic-numeric-function name args))
+    ((and (= (length args) 2) (not (string= name "log10"))
+          (every (lambda (arg)
+                   (or (in-unknown-constant-p arg)
+                       (sql-implicit-coercion-p (expr-type arg) :numeric)))
+                 args))
+     (list :func name (mapcar (lambda (arg) (coerce-common-expression arg :numeric)) args)
+           :type :numeric :typmod -1))
+    (t (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))))
 
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
@@ -434,8 +448,10 @@ including unknown literals."
       ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
                :test #'string=)
        (analyze-basic-numeric-function name args))
-      ((member name '("sqrt" "numeric_sqrt" "exp" "numeric_exp") :test #'string=)
+      ((member name '("sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln") :test #'string=)
        (analyze-basic-numeric-function name args))
+      ((member name '("log" "log10" "numeric_log") :test #'string=)
+       (analyze-log-function name args))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
       ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
       ((string= name "substr") (analyze-substr-function name args))
@@ -1677,7 +1693,8 @@ including unknown literals."
                                "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
                                "substr" "length" "char_length" "character_length" "pg_backend_pid"
                                "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
-                               "sqrt" "numeric_sqrt" "exp" "numeric_exp")
+                               "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
+                               "log" "log10" "numeric_log")
                              :test #'string=)))
            (analyzed-expression-volatile-p (car form))
            (analyzed-expression-volatile-p (cdr form)))))
@@ -2526,6 +2543,18 @@ including unknown literals."
             (cond ((eq value +null+) +null+)
                   ((eq type :numeric) (sql-numeric-sqrt value))
                   (t (sql-float-sqrt value)))))
+         ((member name '("log" "log10" "numeric_log") :test #'string=)
+          (cond ((member +null+ arguments) +null+)
+                ((eq type :numeric)
+                 (if (rest arguments)
+                     (sql-numeric-log (first arguments) (second arguments))
+                     (sql-numeric-log 10 (first arguments))))
+                (t (sql-float-log10 (first arguments)))))
+         ((member name '("ln" "numeric_ln") :test #'string=)
+          (let ((value (first arguments)))
+            (cond ((eq value +null+) +null+)
+                  ((eq type :numeric) (sql-numeric-ln value))
+                  (t (sql-float-ln value)))))
          ((member name '("exp" "numeric_exp") :test #'string=)
           (let ((value (first arguments)))
             (cond ((eq value +null+) +null+)

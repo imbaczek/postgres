@@ -227,6 +227,22 @@ finite inputs, an infinite or zero result signals overflow or underflow."
           ((zerop result) (ereport "22003" "value out of range: underflow"))
           (t result))))
 
+(defun sql-float-ln (value)
+  "Evaluate the float8 natural logarithm with SQL domain errors."
+  (when (sb-ext:float-nan-p value) (return-from sql-float-ln value))
+  (when (zerop value) (ereport "2201E" "cannot take logarithm of zero"))
+  (when (minusp value) (ereport "2201E" "cannot take logarithm of a negative number"))
+  (sb-int:with-float-traps-masked (:inexact :underflow :overflow)
+    (log value)))
+
+(defun sql-float-log10 (value)
+  "Evaluate the float8 base-ten logarithm with SQL domain errors."
+  (when (sb-ext:float-nan-p value) (return-from sql-float-log10 value))
+  (when (zerop value) (ereport "2201E" "cannot take logarithm of zero"))
+  (when (minusp value) (ereport "2201E" "cannot take logarithm of a negative number"))
+  (sb-int:with-float-traps-masked (:inexact :underflow :overflow)
+    (sb-kernel:%log10 value)))
+
 (defun sql-float-basic-function (name value)
   "Apply float.c's unary rounding and sign functions.
 Round uses ties to even, and zero results retain the input's sign.  Like

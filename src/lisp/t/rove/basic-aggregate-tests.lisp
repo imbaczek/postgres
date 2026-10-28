@@ -255,6 +255,46 @@
   (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-exp-zero-scale :seed 42))))
     (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
+(cl-spec:defproperty numeric-ln-one
+    ((scale (range integer 0 32)))
+  (:about sql-numeric-ln)
+  (:trials (:normal 100))
+  (let ((result (sql-numeric-ln (make-sql-decimal (expt 10 scale) scale))))
+    (and (zerop (sql-numeric-rational result))
+         (= (sql-numeric-scale result) (max 16 scale)))))
+
+(cl-spec:defproperty numeric-ln-exp-inverse
+    ((coefficient (range integer -2000 2000)))
+  (:about sql-numeric-ln)
+  (:trials (:normal 150))
+  (let* ((input (make-sql-decimal coefficient 3))
+         (result (sql-numeric-ln (sql-numeric-exp input))))
+    (< (abs (- (sql-numeric-rational result) (sql-numeric-rational input)))
+       1/10000000000000)))
+
+(rove:deftest numeric-ln-inverse-property
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'numeric-ln-exp-inverse :seed 42))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(rove:deftest numeric-ln-expressions
+    (dolist (case '(("SELECT ln(1::numeric)::text" "0.0000000000000000")
+                    ("SELECT ln(2::numeric)::text" "0.6931471805599453")
+                    ("SELECT ln('Infinity'::numeric)::text" "Infinity")
+                    ("SELECT ln('NaN'::numeric)::text" "NaN")
+                    ("SELECT ln(1::float8)::text" "0")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case)))
+  (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-ln-one :seed 42))))
+    (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(rove:deftest numeric-log-expressions
+    (dolist (case '(("SELECT log(100::numeric)::text" "2.0000000000000000")
+                    ("SELECT log(2::numeric,8::numeric)::text" "3.0000000000000000")
+                    ("SELECT log10(1000::numeric)::text" "3.0000000000000000")
+                    ("SELECT log(100::float8)::text" "2")
+                    ("SELECT log(2::numeric,'Infinity'::numeric)::text" "Infinity")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case))))
+
 (cl-spec:defproperty numeric-rounding-is-symmetric
     ((coefficient (range integer -10000000 10000000))
      (input-scale (range integer 0 6))

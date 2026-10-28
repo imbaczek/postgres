@@ -233,6 +233,114 @@ exact.  Negative values signal an error; NaN and positive infinity pass through.
       (decf decimal-weight))
     (floor decimal-weight 4)))
 
+(defun sql-numeric-rational-decimal-weight (value)
+  "Return the decimal weight of the first significant digit of VALUE."
+  (let* ((value (abs value))
+         (weight (- (length (format nil "~d" (numerator value)))
+                    (length (format nil "~d" (denominator value))))))
+    (if (< value (expt 10 weight)) (1- weight) weight)))
+
+(defun sql-numeric-estimate-ln-weight (value)
+  "Estimate the decimal weight of ln(VALUE), following numeric.c."
+  (cond ((not (plusp value)) 0)
+        ((<= 9/10 value 11/10)
+         (if (= value 1) 0 (sql-numeric-rational-decimal-weight (- value 1))))
+        (t
+         (let* ((weight (sql-numeric-rational-weight value))
+                (digits (floor (* value (expt 10 (- 4 (* 4 weight))))))
+                (one-digit (zerop (mod digits 10000)))
+                (digits (if one-digit (/ digits 10000) digits))
+                (dweight (- (* weight 4) (if one-digit 0 4)))
+                (estimate (+ (log (coerce digits 'double-float))
+                             (* dweight 2.302585092994046d0))))
+           (truncate (/ (log (abs estimate)) (log 10d0)))))))
+
+(defun sql-numeric-sqrt-rational (value scale)
+  "Round the positive rational square root to SCALE decimal places."
+  (let* ((scaled (* value (expt 10 (* 2 scale))))
+         (numerator (numerator scaled))
+         (denominator (denominator scaled))
+         (root (isqrt (floor numerator denominator))))
+    (when (>= (* 4 numerator) (* denominator (expt (1+ (* 2 root)) 2)))
+      (incf root))
+    (/ root (expt 10 scale))))
+
+(defun sql-numeric-ln-rational (value scale)
+  "Compute ln at SCALE using numeric.c's square-root reduction and odd-power series.
+Intermediate operations are rounded at guard scales before the final rounding."
+  (when (zerop value) (ereport "2201E" "cannot take logarithm of zero"))
+  (when (minusp value) (ereport "2201E" "cannot take logarithm of a negative number"))
+  (let ((x value) (roots 0))
+    (loop while (or (<= x 9/10) (>= x 11/10))
+          do (setf x (sql-numeric-sqrt-rational
+                      x (+ 8 scale (* -2 (sql-numeric-rational-weight x)))))
+             (incf roots))
+    (let* ((work-scale (+ scale 8 (truncate (* (1+ roots) 0.301029995663981d0))))
+           (z (sql-numeric-round-rational (/ (- x 1) (+ x 1)) work-scale))
+           (square (sql-numeric-round-rational (* z z) work-scale))
+           (power z)
+           (sum z)
+           (index 1))
+      (loop
+        (incf index 2)
+        (setf power (sql-numeric-round-rational (* power square) work-scale))
+        (let ((term (sql-numeric-round-rational (/ power index) work-scale)))
+          (when (zerop term) (return))
+          (incf sum term)
+          (when (< (sql-numeric-rational-weight (abs term))
+                   (- (sql-numeric-rational-weight (abs sum))
+                      (truncate (* work-scale 2) 4)))
+            (return))))
+      (sql-numeric-round-rational (* sum (expt 2 (1+ roots))) scale))))
+
+(defun sql-numeric-ln (value)
+  "Return the numeric natural logarithm with PostgreSQL's display scale.
+Zero and negative inputs raise SQLSTATE 2201E; NaN and positive infinity pass through."
+  (case value
+    (:numeric-negative-infinity
+     (ereport "2201E" "cannot take logarithm of a negative number"))
+    ((:numeric-positive-infinity :numeric-nan) (return-from sql-numeric-ln value)))
+  (let* ((number (sql-numeric-rational value))
+         (weight (sql-numeric-estimate-ln-weight number))
+         (scale (min 1000 (max 0 (sql-numeric-scale value) (- 16 weight))))
+         (result (sql-numeric-ln-rational number scale)))
+    (sql-numeric-result (* result (expt 10 scale)) scale)))
+
+(defun sql-numeric-log (base value)
+  "Return ln(VALUE) / ln(BASE), choosing numeric.c's result and guard scales.
+Reject zero or negative arguments and base one with SQLSTATE 2201E."
+  (when (or (eq base :numeric-nan) (eq value :numeric-nan))
+    (return-from sql-numeric-log :numeric-nan))
+  (when (or (eq base :numeric-negative-infinity) (eq value :numeric-negative-infinity))
+    (ereport "2201E" "cannot take logarithm of a negative number"))
+  (when (or (sql-numeric-special-p base) (sql-numeric-special-p value))
+    (when (or (and (not (sql-numeric-special-p base)) (minusp (sql-numeric-coefficient base)))
+              (and (not (sql-numeric-special-p value)) (minusp (sql-numeric-coefficient value))))
+      (ereport "2201E" "cannot take logarithm of a negative number"))
+    (when (or (and (not (sql-numeric-special-p base)) (zerop (sql-numeric-coefficient base)))
+              (and (not (sql-numeric-special-p value)) (zerop (sql-numeric-coefficient value))))
+      (ereport "2201E" "cannot take logarithm of zero"))
+    (when (eq base :numeric-positive-infinity)
+      (return-from sql-numeric-log (if (eq value :numeric-positive-infinity) :numeric-nan 0)))
+    (let ((compare (sql-numeric-compare base 1)))
+      (cond ((minusp compare) (return-from sql-numeric-log :numeric-negative-infinity))
+            ((plusp compare) (return-from sql-numeric-log :numeric-positive-infinity))
+            (t (ereport "2201E" "cannot take logarithm using base one")))))
+  (let* ((b (sql-numeric-rational base))
+         (v (sql-numeric-rational value)))
+    (when (= b 1) (ereport "2201E" "cannot take logarithm using base one"))
+    (let* ((bw (sql-numeric-estimate-ln-weight b))
+           (vw (sql-numeric-estimate-ln-weight v))
+           (weight (- vw bw))
+           (scale (min 1000 (max 0 (sql-numeric-scale base) (sql-numeric-scale value)
+                                 (- 16 weight))))
+           (base-scale (max 0 (+ scale weight (- bw) 8)))
+           (value-scale (max 0 (+ scale weight (- vw) 8)))
+           (lb (sql-numeric-ln-rational b base-scale))
+           (lv (sql-numeric-ln-rational v value-scale))
+           (result (sql-numeric-round-rational (/ lv lb) scale)))
+      (sql-numeric-result (* result (expt 10 scale)) scale))))
+
 (defun sql-numeric-exp (value)
   "Compute numeric exp using numeric.c's scale and intermediate rounding strategy.
 Reduce the argument by powers of two, sum a rounded Taylor series, then square
