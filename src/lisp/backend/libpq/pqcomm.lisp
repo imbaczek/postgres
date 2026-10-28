@@ -106,7 +106,7 @@ as a second value. Blocking reads stay outside OPERATION-WRAPPER."
               (values (concatenate '(vector (unsigned-byte 8)) code-bytes tail)
                       bypass-p))))))))
 
-(defun read-message-frame (stream)
+(defun read-message-frame (stream &optional (maximum +max-query-message-size+))
   "Read one bounded raw frame without validating or constructing a message.
 
 The caller must validate the returned bytes after entering the appropriate live
@@ -122,7 +122,7 @@ operation.  Only the length check needed to bound body allocation happens here."
                              (ash (aref length-bytes 1) 16)
                              (ash (aref length-bytes 2) 8)
                              (aref length-bytes 3))))
-        (if (<= 4 length +max-query-message-size+)
+        (if (<= 4 length maximum)
             (multiple-value-bind (payload body-got)
                 (read-exact-bytes stream (- length 4))
               (declare (ignore body-got))

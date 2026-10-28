@@ -9,6 +9,7 @@
                (:file "t/coalesce-tests")
                (:file "t/physical-source-tests")
                (:file "t/follow-anchor-tests")
+               (:file "t/physical-client-tests")
                (:file "t/retained-extent-tests")
                (:file "t/retained-inventory-tests")
                (:file "t/retained-root-tests")

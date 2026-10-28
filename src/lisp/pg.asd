@@ -145,6 +145,7 @@
                    (:file "../replication/physical-restartpoint")
                    (:file "../replication/protocol")
                    (:file "../replication/physical-stream")
+                   (:file "../replication/physical-client")
                    (:file "../replication/physical-follow")
                    (:file "../replication/physical-promotion")
                    (:file "../replication/physical-promotion-wal")
