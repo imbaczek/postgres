@@ -132,7 +132,9 @@ Use the verified pending base identity and the recovery retained archive."
                                             (publisher #'physical-promotion-publish-wal))
   "Reconstruct a cold phase-3 process from its exact saved recovery proof.
 Validate identity, generation, receive progress and child artifacts before catalog
-restoration. The default callbacks finish only history/EOR publication and retain
+restoration. Restore any selected pending archive owner before restoring the
+catalog. A missing root or object stops reconstruction before mutation.
+The default callbacks finish only history/EOR publication and retain
 recovery exclusion. Normal startup supplies the checkpoint artifact checker and
 child completion publisher instead. ARTIFACT-CHECKER receives STATE, PREFIX and
 :ALLOW-UNINSTALLED T under restartpoint-start and history locks. The zero-argument

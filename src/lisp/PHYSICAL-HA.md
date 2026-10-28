@@ -534,7 +534,7 @@ guard; Sol medium found no worthwhile refactor.
 The next implementation step was authenticated sealing, including complete
 coverage, exact control readback and handoff before unlink. It is implemented
 below. The native backlog injector now supports 96-byte control and its CRC offset.
-Promotion handoff, scoped consumers, GC and historical network serving remain open.
+Scoped consumers, GC and historical network serving remain open.
 
 ### Sealing before receive-floor advancement
 
@@ -588,6 +588,49 @@ Next, bind exact fork-bounded roots into pending and committed promotion control
 then add scoped consumer references, GC and historical follow/sending. Preserving
 files alone does not make those bytes discoverable or grant serving authority.
 No coordination is added.
+
+### Retained promotion handoff
+
+Pending promotion and committed child control can carry an exact retained root
+through the applied parent fork. Validation checks identity, history, base overlap
+and complete extent coverage before mutation. The committed child uses its own
+history to validate the fixed fork, even after later checkpoints and after the
+manifest, restartpoint, receive spool and original parent history are gone.
+Primary protection is registered before recovery metadata is unlinked; pending
+control is removed and synced last. Pending protection is retired only after
+complete primary control readback and confirmation that pending control is gone.
+These owners are process-local and add no coordination or serving authority.
+
+The pure native control inspector checks the exact version 4 pending generation,
+applied position, next XID and any retained archive without changing files or the
+registry. A phase-3 request whose insertion timeline still equals its parent is
+pending even if that timeline is greater than one.
+
+All 700 physical tests and 170 interop tests pass, as does fresh private-cache
+compilation (`/tmp/pg-handoff-final-cold.log`). The parent-history derivation
+property passes 200 trials with seed 42 and digest `fnv1a64-v1:02699680d7108627`
+(matching replay), and 200 trials with seed 4431408284326246606. No Function Spec
+is registered; rejection counts and input coverage remain unmeasured.
+
+Unit tests cover committed roots without retired recovery files, missing or corrupt
+inventory, extents and overlap, identity and fork rejection before extent reads,
+seven cleanup interruption points with registry reset and cold retry, both reference
+mismatch directions, later checkpoints at the fixed fork, and all three direct
+pending publishers stopping before mutation. Pending inspection tests use an actual
+manifest and restartpoint, including wrong generation or XID and missing or corrupt
+root objects. The timeline-2 classification test isolates a checkpoint helper with a
+stub. These cleanup tests are not real rooted process crashes.
+
+The native rootless promotion-resume matrix passes with freshly generated fixtures
+(`/tmp/pg-promotion-resume.uOhwYK`, `/tmp/pg-handoff-resume-fresh.log`). An initial
+run reused mismatched seeds and failed source-prefix equality; regenerating fixtures
+resolved that mismatch without a production change. Luna max and Sol high cleared
+the code; Sol medium found no worthwhile refactor. Terra 6.1 wrote the source
+documentation, which received separate primary and Sol high reviews.
+
+The default producer remains rootless. Native rooted producer, cold restart and
+nested timeline 2-to-3 acceptance are the next milestone. Receive-owner retirement,
+scoped consumers and historical serving remain open; automatic GC remains disabled.
 
 ### SQL configuration reload
 

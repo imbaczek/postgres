@@ -190,6 +190,7 @@ Parent segments are never selected. Sync the WAL directory after removals."
 The caller must already have synced all referenced WAL and database files.
 Once this image survives, startup must recover the child even if later cleanup
 fails. Do not restore parent control on an error after the rename.
+Carry any retained reference into child control at its fixed parent fork.
 Use crash-recovery state until primary initialization and trigger retirement
 finish; a durable child is not yet a production-ready postmaster."
   (let* ((snapshot (getf plan :snapshot)) (child (getf plan :child)) (end (getf plan :end))

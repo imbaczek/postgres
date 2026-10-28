@@ -120,7 +120,8 @@ matches the supported restartpoint generation bound rather than a WAL segment."
 (defun native-control-recovery-checkpoint (control snapshot)
   "Select the authenticated source checkpoint for recovery control.
 Ordinary recovery may use the base copy. Pending promotion requires its exact
-selected generation and validates any retained archive without registering it."
+version 4 generation, applied position and next XID, and validates any retained
+archive without registering it or changing files."
   (multiple-value-bind (manifest digest) (recovery-read-manifest *pgdata*)
     (recovery-check-manifest-schema manifest)
     (unless (and (every (lambda (key) (eql (getf control key) (getf manifest key)))
@@ -143,9 +144,10 @@ selected generation and validates any retained archive without registering it."
 
 (defun native-control-facts (capture)
   "Validate CAPTURE and return the facts used by native pg_controldata.
-A verified child control wins over obsolete recovery metadata. A standby takes
-its state and applied floor from recovery control. Report checkpoint starts,
-although native WAL control stores checkpoint ends."
+A verified child control wins over obsolete recovery metadata. A phase-3
+request remains pending when insertion equals its parent timeline, even when
+that timeline is greater than one. A standby takes its state and applied floor
+from recovery control. Report checkpoint starts, though WAL control stores ends."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-id namespace metadata)
       (wal-decode-control-line (bytes->string (first capture)))
     (declare (ignore durable namespace))

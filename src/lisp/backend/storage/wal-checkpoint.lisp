@@ -266,7 +266,8 @@ older image's absent lifecycle metadata is unknown state."
 (defun wal-require-supported-timelines (insertion checkpoint)
   "Accept children only through verified child checkpoint control before mutation.
 
-Reject retained primary references until archive startup validation is installed."
+A retained primary reference also requires validation against child history and
+its archive before mutation."
 
   (unless (and (eql insertion 1) (eql checkpoint 1)
                (null (getf (nth-value 6 (wal-read-control-fields)) :retained-reference)))

@@ -16,7 +16,8 @@
   "Verify child control, its checkpoint record and timeline history without writes.
 Return the checkpoint snapshot and parsed history. This check must precede WAL
 scanning or tail repair. It deliberately needs no old generation, receive spool
-or backup manifest: child control is now the recovery authority."
+or backup manifest: child control is now the recovery authority.  An optional
+retained archive is checked against the child history, including its fixed fork."
   (multiple-value-bind (checkpoint durable snapshot timeline checkpoint-id namespace metadata) (wal-read-control-fields)
     (unless (and (typep insertion '(integer 2 4294967295))
                  (= insertion checkpoint-timeline timeline checkpoint-id)
@@ -71,8 +72,10 @@ Do not open its selected generation or receive spool."
   "Remove recovery triggers after verifying committed child control.
 Require the owning cold postmaster or closed admission under quiescence.
 Check every name before deleting any, then unlink and sync the PGDATA directory
-for each step. Remove pending control last. Leave old generation and receive
-directories inert; they are no longer required for primary startup."
+for each step. Register primary archive protection before unlinking anything.
+Remove pending control last, then retire its owner after primary control readback
+and a check that pending control is absent. Old generation and receive directories
+are no longer required for primary startup."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline) (wal-read-control-fields)
     (declare (ignore checkpoint durable))
     (multiple-value-bind (checked history) (physical-promotion-check-child-control insertion checkpoint-timeline)
