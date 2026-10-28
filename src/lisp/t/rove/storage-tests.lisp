@@ -88,6 +88,42 @@
                         (lambda (tuple) (push (aref (htup-values tuple) 0) seen)))
       (rove:ok (equal seen '("visible")) "invisible tuple attributes are not read")))
 
+(rove:deftest test-bytea-tuple-storage
+    (let ((columns (vector (make-pg-column :name "a" :type :int2 :typmod -1 :attnum 1)
+                           (make-pg-column :name "bytes" :type :bytea :typmod -1 :attnum 2)
+                           (make-pg-column :name "z" :type :int4 :typmod -1 :attnum 3))))
+      (dolist (length '(0 1 126 127 256 1024))
+        (let* ((payload (make-array length :element-type '(unsigned-byte 8)
+                                           :initial-contents
+                                           (loop for i below length collect (mod i 256))))
+               (values (vector 7 payload 42))
+               (bytes (form-heap-tuple values columns 3 0 0 0 0)))
+          (multiple-value-bind (decoded xmin xmax cid infomask)
+              (deform-heap-tuple bytes columns)
+            (declare (ignore xmin xmax cid))
+            (rove:ok (equalp values decoded) "arbitrary bytea octets survive heap round trip")
+            (rove:ok (logtest infomask +heap-hasvarwidth+) "bytea sets variable-width flag"))))
+      (let* ((pointer (make-heap-external-varlena :raw-size 5000 :external-info 4996
+                                                  :value-id 42 :relation-id 100 :id-width 4))
+             (values (vector 7 pointer 42)))
+        (rove:ok (equalp values (deform-heap-tuple
+                                    (form-heap-tuple values columns 3 0 0 0 0) columns))
+                 "bytea preserves external pointers"))))
+
+(rove:deftest test-bytea-tuple-ownership
+    (let* ((columns (vector (make-pg-column :name "bytes" :type :bytea :typmod -1 :attnum 1)))
+           (input (make-array 3 :element-type '(unsigned-byte 8)
+                                :initial-contents '(0 128 255)))
+           (tuple (form-heap-tuple (vector input) columns 3 0 0 0 0))
+           (decoded (aref (deform-heap-tuple tuple columns) 0)))
+      (setf (aref input 0) 55 (aref decoded 1) 55)
+      (rove:ok (equalp #(0 128 255) (aref (deform-heap-tuple tuple columns) 0))
+               "formed and decoded payloads own their storage")
+      (rove:ok (eq +null+ (aref (deform-heap-tuple
+                                    (form-heap-tuple (vector +null+) columns 3 0 0 0 0)
+                                  columns) 0))
+               "NULL bytea survives the tuple codec")))
+
 (rove:deftest test-tuple-external-varlena
     (dolist (width '(4 8))
       (let* ((columns (vector (make-pg-column :name "a" :type :int2 :typmod -1 :attnum 1)

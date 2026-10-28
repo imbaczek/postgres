@@ -128,7 +128,7 @@
   (case (pg-column-type col)
     ((:int8 :float8 :time :timestamp :timestamptz :interval :timetz) 8)
     (:int2 2)
-    ((:int4 :numeric :varchar :float4 :date) 4)
+    ((:int4 :numeric :varchar :bytea :float4 :date) 4)
     (t 1)))
 
 (defun column-fixed-size (col)
@@ -161,8 +161,10 @@
 
 (defun form-heap-tuple (values columns xmin xmax cid block off)
   "Build a HeapTupleHeaderData + null bitmap + attribute data byte vector.
-A :varchar value may be a physical external descriptor; write it unaligned
-and set HEAP_HASEXTERNAL. This does not create or fetch TOAST data."
+Inline :bytea values are octet vectors copied into the returned tuple; callers
+must keep them stable during this call. :varchar and :bytea may instead be
+physical external descriptors, written unaligned with HEAP_HASEXTERNAL set.
+This codec does not create or fetch TOAST data."
   (let* ((natts (length columns))
          (bitmap-len (ceiling natts 8))
          (hoff (maxalign (+ +size-of-heap-tuple-header+ bitmap-len)))
@@ -171,9 +173,10 @@ and set HEAP_HASEXTERNAL. This does not create or fetch TOAST data."
          (cursor hoff)
          (infomask 0)
          (has-null nil))
-    ;; Encode varchar once: both the layout and write passes use these bytes.
-    ;; Short headers include their own byte in the 127-byte limit and need no
-    ;; alignment; four-byte headers are aligned and include their header size.
+    ;; Reuse the encoded varchar bytes or caller's bytea vector in both passes.
+    ;; Short inline values (up to 126 payload bytes) and external descriptors
+    ;; need no alignment. Longer inline values use four-byte alignment and a
+    ;; four-byte header; the size encoded in either header includes the header.
     (loop for i from 0 below natts
           for v = (aref values i)
           for col = (aref columns i)
@@ -182,27 +185,29 @@ and set HEAP_HASEXTERNAL. This does not create or fetch TOAST data."
                 (setf has-null t))
                (t
                 (let ((al (column-align col)))
-                  (when (eq (pg-column-type col) :varchar)
+                  (when (member (pg-column-type col) '(:varchar :bytea))
                     (setf (aref varlena-data i)
                           (if (heap-external-varlena-p v)
                               (heap-encode-external-varlena v)
-                              (string->bytes v))))
-                  (unless (and (eq (pg-column-type col) :varchar)
+                              (if (eq (pg-column-type col) :bytea)
+                                  (progn (check-type v (vector (unsigned-byte 8))) v)
+                                  (string->bytes v)))))
+                  (unless (and (member (pg-column-type col) '(:varchar :bytea))
                                (or (heap-external-varlena-p v)
                                    (<= (length (aref varlena-data i)) 126)))
                     (setf cursor (align-up cursor al)))
                   (setf (aref offsets i) cursor)
                   (incf cursor
                         (case (pg-column-type col)
-                          (:varchar (let ((size (length (aref varlena-data i))))
-                                      (if (heap-external-varlena-p v) size
-                                          (+ size (if (<= size 126) 1 4)))))
+                          ((:varchar :bytea) (let ((size (length (aref varlena-data i))))
+                                               (if (heap-external-varlena-p v) size
+                                                   (+ size (if (<= size 126) 1 4)))))
                           (:numeric (+ 4 (length (sql-numeric-output v))))
                           (otherwise (column-fixed-size col))))))))
     (when has-null (setf infomask (logior infomask +heap-hasnull+)))
     (when (some #'heap-external-varlena-p values)
       (setf infomask (logior infomask +heap-hasexternal+)))
-    (when (some (lambda (c) (member (pg-column-type c) '(:varchar :numeric))) columns)
+    (when (some (lambda (c) (member (pg-column-type c) '(:varchar :bytea :numeric))) columns)
       (setf infomask (logior infomask +heap-hasvarwidth+)))
     (let ((bytes (make-array cursor :element-type '(unsigned-byte 8)
                                     :initial-element 0)))
@@ -251,7 +256,7 @@ and set HEAP_HASEXTERNAL. This does not create or fetch TOAST data."
                            (size (+ 4 (length data))))
                       (page-set-u32 bytes off size)
                       (replace bytes data :start1 (+ off 4))))
-                   (:varchar
+                   ((:varchar :bytea)
                     (let ((data (aref varlena-data i)))
                       (if (heap-external-varlena-p v)
                           (replace bytes data :start1 off)
@@ -337,8 +342,9 @@ reject external and compressed datums and lengths outside BYTES."
 
 (defun deform-heap-tuple (bytes columns)
   "Return values, XIDs, command ID, infomask, and successor TID.
-External :varchar attributes become physical descriptors, not strings:
-TOAST fetching, decompression, and SQL-level materialization are not done here."
+Inline :bytea attributes are fresh octet vectors independent of BYTES.
+External :varchar and :bytea attributes become physical descriptors; TOAST
+fetching, decompression, and SQL-level materialization are not done here."
   (let* ((natts (length columns))
          (xmin (page-u32 bytes +heap-tuple-xmin-off+))
          (xmax (page-u32 bytes +heap-tuple-xmax-off+))
@@ -358,7 +364,7 @@ TOAST fetching, decompression, and SQL-level materialization are not done here."
                                                   (floor i 8)))))))
                (unless is-null
                  (let ((al (column-align col)))
-                   (unless (and (eq (pg-column-type col) :varchar)
+                   (unless (and (member (pg-column-type col) '(:varchar :bytea))
                                 (not (zerop (aref bytes cursor))))
                      (setf cursor (align-up cursor al)))
                    (case (pg-column-type col)
@@ -405,14 +411,16 @@ TOAST fetching, decompression, and SQL-level materialization are not done here."
                               (sql-numeric-input (bytes->string bytes :start (+ cursor 4)
                                                                       :end (+ cursor size))))
                         (incf cursor size)))
-                     (:varchar
+                     ((:varchar :bytea)
                       (if (= (aref bytes cursor) 1)
                           (multiple-value-bind (pointer end)
                               (heap-decode-external-varlena bytes cursor)
                             (setf (aref values i) pointer cursor end))
                           (multiple-value-bind (start end)
                               (heap-inline-varlena-range bytes cursor)
-                            (setf (aref values i) (bytes->string bytes :start start :end end)
+                            (setf (aref values i) (if (eq (pg-column-type col) :bytea)
+                                                      (subseq bytes start end)
+                                                      (bytes->string bytes :start start :end end))
                                   cursor end)))))))))
     (values values xmin xmax cid infomask ctid-block ctid-offnum)))
 

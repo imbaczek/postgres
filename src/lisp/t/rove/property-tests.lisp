@@ -271,6 +271,20 @@
     (rove:ok (= target (vacuum-compute-freeze-cutoff next target next))
              "a horizon exactly at the minimum-age target is inclusive")))
 
+(cl-spec:defproperty unit-bytea-tuple-roundtrip
+    ((payload unit-octet-vector))
+  (:about form-heap-tuple deform-heap-tuple)
+  (:trials (:normal 200))
+  (let* ((columns (vector (make-pg-column :name "a" :type :int2 :typmod -1 :attnum 1)
+                          (make-pg-column :name "b" :type :bytea :typmod -1 :attnum 2)
+                          (make-pg-column :name "c" :type :int4 :typmod -1 :attnum 3)))
+         (values (vector 7 payload 42))
+         (bytes (form-heap-tuple values columns 3 0 0 0 0)))
+    (equalp values (deform-heap-tuple bytes columns))))
+
+(rove:deftest generated-unit-bytea-tuple
+    (unit-check-property 'unit-bytea-tuple-roundtrip))
+
 (cl-spec:defproperty unit-varlena-packing-boundaries
     ((n (range integer 0 2048)))
   (:about form-heap-tuple deform-heap-tuple)
