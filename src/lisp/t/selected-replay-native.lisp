@@ -149,6 +149,22 @@
                     (gethash pin *wal-snapshot-retention-pins*))))
     t))
 
+(defun selected-replay-follow-behind-pin (directory)
+  (let* ((request (selected-replay-follow-request directory))
+         (base (getf request :base))
+         (origin (getf request :overlap-start))
+         (prefix (read-bounded-regular-file (merge-pathnames "source-prefix.bin" directory)
+                                            +wal-segment-size+)))
+    (unless (< origin base (getf request :receive-lsn))
+      (error "behind-fork wire fixture needs its base in the fork segment"))
+    (setf (getf request :receive-lsn) base
+          (getf request :receive-timeline) (getf request :base-timeline)
+          (getf request :receive-digest) #xCBF29CE484222325
+          (getf request :overlap-digest)
+          (physical-store-update-digest #xCBF29CE484222325 (subseq prefix 0 (- base origin))))
+    (physical-source-follow-ready "selected_behind" request)
+    t))
+
 (defun selected-replay-bad-follow-overlap (directory)
   (let ((request (selected-replay-follow-request directory)) (rejected nil))
     (setf (getf request :overlap-digest) (logxor 1 (getf request :overlap-digest)))

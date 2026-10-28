@@ -11,6 +11,7 @@ import traceback
 from pathlib import Path
 
 import psutil
+import follow_stream_wire
 
 base, root = Path(sys.argv[1]), Path(sys.argv[2])
 source_port, promoted_port, promoted_pid = map(int, sys.argv[3:])
@@ -124,10 +125,11 @@ def load_helper(endpoint):
     control(endpoint, f'(load {lisp_string(base / "t/selected-replay-native.lisp")})')
 
 
-def restart_promoted_source(connection):
+def restart_promoted_source(connection, pid=None):
+    pid = promoted_pid if pid is None else pid
     directory = root / "copy"
     path = root / "target.sock"
-    owner = psutil.Process(promoted_pid)
+    owner = psutil.Process(pid)
     assert any(c.laddr == str(path) for c in owner.net_connections(kind="unix"))
     assert any(c.status == psutil.CONN_LISTEN and c.laddr.port == promoted_port
                for c in owner.net_connections(kind="tcp"))
@@ -135,8 +137,12 @@ def restart_promoted_source(connection):
     assert stat.S_ISSOCK(original.st_mode)
     connection.close()
     subprocess.run([sys.executable, str(base / "t/interop/signal-owned-server.py"),
-                    str(promoted_pid), str(directory), "KILL", "5"], check=True, timeout=10)
-    (root / "expected-target-sigkill").write_text(str(promoted_pid) + "\n")
+                     str(pid), str(directory), "KILL", "5"], check=True, timeout=10)
+    for process in peer_parameters:
+        if process.pid == pid:
+            assert process.wait(timeout=10) == -signal.SIGKILL
+    if pid == promoted_pid:
+        (root / "expected-target-sigkill").write_text(str(promoted_pid) + "\n")
     if path.exists():
         current = path.lstat()
         assert stat.S_ISSOCK(current.st_mode)
@@ -210,6 +216,10 @@ try:
         else:
             control("target.sock", f'(selected-replay-follow-pin #p{lisp_string(str(bundle) + "/")})')
             reject_bootstrap_for_anchor(system_id, fork, manifest, seed)
+        for name in ("pg_physical_receive", "pg_physical_restartpoints"):
+            retired = root / "copy" / name
+            assert retired.is_dir() and not retired.is_symlink()
+            shutil.rmtree(retired)
         source_peer, source_socket_identity, promoted = restart_promoted_source(promoted)
         connections.append(promoted)
         load_helper("target.sock")
@@ -217,6 +227,31 @@ try:
         control("target.sock", f'(assert (eq :{expected_stage} (physical-follow-pin-stage (gethash "selected_follow" *physical-source-pins*))))')
         control("target.sock", f'(selected-replay-follow-pin #p{lisp_string(str(bundle) + "/")})')
         reject_bootstrap_for_anchor(system_id, fork, manifest, seed)
+        control("target.sock", '(reload)')
+        control("target.sock", f'(selected-replay-follow-behind-pin #p{lisp_string(str(bundle) + "/")})')
+        follow_stream_wire.at_fork(promoted_port, system_id, original_end, fork, manifest, seed)
+        follow_stream_wire.rejects_unbound_requests(
+            promoted_port, system_id, original_end, fork, manifest, seed)
+        follow_stream_wire.early_done(promoted_port, system_id, original_end, original_end,
+                                      fork, manifest, 14695981039346656037, 1,
+                                      "selected_behind", after_data=True)
+        follow_stream_wire.early_done(promoted_port, system_id, original_end, fork,
+                                      fork, manifest, seed, 2, "selected_follow")
+        follow_stream_wire.malformed_copy_done(
+            promoted_port, system_id, original_end, fork, manifest, seed)
+        wait(lambda: ":DONE" in control("target.sock", '(if (gethash "selected_follow" *physical-source-senders*) :waiting :done)'))
+        control("target.sock", f'(assert (= {original_end} (physical-source-pin-confirmed-lsn (gethash "selected_behind" *physical-source-pins*))))')
+        behind_digest = follow_stream_wire.parent_suffix(
+            promoted_port, system_id, original_end, fork, manifest,
+            (bundle / "source-prefix.bin").read_bytes())
+        follow_stream_wire.child_eor(promoted_port, system_id, original_end, fork, manifest, seed,
+                                     (bundle / "eor.bin").read_bytes())
+        wait(lambda: ":DONE" in control("target.sock", '(if (gethash "selected_follow" *physical-source-senders*) :waiting :done)'))
+        source_peer, source_socket_identity, promoted = restart_promoted_source(promoted, source_peer.pid)
+        connections.append(promoted)
+        follow_stream_wire.at_fork(promoted_port, system_id, original_end, fork, manifest,
+                                   behind_digest, slot="selected_behind")
+        print("follow-stream: bounded parent suffix, CopyDone, next timeline, child EOR and source crash/resume PASS", flush=True)
         assert query(promoted, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(False, 3)]
         print(f"follow-anchor: real sibling origin, independent overlap, refusal of bootstrap mode and source SIGKILL recovery ({cut or 'ready'}) PASS", flush=True)
     history = (bundle / "history.txt").read_text()

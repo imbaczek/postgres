@@ -10,11 +10,13 @@ class WireError(RuntimeError):
 
 
 class RawConnection:
-    def __init__(self, port, application_name="executor-parking"):
+    def __init__(self, port, application_name="executor-parking", replication=False):
         self.socket = socket.create_connection(("127.0.0.1", port), timeout=120)
         self.rows_seen = []
         values = ("user", "postgres", "database", "postgres",
                   "application_name", application_name, "client_encoding", "UTF8")
+        if replication:
+            values += ("replication", "true")
         body = struct.pack("!I", 196608) + "\0".join(values).encode() + b"\0\0"
         self.socket.sendall(struct.pack("!I", len(body) + 4) + body)
         while True:
