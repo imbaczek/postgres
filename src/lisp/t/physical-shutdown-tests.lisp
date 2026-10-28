@@ -107,7 +107,10 @@
       (ok (not pg::*shutdown-finished*))))
 
 (deftest postmaster-finalization-prepares-recovery-before-finished
-    (let ((pg::*shutdown-finalizing-p* t)
+    (let ((pg::*physical-follow-controller-blocked-p* nil)
+          (pg::*physical-follow-controller-stopping-p* nil)
+          (pg::*physical-follow-controller-block-owner* nil)
+          (pg::*shutdown-finalizing-p* t)
           (pg::*shutdown-finished* nil)
           (pg::*physical-recovery-state* '(:phase 1 :end 42))
           (pg::*live-operation-depth* 0)
@@ -128,7 +131,10 @@
         (setf (symbol-function 'pg::physical-recovery-prepare-shutdown) original))))
 
 (deftest postmaster-finalization-failure-never-reports-finished
-    (let ((pg::*shutdown-finalizing-p* t)
+    (let ((pg::*physical-follow-controller-blocked-p* nil)
+          (pg::*physical-follow-controller-stopping-p* nil)
+          (pg::*physical-follow-controller-block-owner* nil)
+          (pg::*shutdown-finalizing-p* t)
           (pg::*shutdown-finished* nil)
           (pg::*physical-recovery-state* '(:phase 1 :end 42))
           (pg::*live-operation-depth* 0)
@@ -156,11 +162,12 @@
           (error () t)))))
 
 (deftest process-shutdown-between-startup-worker-checks-is-normal
-    (dolist (boundary '(1 2))
+    (dolist (boundary '(1 2 3))
       (let ((pg::*shutdown* pg::+no-shutdown+)
             (pg::*physical-shutdown-state* nil)
             (pg::*physical-recovery-failed-p* nil)
             (follow (symbol-function 'pg::physical-follow-autostart))
+            (controller (symbol-function 'pg::physical-follow-controller-start-worker))
             (maintenance (symbol-function 'pg::physical-restartpoint-start-worker))
             (calls 0))
         (flet ((start ()
@@ -170,11 +177,13 @@
           (unwind-protect
                (progn
                  (setf (symbol-function 'pg::physical-follow-autostart) #'start
+                       (symbol-function 'pg::physical-follow-controller-start-worker) #'start
                        (symbol-function 'pg::physical-restartpoint-start-worker) #'start)
                  (pg::start-postmaster-recovery-workers)
                  (ok (= calls boundary))
                  (ok (pg::shutdown-in-progress-p)))
             (setf (symbol-function 'pg::physical-follow-autostart) follow
+                  (symbol-function 'pg::physical-follow-controller-start-worker) controller
                   (symbol-function 'pg::physical-restartpoint-start-worker) maintenance))))))
 
 (deftest startup-handoff-preserves-nonshutdown-errors

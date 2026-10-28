@@ -538,12 +538,18 @@ Return the reconstructed state and durable control; do not install runtime state
         (setf (getf state :wal-namespace) namespace)
         (values state control)))))
 
+(declaim (ftype function physical-follow-startup-owner-check physical-follow-prepare-startup
+                physical-follow-check-startup-admission))
+
 (defun physical-recovery-prepare-with-namespace ()
   "Reject a follow binding and verify the base before ordinary startup.
 Publish dirty recovery control before installing state and allowing redo."
   (physical-recovery-check-required-marker)
-  (physical-follow-check-startup-config)
-  (let ((manifest (physical-recovery-verify-base-with-namespace)))
+  (physical-follow-startup-owner-check)
+  (let* ((manifest (physical-recovery-verify-base-with-namespace))
+         (config (physical-follow-prepare-startup manifest)))
+    (setf manifest (physical-recovery-verify-base-with-namespace)
+          (getf manifest :follow-startup-config) config)
     (setf *physical-recovery-state*
           (physical-recovery-write-control
            manifest (getf manifest :phase) (getf manifest :end)
@@ -571,7 +577,7 @@ Publish dirty recovery control before installing state and allowing redo."
 Reject both saved follow binding phases before storage changes, attachment or
 redo; startup integration and the bound receiver remain unavailable."
   (unless (recovery-in-progress-p) (error "physical recovery image was not verified"))
-  (physical-follow-check-startup-config)
+  (physical-follow-check-startup-admission *physical-recovery-state*)
   (let ((streaming (= 2 (getf *physical-recovery-state* :phase))))
     (setf (getf *physical-recovery-state* :replay-timeline) (getf *physical-recovery-state* :timeline)
           *wal-segment-namespace* (getf *physical-recovery-state* :wal-namespace :legacy)

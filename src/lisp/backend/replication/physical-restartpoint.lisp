@@ -454,44 +454,46 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
   (unless (recovery-in-progress-p)
     (ereport "55000" "standby shutdown preparation requires recovery"))
   (when *swank-listener-enabled-p* (error "standby shutdown requires Swank to be off"))
-  (sb-thread:with-mutex (*physical-shutdown-lock*)
-    (sb-thread:with-mutex (*physical-follow-command-lock*)
-      (check-recovery-available)
-      (when (eq *physical-shutdown-state* :prepared)
-        (return-from physical-recovery-prepare-shutdown
-          (or *last-replay-lsn* (getf *physical-recovery-state* :end))))
-      (let ((finished nil) (terminal nil))
-        (unwind-protect
-             (progn
-               (with-live-operation
-                 (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
-                   (setf *physical-shutdown-state* :stopping)))
-               ;; Exit flush needs admission; replay/maintenance may own reload.
-               ;; Join all of them before taking either gate.
-               (physical-follow-quiesce-runtime)
-               (physical-restartpoint-join-for-shutdown)
-               (sb-thread:with-mutex (*reload-run-lock*)
-                 (with-live-operation-quiescence
-                   (check-recovery-available)
-                   (when *physical-receive-store*
-                     (when (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
-                             (physical-store-check-live *physical-receive-store*)
-                             (< (physical-store-flushed-lsn *physical-receive-store*)
-                                (physical-store-written-lsn *physical-receive-store*)))
-                       (physical-recovery-flush)))
-                   (setf terminal (if *physical-receive-store*
-                                      (physical-recovery-restartpoint-core)
-                                      (or *last-replay-lsn* (getf *physical-recovery-state* :end))))
-                   ;; C records clean recovery even when no checkpoint advanced.
-                   ;; Publish only after durable data/pointer/floor and while gated.
-                   (setf *physical-recovery-state*
-                         (physical-recovery-write-control
-                          *physical-recovery-state* (getf *physical-recovery-state* :phase)
-                          terminal *next-xid* :db-state +db-shutdowned-in-recovery+))
-                   (setf *physical-shutdown-state* :prepared)))
-               ;; A failure while reopening admission is a failed preparation too.
-               (setf finished t)
-               terminal)
-          (unless finished
-            (setf *physical-shutdown-state* :failed
-                  *physical-recovery-failed-p* t)))))))
+  (physical-follow-call-with-controller-blocked
+   (lambda ()
+     (sb-thread:with-mutex (*physical-shutdown-lock*)
+       (sb-thread:with-mutex (*physical-follow-command-lock*)
+         (check-recovery-available)
+         (when (eq *physical-shutdown-state* :prepared)
+           (return-from physical-recovery-prepare-shutdown
+             (or *last-replay-lsn* (getf *physical-recovery-state* :end))))
+         (let ((finished nil) (terminal nil))
+           (unwind-protect
+                (progn
+                  (with-live-operation
+                    (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+                      (setf *physical-shutdown-state* :stopping)))
+                  ;; Exit flush needs admission; replay/maintenance may own reload.
+                  ;; Join all of them before taking either gate.
+                  (physical-follow-quiesce-runtime)
+                  (physical-restartpoint-join-for-shutdown)
+                  (sb-thread:with-mutex (*reload-run-lock*)
+                    (with-live-operation-quiescence
+                      (check-recovery-available)
+                      (when *physical-receive-store*
+                        (when (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
+                                (physical-store-check-live *physical-receive-store*)
+                                (< (physical-store-flushed-lsn *physical-receive-store*)
+                                   (physical-store-written-lsn *physical-receive-store*)))
+                          (physical-recovery-flush)))
+                      (setf terminal (if *physical-receive-store*
+                                         (physical-recovery-restartpoint-core)
+                                         (or *last-replay-lsn* (getf *physical-recovery-state* :end))))
+                      ;; C records clean recovery even when no checkpoint advanced.
+                      ;; Publish only after durable data/pointer/floor and while gated.
+                      (setf *physical-recovery-state*
+                            (physical-recovery-write-control
+                             *physical-recovery-state* (getf *physical-recovery-state* :phase)
+                             terminal *next-xid* :db-state +db-shutdowned-in-recovery+))
+                      (setf *physical-shutdown-state* :prepared)))
+                  ;; A failure while reopening admission is a failed preparation too.
+                  (setf finished t)
+                  terminal)
+             (unless finished
+               (setf *physical-shutdown-state* :failed
+                     *physical-recovery-failed-p* t)))))))))

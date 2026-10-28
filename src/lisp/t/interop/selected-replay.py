@@ -170,12 +170,54 @@ def reject_bootstrap_for_anchor(system_id, fork, manifest, seed):
         connection.close()
 
 
+def exercise_controller(promoted, sibling):
+    control("sibling.sock", '(defparameter *controller-original-runtime* *physical-follow-runtime*)')
+    control("sibling.sock", '(physical-follow-retarget "127.0.0.1" 1 "unreachable")', expect_error=True)
+    control("sibling.sock", '(assert (and (eq *controller-original-runtime* *physical-follow-runtime*) (not *physical-recovery-failed-p*)))')
+    control("sibling.sock", f'(physical-follow-retarget "127.0.0.1" {promoted_port} "manual")')
+    wait(lambda: query(sibling, "SELECT count(*) FROM promotion_sql_items") == [(3,)])
+    control("sibling.sock", '(assert (and (not *physical-recovery-failed-p*) (= 2 (physical-recovery-replay-timeline)) (eq :active (getf (fifth (physical-follow-read-config)) :phase))))')
+    query(sibling, "CHECKPOINT")
+    query(promoted, "INSERT INTO promotion_sql_items VALUES (6,'controller-live')")
+    wait(lambda: query(sibling, "SELECT count(*) FROM promotion_sql_items") == [(4,)])
+    wait(lambda: ':CLEANUP-COUNT 0' in control("sibling.sock", '(physical-follow-controller-status)'))
+    print("follow-controller: public retarget, child receipt/replay and asynchronous bootstrap retirement PASS", flush=True)
+
+
+def exercise_controller_parent_catchup():
+    directory = root / "controller-lagging"
+    process, identity = start_peer(directory, replica_port + 1, "lagging.sock", "lagging.log")
+    connection = connect(replica_port + 1)
+    try:
+        control("lagging.sock", f'(physical-follow-retarget "127.0.0.1" {promoted_port} "too_early")', expect_error=True)
+        control("lagging.sock", '(assert (not *physical-recovery-failed-p*))')
+        control("lagging.sock", '(physical-recovery-enable-streaming)')
+        control("lagging.sock", f'(physical-follow-save-config (list 1 "127.0.0.1" {source_port} "controller_lag_seed"))')
+        control("lagging.sock", '(defparameter *controller-attempts* nil)')
+        control("lagging.sock", '(setf *physical-follow-test-hook* (lambda (point) (when (eq point :after-controller-proof) (let ((entry (getf (sixth (physical-follow-read-config)) :preparing))) (push (list (getf entry :pin) (getf (getf entry :request) :receive-lsn)) *controller-attempts*)))))')
+        control("lagging.sock", f'(physical-follow-retarget "127.0.0.1" {promoted_port} "catchup")')
+        wait(lambda: query(connection, "SELECT count(*) FROM promotion_sql_items") == [(4,)])
+        control("lagging.sock", '(assert (= 2 (length *controller-attempts*)))')
+        control("lagging.sock", '(assert (not (equal (first (first *controller-attempts*)) (first (second *controller-attempts*)))))')
+        control("lagging.sock", '(assert (< (second (second *controller-attempts*)) (second (first *controller-attempts*))))')
+        control("lagging.sock", '(assert (and (= 2 (physical-recovery-replay-timeline)) (not *physical-recovery-failed-p*)))')
+        wait(lambda: ':CLEANUP-COUNT 0' in control("lagging.sock", '(physical-follow-controller-status)'))
+        print("follow-controller: lagging parent CopyDone and automatic fresh-pin child handoff PASS", flush=True)
+    finally:
+        connection.close()
+        stop_peer(process, identity)
+
+
 peer, socket_identity = None, None
 source_peer, source_socket_identity = None, None
 connections = []
 try:
     data.mkdir(mode=0o700)
     control("source.sock", f'(physical-base-backup {lisp_string(str(data) + "/")} "sibling_seed")')
+    if os.environ.get("SELECTED_REPLAY_CONTROLLER") == "1":
+        lagging = root / "controller-lagging"
+        lagging.mkdir(mode=0o700)
+        control("source.sock", f'(physical-base-backup {lisp_string(str(lagging) + "/")} "controller_lag_seed")')
     peer, socket_identity = start_peer()
     source, promoted, sibling = [connect(p) for p in (source_port, promoted_port, replica_port)]
     connections.extend((source, promoted, sibling))
@@ -184,12 +226,57 @@ try:
     parent_end = query(source, "SELECT pg_current_wal_flush_lsn()")[0][0]
     for connection in (promoted, sibling):
         wait(lambda: query(connection, f"SELECT pg_last_wal_replay_lsn() >= '{parent_end}'::pg_lsn") == [(True,)])
-    control("sibling.sock", '(physical-follow-stop)')
+    if os.environ.get("SELECTED_REPLAY_CONTROLLER") != "1":
+        control("sibling.sock", '(physical-follow-stop)')
     query(sibling, "CHECKPOINT")
     original_base = {name: (data / name).read_bytes()
                      for name in ("global/pg_wal_control", "global/pg_control")}
     assert query(promoted, "SELECT pg_promote(true,30)") == [(True,)]
     query(promoted, "INSERT INTO promotion_sql_items VALUES (3,'selected-child')")
+    if os.environ.get("SELECTED_REPLAY_CONTROLLER") == "1":
+        exercise_controller(promoted, sibling)
+        exercise_controller_parent_catchup()
+        sibling.close()
+        assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
+        peer, socket_identity = start_peer()
+        sibling = connect(replica_port)
+        connections.append(sibling)
+        assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(True, 4)]
+        query(promoted, "INSERT INTO promotion_sql_items VALUES (7,'controller-restarted')")
+        wait(lambda: query(sibling, "SELECT count(*) FROM promotion_sql_items") == [(5,)])
+        if os.environ.get("SELECTED_REPLAY_CONTROLLER_CUT") == "1":
+            control("sibling.sock", f'(load {lisp_string(base / "t/child-bootstrap-native.lisp")})')
+            control("sibling.sock", f'(child-bootstrap-install-promotion-crash #p{lisp_string(str(root) + "/")} :after-retire-follow-transfer)')
+            assert query(sibling, "SELECT pg_promote(false,30)") == [(True,)]
+            marker = root / "promotion-crash-held"
+            wait(lambda: marker.exists() and int(marker.read_text()) == peer.pid)
+            transferred = (data / "physical-follow.control").read_bytes()
+            assert b":CLEANUP" in transferred and b":ANCHOR" not in transferred
+            assert (data / "physical-backup.manifest").exists()
+            assert (data / "physical-recovery.control").exists()
+            sibling.close()
+            assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
+            peer, socket_identity = start_peer()
+            sibling = connect(replica_port)
+            connections.append(sibling)
+            assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(False, 5)]
+            print("follow-controller: SIGKILL after cleanup transfer, before recovery artifact deletion PASS", flush=True)
+        else:
+            assert query(sibling, "SELECT pg_promote(true,30)") == [(True,)]
+        control("sibling.sock", '(assert (physical-follow-cleanup-only-p (physical-follow-read-config)))')
+        wait(lambda: ':CLEANUP-COUNT 0' in control("sibling.sock", '(physical-follow-controller-status)'))
+        wait(lambda: ':IDLE' in control("sibling.sock", '(if (sb-thread:thread-alive-p *physical-follow-controller-worker*) :running :idle)'))
+        print("follow-controller: active SIGKILL restart and promotion cleanup transfer PASS", flush=True)
+        sibling.close()
+        assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
+        peer, socket_identity = start_peer()
+        sibling = connect(replica_port)
+        connections.append(sibling)
+        assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(False, 5)]
+        query(sibling, "INSERT INTO promotion_sql_items VALUES (8,'controller-primary-restarted')")
+        wait(lambda: ':IDLE' in control("sibling.sock", '(if (sb-thread:thread-alive-p *physical-follow-controller-worker*) :running :idle)'))
+        print("follow-controller: cleanup-only primary SIGKILL restart/write PASS", flush=True)
+        raise SystemExit(0)
     bundle = root / "selected-frames"
     bundle.mkdir(mode=0o700)
     load_helper("target.sock")
@@ -392,7 +479,9 @@ try:
     assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(False, 4)]
     query(sibling, "INSERT INTO promotion_sql_items VALUES (5,'own-restarted-three')")
     print("selected-replay: original base 1, applied child 2, promotion 3 and primary crash restart/write PASS", flush=True)
-except BaseException:
+except BaseException as error:
+    if isinstance(error, SystemExit) and error.code == 0:
+        raise
     traceback.print_exc()
     if os.environ.get("PARKING_KEEP_ON_FAILURE") == "1" and peer is not None and peer.poll() is None:
         print(f"selected-replay: retained owned PID={peer.pid} PGDATA={data} control={root / 'sibling.sock'}; touch {root / 'debug-release'} to finish cleanup", flush=True)

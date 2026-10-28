@@ -127,45 +127,51 @@ finish.  Return the child checkpoint end, or :SHUTDOWN if shutdown takes over
 before intent.  Other failures after work starts fence the process for restart."
   (when (plusp *live-operation-depth*)
     (error "online promotion must run outside operation admission"))
-  (sb-thread:with-mutex (*physical-shutdown-lock*)
-    (sb-thread:with-mutex (*physical-follow-command-lock*)
-      (with-live-operation
-        (physical-promotion-check-online)
-        (when (physical-promotion-awaiting-child-initialization-p)
-          (return-from physical-recovery-promote :awaiting-child-initialization)))
-      (let* ((finished nil)
-             (runtime *physical-follow-runtime*)
-             (config (when runtime
-                       (list 1 (physical-follow-runtime-host runtime)
-                             (physical-follow-runtime-port runtime)
-                             (physical-follow-runtime-pin runtime))))
-             (paused nil)
-             (restartpoint (and *physical-restartpoint-worker*
-                                (sb-thread:thread-alive-p *physical-restartpoint-worker*))))
-        (unwind-protect
-             (handler-case
-                 (progn
-                   (with-live-operation
-                     (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
-                       (sb-thread:with-mutex (*physical-replay-pause-lock*)
-                         (setf paused *physical-replay-paused-p*
-                               *physical-promotion-stopping-p* t
-                               *physical-replay-paused-p* nil))))
-                   (physical-follow-quiesce-runtime)
-                   (physical-restartpoint-join-for-shutdown)
-                   (physical-promotion-test-point :after-online-worker-join)
-                   (loop for result = (physical-promotion-try-online)
-                         unless (eq result :deferred)
-                           do (when (eq result :awaiting-child-initialization)
-                                (physical-promotion-resume-recovery-workers config paused restartpoint))
-                              (setf finished t) (return result)
-                         do (sleep 0.05)))
-               (physical-promotion-shutdown (condition)
-                 (unless (physical-promotion-can-yield-to-shutdown-p)
-                   (error condition))
-                 (setf finished t)
-                 :shutdown))
-          (unless finished (setf *physical-recovery-failed-p* t)))))))
+  (physical-follow-call-with-controller-blocked
+   (lambda ()
+     (sb-thread:with-mutex (*physical-shutdown-lock*)
+       (sb-thread:with-mutex (*physical-follow-command-lock*)
+         (with-live-operation
+           (physical-promotion-check-online)
+           (when (physical-promotion-awaiting-child-initialization-p)
+             (return-from physical-recovery-promote :awaiting-child-initialization)))
+         (let* ((finished nil)
+                (runtime *physical-follow-runtime*)
+                (config (let ((saved (when (probe-file (physical-follow-config-path))
+                                       (physical-follow-read-config))))
+                          (cond ((and saved (physical-follow-controller-enabled-p saved)) saved)
+                                (runtime
+                                 (or (physical-follow-runtime-config runtime)
+                                     (list 1 (physical-follow-runtime-host runtime)
+                                           (physical-follow-runtime-port runtime)
+                                           (physical-follow-runtime-pin runtime)))))))
+                (paused nil)
+                (restartpoint (and *physical-restartpoint-worker*
+                                   (sb-thread:thread-alive-p *physical-restartpoint-worker*))))
+           (unwind-protect
+                (handler-case
+                    (progn
+                      (with-live-operation
+                        (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
+                          (sb-thread:with-mutex (*physical-replay-pause-lock*)
+                            (setf paused *physical-replay-paused-p*
+                                  *physical-promotion-stopping-p* t
+                                  *physical-replay-paused-p* nil))))
+                      (physical-follow-quiesce-runtime)
+                      (physical-restartpoint-join-for-shutdown)
+                      (physical-promotion-test-point :after-online-worker-join)
+                      (loop for result = (physical-promotion-try-online)
+                            unless (eq result :deferred)
+                              do (when (eq result :awaiting-child-initialization)
+                                   (physical-promotion-resume-recovery-workers config paused restartpoint))
+                                 (setf finished t) (return result)
+                            do (sleep 0.05)))
+                  (physical-promotion-shutdown (condition)
+                    (unless (physical-promotion-can-yield-to-shutdown-p)
+                      (error condition))
+                    (setf finished t)
+                    :shutdown))
+             (unless finished (setf *physical-recovery-failed-p* t)))))))))
 
 (defun request-physical-promotion (&rest signal-info)
   "Record SIGUSR1 without locks or file I/O. The request worker checks the file."

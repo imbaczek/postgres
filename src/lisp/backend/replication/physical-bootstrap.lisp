@@ -25,7 +25,8 @@ completion already initialized storage. Invalid proof is an error."
   (when (and (not (wal-namespace-file-stat (physical-recovery-control-path) t))
              (or (wal-namespace-file-stat (merge-pathnames "recovery.required" *pgdata*) t)
                  (wal-namespace-file-stat (merge-pathnames "physical-backup.manifest" *pgdata*) t)
-                 (wal-namespace-file-stat (merge-pathnames "physical-follow.control" *pgdata*) t)
+                 (and (wal-namespace-file-stat (physical-follow-config-path) t)
+                      (not (physical-follow-cleanup-only-p (physical-follow-read-config))))
                  (wal-namespace-file-stat (merge-pathnames "physical-restartpoint.control" *pgdata*) t)))
     (error "recovery metadata is incomplete: recovery control is missing"))
   (cond

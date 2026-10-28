@@ -93,6 +93,11 @@ are no longer required for primary startup."
                  ("physical-restartpoint.control" :after-retire-pointer)
                  ("physical-recovery.control" :after-retire-pending))))
     (physical-promotion-test-point :after-primary-retained-registration)
+    (let ((cleanup (physical-follow-promotion-cleanup-config)))
+      (when cleanup
+        (physical-follow-controller-save-config cleanup)
+        (setf names (remove "physical-follow.control" names :key #'first :test #'equal))
+        (physical-promotion-test-point :after-retire-follow-transfer)))
     (dolist (entry names) (wal-namespace-file-stat (merge-pathnames (first entry) *pgdata*) t))
     (dolist (entry names)
       (let ((path (merge-pathnames (first entry) *pgdata*)))

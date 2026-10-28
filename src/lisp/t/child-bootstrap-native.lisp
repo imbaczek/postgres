@@ -15,7 +15,7 @@
           do (sleep 0.025))))
 
 (defun child-bootstrap-install-promotion-crash (root point)
-  (assert (member point '(:after-online-intent :after-child-control-directory-fsync)))
+  (assert (member point '(:after-online-intent :after-child-control-directory-fsync :after-retire-follow-transfer)))
   (setf *child-bootstrap-crash-root* root
         *child-bootstrap-crash-point* point
         *physical-promotion-test-hook* #'child-bootstrap-promotion-crash-hook)

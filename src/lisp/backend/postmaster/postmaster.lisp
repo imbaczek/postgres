@@ -252,6 +252,7 @@ command (idle) is ignored; the connection and its transaction state survive."
   (handler-case
       (progn
         (physical-follow-autostart)
+        (physical-follow-controller-start-worker)
         (physical-restartpoint-start-worker)
         (physical-promotion-start-worker))
     (physical-recovery-worker-shutdown (condition)
@@ -272,6 +273,7 @@ command (idle) is ignored; the connection and its transaction state survive."
   (unless (sb-thread:with-mutex (*shutdown-lock*) *shutdown-finished*)
     ;; Like C ShutdownXLOG, recovery shutdown publishes an applied restartpoint.
     ;; The signal worker remains free to process SIGQUIT while this waits.
+    (physical-follow-controller-stop-worker)
     (if (recovery-in-progress-p)
         (progn
           (call-with-live-operation #'postmaster-retire-abandoned-backends)
