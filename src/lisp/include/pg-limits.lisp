@@ -46,6 +46,9 @@
 ;;; Heap tuple infomask bits (subset of htup_details.h).
 (defconstant +heap-hasnull+ #x0001)
 (defconstant +heap-hasvarwidth+ #x0002)
+
+(defconstant +heap-hasexternal+ #x0004)
+
 (defconstant +heap-xmin-committed+ #x0100)
 (defconstant +heap-xmin-invalid+ #x0200)
 (defconstant +heap-xmax-invalid+ #x0400)

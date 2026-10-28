@@ -88,6 +88,24 @@
                         (lambda (tuple) (push (aref (htup-values tuple) 0) seen)))
       (rove:ok (equal seen '("visible")) "invisible tuple attributes are not read")))
 
+(rove:deftest test-tuple-external-varlena
+    (dolist (width '(4 8))
+      (let* ((columns (vector (make-pg-column :name "a" :type :int2 :typmod -1 :attnum 1)
+                              (make-pg-column :name "b" :type :varchar :typmod -1 :attnum 2)
+                              (make-pg-column :name "c" :type :int4 :typmod -1 :attnum 3)))
+             (pointer (make-heap-external-varlena :raw-size 5000 :external-info 4996
+                                                  :value-id 42 :relation-id 100
+                                                  :id-width width))
+             (values (vector 17 pointer 91))
+             (bytes (form-heap-tuple values columns 3 0 0 0 0))
+             (offset (+ 2 (aref bytes +heap-tuple-hoff-off+))))
+        (rove:ok (= 1 (aref bytes offset)) "external pointer is stored unaligned")
+        (multiple-value-bind (decoded xmin xmax cid infomask)
+            (deform-heap-tuple bytes columns)
+          (declare (ignore xmin xmax cid))
+          (rove:ok (equalp values decoded) "physical tuple preserves external pointer")
+          (rove:ok (logtest infomask +heap-hasexternal+) "external infomask is set")))))
+
 (rove:deftest test-tuple-roundtrip
     (let* ((cols (coerce
                   (list (make-pg-column :name "a" :type :int4 :typmod -1

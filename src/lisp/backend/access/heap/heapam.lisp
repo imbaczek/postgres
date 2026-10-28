@@ -140,8 +140,29 @@
     ((:int8 :float8 :time :timestamp :timestamptz) 8)
     (t nil)))
 
+(defconstant +vartag-ondisk-oid+ 18)
+
+(defconstant +vartag-ondisk-oid8+ 4)
+
+(defconstant +external-varlena-fixed-size+ 14)
+
+;; Physical on-disk TOAST descriptor (varatt_external_oid / _oid8 in
+;; varatt.h), not the value it references. RAW-SIZE is the original size
+;; including the four-byte header; EXTERNAL-INFO holds the saved size without
+;; that header in its low 30 bits and the compression method in its high two.
+;; VALUE-ID identifies the value in the TOAST table, RELATION-ID identifies the
+;; table, and ID-WIDTH selects a 4- or 8-byte value ID. These are copied scalar
+;; fields; the descriptor owns neither TOAST storage nor materialized data.
+;; The codec preserves the fields as opaque bits and checks their widths, not
+;; whether sizes, compression method, or IDs describe a valid TOAST value.
+
+(defstruct heap-external-varlena
+  raw-size external-info value-id relation-id id-width)
+
 (defun form-heap-tuple (values columns xmin xmax cid block off)
-  "Build a HeapTupleHeaderData + null bitmap + attribute data byte vector."
+  "Build a HeapTupleHeaderData + null bitmap + attribute data byte vector.
+A :varchar value may be a physical external descriptor; write it unaligned
+and set HEAP_HASEXTERNAL. This does not create or fetch TOAST data."
   (let* ((natts (length columns))
          (bitmap-len (ceiling natts 8))
          (hoff (maxalign (+ +size-of-heap-tuple-header+ bitmap-len)))
@@ -162,18 +183,25 @@
                (t
                 (let ((al (column-align col)))
                   (when (eq (pg-column-type col) :varchar)
-                    (setf (aref varlena-data i) (string->bytes v)))
+                    (setf (aref varlena-data i)
+                          (if (heap-external-varlena-p v)
+                              (heap-encode-external-varlena v)
+                              (string->bytes v))))
                   (unless (and (eq (pg-column-type col) :varchar)
-                               (<= (length (aref varlena-data i)) 126))
+                               (or (heap-external-varlena-p v)
+                                   (<= (length (aref varlena-data i)) 126)))
                     (setf cursor (align-up cursor al)))
                   (setf (aref offsets i) cursor)
                   (incf cursor
                         (case (pg-column-type col)
                           (:varchar (let ((size (length (aref varlena-data i))))
-                                      (+ size (if (<= size 126) 1 4))))
+                                      (if (heap-external-varlena-p v) size
+                                          (+ size (if (<= size 126) 1 4)))))
                           (:numeric (+ 4 (length (sql-numeric-output v))))
                           (otherwise (column-fixed-size col))))))))
     (when has-null (setf infomask (logior infomask +heap-hasnull+)))
+    (when (some #'heap-external-varlena-p values)
+      (setf infomask (logior infomask +heap-hasexternal+)))
     (when (some (lambda (c) (member (pg-column-type c) '(:varchar :numeric))) columns)
       (setf infomask (logior infomask +heap-hasvarwidth+)))
     (let ((bytes (make-array cursor :element-type '(unsigned-byte 8)
@@ -225,15 +253,68 @@
                       (replace bytes data :start1 (+ off 4))))
                    (:varchar
                     (let ((data (aref varlena-data i)))
-                      (if (<= (length data) 126)
-                          (progn
-                            (setf (aref bytes off)
-                                  (logior (ash (1+ (length data)) 1) 1))
-                            (replace bytes data :start1 (1+ off)))
-                          (progn
-                            (page-set-u32 bytes off (ash (+ 4 (length data)) 2))
-                            (replace bytes data :start1 (+ off 4)))))))))
+                      (if (heap-external-varlena-p v)
+                          (replace bytes data :start1 off)
+                          (if (<= (length data) 126)
+                              (progn
+                                (setf (aref bytes off)
+                                      (logior (ash (1+ (length data)) 1) 1))
+                                (replace bytes data :start1 (1+ off)))
+                              (progn
+                                (page-set-u32 bytes off (ash (+ 4 (length data)) 2))
+                                (replace bytes data :start1 (+ off 4))))))))))
       bytes)))
+
+(defun heap-encode-external-varlena (pointer)
+  "Return a fresh little-endian physical descriptor, validating field widths.
+The external header and tag precede unaligned fields; no TOAST semantic
+validation, allocation, or materialization is performed."
+  (let* ((width (heap-external-varlena-id-width pointer))
+         (raw (heap-external-varlena-raw-size pointer))
+         (info (heap-external-varlena-external-info pointer))
+         (id (heap-external-varlena-value-id pointer))
+         (relation (heap-external-varlena-relation-id pointer)))
+    (unless (and (member width '(4 8))
+                 (typep raw '(unsigned-byte 32))
+                 (typep info '(unsigned-byte 32))
+                 (typep relation '(unsigned-byte 32))
+                 (integerp id) (<= 0 id) (< id (ash 1 (* 8 width))))
+      (error "Invalid external varlena fields"))
+    (let ((bytes (make-array (+ +external-varlena-fixed-size+ width) :element-type '(unsigned-byte 8)
+                                                                     :initial-element 0)))
+      (setf (aref bytes 0) 1
+            (aref bytes 1) (if (= width 4) +vartag-ondisk-oid+ +vartag-ondisk-oid8+))
+      (page-set-u32 bytes 2 raw)
+      (page-set-u32 bytes 6 info)
+      (if (= width 4)
+          (page-set-u32 bytes 10 id)
+          (page-set-u64 bytes 10 id))
+      (page-set-u32 bytes (+ 10 width) relation)
+      bytes)))
+
+(defun heap-decode-external-varlena (bytes offset)
+  "Decode an on-disk descriptor at OFFSET and return it and its exclusive end.
+Check the header, supported tag, and bounds; preserve field bits without
+validating TOAST semantics. The result does not retain or own BYTES."
+  (unless (and (integerp offset) (<= 0 offset)
+               (<= (+ offset 2) (length bytes))
+               (= (aref bytes offset) 1))
+    (error "Invalid external varlena header"))
+  (let* ((tag (aref bytes (1+ offset)))
+         (width (cond ((= tag +vartag-ondisk-oid+) 4)
+                      ((= tag +vartag-ondisk-oid8+) 8)
+                      (t (error "Unsupported external varlena tag"))))
+         (end (+ offset +external-varlena-fixed-size+ width)))
+    (when (> end (length bytes))
+      (error "Truncated external varlena"))
+    (values (make-heap-external-varlena
+             :raw-size (page-u32 bytes (+ offset 2))
+             :external-info (page-u32 bytes (+ offset 6))
+             :value-id (if (= width 4) (page-u32 bytes (+ offset 10))
+                           (page-u64 bytes (+ offset 10)))
+             :relation-id (page-u32 bytes (+ offset 10 width))
+             :id-width width)
+            end)))
 
 (defun heap-inline-varlena-range (bytes offset)
   "Return inclusive start and exclusive end offsets into BYTES, without copying.
@@ -255,7 +336,9 @@ reject external and compressed datums and lengths outside BYTES."
       (values (+ offset header-size) end))))
 
 (defun deform-heap-tuple (bytes columns)
-  "Return values, XIDs, command ID, infomask, and successor TID."
+  "Return values, XIDs, command ID, infomask, and successor TID.
+External :varchar attributes become physical descriptors, not strings:
+TOAST fetching, decompression, and SQL-level materialization are not done here."
   (let* ((natts (length columns))
          (xmin (page-u32 bytes +heap-tuple-xmin-off+))
          (xmax (page-u32 bytes +heap-tuple-xmax-off+))
@@ -323,10 +406,14 @@ reject external and compressed datums and lengths outside BYTES."
                                                                       :end (+ cursor size))))
                         (incf cursor size)))
                      (:varchar
-                      (multiple-value-bind (start end)
-                          (heap-inline-varlena-range bytes cursor)
-                        (setf (aref values i) (bytes->string bytes :start start :end end)
-                              cursor end))))))))
+                      (if (= (aref bytes cursor) 1)
+                          (multiple-value-bind (pointer end)
+                              (heap-decode-external-varlena bytes cursor)
+                            (setf (aref values i) pointer cursor end))
+                          (multiple-value-bind (start end)
+                              (heap-inline-varlena-range bytes cursor)
+                            (setf (aref values i) (bytes->string bytes :start start :end end)
+                                  cursor end)))))))))
     (values values xmin xmax cid infomask ctid-block ctid-offnum)))
 
 (defun heapam-get-tuple (relfilenode block offnum columns)

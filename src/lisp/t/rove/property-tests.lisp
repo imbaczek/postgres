@@ -321,3 +321,45 @@
                    (progn (heap-inline-varlena-range bytes 0) nil)
                  (error () t))
                "truncated and invalid four-byte varlena lengths are rejected")))
+
+(cl-spec:defproperty unit-external-varlena-roundtrip
+    ((raw-size (range integer 4 1073741823))
+     (external-info (range integer 0 4294967295))
+     (value-id (range integer 0 4294967295))
+     (relation-id (range integer 0 4294967295)))
+  (:about heap-encode-external-varlena heap-decode-external-varlena)
+  (:trials (:normal 200))
+  (loop for width in '(4 8)
+        for value = (make-heap-external-varlena :raw-size raw-size
+                                                :external-info external-info
+                                                :value-id value-id
+                                                :relation-id relation-id
+                                                :id-width width)
+        for bytes = (heap-encode-external-varlena value)
+        always (multiple-value-bind (decoded end)
+                   (heap-decode-external-varlena bytes 0)
+                 (and (= end (length bytes)) (equalp value decoded)))))
+
+(rove:deftest generated-unit-external-varlena
+    (unit-check-property 'unit-external-varlena-roundtrip))
+
+(rove:deftest unit-external-varlena-reference-layout
+    (let* ((bytes (make-array 23 :element-type '(unsigned-byte 8) :initial-element 0))
+           (oid8 (make-heap-external-varlena :raw-size 2048 :external-info 2000
+                                             :value-id #x1122334455667788
+                                             :relation-id #x12345678 :id-width 8)))
+      (replace bytes (heap-encode-external-varlena oid8) :start1 1)
+      (rove:ok (equalp (subseq bytes 1)
+                       #(1 4 0 8 0 0 208 7 0 0 136 119 102 85 68 51 34 17 120 86 52 18))
+               "OID8 external descriptor has PostgreSQL byte layout even unaligned")
+      (multiple-value-bind (decoded end) (heap-decode-external-varlena bytes 1)
+        (rove:ok (and (= end 23) (equalp oid8 decoded)) "unaligned OID8 descriptor decodes")))
+  (let ((oid (make-heap-external-varlena :raw-size 5 :external-info 1 :value-id 9
+                                         :relation-id 10 :id-width 4)))
+    (rove:ok (equalp (heap-encode-external-varlena oid)
+                     #(1 18 5 0 0 0 1 0 0 0 9 0 0 0 10 0 0 0))
+             "OID external descriptor has PostgreSQL byte layout"))
+  (dolist (bytes (list #(1) #(1 18) #(1 4 0 0 0 0) #(1 1) #(1 2) #(1 3) #(1 99) #(0 18)))
+    (rove:ok (handler-case (progn (heap-decode-external-varlena bytes 0) nil)
+               (error () t))
+             "invalid external header is rejected")))
