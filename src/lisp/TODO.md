@@ -25,6 +25,10 @@
 - [ ] Audit cold-image compilation and ASDF load-order dependencies across `pg`
   and its test systems. A warm REPL must not conceal missing declarations or
   compile-time dependencies.
+  The physical-slot range validator exposed another instance: calling a timeline
+  structure accessor before its `DEFSTRUCT` caused an inlining warning only in a
+  cold compile. Moving the slot module after its dependencies fixed that case;
+  the wider audit remains open.
 
 - [ ] Extend implicit simple-query transactions to the remaining statement and
   transaction-control cases, including transactional DDL and TRUNCATE, using C as

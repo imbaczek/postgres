@@ -1,6 +1,12 @@
 (in-package #:pg)
 
+;;; Durable physical slot state and primary startup validation.
+;;; Slot ownership is process-local; the image records retention identity and
+;;; restart state, not the active owner.
+
 (defun physical-slot-state-valid-p (slot)
+  "Check physical kind and durable field shape, including the paired nullable
+restart LSN and timeline. A null restart or lost slot does not retain WAL."
   (let ((restart (wal-replication-slot-restart-lsn slot))
         (timeline (wal-replication-slot-restart-timeline slot)))
     (and (eq :physical (wal-replication-slot-kind slot))
@@ -19,6 +25,10 @@
          (typep (wal-replication-slot-inactive-since slot) '(signed-byte 64)))))
 
 (defun physical-slot-check-retained-range (slot system-id history frontier read-segment)
+  "Check exact system identity and restart position against source history.
+A reserved restart may be inside a segment; require coverage through FRONTIER
+and validate native record placement across segment gaps. Null or lost slots
+need no WAL read. READ-SEGMENT supplies the selected lineage."
   (unless (and (physical-slot-state-valid-p slot)
                (eql system-id (wal-replication-slot-system-id slot))
                (typep frontier '(unsigned-byte 64)))
@@ -57,6 +67,8 @@
 (declaim (ftype function physical-source-lineage-segment))
 
 (defun physical-slot-check-primary-wal (slot system-id)
+  "Under WAL exclusion, check retained coverage against durable primary history.
+Eligible ancestor segments may satisfy a public physical slot."
   (sb-thread:with-mutex (*wal-lock*)
     (when (recovery-in-progress-p)
       (error "physical slot primary validation cannot run during recovery"))
@@ -70,6 +82,8 @@
          (physical-source-lineage-segment system-id timeline history segment cursor t))))))
 
 (defun physical-slot-startup-system-id ()
+  "Read the durable catalog identity for slot restoration. Primary slot loading
+precedes catalog initialization, so startup must not invent an identity."
   (unless (probe-file (catalog-path))
     (error "physical slot startup requires the durable cluster catalog"))
   (let* ((*catalog-identity-needs-persist-p* nil)
@@ -79,6 +93,8 @@
     (catalog-system-identifier catalog)))
 
 (defun physical-slot-restore-primary (slot inactive-since)
+  "Remove temporary slots at startup; validate persistent slots before admitting
+retention and set their new inactive timestamp."
   (cond
     ((wal-replication-slot-temporary-p slot)
      (wal-delete-replication-slot-file (wal-replication-slot-name slot))
@@ -94,6 +110,8 @@
          (loop for index below (length magic) always (= (aref bytes index) (aref magic index))))))
 
 (defun physical-slot-encode (slot)
+  "Encode checked durable slot fields with a checksum. Active and temporary
+owners and pending process state are not persisted."
   (unless (physical-slot-state-valid-p slot) (error "invalid physical replication slot state"))
   (let* ((prefix (format nil "PGPHYSICALSLOT1 ~a ~d ~a ~a ~a ~d ~d"
                          (wal-replication-slot-name slot) (wal-replication-slot-system-id slot)
@@ -118,6 +136,8 @@
     value))
 
 (defun physical-slot-decode (bytes name)
+  "Decode a bounded, checksummed image and check its name and physical fields.
+The returned slot has fresh process-local ownership and transaction state."
   (unless (and (typep bytes '(vector (unsigned-byte 8))) (<= 1 (length bytes) 2048)
                (= 10 (aref bytes (1- (length bytes))))
                (every (lambda (byte) (or (= byte 10) (<= 32 byte 126))) bytes))

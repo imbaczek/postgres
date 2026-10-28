@@ -56,6 +56,8 @@
   relfilenode (fork :main) block page (xids '()) (provenance :unknown))
 
 (defstruct wal-replication-slot
+  "KIND distinguishes logical and physical slots, including unbound logical slots.
+Owners are process-local; the appropriate codec stores durable slot fields."
   name database-oid restart-lsn consistent-lsn confirmed-flush-lsn active-owner
   active-owner-backend
   ;; PGSLOT1-3 were the private protocol even though the old wire name was pgoutput.
@@ -95,9 +97,11 @@
     copy))
 
 (defun wal-logical-slot-p (slot)
+  "Test the explicit slot kind; a nullable database alone does not identify it."
   (eq :logical (wal-replication-slot-kind slot)))
 
 (defun wal-physical-slot-p (slot)
+  "Test the explicit physical kind, not the database field."
   (eq :physical (wal-replication-slot-kind slot)))
 
 (defun wal-valid-slot-plugin-state-p (plugin database-oid confirmed-flush-lsn)
@@ -2111,6 +2115,7 @@ src/backend/access/transam/xlogreader.c."
 (declaim (ftype function physical-slot-encode physical-slot-decode physical-slot-image-p))
 
 (defun wal-encode-replication-slot (slot)
+  "Encode using the slot's explicit kind; reject unknown kinds."
   (when (eq :physical (wal-replication-slot-kind slot))
     (return-from wal-encode-replication-slot (physical-slot-encode slot)))
   (unless (wal-logical-slot-p slot)
@@ -2176,6 +2181,7 @@ src/backend/access/transam/xlogreader.c."
         do (setf start (1+ end))))
 
 (defun wal-read-replication-slot (path)
+  "Dispatch physical images to their codec and read legacy logical formats."
   (let ((bytes (read-bounded-regular-file path 2048)))
     (when (physical-slot-image-p bytes)
       (return-from wal-read-replication-slot
@@ -2462,7 +2468,8 @@ src/backend/access/transam/xlogreader.c."
 (declaim (ftype function physical-slot-restore-primary))
 
 (defun wal-load-replication-slots ()
-  "Load durable WAL restart points before any checkpoint can recycle WAL."
+  "Load durable slots before any checkpoint can recycle WAL.
+Dispatch physical slots to their primary restoration and identity checks."
   (let ((segments (wal-discover-segments))
         (inactive-since (postgres-current-timestamp)))
     (clrhash *wal-replication-slots*)

@@ -621,6 +621,84 @@ path before claiming Patroni `follow` support. Synchronous commit waits and an
 independent acknowledgment-loss oracle remain separate required work; these
 tests do not establish zero-loss failover.
 
+### Standard follow configuration integration — in progress
+
+The next integrated milestone is startup and upstream replacement through
+unmodified Patroni 4.1.5 configuration writers and `Postgresql.follow`, using
+standard settings and an exact persistent physical slot name. Adding GUC names
+alone would not provide that behavior. The implementation must cover first
+attachment, same-timeline changes, descendant transitions, clearing conninfo,
+failed replacement, cold restart and shutdown/promotion races.
+
+A Sol xhigh source audit identified these connected requirements:
+
+- Add an explicit logical/physical discriminator to the shared public slot
+  registry. Legacy private logical slots may have no database OID, so a NULL
+  database cannot identify physical slots. Preserve logical codecs and keep
+  attempt-specific proof pins separate from persistent public slots.
+- Implement physical SQL creation, drop, advancement, catalog visibility,
+  temporary-session ownership, startup loading and WAL retention. A NULL restart
+  position reserves no bytes but still occupies its name and capacity. SQL
+  advancement accepts interior byte positions and clamps to primary flush or
+  standby replay. Streaming feedback may move a physical restart position
+  backward; logical terminal acknowledgments cannot implement that operation.
+- Validate physical slots against role-appropriate live WAL, base overlap and
+  retained history. Preserve proven slots across promotion through the existing
+  retained-root handoff. Do not relax logical-slot or private-proof restrictions
+  without implementing their corresponding ownership rules.
+- Add first-attachment and same-timeline admission alongside descendant proof.
+  The bootstrap manifest's source pin and `primary_slot_name` are distinct.
+- Install desired settings under reload exclusion, then reconcile them after
+  releasing that exclusion. Fence stale requests by desired generation. C retries
+  the newly configured source on failure; it does not revive the old upstream.
+  Clearing conninfo stops receipt while local replay and recovery continue.
+- Preserve real conninfo behavior through a libpq transport adapter, including
+  user, passfile, application name and negotiation. Keep native WAL negotiation
+  explicit and the stable direct-endpoint identity assumption. Do not silently
+  discard unsupported multihost connection semantics.
+- Implement `standby.signal`, the three recovery settings and other fields the
+  real Patroni writer emits. `primary_conninfo` and `primary_slot_name` are SIGHUP
+  settings; `recovery_target_timeline` is POSTMASTER. A signal cannot create native
+  base provenance or bypass committed promotion.
+
+References: C `slotfuncs.c`, `slot.h:248-269`, `walsender.c:PhysicalConfirmReceivedLocation`,
+`startup.c:StartupRereadConfig`, `libpqwalreceiver.c:libpqrcv_connect`, and
+`guc_parameters.dat`; Patroni `config.py:build_recovery_params`,
+`config.py:_write_recovery_params`, `__init__.py:follow`, and
+`slots.py:_ensure_physical_slots`.
+
+The new `t/interop/physical-slots.py` contract passes on a clean pinned C build
+and fails on the current native server at physical-slot creation. It checks
+unreserved NULL state, catalog values, duplicates, invalid names, SQL NULL,
+byte-position advancement, future-position clamping and temporary ownership.
+This is a failing implementation baseline, not completed physical-slot support.
+Evidence: `/tmp/pg-config-slot-probe.nWMDyQ/reference-contract.log`,
+`native-contract-baseline.log`, and `native-control-baseline.log`. The native
+control REPL confirms that the SQL function is absent and the slot catalog still
+has only its earlier six supported fields.
+
+Commit `728fd92a99e` adds the explicit kind, a bounded physical state
+codec on the shared slot path, and guards against applying logical XID tracking
+to physical slots. The state
+property first failed on the missing kind and now passes 200 seed-42 trials.
+This does not complete public creation, streaming or configuration support.
+The checkpoint review found no unintended logical-path change. Primary startup
+now accepts an unreserved NULL floor, checks the durable catalog identity and
+selected history, removes temporary slots after a crash, and resets inactivity
+time as C does. Reserved positions use checked retained ancestry and eligible
+live timeline files. Physical slot validation permits parent files before the
+fork; private follow pins retain their stricter source-file requirement. Native
+rotation gaps need a complete predecessor record and a following record that
+could not fit. Standby loading and promotion carryover remain open. A decoder's
+numeric validity alone does not prove WAL availability. The full physical suite
+passed 869 tests before the final predecessor-record and archive-prefix fixes.
+All 14 focused tests passed on the final source, as did 170 interop tests and
+strict cold compilation. Review also caught unknown slot kinds falling through
+to the logical encoder; a failing regression now verifies their rejection.
+The owned baseline peers remain at ports 6960
+(pinned C) and 6961 (native), with private artifacts under the directory above;
+the native peer must restart after the shared structure layout change.
+
 ### Historical WAL retention implementation order
 
 Preserve the receive floor's current checksum-seed meaning. Before any compaction

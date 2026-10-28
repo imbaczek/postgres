@@ -211,8 +211,9 @@ base. In the base segment, compare the extent prefix with the immutable overlap.
                         (getf identity :base-timeline))))))
 
 (defun physical-source-lineage-live-segment (source-timeline segment history &optional (namespace :timeline) allow-ancestor)
-  "Copy a current-source timeline segment for PIN, bounded by durable WAL.
-An older candidate does not establish current-source coverage."
+  "Copy a selected lineage segment, bounded by durable WAL.
+ALLOW-ANCESTOR permits an eligible older timeline for public slot coverage;
+private follow requires the current-source timeline."
   (multiple-value-bind (stream timeline size)
       (wal-lineage-open-segment segment history 0 namespace)
     (unwind-protect
@@ -236,8 +237,10 @@ An older candidate does not establish current-source coverage."
 The source root is bound to its own base, identity, control reference, projected
 parent history and fixed fork; those need not equal the receiver's base or
 manifest. Retained logical coverage runs from base to fork. A logical read before
-base requires a current-source file eligible in the selected lineage. At the fork,
-compare the child prefix with retained ancestry before returning the child bytes."
+base requires an eligible live file in the selected lineage. At the fork,
+compare the live prefix with retained ancestry before returning those bytes.
+ALLOW-ANCESTOR permits an eligible live ancestor for public slot coverage; the
+private follow caller leaves it false."
   (unless (sb-thread:holding-mutex-p *wal-lock*)
     (error "historical source segment requires WAL exclusion"))
   (when (recovery-in-progress-p)
@@ -281,6 +284,8 @@ compare the child prefix with retained ancestry before returning the child bytes
              (physical-recovery-retained-directory) identity (getf reference :root-id)))))))
 
 (defun physical-follow-source-segment (pin segment &optional logical-start)
+  "Read the selected lineage for a private follow pin, retaining its stricter
+current-source requirement when live WAL is needed."
   (physical-follow-pin-check-source pin)
   (physical-source-lineage-segment
    (physical-source-pin-system-id pin) (physical-source-pin-timeline pin)
