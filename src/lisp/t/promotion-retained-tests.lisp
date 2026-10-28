@@ -204,6 +204,317 @@
         (call-with-promotion-exclusion #'pg::physical-promotion-publish-child-control)
         (funcall function root store reference)))))
 
+(defun call-with-historical-follow-source (function)
+  (handoff-test-committed
+   (lambda (root store reference)
+     (pg::physical-promotion-restore-primary-retained)
+     (let* ((fields (multiple-value-list (pg::wal-read-control-fields)))
+            (pg::*catalog* (pg::make-catalog :cluster-identity "history-source"))
+            (pg::*physical-recovery-state* nil)
+            (pg::*physical-recovery-failed-p* nil)
+            (pg::*wal-insert-timeline* (fourth fields))
+            (pg::*wal-checkpoint-timeline* (fifth fields))
+            (pg::*wal-segment-namespace* :timeline)
+            (pg::*wal-durable-lsn* (second fields))
+            (pg::*physical-source-senders* (make-hash-table :test #'equal))
+            (prefix (lineage-test-bytes (pg::wal-segment-path 0)))
+            (fork (getf reference :end))
+            (eor (subseq prefix fork (+ fork pg::+wal-end-of-recovery-record-size+))))
+       (pg::physical-store-close store)
+       (uiop:delete-directory-tree (pg::physical-store-directory store) :validate t)
+       (funcall function root reference prefix eor)))))
+
+(defun historical-follow-request (reference prefix eor cursor)
+  (list :version 1 :system-id (pg::catalog-system-identifier)
+        :base-timeline 1 :base 152 :manifest-digest (getf reference :manifest-digest)
+        :source-timeline 2 :receive-timeline 1
+        :receive-lsn cursor :receive-digest 91 :overlap-start 0
+        :overlap-digest (pg::physical-store-update-digest
+                         #xCBF29CE484222325 (subseq prefix 0 cursor))
+        :history-text (pg::bytes->string (pg::timeline-history-bytes 2))
+        :eor-octets (coerce eor 'list)))
+
+(deftest historical-source-proof-does-not-confuse-receiver-and-archive-bases
+    (call-with-historical-follow-source
+     (lambda (root reference prefix eor)
+       (declare (ignore root))
+       (loop for base in '(32 152 184)
+             do (let ((request (historical-follow-request reference prefix eor 216)))
+                  (setf (getf request :base) base)
+                  (incf (getf request :manifest-digest))
+                  (let ((pin (pg::physical-source-follow-ready (format nil "base_~d" base) request)))
+                    (ok (pg::physical-follow-pin-ready-p pin))
+                    (ok (= (getf request :manifest-digest) (pg::physical-source-pin-manifest-digest pin)))))))))
+
+(deftest historical-source-rejects-damaged-selected-archive-and-conflicting-child
+    (call-with-historical-follow-source
+     (lambda (root reference prefix eor)
+       (declare (ignore root))
+       (let* ((directory (pg::physical-recovery-retained-directory))
+              (identity (pg::physical-promotion-retained-identity
+                         (pg::catalog-system-identifier) reference))
+              (index (pg::physical-retained-inventory-load
+                      directory (getf reference :root-id) identity (pg::timeline-parse-history 1 "")))
+              (request (historical-follow-request reference prefix eor 184)))
+         (dolist (object (list (cons :inventory (getf reference :root-id))
+                               (cons :extent (caar (getf index :entries)))
+                               (cons :overlap (first (getf index :base-overlap)))
+                               (cons :child nil)))
+           (let* ((path (if (eq (car object) :child) (pg::wal-segment-path 0)
+                            (pg::physical-retained-object-path directory (car object) (cdr object))))
+                  (original (lineage-test-bytes path))
+                  (bad (copy-seq original)))
+             (setf (aref bad 0) (logxor 1 (aref bad 0)))
+             (unwind-protect
+                  (progn
+                    (pg::wal-atomic-write-bytes path bad)
+                    (ok (signals (pg::physical-source-follow-ready "damaged" request) 'error))
+                    (ok (null (gethash "damaged" pg::*physical-source-pins*)))
+                    (ng pg::*wal-poisoned*))
+               (pg::wal-atomic-write-bytes path original))))))))
+
+(deftest historical-follow-anchor-proves-selected-root-and-live-child
+    (call-with-historical-follow-source
+     (lambda (root reference prefix eor)
+       (declare (ignore root))
+       (dolist (cursor '(152 184 216))
+         (let* ((request (list :version 1 :system-id (pg::catalog-system-identifier)
+                               :base-timeline 1 :base 152
+                               :manifest-digest (getf reference :manifest-digest)
+                               :source-timeline 2 :receive-timeline 1
+                               :receive-lsn cursor :receive-digest 91 :overlap-start 0
+                               :overlap-digest (pg::physical-store-update-digest
+                                                #xCBF29CE484222325 (subseq prefix 0 cursor))
+                               :history-text (pg::bytes->string (pg::timeline-history-bytes 2))
+                               :eor-octets (coerce eor 'list)))
+                (pin (pg::physical-source-follow-ready (format nil "sibling_~d" cursor) request)))
+           (ok (pg::physical-follow-pin-ready-p pin))
+           (ok (= 91 (pg::physical-source-pin-prefix-digest pin)))
+           (ok (= cursor (pg::physical-source-pin-confirmed-lsn pin)))
+           (sb-thread:with-mutex (pg::*wal-lock*)
+             (multiple-value-bind (bytes timeline) (pg::physical-follow-source-segment pin 0)
+               (ok (= 2 timeline))
+               (ok (equalp prefix bytes)))))))))
+
+(deftest historical-follow-source-proves-receipt-through-child-fork
+    (call-with-historical-follow-source
+     (lambda (root reference prefix eor)
+       (declare (ignore root))
+       (let* ((cursor 184)
+              (request (list :version 1 :system-id (pg::catalog-system-identifier)
+                             :base-timeline 1 :base 152
+                             :manifest-digest (getf reference :manifest-digest)
+                             :source-timeline 2 :receive-timeline 1
+                             :receive-lsn cursor :receive-digest 91 :overlap-start 0
+                             :overlap-digest (pg::physical-store-update-digest
+                                              #xCBF29CE484222325 (subseq prefix 0 cursor))
+                             :history-text (pg::bytes->string (pg::timeline-history-bytes 2))
+                             :eor-octets (coerce eor 'list)))
+              (pin (pg::physical-source-follow-ready "reader" request))
+              (owner (gensym "SENDER"))
+              (expected (pg::physical-store-update-digest
+                         91 (subseq prefix cursor pg::*wal-durable-lsn*))))
+         (setf (gethash "reader" pg::*physical-source-senders*) owner)
+         (ok (= expected (pg::physical-source-prove-range
+                          "reader" owner cursor pg::*wal-durable-lsn* 91)))
+         (pg::physical-source-confirm-receipt "reader" owner pg::*wal-durable-lsn* expected)
+         (ok (= expected (pg::physical-source-pin-prefix-digest pin)))
+         (multiple-value-bind (record raw durable)
+             (pg::physical-source-read-next "reader" owner pg::*wal-durable-lsn*)
+           (ok (null record)) (ok (null raw)) (ok (= durable pg::*wal-durable-lsn*)))
+         (ok (signals (pg::physical-source-read-next "reader" owner cursor) 'error))))))
+
+(deftest historical-source-prebase-cursor-requires-an-eligible-live-prefix
+    (call-with-historical-follow-source
+     (lambda (root reference prefix eor)
+       (declare (ignore root))
+       (let* ((request (historical-follow-request reference prefix eor 32))
+              (path (pg::wal-segment-path 0)))
+         (setf (getf request :base) 32)
+         (ok (pg::physical-follow-pin-ready-p
+              (pg::physical-source-follow-ready "prebase_present" request)))
+         (unwind-protect
+              (progn
+                (delete-file path)
+                (ok (signals (pg::physical-source-follow-ready "prebase_missing" request) 'error))
+                (ok (null (gethash "prebase_missing" pg::*physical-source-pins*)))
+                (let ((bad (copy-seq prefix)))
+                  (replace bad (sample-physical-record 184) :start1 184)
+                  (pg::wal-atomic-write-bytes path bad))
+                (ok (signals (pg::physical-source-follow-ready "prebase_conflicting" request) 'error))
+                (ok (null (gethash "prebase_conflicting" pg::*physical-source-pins*))))
+           (pg::wal-atomic-write-bytes path prefix))))))
+
+(deftest historical-source-cache-refreshes-at-base-and-durable-end
+    (call-with-historical-follow-source
+     (lambda (root reference prefix eor)
+       (declare (ignore root))
+       (let* ((request (historical-follow-request reference prefix eor 32))
+              (reader (symbol-function 'pg::physical-follow-source-segment))
+              (calls 0)
+              (owner (gensym))
+              (pg::*physical-follow-source-read-cache* (list nil)))
+         (setf (getf request :base) 32)
+         (pg::physical-source-follow-ready "before_base" request)
+         (setf (gethash "before_base" pg::*physical-source-senders*) owner)
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-source-segment)
+                      (lambda (&rest arguments) (incf calls) (apply reader arguments)))
+                (pg::physical-source-read-next "before_base" owner 32)
+                (ok (= 1 calls))
+                (pg::physical-source-read-next "before_base" owner 152)
+                (ok (= 2 calls))
+                (pg::physical-source-read-next "before_base" owner 184)
+                (ok (= 2 calls))
+                (let* ((fields (multiple-value-list (pg::wal-read-control-fields)))
+                       (old-control (lineage-test-bytes (pg::wal-control-path)))
+                       (metadata (copy-tree (seventh fields))))
+                  (unwind-protect
+                       (progn
+                         (incf (getf (getf metadata :retained-reference) :end-digest))
+                         (pg::wal-atomic-write-bytes
+                          (pg::wal-control-path)
+                          (pg::wal-encode-control-image
+                           (first fields) (second fields) (third fields)
+                           :timeline 2 :checkpoint-timeline 2 :namespace :timeline :metadata metadata))
+                         (ok (signals (pg::physical-source-read-next "before_base" owner 184) 'error)))
+                    (pg::wal-atomic-write-bytes (pg::wal-control-path) old-control))
+                  (ok (= 3 calls))
+                  (let* ((start pg::*wal-durable-lsn*)
+                         (extra (concatenate '(vector (unsigned-byte 8))
+                                             (sample-physical-record start)
+                                             (pg::wal-encode-record pg::+wal-record-maintenance+
+                                                                    0 (+ start 32) (empty-octets))))
+                         (pg::*wal-durable-lsn* (+ start (length extra))))
+                    (pg::wal-atomic-write-bytes (pg::wal-segment-path 0)
+                                                (concatenate '(vector (unsigned-byte 8)) prefix extra))
+                    (pg::wal-atomic-write-bytes
+                     (pg::wal-control-path)
+                     (pg::wal-encode-control-image
+                      (first fields) pg::*wal-durable-lsn* (third fields)
+                      :timeline 2 :checkpoint-timeline 2 :namespace :timeline :metadata (seventh fields)))
+                    (ok (= (+ start 32)
+                           (pg::wal-record-end (pg::physical-source-read-next "before_base" owner start))))
+                    (ok (= 4 calls))
+                    (pg::physical-source-read-next "before_base" owner (+ start 32))
+                    (ok (= 4 calls)))))
+           (setf (symbol-function 'pg::physical-follow-source-segment) reader))))))
+
+(deftest historical-source-reads-an-archived-segment-without-a-child-filename
+    ;; Structural WAL fixture; this does not establish replay or network onboarding.
+    (with-physical-store-directory (root)
+      (with-retained-root-registry
+          (let* ((pg::*pgdata* root)
+                 (pg::*catalog* (pg::make-catalog :cluster-identity "historical-segments"))
+                 (pg::*physical-recovery-state* nil) (pg::*physical-recovery-failed-p* nil)
+                 (pg::*wal-insert-timeline* 2) (pg::*wal-segment-namespace* :timeline)
+                 (pg::*physical-source-pins* (make-hash-table :test #'equal))
+                 (pg::*physical-source-senders* (make-hash-table :test #'equal))
+                 (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+                 (pg::*wal-poisoned* nil)
+                 (size pg::+wal-segment-size+)
+                 (base (concatenate '(vector (unsigned-byte 8))
+                                    (legacy-checkpoint-record 0) (legacy-checkpoint-record 32)
+                                    (legacy-checkpoint-record 64)))
+                 (filler (pg::wal-encode-record
+                          pg::+wal-record-batch-start+ 0 96
+                          (make-array (- size 128) :element-type '(unsigned-byte 8) :initial-element 0)))
+                 (first (concatenate '(vector (unsigned-byte 8)) base filler))
+                 (middle-bytes (pg::wal-encode-record
+                                pg::+wal-record-batch-start+ 0 size
+                                (make-array (- size 32) :element-type '(unsigned-byte 8) :initial-element 0)))
+                 (last (legacy-checkpoint-record (* 2 size)))
+                 (fork (+ (* 2 size) 32))
+                 (eor (pg::wal-encode-end-of-recovery-record fork 42 2 1 1))
+                 (snapshot (sample-checkpoint-snapshot
+                            :version 2 :start (+ fork 56) :end (+ fork 176) :redo (+ fork 56)
+                            :timeline 2 :prev-timeline 1))
+                 (checkpoint (pg::wal-encode-record
+                              pg::+wal-record-checkpoint+ 0 (+ fork 56)
+                              (pg::wal-encode-checkpoint-snapshot snapshot)))
+                 (child (concatenate '(vector (unsigned-byte 8)) last eor checkpoint))
+                 (pg::*wal-durable-lsn* (+ fork 176))
+                 (identity (list :system-id (pg::catalog-system-identifier)
+                                 :base-timeline 1 :base 96 :manifest-digest 77))
+                 (middle (pg::physical-store-update-digest #xCBF29CE484222325 filler))
+                 (second-digest (pg::physical-store-update-digest middle middle-bytes))
+                 (digest (pg::physical-store-update-digest second-digest last))
+                 (images (loop for bytes in (list first middle-bytes last)
+                               for start in (list 96 size (* 2 size))
+                               for end in (list size (* 2 size) fork)
+                               for initial in (list #xCBF29CE484222325 middle second-digest)
+                               for final in (list middle second-digest digest)
+                               for segment from 0
+                               collect (pg::physical-retained-extent-encode
+                                        (append (list :version 1) identity
+                                                (list :history-target 1 :history-digest nil :history-text ""
+                                                      :start start :end end :start-digest initial :end-digest final
+                                                      :segment segment :file-timeline 1
+                                                      :prefix-digest (pg::physical-store-update-digest
+                                                                      #xCBF29CE484222325 bytes)))
+                                        bytes)))
+                 (overlap-metadata (overlap-test-metadata 96 base))
+                 (directory (pg::physical-recovery-retained-directory)))
+            (setf (getf overlap-metadata :system-id) (pg::catalog-system-identifier))
+            (pg::wal-ensure-directory-durable directory)
+            (let* ((id (project-test-publish-source
+                        directory images (pg::physical-retained-overlap-encode overlap-metadata base)
+                        identity 1 ""))
+                   (reference (list :root-id id :base-timeline 1 :base 96 :manifest-digest 77
+                                    :end fork :end-digest digest))
+                   (metadata (list :system-id (pg::catalog-system-identifier)
+                                   :db-state pg::+db-in-production+ :state-time 42 :retained-reference reference))
+                   (request (list :version 1 :system-id (pg::catalog-system-identifier)
+                                  :base-timeline 1 :base 32 :manifest-digest 88
+                                  :source-timeline 2 :receive-timeline 1
+                                  :receive-lsn 96 :receive-digest 91 :overlap-start 0
+                                  :overlap-digest (pg::physical-store-update-digest #xCBF29CE484222325 base)
+                                  :history-text (store-history-text 1 fork) :eor-octets (coerce eor 'list))))
+              (pg::wal-ensure-directory-durable (pg::wal-directory))
+              (pg::wal-atomic-write-bytes (pg::wal-segment-path 2) child)
+              (pg::timeline-write-history 2 1 fork "test")
+              (setf (getf request :history-text) (pg::bytes->string (pg::timeline-history-bytes 2)))
+              (pg::wal-atomic-write-bytes
+               (pg::wal-control-path)
+               (pg::wal-encode-control-image pg::*wal-durable-lsn* pg::*wal-durable-lsn* snapshot
+                                             :timeline 2 :checkpoint-timeline 2 :namespace :timeline
+                                             :metadata metadata))
+              (pg::physical-retained-root-register
+               (pg::physical-promotion-retained-owner :primary) directory id identity
+               (pg::timeline-parse-history 1 ""))
+              (ok (null (probe-file (pg::wal-segment-path 0))))
+              (let* ((pin (pg::physical-source-follow-ready "old_sibling" request))
+                     (owner (gensym)))
+                (setf (gethash "old_sibling" pg::*physical-source-senders*) owner)
+                (ok (pg::physical-follow-pin-ready-p pin))
+                (multiple-value-bind (record raw durable)
+                    (pg::physical-source-read-next "old_sibling" owner 96)
+                  (ok (= size (pg::wal-record-end record))))
+                (ok (= (pg::physical-store-update-digest
+                        91 (concatenate '(vector (unsigned-byte 8)) filler middle-bytes last eor checkpoint))
+                       (pg::physical-source-prove-range
+                        "old_sibling" owner 96 pg::*wal-durable-lsn* 91)))
+                (let ((older (copy-tree request)))
+                  (setf (getf older :receive-lsn) 32
+                        (getf older :overlap-digest)
+                        (pg::physical-store-update-digest #xCBF29CE484222325 (subseq base 0 32)))
+                  (ok (signals (pg::physical-source-follow-ready "missing_prebase" older) 'error))
+                  (ok (null (gethash "missing_prebase" pg::*physical-source-pins*)))
+                  (pg::wal-atomic-write-bytes (pg::wal-segment-path 0) first)
+                  (ok (null (probe-file (pg::wal-segment-path 1))))
+                  ;; A tip-named file in a wholly ancestral segment is not a C-eligible carrier.
+                  (ok (signals (pg::physical-source-follow-ready "prebase_live" older) 'error))
+                  (ok (null (gethash "prebase_live" pg::*physical-source-pins*)))
+                  (let ((payload (subseq filler pg::+wal-header-size+)))
+                    (setf (aref payload 0) 1)
+                    (pg::wal-atomic-write-bytes
+                     (pg::wal-segment-path 0)
+                     (concatenate '(vector (unsigned-byte 8)) base
+                                  (pg::wal-encode-record pg::+wal-record-batch-start+ 0 96 payload))))
+                  (ok (signals (pg::physical-source-follow-ready "conflicting_prebase" older) 'error))
+                  (ok (null (gethash "conflicting_prebase" pg::*physical-source-pins*))))))))))
+
 (deftest committed-archive-validation-is-independent-of-retired-recovery-files
     (handoff-test-committed
      (lambda (root store reference)

@@ -11,31 +11,21 @@
   (physical-follow-pin-check-source pin))
 
 (defun physical-follow-pin-check-source-eor (pin)
-  "Compare the anchor's end-of-recovery bytes with durable source WAL."
+  "Compare the requested end-of-recovery bytes with the selected source lineage."
   (multiple-value-bind (history fork expected)
       (physical-follow-anchor-check (physical-follow-pin-anchor pin))
-    (declare (ignore fork))
+    (declare (ignore history fork))
     (let* ((start (wal-record-start expected))
            (segment (floor start +wal-segment-size+))
            (offset (mod start +wal-segment-size+))
            (raw (coerce (getf (physical-follow-pin-anchor pin) :eor-octets)
-                        '(vector (unsigned-byte 8))))
-           (bytes (make-array (length raw) :element-type '(unsigned-byte 8))))
+                        '(vector (unsigned-byte 8)))))
       (unless (<= (wal-record-end expected) *wal-durable-lsn*)
         (wal-invalid-input "physical follow end-of-recovery is not durable"))
-      (multiple-value-bind (stream timeline size)
-          (wal-lineage-open-segment segment history 0 :timeline)
-        (unwind-protect
-             (progn
-               (unless (= timeline (physical-source-pin-timeline pin))
-                 (wal-invalid-input "physical follow end-of-recovery lacks a source WAL extent"))
-               (unless (<= (+ offset (length bytes))
-                           (wal-lineage-effective-size size segment timeline history))
-                 (wal-invalid-input "physical follow source lacks its end-of-recovery bytes"))
-               (file-position stream offset)
-               (unless (and (= (length bytes) (read-sequence bytes stream)) (equalp raw bytes))
-                 (wal-invalid-input "physical follow end-of-recovery differs from source WAL")))
-          (close stream))))))
+      (let ((bytes (physical-follow-source-segment pin segment start)))
+        (unless (and (<= (+ offset (length raw)) (length bytes))
+                     (equalp raw (subseq bytes offset (+ offset (length raw)))))
+          (wal-invalid-input "physical follow end-of-recovery differs from source WAL"))))))
 
 (defun physical-source-follow-reserve (name request)
   "Reserve source WAL for an anchor under admission, write and WAL exclusion.
@@ -87,54 +77,30 @@ pin; an ambiguous save fences the source and keeps retention until restart."
           candidate)))))
 
 (defun physical-follow-pin-proof-digest (pin)
-  "Hash the nonempty retained overlap through the anchor's receive boundary.
-
-The carried receive digest is not independently checked over recycled history.
-A second value of true means the pin was already ready."
+  "Hash the nonempty retained overlap independently of the carried receive seed."
   (with-live-operation
     (let* ((request (physical-follow-pin-anchor pin))
            (start (getf request :overlap-start)) (end (getf request :receive-lsn))
            (segment (floor start +wal-segment-size+))
            (history (physical-follow-pin-history pin))
-           (stream nil) (file-timeline nil) (size nil))
-      (unwind-protect
-           (progn
-             (sb-thread:with-mutex (*wal-lock*)
-               (physical-follow-pin-check-live pin)
-               (when (physical-follow-pin-ready-p pin)
-                 (return-from physical-follow-pin-proof-digest (values nil t)))
-               (multiple-value-setq (stream file-timeline size)
-                 (wal-lineage-open-segment segment history 0 :timeline)))
-             (unless (= file-timeline (physical-source-pin-timeline pin))
-               (wal-invalid-input "physical follow overlap lacks a complete source WAL extent"))
-             (let ((reached
-                     (wal-lineage-scan-segment
-                      (lambda (record owner file) (declare (ignore record owner file)))
-                      stream segment (wal-lineage-effective-size size segment file-timeline history)
-                      0 end history file-timeline nil)))
-               (unless (= reached end)
-                 (wal-invalid-input "physical follow overlap does not end at a source record boundary")))
-             (file-position stream 0)
-             (loop with remaining = (- end start)
-                   with buffer = (make-array (min 65536 remaining) :element-type '(unsigned-byte 8))
-                   with digest = #xCBF29CE484222325
-                   while (plusp remaining)
-                   for count = (min remaining (length buffer))
-                   do (unless (= count (read-sequence buffer stream :end count))
-                        (wal-invalid-input "physical follow overlap is truncated"))
-                      (setf digest
-                            (physical-store-update-digest
-                             digest (if (= count (length buffer)) buffer (subseq buffer 0 count))))
-                      (decf remaining count)
-                   finally (return digest)))
-        (when stream (close stream))))))
+           (bytes nil) (file-timeline nil))
+      (sb-thread:with-mutex (*wal-lock*)
+        (physical-follow-pin-check-live pin)
+        (when (physical-follow-pin-ready-p pin)
+          (return-from physical-follow-pin-proof-digest (values nil t)))
+        (multiple-value-setq (bytes file-timeline)
+          (physical-follow-source-segment pin segment end)))
+      (let ((reached
+              (wal-lineage-scan-segment
+               (lambda (record owner file) (declare (ignore record owner file)))
+               bytes segment (length bytes) 0 end history file-timeline nil)))
+        (unless (= reached end)
+          (wal-invalid-input "physical follow overlap does not end at a source record boundary")))
+      (physical-store-update-digest
+       #xCBF29CE484222325 (subseq bytes 0 (- end start))))))
 
 (defun physical-follow-pin-check-suffix (pin)
-  "Validate the source suffix through a captured durable endpoint.
-
-Check record continuity, rotation and end-of-recovery records. The endpoint
-may fall within an unfinished batch. Each segment scan holds its own live
-admission and runs outside the WAL lock."
+  "Validate selected ancestry and child WAL through a captured durable endpoint."
   (let* ((history (physical-follow-pin-history pin))
          (cursor (physical-source-pin-consistent-lsn pin))
          (end (with-live-operation
@@ -146,42 +112,34 @@ admission and runs outside the WAL lock."
     (loop while (< cursor end)
           do (with-live-operation
                (multiple-value-bind (segment offset) (wal-segment-and-offset cursor)
-                 (let ((stream nil) (timeline nil) (size nil))
-                   (unwind-protect
-                        (progn
-                          (sb-thread:with-mutex (*wal-lock*)
-                            (physical-follow-pin-check-live pin)
-                            (when (physical-follow-pin-ready-p pin)
-                              (return-from physical-follow-pin-check-suffix t))
-                            (multiple-value-setq (stream timeline size)
-                              (wal-lineage-open-segment segment history 0 :timeline)))
-                          (unless (= timeline (physical-source-pin-timeline pin))
-                            (wal-invalid-input "physical follow suffix lacks a complete source WAL extent"))
-                          (setf cursor
-                                (wal-lineage-scan-segment
-                                 (lambda (record owner file)
-                                   (declare (ignore owner file))
-                                   (when (= (wal-record-type record) +wal-record-end-of-recovery+)
-                                     (let* ((fields (wal-end-of-recovery-record-info record))
-                                            (parent (getf fields :prev-timeline))
-                                            (fork (timeline-history-entry-end
-                                                   (find parent history
-                                                         :key #'timeline-history-entry-timeline))))
-                                       (unless (and fork (= logical-cursor fork))
-                                         (wal-invalid-input "physical follow suffix does not reach its fork"))
-                                       (timeline-check-end-of-recovery record parent history)))
-                                   (setf logical-cursor (wal-record-end record)))
-                                 stream segment
-                                 (wal-lineage-effective-size size segment timeline history)
-                                 offset end history timeline gap)
-                                gap nil)
-                          (when (< cursor end)
-                            (let ((next (* (1+ segment) +wal-segment-size+)))
-                              (when (< cursor next)
-                                (when (<= end next)
-                                  (wal-invalid-input "physical follow suffix ends in a rotation gap"))
-                                (setf gap cursor cursor next)))))
-                     (when stream (close stream)))))))
+                 (let ((bytes nil) (timeline nil))
+                   (sb-thread:with-mutex (*wal-lock*)
+                     (physical-follow-pin-check-live pin)
+                     (when (physical-follow-pin-ready-p pin)
+                       (return-from physical-follow-pin-check-suffix t))
+                     (multiple-value-setq (bytes timeline)
+                       (physical-follow-source-segment pin segment cursor)))
+                   (setf cursor
+                         (wal-lineage-scan-segment
+                          (lambda (record owner file)
+                            (declare (ignore owner file))
+                            (when (= (wal-record-type record) +wal-record-end-of-recovery+)
+                              (let* ((fields (wal-end-of-recovery-record-info record))
+                                     (parent (getf fields :prev-timeline))
+                                     (fork (timeline-history-entry-end
+                                            (find parent history :key #'timeline-history-entry-timeline))))
+                                (unless (and fork (= logical-cursor fork))
+                                  (wal-invalid-input "physical follow suffix does not reach its fork"))
+                                (timeline-check-end-of-recovery record parent history)))
+                            (setf logical-cursor (wal-record-end record)))
+                          bytes segment (length bytes) offset end history timeline gap)
+                         gap nil)
+                   (when (< cursor end)
+                     (let ((next (* (1+ segment) +wal-segment-size+)))
+                       (when (< cursor next)
+                         (when (<= end next)
+                           (wal-invalid-input "physical follow suffix ends in a rotation gap"))
+                         (setf gap cursor cursor next))))))))
     t))
 
 (defun physical-source-follow-ready (name request)

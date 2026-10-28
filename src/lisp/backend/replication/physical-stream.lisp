@@ -5,6 +5,8 @@
 
 (defvar *physical-stream-test-hook* nil)
 
+(defvar *physical-follow-source-read-cache* nil)
+
 (defun physical-stream-option (command name)
   (let ((value (cdr (assoc name (logical-replication-command-options command) :test #'equal))))
     (when value (replication-command-value value))))
@@ -99,6 +101,9 @@
                    (and pin (not (physical-source-pin-lost-p pin))
                         (= (physical-source-pin-timeline pin) *wal-insert-timeline*))))
       (ereport "55000" "physical sender lost its local source pin ownership"))
+    (let ((pin (gethash name *physical-source-pins*)))
+      (when (physical-follow-pin-p pin)
+        (return-from physical-source-read-next (physical-follow-source-read-next pin cursor))))
     (let* ((*wal-insert-timeline* (physical-source-pin-timeline (gethash name *physical-source-pins*)))
            (durable *wal-durable-lsn*)
            (segment (floor cursor +wal-segment-size+))
@@ -134,7 +139,8 @@
 
 (defun physical-source-prove-range (name owner cursor requested digest &optional progress)
   "Hash only a newly acknowledged suffix, rejecting an interior record cursor."
-  (let ((last-heartbeat (get-internal-real-time)))
+  (let ((last-heartbeat (get-internal-real-time))
+        (*physical-follow-source-read-cache* (or *physical-follow-source-read-cache* (list nil))))
     (loop while (< cursor requested)
           do (multiple-value-bind (record raw durable)
                  (with-live-operation (physical-source-read-next name owner cursor))
@@ -203,7 +209,8 @@
   (sb-ext:with-timeout 10 (send-logical-keepalive stream durable)))
 
 (defun physical-stream-send-loop (stream command owner)
-  (let* ((name (logical-replication-command-slot-name command))
+  (let* ((*physical-follow-source-read-cache* (list nil))
+         (name (logical-replication-command-slot-name command))
          (cursor (logical-replication-command-requested-lsn command))
          (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
          (status (list :write cursor :flush cursor :apply base)))

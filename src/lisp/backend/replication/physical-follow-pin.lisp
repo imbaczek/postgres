@@ -191,25 +191,17 @@ agreement with retained source WAL."
     (wal-invalid-input "physical follow anchor history differs from its source")))
 
 (defun physical-follow-pin-check-retained-wal (pin)
-  "Require source-timeline files for the retained range through durable WAL.
-
-The caller excludes recycling. This checks file inventory; proof scans check
-record continuity. Uncertified ancestor file prefixes are rejected."
-  (let* ((history (physical-follow-pin-history pin))
-         (floor (physical-source-pin-restart-lsn pin))
-         (previous 0))
+  "Require retained ancestry or current-source WAL through the durable endpoint."
+  (when (physical-follow-pin-ready-p pin)
+    (return-from physical-follow-pin-check-retained-wal
+      (physical-follow-source-check-ready-range pin)))
+  (let ((floor (physical-source-pin-restart-lsn pin)))
     (when (< floor *wal-durable-lsn*)
       (loop for segment from (floor floor +wal-segment-size+)
               to (floor (1- *wal-durable-lsn*) +wal-segment-size+)
-            do (multiple-value-bind (stream timeline size)
-                   (wal-lineage-open-segment segment history previous :timeline)
-                 (declare (ignore size))
-                 (unwind-protect
-                      (unless (= timeline (physical-source-pin-timeline pin))
-                        (wal-invalid-input
-                         "physical follow requires a complete source WAL extent; reseed is required"))
-                   (close stream))
-                 (setf previous timeline))))))
+            do (physical-follow-source-segment
+                pin segment (max floor (physical-source-pin-consistent-lsn pin)
+                                 (* segment +wal-segment-size+)))))))
 
 (defun physical-follow-pin-check-wal (pin)
   "Validate PIN and, unless lost, its retained source file inventory."

@@ -247,7 +247,8 @@
                    (error "injected post-ready-save failure")))))
          (ok (signals (pg::physical-source-follow-ready "sibling" request) 'error)))
        (let ((pin (gethash "sibling" pg::*physical-source-pins*))
-             (disk (pg::physical-source-pin-read (pg::physical-source-pin-path "sibling"))))
+             (disk (sb-thread:with-mutex (pg::*wal-lock*)
+                     (pg::physical-source-pin-read (pg::physical-source-pin-path "sibling")))))
          (ok pg::*wal-poisoned*)
          (ng (pg::physical-follow-pin-ready-p pin))
          (ok (pg::physical-follow-pin-ready-p disk))
@@ -261,6 +262,22 @@
          (ok (pg::physical-follow-pin-ready-p pin))
          (ok (= 64 (gethash pin pg::*wal-snapshot-retention-pins*)))
          (ok (eq pin (pg::physical-source-follow-ready "sibling" request)))))))
+
+(deftest restored-ready-follow-pin-rejects-a-truncated-live-tail
+    (call-with-follow-anchor-source
+     (lambda (root request eor)
+       (declare (ignore root eor))
+       (pg::physical-source-follow-ready "sibling" request)
+       (let* ((path (pg::wal-segment-path 0))
+              (bytes (lineage-test-bytes path)))
+         (unwind-protect
+              (progn
+                (pg::wal-atomic-write-bytes path (subseq bytes 0 (1- (length bytes))))
+                (ok (signals
+                     (sb-thread:with-mutex (pg::*wal-lock*)
+                       (pg::physical-source-pin-read (pg::physical-source-pin-path "sibling")))
+                     'error)))
+           (pg::wal-atomic-write-bytes path bytes))))))
 
 (deftest follow-anchor-envelope-rejects-corruption-and-extra-forms
     (let ((bytes (pg::physical-follow-pin-encode (follow-anchor-pin 123 456))))
@@ -329,26 +346,32 @@
     (dolist (fork (list (- 8192 16) (- pg::+wal-segment-size+ 16)))
       (with-physical-store-directory (root)
         (let* ((pg::*pgdata* root) (pg::*wal-insert-timeline* 2)
+                                   (pg::*catalog* (pg::make-catalog))
+                                   (pg::*physical-recovery-state* nil) (pg::*physical-recovery-failed-p* nil)
+                                   (system-id (pg::catalog-system-identifier))
                                    (pg::*wal-segment-namespace* :timeline)
                                    (start (pg::wal-record-start-after fork pg::+wal-end-of-recovery-record-size+))
                                    (raw (pg::wal-encode-end-of-recovery-record start 42 2 1 1))
                                    (pg::*wal-durable-lsn* (+ start (length raw)))
                                    (request (follow-anchor-request 123 456)))
-          (setf (getf request :receive-lsn) fork
+          (setf (getf request :system-id) system-id
+                (getf request :receive-lsn) fork
                 (getf request :history-text)
                 (format nil "1~c~X/~8,'0X~cpromotion~%" #\Tab
                         (ldb (byte 32 32) fork) (ldb (byte 32 0) fork) #\Tab)
                 (getf request :eor-octets) (coerce raw 'list))
           (pg::wal-ensure-directory-durable (pg::wal-directory))
+          (pg::timeline-write-history 2 1 fork "promotion")
           (with-open-file (out (pg::wal-segment-path (floor start pg::+wal-segment-size+))
                                :direction :output :element-type '(unsigned-byte 8))
             (file-position out (mod start pg::+wal-segment-size+))
             (write-sequence raw out) (pg::fsync-stream out))
           (let ((pin (pg::make-physical-follow-pin
-                      :name "boundary" :system-id 42 :timeline 2 :manifest-digest 77
+                      :name "boundary" :system-id system-id :timeline 2 :manifest-digest 77
                       :restart-lsn 0 :consistent-lsn fork :prefix-digest 123 :anchor request)))
             (pg::physical-follow-pin-check-fields pin)
-            (ok (not (signals (pg::physical-follow-pin-check-source-eor pin) 'error))))))))
+            (ok (not (signals (sb-thread:with-mutex (pg::*wal-lock*)
+                                (pg::physical-follow-pin-check-source-eor pin)) 'error))))))))
 
 (deftest follow-anchor-replaced-reservation-cannot-inherit-an-older-proof
     (call-with-follow-anchor-source

@@ -30,23 +30,32 @@
           (unless stream (sb-posix:close fd))))))
   (error "missing lineage WAL segment ~d" segment))
 
-(defun wal-lineage-read-record (stream segment offset size)
-  "Strict decoder: never repair or truncate any candidate, including a tip."
+(defun wal-lineage-read-record (source segment offset size)
+  "Decode one record from a bounded file or copied segment prefix without repair."
   (let ((header (make-array +wal-header-size+ :element-type '(unsigned-byte 8)))
-        (lsn (+ (* segment +wal-segment-size+) offset)))
-    (when (< (- size offset) +wal-header-size+)
+        (lsn (+ (* segment +wal-segment-size+) offset))
+        (memory (typep source '(vector (unsigned-byte 8)))))
+    (unless (and (<= 0 offset size +wal-segment-size+)
+                 (or (not memory) (<= size (length source)))
+                 (<= (+ offset +wal-header-size+) size))
       (error "incomplete lineage WAL header at ~d" lsn))
-    (file-position stream offset)
-    (unless (= (read-sequence header stream) +wal-header-size+)
-      (error "short lineage WAL header at ~d" lsn))
+    (if memory
+        (replace header source :start2 offset :end2 (+ offset +wal-header-size+))
+        (progn
+          (file-position source offset)
+          (unless (= (read-sequence header source) +wal-header-size+)
+            (error "short lineage WAL header at ~d" lsn))))
     (let ((length (wal-u32 header 8)))
       (unless (and (<= +wal-header-size+ length +wal-segment-size+)
                    (<= (+ offset length) size))
         (error "invalid or incomplete lineage WAL length at ~d" lsn))
       (let ((bytes (make-array length :element-type '(unsigned-byte 8))))
         (replace bytes header)
-        (unless (= (read-sequence bytes stream :start +wal-header-size+) length)
-          (error "short lineage WAL record at ~d" lsn))
+        (if memory
+            (replace bytes source :start1 +wal-header-size+
+                                  :start2 (+ offset +wal-header-size+) :end2 (+ offset length))
+            (unless (= (read-sequence bytes source :start +wal-header-size+) length)
+              (error "short lineage WAL record at ~d" lsn)))
         (wal-decode-record bytes lsn)))))
 
 (defun wal-lineage-check-gap (previous-end record history)
