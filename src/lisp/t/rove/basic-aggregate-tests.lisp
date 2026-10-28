@@ -1216,6 +1216,21 @@
           (rove:ok (and condition (string= (pg-error-sqlstate condition) "57014")))
           (rove:ok (null (backend-cancel-pending *backend*)))))))
 
+(rove:deftest numeric-factorial-cancellation
+    ;; numeric_fac's loop has no iterations for 0, 1, or 2.
+    (dolist (case '((0 "1") (1 "1") (2 "2")))
+      (let ((*backend* (make-backend)))
+        (setf (backend-cancel-pending *backend*) t)
+        (rove:ok (string= (second case) (sql-numeric-output (sql-factorial (first case)))))
+        (rove:ok (backend-cancel-pending *backend*))))
+  ;; The first multiplication at 3 must notice and consume cancellation.
+  (let ((*backend* (make-backend)))
+    (setf (backend-cancel-pending *backend*) t)
+    (let ((condition (handler-case (progn (sql-factorial 3) nil)
+                       (pg-error (error) error))))
+      (rove:ok (and condition (string= (pg-error-sqlstate condition) "57014")))
+      (rove:ok (null (backend-cancel-pending *backend*))))))
+
 (cl-spec:defproperty numeric-rounding-is-symmetric
     ((coefficient (range integer -10000000 10000000))
      (input-scale (range integer 0 6))

@@ -3223,8 +3223,10 @@ candidate selection."
   "Compute PostgreSQL's numeric factorial, checking for interrupts."
   (when (minusp number) (ereport "22003" "factorial of a negative number is undefined"))
   (when (> number 32177) (ereport "22003" "value overflows numeric format"))
-  (let ((result 1))
-    (loop for factor from 2 to number
+  (let ((result (if (zerop number) 1 number)))
+    ;; Like numeric_fac, check before each multiplication; 0, 1 and 2
+    ;; have no loop iterations and therefore no loop interrupt check.
+    (loop for factor downfrom (1- number) above 1
           do (check-for-interrupts)
              (setf result (* result factor)))
     (sql-numeric-result result 0)))
