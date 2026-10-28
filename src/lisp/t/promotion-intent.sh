@@ -32,7 +32,7 @@ sql() {
     PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$TARGET_PORT" -U postgres -d postgres \
         -qAt -v ON_ERROR_STOP=1 -c "$1"
 }
-for point in normal after-fsync after-rename after-directory-fsync after-write; do
+for point in normal after-retained-intent-publication after-fsync after-rename after-directory-fsync after-retained-intent-control after-retained-intent-handoff after-write; do
     CASE=$TMP/$point
     mkdir -m 700 "$CASE"
     cp -a "$SEED/copy" "$CASE/data"
@@ -56,12 +56,13 @@ for point in normal after-fsync after-rename after-directory-fsync after-write; 
         wait "$HELPER" 2>/dev/null || :
         HELPER=
     fi
-    if [ "$point" = after-fsync ]; then
+    if [ "$point" = after-fsync ] || [ "$point" = after-retained-intent-publication ]; then
         "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$CASE/data" >"$CASE/startup.log" 2>&1 &
         SERVER=$!
         test_wait_owned_sql_server "$SERVER" "$TARGET_PORT" "$PSQL"
         test "$(sql 'SELECT pg_is_in_recovery()')" = t
-        test "$(sql 'SELECT count(*) FROM data')" = 5
+        sql 'SELECT id FROM data ORDER BY id' >"$CASE/data.rows"
+        diff -u "$SEED/source.rows" "$CASE/data.rows"
         kill -INT "$SERVER"
         wait "$SERVER"
         SERVER=

@@ -6,12 +6,14 @@
     (asdf:load-system "pg")))
 (in-package #:pg)
 
-(defun promotion-native-barrier (point ignored)
+(defun promotion-native-barrier (point &optional ignored)
   (declare (ignore ignored))
   (when (string-equal (symbol-name point) (uiop:getenv "PG_PROMOTION_PAUSE"))
     (let ((marker (pathname (uiop:getenv "PG_PROMOTION_MARKER"))))
       (wal-atomic-write-bytes marker (string->bytes (format nil "~d~%" (sb-posix:getpid))))
       (loop (sleep 1)))))
+
+(setf *physical-promotion-test-hook* #'promotion-native-barrier)
 
 (handler-case
     (progn
