@@ -5,10 +5,20 @@ from subqueries import QueryConnection
 from parking_wire import WireError
 
 
+NAME_PREFIX = "a" * 63
+
+
 CASES = (
     "SELECT width_bucket(true, ARRAY[false,true])",
     "SELECT width_bucket('b'::varchar, '{a,b,c}'::varchar[])",
     "SELECT width_bucket('b'::name, ARRAY['a'::name,'b'::name])",
+    *(f"SELECT width_bucket('{NAME_PREFIX}'::{operand_type}, "
+      f"ARRAY['{NAME_PREFIX}b'::{threshold_type}])"
+      for operand_type, threshold_type in (("name", "text"), ("name", "varchar"),
+                                           ("text", "name"), ("varchar", "name"),
+                                           ("text", "text"), ("varchar", "text"))),
+    *(f"SELECT width_bucket('{NAME_PREFIX}'::{operand_type}, '{{{NAME_PREFIX}b}}')"
+      for operand_type in ("name", "text")),
     "SELECT width_bucket('b'::\"char\", ARRAY['a'::\"char\",'b'::\"char\"])",
     "SELECT width_bucket('2020-01-02'::date, ARRAY['2020-01-01'::date,'2020-01-02'::date])",
     "SELECT width_bucket('12:00'::time, ARRAY['09:00'::time,'12:00'::time])",

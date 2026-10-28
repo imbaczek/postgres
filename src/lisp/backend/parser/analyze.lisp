@@ -479,12 +479,70 @@ names and unknown types.  setseed has no catalog argument names."
         (ereport "42883" "function ~a(~a) does not exist" name signature))
       (values (if names (coerce slots 'list) analyzed) signature))))
 
-(defun analyze-call-argument-list (name arguments table &optional variadic)
+(defun numeric-function-p (name)
+  "Recognize the supported mathematical catalog functions without argument names."
+  (or (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
+                     "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
+                     "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
+                     "scale" "min_scale" "trim_scale" "width_bucket") :test #'string=)
+      (trig-function-p name)
+      (float-catalog-alias name)
+      (integer-catalog-alias-p name)
+      (numeric-helper-function-p name)
+      (numeric-arithmetic-function-p name)))
+
+(defun numeric-function-argument-count-p (name count)
+  "Match the supported numeric pg_proc overloads before checking argument names."
+  (cond ((string= name "pi") (zerop count))
+        ((string= name "width_bucket") (member count '(2 4)))
+        ((member name '("round" "trunc" "log") :test #'string=) (member count '(1 2)))
+        ((integer-catalog-alias-p name)
+         (= count (if (member (subseq name 4) '("not" "abs") :test #'string=) 1 2)))
+        ((numeric-helper-function-p name)
+         (= count (if (member name '("numeric_inc" "numeric_uminus" "numeric_uplus")
+                              :test #'string=) 1 2)))
+        ((or (and (numeric-arithmetic-function-p name) (not (string= name "factorial")))
+             (member name '("numeric_log" "power" "pow" "numeric_power" "dpow"
+                            "atan2" "atan2d") :test #'string=))
+         (= count 2))
+        (t (= count 1))))
+
+(defun analyze-numeric-call-arguments (name arguments table &optional schema)
+  "Match ParseFuncOrColumn's errors for numeric calls using named notation."
+  (let ((analyzed (mapcar (lambda (argument)
+                            (analyze-expr (if (eq (first argument) :named-arg)
+                                              (third argument) argument) table))
+                          arguments))
+        (names nil)
+        (argument-names nil))
+    ;; transformFuncCall analyzes all arguments before checking named notation.
+    ;; These numeric pg_proc entries have no proargnames, so no named call binds.
+    (dolist (argument arguments)
+      (let ((arg-name (and (eq (first argument) :named-arg) (second argument))))
+        (when (and (null arg-name) names)
+          (ereport "42601" "positional argument cannot follow named argument"))
+        (when (and arg-name (member arg-name names :test #'equal))
+          (ereport "42601" "argument name \"~a\" used more than once" arg-name))
+        (when arg-name (push arg-name names))
+        (push arg-name argument-names)))
+    ;; Lookup rejects these names regardless of types; arity determines which
+    ;; ParseFuncOrColumn detail is reported, using the uncoerced signature.
+    (ereport "42883" "function ~a(~a) does not exist"
+             (if schema (format nil "~a.~a" schema name) name)
+             (random-call-signature analyzed (nreverse argument-names))
+             :detail (if (numeric-function-argument-count-p name (length arguments))
+                         "No function of that name accepts the given argument names."
+                         "No function of that name accepts the given number of arguments."))))
+
+(defun analyze-call-argument-list (name arguments table &optional variadic schema)
   "Analyze call arguments, binding supported named arguments."
   (cond ((string= name "pg_promote")
          (analyze-promotion-arguments arguments table variadic))
         ((member name '("random" "setseed") :test #'string=)
          (analyze-random-arguments arguments table name))
+        ((and (numeric-function-p name)
+              (some (lambda (argument) (eq (first argument) :named-arg)) arguments))
+         (analyze-numeric-call-arguments name arguments table schema))
         (t (mapcar (lambda (argument)
                      (when (eq (first argument) :named-arg)
                        (ereport "0A000" "named arguments are not supported for function ~a" name))
@@ -688,9 +746,11 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
        (when (and element (not (in-unknown-constant-p operand))
                   (not (eq (sql-type-category element) (sql-type-category (expr-type operand)))))
          (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))
+       ;; anycompatible considers the scalar before the array element.  Keep
+       ;; this order: equally coercible types can retain the first candidate.
        (let* ((probe (and element (list :col 0 :type element :typmod -1)))
               (type (handler-case
-                        (common-expression-type (if probe (list probe operand) (list operand)) "width_bucket")
+                        (common-expression-type (if probe (list operand probe) (list operand)) "width_bucket")
                       (pg-error (error)
                         (if (member (pg-error-sqlstate error) '("42804" "42846") :test #'string=)
                             (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args))
@@ -870,7 +930,8 @@ corresponding operator implementation without rewriting the analyzed call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
          (random-signature nil)
          (args (multiple-value-bind (arguments signature)
-                   (analyze-call-argument-list name (third expr) table (getf (cdddr expr) :variadic))
+                   (analyze-call-argument-list name (third expr) table (getf (cdddr expr) :variadic)
+                                               (getf (cdddr expr) :schema))
                  (setf random-signature signature)
                  arguments)))
     (when (member name '("row_number" "rank" "dense_rank") :test #'string=)

@@ -213,6 +213,23 @@
                     ("SELECT ARRAY[false,true]::text" "{f,t}")))
       (rove:ok (equal (list (list (or (second case) +null+))) (subquery-test-rows (first case))) (first case))))
 
+(rove:deftest width-bucket-compatible-string-order
+    (let ((prefix (make-string 63 :initial-element #\a)))
+      (dolist (case '(("name" "text" "1")
+                      ("name" "varchar" "1")
+                      ("text" "name" "1")
+                      ("varchar" "name" "1")
+                      ("text" "text" "0")
+                      ("varchar" "text" "0")))
+        (let ((sql (format nil
+                           "SELECT width_bucket('~a'::~a, ARRAY['~ab'::~a])::text"
+                           prefix (first case) prefix (second case))))
+          (rove:ok (equal (list (list (third case))) (subquery-test-rows sql)) sql)))
+      (dolist (case '(("name" "1") ("text" "0")))
+        (let ((sql (format nil "SELECT width_bucket('~a'::~a, '{~ab}')::text"
+                           prefix (first case) prefix)))
+          (rove:ok (equal (list (list (second case))) (subquery-test-rows sql)) sql)))))
+
 (rove:deftest temporal-array-sort-and-group-spill
     (let* ((directory (merge-pathnames
                        (format nil "pg-array-spill-~d-~d/" (sb-posix:getpid) (random 1000000))
@@ -282,6 +299,65 @@
         (rove:ok (and condition
                       (string= (pg-error-sqlstate condition) (second case))
                       (string= (pg-error-message condition) (third case)))
+                 (first case)))))
+
+(rove:deftest numeric-named-argument-errors
+    (dolist (case '(("SELECT round(x => 1::numeric)" "42883"
+                     "function round(x => numeric) does not exist")
+                    ("SELECT round(1::numeric, x => 2)" "42883"
+                     "function round(numeric, x => integer) does not exist")
+                    ("SELECT round(x => NULL, y => '2')" "42883"
+                     "function round(x => unknown, y => unknown) does not exist")
+                    ("SELECT round(x => 1, 2)" "42601"
+                     "positional argument cannot follow named argument")
+                    ("SELECT round(x => 1, x => 2)" "42601"
+                     "argument name \"x\" used more than once")
+                    ("SELECT round(x => no_such_numeric_argument(), 2)" "42883"
+                     "function no_such_numeric_argument() does not exist")
+                    ("SELECT round(x => 1, x => no_such_numeric_argument())" "42883"
+                     "function no_such_numeric_argument() does not exist")
+                    ("SELECT numeric_abs(x => 1)" "42883"
+                     "function numeric_abs(x => integer) does not exist")
+                    ("SELECT numeric_add(1, x => 2)" "42883"
+                     "function numeric_add(integer, x => integer) does not exist")
+                    ("SELECT int4mod(1, x => 2)" "42883"
+                     "function int4mod(integer, x => integer) does not exist")
+                    ("SELECT atan2(1, x => 2)" "42883"
+                     "function atan2(integer, x => integer) does not exist")
+                    ("SELECT pi(x => 1)" "42883"
+                     "function pi(x => integer) does not exist")
+                    ("SELECT width_bucket(1, x => ARRAY[1,2])" "42883"
+                     "function width_bucket(integer, x => integer[]) does not exist")
+                    ("SELECT dsqrt(x => '4')" "42883"
+                     "function dsqrt(x => unknown) does not exist")
+                    ("SELECT pg_catalog.round(x => 1)" "42883"
+                     "function pg_catalog.round(x => integer) does not exist")
+                    ("SELECT pg_catalog.int4and(1, x => 2)" "42883"
+                     "function pg_catalog.int4and(integer, x => integer) does not exist")))
+      (let ((condition (handler-case (progn (subquery-test-rows (first case)) nil)
+                         (pg-error (error) error))))
+        (rove:ok (and condition
+                      (string= (pg-error-sqlstate condition) (second case))
+                      (string= (pg-error-message condition) (third case)))
+                 (first case)))))
+
+(rove:deftest numeric-named-argument-details
+    (dolist (case '(("SELECT pi(x => 1)" "count")
+                    ("SELECT round(x => 1, y => 2, z => 3)" "count")
+                    ("SELECT width_bucket(x => 1)" "count")
+                    ("SELECT numeric_add(x => 1)" "count")
+                    ("SELECT pg_catalog.round(x => 1)" "names")
+                    ("SELECT round(1, x => '2')" "names")
+                    ("SELECT width_bucket(1, x => ARRAY[1,2])" "names")
+                    ("SELECT atan2(1, x => 2)" "names")
+                    ("SELECT int4mod(1, x => 2)" "names")))
+      (let ((condition (handler-case (progn (subquery-test-rows (first case)) nil)
+                         (pg-error (error) error)))
+            (detail (if (string= (second case) "count")
+                        "No function of that name accepts the given number of arguments."
+                        "No function of that name accepts the given argument names.")))
+        (rove:ok (and condition (string= (pg-error-sqlstate condition) "42883")
+                      (equal (pg-error-detail condition) detail))
                  (first case)))))
 
 (cl-spec:defproperty numeric-sqrt-perfect-squares
