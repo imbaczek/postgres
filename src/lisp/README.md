@@ -206,7 +206,7 @@ is implemented.
 
 SQL array expressions support text, varchar, name, internal `"char"`, bool,
 int2, int4, int8, numeric, float4, float8, oid, date, time, timetz, timestamp,
-timestamptz, interval, pg_lsn and bit elements. `ARRAY[...]` chooses a common element type; an empty
+timestamptz, interval, pg_lsn, bit and int2vector elements. `ARRAY[...]` chooses a common element type; an empty
 constructor needs a type supplied by context or a cast. Nested constructors
 must have matching dimensions and lower bounds, and support up to six
 dimensions. `array_length`, comparisons, scalar `ANY`/`ALL`, and text
@@ -244,6 +244,14 @@ equal to the value, using a binary search. Thresholds must be one-dimensional
 and contain no NULLs; an empty array returns zero. The caller must supply
 ascending thresholds: their order is assumed, not checked. The supported
 threshold element types are the array expression types listed above.
+The two-argument overload resolves a common type from the value first and then
+the threshold element type; unknown literals are resolved from that type. An
+`int2vector` threshold supplies int2 elements, while `int2vector[]` supplies
+int2vector elements. Ordinary array-valued operands require an array type over
+that array type, which is unavailable: even with a NULL threshold, resolution
+reports SQLSTATE `42704` before strict NULL evaluation. An int2vector operand
+can instead resolve to `int2vector[]` thresholds. Incompatible argument types
+fail function resolution before this array-type lookup.
 For `timetz` thresholds, compatibility follows the tested little-endian 64-bit
 C peer: its fixed-width search uses a 12-byte stride over 16-byte aligned
 elements. Results for multiple thresholds can therefore differ from a logical

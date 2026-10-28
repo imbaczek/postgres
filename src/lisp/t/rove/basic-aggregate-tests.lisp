@@ -213,6 +213,32 @@
                     ("SELECT ARRAY[false,true]::text" "{f,t}")))
       (rove:ok (equal (list (list (or (second case) +null+))) (subquery-test-rows (first case))) (first case))))
 
+(rove:deftest width-bucket-array-polymorphic-types
+    (dolist (case '(("SELECT width_bucket(NULL::int2vector,NULL)" :null)
+                    ("SELECT width_bucket('1 2'::int2vector,NULL)" :null)
+                    ("SELECT width_bucket('1 2'::int2vector,ARRAY['1 2'::int2vector,'3 4'::int2vector])" 1)
+                    ("SELECT width_bucket('1 2'::int2vector,'{\"1 2\",\"3 4\"}')" 1)
+                    ("SELECT width_bucket('1 2'::int2vector,ARRAY[]::int2vector[])" 0)
+                    ("SELECT ARRAY['1 2'::int2vector,'3 4'::int2vector]::text" "{\"1 2\",\"3 4\"}")
+                    ("SELECT '{\"1 2\",\"3 4\"}'::int2vector[]::text" "{\"1 2\",\"3 4\"}")))
+      (rove:ok (equalp (subquery-test-expected (list (list (second case))))
+                       (subquery-test-rows (first case)))
+               (first case)))
+  (dolist (type +sql-array-types+)
+    (let* ((argument (list :col 0 :type (cdr type)))
+           (sql (format nil "SELECT width_bucket(NULL::~a,NULL)"
+                        (typed-arg-name argument)))
+           (condition (handler-case (progn (subquery-test-rows sql) nil)
+                        (pg-error (error) error))))
+      (rove:ok (and condition
+                    (equal (pg-error-sqlstate condition) "42704")
+                    (equal (pg-error-message condition)
+                           (format nil "could not find array type for data type ~a"
+                                   (typed-arg-name argument)))
+                    (null (pg-error-detail condition))
+                    (null (pg-error-hint condition)))
+               sql))))
+
 (rove:deftest width-bucket-compatible-string-order
     (let ((prefix (make-string 63 :initial-element #\a)))
       (dolist (case '(("name" "text" "1")

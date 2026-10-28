@@ -24,7 +24,8 @@
     (:name . :name-array) (:varchar . :varchar-array) (:oid . :oid-array)
     (:date . :date-array) (:time . :time-array) (:timetz . :timetz-array)
     (:timestamp . :timestamp-array) (:timestamptz . :timestamptz-array)
-    (:interval . :interval-array) (:pg-lsn . :pg-lsn-array) (:bit . :bit-array)))
+    (:interval . :interval-array) (:pg-lsn . :pg-lsn-array) (:bit . :bit-array)
+    (:int2vector . :int2vector-array)))
 
 (defun sql-array-type (element-type)
   (cdr (assoc element-type +sql-array-types+)))

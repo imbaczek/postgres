@@ -168,7 +168,7 @@
 (defparameter +sql-expression-types+
   '((:bool 16 1) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
     (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1)
-    (:text-array 1009 -1) (:int2-array 1005 -1) (:int4-array 1007 -1) (:int8-array 1016 -1)
+    (:text-array 1009 -1) (:int2-array 1005 -1) (:int2vector-array 1006 -1) (:int4-array 1007 -1) (:int8-array 1016 -1)
     (:numeric-array 1231 -1) (:float4-array 1021 -1) (:float8-array 1022 -1)
     (:bool-array 1000 -1) (:char-array 1002 -1) (:name-array 1003 -1)
     (:varchar-array 1015 -1) (:oid-array 1028 -1) (:date-array 1182 -1)
@@ -789,8 +789,13 @@ and numeric_power select their declared types."
                             (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args))
                             (error error)))))
               (array-type (sql-array-type type)))
+         ;; Like get_array_type in polymorphic resolution, this lookup happens
+         ;; before argument coercion or strict NULL evaluation. Ordinary array
+         ;; types have no array type of their own; int2vector is exceptional
+         ;; because pg_type also defines int2vector[] over it.
          (unless array-type
-           (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))
+           (ereport "42704" "could not find array type for data type ~a"
+                    (typed-arg-name (list :col 0 :type type))))
          (list :func "width_bucket"
                (list (coerce-common-expression operand type)
                      (if (eq (expr-type array) :int2vector)

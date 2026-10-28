@@ -8,6 +8,15 @@ from parking_wire import WireError
 NAME_PREFIX = "a" * 63
 
 
+class ArrayConnection(QueryConnection):
+    def receive(self):
+        kind, body = super().receive()
+        if kind == b"E":
+            fields = self.error_fields(body)
+            self.diagnostics = tuple(fields.get(key) for key in ("C", "M", "D", "H"))
+        return kind, body
+
+
 CASES = (
     "SELECT width_bucket(true, ARRAY[false,true])",
     "SELECT width_bucket('b'::varchar, '{a,b,c}'::varchar[])",
@@ -36,6 +45,16 @@ CASES = (
     "SELECT width_bucket('0/10'::pg_lsn, ARRAY['0/01'::pg_lsn,'0/10'::pg_lsn])",
     "SELECT width_bucket(B'10', ARRAY[B'01',B'10'])",
     "SELECT width_bucket(2, '1 2 3'::int2vector)",
+    "SELECT width_bucket(NULL::int2vector,NULL), width_bucket('1 2'::int2vector,NULL)",
+    "SELECT width_bucket('1 2'::int2vector,ARRAY['1 2'::int2vector,'3 4'::int2vector])",
+    "SELECT width_bucket('1 2'::int2vector,'{\"1 2\",\"3 4\"}')",
+    "SELECT width_bucket('1 2'::int2vector,ARRAY[]::int2vector[])",
+    "SELECT ARRAY['1 2'::int2vector,'3 4'::int2vector], '{\"1 2\",\"3 4\"}'::int2vector[]",
+    "SELECT ARRAY['1 2','3 4']::int2vector[], ARRAY[NULL::int2vector]",
+    "SELECT ARRAY[ARRAY[1,2]::int2vector,'1 2'::int2vector]",
+    "SELECT width_bucket(ARRAY[1,2]::int2vector,ARRAY['1 2'::int2vector,ARRAY[1,2]::int2vector])",
+    "SELECT width_bucket('1 2'::int2vector,ARRAY[NULL::int2vector])",
+    "SELECT width_bucket('1 2'::int2vector,ARRAY[['1 2'::int2vector],['3 4'::int2vector]])",
     "SELECT '1 2'::int2vector::int2[], '1 2'::int2vector::int4[]",
     "SELECT ARRAY[1,2]::int2vector::text, ARRAY[1,2]::int2vector::int2[]",
     "SELECT ARRAY[1,2]::int2vector = '1 2'::int2vector, ARRAY[1,2]::int2vector > '1 2'::int2vector",
@@ -73,7 +92,7 @@ CASES = (
 
 
 def check(reference, native):
-    peers = [QueryConnection(port, "array-types") for port in (reference, native)]
+    peers = [ArrayConnection(port, "array-types") for port in (reference, native)]
     failures = []
     try:
         for peer in peers:
@@ -85,14 +104,19 @@ def check(reference, native):
                 print("array-types: FAIL", failures[-1], flush=True)
         for sql in ("SELECT width_bucket(true, ARRAY['12:00'::time])",
                     "SELECT width_bucket(true, ARRAY['2020-01-01'::date])",
-                    "SELECT width_bucket(true, ARRAY['a'::varchar])"):
+                    "SELECT width_bucket(true, ARRAY['a'::varchar])",
+                    *(f"SELECT width_bucket(NULL::{type_name}[],NULL)"
+                      for type_name in ("int2", "int4", "int8", "numeric", "float4", "float8",
+                                        "text", "varchar", "name", '"char"', "oid", "bool",
+                                        "date", "time", "timetz", "timestamp", "timestamptz",
+                                        "interval", "pg_lsn", "bit", "int2vector"))):
             outcomes = []
             for peer in peers:
                 try:
                     peer.query(sql)
                     outcomes.append("unexpected success")
                 except WireError as error:
-                    outcomes.append(str(error))
+                    outcomes.append(peer.diagnostics)
             if outcomes[0] != outcomes[1]:
                 failures.append((sql, outcomes))
                 print("array-types: FAIL", failures[-1], flush=True)
