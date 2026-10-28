@@ -21,6 +21,40 @@ socket_owners = {}
 peer_parameters = {}
 contract = runpy.run_path(str(base / "t/interop/promotion-sql-contract.py"))
 archive = runpy.run_path(str(base / "t/interop/restartpoint-prefix-inspect.py"))
+control_inspector = runpy.run_path(str(base / "t/interop/control-data-inspect.py"))
+
+
+def inspect_child_control(state, timeline=2, stopped=False):
+    before = control_inspector["storage"](data) if stopped else None
+    rows = control_inspector["run"](data, state)
+    assert int(rows["Latest checkpoint's TimeLineID"]) == timeline
+    assert int(rows["Min recovery ending loc's timeline"]) == (0 if timeline == 3 else 2)
+    if stopped:
+        assert control_inspector["storage"](data) == before, "offline inspection changed standby files"
+
+
+def reject_missing_child_recovery_control():
+    directory = root / "missing-child-control"
+    shutil.copytree(data, directory)
+    (directory / "physical-recovery.control").unlink()
+    before = control_inspector["storage"](directory)
+    utility = subprocess.run([str(base / "bin/pg_controldata"), str(directory)],
+                             capture_output=True, text=True, timeout=15)
+    assert utility.returncode != 0 and "recovery control is missing" in utility.stderr
+    assert control_inspector["storage"](directory) == before
+    process = start_peer(directory, child_port + 1, "missing.sock", "missing-control.log")
+    try:
+        assert process.wait(timeout=30) != 0
+        assert "recovery control is missing" in (root / "missing-control.log").read_text()
+        after = control_inspector["storage"](directory)
+        # Startup takes PGDATA ownership before checking recovery metadata.
+        for name in (".pg_lisp.lock", "postmaster.pid"):
+            before.pop(name, None)
+            after.pop(name, None)
+        assert after == before, "rejected startup changed standby storage"
+    finally:
+        stop_child(process)
+    print("child-bootstrap: missing recovery control rejects inspection and startup unchanged PASS", flush=True)
 
 
 def check_committed_archive(pending):
@@ -259,11 +293,14 @@ try:
         assert zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
     assert source_control[:10] == target_control[:10]
     assert not (data / "pg_physical_retained").exists()
+    inspect_child_control("starting up", stopped=True)
+    reject_missing_child_recovery_control()
     child = start_child()
     ready_child(child)
     child_connection = connect(child_port)
     assert scalar(child_connection, "SELECT pg_is_in_recovery()") is True
     assert scalar(child_connection, "SHOW transaction_read_only") == "on"
+    inspect_child_control("in archive recovery")
     assert query(child_connection, "SELECT id,label FROM promotion_sql_items ORDER BY id") == [(1, "after"), (2, "new"), (3, "child2")]
     if os.environ.get("CHILD_BOOTSTRAP_FORCE_TIMEOUT") == "1":
         (root / "timeout-ready").write_text(str(child.pid))
@@ -290,6 +327,8 @@ try:
     child_connection = None
     assert stop_child(child, crash=os.environ.get("CHILD_BOOTSTRAP_CRASH") == "1") == (-signal.SIGKILL if os.environ.get("CHILD_BOOTSTRAP_CRASH") == "1" else 0)
     child = None
+    inspect_child_control("in archive recovery" if os.environ.get("CHILD_BOOTSTRAP_CRASH") == "1"
+                          else "shut down in recovery", stopped=True)
     query(parent, "INSERT INTO promotion_sql_items VALUES (5,'restart2')")
     child = start_child()
     ready_child(child)
@@ -338,6 +377,7 @@ try:
         assert scalar(child_connection, "SELECT substr(pg_walfile_name(pg_current_wal_lsn()),1,8)") == "00000003"
         query(child_connection, "INSERT INTO promotion_sql_items VALUES (6,'child3')")
         query(child_connection, "CHECKPOINT")
+        inspect_child_control("in production", timeline=3)
         if pending_archive is not None:
             check_committed_archive(pending_archive)
         child_connection.close()
