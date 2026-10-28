@@ -14,6 +14,8 @@ def run(port):
                        'random(0.00001::numeric,0.99999::numeric)',
                        'random(0::numeric,9999999999999999999999999999999999999999::numeric)',
                        'random(0.00000001::numeric,99.99999999::numeric)',
+                       'random(-1.2::numeric,1.00003::numeric)',
+                       'random(1.00000::numeric,1.0::numeric)',
                        'random(4,4)', 'random(1.00::numeric,1.00::numeric)', 'random()',
                        'random(max=>10,min=>1)']
         for seed in ['0.5', '-0.25', '1', '-1', '0', '-0.0']:
@@ -40,6 +42,12 @@ def run(port):
             ['2', '1.23456789', '12345678', "'NaN'::float8",
              "'Infinity'::float8", "'-Infinity'::float8"]]
         diagnostic_expressions += [
+            "random('NaN'::numeric,1::numeric)",
+            "random(1::numeric,'NaN'::numeric)",
+            "random('-Infinity'::numeric,1::numeric)",
+            "random(1::numeric,'Infinity'::numeric)",
+            "random('Infinity'::numeric,'-Infinity'::numeric)",
+            "random('NaN'::numeric,'Infinity'::numeric)",
             'setseed(seed=>0.5)', 'setseed(foo=>NULL)',
             'setseed(foo=>0.5,foo=>0.5)', 'setseed(foo=>0.5,0.5)',
             'random(min=>1)', 'random(foo=>1,max=>2)',

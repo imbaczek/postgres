@@ -148,6 +148,13 @@ CASES = (
     "SELECT width_bucket(11,10,0,5),width_bucket(10,10,0,5),width_bucket(8,10,0,5),width_bucket(0,10,0,5)",
     "SELECT width_bucket(0.3::numeric,0::numeric,1::numeric,10),width_bucket('NaN'::numeric,0,1,3),width_bucket(NULL::numeric,0,1,3)",
     "SELECT width_bucket(0::float8,'-1e308'::float8,'1e308'::float8,10),width_bucket('NaN'::float8,0,1,3)",
+    "SELECT width_bucket('Infinity'::numeric,0,1,3),width_bucket('-Infinity'::numeric,0,1,3),width_bucket('Infinity'::float8,0,1,3),width_bucket('-Infinity'::float8,0,1,3)",
+    "SELECT width_bucket(0,'-Infinity'::numeric,1,3)",
+    "SELECT width_bucket(0,0,'Infinity'::numeric,3)",
+    "SELECT width_bucket(0::float8,'-Infinity'::float8,1,3)",
+    "SELECT width_bucket(0::float8,0,'Infinity'::float8,3)",
+    "SELECT width_bucket(0.299999999999999999999999999999999999,0::numeric,1,10),width_bucket(0.300000000000000000000000000000000001,0::numeric,1,10)",
+    "SELECT width_bucket(0.299999999999999999999999999999999999,1::numeric,0,10),width_bucket(0.300000000000000000000000000000000001,1::numeric,0,10)",
     "SELECT width_bucket(1,0,1,0)",
     "SELECT width_bucket(1,1,1,2)",
     "SELECT width_bucket(1,'NaN'::numeric,1,2)",
@@ -808,9 +815,37 @@ def check_numeric_prefix_errors(reference, native):
             assert outcomes == [expected, expected], (sql, outcomes)
         for sql in ("SELECT @ NULL,|/ NULL,||/ NULL",
                     "SELECT @ (-4)::numeric,|/ 4::numeric,||/ 8::numeric",
-                    "SELECT |/ (-1)::numeric", "SELECT '1' << 1::integer,'1' >> 1::integer"):
+                    "SELECT |/ (-1)::numeric", "SELECT '1' << 1::integer,'1' >> 1::integer",
+                    "SELECT 5 % '2','5' % 2::int2,5::int8 % '2','5.5' % 2::numeric,NULL % 2",
+                    "SELECT '-9223372036854775808'::int8 % '-1'"):
             outcomes = [peer.observe(sql) for peer in peers]
             assert outcomes[0] == outcomes[1], (sql, outcomes)
+        for sql, signature, state in (
+                ("SELECT '3' % '2'", "unknown % unknown", "42725"),
+                ("SELECT NULL % NULL", "unknown % unknown", "42725"),
+                ("SELECT NULL::boolean % 2", "boolean % integer", "42883"),
+                ("SELECT 2 % NULL::text", "integer % text", "42883"),
+                ("SELECT 2::float8 % 1", "double precision % integer", "42883")):
+            ambiguous = state == "42725"
+            expected = (state,
+                        f"operator {'is not unique' if ambiguous else 'does not exist'}: {signature}",
+                        "Could not choose a best candidate operator." if ambiguous else
+                        "No operator of that name accepts the given argument types.",
+                        "You might need to add explicit type casts.")
+            outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+            assert outcomes == [expected, expected], (sql, outcomes)
+        for sql, signature, wrong_count in (
+                ("SELECT int4mod('x',true)", "int4mod(unknown, boolean)", False),
+                ("SELECT pg_catalog.int4mod('x',true)", "pg_catalog.int4mod(unknown, boolean)", False),
+                ("SELECT int2mod(7,2)", "int2mod(integer, integer)", False),
+                ("SELECT int8and('x',true)", "int8and(unknown, boolean)", False),
+                ("SELECT int4mod()", "int4mod()", True)):
+            expected = ("42883", f"function {signature} does not exist",
+                        "No function of that name accepts the given number of arguments." if wrong_count else
+                        "No function of that name accepts the given argument types.",
+                        None if wrong_count else "You might need to add explicit type casts.")
+            outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+            assert outcomes == [expected, expected], (sql, outcomes)
         print("numeric-operators: exact SQLSTATE/message/detail/hint and coercion order PASS", flush=True)
     finally:
         for peer in peers:

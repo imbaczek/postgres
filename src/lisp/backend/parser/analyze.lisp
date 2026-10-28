@@ -232,7 +232,12 @@ exist\" messages."
     (t "text")))
 
 (defun call-signature (args)
-  (format nil "~{~a~^, ~}" (mapcar #'typed-arg-name args)))
+  "Describe argument types before coercion, retaining unknown literals."
+  (format nil "~{~a~^, ~}"
+          (mapcar (lambda (argument)
+                    (if (in-unknown-constant-p argument)
+                        "unknown" (typed-arg-name argument)))
+                  args)))
 
 (defun admin-arg-coercible-p (expr target-type)
   "Whether EXPR can resolve to an admin function's declared integer type."
@@ -925,6 +930,35 @@ corresponding operator implementation without rewriting the analyzed call."
        (member (subseq name 0 4) '("int2" "int4" "int8") :test #'string=)
        (member (subseq name 4) '("and" "or" "xor" "not" "shl" "shr" "abs" "mod") :test #'string=)))
 
+(defun analyze-integer-catalog-function (name args &optional schema)
+  "Resolve a supported integer pg_proc helper without changing its call identity.
+NAME must name a supported helper. Shift functions take int4 as their second
+argument; other binary helpers take two operands of the named integer type.
+Check the complete signature before coercing unknown literals, so resolution
+errors precede input errors."
+  (let* ((type (cdr (assoc (subseq name 0 4)
+                           '(("int2" . :int2) ("int4" . :int4) ("int8" . :int8))
+                           :test #'string=)))
+         (suffix (subseq name 4))
+         (unary (member suffix '("not" "abs") :test #'string=))
+         (shift (member suffix '("shl" "shr") :test #'string=))
+         (types (if unary (list type) (list type (if shift :int4 type)))))
+    (unless (and (= (length args) (length types))
+                 (every (lambda (arg target)
+                          (or (in-unknown-constant-p arg)
+                              (sql-implicit-coercion-p (expr-type arg) target)))
+                        args types))
+      (let ((wrong-count (/= (length args) (length types))))
+        (ereport "42883" "function ~a(~a) does not exist"
+                 (if schema (format nil "~a.~a" schema name) name)
+                 (call-signature args)
+                 :detail (if wrong-count
+                             "No function of that name accepts the given number of arguments."
+                             "No function of that name accepts the given argument types.")
+                 :hint (unless wrong-count "You might need to add explicit type casts."))))
+    (list :func name (mapcar #'coerce-common-expression args types)
+          :type type :typmod -1)))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
@@ -941,22 +975,9 @@ corresponding operator implementation without rewriting the analyzed call."
     (when (string= name "pg_get_publication_tables")
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
-    ;; The catalog's integer helper functions use the same execution paths as
-    ;; their operators, but resolve their declared argument types by name.
     (when (integer-catalog-alias-p name)
-      (let* ((type (cdr (assoc (subseq name 0 4) '(("int2" . :int2) ("int4" . :int4) ("int8" . :int8)) :test #'string=)))
-             (suffix (subseq name 4))
-             (unary (member suffix '("not" "abs") :test #'string=))
-             (shift (member suffix '("shl" "shr") :test #'string=))
-             (types (if unary (list type) (list type (if shift :int4 type)))))
-        (unless (and (= (length args) (length types))
-                     (every (lambda (arg target)
-                              (or (in-unknown-constant-p arg)
-                                  (sql-implicit-coercion-p (expr-type arg) target))) args types))
-          (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-        (let ((coerced (mapcar #'coerce-common-expression args types)))
-          (return-from analyze-function-expression
-            (list :func name coerced :type type :typmod -1)))))
+      (return-from analyze-function-expression
+        (analyze-integer-catalog-function name args (getf (cdddr expr) :schema))))
     ;; These catalog names expose the same implementation as the SQL names,
     ;; but each has a single declared float argument type.
     (let ((alias (float-catalog-alias name)))
@@ -1807,6 +1828,28 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
         (return-from analyze-integer-bitwise
           (list :binop operator left right :type type :typmod -1))))))
 
+(defun analyze-remainder-expression (left right)
+  "Resolve the supported pg_operator remainder overloads before execution.
+As in parse_oper.c's binary_oper_exact, one unknown takes its known neighbor's
+type. Two unknowns are ambiguous; mixed integers widen, and numeric accepts
+integer inputs. This covers integer and numeric overloads, not generic operator
+candidate selection."
+  (let ((arguments (list left right)))
+    (unless (every (lambda (argument)
+                     (or (in-unknown-constant-p argument)
+                         (member (expr-type argument) '(:int2 :int4 :int8 :numeric))))
+                   arguments)
+      (report-operator-resolution-error "%" arguments))
+    (when (every #'in-unknown-constant-p arguments)
+      (report-operator-resolution-error "%" arguments t))
+    (let* ((known (remove-if #'in-unknown-constant-p arguments))
+           (type (cond ((find :numeric known :key #'expr-type) :numeric)
+                       ((find :int8 known :key #'expr-type) :int8)
+                       ((find :int4 known :key #'expr-type) :int4)
+                       (t :int2))))
+      (list :binop "%" (coerce-common-expression left type)
+            (coerce-common-expression right type) :type type :typmod -1))))
+
 (defun analyze-binop-expression (expression scope)
   (let* ((operator (second expression))
          (left (analyze-expr (third expression) scope))
@@ -1826,6 +1869,8 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
                (typed-arg-name left) operator (typed-arg-name right)))
     (when (string= operator "||")
       (return-from analyze-binop-expression (analyze-text-concatenation left right)))
+    (when (string= operator "%")
+      (return-from analyze-binop-expression (analyze-remainder-expression left right)))
     (if (member operator '("=" "<>" "<" "<=" ">" ">=") :test #'string=)
         (let ((operands (analyze-comparison-operands left right)))
           (list :binop operator (first operands) (second operands) :type :bool :typmod -1))
