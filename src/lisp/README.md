@@ -231,6 +231,19 @@ also accept floating-point inputs; the explicitly numeric forms use numeric
 arithmetic. Logarithms reject zero and negative arguments, and a base of one,
 with SQLSTATE `2201E`. These functions return NULL when an argument is NULL.
 
+`div(x, y)` and `numeric_div_trunc(x, y)` return a numeric quotient truncated
+toward zero. `mod(x, y)` supports numeric and integer overloads; `numeric_mod`
+uses numeric. The remainder has the dividend's sign, so `mod(-5, 2)` is -1.
+`numeric_add`, `numeric_sub`, `numeric_mul`, and `numeric_div` expose the
+corresponding numeric arithmetic operations; `numeric_div` uses the normal
+numeric division scale and rounding, unlike `div`. Arguments must be implicitly
+coercible to the selected overload; two unknown `mod` arguments are ambiguous.
+These functions are strict: a NULL argument yields NULL. Division or remainder
+by zero raises `22012`, except that NaN takes precedence. NaN propagates;
+for division, infinity divided by infinity is NaN and a finite value divided
+by infinity is zero. For remainder, infinity modulo a nonzero value is NaN,
+and a finite value modulo infinity is the finite value.
+
 Exponentiation is available as `base ^ exponent`, `power(base, exponent)`,
 `pow(base, exponent)`, `numeric_power(base, exponent)`, and `dpow(base, exponent)`.
 `^` associates left to right and binds more tightly than multiplication and

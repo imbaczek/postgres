@@ -428,6 +428,31 @@ including unknown literals."
   (list :func name (list (coerce-common-expression (first args) :numeric))
         :type (if (string= name "trim_scale") :numeric :int4) :typmod -1))
 
+(defun numeric-arithmetic-function-p (name)
+  "Recognize immutable numeric arithmetic function names."
+  (member name '("div" "mod" "numeric_div_trunc" "numeric_mod"
+                 "numeric_add" "numeric_sub" "numeric_mul" "numeric_div")
+          :test #'string=))
+
+(defun analyze-numeric-arithmetic-function (name args)
+  "Resolve two-argument arithmetic functions using the supported catalog overloads.
+MOD selects numeric or the widest known integer type; two unknown arguments are
+ambiguous. The other names resolve to numeric, subject to implicit coercion."
+  (unless (= (length args) 2)
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+  (let* ((known (remove-if #'in-unknown-constant-p args))
+         (type (cond ((not (string= name "mod")) :numeric)
+                     ((null known) (ereport "42725" "function ~a(~a) is not unique" name (call-signature args)))
+                     ((some (lambda (arg) (eq (expr-type arg) :numeric)) known) :numeric)
+                     ((some (lambda (arg) (eq (expr-type arg) :int8)) known) :int8)
+                     ((some (lambda (arg) (eq (expr-type arg) :int4)) known) :int4)
+                     (t :int2))))
+    (unless (every (lambda (arg) (or (in-unknown-constant-p arg)
+                                     (sql-implicit-coercion-p (expr-type arg) type))) args)
+      (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+    (list :func name (mapcar (lambda (arg) (coerce-common-expression arg type)) args)
+          :type type :typmod -1)))
+
 (defun analyze-log-function (name args)
   "Resolve one-argument or numeric two-argument logarithm overloads."
   (cond
@@ -485,6 +510,8 @@ including unknown literals."
        (analyze-power-function name args))
       ((member name '("scale" "min_scale" "trim_scale") :test #'string=)
        (analyze-numeric-scale-function name args))
+      ((numeric-arithmetic-function-p name)
+       (analyze-numeric-arithmetic-function name args))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
       ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
       ((string= name "substr") (analyze-substr-function name args))
@@ -1729,15 +1756,16 @@ including unknown literals."
   (and (consp form)
        (or (eq (first form) :subplan)
            (and (eq (first form) :func)
-                (not (member (second form)
-                             '("version" "pg_lisp_runtime" "current_database" "current_schema"
-                               "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
-                               "substr" "length" "char_length" "character_length" "pg_backend_pid"
-                               "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
-                               "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
-                               "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
-                               "scale" "min_scale" "trim_scale")
-                             :test #'string=)))
+                (not (or (numeric-arithmetic-function-p (second form))
+                         (member (second form)
+                                 '("version" "pg_lisp_runtime" "current_database" "current_schema"
+                                   "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
+                                   "substr" "length" "char_length" "character_length" "pg_backend_pid"
+                                   "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
+                                   "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
+                                   "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
+                                   "scale" "min_scale" "trim_scale")
+                                 :test #'string=))))
            (analyzed-expression-volatile-p (car form))
            (analyzed-expression-volatile-p (cdr form)))))
 
@@ -2329,6 +2357,23 @@ including unknown literals."
          (current-database) *current-snapshot*))))
     (t (ereport "42883" "function ~a(...) does not exist" name))))
 
+(defun eval-numeric-arithmetic-function (name args type)
+  "Evaluate strict arithmetic calls on already evaluated, coerced arguments.
+DIV truncates toward zero, integer MOD uses integer remainder, and the numeric
+aliases share the corresponding numeric operator implementation."
+  (when (member +null+ args) (return-from eval-numeric-arithmetic-function +null+))
+  (let ((left (first args)) (right (second args)))
+    (cond ((member name '("div" "numeric_div_trunc") :test #'string=)
+           (sql-numeric-div-trunc left right))
+          ((and (string= name "mod") (member type '(:int2 :int4 :int8)))
+           (sql-arith "%" left right))
+          (t (let ((operator (cond ((string= name "numeric_add") "+")
+                                   ((string= name "numeric_sub") "-")
+                                   ((string= name "numeric_mul") "*")
+                                   ((string= name "numeric_div") "/")
+                                   (t "%"))))
+               (sql-numeric-arithmetic operator left right))))))
+
 (defun eval-func (name args)
   (cond
     ((and (member name '("nextval" "currval" "setval") :test #'string=)
@@ -2588,6 +2633,8 @@ including unknown literals."
             (cond ((eq value +null+) +null+)
                   ((eq type :numeric) (sql-numeric-sqrt value))
                   (t (sql-float-sqrt value)))))
+         ((numeric-arithmetic-function-p name)
+          (eval-numeric-arithmetic-function name arguments type))
          ((member name '("scale" "min_scale" "trim_scale") :test #'string=)
           (let ((value (first arguments)))
             (cond ((eq value +null+) +null+)

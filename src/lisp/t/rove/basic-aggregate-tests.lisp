@@ -338,6 +338,49 @@
                (cl-spec:run-property 'numeric-trim-scale-preserves-value :seed 42))))
     (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
+(cl-spec:defproperty numeric-div-rem-identity
+    ((left (range integer -1000000 1000000))
+     (right (range integer 1 10000)))
+  (:about sql-numeric-div-trunc)
+  (:trials (:normal 250))
+  (let ((quotient (sql-numeric-div-trunc left right))
+        (remainder (sql-numeric-arithmetic "%" left right)))
+    (= left (+ (* (sql-numeric-rational quotient) right)
+               (sql-numeric-rational remainder)))))
+
+(cl-spec:defproperty decimal-div-rem-identity
+    ((left (range integer -1000000 1000000))
+     (right (range integer -10000 10000))
+     (left-scale (range integer 0 5))
+     (right-scale (range integer 0 5)))
+  (:about sql-numeric-div-trunc)
+  (:trials (:normal 250))
+  (let* ((a (make-sql-decimal left left-scale))
+         (b (make-sql-decimal (if (zerop right) 1 right) right-scale))
+         (quotient (sql-numeric-div-trunc a b))
+         (remainder (sql-numeric-arithmetic "%" a b)))
+    (= (sql-numeric-rational a)
+       (+ (* (sql-numeric-rational quotient) (sql-numeric-rational b))
+          (sql-numeric-rational remainder)))))
+
+(rove:deftest decimal-div-rem-property
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'decimal-div-rem-identity :seed 42))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(rove:deftest numeric-div-mod-functions
+    (dolist (case '(("SELECT div(-7::numeric,2::numeric)::text" "-3")
+                    ("SELECT numeric_div_trunc(7,2)::text" "3")
+                    ("SELECT mod(-7,3)::text" "-1")
+                    ("SELECT mod(7.50::numeric,2::numeric)::text" "1.50")
+                    ("SELECT numeric_add(1.20::numeric,2::numeric)::text" "3.20")
+                    ("SELECT numeric_sub(1::numeric,2::numeric)::text" "-1")
+                    ("SELECT numeric_mul(1.20::numeric,2::numeric)::text" "2.40")
+                    ("SELECT numeric_div(1::numeric,2::numeric)::text" "0.50000000000000000000")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case)))
+  (let ((data (cl-spec:result-data (cl-spec:run-property 'numeric-div-rem-identity :seed 42))))
+    (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (cl-spec:defproperty numeric-rounding-is-symmetric
     ((coefficient (range integer -10000000 10000000))
      (input-scale (range integer 0 6))

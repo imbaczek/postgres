@@ -601,6 +601,16 @@ infinity.  Numeric sign preserves NaN, unlike the floating-point version."
              (scaled (* quotient (expt 10 scale))))
         (sql-numeric-result (* (signum scaled) (floor (+ (abs scaled) 1/2))) scale)))))
 
+(defun sql-numeric-div-trunc (left right)
+  "Divide numeric operands as numeric_div_trunc: truncate finite quotients toward zero.
+Special operands follow numeric division; a zero divisor signals SQLSTATE 22012
+unless NaN takes precedence."
+  (when (or (sql-numeric-special-p left) (sql-numeric-special-p right))
+    (return-from sql-numeric-div-trunc (sql-numeric-special-arithmetic "/" left right)))
+  (when (zerop (sql-numeric-coefficient right))
+    (ereport "22012" "division by zero"))
+  (sql-numeric-result (truncate (/ (sql-numeric-rational left) (sql-numeric-rational right))) 0))
+
 (defun sql-numeric-arithmetic (operator left right)
   (unless (and (sql-numeric-p left) (sql-numeric-p right))
     (ereport "42883" "numeric operator requires numeric operands"))
