@@ -203,6 +203,23 @@ and precision modifiers are supported. These are subsets of PostgreSQL's full
 type and operator catalog, not a promise that every input spelling or function
 is implemented.
 
+`random()` returns a float8 uniformly in [0, 1). `random(min, max)` supports
+integer, bigint, and numeric bounds, inclusive at both ends; numeric results
+use the greater input scale. Bounds must be ordered, and numeric bounds must
+be finite. Named `min` and `max` arguments are supported. Calls are strict:
+NULL arguments yield NULL. `setseed(float8)` accepts values from -1 through 1,
+returns SQL void (an empty, non-NULL text field on the wire), and rejects NaN
+and out-of-range values. Ambiguous overloads, such as two smallint arguments,
+require explicit casts.
+
+Each connection has its own shared random state, initialized on first use.
+`setseed` resets that state, so the same seed and sequence of calls reproduce
+the same results. State changes survive transaction rollback. The implementation
+uses PostgreSQL's xoroshiro128** generator and splitmix64 seed expansion;
+integer ranges use rejection sampling, and numeric ranges use scaled decimal
+digits and rejection sampling. Equal bounds return the bound without advancing
+the generator. This pseudorandom generator is not cryptographically secure.
+
 Basic numeric functions include `abs`, `numeric_abs`, `sign`, `round`,
 `trunc`, `ceil`/`ceiling`, `floor`, `sqrt`, `numeric_sqrt`, `exp`,
 `numeric_exp`, `ln`, `numeric_ln`, `log`, `log10`, `numeric_log`, `scale`,
@@ -496,6 +513,11 @@ Lisp→Lisp, Lisp→C and C→Lisp with an owned writer, source shutdown as the 
 durable target validation, sequence alignment and post-cutover writes.
 
 ## Testing
+
+From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/random-sql.sh`
+compares seeded sequences and mixed overloads with the repository's C PostgreSQL,
+including session isolation, rollback, void wire output, NULLs and errors. It
+starts both servers and honors `SBCL`, `PYTHON`, `PORT`, and `REFERENCE_PORT`.
 
 From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/subqueries.sh`
 compares the native server with the repository's installed C PostgreSQL and owns

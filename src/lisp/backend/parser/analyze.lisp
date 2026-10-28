@@ -118,6 +118,44 @@
       (query prepared)))
   prepared)
 
+(defvar *sql-prng-state* nil
+  "Connection-local xoroshiro128** state, initialized on first use.")
+
+(defun sql-prng-u64 (value)
+  (logand value #xffffffffffffffff))
+
+(defun sql-prng-rotl (value bits)
+  (sql-prng-u64 (logior (ash value bits) (ash value (- bits 64)))))
+
+(defun sql-prng-seed (seed)
+  (let ((value (sql-prng-u64 seed)))
+    (flet ((next ()
+             (setf value (sql-prng-u64 (+ value #x9e3779b97f4a7c15)))
+             (let ((v value))
+               (setf v (sql-prng-u64 (* (logxor v (ash v -30)) #xbf58476d1ce4e5b9)))
+               (setf v (sql-prng-u64 (* (logxor v (ash v -27)) #x94d049bb133111eb)))
+               (logxor v (ash v -31)))))
+      (setf *sql-prng-state* (vector (next) (next))))))
+
+(defun sql-prng-next ()
+  (unless *sql-prng-state*
+    (sql-prng-seed (random (ash 1 64) (make-random-state t))))
+  (let* ((s0 (aref *sql-prng-state* 0))
+         (sx (logxor (aref *sql-prng-state* 1) s0))
+         (value (sql-prng-u64 (* (sql-prng-rotl (sql-prng-u64 (* s0 5)) 7) 9))))
+    (setf (aref *sql-prng-state* 0)
+          (sql-prng-u64 (logxor (sql-prng-rotl s0 24) sx (ash sx 16)))
+          (aref *sql-prng-state* 1) (sql-prng-rotl sx 37))
+    value))
+
+(defun sql-prng-range (minimum maximum)
+  (if (<= maximum minimum)
+      minimum
+      (let* ((range (- maximum minimum))
+             (shift (- 64 (integer-length range))))
+        (+ minimum (loop for value = (ash (sql-prng-next) (- shift))
+                         when (<= value range) return value)))))
+
 (defmacro sql-strict-let (bindings &body body)
   "Evaluate all BINDINGS once, returning SQL NULL if any value is NULL."
   `(let* ,bindings
@@ -373,15 +411,36 @@ Convert supplied expressions in source order, then return them in parameter orde
         (setf (aref slots index) (coerce-common-expression expression type))))
     (coerce slots 'list)))
 
+(defun analyze-random-arguments (arguments table)
+  (let ((slots (make-array 2 :initial-element nil))
+        (position 0) (names nil))
+    (dolist (argument arguments)
+      (let* ((named (eq (first argument) :named-arg))
+             (arg-name (and named (second argument)))
+             (index (if named (position arg-name '("min" "max") :test #'equal)
+                        (prog1 position (incf position)))))
+        (when (and (not named) names)
+          (ereport "42601" "positional argument cannot follow named argument"))
+        (when (and named (member arg-name names :test #'equal))
+          (ereport "42601" "argument name ~s used more than once" arg-name))
+        (when named (push arg-name names))
+        (unless (and index (< index 2) (not (aref slots index)))
+          (ereport "42883" "function random(...) does not exist"))
+        (setf (aref slots index) (analyze-expr (if named (third argument) argument) table))))
+    (unless (every #'identity slots) (ereport "42883" "function random(...) does not exist"))
+    (coerce slots 'list)))
+
 (defun analyze-call-argument-list (name arguments table &optional variadic)
-  "Analyze call arguments, using pg_promote's named-argument binding where applicable."
-  (if (string= name "pg_promote")
-      (analyze-promotion-arguments arguments table variadic)
-      (mapcar (lambda (argument)
-                (when (eq (first argument) :named-arg)
-                  (ereport "0A000" "named arguments are not supported for function ~a" name))
-                (analyze-expr argument table))
-              arguments)))
+  "Analyze call arguments, binding supported named arguments."
+  (cond ((string= name "pg_promote")
+         (analyze-promotion-arguments arguments table variadic))
+        ((and (string= name "random")
+              (some (lambda (argument) (eq (first argument) :named-arg)) arguments))
+         (analyze-random-arguments arguments table))
+        (t (mapcar (lambda (argument)
+                     (when (eq (first argument) :named-arg)
+                       (ereport "0A000" "named arguments are not supported for function ~a" name))
+                     (analyze-expr argument table)) arguments))))
 
 (defun analyze-nullary-function (name args)
   "Check that a supported nullary function has no arguments and assign its result type."
@@ -617,6 +676,29 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
         ((= (length args) 2) (sql-width-bucket-array (first args) (second args)))
         (t (sql-width-bucket-range args))))
 
+(defun analyze-random-function (name args)
+  (cond
+    ((and (string= name "random") (null args))
+     (list :func name args :type :float8 :typmod -1))
+    ((and (string= name "setseed") (= (length args) 1)
+          (or (in-unknown-constant-p (first args))
+              (sql-implicit-coercion-p (expr-type (first args)) :float8)))
+     (list :func name (list (coerce-common-expression (first args) :float8)) :type :void :typmod -1))
+    ((and (string= name "random") (= (length args) 2))
+     (when (every (lambda (arg) (or (in-unknown-constant-p arg)
+                                    (eq (expr-type arg) :int2))) args)
+       (ereport "42725" "function random(~a) is not unique" (call-signature args)))
+     (let* ((types (mapcar #'expr-type args))
+            (type (cond ((member :numeric types) :numeric)
+                        ((member :int8 types) :int8)
+                        (t :int4))))
+       (unless (every (lambda (arg) (or (in-unknown-constant-p arg)
+                                        (sql-implicit-coercion-p (expr-type arg) type))) args)
+         (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+       (list :func name (mapcar (lambda (arg) (coerce-common-expression arg type)) args)
+             :type type :typmod -1)))
+    (t (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
@@ -649,6 +731,7 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
                   (t (list :binop (cdr (assoc suffix '(("and" . "&") ("or" . "|") ("xor" . "#") ("shl" . "<<") ("shr" . ">>")) :test #'string=))
                            (first coerced) (second coerced) :type type :typmod -1)))))))
     (cond
+      ((member name '("random" "setseed") :test #'string=) (analyze-random-function name args))
       ((trig-function-p name) (analyze-trig-function name args))
       ((string= name "width_bucket") (analyze-width-bucket args))
       ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
@@ -2756,10 +2839,64 @@ aliases share the corresponding numeric operator implementation."
                  (plusp (length array))))
         (length array) +null+)))
 
+(defun sql-random-numeric (minimum maximum)
+  (when (sql-numeric-special-p minimum)
+    (ereport "22023" "lower bound cannot be ~a" (if (eq minimum :numeric-nan) "NaN" "infinity")))
+  (when (sql-numeric-special-p maximum)
+    (ereport "22023" "upper bound cannot be ~a" (if (eq maximum :numeric-nan) "NaN" "infinity")))
+  (let* ((scale (max (sql-numeric-scale minimum) (sql-numeric-scale maximum)))
+         (factor (expt 10 scale))
+         (low (* factor (sql-numeric-rational minimum)))
+         (high (* factor (sql-numeric-rational maximum)))
+         (range (- high low)))
+    (when (minusp range) (ereport "22023" "lower bound must be less than or equal to upper bound"))
+    (when (zerop range) (return-from sql-random-numeric (make-sql-decimal low scale)))
+    (let* ((padding (expt 10 (mod (- scale) 4)))
+           (limit (* range padding))
+           (digits (loop for n = limit then (floor n 10000) count t while (>= n 10000)))
+           (prefix-count (min digits 4))
+           (suffix-count (- digits prefix-count))
+           (prefix (floor limit (expt 10000 suffix-count)))
+           (whole (- digits (if (= padding 1) 0 1))))
+      (loop
+        for result = (if (and (zerop suffix-count) (/= padding 1))
+                         (* padding (sql-prng-range 0 (floor prefix padding)))
+                         (sql-prng-range 0 prefix))
+        do (let ((i prefix-count))
+             (loop while (< i (- whole 3))
+                   do (let ((v (sql-prng-range 0 (1- (expt 10000 4)))))
+                        (dotimes (j 4)
+                          (multiple-value-bind (q digit) (floor v 10000)
+                            (setf result (+ (* result 10000) digit) v q))))
+                      (incf i 4))
+             (loop while (< i whole) do
+               (setf result (+ (* result 10000) (sql-prng-range 0 9999))) (incf i))
+             (when (< i digits)
+               (setf result (+ (* result 10000) (* padding (sql-prng-range 0 (1- (/ 10000 padding))))))))
+        when (<= result limit) return (make-sql-decimal (+ low (/ result padding)) scale)))))
+
+(defun eval-random-function (name arguments type)
+  (when (member +null+ arguments) (return-from eval-random-function +null+))
+  (cond
+    ((string= name "setseed")
+     (let ((seed (first arguments)))
+       (unless (and (not (sb-ext:float-nan-p seed)) (<= -1d0 seed) (<= seed 1d0))
+         (ereport "22023" "setseed parameter ~a is out of allowed range [-1,1]"
+                  (sql-float-output seed :float8 -9)))
+       (sql-prng-seed (truncate (* (1- (ash 1 52)) seed)))
+       nil))
+    ((null arguments) (scale-float (float (ash (sql-prng-next) -12) 1d0) -52))
+    ((eq type :numeric) (sql-random-numeric (first arguments) (second arguments)))
+    (t (when (> (first arguments) (second arguments))
+         (ereport "22023" "lower bound must be less than or equal to upper bound"))
+       (sql-prng-range (first arguments) (second arguments)))))
+
 (defun eval-analyzed-function (name arguments type)
   "Evaluate a resolved call using its coerced argument values and result type.
 Arguments have already been evaluated in order, including for strict calls."
   (cond
+    ((member name '("random" "setseed") :test #'string=)
+     (eval-random-function name arguments type))
     ((and (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
                   :test #'string=)
           (member +null+ arguments))

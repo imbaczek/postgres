@@ -498,7 +498,8 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                                               :thread sb-thread:*current-thread*
                                               :pid (sb-thread:thread-os-tid
                                                     sb-thread:*current-thread*)))
-                     (*output-stream* stream))
+                     (*output-stream* stream)
+                     (*sql-prng-state* nil))
                  (setf backend *backend*)
                  ;; Track the connection before any blocking startup read so
                  ;; fast shutdown can interrupt a client stalled in its first
