@@ -73,6 +73,21 @@
                    (declare (ignore off len))
                    (rove:ok (= flags +lp-normal+) "compaction keeps live LPs")))))
 
+(rove:deftest test-scan-checks-visibility-before-deformation
+    (let* ((columns (vector (make-pg-column :name "s" :type :varchar :typmod -1 :attnum 1)))
+           (invisible (form-heap-tuple (vector "hidden") columns 100 0 0 0 0))
+           (visible (form-heap-tuple (vector "visible") columns +frozen-xid+ 0 0 0 0))
+           (page (page-init (make-page)))
+           (snapshot (make-snapshot-struct :xmin 3 :xmax 10 :xip nil :curcid 1))
+           (seen nil))
+      ;; An external-looking header simulates an unreachable payload of a dead row.
+      (setf (aref invisible (aref invisible +heap-tuple-hoff-off+)) 1)
+      (page-add-item page invisible)
+      (page-add-item page visible)
+      (heapam-scan-page page 0 columns snapshot
+                        (lambda (tuple) (push (aref (htup-values tuple) 0) seen)))
+      (rove:ok (equal seen '("visible")) "invisible tuple attributes are not read")))
+
 (rove:deftest test-tuple-roundtrip
     (let* ((cols (coerce
                   (list (make-pg-column :name "a" :type :int4 :typmod -1

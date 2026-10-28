@@ -597,24 +597,26 @@ when supplied, its result is returned as a sixth value."
                         (and *backend* (backend-xid *backend*)) (htup-infomask tuple)))
 
 (defun heapam-scan-page (page block columns snapshot callback)
+  ;; Check visibility from the tuple header before copying or deforming attributes.
+  ;; Like page_collect_tuples in src/backend/access/heap/heapam.c, only visible
+  ;; tuples proceed through the scan; invisible tuple payloads are never decoded.
   (do-live-page-items (page offnum off len)
-    (let ((bytes (subseq page off (+ off len))))
-      (multiple-value-bind (values raw-xmin raw-xmax cid infomask
-                            ctid-block ctid-offnum)
-          (deform-heap-tuple bytes columns)
-        (let ((xmin (full-xid-from-32 raw-xmin))
-              (xmax (full-xid-from-32 raw-xmax)))
-          (when (heap-tuple-visible-p
-                 xmin xmax cid snapshot
-                 (and *backend* (backend-xid *backend*)) infomask)
-            (let ((tuple (make-htup :block block :offnum offnum
-                                    :ctid-block ctid-block
-                                    :ctid-offnum ctid-offnum
-                                    :xmin xmin :xmax xmax
-                                    :cid cid :infomask infomask
-                                    :values values)))
-              (when (eq (funcall callback tuple) :stop)
-                (return-from heapam-scan-page :stop)))))))))
+    (let ((xmin (full-xid-from-32 (page-u32 page (+ off +heap-tuple-xmin-off+))))
+          (xmax (full-xid-from-32 (page-u32 page (+ off +heap-tuple-xmax-off+))))
+          (cid (page-u32 page (+ off +heap-tuple-cid-off+)))
+          (infomask (page-u16 page (+ off +heap-tuple-infomask-off+))))
+      (when (heap-tuple-visible-p xmin xmax cid snapshot
+                                  (and *backend* (backend-xid *backend*)) infomask)
+        (multiple-value-bind (values raw-xmin raw-xmax raw-cid raw-infomask
+                              ctid-block ctid-offnum)
+            (deform-heap-tuple (subseq page off (+ off len)) columns)
+          (declare (ignore raw-xmin raw-xmax raw-cid raw-infomask))
+          (let ((tuple (make-htup :block block :offnum offnum
+                                  :ctid-block ctid-block :ctid-offnum ctid-offnum
+                                  :xmin xmin :xmax xmax :cid cid :infomask infomask
+                                  :values values)))
+            (when (eq (funcall callback tuple) :stop)
+              (return-from heapam-scan-page :stop))))))))
 
 (defun heapam-scan (relfilenode columns snapshot callback)
   "Call CALLBACK with each visible HTUP. CALLBACK may return :stop."
