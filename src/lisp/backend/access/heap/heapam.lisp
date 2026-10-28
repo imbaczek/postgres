@@ -159,39 +159,37 @@
 (defstruct heap-external-varlena
   raw-size external-info value-id relation-id id-width)
 
-(defun form-heap-tuple (values columns xmin xmax cid block off)
-  "Build a HeapTupleHeaderData + null bitmap + attribute data byte vector.
-Inline :bytea values are octet vectors copied into the returned tuple; callers
-must keep them stable during this call. :varchar and :bytea may instead be
-physical external descriptors, written unaligned with HEAP_HASEXTERNAL set.
-This codec does not create or fetch TOAST data."
+(defun heap-tuple-layout (values columns &optional cached-varlena)
+  "Compute the exact physical layout used to form a heap tuple.
+Return size, attribute offsets, encoded varlena data and infomask.
+CACHED-VARLENA, when supplied, must correspond to the same columns and unchanged
+inline values at each cached index. Clear an entry when its inline value or type
+changes; external descriptors are always encoded afresh. The cache vector is
+copied, but its payloads are not: inline bytea payloads may alias VALUES and
+must remain stable while the layout is used."
   (let* ((natts (length columns))
-         (bitmap-len (ceiling natts 8))
-         (hoff (maxalign (+ +size-of-heap-tuple-header+ bitmap-len)))
+         (hoff (maxalign (+ +size-of-heap-tuple-header+ (ceiling natts 8))))
          (offsets (make-array natts :initial-element nil))
-         (varlena-data (make-array natts :initial-element nil))
+         (varlena-data (if cached-varlena (copy-seq cached-varlena)
+                           (make-array natts :initial-element nil)))
          (cursor hoff)
          (infomask 0)
          (has-null nil))
-    ;; Reuse the encoded varchar bytes or caller's bytea vector in both passes.
-    ;; Short inline values (up to 126 payload bytes) and external descriptors
-    ;; need no alignment. Longer inline values use four-byte alignment and a
-    ;; four-byte header; the size encoded in either header includes the header.
     (loop for i from 0 below natts
           for v = (aref values i)
           for col = (aref columns i)
           do (cond
-               ((eq v +null+)
-                (setf has-null t))
+               ((eq v +null+) (setf has-null t))
                (t
                 (let ((al (column-align col)))
                   (when (member (pg-column-type col) '(:varchar :bytea))
                     (setf (aref varlena-data i)
                           (if (heap-external-varlena-p v)
                               (heap-encode-external-varlena v)
-                              (if (eq (pg-column-type col) :bytea)
-                                  (progn (check-type v (vector (unsigned-byte 8))) v)
-                                  (string->bytes v)))))
+                              (or (aref varlena-data i)
+                                  (if (eq (pg-column-type col) :bytea)
+                                      (progn (check-type v (vector (unsigned-byte 8))) v)
+                                      (string->bytes v))))))
                   (unless (and (member (pg-column-type col) '(:varchar :bytea))
                                (or (heap-external-varlena-p v)
                                    (<= (length (aref varlena-data i)) 126)))
@@ -199,9 +197,10 @@ This codec does not create or fetch TOAST data."
                   (setf (aref offsets i) cursor)
                   (incf cursor
                         (case (pg-column-type col)
-                          ((:varchar :bytea) (let ((size (length (aref varlena-data i))))
-                                               (if (heap-external-varlena-p v) size
-                                                   (+ size (if (<= size 126) 1 4)))))
+                          ((:varchar :bytea)
+                           (let ((size (length (aref varlena-data i))))
+                             (if (heap-external-varlena-p v) size
+                                 (+ size (if (<= size 126) 1 4)))))
                           (:numeric (+ 4 (length (sql-numeric-output v))))
                           (otherwise (column-fixed-size col))))))))
     (when has-null (setf infomask (logior infomask +heap-hasnull+)))
@@ -209,6 +208,21 @@ This codec does not create or fetch TOAST data."
       (setf infomask (logior infomask +heap-hasexternal+)))
     (when (some (lambda (c) (member (pg-column-type c) '(:varchar :bytea :numeric))) columns)
       (setf infomask (logior infomask +heap-hasvarwidth+)))
+    (values cursor offsets varlena-data infomask)))
+
+(defun form-heap-tuple (values columns xmin xmax cid block off)
+  "Build a HeapTupleHeaderData + null bitmap + attribute data byte vector.
+Inline :bytea values are octet vectors copied into the returned tuple; callers
+must keep them stable during this call. :varchar and :bytea may instead be
+physical external descriptors, written unaligned with HEAP_HASEXTERNAL set.
+This codec does not create or fetch TOAST data."
+  (let* ((natts (length columns))
+         (hoff (maxalign (+ +size-of-heap-tuple-header+ (ceiling natts 8))))
+         (layout (multiple-value-list (heap-tuple-layout values columns)))
+         (cursor (first layout))
+         (offsets (second layout))
+         (varlena-data (third layout))
+         (infomask (fourth layout)))
     (let ((bytes (make-array cursor :element-type '(unsigned-byte 8)
                                     :initial-element 0)))
       ;; HeapTupleHeaderData stores 32-bit TransactionIds. The allocator keeps

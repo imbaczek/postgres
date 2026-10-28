@@ -1495,6 +1495,53 @@ The OID encoding alone is a byte prefix of every key for that value."
 (defvar *toast-next-value-id* 1
   "Next candidate TOAST value ID; the index is authoritative after restart.")
 
+(defconstant +toast-tuple-target+
+  (let* ((per-page 4)
+         (space (floor (- +blcksz+ (maxalign (+ +size-of-page-header+
+                                                (* per-page +size-of-item-id+))))
+                       per-page)))
+    (- space (mod space +maxalign+)))
+  "Default target heap tuple size, based on four tuples per page.")
+
+(defun toast-externalization-plan (values columns &optional (target +toast-tuple-target+))
+  "Select inline varchar and bytea attributes to externalize without compression.
+Return (index . payload) pairs in largest-first order; VALUES and COLUMNS are
+unchanged. Payloads may alias inline bytea values and must remain stable until
+used. The target is a goal, not a guarantee: selection stops when the tuple fits
+or no eligible value exceeds the external-pointer size threshold. Existing
+external descriptors are left alone. Compression, per-column storage policies,
+and externalization of other variable-width types are not implemented."
+  (let ((physical (copy-seq values))
+        (selected nil)
+        (cached-varlena nil))
+    (loop
+      (multiple-value-bind (size offsets encoded infomask)
+          (heap-tuple-layout physical columns cached-varlena)
+        (declare (ignore offsets infomask))
+        (setf cached-varlena encoded)
+        (when (<= size target) (return (nreverse selected)))
+        (let ((best nil)
+              (best-size (maxalign (+ 4 +external-varlena-fixed-size+))))
+          (loop for i below (length columns)
+                for value = (aref physical i)
+                for type = (pg-column-type (aref columns i))
+                when (and (member type '(:varchar :bytea))
+                          (not (eq value +null+))
+                          (not (heap-external-varlena-p value)))
+                  do (let* ((payload (aref encoded i))
+                            (payload-size (length payload))
+                            (size (+ payload-size (if (<= payload-size 126) 1 4))))
+                       (when (> size best-size)
+                         (setf best i best-size size))))
+          (unless best (return (nreverse selected)))
+          (let* ((payload (aref encoded best))
+                 (length (length payload)))
+            (push (cons best payload) selected)
+            (setf (aref physical best)
+                  (make-heap-external-varlena :raw-size (+ length 4)
+                                              :external-info length
+                                              :value-id 1 :relation-id 1 :id-width 4))))))))
+
 (defun toast-allocate-value-id-unlocked (toast)
   "Choose an unused nonzero OID in TOAST while its index and *WRITE-LOCK* are held.
 Index entries, including dead or aborted entries, reserve their ID until vacuum
@@ -1546,6 +1593,19 @@ or clean up partial writes on error."
     (make-heap-external-varlena :raw-size (+ 4 (length bytes))
                                 :external-info (length bytes) :value-id value-id
                                 :relation-id (pg-toast-oid toast) :id-width 4)))
+
+(defun toast-externalize-tuple-unlocked (toast values columns xid cid)
+  "Return a physical copy of VALUES with selected attributes stored in TOAST.
+The caller must hold the TOAST index writer lock before acquiring *WRITE-LOCK*
+and keep both held for this call; this function does not acquire either lock.
+Abort XID after any error once storage begins. VALUES remains suitable for SQL
+index keys, RETURNING, and replication. The planner may leave the tuple above
+its target, and supports only uncompressed varchar and bytea externalization."
+  (let ((physical (copy-seq values)))
+    (dolist (entry (toast-externalization-plan values columns))
+      (setf (aref physical (car entry))
+            (toast-store-value-unlocked toast (cdr entry) nil xid cid)))
+    physical))
 
 (defun toast-fetch-value (toast pointer snapshot &key (index-reader #'call-with-btree-relation-read-lock))
   "Return the uncompressed bytes named by POINTER in the owning TOAST storage.

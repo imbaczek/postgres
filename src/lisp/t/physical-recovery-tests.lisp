@@ -401,6 +401,14 @@
                (ok (intake-fails-p (lambda () (pg::toast-fetch-value toast pointer snapshot))))
                (pg::register-active-snapshot snapshot registration)
                (ok (equalp bytes (pg::toast-fetch-value toast pointer snapshot)))
+               (let* ((logical (vector bytes))
+                      (physical (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                                  (pg::with-write-lock
+                                    (pg::toast-externalize-tuple-unlocked
+                                     toast logical (pg::pg-class-columns table) 42 0)))))
+                 (ok (eq (aref logical 0) bytes))
+                 (ok (pg::heap-external-varlena-p (aref physical 0)))
+                 (ok (equalp bytes (pg::toast-fetch-value toast (aref physical 0) snapshot))))
                (pg::clog-set 42 pg::+clog-committed+)
                (pg::with-write-lock
                  (multiple-value-setq (parent-block parent-offset)
