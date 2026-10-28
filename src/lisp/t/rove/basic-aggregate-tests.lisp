@@ -424,6 +424,112 @@
       (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case)))
                (first case))))
 
+(rove:deftest numeric-prefix-operator-errors
+    (dolist (operator '("@" "|/" "||/"))
+      (let* ((sql (format nil "SELECT ~a NULL" operator))
+             (expression (analyze-expr
+                          (getf (first (getf (first (parse-statements sql)) :targets)) :expr) nil)))
+        (rove:ok (and (eq (expr-type expression) :float8)
+                      (eq (eval-expr expression nil) +null+)) sql)))
+  (dolist (case '(("SELECT @ (-4)::numeric" :numeric "4")
+                  ("SELECT |/ 4::numeric" :float8 "2")
+                  ("SELECT ||/ 8::numeric" :float8 "2")))
+    (let* ((expression (analyze-expr
+                        (getf (first (getf (first (parse-statements (first case))) :targets)) :expr) nil)))
+      (rove:ok (and (eq (expr-type expression) (second case))
+                    (equal (value->text (eval-expr expression nil) (expr-type expression))
+                           (third case)))
+               (first case))))
+  (let ((condition (handler-case
+                       (progn (subquery-test-rows "SELECT |/ (-1)::numeric") nil)
+                     (pg-error (error) error))))
+    (rove:ok (and condition (equal (pg-error-sqlstate condition) "2201F"))))
+  (dolist (operator '("@" "|/" "||/"))
+    (dolist (case '(("true" "boolean") ("'x'::text" "text")
+                    ("NULL::text" "text") ("ARRAY[1]" "integer[]")
+                    ("'1'::oid" "oid")))
+      (let* ((sql (format nil "SELECT ~a ~a" operator (first case)))
+             (condition (handler-case (progn (subquery-test-rows sql) nil)
+                          (pg-error (error) error))))
+        (rove:ok (and condition
+                      (equal (pg-error-sqlstate condition) "42883")
+                      (equal (pg-error-message condition)
+                             (format nil "operator does not exist: ~a ~a" operator (second case)))
+                      (equal (pg-error-detail condition)
+                             "No operator of that name accepts the given argument type.")
+                      (equal (pg-error-hint condition)
+                             "You might need to add an explicit type cast."))
+                 sql)))
+    ;; Operand analysis and unknown input coercion retain their own errors.
+    (dolist (case '(("missing_prefix_operand" "42703")
+                    ("'bad'::integer" "22P02") ("'bad'" "22P02")))
+      (let* ((sql (format nil "SELECT ~a ~a" operator (first case)))
+             (condition (handler-case (progn (subquery-test-rows sql) nil)
+                          (pg-error (error) error))))
+        (rove:ok (and condition (equal (pg-error-sqlstate condition) (second case))) sql)))))
+
+(rove:deftest bitwise-operator-resolution-errors
+    (dolist (operator '("<<" ">>"))
+      (dolist (case '(("1::smallint" "42725" "smallint")
+                      ("1::bigint" "42883" "bigint")))
+        (let* ((sql (format nil "SELECT '1' ~a ~a" operator (first case)))
+               (condition (handler-case (progn (subquery-test-rows sql) nil)
+                            (pg-error (error) error))))
+          (rove:ok (and condition
+                        (equal (pg-error-sqlstate condition) (second case))
+                        (equal (pg-error-message condition)
+                               (format nil "~a: unknown ~a ~a"
+                                       (if (equal (second case) "42725")
+                                           "operator is not unique" "operator does not exist")
+                                       operator (third case)))) sql)))
+      (let* ((sql (format nil "SELECT '1' ~a 1::integer" operator))
+             (expression (analyze-expr
+                          (getf (first (getf (first (parse-statements sql)) :targets)) :expr) nil)))
+        (rove:ok (and (eq (expr-type expression) :int4)
+                      (= (eval-expr expression nil) (if (equal operator "<<") 2 0))) sql)))
+  (dolist (case '(("SELECT ~ true" "42883" "~ boolean" t)
+                  ("SELECT ~ '1'" "42725" "~ unknown" t)
+                  ("SELECT ~ NULL" "42725" "~ unknown" t)))
+    (let ((condition (handler-case (progn (subquery-test-rows (first case)) nil)
+                       (pg-error (error) error))))
+      (rove:ok (and condition
+                    (equal (pg-error-sqlstate condition) (second case))
+                    (equal (pg-error-message condition)
+                           (concatenate 'string
+                                        (if (equal (second case) "42725")
+                                            "operator is not unique: " "operator does not exist: ")
+                                        (third case)))
+                    (equal (pg-error-detail condition)
+                           (if (equal (second case) "42725")
+                               "Could not choose a best candidate operator."
+                               "No operator of that name accepts the given argument type."))
+                    (equal (pg-error-hint condition)
+                           (if (equal (second case) "42725")
+                               "You might need to add explicit type casts."
+                               "You might need to add an explicit type cast.")))
+               (first case))))
+  (dolist (operator '("&" "|" "#" "<<" ">>"))
+    (dolist (case '(("true" "1" "42883" "boolean" "integer")
+                    ("'1'" "true" "42883" "unknown" "boolean")
+                    ("'1'" "'2'" "42725" "unknown" "unknown")))
+      (let* ((sql (format nil "SELECT ~a ~a ~a" (first case) operator (second case)))
+             (condition (handler-case (progn (subquery-test-rows sql) nil)
+                          (pg-error (error) error))))
+        (rove:ok (and condition
+                      (equal (pg-error-sqlstate condition) (third case))
+                      (equal (pg-error-message condition)
+                             (format nil "~a~a ~a ~a"
+                                     (if (equal (third case) "42725")
+                                         "operator is not unique: " "operator does not exist: ")
+                                     (fourth case) operator (fifth case)))
+                      (equal (pg-error-detail condition)
+                             (if (equal (third case) "42725")
+                                 "Could not choose a best candidate operator."
+                                 "No operator of that name accepts the given argument types."))
+                      (equal (pg-error-hint condition)
+                             "You might need to add explicit type casts."))
+                 sql)))))
+
 (rove:deftest numeric-sqrt-expressions
     (dolist (case '(("SELECT sqrt(2::numeric)::text" "1.414213562373095")
                     ("SELECT sqrt(4.00::numeric)::text" "2.000000000000000")

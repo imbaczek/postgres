@@ -378,9 +378,17 @@ int4 and int8. Binary bitwise operands resolve to a common integer width;
 shifts retain the left operand's width and take an int4 count. The named
 `int2`, `int4` and `int8` helpers with `and`, `or`, `xor`, `not`, `shl`,
 `shr` and `abs` suffixes are also available. These operations are strict.
+Incompatible bitwise operand types raise `42883` during operator resolution;
+unresolved unknown operands can instead raise the ambiguous-operator error
+`42725`. Both errors include the operand type signature and explicit-cast advice.
 Generic operators bind below arithmetic and associate left to right; prefix
 generic operators take an arithmetic expression as their operand. Prefix `@`,
 `|/` and `||/` provide absolute value, square root and cube root respectively.
+They accept supported numeric operands; `|/` and `||/` return float8, while
+`@` preserves the numeric overload. Unknown literals and NULL resolve through
+the preferred float8 overload. An incompatible typed operand raises SQLSTATE
+`42883` during analysis, after errors in analyzing the operand itself; invalid
+unknown literal input raises its input conversion error after operator resolution.
 Shift counts are masked as on the x86 C peer, with int2 promoted to 32 bits
 before shifting. C does not define all signed shift cases portably, so results
 for such cases may differ from a PostgreSQL server built for another host.

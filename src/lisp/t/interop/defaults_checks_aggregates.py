@@ -744,6 +744,79 @@ CASES = (
 )
 
 
+class NumericErrorConnection(QueryConnection):
+    def receive(self):
+        kind, body = super().receive()
+        if kind == b"E":
+            fields = self.error_fields(body)
+            self.numeric_error = tuple(fields.get(key) for key in ("C", "M", "D", "H"))
+        return kind, body
+
+    def observe_numeric_error(self, sql):
+        self.numeric_error = None
+        self.observe(sql)
+        return self.numeric_error
+
+
+def check_numeric_prefix_errors(reference, native):
+    peers = [NumericErrorConnection(port, "numeric-prefix-errors")
+             for port in (reference, native)]
+    try:
+        for operator in ("@", "|/", "||/", "~"):
+            for operand, type_name in (("true", "boolean"), ("'x'::text", "text"),
+                                       ("NULL::text", "text"), ("ARRAY[1]", "integer[]"),
+                                       ("'1'::oid", "oid")):
+                sql = f"SELECT {operator} {operand}"
+                expected = ("42883", f"operator does not exist: {operator} {type_name}",
+                            "No operator of that name accepts the given argument type.",
+                            "You might need to add an explicit type cast.")
+                outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+                assert outcomes == [expected, expected], (sql, outcomes)
+            for operand, state in (("missing_prefix_operand", "42703"),
+                                   ("'bad'::integer", "22P02"),
+                                   ("'bad'", "42725" if operator == "~" else "22P02")):
+                sql = f"SELECT {operator} {operand}"
+                outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+                assert all(error is not None and error[0] == state for error in outcomes), (sql, outcomes)
+        for operator in ("&", "|", "#", "<<", ">>"):
+            for left, right, signature in (("true", "1", f"boolean {operator} integer"),
+                                           ("'1'", "true", f"unknown {operator} boolean"),
+                                           ("'x'::text", "1", f"text {operator} integer")):
+                sql = f"SELECT {left} {operator} {right}"
+                expected = ("42883", f"operator does not exist: {signature}",
+                            "No operator of that name accepts the given argument types.",
+                            "You might need to add explicit type casts.")
+                outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+                assert outcomes == [expected, expected], (sql, outcomes)
+        ambiguous = [("SELECT ~ '1'", "~ unknown"), ("SELECT ~ NULL", "~ unknown")]
+        ambiguous.extend((f"SELECT '1' {operator} '2'", f"unknown {operator} unknown")
+                         for operator in ("&", "|", "#", "<<", ">>"))
+        ambiguous.extend((f"SELECT '1' {operator} 1::smallint", f"unknown {operator} smallint")
+                         for operator in ("<<", ">>"))
+        for sql, signature in ambiguous:
+            expected = ("42725", f"operator is not unique: {signature}",
+                        "Could not choose a best candidate operator.",
+                        "You might need to add explicit type casts.")
+            outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+            assert outcomes == [expected, expected], (sql, outcomes)
+        for operator in ("<<", ">>"):
+            sql = f"SELECT '1' {operator} 1::bigint"
+            expected = ("42883", f"operator does not exist: unknown {operator} bigint",
+                        "No operator of that name accepts the given argument types.",
+                        "You might need to add explicit type casts.")
+            outcomes = [peer.observe_numeric_error(sql) for peer in peers]
+            assert outcomes == [expected, expected], (sql, outcomes)
+        for sql in ("SELECT @ NULL,|/ NULL,||/ NULL",
+                    "SELECT @ (-4)::numeric,|/ 4::numeric,||/ 8::numeric",
+                    "SELECT |/ (-1)::numeric", "SELECT '1' << 1::integer,'1' >> 1::integer"):
+            outcomes = [peer.observe(sql) for peer in peers]
+            assert outcomes[0] == outcomes[1], (sql, outcomes)
+        print("numeric-operators: exact SQLSTATE/message/detail/hint and coercion order PASS", flush=True)
+    finally:
+        for peer in peers:
+            peer.close()
+
+
 def check(reference, native):
     peers = [QueryConnection(port, "defaults-checks-aggregates") for port in (reference, native)]
     failures = []
@@ -840,6 +913,7 @@ if __name__ == "__main__":
         check_restart(int(sys.argv[1]), int(sys.argv[2]))
     else:
         check(int(sys.argv[1]), int(sys.argv[2]))
+        check_numeric_prefix_errors(int(sys.argv[1]), int(sys.argv[2]))
         check_datestyle_sessions(int(sys.argv[1]), int(sys.argv[2]))
         check_transaction_time(int(sys.argv[1]), int(sys.argv[2]))
         if len(sys.argv) >= 5:

@@ -1758,6 +1758,23 @@ are supported."
   (list :concat (cast-expression-to-text left) (cast-expression-to-text right)
         :type :text :typmod -1))
 
+(defun report-operator-resolution-error (operator arguments &optional ambiguous-p)
+  "Report C op_error's signature and cast advice without coercing operands."
+  (let* ((unary-p (= (length arguments) 1))
+         (types (mapcar (lambda (argument)
+                          (if (in-unknown-constant-p argument)
+                              "unknown" (typed-arg-name argument))) arguments))
+         (signature (if unary-p (cons operator types)
+                        (list (first types) operator (second types)))))
+    (ereport (if ambiguous-p "42725" "42883") "~a: ~{~a~^ ~}"
+             (if ambiguous-p "operator is not unique" "operator does not exist") signature
+             :detail (cond (ambiguous-p "Could not choose a best candidate operator.")
+                           (unary-p "No operator of that name accepts the given argument type.")
+                           (t "No operator of that name accepts the given argument types."))
+             :hint (if (and unary-p (not ambiguous-p))
+                       "You might need to add an explicit type cast."
+                       "You might need to add explicit type casts."))))
+
 (defun analyze-integer-bitwise (operator left right)
   "Resolve supported integer bitwise operators and coerce their operands.
 Same-width catalog overloads choose the wider integer for mixed operands. Shifts
@@ -1768,11 +1785,10 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
       (unless (and (or (in-unknown-constant-p left) (member ltype '(:int2 :int4 :int8)))
                    (or (in-unknown-constant-p right)
                        (member rtype (if shift '(:int2 :int4) '(:int2 :int4 :int8)))))
-        (ereport "42883" "operator does not exist: ~a ~a ~a"
-                 (typed-arg-name left) operator (typed-arg-name right)))
+        (report-operator-resolution-error operator (list left right)))
       (when (and (in-unknown-constant-p left)
                  (or (in-unknown-constant-p right) (and shift (eq rtype :int2))))
-        (ereport "42725" "operator is not unique: ~a" operator))
+        (report-operator-resolution-error operator (list left right) t))
       (when (in-unknown-constant-p left)
         (setf ltype (if (and (not shift) (member rtype '(:int2 :int4 :int8))) rtype :int4)
               left (coerce-in-constant left ltype)))
@@ -1781,8 +1797,7 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
               right (coerce-in-constant right rtype)))
       (unless (and (member ltype '(:int2 :int4 :int8))
                    (member rtype (if shift '(:int2 :int4) '(:int2 :int4 :int8))))
-        (ereport "42883" "operator does not exist: ~a ~a ~a"
-                 (typed-arg-name left) operator (typed-arg-name right)))
+        (report-operator-resolution-error operator (list left right)))
       (let ((type (if shift ltype
                       (cond ((or (eq ltype :int8) (eq rtype :int8)) :int8)
                             ((or (eq ltype :int4) (eq rtype :int4)) :int4)
@@ -2093,8 +2108,12 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
     (:unary
      (let ((e (analyze-expr (third expr) table)))
        (when (member (second expr) '("@" "|/" "||/") :test #'string=)
-         ;; Reuse function overload resolution while retaining operator identity
-         ;; for grouping and expression comparisons.
+         ;; parse_oper.c's left_oper selects a pg_operator candidate before coercion;
+         ;; operand analysis comes first, and input conversion precedes execution.
+         (unless (or (in-unknown-constant-p e)
+                     (member (expr-type e) '(:int2 :int4 :int8 :numeric :float4 :float8)))
+           (report-operator-resolution-error (second expr) (list e)))
+         ;; Share function coercion while retaining operator identity for grouping.
          (let ((resolved (cond ((string= (second expr) "||/")
                                 (analyze-trig-function "cbrt" (list e)))
                                ((string= (second expr) "|/")
@@ -2105,9 +2124,9 @@ keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
                    :type (expr-type resolved) :typmod -1))))
        (when (string= (second expr) "~")
          (when (in-unknown-constant-p e)
-           (ereport "42725" "operator is not unique: ~a unknown" "~"))
+           (report-operator-resolution-error "~" (list e) t))
          (unless (member (expr-type e) '(:int2 :int4 :int8))
-           (ereport "42883" "operator does not exist: ~a ~a" (second expr) (typed-arg-name e)))
+           (report-operator-resolution-error (second expr) (list e)))
          (return-from analyze-expr
            (list :unary "~" e :type (expr-type e) :typmod -1)))
        (unless (string= (second expr) "-")
