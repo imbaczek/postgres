@@ -166,6 +166,7 @@
   (test-nested-loop-seq-cost-models-replayable-inner)
   (test-analyze-parser-and-costed-join-order)
   (test-query-plan-index-lock-order)
+  (test-select-toast-reader-domain)
   (test-index-scan-limit-stops-duplicate-candidates)
   (test-query-plan-compiler-backend-hook)
   (test-query-plan-compiler-dispatch-uses-registry-snapshot)

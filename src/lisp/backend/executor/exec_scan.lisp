@@ -1112,19 +1112,33 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
        (member idx (table-indexes table) :test #'eq)))
 
 (defun select-relation-reader-relfilenodes (relations)
+  "Capture TOAST identities in RELATIONS and return reader relfilenodes.
+Include each non-virtual table, its TOAST heap and index when present, and
+its selected scan index.  The captured TOAST identities are revalidated after
+reader registration."
   (mapcan (lambda (spec)
-            (when (not (getf spec :virtual-p))
+            (unless (getf spec :virtual-p)
               (let* ((table (getf spec :table))
+                     (toast (pg-class-toast table))
+                     (toast-nodes (when toast
+                                    (list (pg-toast-relfilenode toast)
+                                          (pg-toast-index-relfilenode toast))))
                      (path (getf spec :path))
                      (index (and (eq (select-scan-path-kind path) :index-scan)
                                  (select-scan-path-index path))))
-                (cons (pg-class-relfilenode table)
-                      (when index
-                        (list (pg-index-relfilenode index)))))))
+                (unless (loop for key in spec by #'cddr thereis (eq key :registered-toast))
+                  (nconc spec (list :registered-toast nil
+                                    :registered-toast-nodes nil)))
+                (setf (getf spec :registered-toast) toast
+                      (getf spec :registered-toast-nodes) toast-nodes)
+                (append (list (pg-class-relfilenode table))
+                        toast-nodes
+                        (when index (list (pg-index-relfilenode index)))))))
           relations))
 
 (defun revalidate-select-relations (relations)
   "Revalidate registered RELATIONS under the caller's write lock.
+Signal an error if a table, its columns, or its captured TOAST identity changed.
 Replace stale index paths in the copied relation specifications with SeqScans."
   (dolist (spec relations)
     (unless (getf spec :virtual-p)
@@ -1133,6 +1147,13 @@ Replace stale index paths in the copied relation specifications with SeqScans."
              (index (and (eq (select-scan-path-kind path) :index-scan)
                          (select-scan-path-index path))))
         (ensure-current-table table)
+        (let ((toast (pg-class-toast table)))
+          (unless (and (eq toast (getf spec :registered-toast))
+                       (equal (when toast
+                                (list (pg-toast-relfilenode toast)
+                                      (pg-toast-index-relfilenode toast)))
+                              (getf spec :registered-toast-nodes)))
+            (ereport "0A000" "TOAST storage changed during query planning")))
         (unless (eq (getf spec :columns) (pg-class-columns table))
           (ereport "0A000" "table definition changed during query planning"))
         (when (and index (not (select-index-current-p table index)))

@@ -222,6 +222,43 @@
             (symbol-function 'call-with-btree-relation-read-leases) original-locks
             (symbol-function 'query-plan-backend-entry) original-backend-entry))))
 
+(defun test-select-toast-reader-domain ()
+  (let* ((toast (make-pg-toast :oid 100 :relfilenode 104 :index-relfilenode 102))
+         (table (make-pg-class :oid 101 :relfilenode 101 :columns #() :toast toast))
+         (spec (list :table table :columns (pg-class-columns table)
+                     :path (make-select-scan-path :kind :seq-scan)))
+         (relations (list spec))
+         (plan (%make-query-plan :physical '(:result)))
+         (original-nblocks (symbol-function 'buf-nblocks))
+         (original-ensure (symbol-function 'ensure-current-table)))
+    (unwind-protect
+         (progn
+           (check (equal (select-relation-reader-relfilenodes relations) '(101 104 102))
+                  "SELECT captures parent and owned TOAST relations")
+           (setf (symbol-function 'buf-nblocks)
+                 (lambda (node) (declare (ignore node)) 2))
+           (check (equal (query-plan-index-relfilenodes plan relations) '(102))
+                  "sequential SELECT includes the TOAST index in its lease domain")
+           (setf (symbol-function 'ensure-current-table)
+                 (lambda (table) (declare (ignore table)) t))
+           (revalidate-select-relations relations)
+           (setf (pg-toast-index-relfilenode toast) 103)
+           (check (equal (getf spec :registered-toast-nodes) '(104 102))
+                  "captured TOAST node identities survive catalog mutation")
+           (check (handler-case (progn (revalidate-select-relations relations) nil)
+                    (error () t))
+                  "SELECT rejects a changed TOAST node")
+           (check (handler-case (progn (revalidate-subquery-relations relations) nil)
+                    (error () t))
+                  "DML subqueries reject a changed TOAST node")
+           (setf (symbol-function 'buf-nblocks)
+                 (lambda (node) (declare (ignore node)) 1))
+           (check (handler-case (progn (query-plan-index-relfilenodes plan relations) nil)
+                    (error () t))
+                  "missing TOAST index is rejected before initialization"))
+      (setf (symbol-function 'buf-nblocks) original-nblocks
+            (symbol-function 'ensure-current-table) original-ensure))))
+
 (defun test-index-scan-limit-stops-duplicate-candidates ()
   (let* ((table (make-pg-class :oid 91011 :name "limit_index_test"
                                :relfilenode 91012 :columns #()))

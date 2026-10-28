@@ -675,16 +675,24 @@ reordered tree, and each parameterized path can reference only joined Vars."
                               (select-scan-path-selectivity path))))))
 
 (defun query-plan-index-relfilenodes (plan registered-relations)
-  "Validate root scan handles and include registered expression-subplan indexes."
+  "Validate scan handles and return sorted, unique index lease relfilenodes.
+Include selected scan indexes and registered TOAST indexes, signalling an error
+if a registered TOAST index is missing."
   (dolist (node (collect-query-plan-nodes (query-plan-physical plan)))
     (when (eq (first node) :index-scan)
       (physical-scan-path node (physical-scan-relation node registered-relations))))
+  (dolist (relation registered-relations)
+    (let ((toast-nodes (getf relation :registered-toast-nodes)))
+      (when (and toast-nodes (< (buf-nblocks (second toast-nodes)) 2))
+        (ereport "XX001" "TOAST index is missing"))))
   (sort
    (remove-duplicates
     (loop for relation in registered-relations
           for path = (getf relation :path)
-          when (and path (eq (select-scan-path-kind path) :index-scan))
-            collect (pg-index-relfilenode (select-scan-path-index path)))
+          for toast-nodes = (getf relation :registered-toast-nodes)
+          append (append (when toast-nodes (list (second toast-nodes)))
+                         (when (and path (eq (select-scan-path-kind path) :index-scan))
+                           (list (pg-index-relfilenode (select-scan-path-index path))))))
     :test #'eql)
    #'<))
 

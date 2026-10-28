@@ -210,17 +210,8 @@
     (prepare-joined-dml-qualifications prepared)))
 
 (defun revalidate-subquery-relations (relations)
-  (dolist (relation relations)
-    (unless (getf relation :virtual-p)
-      (let* ((table (getf relation :table))
-             (path (getf relation :path))
-             (index (and (eq (select-scan-path-kind path) :index-scan)
-                         (select-scan-path-index path))))
-        (ensure-current-table table)
-        (unless (eq (getf relation :columns) (pg-class-columns table))
-          (ereport "0A000" "table definition changed during query planning"))
-        (when (and index (not (select-index-current-p table index)))
-          (setf (getf relation :path) (make-select-scan-path :kind :seq-scan))))))
+  "Revalidate DML subquery reader relations and return RELATIONS."
+  (revalidate-select-relations relations)
   relations)
 
 (defun call-with-dml-subqueries (prepared function)
