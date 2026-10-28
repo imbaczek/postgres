@@ -288,6 +288,18 @@ NaNs and infinities follow PostgreSQL's power rules, including `NaN ^ 0 = 1`
 and `1 ^ NaN = 1`. Numeric powers use decimal result scales; finite float8
 overflow and underflow raise SQLSTATE `22003`.
 
+Integer bitwise operators `&`, `|`, `#`, `~`, `<<` and `>>` support int2,
+int4 and int8. Binary bitwise operands resolve to a common integer width;
+shifts retain the left operand's width and take an int4 count. The named
+`int2`, `int4` and `int8` helpers with `and`, `or`, `xor`, `not`, `shl`,
+`shr` and `abs` suffixes are also available. These operations are strict.
+Generic operators bind below arithmetic and associate left to right; prefix
+generic operators take an arithmetic expression as their operand. Prefix `@`,
+`|/` and `||/` provide absolute value, square root and cube root respectively.
+Shift counts are masked as on the x86 C peer, with int2 promoted to 32 bits
+before shifting. C does not define all signed shift cases portably, so results
+for such cases may differ from a PostgreSQL server built for another host.
+
 Constant target expressions are evaluated during execution rather than folded
 during planning. Consequently, `WHERE false` or `LIMIT 0` can suppress errors
 from constant SELECT targets that PostgreSQL would raise while planning.

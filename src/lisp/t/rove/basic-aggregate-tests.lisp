@@ -254,6 +254,20 @@
   (rove:ok (equal (list (list +null+)) (subquery-test-rows "SELECT sin(NULL)")))
   (rove:ok (not (analyzed-expression-volatile-p (list :func "sin" nil :type :float8)))))
 
+(rove:deftest integer-bitwise-operators
+    (dolist (case '(("SELECT (5 & 3)::text" "1")
+                    ("SELECT (5 | 2 # 3)::text" "4")
+                    ("SELECT (1 << 31)::text" "-2147483648")
+                    ("SELECT (-8 >> 2)::text" "-2")
+                    ("SELECT (~ 0::int2)::text" "-1")
+                    ("SELECT int8xor(7, 3)::text" "4")
+                    ("SELECT int2shl(1::int2, 15)::text" "-32768")
+                    ("SELECT (@ -2 + 1)::text" "1")
+                    ("SELECT (|/ 9)::text" "3")
+                    ("SELECT (||/ 8)::text" "2")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case)))
+               (first case))))
+
 (rove:deftest numeric-sqrt-expressions
     (dolist (case '(("SELECT sqrt(2::numeric)::text" "1.414213562373095")
                     ("SELECT sqrt(4.00::numeric)::text" "2.000000000000000")

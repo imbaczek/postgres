@@ -1341,7 +1341,16 @@
         (setf left (list :binop op left (funcall next p)))))))
 
 (defun parse-concatenation (p)
-  (parse-binary-level p '("||") #'parse-additive))
+  "Parse generic operators at gram.y's left-associative Op precedence.
+Arithmetic binds more tightly; comparison and boolean operators bind less tightly."
+  (let ((left (parse-additive p)))
+    (loop while (and (eq (pkind p) :op)
+                     (not (member (pval p) '("=" "<>" "!=" "<" "<=" ">" ">=") :test #'string=))
+                     (not (member (pval p) '("::" ":=" "=>") :test #'string=)))
+          do (let ((op (pval p)))
+               (pnext p)
+               (setf left (list :binop op left (parse-additive p)))))
+    left))
 
 (defun parse-additive (p)
   (parse-binary-level p '("+" "-") #'parse-multiplicative))
@@ -1353,8 +1362,7 @@
   "Parse left-associative power between unary and multiplicative precedence."
   (let ((left (parse-unary p)))
     (loop while (and (eq (pkind p) :op)
-                     (plusp (length (pval p)))
-                     (char= (char (pval p) 0) #\^))
+                     (string= (pval p) "^"))
           do (let ((operator (pval p)))
                (pnext p)
                (setf left (list :binop operator left (parse-unary p)))))
@@ -1500,7 +1508,12 @@
         (t (return expression))))))
 
 (defun parse-unary (p)
+  "Parse prefix operators; generic Op takes an additive expression as its operand."
   (cond
+    ((and (eq (pkind p) :op) (not (member (pval p) '("-" "+" "*" "/" "%" "^" "=" "<>" "!=" "<" ">" "<=" ">=" "::" ":=" "=>") :test #'string=)))
+     (let ((op (pval p)))
+       (pnext p)
+       (list :unary op (parse-additive p))))
     ((match-op p "-")
      (let ((argument (parse-unary p)))
        ;; gram.y:doNegate folds raw constants before selecting their type.

@@ -628,6 +628,26 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
     (when (string= name "pg_get_publication_tables")
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
+    ;; The catalog's integer helper functions use the same execution paths as
+    ;; their operators, but resolve their declared argument types by name.
+    (when (and (>= (length name) 5) (member (subseq name 0 4) '("int2" "int4" "int8") :test #'string=)
+               (member (subseq name 4) '("and" "or" "xor" "not" "shl" "shr" "abs") :test #'string=))
+      (let* ((type (cdr (assoc (subseq name 0 4) '(("int2" . :int2) ("int4" . :int4) ("int8" . :int8)) :test #'string=)))
+             (suffix (subseq name 4))
+             (unary (member suffix '("not" "abs") :test #'string=))
+             (shift (member suffix '("shl" "shr") :test #'string=))
+             (types (if unary (list type) (list type (if shift :int4 type)))))
+        (unless (and (= (length args) (length types))
+                     (every (lambda (arg target)
+                              (or (in-unknown-constant-p arg)
+                                  (sql-implicit-coercion-p (expr-type arg) target))) args types))
+          (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+        (let ((coerced (mapcar #'coerce-common-expression args types)))
+          (return-from analyze-function-expression
+            (cond ((string= suffix "abs") (list :func "abs" coerced :type type :typmod -1))
+                  ((string= suffix "not") (list :unary "~" (first coerced) :type type :typmod -1))
+                  (t (list :binop (cdr (assoc suffix '(("and" . "&") ("or" . "|") ("xor" . "#") ("shl" . "<<") ("shr" . ">>")) :test #'string=))
+                           (first coerced) (second coerced) :type type :typmod -1)))))))
     (cond
       ((trig-function-p name) (analyze-trig-function name args))
       ((string= name "width_bucket") (analyze-width-bucket args))
@@ -1285,6 +1305,40 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
   (list :concat (cast-expression-to-text left) (cast-expression-to-text right)
         :type :text :typmod -1))
 
+(defun analyze-integer-bitwise (operator left right)
+  "Resolve supported integer bitwise operators and coerce their operands.
+Same-width catalog overloads choose the wider integer for mixed operands. Shifts
+keep the left type and take int4 counts; unresolved unknowns can be ambiguous."
+  (when (member operator '("&" "|" "#" "<<" ">>") :test #'string=)
+    (let* ((shift (member operator '("<<" ">>") :test #'string=))
+           (ltype (expr-type left)) (rtype (expr-type right)))
+      (unless (and (or (in-unknown-constant-p left) (member ltype '(:int2 :int4 :int8)))
+                   (or (in-unknown-constant-p right)
+                       (member rtype (if shift '(:int2 :int4) '(:int2 :int4 :int8)))))
+        (ereport "42883" "operator does not exist: ~a ~a ~a"
+                 (typed-arg-name left) operator (typed-arg-name right)))
+      (when (and (in-unknown-constant-p left)
+                 (or (in-unknown-constant-p right) (and shift (eq rtype :int2))))
+        (ereport "42725" "operator is not unique: ~a" operator))
+      (when (in-unknown-constant-p left)
+        (setf ltype (if (and (not shift) (member rtype '(:int2 :int4 :int8))) rtype :int4)
+              left (coerce-in-constant left ltype)))
+      (when (in-unknown-constant-p right)
+        (setf rtype (if shift :int4 ltype)
+              right (coerce-in-constant right rtype)))
+      (unless (and (member ltype '(:int2 :int4 :int8))
+                   (member rtype (if shift '(:int2 :int4) '(:int2 :int4 :int8))))
+        (ereport "42883" "operator does not exist: ~a ~a ~a"
+                 (typed-arg-name left) operator (typed-arg-name right)))
+      (let ((type (if shift ltype
+                      (cond ((or (eq ltype :int8) (eq rtype :int8)) :int8)
+                            ((or (eq ltype :int4) (eq rtype :int4)) :int4)
+                            (t :int2)))))
+        (setf left (coerce-common-expression left type)
+              right (coerce-common-expression right (if shift :int4 type)))
+        (return-from analyze-integer-bitwise
+          (list :binop operator left right :type type :typmod -1))))))
+
 (defun analyze-binop-expression (expression scope)
   (let* ((operator (second expression))
          (left (analyze-expr (third expression) scope))
@@ -1297,6 +1351,11 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
         (return-from analyze-binop-expression
           (list :binop operator (first arguments) (second arguments)
                 :type type :typmod -1))))
+    (when (member operator '("&" "|" "#" "<<" ">>") :test #'string=)
+      (return-from analyze-binop-expression (analyze-integer-bitwise operator left right)))
+    (unless (member operator '("||" "+" "-" "*" "/" "%" "=" "<>" "<" "<=" ">" ">=") :test #'string=)
+      (ereport "42883" "operator does not exist: ~a ~a ~a"
+               (typed-arg-name left) operator (typed-arg-name right)))
     (when (string= operator "||")
       (return-from analyze-binop-expression (analyze-text-concatenation left right)))
     (if (member operator '("=" "<>" "<" "<=" ">" ">=") :test #'string=)
@@ -1555,6 +1614,22 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
     (:binop (analyze-binop-expression expr table))
     (:unary
      (let ((e (analyze-expr (third expr) table)))
+       (when (member (second expr) '("@" "|/" "||/") :test #'string=)
+         (return-from analyze-expr
+           (cond ((string= (second expr) "||/")
+                  (analyze-trig-function "cbrt" (list e)))
+                 ((string= (second expr) "|/")
+                  (analyze-trig-function "sqrt" (list e)))
+                 (t (analyze-basic-numeric-function "abs" (list e))))))
+       (when (string= (second expr) "~")
+         (when (in-unknown-constant-p e)
+           (ereport "42725" "operator is not unique: ~a unknown" "~"))
+         (unless (member (expr-type e) '(:int2 :int4 :int8))
+           (ereport "42883" "operator does not exist: ~a ~a" (second expr) (typed-arg-name e)))
+         (return-from analyze-expr
+           (list :unary "~" e :type (expr-type e) :typmod -1)))
+       (unless (string= (second expr) "-")
+         (ereport "42883" "operator does not exist: ~a ~a" (second expr) (typed-arg-name e)))
        (when (member (expr-type e) '(:char :int2vector :text-array :oid :pg-lsn :bit :timestamptz :timestamp :date :time :timetz))
          (ereport "42883" "unary operator does not exist for ~a" (expr-type e)))
        (list :unary (second expr) e
@@ -2739,6 +2814,21 @@ Arguments have already been evaluated in order, including for strict calls."
        (sql-cast-value value type type -1)))
     (t (eval-func name arguments))))
 
+(defun sql-integer-bitwise (op l r type)
+  "Evaluate bitwise operators on already coerced, non-NULL integer operands.
+C's signed shifts can be undefined or implementation-defined. Match the x86
+behavior used by the C peer: mask the count, promote int2 to 32 bits, then
+truncate and interpret the result at TYPE's signed width."
+  (let* ((bits (ecase type (:int2 16) (:int4 32) (:int8 64)))
+         (shift-bits (if (= bits 16) 32 bits))
+         (raw (cond ((string= op "&") (logand l r))
+                    ((string= op "|") (logior l r))
+                    ((string= op "#") (logxor l r))
+                    ((string= op "<<") (ash l (mod r shift-bits)))
+                    (t (ash l (- (mod r shift-bits))))))
+         (unsigned (ldb (byte bits 0) raw)))
+    (if (logbitp (1- bits) unsigned) (- unsigned (ash 1 bits)) unsigned)))
+
 (defun eval-expr (expr env)
   (case (first expr)
     (:subplan (eval-subquery-expression (second expr) env))
@@ -2792,6 +2882,8 @@ Arguments have already been evaluated in order, including for strict calls."
                                                           (sql-session-timezone))))
                               ((or (eq (expr-type (third expr)) :date) (eq (expr-type (fourth expr)) :date))
                                (sql-date-arithmetic op l r (expr-type (third expr)) (expr-type (fourth expr))))
+                              ((member op '("&" "|" "#" "<<" ">>") :test #'string=)
+                               (sql-integer-bitwise op l r (expr-type expr)))
                               ((string= op "^")
                                (if (eq (expr-type expr) :numeric)
                                    (sql-numeric-power l r) (sql-float-power l r)))
@@ -2803,6 +2895,7 @@ Arguments have already been evaluated in order, including for strict calls."
     (:unary
      (sql-strict-let ((value (eval-expr (third expr) env)))
        (cond
+         ((string= (second expr) "~") (lognot value))
          ((string= (second expr) "-")
           (let ((result (cond ((sql-interval-p value) (sql-interval-add (make-sql-interval 0 0 0) value t))
                               ((sql-numeric-p value) (sql-numeric-negate value))
