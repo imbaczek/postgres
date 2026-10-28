@@ -1,12 +1,19 @@
 (in-package #:pg)
 
+;;; Checked native physical follow exchanges. The caller owns transport and
+;;; lifecycle; these helpers do not admit a receiver.
+
 (defconstant +physical-client-proof-frame-maximum+
-  (+ +physical-store-history-maximum-bytes+ 65536))
+  (+ +physical-store-history-maximum-bytes+ 65536)
+  "Per-command frame bound for a 16 MiB history and result framing.")
 
 (defun pg-client-native-reject (message)
+  "Signal a protocol violation; the caller must close the client."
   (error 'pg-client-error :sqlstate "08P01" :message message))
 
 (defun pg-client-native-frame (client maximum)
+  "Read one complete frame within this command's bound.
+Malformed or interrupted framing leaves cleanup and client closure to the caller."
   (multiple-value-bind (type length-bytes payload)
       (read-message-frame (pg-client-stream client) maximum)
     (when (and length-bytes (not (<= 4 (bytes-to-u32 length-bytes 0) maximum)))
@@ -16,10 +23,12 @@
     (values (code-char type) payload)))
 
 (defun pg-client-native-cstring (payload position)
+  "Decode one terminated text field or signal a protocol violation."
   (handler-case (pg-client-cstring payload position)
     (error () (pg-client-native-reject "native response has an invalid text field"))))
 
 (defun pg-client-native-check-description (payload schema)
+  "Require the exact ordered column names, types and text format in SCHEMA."
   (unless (and (>= (length payload) 2) (= (bytes-to-u16 payload 0) (length schema)))
     (pg-client-native-reject "native result has an unexpected column count"))
   (let ((position 2))
@@ -38,6 +47,7 @@
   (mapcar (lambda (expected) (make-pg-client-column :name (first expected) :type-oid (second expected))) schema))
 
 (defun pg-client-native-error-condition (payload)
+  "Validate an ErrorResponse and construct its condition with its SQLSTATE."
   (let ((position 0) (terminated nil))
     (loop while (< position (length payload))
           for code = (aref payload position)
@@ -55,6 +65,8 @@
     (error () (pg-client-native-reject "native source returned a malformed error response"))))
 
 (defun pg-client-native-query-error (client payload maximum)
+  "Drain a valid query error through ReadyForQuery, then signal its SQLSTATE.
+A malformed response or transport failure requires the caller to close the client."
   (let ((condition (pg-client-native-error-condition payload)))
     (loop
       (multiple-value-bind (type bytes) (pg-client-native-frame client maximum)
@@ -67,9 +79,13 @@
           (otherwise (pg-client-native-reject "native error lacks query completion")))))))
 
 (defun pg-client-native-source-error (payload)
+  "Signal a streaming source error immediately; the caller must close the client."
   (error (pg-client-native-error-condition payload)))
 
 (defun pg-client-native-read-row (client schema tag &key (maximum 4096) first-frame)
+  "Read one non-null typed row in description, data, completion, ready order.
+Allow notices and parameter status between frames. Reject extra or malformed
+results; a protocol or transport failure requires the caller to close the client."
   (let ((state :description) (columns nil) (row nil))
     (loop
       (multiple-value-bind (type payload)
@@ -100,6 +116,7 @@
           (otherwise (pg-client-native-reject "unexpected native command response")))))))
 
 (defun pg-client-native-u64 (text &optional timeline)
+  "Parse a bounded unsigned result, optionally requiring a valid timeline."
   (let ((value (handler-case (physical-stream-u64 text)
                  (error () (pg-client-native-reject "native result has an invalid unsigned integer")))))
     (when (and timeline (not (<= 1 value #xFFFFFFFF)))
@@ -107,6 +124,7 @@
     value))
 
 (defun pg-client-native-switch (client &optional first-frame)
+  "Read a typed next-child and fork result at START or after streaming."
   (let* ((row (pg-client-native-read-row client
                                          (list (list "next_tli" +int8oid+)
                                                (list "next_tli_startpos" +textoid+))
@@ -117,6 +135,9 @@
     (list :switch next fork)))
 
 (defun pg-client-native-finish (client next fork)
+  "Finish a historic stream after the backend CopyDone has been consumed.
+The caller must first flush local receipt and send truthful feedback. Send
+frontend CopyDone and require the returned child and fork to match the preparation."
   (write-message (pg-client-stream client) #\c (make-payload))
   (let ((result (pg-client-native-switch client)))
     (unless (equal result (list :switch next fork))
@@ -124,6 +145,9 @@
     result))
 
 (defun pg-client-native-start (client query)
+  "Start native streaming; return :COPY-BOTH or (:SWITCH child fork).
+The caller owns the client, timeouts and cancellation, and closes on protocol
+or transport failure. Do not perform network I/O under recovery quiescence."
   (pg-client-send-query client query)
   (loop
     (multiple-value-bind (type payload) (pg-client-native-frame client 4096)
@@ -138,6 +162,7 @@
         (otherwise (pg-client-native-reject "unexpected native stream startup response"))))))
 
 (defun pg-client-native-lsn (text)
+  "Parse a bounded native result LSN or signal a protocol violation."
   (unless (and (stringp text) (<= 3 (length text) 17)
                (every (lambda (char) (find char "0123456789abcdefABCDEF/")) text))
     (pg-client-native-reject "native result has an invalid WAL position"))
@@ -145,6 +170,9 @@
     (error () (pg-client-native-reject "native result has an invalid WAL position"))))
 
 (defun pg-client-native-history (client timeline)
+  "Fetch and validate the requested child history and return its UTF-8 bytes.
+Preserve valid UTF-8 bytes and check filename, bound and lineage; the caller
+must compare the history with the source anchor."
   (unless (typep timeline '(integer 2 4294967295))
     (error "native history request requires a child timeline"))
   (pg-client-send-query client (format nil "TIMELINE_HISTORY ~d" timeline))
@@ -160,6 +188,7 @@
     bytes))
 
 (defun pg-client-native-prepare-query (slot coordinates)
+  "Build a native PREPARE_FOLLOW query from checked receiver coordinates."
   (unless (wal-valid-replication-slot-name-p slot) (error "invalid native follow pin name"))
   (physical-follow-check-plist coordinates (cons :version (mapcar #'second *physical-follow-wire-fields*)))
   (unless (eql 1 (getf coordinates :version)) (error "invalid native follow request version"))
@@ -175,6 +204,7 @@
     (write-char #\) out)))
 
 (defun pg-client-native-eor (text)
+  "Decode the fixed-size hexadecimal end-of-recovery record."
   (unless (and (= (length text) (* 2 +wal-end-of-recovery-record-size+))
                (every (lambda (char) (find char "0123456789abcdefABCDEF")) text))
     (pg-client-native-reject "native source returned invalid end-of-recovery hex"))
@@ -182,6 +212,13 @@
         collect (parse-integer text :start position :end (+ position 2) :radix 16)))
 
 (defun pg-client-native-prepare (client slot coordinates)
+  "Prepare and return a checked source anchor for the supplied coordinates.
+Check the typed row, echoes, history, EOR, next timeline and fork. The caller
+must independently verify source identity and local durable witnesses, and
+compare the actual immediate-child history with the source ancestry. This helper
+does not install history, redo WAL, update recovery state or admit a receiver.
+The caller owns network deadlines, cancellation and client cleanup; it must not
+perform network I/O under recovery quiescence."
   (pg-client-send-query client (pg-client-native-prepare-query slot coordinates))
   (let* ((schema (append (list (list "slot_name" +textoid+))
                          (loop for (name key kind) in *physical-follow-wire-fields*

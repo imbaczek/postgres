@@ -109,8 +109,10 @@ as a second value. Blocking reads stay outside OPERATION-WRAPPER."
 (defun read-message-frame (stream &optional (maximum +max-query-message-size+))
   "Read one bounded raw frame without validating or constructing a message.
 
-The caller must validate the returned bytes after entering the appropriate live
-operation.  Only the length check needed to bound body allocation happens here."
+Frontend decoding belongs under live-operation admission; client readers
+validate their own response schema. Only the allocation bound is checked here.
+MAXIMUM bounds the length word value, including its four bytes; its default
+retains the frontend limit."
   (let ((type-byte (read-byte stream nil nil)))
     (when (null type-byte)
       (return-from read-message-frame (values nil nil nil)))
