@@ -94,6 +94,10 @@ Receipt may advance the position only when its durable owner is the replay timel
 This native allocation-safety requirement permits its empty batch start first."
   (let* ((state *physical-recovery-state*) (timeline (physical-recovery-replay-timeline state))
                                            (snapshot (getf state :source-checkpoint)) (type (wal-record-type record)))
+    (when (= type +wal-record-checkpoint+)
+      (let ((checkpoint (wal-checkpoint-record-snapshot record)))
+        (when (and checkpoint (/= timeline (getf checkpoint :timeline)))
+          (error "native checkpoint differs from its replay timeline"))))
     (when (/= timeline (getf snapshot :timeline (getf state :timeline)))
       (cond
         ((= type +wal-record-batch-start+)

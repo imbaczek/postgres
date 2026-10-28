@@ -34,9 +34,9 @@
       (list 1 "127.0.0.1" 5433 "binding_probe"
             (list :version 1 :phase :pending :anchor anchor :child-history history
                   :before before :after after :applied '(96 1) :required '(96 1)
-                  :recovery '(:phase 2 :cluster-identity "binding-probe" :checkpoint 64
-                              :observed-next-xid 9 :history-target nil :history-digest nil
-                              :restartpoint nil))))))
+                  :recovery (list :phase 2 :cluster-identity "binding-probe" :checkpoint 64
+                                  :observed-next-xid 9 :history-target nil :history-digest nil
+                                  :restartpoint nil))))))
 
 (deftest follow-binding-config-roundtrips-pending-proof-with-existing-envelope
     (dolist (padding '(nil 8192))
@@ -131,6 +131,222 @@
                                      :observed-next-xid 9 :history-target nil :history-digest nil
                                      :restartpoint (80 4242)))
     (ok (equal config (pg::physical-follow-decode-config (pg::physical-follow-config-image config))))))
+
+(deftest follow-binding-witness-preserves-exhausted-next-xid-sentinel
+    (let* ((config (follow-binding-test-config))
+           (witness (getf (fifth config) :recovery)))
+      (setf (getf witness :observed-next-xid) 18446744073709551616)
+      (ok (equal config (pg::physical-follow-decode-config (pg::physical-follow-config-image config))))))
+
+(defun call-with-follow-replay-proof (function &key unfinished)
+  (with-physical-store-directory (root)
+    (let* ((pg::*pgdata* root)
+           (identity '(:system-id 42 :base-timeline 1 :base 64 :manifest-digest 77))
+           (store (pg::physical-store-open root 42 1 :create t :start-lsn 64 :retained-identity identity))
+           (cursor 64) (first-terminal nil)
+           (base (list :system-id 42 :timeline 1 :end 64 :manifest-digest 77 :checkpoint 64
+                       :cluster-identity "history-source" :next-xid 3 :source-checkpoint nil
+                       :source-reservation (list :version 1 :through 64 :bound 1000 :complete nil))))
+      (unwind-protect
+           (progn
+             (dolist (xid '(10 20))
+               (let ((raw (pg::wal-encode-record pg::+wal-record-batch-start+ 0 cursor (empty-octets))))
+                 (pg::physical-store-input store cursor raw) (incf cursor (length raw)))
+               (let ((raw (pg::wal-encode-record pg::+wal-record-commit+ xid cursor
+                                                 (pg::wal-encode-commit-timestamp 42))))
+                 (pg::physical-store-input store cursor raw) (incf cursor (length raw)))
+               (unless first-terminal (setf first-terminal cursor)))
+             (when unfinished
+               (let ((raw (pg::wal-encode-record pg::+wal-record-batch-start+ 0 cursor (empty-octets))))
+                 (pg::physical-store-input store cursor raw) (incf cursor (length raw))))
+             (pg::physical-store-flush store)
+             (let* ((anchor (follow-anchor-request (pg::physical-store-prefix-digest store cursor) 456))
+                    (history (store-history-text 1 cursor))
+                    (eor (store-history-eor cursor 2 1))
+                    (before (pg::physical-store-control-tuple store))
+                    (applied (list first-terminal 1))
+                    (candidate (sb-thread:with-mutex ((pg::physical-store-mutex store))
+                                 (pg::physical-store-follow-candidate store before applied applied 2 history eor))))
+               (setf (getf anchor :receive-lsn) cursor (getf anchor :history-text) history
+                     (getf anchor :eor-octets) (coerce eor 'list))
+               (let ((binding (list :version 1 :phase :pending :anchor anchor :child-history history
+                                    :before before :after (pg::physical-store-control-tuple candidate)
+                                    :applied applied :required (copy-list applied)
+                                    :recovery (list :phase 2 :cluster-identity "history-source" :checkpoint 64
+                                                    :observed-next-xid 11 :history-target nil
+                                                    :history-digest nil :restartpoint nil))))
+                 (pg::physical-follow-binding-check binding)
+                 (funcall function root store candidate base binding))))
+        (pg::physical-store-close store)))))
+
+(deftest follow-replay-proof-observes-required-position-and-preserves-live-state
+    (call-with-follow-replay-proof
+     (lambda (root store candidate base binding)
+       (let* ((live (list :timeline 99 :source-checkpoint nil :observed-next-xid 999))
+              (pg::*physical-recovery-state* live) (pg::*physical-receive-store* store)
+              (pg::*next-xid* 999) (pg::*last-replay-lsn* 999)
+              (pg::*wal-recovery-group-active* :live)
+              (control-before (lineage-test-bytes (pg::physical-store-path store "receive.control")))
+              (base-before (copy-tree base)))
+         (pg::wal-ensure-directory-durable (merge-pathnames "global/" root))
+         (pg::wal-atomic-write-bytes (pg::catalog-path) #(1 2 3))
+         (pg::wal-atomic-write-bytes (pg::physical-recovery-control-path) #(4 5 6))
+         (let ((result (pg::physical-follow-validate-candidate-replay candidate base binding)))
+           (ok (= 21 (getf result :next-xid)))
+           (ok (= 11 (getf result :required-next-xid)))
+           (ok (= (getf (getf binding :anchor) :receive-lsn) (getf result :terminal)))
+           (ok (= 1 (getf result :timeline))))
+         (incf (getf (getf binding :recovery) :observed-next-xid))
+         (ok (signals (pg::physical-follow-validate-candidate-replay candidate base binding) 'error))
+         (ok (eq live pg::*physical-recovery-state*))
+         (ok (equal live '(:timeline 99 :source-checkpoint nil :observed-next-xid 999)))
+         (ok (eq store pg::*physical-receive-store*))
+         (ok (= 999 pg::*next-xid* pg::*last-replay-lsn*))
+         (ok (eq :live pg::*wal-recovery-group-active*))
+         (ok (equal base-before base))
+         (ok (equalp control-before (lineage-test-bytes (pg::physical-store-path store "receive.control"))))
+         (ok (equalp #(1 2 3) (lineage-test-bytes (pg::catalog-path))))
+         (ok (equalp #(4 5 6) (lineage-test-bytes (pg::physical-recovery-control-path))))))))
+
+(deftest follow-replay-proof-rejects-forged-visibility-and-unclean-boundaries
+    (dolist (kind '(:visibility :applied :unfinished))
+      (call-with-follow-replay-proof
+       (lambda (root store candidate base binding)
+         (declare (ignore root store))
+         (ecase kind
+           (:visibility (incf (getf (getf binding :recovery) :observed-next-xid)))
+           (:applied (setf (getf binding :applied) '(96 1)
+                           (getf binding :required) '(64 1)
+                           (getf (getf binding :recovery) :observed-next-xid) 3))
+           (:unfinished nil))
+         (ok (signals (pg::physical-follow-validate-candidate-replay candidate base binding) 'error)))
+       :unfinished (eq kind :unfinished))))
+
+(defun follow-replay-proof-write-restartpoint (store base lsn next &optional (version 3) (prefix-delta 0) overrides)
+  (multiple-value-bind (deletes catalog) (pg::wal-decode-catalog-payload (history-catalog-payload nil nil))
+    (declare (ignore deletes))
+    (let* ((metadata (list :version version :system-id 42 :cluster-identity "history-source"
+                           :timeline 1 :manifest-digest 77 :base (getf base :end)
+                           :lsn lsn :prefix-digest (+ prefix-delta (pg::physical-store-prefix-digest store lsn))
+                           :next-xid next :forks nil :seen nil :source-checkpoint nil))
+           (pointer (make-array 28 :element-type '(unsigned-byte 8) :initial-element 0)))
+      (when (>= version 3)
+        (setf (getf metadata :source-reservation)
+              (list :version 1 :through lsn :bound 1000 :complete nil)))
+      (when (= version 4) (setf (getf metadata :wal-prefix-digest) nil))
+      (loop for (key value) on overrides by #'cddr do (setf (getf metadata key) value))
+      (let* ((bytes (pg::physical-restartpoint-encode metadata catalog))
+             (digest (pg::physical-store-update-digest #xCBF29CE484222325 bytes)))
+        (pg::wal-ensure-directory-durable (pg::physical-restartpoint-directory))
+        (pg::wal-atomic-write-bytes (pg::physical-restartpoint-generation-path lsn digest) bytes)
+        (replace pointer #(80 71 82 80 80 84 82 49))
+        (pg::wal-set-u64 pointer 8 lsn) (pg::wal-set-u64 pointer 16 digest)
+        (pg::wal-set-u32 pointer 24 (pg::wal-crc32 pointer))
+        (pg::wal-atomic-write-bytes (pg::physical-restartpoint-pointer-path) pointer)
+        (list lsn digest)))))
+
+(deftest follow-replay-proof-seeds-from-real-restartpoint-and-allows-older-required-pair
+    (dolist (empty-scan '(nil t))
+      (call-with-follow-replay-proof
+       (lambda (root store candidate base binding)
+         (declare (ignore root))
+         (let* ((lsn (if empty-scan (pg::physical-store-flushed-lsn store) (first (getf binding :applied))))
+                (next (if empty-scan 21 11))
+                (witness (getf binding :recovery)))
+           (setf (getf witness :restartpoint)
+                 (follow-replay-proof-write-restartpoint store base lsn next)
+                 (getf binding :applied) (list lsn 1)
+                 (getf binding :required) (if empty-scan (list lsn 1) '(64 1))
+                 (getf witness :observed-next-xid) (if empty-scan next 3))
+           (let ((result (pg::physical-follow-validate-candidate-replay candidate base binding)))
+             (ok (= lsn (getf result :start)))
+             (ok (= 21 (getf result :next-xid)))
+             (ok (= (if empty-scan 21 3) (getf result :required-next-xid)))))))))
+
+(deftest follow-replay-proof-rejects-changed-restartpoint-and-visibility-regression
+    (dolist (kind '(:pointer :visibility :prefix :legacy))
+      (call-with-follow-replay-proof
+       (lambda (root store candidate base binding)
+         (declare (ignore root))
+         (let* ((witness (getf binding :recovery))
+                (lsn (first (getf binding :applied)))
+                (token (follow-replay-proof-write-restartpoint
+                        store base lsn 11 (if (eq kind :legacy) 2 3) (if (eq kind :prefix) 1 0))))
+           (setf (getf witness :restartpoint) token)
+           (ecase kind
+             (:pointer (incf (second token)))
+             (:visibility (setf (getf binding :required) '(64 1)
+                                (getf witness :observed-next-xid) 12))
+             (:prefix nil)
+             (:legacy (setf (getf witness :observed-next-xid) 12)))
+           (ok (signals (pg::physical-follow-validate-candidate-replay candidate base binding) 'error)))))))
+
+(deftest follow-replay-proof-legacy-restartpoint-falls-back-to-retained-base
+    (call-with-follow-replay-proof
+     (lambda (root store candidate base binding)
+       (declare (ignore root))
+       (setf (getf (getf binding :recovery) :restartpoint)
+             (follow-replay-proof-write-restartpoint store base (first (getf binding :applied)) 999 2))
+       (let ((result (pg::physical-follow-validate-candidate-replay candidate base binding)))
+         (ok (= 64 (getf result :start)))
+         (ok (= 11 (getf result :required-next-xid)))
+         (ok (= 21 (getf result :next-xid)))))))
+
+(deftest follow-replay-proof-crosses-selected-eor-and-restores-child-seed
+    (dolist (restartpoint '(nil t))
+      (call-with-restartpoint-fixture
+       (lambda (root store)
+         (declare (ignore root))
+         (let ((base (copy-tree pg::*physical-recovery-state*)))
+           (setf (pg::physical-store-retained-identity store)
+                 '(:system-id 42 :base-timeline 1 :base 32 :manifest-digest 77))
+           (selected-replay-test-prepare store)
+           (pg::physical-store-input store 152 (sample-physical-record 152))
+           (pg::physical-store-input store 184 (selected-replay-test-child-checkpoint 184))
+           (pg::physical-store-flush store)
+           (let* ((fork (pg::physical-store-flushed-lsn store))
+                  (before (pg::physical-store-control-tuple store))
+                  (parent-history (getf (pg::physical-store-selection store) :history-text))
+                  (history (store-history-text 2 fork parent-history))
+                  (eor (store-history-eor fork 3 2))
+                  (anchor (follow-anchor-request (pg::physical-store-prefix-digest store fork) 456))
+                  (applied (list fork 2))
+                  (candidate (sb-thread:with-mutex ((pg::physical-store-mutex store))
+                               (pg::physical-store-follow-candidate store before applied '(152 2) 3 history eor)))
+                  (binding (list :version 1 :phase :pending :anchor anchor :child-history history
+                                 :before before :after (pg::physical-store-control-tuple candidate)
+                                 :applied applied :required '(152 2)
+                                 :recovery (list :phase 2 :cluster-identity "history-source" :checkpoint 32
+                                                 :observed-next-xid 50 :history-target 2
+                                                 :history-digest (ninth before) :restartpoint nil))))
+             (setf (getf anchor :base) 32 (getf anchor :source-timeline) 3
+                   (getf anchor :receive-timeline) 2 (getf anchor :receive-lsn) fork
+                   (getf anchor :history-text) history (getf anchor :eor-octets) (coerce eor 'list))
+             (when restartpoint
+               (setf (getf (getf binding :recovery) :restartpoint)
+                     (follow-replay-proof-write-restartpoint
+                      store base 152 50 4 0
+                      (list :replay-timeline 2 :history-target 2 :history-digest (ninth before)
+                            :source-checkpoint (sample-checkpoint-snapshot :start 0 :end 120 :redo 0 :next-xid 50)))))
+             (let ((result (pg::physical-follow-validate-candidate-replay candidate base binding)))
+               (ok (= (if restartpoint 152 32) (getf result :start)))
+               (ok (= 2 (getf result :timeline)))
+               (ok (= 2000 (getf result :next-xid)))
+               (ok (= 50 (getf result :required-next-xid)))))))
+       :system-id 42)))
+
+(deftest native-checkpoint-cannot-change-timeline-without-selected-eor
+    (dolist (claimed '(1 2 9))
+      (let* ((pg::*physical-recovery-state* (list :timeline 1 :replay-timeline 1 :source-checkpoint nil))
+             (record (pg::wal-decode-record (selected-replay-test-child-checkpoint 64) 64))
+             (snapshot (pg::wal-checkpoint-record-snapshot record)))
+        (setf (getf snapshot :timeline) claimed)
+        (setf record (pg::wal-decode-record
+                      (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 64
+                                             (pg::wal-encode-checkpoint-snapshot snapshot)) 64))
+        (if (= claimed 1)
+            (ok (null (pg::physical-replay-check-child-initialization record 3)))
+            (ok (signals (pg::physical-replay-check-child-initialization record 3) 'error))))))
 
 (deftest follow-binding-config-projects-immediate-child-history-from-newer-source
     (let* ((config (follow-binding-test-config))
