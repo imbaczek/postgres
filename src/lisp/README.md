@@ -200,6 +200,13 @@ Fixed-width types accept only `PLAIN` or `DEFAULT`. `VACUUM FULL` rewrites
 existing values using the current policy; it fails if a `PLAIN` value cannot
 fit on a heap page, leaving the original table intact.
 
+`json_typeof(json)` and `jsonb_typeof(jsonb)` return the top-level type as
+text: `object`, `array`, `string`, `number`, `boolean`, or `null`.
+`json_array_length(json)` and `jsonb_array_length(jsonb)` return the number of
+top-level array elements as an integer; objects and scalars raise SQLSTATE
+`22023`. All four return SQL NULL for SQL NULL input. JSON null is a JSON
+scalar, so its type is the text `null` and it is not an array.
+
 Decimal literals and numeric casts support finite values; numeric casts also
 accept NaN, infinities, and signed hexadecimal, octal, and binary integer input
 with PostgreSQL's underscore rules. Precision-constrained numeric values are rounded and range checked. Floating

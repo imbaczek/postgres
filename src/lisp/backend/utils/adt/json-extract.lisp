@@ -34,6 +34,61 @@
       (when pending (surrogate-error nil))))
   (sql-jsonb-value (sql-jsonb-input (subseq text start end))))
 
+(defun sql-json-source-kind (text)
+  "Identify the top-level kind of validated JSON TEXT without decoding strings."
+  (let ((first (find-if-not (lambda (c) (find c '(#\Space #\Tab #\Newline #\Return))) text)))
+    (case first
+      (#\{ "object") (#\[ "array") (#\" "string")
+      ((#\t #\f) "boolean") (#\n "null")
+      (otherwise "number"))))
+
+(defun sql-jsonb-kind (jsonb)
+  "Identify the top-level kind of a normalized JSONB value."
+  (let ((value (sql-jsonb-value jsonb)))
+    (cond ((eq value :json-null) "null")
+          ((member value '(:json-true :json-false)) "boolean")
+          ((stringp value) "string")
+          ((sql-numeric-p value) "number")
+          ((and (consp value) (eq (car value) :object)) "object")
+          ((vectorp value) "array")
+          (t (error "invalid JSONB value")))))
+
+(defun sql-json-source-array-length (text)
+  "Count top-level elements of validated JSON TEXT.
+Track nesting and string escapes without decoding strings, as json_array_length
+does not need their values.  Reject a top-level object or scalar."
+  (let ((kind (sql-json-source-kind text)))
+    (unless (string= kind "array")
+      (ereport "22023" "cannot get array length of a ~a"
+               (if (string= kind "object") "non-array" "scalar")))
+    (let ((depth 0) (in-string nil) (escaped nil) (count 0) (element-p nil))
+      (loop for c across text
+            do (cond
+                 (in-string
+                  (cond (escaped (setf escaped nil))
+                        ((char= c #\\) (setf escaped t))
+                        ((char= c #\") (setf in-string nil))))
+                 ((char= c #\")
+                  (when (= depth 1) (setf element-p t))
+                  (setf in-string t))
+                 ((find c '(#\[ #\{))
+                  (when (= depth 1) (setf element-p t))
+                  (incf depth))
+                 ((find c '(#\] #\})) (decf depth))
+                 ((and (= depth 1) (char= c #\,)) (incf count))
+                 ((and (= depth 1) (not (find c '(#\Space #\Tab #\Newline #\Return))))
+                  (setf element-p t))))
+      (if element-p (1+ count) 0))))
+
+(defun sql-jsonb-array-length (jsonb)
+  "Return the number of top-level array elements in JSONB.
+Reject a top-level object or scalar, including JSON null."
+  (let ((kind (sql-jsonb-kind jsonb)))
+    (unless (string= kind "array")
+      (ereport "22023" "cannot get array length of a ~a"
+               (if (string= kind "object") "non-array" "scalar")))
+    (length (sql-jsonb-value jsonb))))
+
 (defun sql-json-extract (text key text-p)
   "Extract a field or array element from JSON TEXT.
 JSON results and non-string text results retain the selected source spelling;

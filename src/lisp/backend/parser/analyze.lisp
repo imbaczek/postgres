@@ -370,6 +370,18 @@ exist\" messages."
   (if (eq (expr-type argument) :text) argument
       (list :cast argument :type :text :typmod -1)))
 
+(defun analyze-json-inspection-function (name arguments)
+  "Resolve the four JSON inspection functions against their catalog signatures.
+Unknown constants are coerced to the declared JSON or JSONB input type.  The
+result is text for typeof and int4 for array_length."
+  (let ((input-type (if (search "jsonb_" name) :jsonb :json)))
+    (unless (and (= (length arguments) 1)
+                 (or (eq (expr-type (first arguments)) input-type)
+                     (in-unknown-constant-p (first arguments))))
+      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+    (list :func name (list (coerce-common-expression (first arguments) input-type))
+          :type (if (search "_typeof" name) :text :int4) :typmod -1)))
+
 (defun analyze-substr-function (name arguments)
   (unless (and (member (length arguments) '(2 3))
                (sql-implicit-coercion-p (expr-type (first arguments)) :text)
@@ -1105,6 +1117,12 @@ so a nested argument error keeps its own diagnostics."
          (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature)))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
       ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
+      ((member name '("json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length")
+               :test #'string=)
+       (let ((*defer-function-constant-coercion-p*
+               (or (getf (cdddr expr) :call-distinct)
+                   (getf (cdddr expr) :call-order))))
+         (analyze-json-inspection-function name args)))
       ((string= name "substr") (analyze-substr-function name args))
       ((string= name "pg_wal_lsn_diff") (analyze-wal-lsn-diff name args))
       ((string= name "pg_walfile_name") (analyze-wal-filename name args))
@@ -2863,6 +2881,7 @@ candidate selection."
                          (member (second form)
                                  '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                    "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
+                                   "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length"
                                    "substr" "length" "char_length" "character_length" "octet_length" "pg_backend_pid"
                                    "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                                    "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
@@ -3547,6 +3566,13 @@ aliases share the corresponding numeric operator implementation."
     ((string= name "pg_promote") (pg-promote (first args) (second args)))
     ((string= name "pg_stat_get_wal_receiver") (wal-receiver-result))
     ((string= name "pg_postmaster_start_time") (postmaster-start-timestamp))
+    ((member name '("json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length")
+             :test #'string=)
+     (sql-strict-let ((value (first args)))
+       (cond ((string= name "json_typeof") (sql-json-source-kind value))
+             ((string= name "jsonb_typeof") (sql-jsonb-kind value))
+             ((string= name "json_array_length") (sql-json-source-array-length value))
+             (t (sql-jsonb-array-length value)))))
     ((string= name "substr") (eval-substr-function args))
     ((string= name "pg_wal_lsn_diff") (eval-wal-lsn-diff args))
     ((string= name "pg_walfile_name") (eval-wal-filename args))
