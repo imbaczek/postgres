@@ -1113,6 +1113,19 @@
                                (make-logical-recovery-assembler 65536) (length bad) 0 bad) nil)
                      (error () t)))))))
 
+(rove:deftest test-logical-full-row-admission-bound
+    (let* ((small (make-heap-external-varlena :raw-size 5004 :external-info 5000
+                                              :value-id 1 :relation-id 7 :id-width 4))
+           (large (make-heap-external-varlena :raw-size (* 80 1024 1024) :external-info 5000
+                                              :value-id 2 :relation-id 7 :id-width 4))
+           (columns (list (list :type :int4) (list :type :text)))
+           (table (make-pg-class :toast (make-pg-toast :oid 7))))
+      (rove:ok (not (logical-full-row-admission-needed-p 1024 table columns (vector nil small))))
+      (rove:ok (logical-full-row-admission-needed-p (* 60 1024 1024) table columns (vector nil large)))
+      (rove:ok (logical-full-row-admission-needed-p 1024 table (list (list :type :int4) (list :type :jsonb))
+                                                    (vector nil small)))
+      (rove:ok (logical-full-row-admission-needed-p (1+ +max-logical-transaction-bytes+) table columns nil))))
+
 (rove:deftest test-logical-capture-reused-toast-images
     (let* ((pointer (make-heap-external-varlena :raw-size 5004 :external-info 5000
                                                 :value-id 5 :relation-id 7 :id-width 4))
@@ -1129,6 +1142,19 @@
           (logical-capture-row-images :update nil old new reuse)
         (rove:ok (equalp old-image old))
         (rove:ok (equalp new-image new)))
+      (multiple-value-bind (old-image new-image)
+          (logical-capture-row-images :update '(1) (vector 1 pointer) (vector 1 pointer)
+                                      (vector nil pointer))
+        (rove:ok (equalp old-image (vector 1 +null+)))
+        (rove:ok (equalp new-image (vector 1 +logical-unchanged-toast+))))
+      (rove:ok (handler-case
+                   (progn (logical-capture-row-images :update nil (vector 1 pointer)
+                                                      (vector 1 pointer) (vector nil pointer)) nil)
+                 (error () t)))
+      (rove:ok (handler-case
+                   (progn (logical-capture-row-images :update '(1) (vector 1 pointer)
+                                                      (vector 1 pointer) nil) nil)
+                 (error () t)))
       (multiple-value-bind (old-image new-image)
           (logical-capture-row-images :delete '(1) old nil nil)
         (rove:ok (equalp old-image (vector 1 +null+ +null+)))
@@ -2516,6 +2542,43 @@
              (rove:ok (logical-spool-failed-p spool))
              (rove:ok (null (logical-spool-stream spool))))
         (close-logical-spool spool))))
+
+(rove:deftest test-small-marker-update-admission-failure-poisons-spool
+    (let* ((*backend* (make-backend :xid 42))
+           (*logical-capture-xid-modes* (make-hash-table :test #'eql))
+           (*catalog* (make-catalog))
+           (database (make-database :name "postgres" :oid 42))
+           (pointer (make-heap-external-varlena :raw-size (* 80 1024 1024)
+                                                :external-info 5000 :value-id 1 :relation-id 7 :id-width 4))
+           (table (make-pg-class :oid 10 :name "t" :toast (make-pg-toast :oid 7)
+                                 :columns (vector (make-pg-column :name "id" :type :int4 :attnum 1 :typmod -1)
+                                                  (make-pg-column :name "payload" :type :text :attnum 2 :typmod -1))))
+           (old-identity (symbol-function 'logical-table-replica-identity))
+           (old-validator (symbol-function 'logical-validate-large-row-change))
+           (resolved 0) (validated 0))
+      (setf (gethash 42 *logical-capture-xid-modes*) :capture-written
+            (gethash "postgres" (catalog-databases *catalog*)) database
+            (backend-database *backend*) "postgres")
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-table-replica-identity)
+                   (lambda (table) (declare (ignore table)) '(1))
+                   (symbol-function 'logical-validate-large-row-change)
+                   (lambda (change full) (declare (ignore change full))
+                     (incf validated) (error "admission rejected")))
+             (rove:ok (handler-case
+                          (progn (logical-note-row-change
+                                  :update table :old-values (vector 1 pointer)
+                                  :new-values (vector 1 pointer) :toast-reuse (vector nil pointer)
+                                  :full-new-values (lambda () (incf resolved) (vector 1 "full"))) nil)
+                        (error (condition) (rove:ok (search "admission rejected" (princ-to-string condition))) t)))
+             (rove:ok (= resolved 1))
+             (rove:ok (= validated 1))
+             (rove:ok (and (logical-spool-failed-p (backend-logical-spool *backend*))
+                           (zerop (logical-spool-count (backend-logical-spool *backend*))))))
+        (setf (symbol-function 'logical-table-replica-identity) old-identity
+              (symbol-function 'logical-validate-large-row-change) old-validator)
+        (when (backend-logical-spool *backend*) (close-logical-spool (backend-logical-spool *backend*))))))
 
 (rove:deftest test-client-streamed-query-failure-closes-connection
     (let* ((path (merge-pathnames (format nil "pg-query-fail-~d-~d" (sb-posix:getpid) (random 1000000))

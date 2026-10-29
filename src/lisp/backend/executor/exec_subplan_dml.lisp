@@ -419,16 +419,23 @@
          (finish-dml-command stream (getf prepared :returning) (format nil "DELETE ~a" count)))))))
 
 (defun simple-update-toast-demand (prepared table xid)
-  "Return required slots for a narrow no-capture UPDATE, or NIL for full fetch."
-  (when (or (logical-capture-xid-needed-p xid)
-            (getf prepared :dml-source) (getf prepared :dml-source-plan)
+  "Return required slots for a narrow UPDATE, or NIL for full fetch."
+  (when (or (getf prepared :dml-source) (getf prepared :dml-source-plan)
             (getf prepared :ctes) (getf prepared :sublinks)
             (getf prepared :dml-one-time-quals) (getf prepared :returning)
             (pg-class-checks table))
     (return-from simple-update-toast-demand nil))
   (let ((slots nil)
         (width (length (pg-class-columns table)))
-        (sets (getf prepared :sets)))
+        (sets (getf prepared :sets))
+        (identity (when (logical-capture-xid-needed-p xid)
+                    (with-write-lock (logical-table-replica-identity table)))))
+    (when (and (logical-capture-xid-needed-p xid) (null identity))
+      (return-from simple-update-toast-demand nil))
+    (dolist (slot identity)
+      (unless (and (integerp slot) (<= 1 slot width))
+        (return-from simple-update-toast-demand nil))
+      (pushnew slot slots))
     (labels ((walk (expr)
                (and (consp expr)
                     (case (first expr)
@@ -510,7 +517,19 @@
                                (ereport "XX000" "could not link updated heap tuple"))))
                         (declare (ignore block off))
                         (logical-note-row-change :update table :old-values (htup-values tuple)
-                                                 :new-values new :toast-reuse reuse :publication-selection publications)
+                                                 :new-values new :toast-reuse reuse :publication-selection publications
+                                                 :full-new-values
+                                                 (when toast-demand
+                                                   (lambda ()
+                                                     (let ((values (copy-seq new)))
+                                                       (loop for pointer across reuse for i from 0
+                                                             when (heap-external-varlena-p (aref values i))
+                                                               do (unless pointer
+                                                                    (error "missing claimed TOAST reuse pointer"))
+                                                                  (setf (aref values i) pointer))
+                                                       (htup-values
+                                                        (materialize-select-tuple
+                                                         table (make-htup :values values) *current-snapshot*))))))
                         (emit-dml-returning stream (getf prepared :returning) new
                                             :old-values (htup-values tuple) :new-values new :source-values source))
                       (incf count)))

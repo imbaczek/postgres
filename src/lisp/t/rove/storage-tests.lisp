@@ -653,7 +653,8 @@
                                                             (:const 1 :type :int4)) :type :int4)))
                            :where '(:binop "=" (:col 1 :type :int4) (:const 1 :type :int4))))
            (*logical-capture-xid-modes* (make-hash-table :test #'eql))
-           (old (symbol-function 'capture-insert-indexes)))
+           (old (symbol-function 'capture-insert-indexes))
+           (old-identity (symbol-function 'logical-table-replica-identity)))
       (unwind-protect
            (progn
              (setf (gethash 43 *logical-capture-xid-modes*) :skip-written
@@ -678,8 +679,16 @@
              (rove:ok (null (simple-update-toast-demand prepared table 43)))
              (setf (getf prepared :returning) nil
                    (gethash 43 *logical-capture-xid-modes*) :capture-written)
-             (rove:ok (null (simple-update-toast-demand prepared table 43))))
-        (setf (symbol-function 'capture-insert-indexes) old))))
+             (setf (symbol-function 'logical-table-replica-identity)
+                   (lambda (table) (declare (ignore table)) nil))
+             (rove:ok (null (simple-update-toast-demand prepared table 43)))
+             (setf (symbol-function 'logical-table-replica-identity)
+                   (lambda (table) (declare (ignore table)) '(1)))
+             (let ((demand (simple-update-toast-demand prepared table 43)))
+               (rove:ok (and demand (member 1 (cdr demand))
+                             (not (member 3 (cdr demand)))))))
+        (setf (symbol-function 'capture-insert-indexes) old
+              (symbol-function 'logical-table-replica-identity) old-identity))))
 
 (rove:deftest test-tuple-roundtrip
     (let* ((cols (coerce

@@ -1205,13 +1205,34 @@ Other types retain their normal semantic checks and may allocate their values."
               do (unless (heap-external-varlena-p pointer)
                    (error "invalid logical TOAST reuse pointer"))
                  (setf (aref new-image i) +logical-unchanged-toast+)))
+    (dolist (image (list old-image new-image))
+      (when (and image (find-if #'heap-external-varlena-p image))
+        (error "unresolved external value in logical row image")))
     (values old-image new-image)))
 
 (declaim (ftype function logical-validate-large-row-change))
 
 (declaim (special *logical-admission-binary-bytea* *pgoutput-binary-bytea*))
 
-(defun logical-note-row-change (kind table &key old-values new-values toast-reuse (publication-selection :unknown))
+(defun logical-full-row-admission-needed-p (size table columns toast-reuse)
+  "Conservatively include unchanged external values in the full-row bound."
+  (or (> size +max-logical-transaction-bytes+)
+      (and toast-reuse
+           (loop with bound = size
+                 for pointer across toast-reuse for column in columns
+                 when pointer
+                   do (let ((toast (pg-class-toast table)))
+                        (unless toast
+                          (ereport "XX001" "external value has no owning TOAST relation"))
+                        (multiple-value-bind (stored raw) (toast-pointer-storage-size toast pointer)
+                          (declare (ignore stored))
+                          (unless (member (getf column :type) '(:text :varchar :json :bytea))
+                            (return t))
+                          (incf bound (* 2 raw))))
+                      (when (> bound +max-logical-transaction-bytes+)
+                        (return t))))))
+
+(defun logical-note-row-change (kind table &key old-values new-values toast-reuse full-new-values (publication-selection :unknown))
   "Capture a successful executor row operation for its current transaction.
 
 PostgreSQL's logical decode path queues heap changes in DecodeInsert,
@@ -1247,15 +1268,16 @@ executor, so capture the same operation before transaction commit."
       (logical-capture-change
        *backend* change limit
        :after-measure (lambda (size)
-                        (when (> size +max-logical-transaction-bytes+)
-                          (handler-case
-                              (logical-validate-large-row-change change new-values)
-                            (logical-transport-frame-overflow ()
-                              (let ((*logical-admission-binary-bytea* t)
-                                    (*pgoutput-binary-bytea* t))
-                                (logical-validate-large-row-change change new-values))
-                              (logical-require-binary-bytea-for-xid
-                               (backend-xid *backend*) (logical-change-database-oid change)))))))))
+                        (when (logical-full-row-admission-needed-p size table columns toast-reuse)
+                          (let ((full-new (if full-new-values (funcall full-new-values) new-values)))
+                            (handler-case
+                                (logical-validate-large-row-change change full-new)
+                              (logical-transport-frame-overflow ()
+                                (let ((*logical-admission-binary-bytea* t)
+                                      (*pgoutput-binary-bytea* t))
+                                  (logical-validate-large-row-change change full-new))
+                                (logical-require-binary-bytea-for-xid
+                                 (backend-xid *backend*) (logical-change-database-oid change))))))))))
   (values))
 
 (defun logical-encode-chunk (index count events)

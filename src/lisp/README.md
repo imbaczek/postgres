@@ -229,12 +229,16 @@ for columns omitted from its assignments. The pointer comes from the physical
 row version actually claimed after any concurrent-update recheck; its chunks
 are retained for the new version. Assigned columns are written using the
 current storage policy, even when the assigned value is equal to the old one.
-For a simple UPDATE in a transaction whose sticky capture decision is off,
-unassigned external columns that are neither referenced nor indexed can defer
-detoasting; SET and WHERE inputs, assigned columns and index keys remain
-materialized. CHECK constraints, RETURNING, joins, subqueries, unrecognized
-expressions and captured transactions fall back to full materialization. A
-concurrent-update recheck uses the row version actually claimed.
+For a simple UPDATE, unassigned external columns that are neither referenced
+nor indexed can defer detoasting; SET and WHERE inputs, assigned columns and
+index keys remain materialized. Captured updates also materialize replica
+identity columns, and updates without a usable identity fall back to full-row
+materialization. CHECK constraints, RETURNING, joins, subqueries and unrecognized
+expressions also fall back. A concurrent-update recheck uses the row version
+actually claimed. Logical admission conservatively includes reused external
+values in its full-row size bound even when an unchanged marker makes the event
+small; a sufficiently large bound triggers full-row materialization and transport
+validation.
 For an interpreted SELECT plan with a projection over one base-table sequential
 or non-parameterized index scan, optionally with filters, sorting or top-N,
 and LIMIT, external values unused by the projection, filters, ordering, and
