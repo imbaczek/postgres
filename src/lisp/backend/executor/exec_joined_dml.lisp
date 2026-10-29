@@ -87,7 +87,7 @@
                     (nreverse rows) :initial-value '(:bool t)))))
   prepared)
 
-(defun stream-joined-dml-candidates (prepared table function)
+(defun stream-joined-dml-candidates (prepared table function &optional toast-demand)
   ;; Target tuples carry physical identity; replayed source values are independent
   ;; of that identity and remain from the original statement snapshot. The success
   ;; bit belongs to one target tuple and is set only after an actual mutation, so
@@ -105,7 +105,8 @@
          (where (or (getf prepared :dml-row-where) (getf prepared :where))))
     (unwind-protect
          (do-table-tuples (tuple table)
-           (materialize-select-tuple table tuple *current-snapshot*)
+           (materialize-select-tuple table tuple *current-snapshot*
+                                     :demand toast-demand :retain-external-p (not (null toast-demand)))
            (let ((modified-p nil))
              (flet ((offer (source)
                       (let ((environment (concatenate 'vector (htup-values tuple) source)))

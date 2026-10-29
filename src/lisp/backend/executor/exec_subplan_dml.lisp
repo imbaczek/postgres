@@ -418,6 +418,47 @@
                 deleted))))
          (finish-dml-command stream (getf prepared :returning) (format nil "DELETE ~a" count)))))))
 
+(defun simple-update-toast-demand (prepared table xid)
+  "Return required slots for a narrow no-capture UPDATE, or NIL for full fetch."
+  (when (or (logical-capture-xid-needed-p xid)
+            (getf prepared :dml-source) (getf prepared :dml-source-plan)
+            (getf prepared :ctes) (getf prepared :sublinks)
+            (getf prepared :dml-one-time-quals) (getf prepared :returning)
+            (pg-class-checks table))
+    (return-from simple-update-toast-demand nil))
+  (let ((slots nil)
+        (width (length (pg-class-columns table)))
+        (sets (getf prepared :sets)))
+    (labels ((walk (expr)
+               (and (consp expr)
+                    (case (first expr)
+                      ((:const :bool :parameter) t)
+                      (:col
+                       (let ((slot (second expr)))
+                         (when (and (integerp slot) (<= 1 slot width))
+                           (pushnew slot slots) t)))
+                      ((:assignment :cast :not :is-null :is-bool) (walk (second expr)))
+                      (:unary (walk (third expr)))
+                      ((:and :or :concat) (and (walk (second expr)) (walk (third expr))))
+                      (:binop (and (walk (third expr)) (walk (fourth expr))))
+                      (otherwise nil)))))
+      (let ((where (or (getf prepared :dml-row-where) (getf prepared :where))))
+        (unless (and (or (null where) (walk where))
+                     (every (lambda (assignment)
+                              (and (consp (cdr assignment)) (walk (cdr assignment))))
+                            sets))
+          (return-from simple-update-toast-demand nil)))
+      ;; Assigned columns, every index key, and all referenced inputs stay logical.
+      (dolist (assignment sets)
+        (pushnew (pg-column-attnum (car assignment)) slots))
+      (let ((indexes (capture-insert-indexes table)))
+        (dolist (index indexes)
+          (dolist (slot (pg-index-columns index))
+            (unless (and (integerp slot) (<= 1 slot width))
+              (return-from simple-update-toast-demand nil))
+            (pushnew slot slots))))
+      (when (< (length slots) width) (cons table slots)))))
+
 (defun exec-update-subqueries (stream ast)
   (let* ((prepared (prepare-dml-subqueries ast))
          (where (or (getf prepared :dml-row-where) (getf prepared :where)))
@@ -425,7 +466,8 @@
     (call-with-dml-subqueries
      prepared
      (lambda (table rel xid)
-       (let ((columns (getf prepared :columns)) (count 0))
+       (let ((columns (getf prepared :columns)) (count 0)
+                                                (toast-demand (simple-update-toast-demand prepared table xid)))
          (send-dml-returning-description stream (getf prepared :returning))
          (stream-joined-dml-candidates
           prepared table
@@ -441,7 +483,8 @@
                      rel columns (htup-block candidate) (htup-offnum candidate) xid
                      (backend-command-id *backend*)
                      (lambda (tuple)
-                       (materialize-select-tuple table tuple *current-snapshot*)
+                       (materialize-select-tuple table tuple *current-snapshot*
+                                                 :demand toast-demand :retain-external-p (not (null toast-demand)))
                        (call-with-dml-expression-evaluation
                         (lambda ()
                           ;; EPQ replaces only the target version; the matched source values
@@ -455,7 +498,8 @@
                   (when deleted
                     (let ((reuse (unchanged-tuple-toast-pointers tuple sets)))
                       (delete-tuple-toast-values table tuple xid (backend-command-id *backend*) reuse)
-                      (materialize-select-tuple table tuple *current-snapshot*)
+                      (materialize-select-tuple table tuple *current-snapshot*
+                                                :demand toast-demand :retain-external-p (not (null toast-demand)))
                       (multiple-value-bind (block off publications)
                           (insert-tuple-with-unique
                            table new :exclude-tid (cons old-block old-offnum)
@@ -470,5 +514,6 @@
                         (emit-dml-returning stream (getf prepared :returning) new
                                             :old-values (htup-values tuple) :new-values new :source-values source))
                       (incf count)))
-                  deleted)))))
+                  deleted))))
+          toast-demand)
          (finish-dml-command stream (getf prepared :returning) (format nil "UPDATE ~a" count)))))))

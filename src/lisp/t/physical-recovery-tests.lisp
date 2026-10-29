@@ -694,6 +694,73 @@
           (when pg::*clog-stream* (close pg::*clog-stream*))
           (pg::smgr-close-all)))))
 
+(deftest update-retains-unreferenced-toast-without-fetch
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*relation-streams* (make-hash-table :test #'equal))
+             (pg::*wal-page-cache* (make-hash-table :test #'equal))
+             (pg::*wal-ready* nil) (pg::*clog-stream* nil)
+             (pg::*active-xids* (list 43)) (pg::*next-xid* 50)
+             (pg::*logical-capture-xid-modes* (make-hash-table :test #'eql))
+             (pg::*catalog* (pg::make-catalog))
+             (pg::*backend* (pg::make-backend :database "postgres" :state :in-progress
+                                              :explicit t :xid 43))
+             (database (pg::make-database :name "postgres"))
+             (snapshot (pg::make-snapshot-struct :xmin 3 :xmax 50 :xip '(43) :curcid 0))
+             (pg::*current-snapshot* snapshot)
+             (registration (pg::make-snapshot-registration))
+             (raw (make-array 10000 :element-type '(unsigned-byte 8) :initial-element 97))
+             (out-path (merge-pathnames "update-response" root))
+             (old-fetch (symbol-function 'pg::toast-fetch-value)))
+        (setf (gethash "postgres" (pg::catalog-databases pg::*catalog*)) database
+              (gethash 43 pg::*logical-capture-xid-modes*) :skip-written)
+        (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
+        (unwind-protect
+             (let* ((table (pg::create-table* database "update_slice"
+                                              (list (list :name "id" :type :int4 :typmod -1)
+                                                    (list :name "n" :type :int4 :typmod -1)
+                                                    (list :name "payload" :type :text :typmod -1 :notnull t))))
+                    (toast (pg::pg-class-toast table))
+                    (pointer nil))
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (pg::with-write-lock
+                   (setf pointer (pg::toast-store-value-unlocked toast raw nil 42 0))
+                   (pg::heapam-insert (pg::pg-class-relfilenode table)
+                                      (pg::pg-class-columns table) (vector 1 2 pointer) 42 0)))
+               (pg::clog-set 42 pg::+clog-committed+)
+               (pg::register-active-snapshot snapshot registration)
+               (setf (symbol-function 'pg::toast-fetch-value)
+                     (lambda (&rest args) (declare (ignore args))
+                       (error "unchanged payload was fetched")))
+               (with-open-file (out out-path :direction :output :if-exists :supersede
+                                             :element-type '(unsigned-byte 8))
+                 (pg::exec-update-subqueries
+                  out (first (pg::parse-statements "UPDATE update_slice SET n=n+1 WHERE id=1"))))
+               (with-open-file (in out-path :direction :input :element-type '(unsigned-byte 8))
+                 (multiple-value-bind (type size payload) (pg::read-message-frame in)
+                   (declare (ignore size))
+                   (ok (= type (char-code #\C)))
+                   (ok (equalp payload (pg::string->bytes (format nil "UPDATE 1~c" (code-char 0)))))))
+               (setf (symbol-function 'pg::toast-fetch-value) old-fetch)
+               (pg::clog-set 43 pg::+clog-committed+)
+               (let ((new-snapshot (pg::make-snapshot-struct :xmin 3 :xmax 50 :xip nil :curcid 0))
+                     (found nil))
+                 (let ((pg::*backend* nil))
+                   (pg::heapam-scan
+                    (pg::pg-class-relfilenode table) (pg::pg-class-columns table) new-snapshot
+                    (lambda (tuple) (push (pg::htup-values tuple) found))))
+                 (ok (= 1 (length found)))
+                 (ok (= 3 (aref (first found) 1)))
+                 (ok (pg::heap-external-varlena-p (aref (first found) 2)))
+                 (ok (= (pg::heap-external-varlena-value-id pointer)
+                        (pg::heap-external-varlena-value-id (aref (first found) 2))))
+                 (ok (equalp raw (pg::toast-fetch-value toast (aref (first found) 2) snapshot)))))
+          (setf (symbol-function 'pg::toast-fetch-value) old-fetch)
+          (pg::release-snapshot-registration registration)
+          (pg::release-relation-writer-xid 43)
+          (when pg::*clog-stream* (close pg::*clog-stream*))
+          (pg::smgr-close-all)))))
+
 (deftest toast-stores-and-fetches-binary-chunks
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)

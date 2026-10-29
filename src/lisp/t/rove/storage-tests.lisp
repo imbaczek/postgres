@@ -643,6 +643,44 @@
              (*toast-slice-current* (list (cons text (list nil nil nil saved)))))
         (rove:ok (= 2 (eval-expr text other))))))
 
+(rove:deftest test-simple-update-toast-demand
+    (let* ((columns (vector (make-pg-column :name "id" :type :int4 :attnum 1)
+                            (make-pg-column :name "counter" :type :int4 :attnum 2)
+                            (make-pg-column :name "payload" :type :text :attnum 3 :notnull t)))
+           (table (make-pg-class :name "t" :oid 42 :columns columns))
+           (prepared (list :sets (list (cons (aref columns 1)
+                                             '(:assignment (:binop "+" (:col 2 :type :int4)
+                                                            (:const 1 :type :int4)) :type :int4)))
+                           :where '(:binop "=" (:col 1 :type :int4) (:const 1 :type :int4))))
+           (*logical-capture-xid-modes* (make-hash-table :test #'eql))
+           (old (symbol-function 'capture-insert-indexes)))
+      (unwind-protect
+           (progn
+             (setf (gethash 43 *logical-capture-xid-modes*) :skip-written
+                   (symbol-function 'capture-insert-indexes) (lambda (table) (declare (ignore table)) nil))
+             (let ((demand (simple-update-toast-demand prepared table 43)))
+               (rove:ok (and (eq (car demand) table) (member 1 (cdr demand))
+                             (member 2 (cdr demand)) (not (member 3 (cdr demand))))))
+             (setf (getf prepared :where)
+                   '(:binop "=" (:col 3 :type :text) (:const "x" :type :text)))
+             (let ((demand (simple-update-toast-demand prepared table 43)))
+               (rove:ok (and demand (member 3 (cdr demand)))))
+             (setf (getf prepared :where) '(:binop "=" (:col 1 :type :int4) (:const 1 :type :int4)))
+             (setf (symbol-function 'capture-insert-indexes)
+                   (lambda (table) (declare (ignore table))
+                     (list (make-pg-index :columns '(3)))))
+             (rove:ok (null (simple-update-toast-demand prepared table 43)))
+             (setf (symbol-function 'capture-insert-indexes) (lambda (table) (declare (ignore table)) nil))
+             (setf (pg-class-checks table) (list t))
+             (rove:ok (null (simple-update-toast-demand prepared table 43)))
+             (setf (pg-class-checks table) nil
+                   (getf prepared :returning) (list t))
+             (rove:ok (null (simple-update-toast-demand prepared table 43)))
+             (setf (getf prepared :returning) nil
+                   (gethash 43 *logical-capture-xid-modes*) :capture-written)
+             (rove:ok (null (simple-update-toast-demand prepared table 43))))
+        (setf (symbol-function 'capture-insert-indexes) old))))
+
 (rove:deftest test-tuple-roundtrip
     (let* ((cols (coerce
                   (list (make-pg-column :name "a" :type :int4 :typmod -1

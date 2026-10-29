@@ -1442,7 +1442,7 @@ scopes to clean up."
 (defvar *select-toast-slice-plan* nil
   "A recognized expression, owning table, and bytea slot for this scan.")
 
-(defun materialize-select-tuple (table tuple snapshot &key (index-reader #'select-toast-index-reader) demand)
+(defun materialize-select-tuple (table tuple snapshot &key (index-reader #'select-toast-index-reader) demand retain-external-p)
   "Replace external attributes with SQL values, omitting proven unused slots.
 The parent is visible and SNAPSHOT remains active throughout the fetch. TOAST
 chunk visibility follows the parent and is not independently filtered."
@@ -1454,7 +1454,7 @@ chunk visibility follows the parent and is not independently filtered."
             do (if (and demand
                         (eq table (car demand))
                         (not (member (1+ i) (cdr demand))))
-                   (setf (aref values i) +null+)
+                   (unless retain-external-p (setf (aref values i) +null+))
                    (let* ((toast (pg-class-toast table))
                           (type (pg-column-type (aref columns i))))
                      (unless toast

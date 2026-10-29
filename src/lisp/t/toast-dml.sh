@@ -134,7 +134,7 @@ printf '%s\n(quit)\n' '(let ((original (symbol-function (quote btree-search-unlo
 [ "$(run -c 'select substr(v,1,-1) from toast_bytes limit 0')" = '' ]
 printf '%s\n(quit)\n' '(format t "LOOKUPS=~d~%" (symbol-value (intern "*SLICE-LOOKUPS*"))) (setf (symbol-function (quote btree-search-unlocked)) (symbol-value (intern "*SLICE-LOOKUP-ORIGINAL*")))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/slice-restore.out"
 ! grep -q ';; error:' "$TMP/slice-restore.out"
-[ "$(awk -F= '/LOOKUPS=/{print $2}' "$TMP/slice-restore.out")" = 12 ]
+[ "$(awk -F= '/LOOKUPS=/{print $2}' "$TMP/slice-restore.out")" = 13 ]
 run -c "insert into toast_two_slices values (2, '\\x010203', NULL), (3, NULL, '\\x040506')" >/dev/null
 [ "$(run -c 'select substr(v,2,2), substr(w,2,2) from toast_two_slices where id = 2')" = '\x0203|' ]
 [ "$(run -c 'select substr(v,2,2), substr(w,2,2) from toast_two_slices where id = 3')" = '|\x0506' ]
