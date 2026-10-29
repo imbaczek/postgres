@@ -83,28 +83,10 @@ test_wait_owned_sql_server "$TARGET_PID" "$TARGET_PORT" psql 300
 [ "$(sql "$TARGET_PORT" "SELECT state FROM pg_lisp_subscription_progress WHERE source_slot='large_copy'")" = ready ]
 awk 'BEGIN { printf "SELECT payload = \047"; for (i=0;i<8388736;i++) printf "x"; printf "\047 FROM big_copy WHERE id=1;\n" }' >"$TMP/check.sql"
 [ "$(psql -X -qAt -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$TARGET_PORT" -U postgres -d postgres -f "$TMP/check.sql")" = t ]
-# The before/after logical image exceeds one WAL record even though the SQL
-# command is small. Refusal must leave WAL usable and the old value intact.
-if sql "$SOURCE_PORT" "BEGIN; INSERT INTO big_copy VALUES (3, 'must roll back'); UPDATE big_copy SET payload = payload || payload WHERE id=1; COMMIT" >"$TMP/oversize.out" 2>&1; then
-    echo 'logical-large-copy: oversized logical change unexpectedly committed' >&2
-    exit 1
-fi
-grep -F 'one logical row change exceeds the maximum WAL record size' "$TMP/oversize.out" >/dev/null
-[ "$(sql "$SOURCE_PORT" 'SELECT length(payload) FROM big_copy WHERE id=1')" = 8388736 ]
-[ "$(sql "$SOURCE_PORT" 'SELECT count(*) FROM big_copy WHERE id=3')" = 0 ]
-# After a failed explicit COMMIT, ROLLBACK must release the transaction in the
-# same session without relying on connection teardown.
-psql -X -qAt -h 127.0.0.1 -p "$SOURCE_PORT" -U postgres -d postgres >"$TMP/same-session.out" 2>"$TMP/same-session.err" <<'SQL'
-BEGIN;
-UPDATE big_copy SET payload = payload || payload WHERE id=1;
-COMMIT;
-ROLLBACK;
-INSERT INTO big_copy VALUES (4, 'same session');
-SELECT payload FROM big_copy WHERE id=4;
-SQL
-grep -F 'one logical row change exceeds the maximum WAL record size' "$TMP/same-session.err" >/dev/null
-[ "$(grep -c '^ERROR:' "$TMP/same-session.err")" = 1 ]
-grep -Fx 'same session' "$TMP/same-session.out" >/dev/null
+# The before/after logical image exceeds a WAL record. Commit it with a small
+# earlier change and validate the complete value after recovery.
+sql "$SOURCE_PORT" "BEGIN; INSERT INTO big_copy VALUES (3, 'same transaction'); UPDATE big_copy SET payload = payload || payload WHERE id=1; COMMIT" >/dev/null
+[ "$(sql "$SOURCE_PORT" 'SELECT length(payload) FROM big_copy WHERE id=1')" = 16777472 ]
 sql "$SOURCE_PORT" "INSERT INTO big_copy VALUES (2,'still writable')" >/dev/null
 kill "$SOURCE_PID"
 wait "$SOURCE_PID" 2>/dev/null || true
@@ -112,9 +94,31 @@ SOURCE_PID=
 "$BASE/pg-lisp.sh" -p "$SOURCE_PORT" -D "$TMP/source" >>"$TMP/source.log" 2>&1 &
 SOURCE_PID=$!
 test_wait_owned_sql_server "$SOURCE_PID" "$SOURCE_PORT" psql 300
-[ "$(sql "$SOURCE_PORT" 'SELECT length(payload) FROM big_copy WHERE id=1')" = 8388736 ]
-[ "$(psql -X -qAt -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$SOURCE_PORT" -U postgres -d postgres -f "$TMP/check.sql")" = t ]
-[ "$(sql "$SOURCE_PORT" 'SELECT count(*) FROM big_copy WHERE id=3')" = 0 ]
+[ "$(sql "$SOURCE_PORT" 'SELECT length(payload) FROM big_copy WHERE id=1')" = 16777472 ]
+awk 'BEGIN { for (i=0;i<16777472;i++) printf "x"; printf "\n" }' >"$TMP/expected-large.out"
+sql "$SOURCE_PORT" 'SELECT payload FROM big_copy WHERE id=1' >"$TMP/actual-large.out"
+cmp "$TMP/expected-large.out" "$TMP/actual-large.out"
+[ "$(sql "$SOURCE_PORT" 'SELECT payload FROM big_copy WHERE id=3')" = 'same transaction' ]
 [ "$(sql "$SOURCE_PORT" 'SELECT payload FROM big_copy WHERE id=2')" = 'still writable' ]
-[ "$(sql "$SOURCE_PORT" 'SELECT payload FROM big_copy WHERE id=4')" = 'same session' ]
+"$BASE/pg-lisp-subscribe" --slot large_copy --source-port "$SOURCE_PORT" --target-port "$TARGET_PORT" --table big_copy >>"$TMP/worker.log" 2>&1 &
+WORKER_PID=$!
+i=0
+until [ "$(sql "$TARGET_PORT" 'SELECT length(payload) FROM big_copy WHERE id=1' 2>/dev/null || true)" = 16777472 ]; do
+    kill -0 "$WORKER_PID" 2>/dev/null || { cat "$TMP/worker.log" >&2; exit 1; }
+    i=$((i + 1))
+    [ "$i" -lt 1200 ] || { echo 'logical-large-copy: fragmented apply timed out' >&2; exit 1; }
+    sleep 0.25
+done
+kill "$WORKER_PID"
+wait "$WORKER_PID" 2>/dev/null || true
+WORKER_PID=
+kill "$TARGET_PID"
+wait "$TARGET_PID" 2>/dev/null || true
+TARGET_PID=
+"$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/target" >>"$TMP/target.log" 2>&1 &
+TARGET_PID=$!
+test_wait_owned_sql_server "$TARGET_PID" "$TARGET_PORT" psql 300
+sql "$TARGET_PORT" 'SELECT payload FROM big_copy WHERE id=1' >"$TMP/actual-target-large.out"
+cmp "$TMP/expected-large.out" "$TMP/actual-target-large.out"
+[ "$(sql "$TARGET_PORT" 'SELECT payload FROM big_copy WHERE id=3')" = 'same transaction' ]
 echo 'logical-large-copy: PASS'

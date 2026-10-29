@@ -1781,7 +1781,7 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
           ;; Validate record sizes before entering the WAL critical section: a
           ;; rejected row must not leave a partially published commit batch.
           (when (and *wal-ready* (backend-logical-changes b))
-            (logical-split-encoded-changes (backend-logical-changes b)))
+            (logical-preflight-event-fragments (backend-logical-changes b)))
           ;; WAL page images and the commit record reach stable storage
           ;; before CLOG can make the transaction visible. The callback and
           ;; transaction reset are kept in the same interrupt-free section

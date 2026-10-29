@@ -26,8 +26,12 @@
   bytes (offset 0))
 
 (defstruct logical-reader-state
-  database-oid batch-open-p xid chunk-count next-chunk
+  database-oid batch-open-p xid chunk-count next-chunk fragment-batch
   (change-bytes 0) (changes '()) (transactions '()))
+
+(declaim (notinline logical-fragment-assembler-bytes logical-fragment-batch-p
+                    logical-fragment-batch-xid logical-fragment-batch-count
+                    logical-fragment-batch-next logical-fragment-batch-assembler))
 
 (defun logical-type-code (type)
   "Map a column type to its logical schema code; text, varchar and json are distinct."
@@ -725,12 +729,22 @@ executor, so capture the same operation before transaction commit."
            (event-bytes (reduce #'+ events :key #'length :initial-value 0)))
       (when (> event-bytes +max-logical-wal-transaction-bytes+)
         (error "logical transaction exceeds its WAL change limit"))
-      (let* ((chunks (logical-split-encoded-changes events))
-             (chunk-count (length chunks)))
-        (loop for chunk in chunks
-              for index from 0
-              do (wal-append-record +wal-record-logical-changes+ xid
-                                    (logical-encode-chunk index chunk-count chunk))))))
+      (let ((legacy-limit (- +wal-segment-size+ +wal-header-size+
+                             +logical-change-chunk-header-size+ 4)))
+        (if (some (lambda (event) (> (length event) legacy-limit)) events)
+            (let* ((fragments (logical-plan-event-fragments
+                               events (- +wal-segment-size+ +wal-header-size+
+                                         +logical-fragment-header-size+)
+                               +max-logical-wal-transaction-bytes+))
+                   (count (length fragments)))
+              (loop for fragment in fragments for index from 0
+                    do (wal-append-record +wal-record-logical-changes+ xid
+                                          (logical-encode-fragment index count fragment))))
+            (let* ((chunks (logical-split-encoded-changes events))
+                   (chunk-count (length chunks)))
+              (loop for chunk in chunks for index from 0
+                    do (wal-append-record +wal-record-logical-changes+ xid
+                                          (logical-encode-chunk index chunk-count chunk))))))))
   (values))
 
 (defun wal-decode-logical-change-chunk (payload)
@@ -787,28 +801,43 @@ executor, so capture the same operation before transaction commit."
 (defun wal-recovery-accept-logical-change-chunk (record)
   (unless *wal-recovery-group-active*
     (error "logical row changes appear outside a WAL batch"))
-  (multiple-value-bind (xid count next-index change-bytes)
-      (wal-advance-logical-change-chunk
-       record *wal-recovery-logical-xid*
-       *wal-recovery-logical-chunk-count*
-       *wal-recovery-logical-next-chunk*
-       *wal-recovery-logical-bytes*)
-    (setf *wal-recovery-logical-xid* xid
-          *wal-recovery-logical-chunk-count* count
-          *wal-recovery-logical-next-chunk* next-index
-          *wal-recovery-logical-bytes* change-bytes))
+  (if (logical-fragment-payload-p (wal-record-payload record))
+      (let ((batch (or *wal-recovery-logical-xid*
+                       (make-logical-fragment-batch +max-logical-wal-transaction-bytes+))))
+        (unless (logical-fragment-batch-p batch)
+          (error "logical WAL batch mixes fragment and legacy records"))
+        (logical-fragment-batch-accept batch (wal-record-xid record) (wal-record-payload record))
+        (setf *wal-recovery-logical-xid* batch
+              *wal-recovery-logical-chunk-count* (logical-fragment-batch-count batch)
+              *wal-recovery-logical-next-chunk* (logical-fragment-batch-next batch)
+              *wal-recovery-logical-bytes*
+              (logical-fragment-assembler-bytes (logical-fragment-batch-assembler batch))))
+      (progn
+        (when (logical-fragment-batch-p *wal-recovery-logical-xid*)
+          (error "logical WAL batch mixes fragment and legacy records"))
+        (multiple-value-bind (xid count next-index change-bytes)
+            (wal-advance-logical-change-chunk
+             record *wal-recovery-logical-xid* *wal-recovery-logical-chunk-count*
+             *wal-recovery-logical-next-chunk* *wal-recovery-logical-bytes*)
+          (setf *wal-recovery-logical-xid* xid
+                *wal-recovery-logical-chunk-count* count
+                *wal-recovery-logical-next-chunk* next-index
+                *wal-recovery-logical-bytes* change-bytes))))
   (values))
 
 (defun wal-recovery-finish-logical-change-batch (xid)
   (when *wal-recovery-logical-chunk-count*
-    (unless (and (= xid *wal-recovery-logical-xid*)
-                 (= *wal-recovery-logical-next-chunk*
-                    *wal-recovery-logical-chunk-count*))
-      (error "logical WAL chunks do not match their commit record")))
+    (if (logical-fragment-batch-p *wal-recovery-logical-xid*)
+        (logical-fragment-batch-finish *wal-recovery-logical-xid* xid)
+        (unless (and (= xid *wal-recovery-logical-xid*)
+                     (= *wal-recovery-logical-next-chunk*
+                        *wal-recovery-logical-chunk-count*))
+          (error "logical WAL chunks do not match their commit record"))))
   (wal-recovery-reset-logical-change-batch))
 
 (defun wal-logical-reader-reset-batch (state batch-open-p)
   (setf (logical-reader-state-batch-open-p state) batch-open-p
+        (logical-reader-state-fragment-batch state) nil
         (logical-reader-state-xid state) nil
         (logical-reader-state-chunk-count state) nil
         (logical-reader-state-next-chunk state) 0
@@ -829,23 +858,41 @@ executor, so capture the same operation before transaction commit."
                 (member (logical-change-kind change) '(:ddl :sequence-state)))
               (logical-reader-state-changes state))
     (error "row changes follow a logical catalog event in the same WAL batch"))
-  (multiple-value-bind (xid count next-index change-bytes changes)
-      (wal-advance-logical-change-chunk
-       record (logical-reader-state-xid state)
-       (logical-reader-state-chunk-count state)
-       (logical-reader-state-next-chunk state)
-       (logical-reader-state-change-bytes state))
-    (setf (logical-reader-state-xid state) xid
-          (logical-reader-state-chunk-count state) count
-          (logical-reader-state-next-chunk state) next-index
-          (logical-reader-state-change-bytes state) change-bytes
-          (logical-reader-state-changes state)
-          (nconc (logical-reader-state-changes state) changes))
-    (unless (every (lambda (change)
-                     (member (logical-change-kind change)
-                             '(:insert :update :delete :truncate)))
-                   changes)
-      (error "catalog event appears in a transactional row-change record")))
+  (if (logical-fragment-payload-p (wal-record-payload record))
+      (progn
+        (when (and (logical-reader-state-chunk-count state)
+                   (null (logical-reader-state-fragment-batch state)))
+          (error "logical WAL batch mixes fragment and legacy records"))
+        (let* ((batch (or (logical-reader-state-fragment-batch state)
+                          (make-logical-fragment-batch +max-logical-wal-transaction-bytes+)))
+               (change (logical-fragment-batch-accept batch (wal-record-xid record)
+                                                      (wal-record-payload record))))
+          (setf (logical-reader-state-fragment-batch state) batch
+                (logical-reader-state-xid state) (logical-fragment-batch-xid batch)
+                (logical-reader-state-chunk-count state) (logical-fragment-batch-count batch)
+                (logical-reader-state-next-chunk state) (logical-fragment-batch-next batch)
+                (logical-reader-state-change-bytes state)
+                (logical-fragment-assembler-bytes (logical-fragment-batch-assembler batch)))
+          (when change
+            (setf (logical-reader-state-changes state)
+                  (nconc (logical-reader-state-changes state) (list change))))))
+      (progn
+        (when (logical-reader-state-fragment-batch state)
+          (error "logical WAL batch mixes fragment and legacy records"))
+        (multiple-value-bind (xid count next-index change-bytes changes)
+            (wal-advance-logical-change-chunk
+             record (logical-reader-state-xid state) (logical-reader-state-chunk-count state)
+             (logical-reader-state-next-chunk state) (logical-reader-state-change-bytes state))
+          (setf (logical-reader-state-xid state) xid
+                (logical-reader-state-chunk-count state) count
+                (logical-reader-state-next-chunk state) next-index
+                (logical-reader-state-change-bytes state) change-bytes
+                (logical-reader-state-changes state)
+                (nconc (logical-reader-state-changes state) changes))
+          (unless (every (lambda (change)
+                           (member (logical-change-kind change) '(:insert :update :delete :truncate)))
+                         changes)
+            (error "catalog event appears in a transactional row-change record")))))
   (values))
 
 (defun wal-logical-reader-add-catalog-event (state record)
@@ -902,6 +949,9 @@ executor, so capture the same operation before transaction commit."
       (wal-xid-reservation-record-bound record))
     (cond
       ((= record-type +wal-record-commit+)
+       (when (logical-reader-state-fragment-batch state)
+         (logical-fragment-batch-finish (logical-reader-state-fragment-batch state)
+                                        (wal-record-xid record)))
        (when catalog-event-p
          (error "logical catalog events are attached to a row commit"))
        (when (logical-reader-state-chunk-count state)
@@ -1099,14 +1149,14 @@ slot restart point. It permits standard senders to scan ahead of feedback."
          (lambda (record)
            (wal-note-recovery-batch-record record)
            (let ((record-type (wal-record-type record)))
-             (case record-type
-               (#.+wal-record-batch-start+
+             (cond
+               ((= record-type +wal-record-batch-start+)
                 (wal-logical-reader-start-batch state))
-               (#.+wal-record-logical-changes+
+               ((= record-type +wal-record-logical-changes+)
                 (wal-logical-reader-add-chunk state record))
-               (#.+wal-record-logical-catalog-event+
+               ((= record-type +wal-record-logical-catalog-event+)
                 (wal-logical-reader-add-catalog-event state record))
-               (otherwise
+               (t
                 (when (wal-terminal-record-type-p record-type)
                   (let* ((has-changes
                            (and (or (= record-type +wal-record-commit+)

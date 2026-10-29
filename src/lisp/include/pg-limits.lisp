@@ -27,7 +27,10 @@
 ;;; with MAX_STARTUP_PACKET_LENGTH. Query message sizes include the length word.
 (defconstant +max-startup-packet-length+ 10000)
 (defconstant +max-startup-message-size+ (+ 4 +max-startup-packet-length+))
-(defconstant +max-query-message-size+ (* 16 1024 1024))
+
+(defconstant +max-query-message-size+ (* 132 1024 1024))
+
+(defconstant +logical-fragment-header-size+ 24)
 
 ;;; Transaction IDs.
 (defconstant +invalid-xid+ 0)

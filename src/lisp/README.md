@@ -578,6 +578,19 @@ the worker sends replication feedback only after that commit. The worker explici
 requests the `pg_lisp` output plugin for its snapshot lifecycle and private events.
 Initial copy batches rows to an 8 MiB target; a larger row uses a separate
 transaction and must still fit the source/target protocol and logical WAL limits.
+Frontend query message lengths are limited to 132 MiB, including the four-byte
+length word. Logical capture normally limits the sum of encoded row changes
+and transactional events to 64 MiB per transaction, including their encoding
+overhead. Row changes made by the `pg-lisp-subscribe-apply` application have
+an extra 1 MiB of headroom; transactional utility events still check the
+64 MiB limit. The WAL transaction and fragment reader limit is 65 MiB. These
+are encoded-change limits, not guarantees that a value of that size will fit.
+
+When an encoded row event exceeds one WAL record, the transaction's events
+are written as ordered fragments and reassembled by recovery and logical slot
+reads. Smaller events retain the existing chunk format. Fragmentation does not
+remove the transaction limit; the commit path checks the complete batch before
+writing its logical records.
 `t/logical-replication.sh`
 exercises initial copy, DDL and sequence changes, two independent replicas, and
 restart after a lost feedback message.

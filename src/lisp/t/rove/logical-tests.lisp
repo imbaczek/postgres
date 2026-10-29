@@ -611,6 +611,157 @@
                  (error () t))
                "a replacement publisher incarnation cannot reuse the old event marker")))
 
+(rove:deftest test-logical-fragment-assembly
+    (let* ((first (make-array 10 :element-type '(unsigned-byte 8)
+                                 :initial-contents '(0 1 2 3 4 5 6 7 8 9)))
+           (second (make-array 2 :element-type '(unsigned-byte 8)
+                                 :initial-contents '(10 11)))
+           (plan (logical-plan-event-fragments (list first second) 4 12))
+           (state (make-logical-fragment-assembler 12))
+           (complete '()))
+      (rove:ok (= (length plan) 4))
+      (dolist (fragment plan)
+        (let* ((event (logical-fragment-event fragment))
+               (start (logical-fragment-start fragment))
+               (end (logical-fragment-end fragment))
+               (result (logical-assemble-event-fragment state (length event) start
+                                                        (subseq event start end))))
+          (when result (push result complete))))
+      (logical-finish-fragment-assembly state)
+      (rove:ok (equalp (nreverse complete) (list first second)))
+      (rove:ok (= (logical-fragment-assembler-bytes state) 12))
+      (rove:ok (handler-case (progn (logical-plan-event-fragments (list first second) 4 11) nil)
+                 (error () t))))
+  (flet ((bad (total offset octets)
+           (handler-case
+               (progn (logical-assemble-event-fragment
+                       (make-logical-fragment-assembler 10) total offset
+                       (coerce octets '(vector (unsigned-byte 8))))
+                      nil)
+             (error () t))))
+    (rove:ok (bad 4 1 #(1)))
+    (rove:ok (bad 11 0 #(1)))
+    (rove:ok (bad 2 0 #()))
+    (rove:ok (bad 2 1 #(1 2))))
+  (let ((state (make-logical-fragment-assembler 10)))
+    (logical-assemble-event-fragment state 4 0 (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(1 2)))
+    (rove:ok (handler-case (progn (logical-assemble-event-fragment state 4 3 (make-array 1 :element-type '(unsigned-byte 8) :initial-element 3)) nil) (error () t)))
+    (rove:ok (handler-case (progn (logical-assemble-event-fragment state 5 2 (make-array 1 :element-type '(unsigned-byte 8) :initial-element 3)) nil) (error () t)))
+    (rove:ok (handler-case (progn (logical-finish-fragment-assembly state) nil) (error () t)))))
+
+(rove:deftest test-logical-fragment-limits-and-failure-state
+    (let* ((bytes (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(7 8)))
+           (state (make-logical-fragment-assembler 3)))
+      (rove:ok (equalp (logical-assemble-event-fragment state 2 0 bytes) bytes))
+      (rove:ok (= (logical-fragment-assembler-bytes state) 2))
+      (rove:ok (handler-case
+                   (progn (logical-assemble-event-fragment state 2 0 bytes) nil)
+                 (error () t)))
+      (rove:ok (= (logical-fragment-assembler-bytes state) 2))
+      (rove:ok (null (logical-fragment-assembler-buffer state)))
+      (rove:ok (handler-case
+                   (progn (logical-assemble-event-fragment state 1 0 #(999)) nil)
+                 (error () t)))
+      (rove:ok (= (logical-fragment-assembler-bytes state) 2)))
+  (dolist (limits '((0 10) (-1 10) (1 0) (1 -1)))
+    (rove:ok (handler-case
+                 (progn (logical-plan-event-fragments '() (first limits) (second limits)) nil)
+               (error () t)))))
+
+(rove:deftest test-logical-fragment-payload-roundtrip
+    (let* ((event (make-array 9 :element-type '(unsigned-byte 8)
+                                :initial-contents '(0 1 2 3 4 5 6 7 8)))
+           (plan (logical-plan-event-fragments (list event) 4 9))
+           (state (make-logical-fragment-assembler 9))
+           (completed nil))
+      (loop for fragment in plan for index from 0
+            for payload = (logical-encode-fragment index (length plan) fragment)
+            do (multiple-value-bind (actual-index count total offset bytes)
+                   (logical-decode-fragment payload)
+                 (rove:ok (= actual-index index))
+                 (rove:ok (= count (length plan)))
+                 (setf completed (or (logical-assemble-event-fragment state total offset bytes)
+                                     completed))))
+      (logical-finish-fragment-assembly state)
+      (rove:ok (equalp event completed))
+      (let* ((payload (logical-encode-fragment 0 3 (first plan)))
+             (trailing (concatenate '(vector (unsigned-byte 8)) payload #(0))))
+        (rove:ok (handler-case (progn (logical-decode-fragment trailing) nil)
+                   (error () t)))
+        (setf (aref payload 0) 0)
+        (rove:ok (handler-case (progn (logical-decode-fragment payload) nil)
+                   (error () t))))))
+
+(rove:deftest test-logical-fragment-rejects-truncated-payloads
+    (let* ((event (make-array 5 :element-type '(unsigned-byte 8) :initial-element 42))
+           (fragment (first (logical-plan-event-fragments (list event) 4 5)))
+           (payload (logical-encode-fragment 0 2 fragment)))
+      (loop for length below (length payload)
+            do (rove:ok (handler-case
+                            (progn (logical-decode-fragment (subseq payload 0 length)) nil)
+                          (error () t)))))
+  (let* ((event (make-array 5 :element-type '(unsigned-byte 8) :initial-element 42))
+         (fragment (first (logical-plan-event-fragments (list event) 4 5))))
+    (dolist (field-offset '(8 12 20))
+      (let ((payload (logical-encode-fragment 0 2 fragment)))
+        (fill payload 0 :start field-offset :end (+ field-offset 4))
+        (rove:ok (handler-case (progn (logical-decode-fragment payload) nil)
+                   (error () t)))))))
+
+(rove:deftest test-logical-fragment-batch-validation
+    (let* ((event (logical-encode-change
+                   (logical-test-change :insert 7 701 :new-values #(1 2 "fragment"))))
+           (plan (logical-plan-event-fragments (list event) 9 10000))
+           (payloads (loop for fragment in plan for index from 0
+                           collect (logical-encode-fragment index (length plan) fragment)))
+           (batch (make-logical-fragment-batch 10000)))
+      (rove:ok (handler-case
+                   (progn (logical-fragment-batch-accept batch 5 (second payloads)) nil)
+                 (error () t)))
+      (logical-fragment-batch-accept batch 5 (first payloads))
+      (rove:ok (handler-case (progn (logical-fragment-batch-finish batch 5) nil)
+                 (error () t)))
+      (rove:ok (handler-case
+                   (progn (logical-fragment-batch-accept batch 6 (second payloads)) nil)
+                 (error () t)))
+      (let ((change nil))
+        (dolist (payload (rest payloads))
+          (let ((result (logical-fragment-batch-accept batch 5 payload)))
+            (when result (setf change result))))
+        (rove:ok (eq (logical-change-kind change) :insert))
+        (rove:ok (= (logical-change-relation-oid change) 701)))
+      (rove:ok (handler-case (progn (logical-fragment-batch-finish batch 6) nil)
+                 (error () t)))
+      (logical-fragment-batch-finish batch 5)))
+
+(rove:deftest test-logical-fragments-recovery-and-slot-reader
+    (let* ((event (logical-encode-change
+                   (logical-test-change :insert 7 701 :new-values #(1 2 "fragment"))))
+           (plan (logical-plan-event-fragments (list event) 9 10000))
+           (records (loop for fragment in plan for index from 0
+                          collect (make-wal-record :type +wal-record-logical-changes+ :xid 88
+                                                   :payload (logical-encode-fragment index (length plan) fragment))))
+           (state (make-logical-reader-state :database-oid 7))
+           (*wal-recovery-group-active* t)
+           (*wal-recovery-logical-xid* nil)
+           (*wal-recovery-logical-chunk-count* nil)
+           (*wal-recovery-logical-next-chunk* 0)
+           (*wal-recovery-logical-bytes* 0))
+      (wal-logical-reader-start-batch state)
+      (wal-recovery-accept-logical-change-chunk (first records))
+      (wal-logical-reader-add-chunk state (first records))
+      (rove:ok (handler-case (progn (wal-recovery-finish-logical-change-batch 88) nil)
+                 (error () t)))
+      (dolist (record (rest records))
+        (wal-recovery-accept-logical-change-chunk record)
+        (wal-logical-reader-add-chunk state record))
+      (wal-recovery-finish-logical-change-batch 88)
+      (rove:ok (= (length (logical-reader-state-changes state)) 1))
+      (rove:ok (= (logical-reader-state-change-bytes state) (length event)))
+      (logical-fragment-batch-finish (logical-reader-state-fragment-batch state) 88)
+      (wal-logical-reader-reset-batch state nil)
+      (rove:ok (null (logical-reader-state-fragment-batch state)))))
+
 (rove:deftest test-logical-change-chunk-validation
     (let* ((event
              (logical-encode-change

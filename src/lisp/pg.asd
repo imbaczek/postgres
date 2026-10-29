@@ -72,7 +72,8 @@
                    (:file "namespace")))
      (:module "replication"
       :serial t
-      :components ((:file "logical")
+      :components ((:file "logical" :pathname "logical-stream")
+                   (:file "logical-fragments")
                    (:file "schema-contracts")
                    (:file "client")
                    (:file "physical")
