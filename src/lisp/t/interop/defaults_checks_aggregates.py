@@ -148,6 +148,7 @@ CASES = (
     "SELECT substr('\\x01020304'::bytea,2,2),substring('\\x01020304'::bytea,3),substr('\\x01020304'::bytea,0,2),substr('\\x01020304'::bytea,2147483647,2147483647)",
     "SELECT substr(NULL::bytea,1,1),substring('\\x01'::bytea,NULL,1)",
     "SELECT substr('\\x01'::bytea,1,-1)",
+    "SELECT 42,substr('\\x01020304'::bytea,1,2),substring('\\x01020304'::bytea,3,2),length('\\x01020304'::bytea)",
     "SELECT substr('\\x01020304'::bytea,-1,4),substr('\\x01020304'::bytea,(-2147483647-1),2147483647),substr('\\x01020304'::bytea,2::int2,2::int2),substr('\\x01020304'::bytea,2,2147483647)",
     "SELECT substr('\\x01'::bytea,1::bigint,1)",
     "SELECT substr(DISTINCT '\\x01'::bytea,'bad')",

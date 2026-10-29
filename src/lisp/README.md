@@ -799,11 +799,14 @@ outside signed int64; `::bigint` checks overflow.
 Text `||` and `substr(text, start [, length])` support the string operations used
 by Patroni's status expression. Substring positions count Unicode characters,
 including SQL's adjusted zero/negative starts. The `substr` and `substring`
-function forms also accept `bytea`, where positions count bytes. An interpreted
-single-column substring projection with constant bounds over one base-table
-sequential scan can read only the needed uncompressed TOAST chunks. Optional
-filters must not reference that bytea column; LIMIT is supported. Other plan
-shapes materialize the value, as do compressed external values.
+function forms also accept `bytea`, where positions count bytes. Interpreted
+direct substring projections with constant bounds over one base-table sequential
+scan can read only the needed uncompressed TOAST chunks when the column is not
+otherwise needed in full. Multiple slices and other recognized projections,
+filters, and LIMIT are supported. A column used in full by a projection or filter
+is materialized, while eligible slices of other columns can still use partial
+fetches. Unrecognized plan or expression shapes fall back to ordinary
+materialization; compressed external values use a full fetch.
 Array concatenation remains unsupported.
 Fixed `bit(N)` expression casts and `B'...'`/`X'...'` literals support binary/hex
 input, explicit padding/truncation, and C-compatible integer/bigint conversion.

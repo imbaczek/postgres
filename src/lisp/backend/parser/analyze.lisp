@@ -419,17 +419,15 @@ result is text for typeof and int4 for array_length."
              (end (if count (min size (+ begin count)) size)))
         (subseq value begin end)))))
 
-(defvar *toast-slice-expression* nil)
-
 (defvar *toast-slice-current* nil)
 
-(defun eval-toast-bytea-substring (arguments)
+(defun eval-toast-bytea-substring (arguments context)
   "Evaluate a selected external bytea substring at its projection position."
   (let ((bounds (mapcar (lambda (argument) (eval-expr argument nil)) (rest arguments))))
     (when (member +null+ bounds) (return-from eval-toast-bytea-substring +null+))
     (multiple-value-bind (offset count)
         (sql-substring-range (first bounds) (second bounds) (not (null (rest bounds))))
-      (destructuring-bind (toast pointer snapshot environment) *toast-slice-current*
+      (destructuring-bind (toast pointer snapshot environment) context
         (declare (ignore environment))
         (unless toast (ereport "XX001" "external value has no owning TOAST relation"))
         (toast-fetch-value-slice toast pointer snapshot offset (or count #x40000000)
@@ -4033,9 +4031,9 @@ truncate and interpret the result at TYPE's signed width."
                            (t (eq want nil)))))
          (if neg (not result) result))))
     (:func
-     (when (and *toast-slice-current* (eq expr *toast-slice-expression*)
-                (eq env (fourth *toast-slice-current*)))
-       (return-from eval-expr (eval-toast-bytea-substring (third expr))))
+     (let ((slice (assoc expr *toast-slice-current* :test #'eq)))
+       (when (and slice (eq env (fourth (cdr slice))))
+         (return-from eval-expr (eval-toast-bytea-substring (third expr) (cdr slice)))))
      (let* ((name (second expr))
             (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr)))
             (type (expr-type expr)))

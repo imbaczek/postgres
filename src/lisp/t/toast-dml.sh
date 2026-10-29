@@ -106,6 +106,11 @@ fi
 run -c 'create table toast_bytes (id int primary key, v bytea)' >/dev/null
 run -c 'alter table toast_bytes alter column v set storage external' >/dev/null
 run -c "insert into toast_bytes values (1, '\\x$binary_hex')" >/dev/null
+run -c 'create table toast_two_slices (id int, v bytea, w bytea)' >/dev/null
+run -c 'alter table toast_two_slices alter column v set storage external' >/dev/null
+run -c 'alter table toast_two_slices alter column w set storage external' >/dev/null
+binary_hex_other="11$binary_hex"
+run -c "insert into toast_two_slices values (1, '\\x$binary_hex', '\\x$binary_hex_other')" >/dev/null
 [ "$(run -c 'select length(v) from toast_bytes where id = 1')" = 3000 ]
 [ "$(run -c "select v = '\\x$binary_hex' from toast_bytes where id = 1")" = t ]
 # Count exact chunk lookups to distinguish a partial fetch from full detoasting.
@@ -113,13 +118,30 @@ printf '%s\n(quit)\n' '(let ((original (symbol-function (quote btree-search-unlo
 ! grep -q ';; error:' "$TMP/slice-install.out"
 [ "$(run -c 'select substr(v,100,20) from toast_bytes where id + 0 = 1')" = "\\x$(printf '%s' "$binary_hex" | cut -c 199-238)" ]
 [ "$(run -c 'select substring(v,1995,20) from toast_bytes where id + 0 = 1')" = "\\x$(printf '%s' "$binary_hex" | cut -c 3989-4028)" ]
+[ "$(run -c 'select id, substr(v,100,20), substring(v,200,20) from toast_bytes where id + 0 = 1')" = "1|\\x$(printf '%s' "$binary_hex" | cut -c 199-238)|\\x$(printf '%s' "$binary_hex" | cut -c 399-438)" ]
+[ "$(run -c 'select substr(v,100,20), substr(w,200,20) from toast_two_slices')" = "\\x$(printf '%s' "$binary_hex" | cut -c 199-238)|\\x$(printf '%s' "$binary_hex_other" | cut -c 399-438)" ]
+[ "$(run -c 'select substr(v,100,20), length(v), substr(w,200,20) from toast_two_slices')" = "\\x$(printf '%s' "$binary_hex" | cut -c 199-238)|3000|\\x$(printf '%s' "$binary_hex_other" | cut -c 399-438)" ]
+[ "$(run -c 'select substr(v,100,20), substr(v,100,20) from toast_two_slices')" = "\\x$(printf '%s' "$binary_hex" | cut -c 199-238)|\\x$(printf '%s' "$binary_hex" | cut -c 199-238)" ]
+[ "$(run -c "select substr(w,200,20) from toast_two_slices where v = '\\x$binary_hex'")" = "\\x$(printf '%s' "$binary_hex_other" | cut -c 399-438)" ]
+[ "$(run -c 'select substr(v,NULL), substr(w,200,20) from toast_two_slices')" = "|\\x$(printf '%s' "$binary_hex_other" | cut -c 399-438)" ]
 [ "$(run -c 'select substr(v,NULL) from toast_bytes where id + 0 = 1')" = '' ]
 [ "$(run -c 'select substr(v,1,NULL) from toast_bytes where id + 0 = 1')" = '' ]
 [ "$(run -c 'select substr(v,1,-1) from toast_bytes where id + 0 = 0')" = '' ]
 [ "$(run -c 'select substr(v,1,-1) from toast_bytes limit 0')" = '' ]
 printf '%s\n(quit)\n' '(format t "LOOKUPS=~d~%" (symbol-value (intern "*SLICE-LOOKUPS*"))) (setf (symbol-function (quote btree-search-unlocked)) (symbol-value (intern "*SLICE-LOOKUP-ORIGINAL*")))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/slice-restore.out"
 ! grep -q ';; error:' "$TMP/slice-restore.out"
-[ "$(awk -F= '/LOOKUPS=/{print $2}' "$TMP/slice-restore.out")" = 3 ]
+[ "$(awk -F= '/LOOKUPS=/{print $2}' "$TMP/slice-restore.out")" = 12 ]
+run -c "insert into toast_two_slices values (2, '\\x010203', NULL), (3, NULL, '\\x040506')" >/dev/null
+[ "$(run -c 'select substr(v,2,2), substr(w,2,2) from toast_two_slices where id = 2')" = '\x0203|' ]
+[ "$(run -c 'select substr(v,2,2), substr(w,2,2) from toast_two_slices where id = 3')" = '|\x0506' ]
+if run -c 'select 1/0, substr(w,1,-1) from toast_two_slices where id = 1' >"$TMP/slice-order.out" 2>&1; then
+    echo 'toast-dml: expected first projection error' >&2; exit 1
+fi
+grep -q 'division by zero' "$TMP/slice-order.out"
+if run -c 'select substr(w,1,-1), 1/0 from toast_two_slices where id = 1' >"$TMP/slice-order.out" 2>&1; then
+    echo 'toast-dml: expected first projection error' >&2; exit 1
+fi
+grep -q 'negative substring length not allowed' "$TMP/slice-order.out"
 if run -c 'select substr(v,1,-1) from toast_bytes where id + 0 = 1' >"$TMP/slice-negative.out" 2>&1; then
     echo 'toast-dml: negative substring length was accepted' >&2
     exit 1

@@ -1534,12 +1534,15 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
     (:seq-scan
      (heapam-scan relfilenode (pg-class-columns table) snapshot
                   (lambda (tuple)
-                    (let* ((slot (and *select-toast-slice-plan*
-                                      (eq table (second *select-toast-slice-plan*))
-                                      (third *select-toast-slice-plan*)))
-                           (value (and slot (aref (htup-values tuple) (1- slot))))
-                           (*toast-slice-current* (when (heap-external-varlena-p value)
-                                                    (list (pg-class-toast table) value snapshot (htup-values tuple))))
+                    (let* ((*toast-slice-current*
+                             (when (and *select-toast-slice-plan*
+                                        (eq table (car *select-toast-slice-plan*)))
+                               (loop for (expression . slot) in (cdr *select-toast-slice-plan*)
+                                     for value = (aref (htup-values tuple) (1- slot))
+                                     when (heap-external-varlena-p value)
+                                       collect (cons expression
+                                                     (list (pg-class-toast table) value snapshot
+                                                           (htup-values tuple))))))
                            (row (materialize-select-tuple table tuple snapshot :demand *select-toast-demand*)))
                       (let ((*select-toast-demand* nil)
                             (*select-toast-slice-plan* nil))
