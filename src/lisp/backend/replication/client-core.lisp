@@ -61,34 +61,114 @@
              (decf (logical-wire-cursor-remaining cursor) (- next position)))
     bytes))
 
-(defun logical-wire-text (cursor size)
-  "Decode a bounded UTF-8 field without retaining its complete octet vector."
+(defun logical-wire-write-text (cursor size output &optional octet-consumer)
+  "Validate SIZE UTF-8 bytes, writing decoded characters to OUTPUT when supplied.
+OCTET-CONSUMER, when supplied, receives each bounded input block."
   (unless (<= size (logical-wire-cursor-remaining cursor))
     (error "truncated logical replication value"))
-  (with-output-to-string (output)
-    (let ((remaining size) (needed 0) (code 0) (minimum 0))
-      (loop while (plusp remaining) do
-        (let* ((count (min remaining 65536))
-               (bytes (logical-wire-octets cursor count)))
-          (decf remaining count)
-          (loop for byte across bytes do
-            (if (zerop needed)
-                (cond
-                  ((< byte #x80) (write-char (code-char byte) output))
-                  ((<= #xc2 byte #xdf) (setf needed 1 code (logand byte #x1f) minimum #x80))
-                  ((<= #xe0 byte #xef) (setf needed 2 code (logand byte #x0f) minimum #x800))
-                  ((<= #xf0 byte #xf4) (setf needed 3 code (logand byte #x07) minimum #x10000))
-                  (t (error "invalid UTF-8 in logical replication value")))
-                (progn
-                  (unless (<= #x80 byte #xbf)
+  (let ((remaining size) (needed 0) (code 0) (minimum 0))
+    (loop while (plusp remaining) do
+      (let* ((count (min remaining 65536))
+             (bytes (logical-wire-octets cursor count)))
+        (decf remaining count)
+        (loop for byte across bytes do
+          (if (zerop needed)
+              (cond
+                ((< byte #x80) (when output (write-char (code-char byte) output)))
+                ((<= #xc2 byte #xdf) (setf needed 1 code (logand byte #x1f) minimum #x80))
+                ((<= #xe0 byte #xef) (setf needed 2 code (logand byte #x0f) minimum #x800))
+                ((<= #xf0 byte #xf4) (setf needed 3 code (logand byte #x07) minimum #x10000))
+                (t (error "invalid UTF-8 in logical replication value")))
+              (progn
+                (unless (<= #x80 byte #xbf)
+                  (error "invalid UTF-8 in logical replication value"))
+                (setf code (logior (ash code 6) (logand byte #x3f)))
+                (decf needed)
+                (when (zerop needed)
+                  (unless (and (<= minimum code #x10ffff) (not (<= #xd800 code #xdfff)))
                     (error "invalid UTF-8 in logical replication value"))
-                  (setf code (logior (ash code 6) (logand byte #x3f)))
-                  (decf needed)
-                  (when (zerop needed)
-                    (unless (and (<= minimum code #x10ffff) (not (<= #xd800 code #xdfff)))
-                      (error "invalid UTF-8 in logical replication value"))
-                    (write-char (code-char code) output)))))))
-      (unless (zerop needed) (error "truncated UTF-8 in logical replication value")))))
+                  (when output (write-char (code-char code) output))))))
+        (when octet-consumer (funcall octet-consumer bytes))))
+    (unless (zerop needed) (error "truncated UTF-8 in logical replication value"))))
+
+(defun logical-wire-text (cursor size)
+  "Decode a bounded UTF-8 field without retaining its complete octet vector."
+  (with-output-to-string (output)
+    (logical-wire-write-text cursor size output)))
+
+(defstruct logical-wire-field-owner stream (size 0) (active-p t))
+
+(defstruct logical-wire-field owner offset size crc)
+
+(defun logical-wire-field-open (owner)
+  "Open an anonymous, process-owned scratch file for OWNER."
+  (unless (logical-wire-field-owner-active-p owner)
+    (error "logical field owner is closed"))
+  (or (logical-wire-field-owner-stream owner)
+      (sb-sys:without-interrupts
+        (loop repeat 100
+              for path = (merge-pathnames
+                          (format nil "pg-logical-field-~d-~d"
+                                  (sb-posix:getpid) (random most-positive-fixnum))
+                          (uiop:temporary-directory))
+              do (let ((fd nil) (stream nil) (published nil))
+                   (unwind-protect
+                        (progn
+                          (setf fd (handler-case
+                                       (sb-posix:open (namestring path)
+                                                      (logior sb-posix:o-rdwr sb-posix:o-creat
+                                                              sb-posix:o-excl sb-posix:o-nofollow
+                                                              +postmaster-o-cloexec+) #o600)
+                                     (sb-posix:syscall-error () nil)))
+                          (when fd
+                            (sb-posix:unlink (namestring path))
+                            (setf stream (sb-sys:make-fd-stream
+                                          fd :input t :output t
+                                          :element-type '(unsigned-byte 8)))
+                            (setf (logical-wire-field-owner-stream owner) stream
+                                  published t)
+                            (return stream)))
+                     (unless published
+                       (when fd
+                         (if stream (close stream :abort t) (sb-posix:close fd))
+                         (ignore-errors (sb-posix:unlink (namestring path)))))))
+              finally (error "could not create logical receiver scratch file")))))
+
+(defun logical-wire-field-capture (owner cursor size)
+  "Validate and spool one field in OWNER, publishing only a complete slice."
+  (unless (and (logical-wire-field-owner-active-p owner)
+               (<= size (logical-wire-cursor-remaining cursor))
+               (<= (+ size (logical-wire-field-owner-size owner)) +max-query-message-size+))
+    (error "invalid logical receiver field length"))
+  (let* ((stream (logical-wire-field-open owner))
+         (offset (logical-wire-field-owner-size owner)))
+    (unless (file-position stream offset) (error "cannot seek logical receiver scratch file"))
+    (multiple-value-bind (sink metrics) (logical-encoding-sink size stream)
+      (logical-wire-write-text cursor size nil sink)
+      (multiple-value-bind (written crc) (funcall metrics)
+        (unless (= written size) (error "invalid logical receiver field size"))
+        (setf (logical-wire-field-owner-size owner) (+ offset size))
+        (make-logical-wire-field :owner owner :offset offset :size size :crc crc)))))
+
+(defun logical-wire-field-visit (field output)
+  "Verify FIELD and optionally write its decoded characters to OUTPUT."
+  (let* ((owner (logical-wire-field-owner field))
+         (stream (and (logical-wire-field-owner-active-p owner)
+                      (logical-wire-field-owner-stream owner)))
+         (size (logical-wire-field-size field)))
+    (unless (and stream (<= (+ (logical-wire-field-offset field) size)
+                            (logical-wire-field-owner-size owner)))
+      (error "logical receiver field has expired"))
+    (finish-output stream)
+    (unless (file-position stream (logical-wire-field-offset field))
+      (error "cannot seek logical receiver field"))
+    (multiple-value-bind (sink metrics) (logical-encoding-sink size)
+      (logical-wire-write-text (make-logical-wire-cursor :stream stream :remaining size)
+                               size output sink)
+      (multiple-value-bind (read-size crc) (funcall metrics)
+        (unless (and (= read-size size) (= crc (logical-wire-field-crc field)))
+          (error "logical receiver field checksum mismatch")))))
+  (values))
 
 (defun pg-client-frame (stream)
   (multiple-value-bind (type length-bytes payload) (read-message-frame stream)

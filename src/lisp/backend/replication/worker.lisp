@@ -821,15 +821,31 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
         collect (cons (pgoutput-column-name column)
                       (cons (pgoutput-column-type-oid column) value))))
 
+(defclass logical-field-quote-stream (sb-gray:fundamental-character-output-stream)
+  ((output :initarg :output :reader logical-field-quote-output)))
+
+(defmethod sb-gray:stream-write-char ((stream logical-field-quote-stream) character)
+  (let ((output (logical-field-quote-output stream)))
+    (when (char= character #\') (write-char #\' output))
+    (write-char character output))
+  character)
+
+(defvar *logical-wire-field-owner* nil)
+
+(defparameter *logical-wire-field-spill-threshold* (* 1024 1024))
+
 (defun logical-write-value-literal (stream type value &optional (context :pgoutput))
   (cond
     ((or (null value) (eq value :unchanged-toast) (member type '(20 21 23)))
      (write-string (logical-source-value-literal type value context) stream))
     ((member type '(17 25 114 3802 700 701 1043 1082 1083 1114 1184 1186 1266 1700))
      (write-char #\' stream)
-     (loop for character across value do
-       (when (char= character #\') (write-char #\' stream))
-       (write-char character stream))
+     (if (logical-wire-field-p value)
+         (logical-wire-field-visit value
+                                   (make-instance 'logical-field-quote-stream :output stream))
+         (loop for character across value do
+           (when (char= character #\') (write-char #\' stream))
+           (write-char character stream)))
      (write-char #\' stream))
     (t (logical-source-value-literal type value context))))
 
@@ -1346,15 +1362,24 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
           until (zerop byte) do (vector-push-extend byte bytes))
     (bytes->string bytes)))
 
-(defun logical-wire-tuple (cursor)
+(defun logical-wire-tuple (cursor &optional columns)
   (let ((count (logical-wire-uint cursor 2)))
-    (coerce (loop repeat count
-                  collect (case (code-char (logical-wire-byte cursor))
-                            (#\n nil)
-                            (#\u :unchanged-toast)
-                            (#\t (logical-wire-text cursor (logical-wire-uint cursor 4)))
-                            (otherwise (error "unsupported pgoutput tuple value kind"))))
-            'vector)))
+    (coerce
+     (loop for index below count
+           for column = (nth index columns)
+           collect (case (code-char (logical-wire-byte cursor))
+                     (#\n nil)
+                     (#\u :unchanged-toast)
+                     (#\t (let ((size (logical-wire-uint cursor 4)))
+                            (if (and *logical-wire-field-owner*
+                                     (> size *logical-wire-field-spill-threshold*)
+                                     (not (and column
+                                               (member (pgoutput-column-type-oid column)
+                                                       '(20 21 23)))))
+                                (logical-wire-field-capture *logical-wire-field-owner* cursor size)
+                                (logical-wire-text cursor size))))
+                     (otherwise (error "unsupported pgoutput tuple value kind"))))
+     'vector)))
 
 (defun logical-wire-relation (cursor standard-p)
   (let* ((oid (logical-wire-uint cursor 4))
@@ -1400,16 +1425,19 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
       ((#\I #\U #\D)
        (unless (logical-subscription-runtime-transaction-open-p runtime)
          (error "pgoutput row change appeared outside a transaction"))
-       (let ((oid (logical-wire-uint cursor 4)) (tag (code-char (logical-wire-byte cursor))))
+       (let* ((oid (logical-wire-uint cursor 4))
+              (tag (code-char (logical-wire-byte cursor)))
+              (relation (gethash oid (logical-subscription-runtime-relations runtime)))
+              (columns (and relation (pgoutput-relation-columns relation))))
          (ecase kind
            (#\I (unless (char= tag #\N) (error "pgoutput INSERT lacks a new tuple"))
-            (list kind oid (logical-wire-tuple cursor)))
-           (#\D (list kind oid (logical-wire-tuple cursor) tag))
+            (list kind oid (logical-wire-tuple cursor columns)))
+           (#\D (list kind oid (logical-wire-tuple cursor columns) tag))
            (#\U (let ((old nil) (initial tag))
                   (when (member tag '(#\K #\O))
-                    (setf old (logical-wire-tuple cursor) tag (code-char (logical-wire-byte cursor))))
+                    (setf old (logical-wire-tuple cursor columns) tag (code-char (logical-wire-byte cursor))))
                   (unless (char= tag #\N) (error "pgoutput UPDATE lacks a new tuple"))
-                  (list kind oid old (logical-wire-tuple cursor) initial))))))
+                  (list kind oid old (logical-wire-tuple cursor columns) initial))))))
       (#\T
        (unless (logical-subscription-runtime-transaction-open-p runtime)
          (error "pgoutput TRUNCATE appeared outside a transaction"))
@@ -1435,7 +1463,8 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
 
 (defun logical-read-stream-operation (runtime source)
   "Read one complete replication frame before applying its decoded operation."
-  (let ((stream (pg-client-stream source)) (complete nil))
+  (let ((stream (pg-client-stream source)) (complete nil)
+                                           (*logical-wire-field-owner* (make-logical-wire-field-owner)))
     (unwind-protect
          (let* ((type (read-byte stream nil nil))
                 (header (make-logical-wire-cursor :stream stream :remaining 4))
@@ -1469,7 +1498,12 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
              (if (char= (first operation) #\k)
                  (logical-progress-keepalive runtime (second operation))
                  (logical-pgoutput-apply-operation runtime operation))))
-      (unless complete (pg-client-close source)))))
+      (sb-sys:without-interrupts
+        (setf (logical-wire-field-owner-active-p *logical-wire-field-owner*) nil)
+        (unwind-protect
+             (when (logical-wire-field-owner-stream *logical-wire-field-owner*)
+               (close (logical-wire-field-owner-stream *logical-wire-field-owner*) :abort t))
+          (unless complete (pg-client-close source)))))))
 
 (defun logical-run-stream (options target marker)
   (let* ((source (logical-startup-replication-client options))

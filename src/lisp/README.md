@@ -672,8 +672,11 @@ bounded stream cursor, without allocating the complete encoded event. The
 sender measures each INSERT, UPDATE, or DELETE row before writing one pgoutput
 CopyData frame through a bounded buffer. The subscriber reads replication frames
 directly through a length-bounded stream cursor and completes decoding before
-applying an operation. UTF-8 field bytes are decoded in bounded blocks, but
-complete decoded field values remain in memory. INSERT, UPDATE and DELETE apply
+applying an operation. Eligible pgoutput row text fields larger than 1 MiB are
+validated as UTF-8 and stored in an unlinked, process-owned temporary file for
+the duration of synchronous apply; their CRC is checked during SQL preflight
+and emission. Smaller fields and integer fields are materialized, as are
+initial-copy DataRow fields and extension Message contents. INSERT, UPDATE and DELETE apply
 queries use producers that count and then emit SQL in bounded UTF-8 blocks
 without building a full query string; the target still receives and parses the
 complete Simple Query. A malformed or incomplete

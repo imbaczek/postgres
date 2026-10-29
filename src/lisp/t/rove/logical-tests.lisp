@@ -332,6 +332,214 @@
                                   (error () t))))))))
         (when (probe-file path) (delete-file path)))))
 
+(rove:deftest test-logical-wire-text-bounded-visitor
+    (let* ((path (merge-pathnames (format nil "pg-wire-visitor-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (value (concatenate 'string (make-string 65535 :initial-element #\a) "🙂'ż"))
+           (bytes (string->bytes value))
+           (blocks nil))
+      (unwind-protect
+           (progn
+             (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede :if-does-not-exist :create)
+               (write-sequence bytes stream))
+             (with-open-file (stream path :element-type '(unsigned-byte 8))
+               (let ((cursor (make-logical-wire-cursor :stream stream :remaining (length bytes))))
+                 (rove:ok
+                  (string= value
+                           (with-output-to-string (out)
+                             (logical-wire-write-text cursor (length bytes) out
+                                                      (lambda (block) (push block blocks))))))
+                 (rove:ok (= 2 (length blocks)))
+                 (rove:ok (equalp bytes (apply #'concatenate '(vector (unsigned-byte 8))
+                                               (reverse blocks)))))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-logical-wire-field-spool-quoting-and-lifetime
+    (let* ((path (merge-pathnames (format nil "pg-wire-field-input-~d-~d"
+                                          (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (value (concatenate 'string (make-string 65535 :initial-element #\a) "🙂'ż"))
+           (bytes (string->bytes value))
+           (owner (make-logical-wire-field-owner))
+           (field nil))
+      (unwind-protect
+           (progn
+             (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede :if-does-not-exist :create)
+               (write-sequence bytes stream))
+             (with-open-file (stream path :element-type '(unsigned-byte 8))
+               (setf field (logical-wire-field-capture
+                            owner (make-logical-wire-cursor :stream stream :remaining (length bytes))
+                            (length bytes))))
+             (rove:ok (string= (logical-source-value-literal 25 value :pgoutput)
+                               (with-output-to-string (out)
+                                 (logical-write-value-literal out 25 field))))
+             (let ((stream (logical-wire-field-owner-stream owner)))
+               (file-position stream 0)
+               (write-byte (char-code #\b) stream)
+               (finish-output stream))
+             (rove:ok (handler-case (progn (logical-wire-field-visit field nil) nil)
+                        (error () t)))
+             (setf (logical-wire-field-owner-active-p owner) nil)
+             (rove:ok (handler-case (progn (logical-wire-field-visit field nil) nil)
+                        (error () t))))
+        (when (logical-wire-field-owner-stream owner)
+          (close (logical-wire-field-owner-stream owner) :abort t))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-logical-wire-field-corruption-at-query-boundaries
+    (let* ((input (merge-pathnames (format nil "pg-wire-source-~d-~d" (sb-posix:getpid) (random 1000000))
+                                   (uiop:temporary-directory)))
+           (target (merge-pathnames (format nil "pg-wire-target-~d-~d" (sb-posix:getpid) (random 1000000))
+                                    (uiop:temporary-directory)))
+           (owner (make-logical-wire-field-owner))
+           (value (make-string 5000 :initial-element #\a))
+           (field nil))
+      (unwind-protect
+           (progn
+             (with-open-file (stream input :direction :output :element-type '(unsigned-byte 8)
+                                           :if-exists :supersede :if-does-not-exist :create)
+               (write-sequence (string->bytes value) stream))
+             (with-open-file (stream input :element-type '(unsigned-byte 8))
+               (setf field (logical-wire-field-capture owner
+                                                       (make-logical-wire-cursor :stream stream :remaining (length value)) (length value))))
+             (flet ((corrupt ()
+                      (let ((scratch (logical-wire-field-owner-stream owner)))
+                        (file-position scratch 0)
+                        (write-byte (char-code #\z) scratch)
+                        (finish-output scratch))))
+               (corrupt)
+               (with-open-file (stream target :direction :output :element-type '(unsigned-byte 8)
+                                              :if-exists :supersede :if-does-not-exist :create)
+                 (let ((client (make-pg-client :stream stream)))
+                   (rove:ok (handler-case
+                                (progn (pg-client-send-query-plan
+                                        client (make-pg-client-query-plan
+                                                :writer (lambda (out)
+                                                          (logical-write-value-literal out 25 field))))
+                                       nil)
+                              (error () t)))
+                   (rove:ok (and (open-stream-p stream) (zerop (file-position stream))))))
+               (let ((scratch (logical-wire-field-owner-stream owner)))
+                 (file-position scratch 0)
+                 (write-byte (char-code #\a) scratch)
+                 (finish-output scratch))
+               (let ((calls 0))
+                 (let* ((stream (open target :direction :output :element-type '(unsigned-byte 8)
+                                             :if-exists :supersede :if-does-not-exist :create))
+                        (client (make-pg-client :stream stream)))
+                   (unwind-protect
+                        (progn
+                          (rove:ok (handler-case
+                                       (progn
+                                         (pg-client-send-query-plan
+                                          client (make-pg-client-query-plan
+                                                  :writer (lambda (out)
+                                                            (incf calls)
+                                                            (when (= calls 2) (corrupt))
+                                                            (logical-write-value-literal out 25 field))))
+                                         nil)
+                                     (error () t)))
+                          (rove:ok (= calls 2))
+                          (rove:ok (not (open-stream-p stream))))
+                     (when (open-stream-p stream) (close stream))))
+                 (rove:ok (or (not (probe-file target))
+                              (with-open-file (stream target :element-type '(unsigned-byte 8))
+                                (< (file-length stream) (+ (length value) 8))))))))
+        (setf (logical-wire-field-owner-active-p owner) nil)
+        (when (logical-wire-field-owner-stream owner)
+          (close (logical-wire-field-owner-stream owner) :abort t))
+        (when (probe-file input) (delete-file input))
+        (when (probe-file target) (delete-file target)))))
+
+(rove:deftest test-logical-wire-frame-scopes-field-slices
+    (let* ((path (merge-pathnames (format nil "pg-wire-slice-frame-~d-~d"
+                                          (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (runtime (make-logical-subscription-runtime
+                     :options (make-logical-subscription-options) :transaction-open-p t))
+           (original (symbol-function 'logical-pgoutput-apply-operation))
+           (*logical-wire-field-spill-threshold* 1)
+           (value "ż'🙂") (retained nil) (calls 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-pgoutput-apply-operation)
+                   (lambda (receiver operation)
+                     (declare (ignore receiver))
+                     (incf calls)
+                     (setf retained (aref (third operation) 0))
+                     (rove:ok (logical-wire-field-p retained))
+                     (rove:ok (string= (logical-source-value-literal 25 value :pgoutput)
+                                       (with-output-to-string (out)
+                                         (logical-write-value-literal out 25 retained))))))
+             (dolist (extra '(nil trailing invalid))
+               (let ((payload (make-payload)) (bytes (string->bytes value)))
+                 (payload-push-byte payload (char-code #\w))
+                 (dotimes (index 24) (payload-push-byte payload 0))
+                 (payload-push-byte payload (char-code #\I))
+                 (payload-push-u32 payload 7)
+                 (payload-push-byte payload (char-code #\N))
+                 (payload-push-u16 payload (if (eq extra 'invalid) 2 1))
+                 (payload-push-byte payload (char-code #\t))
+                 (payload-push-u32 payload (length bytes))
+                 (payload-push payload bytes)
+                 (when (eq extra 'invalid)
+                   (payload-push-byte payload (char-code #\t))
+                   (payload-push-u32 payload 2)
+                   (payload-push payload #(192 128)))
+                 (when (eq extra 'trailing) (payload-push-byte payload 0))
+                 (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                              :if-exists :supersede :if-does-not-exist :create)
+                   (write-byte (char-code #\d) stream)
+                   (write-sequence (u32-to-bytes (+ 4 (length payload))) stream)
+                   (write-sequence payload stream))
+                 (let* ((stream (open path :element-type '(unsigned-byte 8)))
+                        (client (make-pg-client :stream stream)))
+                   (unwind-protect
+                        (if extra
+                            (rove:ok (handler-case (progn (logical-read-stream-operation runtime client) nil)
+                                       (error () t)))
+                            (logical-read-stream-operation runtime client))
+                     (when (open-stream-p stream) (close stream))))))
+             (rove:ok (= calls 1))
+             (rove:ok (handler-case (progn (logical-wire-field-visit retained nil) nil)
+                        (error () t))))
+        (setf (symbol-function 'logical-pgoutput-apply-operation) original)
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-logical-wire-field-spill-threshold
+    (let* ((path (merge-pathnames (format nil "pg-wire-threshold-~d-~d"
+                                          (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (*logical-wire-field-spill-threshold* 3)
+           (*logical-wire-field-owner* (make-logical-wire-field-owner))
+           (payload (make-payload)))
+      (unwind-protect
+           (progn
+             (payload-push-u16 payload 3)
+             (dolist (value '("abc" "abcd" "0000"))
+               (payload-push-byte payload (char-code #\t))
+               (payload-push-u32 payload (length value))
+               (payload-push payload (string->bytes value)))
+             (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede :if-does-not-exist :create)
+               (write-sequence payload stream))
+             (with-open-file (stream path :element-type '(unsigned-byte 8))
+               (let* ((columns (list (make-pgoutput-column :type-oid 25)
+                                     (make-pgoutput-column :type-oid 25)
+                                     (make-pgoutput-column :type-oid 23)))
+                      (row (logical-wire-tuple
+                            (make-logical-wire-cursor :stream stream :remaining (length payload))
+                            columns)))
+                 (rove:ok (string= "abc" (aref row 0)))
+                 (rove:ok (logical-wire-field-p (aref row 1)))
+                 (rove:ok (string= "0000" (aref row 2))))))
+        (setf (logical-wire-field-owner-active-p *logical-wire-field-owner*) nil)
+        (when (logical-wire-field-owner-stream *logical-wire-field-owner*)
+          (close (logical-wire-field-owner-stream *logical-wire-field-owner*) :abort t))
+        (when (probe-file path) (delete-file path)))))
+
 (rove:deftest test-logical-wire-operations-match-vector-decoder
     (let* ((path (merge-pathnames (format nil "pg-wire-diff-~d-~d" (sb-posix:getpid) (random 1000000))
                                   (uiop:temporary-directory)))
