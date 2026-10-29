@@ -262,8 +262,9 @@ LATERAL joins also retain origins from their outer rows. Grouping and DISTINCT r
 the first representative; MIN/MAX retain the first non-NULL input until another
 non-NULL input is compared. Compatible binary casts and varchar/numeric typmod
 widening retain provenance; casts that transform the datum clear it. Source and
-shared-key values also retain provenance through ranking windows. Aggregate
-windows and other unsupported producer shapes do not yet retain it.
+shared-key values retain provenance through supported windows, whose MIN/MAX
+transitions follow the same first-input rule. Other unsupported producer shapes
+do not yet retain it.
 For an interpreted SELECT plan with a projection over one base-table sequential
 or non-parameterized index scan, optionally with filters, sorting or top-N,
 and LIMIT, external values unused by the projection, filters, ordering, and

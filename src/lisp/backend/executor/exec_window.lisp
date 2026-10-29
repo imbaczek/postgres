@@ -80,13 +80,18 @@
 
 (defun window-aggregate-inputs (aggregates environment)
   ;; Copy evaluated inputs before transition state can retain them across rows.
-  ;; Aggregates without an input receive +NULL+ as a placeholder.
-  (map 'vector (lambda (descriptor)
-                 (if (getf descriptor :input)
-                     (copy-query-sort-value
-                      (eval-expr (getf descriptor :input) environment))
-                     +null+))
-       aggregates))
+  (let ((values (make-array (length aggregates) :initial-element +null+))
+        (origins (and *datum-origin-capture* (make-array (length aggregates) :initial-element nil))))
+    (loop for descriptor in aggregates for i from 0
+          for expression = (getf descriptor :input)
+          when expression
+            do (multiple-value-bind (value origin)
+                   (if *datum-origin-capture*
+                       (eval-expr-with-origin expression environment *query-row-origins*)
+                       (values (eval-expr expression environment) nil))
+                 (setf (aref values i) (copy-query-sort-value value))
+                 (when origins (setf (aref origins i) origin))))
+    (values values origins)))
 
 (defun window-project-row (environment width functions results position rank dense)
   ;; Copy the outer row vector and each aggregate result; base-column values
@@ -105,11 +110,15 @@
       (when origins (replace result origins :end1 (min width (length origins))))
       result)))
 
-(defun window-output-origins (origins width functions)
-  (let ((result (window-pad-origins origins width)))
+(defun window-output-origins (origins width functions &optional transition-origins)
+  (let ((result (window-pad-origins origins width)) (aggregate-index 0))
     (when result
       (dolist (function functions)
-        (setf (aref result (getf function :slot)) nil)))
+        (setf (aref result (getf function :slot))
+              (if (member (getf function :kind) '(:row-number :rank :dense-rank))
+                  nil
+                  (prog1 (and transition-origins (aref transition-origins aggregate-index))
+                    (incf aggregate-index))))))
     result))
 
 (defun window-input-with-origins (environment expressions origins)
@@ -143,7 +152,7 @@
                                 (width (getf stage :width))
                                 (whole-p (and aggregates (eq (second (getf stage :frame)) :unbounded-following)))
                                 (peers-p (and aggregates (not whole-p) (eq (first (getf stage :frame)) :range)))
-                                (buffer nil) (states nil) (partition-key nil) (peer-key nil)
+                                (buffer nil) (states nil) (transition-origins nil) (partition-key nil) (peer-key nil)
                                 (position 0) (rank 1) (dense 1))
                            (labels
                                ((close-buffer ()
@@ -153,10 +162,11 @@
                                       (delete-query-temp-file (query-row-spool-pathname buffer)))
                                     (setf buffer nil)))
                                 (advance-states (environment)
-                                  (let ((inputs (window-aggregate-inputs aggregates environment)))
+                                  (multiple-value-bind (inputs input-origins) (window-aggregate-inputs aggregates environment)
+                                    (step-aggregate-transition-origins states aggregates inputs input-origins transition-origins 0)
                                     (step-aggregate-transition-states states aggregates inputs 0)))
                                 (output (environment results row-position row-rank row-dense)
-                                  (let ((*query-row-origins* (window-output-origins *query-row-origins* width functions)))
+                                  (let ((*query-row-origins* (window-output-origins *query-row-origins* width functions transition-origins)))
                                     (funcall emit (window-project-row environment width functions results
                                                                       row-position row-rank row-dense))))
                                 (flush-buffer ()
@@ -168,7 +178,8 @@
                                                       buffer
                                                       (lambda (row index)
                                                         (declare (ignore index))
-                                                        (output (first row) results (second row) (third row) (fourth row))))
+                                                        (let ((*query-row-origins* (datum-origins-from-spill (fifth row))))
+                                                          (output (first row) results (second row) (third row) (fourth row)))))
                                                      :stop)
                                              (return-from stream-window-stage :stop))
                                         (close-buffer)))))
@@ -187,6 +198,7 @@
                                     (unless same-partition
                                       (close-aggregate-transition-states states)
                                       (setf states (make-aggregate-transition-states aggregates)
+                                            transition-origins (and *datum-origin-capture* (make-array (length aggregates) :initial-element nil))
                                             position 0 rank 1 dense 1 partition-key (copy-query-sort-value new-partition)))
                                     (incf position)
                                     (when (> position 1)
@@ -198,7 +210,8 @@
                                     (if (or whole-p peers-p)
                                         (progn
                                           (unless buffer (setf buffer (make-query-row-spool)))
-                                          (query-row-spool-append buffer (list (copy-query-sort-value environment) position rank dense)))
+                                          (query-row-spool-append buffer (list (copy-query-sort-value environment) position rank dense
+                                                                               (and *datum-origin-capture* (datum-origins-for-spill *query-row-origins*)))))
                                         (output environment (window-transition-results states) position rank dense))))
                                 (input (callback)
                                   (funcall source

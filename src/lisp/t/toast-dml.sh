@@ -149,6 +149,27 @@ run -c 'insert into toast_window_result select v,row_number() over (order by id)
 run -c 'insert into toast_window_result select v,rank() over (order by v) from toast_scalar_source' >/dev/null
 run -c 'insert into toast_window_result with q as materialized (select v,dense_rank() over (order by id) as n from toast_scalar_source) select v,n from q' >/dev/null
 [ "$(run -c "select count(*) from toast_window_result where (n=1 and length(v)=20000 and substr(v,1,1)='a') or (n=2 and length(v)=20001 and substr(v,1,1)='b')")" = 6 ]
+run -c 'create table toast_window_aggregate (v text, n int)' >/dev/null
+run -c 'alter table toast_window_aggregate alter column v set storage plain' >/dev/null
+run -c 'insert into toast_window_aggregate select v,count(*) over (order by id rows between unbounded preceding and current row) from toast_scalar_source' >/dev/null
+run -c 'insert into toast_window_aggregate select v,min(id) over () from toast_scalar_source' >/dev/null
+run -c 'insert into toast_window_aggregate with q as materialized (select min(v) over (partition by id rows between unbounded preceding and unbounded following) as v,id from toast_scalar_source) select v,id from q' >/dev/null
+run -c 'insert into toast_window_aggregate with q as materialized (select v,count(*) over (order by id) as n from toast_scalar_source) select v,n from q' >/dev/null
+run -c 'insert into toast_window_aggregate with q as materialized (select min(v) over (partition by id order by id) as v,id from toast_scalar_source) select v,id from q' >/dev/null
+[ "$(run -c 'select count(*) from toast_window_aggregate where length(v)=20000')" = 5 ]
+[ "$(run -c 'select count(*) from toast_window_aggregate where length(v)=20001')" = 5 ]
+run -c 'create table toast_window_stages (a text, b text)' >/dev/null
+run -c 'alter table toast_window_stages alter column a set storage plain' >/dev/null
+run -c 'alter table toast_window_stages alter column b set storage plain' >/dev/null
+run -c 'insert into toast_window_stages select min(v) over (partition by id),max(v) over (partition by id+0) from toast_scalar_source' >/dev/null
+[ "$(run -c 'select count(*) from toast_window_stages where length(a)=length(b) and length(a)>19999')" = 2 ]
+if run -v VERBOSITY=verbose -c 'insert into toast_window_aggregate select min(v) over (),id from toast_scalar_source' >"$TMP/window-min-multiple.out" 2>&1; then
+    echo 'toast-dml: compared window aggregate retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/window-min-multiple.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: compared window aggregate did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 run -c 'create table toast_conflict_origins (id int primary key, a text, b text)' >/dev/null
 run -c 'alter table toast_conflict_origins alter column a set storage external' >/dev/null
 run -c 'alter table toast_conflict_origins alter column b set storage plain' >/dev/null

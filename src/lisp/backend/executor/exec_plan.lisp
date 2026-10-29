@@ -1241,6 +1241,18 @@ on an abnormal exit."
               (if (logbitp 63 bits) (- bits (ash 1 64)) bits))
             total))))
 
+(defun step-aggregate-transition-origins (states descriptors inputs input-origins result-origins offset)
+  "Keep the first MIN/MAX datum origin until another non-NULL transition."
+  (when result-origins
+    (loop for descriptor in descriptors for i from 0
+          for value = (aref inputs (+ offset i))
+          when (and (member (getf descriptor :kind) '(:min :max))
+                    (not (eq value +null+)))
+            do (setf (aref result-origins i)
+                     (if (eq (aref states i) +null+)
+                         (and input-origins (aref input-origins (+ offset i)))
+                         nil)))))
+
 (defun step-aggregate-transition-states (states descriptors inputs offset)
   (loop for descriptor in descriptors for index from 0
         for state = (aref states index)
@@ -1331,16 +1343,8 @@ on an abnormal exit."
                                             (when (and *datum-origin-capture* *query-row-origins*)
                                               (dotimes (i width)
                                                 (setf (aref group-origins i) (aref *query-row-origins* i)))))
-                                          (when *datum-origin-capture*
-                                            (loop for descriptor in descriptors for i from 0
-                                                  for value = (aref environment (+ width i))
-                                                  when (and (member (getf descriptor :kind) '(:min :max))
-                                                            (not (eq value +null+)))
-                                                    do (setf (aref transition-origins i)
-                                                             (if (eq (aref states i) +null+)
-                                                                 (and *query-row-origins*
-                                                                      (aref *query-row-origins* (+ width i)))
-                                                                 nil))))
+                                          (step-aggregate-transition-origins states descriptors environment
+                                                                             *query-row-origins* transition-origins width)
                                           (step-aggregate-transition-states states descriptors environment width))))
                                     (finish ()
                                       (when (and (null states) (null group-keys))
@@ -1430,9 +1434,7 @@ on an abnormal exit."
     ((:filter :project :sort :limit :window-input)
      (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
     (:window
-     (and (every (lambda (function) (member (getf function :kind) '(:row-number :rank :dense-rank)))
-                 (getf (second node) :functions))
-          (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen)))
+     (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
     (:top-n (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable seen))
     (:hash-distinct (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
     (:append
