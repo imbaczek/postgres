@@ -27,6 +27,29 @@
       (rove:ok (= opened 1) "consumer stop prevents opening the next arm")
       (rove:ok (= visited 1))))
 
+(rove:deftest buffered-plan-clears-toast-demand-for-consumer
+    (let ((original (symbol-function 'simple-select-toast-demand))
+          (seen :unreached)
+          (targets (list (list :expr '(:const 1 :type :int4 :typmod -1))))
+          (order (list (cons '(:sort-output 1) nil))))
+      (unwind-protect
+           (progn
+             ;; A synthetic demand isolates the outward-callback contract from storage.
+             (setf (symbol-function 'simple-select-toast-demand)
+                   (lambda (node relations) (declare (ignore node relations)) (list :sentinel)))
+             (dolist (kind '(:sort :top-n))
+               (setf seen :unreached)
+               (let* ((project (list :project targets '(:result)))
+                      (node (if (eq kind :sort) (list :sort order project)
+                                (list :top-n order 1 project)))
+                      (plan (%make-query-plan :physical node)))
+                 (interpret-query-plan plan nil
+                                       (lambda (row)
+                                         (declare (ignore row))
+                                         (setf seen *select-toast-demand*)))
+                 (rove:ok (null seen) (format nil "~a consumer sees no scan demand" kind)))))
+        (setf (symbol-function 'simple-select-toast-demand) original))))
+
 (rove:deftest subquery-parser-forms
     (dolist (sql '("SELECT (SELECT 1)" "SELECT ((SELECT 1))"
                    "SELECT ((SELECT 1) UNION ALL SELECT 2)"

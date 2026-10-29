@@ -440,7 +440,17 @@
         (setf (fifth index-scan) qual
               (seventh index-scan) '(:outer-ref 1 (:col 1)))
         (rove:ok (null (simple-select-toast-demand index-node index-relations))))
-      (rove:ok (null (simple-select-toast-demand (list :sort nil node) relations)))
+      (let ((ordered (simple-select-toast-demand
+                      (list :sort (list (cons '(:col 2) nil)) node) relations)))
+        (rove:ok (and ordered (member 1 (cdr ordered)) (member 2 (cdr ordered)))))
+      (rove:ok (equal '(1) (cdr (simple-select-toast-demand
+                                 (list :top-n (list (cons '(:sort-output 1) nil)) 1 node)
+                                 relations))))
+      (rove:ok (null (simple-select-toast-demand
+                      (list :sort (list (cons '(:sort-output 2) nil)) node) relations)))
+      (rove:ok (null (simple-select-toast-demand
+                      (list :sort (list (cons '(:subplan opaque) nil)) node) relations)))
+      (rove:ok (null (simple-select-toast-demand (list :window nil node) relations)))
       (let ((filtered (simple-select-toast-demand
                        (list :project
                              (list (list :expr '(:binop "+" (:col 1) (:const 1))))

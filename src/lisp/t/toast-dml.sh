@@ -266,11 +266,17 @@ original_pointer=$(reuse_pointer)
 [ "$(run -c "insert into toast_reuse (id, marker) select id, marker from toast_reuse on conflict (id) do update set marker = excluded.marker + 1 returning v = '$big'")" = t ]
 [ "$(run -c "select marker, v = '$big' from toast_reuse where id = 1")" = '1|t' ]
 [ "$(reuse_pointer)" = "$original_pointer" ]
+[ "$(run -c "insert into toast_reuse (id, marker) select id, marker from toast_reuse order by id on conflict (id) do update set marker = excluded.marker returning v = '$big'")" = t ]
+[ "$(run -c "insert into toast_reuse (id, marker) select id, marker from toast_reuse order by id limit 1 on conflict (id) do update set marker = excluded.marker returning v = '$big'")" = t ]
+[ "$(reuse_pointer)" = "$original_pointer" ]
 run -c 'create table toast_index_demand (id int primary key, v text)' >/dev/null
 run -c 'alter table toast_index_demand alter column v set storage external' >/dev/null
 index_rows=$(awk 'BEGIN { for (i=2;i<=1001;i++) printf "%s(%d, NULL)", i==2 ? "" : ",", i }')
 run -c "insert into toast_index_demand values $index_rows, (1, '$big')" >/dev/null
 run -c 'analyze toast_index_demand' >/dev/null
+run -c 'create table toast_sort_demand (id int, v text)' >/dev/null
+run -c 'alter table toast_sort_demand alter column v set storage external' >/dev/null
+run -c "insert into toast_sort_demand values (1, 'c$big'), (2, 'a$big'), (3, 'b$big')" >/dev/null
 # Count actual TOAST fetches during live SQL execution. A query that needs only
 # id must not touch v; fetching v and using it in a filter must still work.
 printf '%s\n(quit)\n' '(let ((counter (intern "*TOAST-TEST-FETCH-COUNT*")) (original (symbol-function (quote toast-fetch-value)))) (setf (symbol-value counter) 0 (symbol-value (intern "*TOAST-TEST-FETCH-ORIGINAL*")) original) (setf (symbol-function (quote toast-fetch-value)) (lambda (&rest args) (incf (symbol-value counter)) (apply original args))))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/toast-fetch-install.out"
@@ -291,9 +297,34 @@ run -c 'explain select id from toast_index_demand where id = 1' | grep -q 'Index
 [ "$(toast_fetch_count)" = 0 ]
 [ "$(run -c 'select abs(id) from toast_reuse where id + 0 = 1')" = 1 ]
 [ "$(toast_fetch_count)" = 0 ]
+run -c 'explain select id from toast_reuse order by id' | grep -q 'Sort'
+[ "$(run -c 'select id from toast_reuse order by id')" = 1 ]
+[ "$(toast_fetch_count)" = 0 ]
+run -c 'explain select id from toast_reuse order by id limit 1' | grep -q 'Top-N'
+[ "$(run -c 'select id from toast_reuse order by id limit 1')" = 1 ]
+[ "$(toast_fetch_count)" = 0 ]
+# Sort and top-N must retain unprojected ordering values, while sorting by an
+# alias or ordinal only needs the selected id. Force and count external runs.
+printf '%s\n(quit)\n' '(let ((counter (intern "*TOAST-TEST-SORT-COUNT*")) (original (symbol-function (quote write-query-sort-run)))) (setf (symbol-value counter) 0 (symbol-value (intern "*TOAST-TEST-SORT-ORIGINAL*")) original (symbol-value (intern "*TOAST-TEST-WORK-ORIGINAL*")) *query-work-memory-bytes* *query-work-memory-bytes* 1) (setf (symbol-function (quote write-query-sort-run)) (lambda (&rest args) (incf (symbol-value counter)) (apply original args))))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/toast-sort-install.out"
+! grep -q ';; error:' "$TMP/toast-sort-install.out"
+[ "$(run -c 'select id as k from toast_sort_demand order by k')" = "$(printf '1\n2\n3')" ]
+[ "$(run -c 'select id from toast_sort_demand order by 1 limit 2')" = "$(printf '1\n2')" ]
+[ "$(run -c 'select id from toast_sort_demand order by id + 1 desc')" = "$(printf '3\n2\n1')" ]
+[ "$(toast_fetch_count)" = 0 ]
+[ "$(run -c 'select id from toast_sort_demand order by v')" = "$(printf '2\n3\n1')" ]
+fetch_after_multi_sort=$(toast_fetch_count)
+[ "$fetch_after_multi_sort" = 3 ]
+[ "$(run -c 'select id from toast_sort_demand order by v limit 2')" = "$(printf '2\n3')" ]
+[ "$(toast_fetch_count)" = 6 ]
+printf '%s\n(quit)\n' '(format t "SORT-COUNT=~d~%" (symbol-value (intern "*TOAST-TEST-SORT-COUNT*"))) (setf (symbol-function (quote write-query-sort-run)) (symbol-value (intern "*TOAST-TEST-SORT-ORIGINAL*")) *query-work-memory-bytes* (symbol-value (intern "*TOAST-TEST-WORK-ORIGINAL*")))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/toast-sort-restore.out"
+! grep -q ';; error:' "$TMP/toast-sort-restore.out"
+[ "$(awk -F= '/SORT-COUNT=/{print $2}' "$TMP/toast-sort-restore.out")" -gt 0 ]
+[ "$(run -c 'select id from toast_reuse order by v limit 1')" = 1 ]
+fetch_after_order=$(toast_fetch_count)
+[ "$fetch_after_order" -gt 6 ]
 [ "$(run -c "select v = '$big' from toast_index_demand where id = 1")" = t ]
 fetch_after_index=$(toast_fetch_count)
-[ "$fetch_after_index" -gt 0 ]
+[ "$fetch_after_index" -gt "$fetch_after_order" ]
 [ "$(run -c "select v = '$big' from toast_reuse where id = 1")" = t ]
 fetch_after_projection=$(toast_fetch_count)
 [ "$fetch_after_projection" -gt "$fetch_after_index" ]
