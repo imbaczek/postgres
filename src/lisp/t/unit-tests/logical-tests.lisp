@@ -814,6 +814,7 @@
             (progress-messages 0)
             (keepalives 0)
             (delivered nil)
+            (delivered-kind nil)
             (crashed nil)
             (crash-actions nil))
        (setf (gethash "scan_progress_slot" *wal-replication-slots*) slot
@@ -847,6 +848,10 @@
              (symbol-function 'send-logical-transaction)
              (lambda (stream transaction wal-end)
                (declare (ignore stream wal-end))
+               (logical-transaction-map-changes
+                transaction (lambda (change)
+                              (unless delivered-kind
+                                (setf delivered-kind (logical-change-kind change)))))
                (setf delivered transaction
                      feedback (logical-transaction-commit-lsn transaction))
                ;; Model the subscriber COMMIT followed by its feedback.
@@ -937,9 +942,7 @@
                        "restarted subscriber commits the pending DDL before feedback"))
               (check (and delivered
                           (zerop (logical-transaction-xid delivered))
-                          (eq (logical-change-kind
-                               (first (logical-transaction-changes delivered)))
-                              :ddl))
+                          (eq delivered-kind :ddl))
                      "publisher loop reaches the pending DDL after scan progress")
               (check (= (wal-replication-slot-confirmed-flush-lsn slot)
                         (logical-transaction-commit-lsn delivered))
@@ -1225,6 +1228,8 @@
             (xid 9501)
             (*backend* (make-backend :xid xid))
             (*active-xids* (list xid))
+            (*logical-capture-xid-modes* (make-hash-table :test #'eql))
+            (*logical-capture-live-slots* 0)
             (*next-xid* (1+ xid))
             (*active-snapshots* 0)
             (*active-snapshot-set* (make-hash-table :test #'eq))
@@ -1242,14 +1247,18 @@
             (ack-lsn nil))
        (setf (backend-database *backend*) "postgres"
              (backend-state *backend*) :in-progress
+             (gethash xid *logical-capture-xid-modes*) :capture
              (gethash "postgres" (catalog-databases *catalog*)) database
              (gethash "logical_rows" (database-tables database)) table)
        (logical-note-row-change :insert table :new-values #(55 4 "across boundary"))
        (logical-test-commit-boundary-batch xid)
        (multiple-value-setq (snapshot boundary-lsn restart-lsn slot)
-         (with-write-lock
-           (wal-create-replication-slot-under-writer-lock
-            "handoff_slot" 0 registration owner 7)))
+         (let ((*backend* (make-backend :database "postgres")))
+           (call-with-logical-capture-armed
+            (lambda ()
+              (with-write-lock
+                (wal-create-replication-slot-under-writer-lock
+                 "handoff_slot" 0 registration owner 7))))))
        (check (member xid (snapshot-xip snapshot) :test #'=)
               "snapshot contains the active writer")
        (check (< restart-lsn boundary-lsn)

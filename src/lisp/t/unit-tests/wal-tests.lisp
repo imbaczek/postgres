@@ -752,6 +752,8 @@
          (*wal-xid-first-lsn* (make-hash-table :test #'eql))
          (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
          (*wal-replication-slots* (make-hash-table :test #'equal))
+         (*logical-capture-xid-modes* (make-hash-table :test #'eql))
+         (*logical-capture-live-slots* 0)
          (*wal-output-stream* nil)
          (*wal-output-segment* nil)
          (checkpoint-lsn *wal-durable-lsn*)
@@ -777,10 +779,13 @@
                                      :if-exists :supersede
                                      :if-does-not-exist :create)
                (write-byte 0 stream)))
-           (with-write-lock
-             (multiple-value-setq (snapshot boundary-lsn restart-lsn slot)
-               (wal-create-replication-slot-under-writer-lock
-                "copy_slot" 7 registration slot-owner)))
+           (let ((*backend* (make-backend)))
+             (call-with-logical-capture-armed
+              (lambda ()
+                (with-write-lock
+                  (multiple-value-setq (snapshot boundary-lsn restart-lsn slot)
+                    (wal-create-replication-slot-under-writer-lock
+                     "copy_slot" 7 registration slot-owner))))))
            (check (and snapshot (= boundary-lsn checkpoint-lsn)
                        (= restart-lsn 100)
                        (= (wal-replication-slot-consistent-lsn slot)
@@ -1124,6 +1129,8 @@
          (*wal-xid-first-lsn* (make-hash-table :test #'eql))
          (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
          (*wal-replication-slots* (make-hash-table :test #'equal))
+         (*logical-capture-xid-modes* (make-hash-table :test #'eql))
+         (*logical-capture-live-slots* 0)
          (*wal-output-stream* nil)
          (*wal-output-segment* nil)
          (checkpoint-lsn *wal-durable-lsn*)
@@ -1151,9 +1158,12 @@
            (setf failed
                  (handler-case
                      (progn
-                       (with-write-lock
-                         (wal-create-replication-slot-under-writer-lock
-                          "fsync_slot" 7 registration))
+                       (let ((*backend* (make-backend)))
+                         (call-with-logical-capture-armed
+                          (lambda ()
+                            (with-write-lock
+                              (wal-create-replication-slot-under-writer-lock
+                               "fsync_slot" 7 registration)))))
                        nil)
                    (error () t)))
            (setf (symbol-function 'fsync-directory) original-fsync-directory)

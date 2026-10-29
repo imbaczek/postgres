@@ -162,7 +162,7 @@
          (worker-error nil)
          (worker nil)
          (original-decoder (symbol-function 'decode-frontend-message))
-         (original-handler (symbol-function 'handle-unsupported-message)))
+         (original-handler (symbol-function 'extended-apply-operation)))
     (unwind-protect
          (progn
            (setf (symbol-function 'decode-frontend-message)
@@ -174,9 +174,9 @@
                              decoder-live-count *live-operation-count*
                              decoder-lane *live-operation-current-lane*))
                      message))
-                 (symbol-function 'handle-unsupported-message)
-                 (lambda (stream message)
-                   (declare (ignore stream message))
+                 (symbol-function 'extended-apply-operation)
+                 (lambda (stream operation payload)
+                   (declare (ignore stream operation payload))
                    (sb-thread:with-mutex (test-lock)
                      (setf handler-ran t))))
            (let ((*backend* backend))
@@ -191,7 +191,8 @@
                                     (setf admission-waited t)))))
                           (handler-case
                               (dispatch-frontend-frame
-                               nil (char-code #\D) (u32-to-bytes 5) #(0))
+                               nil (char-code #\D) (u32-to-bytes 6)
+                               (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(83 0)))
                             (error (condition)
                               (sb-thread:with-mutex (test-lock)
                                 (setf worker-error condition))))))
@@ -222,7 +223,7 @@
           worker (lambda () (error "protocol admission test timed out"))))
         (ignore-errors (sb-thread:join-thread worker :timeout 2)))
       (setf (symbol-function 'decode-frontend-message) original-decoder
-            (symbol-function 'handle-unsupported-message) original-handler)
+            (symbol-function 'extended-apply-operation) original-handler)
       (test-reset-live-operation-admission))))
 
 (defun test-malformed-protocol-frames-drain-to-fatal-error ()

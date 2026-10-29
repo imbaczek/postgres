@@ -36,7 +36,7 @@
                 :confirmed-flush-lsn 3072 :active-owner (gensym "OWNER-")
                 :wal-status :reserved))
          (ast (first (parse-statements
-                      "SELECT * FROM pg_catalog.pg_replication_slots")))
+                      "SELECT slot_name,active,restart_lsn,confirmed_flush_lsn,wal_status,retained_wal_bytes FROM pg_catalog.pg_replication_slots")))
          (plan (plan-select-query ast))
          (relations (getf (query-plan-prepared plan) :relations))
          (rows '()))
