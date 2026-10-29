@@ -652,6 +652,23 @@ run_direction() {
             attempt=$((attempt + 1)); test "$attempt" -lt 1200 || return 1; sleep 0.5
         done
         echo 'logical-interop: native subscriber preserved unchanged external bytea above 32 MiB'
+        # Four 17 MiB events exceed the former 65 MiB transaction limit.
+        # Every observer query must see either none or all of the transaction.
+        awk 'BEGIN { printf "BEGIN;\n"; for (r=0;r<4;r++) { printf "INSERT INTO interop_rows (id,amount,payload) VALUES (%d,%d,\047\\x", 80+r, r; for(i=0;i<17825792;i++) printf "0%d", r; printf "\047::bytea);\n"; } printf "COMMIT;\n" }' >"$TMP/large-transaction.sql"
+        "$C_PG_BINDIR/psql" -X -h 127.0.0.1 -p "$LISP_PORT" -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -f "$TMP/large-transaction.sql" >"$TMP/large-transaction.log" 2>&1
+        attempt=0
+        while :; do
+            observed=$(sql "$C_PORT" 'SELECT count(*) FROM interop_rows WHERE id BETWEEN 80 AND 83')
+            case "$observed" in 0) ;; 4) break ;; *) echo "logical-interop: partial native transaction: $observed rows" >&2; return 1 ;; esac
+            attempt=$((attempt + 1)); test "$attempt" -lt 1200 || { echo 'logical-interop: large transaction timed out' >&2; return 1; }; sleep 0.5
+        done
+        test "$(sql "$C_PORT" "SELECT count(*) FROM interop_rows WHERE id BETWEEN 80 AND 83 AND amount=id-80 AND length(payload)=17825792 AND payload=decode(repeat('0' || amount::text,17825792),'hex')")" = 4
+        sql "$LISP_PORT" 'DELETE FROM interop_rows WHERE id >= 80 AND id <= 83' >/dev/null
+        attempt=0
+        until [ "$(sql "$C_PORT" 'SELECT count(*) FROM interop_rows WHERE id BETWEEN 80 AND 83')" = 0 ]; do
+            attempt=$((attempt + 1)); test "$attempt" -lt 1200 || return 1; sleep 0.5
+        done
+        echo 'logical-interop: native subscriber applied atomic transaction above 65 MiB'
     fi
     echo "logical-interop: direction=$direction phase=live-stream"
     workload "$source"

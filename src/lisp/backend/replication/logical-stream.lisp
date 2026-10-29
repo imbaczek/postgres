@@ -6,6 +6,14 @@
 (defconstant +max-logical-apply-headroom-bytes+ (* 1024 1024))
 (defconstant +max-logical-wal-transaction-bytes+
   (+ +max-logical-transaction-bytes+ +max-logical-apply-headroom-bytes+))
+
+;; These bounds apply to one encoded event; transaction spools are quota controlled.
+(defconstant +max-logical-event-bytes+ +max-logical-transaction-bytes+)
+
+(defconstant +max-logical-wal-event-bytes+ +max-logical-wal-transaction-bytes+)
+
+(defconstant +max-unscoped-logical-materialization-bytes+ +max-logical-wal-transaction-bytes+)
+
 (defconstant +max-logical-read-transactions+ 128)
 (defconstant +max-logical-read-bytes+ (* 8 1024 1024))
 (defconstant +max-logical-read-scan-bytes+ (* 16 1024 1024))
@@ -58,9 +66,12 @@ Discard the cursor after a read error; the stream may have advanced."
                       (logical-reader-state-spool state) spool))
               (push spool (car *logical-reader-spool-scope*))))
           (logical-spool-append-change
-           spool change (- +max-logical-wal-transaction-bytes+ (logical-spool-bytes spool)))))
-      (setf (logical-reader-state-changes state)
-            (nconc (logical-reader-state-changes state) (list change))))
+           spool change +max-logical-wal-event-bytes+)))
+      (progn
+        (when (> (logical-reader-state-change-bytes state) +max-unscoped-logical-materialization-bytes+)
+          (error "unscoped logical reader exceeds its materialization limit"))
+        (setf (logical-reader-state-changes state)
+              (nconc (logical-reader-state-changes state) (list change)))))
   (values))
 
 (defun logical-transaction-map-changes (transaction function)
@@ -835,12 +846,12 @@ Other types retain their normal semantic checks and may allocate their values."
   (values))
 
 (defun logical-capture-change (backend change limit)
-  "Encode CHANGE into BACKEND's spool within the remaining transaction budget."
+  "Encode CHANGE into BACKEND's spool within its per-event budget."
   (let ((spool (sb-sys:without-interrupts
                  (or (backend-logical-spool backend)
                      (setf (backend-logical-spool backend) (make-logical-spool))))))
     (let ((size (logical-spool-append-change
-                 spool change (- limit (backend-logical-change-bytes backend)))))
+                 spool change limit)))
       (incf (backend-logical-change-bytes backend) size)))
   (values))
 
@@ -857,7 +868,7 @@ Other types retain their normal semantic checks and may allocate their values."
                     :kind kind :publication-selection publication-selection
                     :database-oid (database-oid (current-database))
                     :event-payload text)))
-      (logical-capture-change *backend* change +max-logical-transaction-bytes+)
+      (logical-capture-change *backend* change +max-logical-event-bytes+)
       change)))
 
 (defun logical-relation-columns (table)
@@ -914,7 +925,7 @@ executor, so capture the same operation before transaction commit."
                     :publication-selection publication-selection
                     :old-values old-image
                     :new-values new-image))
-           (limit (+ +max-logical-transaction-bytes+
+           (limit (+ +max-logical-event-bytes+
                      (if (string= (or (backend-application-name *backend*) "")
                                   "pg-lisp-subscribe-apply")
                          +max-logical-apply-headroom-bytes+
@@ -996,7 +1007,10 @@ executor, so capture the same operation before transaction commit."
       (error "invalid logical WAL chunk header"))
     (loop repeat event-count
           for length = (logical-read-u32 cursor)
-          for event = (logical-read-octets cursor length)
+          for event = (progn
+                        (unless (<= 1 length +max-logical-wal-event-bytes+)
+                          (error "invalid logical WAL event length"))
+                        (logical-read-octets cursor length))
           do (incf change-bytes length)
              (push (logical-decode-change event) changes))
     (unless (= (logical-cursor-offset cursor) (length payload))
@@ -1037,8 +1051,6 @@ executor, so capture the same operation before transaction commit."
         (error "logical WAL chunks are out of order or change transaction"))
       (let ((next-index (1+ expected-index))
             (next-bytes (+ change-bytes event-bytes)))
-        (when (> next-bytes +max-logical-wal-transaction-bytes+)
-          (error "logical WAL transaction exceeds the 65 MiB limit"))
         (values expected-xid expected-count next-index next-bytes changes)))))
 
 (defun wal-recovery-accept-logical-change-chunk (record)
@@ -1046,7 +1058,7 @@ executor, so capture the same operation before transaction commit."
     (error "logical row changes appear outside a WAL batch"))
   (if (logical-fragment-payload-p (wal-record-payload record))
       (let ((batch (or *wal-recovery-logical-xid*
-                       (make-logical-fragment-batch +max-logical-wal-transaction-bytes+))))
+                       (make-logical-fragment-batch +max-logical-wal-event-bytes+))))
         (unless (logical-fragment-batch-p batch)
           (error "logical WAL batch mixes fragment and legacy records"))
         ;; The staging cleanup must own BATCH before it can acquire a file.
@@ -1115,7 +1127,7 @@ executor, so capture the same operation before transaction commit."
                    (null (logical-reader-state-fragment-batch state)))
           (error "logical WAL batch mixes fragment and legacy records"))
         (let* ((batch (or (logical-reader-state-fragment-batch state)
-                          (make-logical-fragment-batch +max-logical-wal-transaction-bytes+)))
+                          (make-logical-fragment-batch +max-logical-wal-event-bytes+)))
                (change (progn
                          ;; Publish ownership before acceptance can acquire a file.
                          (setf (logical-reader-state-fragment-batch state) batch)
@@ -1363,7 +1375,7 @@ tracked by the bounded sender. SENT-LSN never includes an unfinished frame."
   "Read a bounded committed batch and its safe progress LSN for an owned slot.
 
 MAX-BYTES limits encoded row-change bytes per read; a first transaction may
-exceed it, up to the per-transaction limit, so callers can always make progress.
+exceed it so callers can always make progress. Scoped readers spool that transaction.
 MAX-SCAN-BYTES bounds WAL scanning through the next terminal batch boundary.
 The second return value is the last safe progress LSN: the last terminal fully
 scanned, or the slot's starting position when no scan was needed.

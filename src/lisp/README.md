@@ -624,12 +624,16 @@ DataRow is read through a bounded cursor without a complete frame copy, but
 decoded fields and the current row batch remain in memory. The target still
 receives and parses the complete Simple Query frame.
 Frontend query message lengths are limited to 132 MiB, including the four-byte
-length word. Logical capture normally limits the sum of encoded row changes
-and transactional events to 64 MiB per transaction, including their encoding
-overhead. Row changes made by the `pg-lisp-subscribe-apply` application have
-an extra 1 MiB of headroom; transactional utility events still check the
-64 MiB limit. The WAL transaction and fragment reader limit is 65 MiB. These
-are encoded-change limits, not guarantees that a value of that size will fit.
+length word. Logical capture normally limits each encoded row change or
+transactional event to 64 MiB, including its encoding overhead. Row changes
+made by the `pg-lisp-subscribe-apply` application have an extra 1 MiB of
+headroom; transactional utility events retain the 64 MiB event limit. WAL
+recovery and slot readers accept individual events up to 65 MiB. The aggregate
+transaction size is controlled by the capture spool's temporary-file quota,
+which is unlimited by default. Unscoped logical readers that materialize changes
+retain a 65 MiB limit; scoped slot readers use temporary spools instead. Large
+transactions can hold the WAL lock for their full scan or publication.
+These event limits do not guarantee that a value of that size will fit.
 
 Logical capture keeps encoded events in memory until their cumulative size
 exceeds 4 MiB, then spills all events to a transaction-owned temporary file.
@@ -665,12 +669,16 @@ complete Simple Query. A malformed or incomplete
 incoming frame closes the source connection; a partial row-frame or query write
 closes its connection. Other message types use their existing encoders. The 4 MiB
 threshold is not a bound on the size of an individual event. The 64 MiB capture
-and 65 MiB WAL limits and protocol frame length limit still apply.
+and 65 MiB WAL event limits and protocol frame length limit still apply. The
+legacy unscoped reader that materializes a transaction remains limited to 65 MiB;
+both replication senders use the scoped spool reader. The internal legacy
+list-based WAL adapter also retains its aggregate limit; normal capture uses
+the transaction spool.
 
 When an encoded row event exceeds one WAL record, the transaction's events
 are written as ordered fragments and reassembled by recovery and logical slot
 reads. Smaller events retain the existing chunk format. Fragmentation does not
-remove the transaction limit; the commit path checks the complete batch before
+remove the per-event limit; the commit path checks the complete batch before
 writing its logical records.
 `t/logical-replication.sh`
 exercises initial copy, DDL and sequence changes, two independent replicas, and
@@ -895,6 +903,7 @@ cd src/lisp
 ./t/logical-replication.sh # exported snapshot, row/DDL/sequence stream, restart recovery
 ./t/logical-large-json.sh # fragmented external JSON/JSONB capture, apply, and restarts
 ./t/logical-large-bytea.sh # exact external bytea, fragmented replication, and restarts
+./t/logical-large-transaction.sh # transactions above 65 MiB, replay and apply
 ./t/logical-unchanged-toast.sh # retained marker replay after source crash and subscriber resume
 ./t/logical-private-metadata-ddl.sh # rejects replicated DDL targeting subscriber metadata
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)

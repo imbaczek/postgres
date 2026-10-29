@@ -340,11 +340,14 @@ BLOCK-FUNCTION must consume its byte range before returning; file buffers are re
 
 (defstruct logical-spool-wal-plan spool mode count)
 
+(defun logical-check-wal-record-count (count)
+  "Reject a count that cannot be represented before publishing any WAL."
+  (unless (<= 1 count #xffffffff) (error "invalid logical WAL chunk count"))
+  count)
+
 (defun logical-preflight-spool (spool)
   "Validate SPOOL and plan bounded WAL records before publishing a batch."
   (logical-spool-seal spool)
-  (when (> (logical-spool-bytes spool) +max-logical-wal-transaction-bytes+)
-    (error "logical transaction exceeds its WAL change limit"))
   (let ((payload-limit (- +wal-segment-size+ +wal-header-size+
                           +logical-change-chunk-header-size+))
         (fragment-limit (- +wal-segment-size+ +wal-header-size+
@@ -353,6 +356,8 @@ BLOCK-FUNCTION must consume its byte range before returning; file buffers are re
     (logical-spool-map-event-blocks
      spool
      (lambda (size)
+       (unless (<= 1 size +max-logical-wal-event-bytes+)
+         (error "logical event exceeds its WAL change limit"))
        (let ((entry (+ 4 size)))
          (incf fragments (ceiling size fragment-limit))
          (when (> entry payload-limit) (setf fragment-p t))
@@ -364,7 +369,7 @@ BLOCK-FUNCTION must consume its byte range before returning; file buffers are re
      (lambda ()))
     (when (plusp chunk-bytes) (incf chunks))
     (let ((count (if fragment-p fragments chunks)))
-      (unless (<= 1 count #xffffffff) (error "invalid logical WAL chunk count"))
+      (logical-check-wal-record-count count)
       (make-logical-spool-wal-plan :spool spool
                                    :mode (if fragment-p :fragment :legacy)
                                    :count count))))
@@ -478,9 +483,9 @@ A second read failure is a WAL critical-section failure, like other WAL I/O."
           (error "logical WAL fragments are out of order"))
         (progn
           (unless (zerop offset) (error "logical WAL event does not start at offset zero"))
-          (when (> (+ total (logical-recovery-assembler-bytes assembler))
+          (when (> total
                    (logical-recovery-assembler-limit assembler))
-            (error "logical WAL transaction exceeds its change limit"))
+            (error "logical WAL event exceeds its change limit"))
           (setf (logical-recovery-assembler-total assembler) total)
           (incf (logical-recovery-assembler-bytes assembler) total)
           (if (<= total *logical-capture-memory-bytes*)

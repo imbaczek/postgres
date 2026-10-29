@@ -1526,6 +1526,8 @@
                                  (pg-error (condition) (string= (pg-error-sqlstate condition) "53400"))))
                       (rove:ok (logical-spool-failed-p spool))
                       (rove:ok (handler-case (progn (logical-spool-seal spool) nil)
+                                 (error () t)))
+                      (rove:ok (handler-case (progn (logical-preflight-spool spool) nil)
                                  (error () t))))
                  (close-logical-spool spool)))
              (let ((*query-temp-file-limit-bytes* nil)
@@ -1597,6 +1599,11 @@
         (setf (symbol-function 'unlink-query-temp-file) original)
         (retry-pending-query-temp-cleanup)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-logical-wal-record-count-bounds
+    (rove:ok (= #xffffffff (logical-check-wal-record-count #xffffffff)))
+  (rove:ok (handler-case (progn (logical-check-wal-record-count 0) nil) (error () t)))
+  (rove:ok (handler-case (progn (logical-check-wal-record-count #x100000000) nil) (error () t))))
 
 (rove:deftest test-logical-spool-wal-plan-boundaries
     (let* ((*logical-capture-memory-bytes* (* 64 1024 1024))
@@ -1684,6 +1691,22 @@
                  (close-logical-spool spool)))
              (rove:ok (null (uiop:directory-files directory))))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-logical-one-event-still-has-a-size-limit
+    (let* ((spool (make-logical-spool))
+           (change (logical-test-change :insert 7 701
+                                        :new-values (vector 1 2
+                                                            (make-string +max-logical-event-bytes+
+                                                                         :initial-element #\x)))))
+      (unwind-protect
+           (progn
+             (rove:ok (handler-case
+                          (progn (logical-spool-append-change spool change +max-logical-event-bytes+) nil)
+                        (pg-error (error) (string= (pg-error-sqlstate error) "54000"))))
+             (rove:ok (zerop (logical-spool-count spool)))
+             (rove:ok (logical-spool-failed-p spool))
+             (rove:ok (handler-case (progn (logical-preflight-spool spool) nil) (error () t))))
+        (close-logical-spool spool))))
 
 (rove:deftest test-logical-encoder-stream-bytea-and-jsonb
     (dolist (case (list (list :bytea (make-array 256 :element-type '(unsigned-byte 8)
@@ -2181,6 +2204,36 @@
         (rove:ok (not (accepts bad-tag)))
         (rove:ok (not (accepts truncated)))
         (rove:ok (not (accepts truncated-binary))))))
+
+(rove:deftest test-logical-recovery-enforces-per-event-not-total
+    (let* ((event (logical-encode-change
+                   (logical-test-change :insert 7 701 :new-values #(1 2 "value"))))
+           (size (length event))
+           (assembler (make-logical-recovery-assembler size))
+           (too-small (make-logical-recovery-assembler (1- size))))
+      (unwind-protect
+           (progn
+             (logical-recovery-assembler-append assembler size 0 event)
+             (logical-recovery-assembler-append assembler size 0 event)
+             (rove:ok (= (* 2 size) (logical-recovery-assembler-bytes assembler)))
+             (rove:ok (handler-case
+                          (progn (logical-recovery-assembler-append too-small size 0 event) nil)
+                        (error () t)))
+             (rove:ok (zerop (logical-recovery-assembler-bytes too-small))))
+        (logical-close-recovery-assembler assembler)
+        (logical-close-recovery-assembler too-small))))
+
+(rove:deftest test-unscoped-logical-reader-remains-bounded
+    (let* ((state (make-logical-reader-state :database-oid 7
+                                             :change-bytes (1+ +max-unscoped-logical-materialization-bytes+)))
+           (change (logical-test-change :insert 7 701 :new-values #(1 2 "value"))))
+      (rove:ok (handler-case (progn (logical-reader-store-change state change) nil)
+                 (error () t)))
+      (rove:ok (null (logical-reader-state-changes state)))
+      (call-with-logical-reader-spools
+       (lambda ()
+         (logical-reader-store-change state change)
+         (rove:ok (= 1 (logical-spool-count (logical-reader-state-spool state))))))))
 
 (rove:deftest test-logical-recovery-spool-lifetime
     (let* ((directory (merge-pathnames
@@ -2739,9 +2792,9 @@
                  "logical chunks must be sequential")
         (rove:ok (rejects (logical-test-chunk-record 88 1 3) 88 2 1 change-bytes)
                  "logical chunk count cannot change within a transaction")
-        (rove:ok (rejects (logical-test-chunk-record 88 1 2) 88 2 1
-                          +max-logical-wal-transaction-bytes+)
-                 "logical chunk progress enforces the 65 MiB transaction cap")
+        (rove:ok (not (rejects (logical-test-chunk-record 88 1 2) 88 2 1
+                               +max-logical-wal-transaction-bytes+))
+                 "logical chunk progress permits aggregate bytes above the per-event cap")
         (let ((state (make-logical-reader-state :database-oid 7 :batch-open-p t
                                                 :next-chunk 0))
               (commit (make-wal-record :type +wal-record-commit+ :xid 88 :end 100)))
@@ -3026,8 +3079,8 @@
                             catalog table application initial)
                          (rove:ok (= (if accepted total (+ initial event-bytes)) expected)
                                   (format nil "~a accounts for encoded event bytes" label))
-                         (rove:ok (eq accepted (<= expected limit))
-                                  (format nil "~a accepts through its inclusive cap" label)))))))
+                         (rove:ok accepted
+                                  (format nil "~a accepts a small event after prior bytes" label)))))))
           (check-boundary "postgres" +max-logical-transaction-bytes+
                           "ordinary source transaction")
           (check-boundary "pg-lisp-subscribe-apply"
@@ -3049,9 +3102,8 @@
                 (logical-test-capture-truncate-event catalog initial)
               (rove:ok (= (if accepted total (+ initial event-bytes)) expected)
                        "TRUNCATE capture accounts for encoded utility-event bytes")
-              (rove:ok (eq accepted
-                           (<= expected +max-logical-transaction-bytes+))
-                       "TRUNCATE accepts through the inclusive 64 MiB cap")))))))
+              (rove:ok accepted
+                       "TRUNCATE accepts a small event after prior transaction bytes")))))))
 
 (rove:deftest test-logical-catalog-terminal-validation
     (let ((catalog-event (make-logical-change :kind :ddl :database-oid 7))
@@ -3140,8 +3192,8 @@
                  "WAL recovery accepts 65 MiB minus one byte")
         (rove:ok (accepted-total-p (- limit change-bytes) limit)
                  "WAL recovery accepts exactly 65 MiB")
-        (rove:ok (rejected-p (1+ (- limit change-bytes)))
-                 "WAL recovery rejects one byte above 65 MiB"))))
+        (rove:ok (not (rejected-p (1+ (- limit change-bytes))))
+                 "WAL recovery permits aggregate bytes above the event cap"))))
 
 (rove:deftest test-unpinned-snapshot-release-preserves-wal-pin-map
     ;; Snapshot release follows snapmgr.c:AtEOXact_Snapshot for the MVCC
