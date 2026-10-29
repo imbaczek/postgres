@@ -1759,6 +1759,21 @@ are supported."
                      (t (ereport "22P02" "invalid input syntax for type bytea")))))
       (coerce out '(simple-array (unsigned-byte 8) (*))))))
 
+(defun sql-bytea-concat-size (left-size right-size)
+  "Check byteacat's varlena allocation size before constructing the result."
+  (let ((allocation (+ left-size right-size 4)))
+    (when (> allocation #x3fffffff)
+      (ereport "XX000" "invalid memory alloc request size ~d" allocation))
+    (- allocation 4)))
+
+(defun sql-bytea-concat (left right)
+  "Concatenate bytea values after enforcing PostgreSQL's allocation limit."
+  (let* ((size (sql-bytea-concat-size (length left) (length right)))
+         (result (make-array size :element-type '(unsigned-byte 8))))
+    (replace result left)
+    (replace result right :start1 (length left))
+    result))
+
 (defun sql-bytea-output (bytes &optional (format "hex"))
   "Render BYTES in PostgreSQL's hex or traditional escape format."
   (check-type bytes (vector (unsigned-byte 8)))
@@ -2045,12 +2060,23 @@ are supported."
 
 (defun analyze-text-concatenation (left right)
   "Resolve textcat and text/anynonarray overloads without treating arrays as text."
+  (when (and (or (and (eq (expr-type left) :bytea) (not (in-unknown-constant-p left)))
+                 (and (eq (expr-type right) :bytea) (not (in-unknown-constant-p right))))
+             (every (lambda (argument)
+                      (or (in-unknown-constant-p argument)
+                          (eq (expr-type argument) :bytea)))
+                    (list left right)))
+    (return-from analyze-text-concatenation
+      (list :concat (coerce-common-expression left :bytea)
+            (coerce-common-expression right :bytea) :type :bytea :typmod -1)))
   (when (and (eq (expr-type left) :bit) (eq (expr-type right) :bit))
     (ereport "0A000" "bit concatenation is not implemented"))
   (when (some (lambda (argument) (or (eq (expr-type argument) :int2vector)
                                      (sql-array-element-type (expr-type argument))))
               (list left right))
-    (ereport "0A000" "array concatenation is not implemented"))
+    (if (or (eq (expr-type left) :bytea) (eq (expr-type right) :bytea))
+        (report-operator-resolution-error "||" (list left right))
+        (ereport "0A000" "array concatenation is not implemented")))
   (unless (some (lambda (argument) (sql-implicit-coercion-p (expr-type argument) :text))
                 (list left right))
     (ereport "42883" "operator does not exist: ~a || ~a"
@@ -3947,7 +3973,9 @@ truncate and interpret the result at TYPE's signed width."
     (:concat
      (sql-strict-let ((left (eval-expr (second expr) env))
                       (right (eval-expr (third expr) env)))
-       (concatenate 'string left right)))
+       (if (eq (expr-type expr) :bytea)
+           (sql-bytea-concat left right)
+           (concatenate 'string left right))))
     (:binop
      (let ((op (second expr))
            (l (eval-expr (third expr) env))

@@ -113,6 +113,8 @@ binary_hex_other="11$binary_hex"
 run -c "insert into toast_two_slices values (1, '\\x$binary_hex', '\\x$binary_hex_other')" >/dev/null
 [ "$(run -c 'select length(v) from toast_bytes where id = 1')" = 3000 ]
 [ "$(run -c "select v = '\\x$binary_hex' from toast_bytes where id = 1")" = t ]
+[ "$(run -c "select length(v || '\\x00'::bytea), length('\\xff'::bytea || v) from toast_bytes where id = 1")" = '3001|3001' ]
+[ "$(run -c "select v || '\\x00'::bytea = '\\x${binary_hex}00'::bytea from toast_bytes where id = 1")" = t ]
 # Count exact chunk lookups to distinguish a partial fetch from full detoasting.
 printf '%s\n(quit)\n' '(let ((original (symbol-function (quote btree-search-unlocked))) (counter (intern "*SLICE-LOOKUPS*"))) (setf (symbol-value counter) 0 (symbol-value (intern "*SLICE-LOOKUP-ORIGINAL*")) original) (setf (symbol-function (quote btree-search-unlocked)) (lambda (&rest args) (incf (symbol-value counter)) (apply original args))))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/slice-install.out"
 ! grep -q ';; error:' "$TMP/slice-install.out"

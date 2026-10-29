@@ -67,6 +67,30 @@
                    (pg-error (error) error))))
       (rove:ok (and error (string= (second case) (pg-error-sqlstate error))) (first case)))))
 
+(rove:deftest bytea-concatenation
+    (dolist (case '(("SELECT ('\\x0001'::bytea || '\\xff'::bytea)::text" "\\x0001ff")
+                    ("SELECT ('\\x01'::bytea || '\\x0203')::text" "\\x010203")
+                    ("SELECT ('\\x01' || '\\x0203'::bytea)::text" "\\x010203")
+                    ("SELECT ('\\x'::bytea || '\\x00'::bytea)::text" "\\x00")
+                    ("SELECT 'x' || 'y'" "xy")
+                    ("SELECT ('x'::bytea || 'y'::text)" "\\x78y")
+                    ("SELECT ('y'::text || 'x'::bytea)" "y\\x78")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case)))
+  (dolist (sql '("SELECT NULL || '\\x01'::bytea" "SELECT '\\x01'::bytea || NULL"))
+    (rove:ok (equal (list (list +null+)) (subquery-test-rows sql)) sql))
+  (rove:ok (= (sql-bytea-concat-size 1 1073741818) 1073741819))
+  (let ((condition (handler-case (progn (sql-bytea-concat-size 1 1073741819) nil)
+                     (pg-error (error) error))))
+    (rove:ok (and condition (string= (pg-error-sqlstate condition) "XX000")
+                  (string= (pg-error-message condition) "invalid memory alloc request size 1073741824"))))
+  (dolist (case '(("SELECT '\\x01'::bytea || ARRAY[1]" "42883")
+                  ("SELECT ARRAY[1] || '\\x01'::bytea" "42883")
+                  ("SELECT '\\x01'::bytea || 1" "42883")
+                  ("SELECT '\\x01'::bytea || '\\x0'" "22023")))
+    (let ((condition (handler-case (progn (subquery-test-rows (first case)) nil)
+                       (pg-error (error) error))))
+      (rove:ok (and condition (string= (pg-error-sqlstate condition) (second case))) (first case)))))
+
 (rove:deftest subquery-parser-forms
     (dolist (sql '("SELECT (SELECT 1)" "SELECT ((SELECT 1))"
                    "SELECT ((SELECT 1) UNION ALL SELECT 2)"
