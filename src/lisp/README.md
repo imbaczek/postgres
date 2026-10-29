@@ -539,7 +539,8 @@ and returns it from `SHOW timezone`; numeric offsets and `INTERVAL` forms are
 unsupported. `RESET TIME ZONE` and `RESET ALL` restore the startup baseline, UTC
 when unspecified. `DateStyle` supports ISO, SQL, Postgres and German output and
 MDY, DMY and YMD input order; `IntervalStyle` supports only `postgres`.
-`extra_float_digits` controls floating-point output. Supported isolation levels
+`extra_float_digits` controls floating-point output. `bytea_output` selects
+hexadecimal (the default) or traditional escape output. Supported isolation levels
 are `READ COMMITTED` and `REPEATABLE READ`; client encoding is UTF8 and
 `standard_conforming_strings = on`.
 Client startup and SQL `application_name` support SET, SHOW, RESET and

@@ -16,7 +16,7 @@
                 parts))))
 
 (defparameter *session-format-defaults*
-  '(("datestyle" . "ISO, MDY") ("intervalstyle" . "postgres") ("extra_float_digits" . 1)))
+  '(("datestyle" . "ISO, MDY") ("intervalstyle" . "postgres") ("extra_float_digits" . 1) ("bytea_output" . "hex")))
 
 (defun session-integer-setting (name value minimum maximum unit)
   (handler-case
@@ -70,6 +70,10 @@
     ((string= name "statement_timeout")
      (session-integer-setting name value 0 2147483647 :milliseconds))
     ((string= name "extra_float_digits") (session-integer-setting name value -15 3 nil))
+    ((string= name "bytea_output")
+     (unless (member value '("hex" "escape") :test #'string-equal)
+       (ereport "22023" "invalid value for parameter \"bytea_output\": \"~a\"" value))
+     (string-downcase value))
     ((string= name "datestyle") (session-normalize-datestyle value))
     ((string= name "intervalstyle")
      (unless (string-equal value "postgres")

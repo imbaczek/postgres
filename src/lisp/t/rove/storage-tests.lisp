@@ -155,6 +155,18 @@
     (rove:ok (handler-case (progn (sql-bytea-input input) nil) (error () t))
              "malformed bytea input signals an error")))
 
+(rove:deftest test-sql-bytea-escape-output
+    (let* ((bytes (make-array 256 :element-type '(unsigned-byte 8)
+                                  :initial-contents (loop for i below 256 collect i)))
+           (escaped (sql-bytea-output bytes "escape")))
+      (rove:ok (equalp bytes (sql-bytea-input escaped)))
+      (rove:ok (string= (sql-bytea-output (make-array 7 :element-type '(unsigned-byte 8) :initial-contents '(0 92 127 128 255 32 65)) "escape")
+                        (concatenate 'string (string #\\) "000" (string #\\) (string #\\)
+                                     (string #\\) "177" (string #\\) "200"
+                                     (string #\\) "377 A")))
+      (rove:ok (string= (sql-bytea-output (subseq bytes 0 0) "escape") ""))
+      (rove:ok (string= (session-normalize-extra-setting "bytea_output" "ESCAPE") "escape"))))
+
 (rove:deftest test-sql-bytea-integer-casts
     (dolist (case '((:int2 -32768) (:int2 32767) (:int4 -2147483648)
                     (:int4 2147483647) (:int8 -9223372036854775808)

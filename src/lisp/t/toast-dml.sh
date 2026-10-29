@@ -88,6 +88,17 @@ if run -c "insert into toast_json values (2, '{invalid}')" >/dev/null 2>&1; then
     exit 1
 fi
 binary_hex=$(awk 'BEGIN { for (i=0;i<1500;i++) printf "00ff" }')
+bytea_escape=$(printf '%s' '\000\\\177\200\377 A')
+[ "$(run -c "set bytea_output = escape; select '\\x005c7f80ff2041'::bytea")" = "$bytea_escape" ]
+[ "$(run -c "set bytea_output = escape; select '\\x005c7f80ff2041'::bytea::text")" = "$bytea_escape" ]
+[ "$(run -c "set bytea_output = escape; reset bytea_output; show bytea_output")" = hex ]
+[ "$(run -c "set bytea_output = escape; begin; set bytea_output = hex; rollback; show bytea_output")" = escape ]
+[ "$(run -c "begin; set bytea_output = escape; commit; show bytea_output")" = escape ]
+[ "$(PGOPTIONS='-c bytea_output=escape' run -c "set bytea_output = hex; reset bytea_output; show bytea_output")" = escape ]
+if run -c 'set bytea_output = invalid' >/dev/null 2>&1; then
+    echo 'toast-dml: invalid bytea_output was accepted' >&2
+    exit 1
+fi
 run -c 'create table toast_bytes (id int primary key, v bytea)' >/dev/null
 run -c "insert into toast_bytes values (1, '\\x$binary_hex')" >/dev/null
 [ "$(run -c 'select length(v) from toast_bytes where id = 1')" = 3000 ]

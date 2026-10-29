@@ -1711,17 +1711,28 @@ are supported."
                      (t (ereport "22P02" "invalid input syntax for type bytea")))))
       (coerce out '(simple-array (unsigned-byte 8) (*))))))
 
-(defun sql-bytea-output (bytes)
-  "Render BYTES as lowercase hex bytea output; escape output is not supported."
+(defun sql-bytea-output (bytes &optional (format "hex"))
+  "Render BYTES in PostgreSQL's hex or traditional escape format."
   (check-type bytes (vector (unsigned-byte 8)))
-  (let* ((digits "0123456789abcdef")
-         (result (make-string (+ 2 (* 2 (length bytes))))))
-    (setf (aref result 0) (code-char 92) (aref result 1) #\x)
-    (loop for byte across bytes
-          for i from 2 by 2
-          do (setf (aref result i) (aref digits (ash byte -4))
-                   (aref result (1+ i)) (aref digits (logand byte 15))))
-    result))
+  (if (string= format "escape")
+      (with-output-to-string (stream)
+        (loop for byte across bytes
+              do (cond ((= byte 92)
+                        (write-char #\\ stream) (write-char #\\ stream))
+                       ((or (< byte 32) (> byte 126))
+                        (write-char #\\ stream)
+                        (write-char (digit-char (ldb (byte 2 6) byte)) stream)
+                        (write-char (digit-char (ldb (byte 3 3) byte)) stream)
+                        (write-char (digit-char (ldb (byte 3 0) byte)) stream))
+                       (t (write-char (code-char byte) stream)))))
+      (let* ((digits "0123456789abcdef")
+             (result (make-string (+ 2 (* 2 (length bytes))))))
+        (setf (aref result 0) (code-char 92) (aref result 1) #\x)
+        (loop for byte across bytes
+              for i from 2 by 2
+              do (setf (aref result i) (aref digits (ash byte -4))
+                       (aref result (1+ i)) (aref digits (logand byte 15))))
+        result)))
 
 (defun sql-integer-to-bytea (value type)
   "Encode a signed SQL integer as its fixed-width network byte representation."
@@ -1769,7 +1780,7 @@ are supported."
     (return-from sql-cast-value (sql-bytea-to-integer value target)))
   (when (and (eq source :bytea) (member target '(:text :varchar :name)))
     (return-from sql-cast-value
-      (sql-cast-value (sql-bytea-output value) :text target typmod)))
+      (sql-cast-value (value->text value :bytea) :text target typmod)))
   ;; A directly cast ARRAY constructor has already been analyzed as int2[].
   ;; Keep its shape and nulls; a general array-to-int2vector cast is rejected
   ;; by analysis before this function is reached.
@@ -4029,7 +4040,8 @@ truncate and interpret the result at TYPE's signed width."
   (cond
     ((eq v +null+) nil)
     ((eq type :void) "")
-    ((eq type :bytea) (sql-bytea-output v))
+    ((eq type :bytea)
+     (sql-bytea-output v (or (session-extra-setting-value "bytea_output") "hex")))
     ((eq type :jsonb) (sql-jsonb-output v))
     ((member type '(:float4 :float8))
      (sql-float-output v type (if *backend* (parse-integer (session-extra-setting-value "extra_float_digits")) 1)))
