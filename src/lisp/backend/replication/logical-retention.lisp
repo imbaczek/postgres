@@ -59,7 +59,8 @@ checks outside WAL are advisory."
        (not (shutdown-in-progress-p))))
 
 (defun wal-slot-recycling-owner-current-p (work slot owner backend)
-  "Recheck the owner and current removal predicate under WAL before signaling."
+  "Recheck the owner and current removal predicate under WAL before signaling.
+Use the ticket's frozen endpoint for wal_keep_size and slot-cap calculations."
   (and (wal-slot-recycling-work-current-p work)
        (eq :segments (wal-slot-retention-mode))
        (eq slot (gethash (wal-replication-slot-name slot) *wal-replication-slots*))
@@ -179,7 +180,8 @@ The saved restart floor remains internal; consumer cleanup runs after locks drai
 
 (defun wal-prepare-standard-slot-recycling-under-lock (redo-segment current)
   "Save loss for inactive slots and collect active owner triples under WAL.
-Active slots retain WAL until their owners release and the predicate is rechecked."
+Combine independent retention, including wal_keep_size, before judging loss.
+Active slots retain WAL until release and a recheck at the same endpoint."
   (let* ((independent (wal-independent-retention-segment redo-segment current))
          (keep (wal-slot-removal-segment redo-segment independent current))
          (requests nil))

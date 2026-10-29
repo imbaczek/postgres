@@ -433,7 +433,8 @@ The other worker pools use their C defaults in the process-budget calculation."
       (error "too many server processes configured"))))
 
 (defun startup-install-settings (settings native overrides)
-  "Validate and install startup settings, including session quotas before listen."
+  "Validate and install settings, including session quotas before listen.
+Install wal_keep_size in MB on startup and on a successful reload."
   (startup-check-connection-limits settings)
   (let ((timeout (startup-setting-value settings "checkpoint_timeout"))
         (wal-bytes (* 1024 1024 (startup-setting-value settings "max_wal_size")))

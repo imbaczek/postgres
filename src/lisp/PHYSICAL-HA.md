@@ -663,7 +663,7 @@ zero senders, saturated cancellation and a pending raw handshake. Native control
 checks observed reload preserving the active caps. Fresh full physical tests passed
 975, interop 185, legacy 1,155 checks and strict cold compilation passed. The
 seeded admission property passed with input-coverage and rejection-count gaps
-unmeasured. Full writer GUC behavior, `wal_keep_size`, hot standby, libraries and
+unmeasured. Full writer GUC behavior, hot standby, libraries and
 effective follow remain open; the writer oracle still first rejects `cluster_name`.
 
 A Sol xhigh source audit identified these connected requirements:
@@ -797,6 +797,23 @@ The default standard `max_slot_wal_keep_size = -1` is unlimited. Its policy
 rounds the cap down to whole segments. Explicit `--max-slot-wal-keep-bytes` or
 `PG_MAX_SLOT_WAL_KEEP_BYTES` selects the native exact-byte policy. Capacity in
 `max_replication_slots` is shared by logical, physical, temporary and lost names.
+Reloadable `wal_keep_size` accepts 0 through 2147483647 MB; SHOW formats units
+and `-C` returns base MB. Like C, its MB value rounds down to whole 16 MiB
+segments. Native WAL begins at segment zero, so its floor clamps to zero rather
+than C's segment one. The standard recycling horizon combines this floor with
+redo, XID and snapshot retention before testing slot loss. Its safe size uses the
+greater of the slot cap and `wal_keep_size`, plus one segment; advisory slot
+metadata ignores XID and snapshot floors as C does.
+
+The explicit native byte cap and private proof-pin cap still invalidate when
+exceeded even if `wal_keep_size` retains the underlying files; reload does not
+revive lost slots. Wire tests against native and C cover metadata thresholds,
+safe size, unlimited caps and reload. Native file recycling has Rove coverage;
+the C wire oracle does not test actual C file recycling. The full physical suite
+passed 987 tests, interop 185 and legacy 1,155 checks, with strict cold compilation
+passing. Seed 42 and 43 properties passed 200 trials each; input coverage and
+rejection counts remain unmeasured.
+
 The standard segment policy now stops active owners, waits for release, rechecks
 the predicate, saves loss and then recycles. The native exact-byte policy retains
 its earlier save-loss-then-cleanup behavior. A validated generation and owner

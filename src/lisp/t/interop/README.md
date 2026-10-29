@@ -72,6 +72,13 @@ Set `REFERENCE_POSTGRES` to the pinned C executable to run the same driver
 against C. The script owns and cleans up its peers; these checks do not establish
 a pre-authentication socket or thread limit.
 
+Run `PATRONI_PYTHON=/path/to/pinned-venv/bin/python3 ./t/wal-keep.sh` from
+`src/lisp` for native `wal_keep_size` metadata and reload checks. Set
+`REFERENCE_POSTGRES` for the C wire comparison. It checks metadata thresholds,
+safe size and unlimited caps, not actual C file recycling; native file recycling
+is covered by the physical Rove suite. `t/config-output.sh` also compares the
+setting's `-C` base-unit output when a C reference is available.
+
 ## Verification
 
 - Primary Rove: 134 pass; live apply/SQL/wire: 21 pass; native C subscriber: 3 pass.

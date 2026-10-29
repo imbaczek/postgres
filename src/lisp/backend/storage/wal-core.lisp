@@ -39,7 +39,8 @@
 
 (defconstant +wal-version+ 7)
 
-(defvar *wal-keep-size-mb* 0)
+(defvar *wal-keep-size-mb* 0
+  "Installed wal_keep_size in MB; reload may change the retention horizon.")
 
 (defparameter *max-slot-wal-keep-bytes* (* 1024 1024 1024)
   "Native exact-byte slot cap; NIL disables it. Installed settings select the policy.
@@ -2157,12 +2158,15 @@ This is distinct from the advisory public reserved, extended or unreserved statu
        (wal-replication-slot-restart-lsn slot)))
 
 (defun wal-keep-retention-segment (current)
+  "Return the wal_keep_size floor at CURRENT, rounding down to whole segments.
+Native WAL starts at segment zero, so clamp there rather than C's segment one."
   (max 0 (- (floor current +wal-segment-size+)
             (floor (* *wal-keep-size-mb* 1024 1024) +wal-segment-size+))))
 
 (defun wal-independent-retention-segment (redo-segment &optional (current *wal-durable-lsn*))
-  "Combine redo, active XID and snapshot floors independent of slots.
-The caller holds WAL; take the XID lock to copy active positions."
+  "Combine redo, wal_keep_size, active XID and snapshot floors independent of slots.
+The caller holds WAL; take the XID lock to copy active positions. CURRENT is the
+checkpoint endpoint used for both the initial calculation and later rechecks."
   (let ((positions
           (append
            (sb-thread:with-mutex (*xid-lock*)
@@ -2191,7 +2195,9 @@ The standard policy rounds its limit down to whole WAL segments."
 (declaim (ftype function physical-slot-recovery-durable-lsn))
 
 (defun wal-slot-safe-wal-bytes (slot)
-  "Report remaining safe bytes from the write endpoint, which can be negative."
+  "Report remaining safe bytes from the write endpoint, which can be negative.
+For the standard segment policy use the greater of slot cap and wal_keep_size,
+plus one segment. The native byte policy retains its own exact-byte calculation."
   (let* ((restart (wal-replication-slot-restart-lsn slot))
          (limit (wal-slot-retention-limit))
          (mode (wal-slot-retention-mode))
@@ -2223,7 +2229,9 @@ Use 1 GiB when no policy is installed."
     (>= (floor restart +wal-segment-size+) oldest)))
 
 (defun wal-slot-catalog-status (slot)
-  "Compute advisory public WAL status at the write endpoint; do not invalidate."
+  "Compute advisory public WAL status at the write endpoint; do not invalidate.
+The standard horizon includes wal_keep_size but excludes XID and snapshot floors,
+as in C's metadata calculation. Lost slots remain lost."
   (when (eq :lost (wal-replication-slot-wal-status slot))
     (return-from wal-slot-catalog-status "lost"))
   (let ((restart (wal-replication-slot-restart-lsn slot)))

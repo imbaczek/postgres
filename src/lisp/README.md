@@ -1587,7 +1587,7 @@ These tests check process discovery, start-time validation, direct startup, fast
 configuration precedence, SIGHUP and the pinned ConfigHandler's settings queries
 through real psycopg2. The configuration subset supports `port`,
 `listen_addresses`, `data_directory`, `checkpoint_timeout`, `max_wal_size`,
-`max_slot_wal_keep_size`, `max_connections`, `max_wal_senders`,
+`max_slot_wal_keep_size`, `wal_keep_size`, `max_connections`, `max_wal_senders`,
 `reserved_connections`, `superuser_reserved_connections` and the empty
 `restore_command` default, with includes,
 auto.conf and CLI overrides. Nonempty restore commands are rejected until archive
@@ -1617,6 +1617,13 @@ uses whole segments. Public physical slot create, advance and drop, the
 columns total) are
 implemented. The standard segment policy stops active owners and rechecks before
 loss and recycling; the native exact-byte policy keeps its existing behavior.
+`wal_keep_size` is a reloadable integer MB setting. SHOW uses human-readable
+units and `-C` reports base MB. It retains whole segments independently of slots;
+the standard slot policy accounts for that horizon before marking a slot lost.
+Slots and private proof pins can still become lost at their native byte caps
+even when `wal_keep_size` retains the files. Lost slots are not revived by reload.
+Run `PATRONI_PYTHON=/path/to/pinned-venv/bin/python3 ./t/wal-keep.sh`; set
+`REFERENCE_POSTGRES` to compare wire metadata with pinned C.
 Named native physical streams can claim an existing public physical slot while
 using a separate private proof pin. Actual validated positive flush feedback
 updates the public slot; resume proof alone updates the private pin.
