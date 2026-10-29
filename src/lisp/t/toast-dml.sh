@@ -114,6 +114,21 @@ run -c 'insert into toast_cte_result with q as not materialized (select v from t
 run -c 'insert into toast_cte_result with q as materialized (select v from toast_inline_build) select a.v from q a join q b on a.v=b.v' >/dev/null
 [ "$(run -c 'select count(*) from toast_cte_result where length(v)=20000')" = 3 ]
 [ "$(run -c "select count(*) from toast_cte_result where v='short'")" = 2 ]
+run -c 'create table toast_cte_chain (v text)' >/dev/null
+run -c 'alter table toast_cte_chain alter column v set storage plain' >/dev/null
+run -c 'insert into toast_cte_chain with a as materialized (select v from toast_inline_build), b as materialized (select v from a) select v from b' >/dev/null
+run -c 'insert into toast_cte_chain with a as materialized (with b as materialized (select v from toast_inline_build) select v from b) select v from a' >/dev/null
+run -c 'insert into toast_cte_chain with a as not materialized (select v from toast_inline_build), b as materialized (select v from a) select v from b' >/dev/null
+run -c 'insert into toast_cte_chain with recursive a(v,n) as (select v,1 from toast_inline_build union all select v,n+1 from a where n<2), b as materialized (select v from a where n=2) select v from b' >/dev/null
+[ "$(run -c 'select count(*) from toast_cte_chain where length(v)=20000')" = 4 ]
+[ "$(run -c "select count(*) from toast_cte_chain where v='short'")" = 4 ]
+if run -v VERBOSITY=verbose -c "insert into toast_cte_chain with a as materialized (select v from toast_inline_build), b as materialized (select v || '' as v from a) select v from b" >"$TMP/cte-chain-computed.out" 2>&1; then
+    echo 'toast-dml: computed chained CTE retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/cte-chain-computed.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: computed chained CTE did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 run -c 'create table toast_recursive_result (v text)' >/dev/null
 run -c 'alter table toast_recursive_result alter column v set storage plain' >/dev/null
 run -c 'insert into toast_recursive_result with recursive q(v,n) as (select v,1 from toast_inline_build union all select v,n+1 from q where n<3) select v from q' >/dev/null
@@ -274,7 +289,8 @@ wait "$WRITER"; WRITER=
 run -c 'create table toast_scalar_mixed (id int, v text)' >/dev/null
 run -c 'alter table toast_scalar_mixed alter column v set storage plain' >/dev/null
 run -c 'insert into toast_scalar_mixed select id,(select (select v)) from toast_scalar_source' >/dev/null
-[ "$(run -c "select count(*) from toast_scalar_mixed where (id=1 and length(v)=20000 and substr(v,1,1)='a') or (id=2 and length(v)=20001 and substr(v,1,1)='b')")" = 2 ]
+run -c 'insert into toast_scalar_mixed select s.id,(with a as materialized (select s.v), b as materialized (select v from a) select v from b) from toast_scalar_source s' >/dev/null
+[ "$(run -c "select count(*) from toast_scalar_mixed where (id=1 and length(v)=20000 and substr(v,1,1)='a') or (id=2 and length(v)=20001 and substr(v,1,1)='b')")" = 4 ]
 run -c 'create table toast_union_result (v text)' >/dev/null
 run -c 'alter table toast_union_result alter column v set storage plain' >/dev/null
 run -c 'insert into toast_union_result select v from toast_scalar_source where id=1 union all select v from toast_scalar_source where id=2' >/dev/null

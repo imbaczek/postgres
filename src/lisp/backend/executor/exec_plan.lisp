@@ -1423,40 +1423,40 @@ on an abnormal exit."
                        :stop)))))
       (when stopped-p (return :stop)))))
 
-(defun simple-datum-origin-plan-p (node &optional relations iterator-p worktable)
+(defun simple-datum-origin-plan-p (node &optional relations iterator-p worktable seen)
   "Recognize plans whose execution retains detached row origins."
   (case (first node)
     ((:result :seq-scan :index-scan) t)
     ((:filter :project :sort :limit)
-     (simple-datum-origin-plan-p (third node) relations iterator-p worktable))
-    (:top-n (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
-    (:hash-distinct (simple-datum-origin-plan-p (third node) relations iterator-p worktable))
+     (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
+    (:top-n (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable seen))
+    (:hash-distinct (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
     (:append
      (every (lambda (arm)
-              (simple-datum-origin-plan-p (second arm) relations iterator-p worktable))
+              (simple-datum-origin-plan-p (second arm) relations iterator-p worktable seen))
             (second node)))
     ((:sorted-aggregate :hash-aggregate)
-     (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
-    (:subquery-scan (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
+     (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable seen))
+    (:subquery-scan (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable seen))
     (:nested-loop-join
-     (and (simple-datum-origin-plan-p (third node) relations iterator-p worktable)
-          (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable)))
+     (and (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen)
+          (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable seen)))
     (:with-ctes
-        (and (not iterator-p)
-             (simple-datum-origin-plan-p (third node) relations)))
+        (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
     (:cte-scan
-     (and (not iterator-p) relations
+     (and relations
           (let* ((relation (physical-scan-relation node relations))
                  (definition (getf relation :cte))
                  (plan (or (getf relation :cte-reference-plan)
                            (and definition (sql-cte-plan definition)))))
-            (and plan
+            (and definition plan (not (member definition seen :test #'eq))
                  (simple-datum-origin-plan-p (query-plan-physical plan)
-                                             (subquery-registered-relations plan) t)))))
+                                             (subquery-registered-relations plan) t worktable
+                                             (cons definition seen))))))
     (:recursive-union
      (and iterator-p
-          (simple-datum-origin-plan-p (third node) relations t (second node))
-          (simple-datum-origin-plan-p (fourth node) relations t (second node))))
+          (simple-datum-origin-plan-p (third node) relations t (second node) seen)
+          (simple-datum-origin-plan-p (fourth node) relations t (second node) seen)))
     (:worktable-scan
      (and iterator-p worktable relations
           (eq (getf (physical-scan-relation node relations) :cte) worktable)))
