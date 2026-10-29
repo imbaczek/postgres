@@ -331,8 +331,11 @@ logical event also applies that limit across its materialized array elements.
 Scalar read subscripts on registered SQL array types use actual dimensions and
 lower bounds, with up to six indices coerced to int4. A NULL array or index,
 wrong number of indices, or out-of-range index returns SQL NULL. The array is
-materialized for access. Slices, subscript assignment and direct `int2vector`
-subscripting are unsupported.
+materialized for access. Read slices support omitted bounds and mixed scalar and
+slice groups, clipping bounds to the source dimensions. Nonempty results use
+one-based lower bounds; disjoint slices return an empty array. A NULL array or
+explicit NULL slice bound returns SQL NULL.
+Subscript assignment and direct `int2vector` subscripting are unsupported.
 
 Typed array input accepts brace-delimited values, quoted and backslash-escaped
 elements, unquoted `NULL`, rectangular nested arrays, and explicit bounds such

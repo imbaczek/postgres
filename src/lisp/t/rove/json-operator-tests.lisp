@@ -225,6 +225,28 @@
   (rove:ok (eq +null+ (json-test-evaluate "select (null::int4[])[1]")))
   (rove:ok (string= "a" (json-test-evaluate "select (ARRAY['{\"id\":\"a\"}'::jsonb])[1] ->> 'id'"))))
 
+(rove:deftest test-array-slice-reads
+    (flet ((array-text (sql)
+             (value->text (json-test-evaluate sql) :int4-array)))
+      (rove:ok (string= "{1,2}" (array-text "select (ARRAY[1,2,3])[1:2]")))
+      (rove:ok (string= "{{1,2},{3,4}}" (array-text "select (ARRAY[[1,2],[3,4]])[2][:]")))
+      (rove:ok (string= "{{3,4}}" (array-text "select (ARRAY[[1,2],[3,4]])[2:2]")))
+      (rove:ok (string= "{10,20,30}" (array-text "select ('[-2:0]={10,20,30}'::int4[])[:]")))
+      (rove:ok (string= "{}" (array-text "select ('[-2:0]={10,20,30}'::int4[])[0][:]")))
+      (rove:ok (string= "{}" (array-text "select (ARRAY[1,2])[3:4]")))
+      (rove:ok (string= "{}" (array-text "select ('[-2:0][-1:0]={{1,2},{3,4},{5,6}}'::int4[])[0][:]")))
+      (rove:ok (string= "{{2,NULL},{5,6}}" (array-text "select (ARRAY[[1,2,NULL],[4,5,6]])[1:2][2:3]"))))
+  (let* ((expr (analyze-expr (parse-expr (make-sql-parser :tokens (tokenize "(ARRAY[1,2])[(1/0):(2147483647+1)]"))) nil))
+         (condition (handler-case (progn (having-gate-value (having-gate-skeleton expr)) nil)
+                      (pg-error (error) error))))
+    (rove:ok (and condition (string= (pg-error-sqlstate condition) "22003"))))
+  (rove:ok (eq +null+ (json-test-evaluate "select (ARRAY[1,2])[NULL:2]")))
+  (rove:ok (eq +null+ (json-test-evaluate "select (NULL::int4[])[1/(random()*0)::int4:]")))
+  (let ((condition (handler-case
+                       (progn (json-test-evaluate "select (ARRAY[1,2])[NULL:1/(random()*0)::int4]") nil)
+                     (pg-error (error) error))))
+    (rove:ok (and condition (string= (pg-error-sqlstate condition) "22012")))))
+
 (rove:deftest test-json-array-group-ordinal-error
     (let* ((statement (first (parse-statements "select ARRAY['null'::json] group by 1")))
            (condition (handler-case

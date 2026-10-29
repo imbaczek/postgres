@@ -2723,6 +2723,73 @@ candidate selection."
                (setf offset (+ (* offset dimension) relative)))
       (aref (sql-array-elements array) offset))))
 
+(defun analyze-array-slice (expression scope)
+  "Resolve slice bounds while retaining omitted bounds."
+  (let* ((array (analyze-expr (second expression) scope))
+         (element-type (sql-array-element-type (expr-type array))))
+    (unless element-type
+      (ereport "42804" "cannot subscript type ~a because it does not support subscripting"
+               (expr-type array)))
+    (let ((bounds
+            (mapcar (lambda (dimension)
+                      (mapcar (lambda (raw)
+                                (when raw
+                                  (let ((index (analyze-expr raw scope)))
+                                    (cond ((in-unknown-constant-p index) (coerce-in-constant index :int4))
+                                          ((eq (expr-type index) :int4) index)
+                                          ((member (expr-type index) '(:int2 :int8 :oid :numeric :float4 :float8))
+                                           (list :cast index :type :int4 :typmod -1))
+                                          (t (ereport "42804" "array subscript must have type integer"))))))
+                              dimension))
+                    (third expression))))
+      (when (> (length bounds) 6)
+        (ereport "54000" "number of array dimensions exceeds the maximum allowed"))
+      (list :array-slice array bounds :type (expr-type array) :typmod (expr-typmod array)))))
+
+(defun eval-array-slice (expression env)
+  "Return a clipped array slice with fresh one-based dimensions."
+  (let ((array (eval-expr (second expression) env)))
+    (when (eq array +null+) (return-from eval-array-slice +null+))
+    (let* ((specs (third expression))
+           (uppers (mapcar (lambda (pair) (when (second pair) (eval-expr (second pair) env))) specs))
+           (lowers (mapcar (lambda (pair) (when (first pair) (eval-expr (first pair) env))) specs))
+           (dimensions (sql-array-dimensions array))
+           (bounds (sql-array-lower-bounds array))
+           (element-type (sql-array-element-type-id array))
+           (empty (lambda () (make-sql-array :element-type-id element-type
+                                             :elements #() :dimensions nil :lower-bounds nil))))
+      (when (or (member +null+ uppers) (member +null+ lowers))
+        (return-from eval-array-slice +null+))
+      (when (or (null dimensions) (> (length specs) (length dimensions)))
+        (return-from eval-array-slice (funcall empty)))
+      (let ((starts nil) (sizes nil))
+        (loop for dim in dimensions for base in bounds for i from 0
+              for low = (or (nth i lowers) base)
+              for high = (or (nth i uppers) (+ base dim -1))
+              for start = (max low base)
+              for end = (min high (+ base dim -1))
+              do (when (> start end) (return-from eval-array-slice (funcall empty)))
+                 (push (- start base) starts)
+                 (push (1+ (- end start)) sizes))
+        (setf starts (nreverse starts) sizes (nreverse sizes))
+        (let* ((count (reduce #'* sizes :initial-value 1))
+               (result (make-array count))
+               (source (sql-array-elements array))
+               (reverse-dimensions (reverse dimensions))
+               (reverse-sizes (reverse sizes))
+               (reverse-starts (reverse starts)))
+          (dotimes (index count)
+            (when (zerop (mod index 4096)) (check-for-interrupts))
+            (let ((remainder index) (offset 0) (stride 1))
+              (loop for dimension in reverse-dimensions
+                    for size in reverse-sizes for start in reverse-starts
+                    do (multiple-value-bind (quotient coordinate) (floor remainder size)
+                         (incf offset (* (+ start coordinate) stride))
+                         (setf remainder quotient stride (* stride dimension))))
+              (setf (aref result index) (aref source offset))))
+          (make-sql-array :element-type-id element-type :elements result
+                          :dimensions sizes :lower-bounds (make-list (length sizes) :initial-element 1)))))))
+
 (defun analyze-scalar-array-argument (raw scope)
   (let ((array (analyze-expr raw scope)))
     (if (and (in-unknown-constant-p array) (stringp (second array)))
@@ -2794,6 +2861,7 @@ candidate selection."
     (:case (analyze-case-expression expr table))
     (:array-literal (analyze-array-literal expr table))
     (:array-subscript (analyze-array-subscript expr table))
+    (:array-slice (analyze-array-slice expr table))
     ((:any :all) (analyze-any-expression expr table))
     (:cast (analyze-cast-expression expr table))
     (:record-field (analyze-record-field expr table))
@@ -2901,7 +2969,7 @@ candidate selection."
 
 (defun target-default-name (ast)
   (case (first ast)
-    ((:window :array-subscript) (target-default-name (second ast)))
+    ((:window :array-subscript :array-slice) (target-default-name (second ast)))
     (:column
      (if (third ast) (third ast) (second ast)))
     (:array-literal "array")
@@ -4280,6 +4348,7 @@ truncate and interpret the result at TYPE's signed width."
     (:bool (second expr))
     (:array (eval-array-constructor expr env))
     (:array-subscript (eval-array-subscript expr env))
+    (:array-slice (eval-array-slice expr env))
     (:record-field
      (let ((record (eval-expr (second expr) env)))
        (if (eq record +null+) +null+ (aref (sql-record-values record) (third expr)))))

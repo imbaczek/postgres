@@ -55,10 +55,19 @@ those arguments therefore occur before any row execution or sequence effects."
              (unless (consp node) (return-from fold node))
              (case (first node)
                ((:const :bool :scalar-array-const) node)
+               (:array-slice
+                (let ((copy (copy-list node)))
+                  (let* ((pairs (third node))
+                         (uppers (mapcar (lambda (pair) (when (second pair) (fold (second pair)))) pairs))
+                         (lowers (mapcar (lambda (pair) (when (first pair) (fold (first pair)))) pairs)))
+                    (setf (second copy) (fold (second node))
+                          (third copy) (mapcar #'list lowers uppers)))
+                  (finish copy)))
                (:array-subscript
                 (let ((copy (copy-list node)))
-                  (setf (second copy) (fold (second node))
-                        (third copy) (mapcar #'fold (third node)))
+                  (let ((indices (mapcar #'fold (third node))))
+                    (setf (second copy) (fold (second node))
+                          (third copy) indices))
                   (finish copy)))
                (:assignment
                 (let ((copy (copy-list node)) (argument (fold (second node))))

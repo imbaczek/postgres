@@ -1370,7 +1370,7 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
   (let ((left (parse-additive p)))
     (loop while (and (eq (pkind p) :op)
                      (not (member (pval p) '("=" "<>" "!=" "<" "<=" ">" ">=") :test #'string=))
-                     (not (member (pval p) '("::" ":=" "=>") :test #'string=)))
+                     (not (member (pval p) '("::" ":=" "=>" ":") :test #'string=)))
           do (let ((op (pval p)))
                (pnext p)
                (setf left (list :binop op left (parse-additive p)))))
@@ -1529,10 +1529,25 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
          (multiple-value-bind (type typmod) (parse-cast-type p)
            (setf expression (list :cast expression type typmod))))
         ((match-punct p #\[)
-         (let ((indices (list (prog1 (parse-expr p) (expect-punct p #\])))))
-           (loop while (match-punct p #\[)
-                 do (push (prog1 (parse-expr p) (expect-punct p #\])) indices))
-           (setf expression (list :array-subscript expression (nreverse indices)))))
+         (let ((dimensions nil) (slice-p nil))
+           (loop
+             (let* ((first (unless (op-p p ":") (parse-expr p)))
+                    (colon (match-op p ":"))
+                    (upper (if colon (unless (punct-p p #\]) (parse-expr p)) first)))
+               (when colon (setf slice-p t))
+               (push (list colon (if colon first nil) upper) dimensions)
+               (expect-punct p #\]))
+             (unless (match-punct p #\[) (return)))
+           (setf dimensions (nreverse dimensions)
+                 expression
+                 (if slice-p
+                     (list :array-slice expression
+                           (mapcar (lambda (dimension)
+                                     (if (first dimension)
+                                         (rest dimension)
+                                         (list (list :const 1) (third dimension))))
+                                   dimensions))
+                     (list :array-subscript expression (mapcar #'third dimensions))))))
         ((match-punct p #\.)
          (setf expression
                (if (match-op p "*") (list :record-expand expression)
