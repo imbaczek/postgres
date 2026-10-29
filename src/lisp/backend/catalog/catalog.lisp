@@ -1720,57 +1720,63 @@ The caller holds the TOAST index and write locks and must abort after errors."
                                               nil xid cid :compress (member index compressed-indexes))))))
       physical)))
 
+(defun toast-map-value-chunks-unlocked (toast pointer size function)
+  "Validate and visit every visible indexed chunk under the caller's index lease."
+  (let* ((id (heap-external-varlena-value-id pointer))
+         (index-node (pg-toast-index-relfilenode toast))
+         (heap-node (pg-toast-relfilenode toast))
+         (expected 0)
+         (total (ceiling size +toast-oid-chunk-size+)))
+    (btree-map-prefix-entries-unlocked
+     index-node (encode-index-key (list id) '(:oid))
+     (lambda (entry)
+       (let ((tuple (heapam-get-tuple heap-node (second entry) (third entry)
+                                      *toast-chunk-columns* t)))
+         (when tuple
+           (let* ((values (htup-values tuple))
+                  (chunk-id (aref values 0))
+                  (sequence (aref values 1))
+                  (data (aref values 2))
+                  (expected-size (if (= expected (1- total))
+                                     (- size (* expected +toast-oid-chunk-size+))
+                                     +toast-oid-chunk-size+)))
+             (unless (and (= chunk-id id)
+                          (equalp (first entry) (toast-chunk-key chunk-id sequence)))
+               (ereport "XX001" "TOAST index points to the wrong chunk"))
+             (unless (and (eql sequence expected) (< expected total)
+                          (vectorp data)
+                          (every (lambda (octet) (typep octet '(unsigned-byte 8))) data)
+                          (= (length data) expected-size))
+               (ereport "XX001" "invalid TOAST chunk ~a" sequence))
+             (funcall function data expected)
+             (incf expected))))))
+    (unless (= expected total)
+      (ereport "XX001" "missing TOAST chunk ~a" expected)))
+  (values))
+
 (defun toast-fetch-value (toast pointer snapshot &key (index-reader #'call-with-btree-relation-read-lock))
   "Return the uncompressed bytes named by POINTER in the owning TOAST storage.
 SNAPSHOT must remain active for the entire call, protecting the parent value's
 lifetime; chunk visibility is parent-driven, not evaluated against SNAPSHOT.
-INDEX-READER is called with the index relfilenode and a zero-argument function;
-it must call that function under a read lease on the index and return its result.
-The lease covers reading and assembling chunks. Only matching 32-bit relation
-pointers with raw sizes from 1 to 1073741819 are accepted; missing,
-misordered, or malformed chunks signal corruption."
+INDEX-READER calls its zero-argument callback under a read lease on the index.
+The lease covers reading, validation and assembly. Invalid pointers and missing,
+misordered, extra or malformed chunks signal corruption."
   (unless (and snapshot
                (sb-thread:with-mutex (*snapshot-count-lock*)
                  (gethash snapshot *active-snapshot-set*)))
     (error "TOAST fetch requires an active snapshot"))
   (let* ((size (toast-pointer-storage-size toast pointer))
-         (id (heap-external-varlena-value-id pointer))
-         (index-node (pg-toast-index-relfilenode toast))
-         (heap-node (pg-toast-relfilenode toast)))
+         (index-node (pg-toast-index-relfilenode toast)))
     (when (< (buf-nblocks index-node) 2)
       (ereport "XX001" "TOAST index is missing"))
-    (funcall index-reader
-             index-node
+    (funcall index-reader index-node
              (lambda ()
-               (let* ((payload (make-array size :element-type '(unsigned-byte 8)))
-                      (expected 0)
-                      (total (ceiling size +toast-oid-chunk-size+))
-                      (raw-size (- (heap-external-varlena-raw-size pointer) 4)))
-                 (btree-map-prefix-entries-unlocked
-                  index-node (encode-index-key (list id) '(:oid))
-                  (lambda (entry)
-                    (let ((tuple (heapam-get-tuple heap-node (second entry) (third entry)
-                                                   *toast-chunk-columns* t)))
-                      (when tuple
-                        (let* ((values (htup-values tuple))
-                               (chunk-id (aref values 0))
-                               (sequence (aref values 1))
-                               (data (aref values 2))
-                               (expected-size (if (= expected (1- total))
-                                                  (- size (* expected +toast-oid-chunk-size+))
-                                                  +toast-oid-chunk-size+)))
-                          (unless (and (= chunk-id id)
-                                       (equalp (first entry) (toast-chunk-key chunk-id sequence)))
-                            (ereport "XX001" "TOAST index points to the wrong chunk"))
-                          (unless (and (eql sequence expected) (< expected total)
-                                       (vectorp data)
-                                       (every (lambda (octet) (typep octet '(unsigned-byte 8))) data)
-                                       (= (length data) expected-size))
-                            (ereport "XX001" "invalid TOAST chunk ~a" sequence))
-                          (replace payload data :start1 (* expected +toast-oid-chunk-size+))
-                          (incf expected))))))
-                 (unless (= expected total)
-                   (ereport "XX001" "missing TOAST chunk ~a" expected))
+               (let ((payload (make-array size :element-type '(unsigned-byte 8)))
+                     (raw-size (- (heap-external-varlena-raw-size pointer) 4)))
+                 (toast-map-value-chunks-unlocked
+                  toast pointer size
+                  (lambda (data sequence)
+                    (replace payload data :start1 (* sequence +toast-oid-chunk-size+))))
                  (if (< size raw-size)
                      (toast-decompress-payload payload raw-size)
                      payload))))))
@@ -1779,9 +1785,10 @@ misordered, or malformed chunks signal corruption."
                                 &key (index-reader #'call-with-btree-relation-read-lock))
   "Fetch up to LENGTH bytes from START, clamped to the logical value.
 SNAPSHOT must protect the owning parent throughout the call. Uncompressed
-values read only intersecting chunk keys under one index lease; compressed
-values use the full validated fetch. Corruption in unrequested chunks is not
-checked by a partial fetch."
+values read only intersecting chunk keys under one index lease. Compressed
+values validate every chunk and the full stream while retaining only the slice.
+Corruption in unrequested chunks is not checked for uncompressed partial fetches.
+Empty slices return without checking chunk contents, for either storage form."
   (unless (and (integerp start) (>= start 0) (integerp length) (>= length 0))
     (error "TOAST slice offset and length must be nonnegative integers"))
   (unless (and snapshot
@@ -1803,7 +1810,20 @@ checked by a partial fetch."
         (return-from toast-fetch-value-slice (make-array 0 :element-type '(unsigned-byte 8))))
       (when compressed-p
         (return-from toast-fetch-value-slice
-          (subseq (toast-fetch-value toast pointer snapshot :index-reader index-reader) begin end)))
+          (funcall index-reader index-node
+                   (lambda ()
+                     (pglz-decompress-slice
+                      raw-size begin (- end begin) (- size 4)
+                      (lambda (consume)
+                        (toast-map-value-chunks-unlocked
+                         toast pointer size
+                         (lambda (data sequence)
+                           (when (zerop sequence)
+                             (unless (and (> (length data) 4)
+                                          (= (page-u32 data 0) raw-size))
+                               (ereport "XX001" "invalid compressed TOAST header")))
+                           (loop for i from (if (zerop sequence) 4 0) below (length data)
+                                 do (funcall consume (aref data i)))))))))))
       (setf result (make-array (- end begin) :element-type '(unsigned-byte 8)))
       (funcall index-reader index-node
                (lambda ()

@@ -90,6 +90,11 @@
         (let ((decoded (pglz-decompress stream 4098 :start 1 :end end)))
           (rove:ok (= 4098 (length decoded)))
           (rove:ok (equalp (subseq decoded 4095) (subseq decoded 0 3))))
+        (rove:ok (equalp #(0 1 2)
+                         (pglz-decompress-slice
+                          4098 4095 3 (1- end)
+                          (lambda (consume)
+                            (loop for i from 1 below end do (funcall consume (aref stream i)))))))
         (rove:ok (equal "XX001"
                         (handler-case (progn (pglz-decompress stream 4098 :start 1 :end (1- end)) nil)
                           (pg-error (condition) (pg-error-sqlstate condition))))))))
@@ -109,6 +114,38 @@
     (rove:ok (equalp data (pglz-decompress compressed (length data)))))
   (rove:ok (null (pglz-compress (make-array 31 :element-type '(unsigned-byte 8)
                                                :initial-element 0)))))
+
+(rove:deftest test-pglz-streamed-slices-and-corruption
+    (flet ((decode (stream raw-size start length)
+             (pglz-decompress-slice raw-size start length (length stream)
+                                    (lambda (consume)
+                                      (loop for byte across stream do (funcall consume byte))))))
+      (let* ((data (make-array 20000 :element-type '(unsigned-byte 8)))
+             (state 5))
+        (dotimes (i 2000)
+          (setf state (logand #xffffffff (+ (* state 1664525) 1013904223))
+                (aref data i) (ldb (byte 8 24) state)))
+        (loop for i from 2000 below (length data)
+              do (setf (aref data i) (aref data (mod i 2000))))
+        (let ((stream (pglz-compress data)))
+          (rove:ok stream)
+          (dolist (bounds '((0 1) (4094 10) (9990 40) (19999 1) (20000 0) (0 20000)))
+            (rove:ok (equalp (subseq data (first bounds) (+ (first bounds) (second bounds)))
+                             (decode stream (length data) (first bounds) (second bounds)))))
+          ;; Corruption after the requested first byte must still fail.
+          (let ((truncated (subseq stream 0 (1- (length stream))))
+                (trailing (concatenate '(vector (unsigned-byte 8)) stream #(0))))
+            (dolist (bad (list truncated trailing))
+              (rove:ok (equal "XX001"
+                              (handler-case (progn (decode bad (length data) 0 1) nil)
+                                (pg-error (condition) (pg-error-sqlstate condition)))))))))
+      (let ((overlap #(2 97 15 1 255)))
+        (rove:ok (equalp (make-array 10 :element-type '(unsigned-byte 8) :initial-element 97)
+                         (decode overlap 274 260 10)))
+        (rove:ok (equal "XX001"
+                        (handler-case
+                            (progn (decode #(2 97 15 1) 274 0 1) nil)
+                          (pg-error (condition) (pg-error-sqlstate condition))))))))
 
 (rove:deftest test-pglz-default-threshold
     ;; The stream is exactly floor(33 * 0.75) bytes, which is rejected.

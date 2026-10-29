@@ -238,8 +238,10 @@ or expression shapes fall back to full tuple materialization.
 An internal TOAST byte-slice API reads only intersecting chunks of an
 uncompressed external value under an active snapshot protecting its parent.
 It validates the pointer and requested chunks, but does not check unrequested
-chunks; compressed values use a full validated fetch. The limited SQL bytea
-substring optimization described below uses this API.
+chunks. For a nonempty compressed slice it reads and validates every stored
+chunk and the complete PGLZ stream, retaining the requested slice and a 4096-byte
+history rather than the full value. Empty slices skip chunk checks. The limited
+SQL bytea substring optimization described below uses this API.
 Fixed-width types accept only `PLAIN` or `DEFAULT`. `VACUUM FULL` rewrites
 existing values using the current policy; it fails if a `PLAIN` value cannot
 fit on a heap page, leaving the original table intact.
@@ -981,7 +983,7 @@ otherwise needed in full. Multiple slices and other recognized projections,
 filters, and LIMIT are supported. A column used in full by a projection or filter
 is materialized, while eligible slices of other columns can still use partial
 fetches. Unrecognized plan or expression shapes fall back to ordinary
-materialization; compressed external values use a full fetch.
+materialization; compressed slices still decode the complete stored stream.
 Array concatenation remains unsupported.
 Fixed `bit(N)` expression casts and `B'...'`/`X'...'` literals support binary/hex
 input, explicit padding/truncation, and C-compatible integer/bigint conversion.

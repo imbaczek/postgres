@@ -367,7 +367,13 @@
              (registration (pg::make-snapshot-registration))
              (bytes (make-array 5000 :element-type '(unsigned-byte 8)
                                      :initial-contents (loop for i below 5000 collect (mod i 251))))
-             (compressible (make-array 5000 :element-type '(unsigned-byte 8) :initial-element 42)))
+             (compressible (make-array 6300 :element-type '(unsigned-byte 8))))
+        (let ((state 1))
+          (dotimes (i 2100)
+            (setf state (logand #xffffffff (+ (* state 1664525) 1013904223))
+                  (aref compressible i) (if (< i 200) 42 (ldb (byte 8 24) state))
+                  (aref compressible (+ i 2100)) (aref compressible i)
+                  (aref compressible (+ i 4200)) (aref compressible i))))
         (setf (gethash "postgres" (pg::catalog-databases pg::*catalog*)) database)
         (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
         (unwind-protect
@@ -408,8 +414,51 @@
                  (ok t))
                (ok (equalp bytes (pg::toast-fetch-value toast pointer snapshot)))
                (ok (nth-value 2 (pg::toast-pointer-storage-size toast compressed)))
-               (ok (equalp (subseq compressible 1900 2100)
-                           (pg::toast-fetch-value-slice toast compressed snapshot 1900 200)))
+               (ok (> (pg::toast-pointer-storage-size toast compressed) pg::+toast-oid-chunk-size+))
+               (let ((old (symbol-function 'pg::toast-fetch-value)))
+                 (unwind-protect
+                      (progn
+                        (setf (symbol-function 'pg::toast-fetch-value)
+                              (lambda (&rest args) (declare (ignore args))
+                                (error "compressed slice must stream")))
+                        (ok (equalp (subseq compressible 1900 2100)
+                                    (pg::toast-fetch-value-slice toast compressed snapshot 1900 200))))
+                   (setf (symbol-function 'pg::toast-fetch-value) old)))
+               ;; Cancellation during decompression must release the index lease.
+               (let* ((long (make-array 200000 :element-type '(unsigned-byte 8) :initial-element 42))
+                      (long-pointer
+                        (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                          (pg::with-write-lock
+                            (pg::toast-store-value-unlocked toast long nil 42 0 :compress t))))
+                      (old (symbol-function 'pg::check-for-interrupts))
+                      (polls 0))
+                 (unwind-protect
+                      (progn
+                        (setf (symbol-function 'pg::check-for-interrupts)
+                              (lambda () (incf polls) (error "cancel slice")))
+                        (ok (intake-fails-p
+                             (lambda () (pg::toast-fetch-value-slice toast long-pointer snapshot 0 1))))
+                        (ok (= polls 1)))
+                   (setf (symbol-function 'pg::check-for-interrupts) old))
+                 (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                   (ok t))
+                 (ok (equalp #(42) (pg::toast-fetch-value-slice toast long-pointer snapshot 0 1))))
+               ;; Even after the selected output is complete, an extra indexed
+               ;; chunk is corrupt; an empty slice preserves the old fast path.
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (pg::with-write-lock
+                   (multiple-value-bind (block offset)
+                       (pg::heapam-insert (pg::pg-toast-relfilenode toast) pg::*toast-chunk-columns*
+                                          (vector (pg::heap-external-varlena-value-id compressed)
+                                                  (ceiling (pg::toast-pointer-storage-size toast compressed) pg::+toast-oid-chunk-size+)
+                                                  (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0)) 42 0)
+                     (pg::btree-insert-unlocked (pg::pg-toast-index-relfilenode toast)
+                                                (pg::toast-chunk-key (pg::heap-external-varlena-value-id compressed)
+                                                                     (ceiling (pg::toast-pointer-storage-size toast compressed) pg::+toast-oid-chunk-size+))
+                                                block offset))))
+               (ok (equal "XX001" (recovery-state-of
+                                   (lambda () (pg::toast-fetch-value-slice toast compressed snapshot 0 1)))))
+               (ok (equalp #() (pg::toast-fetch-value-slice toast compressed snapshot 0 0)))
                (let ((original (symbol-function 'pg::btree-search-unlocked))
                      (calls 0))
                  (unwind-protect
