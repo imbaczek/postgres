@@ -1363,8 +1363,13 @@
       (unwind-protect
            (progn
              (setf (symbol-function 'pg::logical-target-query)
-                   (lambda (target query) (declare (ignore target)) (push query queries)
-                           (values nil nil "UPDATE 1")))
+                   (lambda (target query) (declare (ignore target))
+                     (push (if (pg::pg-client-query-plan-p query)
+                               (with-output-to-string (stream)
+                                 (funcall (pg::pg-client-query-plan-writer query) stream))
+                               query)
+                           queries)
+                     (values nil nil "UPDATE 1")))
              ;; A varlena key may be unchanged when an old K tuple supplies it.
              (pg::logical-apply-update runtime relation valid 0)
              (ok (equal (first queries) "UPDATE t SET n = 1 WHERE id = '7'"))

@@ -119,6 +119,44 @@
     (ignore-errors (sb-bsd-sockets:socket-close (pg-client-socket client))))
   (values))
 
+(defstruct pg-client-query-plan writer)
+
+(defclass pg-client-query-output-stream (logical-utf8-output-stream) ())
+
+(defmethod sb-gray:stream-write-char :before ((stream pg-client-query-output-stream) character)
+  (declare (ignore stream))
+  (when (char= character (code-char 0)) (error "SQL query contains a null byte")))
+
+(defun pg-client-send-query-plan (client plan)
+  "Preflight and emit a deterministic query producer without a full SQL string."
+  (let* ((counter (make-instance 'pg-client-query-output-stream :buffer nil))
+         (writer (pg-client-query-plan-writer plan)))
+    (funcall writer counter)
+    (logical-flush-utf8-output counter)
+    (let* ((size (logical-utf8-size counter))
+           (length (+ size 5)) (stream (pg-client-stream client))
+           (started nil) (complete nil) (written 0))
+      (when (> length +max-query-message-size+)
+        (error "SQL query exceeds PostgreSQL message length"))
+      (unwind-protect
+           (progn
+             (setf started t)
+             (write-byte (char-code #\Q) stream)
+             (write-sequence (u32-to-bytes length) stream)
+             (let ((output (make-instance 'pg-client-query-output-stream
+                                          :buffer (lambda (bytes)
+                                                    (incf written (length bytes))
+                                                    (when (> written size)
+                                                      (error "SQL query changed while sending"))
+                                                    (write-sequence bytes stream)))))
+               (funcall writer output)
+               (logical-flush-utf8-output output))
+             (unless (= written size) (error "SQL query changed while sending"))
+             (write-byte 0 stream)
+             (force-output stream)
+             (setf complete t))
+        (when (and started (not complete)) (pg-client-close client))))))
+
 (defun pg-client-send-query (client query)
   (when (find (code-char 0) query)
     (error "SQL query contains a null byte"))
@@ -195,7 +233,9 @@
 When ON-ROW is supplied, call it for each streamed row without retaining the
 result set. This is used by the initial copy so its memory bound is the worker's
 8 MiB apply chunk rather than the complete source table."
-  (pg-client-send-query client query)
+  (if (pg-client-query-plan-p query)
+      (pg-client-send-query-plan client query)
+      (pg-client-send-query client query))
   (let ((columns nil)
         (rows '())
         (tag nil)

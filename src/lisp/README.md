@@ -652,9 +652,11 @@ bounded stream cursor, without allocating the complete encoded event. The
 sender measures each INSERT, UPDATE, or DELETE row before writing one pgoutput
 CopyData frame through a bounded buffer. The subscriber reads replication frames
 directly through a length-bounded stream cursor and completes decoding before
-applying an operation. It still materializes individual field values and
-generated apply SQL. Its Simple Query sender counts UTF-8 bytes and writes them
-in bounded blocks, while retaining the query string. A malformed or incomplete
+applying an operation. UTF-8 field bytes are decoded in bounded blocks, but
+complete decoded field values remain in memory. INSERT, UPDATE and DELETE apply
+queries use producers that count and then emit SQL in bounded UTF-8 blocks
+without building a full query string; the target still receives and parses the
+complete Simple Query. A malformed or incomplete
 incoming frame closes the source connection; a partial row-frame or query write
 closes its connection. Other message types use their existing encoders. The 4 MiB
 threshold is not a bound on the size of an individual event. The 64 MiB capture

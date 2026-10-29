@@ -809,6 +809,60 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
         collect (cons (pgoutput-column-name column)
                       (cons (pgoutput-column-type-oid column) value))))
 
+(defun logical-write-value-literal (stream type value)
+  (cond
+    ((or (null value) (eq value :unchanged-toast) (member type '(20 21 23)))
+     (write-string (logical-source-value-literal type value :pgoutput) stream))
+    ((member type '(17 25 114 3802 700 701 1043 1082 1083 1114 1184 1186 1266 1700))
+     (write-char #\' stream)
+     (loop for character across value do
+       (when (char= character #\') (write-char #\' stream))
+       (write-char character stream))
+     (write-char #\' stream))
+    (t (logical-source-value-literal type value :pgoutput))))
+
+(defun logical-write-insert (stream relation tuple)
+  (logical-validate-pgoutput-tuple relation tuple nil)
+  (let ((values (logical-row-values-for-columns tuple (pgoutput-relation-columns relation))))
+    (format stream "INSERT INTO ~a (" (pgoutput-relation-name relation))
+    (loop for entry in values for first = t then nil do
+      (unless first (write-string ", " stream)) (write-string (car entry) stream))
+    (write-string ") VALUES (" stream)
+    (loop for entry in values for first = t then nil do
+      (unless first (write-string ", " stream))
+      (logical-write-value-literal stream (cadr entry) (cddr entry)))
+    (write-char #\) stream)))
+
+(defun logical-write-key-predicate (stream tuple columns)
+  (loop for entry in (logical-row-values-for-columns tuple columns) for first = t then nil do
+    (unless first (write-string " AND " stream))
+    (write-string (car entry) stream)
+    (if (null (cddr entry)) (write-string " IS NULL" stream)
+        (progn (write-string " = " stream)
+               (logical-write-value-literal stream (cadr entry) (cddr entry))))))
+
+(defun logical-write-update (stream relation old new)
+  (format stream "UPDATE ~a SET " (pgoutput-relation-name relation))
+  (let ((first t))
+    (loop for column in (pgoutput-relation-columns relation) for value across new
+          unless (eq value :unchanged-toast) do
+            (unless first (write-string ", " stream))
+            (setf first nil)
+            (format stream "~a = " (pgoutput-column-name column))
+            (logical-write-value-literal stream (pgoutput-column-type-oid column) value))
+    (when first
+      (let ((key (first (pgoutput-relation-key-columns relation))))
+        (unless key (error "pgoutput relation has no replica identity"))
+        (format stream "~a = ~a" (pgoutput-column-name key) (pgoutput-column-name key)))))
+  (write-string " WHERE " stream)
+  (logical-write-key-predicate stream (logical-pgoutput-key-values relation (or old new))
+                               (pgoutput-relation-key-columns relation)))
+
+(defun logical-write-delete (stream relation tuple)
+  (format stream "DELETE FROM ~a WHERE " (pgoutput-relation-name relation))
+  (logical-write-key-predicate stream (logical-pgoutput-key-values relation tuple)
+                               (pgoutput-relation-key-columns relation)))
+
 (defun logical-row-insert-sql (relation tuple)
   (logical-validate-pgoutput-tuple relation tuple nil)
   (let* ((columns (pgoutput-relation-columns relation))
@@ -845,7 +899,8 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (unless (= (length tuple) (length (pgoutput-relation-columns relation)))
       (error "pgoutput INSERT tuple is not a full row"))
     (logical-target-query (logical-subscription-runtime-target runtime)
-                          (logical-row-insert-sql relation tuple))))
+                          (make-pg-client-query-plan
+                           :writer (lambda (stream) (logical-write-insert stream relation tuple))))))
 
 (defun logical-pgoutput-read-insert (payload position)
   (unless (and (< position (length payload))
@@ -912,18 +967,17 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
   (when (logical-relation-selected-p runtime relation)
     (when old-tuple (logical-validate-pgoutput-tuple relation old-tuple nil))
     (logical-validate-pgoutput-tuple relation new-tuple t)
-    (when (char= kind #\O)
-      (error "REPLICA IDENTITY FULL is not supported"))
+    (when (char= kind #\O) (error "REPLICA IDENTITY FULL is not supported"))
     (unless (= (length new-tuple) (length (pgoutput-relation-columns relation)))
       (error "pgoutput UPDATE tuple is not a full row"))
-    (let* ((set-clause (logical-update-set-clause relation new-tuple))
-           (where (logical-row-key-predicate
-                   (logical-pgoutput-key-values relation (or old-tuple new-tuple))
-                   (pgoutput-relation-key-columns relation)))
-           (tag (nth-value 2 (logical-target-query
-                              (logical-subscription-runtime-target runtime)
-                              (format nil "UPDATE ~a SET ~a WHERE ~a"
-                                      (pgoutput-relation-name relation) set-clause where)))))
+    (when (find :unchanged-toast (logical-pgoutput-key-values relation (or old-tuple new-tuple)))
+      (error "unchanged TOAST value cannot be used here"))
+    (let ((tag (nth-value 2
+                          (logical-target-query
+                           (logical-subscription-runtime-target runtime)
+                           (make-pg-client-query-plan
+                            :writer (lambda (stream)
+                                      (logical-write-update stream relation old-tuple new-tuple)))))))
       (logical-assert-one-row-affected tag "UPDATE"))))
 
 (defun logical-apply-update (runtime relation payload position)
@@ -944,13 +998,11 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (unless (char= kind #\K)
       (error "allowlisted table ~a requires a pgoutput K identity tuple"
              (pgoutput-relation-name relation)))
-    (let* ((where (logical-row-key-predicate
-                   (logical-pgoutput-key-values relation tuple)
-                   (pgoutput-relation-key-columns relation)))
-           (tag (nth-value 2 (logical-target-query
-                              (logical-subscription-runtime-target runtime)
-                              (format nil "DELETE FROM ~a WHERE ~a"
-                                      (pgoutput-relation-name relation) where)))))
+    (let ((tag (nth-value 2
+                          (logical-target-query
+                           (logical-subscription-runtime-target runtime)
+                           (make-pg-client-query-plan
+                            :writer (lambda (stream) (logical-write-delete stream relation tuple)))))))
       (logical-assert-one-row-affected tag "DELETE"))))
 
 (defun logical-apply-delete (runtime relation payload position)
@@ -1301,6 +1353,35 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
              (decf (logical-wire-cursor-remaining cursor) (- next position)))
     bytes))
 
+(defun logical-wire-text (cursor size)
+  "Decode a bounded UTF-8 field without retaining its complete octet vector."
+  (unless (<= size (logical-wire-cursor-remaining cursor))
+    (error "truncated logical replication value"))
+  (with-output-to-string (output)
+    (let ((remaining size) (needed 0) (code 0) (minimum 0))
+      (loop while (plusp remaining) do
+        (let* ((count (min remaining 65536))
+               (bytes (logical-wire-octets cursor count)))
+          (decf remaining count)
+          (loop for byte across bytes do
+            (if (zerop needed)
+                (cond
+                  ((< byte #x80) (write-char (code-char byte) output))
+                  ((<= #xc2 byte #xdf) (setf needed 1 code (logand byte #x1f) minimum #x80))
+                  ((<= #xe0 byte #xef) (setf needed 2 code (logand byte #x0f) minimum #x800))
+                  ((<= #xf0 byte #xf4) (setf needed 3 code (logand byte #x07) minimum #x10000))
+                  (t (error "invalid UTF-8 in logical replication value")))
+                (progn
+                  (unless (<= #x80 byte #xbf)
+                    (error "invalid UTF-8 in logical replication value"))
+                  (setf code (logior (ash code 6) (logand byte #x3f)))
+                  (decf needed)
+                  (when (zerop needed)
+                    (unless (and (<= minimum code #x10ffff) (not (<= #xd800 code #xdfff)))
+                      (error "invalid UTF-8 in logical replication value"))
+                    (write-char (code-char code) output)))))))
+      (unless (zerop needed) (error "truncated UTF-8 in logical replication value")))))
+
 (defun logical-wire-cstring (cursor)
   (let ((bytes (make-array 0 :element-type '(unsigned-byte 8)
                              :adjustable t :fill-pointer 0)))
@@ -1314,8 +1395,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                   collect (case (code-char (logical-wire-byte cursor))
                             (#\n nil)
                             (#\u :unchanged-toast)
-                            (#\t (bytes->string
-                                  (logical-wire-octets cursor (logical-wire-uint cursor 4))))
+                            (#\t (logical-wire-text cursor (logical-wire-uint cursor 4)))
                             (otherwise (error "unsupported pgoutput tuple value kind"))))
             'vector)))
 
@@ -1393,7 +1473,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
            (unless (and (<= size +max-logical-transaction-bytes+)
                         (= size (logical-wire-cursor-remaining cursor)))
              (error "invalid pgoutput Message content length"))
-           (list kind prefix lsn (bytes->string (logical-wire-octets cursor size)) (= flags 1)))))
+           (list kind prefix lsn (logical-wire-text cursor size) (= flags 1)))))
       (otherwise (error "unsupported pgoutput message ~s" kind)))))
 
 (defun logical-read-stream-operation (runtime source)

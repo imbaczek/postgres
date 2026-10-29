@@ -177,6 +177,27 @@
         (setf (symbol-function 'logical-pgoutput-apply-operation) original)
         (when (probe-file path) (delete-file path)))))
 
+(rove:deftest test-logical-wire-text-chunk-boundaries-and-invalid-utf8
+    (let* ((path (merge-pathnames (format nil "pg-wire-utf8-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (value (concatenate 'string (make-string 65535 :initial-element #\a) "🙂ż"))
+           (encoded (string->bytes value)))
+      (unwind-protect
+           (progn
+             (dolist (bytes (list encoded #(192 128) #(237 160 128) #(244 144 128 128)
+                                  #(226 130) #(226 40 161)))
+               (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                            :if-exists :supersede :if-does-not-exist :create)
+                 (write-sequence bytes stream))
+               (with-open-file (stream path :element-type '(unsigned-byte 8))
+                 (let ((cursor (make-logical-wire-cursor :stream stream :remaining (length bytes))))
+                   (if (eq bytes encoded)
+                       (rove:ok (string= value (logical-wire-text cursor (length bytes))))
+                       (rove:ok (handler-case
+                                    (progn (logical-wire-text cursor (length bytes)) nil)
+                                  (error () t))))))))
+        (when (probe-file path) (delete-file path)))))
+
 (rove:deftest test-logical-wire-operations-match-vector-decoder
     (let* ((path (merge-pathnames (format nil "pg-wire-diff-~d-~d" (sb-posix:getpid) (random 1000000))
                                   (uiop:temporary-directory)))
@@ -525,6 +546,104 @@
                  (rove:ok (= (read-sequence actual stream) (length actual)))
                  (rove:ok (equalp actual expected)))))
         (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-client-query-plan-frame-and-preflight
+    (let* ((path (merge-pathnames (format nil "pg-plan-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (value (concatenate 'string (make-string 4095 :initial-element #\a) "🙂'\\"))
+           (expected (format nil "SELECT ~a" (logical-sql-literal value)))
+           (plan (make-pg-client-query-plan
+                  :writer (lambda (stream) (write-string "SELECT " stream)
+                            (logical-write-value-literal stream 25 value)))))
+      (unwind-protect
+           (progn
+             (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede :if-does-not-exist :create)
+               (let ((client (make-pg-client :stream stream)))
+                 (rove:ok (handler-case
+                              (progn (pg-client-send-query-plan
+                                      client (make-pg-client-query-plan
+                                              :writer (lambda (out) (write-char (code-char 0) out)))) nil)
+                            (error () t)))
+                 (rove:ok (and (open-stream-p stream) (zerop (file-position stream))))
+                 (pg-client-send-query-plan client plan)))
+             (with-open-file (stream path :element-type '(unsigned-byte 8))
+               (multiple-value-bind (type length payload) (read-message-frame stream)
+                 (declare (ignore length))
+                 (rove:ok (= type (char-code #\Q)))
+                 (rove:ok (equalp payload (concatenate '(vector (unsigned-byte 8))
+                                                       (string->bytes expected) #(0)))))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-client-query-plan-partial-frame-closes-client
+    (let ((path (merge-pathnames (format nil "pg-plan-fail-~d-~d" (sb-posix:getpid) (random 1000000))
+                                 (uiop:temporary-directory))))
+      (unwind-protect
+           (dolist (short '(t nil))
+             (let ((pass 0)
+                   (stream (open path :direction :output :element-type '(unsigned-byte 8)
+                                      :if-exists :supersede :if-does-not-exist :create)))
+               (unwind-protect
+                    (progn
+                      (rove:ok (handler-case
+                                   (progn
+                                     (pg-client-send-query-plan
+                                      (make-pg-client :stream stream)
+                                      (make-pg-client-query-plan
+                                       :writer (lambda (out)
+                                                 (incf pass)
+                                                 (write-string (if (= pass 1) "abc"
+                                                                   (if short "ab" "abcd")) out))))
+                                     nil)
+                                 (error () t)))
+                      (rove:ok (not (open-stream-p stream))))
+                 (when (open-stream-p stream) (close stream :abort t)))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-client-query-plan-rejects-late-invalid-before-header
+    (let ((path (merge-pathnames (format nil "pg-plan-invalid-~d-~d" (sb-posix:getpid) (random 1000000))
+                                 (uiop:temporary-directory))))
+      (unwind-protect
+           (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                        :if-exists :supersede :if-does-not-exist :create)
+             (let ((client (make-pg-client :stream stream)))
+               (dolist (type '(23 999999))
+                 (rove:ok (handler-case
+                              (progn
+                                (pg-client-send-query-plan
+                                 client (make-pg-client-query-plan
+                                         :writer (lambda (out)
+                                                   (write-string "SELECT 'valid', " out)
+                                                   (logical-write-value-literal out type "bad"))))
+                                nil)
+                            (error () t)))
+                 (rove:ok (and (open-stream-p stream) (zerop (file-position stream)))))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-streamed-row-sql-matches-existing-builders
+    (let* ((id (make-pgoutput-column :name "id" :type-oid 25 :key-p t))
+           (n (make-pgoutput-column :name "n" :type-oid 23))
+           (body (make-pgoutput-column :name "body" :type-oid 17))
+           (relation (make-pgoutput-relation :name "t" :columns (list id n body) :key-columns (list id)))
+           (old (vector "a'\\🙂" "1" nil))
+           (new (vector :unchanged-toast "-2" "\\x00ff"))
+           (insert (vector "a'\\🙂" "1" "\\x00ff"))
+           (keys (logical-pgoutput-key-values relation old)))
+      (rove:ok (string= (logical-row-insert-sql relation insert)
+                        (with-output-to-string (out) (logical-write-insert out relation insert))))
+      (rove:ok (string= (format nil "UPDATE t SET ~a WHERE ~a"
+                                (logical-update-set-clause relation new)
+                                (logical-row-key-predicate keys (list id)))
+                        (with-output-to-string (out) (logical-write-update out relation old new))))
+      (rove:ok (string= (format nil "DELETE FROM t WHERE ~a" (logical-row-key-predicate keys (list id)))
+                        (with-output-to-string (out) (logical-write-delete out relation old))))
+      (let ((null-old (vector nil "1" nil))
+            (all-unchanged (vector :unchanged-toast :unchanged-toast :unchanged-toast)))
+        (setf (pgoutput-column-type-oid n) 25)
+        (rove:ok (logical-validate-pgoutput-tuple relation all-unchanged t))
+        (rove:ok (string= "UPDATE t SET id = id WHERE id IS NULL"
+                          (with-output-to-string (out)
+                            (logical-write-update out relation null-old all-unchanged)))))))
 
 (rove:deftest test-client-streamed-query-failure-closes-connection
     (let* ((path (merge-pathnames (format nil "pg-query-fail-~d-~d" (sb-posix:getpid) (random 1000000))
