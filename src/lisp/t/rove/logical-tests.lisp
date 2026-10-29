@@ -761,6 +761,101 @@
                  (rove:ok (= (logical-spool-wal-plan-count plan) 2))))
           (close-logical-spool spool)))))
 
+(rove:deftest test-logical-encoder-stream-matches-vector
+    (let* ((text (concatenate 'string (make-string 4095 :initial-element #\a) "🙂é"))
+           (change (logical-test-change :update 7 701 :old-values (vector 1 2 text)
+                                                      :new-values (vector 3 4 text)))
+           (expected (logical-encode-change change))
+           (actual (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+      (logical-encode-change change
+                             (lambda (part)
+                               (if (integerp part)
+                                   (vector-push-extend part actual)
+                                   (loop for byte across part do (vector-push-extend byte actual)))))
+      (rove:ok (equalp actual expected))
+      (rove:ok (equalp (logical-change-new-values (logical-decode-change actual))
+                       (vector 3 4 text)))))
+
+(rove:deftest test-logical-spool-append-change-boundaries
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-logical-encode-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (change (logical-test-change :insert 7 701 :new-values (vector 1 2 "hello🙂")))
+           (expected (logical-encode-change change))
+           (size (length expected)))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (multiple-value-bind (sink metrics) (logical-encoding-sink size)
+               (logical-encode-change change sink)
+               (multiple-value-bind (actual-size crc) (funcall metrics)
+                 (rove:ok (= actual-size size))
+                 (rove:ok (= crc (wal-crc32 expected)))))
+             (let ((spool (make-logical-spool)))
+               (unwind-protect
+                    (progn
+                      (rove:ok (= (logical-spool-append-change spool change size) size))
+                      (rove:ok (probe-file (logical-spool-path spool)))
+                      (logical-spool-seal spool)
+                      (rove:ok (equalp (logical-spool-events-in-order spool) (list expected))))
+                 (close-logical-spool spool)))
+             (let ((spool (make-logical-spool)))
+               (unwind-protect
+                    (progn
+                      (rove:ok (handler-case
+                                   (progn (logical-spool-append-change spool change (1- size)) nil)
+                                 (pg-error (condition) (string= (pg-error-sqlstate condition) "54000"))))
+                      (rove:ok (logical-spool-failed-p spool))
+                      (rove:ok (zerop (logical-spool-count spool))))
+                 (close-logical-spool spool)))
+             (rove:ok (null (uiop:directory-files directory))))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-logical-encoder-stream-bytea-and-jsonb
+    (dolist (case (list (list :bytea (make-array 256 :element-type '(unsigned-byte 8)
+                                                     :initial-contents (loop for i below 256 collect i)))
+                        (list :jsonb (sql-jsonb-input "{\"a\":[null,\"🙂\",1.00]}"))))
+      (let* ((event (logical-test-change :insert 7 701 :new-values (vector 1 2 (second case))))
+             (actual (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+        (setf (getf (third (logical-change-columns event)) :type) (first case)
+              (getf (third (logical-change-columns event)) :typmod) -1)
+        (let ((expected (logical-encode-change event)))
+          (logical-encode-change event
+                                 (lambda (part)
+                                   (if (integerp part)
+                                       (vector-push-extend part actual)
+                                       (loop for byte across part do (vector-push-extend byte actual)))))
+          (rove:ok (equalp expected actual))))))
+
+(rove:deftest test-logical-spool-detects-change-between-passes
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-logical-mutation-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (change (logical-test-change :insert 7 701 :new-values (vector 1 2 (copy-seq "hello"))))
+           (*logical-spool-test-after-measure*
+             (lambda (item) (setf (char (aref (logical-change-new-values item) 2) 0) #\H)))
+           (spool (make-logical-spool)))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (rove:ok (handler-case (progn (logical-spool-append-change spool change 10000) nil)
+                        (error (condition)
+                          (search "logical event changed during encoding" (princ-to-string condition)))))
+             (rove:ok (probe-file (logical-spool-path spool)))
+             (rove:ok (char= (char (aref (logical-change-new-values change) 2) 0) #\H))
+             (rove:ok (logical-spool-failed-p spool))
+             (rove:ok (zerop (logical-spool-count spool)))
+             (rove:ok (zerop (logical-spool-bytes spool)))
+             (rove:ok (handler-case (progn (logical-spool-seal spool) nil) (error () t)))
+             (close-logical-spool spool)
+             (rove:ok (null (uiop:directory-files directory))))
+        (close-logical-spool spool)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest test-logical-fragment-assembly
     (let* ((first (make-array 10 :element-type '(unsigned-byte 8)
                                  :initial-contents '(0 1 2 3 4 5 6 7 8 9)))

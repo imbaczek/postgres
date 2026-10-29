@@ -99,34 +99,46 @@
 (defun logical-write-u8 (buffer value)
   (unless (and (integerp value) (<= 0 value #xFF))
     (error "logical WAL byte is out of range: ~a" value))
-  (vector-push-extend value buffer))
+  (if (functionp buffer)
+      (funcall buffer value)
+      (vector-push-extend value buffer)))
 
 (defun logical-write-u16 (buffer value)
   (unless (and (integerp value) (<= 0 value #xFFFF))
     (error "logical WAL 16-bit value is out of range: ~a" value))
-  (vector-push-extend (logand value #xFF) buffer)
-  (vector-push-extend (logand (ash value -8) #xFF) buffer))
+  (dotimes (shift 2)
+    (logical-write-u8 buffer (logand (ash value (* -8 shift)) #xFF))))
 
 (defun logical-write-u32 (buffer value)
   (unless (and (integerp value) (<= 0 value #xFFFFFFFF))
     (error "logical WAL 32-bit value is out of range: ~a" value))
   (dotimes (shift 4)
-    (vector-push-extend (logand (ash value (* -8 shift)) #xFF) buffer)))
+    (logical-write-u8 buffer (logand (ash value (* -8 shift)) #xFF))))
 
 (defun logical-write-u64 (buffer value)
   (unless (and (integerp value) (<= 0 value #xFFFFFFFFFFFFFFFF))
     (error "logical WAL 64-bit value is out of range: ~a" value))
   (dotimes (shift 8)
-    (vector-push-extend (logand (ash value (* -8 shift)) #xFF) buffer)))
+    (logical-write-u8 buffer (logand (ash value (* -8 shift)) #xFF))))
 
 (defun logical-write-octets (buffer octets)
-  (loop for byte across octets do (vector-push-extend byte buffer))
+  (if (functionp buffer)
+      (funcall buffer octets)
+      (loop for byte across octets do (vector-push-extend byte buffer)))
   buffer)
 
 (defun logical-write-string-u32 (buffer string)
-  (let ((octets (sb-ext:string-to-octets string :external-format :utf-8)))
-    (logical-write-u32 buffer (length octets))
-    (logical-write-octets buffer octets)))
+  "Encode UTF-8 in bounded blocks, retaining the existing u32 byte length."
+  (let ((size (loop for start from 0 below (length string) by 4096
+                    for end = (min (length string) (+ start 4096))
+                    sum (length (sb-ext:string-to-octets string :external-format :utf-8
+                                                                :start start :end end)))))
+    (logical-write-u32 buffer size)
+    (loop for start from 0 below (length string) by 4096
+          for end = (min (length string) (+ start 4096))
+          do (logical-write-octets buffer
+                                   (sb-ext:string-to-octets string :external-format :utf-8
+                                                                   :start start :end end)))))
 
 (defun logical-write-value (buffer type value)
   "Encode a value; text, varchar and json share UTF-8 tag 3. Their schema codes
@@ -189,10 +201,8 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
     ((member type '(:varchar :text :json))
      (unless (stringp value)
        (error "invalid varchar logical row value ~s" value))
-     (let ((octets (sb-ext:string-to-octets value :external-format :utf-8)))
-       (logical-write-u8 buffer 3)
-       (logical-write-u32 buffer (length octets))
-       (logical-write-octets buffer octets)))
+     (logical-write-u8 buffer 3)
+     (logical-write-string-u32 buffer value))
     (t (error "logical replication does not support type ~a" type))))
 
 (defun logical-write-row (buffer columns values)
@@ -292,11 +302,10 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
       (logical-write-u64 buffer (getf publication :generation))
       (logical-write-u8 buffer (if (getf publication :unsupported) 1 0)))))
 
-(defun logical-encode-change (change)
+(defun logical-encode-change (change &optional (buffer (make-array 0 :element-type '(unsigned-byte 8)
+                                                                     :adjustable t :fill-pointer 0)))
   (logical-validate-change-publications change)
-  (let ((buffer (make-array 0 :element-type '(unsigned-byte 8)
-                              :adjustable t :fill-pointer 0))
-        (columns (logical-change-columns change))
+  (let ((columns (logical-change-columns change))
         (key-attnums (logical-change-key-attnums change)))
     (when (member (logical-change-kind change)
                   '(:truncate :ddl :sequence-state))
@@ -627,6 +636,16 @@ revalidated by this codec."
     (setf (backend-logical-change-bytes backend) total))
   (values))
 
+(defun logical-capture-change (backend change limit)
+  "Encode CHANGE into BACKEND's spool within the remaining transaction budget."
+  (let ((spool (sb-sys:without-interrupts
+                 (or (backend-logical-spool backend)
+                     (setf (backend-logical-spool backend) (make-logical-spool))))))
+    (let ((size (logical-spool-append-change
+                 spool change (- limit (backend-logical-change-bytes backend)))))
+      (incf (backend-logical-change-bytes backend) size)))
+  (values))
+
 (defun logical-note-transaction-event (kind payload &key (publication-selection :unknown))
   "Capture a transactional utility event such as TRUNCATE before XID commit."
   (when (and *backend* (backend-xid *backend*))
@@ -639,13 +658,8 @@ revalidated by this codec."
            (change (make-logical-change
                     :kind kind :publication-selection publication-selection
                     :database-oid (database-oid (current-database))
-                    :event-payload text))
-           (encoded (logical-encode-change change))
-           (total (+ (backend-logical-change-bytes *backend*)
-                     (length encoded))))
-      (when (> total +max-logical-transaction-bytes+)
-        (ereport "54000" "logical transaction exceeds the 64 MiB change limit"))
-      (logical-capture-encoded-event *backend* encoded total)
+                    :event-payload text)))
+      (logical-capture-change *backend* change +max-logical-transaction-bytes+)
       change)))
 
 (defun logical-relation-columns (table)
@@ -683,18 +697,12 @@ executor, so capture the same operation before transaction commit."
                     :publication-selection publication-selection
                     :old-values (and old-values (copy-seq old-values))
                     :new-values (and new-values (copy-seq new-values))))
-           (encoded (logical-encode-change change))
-           (total (+ (backend-logical-change-bytes *backend*)
-                     (length encoded)))
            (limit (+ +max-logical-transaction-bytes+
                      (if (string= (or (backend-application-name *backend*) "")
                                   "pg-lisp-subscribe-apply")
                          +max-logical-apply-headroom-bytes+
                          0))))
-      (when (> total limit)
-        (ereport "54000"
-                 "logical change stream transaction exceeds the 64 MiB limit"))
-      (logical-capture-encoded-event *backend* encoded total)))
+      (logical-capture-change *backend* change limit)))
   (values))
 
 (defun logical-encode-chunk (index count events)

@@ -3,6 +3,8 @@
 
 (defparameter *logical-capture-memory-bytes* (* 4 1024 1024))
 
+(defvar *logical-spool-test-after-measure* nil)
+
 (defstruct (logical-spool (:constructor %make-logical-spool))
   owner (events '()) (bytes 0) (count 0) path stream sealed-p closed-p failed-p)
 
@@ -38,6 +40,36 @@
         (write-byte (logand (ash word (* -8 shift)) #xff) stream)))
     (write-sequence event stream)))
 
+(defun logical-spool-ensure-file (spool)
+  "Move buffered events to a transaction-owned file if needed."
+  (unless (logical-spool-stream spool)
+    (sb-sys:without-interrupts
+      (multiple-value-bind (path stream) (open-query-temp-io)
+        (setf (logical-spool-path spool) path
+              (logical-spool-stream spool) stream)))
+    (dolist (prior (reverse (logical-spool-events spool)))
+      (logical-spool-write-event spool prior))
+    (setf (logical-spool-events spool) nil))
+  (values))
+
+(defun logical-encoding-sink (limit &optional stream)
+  "Return a sink and a metrics closure for bounded counting, CRC and optional output."
+  (let ((size 0) (crc #xffffffff))
+    (values
+     (lambda (part)
+       (let ((length (if (integerp part) 1 (length part))))
+         (when (> (+ size length) limit)
+           (ereport "54000" "logical change stream transaction exceeds the 64 MiB limit"))
+         (incf size length)
+         (flet ((step-byte (byte)
+                  (setf crc (logxor (ash crc -8)
+                                    (aref *wal-crc32-table* (logand (logxor crc byte) #xff))))))
+           (if (integerp part)
+               (progn (step-byte part) (when stream (write-byte part stream)))
+               (progn (loop for byte across part do (step-byte byte))
+                      (when stream (write-sequence part stream)))))))
+     (lambda () (values size (logxor crc #xffffffff))))))
+
 (defun logical-spool-append (spool event)
   "Take ownership of a fresh EVENT, spilling once the memory limit is reached.
 The caller must not mutate EVENT after passing it to this function."
@@ -55,13 +87,7 @@ The caller must not mutate EVENT after passing it to this function."
               (when (and (null (logical-spool-stream spool))
                          (> (+ (logical-spool-bytes spool) (length event))
                             *logical-capture-memory-bytes*))
-                (sb-sys:without-interrupts
-                  (multiple-value-bind (path stream) (open-query-temp-io)
-                    (setf (logical-spool-path spool) path
-                          (logical-spool-stream spool) stream)))
-                (dolist (prior (reverse (logical-spool-events spool)))
-                  (logical-spool-write-event spool prior))
-                (setf (logical-spool-events spool) nil))
+                (logical-spool-ensure-file spool))
               (if (logical-spool-stream spool)
                   (logical-spool-write-event spool event)
                   (push event (logical-spool-events spool)))
@@ -70,6 +96,46 @@ The caller must not mutate EVENT after passing it to this function."
            (setf complete t))
       (unless complete (setf (logical-spool-failed-p spool) t))))
   (values))
+
+(defun logical-spool-append-change (spool change remaining)
+  "Encode CHANGE into SPOOL without retaining a large encoded event vector."
+  (when (or (logical-spool-sealed-p spool) (logical-spool-closed-p spool)
+            (logical-spool-failed-p spool))
+    (error "logical spool is not writable"))
+  (let ((complete nil))
+    (unwind-protect
+         (multiple-value-bind (counter metrics) (logical-encoding-sink remaining)
+           (logical-encode-change change counter)
+           (multiple-value-bind (size checksum) (funcall metrics)
+             (unless (<= 1 size #xffffffff) (error "invalid logical spool event length"))
+             (when *logical-spool-test-after-measure*
+               (funcall *logical-spool-test-after-measure* change))
+             (if (and (null (logical-spool-stream spool))
+                      (<= (+ (logical-spool-bytes spool) size) *logical-capture-memory-bytes*))
+                 (let ((event (logical-encode-change change)))
+                   (unless (and (= (length event) size) (= (wal-crc32 event) checksum))
+                     (error "logical event changed during encoding"))
+                   (logical-spool-append spool event))
+                 (call-with-logical-spool-owner
+                  spool
+                  (lambda ()
+                    (logical-spool-ensure-file spool)
+                    (let ((path (logical-spool-path spool)) (stream (logical-spool-stream spool)))
+                      (query-temp-check-space path (+ 8 size))
+                      (query-temp-account-space path (+ 8 size))
+                      (dolist (word (list size checksum))
+                        (dotimes (shift 4)
+                          (write-byte (logand (ash word (* -8 shift)) #xff) stream)))
+                      (multiple-value-bind (writer written) (logical-encoding-sink size stream)
+                        (logical-encode-change change writer)
+                        (multiple-value-bind (actual-size actual-checksum) (funcall written)
+                          (unless (and (= actual-size size) (= actual-checksum checksum))
+                            (error "logical event changed during encoding"))))
+                      (incf (logical-spool-bytes spool) size)
+                      (incf (logical-spool-count spool))))))
+             (setf complete t)
+             size))
+      (unless complete (setf (logical-spool-failed-p spool) t)))))
 
 (defun logical-spool-seal (spool)
   "Flush completed events before a caller enters the WAL critical section."

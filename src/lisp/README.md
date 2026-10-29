@@ -589,14 +589,19 @@ are encoded-change limits, not guarantees that a value of that size will fit.
 
 Logical capture keeps encoded events in memory until their cumulative size
 exceeds 4 MiB, then spills all events to a transaction-owned temporary file.
+For each change, capture first counts encoded bytes and computes a checksum;
+when the threshold would be exceeded, a second encoding pass writes directly
+to the file. String encoding uses bounded UTF-8 blocks, though JSONB output
+still constructs a complete text representation.
 The spool has its own quota using the `--temp-file-limit-bytes` setting,
 separate from query spill quotas; its length and checksum framing also counts
 against that quota. It is cleaned up when the transaction ends. At commit the
 spool is validated and its WAL records planned before publication. A second
 pass writes events as fragments or bounded chunks, keeping memory proportional
 to the largest event plus a WAL record rather than the whole spilled transaction.
-The 4 MiB threshold is not a bound on the size of an individual event. The
-64 MiB capture and 65 MiB WAL limits still apply.
+Preflight reads a whole encoded event at a time, and WAL decoding also assembles
+whole events. The 4 MiB threshold is not a bound on the size of an individual
+event. The 64 MiB capture and 65 MiB WAL limits still apply.
 
 When an encoded row event exceeds one WAL record, the transaction's events
 are written as ordered fragments and reassembled by recovery and logical slot
