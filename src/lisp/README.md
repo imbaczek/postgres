@@ -638,11 +638,15 @@ target counts the original UTF-8 field bytes. Row metadata and other allocations
 remain in memory, and the target still receives and parses the complete Simple
 Query frame.
 Frontend query message lengths are limited to 132 MiB, including the four-byte
-length word. When capture is enabled, it normally limits each encoded row change or
-transactional event to 64 MiB, including its encoding overhead. Row changes
-made by the `pg-lisp-subscribe-apply` application have an extra 1 MiB of
-headroom; transactional utility events retain the 64 MiB event limit. WAL
-recovery and slot readers accept individual events up to 65 MiB. The aggregate
+length word. When capture is enabled, each encoded row change is limited to
+128 MiB, including encoding overhead; transactional utility events retain a
+64 MiB limit. Row changes made by the `pg-lisp-subscribe-apply` application have an extra 1 MiB of headroom; WAL
+recovery and slot readers accept individual events up to 129 MiB. Captured row
+events above 64 MiB require a supported replica identity and schema and must
+pass preflight checks for pgoutput, subscriber apply SQL, and full-new-row
+initial-copy DataRow and SQL frames. Values written before a slot existed may
+still be too large for a later initial copy. Individual decoded values and JSONB
+trees can still require substantial memory. The aggregate
 transaction size is controlled by the capture spool's temporary-file quota,
 which is unlimited by default. Unscoped logical readers that materialize changes
 retain a 65 MiB encoded-byte limit, checked after decoding the event or legacy
@@ -696,8 +700,8 @@ without building a full query string; the target still receives and parses the
 complete Simple Query. A malformed or incomplete
 incoming frame closes the source connection; a partial row-frame or query write
 closes its connection. Other message types use their existing encoders. The 4 MiB
-threshold is not a bound on the size of an individual event. The 64 MiB capture
-and 65 MiB WAL event limits and protocol frame length limit still apply. The
+threshold is not a bound on the size of an individual event. The 128 MiB capture
+and 129 MiB WAL event limits and protocol frame length limit still apply. The
 legacy unscoped reader that materializes a transaction remains limited to 65 MiB;
 both replication senders use the scoped spool reader. The internal legacy
 list-based WAL adapter also retains its aggregate limit; normal capture uses

@@ -100,7 +100,7 @@ The caller must not mutate EVENT after passing it to this function."
       (unless complete (setf (logical-spool-failed-p spool) t))))
   (values))
 
-(defun logical-spool-append-change (spool change remaining)
+(defun logical-spool-append-change (spool change remaining &key after-measure)
   "Encode CHANGE into SPOOL without retaining a large encoded event vector."
   (when (or (logical-spool-sealed-p spool) (logical-spool-closed-p spool)
             (logical-spool-failed-p spool))
@@ -111,6 +111,7 @@ The caller must not mutate EVENT after passing it to this function."
            (logical-encode-change change counter)
            (multiple-value-bind (size checksum) (funcall metrics)
              (unless (<= 1 size #xffffffff) (error "invalid logical spool event length"))
+             (when after-measure (funcall after-measure size))
              (when *logical-spool-test-after-measure*
                (funcall *logical-spool-test-after-measure* change))
              (if (and (null (logical-spool-stream spool))

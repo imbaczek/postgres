@@ -251,7 +251,7 @@
   (logical-target-query client (logical-subscription-config-ddl)))
 
 (defparameter +logical-replication-format-options+
-  "-c DateStyle=ISO,MDY -c IntervalStyle=postgres -c extra_float_digits=3 -c TimeZone=UTC")
+  "-c DateStyle=ISO,MDY -c IntervalStyle=postgres -c extra_float_digits=3 -c TimeZone=UTC -c bytea_output=hex")
 
 (defun logical-startup-replication-client (options)
   (pg-client-connect
@@ -888,8 +888,19 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (unless (member (logical-field-integer-state stream) '(:digits :trailing))
       (logical-field-integer-error context))))
 
+(defstruct logical-admission-value bytes quotes)
+
 (defun logical-write-value-literal (stream type value &optional (context :pgoutput))
   (cond
+    ((logical-admission-value-p value)
+     (unless (and (typep stream 'pg-client-query-output-stream)
+                  (null (logical-utf8-buffer stream)))
+       (error "logical admission values require a counting stream"))
+     (logical-flush-utf8-output stream)
+     (incf (logical-utf8-size stream)
+           (+ (logical-admission-value-bytes value)
+              (if (member type '(20 21 23)) 0
+                  (+ 2 (logical-admission-value-quotes value))))))
     ((and (member type '(20 21 23)) (logical-wire-field-p value))
      (logical-write-integer-field stream value context))
     ((or (null value) (eq value :unchanged-toast) (member type '(20 21 23)))
@@ -946,6 +957,90 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
   (format stream "DELETE FROM ~a WHERE " (pgoutput-relation-name relation))
   (logical-write-key-predicate stream (logical-pgoutput-key-values relation tuple)
                                (pgoutput-relation-key-columns relation)))
+
+(defun logical-admission-measure-value (value type)
+  "Measure the emitted pgoutput text and SQL quote expansion in bounded blocks."
+  (if (eq type :bytea)
+      (make-logical-admission-value :bytes (+ 2 (* 2 (length value))) :quotes 0)
+      (let ((header 4) (bytes 0) (quotes 0))
+        (labels ((measure-byte (byte)
+                   (if (plusp header)
+                       (decf header)
+                       (progn
+                         (when (zerop byte) (error "logical value contains a zero byte"))
+                         (incf bytes)
+                         (when (= byte 39) (incf quotes))))))
+          (pgoutput-emit-text-value
+           (lambda (part)
+             (if (integerp part) (measure-byte part)
+                 (loop for byte across part do (measure-byte byte))))
+           value type))
+        (unless (zerop header) (error "invalid pgoutput text field"))
+        (make-logical-admission-value :bytes bytes :quotes quotes))))
+
+(defun logical-admission-row (columns values)
+  "Project source values into small, measured subscriber literals."
+  (when values
+    (unless (= (length columns) (length values)) (error "logical row width mismatch"))
+    (coerce (loop for column in columns for value across values
+                  collect (cond ((eq value +null+) nil)
+                                ((eq value +logical-unchanged-toast+) :unchanged-toast)
+                                (t (logical-admission-measure-value value (getf column :type)))))
+            'vector)))
+
+(defun logical-admission-query-size (writer)
+  "Measure WRITER with exactly the same SQL grammar as the subscriber."
+  (pg-client-query-plan-size (make-pg-client-query-plan :writer writer)))
+
+(defun logical-validate-large-row-change (change full-new)
+  "Reject a large row that cannot fit the native replication and copy frames."
+  (let* ((columns (logical-change-columns change))
+         (keys (logical-change-key-attnums change))
+         (name (logical-change-relation-name change)))
+    (unless (and keys (logical-simple-identifier-p name)
+                 (every (lambda (column)
+                          (and (logical-simple-identifier-p (getf column :name))
+                               (logical-type-supported-p (pgoutput-type-oid (getf column :type)))))
+                        columns))
+      (error "large logical row requires a supported replica identity and schema"))
+    (let* ((wire-size (pgoutput-row-change-size change))
+           (subscriber-columns
+             (mapcar (lambda (column)
+                       (make-pgoutput-column :name (getf column :name)
+                                             :type-oid (pgoutput-type-oid (getf column :type))
+                                             :key-p (not (null (member (getf column :attnum) keys)))
+                                             :typmod (getf column :typmod)))
+                     columns))
+           (relation (make-pgoutput-relation
+                      :name name :columns subscriber-columns
+                      :key-columns (remove-if-not #'pgoutput-column-key-p subscriber-columns)))
+           (old (logical-admission-row columns (logical-change-old-values change)))
+           (new (logical-admission-row columns (logical-change-new-values change)))
+           (copy-row (logical-admission-row columns full-new)))
+      (when (> (+ 4 25 wire-size) +max-query-message-size+)
+        (error "large logical row exceeds the subscriber replication frame limit"))
+      (logical-admission-query-size
+       (lambda (stream)
+         (case (logical-change-kind change)
+           (:insert (logical-write-insert stream relation new))
+           (:update (logical-write-update stream relation old new))
+           (:delete (logical-write-delete stream relation old))
+           (otherwise (error "invalid large logical row kind")))))
+      (when copy-row
+        (let ((data-row-size (+ 6 (* 4 (length copy-row))
+                                (loop for value across copy-row
+                                      when (logical-admission-value-p value)
+                                        sum (logical-admission-value-bytes value))))
+              (client-columns
+                (mapcar (lambda (column)
+                          (make-pg-client-column :name (pgoutput-column-name column)
+                                                 :type-oid (pgoutput-column-type-oid column)))
+                        subscriber-columns)))
+          (when (> data-row-size +max-query-message-size+)
+            (error "large logical row exceeds the initial copy frame limit"))
+          (logical-admission-query-size
+           (lambda (stream) (logical-write-copy-insert stream name client-columns copy-row)))))))
+  (values))
 
 (defun logical-row-insert-sql (relation tuple)
   (logical-validate-pgoutput-tuple relation tuple nil)

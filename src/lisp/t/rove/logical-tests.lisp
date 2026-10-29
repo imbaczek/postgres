@@ -1441,6 +1441,143 @@
                           (with-output-to-string (out)
                             (logical-write-update out relation null-old all-unchanged)))))))
 
+(rove:deftest test-large-row-admission-literal-measurements-match-sql
+    (dolist (entry (list (list :int4 23 -42)
+                         (list :text 25 "ž🙂'\\")
+                         (list :bytea 17 (make-array 4 :element-type '(unsigned-byte 8)
+                                                       :initial-contents '(0 39 128 255)))
+                         (list :json 114 "{\"a\":\"'ž\"}")
+                         (list :jsonb 3802 (sql-jsonb-input "{\"b\":\"'🙂\",\"a\":1}"))))
+      (destructuring-bind (type oid value) entry
+        (let* ((proxy (logical-admission-measure-value value type))
+               (text (pgoutput-value-text value type))
+               (actual (logical-admission-query-size
+                        (lambda (stream) (logical-write-value-literal stream oid text))))
+               (measured (logical-admission-query-size
+                          (lambda (stream) (logical-write-value-literal stream oid proxy)))))
+          (rove:ok (= measured actual))
+          (rove:ok (= (logical-admission-value-bytes proxy)
+                      (length (string->bytes text))))))))
+
+(rove:deftest test-large-row-admission-validates-identity-and-copy
+    (let* ((old (vector 1 9 "old'🙂"))
+           (new (vector 2 10 "new'ž"))
+           (insert (logical-test-change :insert 1 10 :new-values new))
+           (update (logical-test-change :update 1 10 :old-values old :new-values new))
+           (delete (logical-test-change :delete 1 10 :old-values old)))
+      (rove:ok (not (handler-case
+                        (progn (logical-validate-large-row-change insert new) nil)
+                      (error () t))))
+      (rove:ok (not (handler-case
+                        (progn (logical-validate-large-row-change update new) nil)
+                      (error () t))))
+      (rove:ok (not (handler-case
+                        (progn (logical-validate-large-row-change delete nil) nil)
+                      (error () t))))
+      (setf (logical-change-key-attnums update) nil)
+      (rove:ok (handler-case
+                   (progn (logical-validate-large-row-change update new) nil)
+                 (error () t)))))
+
+(rove:deftest test-large-row-admission-query-measurements-match-writers
+    (let* ((columns (logical-test-columns))
+           (subscriber-columns
+             (mapcar (lambda (column)
+                       (make-pgoutput-column :name (getf column :name)
+                                             :type-oid (pgoutput-type-oid (getf column :type))
+                                             :key-p (= (getf column :attnum) 1)))
+                     columns))
+           (relation (make-pgoutput-relation :name "logical_rows" :columns subscriber-columns
+                                             :key-columns (list (first subscriber-columns))))
+           (old (vector 1 +null+ +null+))
+           (new (vector 2 10 +logical-unchanged-toast+))
+           (full (vector 2 10 "🙂'test"))
+           (old-proxy (logical-admission-row columns old))
+           (new-proxy (logical-admission-row columns new))
+           (full-proxy (logical-admission-row columns full))
+           (old-text (vector "1" nil nil))
+           (new-text (vector "2" "10" :unchanged-toast))
+           (full-text (vector "2" "10" "🙂'test"))
+           (copy-columns (mapcar (lambda (column)
+                                   (make-pg-client-column :name (pgoutput-column-name column)
+                                                          :type-oid (pgoutput-column-type-oid column)))
+                                 subscriber-columns)))
+      (flet ((measured (writer) (logical-admission-query-size writer)))
+        (rove:ok (= (measured (lambda (stream)
+                                (logical-write-update stream relation old-proxy new-proxy)))
+                    (measured (lambda (stream)
+                                (logical-write-update stream relation old-text new-text)))))
+        (rove:ok (= (measured (lambda (stream)
+                                (logical-write-delete stream relation old-proxy)))
+                    (measured (lambda (stream)
+                                (logical-write-delete stream relation old-text)))))
+        (rove:ok (= (measured (lambda (stream)
+                                (logical-write-copy-insert stream "logical_rows" copy-columns full-proxy)))
+                    (measured (lambda (stream)
+                                (logical-write-copy-insert stream "logical_rows" copy-columns full-text))))))))
+
+(rove:deftest test-large-row-admission-update-new-key-predicate
+    (let* ((columns (logical-test-columns))
+           (subscriber-columns
+             (mapcar (lambda (column)
+                       (make-pgoutput-column :name (getf column :name)
+                                             :type-oid (pgoutput-type-oid (getf column :type))
+                                             :key-p (= (getf column :attnum) 1)))
+                     columns))
+           (relation (make-pgoutput-relation :name "logical_rows" :columns subscriber-columns
+                                             :key-columns (list (first subscriber-columns))))
+           (proxy (logical-admission-row columns (vector 2 10 "quoted'")))
+           (value (vector "2" "10" "quoted'")))
+      (rove:ok (= (logical-admission-query-size
+                   (lambda (stream) (logical-write-update stream relation nil proxy)))
+                  (logical-admission-query-size
+                   (lambda (stream) (logical-write-update stream relation nil value)))))))
+
+(rove:deftest test-large-row-admission-sql-frame-boundary
+    (let ((at-limit (make-logical-admission-value :bytes (- +max-query-message-size+ 7) :quotes 0))
+          (over-limit (make-logical-admission-value :bytes (- +max-query-message-size+ 6) :quotes 0)))
+      (rove:ok (= (- +max-query-message-size+ 5)
+                  (logical-admission-query-size
+                   (lambda (out) (logical-write-value-literal out 25 at-limit)))))
+      (rove:ok (handler-case
+                   (progn (logical-admission-query-size
+                           (lambda (out) (logical-write-value-literal out 25 over-limit))) nil)
+                 (error () t)))))
+
+(rove:deftest test-large-row-admission-checks-full-unchanged-copy-row
+    (let* ((original (symbol-function 'logical-admission-measure-value))
+           (new (vector 1 2 +logical-unchanged-toast+))
+           (full (vector 1 2 "oversized"))
+           (change (logical-test-change :update 1 10 :old-values (vector 1 +null+ +null+)
+                                                     :new-values new)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-admission-measure-value)
+                   (lambda (value type)
+                     (if (and (stringp value) (string= value "oversized"))
+                         (make-logical-admission-value :bytes +max-query-message-size+ :quotes 0)
+                         (funcall original value type))))
+             (rove:ok (handler-case (progn (logical-validate-large-row-change change full) nil)
+                        (error () t))))
+        (setf (symbol-function 'logical-admission-measure-value) original))))
+
+(rove:deftest test-large-row-admission-failure-poisons-spool-before-append
+    (let ((spool (make-logical-spool))
+          (change (logical-test-change :insert 1 10 :new-values (vector 1 2 "small"))))
+      (unwind-protect
+           (progn
+             (rove:ok (handler-case
+                          (progn (logical-spool-append-change
+                                  spool change 100000
+                                  :after-measure (lambda (size) (declare (ignore size))
+                                                   (error "admission rejected")))
+                                 nil)
+                        (error () t)))
+             (rove:ok (zerop (logical-spool-count spool)))
+             (rove:ok (logical-spool-failed-p spool))
+             (rove:ok (null (logical-spool-stream spool))))
+        (close-logical-spool spool))))
+
 (rove:deftest test-client-streamed-query-failure-closes-connection
     (let* ((path (merge-pathnames (format nil "pg-query-fail-~d-~d" (sb-posix:getpid) (random 1000000))
                                   (uiop:temporary-directory)))

@@ -8,9 +8,9 @@
   (+ +max-logical-transaction-bytes+ +max-logical-apply-headroom-bytes+))
 
 ;; These bounds apply to one encoded event; transaction spools are quota controlled.
-(defconstant +max-logical-event-bytes+ +max-logical-transaction-bytes+)
+(defconstant +max-logical-event-bytes+ (* 128 1024 1024))
 
-(defconstant +max-logical-wal-event-bytes+ +max-logical-wal-transaction-bytes+)
+(defconstant +max-logical-wal-event-bytes+ (+ +max-logical-event-bytes+ +max-logical-apply-headroom-bytes+))
 
 (defconstant +max-unscoped-logical-materialization-bytes+ +max-logical-wal-transaction-bytes+)
 
@@ -854,13 +854,13 @@ Other types retain their normal semantic checks and may allocate their values."
     (setf (backend-logical-change-bytes backend) total))
   (values))
 
-(defun logical-capture-change (backend change limit)
+(defun logical-capture-change (backend change limit &key after-measure)
   "Encode CHANGE into BACKEND's spool within its per-event budget."
   (let ((spool (sb-sys:without-interrupts
                  (or (backend-logical-spool backend)
                      (setf (backend-logical-spool backend) (make-logical-spool))))))
     (let ((size (logical-spool-append-change
-                 spool change limit)))
+                 spool change limit :after-measure after-measure)))
       (incf (backend-logical-change-bytes backend) size)))
   (values))
 
@@ -878,7 +878,7 @@ Other types retain their normal semantic checks and may allocate their values."
                     :kind kind :publication-selection publication-selection
                     :database-oid (database-oid (current-database))
                     :event-payload text)))
-      (logical-capture-change *backend* change +max-logical-event-bytes+)
+      (logical-capture-change *backend* change +max-logical-transaction-bytes+)
       change)))
 
 (defun logical-relation-columns (table)
@@ -911,6 +911,8 @@ Other types retain their normal semantic checks and may allocate their values."
                    (error "invalid logical TOAST reuse pointer"))
                  (setf (aref new-image i) +logical-unchanged-toast+)))
     (values old-image new-image)))
+
+(declaim (ftype function logical-validate-large-row-change))
 
 (defun logical-note-row-change (kind table &key old-values new-values toast-reuse (publication-selection :unknown))
   "Capture a successful executor row operation for its current transaction.
@@ -945,7 +947,11 @@ executor, so capture the same operation before transaction commit."
         (logical-capture-row-images kind key-attnums old-values new-values toast-reuse))
       (setf (logical-change-old-values change) old-image
             (logical-change-new-values change) new-image)
-      (logical-capture-change *backend* change limit)))
+      (logical-capture-change
+       *backend* change limit
+       :after-measure (lambda (size)
+                        (when (> size +max-logical-transaction-bytes+)
+                          (logical-validate-large-row-change change new-values))))))
   (values))
 
 (defun logical-encode-chunk (index count events)
