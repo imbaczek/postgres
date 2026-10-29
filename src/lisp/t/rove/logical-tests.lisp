@@ -316,7 +316,8 @@
       (unwind-protect
            (progn
              (setf (symbol-function 'pg-client-query)
-                   (lambda (client query &key on-row-with-owner)
+                   (lambda (client query &key on-row-with-owner field-budget)
+                     (declare (ignore field-budget))
                      (declare (ignore client query))
                      (dolist (owner owners)
                        (funcall on-row-with-owner #("value") nil owner)))
@@ -646,10 +647,196 @@
                             columns)))
                  (rove:ok (string= "abc" (aref row 0)))
                  (rove:ok (logical-wire-field-p (aref row 1)))
-                 (rove:ok (string= "0000" (aref row 2))))))
+                 (rove:ok (logical-wire-field-p (aref row 2)))
+                 (rove:ok (string= "0000"
+                                   (with-output-to-string (out)
+                                     (logical-write-value-literal out 23 (aref row 2))))))))
         (setf (logical-wire-field-owner-active-p *logical-wire-field-owner*) nil)
         (when (logical-wire-field-owner-stream *logical-wire-field-owner*)
           (close (logical-wire-field-owner-stream *logical-wire-field-owner*) :abort t))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-logical-wire-shared-resident-budget
+    (let* ((path (merge-pathnames (format nil "pg-wire-budget-~d-~d"
+                                          (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (budget (make-logical-wire-field-budget 80))
+           (one (make-logical-wire-field-owner :budget budget))
+           (two (make-logical-wire-field-owner :budget budget))
+           (three (make-logical-wire-field-owner :budget budget))
+           (slice nil))
+      (unwind-protect
+           (progn
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede :if-does-not-exist :create)
+               (write-sequence (string->bytes "abcdbcdexxxx") out)
+               (write-sequence #(192 128) out))
+             (with-open-file (in path :element-type '(unsigned-byte 8))
+               (let ((cursor (make-logical-wire-cursor :stream in :remaining 14)))
+                 (rove:ok (string= "abcd" (logical-wire-received-field cursor 4 one 25)))
+                 (rove:ok (= 80 (logical-wire-field-budget-used budget)))
+                 (setf slice (logical-wire-received-field cursor 4 two 25))
+                 (rove:ok (logical-wire-field-p slice))
+                 (rove:ok (= 80 (logical-wire-field-budget-used budget)))
+                 (close-logical-wire-field-owner one)
+                 (rove:ok (= 0 (logical-wire-field-budget-used budget)))
+                 (rove:ok (string= "xxxx" (logical-wire-received-field cursor 4 two 25)))
+                 (rove:ok (= 80 (logical-wire-field-budget-used budget)))
+                 (close-logical-wire-field-owner two)
+                 (rove:ok (= 0 (logical-wire-field-budget-used budget)))
+                 (rove:ok (handler-case
+                              (progn (logical-wire-received-field cursor 2 three 25) nil)
+                            (error () t)))
+                 (rove:ok (= 72 (logical-wire-field-budget-used budget)))
+                 (close-logical-wire-field-owner three)
+                 (rove:ok (= 0 (logical-wire-field-budget-used budget)))
+                 (close-logical-wire-field-owner three)
+                 (rove:ok (= 0 (logical-wire-field-budget-used budget))))))
+        (dolist (owner (list one two three)) (close-logical-wire-field-owner owner))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-spilled-integer-spelling-matches-parse-integer
+    (let ((path (merge-pathnames (format nil "pg-integer-field-~d-~d"
+                                         (sb-posix:getpid) (random 1000000))
+                                 (uiop:temporary-directory))))
+      (unwind-protect
+           (dolist (value (list "0" "+001" "-00" "  5  " (format nil "~c-7~c" #\Tab #\Newline)
+                                "" "+" "   " "1 2" "++1" "12x" "１２"
+                                (concatenate 'string (make-string 70000 :initial-element #\0) "1")))
+             (let ((owner (make-logical-wire-field-owner)) (bytes (string->bytes value)))
+               (unwind-protect
+                    (progn
+                      (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                                :if-exists :supersede :if-does-not-exist :create)
+                        (write-sequence bytes out))
+                      (with-open-file (in path :element-type '(unsigned-byte 8))
+                        (let* ((field (logical-wire-field-capture
+                                       owner (make-logical-wire-cursor :stream in :remaining (length bytes))
+                                       (length bytes)))
+                               (expected (not (null (ignore-errors
+                                                     (parse-integer value :junk-allowed nil)))))
+                               (actual (handler-case
+                                           (let ((rendered (with-output-to-string (out)
+                                                             (logical-write-value-literal out 23 field))))
+                                             (and (string= rendered value) t))
+                                         (error () nil))))
+                          (rove:ok (eql expected actual)))))
+                 (close-logical-wire-field-owner owner))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-streamed-integer-syntax-matches-parse-integer
+    (labels ((accepted-p (text)
+               (handler-case
+                   (let* ((out (make-string-output-stream))
+                          (stream (make-instance 'logical-field-integer-stream
+                                                 :output out :context :pgoutput)))
+                     (write-string text stream)
+                     (and (member (logical-field-integer-state stream) '(:digits :trailing))
+                          (string= text (get-output-stream-string out))))
+                 (error () nil)))
+             (same-p (text)
+               (eql (not (null (ignore-errors (parse-integer text :junk-allowed nil))))
+                    (not (null (accepted-p text))))))
+      (rove:ok
+       (loop for code below 256
+             for char = (code-char code)
+             always (and (same-p (concatenate 'string (string char) "1"))
+                         (same-p (concatenate 'string "1" (string char)))
+                         (same-p (concatenate 'string "+" (string char) "1")))))
+      (rove:ok (every #'same-p (mapcar (lambda (code) (string (code-char code)))
+                                       '(1632 1776 2406 65296 160 8192 8232 12288))))))
+
+(rove:deftest test-copy-query-shares-budget-across-rows
+    (let* ((path (merge-pathnames (format nil "pg-copy-budget-~d-~d"
+                                          (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (original (symbol-function 'pg-client-send-query))
+           (budget (make-logical-wire-field-budget 80))
+           (owners nil) (rows nil)
+           (description (make-payload)))
+      (payload-push-u16 description 1)
+      (payload-push-cstring description "a")
+      (dotimes (i 6) (payload-push-byte description 0))
+      (payload-push-u32 description 25)
+      (payload-push-u16 description #xffff)
+      (payload-push-u32 description #xffffffff)
+      (payload-push-u16 description 0)
+      (unwind-protect
+           (progn
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede :if-does-not-exist :create)
+               (write-message out #\T description)
+               (dolist (value '("abcd" "wxyz"))
+                 (let ((row (make-payload)))
+                   (payload-push-u16 row 1)
+                   (payload-push-u32 row 4)
+                   (payload-push row (string->bytes value))
+                   (write-message out #\D row)))
+               (write-message out #\Z #(73)))
+             (setf (symbol-function 'pg-client-send-query) (lambda (&rest args) (declare (ignore args))))
+             (with-open-file (in path :element-type '(unsigned-byte 8))
+               (pg-client-query
+                (make-pg-client :stream in) "SELECT" :field-budget budget
+                :on-row-with-owner
+                (lambda (row columns owner)
+                  (declare (ignore columns))
+                  (push row rows)
+                  (push owner owners)
+                  :retain)))
+             (setf rows (nreverse rows))
+             (rove:ok (string= (aref (first rows) 0) "abcd"))
+             (rove:ok (logical-wire-field-p (aref (second rows) 0)))
+             (rove:ok (= (logical-wire-field-budget-used budget) 80))
+             (dolist (owner owners) (close-logical-wire-field-owner owner))
+             (rove:ok (zerop (logical-wire-field-budget-used budget))))
+        (setf (symbol-function 'pg-client-send-query) original)
+        (dolist (owner owners) (close-logical-wire-field-owner owner))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-copy-bounds-spilled-row-descriptors
+    (let* ((path (merge-pathnames (format nil "pg-copy-fds-~d-~d"
+                                          (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (original-send (symbol-function 'pg-client-send-query))
+           (original-chunk (symbol-function 'logical-copy-target-chunk))
+           (*logical-wire-resident-field-budget* 80)
+           (description (make-payload)) (chunk-sizes nil) (field-count 0))
+      (payload-push-u16 description 1)
+      (payload-push-cstring description "a")
+      (dotimes (i 6) (payload-push-byte description 0))
+      (payload-push-u32 description 25)
+      (payload-push-u16 description #xffff)
+      (payload-push-u32 description #xffffffff)
+      (payload-push-u16 description 0)
+      (unwind-protect
+           (progn
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede :if-does-not-exist :create)
+               (write-message out #\T description)
+               (dotimes (i 100)
+                 (let ((row (make-payload)))
+                   (payload-push-u16 row 1)
+                   (payload-push-u32 row 4)
+                   (payload-push row (string->bytes "abcd"))
+                   (write-message out #\D row)))
+               (write-message out #\Z #(73)))
+             (setf (symbol-function 'pg-client-send-query)
+                   (lambda (&rest args) (declare (ignore args)))
+                   (symbol-function 'logical-copy-target-chunk)
+                   (lambda (target table columns rows)
+                     (declare (ignore target table columns))
+                     (let ((spilled (count-if (lambda (row) (logical-wire-field-p (aref row 0))) rows)))
+                       (push spilled chunk-sizes)
+                       (incf field-count (length rows))
+                       (rove:ok (<= spilled 32)))))
+             (with-open-file (in path :element-type '(unsigned-byte 8))
+               (logical-copy-source-table (make-pg-client :stream in) nil "copy_rows"
+                                          (lambda (&rest args) (declare (ignore args)) nil)))
+             (rove:ok (= field-count 100))
+             (rove:ok (> (length chunk-sizes) 1))
+             (rove:ok (find 32 chunk-sizes)))
+        (setf (symbol-function 'pg-client-send-query) original-send
+              (symbol-function 'logical-copy-target-chunk) original-chunk)
         (when (probe-file path) (delete-file path)))))
 
 (rove:deftest test-logical-wire-operations-match-vector-decoder

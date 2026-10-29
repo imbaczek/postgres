@@ -3,6 +3,10 @@
 (in-package #:pg)
 
 (defconstant +logical-copy-chunk-bytes+ (* 8 1024 1024))
+
+(defconstant +logical-copy-max-spilled-owners+ 32
+  "Bound the scratch descriptors retained by a copy chunk.")
+
 (defparameter +subscription-progress-table+ "pg_lisp_subscription_progress")
 (defparameter +subscription-config-table+ "pg_lisp_subscription_config")
 
@@ -559,7 +563,8 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
 
 (defun logical-copy-source-table (source target table &optional (validate-schema #'logical-validate-copy-schema) (source-table table))
   (let ((columns (funcall validate-schema source target table))
-        (rows '()) (owners '()) (chunk-bytes 0)
+        (rows '()) (owners '()) (chunk-bytes 0) (spilled-owners 0)
+        (field-budget (make-logical-wire-field-budget))
         (chunk-limit (logical-copy-chunk-limit-bytes)))
     (labels ((release-owners ()
                (sb-sys:without-interrupts
@@ -568,7 +573,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                         (dolist (owner owners)
                           (handler-case (close-logical-wire-field-owner owner)
                             (error (condition) (unless failure (setf failure condition)))))
-                     (setf owners nil rows nil chunk-bytes 0))
+                     (setf owners nil rows nil chunk-bytes 0 spilled-owners 0))
                    (when failure (error failure)))))
              (flush-chunk ()
                (when rows
@@ -584,15 +589,17 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                  (sb-sys:without-interrupts
                    (push owner owners)
                    (push row rows)
-                   (incf chunk-bytes row-bytes))
-                 (when (> row-bytes chunk-limit)
+                   (incf chunk-bytes row-bytes)
+                   (when (and owner (logical-wire-field-owner-stream owner)) (incf spilled-owners)))
+                 ;; Bound simultaneously retained anonymous file descriptors as well as bytes.
+                 (when (or (> row-bytes chunk-limit) (>= spilled-owners +logical-copy-max-spilled-owners+))
                    (flush-chunk))
                  :retain)))
       (unwind-protect
            (progn
              ;; Each source row owns its slices through its target chunk commit.
              (pg-client-query source (format nil "SELECT * FROM ~a" source-table)
-                              :on-row-with-owner #'consume-row)
+                              :on-row-with-owner #'consume-row :field-budget field-budget)
              (flush-chunk))
         (release-owners)))))
 
@@ -846,8 +853,45 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
 
 (defvar *logical-wire-field-owner* nil)
 
+(defclass logical-field-integer-stream (sb-gray:fundamental-character-output-stream)
+  ((output :initarg :output :reader logical-field-integer-output)
+   (context :initarg :context :reader logical-field-integer-context)
+   (state :initform :leading :accessor logical-field-integer-state)))
+
+(defun logical-field-integer-error (context)
+  (if (eq context :copy)
+      (error "source returned a malformed integer value")
+      (error "pgoutput integer value is malformed")))
+
+(defmethod sb-gray:stream-write-char ((stream logical-field-integer-stream) character)
+  (let ((state (logical-field-integer-state stream))
+        (space-p (find character '(#\Space #\Tab #\Newline #\Page #\Return))))
+    (setf (logical-field-integer-state stream)
+          (case state
+            (:leading (cond (space-p :leading)
+                            ((find character '(#\+ #\-)) :sign)
+                            ((digit-char-p character 10) :digits)))
+            (:sign (when (digit-char-p character 10) :digits))
+            (:digits (cond ((digit-char-p character 10) :digits) (space-p :trailing)))
+            (:trailing (when space-p :trailing))))
+    (unless (logical-field-integer-state stream)
+      (logical-field-integer-error (logical-field-integer-context stream)))
+    (write-char character (logical-field-integer-output stream)))
+  character)
+
+(defun logical-write-integer-field (output field context)
+  "Validate the full integer spelling while streaming its original characters."
+  (unless (member context '(:copy :pgoutput))
+    (error "unknown logical value conversion context ~s" context))
+  (let ((stream (make-instance 'logical-field-integer-stream :output output :context context)))
+    (logical-wire-field-visit field stream)
+    (unless (member (logical-field-integer-state stream) '(:digits :trailing))
+      (logical-field-integer-error context))))
+
 (defun logical-write-value-literal (stream type value &optional (context :pgoutput))
   (cond
+    ((and (member type '(20 21 23)) (logical-wire-field-p value))
+     (logical-write-integer-field stream value context))
     ((or (null value) (eq value :unchanged-toast) (member type '(20 21 23)))
      (write-string (logical-source-value-literal type value context) stream))
     ((member type '(17 25 114 3802 700 701 1043 1082 1083 1114 1184 1186 1266 1700))

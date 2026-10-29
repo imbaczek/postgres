@@ -96,7 +96,15 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
   (with-output-to-string (output)
     (logical-wire-write-text cursor size output)))
 
-(defstruct logical-wire-field-owner stream (size 0) (active-p t))
+(defparameter *logical-wire-resident-field-budget* (* 4 1024 1024)
+  "Conservative budget for retained field strings per receiver scope.")
+
+(defstruct (logical-wire-field-budget (:constructor make-logical-wire-field-budget
+                                          (&optional (limit *logical-wire-resident-field-budget*))))
+  limit (used 0))
+
+(defstruct logical-wire-field-owner stream (size 0) (active-p t)
+           (budget (make-logical-wire-field-budget)) (resident-bytes 0))
 
 (defstruct logical-wire-field owner offset size crc)
 
@@ -108,6 +116,9 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
     (sb-sys:without-interrupts
       (when (logical-wire-field-owner-active-p owner)
         (setf (logical-wire-field-owner-active-p owner) nil)
+        (decf (logical-wire-field-budget-used (logical-wire-field-owner-budget owner))
+              (logical-wire-field-owner-resident-bytes owner))
+        (setf (logical-wire-field-owner-resident-bytes owner) 0)
         (when (logical-wire-field-owner-stream owner)
           (close (logical-wire-field-owner-stream owner) :abort t)))))
   (values))
@@ -162,12 +173,28 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
         (setf (logical-wire-field-owner-size owner) (+ offset size))
         (make-logical-wire-field :owner owner :offset offset :size size :crc crc)))))
 
+(defun logical-wire-reserve-field (owner size)
+  "Reserve a conservative resident charge before decoding one field."
+  (sb-sys:without-interrupts
+    (unless (logical-wire-field-owner-active-p owner)
+      (error "logical field owner is closed"))
+    (let* ((budget (logical-wire-field-owner-budget owner))
+           (charge (+ 64 (* 4 size))))
+      (when (<= (+ (logical-wire-field-budget-used budget) charge)
+                (logical-wire-field-budget-limit budget))
+        (incf (logical-wire-field-budget-used budget) charge)
+        (incf (logical-wire-field-owner-resident-bytes owner) charge)
+        t))))
+
 (defun logical-wire-received-field (cursor size owner type-oid)
   "Return a string or a scoped slice for one text-format field."
-  (if (and owner (> size *logical-wire-field-spill-threshold*)
-           (not (member type-oid '(20 21 23))))
-      (logical-wire-field-capture owner cursor size)
-      (logical-wire-text cursor size)))
+  (declare (ignore type-oid))
+  (cond
+    ((null owner) (logical-wire-text cursor size))
+    ((or (> size *logical-wire-field-spill-threshold*)
+         (not (logical-wire-reserve-field owner size)))
+     (logical-wire-field-capture owner cursor size))
+    (t (logical-wire-text cursor size))))
 
 (defun logical-wire-field-visit (field output)
   "Verify FIELD and optionally write its decoded characters to OUTPUT."
@@ -418,7 +445,7 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
              (values (code-char type) payload decoded-p)))
       (unless complete (pg-client-close client)))))
 
-(defun pg-client-query (client query &key on-row on-row-with-owner)
+(defun pg-client-query (client query &key on-row on-row-with-owner field-budget)
   "Send one simple query and return ROWS, COLUMNS, and the completion tag.
 
 ON-ROW receives each streamed row. ON-ROW-WITH-OWNER receives a row, columns,
@@ -431,7 +458,9 @@ to the callback. Otherwise the owner expires as soon as the callback returns."
       (pg-client-send-query client query))
   (let ((columns nil) (rows '()) (tag nil) (server-error nil))
     (loop
-      (let ((owner (and on-row-with-owner (make-logical-wire-field-owner)))
+      (let ((owner (and on-row-with-owner (if field-budget
+                                              (make-logical-wire-field-owner :budget field-budget)
+                                              (make-logical-wire-field-owner))))
             (transferred nil))
         (sb-sys:without-interrupts
           (unwind-protect

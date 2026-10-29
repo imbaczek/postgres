@@ -620,12 +620,14 @@ Initial copy batches rows to an 8 MiB target; a larger row uses a separate
 transaction and must still fit the source/target protocol and logical WAL limits.
 For extension-mode initial copy, each target INSERT is counted and emitted in
 bounded UTF-8 blocks without constructing a complete query string. The source
-DataRow is read through a bounded cursor without a complete frame copy. Eligible
-text-format fields above 1 MiB use row-owned temporary slices, retained through
-their target chunk commit and released on completion or error. Smaller fields,
-integer fields and row metadata remain in memory, including the current batch;
-the 8 MiB batching target counts the original UTF-8 field bytes. The target
-still receives and parses the complete Simple Query frame.
+DataRow is read through a bounded cursor without a complete frame copy. Text-format
+fields above 1 MiB, or fields that would exceed the shared 4 MiB conservative
+resident-field budget, use row-owned temporary slices, retained through their
+target chunk commit and released on completion or error. This includes integer
+fields. A chunk flushes after 32 rows with spilled owners; the 8 MiB batching
+target counts the original UTF-8 field bytes. Row metadata and other allocations
+remain in memory, and the target still receives and parses the complete Simple
+Query frame.
 Frontend query message lengths are limited to 132 MiB, including the four-byte
 length word. Logical capture normally limits each encoded row change or
 transactional event to 64 MiB, including its encoding overhead. Row changes
@@ -675,11 +677,11 @@ bounded stream cursor, without allocating the complete encoded event. The
 sender measures each INSERT, UPDATE, or DELETE row before writing one pgoutput
 CopyData frame through a bounded buffer. The subscriber reads replication frames
 directly through a length-bounded stream cursor and completes decoding before
-applying an operation. Eligible pgoutput row text fields larger than 1 MiB are
-validated as UTF-8 and stored in an unlinked, process-owned temporary file for
-the duration of synchronous apply; their CRC is checked during SQL preflight
-and emission. Smaller fields and integer fields are materialized, as are
-extension Message contents. INSERT, UPDATE and DELETE apply
+applying an operation. Pgoutput row text-format fields above 1 MiB or beyond
+the frame's conservative 4 MiB resident-field budget, including integer fields,
+are validated as UTF-8 and stored in an unlinked, process-owned temporary file
+for synchronous apply; their CRC is checked during SQL preflight and emission.
+Extension Message contents and other allocations still materialize. INSERT, UPDATE and DELETE apply
 queries use producers that count and then emit SQL in bounded UTF-8 blocks
 without building a full query string; the target still receives and parses the
 complete Simple Query. A malformed or incomplete
