@@ -285,7 +285,9 @@
       (setf (gethash name settings) (subseq assignment (1+ equals))))))
 
 (defun startup-cli-inputs (argv)
-  "Consume values once and reject unknown flags or positional arguments."
+  "Consume values once and reject unknown flags or positional arguments.
+For -C, values containing only decimal digits select the native control port;
+other values request configuration output. The last -C selects between these uses."
   (let ((native (make-hash-table :test #'equal))
         (settings (make-hash-table :test #'equal)))
     (loop while argv
@@ -512,7 +514,9 @@
                   t))))))
 
 (defun startup-configuration-output (argv)
-  "Return a requested -C value in base units without installing server state."
+  "Return the requested -C value in base units using normal configuration precedence.
+Require an existing data directory. Resolve names case-insensitively without
+installing settings, taking PGDATA ownership or starting listeners."
   (multiple-value-bind (native overrides) (startup-cli-inputs argv)
     (let ((name (gethash "config-output" native)))
       (when name
@@ -527,6 +531,7 @@
                 (princ-to-string value))))))))
 
 (defun startup-handle-meta-request (argv)
+  "Print and exit for version or configuration requests before server startup."
   (when (or (equal argv '("--version")) (equal argv '("-V")))
     (format t "pg-lisp (PostgreSQL) ~a~%" *server-version*)
     (finish-output)

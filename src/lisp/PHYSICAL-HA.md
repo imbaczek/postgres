@@ -630,6 +630,22 @@ alone would not provide that behavior. The implementation must cover first
 attachment, same-timeline changes, descendant transitions, clearing conninfo,
 failed replacement, cold restart and shutdown/promotion races.
 
+The native `-C` metadata path now prints supported static settings using
+configuration precedence and base units before storage ownership or listener
+startup, provided the data directory exists. The CLI oracle passes five C
+comparisons without creating storage files; the pinned Patroni startup smoke,
+control reload and SQL checks, 12 focused startup tests and strict cold
+compilation pass.
+
+A separate pinned Patroni 4.1.5 oracle constructs the real `Postgresql` and
+`ConfigHandler`, writes attach, replace and clear configurations, and checks all
+emitted and recovery settings with C `postgres -C`. It verifies passfile mode
+and escaping, connection options, slot name, local configuration and signal
+files. The C run passes; the full native comparison currently fails on unsupported
+`cluster_name`. This is a writer and metadata oracle, not a `Postgresql.follow`
+or receiver test. Full GUC behavior, desired-generation reconciliation, libpq,
+first attachment, same-timeline follow and the follow acceptance matrix remain open.
+
 A Sol xhigh source audit identified these connected requirements:
 
 - Add an explicit logical/physical discriminator to the shared public slot

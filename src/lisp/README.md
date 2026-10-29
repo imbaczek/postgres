@@ -1528,6 +1528,28 @@ PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/patroni-start.sh
 PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/physical-follow.sh
 ```
 
+`./pg-lisp.sh -D EXISTING_PGDATA -C setting` prints a supported configuration
+value in base units using normal file and command-line precedence, without
+initializing storage or opening listeners. `-Csetting` also works; names are
+case-insensitive. A `-C` value containing only decimal digits retains the native
+control-port meaning, and the last `-C` selects between the two meanings.
+`--control-port` is unchanged.
+Run `./t/config-output.sh` for the CLI checks, optionally setting
+`REFERENCE_POSTGRES` to the pinned C executable for comparison.
+
+The pinned Patroni writer metadata oracle requires the C 20 binary directory:
+
+```sh
+PATRONI_PYTHON=/path/to/pinned-venv/bin/python3
+"$PATRONI_PYTHON" t/interop/patroni-follow-config.py /path/to/c/bin /tmp/new-follow-config-oracle
+```
+
+It exercises the unmodified writer's attach, replace and clear configuration
+against C `postgres -C`; the output directory must not already exist. Optional
+`--native /path/to/pg-lisp.sh` also compares native metadata. That full native
+comparison currently fails on unsupported `cluster_name`. This checks generated
+metadata, not `Postgresql.follow`, a receiver, an HA controller or DCS.
+
 Physical follow also requires that pinned environment and checks Patroni's unchanged
 five-column timeline/LSN fragment on primary, standby and paused standby, including
 reload and resume. It also checks the unchanged ordinary 16-column cluster status

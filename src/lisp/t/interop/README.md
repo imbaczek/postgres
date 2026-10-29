@@ -48,6 +48,20 @@ isolated pg-lisp and unmodified C peers through `PG_INTEROP_TARGET_PORT` and
 `PG_INTEROP_REFERENCE_PORT`; `PG_INTEROP_REFERENCE_USER` defaults to postgres.
 The apply suite creates fixtures and must start against fresh databases.
 
+`patroni-follow-config.py` constructs the pinned unmodified Patroni 4.1.5
+`Postgresql` and `ConfigHandler` and checks the complete attach, replace and
+clear writer output with C `postgres -C`. Use the pinned requirements, the C 20
+binary directory and a new artifact directory:
+
+```sh
+PATRONI_PYTHON=/path/to/pinned-venv/bin/python3
+"$PATRONI_PYTHON" t/interop/patroni-follow-config.py /path/to/c/bin /tmp/new-follow-config-oracle
+```
+
+Pass `--native /path/to/pg-lisp.sh` to compare native metadata as well; the full
+comparison currently fails on unsupported `cluster_name`. This oracle does not
+run `Postgresql.follow`, a receiver, a coordinator or DCS.
+
 ## Verification
 
 - Primary Rove: 134 pass; live apply/SQL/wire: 21 pass; native C subscriber: 3 pass.
