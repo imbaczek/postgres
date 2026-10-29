@@ -9,6 +9,7 @@
                (:file "t/rove/pglz-tests")
                (:file "t/rove/numeric-storage-tests")
                (:file "t/rove/jsonb-storage-tests")
+               (:file "t/rove/json-operator-tests")
                (:file "t/rove/sql-tests")
                (:file "t/rove/catalog-tests")
                (:file "t/rove/protocol-tests")

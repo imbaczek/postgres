@@ -149,6 +149,31 @@ depth greater than 512 are rejected with SQLSTATE 54001; the root has depth zero
                (t (write-string (sql-numeric-output value) out)))))
     (with-output-to-string (out) (emit (sql-jsonb-value jsonb) out))))
 
+(defun sql-jsonb-extract (jsonb key text-p)
+  "Extract a JSONB object field or array element; return SQL NULL when absent.
+KEY is a string field name or an integer index, including negative indexes.
+TEXT-P requests the text form, for which JSON null becomes SQL NULL."
+  (let* ((value (sql-jsonb-value jsonb))
+         (found nil)
+         (result nil))
+    (cond
+      ((and (stringp key) (consp value) (eq (car value) :object))
+       (let ((pair (assoc key (cdr value) :test #'string=)))
+         (when pair (setf found t result (cdr pair)))))
+      ((and (integerp key) (vectorp value) (not (stringp value)))
+       (let ((index (if (minusp key) (+ (length value) key) key)))
+         (when (<= 0 index (1- (length value)))
+           (setf found t result (aref value index)))))
+      ((and (integerp key) (member key '(0 -1))
+            (not (and (consp value) (eq (car value) :object))))
+       ;; JSONB stores a scalar root as a one-element raw-scalar array.
+       (setf found t result value)))
+    (cond ((not found) +null+)
+          ((not text-p) (make-sql-jsonb result))
+          ((eq result :json-null) +null+)
+          ((stringp result) result)
+          (t (sql-jsonb-output (make-sql-jsonb result))))))
+
 (defun sql-jsonb-equality-key (jsonb)
   "Return an EQUAL-comparable key that ignores JSONB numeric display scale.
 Numeric values are compared by value recursively, so 1 and 1.0 are equal even

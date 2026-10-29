@@ -1,0 +1,42 @@
+;;;; SQL JSONB field and array extraction.
+(in-package #:pg)
+
+(defun json-test-evaluate (sql)
+  (let* ((statement (first (parse-statements sql)))
+         (target (first (getf statement :targets)))
+         (expr (analyze-expr (getf target :expr) nil)))
+    (values (eval-expr expr nil) (expr-type expr))))
+
+(rove:deftest test-jsonb-extraction
+    (flet ((check (sql expected type)
+             (multiple-value-bind (value actual-type) (json-test-evaluate sql)
+               (rove:ok (eq actual-type type))
+               (rove:ok (equal (if (sql-jsonb-p value) (sql-jsonb-output value) value)
+                               expected)))))
+      (check "select '{\"a\": [1, \"two\", null]}'::jsonb -> 'a' -> -2" "\"two\"" :jsonb)
+      (check "select '{\"a\": [1, \"two\", null]}'::jsonb -> 'a' ->> -2" "two" :text)
+      (check "select '{\"a\":null}'::jsonb -> 'a'" "null" :jsonb)
+      (check "select '{\"a\":null}'::jsonb ->> 'a'" +null+ :text)
+      (check "select '{\"a\":1}'::jsonb -> 'missing'" +null+ :jsonb)
+      (check "select '[1,2]'::jsonb -> -3" +null+ :jsonb)
+      (check "select '1'::jsonb -> 0" "1" :jsonb)
+      (check "select '1'::jsonb -> -1" "1" :jsonb)
+      (check "select '\"abc\"'::jsonb ->> 0" "abc" :text)
+      (check "select '{\"a\":1}'::jsonb -> 'a'::name" "1" :jsonb)
+      (check "select '{\"a\":1}'::jsonb -> 'a'::\"char\"" "1" :jsonb)
+      (check "select null::jsonb -> 'a'" +null+ :jsonb)
+      (check "select '{}'::jsonb -> null" +null+ :jsonb)
+      (check "select '{}'::jsonb -> null::int" +null+ :jsonb)
+      (check "select '{\"a\": true}'::jsonb ->> 'a'" "true" :text)
+      (check "select '{\"a\": {\"b\":1}}'::jsonb ->> 'a'" "{\"b\": 1}" :text)))
+
+(rove:deftest test-jsonb-extraction-invalid-operator-types
+    (dolist (case '(("select '{}'::jsonb -> 1::bigint" "42883" "operator does not exist: jsonb -> bigint")
+                    ("select '{}'::jsonb -> true" "42883" "operator does not exist: jsonb -> boolean")
+                    ("select '{}' -> 0" "42725" "operator is not unique: unknown -> integer")
+                    ("select '{}' -> 'a'" "42725" "operator is not unique: unknown -> unknown")))
+      (let ((condition (handler-case (progn (json-test-evaluate (first case)) nil)
+                         (pg-error (error) error))))
+        (rove:ok (and condition
+                      (string= (pg-error-sqlstate condition) (second case))
+                      (string= (pg-error-message condition) (third case)))))))

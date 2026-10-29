@@ -229,6 +229,9 @@ exist\" messages."
     (:int2vector "int2vector")
     (:char "\"char\"")
     (:name "name")
+    (:json "json")
+    (:jsonb "jsonb")
+    (:bytea "bytea")
     (t "text")))
 
 (defun call-signature (args)
@@ -2067,6 +2070,25 @@ candidate selection."
       (list :binop "%" (coerce-common-expression left type)
             (coerce-common-expression right type) :type type :typmod -1))))
 
+(defun analyze-jsonb-extraction (operator left right)
+  "Resolve JSONB field and element extraction with PostgreSQL operand types."
+  (unless (eq (expr-type left) :jsonb)
+    (report-operator-resolution-error
+     operator (list left right)
+     (and (in-unknown-constant-p left)
+          (or (in-unknown-constant-p right)
+              (member (expr-type right) '(:text :varchar :name :char :int2 :int4))))))
+  (cond
+    ((in-unknown-constant-p right) (setf right (coerce-in-constant right :text)))
+    ((member (expr-type right) '(:varchar :name :char))
+     (setf right (list :cast right :type :text :typmod -1)))
+    ((eq (expr-type right) :int2)
+     (setf right (list :cast right :type :int4 :typmod -1))))
+  (unless (member (expr-type right) '(:text :int4))
+    (report-operator-resolution-error operator (list left right)))
+  (list :binop operator left right :type (if (string= operator "->") :jsonb :text)
+        :typmod -1))
+
 (defun analyze-binop-expression (expression scope)
   (let* ((operator (second expression))
          (left (analyze-expr (third expression) scope))
@@ -2074,6 +2096,8 @@ candidate selection."
     (when (and (> (length operator) 1) (char= (char operator 0) #\^))
       (ereport "42883" "operator does not exist: ~a ~a ~a"
                (typed-arg-name left) operator (typed-arg-name right)))
+    (when (member operator '("->" "->>") :test #'string=)
+      (return-from analyze-binop-expression (analyze-jsonb-extraction operator left right)))
     (when (string= operator "^")
       ;; Resolve the operator before coercing unknowns; retain op_error's
       ;; diagnostics rather than reporting the corresponding power function.
@@ -3806,6 +3830,8 @@ truncate and interpret the result at TYPE's signed width."
        (if (member op '("=" "<>" "<" "<=" ">" ">=") :test #'string=)
            (sql-compare op l r)
            (let ((value (cond ((or (eq l +null+) (eq r +null+)) +null+)
+                              ((member op '("->" "->>") :test #'string=)
+                               (sql-jsonb-extract l r (string= op "->>")))
                               ((or (member (expr-type (third expr)) '(:time :timestamp :timestamptz :interval))
                                    (member (expr-type (fourth expr)) '(:time :timestamp :timestamptz :interval)))
                                (sql-temporal-arithmetic op l r (expr-type (third expr)) (expr-type (fourth expr))
