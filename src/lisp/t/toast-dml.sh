@@ -158,6 +158,13 @@ run -c "insert into vacuum_inline_text values ('$numeric_repeat')" >/dev/null
 run -c 'vacuum full vacuum_inline_text' >/dev/null
 [ "$(run -c 'select length(v) from vacuum_inline_text')" = 20000 ]
 run -c 'create table toast_numeric (id int primary key, v numeric)' >/dev/null
+numeric_toast_oid=$(run -c "select reltoastrelid from pg_class where relname = 'toast_numeric'")
+[ "$numeric_toast_oid" -gt 0 ]
+[ "$(run -c "select relkind from pg_class where oid = $numeric_toast_oid")" = t ]
+[ "$(run -c "select count(*) from pg_index where indrelid = $numeric_toast_oid")" = 1 ]
+[ "$(run -c "select count(*) from pg_attribute where attrelid = $numeric_toast_oid")" = 3 ]
+[ "$(run -c "select a.attstorage from pg_attribute a join pg_class c on a.attrelid = c.oid where c.relname = 'toast_numeric' and a.attname = 'v'")" = m ]
+[ "$(run -c "select count(*) from pg_type where typname in ('text','bytea','json','jsonb','numeric')")" = 5 ]
 run -c "insert into toast_numeric values (1, '$numeric_big'::numeric), (2, '$numeric_repeat'::numeric), (3, 'NaN'::numeric)" >/dev/null
 [ "$(run -c 'select length(v::text) from toast_numeric where id = 1')" = 8000 ]
 [ "$(run -c "select v = '$numeric_big'::numeric from toast_numeric where id = 1")" = t ]
@@ -173,8 +180,13 @@ wait "$SRV" || true
 SRV=
 test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
+[ "$(run -c "select reltoastrelid from pg_class where relname = 'toast_numeric'")" = "$numeric_toast_oid" ]
 [ "$(run -c "select v = '$numeric_big'::numeric from toast_numeric where id = 1")" = t ]
 [ "$(run -c 'select length(v::text) from toast_numeric where id = 2')" = 20000 ]
 [ "$(run -c "select v = '$numeric_repeat'::numeric from toast_numeric where id = 2")" = t ]
 [ "$(run -c 'delete from toast_numeric where id = 1 returning length(v::text)')" = 8000 ]
+run -c 'drop table toast_numeric' >/dev/null
+[ "$(run -c "select count(*) from pg_class where oid = $numeric_toast_oid")" = 0 ]
+[ "$(run -c "select count(*) from pg_attribute where attrelid = $numeric_toast_oid")" = 0 ]
+[ "$(run -c "select count(*) from pg_index where indrelid = $numeric_toast_oid")" = 0 ]
 echo 'toast-dml: PASS'

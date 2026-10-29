@@ -69,6 +69,25 @@
         (rove:ok (and (member 51 nodes) (member 101 nodes) (member 103 nodes))
                  "inventory retains parent, TOAST heap, and TOAST index"))))
 
+(rove:deftest test-toast-catalog-type-metadata
+    (let ((rows (sql-type-rows)))
+      (dolist (case '((25 "text" -1 #\i #\x)
+                      (17 "bytea" -1 #\i #\x)
+                      (114 "json" -1 #\i #\x)
+                      (3802 "jsonb" -1 #\i #\x)
+                      (1700 "numeric" -1 #\i #\m)
+                      (23 "int4" 4 #\i #\p)
+                      (1016 "_int8" -1 #\d #\x)))
+        (let ((row (find (first case) rows :key (lambda (row) (aref row 0)))))
+          (rove:ok row)
+          (when row
+            (rove:ok (equal (coerce row 'list)
+                            (list (first case) (second case) 11 (third case)
+                                  (char-code (fourth case)) (char-code (fifth case)))))))))
+  (rove:ok (= (sql-result-column-attnum 1259 7) 14))
+  (rove:ok (= (sql-result-column-attnum 1249 9) 10))
+  (rove:ok (= (sql-result-column-attnum 1247 6) 24)))
+
 (rove:deftest test-toast-ownership-horizon-and-drop
     (let* ((*catalog* (make-catalog))
            (*wal-ready* t)

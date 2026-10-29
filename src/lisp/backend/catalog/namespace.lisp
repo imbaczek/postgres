@@ -251,12 +251,18 @@ Reject unsupported parameters and unsupported local settings."
    (list :oid 1259 :name "pg_class" :kind #\r :rows 'sql-class-rows
          :fields '(("oid" :oid t 1) ("relname" :name t 2)
                    ("relnamespace" :oid t 3) ("relkind" :char t 18)
-                   ("relnatts" :int2 t 19) ("relreplident" :char t 27)))
+                   ("relnatts" :int2 t 19) ("relreplident" :char t 27)
+                   ("reltoastrelid" :oid t 14)))
    (list :oid 1249 :name "pg_attribute" :kind #\r :rows 'sql-attribute-rows
          :fields '(("attrelid" :oid t 1) ("attname" :name t 2)
                    ("atttypid" :oid t 3) ("attnum" :int2 t 5)
                    ("atttypmod" :int4 t 6) ("attnotnull" :bool t 12)
-                   ("attgenerated" :char t 16) ("attisdropped" :bool t 17)))
+                   ("attgenerated" :char t 16) ("attisdropped" :bool t 17)
+                   ("attstorage" :char t 10)))
+   (list :oid 1247 :name "pg_type" :kind #\r :rows 'sql-type-rows
+         :fields '(("oid" :oid t 1) ("typname" :name t 2)
+                   ("typnamespace" :oid t 3) ("typlen" :int2 t 5)
+                   ("typalign" :char t 23) ("typstorage" :char t 24)))
    (list :oid 2610 :name "pg_index" :kind #\r :rows 'sql-index-rows
          :fields '(("indexrelid" :oid t 1) ("indrelid" :oid t 2)
                    ("indisunique" :bool t 5) ("indisprimary" :bool t 7)
@@ -286,8 +292,8 @@ Reject unsupported parameters and unsupported local settings."
   (getf (sql-system-relation-definition (pg-class-oid table)) :rows))
 
 (defun sql-namespace-rows ()
-  ;; These are the two namespaces implemented by SQL relation resolution.
-  (list (vector 11 "pg_catalog") (vector 2200 "public")))
+  "Return public, catalog, and internal TOAST namespace metadata."
+  (list (vector 11 "pg_catalog") (vector 99 "pg_toast") (vector 2200 "public")))
 
 (defun sql-replication-slot-row (row)
   "Adapt the extension WAL snapshot to typed SQL values and catalog column order."
@@ -306,11 +312,21 @@ Reject unsupported parameters and unsupported local settings."
           (rows (loop for entry in +sql-system-relations+
                       collect (vector (getf entry :oid) (getf entry :name) 11
                                       (char-code (getf entry :kind))
-                                      (reduce #'max (getf entry :fields) :key #'fourth) (char-code #\d)))))
-      (labels ((add-object (oid name kind columns)
-                 (push (vector oid name 2200 (char-code kind) columns (char-code #\d)) rows)))
+                                      (reduce #'max (getf entry :fields) :key #'fourth)
+                                      (char-code #\d) 0))))
+      (labels ((add-object (oid name kind columns &optional (toast-oid 0) (namespace 2200) (identity #\d))
+                 (push (vector oid name namespace (char-code kind) columns
+                               (char-code identity) toast-oid) rows)))
         (maphash (lambda (name table)
-                   (add-object (pg-class-oid table) name #\r (length (pg-class-columns table))))
+                   (let* ((toast (pg-class-toast table))
+                          (parent-oid (pg-class-oid table)))
+                     (add-object parent-oid name #\r (length (pg-class-columns table))
+                                 (if toast (pg-toast-oid toast) 0))
+                     (when toast
+                       (let ((toast-name (format nil "pg_toast_~d" parent-oid)))
+                         (add-object (pg-toast-oid toast) toast-name #\t 3 0 99 #\n)
+                         (add-object (pg-toast-index-oid toast)
+                                     (concatenate 'string toast-name "_index") #\i 2 0 99 #\n)))))
                  (database-tables database))
         (maphash (lambda (name index)
                    (add-object (pg-index-oid index) name #\i (length (pg-index-columns index))))
@@ -320,8 +336,44 @@ Reject unsupported parameters and unsupported local settings."
                  (database-sequences database)))
       (sort rows #'< :key (lambda (row) (aref row 0))))))
 
-(defun sql-attribute-row (oid name type number typmod notnull)
-  (vector oid name (type-oid type) number (or typmod -1) notnull 0 nil))
+(defun sql-type-storage-code (type)
+  "Return PostgreSQL's default typstorage code for a supported TYPE."
+  (cond ((eq type :numeric) #\m)
+        ((or (sql-array-element-type type)
+             (member type '(:text :varchar :bytea :json :jsonb :bit :pg-node-tree :record)))
+         #\x)
+        (t #\p)))
+
+(defun sql-type-catalog-name (type)
+  "Return PostgreSQL's internal typname for a supported Lisp type identifier."
+  (let ((element (sql-array-element-type type)))
+    (if element
+        (concatenate 'string "_" (sql-type-catalog-name element))
+        (substitute #\_ #\- (string-downcase (symbol-name type))))))
+
+(defun sql-type-alignment-code (type)
+  "Return the native typalign code for a supported type."
+  (let ((element (sql-array-element-type type)))
+    (cond
+      (element (if (member element '(:int8 :float8 :time :timetz :timestamp
+                                     :timestamptz :interval :pg-lsn))
+                   #\d #\i))
+      ((member type '(:bool :char :name)) #\c)
+      ((eq type :int2) #\s)
+      ((member type '(:int8 :float8 :time :timetz :timestamp :timestamptz
+                      :interval :pg-lsn :record)) #\d)
+      (t #\i))))
+
+(defun sql-type-rows ()
+  "Expose metadata for the type identifiers recognized by SQL expression analysis."
+  (loop for (type oid length) in (symbol-value '+sql-expression-types+)
+        collect (vector oid (sql-type-catalog-name type) 11 length
+                        (char-code (sql-type-alignment-code type))
+                        (char-code (sql-type-storage-code type)))))
+
+(defun sql-attribute-row (oid name type number typmod notnull &optional storage)
+  (vector oid name (type-oid type) number (or typmod -1) notnull 0 nil
+          (char-code (or storage (sql-type-storage-code type)))))
 
 (defun sql-attribute-rows ()
   "Expose original attribute numbers; virtual executor slots remain dense internally."
@@ -338,7 +390,15 @@ Reject unsupported parameters and unsupported local settings."
                do (push (sql-attribute-row
                          (pg-class-oid table) (pg-column-name column) (pg-column-type column)
                          (pg-column-attnum column) (pg-column-typmod column)
-                         (pg-column-notnull column)) rows)))
+                         (pg-column-notnull column)) rows))
+         (let ((toast (pg-class-toast table)))
+           (when toast
+             (dolist (relation (list (cons (pg-toast-oid toast) t)
+                                     (cons (pg-toast-index-oid toast) nil)))
+               (loop for (column type) in '(("chunk_id" :oid) ("chunk_seq" :int4) ("chunk_data" :bytea))
+                     for number from 1
+                     when (or (cdr relation) (< number 3))
+                       do (push (sql-attribute-row (car relation) column type number -1 nil #\p) rows))))))
        (database-tables database))
       (maphash
        (lambda (name index)
@@ -365,11 +425,22 @@ Reject unsupported parameters and unsupported local settings."
 
 (defun sql-index-rows ()
   (with-write-lock
-    (loop for index being the hash-values of (database-indexes (current-database))
-          collect (vector (pg-index-oid index) (pg-index-table-oid index)
-                          (pg-index-unique-p index) (pg-index-primary-p index)
-                          (pg-index-valid-p index) (coerce (pg-index-columns index) 'vector)
-                          (length (pg-index-columns index))))))
+    (let ((database (current-database)) (rows nil))
+      (maphash (lambda (name index)
+                 (declare (ignore name))
+                 (push (vector (pg-index-oid index) (pg-index-table-oid index)
+                               (pg-index-unique-p index) (pg-index-primary-p index)
+                               (pg-index-valid-p index) (coerce (pg-index-columns index) 'vector)
+                               (length (pg-index-columns index))) rows))
+               (database-indexes database))
+      (maphash (lambda (name table)
+                 (declare (ignore name))
+                 (let ((toast (pg-class-toast table)))
+                   (when toast
+                     (push (vector (pg-toast-index-oid toast) (pg-toast-oid toast)
+                                   t t t #(1 2) 2) rows))))
+               (database-tables database))
+      rows)))
 
 (defun sql-replica-identity-index (oid)
   (with-write-lock

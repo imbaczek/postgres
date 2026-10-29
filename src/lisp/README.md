@@ -544,6 +544,11 @@ Idle simple-query messages containing only supported ordinary settings and MVCC
 statements commit or roll back together. DDL, maintenance and transaction-control
 messages retain the prior per-statement behavior; see the staged boundary in
 [the HA ledger](PHYSICAL-HA.md#application-name-and-supported-implicit-query-messages).
+The read-only virtual catalogs expose a subset of `pg_type`, `pg_class`,
+`pg_attribute`, and `pg_index`. TOAST ownership and its heap and index appear in
+those rows, but the internal TOAST relations are not directly queryable as SQL
+tables. `pg_type` describes the built-in expression types supported here; it is
+not a complete PostgreSQL type catalog.
 Meta-commands that need `pg_catalog` and regular-expression operators (`\d`,
 `\dt`, `\l`) return an error from the server; `psql` prints it and continues.
 
