@@ -311,7 +311,8 @@ Preserve FUNCTION's values; callers may choose a nonwaiting retry."
   (make-hash-table :test #'eq))
 
 (defun wal-release-replication-slot-owner (name owner &optional expected-slot)
-  "Release OWNER's runtime claim and backend association."
+  "Release OWNER's claim, optionally requiring the exact slot generation.
+A temporary physical slot returns to its creator and records inactivity time."
   (sb-sys:without-interrupts
     (sb-thread:with-mutex (*wal-lock*)
       (let ((slot (gethash name *wal-replication-slots*)))

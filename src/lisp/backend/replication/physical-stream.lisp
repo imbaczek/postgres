@@ -271,6 +271,8 @@ end-of-recovery bytes use text."
       (send-ready-for-query stream (transaction-status-char)))))
 
 (defun physical-source-public-slot-under-lock (command)
+  "Check an optional existing public physical slot under WAL before claiming it.
+A temporary slot may be claimed by its creator; other active owners are refused."
   (let ((name (logical-replication-command-slot-name command)))
     (when name
       (let ((slot (gethash name *wal-replication-slots*)))
@@ -288,6 +290,8 @@ end-of-recovery bytes use text."
         slot))))
 
 (defun call-with-native-physical-sender (command function)
+  "Own both sender claims for FUNCTION and release them on every exit.
+Release does not delete the public slot or private proof pin."
   (let* ((name (physical-stream-proof-pin command))
          (owner (make-physical-sender :name name :backend *backend*)))
     (unwind-protect
@@ -298,7 +302,7 @@ end-of-recovery bytes use text."
         (physical-source-release-sender name owner)))))
 
 (defun physical-source-acquire-sender (command &optional context)
-  "Validate the requested mode and claim its pin under WAL exclusion.
+  "Validate and claim the private pin and optional public slot under WAL.
 A follow pin must be ready and bound to the current writer timeline; START may
 request an eligible ancestor. In follow mode base_lsn is the receiver's immutable
 base and bounds apply feedback, not the anchor cursor."
@@ -356,6 +360,7 @@ base and bounds apply feedback, not the anchor cursor."
           (values owner limit next))))))
 
 (defun physical-source-release-sender (name owner)
+  "Release only this sender and its exact public slot generation."
   (sb-sys:without-interrupts
     (sb-thread:with-mutex (*wal-lock*)
       (when (eq owner (gethash name *physical-source-senders*))
@@ -365,6 +370,7 @@ base and bounds apply feedback, not the anchor cursor."
        (physical-sender-public-name owner) owner (physical-sender-public-slot owner)))))
 
 (defun physical-source-retained-sender-pin (name owner)
+  "Return the validated retained pin under WAL or report a stale sender."
   (handler-case (physical-source-check-sender-under-lock name owner)
     (wal-input-validation-error (condition) (ereport "55000" "~a" condition))))
 
@@ -438,6 +444,9 @@ Explicit follow START admission acquires a ready follow pin."
   digest)
 
 (defun physical-source-publish-public-flush-under-lock (owner lsn timeline)
+  "Save positive public flush feedback with its prefix timeline under WAL.
+Install a lower floor before a backward save; preserve the old floor on forward
+saves. The caller must fence interrupted publication before releasing WAL."
   (let ((slot (when (physical-sender-p owner) (physical-sender-public-slot owner))))
     (when (and slot (plusp lsn)
                (or (not (eql lsn (wal-replication-slot-restart-lsn slot)))
@@ -454,6 +463,9 @@ Explicit follow START admission acquires a ready follow pin."
               (wal-replication-slot-restart-timeline slot) timeline)))))
 
 (defun physical-source-confirm-feedback (command owner received digest)
+  "Validate feedback under WAL, save public flush first, then confirm the pin.
+An interrupted positive public publication poisons WAL under lock and requests
+shutdown after unlocking; the private pin remains retained."
   (let ((name (physical-stream-proof-pin command))
         (started nil) (finished nil) (interrupted nil))
     (unwind-protect
@@ -600,7 +612,9 @@ A historic stream stops at its fork before sending child end-of-recovery WAL."
 
 (defun start-native-physical-replication (stream command)
   "Serve a negotiated native physical stream with bounded timeline completion.
-Prove the resume prefix before WalData. Always release both sender claims."
+Prove the resume prefix before WalData. Resume proof alone confirms the private
+pin; only actual validated positive flush feedback updates the public slot.
+Always release both sender claims."
   (call-with-native-physical-sender
    command
    (lambda (owner limit next)

@@ -13,9 +13,13 @@ checks received WAL progress. These digests detect corruption or divergence."
 (defvar *physical-source-senders* (make-hash-table :test #'equal))
 
 (defstruct physical-sender
+  "Runtime claims for one private pin and optional public slot generation.
+The backend and source identity fence use after release or source replacement."
   name pin public-name public-slot backend system-id timeline namespace)
 
 (defun physical-source-check-sender-under-lock (name owner)
+  "Validate the pin, sender and optional public claim under WAL; return the pin.
+For a sender context also check the calling backend and source incarnation."
   (let ((pin (gethash name *physical-source-pins*)))
     (unless (and pin (physical-source-pin-stream-ready-p pin)
                  (not (physical-source-pin-lost-p pin))
@@ -42,6 +46,7 @@ checks received WAL progress. These digests detect corruption or divergence."
     pin))
 
 (defun physical-source-validate-receipt-under-lock (name owner lsn digest)
+  "Validate private receipt against the current sender and durable WAL under WAL."
   (let* ((pin (physical-source-check-sender-under-lock name owner))
          (old (physical-source-pin-confirmed-lsn pin)))
     (unless (and (typep digest '(unsigned-byte 64))
@@ -338,6 +343,7 @@ leave that registry intact."
   (values))
 
 (defun physical-source-confirm-receipt-under-lock (name owner lsn digest)
+  "Save a validated private receipt before publishing its new retention floor."
   (let* ((pin (physical-source-validate-receipt-under-lock name owner lsn digest))
          (old (physical-source-pin-confirmed-lsn pin)))
     (when (eql old lsn) (return-from physical-source-confirm-receipt-under-lock pin))

@@ -10,7 +10,7 @@ and online promotion are implemented. Fresh backups from a promoted child can fo
 that same timeline. Pinned Patroni's full promotion method passes through native
 pg_ctl and pg_controldata, including its production-state wait. Locally selected
 ancestor-spool fork replay and later promotion now pass manual crash tests.
-Network fork following and rejoin, named physical-slot streaming, synchronous
+Standard follow configuration, rewind/rejoin, synchronous
 durability and remaining Patroni interfaces are unfinished. C physical WAL/disk
 compatibility remains future work. Coordination is excluded. The repository's
 original C source is the behavior oracle.
@@ -642,13 +642,9 @@ A Sol xhigh source audit identified these connected requirements:
   advancement accepts interior byte positions and clamps to primary flush or
   standby replay. Streaming feedback may move a physical restart position
   backward; logical terminal acknowledgments cannot implement that operation.
-  Future named streaming must protect `min(old, new)` through the save and any
-  ambiguous rename or directory sync failure: the old, higher live floor is not
-  conservative. Use an audited existing private proof-pin lifetime or an owned
-  process-local provisional pin; otherwise fence WAL maintenance. A process-local
-  pin protects only the running process: resolve an ambiguous save durably before
-  admitting restart, or fence startup and require reseeding. Forward-only SQL
-  advancement is unaffected. Named streaming is not implemented.
+  Named streaming now protects `min(old, new)` through public save, including
+  ambiguous rename or directory sync failure. Startup stabilizes the selected
+  durable image before trusting it. Forward-only SQL advancement is unaffected.
 - Validate physical slots against role-appropriate live WAL, base overlap and
   retained history. Preserve proven slots across promotion through the existing
   retained-root handoff. Do not relax logical-slot or private-proof restrictions
@@ -739,8 +735,8 @@ A separate pinned C standby probe confirms the replay bound with replay paused
 and newer WAL already received. Reservation remained below replay, an interior
 byte advance succeeded, and a future target clamped to replay. Evidence:
 `/tmp/pg-config-slot-probe.nWMDyQ/standby-slot-contract.log`.
-This completed internal standby loading. The public SQL milestone below followed;
-named-slot streaming, promotion carryover and standard Patroni follow remain open.
+This completed internal standby loading. Public SQL and named native streaming
+followed; promotion carryover and standard Patroni follow remain open.
 
 ### Public physical slot SQL checkpoint
 
@@ -770,8 +766,29 @@ the predicate, saves loss and then recycles. The native exact-byte policy retain
 its earlier save-loss-then-cleanup behavior. A validated generation and owner
 check authorizes captured backend termination; release after that claim does not
 revoke it. A self-owner receives FATAL outside locks before loss is saved.
-Named public physical streaming remains disabled until its sender ownership
-context is implemented. Private follow proof pins remain distinct from public slots.
+Named native physical streaming now owns a public slot alongside its distinct
+private proof pin. Standard follow configuration and promotion carryover remain open.
+
+A named START requires an existing usable physical slot and claims its exact
+generation; a temporary slot may be claimed by its creator. Resume proof alone
+updates the private pin. Actual validated positive flush feedback reserves or
+updates the public restart position and its prefix timeline, independently of
+write and apply. Public state is saved before private confirmation. Backward
+movement installs the lower live floor before saving; interrupted positive public
+publication poisons WAL under lock and requests shutdown after unlocking, retaining
+the private pin. C marks feedback dirty; native saves changed public progress during
+feedback processing. Cleanup releases claims without deleting persistent public
+slots or private proof pins.
+
+The named native wire oracle exercised claims, CopyDone, historical switch,
+flush-only feedback, backward reconnect and fork timeline selection. A persistent
+public slot survived source SIGKILL while active and loaded idle on cold restart
+(`/tmp/pg-named-slot-selected-active-crash.log`). This is not a kill at the
+save, rename or unlink boundary; that crash oracle remains in TODO. The C feedback
+oracle passed (`/tmp/pg-named-slot-c-feedback-oracle.log`). Full physical testing
+passed 953 tests before the final guard and pin lookup cleanup; focused tests and
+actual named and continuous follow wire tests passed on the final implementation.
+Interop passed 185, legacy 1,155 checks and strict cold compilation passed.
 
 CHECKPOINT runs its core once and retries recycling only, waiting in five-second
 slices until a live owner releases rather than imposing a five-second total limit.
@@ -4062,9 +4079,8 @@ START_REPLICATION PHYSICAL lsn
 
 `proof_pin` is required exactly once and names the private proof pin saved in
 receiver control. PREPARE and RELEASE also use private pins. An optional
-`SLOT public_slot` may precede `PHYSICAL` in the parsed form, but named public
-slot streaming returns `0A000` until public ownership and the stop, wait and
-recheck invalidation driver are implemented. An old START without `proof_pin`
+`SLOT public_slot` may precede `PHYSICAL` to claim an existing public physical
+slot. An old START without `proof_pin`
 also returns `0A000`; there is no fallback from SLOT to proof pin. The native
 WAL format remains version 7. Unnamed streaming is supported.
 
