@@ -408,7 +408,14 @@
                                      toast logical (pg::pg-class-columns table) 42 0)))))
                  (ok (eq (aref logical 0) bytes))
                  (ok (pg::heap-external-varlena-p (aref physical 0)))
-                 (ok (equalp bytes (pg::toast-fetch-value toast (aref physical 0) snapshot))))
+                 (let ((compressed-pointer (aref physical 0)))
+                   (ok (< (pg::heap-external-varlena-external-info compressed-pointer)
+                          (length bytes)))
+                   (ok (equalp bytes (pg::toast-fetch-value toast compressed-pointer snapshot)))
+                   (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                     (pg::with-write-lock
+                       (pg::toast-delete-value-unlocked toast compressed-pointer 44 0)))
+                   (ok (equalp bytes (pg::toast-fetch-value toast compressed-pointer snapshot)))))
                (pg::clog-set 42 pg::+clog-committed+)
                (pg::with-write-lock
                  (multiple-value-setq (parent-block parent-offset)

@@ -85,6 +85,13 @@ run -c "insert into toast_bytes values (1, '\\x$binary_hex')" >/dev/null
 run -c 'create index toast_bytes_v_idx on toast_bytes (v)' >/dev/null
 [ "$(run -c "select id from toast_bytes where v = '\\x$binary_hex'")" = 1 ]
 [ "$(run -c "delete from toast_bytes where id = 1 returning v")" = "\\x$binary_hex" ]
+# The first run encourages PGLZ, while the pseudorandom block makes its
+# compressed result span multiple TOAST chunks.
+binary_block=$(awk 'BEGIN { s=1; for (i=0;i<2100;i++) { s=(s*1664525+1013904223)%4294967296; printf "%02x", (i<200 ? 42 : int(s/16777216)) } }')
+binary_multi="$binary_block$binary_block$binary_block"
+run -c "insert into toast_bytes values (2, '\\x$binary_multi')" >/dev/null
+[ "$(run -c 'select length(v) from toast_bytes where id = 2')" = 6300 ]
+[ "$(run -c "delete from toast_bytes where id = 2 returning v")" = "\\x$binary_multi" ]
 run -c 'create table toast_text (id int primary key, v text)' >/dev/null
 run -c "insert into toast_text values (1, '$big')" >/dev/null
 [ "$(run -c 'select length(v) from toast_text where id = 1')" = 3000 ]

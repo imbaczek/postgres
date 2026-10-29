@@ -1514,13 +1514,13 @@ The OID encoding alone is a byte prefix of every key for that value."
   "Default target heap tuple size, based on four tuples per page.")
 
 (defun toast-externalization-plan (values columns &optional (target +toast-tuple-target+))
-  "Select inline varchar, text, json and bytea attributes to externalize without compression.
-Return (index . payload) pairs in largest-first order; VALUES and COLUMNS are
-unchanged. Payloads may alias inline bytea values and must remain stable until
-used. The target is a goal, not a guarantee: selection stops when the tuple fits
-or no eligible value exceeds the external-pointer size threshold. Existing
-external descriptors are left alone. Compression, per-column storage policies,
-and externalization of other variable-width types are not implemented."
+  "Select inline varchar, text, json, jsonb and bytea attributes to externalize.
+Return (index . raw-payload) pairs in largest-first order; VALUES and COLUMNS are
+unchanged. Storage may subsequently compress each selected payload. Payloads may
+alias inline bytea values and must remain stable until used. The target is a goal,
+not a guarantee: selection stops when the tuple fits or no eligible value exceeds
+the external-pointer size threshold. Existing external descriptors are left alone.
+Per-column storage policies and other variable-width types are not supported."
   (let ((physical (copy-seq values))
         (selected nil)
         (cached-varlena nil))
@@ -1572,36 +1572,70 @@ removes them. The in-memory candidate is only a hint and need not survive restar
       (when (= candidate start)
         (ereport "54000" "TOAST value ID space is exhausted")))))
 
-(defun toast-store-value-unlocked (toast bytes value-id xid cid)
-  "Store nonempty uncompressed BYTES in TOAST and return an external pointer.
-The caller owns TOAST and holds its index's exclusive relation lock and
-*WRITE-LOCK* throughout this call, in that order. VALUE-ID is an unused nonzero
-32-bit ID, or NIL to allocate one from the TOAST index. XID and CID identify the
-inserting transaction and command. BYTES may contain 1 through 1073741819 octets;
-chunks are copied. This low-level operation does not externalize a parent tuple
-or clean up partial writes on error."
+(defun toast-pointer-storage-size (toast pointer)
+  "Validate POINTER ownership and size fields and return stored and raw sizes."
+  (let* ((info (heap-external-varlena-external-info pointer))
+         (size (logand info #x3fffffff))
+         (method (ash info -30))
+         (raw (heap-external-varlena-raw-size pointer)))
+    (unless (and (= (heap-external-varlena-id-width pointer) 4)
+                 (= (heap-external-varlena-relation-id pointer) (pg-toast-oid toast))
+                 (typep raw '(integer 5 1073741823))
+                 (<= 1 size (- raw 4))
+                 ;; Only PGLZ (method zero) is currently supported.
+                 (zerop method)
+                 (or (= size (- raw 4)) (> size 4)))
+      (ereport "XX001" "invalid TOAST pointer"))
+    (values size (- raw 4) (< size (- raw 4)))))
+
+(defun toast-compressed-payload (bytes)
+  "Return a tcinfo-prefixed PGLZ stream for BYTES, or NIL if unsuitable."
+  (let ((stream (pglz-compress bytes)))
+    (when (and stream (< (+ 4 (length stream)) (length bytes)))
+      (let ((payload (make-array (+ 4 (length stream))
+                                 :element-type '(unsigned-byte 8))))
+        ;; PGLZ's compression method ID is zero in the high two bits.
+        (page-set-u32 payload 0 (length bytes))
+        (replace payload stream :start1 4)
+        payload))))
+
+(defun toast-decompress-payload (payload raw-size)
+  "Validate tcinfo and return the RAW-SIZE octets in compressed PAYLOAD."
+  (unless (and (> (length payload) 4)
+               (= (page-u32 payload 0) raw-size))
+    (ereport "XX001" "invalid compressed TOAST header"))
+  (pglz-decompress (subseq payload 4) raw-size))
+
+(defun toast-store-value-unlocked (toast bytes value-id xid cid &key compress)
+  "Store BYTES as TOAST chunks, optionally using PGLZ, and return a pointer.
+The caller holds TOAST's index writer lock and then *WRITE-LOCK*. VALUE-ID is an
+unused nonzero 32-bit ID, or NIL to allocate one. XID and CID identify the
+inserting transaction and command. BYTES contains 1 through 1073741819 octets;
+chunks are copied. Abort the transaction after any partial write."
   (check-type bytes (vector (unsigned-byte 8)))
-  (unless value-id (setf value-id (toast-allocate-value-id-unlocked toast)))
-  (unless (and (typep value-id '(integer 1 4294967295))
-               (<= 1 (length bytes) 1073741819))
+  (unless (and (<= 1 (length bytes) 1073741819)
+               (or (null value-id) (typep value-id '(integer 1 4294967295))))
     (error "Invalid TOAST value or ID"))
-  (let ((index-node (pg-toast-index-relfilenode toast))
-        (heap-node (pg-toast-relfilenode toast)))
+  (unless value-id (setf value-id (toast-allocate-value-id-unlocked toast)))
+  (let* ((raw-size (length bytes))
+         (payload (or (and compress (toast-compressed-payload bytes)) bytes))
+         (index-node (pg-toast-index-relfilenode toast))
+         (heap-node (pg-toast-relfilenode toast)))
     (when (< (buf-nblocks index-node) 2)
       (ereport "XX001" "TOAST index is missing"))
     (when (btree-prefix-entries-unlocked index-node
                                          (encode-index-key (list value-id) '(:oid)))
       (error "TOAST value ID is already in use"))
-    (loop for start from 0 below (length bytes) by +toast-oid-chunk-size+
+    (loop for start from 0 below (length payload) by +toast-oid-chunk-size+
           for sequence from 0
-          for end = (min (length bytes) (+ start +toast-oid-chunk-size+))
+          for end = (min (length payload) (+ start +toast-oid-chunk-size+))
           do (multiple-value-bind (block offset)
                  (heapam-insert heap-node *toast-chunk-columns*
-                                (vector value-id sequence (subseq bytes start end)) xid cid)
+                                (vector value-id sequence (subseq payload start end)) xid cid)
                (btree-insert-unlocked index-node (toast-chunk-key value-id sequence)
                                       block offset)))
-    (make-heap-external-varlena :raw-size (+ 4 (length bytes))
-                                :external-info (length bytes) :value-id value-id
+    (make-heap-external-varlena :raw-size (+ 4 raw-size)
+                                :external-info (length payload) :value-id value-id
                                 :relation-id (pg-toast-oid toast) :id-width 4)))
 
 (defun toast-externalize-tuple-unlocked (toast values columns xid cid)
@@ -1610,11 +1644,11 @@ The caller must hold the TOAST index writer lock before acquiring *WRITE-LOCK*
 and keep both held for this call; this function does not acquire either lock.
 Abort XID after any error once storage begins. VALUES remains suitable for SQL
 index keys, RETURNING, and replication. The planner may leave the tuple above
-its target, and supports only uncompressed varchar and bytea externalization."
+its target. Selected external payloads use PGLZ when it meets the size threshold."
   (let ((physical (copy-seq values)))
     (dolist (entry (toast-externalization-plan values columns))
       (setf (aref physical (car entry))
-            (toast-store-value-unlocked toast (cdr entry) nil xid cid)))
+            (toast-store-value-unlocked toast (cdr entry) nil xid cid :compress t)))
     physical))
 
 (defun toast-fetch-value (toast pointer snapshot &key (index-reader #'call-with-btree-relation-read-lock))
@@ -1624,21 +1658,16 @@ lifetime; chunk visibility is parent-driven, not evaluated against SNAPSHOT.
 INDEX-READER is called with the index relfilenode and a zero-argument function;
 it must call that function under a read lease on the index and return its result.
 The lease covers reading and assembling chunks. Only matching 32-bit relation
-pointers with uncompressed sizes from 1 to 1073741819 are accepted; missing,
+pointers with raw sizes from 1 to 1073741819 are accepted; missing,
 misordered, or malformed chunks signal corruption."
   (unless (and snapshot
                (sb-thread:with-mutex (*snapshot-count-lock*)
                  (gethash snapshot *active-snapshot-set*)))
     (error "TOAST fetch requires an active snapshot"))
-  (let* ((size (heap-external-varlena-external-info pointer))
+  (let* ((size (toast-pointer-storage-size toast pointer))
          (id (heap-external-varlena-value-id pointer))
          (index-node (pg-toast-index-relfilenode toast))
          (heap-node (pg-toast-relfilenode toast)))
-    (unless (and (= (heap-external-varlena-id-width pointer) 4)
-                 (= (heap-external-varlena-relation-id pointer) (pg-toast-oid toast))
-                 (typep size '(integer 1 1073741819))
-                 (= (heap-external-varlena-raw-size pointer) (+ size 4)))
-      (ereport "XX001" "invalid or compressed TOAST pointer"))
     (when (< (buf-nblocks index-node) 2)
       (ereport "XX001" "TOAST index is missing"))
     (funcall index-reader
@@ -1657,7 +1686,11 @@ misordered, or malformed chunks signal corruption."
                                       (equalp (first entry) (toast-chunk-key chunk-id sequence)))
                            (ereport "XX001" "TOAST index points to the wrong chunk"))
                          (push (cons sequence (aref values 2)) chunks)))))
-                 (toast-assemble-chunks (nreverse chunks) size +toast-oid-chunk-size+))))))
+                 (let ((payload (toast-assemble-chunks (nreverse chunks) size +toast-oid-chunk-size+))
+                       (raw-size (- (heap-external-varlena-raw-size pointer) 4)))
+                   (if (< size raw-size)
+                       (toast-decompress-payload payload raw-size)
+                       payload)))))))
 
 (defun toast-delete-value-unlocked (toast pointer xid cid)
   "Mark the chunks referenced by POINTER deleted by XID and CID.
@@ -1671,17 +1704,12 @@ aborted XMAX is replaced; this XID's own XMAX is left unchanged, making a
 repeat deletion idempotent.  Any other nonzero XMAX signals a conflict.  If an
 error occurs after marking begins, the caller must abort the transaction so a
 partial deletion cannot commit."
-  (let* ((size (heap-external-varlena-external-info pointer))
+  (let* ((size (toast-pointer-storage-size toast pointer))
          (id (heap-external-varlena-value-id pointer))
          (index-node (pg-toast-index-relfilenode toast))
          (heap-node (pg-toast-relfilenode toast))
          (chunks nil)
          (tids nil))
-    (unless (and (= (heap-external-varlena-id-width pointer) 4)
-                 (= (heap-external-varlena-relation-id pointer) (pg-toast-oid toast))
-                 (typep size '(integer 1 1073741819))
-                 (= (heap-external-varlena-raw-size pointer) (+ size 4)))
-      (ereport "XX001" "invalid or compressed TOAST pointer"))
     (when (< (buf-nblocks index-node) 2)
       (ereport "XX001" "TOAST index is missing"))
     (dolist (entry (btree-prefix-entries-unlocked
