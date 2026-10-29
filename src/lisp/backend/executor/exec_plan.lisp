@@ -1384,6 +1384,13 @@ on an abnormal exit."
            (apply #'make-publication-table-result-iterator arguments))
           (t (ereport "0A000" "unsupported set-returning function ~a" (second call))))))
 
+(defun project-set-row-origins (origins input-width output-width)
+  "Repeat input origins and clear generated or NULL-padded set-result slots."
+  (when *datum-origin-capture*
+    (let ((result (make-array (+ input-width output-width) :initial-element nil)))
+      (when origins (replace result origins :end1 (min input-width (length origins))))
+      result)))
+
 (defun stream-set-iterator-rows (environment iterators callback)
   "Zip independent sets, pad exhausted calls with NULL, and suppress all-empty rows."
   (loop
@@ -1396,8 +1403,10 @@ on an abnormal exit."
                  (when present-p
                    (setf (aref values position) value any-row-p t))))
       (unless any-row-p (return))
-      (when (eq (funcall callback (concatenate 'vector environment values)) :stop)
-        (return :stop)))))
+      (let ((*query-row-origins*
+              (project-set-row-origins *query-row-origins* (length environment) (length values))))
+        (when (eq (funcall callback (concatenate 'vector environment values)) :stop)
+          (return :stop))))))
 
 (defun stream-project-set (environment calls callback)
   (stream-set-iterator-rows
@@ -1431,7 +1440,7 @@ on an abnormal exit."
   "Recognize plans whose execution retains detached row origins."
   (case (first node)
     ((:result :seq-scan :index-scan) t)
-    ((:filter :project :sort :limit :window-input)
+    ((:filter :project :project-set :sort :limit :window-input)
      (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
     (:window
      (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))

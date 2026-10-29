@@ -263,8 +263,8 @@ the first representative; MIN/MAX retain the first non-NULL input until another
 non-NULL input is compared. Compatible binary casts and varchar/numeric typmod
 widening retain provenance; casts that transform the datum clear it. Source and
 shared-key values retain provenance through supported windows, whose MIN/MAX
-transitions follow the same first-input rule. Other unsupported producer shapes
-do not yet retain it.
+transitions follow the same first-input rule. Supported set-returning projections
+retain input origins for each emitted row; generated result slots have no origin.
 For an interpreted SELECT plan with a projection over one base-table sequential
 or non-parameterized index scan, optionally with filters, sorting or top-N,
 and LIMIT, external values unused by the projection, filters, ordering, and

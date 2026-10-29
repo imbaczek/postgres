@@ -143,6 +143,16 @@ run -c 'insert into toast_scalar_result select (select (select v)) from toast_in
 [ "$(run -c "select count(*) from toast_scalar_result where v='short'")" = 2 ]
 run -c 'create table toast_scalar_source (id int, v text)' >/dev/null
 run -c "insert into toast_scalar_source values (1,'$index_suffix'),(2,'b$index_suffix')" >/dev/null
+run -c 'create publication toast_project_set for table toast_scalar_source' >/dev/null
+run -c 'create table toast_project_set_result (v text)' >/dev/null
+run -c 'alter table toast_project_set_result alter column v set storage plain' >/dev/null
+run -c "insert into toast_project_set_result select v from (select v,(pg_get_publication_tables('toast_project_set')).relid as r from toast_scalar_source) q" >/dev/null
+run -c "insert into toast_project_set_result with q as materialized (select v,(pg_get_publication_tables('toast_project_set')).relid as r from toast_scalar_source) select v from q" >/dev/null
+run -c "insert into toast_project_set_result select distinct v from (select v,(pg_get_publication_tables('toast_project_set')).relid as r from toast_scalar_source) q" >/dev/null
+[ "$(run -c "select count(*) from toast_project_set_result where (length(v)=20000 and substr(v,1,1)='a') or (length(v)=20001 and substr(v,1,1)='b')")" = 6 ]
+run -c 'create publication toast_project_set_two for table toast_scalar_source,toast_join_keys' >/dev/null
+run -c "insert into toast_project_set_result with q as materialized (select v,(pg_get_publication_tables('toast_project_set')).relid as a,(pg_get_publication_tables('toast_project_set_two')).relid as b from toast_scalar_source) select v from q" >/dev/null
+[ "$(run -c "select count(*) from toast_project_set_result where (length(v)=20000 and substr(v,1,1)='a') or (length(v)=20001 and substr(v,1,1)='b')")" = 10 ]
 run -c 'create table toast_window_result (v text, n int)' >/dev/null
 run -c 'alter table toast_window_result alter column v set storage plain' >/dev/null
 run -c 'insert into toast_window_result select v,row_number() over (order by id) from toast_scalar_source' >/dev/null

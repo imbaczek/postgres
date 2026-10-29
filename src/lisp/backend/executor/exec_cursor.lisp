@@ -126,22 +126,26 @@
      (lambda () (close-sql-iterator input)))))
 
 (defun make-project-set-iterator (input calls)
-  (let ((environment nil) (sets nil))
+  (let ((environment nil) (input-origins nil) (sets nil))
     (make-sql-iterator
      (lambda ()
        (loop
          (unless sets
-           (multiple-value-bind (row present) (sql-iterator-next input)
+           (multiple-value-bind (row present origins) (sql-iterator-next input)
              (unless present (return (values nil nil)))
-             (setf environment row
-                   sets (mapcar (lambda (call) (make-sql-set-function-iterator call environment)) calls))))
-         (let ((values (make-array (length sets) :initial-element +null+)) (any nil))
+             (setf environment row input-origins origins)
+             (let ((*query-row-origins* origins))
+               (setf sets (mapcar (lambda (call) (make-sql-set-function-iterator call environment)) calls)))))
+         (let ((values (make-array (length sets) :initial-element +null+)) (any nil)
+                                                                           (*query-row-origins* input-origins))
            (loop for iterator in sets for index from 0
                  do (multiple-value-bind (value present) (funcall iterator)
                       (when present (setf any t (aref values index) value))))
-           (if any (return (values (concatenate 'vector environment values) t))
+           (if any
+               (return (values (concatenate 'vector environment values) t
+                               (project-set-row-origins input-origins (length environment) (length values))))
                (setf sets nil)))))
-     (lambda () (setf sets nil environment nil) (close-sql-iterator input)))))
+     (lambda () (setf sets nil environment nil input-origins nil) (close-sql-iterator input)))))
 
 (defun make-lateral-join-iterator (join left right-factory)
   ;; Each left row owns a fresh right iterator and parameter epoch.
