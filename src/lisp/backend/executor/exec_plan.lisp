@@ -1435,6 +1435,10 @@ on an abnormal exit."
                              outer-environment #())
                          (make-hash-table :test #'eq)))
             (*subquery-outer-frames* (cons frame parent-frames)))
+       (when (and *datum-origin-capture*
+                  (getf (physical-scan-relation node registered-relations) :lateral-dependent))
+         (setf (gethash +subquery-frame-origins-key+ (cdr frame))
+               (datum-origins-from-spill (datum-origins-for-spill *query-row-origins*))))
        (unwind-protect
             (funcall run-child (fourth node)
                      (lambda (row)

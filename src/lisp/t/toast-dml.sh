@@ -132,6 +132,19 @@ run -c 'create table toast_scalar_mixed (id int, v text)' >/dev/null
 run -c 'alter table toast_scalar_mixed alter column v set storage plain' >/dev/null
 run -c 'insert into toast_scalar_mixed select id,(select (select v)) from toast_scalar_source' >/dev/null
 [ "$(run -c "select count(*) from toast_scalar_mixed where (id=1 and length(v)=20000 and substr(v,1,1)='a') or (id=2 and length(v)=20001 and substr(v,1,1)='b')")" = 2 ]
+run -c 'create table toast_lateral_result (id int, v text)' >/dev/null
+run -c 'alter table toast_lateral_result alter column v set storage plain' >/dev/null
+run -c 'insert into toast_lateral_result select s.id,q.v from toast_scalar_source s cross join lateral (select s.v) q' >/dev/null
+run -c 'insert into toast_lateral_result select s.id,q.v from toast_scalar_source s left join lateral (select s.v where s.id=1) q on true' >/dev/null
+[ "$(run -c "select count(*) from toast_lateral_result where (id=1 and length(v)=20000 and substr(v,1,1)='a') or (id=2 and length(v)=20001 and substr(v,1,1)='b')")" = 3 ]
+[ "$(run -c 'select count(*) from toast_lateral_result where id=2 and v is null')" = 1 ]
+if run -v VERBOSITY=verbose -c "insert into toast_lateral_result select s.id,q.v from toast_scalar_source s cross join lateral (select s.v || '' as v) q" >"$TMP/lateral-computed.out" 2>&1; then
+    echo 'toast-dml: computed lateral datum retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/lateral-computed.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: computed lateral datum did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 run -c 'insert into toast_scalar_result select (select v from toast_inline_build where false)' >/dev/null
 [ "$(run -c 'select count(*) from toast_scalar_result where v is null')" = 1 ]
 if run -v VERBOSITY=verbose -c "insert into toast_scalar_result select (select v || '') from toast_inline_build" >"$TMP/scalar-computed.out" 2>&1; then
