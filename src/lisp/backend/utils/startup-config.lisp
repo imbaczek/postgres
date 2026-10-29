@@ -18,6 +18,10 @@
     ("listen_addresses" :postmaster :string "127.0.0.1")
     ("data_directory" :postmaster :string nil)
     ("restore_command" :sighup :string "")
+    ("max_connections" :postmaster :integer "100" 1 262143 nil)
+    ("max_wal_senders" :postmaster :integer "10" 0 262143 nil)
+    ("reserved_connections" :postmaster :integer "0" 0 262143 nil)
+    ("superuser_reserved_connections" :postmaster :integer "3" 0 262143 nil)
     ("max_replication_slots" :postmaster :integer "10" 0 262143 nil)
     ("checkpoint_timeout" :sighup :integer "300" 30 86400 :seconds)
     ("max_wal_size" :sighup :integer "1024" 2 2147483647 :megabytes)
@@ -413,7 +417,20 @@ other values request configuration output. The last -C selects between these use
               (startup-effective-slot-limit settings native)
               settings native overrides))))
 
+(defun startup-check-connection-limits (settings)
+  (let ((connections (startup-setting-value settings "max_connections"))
+        (senders (startup-setting-value settings "max_wal_senders"))
+        (reserved (startup-setting-value settings "reserved_connections"))
+        (superuser (startup-setting-value settings "superuser_reserved_connections")))
+    (unless (< (+ reserved superuser) connections)
+      (error "reserved_connections plus superuser_reserved_connections must be less than max_connections"))
+    ;; Other C worker pools still have their defaults: autovacuum 16,
+    ;; configurable background workers 8 and special workers 2.
+    (when (> (+ connections senders 16 8 2) 262143)
+      (error "too many server processes configured"))))
+
 (defun startup-install-settings (settings native overrides)
+  (startup-check-connection-limits settings)
   (let ((timeout (startup-setting-value settings "checkpoint_timeout"))
         (wal-bytes (* 1024 1024 (startup-setting-value settings "max_wal_size")))
         (slot-policy (startup-effective-slot-policy settings native)))
@@ -423,7 +440,9 @@ other values request configuration output. The last -C selects between these use
           *physical-restartpoint-wal-bytes* wal-bytes
           *max-slot-wal-keep-bytes* (wal-slot-retention-policy-limit slot-policy)
           *wal-slot-retention-policy* slot-policy
-          *max-replication-slots* (startup-setting-value settings "max_replication_slots")))
+          *max-replication-slots* (startup-setting-value settings "max_replication_slots")
+          *max-connections* (startup-setting-value settings "max_connections")
+          *max-wal-senders* (startup-setting-value settings "max_wal_senders")))
   settings)
 
 (defun startup-reload-settings ()

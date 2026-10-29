@@ -164,6 +164,7 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
         (setf (backend-database *backend*) dbname)
         (setf (backend-application-name *backend*) app)
         (setf (backend-replication-mode *backend*) (startup-replication-mode replication))
+        (postmaster-admit-startup-backend *backend*)
         (send-auth-ok stream)
         (session-apply-startup-options params)
         (with-catalog-lock
@@ -677,10 +678,12 @@ Preserve all dispatch values, including secondary values, for the caller."
       (sb-sys:without-interrupts
         (unwind-protect
              (when backend
-               (forget-extended-query-state backend)
-               (wal-cleanup-backend-physical-slots backend)
-               (logical-release-subscription-owner backend)
-               (unregister-backend backend))
+               (unwind-protect
+                    (progn
+                      (forget-extended-query-state backend)
+                      (wal-cleanup-backend-physical-slots backend)
+                      (logical-release-subscription-owner backend))
+                 (unregister-backend backend)))
           (connection-finished))))))
 
 (defun handle-connection (sock)

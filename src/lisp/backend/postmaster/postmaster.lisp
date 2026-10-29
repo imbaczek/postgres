@@ -81,6 +81,12 @@ The registry lock protects this queue. MAIN retires it after all clients leave."
 (defvar *n-backends* 0)
 (defvar *n-connections* 0)
 
+(defvar *max-connections* 100)
+
+(defvar *max-wal-senders* 10)
+
+(defvar *backend-admission-classes* (make-hash-table :test #'eq))
+
 (declaim (special *live-operation-lock* *live-operation-cv*
                   *live-operation-backend-query-tokens*
                   *live-operation-admission-open*
@@ -95,17 +101,45 @@ The registry lock protects this queue. MAIN retires it after all clients leave."
   (sb-thread:with-mutex (*backend-registry-lock*)
     (gethash pid *backend-registry*)))
 
+(defun postmaster-admit-startup-backend (backend)
+  "Reserve the SQL or WAL-sender session quota for this registered generation."
+  (let* ((mode (backend-replication-mode backend))
+         (kind (if mode :walsender :sql))
+         (limit (if mode *max-wal-senders* *max-connections*)))
+    (unless (member mode '(nil :physical :database))
+      (error "invalid startup replication class"))
+    (sb-thread:with-mutex (*backend-registry-lock*)
+      (unless (eq backend (gethash (backend-pid backend) *backend-registry*))
+        (error "startup backend is no longer registered"))
+      (let ((old (gethash backend *backend-admission-classes*)))
+        (when old
+          (unless (eq old kind) (error "startup backend changed its admission class"))
+          (return-from postmaster-admit-startup-backend backend)))
+      (when (>= (loop for class being the hash-values of *backend-admission-classes*
+                      count (eq class kind))
+                limit)
+        (if mode
+            (ereport-fatal "53300"
+                           "number of requested standby connections exceeds \"max_wal_senders\" (currently ~d)"
+                           limit)
+            (ereport-fatal "53300" "sorry, too many clients already")))
+      (sb-sys:without-interrupts
+        (setf (gethash backend *backend-admission-classes*) kind))))
+  backend)
+
 (defun register-backend (backend)
   ;; Serialize with the reload snapshot. A provisional backend registered after
   ;; admission closes may finish teardown during drain, but must not gain SQL
   ;; transaction-drain eligibility merely by arriving late.
   (sb-thread:with-mutex (*live-operation-lock*)
-    (unless *live-operation-admission-open*
-      (pushnew backend *live-operation-cleanup-backends* :test #'eq))
     (sb-thread:with-mutex (*backend-registry-lock*)
+      (when (gethash (backend-pid backend) *backend-registry*)
+        (error "backend PID is already registered"))
       (sb-sys:without-interrupts
         (setf (gethash (backend-pid backend) *backend-registry*) backend)
-        (incf *n-backends*))))
+        (incf *n-backends*)
+        (unless *live-operation-admission-open*
+          (pushnew backend *live-operation-cleanup-backends* :test #'eq)))))
   ;; Close the race where fast shutdown snapshots the registry just before
   ;; this backend is added.  The caller is the backend thread itself.
   (when (and (eq backend *backend*)
@@ -151,6 +185,7 @@ already recorded in CLOG while releasing the backend's remaining registrations."
       (sb-thread:release-mutex *live-operation-lock*)))
   (sb-thread:with-mutex (*backend-registry-lock*)
     (sb-sys:without-interrupts
+      (remhash backend *backend-admission-classes*)
       (when (eq (gethash (backend-pid backend) *backend-registry*) backend)
         (remhash (backend-pid backend) *backend-registry*)
         (decf *n-backends*))))
