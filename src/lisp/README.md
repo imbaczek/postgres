@@ -601,6 +601,12 @@ extended-query support. During reload drain, a Simple Query sent while an
 extended implicit transaction is open is rejected if it has statements after a
 transaction-ending statement. An old protocol handler also fails closed for
 extended message suffixes during a mixed live reload.
+Connections entering the new backend loop spool Bind messages whose length word
+exceeds 1 MiB to an anonymous per-frame file using 64 KiB receive buffers. The
+complete spool's CRC is checked before parsing and it is closed after dispatch,
+including on error. Individual typed parameters and portal and statement names
+still materialize. During reload drain, extended messages other than Sync are
+rejected; an open implicit extended transaction is rolled back on error.
 Client startup and SQL `application_name` support SET, SHOW, RESET and
 `current_setting`/`set_config`, including transaction-local values. Other LOCAL
 settings remain unsupported. Parameter reports are coalesced before ReadyForQuery.
@@ -654,8 +660,7 @@ resident-field budget, use row-owned temporary slices, retained through their
 target chunk commit and released on completion or error. This includes integer
 fields. A chunk flushes after 32 rows with spilled owners; the 8 MiB batching
 target counts the original UTF-8 field bytes. Row metadata and other allocations
-remain in memory, and the target still buffers the complete Bind frame and
-materializes parameter values.
+remain in memory, and the target still materializes parameter values.
 Frontend query message lengths are limited to 132 MiB, including the four-byte
 length word. The lexer counts quoted string and identifier contents before
 allocating their exact-sized decoded strings, avoiding a growable literal buffer;
@@ -733,7 +738,7 @@ are validated as UTF-8 and stored in an unlinked, process-owned temporary file
 for synchronous apply; their CRC is checked during SQL preflight and emission.
 Extension Message contents and other allocations still materialize. INSERT, UPDATE and DELETE apply
 uses typed Bind parameters, counted and emitted in bounded blocks; the target
-still buffers the complete Bind frame and materializes parameter values. A malformed or incomplete
+still materializes parameter values. A malformed or incomplete
 incoming frame closes the source connection; a partial row-frame or query write
 closes its connection. Other message types use their existing encoders. The 4 MiB
 threshold is not a bound on the size of an individual event. The 128 MiB capture

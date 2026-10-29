@@ -212,7 +212,10 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
        (let ((length (bytes-to-u32 length-bytes 0)))
          (and (<= 4 length +max-query-message-size+)
               payload
-              (= (length payload) (- length 4))))))
+              (= (if (extended-bind-spool-p payload)
+                     (extended-bind-spool-size payload)
+                     (length payload))
+                 (- length 4))))))
 
 (defun simple-query-payload-starts-with-word-p
     (payload words &optional (end (and payload
@@ -428,15 +431,20 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
 (defun handle-extended-query-frame (stream type-byte length-bytes payload)
   (let ((state *extended-query-state*))
     (with-backend-query-execution (:cleanup :query-state)
-      (with-live-operation-query-dispatch
-          (or (= type-byte (char-code #\S))
-              (not (frontend-frame-envelope-valid-p length-bytes payload)))
+      (with-live-operation-query-dispatch t
         (handler-case
             (progn
               (when (extended-query-state-statement-deadline state)
                 (setf (backend-statement-deadline *backend*)
                       (extended-query-state-statement-deadline state)))
-              (decode-frontend-message type-byte length-bytes payload)
+              (if (extended-bind-spool-p payload)
+                  (unless (and (= type-byte (char-code #\B))
+                               (frontend-frame-envelope-valid-p length-bytes payload))
+                    (malformed-protocol-message "invalid spooled Bind frame"))
+                  (decode-frontend-message type-byte length-bytes payload))
+              (when (and (eq *live-operation-current-lane* :drain)
+                         (/= type-byte (char-code #\S)))
+                (ereport "0A000" "extended query cannot start work during reload drain"))
               (arm-statement-timeout)
               (check-for-interrupts)
               (unless (= type-byte (char-code #\S))
@@ -444,7 +452,11 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
               (unless (and (extended-query-state-ignore-until-sync state)
                            (/= type-byte (char-code #\S)))
                 (extended-apply-operation stream
-                                          (extended-parse-frame (code-char type-byte) payload)
+                                          (if (extended-bind-spool-p payload)
+                                              (progn
+                                                (extended-verify-bind-spool payload)
+                                                (extended-parse-bind-spool payload))
+                                              (extended-parse-frame (code-char type-byte) payload))
                                           payload))
               (setf (extended-query-state-statement-deadline state)
                     (unless (member (code-char type-byte) '(#\E #\S))
@@ -623,11 +635,30 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
 
 (defun backend-loop (stream)
   (loop
-    (multiple-value-bind (type-byte length-bytes payload)
-        (read-message-frame stream)
-      (when (null type-byte) (return))
-      (when (eq (dispatch-frontend-frame stream type-byte length-bytes payload) :terminate)
-        (return)))))
+    (let ((type-byte (read-byte stream nil nil)))
+      (unless type-byte (return))
+      (multiple-value-bind (length-bytes got) (read-exact-bytes stream 4)
+        (declare (ignore got))
+        (let ((length (and length-bytes (bytes-to-u32 length-bytes 0))))
+          (if (and (= type-byte (char-code #\B)) length
+                   (<= 4 length +max-query-message-size+)
+                   (> length (* 1024 1024)))
+              (let ((complete nil))
+                (unwind-protect
+                     (call-with-extended-bind-spool
+                      stream (- length 4)
+                      (lambda (spool crc)
+                        (setf complete t)
+                        (when (eq (dispatch-frontend-frame
+                                   stream type-byte length-bytes
+                                   (make-extended-bind-spool :stream spool :size (- length 4) :crc crc))
+                                  :terminate)
+                          (return))))
+                  (unless complete (close stream :abort t))))
+              (let ((payload (when (and length (<= 4 length +max-query-message-size+))
+                               (read-exact-bytes stream (- length 4)))))
+                (when (eq (dispatch-frontend-frame stream type-byte length-bytes payload) :terminate)
+                  (return)))))))))
 
 (defun finish-backend-connection (backend sock stream)
   "Send final connection cleanup through the backend's captured cleanup lane."
