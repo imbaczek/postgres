@@ -51,8 +51,8 @@
                 (lambda (callback) (dolist (row input) (funcall callback row)))
                 '((:col 1 :type :int4)) descriptors
                 (lambda (row) (push row output)))
-               (ok (equalp (list (vector 1 2 18446744073709551614 #("a" "b"))
-                                 (vector 2 2 pg::+null+ #("x" "y")))
+               (ok (equalp (list (vector 1 2 18446744073709551614 (text-array '("a" "b")))
+                                 (vector 2 2 pg::+null+ (text-array '("x" "y"))))
                            (nreverse output)))
                (ok (null (uiop:directory-files directory)))
                (ok (equalp (list (vector 1 18446744073709551614 18446744073709551614 2)

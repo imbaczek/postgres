@@ -66,6 +66,10 @@
   "Match the variadic SRF and C20's missing-publication-tolerant relation overload."
   (when (or (eq names +null+) (and relation-p (eq relation-id +null+)))
     (return-from publication-table-result-rows nil))
+  (when (sql-array-p names)
+    (unless (eq (sql-array-element-type-id names) :text)
+      (ereport "42804" "publication names must be a text array"))
+    (setf names (sql-array-elements names)))
   (unless (and (vectorp names) (not (stringp names)))
     (ereport "42804" "publication names must be a text array"))
   (with-write-lock

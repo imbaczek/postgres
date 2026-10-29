@@ -6,6 +6,12 @@
 (defun octets (values)
   (make-array (length values) :element-type '(unsigned-byte 8) :initial-contents values))
 
+(defun text-array (elements)
+  "Build an expected one-dimensional SQL text array with PostgreSQL bounds."
+  (pg::make-sql-array :element-type-id :text :elements (coerce elements 'vector)
+                      :dimensions (when (plusp (length elements)) (list (length elements)))
+                      :lower-bounds (when (plusp (length elements)) '(1))))
+
 (defmacro sqlstate-of (&body body)
   "Return a PostgreSQL error's SQLSTATE, NIL on success; propagate other errors."
   `(handler-case (progn ,@body nil)
@@ -339,7 +345,7 @@
              (pg::make-pg-index :oid 203 :name "alpha_pkey" :table-oid 201)
              (gethash "catalog_counter" (pg::database-sequences database))
              (pg::make-pg-sequence :oid 210 :name "catalog_counter"))
-       (ok (equalp '(#(11 "pg_catalog") #(2200 "public"))
+       (ok (equalp '(#(11 "pg_catalog") #(99 "pg_toast") #(2200 "public"))
                    (derived-query-rows "SELECT oid,nspname FROM pg_catalog.pg_namespace ORDER BY oid")))
        (ok (equalp (list (vector "alpha" (char-code #\r))
                          (vector "alpha_pkey" (char-code #\i))
@@ -586,8 +592,8 @@
                 (lambda (callback) (dolist (row input) (funcall callback row)))
                 '((:col 1 :type :int4)) descriptors
                 (lambda (row) (push row output)))
-               (ok (equalp (list (vector 1 3 (vector "a" pg::+null+ "b"))
-                                 (vector 2 2 (vector "x" "y")))
+               (ok (equalp (list (vector 1 3 (text-array (list "a" pg::+null+ "b")))
+                                 (vector 2 2 (text-array '("x" "y"))))
                            (nreverse output)))
                (ok (null (uiop:directory-files directory)))
                (let ((count 0))
@@ -609,8 +615,8 @@
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (deftest array-aggregate-scalar-and-empty
-    (ok (equalp '(#(#("x"))) (derived-query-rows "SELECT array_agg('x'::text)")))
-  (ok (equalp (list (vector (vector pg::+null+)))
+    (ok (equalp (list (vector (text-array '("x")))) (derived-query-rows "SELECT array_agg('x'::text)")))
+  (ok (equalp (list (vector (text-array (list pg::+null+))))
               (derived-query-rows "SELECT array_agg(NULL::text)")))
   (ok (equalp (list (vector pg::+null+ 0))
               (derived-query-rows "SELECT array_agg('x'::text), COUNT(*) WHERE false")))
@@ -628,8 +634,8 @@
     (ok (equalp '(#(1)) (derived-query-rows "SELECT DISTINCT COUNT(*) ORDER BY COUNT(*)")))
   (dolist (sql '("SELECT DISTINCT array_agg('x'::text) ORDER BY array_agg('x'::text)"
                  "SELECT DISTINCT array_agg('x'::text) ORDER BY pg_catalog.array_agg('x'::text)"))
-    (ok (equalp '(#(#("x"))) (derived-query-rows sql))))
-  (ok (equalp (list (vector (vector "x") (vector pg::+null+)))
+    (ok (equalp (list (vector (text-array '("x")))) (derived-query-rows sql))))
+  (ok (equalp (list (vector (text-array '("x")) (text-array (list pg::+null+))))
               (derived-query-rows "SELECT array_agg('x'::text),array_agg(NULL::text)"))))
 
 (deftest array-invalid-operators

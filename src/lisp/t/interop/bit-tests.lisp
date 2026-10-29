@@ -49,8 +49,11 @@
                (sqlstate-of (derived-query-rows (format nil "SELECT NULL::bit(~a)" expression))))))
   (ok (equalp (list (vector pg::+null+ pg::+null+))
               (derived-query-rows "SELECT NULL::bit(0x20),NULL::bit(1_0)")))
-  (dolist (sql '("SELECT 1.5" "SELECT 1e1" "SELECT .5" "SELECT 1."
-                 "SELECT 1 LIMIT 1.5" "SET statement_timeout TO 1.5"))
+  (dolist (case '(("SELECT 1.5" "1.5") ("SELECT 1e1" "10")
+                  ("SELECT .5" "0.5") ("SELECT 1." "1")))
+    (ok (string= (second case)
+                 (pg::sql-numeric-output (aref (first (derived-query-rows (first case))) 0)))))
+  (dolist (sql '("SELECT 1 LIMIT 1.5" "SET statement_timeout TO 1.5"))
     (ok (equal "0A000" (sqlstate-of (derived-query-rows sql)))))
   (ok (equalp '(#(32 10 63 3))
               (derived-query-rows "SELECT 0x20,1_0,0o7_7,0b1_1")))
