@@ -28,8 +28,10 @@ symlink or block opening a FIFO. The caller owns and must close the stream."
 
 (defun read-bounded-regular-file (path maximum &key (minimum 0) stabilize)
   "Read the descriptor's checked byte count, enforcing MINIMUM and MAXIMUM.
-Reject a short read and close the stream on every exit. Callers that need a
-coherent view across atomic publications must compare their control images."
+With STABILIZE, open read-write and sync the checked file then its parent before
+reading from the same descriptor. The caller must exclude concurrent renames.
+Otherwise inspection reads do not sync. Reject short reads and close on every exit;
+callers needing a coherent view across publications must compare control images."
   (multiple-value-bind (stream size) (open-bounded-regular-file path maximum stabilize)
     (unwind-protect
          (progn
@@ -114,6 +116,9 @@ error is reported rather than returning a partial inventory."
           (sb-posix:closedir directory))))))
 
 (defun durable-state-file-paths (directory type)
+  "Sync the inventory directory, including when empty, then return sorted raw
+entry names of TYPE as paths. If absent, sync its parent without creating it.
+The caller excludes concurrent changes; the reader validates selected entries."
   (let ((entries (directory-entry-names directory)))
     (handler-case (fsync-directory directory)
       (sb-posix:syscall-error (condition)

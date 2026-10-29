@@ -2309,7 +2309,7 @@ Use 1 GiB when no policy is installed."
         do (setf start (1+ end))))
 
 (defun wal-read-replication-slot (path &key stabilize)
-  "Dispatch physical images to their codec and read legacy logical formats."
+  "Read physical or legacy logical state; startup may stabilize it before decoding."
   (let ((bytes (read-bounded-regular-file path 2048 :stabilize stabilize)))
     (when (physical-slot-image-p bytes)
       (return-from wal-read-replication-slot
@@ -2600,7 +2600,9 @@ Use 1 GiB when no policy is installed."
 (declaim (ftype function physical-slot-restore physical-slot-check-standby-slots physical-slot-startup-system-id))
 
 (defun wal-load-replication-slots ()
-  "Load durable slots before checkpoints can recycle WAL.
+  "Load durable slots before checkpoints can recycle WAL, under startup exclusion.
+Stabilize the inventory and each selected file before trusting its state. Entries
+are published incrementally; a later error fails startup after earlier publication.
 Remove temporary physical slots and validate persistent physical slots using
 primary WAL or a standby batch proof. Logical slot restoration during native
 recovery is unsupported. Standby loading requires startup quiescence."

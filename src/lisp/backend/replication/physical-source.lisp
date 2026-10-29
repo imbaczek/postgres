@@ -208,6 +208,7 @@ A standby may have only the durable pin; a primary requires registry agreement."
          (values (or pin disk) disk))))))
 
 (defun physical-source-pin-read (path &key stabilize)
+  "Read and validate a private source pin; startup may stabilize it first."
   (let ((bytes (read-bounded-regular-file path (physical-follow-pin-image-limit) :stabilize stabilize)))
     (if (physical-follow-pin-image-p bytes)
         (let ((pin (physical-follow-pin-decode bytes)))
@@ -270,7 +271,10 @@ Publish the in-memory binding only after saving the candidate pin."
   pin)
 
 (defun physical-source-pin-load ()
-  "Restore source retention before startup can admit checkpoint/recycle work."
+  "Restore source retention before startup can admit checkpoint or recycle work.
+Under write and WAL exclusion, stabilize the inventory and every selected file.
+Validate all candidates before replacing the existing pin registry; on failure
+leave that registry intact."
   (with-write-lock
     (with-wal-critical
       (let ((candidates (make-hash-table :test #'equal)))

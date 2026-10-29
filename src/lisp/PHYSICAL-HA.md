@@ -790,6 +790,22 @@ and control tests, 185 interop tests, 1,155 legacy checks and strict cold compil
 passed. Native physical follow wire acceptance passed. A 200-trial seed-42 helper
 property passed with rejection-count and input-coverage gaps unmeasured.
 
+C's `RestoreSlotFromDisk` syncs the selected state file and its directory before
+reading it. Startup now stabilizes public slot and private source-pin inventories before
+trusting them. It syncs an existing inventory directory even when empty, or the
+parent of an absent optional directory without creating it. Under startup
+exclusion, selected entries are opened read-write without following a final
+symlink, checked as bounded regular files, and synced on that descriptor before
+the parent directory is synced and the bytes are read and decoded. Normal
+inspection reads retain their existing behavior. This closes the startup
+durability gap after an ambiguous publication or unlink; a real power-cut oracle
+remains open. The native flat-file checks differ from C's directory traversal.
+
+Public slot loading publishes entries incrementally and fails startup if a later
+entry fails. Private pin loading validates all candidates before replacing its
+registry. Focused startup and follow tests passed, including a cold restore in
+`/tmp/pg-physical-follow.GazboO`; strict cold compilation also passed.
+
 Fresh runs passed 911 physical tests, 181 interop tests and 1,155 legacy checks.
 Strict cold compilation passed. Native and pinned C public SQL, SRF and unchanged Patroni
 SlotsHandler methods passed, as did native follow including paused standby SQL.

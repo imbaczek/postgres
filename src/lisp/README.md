@@ -1584,6 +1584,8 @@ columns total) are
 implemented. The standard segment policy stops active owners and rechecks before
 loss and recycling; the native exact-byte policy keeps its existing behavior.
 Named physical slot streaming remains disabled until sender ownership is added.
+Startup stabilizes slot and private source-pin files and inventories before
+restoring retention; a real power-cut recovery oracle remains open.
 Full generated Patroni
 configurations, recovery parameters, session GUC catalog coverage and control
 interfaces remain unfinished, as does C physical data compatibility; see

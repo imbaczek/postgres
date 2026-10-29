@@ -179,6 +179,9 @@ appropriate instead of replacing the native C peer or adding a message relay.
 - Use cl-mcp structural edits for Lisp. A rejected patch that would add an extra
   closing parenthesis leaves the source intact; correct the patch rather than
   bypassing that guard.
+- Collapsed cl-mcp outlines can abbreviate long test names. Use a full raw Lisp
+  read or runtime Rove metadata for exact selectors: one abbreviated name made a
+  159-test selector batch fail immediately; corrected names ran all 159 tests.
 - Distinguish `#(...)` vector literals from `#.` read-time evaluation. Empty and
   nonempty vectors work in the current tools. Several server files legitimately
   use `#.(char-code ...)`; a tool with `*read-eval*` disabled can reject those
