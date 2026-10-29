@@ -890,6 +890,56 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (unless (member (logical-field-integer-state stream) '(:digits :trailing))
       (logical-field-integer-error context))))
 
+(defconstant +logical-binary-bytea-min-hex-size+ 262144
+  "Minimum hex size ensuring binary savings cover every Bind format code.")
+
+(defclass logical-bytea-hex-stream (sb-gray:fundamental-character-output-stream)
+  ((position :initform 0 :accessor logical-bytea-position)
+   (high :initform nil :accessor logical-bytea-high)
+   (buffer :initform (make-array 65536 :element-type '(unsigned-byte 8)) :reader logical-bytea-buffer)
+   (used :initform 0 :accessor logical-bytea-used)
+   (sink :initarg :sink :reader logical-bytea-sink)))
+
+(defun logical-bytea-hex-flush (stream)
+  (when (plusp (logical-bytea-used stream))
+    (when (logical-bytea-sink stream)
+      (funcall (logical-bytea-sink stream)
+               (subseq (logical-bytea-buffer stream) 0 (logical-bytea-used stream))))
+    (setf (logical-bytea-used stream) 0)))
+
+(defmethod sb-gray:stream-write-char ((stream logical-bytea-hex-stream) character)
+  (let ((position (logical-bytea-position stream)))
+    (incf (logical-bytea-position stream))
+    (cond ((= position 0) (unless (= (char-code character) 92) (throw 'noncanonical-bytea nil)))
+          ((= position 1) (unless (= (char-code character) 120) (throw 'noncanonical-bytea nil)))
+          (t (let* ((code (char-code character))
+                    (digit (cond ((<= 48 code 57) (- code 48))
+                                 ((<= 65 code 70) (+ 10 (- code 65)))
+                                 ((<= 97 code 102) (+ 10 (- code 97))))))
+               (unless digit (throw 'noncanonical-bytea nil))
+               (if (logical-bytea-high stream)
+                   (progn
+                     (setf (aref (logical-bytea-buffer stream) (logical-bytea-used stream))
+                           (+ (ash (logical-bytea-high stream) 4) digit)
+                           (logical-bytea-high stream) nil)
+                     (incf (logical-bytea-used stream))
+                     (when (= (logical-bytea-used stream) (length (logical-bytea-buffer stream)))
+                       (logical-bytea-hex-flush stream)))
+                   (setf (logical-bytea-high stream) digit))))))
+  character)
+
+(defun logical-write-bytea-hex-binary (value sink)
+  "Write canonical bytea hex as binary; NIL may follow partial SINK output."
+  (catch 'noncanonical-bytea
+    (let ((out (make-instance 'logical-bytea-hex-stream :sink sink)))
+      (if (logical-wire-field-p value)
+          (logical-wire-field-visit value out)
+          (write-string value out))
+      (unless (and (>= (logical-bytea-position out) 2) (null (logical-bytea-high out)))
+        (throw 'noncanonical-bytea nil))
+      (logical-bytea-hex-flush out)
+      t)))
+
 (defvar *logical-bind-parameters* nil)
 
 (defvar *logical-admission-bind-state* nil)
@@ -911,10 +961,19 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     ((and *logical-bind-parameters* value (not (eq value :unchanged-toast)))
      (let ((index (1+ (length *logical-bind-parameters*))))
        (vector-push-extend
-        (cons type (lambda (out)
-                     (if (logical-wire-field-p value)
-                         (logical-wire-field-visit value out)
-                         (write-string value out))))
+        (cons type
+              (if (and (= type 17)
+                       (> (if (logical-wire-field-p value) (logical-wire-field-size value) (length value))
+                          +logical-binary-bytea-min-hex-size+)
+                       (logical-write-bytea-hex-binary value nil))
+                  (make-pg-client-binary-parameter
+                   :writer (lambda (sink)
+                             (unless (logical-write-bytea-hex-binary value sink)
+                               (error "bytea field changed while sending"))))
+                  (lambda (out)
+                    (if (logical-wire-field-p value)
+                        (logical-wire-field-visit value out)
+                        (write-string value out)))))
         *logical-bind-parameters*)
        (format stream "$~d" index)))
     ((logical-admission-value-p value)

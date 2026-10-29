@@ -304,6 +304,8 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
 
 (defstruct pg-client-bound-query sql parameters)
 
+(defstruct pg-client-binary-parameter writer)
+
 (defun pg-client-bound-field-write (writer sink &optional (limit +max-query-message-size+))
   (multiple-value-bind (counting metrics) (logical-encoding-sink limit)
     (let ((out (make-instance 'pg-client-query-output-stream
@@ -314,13 +316,24 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
       (logical-flush-utf8-output out)
       (funcall metrics))))
 
+(defun pg-client-bound-parameter-write (parameter sink &optional (limit +max-query-message-size+))
+  (if (pg-client-binary-parameter-p parameter)
+      (multiple-value-bind (counting metrics) (logical-encoding-sink limit)
+        (funcall (pg-client-binary-parameter-writer parameter)
+                 (lambda (bytes)
+                   (funcall counting bytes)
+                   (when sink (funcall sink bytes))))
+        (funcall metrics))
+      (pg-client-bound-field-write parameter sink limit)))
+
 (defun pg-client-send-bound-query (client query)
   "Send Parse/Bind/Execute/Sync, preflighting every parameter before Parse."
   (let* ((sql (pg-client-bound-query-sql query))
          (params (pg-client-bound-query-parameters query))
          (stream (pg-client-stream client))
          (lengths nil) (checksums nil)
-         (bind-length (+ 12 (* 4 (length params))))
+         (binary-p (some (lambda (param) (pg-client-binary-parameter-p (cdr param))) params))
+         (bind-length (+ 12 (* 4 (length params)) (if binary-p (* 2 (length params)) 0)))
          (started nil) (complete nil))
     (unless (<= (length params) #xffff) (error "too many bind parameters"))
     (when (find (code-char 0) sql) (error "SQL query contains a null byte"))
@@ -330,11 +343,14 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
         (error "Parse frame exceeds size limit")))
     (unless (every (lambda (param)
                      (and (consp param) (typep (car param) '(unsigned-byte 32))
-                          (functionp (cdr param))))
+                          (or (functionp (cdr param))
+                              (and (= (car param) 17)
+                                   (pg-client-binary-parameter-p (cdr param))
+                                   (functionp (pg-client-binary-parameter-writer (cdr param)))))))
                    params)
       (error "invalid bind parameter descriptor"))
     (dolist (param params)
-      (multiple-value-bind (size checksum) (pg-client-bound-field-write (cdr param) nil)
+      (multiple-value-bind (size checksum) (pg-client-bound-parameter-write (cdr param) nil)
         (incf bind-length size)
         (push size lengths) (push checksum checksums)))
     (when (> bind-length +max-query-message-size+) (error "Bind frame exceeds size limit"))
@@ -353,13 +369,16 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
              (write-byte (char-code #\B) stream)
              (write-sequence (u32-to-bytes bind-length) stream)
              (write-byte 0 stream) (write-byte 0 stream)
-             (write-sequence (u16-to-bytes 0) stream)
+             (write-sequence (u16-to-bytes (if binary-p (length params) 0)) stream)
+             (when binary-p
+               (dolist (param params)
+                 (write-sequence (u16-to-bytes (if (pg-client-binary-parameter-p (cdr param)) 1 0)) stream)))
              (write-sequence (u16-to-bytes (length params)) stream)
              (loop for param in params for size in (nreverse lengths)
                    for expected in (nreverse checksums)
                    do (write-sequence (u32-to-bytes size) stream)
                       (multiple-value-bind (actual checksum)
-                          (pg-client-bound-field-write
+                          (pg-client-bound-parameter-write
                            (cdr param)
                            (lambda (bytes) (write-sequence bytes stream)) size)
                         (unless (and (= actual size) (= checksum expected))

@@ -738,7 +738,11 @@ are validated as UTF-8 and stored in an unlinked, process-owned temporary file
 for synchronous apply; their CRC is checked during SQL preflight and emission.
 Extension Message contents and other allocations still materialize. INSERT, UPDATE and DELETE apply
 uses typed Bind parameters, counted and emitted in bounded blocks; the target
-still materializes parameter values. A malformed or incomplete
+still materializes parameter values. For bytea fields, canonical hex text over
+262144 characters is decoded in bounded blocks to a binary Bind parameter;
+other spellings and smaller fields use text Bind. Pgoutput and initial-copy
+source fields remain text, and this conversion does not raise the source bytea,
+event or frame limits. A malformed or incomplete
 incoming frame closes the source connection; a partial row-frame or query write
 closes its connection. Other message types use their existing encoders. The 4 MiB
 threshold is not a bound on the size of an individual event. The 128 MiB capture
