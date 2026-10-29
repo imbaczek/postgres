@@ -151,7 +151,11 @@ def exercise_temporary_slot_loss(connection, prefix, switch_wal=False):
 
 
 def exercise_active_owner_oracle(connection, prefix):
-    """Freeze this C peer's sender and observe CHECKPOINT waiting for release."""
+    """Stop the owned C sender and verify CHECKPOINT waits beyond five seconds.
+
+    Check that the slot remains active and not lost until the sender resumes,
+    then verify the slot is lost after CHECKPOINT completes.
+    """
     from psycopg2.extras import PhysicalReplicationConnection
 
     name = prefix + "_active_owner"

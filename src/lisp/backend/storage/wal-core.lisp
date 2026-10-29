@@ -56,7 +56,8 @@ MAX-WAL-BYTES sets the normal WAL window used by catalog status."
 (defvar *wal-replication-slot-loss-collector* nil
   "Dynamically bound list receiving durably invalidated slots during WAL maintenance.")
 
-(defvar *wal-slot-recycling-pending* nil)
+(defvar *wal-slot-recycling-pending* nil
+  "One process-local pending recycling ticket, retained across cancellation.")
 
 (declaim (ftype function wal-capture-slot-recycling-work))
 
@@ -2856,9 +2857,14 @@ Refresh its modification time. Update memory only after atomic publication."
 (declaim (ftype function wal-prepare-slot-recycling-under-lock))
 
 (defun wal-checkpoint-recycling-segment (checkpoint-lsn)
+  "Return the segment containing the checkpoint's last byte; zero for LSN zero."
   (if (zerop checkpoint-lsn) 0 (floor (1- checkpoint-lsn) +wal-segment-size+)))
 
 (defun wal-remove-checkpointed-segments-under-wal-lock (checkpoint-lsn &optional (current *wal-durable-lsn*))
+  "Plan and remove a contiguous WAL prefix under WAL exclusion.
+Active standard-policy owners defer removal in a process-local ticket; the caller
+retries outside locks after stopping them. Independent XID and snapshot floors
+also constrain removal. CURRENT freezes the endpoint across that retry."
   (let ((checkpoint-segment (wal-checkpoint-recycling-segment checkpoint-lsn)))
     (multiple-value-bind (keep-segment requests)
         (wal-prepare-slot-recycling-under-lock checkpoint-segment current)

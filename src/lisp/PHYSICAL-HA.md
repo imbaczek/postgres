@@ -765,11 +765,30 @@ The default standard `max_slot_wal_keep_size = -1` is unlimited. Its policy
 rounds the cap down to whole segments. Explicit `--max-slot-wal-keep-bytes` or
 `PG_MAX_SLOT_WAL_KEEP_BYTES` selects the native exact-byte policy. Capacity in
 `max_replication_slots` is shared by logical, physical, temporary and lost names.
-Native invalidation currently saves loss and then cleans consumers. A validated
-generation and owner check authorizes the captured backend termination; release
-after that claim does not revoke it. Before named public physical streaming is
-enabled, implement and review C's stop-owner, recheck-predicate, save-loss, then
-recycle sequence. Private follow proof pins remain distinct from public slots.
+The standard segment policy now stops active owners, waits for release, rechecks
+the predicate, saves loss and then recycles. The native exact-byte policy retains
+its earlier save-loss-then-cleanup behavior. A validated generation and owner
+check authorizes captured backend termination; release after that claim does not
+revoke it. A self-owner receives FATAL outside locks before loss is saved.
+Named public physical streaming remains disabled until its sender ownership
+context is implemented. Private follow proof pins remain distinct from public slots.
+
+CHECKPOINT runs its core once and retries recycling only, waiting in five-second
+slices until a live owner releases rather than imposing a five-second total limit.
+An optional frontend retry never parks or waits for admission. Schema locks,
+exported snapshot scopes, quiescence and reload exclusion defer cleanup. A bounded
+process-local pending ticket survives cancellation and records the EQ slot registry
+incarnation, PGDATA, system identities, timeline, namespace, checkpoint, frozen
+current endpoint and retained reference. Stale context is discarded; each retry
+rechecks the current policy and predicate. An owner without a live backend leaves
+WAL retained and work pending. This is not an HA journal.
+
+The pinned C active-owner oracle stopped a sender and observed CHECKPOINT waiting
+more than five seconds before release and loss. The full physical suite passed
+934 tests before the final gate fix; the final focused 78 slot, parking, bootstrap
+and control tests, 185 interop tests, 1,155 legacy checks and strict cold compile
+passed. Native physical follow wire acceptance passed. A 200-trial seed-42 helper
+property passed with rejection-count and input-coverage gaps unmeasured.
 
 Fresh runs passed 911 physical tests, 181 interop tests and 1,155 legacy checks.
 Strict cold compilation passed. Native and pinned C public SQL, SRF and unchanged Patroni

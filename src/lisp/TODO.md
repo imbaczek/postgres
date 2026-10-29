@@ -49,6 +49,10 @@
   of the target. Audit callers and add a regression for rejection or a distinct
   temporary name before changing the cleanup path.
 
+- [ ] Add a real process-kill and restart oracle at the durable slot-loss save
+  and WAL unlink boundary. Current injected cuts exercise this in process, but
+  do not establish crash recovery across an actual process death.
+
 The cold-image audit should cover:
 
 - Cross-file constants and specials referenced before their definitions or

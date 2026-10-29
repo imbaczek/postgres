@@ -609,6 +609,8 @@ The primary finalizer separately holds reload exclusion."
   `(with-live-operation-internal (nil) ,@body))
 
 (defmacro with-live-operation-if-admitted (&body body)
+  "Run BODY without waiting for admission. Nested calls inherit the current
+operation and its lane, including a drain lane."
   `(with-live-operation-internal (nil nil nil) ,@body))
 
 (defmacro with-live-operation-shutdown-cleanup (&body body)

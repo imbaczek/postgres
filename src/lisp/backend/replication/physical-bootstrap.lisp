@@ -213,7 +213,8 @@ The new base receives its own archive; the old primary archive is not copied."
 Invoke as a direct control form with two literal strings, or outside a live
 operation. Idle transactions with assigned XIDs cause refusal; new operations
 wait until the copy completes. This initial copy pauses the source for its
-duration. It is not the final online base-backup protocol."
+duration. Cleanup of any deferred slot recycling runs after reload exclusion and
+quiescence end. It is not the final online base-backup protocol."
   (prevent-recovery-primary-operation "native base backup")
   (when *swank-listener-enabled-p*
     (error "gated physical base backup requires the optional Swank listener to be off"))

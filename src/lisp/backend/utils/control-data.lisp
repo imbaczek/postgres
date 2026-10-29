@@ -65,8 +65,9 @@ The caller must finish those steps before calling this function."
   "Finish smart or fast shutdown in the owning postmaster, outside admission.
 Clients must already be gone. Serialize with reload, close admission permanently,
 retire abandoned transactions, then sync a checkpoint before recording clean
-shutdown. An error keeps admission closed. Do not roll back a possibly
-published clean state."
+shutdown. An unexpected active slot owner leaves recycling pending and prevents
+clean shutdown publication. An error keeps admission closed. Do not roll back a
+possibly published clean state."
   (unless (and *postmaster-data-lock* (postmaster-pid-owned-p)
                *shutdown-finalizing-p* (zerop *live-operation-depth*))
     (error "primary shutdown requires the owning unadmitted postmaster"))

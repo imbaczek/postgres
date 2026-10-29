@@ -627,6 +627,8 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
        (malformed-protocol-message "unsupported frontend message type")))))
 
 (defun dispatch-frontend-frame (stream type-byte length-bytes payload)
+  "Dispatch a frame, then drain recycling without waiting for admission or owner exit.
+Preserve all dispatch values, including secondary values, for the caller."
   (let* ((*extended-query-state*
            (or *extended-query-state* (extended-query-state-for-backend *backend*)))
          (results (multiple-value-list

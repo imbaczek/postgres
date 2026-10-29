@@ -2,10 +2,17 @@
 
 (in-package #:pg)
 
+;;; Standard slot recycling stops active owners before saving loss and removing WAL.
+;;; Consumer cleanup also retires logical snapshot exports and importers.
+
 (defstruct wal-slot-recycling-work
+  "Process-local recycling ticket and captured (slot owner backend) requests.
+The registry identity and storage context fence retries after storage replacement
+or role changes. DURABLE-LSN freezes the checkpoint's current endpoint for the removal horizon."
   slots directory system-id control-system-id timeline namespace checkpoint-lsn durable-lsn retained-reference requests)
 
 (defun wal-capture-slot-recycling-work (checkpoint-lsn durable-lsn requests)
+  "Capture the storage incarnation and owners under WAL for a later retry."
   (make-wal-slot-recycling-work
    :slots *wal-replication-slots* :directory (namestring *pgdata*)
    :system-id (catalog-system-identifier)
@@ -16,6 +23,8 @@
    :requests requests))
 
 (defun wal-slot-recycling-work-current-p (work)
+  "Check the ticket's registry and storage context. Authoritative callers hold WAL;
+checks outside WAL are advisory."
   (and *wal-ready* (not *wal-poisoned*)
        (eq :segments (wal-slot-retention-mode))
        (not (recovery-in-progress-p)) (not *physical-recovery-failed-p*)
@@ -34,6 +43,7 @@
               (getf *wal-control-metadata* :retained-reference))))
 
 (defun wal-slot-recycling-can-wait-p ()
+  "Defer cleanup where waiting or parking would retain incompatible resources."
   (and (not (sb-thread:holding-mutex-p *wal-lock*))
        (not (sb-thread:holding-mutex-p *write-lock*))
        (not (sb-thread:holding-mutex-p *reload-run-lock*))
@@ -49,6 +59,7 @@
        (not (shutdown-in-progress-p))))
 
 (defun wal-slot-recycling-owner-current-p (work slot owner backend)
+  "Recheck the owner and current removal predicate under WAL before signaling."
   (and (wal-slot-recycling-work-current-p work)
        (eq :segments (wal-slot-retention-mode))
        (eq slot (gethash (wal-replication-slot-name slot) *wal-replication-slots*))
@@ -62,11 +73,16 @@
          (< (wal-replication-slot-restart-lsn slot) (* keep +wal-segment-size+)))))
 
 (defvar *wal-slot-recycling-termination-requests*
-  (make-hash-table :test #'eq :weakness :key))
+  (make-hash-table :test #'eq :weakness :key)
+  "Remember termination requests by slot generation and captured owner pair.")
 
-(defvar *wal-slot-owner-wait-seconds* 5)
+(defvar *wal-slot-owner-wait-seconds* 5
+  "Duration of each owner wait slice, not a total checkpoint deadline.")
 
 (defun wal-request-recycling-owner-termination (work request)
+  "Claim a current owner request under WAL, then signal outside the lock.
+A self-owner terminates before loss is published; release after a claim does not
+revoke the already authorized signal."
   (destructuring-bind (slot owner backend) request
     (when backend
       (logical-test-failpoint :before-recycling-owner-termination-claim slot owner backend)
@@ -87,6 +103,9 @@
         (when current backend)))))
 
 (defun wal-finish-slot-recycling-work (work &key (wait t))
+  "Stop owners outside storage locks, then recheck and retry WAL removal.
+WAIT parks admission in bounded slices until owners release or work becomes stale.
+With WAIT NIL, never park; leave unresolved work for another safe retry."
   (when (wal-slot-recycling-can-wait-p)
     (with-live-operation
       (loop
@@ -122,6 +141,8 @@
   (values))
 
 (defun wal-finish-pending-slot-recycling (&key (wait nil))
+  "Retry the current ticket or discard stale work; optional callers never wait
+for admission or park. Unsafe resource and quiescence contexts defer the work."
   (when (and *wal-slot-recycling-pending* (wal-slot-recycling-can-wait-p))
     (flet ((drain ()
              (when (eq :normal *live-operation-current-lane*)
@@ -157,6 +178,8 @@ The saved restart floor remains internal; consumer cleanup runs after locks drai
   (values))
 
 (defun wal-prepare-standard-slot-recycling-under-lock (redo-segment current)
+  "Save loss for inactive slots and collect active owner triples under WAL.
+Active slots retain WAL until their owners release and the predicate is rechecked."
   (let* ((independent (wal-independent-retention-segment redo-segment))
          (keep (wal-slot-removal-segment redo-segment independent current))
          (requests nil))
@@ -173,6 +196,8 @@ The saved restart floor remains internal; consumer cleanup runs after locks drai
     (values (wal-slot-removal-segment redo-segment independent current) (nreverse requests))))
 
 (defun wal-prepare-slot-recycling-under-lock (redo-segment &optional (current *wal-durable-lsn*))
+  "Apply the selected policy under WAL and return the floor and owner requests.
+Standard segments stop active owners first; native bytes keep their existing path."
   (ecase (wal-slot-retention-mode)
     (:bytes
      (wal-invalidate-lagging-replication-slots-under-wal-lock)
@@ -199,6 +224,8 @@ The recycling dispatcher selects the standard segment policy separately."
             collect slot)))
 
 (defun call-with-invalidated-slot-cleanup (function &key (wait t))
+  "Run maintenance, retry pending recycling and clean lost consumers on exit.
+Preserve FUNCTION's values; callers may choose a nonwaiting retry."
   (let ((*wal-replication-slot-loss-collector* (list nil)))
     (unwind-protect
          (multiple-value-prog1 (funcall function)

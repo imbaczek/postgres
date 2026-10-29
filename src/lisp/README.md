@@ -1581,7 +1581,10 @@ Native defaults remain port 5433 and unlimited standard slot retention
 uses whole segments. Public physical slot create, advance and drop, the
 21-column SRF and the 22 C view columns plus native `retained_wal_bytes` (23
 columns total) are
-implemented. Named physical slot streaming remains open. Full generated Patroni
+implemented. The standard segment policy stops active owners and rechecks before
+loss and recycling; the native exact-byte policy keeps its existing behavior.
+Named physical slot streaming remains disabled until sender ownership is added.
+Full generated Patroni
 configurations, recovery parameters, session GUC catalog coverage and control
 interfaces remain unfinished, as does C physical data compatibility; see
 [the HA ledger](PHYSICAL-HA.md).
