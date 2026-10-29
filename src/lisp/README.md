@@ -1590,3 +1590,10 @@ Physical replication connections support inspection with `IDENTIFY_SYSTEM`,
 `TIMELINE_HISTORY` and `SHOW`. History parsing includes native ancestry-position
 checks; it does not perform promotion or change the current timeline. Timeline
 aware writer storage, crash-safe promotion and rejoin remain unfinished.
+
+Native follow starts an unnamed stream with `START_REPLICATION PHYSICAL <lsn>`
+and options including `native_format 'pg_lisp_wal_7'` and exactly one private
+`proof_pin`. The optional `SLOT <public>` form is parsed, but named public slot
+streaming returns `0A000` until its ownership and invalidation driver are ready.
+START without `proof_pin` also returns `0A000`; PREPARE, RELEASE and saved
+control continue to use private pins. Native format version 7 is unchanged.

@@ -15,6 +15,7 @@
     (when value (replication-command-value value))))
 
 (defun physical-stream-proof-pin (command)
+  "Return the private proof pin, distinct from the optional public slot name."
   (physical-stream-option command "proof_pin"))
 
 (defun physical-stream-u64 (text)
@@ -52,6 +53,8 @@ the requested timeline may be an ancestor."
                     (timeline-history-entry-timeline (nth (1- position) history))))))
 
 (defun parse-native-physical-start (words)
+  "Parse native START with an optional public SLOT and exactly one private proof_pin.
+Missing, duplicate or unknown options fail before a sender is acquired."
   (let* ((named (string-equal (second words) "SLOT"))
          (physical-position (if named 3 1))
          (lsn-position (1+ physical-position))

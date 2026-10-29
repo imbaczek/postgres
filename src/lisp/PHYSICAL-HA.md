@@ -746,7 +746,7 @@ named-slot streaming, promotion carryover and standard Patroni follow remain ope
 
 Public SQL supports physical slot creation, advancement and drop, and the
 21-column `pg_get_replication_slots` SRF. The view exposes the 22 pinned C
-columns plus native `retained_wal_bytes` at attribute 23. The private six-column
+columns plus native `retained_wal_bytes` at attribute 23. The private eight-column
 `wal-replication-slot-rows` snapshot remains logical-only. Logical-only fields
 are NULL for physical slots; a lost slot exposes NULL restart LSN while its saved floor stays
 internal. Safe WAL size uses the write endpoint; retained bytes use the durable
@@ -4020,10 +4020,18 @@ The native request binds a source bootstrap pin, system identifier, timeline 1,
 base boundary, requested record end and cumulative received-prefix checksum:
 
 ```
-START_REPLICATION SLOT pin PHYSICAL lsn
- (native_format 'pg_lisp_wal_7', system_id '...', timeline '1',
+START_REPLICATION PHYSICAL lsn
+ (native_format 'pg_lisp_wal_7', proof_pin 'private_pin', system_id '...', timeline '1',
  base_lsn '...', prefix_digest '...')
 ```
+
+`proof_pin` is required exactly once and names the private proof pin saved in
+receiver control. PREPARE and RELEASE also use private pins. An optional
+`SLOT public_slot` may precede `PHYSICAL` in the parsed form, but named public
+slot streaming returns `0A000` until public ownership and the stop, wait and
+recheck invalidation driver are implemented. An old START without `proof_pin`
+also returns `0A000`; there is no fallback from SLOT to proof pin. The native
+WAL format remains version 7. Unnamed streaming is supported.
 
 Source acquisition validates identity/base and claims the pin under the WAL
 mutex; pin release rejects active senders. The durable pin remains after network
