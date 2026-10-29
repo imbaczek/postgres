@@ -39,6 +39,7 @@ def connect(port, mode=None, options=None):
             elif kind == b'E':
                 fields = connection.error_fields(body)
                 error = WireError(fields)
+                error.fields = fields
                 error.authenticated = authenticated
                 error.severity = fields.get('V', fields.get('S'))
                 raise error
@@ -180,7 +181,7 @@ def exercise(base, root, port, connections, senders, native, reload_limits=False
             connection.close()
 
 
-def start(base, root, executable, port, label, native, processes):
+def start(base, root, executable, port, label, native, processes, *, sql_ready=True):
     registry, directory = root / 'owned', root / 'data'
     arguments = [str(executable), '-D', str(directory), '-p', str(port)]
     if native:
@@ -200,6 +201,8 @@ def start(base, root, executable, port, label, native, processes):
             for item in psutil.Process(process.pid).net_connections(kind='tcp'))
         if not listening:
             return False
+        if not sql_ready:
+            return True
         try:
             probe = connect(port)
         except WireError as error:
