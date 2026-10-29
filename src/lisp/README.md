@@ -86,6 +86,12 @@ temporary file is cleaned up at batch completion or unwind and does not use the
 SQL temporary-file quota. Each page record and catalog chunks are still decoded
 in memory; standby replay preflight also retains metadata proportional to the
 number of pages. The primary's dirty page cache is not bounded by this spool.
+Primary WAL publication also stages copied page records in an internal spool,
+building bounded record-sized chunks in sorted page-key order and validating the
+spool before the terminal record. Its temporary file is independent of the SQL
+temporary-file quota and is cleaned up on exit. The original dirty page cache
+and sorted key list remain in memory, so total memory still grows with dirty
+pages. WAL is flushed before commit visibility and page application.
 `./t/checkpoint-snapshot.sh` covers legacy upgrade, both publication crash
 boundaries, control-copy mismatch rejection and standby restartpoint preservation.
 Version 7 additionally logs native XID reservations before allocation. Standby

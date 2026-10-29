@@ -88,13 +88,20 @@
   t)
 
 (defun row-replay-test-legacy-next-page-batch ()
-  (let ((original (symbol-function 'wal-page-images)))
-    (setf (symbol-function 'wal-page-images)
-          (lambda (&optional excluded)
-            (setf (symbol-function 'wal-page-images) original)
-            (let ((images (funcall original excluded)))
-              (dolist (image images) (setf (wal-page-image-provenance image) :unknown))
-              images))))
+  (let ((append-original (symbol-function 'wal-primary-append-pages))
+        (image-original (symbol-function 'wal-primary-page-image)))
+    (setf (symbol-function 'wal-primary-append-pages)
+          (lambda (keys spool)
+            (setf (symbol-function 'wal-primary-append-pages) append-original)
+            (unwind-protect
+                 (progn
+                   (setf (symbol-function 'wal-primary-page-image)
+                         (lambda (key)
+                           (let ((image (funcall image-original key)))
+                             (setf (wal-page-image-provenance image) :unknown)
+                             image)))
+                   (funcall append-original keys spool))
+              (setf (symbol-function 'wal-primary-page-image) image-original)))))
   t)
 
 (defun row-replay-test-incomplete-next-running-snapshot ()

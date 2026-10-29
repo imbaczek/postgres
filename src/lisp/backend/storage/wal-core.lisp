@@ -519,6 +519,42 @@ Legacy 16-hex segment names always belong to timeline 1."
                   (t (< (wal-page-image-block a)
                         (wal-page-image-block b))))))))
 
+(defun wal-primary-page-keys (&optional excluded-relfilenodes)
+  "Plan a deterministic cache traversal without copying page contents."
+  (let ((keys nil))
+    (maphash (lambda (key page)
+               (declare (ignore page))
+               (unless (member (first key) excluded-relfilenodes :test #'eql)
+                 (push key keys)))
+             *wal-page-cache*)
+    (sort keys
+          (lambda (a b)
+            (cond ((/= (first a) (first b)) (< (first a) (first b)))
+                  ((/= (wal-page-fork-id (second a)) (wal-page-fork-id (second b)))
+                   (< (wal-page-fork-id (second a)) (wal-page-fork-id (second b))))
+                  (t (< (third a) (third b))))))))
+
+(defun wal-primary-page-image (key)
+  "Copy one page and its contributor metadata while the WAL lock is held."
+  (let* ((page (gethash key *wal-page-cache*))
+         (xids (gethash key *wal-page-cache-xids*)))
+    (unless page (error "planned WAL page disappeared"))
+    (make-wal-page-image :relfilenode (first key) :fork (second key) :block (third key)
+                         :page (copy-seq page)
+                         :xids (remove-if (lambda (xid) (< xid 3)) xids)
+                         :provenance (cond ((member 0 xids :test #'eql) :maintenance)
+                                           ((member 1 xids :test #'eql) :row)
+                                           (t :unknown)))))
+
+(defun wal-primary-preflight-page-keys (keys)
+  "Reject a too-large individual image before the batch begins."
+  (dolist (key keys)
+    (let* ((xids (gethash key *wal-page-cache-xids*))
+           (size (+ 12 +blcksz+ 4 (* 8 (count-if (lambda (xid) (>= xid 3)) xids)))))
+      (when (> (+ +wal-header-size+ 4 size) +wal-segment-size+)
+        (error "WAL page image has too many transaction contributors"))))
+  (values))
+
 (defun wal-page-image-encoded-size (image)
   (+ 12 +blcksz+ 4 (* 8 (length (wal-page-image-xids image)))))
 
@@ -836,6 +872,26 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
               (wal-slot-record-xid-batch-under-wal-lock xid first-lsn))))))
     (values)))
 
+(defun wal-primary-record-page-xids (keys batch-start-lsn)
+  "Record each contributor once, without constructing a page-image list."
+  (let ((xids (make-hash-table :test #'eql)))
+    (dolist (key keys)
+      (dolist (xid (gethash key *wal-page-cache-xids*))
+        (when (>= xid 3) (setf (gethash xid xids) t))))
+    (when (plusp (hash-table-count xids))
+      (sb-thread:with-mutex (*xid-lock*)
+        (maphash
+         (lambda (xid present)
+           (declare (ignore present))
+           (when (member xid *active-xids* :test #'eql)
+             (multiple-value-bind (first-lsn present-p) (gethash xid *wal-xid-first-lsn*)
+               (unless present-p
+                 (setf first-lsn batch-start-lsn
+                       (gethash xid *wal-xid-first-lsn*) first-lsn))
+               (wal-slot-record-xid-batch-under-wal-lock xid first-lsn))))
+         xids))))
+  (values))
+
 (defun wal-apply-page-images (images &key split-p fault-on-first-write)
   (let ((paused nil))
     (loop for image in images
@@ -852,6 +908,83 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
                             (null *wal-test-pause-relfilenode*)))
                (setf paused t)
                (wal-test-pause :after-btree-split-page-write))))
+  (values))
+
+(defmacro with-wal-primary-page-spool ((spool) &body body)
+  "Own internal commit staging independently of any SQL temp quota."
+  `(let ((,spool nil))
+     (unwind-protect
+          (progn
+            (sb-sys:without-interrupts
+              (let ((*query-temp-file-limit-bytes* nil))
+                (setf ,spool (make-logical-spool))))
+            ,@body)
+       (when ,spool
+         (close-logical-spool ,spool)
+         (unless (eq :resolved (query-temp-cleanup-owner-state (logical-spool-owner ,spool)))
+           (error "primary WAL page spool cleanup failed"))))))
+
+(defun wal-primary-append-pages (keys spool)
+  "Append and stage bounded WAL page records in sorted key order."
+  (labels ((append-chunk (chunk)
+             (let* ((length (+ +wal-header-size+ (wal-page-payload-length chunk)))
+                    (lsn (+ (wal-next-record-start length) length))
+                    (payload (wal-encode-page-images chunk lsn))
+                    (event (make-array (+ 12 (length payload)) :element-type '(unsigned-byte 8))))
+               (unless (= lsn (wal-append-record +wal-record-pages+ 0 payload))
+                 (error "WAL page-image LSN changed while appending"))
+               (wal-set-u32 event 0 +wal-version+)
+               (wal-set-u64 event 4 lsn)
+               (replace event payload :start1 12)
+               (logical-spool-append spool event))))
+    (let ((chunk nil) (chunk-count 0) (chunk-bytes (+ +wal-header-size+ 4)))
+      (dolist (key keys)
+        (let* ((image (wal-primary-page-image key))
+               (image-size (wal-page-image-encoded-size image)))
+          (when (and chunk
+                     (or (>= chunk-count +wal-max-page-images-per-record+)
+                         (> (+ chunk-bytes image-size) +wal-segment-size+)))
+            (append-chunk (nreverse chunk))
+            (setf chunk nil chunk-count 0 chunk-bytes (+ +wal-header-size+ 4)))
+          (push image chunk)
+          (incf chunk-count)
+          (incf chunk-bytes image-size)))
+      (when chunk (append-chunk (nreverse chunk)))))
+  (values))
+
+(defun wal-primary-map-page-spool (spool function)
+  "Validate and visit staged page records in their original order."
+  (logical-spool-map-events
+   spool
+   (lambda (event)
+     (unless (>= (length event) 12) (error "invalid primary WAL page spool record"))
+     (let ((version (wal-u32 event 0)) (lsn (wal-u64 event 4)))
+       (unless (= version +wal-version+) (error "invalid primary WAL page spool version"))
+       (funcall function (wal-decode-page-images (subseq event 12) lsn version)))))
+  (values))
+
+(defun wal-primary-seal-page-spool (spool)
+  "Preflight every staged record before publishing a terminal WAL record."
+  (logical-spool-seal spool)
+  (wal-primary-map-page-spool spool (lambda (images) (declare (ignore images))))
+  (values))
+
+(defun wal-primary-apply-page-spool (spool &key split-p fault-on-first-write)
+  "Apply all records, keeping the split fault point global to the batch."
+  (let ((paused nil))
+    (wal-primary-map-page-spool
+     spool
+     (lambda (images)
+       (wal-apply-page-images images :split-p split-p
+                                     :fault-on-first-write (and fault-on-first-write (not paused)))
+       (when (and fault-on-first-write split-p (not paused)
+                  (some (lambda (image)
+                          (or (null *wal-test-pause-relfilenode*)
+                              (and (eql *wal-test-pause-relfilenode*
+                                        (wal-page-image-relfilenode image))
+                                   (plusp (wal-page-image-block image)))))
+                        images))
+         (setf paused t)))))
   (values))
 
 (defun wal-clear-page-cache (&optional excluded-relfilenodes)
@@ -915,32 +1048,26 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
     (funcall after-durable-function)
     (return-from wal-commit-transaction (values)))
   (with-wal-critical
-    (wal-append-running-xacts-under-lock xid)
-    (let* ((split-p *wal-pending-btree-split*)
-           (images (wal-page-images)))
-      (wal-record-page-xids-at-batch-start
-       images (wal-append-batch-start))
-      (wal-append-page-images images)
-      ;; PostgreSQL's decode.c queues heap changes by XID and reorderbuffer.c
-      ;; emits them at ReorderBufferCommit(). These executor-captured rows use
-      ;; the same visibility boundary: append them before this batch's commit.
-      (when logical-changes
-        (wal-append-logical-changes xid logical-changes))
-      ;; This hook leaves complete page records in the file without a
-      ;; terminal record, so recovery must discard this entire batch.
-      (when *wal-output-stream* (finish-output *wal-output-stream*))
-      (wal-test-pause :after-page-images)
-      (let ((commit-lsn
-              (wal-append-record +wal-record-commit+ xid
-                                 (wal-encode-commit-timestamp (postgres-current-timestamp)))))
-        (wal-flush)
-        (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn))
-      (wal-test-pause :after-wal-flush)
-      (funcall after-durable-function)
-      (wal-apply-page-images images :split-p split-p
-                                    :fault-on-first-write t)
-      (wal-clear-page-cache)
-      (setf *wal-pending-btree-split* nil)))
+    (let ((keys (wal-primary-page-keys)) (split-p *wal-pending-btree-split*))
+      (wal-primary-preflight-page-keys keys)
+      (with-wal-primary-page-spool (spool)
+        (wal-append-running-xacts-under-lock xid)
+        (wal-primary-record-page-xids keys (wal-append-batch-start))
+        (wal-primary-append-pages keys spool)
+        (wal-primary-seal-page-spool spool)
+        (when logical-changes (wal-append-logical-changes xid logical-changes))
+        (when *wal-output-stream* (finish-output *wal-output-stream*))
+        (wal-test-pause :after-page-images)
+        (let ((commit-lsn
+                (wal-append-record +wal-record-commit+ xid
+                                   (wal-encode-commit-timestamp (postgres-current-timestamp)))))
+          (wal-flush)
+          (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn))
+        (wal-test-pause :after-wal-flush)
+        (funcall after-durable-function)
+        (wal-primary-apply-page-spool spool :split-p split-p :fault-on-first-write t)
+        (wal-clear-page-cache)
+        (setf *wal-pending-btree-split* nil))))
   (values))
 
 (defun wal-commit-maintenance ()
@@ -948,19 +1075,19 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
   (unless *wal-ready*
     (return-from wal-commit-maintenance (values)))
   (with-wal-critical
-    (let* ((split-p *wal-pending-btree-split*)
-           (images (wal-page-images)))
-      (wal-record-page-xids-at-batch-start
-       images (wal-append-batch-start))
-      (wal-append-page-images images)
-      (wal-append-record +wal-record-maintenance+ 0
-                         (make-array 0 :element-type '(unsigned-byte 8)))
-      (wal-flush)
-      (wal-test-pause :after-wal-flush)
-      (wal-apply-page-images images :split-p split-p
-                                    :fault-on-first-write t)
-      (wal-clear-page-cache)
-      (setf *wal-pending-btree-split* nil)))
+    (let ((keys (wal-primary-page-keys)) (split-p *wal-pending-btree-split*))
+      (wal-primary-preflight-page-keys keys)
+      (with-wal-primary-page-spool (spool)
+        (wal-primary-record-page-xids keys (wal-append-batch-start))
+        (wal-primary-append-pages keys spool)
+        (wal-primary-seal-page-spool spool)
+        (wal-append-record +wal-record-maintenance+ 0
+                           (make-array 0 :element-type '(unsigned-byte 8)))
+        (wal-flush)
+        (wal-test-pause :after-wal-flush)
+        (wal-primary-apply-page-spool spool :split-p split-p :fault-on-first-write t)
+        (wal-clear-page-cache)
+        (setf *wal-pending-btree-split* nil))))
   (values))
 
 ;; TODO: Stream catalog serialization into a temporary file and write bounded
@@ -1155,7 +1282,7 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
                                    (copy-list relation-deletes))
                            :test #'eql)
                           #'<))
-           (images (wal-page-images deletes))
+           (keys (wal-primary-page-keys deletes))
            (catalog-payload
              (wal-encode-catalog-payload catalog-bytes deletes))
            (chunked-p
@@ -1166,61 +1293,63 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
            (commit-payload (when chunked-p
                              (wal-encode-catalog-commit-payload
                               catalog-payload chunk-count))))
-      (wal-record-page-xids-at-batch-start
-       images (wal-append-batch-start))
-      (wal-append-page-images images)
-      (when chunked-p
-        (wal-append-catalog-chunks catalog-payload chunk-count)
-        (when *wal-output-stream*
-          (finish-output *wal-output-stream*))
-        (wal-test-pause :after-catalog-chunks))
-      (when logical-event
-        ;; A reader exposes this event only when the following catalog terminal
-        ;; is complete. This mirrors pgoutput's commit callback boundary.
-        (wal-append-record +wal-record-logical-catalog-event+ 0 logical-event))
-      (when (and *wal-vacuum-full-publication*
-                 *wal-test-before-vacuum-full-catalog-record-appended-hook*)
-        (funcall *wal-test-before-vacuum-full-catalog-record-appended-hook*))
-      (if chunked-p
-          (wal-append-record +wal-record-catalog-commit+ 0 commit-payload)
-          (wal-append-record +wal-record-catalog+ 0 catalog-payload))
-      ;; Only a complete terminal record makes this catalog image replayable.
-      (when on-record-appended
-        (funcall on-record-appended))
-      (when (and *wal-vacuum-full-publication*
-                 *wal-test-pause-at*
-                 (string= *wal-test-pause-at*
-                          "after-vacuum-full-catalog-wal-append"))
-        ;; Reproduce a complete record that reached stable storage before a
-        ;; failure left the durable-LSN control file unchanged.
-        (finish-output *wal-output-stream*)
-        (fsync-stream *wal-output-stream*)
-        (when *wal-new-segments*
-          (fsync-directory (wal-directory))
-          (setf *wal-new-segments* '()))
-        (wal-test-pause :after-vacuum-full-catalog-wal-append))
-      (when (and *wal-vacuum-full-publication*
-                 *wal-test-before-vacuum-full-catalog-flush-hook*)
-        (funcall *wal-test-before-vacuum-full-catalog-flush-hook*))
-      (wal-flush)
-      ;; This marker advances at the durable boundary, before any fallible
-      ;; page application, catalog-file replacement, or relfile deletion.
-      (incf *wal-catalog-flush-generation*)
-      (wal-test-pause :after-catalog-wal-flush)
-      (when *wal-vacuum-full-publication*
-        (wal-test-pause :after-vacuum-full-catalog-wal-flush))
-      (when (and *wal-vacuum-full-publication*
-                 *wal-test-after-vacuum-full-catalog-flush-hook*)
-        (funcall *wal-test-after-vacuum-full-catalog-flush-hook*))
-      (wal-apply-page-images images)
-      (funcall write-function catalog-bytes)
-      (dolist (relfilenode deletes)
-        (smgr-forget relfilenode :delete t))
-      (setf *wal-pending-deletes*
-            (set-difference *wal-pending-deletes* deletes :test #'eql))
-      (when deletes (fsync-directory (merge-pathnames "base/" *pgdata*)))
-      (wal-clear-page-cache)
-      (setf *wal-pending-btree-split* nil)))
+      (wal-primary-preflight-page-keys keys)
+      (with-wal-primary-page-spool (spool)
+        (wal-primary-record-page-xids keys (wal-append-batch-start))
+        (wal-primary-append-pages keys spool)
+        (wal-primary-seal-page-spool spool)
+        (when chunked-p
+          (wal-append-catalog-chunks catalog-payload chunk-count)
+          (when *wal-output-stream*
+            (finish-output *wal-output-stream*))
+          (wal-test-pause :after-catalog-chunks))
+        (when logical-event
+          ;; A reader exposes this event only when the following catalog terminal
+          ;; is complete. This mirrors pgoutput's commit callback boundary.
+          (wal-append-record +wal-record-logical-catalog-event+ 0 logical-event))
+        (when (and *wal-vacuum-full-publication*
+                   *wal-test-before-vacuum-full-catalog-record-appended-hook*)
+          (funcall *wal-test-before-vacuum-full-catalog-record-appended-hook*))
+        (if chunked-p
+            (wal-append-record +wal-record-catalog-commit+ 0 commit-payload)
+            (wal-append-record +wal-record-catalog+ 0 catalog-payload))
+        ;; Only a complete terminal record makes this catalog image replayable.
+        (when on-record-appended
+          (funcall on-record-appended))
+        (when (and *wal-vacuum-full-publication*
+                   *wal-test-pause-at*
+                   (string= *wal-test-pause-at*
+                            "after-vacuum-full-catalog-wal-append"))
+          ;; Reproduce a complete record that reached stable storage before a
+          ;; failure left the durable-LSN control file unchanged.
+          (finish-output *wal-output-stream*)
+          (fsync-stream *wal-output-stream*)
+          (when *wal-new-segments*
+            (fsync-directory (wal-directory))
+            (setf *wal-new-segments* '()))
+          (wal-test-pause :after-vacuum-full-catalog-wal-append))
+        (when (and *wal-vacuum-full-publication*
+                   *wal-test-before-vacuum-full-catalog-flush-hook*)
+          (funcall *wal-test-before-vacuum-full-catalog-flush-hook*))
+        (wal-flush)
+        ;; This marker advances at the durable boundary, before any fallible
+        ;; page application, catalog-file replacement, or relfile deletion.
+        (incf *wal-catalog-flush-generation*)
+        (wal-test-pause :after-catalog-wal-flush)
+        (when *wal-vacuum-full-publication*
+          (wal-test-pause :after-vacuum-full-catalog-wal-flush))
+        (when (and *wal-vacuum-full-publication*
+                   *wal-test-after-vacuum-full-catalog-flush-hook*)
+          (funcall *wal-test-after-vacuum-full-catalog-flush-hook*))
+        (wal-primary-apply-page-spool spool)
+        (funcall write-function catalog-bytes)
+        (dolist (relfilenode deletes)
+          (smgr-forget relfilenode :delete t))
+        (setf *wal-pending-deletes*
+              (set-difference *wal-pending-deletes* deletes :test #'eql))
+        (when deletes (fsync-directory (merge-pathnames "base/" *pgdata*)))
+        (wal-clear-page-cache)
+        (setf *wal-pending-btree-split* nil))))
   (values))
 
 (defun wal-segment-entry-names ()
@@ -2284,28 +2413,29 @@ Refresh its modification time. Update memory only after atomic publication."
   ;; CHECKPOINT follows the global write-lock -> WAL-lock order.
   (with-write-lock
     (with-wal-critical
-      (let ((images (wal-page-images)))
-        (wal-record-page-xids-at-batch-start
-         images (wal-append-batch-start))
-        (wal-append-page-images images)
-        (let* ((start (wal-next-record-start (wal-checkpoint-record-size)))
-               (snapshot (wal-capture-checkpoint-snapshot start))
-               (checkpoint-end
-                 (wal-append-record +wal-record-checkpoint+ 0
-                                    (wal-encode-checkpoint-snapshot snapshot))))
-          (wal-flush)
-          (wal-test-pause :after-checkpoint-wal-flush)
-          (wal-apply-page-images images)
-          (wal-clear-page-cache)
-          (smgr-fsync-all)
-          (clog-fsync)
-          (fsync-directory *pgdata*)
-          (fsync-directory (merge-pathnames "base/" *pgdata*))
-          (fsync-directory (merge-pathnames "global/" *pgdata*))
-          (wal-save-checkpoint-control checkpoint-end snapshot)
-          (wal-test-pause :after-checkpoint-control)
-          (wal-remove-checkpointed-segments-under-wal-lock
-           checkpoint-end)))))
+      (let ((keys (wal-primary-page-keys)))
+        (wal-primary-preflight-page-keys keys)
+        (with-wal-primary-page-spool (spool)
+          (wal-primary-record-page-xids keys (wal-append-batch-start))
+          (wal-primary-append-pages keys spool)
+          (wal-primary-seal-page-spool spool)
+          (let* ((start (wal-next-record-start (wal-checkpoint-record-size)))
+                 (snapshot (wal-capture-checkpoint-snapshot start))
+                 (checkpoint-end
+                   (wal-append-record +wal-record-checkpoint+ 0
+                                      (wal-encode-checkpoint-snapshot snapshot))))
+            (wal-flush)
+            (wal-test-pause :after-checkpoint-wal-flush)
+            (wal-primary-apply-page-spool spool)
+            (wal-clear-page-cache)
+            (smgr-fsync-all)
+            (clog-fsync)
+            (fsync-directory *pgdata*)
+            (fsync-directory (merge-pathnames "base/" *pgdata*))
+            (fsync-directory (merge-pathnames "global/" *pgdata*))
+            (wal-save-checkpoint-control checkpoint-end snapshot)
+            (wal-test-pause :after-checkpoint-control)
+            (wal-remove-checkpointed-segments-under-wal-lock checkpoint-end))))))
   (values))
 
 (defun wal-remove-checkpointed-segments-under-wal-lock (checkpoint-lsn)
@@ -2371,15 +2501,16 @@ PostgreSQL's checkpoint-time invalidation policy."
   (when *wal-ready*
     (with-wal-critical
       (let* ((next-xid (symbol-value '*next-xid*))
-             (images (wal-page-images))
-             (payload (make-array 8 :element-type '(unsigned-byte 8)
-                                    :initial-element 0)))
-        (wal-record-page-xids-at-batch-start
-         images (wal-append-batch-start))
-        (wal-append-page-images images)
-        (wal-set-u64 payload 0 next-xid)
-        (wal-append-record +wal-record-clog-reset+ next-xid payload)
-        (wal-flush)
-        (wal-apply-page-images images)
-        (wal-clear-page-cache))))
+             (keys (wal-primary-page-keys))
+             (payload (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0)))
+        (wal-primary-preflight-page-keys keys)
+        (with-wal-primary-page-spool (spool)
+          (wal-primary-record-page-xids keys (wal-append-batch-start))
+          (wal-primary-append-pages keys spool)
+          (wal-primary-seal-page-spool spool)
+          (wal-set-u64 payload 0 next-xid)
+          (wal-append-record +wal-record-clog-reset+ next-xid payload)
+          (wal-flush)
+          (wal-primary-apply-page-spool spool)
+          (wal-clear-page-cache)))))
   (values))
