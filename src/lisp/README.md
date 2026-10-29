@@ -290,12 +290,16 @@ missing paths unchanged. Scalar roots and integer deletion from objects raise
 errors; path traversal rejects reached NULL elements and invalid array indices.
 These operations preserve their inputs and operate on materialized JSONB trees.
 `to_jsonb` accepts typed text, varchar, name, boolean, integer, numeric, float,
-JSON and JSONB values, plus the existing supported arrays of applicable element
-types. SQL `json[]` and `jsonb[]` array types are not supported; JSON documents
+JSON, JSONB, bytea, oid, internal char, bit, date/time types, interval, pg_lsn
+and int2vector, plus existing supported arrays of applicable element types.
+SQL `bytea[]`, `json[]` and `jsonb[]` array types are not supported; JSON documents
 with array roots are supported. SQL NULL input returns SQL NULL;
 NULL array elements become JSON null. JSON input is parsed as JSON, while text
 becomes a JSON string. Finite floats use session-controlled float output before
-numeric conversion; NaN and infinities become strings. Temporal and other
+numeric conversion; NaN and infinities become strings. Dates and timestamps use
+XSD-style output independent of DateStyle; timestamptz uses the session time
+zone. Other type output follows applicable session settings, including
+`bytea_output`; only `postgres` IntervalStyle is supported. Records and other
 unsupported types raise `0A000`. The result is materialized and subject to the
 JSON nesting limit.
 
