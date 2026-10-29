@@ -793,17 +793,21 @@ if a registered TOAST index is missing."
          (lambda (origin)
            (when origin
              (list (datum-origin-external-p origin)
-                   (heap-compressed-varlena-payload (datum-origin-compressed origin)))))
+                   (and (datum-origin-compressed origin)
+                        (heap-compressed-varlena-payload (datum-origin-compressed origin)))
+                   (datum-origin-descriptor origin))))
          origins)))
 
 (defun datum-origins-from-spill (origins)
-  "Restore detached origins after a sorted row has been copied or spilled."
+  "Restore owned detached origins after a row has been copied or spilled."
   (when origins
     (map 'vector
          (lambda (origin)
            (when origin
              (make-datum-origin :external-p (first origin)
-                                :compressed (make-heap-compressed-varlena :payload (copy-seq (second origin))))))
+                                :compressed (and (second origin)
+                                                 (make-heap-compressed-varlena :payload (copy-seq (second origin))))
+                                :descriptor (and (third origin) (copy-seq (third origin))))))
          origins)))
 
 (defun stream-select-sort-with-arena (streamer order callback arena &optional on-complete)

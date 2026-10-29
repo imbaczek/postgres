@@ -255,8 +255,9 @@ duplicate elimination compares logical values. Scalar subqueries with supported
 plans retain the selected datum, including correlated outer references. Supported
 scalar subqueries also retain compatible compressed values in INSERT VALUES and
 UPDATE assignments. Supported UPDATE FROM source plans retain their raw source
-slot origins through replay and concurrent row rechecks. Same-row external
-descriptors inside computed expressions do not yet carry their physical origin.
+slot origins through replay and concurrent row rechecks. An external descriptor
+may be reused only when it matches the corresponding attribute of the claimed
+old row and the assigned value remains unchanged.
 LATERAL joins also retain origins from their outer rows. Grouping and DISTINCT retain
 the first representative; MIN/MAX retain the first non-NULL input until another
 non-NULL input is compared. Other CTE producer shapes,

@@ -400,6 +400,65 @@ run -c 'alter table toast_external_compressed alter column v set storage externa
 run -c 'update toast_external_compressed set v=v' >/dev/null
 run -c 'vacuum full toast_external_compressed' >/dev/null
 [ "$(run -c 'select length(v) from toast_external_compressed')" = 200000 ]
+run -c 'create table toast_external_self (id int primary key, v text)' >/dev/null
+awk 'BEGIN { printf "insert into toast_external_self values (1,\047"; for (i=0;i<200000;i++) printf "a"; printf "\047),(2,\047"; for (i=0;i<200000;i++) printf "a"; print "\047);" }' | run >/dev/null
+run -c 'alter table toast_external_self alter column v set storage plain' >/dev/null
+run -c 'update toast_external_self set v=(select v) where id=1' >/dev/null
+run -c "update toast_external_self set v=coalesce(v,'') where id=1" >/dev/null
+run -c 'update toast_external_self t set v=s.v from toast_external_self s where t.id=1 and s.id=1' >/dev/null
+[ "$(run -c 'select length(v) from toast_external_self where id=1')" = 200000 ]
+if run -v VERBOSITY=verbose -c 'update toast_external_self t set v=s.v from toast_external_self s where t.id=1 and s.id=2' >"$TMP/external-other-row.out" 2>&1; then
+    echo 'toast-dml: equal external value from another row reused a descriptor' >&2; exit 1
+fi
+case $(cat "$TMP/external-other-row.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: foreign external descriptor did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+raw_external=$(awk 'BEGIN { s=1; for (i=0;i<10000;i++) { s=(s*1664525+1013904223)%4294967296; printf "%c", 97+int(s/16777216)%26 } }')
+run -c 'create table toast_raw_self (id int primary key, v text)' >/dev/null
+run -c 'alter table toast_raw_self alter column v set storage external' >/dev/null
+run -c "insert into toast_raw_self values (1,'$raw_external'),(2,'$raw_external')" >/dev/null
+run -c 'alter table toast_raw_self alter column v set storage plain' >/dev/null
+run -c 'update toast_raw_self set v=(select v) where id=1' >/dev/null
+run -c "update toast_raw_self set v=case when true then v else '' end where id=1" >/dev/null
+[ "$(run -c 'select length(v) from toast_raw_self where id=1')" = 10000 ]
+if run -v VERBOSITY=verbose -c 'update toast_raw_self t set v=s.v from toast_raw_self s where t.id=1 and s.id=2' >"$TMP/raw-other-row.out" 2>&1; then
+    echo 'toast-dml: equal raw external value from another row reused a descriptor' >&2; exit 1
+fi
+case $(cat "$TMP/raw-other-row.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: foreign raw descriptor did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+# A cached source descriptor from the old snapshot must not be reused after
+# the target is concurrently replaced with a different claimed tuple.
+mkfifo "$TMP/descriptor-epq.sql"
+run < "$TMP/descriptor-epq.sql" > "$TMP/descriptor-epq.out" 2>&1 &
+READER=$!
+exec 3> "$TMP/descriptor-epq.sql"
+printf '%s\n' "begin; update toast_raw_self set v='short' where id=1;" '\echo ready' >&3
+i=0
+until grep -Fxq ready "$TMP/descriptor-epq.out"; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || { cat "$TMP/descriptor-epq.out" >&2; exit 1; }; sleep 0.1
+done
+run -v VERBOSITY=verbose -c 'select pg_backend_pid()' -c 'update toast_raw_self set v=(select v from toast_raw_self where id=1) where id=1' >"$TMP/descriptor-epq-waiter.out" 2>&1 &
+WRITER=$!
+i=0
+until waiter_pid=$(awk '/^[0-9]+$/{print; exit}' "$TMP/descriptor-epq-waiter.out") && [ -n "$waiter_pid" ]; do
+    kill -0 "$WRITER" 2>/dev/null || { cat "$TMP/descriptor-epq-waiter.out" >&2; exit 1; }
+    i=$((i + 1)); [ "$i" -lt 100 ] || exit 1; sleep 0.1
+done
+printf '%s\n(quit)\n' "(loop repeat 100 for backend = (lookup-backend $waiter_pid) when (and backend (backend-waiting-xid backend)) return :waiting do (sleep 0.05) finally (return :timeout))" | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/descriptor-epq-wait.out"
+grep -Fq ':WAITING' "$TMP/descriptor-epq-wait.out" || { cat "$TMP/descriptor-epq-wait.out" >&2; exit 1; }
+printf '%s\n' 'commit;' '\q' >&3
+exec 3>&-
+wait "$READER"; READER=
+if wait "$WRITER"; then echo 'toast-dml: stale descriptor reused after EPQ' >&2; exit 1; fi
+WRITER=
+case $(cat "$TMP/descriptor-epq-waiter.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: stale descriptor did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+[ "$(run -c 'select v from toast_raw_self where id=1')" = short ]
 if run -v VERBOSITY=verbose -c 'insert into toast_scalar_dml values (4,(select v from toast_external_compressed))' >"$TMP/dml-scalar-external.out" 2>&1; then
     echo 'toast-dml: external scalar datum was retained under PLAIN' >&2; exit 1
 fi

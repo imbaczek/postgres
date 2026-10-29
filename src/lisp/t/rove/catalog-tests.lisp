@@ -102,6 +102,15 @@
       (rove:ok (datum-origin-external-p (aref restored 0)))
       (rove:ok (null (aref restored 1)))))
 
+(rove:deftest external-origin-descriptor-is-owned
+    (let* ((descriptor (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(4 5 6)))
+           (origin (make-datum-origin :external-p t :descriptor descriptor))
+           (restored (datum-origins-from-spill (datum-origins-for-spill (vector origin)))))
+      (setf (aref descriptor 0) 9)
+      (rove:ok (null (datum-origin-compressed (aref restored 0))))
+      (rove:ok (datum-origin-external-p (aref restored 0)))
+      (rove:ok (= 4 (aref (datum-origin-descriptor (aref restored 0)) 0)))))
+
 (rove:deftest replay-origin-readers-own-payloads
     (let ((*query-temp-directory* (uiop:temporary-directory)))
       (with-query-temp-files
@@ -110,12 +119,13 @@
                  (bytes (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3)))
                  (origin (make-datum-origin :external-p t
                                             :compressed (make-heap-compressed-varlena :payload bytes)))
+                 (raw-origin (make-datum-origin :external-p t :descriptor (copy-seq bytes)))
                  (done nil)
                  (producer (make-sql-iterator
                             (lambda ()
                               (unless done
                                 (setf done t)
-                                (values (vector "row") t (vector origin))))))
+                                (values (vector "row") t (vector origin raw-origin))))))
                  (store (make-query-replay-store producer limit))
                  (first-reader (make-query-replay-reader store))
                  (second-reader (make-query-replay-reader store)))
@@ -125,14 +135,17 @@
                      (rove:ok present)
                      (rove:ok (equal "row" (aref row 0)))
                      (setf (aref (heap-compressed-varlena-payload
-                                  (datum-origin-compressed (aref origins 0))) 0) 9))
+                                  (datum-origin-compressed (aref origins 0))) 0) 9)
+                     (setf (aref (datum-origin-descriptor (aref origins 1)) 0) 9))
                    (multiple-value-bind (row present origins) (sql-iterator-next second-reader)
                      (declare (ignore row))
                      (rove:ok present)
                      (rove:ok (datum-origin-external-p (aref origins 0)))
                      (rove:ok (= 1 (aref (heap-compressed-varlena-payload
                                           (datum-origin-compressed (aref origins 0))) 0)))
-                     (rove:ok (= 1 (aref bytes 0)))))
+                     (rove:ok (= 1 (aref bytes 0)))
+                     (rove:ok (null (datum-origin-compressed (aref origins 1))))
+                     (rove:ok (= 1 (aref (datum-origin-descriptor (aref origins 1)) 0)))))
               (close-query-replay-store store)))))))
 
 (rove:deftest test-toast-catalog-ownership-roundtrip

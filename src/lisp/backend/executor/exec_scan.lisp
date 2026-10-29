@@ -1481,11 +1481,11 @@ chunk visibility follows the parent and is not independently filtered."
                        (ereport "XX001" "external value has no owning TOAST relation"))
                      (when *datum-origin-capture*
                        (let ((compressed (toast-fetch-compressed-value toast value snapshot :index-reader index-reader)))
-                         (when compressed
-                           (unless (htup-origins tuple)
-                             (setf (htup-origins tuple) (make-array (length values) :initial-element nil)))
-                           (setf (aref (htup-origins tuple) i)
-                                 (make-datum-origin :compressed compressed :external-p t)))))
+                         (unless (htup-origins tuple)
+                           (setf (htup-origins tuple) (make-array (length values) :initial-element nil)))
+                         (setf (aref (htup-origins tuple) i)
+                               (make-datum-origin :compressed compressed :external-p t
+                                                  :descriptor (heap-encode-external-varlena value)))))
                      (let ((bytes (toast-fetch-value toast value snapshot :index-reader index-reader)))
                        (setf (aref values i)
                              (case type

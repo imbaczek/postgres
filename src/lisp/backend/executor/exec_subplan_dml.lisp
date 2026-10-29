@@ -336,25 +336,26 @@
   ;; All assignments read the same old row, including volatile expressions.
   (let* ((columns (pg-class-columns table))
          (new (copy-seq old))
-         (compressed (make-array (length columns) :initial-element nil)))
+         (compressed (make-array (length columns) :initial-element nil))
+         (descriptors (make-array (length columns) :initial-element nil)))
     (dolist (assignment sets)
       (let* ((column (car assignment))
              (expression (cdr assignment))
              (i (1- (pg-column-attnum column))))
-        (multiple-value-bind (value origin)
+        (multiple-value-bind (value origin descriptor)
             (if (eq expression :default)
-                (values (coerce-dml-column-default column) nil)
+                (values (coerce-dml-column-default column) nil nil)
                 (eval-dml-assignment-with-origin expression environment column))
-          (let ((coerced (coerce-value value (pg-column-type column) (pg-column-typmod column))))
+          (let* ((coerced (coerce-value value (pg-column-type column) (pg-column-typmod column)))
+                 (unchanged (and (or origin descriptor)
+                                 (equalp (aref (nth-value 2 (heap-tuple-layout (vector value) (vector column))) 0)
+                                         (aref (nth-value 2 (heap-tuple-layout (vector coerced) (vector column))) 0)))))
             (setf (aref new i) coerced
-                  (aref compressed i)
-                  (and origin
-                       (equalp (aref (nth-value 2 (heap-tuple-layout (vector value) (vector column))) 0)
-                               (aref (nth-value 2 (heap-tuple-layout (vector coerced) (vector column))) 0))
-                       origin))))))
+                  (aref compressed i) (and unchanged origin)
+                  (aref descriptors i) (and unchanged descriptor))))))
     (check-not-null new columns)
     (check-table-constraints table new)
-    (values new compressed)))
+    (values new compressed descriptors)))
 
 (defun datum-origin-assignment-compatible-p (source column)
   "Whether C's assignment coercion can pass SOURCE's datum without detoasting.
@@ -373,20 +374,23 @@ Match varchar_support and numeric_support's typmod relabel conditions."
           (t (and (eq from to) (= old new))))))
 
 (defun eval-dml-assignment-with-origin (expression environment column)
-  "Evaluate an assignment once and return its compatible detached compression."
+  "Evaluate once and return compatible compression and external descriptor bytes."
   (if (and (consp expression) (eq (first expression) :assignment))
       (let ((input (second expression)))
         (multiple-value-bind (raw origin)
             (eval-expr-with-origin input environment *query-row-origins*)
-          (let ((value (coerce-subquery-assignment-value expression raw)))
+          (let* ((value (coerce-subquery-assignment-value expression raw))
+                 (compatible
+                   (and origin (datum-origin-assignment-compatible-p input column)
+                        (equalp (aref (nth-value 2 (heap-tuple-layout (vector raw) (vector column))) 0)
+                                (aref (nth-value 2 (heap-tuple-layout (vector value) (vector column))) 0)))))
             (values value
-                    (and origin (datum-origin-assignment-compatible-p input column)
+                    (and compatible
                          (or (not (datum-origin-external-p origin))
                              (not (char= (pg-column-effective-storage column) #\p)))
-                         (equalp (aref (nth-value 2 (heap-tuple-layout (vector raw) (vector column))) 0)
-                                 (aref (nth-value 2 (heap-tuple-layout (vector value) (vector column))) 0))
-                         (datum-origin-compressed origin))))))
-      (values (eval-expr expression environment) nil)))
+                         (datum-origin-compressed origin))
+                    (and compatible (datum-origin-descriptor origin))))))
+      (values (eval-expr expression environment) nil nil)))
 
 (defun exec-insert-subqueries (stream ast)
   (let ((*datum-origin-capture* nil) (*query-row-origins* nil)
@@ -574,6 +578,25 @@ Match varchar_support and numeric_support's typmod relabel conditions."
                               (subseq *query-row-origins* target-width))))
     (dml-row-origins tuple source-origins environment)))
 
+(defun dml-reuse-matching-external-descriptors (table tuple new descriptors reuse snapshot)
+  "Reuse only descriptors identical to the attribute of the claimed old tuple."
+  (let ((old-values (htup-values tuple)) (materialized nil)
+                                         (columns (pg-class-columns table)))
+    (loop for descriptor across descriptors for i from 0
+          for pointer = (aref old-values i)
+          when (and descriptor (heap-external-varlena-p pointer)
+                    (equalp descriptor (heap-encode-external-varlena pointer)))
+            do (unless materialized
+                 (let ((*datum-origin-capture* nil))
+                   (setf materialized
+                         (htup-values
+                          (materialize-select-tuple table (make-htup :values (copy-seq old-values)) snapshot)))))
+               (let ((column (aref columns i)))
+                 (when (equalp (aref (nth-value 2 (heap-tuple-layout (vector (aref new i)) (vector column))) 0)
+                               (aref (nth-value 2 (heap-tuple-layout (vector (aref materialized i)) (vector column))) 0))
+                   (setf (aref reuse i) pointer)))))
+  reuse)
+
 (defun exec-update-subqueries (stream ast)
   (let* ((*datum-origin-capture* t)
          (*query-row-origins* nil)
@@ -592,7 +615,7 @@ Match varchar_support and numeric_support's typmod relabel conditions."
             (check-for-interrupts)
             ;; Project every qualifying match before suppressing duplicate mutations,
             ;; as C evaluates the plan output before TM_SelfModified handling.
-            (multiple-value-bind (new compressed)
+            (multiple-value-bind (new compressed descriptors)
                 (call-with-dml-expression-evaluation
                  (lambda ()
                    (let ((*query-row-origins* (dml-target-row-origins candidate environment)))
@@ -612,13 +635,14 @@ Match varchar_support and numeric_support's typmod relabel conditions."
                           (let* ((environment (concatenate 'vector (htup-values tuple) source))
                                  (*query-row-origins* (dml-target-row-origins tuple environment)))
                             (when (or (null where) (true-p (eval-expr where environment)))
-                              (multiple-value-setq (new compressed)
+                              (multiple-value-setq (new compressed descriptors)
                                 (subquery-update-values table sets (htup-values tuple) environment))
                               t)))))
                      nil t candidate)
                   (check-heapam-write-status status)
                   (when deleted
                     (let ((reuse (unchanged-tuple-toast-pointers tuple sets table new *current-snapshot*)))
+                      (dml-reuse-matching-external-descriptors table tuple new descriptors reuse *current-snapshot*)
                       (delete-tuple-toast-values table tuple xid (backend-command-id *backend*) reuse)
                       (materialize-select-tuple table tuple *current-snapshot*
                                                 :demand toast-demand :retain-external-p (not (null toast-demand)))
