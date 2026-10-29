@@ -366,6 +366,8 @@ reply to its exchange. A stopped channel cannot be reused; failed exchanges clos
   (lock (sb-thread:make-mutex :name "libpq channel")))
 
 (defun physical-libpq-read-exactly (stream size &optional channel)
+  "Read a complete helper frame part. Explicit stop is distinct from an
+unsolicited EOF, which is a protocol violation."
   (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
     (loop with position = 0
           while (< position size)

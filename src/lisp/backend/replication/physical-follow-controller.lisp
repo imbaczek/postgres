@@ -527,6 +527,7 @@ publication failures fence recovery for restart reconciliation."
 (declaim (special *physical-follow-prepare-timeout*))
 
 (defun physical-follow-operation-cancelled-condition-p (operation condition)
+  "Treat a stopped client as cancellation only when OPERATION was cancelled."
   (or (typep condition 'physical-follow-controller-cancelled)
       (and (typep condition 'physical-client-stopped)
            (sb-thread:with-mutex (*physical-follow-lock*)

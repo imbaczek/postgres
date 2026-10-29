@@ -4,13 +4,16 @@
 (define-condition physical-follow-terminal-error (simple-error) ())
 (defstruct (physical-follow-runtime (:print-function physical-libpq-print-private-object))
   "CONFIG is the runtime's private saved configuration; TRANSITION requests a
-controller handoff. Lifecycle and client ownership use the follow lock."
+controller handoff. Lifecycle and client ownership use the follow lock.
+STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
   host port pin config transition limit next-timeline
   (stopped-p nil) (receiver-stopped-p nil) (connected-p nil) last-error client receiver-thread replay-thread)
 
-(define-condition physical-follow-receiver-stopped (physical-client-stopped) ())
+(define-condition physical-follow-receiver-stopped (physical-client-stopped) ()
+  (:documentation "The runtime stopped receipt before client registration completed."))
 
 (defun physical-follow-receiver-stopped-p (runtime)
+  "Whether either the receiver-only or the all-workers stop was requested."
   (or (physical-follow-runtime-stopped-p runtime)
       (physical-follow-runtime-receiver-stopped-p runtime)))
 
@@ -1265,6 +1268,11 @@ Validate before creating workers and publish only a complete worker pair."
   :started)
 
 (defun physical-follow-quiesce-receiver ()
+  "Stop and join receipt, preserving replay, pause state, config and runtime.
+The lifecycle owner must first block the controller and cancel its operation
+outside command, reload and admission locks, then hold the command mutex here.
+A controller operation already owns its transition when quiescing its runtime.
+Signal and join outside admission; a failed join or exit flush signals an error."
   (when (plusp *live-operation-depth*)
     (error "receiver quiescence must join outside admission"))
   (unless (sb-thread:holding-mutex-p *physical-follow-command-lock*)
@@ -1287,7 +1295,10 @@ Validate before creating workers and publish only a complete worker pair."
   :stopped)
 
 (defun physical-follow-quiesce-runtime ()
-  "Caller owns the command mutex, outside admission; preserve durable follow configuration."
+  "Stop and join both workers and preserve durable follow configuration.
+The caller owns the command mutex and joins outside admission. A lifecycle
+owner first blocks and cancels the controller; a controller operation already
+owns its transition."
   (when (plusp *live-operation-depth*) (error "follow quiescence must join outside admission"))
   (let ((runtime *physical-follow-runtime*))
     (when runtime

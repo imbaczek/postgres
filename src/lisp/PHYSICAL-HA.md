@@ -650,6 +650,26 @@ Patroni configuration integration, synchronous replication, rejoin, the full
 acceptance matrix and cold audit remain unfinished; this milestone adds no
 coordinator. The earlier libpq references below describe the prior checkpoint.
 
+### Receiver-only stop prerequisite — completed milestone
+
+The controller can stop and join receipt while preserving replay, its pause
+state, follow configuration and runtime. This is distinct from stopping all
+recovery workers. It is a prerequisite for configuration changes: standard GUC
+clear, desired-generation reconciliation and cold replay-only launch are not
+yet wired. PostgreSQL's `StartupRereadConfig` in `startup.c` and receiver restart
+and launch in `xlogrecovery.c:3822-3881` are the corresponding C references.
+
+The physical suite passed 1029 tests with zero failures and zero pending
+(`/tmp/pg-receiver-only-physical-suite.log`); seven final targeted tests passed
+after mutex refinement. Strict compilation passed
+(`/tmp/pg-receiver-only-reviewed-compile.log`). Native end-to-end follow passed for libpq
+(`/tmp/pg-receiver-only-follow-final.log`, artifacts
+`/tmp/pg-operation-parking.mwctQq`) and raw transport
+(`/tmp/pg-receiver-only-raw-follow-final.log`, artifacts
+`/tmp/pg-operation-parking.z7dTLm`). Luna and Sol high reviews were clear;
+Sol medium found no further refactor needed, and functions remained under 120
+lines.
+
 ### Standard follow configuration integration — in progress
 
 The next integrated milestone is startup and upstream replacement through

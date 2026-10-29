@@ -3,7 +3,8 @@
 ;;; Checked native physical follow exchanges. The caller owns transport and
 ;;; lifecycle; these helpers do not admit a receiver.
 
-(define-condition physical-client-stopped (error) ())
+(define-condition physical-client-stopped (error) ()
+  (:documentation "The transport was explicitly stopped by its owner or controller."))
 
 (defconstant +physical-client-proof-frame-maximum+
   (+ +physical-store-history-maximum-bytes+ 65536)

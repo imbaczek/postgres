@@ -446,6 +446,10 @@ this mode.
 
 ### Startup and timeout debugging
 
+- Inspect receiver and replay state through the owned control REPL when a stop
+  unexpectedly poisons recovery. An intentional helper SIGKILL once surfaced as
+  `08P01` and stopped replay too; explicit stop must be distinguished from an
+  unsolicited helper EOF.
 - Patroni's driver wrapper appends `-c search_path=pg_catalog` to connection
   options. Inspect the actual wrapper as well as ConnectionPool defaults. A
   startup setter can emit ParameterStatus through the backend stream even if
