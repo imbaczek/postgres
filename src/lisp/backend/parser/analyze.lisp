@@ -2790,6 +2790,50 @@ candidate selection."
           (make-sql-array :element-type-id element-type :elements result
                           :dimensions sizes :lower-bounds (make-list (length sizes) :initial-element 1)))))))
 
+(defun eval-array-assignment (expression env)
+  "Assign an element without mutating the input array or its element vector."
+  (let* ((array (eval-expr (second expression) env))
+         (indices (mapcar (lambda (index) (eval-expr index env)) (third expression))))
+    (when (member +null+ indices)
+      (ereport "22004" "array subscript in assignment must not be null"))
+    (let* ((value (eval-expr (fourth expression) env))
+           (element-type (sql-array-element-type (expr-type expression)))
+           (dimensions (unless (eq array +null+) (sql-array-dimensions array)))
+           (bounds (unless (eq array +null+) (sql-array-lower-bounds array))))
+      (when (null dimensions)
+        (when (member #x7fffffff indices)
+          (ereport "54000" "array subscript out of range"))
+        (return-from eval-array-assignment
+          (make-sql-array :element-type-id element-type :elements (vector value)
+                          :dimensions (make-list (length indices) :initial-element 1)
+                          :lower-bounds (copy-list indices))))
+      (unless (= (length indices) (length dimensions))
+        (ereport "2202E" "wrong number of array subscripts"))
+      (if (= (length dimensions) 1)
+          (let* ((old-lower (first bounds)) (old-size (first dimensions))
+                                            (index (first indices))
+                                            (new-lower (min old-lower index))
+                                            (new-upper (max (+ old-lower old-size -1) index))
+                                            (size (1+ (- new-upper new-lower))))
+            (when (or (> size +max-varlena-array-elements+) (> size #x7fffffff)
+                      (= new-upper #x7fffffff))
+              (ereport "54000" "array size exceeds the maximum allowed"))
+            (let ((result (make-array size :initial-element +null+)))
+              (replace result (sql-array-elements array) :start1 (- old-lower new-lower))
+              (setf (aref result (- index new-lower)) value)
+              (make-sql-array :element-type-id element-type :elements result
+                              :dimensions (list size) :lower-bounds (list new-lower))))
+          (let ((offset 0))
+            (loop for index in indices for dimension in dimensions for lower in bounds
+                  for relative = (- index lower)
+                  do (unless (<= 0 relative (1- dimension))
+                       (ereport "2202E" "array subscript out of range"))
+                     (setf offset (+ (* offset dimension) relative)))
+            (let ((result (copy-seq (sql-array-elements array))))
+              (setf (aref result offset) value)
+              (make-sql-array :element-type-id element-type :elements result
+                              :dimensions (copy-list dimensions) :lower-bounds (copy-list bounds))))))))
+
 (defun analyze-scalar-array-argument (raw scope)
   (let ((array (analyze-expr raw scope)))
     (if (and (in-unknown-constant-p array) (stringp (second array)))
@@ -4349,6 +4393,7 @@ truncate and interpret the result at TYPE's signed width."
     (:array (eval-array-constructor expr env))
     (:array-subscript (eval-array-subscript expr env))
     (:array-slice (eval-array-slice expr env))
+    (:array-assign (eval-array-assignment expr env))
     (:record-field
      (let ((record (eval-expr (second expr) env)))
        (if (eq record +null+) +null+ (aref (sql-record-values record) (third expr)))))

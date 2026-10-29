@@ -782,6 +782,68 @@
           (when pg::*clog-stream* (close pg::*clog-stream*))
           (pg::smgr-close-all)))))
 
+(deftest array-element-update-from-and-repeated-targets
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*relation-streams* (make-hash-table :test #'equal))
+             (pg::*wal-page-cache* (make-hash-table :test #'equal))
+             (pg::*wal-ready* nil) (pg::*clog-stream* nil)
+             (pg::*active-xids* (list 43)) (pg::*next-xid* 50)
+             (pg::*logical-capture-xid-modes* (make-hash-table :test #'eql))
+             (pg::*catalog* (pg::make-catalog))
+             (pg::*backend* (pg::make-backend :database "postgres" :state :in-progress :explicit t :xid 43))
+             (database (pg::make-database :name "postgres"))
+             (snapshot (pg::make-snapshot-struct :xmin 3 :xmax 50 :xip '(43) :curcid 0))
+             (pg::*current-snapshot* snapshot)
+             (registration (pg::make-snapshot-registration))
+             (out-path (merge-pathnames "array-update-response" root)))
+        (setf (gethash "postgres" (pg::catalog-databases pg::*catalog*)) database
+              (gethash 43 pg::*logical-capture-xid-modes*) :skip-written)
+        (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
+        (unwind-protect
+             (let* ((columns (list (list :name "id" :type :int4 :typmod -1)
+                                   (list :name "a" :type :jsonb-array :typmod -1)))
+                    (target (pg::create-table* database "array_target" columns))
+                    (source (pg::create-table* database "array_source" columns))
+                    (array (pg::make-sql-array :element-type-id :jsonb
+                                               :elements (vector (pg::sql-jsonb-input "1") (pg::sql-jsonb-input "2"))
+                                               :dimensions '(2) :lower-bounds '(1))))
+               (pg::with-write-lock
+                 (pg::heapam-insert (pg::pg-class-relfilenode target) (pg::pg-class-columns target) (vector 1 array) 42 0)
+                 (pg::heapam-insert (pg::pg-class-relfilenode source) (pg::pg-class-columns source) (vector 1 array) 42 0))
+               (pg::clog-set 42 pg::+clog-committed+)
+               (pg::register-active-snapshot snapshot registration)
+               (with-open-file (out out-path :direction :output :if-exists :supersede :element-type '(unsigned-byte 8))
+                 (pg::exec-update-subqueries
+                  out (first (pg::parse-statements
+                              "UPDATE array_target AS t SET a[1]=t.a[2],a[2]=t.a[1] FROM array_source AS s WHERE t.id=s.id"))))
+               (let ((sql (format nil "UPDATE array_target SET ~{~a~^,~}"
+                                  (loop for i from 1 to 512 collect (format nil "a[1]='~a'::jsonb" i)))))
+                 (incf (pg::backend-command-id pg::*backend*))
+                 (with-open-file (out out-path :direction :output :if-exists :supersede :element-type '(unsigned-byte 8))
+                   (pg::exec-update-subqueries out (first (pg::parse-statements sql)))))
+               (let ((sql (format nil "UPDATE array_target SET ~{~a~^,~}"
+                                  (loop for i from 1 to 513 collect (format nil "a[1]='~a'::jsonb" i)))))
+                 (ok (handler-case (progn (pg::prepare-dml-subqueries (first (pg::parse-statements sql))) nil)
+                       (pg::pg-error (condition) (string= "54000" (pg::pg-error-sqlstate condition))))))
+               (pg::clog-set 43 pg::+clog-committed+)
+               (let ((found nil) (pg::*backend* nil)
+                                 (fresh (pg::make-snapshot-struct :xmin 3 :xmax 50 :xip nil :curcid 0)))
+                 (pg::heapam-scan (pg::pg-class-relfilenode target) (pg::pg-class-columns target) fresh
+                                  (lambda (tuple) (push (pg::htup-values tuple) found)))
+                 (ok (= 2 (length found)))
+                 (ok (some (lambda (row)
+                             (let ((elements (pg::sql-array-elements (aref row 1))))
+                               (and (string= "2" (pg::sql-jsonb-output (aref elements 0)))
+                                    (string= "1" (pg::sql-jsonb-output (aref elements 1)))))) found))
+                 (ok (some (lambda (row)
+                             (let ((elements (pg::sql-array-elements (aref row 1))))
+                               (string= "512" (pg::sql-jsonb-output (aref elements 0))))) found))))
+          (pg::release-snapshot-registration registration)
+          (pg::release-relation-writer-xid 43)
+          (when pg::*clog-stream* (close pg::*clog-stream*))
+          (pg::smgr-close-all)))))
+
 (deftest internal-varlena-array-external-toast-roundtrip
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)

@@ -247,6 +247,35 @@
                      (pg-error (error) error))))
     (rove:ok (and condition (string= (pg-error-sqlstate condition) "22012")))))
 
+(rove:deftest test-array-element-assignment
+    (rove:ok (handler-case
+                 (progn (analyze-array-update-assignments (make-list 513) nil nil nil) nil)
+               (pg-error (condition) (string= (pg-error-sqlstate condition) "54000"))))
+  (flet ((constant (value type) (list :const value :type type :typmod -1)))
+    (let* ((original (make-sql-array :element-type-id :int4 :elements #(1 2)
+                                     :dimensions '(2) :lower-bounds '(1)))
+           (assignment (list :array-assign (constant original :int4-array)
+                             (list (constant 4 :int4)) (constant 9 :int4)
+                             :type :int4-array :typmod -1))
+           (updated (eval-array-assignment assignment #())))
+      (rove:ok (equalp (sql-array-elements updated) (vector 1 2 +null+ 9)))
+      (rove:ok (equalp (sql-array-elements original) #(1 2)))
+      (rove:ok (equal (sql-array-lower-bounds updated) '(1))))
+    (let* ((assignment (list :array-assign (constant +null+ :int4-array)
+                             (list (constant -2 :int4) (constant 7 :int4))
+                             (constant +null+ :int4) :type :int4-array :typmod -1))
+           (updated (eval-array-assignment assignment #())))
+      (rove:ok (equal (sql-array-dimensions updated) '(1 1)))
+      (rove:ok (equal (sql-array-lower-bounds updated) '(-2 7)))
+      (rove:ok (eq +null+ (aref (sql-array-elements updated) 0))))
+    (let ((condition (handler-case
+                         (eval-array-assignment
+                          (list :array-assign (constant +null+ :int4-array)
+                                (list (constant #x7fffffff :int4))
+                                (constant 1 :int4) :type :int4-array :typmod -1) #())
+                       (pg-error (error) error))))
+      (rove:ok (and condition (string= (pg-error-sqlstate condition) "54000"))))))
+
 (rove:deftest test-json-array-group-ordinal-error
     (let* ((statement (first (parse-statements "select ARRAY['null'::json] group by 1")))
            (condition (handler-case

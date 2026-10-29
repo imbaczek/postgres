@@ -335,7 +335,13 @@ materialized for access. Read slices support omitted bounds and mixed scalar and
 slice groups, clipping bounds to the source dimensions. Nonempty results use
 one-based lower bounds; disjoint slices return an empty array. A NULL array or
 explicit NULL slice bound returns SQL NULL.
-Subscript assignment and direct `int2vector` subscripting are unsupported.
+UPDATE supports scalar element assignment to array columns. Multiple assignments
+to one array are applied in order while their indices and right-hand expressions
+read the original row. A NULL or empty array is initialized at the assigned
+indices; one-dimensional arrays can expand with NULL-filled gaps, while existing
+multidimensional arrays require in-range indices. NULL assignment indices error.
+An UPDATE supports at most 512 element assignments to the same array column.
+Slice assignment, element DEFAULT and direct `int2vector` subscripting are unsupported.
 
 Typed array input accepts brace-delimited values, quoted and backslash-escaped
 elements, unquoted `NULL`, rectangular nested arrays, and explicit bounds such
