@@ -238,7 +238,7 @@ The caller excludes concurrent changes; the reader validates selected entries."
     (logical-test-failpoint point target-path)))
 
 (defun atomic-replace-file (target-path temporary-path directory write-function
-                            &key (element-type 'character)
+                            &key (element-type 'character) mode
                               (fsync-function #'sb-posix:fsync)
                               (rename-function #'sb-posix:rename)
                               (fsync-directory-function #'fsync-directory))
@@ -251,6 +251,7 @@ The caller excludes concurrent changes; the reader validates selected entries."
                                  :if-exists :supersede
                                  :if-does-not-exist :create
                                  :element-type element-type)
+           (when mode (sb-posix:fchmod (sb-sys:fd-stream-fd stream) mode))
            (atomic-replace-slot-failpoint :slot-file-before-write target-path)
            (funcall write-function stream)
            (finish-output stream)

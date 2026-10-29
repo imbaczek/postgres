@@ -799,7 +799,7 @@ Optional test hooks mark fsync, rename and directory-sync cuts."
   (let ((path (physical-follow-config-path)) (bytes (physical-follow-config-image config)))
     (with-atomic-output
         (stream path (make-pathname :type "tmp" :defaults path) *pgdata*
-                :element-type '(unsigned-byte 8)
+                :element-type '(unsigned-byte 8) :mode #o600
                 :fsync-function
                 (lambda (fd)
                   (physical-follow-test-point :before-follow-config-fsync)
