@@ -71,6 +71,46 @@ Discard the cursor after a read error; the stream may have advanced."
     (logical-spool-append (logical-reader-owned-spool state) event))
   (values))
 
+(declaim (special *logical-validation-only*))
+
+(defun logical-reader-store-fragment-cursor (state cursor expected-crc)
+  "Validate a completed event, then retain its original framed bytes when selected."
+  (let ((size (logical-cursor-limit cursor)))
+    (multiple-value-bind (sink metrics) (logical-encoding-sink size)
+      (loop while (< (logical-cursor-offset cursor) size)
+            do (funcall sink (logical-read-octets cursor
+                                                  (min 65536 (- size (logical-cursor-offset cursor))))))
+      (multiple-value-bind (count checksum) (funcall metrics)
+        (unless (and (= count size) (= checksum expected-crc))
+          (error "logical event checksum mismatch"))))
+    (when (logical-cursor-stream cursor)
+      (unless (file-position (logical-cursor-stream cursor) 0)
+        (error "cannot rewind logical event spool")))
+    (setf (logical-cursor-offset cursor) 0)
+    (let* ((*logical-validation-only* t)
+           (change (logical-decode-change-from-cursor cursor)))
+      (unless (member (logical-change-kind change) '(:insert :update :delete :truncate))
+        (error "catalog event appears in a transactional row-change record"))
+      (when (logical-cursor-stream cursor)
+        (unless (file-position (logical-cursor-stream cursor) 0)
+          (error "cannot rewind logical event spool")))
+      (setf (logical-cursor-offset cursor) 0)
+      (multiple-value-bind (sink metrics) (logical-encoding-sink size)
+        (loop while (< (logical-cursor-offset cursor) size)
+              do (funcall sink (logical-read-octets cursor
+                                                    (min 65536 (- size (logical-cursor-offset cursor))))))
+        (multiple-value-bind (count checksum) (funcall metrics)
+          (unless (and (= count size) (= checksum expected-crc))
+            (error "logical event checksum mismatch"))))
+      (setf (logical-reader-state-row-p state) t)
+      (when (= (logical-change-database-oid change) (logical-reader-state-database-oid state))
+        (when (logical-cursor-stream cursor)
+          (unless (file-position (logical-cursor-stream cursor) 0)
+            (error "cannot rewind logical event spool")))
+        (setf (logical-cursor-offset cursor) 0)
+        (logical-spool-append-cursor (logical-reader-owned-spool state) cursor expected-crc))))
+  (values))
+
 (defun logical-reader-store-change (state change)
   (if *logical-reader-spool-scope*
       (when (= (logical-change-database-oid change) (logical-reader-state-database-oid state))
@@ -1151,7 +1191,11 @@ executor, so capture the same operation before transaction commit."
                          ;; Publish ownership before acceptance can acquire a file.
                          (setf (logical-reader-state-fragment-batch state) batch)
                          (logical-fragment-batch-accept batch (wal-record-xid record)
-                                                        (wal-record-payload record)))))
+                                                        (wal-record-payload record)
+                                                        :on-complete
+                                                        (when *logical-reader-spool-scope*
+                                                          (lambda (cursor crc)
+                                                            (logical-reader-store-fragment-cursor state cursor crc)))))))
           (setf (logical-reader-state-fragment-batch state) batch
                 (logical-reader-state-xid state) (logical-fragment-batch-xid batch)
                 (logical-reader-state-chunk-count state) (logical-fragment-batch-count batch)

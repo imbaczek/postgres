@@ -676,8 +676,12 @@ numeric values. The scoped slot sender stages committed changes in a
 transaction spool, spilling above 4 MiB without the SQL temporary-file quota.
 For legacy WAL chunks, the scoped reader validates each event and stages its
 original encoded bytes, avoiding re-encoding and retaining decoded text or
-bytea values during staging. Fragmented events still use their existing
-assembly and decoding path. A slot scan captures a fixed durable horizon and
+bytea values during staging. For fragmented events, the scoped reader validates
+the complete event and copies its original bytes into the transaction spool in
+bounded blocks. Validation avoids materializing text and bytea, but still
+constructs JSONB and numeric values; later output decoding can materialize
+individual values. The unscoped reader retains its materialization behavior.
+Commit and terminal validation still precede output. A slot scan captures a fixed durable horizon and
 pins its retained start under the WAL lock. It copies one WAL record at a time
 under that lock, then validates and stages it outside the lock. The pin prevents
 recycling during the scan, but does not prevent slot invalidation; slot identity,

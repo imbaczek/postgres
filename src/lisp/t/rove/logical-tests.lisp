@@ -3399,6 +3399,114 @@
         (wal-logical-reader-reset-batch state nil)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest test-scoped-fragments-retain-original-validated-bytes
+    (let* ((*query-temp-directory* (uiop:temporary-directory))
+           (*logical-capture-memory-bytes* 1)
+           (event (logical-encode-change
+                   (logical-test-change :insert 7 701 :new-values (vector 1 2 "fragment🙂"))))
+           (middle (floor (length event) 2))
+           (state (make-logical-reader-state :database-oid 7))
+           (original (symbol-function 'logical-spool-append-change)))
+      (unwind-protect
+           (call-with-logical-reader-spools
+            (lambda ()
+              (setf (symbol-function 'logical-spool-append-change)
+                    (lambda (&rest args) (declare (ignore args)) (error "unexpected reencode")))
+              (wal-logical-reader-start-batch state)
+              (loop for start in (list 0 middle)
+                    for end in (list middle (length event))
+                    for index from 0
+                    do (wal-logical-reader-add-chunk
+                        state (make-wal-record
+                               :type +wal-record-logical-changes+ :xid 91
+                               :payload (logical-encode-fragment
+                                         index 2 (make-logical-fragment :event event :start start :end end)))))
+              (let ((spool (logical-reader-state-spool state)) (actual nil))
+                (logical-spool-seal spool)
+                (logical-spool-map-events spool (lambda (bytes) (setf actual bytes)))
+                (rove:ok (equalp event actual))
+                (rove:ok (equalp (logical-change-new-values (logical-decode-change actual))
+                                 (vector 1 2 "fragment🙂"))))
+              (wal-logical-reader-reset-batch state nil)))
+        (setf (symbol-function 'logical-spool-append-change) original)
+        (wal-logical-reader-reset-batch state nil))))
+
+(rove:deftest test-scoped-fragment-rejects-corrupted-source
+    (let* ((state (make-logical-reader-state :database-oid 7))
+           (event (logical-encode-change
+                   (logical-test-change :insert 7 701 :new-values (vector 1 2 "valid"))))
+           (crc (wal-crc32 event)))
+      (setf (aref event (1- (length event))) 65)
+      (call-with-logical-reader-spools
+       (lambda ()
+         (rove:ok (handler-case
+                      (progn (logical-reader-store-fragment-cursor
+                              state (make-logical-cursor :bytes event) crc) nil)
+                    (error () t)))
+         (rove:ok (null (logical-reader-state-spool state)))))))
+
+(rove:deftest test-scoped-fragment-rechecks-filtered-event-after-decode
+    (let* ((state (make-logical-reader-state :database-oid 8))
+           (event (logical-encode-change
+                   (logical-test-change :insert 7 701 :new-values (vector 1 2 "valid"))))
+           (crc (wal-crc32 event))
+           (original (symbol-function 'logical-decode-change-from-cursor)))
+      (unwind-protect
+           (call-with-logical-reader-spools
+            (lambda ()
+              (setf (symbol-function 'logical-decode-change-from-cursor)
+                    (lambda (cursor)
+                      (prog1 (funcall original cursor)
+                        (setf (aref event (1- (length event))) 65))))
+              (rove:ok (handler-case
+                           (progn (logical-reader-store-fragment-cursor
+                                   state (make-logical-cursor :bytes event) crc) nil)
+                         (error () t)))
+              (rove:ok (null (logical-reader-state-spool state)))))
+        (setf (symbol-function 'logical-decode-change-from-cursor) original))))
+
+(rove:deftest test-scoped-fragment-rejects-invalid-jsonb-in-other-database
+    (let* ((change (logical-test-change :insert 7 701
+                                        :new-values (vector 1 2 (sql-jsonb-input "[123]"))))
+           (state (make-logical-reader-state :database-oid 8)))
+      (setf (getf (third (logical-change-columns change)) :type) :jsonb)
+      (let* ((event (logical-encode-change change))
+             (position (search (string->bytes "[123]") event)))
+        (rove:ok position)
+        (when position (setf (aref event (+ position 1)) (char-code #\x)))
+        (call-with-logical-reader-spools
+         (lambda ()
+           (rove:ok (handler-case
+                        (progn (logical-reader-store-fragment-cursor
+                                state (make-logical-cursor :bytes event) (wal-crc32 event)) nil)
+                      (error () t)))
+           (rove:ok (null (logical-reader-state-spool state))))))))
+
+(rove:deftest test-fragment-copy-failure-poisons-destination
+    (let* ((*query-temp-directory* (uiop:temporary-directory))
+           (event (logical-encode-change
+                   (logical-test-change :insert 7 701 :new-values (vector 1 2 "valid"))))
+           (crc (wal-crc32 event))
+           (spool (make-logical-spool))
+           (original (symbol-function 'logical-read-octets))
+           (reads 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-read-octets)
+                   (lambda (cursor count)
+                     (incf reads)
+                     (when (= reads 2)
+                       (setf (aref event (1- (length event))) 65))
+                     (funcall original cursor count)))
+             (rove:ok (handler-case
+                          (progn (logical-spool-append-cursor
+                                  spool (make-logical-cursor :bytes event) crc) nil)
+                        (error () t)))
+             (rove:ok (logical-spool-failed-p spool))
+             (rove:ok (zerop (logical-spool-count spool))))
+        (setf (symbol-function 'logical-read-octets) original)
+        (close-logical-spool spool))))
+
 (rove:deftest test-scoped-legacy-reader-retains-validated-raw-events
     (let* ((directory (merge-pathnames
                        (format nil "pg-raw-reader-~d-~d/" (sb-posix:getpid) (random 1000000))

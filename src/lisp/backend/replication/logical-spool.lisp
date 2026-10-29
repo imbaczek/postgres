@@ -100,6 +100,50 @@ The caller must not mutate EVENT after passing it to this function."
       (unless complete (setf (logical-spool-failed-p spool) t))))
   (values))
 
+(defun logical-spool-append-cursor (spool cursor expected-crc)
+  "Copy a validated, rewound event into SPOOL without materializing its bytes."
+  (when (or (logical-spool-sealed-p spool) (logical-spool-closed-p spool)
+            (logical-spool-failed-p spool))
+    (error "logical spool is not writable"))
+  (let ((size (logical-cursor-limit cursor)) (complete nil))
+    (unless (and (zerop (logical-cursor-offset cursor)) (<= 1 size #xffffffff))
+      (error "invalid logical event cursor"))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (sink metrics) (logical-encoding-sink size)
+             (loop while (< (logical-cursor-offset cursor) size)
+                   do (funcall sink (logical-read-octets cursor
+                                                         (min 65536 (- size (logical-cursor-offset cursor))))))
+             (multiple-value-bind (count checksum) (funcall metrics)
+               (unless (and (= count size) (= checksum expected-crc)) (error "logical event checksum mismatch"))
+               (when (logical-cursor-stream cursor)
+                 (unless (file-position (logical-cursor-stream cursor) 0)
+                   (error "cannot rewind logical event spool")))
+               (setf (logical-cursor-offset cursor) 0)
+               (call-with-logical-spool-owner
+                spool
+                (lambda ()
+                  (logical-spool-ensure-file spool)
+                  (let ((path (logical-spool-path spool))
+                        (stream (logical-spool-stream spool)))
+                    (query-temp-check-space path (+ 8 size))
+                    (query-temp-account-space path (+ 8 size))
+                    (dolist (word (list size checksum))
+                      (dotimes (shift 4)
+                        (write-byte (logand (ash word (* -8 shift)) #xff) stream)))
+                    (multiple-value-bind (writer written) (logical-encoding-sink size stream)
+                      (loop while (< (logical-cursor-offset cursor) size)
+                            do (funcall writer (logical-read-octets cursor
+                                                                    (min 65536 (- size (logical-cursor-offset cursor))))))
+                      (multiple-value-bind (actual actual-checksum) (funcall written)
+                        (unless (and (= actual size) (= actual-checksum checksum))
+                          (error "logical event changed during transfer"))))
+                    (incf (logical-spool-bytes spool) size)
+                    (incf (logical-spool-count spool)))))))
+           (setf complete t))
+      (unless complete (setf (logical-spool-failed-p spool) t))))
+  (values))
+
 (defun logical-spool-append-change (spool change remaining &key after-measure)
   "Encode CHANGE into SPOOL without retaining a large encoded event vector."
   (when (or (logical-spool-sealed-p spool) (logical-spool-closed-p spool)
@@ -459,7 +503,7 @@ A second read failure is a WAL critical-section failure, like other WAL I/O."
 
 (defstruct (logical-recovery-assembler
             (:constructor make-logical-recovery-assembler (limit)))
-  limit (bytes 0) total (received 0) buffer spool)
+  limit (bytes 0) total (received 0) buffer spool (crc #xffffffff))
 
 (defun logical-close-recovery-assembler (assembler)
   "Release an incomplete replay or logical-slot event and its file owner."
@@ -468,10 +512,11 @@ A second read failure is a WAL critical-section failure, like other WAL I/O."
     (setf (logical-recovery-assembler-spool assembler) nil))
   (setf (logical-recovery-assembler-buffer assembler) nil
         (logical-recovery-assembler-total assembler) nil
-        (logical-recovery-assembler-received assembler) 0)
+        (logical-recovery-assembler-received assembler) 0
+        (logical-recovery-assembler-crc assembler) #xffffffff)
   (values))
 
-(defun logical-recovery-assembler-append (assembler total offset bytes &key materialize)
+(defun logical-recovery-assembler-append (assembler total offset bytes &key materialize on-complete)
   "Assemble an event, spilling when large; decode it if MATERIALIZE is true."
   (let ((size (length bytes)))
     (unless (and (typep bytes '(vector (unsigned-byte 8)))
@@ -504,6 +549,11 @@ A second read failure is a WAL critical-section failure, like other WAL I/O."
                    (query-temp-account-space (logical-spool-path spool) size)
                    (write-sequence bytes (logical-spool-stream spool)))))
         (replace (logical-recovery-assembler-buffer assembler) bytes :start1 offset))
+    (loop for byte across bytes
+          do (setf (logical-recovery-assembler-crc assembler)
+                   (logxor (ash (logical-recovery-assembler-crc assembler) -8)
+                           (aref *wal-crc32-table*
+                                 (logand (logxor (logical-recovery-assembler-crc assembler) byte) #xff)))))
     (incf (logical-recovery-assembler-received assembler) size)
     (when (= (logical-recovery-assembler-received assembler) total)
       (return-from logical-recovery-assembler-append
@@ -516,10 +566,12 @@ A second read failure is a WAL critical-section failure, like other WAL I/O."
                            (unless (file-position stream 0) (error "cannot seek logical event spool"))
                            (make-logical-cursor :stream stream :size total))
                          (make-logical-cursor :bytes (logical-recovery-assembler-buffer assembler)))))
-               (if materialize
-                   (let ((*logical-validation-only* nil))
-                     (logical-decode-change-from-cursor cursor))
-                   (logical-validate-change-from-cursor cursor)))
+               (cond (on-complete
+                      (funcall on-complete cursor (logxor (logical-recovery-assembler-crc assembler) #xffffffff)))
+                     (materialize
+                      (let ((*logical-validation-only* nil))
+                        (logical-decode-change-from-cursor cursor)))
+                     (t (logical-validate-change-from-cursor cursor))))
           (logical-close-recovery-assembler assembler)))))
   (values))
 
