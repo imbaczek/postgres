@@ -1375,7 +1375,7 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
   (loop for attnum in (pg-index-columns idx)
         collect (aref values (1- attnum))))
 
-(defun index-storage-key (index table values)
+(defun index-storage-key (index table values &optional physical-values)
   "Encode VALUES, retaining independently compressed eligible column segments.
 The segments preserve their storage representation across B-tree page rewrites."
   (let ((parts nil) (compressed-p nil))
@@ -1384,7 +1384,12 @@ The segments preserve their storage representation across B-tree page rewrites."
           for column = (aref (pg-class-columns table) (1- attnum))
           for raw = (encode-index-key (list value) (list (pg-column-type column)))
           for compressed = (and (> (length raw) 1024)
-                                (find (pg-column-effective-storage column) "xm")
+                                (or (find (pg-column-effective-storage column) "xm")
+                                    (let ((physical (and physical-values (aref physical-values (1- attnum)))))
+                                      (or (heap-compressed-varlena-p physical)
+                                          (and (heap-external-varlena-p physical)
+                                               (< (logand (heap-external-varlena-external-info physical) #x3fffffff)
+                                                  (- (heap-external-varlena-raw-size physical) 4))))))
                                 (pglz-compress raw))
           do (when compressed (setf compressed-p t))
              (push (list raw compressed) parts))
@@ -1756,7 +1761,7 @@ VALUES remains unchanged; EXTERNAL-P says whether the relation has a TOAST table
               while best do (externalize best)))
       (values physical (nreverse selected) compressed-selected))))
 
-(defun toast-externalize-tuple-unlocked (toast values columns xid cid &optional reuse)
+(defun toast-externalize-tuple-unlocked (toast values columns xid cid &optional reuse compressed-reuse)
   "Return a physical tuple while keeping VALUES usable for SQL and replication.
 REUSE holds external pointers from the claimed old tuple for unchanged columns.
 The caller holds the TOAST index and write locks and must abort after errors."
@@ -1764,6 +1769,9 @@ The caller holds the TOAST index and write locks and must abort after errors."
     (when reuse
       (loop for pointer across reuse for i from 0
             when pointer do (setf (aref planning-values i) pointer)))
+    (when compressed-reuse
+      (loop for value across compressed-reuse for i from 0
+            when value do (setf (aref planning-values i) value)))
     (multiple-value-bind (physical indexes compressed-indexes)
         (toast-plan-tuple planning-values columns :external-p (not (null toast)))
       (when indexes
@@ -1834,6 +1842,28 @@ misordered, extra or malformed chunks signal corruption."
                  (if (< size raw-size)
                      (toast-decompress-payload payload raw-size)
                      payload))))))
+
+(defun toast-fetch-compressed-value (toast pointer snapshot &key (index-reader #'call-with-btree-relation-read-lock))
+  "Detach an external compressed value under SNAPSHOT; return NIL for uncompressed values.
+The returned inline wrapper owns a validated PGLZ payload, not a foreign pointer."
+  (unless (and snapshot
+               (sb-thread:with-mutex (*snapshot-count-lock*)
+                 (gethash snapshot *active-snapshot-set*)))
+    (error "TOAST fetch requires an active snapshot"))
+  (multiple-value-bind (size raw-size compressed-p) (toast-pointer-storage-size toast pointer)
+    (when compressed-p
+      (let ((index-node (pg-toast-index-relfilenode toast)))
+        (when (< (buf-nblocks index-node) 2)
+          (ereport "XX001" "TOAST index is missing"))
+        (funcall index-reader index-node
+                 (lambda ()
+                   (let ((payload (make-array size :element-type '(unsigned-byte 8))))
+                     (toast-map-value-chunks-unlocked
+                      toast pointer size
+                      (lambda (data sequence)
+                        (replace payload data :start1 (* sequence +toast-oid-chunk-size+))))
+                     (toast-decompress-payload payload raw-size)
+                     (make-heap-compressed-varlena :payload payload))))))))
 
 (defun toast-map-value-octets (toast pointer snapshot function
                                &key (index-reader #'call-with-btree-relation-read-lock))

@@ -148,7 +148,7 @@ B-tree relation locks, then reacquires it and checks the TOAST identity."
                       (when toast-node (list toast-node)))
               toast toast-node))))
 
-(defun insert-tuple-with-unique (table values &key exclude-tid on-success publication-kind before-check toast-reuse)
+(defun insert-tuple-with-unique (table values &key exclude-tid on-success publication-kind before-check toast-reuse compressed-reuse)
   "Insert logical VALUES, externalizing them only after uniqueness succeeds.
 Index keys use the logical values; the heap receives the physical tuple. B-tree
 locks precede the write lock, and transaction waits happen after both are released.
@@ -183,11 +183,11 @@ can claim an ON CONFLICT tuple or ask the released-lock loop to wait."
                   ((eq check :ok)
                    (let* ((columns (pg-class-columns table))
                           (cid (backend-command-id *backend*))
-                          (physical (toast-externalize-tuple-unlocked toast values columns xid cid toast-reuse)))
+                          (physical (toast-externalize-tuple-unlocked toast values columns xid cid toast-reuse compressed-reuse)))
                      (multiple-value-bind (block off)
                          (heapam-insert relfilenode columns physical xid cid)
                        (dolist (idx indexes)
-                         (let ((key (index-storage-key idx table (index-values idx values))))
+                         (let ((key (index-storage-key idx table (index-values idx values) physical)))
                            (btree-insert-unlocked (pg-index-relfilenode idx) key block off)))
                        (when on-success (funcall on-success block off))
                        (return-from insert-tuple-with-unique

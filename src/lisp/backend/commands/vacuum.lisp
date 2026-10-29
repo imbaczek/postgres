@@ -205,21 +205,34 @@ implementation's replacement metadata transition atomic as well."
      (funcall function (second current)))))
 
 (defun vacuum-full-rewrite-values (source-table target-table tuple xmin xmax)
-  "Materialize TUPLE and apply current storage policies to detached TOAST."
-  (materialize-select-tuple source-table tuple (statement-protection-snapshot))
-  (let ((toast (pg-class-toast target-table))
-        (columns (pg-class-columns target-table)))
+  "Rewrite TUPLE, retaining eligible compressed physical values without foreign pointers."
+  (let* ((toast (pg-class-toast target-table))
+         (columns (pg-class-columns target-table))
+         (snapshot (statement-protection-snapshot))
+         (reuse (if (htup-physical-compressed tuple)
+                    (copy-seq (htup-physical-compressed tuple))
+                    (make-array (length columns) :initial-element nil))))
+    (loop for value across (htup-values tuple) for column across columns for i from 0
+          when (and (heap-external-varlena-p value)
+                    (not (char= (pg-column-effective-storage column) #\p)))
+            do (setf (aref reuse i)
+                     (toast-fetch-compressed-value (pg-class-toast source-table) value snapshot
+                                                   :index-reader #'select-toast-index-reader)))
+    (materialize-select-tuple source-table tuple snapshot)
     (if toast
         (with-btree-relation-locks ((list (pg-toast-index-relfilenode toast)))
           (with-write-lock
             (let ((physical (toast-externalize-tuple-unlocked toast (htup-values tuple)
-                                                              columns xmin (htup-cid tuple))))
+                                                              columns xmin (htup-cid tuple) nil reuse)))
               (unless (zerop xmax)
                 (loop for value across physical
                       when (heap-external-varlena-p value)
                         do (toast-delete-value-unlocked toast value xmax (htup-cid tuple))))
               physical)))
-        (toast-plan-tuple (htup-values tuple) columns :external-p nil))))
+        (let ((values (copy-seq (htup-values tuple))))
+          (loop for value across reuse for i from 0
+                when value do (setf (aref values i) value))
+          (toast-plan-tuple values columns :external-p nil)))))
 
 (defun vacuum-full-copy-tuple (source-table source-relfilenode target-table
                                target-relfilenode block offnum oldest-xmin

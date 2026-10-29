@@ -795,12 +795,17 @@ before this removal horizon is captured."
                               (not (tuple-prunable-p (htup-xmin tuple)
                                                      (htup-xmax tuple)
                                                      removal-horizon)))
-                     (materialize-select-tuple
-                      table tuple
-                      (statement-protection-snapshot snapshot)
-                      :index-reader #'index-build-toast-reader)
-                     (let* ((vals (index-values idx (htup-values tuple)))
-                            (key (index-storage-key idx table vals)))
+                     (let* ((physical-values
+                              (let ((physical (copy-seq (htup-values tuple))))
+                                (when (htup-physical-compressed tuple)
+                                  (loop for value across (htup-physical-compressed tuple) for i from 0
+                                        when value do (setf (aref physical i) value)))
+                                (materialize-select-tuple
+                                 table tuple (statement-protection-snapshot snapshot)
+                                 :index-reader #'index-build-toast-reader)
+                                physical))
+                            (vals (index-values idx (htup-values tuple)))
+                            (key (index-storage-key idx table vals physical-values)))
                        ;; Retain recently dead versions for old snapshots, but
                        ;; don't let those versions create unique violations.
                        (when (and unique

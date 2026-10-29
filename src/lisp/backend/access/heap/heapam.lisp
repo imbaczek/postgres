@@ -17,7 +17,8 @@
   xmax
   cid
   infomask
-  values)
+  values
+  physical-compressed)
 
 ;;; The PostgreSQL FSM is persisted in a separate relation fork. Keep the MVP's
 ;;; page-space candidates in memory and rebuild them once per relation after a
@@ -459,6 +460,7 @@ external decompression are deferred."
          (infomask (page-u16 bytes +heap-tuple-infomask-off+))
          (hoff (aref bytes +heap-tuple-hoff-off+))
          (values (make-array natts :initial-element +null+))
+         (physical-compressed nil)
          (cursor hoff))
     (loop for i from 0 below natts
           for col = (aref columns i)
@@ -521,6 +523,11 @@ external decompression are deferred."
                             (setf (aref values i) pointer cursor end))
                           (multiple-value-bind (payload end)
                               (heap-inline-varlena-bytes bytes cursor)
+                            (when (= (logand (aref bytes cursor) 3) 2)
+                              (unless physical-compressed
+                                (setf physical-compressed (make-array natts :initial-element nil)))
+                              (setf (aref physical-compressed i)
+                                    (make-heap-compressed-varlena :payload (subseq bytes (+ cursor 4) end))))
                             (setf (aref values i) (case (pg-column-type col)
                                                     (:bytea payload)
                                                     (:jsonb (sql-jsonb-from-octets payload))
@@ -529,7 +536,7 @@ external decompression are deferred."
                                                      (sql-varlena-array-decode payload (heap-varlena-array-element-type (pg-column-type col))))
                                                     (otherwise (bytes->string payload)))
                                   cursor end)))))))))
-    (values values xmin xmax cid infomask ctid-block ctid-offnum)))
+    (values values xmin xmax cid infomask ctid-block ctid-offnum physical-compressed)))
 
 (defun heapam-get-tuple (relfilenode block offnum columns &optional toast-visibility-p)
   "Fetch and deform the live tuple at BLOCK and OFFNUM, or return NIL if absent.
@@ -548,13 +555,13 @@ option false, no visibility check is performed."
           (return-from heapam-get-tuple nil))
         (let ((bytes (subseq page off (+ off len))))
           (multiple-value-bind (values xmin xmax cid infomask
-                                ctid-block ctid-offnum)
+                                ctid-block ctid-offnum physical-compressed)
               (deform-heap-tuple bytes columns)
             (make-htup :block block :offnum offnum
                        :ctid-block ctid-block :ctid-offnum ctid-offnum
                        :xmin (full-xid-from-32 xmin)
                        :xmax (full-xid-from-32 xmax) :cid cid
-                       :infomask infomask :values values)))))))
+                       :infomask infomask :values values :physical-compressed physical-compressed)))))))
 
 (defun heapam-insert (relfilenode columns values xmin cid)
   "Insert a tuple; return (values block offnum)."
@@ -821,13 +828,13 @@ when supplied, its result is returned as a sixth value."
       (when (heap-tuple-visible-p xmin xmax cid snapshot
                                   (and *backend* (backend-xid *backend*)) infomask)
         (multiple-value-bind (values raw-xmin raw-xmax raw-cid raw-infomask
-                              ctid-block ctid-offnum)
+                              ctid-block ctid-offnum physical-compressed)
             (deform-heap-tuple (subseq page off (+ off len)) columns)
           (declare (ignore raw-xmin raw-xmax raw-cid raw-infomask))
           (let ((tuple (make-htup :block block :offnum offnum
                                   :ctid-block ctid-block :ctid-offnum ctid-offnum
                                   :xmin xmin :xmax xmax :cid cid :infomask infomask
-                                  :values values)))
+                                  :values values :physical-compressed physical-compressed)))
             (when (eq (funcall callback tuple) :stop)
               (return-from heapam-scan-page :stop))))))))
 

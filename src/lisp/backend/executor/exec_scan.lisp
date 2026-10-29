@@ -1482,18 +1482,64 @@ chunk visibility follows the parent and is not independently filtered."
                                (otherwise (ereport "XX001" "external value has unsupported type"))))))))
     tuple))
 
-(defun unchanged-tuple-toast-pointers (tuple assignments)
-  "Return pointers for columns not assigned by this update.
-TUPLE is the physical version actually claimed, including after an EPQ recheck."
+(defun unchanged-tuple-toast-pointers (tuple assignments &optional table new-values snapshot)
+  "Return reusable external pointers from the physical version actually claimed.
+Assigned pointers are retained only for a direct self Var whose bytes still
+match the claimed row, protecting against stale candidate evaluation."
   (let* ((values (htup-values tuple))
-         (reuse (make-array (length values) :initial-element nil)))
+         (reuse (make-array (length values) :initial-element nil))
+         (actual-values nil))
     (loop for value across values for i from 0
-          when (and (heap-external-varlena-p value)
-                    (notany (lambda (assignment)
-                              (= (pg-column-attnum (car assignment)) (1+ i)))
-                            assignments))
-            do (setf (aref reuse i) value))
+          when (heap-external-varlena-p value)
+            do (let* ((assignment (find (1+ i) assignments
+                                        :key (lambda (item) (pg-column-attnum (car item)))))
+                      (column (and assignment (car assignment)))
+                      (target (and assignment (cdr assignment)))
+                      (expr (if (and (consp target) (eq (first target) :expr))
+                                (getf target :expr) target))
+                      (input (and (consp expr) (eq (first expr) :assignment) (second expr))))
+                 (when (or (null assignment)
+                           (and table new-values snapshot
+                                (consp input) (eq (first input) :col)
+                                (= (second input) (1+ i))
+                                (eq (expr-type input) (pg-column-type column))
+                                (progn
+                                  (unless actual-values
+                                    (setf actual-values
+                                          (htup-values
+                                           (materialize-select-tuple
+                                            table (make-htup :values (copy-seq values)) snapshot))))
+                                  (equalp (aref (nth-value 2 (heap-tuple-layout
+                                                              (vector (aref new-values i)) (vector column))) 0)
+                                          (aref (nth-value 2 (heap-tuple-layout
+                                                              (vector (aref actual-values i)) (vector column))) 0)))))
+                   (setf (aref reuse i) value))))
     reuse))
+
+(defun unchanged-tuple-compressed-values (tuple assignments new-values)
+  "Preserve compressed values from TUPLE for omitted and direct self assignments.
+Only unchanged-type direct Vars whose value matches the claimed
+row can carry a physical datum across a concurrent-update recheck."
+  (let ((source (htup-physical-compressed tuple)))
+    (when source
+      (let ((result (copy-seq source))
+            (old-values (htup-values tuple)))
+        (dolist (assignment assignments)
+          (let* ((column (car assignment))
+                 (i (1- (pg-column-attnum column)))
+                 (target (cdr assignment))
+                 (expr (if (and (consp target) (eq (first target) :expr))
+                           (getf target :expr) target))
+                 (input (and (consp expr) (eq (first expr) :assignment) (second expr)))
+                 (slot (and (consp input) (eq (first input) :col) (second input))))
+            (setf (aref result i)
+                  (and slot (= slot (1+ i)) (<= 1 slot (length source))
+                       (eq (expr-type input) (pg-column-type column))
+                       (aref source (1- slot))
+                       (equalp (aref (nth-value 2 (heap-tuple-layout (vector (aref new-values i)) (vector column))) 0)
+                               (aref (nth-value 2 (heap-tuple-layout (vector (aref old-values (1- slot))) (vector column))) 0))
+                       (aref source (1- slot))))))
+        result))))
 
 (defun delete-tuple-toast-values (table tuple xid cid &optional reuse)
   "Mark the physical external attributes of a claimed parent tuple deleted.

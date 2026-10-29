@@ -44,6 +44,38 @@ run -f "$TMP/uneven-index.sql" >/dev/null
 # Force compressed leaf entries and internal separators with long logical keys.
 # Build the index after loading rows, then exercise its unique insert path.
 index_suffix=$(awk 'BEGIN { for (i=0;i<20000;i++) printf "a" }')
+run -c 'create table toast_inline_provenance (id int primary key, v text unique)' >/dev/null
+run -c "insert into toast_inline_provenance values (1,'$index_suffix')" >/dev/null
+run -c 'alter table toast_inline_provenance alter column v set storage external' >/dev/null
+run -c 'update toast_inline_provenance set id=2 where id=1' >/dev/null
+run -c 'update toast_inline_provenance set v=v where id=2' >/dev/null
+run -c "insert into toast_inline_provenance values (2,'short') on conflict (id) do update set v=toast_inline_provenance.v" >/dev/null
+if run -v VERBOSITY=verbose -c "update toast_inline_provenance set v=v || '' where id=2" >"$TMP/inline-computed.out" 2>&1; then
+    echo 'toast-dml: computed value incorrectly retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/inline-computed.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: computed value did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+[ "$(run -c 'select id,length(v) from toast_inline_provenance')" = '2|20000' ]
+run -c 'alter table toast_inline_provenance alter column v set storage plain' >/dev/null
+run -c 'vacuum full toast_inline_provenance' >/dev/null
+[ "$(run -c 'select id,length(v) from toast_inline_provenance')" = '2|20000' ]
+run -c 'create table toast_inline_build (v text)' >/dev/null
+run -c "insert into toast_inline_build values ('$index_suffix')" >/dev/null
+run -c 'alter table toast_inline_build alter column v set storage external' >/dev/null
+run -c 'create unique index toast_inline_build_v on toast_inline_build(v)' >/dev/null
+run -c 'create table toast_inline_varchar (id int primary key, v varchar(30000) unique)' >/dev/null
+run -c "insert into toast_inline_varchar values (1,'$index_suffix')" >/dev/null
+run -c 'alter table toast_inline_varchar alter column v set storage external' >/dev/null
+run -c 'update toast_inline_varchar set id=2, v=v where id=1' >/dev/null
+[ "$(run -c 'select id,length(v) from toast_inline_varchar')" = '2|20000' ]
+run -c 'create table toast_external_compressed (v text unique)' >/dev/null
+awk 'BEGIN { printf "insert into toast_external_compressed values (\047"; for (i=0;i<200000;i++) printf "a"; print "\047);" }' | run >/dev/null
+run -c 'alter table toast_external_compressed alter column v set storage external' >/dev/null
+run -c 'update toast_external_compressed set v=v' >/dev/null
+run -c 'vacuum full toast_external_compressed' >/dev/null
+[ "$(run -c 'select length(v) from toast_external_compressed')" = 200000 ]
 run -c 'create table toast_long_index (v text)' >/dev/null
 i=0
 while [ "$i" -lt 80 ]; do

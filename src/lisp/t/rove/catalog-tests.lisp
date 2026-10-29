@@ -45,6 +45,16 @@
                  (pg-error (e) (string= (pg-error-sqlstate e) "54000")))
                "an unsplittable entry reports 54000")))
 
+(rove:deftest compressed-reuse-requires-exact-claimed-bytes
+    (let* ((column (make-pg-column :name "v" :type :text :typmod -1 :attnum 1))
+           (compressed (make-heap-compressed-varlena :payload #(1 2)))
+           (tuple (make-htup :values (vector "abc") :physical-compressed (vector compressed)))
+           (assignment (cons column (list :assignment (list :col 1 :type :text :typmod -1) :type :text :typmod -1))))
+      (rove:ok (eq compressed (aref (unchanged-tuple-compressed-values tuple (list assignment) (vector "abc")) 0)))
+      (rove:ok (null (aref (unchanged-tuple-compressed-values tuple (list assignment) (vector "ABC")) 0)))
+      (let ((conflict (cons column (list :expr (cdr assignment)))))
+        (rove:ok (eq compressed (aref (unchanged-tuple-compressed-values tuple (list conflict) (vector "abc")) 0))))))
+
 (rove:deftest test-toast-catalog-ownership-roundtrip
     (let* ((toast (make-pg-toast :oid 100 :relfilenode 101 :index-oid 102
                                  :index-relfilenode 103 :relfrozenxid 20))

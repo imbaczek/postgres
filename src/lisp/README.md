@@ -226,10 +226,11 @@ range of the existing source buffer without copying the compressed stream; the
 external stored payload and full decompressed output still require allocations.
 Malformed streams and trailing bytes in the selected range are rejected.
 An UPDATE, including `ON CONFLICT DO UPDATE`, reuses external TOAST pointers
-for columns omitted from its assignments. The pointer comes from the physical
-row version actually claimed after any concurrent-update recheck; its chunks
-are retained for the new version. Assigned columns are written using the
-current storage policy, even when the assigned value is equal to the old one.
+for columns omitted from its assignments and direct self-assignments whose
+encoded value matches the claimed row. It also retains eligible inline
+compressed values for these cases. Reuse comes from the physical row version
+actually claimed after any concurrent-update recheck. Other assignments use
+the current storage policy, even when their computed value equals the old one.
 For a simple UPDATE, unassigned external columns that are neither referenced
 nor indexed can defer detoasting; SET and WHERE inputs, assigned columns and
 index keys remain materialized. Captured updates also materialize replica
@@ -255,9 +256,10 @@ chunks. For a nonempty compressed slice it reads and validates every stored
 chunk and the complete PGLZ stream, retaining the requested slice and a 4096-byte
 history rather than the full value. Empty slices skip chunk checks. The limited
 SQL bytea substring optimization described below uses this API.
-Fixed-width types accept only `PLAIN` or `DEFAULT`. `VACUUM FULL` rewrites
-existing values using the current policy; it fails if a `PLAIN` value cannot
-fit on a heap page, leaving the original table intact.
+Fixed-width types accept only `PLAIN` or `DEFAULT`. `VACUUM FULL` preserves
+inline compressed values and can retain externally compressed values under a
+non-`PLAIN` policy. An external value rewritten under `PLAIN` is flattened;
+if it cannot fit on a heap page, the rewrite fails and leaves the original table intact.
 
 `json_typeof(json)` and `jsonb_typeof(jsonb)` return the top-level type as
 text: `object`, `array`, `string`, `number`, `boolean`, or `null`.

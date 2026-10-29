@@ -551,14 +551,15 @@
                      nil t candidate)
                   (check-heapam-write-status status)
                   (when deleted
-                    (let ((reuse (unchanged-tuple-toast-pointers tuple sets)))
+                    (let ((reuse (unchanged-tuple-toast-pointers tuple sets table new *current-snapshot*)))
                       (delete-tuple-toast-values table tuple xid (backend-command-id *backend*) reuse)
                       (materialize-select-tuple table tuple *current-snapshot*
                                                 :demand toast-demand :retain-external-p (not (null toast-demand)))
                       (multiple-value-bind (block off publications)
                           (insert-tuple-with-unique
                            table new :exclude-tid (cons old-block old-offnum)
-                           :toast-reuse reuse :publication-kind :update
+                           :toast-reuse reuse :compressed-reuse (unchanged-tuple-compressed-values tuple sets new)
+                           :publication-kind :update
                            :on-success
                            (lambda (block off)
                              (unless (heapam-set-ctid-unlocked rel old-block old-offnum block off)

@@ -240,13 +240,13 @@
                                    xid (backend-command-id *backend*))
               (check-heapam-write-status write-status)
               (when deleted
-                (let ((reuse (unchanged-tuple-toast-pointers actual (getf conflict :sets))))
+                (let ((reuse (unchanged-tuple-toast-pointers actual (getf conflict :sets) table new protected-snapshot)))
                   (delete-tuple-toast-values table actual xid (backend-command-id *backend*) reuse)
                   (materialize-select-tuple table actual protected-snapshot)
                   (multiple-value-bind (new-block new-offnum selection)
                       (insert-tuple-with-unique
                        table new :exclude-tid (cons old-block old-offnum) :publication-kind :update
-                       :toast-reuse reuse
+                       :toast-reuse reuse :compressed-reuse (unchanged-tuple-compressed-values actual (getf conflict :sets) new)
                        :on-success
                        (lambda (next-block next-offnum)
                          (unless (heapam-set-ctid-unlocked rel old-block old-offnum next-block next-offnum)
