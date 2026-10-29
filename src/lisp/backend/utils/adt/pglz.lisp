@@ -1,18 +1,21 @@
 ;;;; PostgreSQL PGLZ stream codec.  See src/common/pg_lzcompress.c.
 (in-package #:pg)
 
-(defun pglz-decompress (source raw-size)
+(defun pglz-decompress (source raw-size &key (start 0) (end (length source)))
   "Decode raw PGLZ SOURCE octets to the separately supplied RAW-SIZE.
-Reject malformed streams and trailing bytes with corruption error XX001."
+Decode only the half-open range [START, END); reject malformed streams and
+trailing bytes within that range with corruption error XX001."
   (check-type source (vector (unsigned-byte 8)))
   (check-type raw-size (integer 0 1073741819))
+  (unless (and (integerp start) (integerp end) (<= 0 start end (length source)))
+    (error "invalid PGLZ source bounds"))
   ;; No input byte can contribute more than the maximum match length.
-  (when (> raw-size (* 273 (length source)))
+  (when (> raw-size (* 273 (- end start)))
     (ereport "XX001" "corrupt PGLZ data"))
   (let ((result (make-array raw-size :element-type '(unsigned-byte 8)))
-        (in 0)
+        (in start)
         (out 0)
-        (limit (length source)))
+        (limit end))
     (labels ((corrupt () (ereport "XX001" "corrupt PGLZ data"))
              (next-byte ()
                (when (>= in limit) (corrupt))

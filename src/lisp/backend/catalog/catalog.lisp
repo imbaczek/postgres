@@ -1587,7 +1587,7 @@ removes them. The in-memory candidate is only a hint and need not survive restar
   (unless (and (> (length payload) 4)
                (= (page-u32 payload 0) raw-size))
     (ereport "XX001" "invalid compressed TOAST header"))
-  (pglz-decompress (subseq payload 4) raw-size))
+  (pglz-decompress payload raw-size :start 4))
 
 (defun toast-store-value-unlocked (toast bytes value-id xid cid &key compress)
   "Store BYTES as TOAST chunks, optionally using PGLZ, and return a pointer.

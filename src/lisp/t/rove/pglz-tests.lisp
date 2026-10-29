@@ -18,6 +18,82 @@
         (rove:ok (handler-case (progn (pglz-decompress stream 1) nil)
                    (error () t))))))
 
+(rove:deftest test-pglz-bounded-source
+    (let ((buffer (make-array 8 :element-type '(unsigned-byte 8)
+                                :initial-contents '(255 255 2 97 2 1 255 255))))
+      (rove:ok (equalp (pglz-decompress buffer 6 :start 2 :end 6)
+                       #(97 97 97 97 97 97)))
+      (rove:ok (equalp (pglz-decompress buffer 0 :start 2 :end 2) #()))
+      ;; The maximum extended match overlaps its own output and must not read
+      ;; its length byte from outside the selected range.
+      (let ((extended (make-array 7 :element-type '(unsigned-byte 8)
+                                    :initial-contents '(255 2 97 15 1 255 255))))
+        (rove:ok (equalp (pglz-decompress extended 274 :start 1 :end 6)
+                         (make-array 274 :element-type '(unsigned-byte 8) :initial-element 97)))
+        (rove:ok (equal "XX001"
+                        (handler-case (progn (pglz-decompress extended 274 :start 1 :end 5) nil)
+                          (pg-error (condition) (pg-error-sqlstate condition))))))
+      ;; Prefix/suffix cannot complete a truncated tag or hide trailing bytes.
+      (dolist (end '(2 3 4 5 7))
+        (rove:ok (equal "XX001"
+                        (handler-case (progn (pglz-decompress buffer 6 :start 2 :end end) nil)
+                          (pg-error (condition) (pg-error-sqlstate condition))))))
+      (dolist (bounds '((-1 2) (3 2) (0 9)))
+        (rove:ok (handler-case
+                     (progn (pglz-decompress buffer 0 :start (first bounds) :end (second bounds)) nil)
+                   (error () t))))
+      ;; An empty range cannot satisfy a nonempty output, regardless of padding.
+      (rove:ok (equal "XX001"
+                      (handler-case (progn (pglz-decompress buffer 1 :start 4 :end 4) nil)
+                        (pg-error (condition) (pg-error-sqlstate condition)))))))
+
+(rove:deftest test-pglz-callers-use-original-buffer
+    (let* ((raw (make-array 5000 :element-type '(unsigned-byte 8) :initial-element 7))
+           (payload (toast-compressed-payload raw))
+           (columns (vector (make-pg-column :type :bytea)))
+           (physical (toast-plan-tuple (vector raw) columns))
+           (tuple (form-heap-tuple physical columns 42 0 0 0 1))
+           (offset (aref (nth-value 1 (heap-tuple-layout physical columns)) 0))
+           (old (symbol-function 'pglz-decompress))
+           (calls nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pglz-decompress)
+                   (lambda (source size &rest keys)
+                     (push (list source keys) calls)
+                     (apply old source size keys)))
+             (rove:ok (equalp raw (toast-decompress-payload payload (length raw))))
+             (multiple-value-bind (decoded end) (heap-decode-inline-compressed tuple offset)
+               (rove:ok (equalp raw decoded))
+               (rove:ok (= end (+ offset (ash (page-u32 tuple offset) -2)))))
+             (let ((inline (first calls)) (external (second calls)))
+               (rove:ok (and (eq (first inline) tuple)
+                             (= (getf (second inline) :start) (+ offset 8))
+                             (integerp (getf (second inline) :end))))
+               (rove:ok (and (eq (first external) payload)
+                             (= (getf (second external) :start) 4)))))
+        (setf (symbol-function 'pglz-decompress) old))))
+
+(rove:deftest test-pglz-bounded-maximum-backreference
+    (let ((stream (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+      (vector-push-extend 255 stream)
+      (dotimes (group 511)
+        (declare (ignorable group))
+        (vector-push-extend 0 stream)
+        (dotimes (i 8) (vector-push-extend (mod i 256) stream)))
+      (vector-push-extend 128 stream)
+      (dotimes (i 7) (vector-push-extend i stream))
+      (vector-push-extend #xf0 stream)
+      (vector-push-extend #xff stream)
+      (let ((end (length stream)))
+        (vector-push-extend 255 stream)
+        (let ((decoded (pglz-decompress stream 4098 :start 1 :end end)))
+          (rove:ok (= 4098 (length decoded)))
+          (rove:ok (equalp (subseq decoded 4095) (subseq decoded 0 3))))
+        (rove:ok (equal "XX001"
+                        (handler-case (progn (pglz-decompress stream 4098 :start 1 :end (1- end)) nil)
+                          (pg-error (condition) (pg-error-sqlstate condition))))))))
+
 (rove:deftest test-pglz-roundtrip
     (dolist (size '(32 126 127 273 1024 4096 10000))
       (let ((data (make-array size :element-type '(unsigned-byte 8))))

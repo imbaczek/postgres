@@ -220,8 +220,10 @@ applies to subsequent writes; existing values remain readable after a change.
 Full TOAST fetch walks the B-tree prefix under a read lease, validating and
 copying one chunk at a time into a complete stored-payload buffer. It rejects
 missing, misordered or malformed chunks and mismatched index entries. The full
-value still occupies memory, and compressed values require decompression and its
-output allocation.
+value still occupies memory. Inline and external PGLZ decoding reads a validated
+range of the existing source buffer without copying the compressed stream; the
+external stored payload and full decompressed output still require allocations.
+Malformed streams and trailing bytes in the selected range are rejected.
 An UPDATE, including `ON CONFLICT DO UPDATE`, reuses external TOAST pointers
 for columns omitted from its assignments. The pointer comes from the physical
 row version actually claimed after any concurrent-update recheck; its chunks

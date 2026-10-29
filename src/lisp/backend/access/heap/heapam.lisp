@@ -424,7 +424,7 @@ reject external and compressed datums and lengths outside BYTES."
                  (<= end (length bytes)) (zerop (ash info -30))
                  (> raw-size 0))
       (ereport "XX001" "invalid compressed varlena"))
-    (values (pglz-decompress (subseq bytes (+ offset 8) end) raw-size) end)))
+    (values (pglz-decompress bytes raw-size :start (+ offset 8) :end end) end)))
 
 (defun heap-inline-varlena-bytes (bytes offset)
   "Return a fresh uncompressed payload and the physical end of an inline datum."
