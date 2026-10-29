@@ -465,9 +465,14 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
        (logical-target-query target (format nil "TRUNCATE TABLE ~a" table)))))
   (values))
 
+(defun logical-utf8-size-bounded (value)
+  "Count UTF-8 bytes without allocating an encoding of the entire string."
+  (loop for start from 0 below (length value) by 4096
+        sum (length (string->bytes (subseq value start (min (length value) (+ start 4096)))))))
+
 (defun logical-copy-row-size (row)
   (+ 32 (* 16 (length row))
-     (loop for value across row when value sum (length (string->bytes value)))))
+     (loop for value across row when value sum (logical-utf8-size-bounded value))))
 
 (defun logical-copy-chunk-limit (test-limit failpoint action)
   (if (null test-limit)
@@ -516,7 +521,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
 
 (defun logical-copy-check-query-size (query)
   "Reject a Simple Query frame that the target cannot accept."
-  (when (> (+ 5 (length (string->bytes query))) +max-query-message-size+)
+  (when (> (+ 5 (logical-utf8-size-bounded query)) +max-query-message-size+)
     (error "initial-copy row exceeds the target query frame limit (~d bytes)"
            +max-query-message-size+))
   query)
@@ -1180,7 +1185,10 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
   (case (code-char (aref payload 0))
     (#\w
      (when (< (length payload) 26) (error "truncated logical XLogData frame"))
-     (logical-pgoutput-dispatch runtime (subseq payload 25)))
+     (logical-pgoutput-dispatch
+      runtime (make-array (- (length payload) 25)
+                          :element-type '(unsigned-byte 8)
+                          :displaced-to payload :displaced-index-offset 25)))
     (#\k
      (unless (= (length payload) 18) (error "invalid logical keepalive frame"))
      (logical-progress-keepalive runtime (pg-client-u64 payload 1)))

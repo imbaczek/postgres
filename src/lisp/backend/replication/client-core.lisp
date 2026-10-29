@@ -52,9 +52,9 @@
              (multiple-value-bind (value next)
                  (pg-client-cstring payload position)
                (setf position next)
-               (case code
-                 (#.(char-code #\C) (setf sqlstate value))
-                 (#.(char-code #\M) (setf message value)))))
+               (cond
+                 ((= code (char-code #\C)) (setf sqlstate value))
+                 ((= code (char-code #\M)) (setf message value)))))
     (make-condition 'pg-client-error :sqlstate sqlstate :message message)))
 
 (defun pg-client-connect (host port database &key (user "postgres")
@@ -122,10 +122,32 @@
 (defun pg-client-send-query (client query)
   (when (find (code-char 0) query)
     (error "SQL query contains a null byte"))
-  (let ((payload (make-payload)))
-    (payload-push payload (string->bytes query))
-    (vector-push-extend 0 payload)
-    (write-message (pg-client-stream client) #\Q payload)))
+  (let* ((size (loop for start from 0 below (length query) by 4096
+                     sum (length (string->bytes
+                                  (subseq query start (min (length query) (+ start 4096)))))))
+         (frame-length (+ size 5))
+         (stream (pg-client-stream client))
+         (started nil)
+         (complete nil))
+    (unless (<= frame-length #x7fffffff)
+      (error "SQL query exceeds PostgreSQL message length"))
+    (unwind-protect
+         (progn
+           (setf started t)
+           (write-byte (char-code #\Q) stream)
+           (write-sequence (u32-to-bytes frame-length) stream)
+           (loop for start from 0 below (length query) by 4096
+                 for bytes = (string->bytes
+                              (subseq query start (min (length query) (+ start 4096))))
+                 sum (length bytes) into written
+                 do (write-sequence bytes stream)
+                 finally (unless (= written size)
+                           (error "SQL query changed while sending")))
+           (write-byte 0 stream)
+           (force-output stream)
+           (setf complete t))
+      (when (and started (not complete))
+        (pg-client-close client)))))
 
 (defun pg-client-read-column-description (payload)
   (let ((position 2)

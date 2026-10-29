@@ -66,7 +66,7 @@ row messages, v2 `Message` events, keepalives, and standby status.
 supported table/index/sequence definitions, copies allowlisted table rows,
 applies committed row changes and supported DDL/sequence events, and persists
 target markers with the corresponding durable catalog update.
-`backend/replication/client.lisp` is the small wire frontend used by the worker.
+`backend/replication/client-core.lisp` is the small wire frontend used by the worker.
 Run `t/logical-replication.sh` to boot one source and two independent replicas
 and exercise this path.
 

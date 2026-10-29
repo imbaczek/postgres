@@ -75,7 +75,7 @@
       :components ((:file "logical" :pathname "logical-stream")
                    (:file "logical-fragments")
                    (:file "schema-contracts")
-                   (:file "client")
+                   (:file "client-core")
                    (:file "physical")
                    (:file "physical-store")
                    (:file "physical-source")

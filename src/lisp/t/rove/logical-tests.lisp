@@ -152,6 +152,76 @@
       (rove:ok (handler-case (progn (logical-copy-check-query-size within) nil)
                  (error () t)))))
 
+(rove:deftest test-logical-bounded-utf8-and-frame-view
+    (let* ((value (concatenate 'string (make-string 4095 :initial-element #\a)
+                               (string (code-char #x1f642)) "ż"))
+           (payload (make-array 28 :element-type '(unsigned-byte 8) :initial-element 0))
+           (original (symbol-function 'logical-pgoutput-dispatch))
+           (seen nil))
+      (rove:ok (= (logical-utf8-size-bounded value) (length (string->bytes value))))
+      (setf (aref payload 0) (char-code #\w)
+            (aref payload 25) (char-code #\X)
+            (aref payload 26) 7
+            (aref payload 27) 9)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-pgoutput-dispatch)
+                   (lambda (runtime view)
+                     (declare (ignore runtime))
+                     (multiple-value-bind (base offset) (array-displacement view)
+                       (setf seen (and (eq base payload) (= offset 25)
+                                       (equalp view #(88 7 9)))))))
+             (logical-stream-frame nil payload)
+             (rove:ok seen))
+        (setf (symbol-function 'logical-pgoutput-dispatch) original))))
+
+(rove:deftest test-client-streamed-query-frame
+    (let* ((path (merge-pathnames (format nil "pg-query-frame-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (query (concatenate 'string (make-string 4095 :initial-element #\a) "🙂ż'\\"))
+           (encoded (string->bytes query))
+           (expected (make-payload)))
+      (unwind-protect
+           (progn
+             (payload-push-byte expected (char-code #\Q))
+             (payload-push expected (u32-to-bytes (+ 5 (length encoded))))
+             (payload-push expected encoded)
+             (payload-push-byte expected 0)
+             (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede :if-does-not-exist :create)
+               (pg-client-send-query (make-pg-client :stream stream) query))
+             (with-open-file (stream path :element-type '(unsigned-byte 8))
+               (let ((actual (make-array (file-length stream) :element-type '(unsigned-byte 8))))
+                 (rove:ok (= (read-sequence actual stream) (length actual)))
+                 (rove:ok (equalp actual expected)))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-client-streamed-query-failure-closes-connection
+    (let* ((path (merge-pathnames (format nil "pg-query-fail-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (original (symbol-function 'string->bytes))
+           (calls 0)
+           (stream nil))
+      (unwind-protect
+           (progn
+             (setf stream (open path :direction :output :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede :if-does-not-exist :create))
+             (let ((client (make-pg-client :stream stream)))
+               (rove:ok (handler-case (progn (pg-client-send-query client (string (code-char 0))) nil)
+                          (error () t)))
+               (rove:ok (and (open-stream-p stream) (zerop (file-position stream))))
+               (setf (symbol-function 'string->bytes)
+                     (lambda (value)
+                       (incf calls)
+                       (if (= calls 2) (error "injected query write failure")
+                           (funcall original value))))
+               (rove:ok (handler-case (progn (pg-client-send-query client "abc") nil)
+                          (error () t)))
+               (rove:ok (not (open-stream-p stream)))))
+        (setf (symbol-function 'string->bytes) original)
+        (when (and stream (open-stream-p stream)) (close stream :abort t))
+        (when (probe-file path) (delete-file path)))))
+
 (rove:deftest test-logical-copy-frame-counts-sql-escaping
     (let* ((column (make-pg-client-column :name "payload" :type-oid 25))
            (row (vector (make-string (floor +max-query-message-size+ 2) :initial-element #\')))

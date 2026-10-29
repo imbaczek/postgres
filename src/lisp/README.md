@@ -650,9 +650,12 @@ output; the spool is cleaned up when the reader scope ends. For spilled events,
 each iteration checks the event CRC in bounded blocks before decoding through a
 bounded stream cursor, without allocating the complete encoded event. The
 sender measures each INSERT, UPDATE, or DELETE row before writing one pgoutput
-CopyData frame through a bounded buffer. Decoded values still occupy memory,
-and the receiver still handles complete frames; other message types use their
-existing encoders. A partial row-frame write closes the connection. The 4 MiB
+CopyData frame through a bounded buffer. The subscriber reads a complete frame
+but views its XLogData payload without copying it. It still materializes decoded
+values and generated apply SQL. Its Simple Query sender counts UTF-8 bytes and
+writes them in bounded blocks, while retaining the query string. Other message
+types use their existing encoders. A partial row-frame or query write closes
+the connection. The 4 MiB
 threshold is not a bound on the size of an individual event. The 64 MiB capture
 and 65 MiB WAL limits and protocol frame length limit still apply.
 
