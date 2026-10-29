@@ -97,7 +97,7 @@
            (ok (null pg::*physical-follow-runtime*)))))
      :system-id 42))
 
-(defun call-with-controller-intent (function)
+(defun call-with-controller-intent (function &key before-intent)
   (call-with-promotion-fixture
    (lambda (root store)
      (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
@@ -107,6 +107,7 @@
             (pg::*physical-follow-controller-blocked-p* nil)
             (pg::*physical-follow-controller-stopping-p* nil))
        (pg::physical-follow-save-config '(1 "127.0.0.1" 5432 "old_bootstrap"))
+       (when before-intent (funcall before-intent operation))
        (pg::physical-follow-operation-initial-config operation)
        (multiple-value-bind (entry snapshot) (pg::physical-follow-operation-intent operation view)
          (funcall function root store operation view entry snapshot))))

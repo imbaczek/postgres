@@ -4,7 +4,7 @@
 ;;; Save preparation before remote proof and reconcile pending state before use.
 ;;; Cancel sockets and join operations outside command, reload and admission locks.
 
-(defstruct physical-follow-operation
+(defstruct (physical-follow-operation (:print-function physical-libpq-print-private-object))
   "One transition and its socket, thread, saved intent and failure context."
   host port prefix runtime config client thread cancelled-p result error context)
 
@@ -188,9 +188,10 @@ to identify the same PGDATA."
                (list :version 1 :system-id (getf base :system-id)
                      :source-timeline (getf base :timeline) :base (getf base :end)
                      :manifest-digest (getf base :manifest-digest)))))
-    (physical-follow-cleanup-copy
+    (physical-follow-cleanup-with-owner
      (list :kind (if binding :follow :bootstrap) :host (second config) :port (third config)
-           :pin (fourth config) :request request))))
+           :pin (fourth config) :request request)
+     (getf (physical-follow-controller-state config) :source))))
 
 (defun physical-follow-promotion-cleanup-config ()
   "Build the post-promotion cleanup image before retiring base provenance.
@@ -217,6 +218,7 @@ retirement may finish later."
         (setf (getf state :enabled) nil
               state (physical-follow-enqueue-cleanup
                      state (physical-follow-current-retirement config base)))
+        (remf state :source)
         (physical-follow-check-config (list 1 nil nil nil nil state))))))
 
 (defun physical-follow-startup-owner-check ()
@@ -327,23 +329,57 @@ state before validating an active binding. Protect the store and retained root."
               (physical-follow-operation-config operation) config)
         config))))
 
+(defun physical-follow-operation-register-client (operation client)
+  (sb-thread:with-mutex (*physical-follow-lock*)
+    (when (or (physical-follow-operation-cancelled-p operation)
+              *physical-follow-controller-blocked-p* *physical-follow-controller-stopping-p*)
+      (error 'physical-follow-controller-cancelled
+             :format-control "native follow connection was canceled"))
+    (setf (physical-follow-operation-client operation) client))
+  client)
+
 (defun physical-follow-operation-connect (operation)
-  (let ((client (sb-ext:with-timeout 10
-                  (pg-client-connect (physical-follow-operation-host operation)
-                                     (physical-follow-operation-port operation) "postgres"
-                                     :application-name "pg_lisp_follow_prepare" :replication-p t)))
-        (accepted nil))
+  (let ((client nil) (accepted nil)
+                     (profile (getf (physical-follow-operation-context operation) :requested-profile)))
     (unwind-protect
          (progn
-           (setf (sb-bsd-sockets:sockopt-tcp-nodelay (pg-client-socket client)) t)
-           (sb-thread:with-mutex (*physical-follow-lock*)
-             (unless (or (physical-follow-operation-cancelled-p operation)
-                         *physical-follow-controller-blocked-p* *physical-follow-controller-stopping-p*)
-               (setf (physical-follow-operation-client operation) client accepted t)))
-           (unless accepted
-             (error 'physical-follow-controller-cancelled :format-control "native follow connection was canceled"))
+           (if profile
+               (progn
+                 (setf client
+                       (physical-libpq-connect
+                        (physical-libpq-helper-path) profile
+                        :on-spawn (lambda (channel)
+                                    (setf client channel)
+                                    (physical-follow-operation-register-client operation channel))))
+                 (let* ((info (physical-libpq-channel-info client))
+                        (host (physical-libpq-display-octets
+                               (physical-libpq-connection-info-host info)))
+                        (owner (physical-libpq-frozen-profile-datum
+                                (make-physical-libpq-frozen-profile info))))
+                   (setf (physical-follow-operation-host operation)
+                         (subseq host 0 (min 255 (length host)))
+                         (physical-follow-operation-port operation)
+                         (physical-libpq-connection-info-port info)
+                         (getf (physical-follow-operation-context operation) :accepted-source)
+                         (physical-follow-source-copy
+                          (list :conninfo (physical-libpq-profile-conninfo profile)
+                                :fallback (physical-libpq-profile-fallback profile)
+                                :owner owner)))))
+               (progn
+                 (setf client (sb-ext:with-timeout 10
+                                (pg-client-connect (physical-follow-operation-host operation)
+                                                   (physical-follow-operation-port operation) "postgres"
+                                                   :application-name "pg_lisp_follow_prepare"
+                                                   :replication-p t)))
+                 (setf (sb-bsd-sockets:sockopt-tcp-nodelay (pg-client-socket client)) t)
+                 (physical-follow-operation-register-client operation client)))
+           (setf accepted t)
            client)
-      (unless accepted (pg-client-close client)))))
+      (unless accepted
+        (physical-client-close client)
+        (sb-thread:with-mutex (*physical-follow-lock*)
+          (when (eq client (physical-follow-operation-client operation))
+            (setf (physical-follow-operation-client operation) nil)))))))
 
 (defun physical-follow-fresh-attempt-name (prefix config)
   "Generate an attempt-specific pin name distinct from current and queued names."
@@ -354,6 +390,20 @@ state before validating an active binding. Protect the store and retained root."
                    (find name (getf (physical-follow-controller-state config) :cleanup)
                          :key (lambda (entry) (getf entry :pin)) :test #'equal))
           return name))
+
+(defun physical-follow-preparation-entry (operation slot coordinates)
+  (physical-follow-cleanup-with-owner
+   (list :kind :follow :host (physical-follow-operation-host operation)
+         :port (physical-follow-operation-port operation) :pin slot :request coordinates)
+   (getf (physical-follow-operation-context operation) :accepted-source)))
+
+(defun physical-follow-operation-source-state (operation state)
+  (let ((copy (physical-follow-controller-copy state))
+        (source (getf (physical-follow-operation-context operation) :accepted-source)))
+    (if source
+        (setf (getf copy :source) (physical-follow-source-copy source))
+        (remf copy :source))
+    copy))
 
 (defun physical-follow-operation-intent (operation view)
   "Stop the old runtime and save preparation intent before contacting PREPARE.
@@ -376,14 +426,14 @@ Hold command exclusion; snapshot under reload and live-operation quiescence."
           (let* ((snapshot (physical-follow-controller-snapshot view))
                  (state (physical-follow-controller-state current))
                  (slot (physical-follow-fresh-attempt-name (physical-follow-operation-prefix operation) current))
-                 (entry (physical-follow-cleanup-copy
-                         (list :kind :follow :host (physical-follow-operation-host operation)
-                               :port (physical-follow-operation-port operation) :pin slot
-                               :request (getf snapshot :coordinates))))
+                 (entry (physical-follow-preparation-entry operation slot (getf snapshot :coordinates)))
                  (intent nil))
             (setf (getf state :preparing) entry
                   intent (physical-follow-with-controller current state))
             (physical-follow-config-image (physical-follow-abandon-preparation-config intent))
+            (physical-follow-config-image
+             (physical-follow-with-controller
+              intent (physical-follow-operation-source-state operation state)))
             (setf (getf (physical-follow-operation-context operation) :intent-write) t)
             (physical-follow-controller-save-config intent)
             (setf (physical-follow-operation-config operation) intent
@@ -411,6 +461,7 @@ the old source before publication; its remote acknowledgment is not required."
           (unless (and (equal request (getf entry :request))
                        (equal (getf anchor :history-text) (getf view :history-text)))
             (error "native follow prefix or source history changed during preparation"))
+          (setf state (physical-follow-operation-source-state operation state))
           (setf (getf state :preparing) nil
                 (getf state :enabled) t
                 state (physical-follow-enqueue-cleanup state retired)
@@ -506,10 +557,7 @@ publication failures fence recovery for restart reconciliation."
                  (setf *physical-recovery-failed-p* t)
                  (admin-log "native follow transition recovery failed: ~a" recovery-error)))
              (physical-follow-controller-record-error :transition condition)
-             (unless (or (typep condition '(or stream-error sb-bsd-sockets:socket-error sb-ext:timeout))
-                         (and (typep condition 'pg-client-error)
-                              (member (pg-client-error-sqlstate condition)
-                                      '("57P01" "57P03" "53300" "55006") :test #'equal))
+             (unless (or (physical-client-retryable-condition-p condition)
                          (typep condition 'physical-follow-controller-cancelled))
                (setf *physical-follow-auto-error*
                      (list (and (physical-follow-operation-config operation)
@@ -517,17 +565,24 @@ publication failures fence recovery for restart reconciliation."
                            (princ-to-string condition))))
              (setf *physical-follow-auto-retry-after*
                    (+ (get-internal-real-time) internal-time-units-per-second))))
-      (pg-client-close client)
+      (physical-client-close client)
       (sb-thread:with-mutex (*physical-follow-lock*)
         (setf (physical-follow-operation-client operation) nil)
         (when (eq operation *physical-follow-operation*)
           (setf *physical-follow-operation* nil))))))
 
-(defun physical-follow-start-operation (host port prefix &optional runtime)
+(defun physical-follow-start-operation (host port prefix &optional runtime profile)
   (physical-follow-endpoint-check host port prefix)
   (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))
-  (let ((ready nil) (operation (make-physical-follow-operation
-                                :host (copy-seq host) :port port :prefix (copy-seq prefix) :runtime runtime)))
+  (let* ((source (when runtime (physical-follow-config-source (physical-follow-runtime-config runtime))))
+         (requested (or profile
+                        (when source
+                          (make-physical-libpq-profile (getf source :conninfo)
+                                                       :fallback (getf source :fallback)))))
+         (ready nil)
+         (operation (make-physical-follow-operation
+                     :host (copy-seq host) :port port :prefix (copy-seq prefix) :runtime runtime
+                     :context (when requested (list :requested-profile requested)))))
     (sb-thread:with-mutex (*physical-follow-lock*)
       (when (or *physical-follow-operation* *physical-follow-controller-blocked-p*
                 *physical-follow-controller-stopping-p*)
@@ -552,7 +607,7 @@ live-operation admission locks. A failed join fences recovery."
         (setf (physical-follow-operation-cancelled-p operation) t
               client (physical-follow-operation-client operation))))
     (when client
-      (ignore-errors (sb-bsd-sockets:socket-shutdown (pg-client-socket client) :direction :io)))
+      (ignore-errors (physical-client-stop client)))
     (when operation
       (let ((thread (physical-follow-operation-thread operation)))
         (when (eq thread sb-thread:*current-thread*) (error "follow controller cannot join itself"))
@@ -590,6 +645,17 @@ The caller must not hold command, reload or live-operation admission locks."
       (error "native follow transition failed: ~a" (physical-follow-operation-error operation)))
     (physical-follow-operation-result operation)))
 
+(defun physical-follow-retarget-conninfo (conninfo &key (prefix "follow") (fallback "walreceiver"))
+  (when (plusp *live-operation-depth*)
+    (error "native follow retarget requires its own operation admission"))
+  (let ((profile (make-physical-libpq-profile conninfo :fallback fallback)))
+    (physical-follow-controller-start-worker :force t)
+    (let ((operation (physical-follow-start-operation "libpq" 5432 prefix nil profile)))
+      (sb-thread:join-thread (physical-follow-operation-thread operation))
+      (when (physical-follow-operation-error operation)
+        (error "native follow transition failed: ~a" (physical-follow-operation-error operation)))
+      :started)))
+
 (defvar *physical-follow-cleanup-retry-after* (make-hash-table :test #'equal))
 
 (defvar *physical-follow-cleanup-last* nil)
@@ -602,6 +668,40 @@ The caller must not hold command, reload or live-operation admission locks."
       (setf (gethash key *physical-follow-controller-errors*) message)))
   nil)
 
+(defun physical-follow-cleanup-register-client (client)
+  (sb-thread:with-mutex (*physical-follow-lock*)
+    (when *physical-follow-controller-stopping-p*
+      (error 'physical-follow-controller-cancelled :format-control "follow cleanup is stopping"))
+    (setf *physical-follow-cleanup-client* client))
+  client)
+
+(defun physical-follow-cleanup-connect (entry)
+  (let ((client nil) (accepted nil))
+    (unwind-protect
+         (progn
+           (if (getf entry :connection)
+               (setf client
+                     (physical-libpq-connect-frozen
+                      (physical-libpq-helper-path)
+                      (physical-libpq-frozen-profile-from-datum (getf entry :connection))
+                      :on-spawn (lambda (channel)
+                                  (setf client channel)
+                                  (physical-follow-cleanup-register-client channel))))
+               (progn
+                 (setf client
+                       (sb-ext:with-timeout 10
+                         (pg-client-connect (getf entry :host) (getf entry :port) "postgres"
+                                            :application-name "pg_lisp_follow_cleanup"
+                                            :replication-p t)))
+                 (physical-follow-cleanup-register-client client)))
+           (setf accepted t)
+           client)
+      (unless accepted
+        (physical-client-close client)
+        (sb-thread:with-mutex (*physical-follow-lock*)
+          (when (eq client *physical-follow-cleanup-client*)
+            (setf *physical-follow-cleanup-client* nil)))))))
+
 (defun physical-follow-controller-cleanup (entry)
   "Retry exact remote retirement outside command exclusion. Remove the durable
 queue entry only after acknowledgment and a fresh local state check."
@@ -609,13 +709,7 @@ queue entry only after acknowledgment and a fresh local state check."
     (unwind-protect
          (handler-case
              (progn
-               (setf client (sb-ext:with-timeout 10
-                              (pg-client-connect (getf entry :host) (getf entry :port) "postgres"
-                                                 :application-name "pg_lisp_follow_cleanup" :replication-p t)))
-               (sb-thread:with-mutex (*physical-follow-lock*)
-                 (when *physical-follow-controller-stopping-p*
-                   (error 'physical-follow-controller-cancelled :format-control "follow cleanup is stopping"))
-                 (setf *physical-follow-cleanup-client* client))
+               (setf client (physical-follow-cleanup-connect entry))
                (sb-ext:with-timeout 10
                  (ecase (getf entry :kind)
                    (:follow (pg-client-native-abort client (getf entry :pin) (getf entry :request)))
@@ -640,7 +734,7 @@ queue entry only after acknowledgment and a fresh local state check."
              (physical-follow-controller-record-error entry condition)
              (setf (gethash entry *physical-follow-cleanup-retry-after*)
                    (+ (get-internal-real-time) (* 5 internal-time-units-per-second)))))
-      (pg-client-close client)
+      (physical-client-close client)
       (sb-thread:with-mutex (*physical-follow-lock*)
         (when (eq client *physical-follow-cleanup-client*)
           (setf *physical-follow-cleanup-client* nil))))))
@@ -694,7 +788,7 @@ Call outside command, reload and live-operation admission locks."
             worker *physical-follow-controller-worker*
             client *physical-follow-cleanup-client*))
     (when client
-      (ignore-errors (sb-bsd-sockets:socket-shutdown (pg-client-socket client) :direction :io)))
+      (ignore-errors (physical-client-stop client)))
     (physical-follow-controller-cancel-join)
     (when worker
       (sb-thread:join-thread worker :timeout 15 :default :timeout)

@@ -54,6 +54,386 @@
     (pg::payload-push-u32 payload (length bytes))
     (loop for byte across bytes do (vector-push-extend byte payload))))
 
+(defun libpq-test-connection-body (parameters)
+  (let ((body (pg::make-payload)))
+    (dolist (text '("localhost" "127.0.0.1" "5432" "db=literal" "postgres"))
+      (libpq-test-string body text))
+    (pg::payload-push-u32 body (length parameters))
+    (dolist (parameter parameters)
+      (libpq-test-string body (first parameter))
+      (if (null (second parameter))
+          (pg::payload-push-u32 body #xffffffff)
+          (let ((value (second parameter)))
+            (if (stringp value) (libpq-test-string body value)
+                (progn
+                  (pg::payload-push-u32 body (length value))
+                  (loop for byte across value do (vector-push-extend byte body)))))))
+    body))
+
+(deftest physical-libpq-connection-metadata-keeps-private-options-out-of-public-text
+    (let* ((body (libpq-test-connection-body
+                  '(("password" "private-marker") ("options" "private-options")
+                    ("scram_client_key" "private-scram") ("application_name" "receiver")
+                    ("sslmode" "verify-full") ("passfile" nil) ("sslcert" ""))))
+           (info (pg::physical-libpq-decode-connection-info body))
+           (public (pg::physical-libpq-public-connection-info info)))
+      (ok (equalp (pg::string->bytes "127.0.0.1") (pg::physical-libpq-connection-info-hostaddr info)))
+      (ok (= 5432 (pg::physical-libpq-connection-info-port info)))
+      (ok (equalp (pg::string->bytes "db=literal") (pg::physical-libpq-connection-info-database info)))
+      (ok (not (search "private-" public)))
+      (ok (not (search "private-" (princ-to-string info))))
+      (ok (search "application_name='receiver'" public))
+      (ok (search "sslmode='verify-full'" public))
+      (ok (null (second (assoc "passfile" (pg::physical-libpq-connection-info-parameters info)
+                               :test #'equal))))
+      (ok (equalp (pg::string->bytes "") (second (assoc "sslcert" (pg::physical-libpq-connection-info-parameters info)
+                                                        :test #'equal))))))
+
+(deftest physical-libpq-connection-metadata-rejects-duplicates-truncation-and-trailing-bytes
+    (let ((body (libpq-test-connection-body '(("host" "localhost")))))
+      (dolist (bad (list (subseq body 0 (1- (length body)))
+                         (concatenate '(vector (unsigned-byte 8)) body #(0))
+                         (libpq-test-connection-body '(("host" "a") ("host" "b")))
+                         (libpq-test-connection-body '(("bad-key" "a")))))
+        (ok (physical-client-test-protocol-error-p
+             (lambda () (pg::physical-libpq-decode-connection-info bad)))))))
+
+(deftest physical-libpq-private-option-octets-survive-freezing-and-hex-roundtrip
+    (let* ((raw (make-array 255 :element-type '(unsigned-byte 8)
+                                :initial-contents (loop for byte from 1 to 255 collect byte)))
+           (body (libpq-test-connection-body
+                  (list (list "passfile" raw) (list "application_name" (subseq raw 254)))))
+           (info (pg::physical-libpq-decode-connection-info body))
+           (profile (pg::make-physical-libpq-frozen-profile info))
+           (parameters (pg::%physical-libpq-frozen-profile-parameters profile))
+           (datum (pg::physical-libpq-frozen-profile-datum profile)))
+      (ok (equalp raw (second (assoc "passfile" parameters :test #'equal))))
+      (ok (equalp raw (pg::physical-libpq-datum-octets (pg::physical-libpq-octets-datum raw))))
+      (ok (search raw (pg::physical-libpq-frozen-profile-body profile)))
+      (ok (search "\\xff" (pg::physical-libpq-public-connection-info info)))
+      (let ((*read-eval* nil))
+        (ok (equal datum (read-from-string (write-to-string datum :readably t)))))
+      (ok (not (equal nil (pg::physical-libpq-octets-datum
+                           (make-array 0 :element-type '(unsigned-byte 8))))))
+      (let ((saved (pg::physical-libpq-frozen-profile-body profile)))
+        (setf (aref (second (assoc "passfile"
+                                   (pg::physical-libpq-connection-info-parameters info)
+                                   :test #'equal)) 0) 99)
+        (ok (equalp saved (pg::physical-libpq-frozen-profile-body profile))))))
+
+(deftest physical-libpq-private-byte-datum-rejects-noncanonical-and-oversized-values
+    (dolist (datum (list '(:bytes "FF") '(:bytes "f") '(:bytes "xx")
+                         '(:bytes "" :extra) '(:wrong "")
+                         (list :bytes (make-string 32770 :initial-element #\a))))
+      (ok (intake-fails-p (lambda () (pg::physical-libpq-datum-octets datum))))))
+
+(cl-spec:defproperty physical-libpq-private-byte-datums-preserve-unsigned-values
+    ((value (range integer 0 #xffffffffffffffff)))
+  (:about pg::physical-libpq-octets-datum)
+  (:trials (:normal 200))
+  (let ((bytes (make-array 8 :element-type '(unsigned-byte 8))))
+    (loop for shift downfrom 56 to 0 by 8 for index from 0
+          do (setf (aref bytes index) (ldb (byte 8 shift) value)))
+    (equalp bytes (pg::physical-libpq-datum-octets
+                   (pg::physical-libpq-octets-datum bytes)))))
+
+(deftest generated-physical-libpq-private-byte-datum-roundtrips
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'physical-libpq-private-byte-datums-preserve-unsigned-values
+                                       :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (ok (= 200 (getf data :trials)))))
+
+(deftest physical-libpq-frozen-profile-reload-rejects-malformed-route-and-datum
+    (let* ((info (pg::physical-libpq-decode-connection-info
+                  (libpq-test-connection-body '(("passfile" "fixture-path")))))
+           (profile (pg::make-physical-libpq-frozen-profile info))
+           (datum (pg::physical-libpq-frozen-profile-datum profile))
+           (reloaded (pg::physical-libpq-frozen-profile-from-datum datum)))
+      (ok (equalp (pg::physical-libpq-frozen-profile-body profile)
+                  (pg::physical-libpq-frozen-profile-body reloaded)))
+      (dolist (bad (list (append datum (list (copy-tree (first datum))))
+                         (append datum '(("service" (:bytes "78"))))
+                         (remove "hostaddr" datum :key #'first :test #'equal)
+                         (cons '("host" (:bytes "00")) (remove "host" datum :key #'first :test #'equal))
+                         (cons '("port" (:bytes "30")) (remove "port" datum :key #'first :test #'equal))
+                         (cons '("extra" (:bytes "FF")) datum)
+                         (cons '("extra" (:bytes "")) :dotted)))
+        (ok (intake-fails-p
+             (lambda () (pg::physical-libpq-frozen-profile-from-datum bad)))))))
+
+(deftest private-atomic-output-establishes-mode-before-writing
+    (with-physical-store-directory (root)
+      (let ((target (merge-pathnames "private.control" root))
+            (temporary (merge-pathnames "private.tmp" root))
+            (observed nil))
+        (pg::with-atomic-output (stream target temporary root :mode #o600)
+          (setf observed (logand #o777 (sb-posix:stat-mode
+                                        (sb-posix:fstat (sb-sys:fd-stream-fd stream)))))
+          (write-string "private-fixture" stream))
+        (ok (= #o600 observed))
+        (ok (= #o600 (logand #o777 (sb-posix:stat-mode (sb-posix:stat target))))))
+      ))
+
+(deftest physical-follow-private-source-and-retirement-survive-control-reload
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (owner (pg::physical-libpq-frozen-profile-datum
+                     (pg::make-physical-libpq-frozen-profile
+                      (pg::physical-libpq-decode-connection-info
+                       (libpq-test-connection-body '(("password" "private-marker")))))))
+             (source (list :conninfo (copy-seq "host=localhost password=private-marker")
+                           :fallback "receiver" :owner owner))
+             (entry (list :kind :follow :host "localhost" :port 5432 :pin "retired"
+                          :request (follow-anchor-receiver-request (follow-anchor-request 123 456))
+                          :connection owner))
+             (state (pg::physical-follow-controller-copy
+                     (list :version 1 :enabled t :preparing nil :cleanup (list entry) :source source)))
+             (config (list 1 "localhost" 5432 "current" nil state)))
+        (pg::physical-follow-save-config config)
+        (let* ((loaded (pg::physical-follow-read-config))
+               (reloaded-state (pg::physical-follow-controller-state loaded))
+               (deduplicated (pg::physical-follow-enqueue-cleanup reloaded-state entry)))
+          (ok (equal config loaded))
+          (let* ((changed-state (pg::physical-follow-controller-copy reloaded-state))
+                 (changed-source (getf changed-state :source)))
+            (setf (getf changed-source :fallback) "different-fallback")
+            (ok (not (equal (pg::physical-follow-effective-config loaded)
+                            (pg::physical-follow-effective-config
+                             (pg::physical-follow-with-controller loaded changed-state))))))
+          (ok (= 1 (length (getf deduplicated :cleanup))))
+          (ok (null (remove entry (getf reloaded-state :cleanup) :test #'equal)))
+          (ok (= #o600 (logand #o777 (sb-posix:stat-mode
+                                      (sb-posix:stat (pg::physical-follow-config-path))))))
+          (setf (char (getf source :conninfo) 0) #\X)
+          (ok (equal "host=localhost password=private-marker"
+                     (getf (getf (sixth loaded) :source) :conninfo)))))))
+
+(defun libpq-test-source (label port)
+  (let ((info (pg::physical-libpq-decode-connection-info
+               (libpq-test-connection-body (list (list "password" label))))))
+    (setf (pg::physical-libpq-connection-info-port info) port)
+    (list :conninfo (format nil "host=localhost port=~d password=~a" port label)
+          :fallback label
+          :owner (pg::physical-libpq-frozen-profile-datum
+                  (pg::make-physical-libpq-frozen-profile info)))))
+
+(deftest physical-follow-intent-keeps-candidate-owner-separate-from-current-source
+    (let ((old-source (libpq-test-source "old-private-marker" 5432))
+          (new-source (libpq-test-source "new-private-marker" 5433)))
+      (call-with-controller-intent
+       (lambda (root store operation view entry snapshot)
+         (declare (ignore root store view snapshot))
+         (let* ((saved (pg::physical-follow-read-config))
+                (state (pg::physical-follow-controller-state saved)))
+           (ok (equal (getf old-source :owner)
+                      (getf (getf state :source) :owner)))
+           (ok (equal (getf new-source :owner) (getf (getf state :preparing) :connection)))
+           (ok (equal entry (getf state :preparing)))
+           (setf (pg::physical-follow-operation-cancelled-p operation) t)
+           (pg::physical-follow-operation-recover operation)
+           (let ((recovered (pg::physical-follow-controller-state (pg::physical-follow-read-config))))
+             (ok (equal old-source (getf recovered :source)))
+             (ok (equal (getf new-source :owner) (getf (first (getf recovered :cleanup)) :connection))))
+           (ok (not (search "new-private-marker" (princ-to-string operation))))))
+       :before-intent
+       (lambda (operation)
+         (setf (getf (pg::physical-follow-operation-context operation) :accepted-source) new-source)
+         (pg::physical-follow-save-config
+          (pg::physical-follow-with-controller
+           '(1 "127.0.0.1" 5432 "old_bootstrap")
+           (list :version 1 :enabled t :preparing nil :cleanup nil :source old-source)))))))
+
+(deftest physical-follow-publication-retains-new-owner-and-retires-old-owner
+    (let ((old-source (libpq-test-source "old-private-marker" 5432))
+          (new-source (libpq-test-source "new-private-marker" 5433)))
+      (call-with-controller-intent
+       (lambda (root store operation view entry snapshot)
+         (declare (ignore root store snapshot))
+         (let ((anchor (copy-list (getf entry :request))))
+           (setf (getf anchor :history-text) (getf view :history-text)
+                 (getf anchor :eor-octets)
+                 (coerce (store-history-eor (getf view :fork) 2 1) 'list))
+           (let* ((active (pg::physical-follow-operation-publish operation view entry anchor))
+                  (state (pg::physical-follow-controller-state active))
+                  (retired (first (getf state :cleanup))))
+             (ok (equal new-source (getf state :source)))
+             (ok (equal (getf old-source :owner) (getf retired :connection)))
+             (ok (null (getf state :preparing)))
+             (ok (eq :active (getf (fifth active) :phase)))
+             (ok (not (search "private-marker" (princ-to-string
+                                                (pg::make-physical-follow-runtime :config active)))))
+             (ok (not (search "private-marker" (princ-to-string
+                                                (pg::physical-follow-controller-status))))))))
+       :before-intent
+       (lambda (operation)
+         (setf (getf (pg::physical-follow-operation-context operation) :accepted-source) new-source)
+         (pg::physical-follow-save-config
+          (pg::physical-follow-with-controller
+           '(1 "127.0.0.1" 5432 "old_bootstrap")
+           (list :version 1 :enabled t :preparing nil :cleanup nil :source old-source)))))))
+
+(deftest physical-follow-controller-connect-failure-clears-published-channel
+    (let* ((profile (pg::make-physical-libpq-profile "host=fixture password=private-marker"))
+           (operation (pg::make-physical-follow-operation
+                       :host "fixture" :port 5432 :context (list :requested-profile profile)))
+           (channel (pg::physical-libpq-reserve-channel))
+           (path-function (symbol-function 'pg::physical-libpq-helper-path))
+           (connect-function (symbol-function 'pg::physical-libpq-connect))
+           (pg::*physical-follow-controller-blocked-p* nil)
+           (pg::*physical-follow-controller-stopping-p* nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-libpq-helper-path) (lambda () "/fixture/helper"))
+             (setf (symbol-function 'pg::physical-libpq-connect)
+                   (lambda (helper requested &key on-spawn)
+                     (declare (ignore helper))
+                     (ok (eq profile requested))
+                     (funcall on-spawn channel)
+                     (ok (eq channel (pg::physical-follow-operation-client operation)))
+                     (error 'pg::pg-client-error :sqlstate "08001" :message "fixture connection failed")))
+             (ok (signals (pg::physical-follow-operation-connect operation) 'pg::pg-client-error))
+             (ok (null (pg::physical-follow-operation-client operation)))
+             (ok (pg::physical-libpq-channel-closed channel))
+             (ok (not (gethash channel pg::*physical-libpq-channels*)))
+             (ok (not (search "private-marker" (princ-to-string operation)))))
+        (setf (symbol-function 'pg::physical-libpq-helper-path) path-function
+              (symbol-function 'pg::physical-libpq-connect) connect-function)
+        (pg::physical-client-close channel))))
+
+(deftest physical-follow-runtime-publishes-connect-and-rejects-owner-route-changes
+    (dolist (mode '(:same :changed :failure))
+      (let* ((source (libpq-test-source "private-marker" 5432))
+             (config (pg::physical-follow-with-controller
+                      '(1 "localhost" 5432 "current")
+                      (list :version 1 :enabled t :preparing nil :cleanup nil :source source)))
+             (runtime (pg::make-physical-follow-runtime :host "localhost" :port 5432
+                                                        :pin "current" :config config))
+             (pg::*physical-follow-runtime* runtime)
+             (pg::*physical-follow-statistics* nil)
+             (pg::*physical-recovery-state* (list :timeline 1))
+             (channel (pg::physical-libpq-reserve-channel))
+             (info (pg::physical-libpq-decode-connection-info (libpq-test-connection-body nil)))
+             (path-function (symbol-function 'pg::physical-libpq-helper-path))
+             (connect-function (symbol-function 'pg::physical-libpq-connect))
+             (flush-function (symbol-function 'pg::physical-follow-flush-on-exit))
+             (called nil))
+        (when (eq mode :changed) (setf (pg::physical-libpq-connection-info-port info) 5433))
+        (setf (pg::physical-libpq-channel-info channel) info)
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'pg::physical-libpq-helper-path) (lambda () "/fixture/helper")
+                     (symbol-function 'pg::physical-follow-flush-on-exit)
+                     (lambda (ignored) (declare (ignore ignored)) nil))
+               (setf (symbol-function 'pg::physical-libpq-connect)
+                     (lambda (helper profile &key on-spawn)
+                       (declare (ignore helper profile))
+                       (funcall on-spawn channel)
+                       (ok (eq channel (pg::physical-follow-runtime-client runtime)))
+                       (when (eq mode :failure)
+                         (error 'pg::pg-client-error :sqlstate "08001" :message "fixture connect failed"))
+                       channel))
+               (flet ((run ()
+                        (pg::physical-follow-call-with-client
+                         runtime 64
+                         (lambda (client)
+                           (setf called t)
+                           (ok (eq channel client))
+                           (pg::physical-follow-monitor-connected runtime)
+                           (ok (not (search "private-marker"
+                                            (princ-to-string pg::*physical-follow-statistics*))))
+                           :connected))))
+                 (ecase mode
+                   (:same (ok (eq :connected (run))))
+                   (:changed (ok (signals (run) 'pg::physical-follow-route-changed)))
+                   (:failure (ok (signals (run) 'pg::pg-client-error)))))
+               (ok (eq called (eq mode :same)))
+               (ok (null (pg::physical-follow-runtime-client runtime)))
+               (ok (pg::physical-libpq-channel-closed channel))
+               (ok (equal source (pg::physical-follow-config-source
+                                  (pg::physical-follow-runtime-config runtime)))))
+          (setf (symbol-function 'pg::physical-libpq-helper-path) path-function
+                (symbol-function 'pg::physical-libpq-connect) connect-function
+                (symbol-function 'pg::physical-follow-flush-on-exit) flush-function)
+          (pg::physical-client-close channel)))))
+
+(deftest physical-follow-receiver-retries-libpq-connect-and-stream-errors
+    (dolist (sqlstate '("08001" "08006" "08P01"))
+      (with-physical-store-directory (root)
+        (let* ((store (pg::physical-store-open root 123 1 :create t))
+               (pg::*physical-receive-store* store)
+               (pg::*physical-recovery-state* (list :end 0))
+               (pg::*physical-recovery-failed-p* nil)
+               (pg::*shutdown* pg::+no-shutdown+)
+               (runtime (pg::make-physical-follow-runtime))
+               (original (symbol-function 'pg::physical-follow-session))
+               (attempts 0))
+          (unwind-protect
+               (progn
+                 (setf (symbol-function 'pg::physical-follow-session)
+                       (lambda (state cursor)
+                         (declare (ignore cursor))
+                         (if (= (incf attempts) 1)
+                             (error 'pg::pg-client-error :sqlstate sqlstate :message "fixture transport failure")
+                             (setf (pg::physical-follow-runtime-stopped-p state) t))))
+                 (pg::physical-follow-receiver-loop runtime)
+                 (ok (= attempts (if (equal sqlstate "08P01") 1 2)))
+                 (ok (not pg::*physical-recovery-failed-p*)))
+            (setf (symbol-function 'pg::physical-follow-session) original)
+            (pg::physical-store-close store))))))
+
+(deftest physical-follow-controller-does-not-suppress-transport-refresh-retries
+    (let ((original (symbol-function 'pg::physical-follow-operation-initial-config)))
+      (unwind-protect
+           (dolist (sqlstate '("08001" "08006" "08P01"))
+             (let* ((operation (pg::make-physical-follow-operation))
+                    (pg::*physical-follow-operation* operation)
+                    (pg::*physical-follow-auto-error* nil)
+                    (pg::*physical-follow-auto-retry-after* 0)
+                    (pg::*physical-follow-controller-errors* (make-hash-table :test #'equal))
+                    (pg::*physical-recovery-failed-p* nil))
+               (setf (symbol-function 'pg::physical-follow-operation-initial-config)
+                     (lambda (state)
+                       (setf (pg::physical-follow-operation-config state)
+                             '(1 "localhost" 5432 "current"))
+                       (error 'pg::pg-client-error :sqlstate sqlstate :message "fixture transport failure")))
+               (pg::physical-follow-operation-run operation)
+               (ok (eq (not (null pg::*physical-follow-auto-error*)) (equal sqlstate "08P01")))
+               (ok (plusp pg::*physical-follow-auto-retry-after*))
+               (ok (null pg::*physical-follow-operation*))
+               (ok (not pg::*physical-recovery-failed-p*))))
+        (setf (symbol-function 'pg::physical-follow-operation-initial-config) original))))
+
+(deftest physical-follow-cleanup-keeps-frozen-entry-after-credential-rejection
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*physical-follow-controller-errors* (make-hash-table :test #'equal))
+             (pg::*physical-follow-cleanup-retry-after* (make-hash-table :test #'equal))
+             (pg::*physical-follow-cleanup-client* nil)
+             (source (libpq-test-source "private-marker" 5432))
+             (entry (pg::physical-follow-cleanup-with-owner
+                     (list :kind :follow :host "localhost" :port 5432 :pin "retired"
+                           :request (follow-anchor-receiver-request (follow-anchor-request 123 456)))
+                     source))
+             (state (list :version 1 :enabled nil :preparing nil :cleanup (list entry)))
+             (config (list 1 nil nil nil nil state))
+             (connect-function (symbol-function 'pg::physical-follow-cleanup-connect)))
+        (pg::physical-follow-save-config config)
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'pg::physical-follow-cleanup-connect)
+                     (lambda (requested)
+                       (ok (equal entry requested))
+                       (error 'pg::pg-client-error :sqlstate "08001"
+                                                   :message "fixture credential rejected")))
+               (pg::physical-follow-controller-cleanup entry)
+               (ok (equal config (pg::physical-follow-read-config)))
+               (ok (gethash entry pg::*physical-follow-controller-errors*))
+               (ok (plusp (gethash entry pg::*physical-follow-cleanup-retry-after*)))
+               (ok (not (search "private-marker"
+                                (princ-to-string (pg::physical-follow-controller-status))))))
+          (setf (symbol-function 'pg::physical-follow-cleanup-connect) connect-function)))))
+
 (defun libpq-test-result-body (&key (name "systemid") (oid 25) (format 0) (value "42")
                                  (tag "IDENTIFY_SYSTEM") (status 0))
   (let ((payload (pg::make-payload)))
@@ -229,6 +609,60 @@
              (pg::physical-libpq-stop channel))))
          (ok rejected)
          (ok (pg::physical-libpq-channel-stopped channel))))))
+
+(deftest physical-client-transport-receives-full-native-fragment-and-completion
+    (let ((payload (make-array (+ 25 65536) :element-type '(unsigned-byte 8) :initial-element 0)))
+      (setf (aref payload 0) (char-code #\w))
+      (call-with-physical-client-wire
+       (lambda (client request)
+         (declare (ignore request))
+         (multiple-value-bind (kind bytes) (pg::physical-client-receive client)
+           (ok (eq kind :data))
+           (ok (equalp payload bytes)))
+         (multiple-value-bind (kind bytes) (pg::physical-client-receive client)
+           (ok (eq kind :done))
+           (ok (null bytes))))
+       (lambda (out)
+         (pg::write-message out #\d payload)
+         (pg::write-message out #\c (pg::make-payload))))))
+
+(deftest physical-client-transport-rejects-oversized-copy-before-body
+    (call-with-physical-client-wire
+     (lambda (client request)
+       (declare (ignore request))
+       (ok (intake-fails-p (lambda () (pg::physical-client-receive client)))))
+     (lambda (out)
+       (write-byte (char-code #\d) out)
+       (write-sequence (pg::u32-to-bytes (+ 5 25 65536)) out))))
+
+(deftest physical-libpq-native-prepare-reuses-source-proof-validation
+    (let* ((expected (follow-anchor-request 123 456))
+           (coordinates (follow-anchor-receiver-request expected))
+           (channel (pg::physical-libpq-reserve-channel))
+           (original (symbol-function 'pg::physical-libpq-query))
+           (changed nil)
+           (calls 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-libpq-query)
+                   (lambda (client query schema tag &key maximum command-only)
+                     (ok (eq client channel))
+                     (ok (search "PREPARE_FOLLOW SLOT bound" query))
+                     (ok (equal schema (physical-client-test-prepare-schema)))
+                     (ok (equal tag "PREPARE_FOLLOW"))
+                     (ok (= maximum pg::+physical-client-proof-frame-maximum+))
+                     (ok (not command-only))
+                     (incf calls)
+                     (let ((row (coerce (physical-client-test-prepare-row) 'vector)))
+                       (when changed (setf (aref row 8) "124"))
+                       row)))
+             (ok (equal expected (pg::pg-client-native-prepare channel "bound" coordinates)))
+             (setf changed t)
+             (ok (physical-client-test-protocol-error-p
+                  (lambda () (pg::pg-client-native-prepare channel "bound" coordinates))))
+             (ok (= calls 2)))
+        (setf (symbol-function 'pg::physical-libpq-query) original)
+        (pg::physical-libpq-close channel))))
 
 (deftest physical-libpq-query-validation-failure-closes-channel
     (let ((original (symbol-function 'pg::physical-libpq-exchange))

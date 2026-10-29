@@ -2,7 +2,7 @@
 (in-package #:pg)
 
 (define-condition physical-follow-terminal-error (simple-error) ())
-(defstruct physical-follow-runtime
+(defstruct (physical-follow-runtime (:print-function physical-libpq-print-private-object))
   "CONFIG is the runtime's private saved configuration; TRANSITION requests a
 controller handoff. Lifecycle and client ownership use the follow lock."
   host port pin config transition limit next-timeline
@@ -20,6 +20,10 @@ controller handoff. Lifecycle and client ownership use the follow lock."
 
 (defun physical-follow-connection-description (runtime)
   "Describe the successful native plaintext connection, without libpq-only defaults."
+  (let ((client (physical-follow-runtime-client runtime)))
+    (when (typep client 'physical-libpq-channel)
+      (return-from physical-follow-connection-description
+        (physical-libpq-public-connection-info (physical-libpq-channel-info client)))))
   (let ((host (with-output-to-string (stream)
                 (write-char (code-char 39) stream)
                 (loop for character across (physical-follow-runtime-host runtime)
@@ -46,11 +50,17 @@ controller handoff. Lifecycle and client ownership use the follow lock."
   "Publish sender details only after native streaming is established."
   (sb-thread:with-mutex (*physical-follow-lock*)
     (when (eq runtime (getf *physical-follow-statistics* :runtime))
-      (setf (getf *physical-follow-statistics* :host) (physical-follow-runtime-host runtime)
-            (getf *physical-follow-statistics* :port) (physical-follow-runtime-port runtime)
-            (getf *physical-follow-statistics* :conninfo) (physical-follow-connection-description runtime)
-            (physical-follow-runtime-connected-p runtime) t
-            (physical-follow-runtime-last-error runtime) nil))))
+      (let* ((client (physical-follow-runtime-client runtime))
+             (info (when (typep client 'physical-libpq-channel)
+                     (physical-libpq-channel-info client))))
+        (setf (getf *physical-follow-statistics* :host)
+              (if info (physical-libpq-display-octets (physical-libpq-connection-info-host info))
+                  (physical-follow-runtime-host runtime))
+              (getf *physical-follow-statistics* :port)
+              (if info (physical-libpq-connection-info-port info) (physical-follow-runtime-port runtime))
+              (getf *physical-follow-statistics* :conninfo) (physical-follow-connection-description runtime)
+              (physical-follow-runtime-connected-p runtime) t
+              (physical-follow-runtime-last-error runtime) nil)))))
 
 (defun physical-follow-monitor-message (runtime end send-time)
   "Match ProcessWalSndrMessage without using source end as local progress."
@@ -98,7 +108,9 @@ controller handoff. Lifecycle and client ownership use the follow lock."
   (merge-pathnames "physical-follow.control" *pgdata*))
 
 (defconstant +physical-follow-config-maximum-bytes+
-  (+ (* 4 +physical-store-history-maximum-bytes+) 65536)
+  (+ (* 4 +physical-store-history-maximum-bytes+) 65536
+     (* 2 (+ (* 2 1048576) 32768))
+     (* +physical-follow-cleanup-capacity+ 32768))
   "Maximum config envelope size before parsing, including bounded histories.")
 
 (defparameter *physical-follow-binding-keys*
@@ -865,7 +877,7 @@ Validation checks coherence, not durable state or source proof."
                        (payload-push-byte result 0))
                      result))))
     (sb-ext:with-timeout 10
-      (write-message (pg-client-stream client) #\d payload))))
+      (physical-client-feedback client payload))))
 
 (defun physical-follow-process-frame (payload &optional runtime)
   (unless (and payload (plusp (length payload))) (physical-follow-reject "empty native physical frame"))
@@ -903,6 +915,8 @@ Validation checks coherence, not durable state or source proof."
 (define-condition physical-follow-source-changed (simple-error)
   ((timeline :initarg :timeline :reader physical-follow-changed-timeline)))
 
+(define-condition physical-follow-route-changed (simple-error) ())
+
 (defun physical-follow-runtime-binding (runtime)
   (fifth (physical-follow-runtime-config runtime)))
 
@@ -927,13 +941,10 @@ Validation checks coherence, not durable state or source proof."
                     (timeline-history-entry-timeline (nth (1- position) history)))))))))
 
 (defun physical-follow-client-identity (client)
-  (let ((rows (sb-ext:with-timeout 10 (pg-client-query client "IDENTIFY_SYSTEM"))))
-    (unless (and (= 1 (length rows)) (= 4 (length (first rows))))
-      (pg-client-native-reject "invalid native source identity row"))
-    (let ((row (first rows)))
-      (values (pg-client-native-u64 (aref row 0))
-              (pg-client-native-u64 (aref row 1) t)
-              (pg-client-native-lsn (aref row 2))))))
+  (let ((row (sb-ext:with-timeout 10 (physical-client-identity-row client))))
+    (values (pg-client-native-u64 (aref row 0))
+            (pg-client-native-u64 (aref row 1) t)
+            (pg-client-native-lsn (aref row 2)))))
 
 (defun physical-follow-start-query (runtime cursor)
   "Build an unnamed native START using the runtime's private proof pin."
@@ -988,21 +999,47 @@ Validation checks coherence, not durable state or source proof."
     (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
       (physical-store-check-live *physical-receive-store*))))
 
+(defun physical-follow-register-runtime-client (runtime client)
+  (sb-thread:with-mutex (*physical-follow-lock*)
+    (unless (and (eq runtime *physical-follow-runtime*)
+                 (not (physical-follow-runtime-stopped-p runtime)))
+      (setf (physical-follow-runtime-stopped-p runtime) t)
+      (error "native physical receiver was stopped during connection"))
+    (setf (physical-follow-runtime-client runtime) client))
+  client)
+
+(defun physical-follow-open-runtime-client (runtime publish)
+  (let ((source (physical-follow-config-source (physical-follow-runtime-config runtime))))
+    (if source
+        (let* ((profile (make-physical-libpq-profile (getf source :conninfo)
+                                                     :fallback (getf source :fallback)))
+               (client (physical-libpq-connect (physical-libpq-helper-path) profile :on-spawn publish))
+               (owner (physical-libpq-frozen-profile-from-datum (getf source :owner))))
+          (unless (equal (physical-libpq-connection-route (physical-libpq-channel-info client))
+                         (physical-libpq-frozen-route owner))
+            (error 'physical-follow-route-changed
+                   :format-control "native physical source route changed"))
+          client)
+        (let ((client (sb-ext:with-timeout 10
+                        (pg-client-connect (physical-follow-runtime-host runtime)
+                                           (physical-follow-runtime-port runtime) "postgres"
+                                           :application-name "pg_lisp_physical_receiver"
+                                           :replication-p t))))
+          (funcall publish client)
+          (setf (sb-bsd-sockets:sockopt-tcp-nodelay (pg-client-socket client)) t)
+          client))))
+
 (defun physical-follow-call-with-client (runtime cursor function)
   (let ((client nil))
     (unwind-protect
          (progn
            (physical-follow-monitor-start runtime cursor)
-           (setf client (sb-ext:with-timeout 10
-                          (pg-client-connect (physical-follow-runtime-host runtime)
-                                             (physical-follow-runtime-port runtime) "postgres"
-                                             :application-name "pg_lisp_physical_receiver"
-                                             :replication-p t)))
-           (setf (sb-bsd-sockets:sockopt-tcp-nodelay (pg-client-socket client)) t)
-           (sb-thread:with-mutex (*physical-follow-lock*)
-             (when (physical-follow-runtime-stopped-p runtime)
-               (return-from physical-follow-call-with-client nil))
-             (setf (physical-follow-runtime-client runtime) client))
+           (setf client
+                 (physical-follow-open-runtime-client
+                  runtime (lambda (opened)
+                            (setf client opened)
+                            (physical-follow-register-runtime-client runtime opened))))
+           (physical-follow-register-runtime-client runtime client)
            (funcall function client))
       (unwind-protect
            (physical-follow-flush-on-exit runtime)
@@ -1010,7 +1047,7 @@ Validation checks coherence, not durable state or source proof."
         (sb-thread:with-mutex (*physical-follow-lock*)
           (when (eq client (physical-follow-runtime-client runtime))
             (setf (physical-follow-runtime-client runtime) nil)))
-        (pg-client-close client)))))
+        (physical-client-close client)))))
 
 (defun physical-follow-finish-bound-stream (client runtime)
   "Flush and verify the parent fork before accepting the source's timeline switch."
@@ -1027,21 +1064,21 @@ Validation checks coherence, not durable state or source proof."
           (unless (= limit (physical-store-flushed-lsn store))
             (physical-follow-reject "parent stream ended before its durable fork")))))
     (physical-follow-feedback client)
-    (sb-ext:with-timeout 10 (pg-client-native-finish client next limit))))
+    (sb-ext:with-timeout 10 (physical-client-finish client next limit))))
 
 (defun physical-follow-copy-stream (client runtime)
   (physical-follow-monitor-connected runtime)
   (loop until (physical-follow-runtime-stopped-p runtime)
-        do (multiple-value-bind (type payload)
-               (sb-ext:with-timeout 10 (pg-client-replication-frame client))
-             (case type
-               (#\d (with-live-operation (physical-follow-process-frame payload runtime)))
-               (#\c
-                (unless (and (physical-follow-runtime-binding runtime) (zerop (length payload)))
+        do (multiple-value-bind (kind payload)
+               (physical-client-receive client)
+             (case kind
+               (:data (with-live-operation (physical-follow-process-frame payload runtime)))
+               (:done
+                (unless (physical-follow-runtime-binding runtime)
                   (physical-follow-reject "unexpected native CopyDone"))
                 (return-from physical-follow-copy-stream
                   (physical-follow-finish-bound-stream client runtime)))
-               (#\E (pg-client-native-source-error payload))
+               (:idle nil)
                (otherwise (physical-follow-reject "unexpected native replication frame"))))
            (physical-follow-feedback client)))
 
@@ -1059,7 +1096,7 @@ Validation checks coherence, not durable state or source proof."
     (setf (physical-follow-runtime-limit runtime) limit
           (physical-follow-runtime-next-timeline runtime) next)
     (let* ((query (physical-follow-start-query runtime cursor))
-           (result (sb-ext:with-timeout 10 (pg-client-native-start client query))))
+           (result (sb-ext:with-timeout 10 (physical-client-start client query))))
       (if (eq :copy-both result)
           (physical-follow-copy-stream client runtime)
           (progn
@@ -1075,8 +1112,9 @@ Validation checks coherence, not durable state or source proof."
          (physical-follow-bound-stream client runtime cursor)
          (let ((query (physical-follow-start-query runtime cursor)))
            (sb-ext:with-timeout 10
-             (physical-follow-check-identity (pg-client-query client "IDENTIFY_SYSTEM"))
-             (pg-client-start-replication client query))
+             (physical-follow-check-identity (list (physical-client-identity-row client)))
+             (unless (eq :copy-both (physical-client-start client query))
+               (physical-follow-reject "unbound native stream returned a timeline switch")))
            (physical-follow-copy-stream client runtime))))))
 
 (defun physical-follow-terminal-p (condition)
@@ -1084,8 +1122,7 @@ Validation checks coherence, not durable state or source proof."
       *physical-recovery-failed-p*
       (and *physical-receive-store* (physical-store-failed-p *physical-receive-store*))
       (and (typep condition 'pg-client-error)
-           (not (member (pg-client-error-sqlstate condition) '("57P01" "57P03" "53300" "55006")
-                        :test #'equal)))))
+           (not (physical-client-retryable-condition-p condition)))))
 
 (defun physical-follow-note-error (runtime condition &optional terminal)
   (setf (physical-follow-runtime-last-error runtime) (princ-to-string condition))
@@ -1110,6 +1147,11 @@ Validation checks coherence, not durable state or source proof."
                  (when (eq runtime *physical-follow-runtime*)
                    (setf (physical-follow-runtime-transition runtime)
                          (list :refresh (physical-follow-changed-timeline condition)))))
+               (return-from physical-follow-receiver-loop :refresh))
+             (physical-follow-route-changed ()
+               (sb-thread:with-mutex (*physical-follow-lock*)
+                 (when (eq runtime *physical-follow-runtime*)
+                   (setf (physical-follow-runtime-transition runtime) '(:refresh-route))))
                (return-from physical-follow-receiver-loop :refresh))
              ((or error sb-ext:timeout) (condition)
                (let ((terminal (physical-follow-terminal-p condition)))
@@ -1216,7 +1258,7 @@ Validate before creating workers and publish only a complete worker pair."
                       (physical-follow-runtime-client runtime))))
         (when client
           (ignore-errors
-           (sb-bsd-sockets:socket-shutdown (pg-client-socket client) :direction :io))))
+           (physical-client-stop client))))
       (let ((threads (list (physical-follow-runtime-receiver-thread runtime)
                            (physical-follow-runtime-replay-thread runtime))))
         (dolist (thread threads)

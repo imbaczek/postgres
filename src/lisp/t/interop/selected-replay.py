@@ -10,6 +10,9 @@ import time
 import traceback
 from pathlib import Path
 
+if not __debug__:
+    raise RuntimeError('selected replay tests require Python assertions')
+
 import psutil
 import follow_stream_wire
 
@@ -219,13 +222,32 @@ def exercise_named_streams(promoted, port, system_id, base, fork, manifest, seed
         raise
 
 
+def retarget_form(port, prefix):
+    if os.environ.get('FOLLOW_LIBPQ') == '1':
+        conninfo = (f'host=127.0.0.1 port={port} user=postgres dbname=postgres '
+                    'sslmode=disable gssencmode=disable password=private-acceptance-marker')
+        return (f'(physical-follow-retarget-conninfo "{conninfo}" '
+                f':prefix "{prefix}" :fallback "controller-libpq")')
+    return f'(physical-follow-retarget "127.0.0.1" {port} "{prefix}")'
+
+
 def exercise_controller(promoted, sibling):
     control("sibling.sock", '(defparameter *controller-original-runtime* *physical-follow-runtime*)')
-    control("sibling.sock", '(physical-follow-retarget "127.0.0.1" 1 "unreachable")', expect_error=True)
+    control("sibling.sock", retarget_form(1, 'unreachable'), expect_error=True)
     control("sibling.sock", '(assert (and (eq *controller-original-runtime* *physical-follow-runtime*) (not *physical-recovery-failed-p*)))')
-    control("sibling.sock", f'(physical-follow-retarget "127.0.0.1" {promoted_port} "manual")')
+    control("sibling.sock", retarget_form(promoted_port, 'manual'))
     wait(lambda: query(sibling, "SELECT count(*) FROM promotion_sql_items") == [(3,)])
     control("sibling.sock", '(assert (and (not *physical-recovery-failed-p*) (= 2 (physical-recovery-replay-timeline)) (eq :active (getf (fifth (physical-follow-read-config)) :phase))))')
+    if os.environ.get('FOLLOW_LIBPQ') == '1':
+        control('sibling.sock', "(assert (typep (physical-follow-runtime-client *physical-follow-runtime*) 'physical-libpq-channel))")
+        control('sibling.sock', '(assert (physical-follow-config-source (physical-follow-read-config)))')
+        status = control('sibling.sock', '(physical-follow-controller-status)')
+        assert 'private-acceptance-marker' not in status
+        conninfo = query(sibling, 'SELECT * FROM pg_catalog.pg_stat_get_wal_receiver()')[0][-1]
+        assert 'controller-libpq' in conninfo and 'private-acceptance-marker' not in conninfo, (
+            'fallback visible', 'controller-libpq' in conninfo,
+            'private fixture visible', 'private-acceptance-marker' in conninfo)
+        assert stat.S_IMODE((data / 'physical-follow.control').stat().st_mode) == 0o600
     query(sibling, "CHECKPOINT")
     query(promoted, "INSERT INTO promotion_sql_items VALUES (6,'controller-live')")
     wait(lambda: query(sibling, "SELECT count(*) FROM promotion_sql_items") == [(4,)])
@@ -238,13 +260,13 @@ def exercise_controller_parent_catchup():
     process, identity = start_peer(directory, replica_port + 1, "lagging.sock", "lagging.log")
     connection = connect(replica_port + 1)
     try:
-        control("lagging.sock", f'(physical-follow-retarget "127.0.0.1" {promoted_port} "too_early")', expect_error=True)
+        control("lagging.sock", retarget_form(promoted_port, 'too_early'), expect_error=True)
         control("lagging.sock", '(assert (not *physical-recovery-failed-p*))')
         control("lagging.sock", '(physical-recovery-enable-streaming)')
         control("lagging.sock", f'(physical-follow-save-config (list 1 "127.0.0.1" {source_port} "controller_lag_seed"))')
         control("lagging.sock", '(defparameter *controller-attempts* nil)')
         control("lagging.sock", '(setf *physical-follow-test-hook* (lambda (point) (when (eq point :after-controller-proof) (let ((entry (getf (sixth (physical-follow-read-config)) :preparing))) (push (list (getf entry :pin) (getf (getf entry :request) :receive-lsn)) *controller-attempts*)))))')
-        control("lagging.sock", f'(physical-follow-retarget "127.0.0.1" {promoted_port} "catchup")')
+        control("lagging.sock", retarget_form(promoted_port, 'catchup'))
         wait(lambda: query(connection, "SELECT count(*) FROM promotion_sql_items") == [(4,)])
         control("lagging.sock", '(assert (= 2 (length *controller-attempts*)))')
         control("lagging.sock", '(assert (not (equal (first (first *controller-attempts*)) (first (second *controller-attempts*)))))')

@@ -857,6 +857,8 @@ this listener evaluates arbitrary Lisp."
 
 (declaim (ftype function physical-recovery-select-history))
 
+(declaim (ftype function physical-follow-retarget-conninfo))
+
 (defun control-eval (stream form)
   "Evaluate FORM, printing its values (or an error) to STREAM."
   (handler-case
@@ -890,6 +892,15 @@ this listener evaluates arbitrary Lisp."
                        (or (= (length form) 3) (stringp (fourth form))))
                   (physical-follow-retarget (second form) (third form)
                                             (if (= (length form) 4) (fourth form) "follow")))
+                 ((and (consp form) (eq (first form) 'physical-follow-retarget-conninfo)
+                       (member (length form) '(2 4 6)) (stringp (second form))
+                       (loop for (key value) on (cddr form) by #'cddr
+                             always (and (member key '(:prefix :fallback)) (stringp value)))
+                       (= (length (cddr form))
+                          (* 2 (length (remove-duplicates
+                                        (loop for (key value) on (cddr form) by #'cddr
+                                              collect key))))))
+                  (apply #'physical-follow-retarget-conninfo (rest form)))
                  (t (with-live-operation (eval form))))))
     (error (e)
       (format stream "~&;; error: ~a~%" e))))

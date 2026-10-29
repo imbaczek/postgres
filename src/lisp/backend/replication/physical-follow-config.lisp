@@ -13,22 +13,52 @@
                (stringp pin) (wal-valid-replication-slot-name-p pin))
     (error "invalid native physical follow endpoint")))
 
+(defun physical-follow-source-copy (source)
+  (physical-follow-check-plist source '(:conninfo :fallback :owner))
+  (let* ((profile (make-physical-libpq-profile (getf source :conninfo)
+                                               :fallback (getf source :fallback)))
+         (owner (physical-libpq-frozen-profile-from-datum (getf source :owner))))
+    (list :conninfo (physical-libpq-profile-conninfo profile)
+          :fallback (physical-libpq-profile-fallback profile)
+          :owner (physical-libpq-frozen-profile-datum owner))))
+
 (defun physical-follow-cleanup-copy (entry)
   "Check and copy a cleanup endpoint and its immutable request.
 The tuple identifies a pin; it does not authenticate the remote endpoint."
-  (physical-follow-check-plist entry '(:kind :host :port :pin :request))
+  (physical-follow-check-plist
+   entry (if (getf entry :connection) '(:kind :host :port :pin :request :connection)
+             '(:kind :host :port :pin :request)))
   (physical-follow-endpoint-check (getf entry :host) (getf entry :port) (getf entry :pin))
   (let ((kind (getf entry :kind)))
     (unless (member kind '(:follow :bootstrap)) (error "invalid native cleanup kind"))
-    (list :kind kind :host (copy-seq (getf entry :host)) :port (getf entry :port)
-          :pin (copy-seq (getf entry :pin))
-          :request (ecase kind
-                     (:follow (physical-follow-request-copy (getf entry :request)))
-                     (:bootstrap (physical-follow-bootstrap-request-copy (getf entry :request)))))))
+    (let ((result
+            (list :kind kind
+                  :host (copy-seq (getf entry :host))
+                  :port (getf entry :port)
+                  :pin (copy-seq (getf entry :pin))
+                  :request (ecase kind
+                             (:follow (physical-follow-request-copy (getf entry :request)))
+                             (:bootstrap (physical-follow-bootstrap-request-copy
+                                          (getf entry :request)))))))
+      (when (getf entry :connection)
+        (let ((profile (physical-libpq-frozen-profile-from-datum (getf entry :connection))))
+          (multiple-value-bind (host port) (physical-libpq-frozen-display-endpoint profile)
+            (setf (getf result :host) host (getf result :port) port))
+          (setf result (append result (list :connection
+                                            (physical-libpq-frozen-profile-datum profile))))))
+      result)))
+
+(defun physical-follow-cleanup-with-owner (entry source)
+  (physical-follow-cleanup-copy
+   (append entry
+           (when source
+             (list :connection (getf (physical-follow-source-copy source) :owner))))))
 
 (defun physical-follow-controller-copy (state)
   "Check and copy durable controller state. A preparation reserves one queue slot."
-  (physical-follow-check-plist state '(:version :enabled :preparing :cleanup))
+  (physical-follow-check-plist
+   state (if (getf state :source) '(:version :enabled :preparing :cleanup :source)
+             '(:version :enabled :preparing :cleanup)))
   (unless (and (eql 1 (getf state :version)) (member (getf state :enabled) '(nil t))
                (listp (getf state :cleanup)))
     (error "invalid native follow controller state"))
@@ -39,7 +69,9 @@ The tuple identifies a pin; it does not authenticate the remote endpoint."
                  (<= (+ (length queue) (if preparing 1 0)) +physical-follow-cleanup-capacity+)
                  (= (length queue) (length (remove-duplicates queue :test #'equal))))
       (error "native follow cleanup capacity, preparation or duplicate entry is invalid"))
-    (list :version 1 :enabled (getf state :enabled) :preparing preparing :cleanup queue)))
+    (append (list :version 1 :enabled (getf state :enabled) :preparing preparing :cleanup queue)
+            (when (getf state :source)
+              (list :source (physical-follow-source-copy (getf state :source)))))))
 
 (defun physical-follow-cleanup-only-p (config)
   (and (listp config) (= 6 (length config)) (eql 1 (first config))
@@ -47,12 +79,21 @@ The tuple identifies a pin; it does not authenticate the remote endpoint."
 
 (defun physical-follow-effective-config (config)
   (unless (physical-follow-cleanup-only-p config)
-    (subseq config 0 (if (fifth config) 5 4))))
+    (let ((core (subseq config 0 (if (fifth config) 5 4)))
+          (source (when (= 6 (length config)) (getf (sixth config) :source))))
+      (if source
+          (append core (list :source (physical-follow-source-copy source)))
+          core))))
 
 (defun physical-follow-controller-state (config)
   (if (= 6 (length config))
       (physical-follow-controller-copy (sixth config))
       (list :version 1 :enabled t :preparing nil :cleanup nil)))
+
+(defun physical-follow-config-source (config)
+  (when (= 6 (length config))
+    (let ((source (getf (sixth config) :source)))
+      (when source (physical-follow-source-copy source)))))
 
 (defun physical-follow-controller-enabled-p (config)
   (and (not (physical-follow-cleanup-only-p config))
