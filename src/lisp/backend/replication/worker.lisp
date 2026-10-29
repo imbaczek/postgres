@@ -158,14 +158,21 @@
   (format nil "CREATE TABLE IF NOT EXISTS ~a (source_slot varchar PRIMARY KEY, source_host varchar NOT NULL, source_port integer NOT NULL, source_database varchar NOT NULL, table_allowlist varchar NOT NULL)"
           +subscription-config-table+))
 
+(defun logical-subscription-binary-profile-p (options)
+  (and (eq (logical-subscription-options-mode options) :extension)
+       (logical-subscription-options-binary-bytea-p options)
+       (logical-subscription-options-binary-copy-p options)))
+
 (defun logical-subscription-config-values (options)
   (list (logical-subscription-options-source-host options)
         (logical-subscription-options-source-port options)
         (logical-subscription-options-source-database options)
-        (format nil "~{~a~^,~}"
+        (format nil "~{~a~^,~}~a"
                 (sort (copy-list
                        (logical-subscription-options-tables options))
-                      #'string<))))
+                      #'string<)
+                (if (logical-subscription-binary-profile-p options)
+                    "|binary-bytea-v1" ""))))
 
 (defun logical-subscription-config-insert-query (slot options)
   (destructuring-bind (host port database allowlist)
@@ -328,8 +335,11 @@
          (let* ((rows
                   (pg-client-query
                    client
-                   (format nil "CREATE_REPLICATION_SLOT ~a LOGICAL pg_lisp EXPORT_SNAPSHOT"
-                           (logical-subscription-options-slot-name options))))
+                   (format nil "CREATE_REPLICATION_SLOT ~a LOGICAL pg_lisp ~a"
+                           (logical-subscription-options-slot-name options)
+                           (if (logical-subscription-binary-profile-p options)
+                               "(snapshot 'export', binary_bytea 'true')"
+                               "EXPORT_SNAPSHOT"))))
                 (row (first rows)))
            (unless (and row (= (length row) 4) (equal (aref row 3) "pg_lisp")
                         (string= (aref row 0)
@@ -1008,6 +1018,9 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (let ((sql (with-output-to-string (out) (funcall writer out))))
       (make-pg-client-bound-query :sql sql :parameters (coerce *logical-bind-parameters* 'list)))))
 
+(defvar *logical-admission-binary-bytea* nil
+  "Measure bytea as binary for capability-gated admission.")
+
 (defstruct logical-admission-value bytes quotes)
 
 (defun logical-write-value-literal (stream type value &optional (context :pgoutput))
@@ -1112,7 +1125,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
 (defun logical-admission-measure-value (value type)
   "Measure the emitted pgoutput text and SQL quote expansion in bounded blocks."
   (if (eq type :bytea)
-      (make-logical-admission-value :bytes (+ 2 (* 2 (length value))) :quotes 0)
+      (make-logical-admission-value :bytes (if *logical-admission-binary-bytea* (length value) (+ 2 (* 2 (length value)))) :quotes 0)
       (let ((header 4) (bytes 0) (quotes 0))
         (labels ((measure-byte (byte)
                    (if (plusp header)
@@ -1150,10 +1163,10 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
          (count (car *logical-admission-bind-state*))
          (bytes (cdr *logical-admission-bind-state*))
          (parse-size (+ 8 (* 4 count) (logical-utf8-size-bounded sql)))
-         (bind-size (+ 12 (* 4 count) bytes)))
+         (bind-size (+ 12 (* (if *logical-admission-binary-bytea* 6 4) count) bytes)))
     (unless (and (<= count #xffff) (<= parse-size +max-query-message-size+)
                  (<= bind-size +max-query-message-size+))
-      (error "large logical row exceeds subscriber Bind frame limit"))
+      (error 'logical-transport-frame-overflow :format-control "large logical row exceeds subscriber Bind frame limit"))
     bind-size))
 
 (defun logical-validate-large-row-change (change full-new)
@@ -1182,7 +1195,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
            (new (logical-admission-row columns (logical-change-new-values change)))
            (copy-row (logical-admission-row columns full-new)))
       (when (> (+ 4 25 wire-size) +max-query-message-size+)
-        (error "large logical row exceeds the subscriber replication frame limit"))
+        (error 'logical-transport-frame-overflow :format-control "large logical row exceeds the subscriber replication frame limit"))
       (logical-admission-bound-query-size
        (lambda (stream)
          (case (logical-change-kind change)
@@ -1201,7 +1214,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                                                  :type-oid (pgoutput-column-type-oid column)))
                         subscriber-columns)))
           (when (> data-row-size +max-query-message-size+)
-            (error "large logical row exceeds the initial copy frame limit"))
+            (error 'logical-transport-frame-overflow :format-control "large logical row exceeds the initial copy frame limit"))
           (logical-admission-bound-query-size
            (lambda (stream) (logical-write-copy-insert stream name client-columns copy-row)))))))
   (values))

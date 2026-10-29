@@ -221,6 +221,43 @@ or :QUERY-STATE for the wire dispatch's existing reload/shutdown cleanup lane."
 ;; once per XID; arming a slot enables new XIDs before old uncaptured XIDs drain.
 (defvar *logical-capture-xid-modes* (make-hash-table :test #'eql))
 
+(defvar *logical-binary-required-xids* (make-hash-table :test #'eql)
+  "Database OIDs of active XIDs requiring binary bytea; protected by *XID-LOCK*.")
+
+(defun logical-require-binary-bytea-for-xid (xid database-oid)
+  (unless (and (integerp database-oid) (<= 1 database-oid #xffffffff))
+    (error "invalid database OID for binary transport"))
+  (sb-thread:with-mutex (*xid-lock*)
+    (unless (member xid *active-xids* :test #'eql)
+      (error "cannot mark an inactive transaction for binary transport"))
+    (let ((prior (gethash xid *logical-binary-required-xids*)))
+      (when (and prior (/= prior database-oid))
+        (error "binary transport transaction database changed"))
+      (setf (gethash xid *logical-binary-required-xids*) database-oid)))
+  (values))
+
+(declaim (special *logical-capture-arming*))
+
+(defun wal-validate-logical-binary-capability-under-lock (xid)
+  "Reject incompatible live slots before beginning XID's WAL publication."
+  (multiple-value-bind (database-oid slot-creation-p)
+      (sb-thread:with-mutex (*xid-lock*)
+        (values (gethash xid *logical-binary-required-xids*)
+                (plusp (hash-table-count *logical-capture-arming*))))
+    (when database-oid
+      (when slot-creation-p
+        (wal-invalid-input "replication slot creation conflicts with binary-only bytea transaction"))
+      (maphash
+       (lambda (name slot)
+         (declare (ignore name))
+         (when (and (eq (wal-replication-slot-wal-status slot) :reserved)
+                    (or (null (wal-replication-slot-database-oid slot))
+                        (= database-oid (wal-replication-slot-database-oid slot)))
+                    (not (eq (wal-slot-profile slot) :binary-bytea)))
+           (wal-invalid-input "active replication slot cannot receive binary-only bytea")))
+       *wal-replication-slots*)))
+  (values))
+
 (defvar *logical-capture-arming* (make-hash-table :test #'eq))
 
 (defvar *logical-capture-live-slots* nil
@@ -1009,7 +1046,8 @@ XID lock.  Relation waiters are notified after the registrations are removed."
       ;; WAL snapshot-boundary state shares the XID lock so removal from the
       ;; active set and removal of its retained LSN remain one atomic change.
       (wal-forget-xid-under-xid-lock xid)
-      (remhash xid *logical-capture-xid-modes*))
+      (remhash xid *logical-capture-xid-modes*)
+      (remhash xid *logical-binary-required-xids*))
     (dolist (registrations (list *relation-writers* *relation-readers*))
       (let ((empty-relations '()))
         (maphash (lambda (relfilenode xids)
@@ -1267,6 +1305,7 @@ excluded, so a sequence advance before slot publication remains streamable."
                :database-oid database-oid
                :active-owner active-owner
                :active-owner-backend (and active-owner *backend*))))
+    (wal-slot-set-initial-profile slot *wal-new-slot-profile*)
     ;; Reserve the in-memory pin before slot-file I/O. If atomic replace has
     ;; renamed the file but directory fsync fails, retain the pin: startup may
     ;; still observe that file and will require its WAL.

@@ -63,6 +63,35 @@
   (pending-xids (make-hash-table :test #'eql))
   (wal-status :reserved))
 
+(declaim (special *wal-replication-slots*))
+
+(defvar *wal-slot-profiles* (make-hash-table :test #'eq :weakness :key :synchronized t)
+  "Immutable transport profiles; synchronized for readers outside *WAL-LOCK*.")
+
+(defvar *wal-new-slot-profile* :text
+  "Transport profile selected for the current slot-creation operation.")
+
+(defun wal-slot-profile (slot)
+  (gethash slot *wal-slot-profiles* :text))
+
+(defun wal-slot-set-initial-profile (slot profile)
+  "Set a profile before SLOT is published; never mutate an existing profile."
+  (unless (member profile '(:text :binary-bytea))
+    (error "invalid replication slot transport profile ~s" profile))
+  (when (or (nth-value 1 (gethash slot *wal-slot-profiles*))
+            (and (boundp '*wal-replication-slots*)
+                 (eq slot (gethash (wal-replication-slot-name slot) *wal-replication-slots*))))
+    (error "replication slot transport profile is already initialized or published"))
+  (setf (gethash slot *wal-slot-profiles*) profile)
+  slot)
+
+(defun wal-copy-replication-slot-with-profile (slot)
+  "Copy a slot while preserving its immutable durable transport profile."
+  (let ((copy (copy-wal-replication-slot slot)))
+    (unless (eq (wal-slot-profile slot) :text)
+      (wal-slot-set-initial-profile copy (wal-slot-profile slot)))
+    copy))
+
 (defun wal-valid-slot-plugin-state-p (plugin database-oid confirmed-flush-lsn)
   "A standard slot must be database-bound and confirmed in its first durable image."
   (and (stringp plugin)
@@ -1235,12 +1264,15 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
          (if (logbitp 63 value) (- value (ash 1 64)) value)))
     (otherwise (error "WAL commit record has an invalid payload"))))
 
+(declaim (ftype function wal-validate-logical-binary-capability-under-lock))
+
 (defun wal-commit-transaction (xid after-durable-function &optional logical-changes)
   "Flush page images, LOGICAL-CHANGES, and XID's commit as one WAL boundary."
   (unless *wal-ready*
     (funcall after-durable-function)
     (return-from wal-commit-transaction (values)))
   (with-wal-critical
+    (wal-validate-logical-binary-capability-under-lock xid)
     (let ((keys (wal-primary-page-keys)) (split-p *wal-pending-btree-split*))
       (wal-primary-preflight-page-keys keys)
       (with-wal-primary-page-spool (spool)
@@ -2075,7 +2107,8 @@ src/backend/access/transam/xlogreader.c."
          (consistent-lsn (wal-replication-slot-consistent-lsn slot))
          (confirmed-flush-lsn (wal-replication-slot-confirmed-flush-lsn slot))
          (wal-status (wal-replication-slot-wal-status slot))
-         (plugin (wal-replication-slot-plugin slot)))
+         (plugin (wal-replication-slot-plugin slot))
+         (profile (wal-slot-profile slot)))
     (unless (and (wal-valid-replication-slot-name-p name)
                  (wal-valid-slot-plugin-state-p plugin database-oid confirmed-flush-lsn)
                  (or (null database-oid)
@@ -2087,12 +2120,16 @@ src/backend/access/transam/xlogreader.c."
                           (<= consistent-lsn confirmed-flush-lsn #xffffffffffffffff)
                           (<= restart-lsn confirmed-flush-lsn)))
                  (or confirmed-flush-lsn (<= restart-lsn consistent-lsn))
-                 (member wal-status '(:reserved :lost)))
+                 (member wal-status '(:reserved :lost))
+                 (member profile '(:text :binary-bytea))
+                 (or (eq profile :text) (and database-oid (string= plugin "pg_lisp"))))
       (error "invalid WAL replication slot state ~s" slot))
-    (let* ((prefix (format nil "PGSLOT4 ~a ~a ~a ~a ~a ~a ~a"
+    (let* ((prefix (format nil "~a ~a ~a ~a ~a ~a ~a ~a~a"
+                           (if (eq profile :text) "PGSLOT4" "PGSLOT5")
                            name (or database-oid "-") restart-lsn consistent-lsn
                            (or confirmed-flush-lsn "-")
-                           (string-downcase (symbol-name wal-status)) plugin))
+                           (string-downcase (symbol-name wal-status)) plugin
+                           (if (eq profile :text) "" " binary-bytea")))
            (crc (wal-crc32 (string->bytes prefix))))
       (string->bytes (format nil "~a ~8,'0X~%" prefix crc)))))
 
@@ -2133,8 +2170,9 @@ src/backend/access/transam/xlogreader.c."
            (legacy-v2-p (equal version "PGSLOT2"))
            (v3-p (equal version "PGSLOT3"))
            (v4-p (equal version "PGSLOT4"))
-           (expected-count (cond (legacy-v1-p 5) (legacy-v2-p 7) (v3-p 8) (v4-p 9)))
-           (database-index (when (or v3-p v4-p) 2))
+           (v5-p (equal version "PGSLOT5"))
+           (expected-count (cond (legacy-v1-p 5) (legacy-v2-p 7) (v3-p 8) (v4-p 9) (v5-p 10)))
+           (database-index (when (or v3-p v4-p v5-p) 2))
            (restart-index (if database-index 3 2))
            (consistent-index (1+ restart-index))
            (confirmed-index (unless legacy-v1-p (+ restart-index 2)))
@@ -2158,7 +2196,8 @@ src/backend/access/transam/xlogreader.c."
              (wal-status (cond ((string= status-text "reserved") :reserved)
                                ((string= status-text "lost") :lost)))
              ;; Every older format was the private extension protocol.
-             (plugin (if v4-p (nth 7 fields) "pg_lisp"))
+             (plugin (if (or v4-p v5-p) (nth 7 fields) "pg_lisp"))
+             (profile (if v5-p (nth 8 fields) "text"))
              (prefix (format nil "~{~a~^ ~}" (butlast fields)))
              (crc (ignore-errors (parse-integer (car (last fields)) :radix 16))))
         (unless (and (wal-valid-replication-slot-name-p name)
@@ -2166,6 +2205,8 @@ src/backend/access/transam/xlogreader.c."
                      restart-lsn consistent-lsn crc wal-status database-valid-p
                      (or legacy-v1-p (string= confirmed-text "-") confirmed-flush-lsn)
                      (wal-valid-slot-plugin-state-p plugin database-oid confirmed-flush-lsn)
+                     (or (and (not v5-p) (string= profile "text"))
+                         (and v5-p database-oid (string= profile "binary-bytea") (string= plugin "pg_lisp")))
                      (<= 0 restart-lsn *wal-durable-lsn* #xffffffffffffffff)
                      (<= 0 consistent-lsn *wal-durable-lsn* #xffffffffffffffff)
                      (or (null confirmed-flush-lsn)
@@ -2174,10 +2215,12 @@ src/backend/access/transam/xlogreader.c."
                      (or confirmed-flush-lsn (<= restart-lsn consistent-lsn))
                      (= crc (wal-crc32 (string->bytes prefix))))
           (error "replication slot file ~a is corrupt or outside durable WAL" path))
-        (make-wal-replication-slot
-         :name name :database-oid database-oid :restart-lsn restart-lsn
-         :consistent-lsn consistent-lsn :confirmed-flush-lsn confirmed-flush-lsn
-         :wal-status wal-status :plugin plugin)))))
+        (let ((slot (make-wal-replication-slot
+                     :name name :database-oid database-oid :restart-lsn restart-lsn
+                     :consistent-lsn consistent-lsn :confirmed-flush-lsn confirmed-flush-lsn
+                     :wal-status wal-status :plugin plugin)))
+          (when v5-p (wal-slot-set-initial-profile slot :binary-bytea))
+          slot)))))
 
 (defun wal-validate-replication-slot-wal (slot segments)
   (let ((restart-lsn (wal-replication-slot-restart-lsn slot)))
@@ -2295,7 +2338,7 @@ src/backend/access/transam/xlogreader.c."
   "Persist an already-validated slot acknowledgment while *WAL-LOCK* is held."
   (let* ((pending (wal-slot-pending-after-ack slot acknowledged-lsn))
          (restart-lsn (wal-slot-restart-for-ack restart-floor pending))
-         (candidate (copy-wal-replication-slot slot)))
+         (candidate (wal-copy-replication-slot-with-profile slot)))
     (setf (wal-replication-slot-confirmed-flush-lsn candidate) acknowledged-lsn
           (wal-replication-slot-restart-lsn candidate) restart-lsn
           (wal-replication-slot-pending-xids candidate) pending)

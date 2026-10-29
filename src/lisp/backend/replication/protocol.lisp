@@ -112,7 +112,7 @@
                               ((string-equal word "TWO_PHASE") (cons "two_phase" nil))
                               ((string-equal word "RESERVE_WAL") (cons "reserve_wal" nil))
                               (t (ereport "42601" "invalid replication slot option"))))))
-        (seen nil) (snapshot :export))
+        (seen nil) (snapshot :export) (binary-bytea nil))
     (dolist (option options)
       (let ((name (car option)) (word (cdr option)))
         (when (member name seen :test #'equal)
@@ -130,10 +130,12 @@
           ((member name '("two_phase" "failover") :test #'equal)
            (when (replication-option-boolean name word)
              (ereport "0A000" "~a slots are not supported" name)))
+          ((equal name "binary_bytea")
+           (setf binary-bytea (replication-option-boolean name word)))
           ((equal name "reserve_wal")
            (ereport "42601" "reserve_wal is only valid for physical slots"))
           (t (ereport "42601" "unrecognized replication slot option ~a" name)))))
-    snapshot))
+    (values snapshot binary-bytea)))
 
 (defun parse-create-replication-slot (words)
   (let* ((slot-name (replication-command-identifier (second words)))
@@ -144,14 +146,18 @@
       (ereport "42601" "expected LOGICAL and an output plugin"))
     (unless (wal-valid-replication-slot-name-p slot-name)
       (ereport "42602" "invalid replication slot name ~s" slot-name))
-    (let* ((plugin (replication-command-identifier (second remaining)))
-           (snapshot (parse-create-slot-options (cddr remaining))))
-      (unless (member plugin '("pgoutput" "pg_lisp") :test #'equal)
-        (ereport "0A000" "unsupported output plugin ~s" plugin))
-      (when (and (equal plugin "pg_lisp") (not (eq snapshot :export)))
-        (ereport "0A000" "pg_lisp slots require an exported snapshot"))
-      (make-logical-replication-command
-       :type :create :slot-name slot-name :plugin plugin :snapshot-action snapshot))))
+    (let ((plugin (replication-command-identifier (second remaining))))
+      (multiple-value-bind (snapshot binary-bytea)
+          (parse-create-slot-options (cddr remaining))
+        (unless (member plugin '("pgoutput" "pg_lisp") :test #'equal)
+          (ereport "0A000" "unsupported output plugin ~s" plugin))
+        (when (and (equal plugin "pg_lisp") (not (eq snapshot :export)))
+          (ereport "0A000" "pg_lisp slots require an exported snapshot"))
+        (when (and binary-bytea (not (equal plugin "pg_lisp")))
+          (ereport "0A000" "binary_bytea slot profile requires pg_lisp"))
+        (make-logical-replication-command
+         :type :create :slot-name slot-name :plugin plugin :snapshot-action snapshot
+         :options (when binary-bytea (list (cons "binary_bytea" t))))))))
 
 (defun parse-replication-lsn (text)
   (let ((slash (position #\/ text)))
@@ -810,6 +816,13 @@ keepalive's WAL-end field, which may include changes not yet applied."
         (lambda (slot)
           (unless (equal (wal-replication-slot-plugin slot) "pg_lisp")
             (ereport "0A000" "standard pgoutput streaming is not implemented"))
+          (when (eq (wal-slot-profile slot) :binary-bytea)
+            (let ((option (and command
+                               (assoc "binary_bytea"
+                                      (logical-replication-command-options command)
+                                      :test #'equal))))
+              (unless (and option (replication-option-boolean "binary_bytea" (cdr option)))
+                (ereport "0A000" "replication slot requires binary bytea transport"))))
           (let ((initial-copy-p
                   (null (wal-replication-slot-confirmed-flush-lsn slot))))
             (wal-logical-slot-validate-start-position
@@ -903,7 +916,10 @@ keepalive's WAL-end field, which may include changes not yet applied."
 (defun create-replication-slot-command (stream command)
   (let ((name (logical-replication-command-slot-name command))
         (plugin (logical-replication-command-plugin command))
-        (snapshot (logical-replication-command-snapshot-action command)))
+        (snapshot (logical-replication-command-snapshot-action command))
+        (*wal-new-slot-profile*
+          (if (assoc "binary_bytea" (logical-replication-command-options command) :test #'equal)
+              :binary-bytea :text)))
     ;; Drain uncaptured XIDs before taking the lifecycle mutex: an older writer
     ;; may itself need that mutex before it can finish.
     (call-with-logical-capture-armed

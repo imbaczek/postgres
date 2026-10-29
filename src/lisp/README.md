@@ -651,6 +651,15 @@ as a writer or changed by row, TRUNCATE or sequence work, and rejects a wait
 that would deadlock on its retained schema lease. Dropping or losing the last
 slot permits new transactions to skip capture; already captured transactions
 remain captured. Unknown capture state is handled conservatively.
+In extension mode, combining `--binary-bytea` and `--binary-copy` creates a
+durable binary-bytea-only slot profile and records the subscription configuration
+for restart; reconnecting that slot requires binary bytea streaming. When a row
+fits binary transport but not text transport, admission requires that profile.
+Before publishing the transaction's WAL, a commit fence rejects it if an
+incompatible live slot exists or slot creation is armed, conservatively avoiding
+an incompatible concurrent subscriber. A later text-profile initial copy can
+still fail on a large bytea already stored before that slot was created. The
+128 MiB captured row event and 132 MiB frame limits remain in force.
 Initial copy batches rows to an 8 MiB target; a larger row uses a separate
 transaction and must still fit the source/target protocol and logical WAL limits.
 For extension-mode initial copy, each target INSERT uses typed Bind parameters
@@ -811,8 +820,9 @@ bytea streaming from a supporting pg-lisp source. Older sources that do not
 recognize the option fail rather than silently switching formats. Separately,
 `--binary-copy` requests binary bytea and text for other columns through an
 extended SELECT during initial copy. It works with the native private snapshot
-and with C standard sources using an exported snapshot bridge; native standard
-snapshot export is not supported. This is not binary COPY and does not request
+and with C standard sources using an exported snapshot bridge. Standard mode
+requires source `pg_export_snapshot()`, which native pgoutput does not implement.
+This is not binary COPY and does not request
 arbitrary C global binary output or change admission and copy limits. DDL/sequence
 automation remains in extension mode. UPDATE messages may omit unchanged
 out-of-line values; the subscriber preserves those values on the target. Row

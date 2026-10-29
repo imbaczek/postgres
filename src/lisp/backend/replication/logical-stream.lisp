@@ -26,6 +26,8 @@
 (defconstant +logical-unchanged-toast+ :logical-unchanged-toast
   "Internal row-codec marker for an unchanged external non-key value.")
 
+(define-condition logical-transport-frame-overflow (simple-error) ())
+
 (defstruct logical-change
   kind database-oid relation-oid relation-name columns key-attnums
   old-values new-values event-payload (publication-selection :unknown))
@@ -1207,6 +1209,8 @@ Other types retain their normal semantic checks and may allocate their values."
 
 (declaim (ftype function logical-validate-large-row-change))
 
+(declaim (special *logical-admission-binary-bytea* *pgoutput-binary-bytea*))
+
 (defun logical-note-row-change (kind table &key old-values new-values toast-reuse (publication-selection :unknown))
   "Capture a successful executor row operation for its current transaction.
 
@@ -1244,7 +1248,14 @@ executor, so capture the same operation before transaction commit."
        *backend* change limit
        :after-measure (lambda (size)
                         (when (> size +max-logical-transaction-bytes+)
-                          (logical-validate-large-row-change change new-values))))))
+                          (handler-case
+                              (logical-validate-large-row-change change new-values)
+                            (logical-transport-frame-overflow ()
+                              (let ((*logical-admission-binary-bytea* t)
+                                    (*pgoutput-binary-bytea* t))
+                                (logical-validate-large-row-change change new-values))
+                              (logical-require-binary-bytea-for-xid
+                               (backend-xid *backend*) (logical-change-database-oid change)))))))))
   (values))
 
 (defun logical-encode-chunk (index count events)

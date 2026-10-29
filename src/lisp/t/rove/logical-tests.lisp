@@ -1177,6 +1177,40 @@
       (rove:ok (null (logical-note-transaction-event :invalid nil)))
       (rove:ok (null (backend-logical-spool *backend*)))))
 
+(rove:deftest test-binary-capability-commit-fence
+    (let* ((*active-xids* (list 101))
+           (*logical-binary-required-xids* (make-hash-table :test #'eql))
+           (*logical-capture-arming* (make-hash-table :test #'eq))
+           (*wal-replication-slots* (make-hash-table :test #'equal))
+           (*wal-ready* t)
+           (*wal-end-lsn* 123)
+           (*wal-durable-lsn* 100)
+           (*wal-poisoned* nil)
+           (slot (make-wal-replication-slot :name "text_slot" :database-oid 42
+                                            :restart-lsn 0 :consistent-lsn 0))
+           (committed nil))
+      (logical-require-binary-bytea-for-xid 101 42)
+      (setf (gethash "text_slot" *wal-replication-slots*) slot)
+      (rove:ok (handler-case
+                   (progn (wal-commit-transaction 101 (lambda () (setf committed t))) nil)
+                 (wal-input-validation-error () t)))
+      (rove:ok (and (not committed) (not *wal-poisoned*)
+                    (= *wal-end-lsn* 123) (= *wal-durable-lsn* 100)))
+      (remhash "text_slot" *wal-replication-slots*)
+      (let ((arm (gensym)))
+        (setf (gethash arm *logical-capture-arming*) t)
+        (rove:ok (handler-case (progn (wal-validate-logical-binary-capability-under-lock 101) nil)
+                   (wal-input-validation-error () t)))
+        (remhash arm *logical-capture-arming*))
+      (let ((other (make-wal-replication-slot :name "other" :database-oid 43
+                                              :restart-lsn 0 :consistent-lsn 0)))
+        (setf (gethash "other" *wal-replication-slots*) other)
+        (rove:ok (not (handler-case (progn (wal-validate-logical-binary-capability-under-lock 101) nil)
+                        (error () t))))
+        (setf (wal-replication-slot-database-oid other) nil)
+        (rove:ok (handler-case (progn (wal-validate-logical-binary-capability-under-lock 101) nil)
+                   (wal-input-validation-error () t))))))
+
 (rove:deftest test-logical-capture-gate-unknown-mirror-captures
     (let ((*logical-capture-xid-modes* (make-hash-table :test #'eql))
           (*logical-capture-arming* (make-hash-table :test #'eq))
@@ -3656,6 +3690,25 @@
                      nil)
                  (error () t))
                "a replacement publisher incarnation cannot reuse the old event marker")))
+
+(rove:deftest test-binary-profile-resume-rejects-downgrade
+    (let* ((options (make-logical-subscription-options :slot-name "s" :tables '("t")
+                                                       :source-identity "cluster"
+                                                       :binary-bytea-p t))
+           (progress '(:state "ready"))
+           (config (list :source-host "127.0.0.1" :source-port 5433
+                         :source-database "postgres" :source-identity "cluster"
+                         :table-allowlist "t|binary-bytea-v1")))
+      (setf (logical-subscription-options-binary-copy-p options) t)
+      (rove:ok (not (handler-case (progn (logical-validate-resume-config options progress config) nil)
+                      (error () t))))
+      (setf (logical-subscription-options-binary-bytea-p options) nil)
+      (rove:ok (handler-case (progn (logical-validate-resume-config options progress config) nil)
+                 (error () t)))
+      (setf (logical-subscription-options-binary-bytea-p options) t
+            (logical-subscription-options-binary-copy-p options) nil)
+      (rove:ok (handler-case (progn (logical-validate-resume-config options progress config) nil)
+                 (error () t)))))
 
 (rove:deftest test-logical-spool-spills-and-cleans-up
     (let* ((directory (merge-pathnames

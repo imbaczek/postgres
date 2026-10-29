@@ -12,7 +12,7 @@
                   (> (- *wal-durable-lsn*
                         (wal-replication-slot-restart-lsn slot))
                      *max-slot-wal-keep-bytes*))
-         (let ((candidate (copy-wal-replication-slot slot)))
+         (let ((candidate (wal-copy-replication-slot-with-profile slot)))
            (setf (wal-replication-slot-wal-status candidate) :lost
                  (wal-replication-slot-pending-xids candidate)
                  (make-hash-table :test #'eql))

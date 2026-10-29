@@ -317,6 +317,65 @@
                    (error () t))))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(deftest slot-binary-profile-durable-and-fail-closed
+    (let* ((directory (merge-pathnames (format nil "pg-slot-profile-~a/" (gensym))
+                                       (uiop:temporary-directory)))
+           (path (merge-pathnames "codec_slot.slot" directory))
+           (pg::*wal-durable-lsn* 1000)
+           (slot (pg::make-wal-replication-slot :name "codec_slot" :database-oid 16384
+                                                :restart-lsn 100 :consistent-lsn 200)))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (ok (eq :text (pg::wal-slot-profile slot)))
+             (pg::wal-slot-set-initial-profile slot :binary-bytea)
+             (ok (handler-case (progn (pg::wal-slot-set-initial-profile slot :text) nil) (error () t)))
+             (with-open-file (stream path :direction :output :if-exists :supersede
+                                          :element-type '(unsigned-byte 8))
+               (write-sequence (pg::wal-encode-replication-slot slot) stream))
+             (ok (eq :binary-bytea (pg::wal-slot-profile (pg::wal-read-replication-slot path))))
+             (dolist (prefix '("PGSLOT5 codec_slot 16384 100 200 - reserved pg_lisp unknown"
+                               "PGSLOT5 codec_slot 16384 100 200 200 reserved pgoutput binary-bytea"))
+               (with-open-file (stream path :direction :output :if-exists :supersede)
+                 (format stream "~a ~8,'0X~%" prefix (pg::wal-crc32 (pg::string->bytes prefix))))
+               (ok (handler-case (progn (pg::wal-read-replication-slot path) nil) (error () t)))))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest slot-binary-profile-survives-ack-and-loss
+    (let* ((slot (pg::make-wal-replication-slot :name "binary_slot" :database-oid 16384
+                                                :restart-lsn 100 :consistent-lsn 200))
+           (old-save (symbol-function 'pg::wal-save-replication-slot))
+           (saved nil)
+           (pg::*wal-durable-lsn* 1000)
+           (pg::*logical-capture-live-slots* nil)
+           (pg::*max-slot-wal-keep-bytes* 1)
+           (pg::*wal-replication-slots* (make-hash-table :test #'equal)))
+      (pg::wal-slot-set-initial-profile slot :binary-bytea)
+      (setf (gethash "binary_slot" pg::*wal-replication-slots*) slot)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::wal-save-replication-slot)
+                   (lambda (candidate)
+                     (push (pg::bytes->string (pg::wal-encode-replication-slot candidate)) saved)))
+             (pg::wal-persist-replication-slot-ack-under-lock slot 200)
+             (pg::wal-invalidate-lagging-replication-slots-under-wal-lock)
+             (ok (= 2 (length saved)))
+             (ok (every (lambda (line) (and (search "PGSLOT5 " line)
+                                            (search " binary-bytea " line))) saved))
+             (ok (eq :lost (pg::wal-replication-slot-wal-status slot))))
+        (setf (symbol-function 'pg::wal-save-replication-slot) old-save))))
+
+(deftest slot-binary-profile-create-parsing
+    (let ((command (pg::parse-replication-command
+                    "CREATE_REPLICATION_SLOT bin_slot LOGICAL pg_lisp (snapshot 'export', binary_bytea 'true')")))
+      (ok (assoc "binary_bytea" (pg::logical-replication-command-options command) :test #'equal))
+      (ok (eq :export (pg::logical-replication-command-snapshot-action command))))
+  (ok (handler-case
+          (progn (pg::parse-replication-command
+                  "CREATE_REPLICATION_SLOT bin_slot LOGICAL pgoutput (snapshot 'export', binary_bytea 'true')")
+                 nil)
+        (pg::pg-error () t))))
+
 (defun call-with-publication-srf-fixture (function)
   (let* ((pg::*backend* (pg::make-backend))
          (pg::*catalog* (pg::make-catalog))
