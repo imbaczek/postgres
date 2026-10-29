@@ -26,14 +26,17 @@ symlink or block opening a FIFO. The caller owns and must close the stream."
            (values stream size))
       (unless stream (sb-posix:close fd)))))
 
-(defun read-bounded-regular-file (path maximum &key (minimum 0))
+(defun read-bounded-regular-file (path maximum &key (minimum 0) stabilize)
   "Read the descriptor's checked byte count, enforcing MINIMUM and MAXIMUM.
 Reject a short read and close the stream on every exit. Callers that need a
 coherent view across atomic publications must compare their control images."
-  (multiple-value-bind (stream size) (open-bounded-regular-file path maximum)
+  (multiple-value-bind (stream size) (open-bounded-regular-file path maximum stabilize)
     (unwind-protect
          (progn
            (unless (<= minimum size) (error "invalid regular metadata length: ~a" path))
+           (when stabilize
+             (fsync-stream stream)
+             (fsync-directory (uiop:pathname-directory-pathname path)))
            (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
              (unless (= size (read-sequence bytes stream)) (error "short regular file read: ~a" path))
              bytes))
@@ -109,6 +112,17 @@ error is reported rather than returning a partial inventory."
                    unless (member item '("." "..") :test #'string=)
                      collect item)
           (sb-posix:closedir directory))))))
+
+(defun durable-state-file-paths (directory type)
+  (let ((entries (directory-entry-names directory)))
+    (handler-case (fsync-directory directory)
+      (sb-posix:syscall-error (condition)
+        (if (and (= (sb-posix:syscall-errno condition) sb-posix:enoent) (null entries))
+            (fsync-directory (uiop:pathname-parent-directory-pathname directory))
+            (error condition))))
+    (loop for name in (sort entries #'string<)
+          when (equal (pathname-type name) type)
+            collect (merge-pathnames name directory))))
 
 (defvar *logical-test-failpoint-hook* nil)
 

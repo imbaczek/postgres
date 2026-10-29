@@ -207,8 +207,8 @@ A standby may have only the durable pin; a primary requires registry agreement."
            (wal-invalid-input "registered and durable physical pin payloads differ"))
          (values (or pin disk) disk))))))
 
-(defun physical-source-pin-read (path)
-  (let ((bytes (read-bounded-regular-file path (physical-follow-pin-image-limit))))
+(defun physical-source-pin-read (path &key stabilize)
+  (let ((bytes (read-bounded-regular-file path (physical-follow-pin-image-limit) :stabilize stabilize)))
     (if (physical-follow-pin-image-p bytes)
         (let ((pin (physical-follow-pin-decode bytes)))
           (unless (equal (physical-source-pin-name pin) (pathname-name path))
@@ -274,8 +274,8 @@ Publish the in-memory binding only after saving the candidate pin."
   (with-write-lock
     (with-wal-critical
       (let ((candidates (make-hash-table :test #'equal)))
-        (dolist (path (directory (merge-pathnames "*.pin" (physical-source-pin-directory))))
-          (let* ((pin (physical-source-pin-read path))
+        (dolist (path (durable-state-file-paths (physical-source-pin-directory) "pin"))
+          (let* ((pin (physical-source-pin-read path :stabilize t))
                  (name (physical-source-pin-name pin)))
             (when (gethash name candidates)
               (error "duplicate physical source pin ~a" name))

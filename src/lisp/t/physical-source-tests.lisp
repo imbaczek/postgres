@@ -113,6 +113,66 @@
          (ok (pg::physical-source-pin-lost-p (gethash "lagged" pg::*physical-source-pins*)))
          (ok (zerop (hash-table-count pg::*wal-snapshot-retention-pins*)))))))
 
+(deftest private-proof-startup-stabilizes-before-replacing-retention
+    (dolist (failure '(nil :file :directory))
+      (call-with-physical-source-fixture
+       (lambda ()
+         (let* ((pin (pg::physical-source-pin-create "startup_sync"))
+                (old-table pg::*physical-source-pins*)
+                (floor (pg::physical-source-pin-restart-lsn pin)))
+           (call-with-metadata-sync-observer
+            (lambda (events streams)
+              (pg::physical-source-pin-read (pg::physical-source-pin-path "startup_sync"))
+              (ok (null (car events)))
+              (if failure
+                  (progn
+                    (ok (intake-fails-p #'pg::physical-source-pin-load))
+                    (ok pg::*wal-poisoned*)
+                    (ok (eq old-table pg::*physical-source-pins*))
+                    (ok (= floor (gethash pin pg::*wal-snapshot-retention-pins*))))
+                  (progn
+                    (pg::physical-source-pin-load)
+                    (ok (not (eq old-table pg::*physical-source-pins*)))
+                    (ok (equal '(:directory :file :directory) (mapcar #'first (reverse (car events)))))
+                    (let ((loaded (gethash "startup_sync" pg::*physical-source-pins*)))
+                      (ok (not (eq pin loaded)))
+                      (ok (= floor (gethash loaded pg::*wal-snapshot-retention-pins*))))
+                    (ok (null (gethash pin pg::*wal-snapshot-retention-pins*)))))
+              (ok (every (complement #'open-stream-p) (car streams))))
+            :fail-at failure
+            :before-sync (lambda (stage)
+                           (declare (ignore stage))
+                           (ok (eq old-table pg::*physical-source-pins*))
+                           (ok (= floor (gethash pin pg::*wal-snapshot-retention-pins*))))))))))
+
+(deftest empty-private-proof-inventory-stabilizes-deletion-before-dropping-floor
+    (dolist (failure '(nil :directory))
+      (call-with-physical-source-fixture
+       (lambda ()
+         (let* ((pin (pg::physical-source-pin-create "removed_sync"))
+                (old-table pg::*physical-source-pins*)
+                (floor (pg::physical-source-pin-restart-lsn pin)))
+           (delete-file (pg::physical-source-pin-path "removed_sync"))
+           (call-with-metadata-sync-observer
+            (lambda (events streams)
+              (if failure
+                  (progn
+                    (ok (intake-fails-p #'pg::physical-source-pin-load))
+                    (ok pg::*wal-poisoned*)
+                    (ok (eq old-table pg::*physical-source-pins*))
+                    (ok (= floor (gethash pin pg::*wal-snapshot-retention-pins*))))
+                  (progn
+                    (pg::physical-source-pin-load)
+                    (ok (zerop (hash-table-count pg::*physical-source-pins*)))
+                    (ok (null (gethash pin pg::*wal-snapshot-retention-pins*)))))
+              (ok (equal '(:directory) (mapcar #'first (reverse (car events)))))
+              (ok (null (car streams))))
+            :fail-at failure
+            :before-sync (lambda (stage)
+                           (declare (ignore stage))
+                           (ok (eq old-table pg::*physical-source-pins*))
+                           (ok (= floor (gethash pin pg::*wal-snapshot-retention-pins*))))))))))
+
 (deftest physical-source-retention-survives-reload
     (call-with-physical-source-fixture
      (lambda ()

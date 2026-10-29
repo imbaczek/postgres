@@ -2308,9 +2308,9 @@ Use 1 GiB when no policy is installed."
         while end
         do (setf start (1+ end))))
 
-(defun wal-read-replication-slot (path)
+(defun wal-read-replication-slot (path &key stabilize)
   "Dispatch physical images to their codec and read legacy logical formats."
-  (let ((bytes (read-bounded-regular-file path 2048)))
+  (let ((bytes (read-bounded-regular-file path 2048 :stabilize stabilize)))
     (when (physical-slot-image-p bytes)
       (return-from wal-read-replication-slot
         (physical-slot-decode bytes (pathname-name path))))
@@ -2607,10 +2607,8 @@ recovery is unsupported. Standby loading requires startup quiescence."
   (let ((segments (wal-discover-segments))
         (inactive-since (postgres-current-timestamp)))
     (clrhash *wal-replication-slots*)
-    (dolist (path (directory
-                   (merge-pathnames "*.slot"
-                                    (wal-replication-slot-directory))))
-      (let* ((slot (wal-read-replication-slot path))
+    (dolist (path (durable-state-file-paths (wal-replication-slot-directory) "slot"))
+      (let* ((slot (wal-read-replication-slot path :stabilize t))
              (name (wal-replication-slot-name slot)))
         (when (gethash name *wal-replication-slots*)
           (error "duplicate WAL replication slot ~a" name))

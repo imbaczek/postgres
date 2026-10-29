@@ -137,6 +137,162 @@
         (delete-file (pg::catalog-path))
         (ok (signals (pg::wal-load-replication-slots) 'error)))))
 
+(defun call-with-metadata-sync-observer (function &key fail-at before-sync)
+  (let* ((file-sync (symbol-function 'pg::fsync-stream))
+         (directory-sync (symbol-function 'pg::fsync-directory))
+         (events (list nil)) (streams (list nil)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'pg::fsync-stream)
+                 (lambda (stream)
+                   (push (list :file (sb-posix:stat-ino (sb-posix:fstat (sb-sys:fd-stream-fd stream))))
+                         (car events))
+                   (push stream (car streams))
+                   (when before-sync (funcall before-sync :file))
+                   (when (eq fail-at :file) (error "injected metadata file sync failure"))
+                   (funcall file-sync stream))
+                 (symbol-function 'pg::fsync-directory)
+                 (lambda (directory)
+                   (push (list :directory directory) (car events))
+                   (when before-sync (funcall before-sync :directory))
+                   (when (eq fail-at :directory) (error "injected metadata directory sync failure"))
+                   (funcall directory-sync directory)))
+           (funcall function events streams))
+      (setf (symbol-function 'pg::fsync-stream) file-sync
+            (symbol-function 'pg::fsync-directory) directory-sync))))
+
+(deftest selected-metadata-stabilization-syncs-the-opened-inode-before-return
+    (with-physical-store-directory (root)
+      (let* ((path (merge-pathnames "selected.state" root))
+             (bytes (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3))))
+        (pg::wal-atomic-write-bytes path bytes)
+        (call-with-metadata-sync-observer
+         (lambda (events streams)
+           (ok (equalp bytes (pg::read-bounded-regular-file path 3)))
+           (ok (null (car events)))
+           (ok (equalp bytes (pg::read-bounded-regular-file path 3 :stabilize t)))
+           (ok (equal (list (list :file (sb-posix:stat-ino (sb-posix:stat path)))
+                            (list :directory root))
+                      (reverse (car events))))
+           (ok (every (complement #'open-stream-p) (car streams))))))))
+
+(deftest selected-metadata-sync-failure-closes-the-descriptor
+    (dolist (stage '(:file :directory))
+      (with-physical-store-directory (root)
+        (let ((path (merge-pathnames "selected.state" root)))
+          (pg::wal-atomic-write-bytes path (make-array 1 :element-type '(unsigned-byte 8)))
+          (call-with-metadata-sync-observer
+           (lambda (events streams)
+             (ok (intake-fails-p
+                  (lambda () (pg::read-bounded-regular-file path 1 :stabilize t))))
+             (ok (= (if (eq stage :file) 1 2) (length (car events))))
+             (ok (= 1 (length (car streams))))
+             (ok (every (complement #'open-stream-p) (car streams))))
+           :fail-at stage)))))
+
+(deftest public-slot-startup-stabilizes-before-publishing-retention
+    (dolist (failure '(nil :file :directory :second-file))
+      (with-physical-store-directory (root)
+        (let* ((pg::*pgdata* root)
+               (pg::*catalog* (pg::make-catalog :cluster-identity "slot-startup-sync"))
+               (pg::*physical-recovery-state* nil)
+               (pg::*physical-recovery-failed-p* nil)
+               (pg::*wal-insert-timeline* 1) (pg::*wal-segment-namespace* :legacy)
+               (pg::*wal-durable-lsn* 96)
+               (pg::*wal-replication-slots* (make-hash-table :test #'equal))
+               (pg::*max-replication-slots* 10)
+               (file-syncs 0)
+               (slot (physical-slot-test-object :system-id (pg::catalog-system-identifier)))
+               (logical (pg::make-wal-replication-slot
+                         :name "logical_restore" :restart-lsn 0 :consistent-lsn 0 :wal-status :lost)))
+          (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
+          (ensure-directories-exist (pg::catalog-path))
+          (pg::write-catalog-image (pg::catalog-image-bytes))
+          (pg::wal-save-replication-slot slot)
+          (pg::wal-save-replication-slot logical)
+          (call-with-metadata-sync-observer
+           (lambda (events streams)
+             (if failure
+                 (progn
+                   (ok (intake-fails-p #'pg::wal-load-replication-slots))
+                   (ok (= (if (eq failure :second-file) 1 0)
+                          (hash-table-count pg::*wal-replication-slots*)))
+                   (ok (null (gethash "public_physical" pg::*wal-replication-slots*))))
+                 (progn
+                   (pg::wal-load-replication-slots)
+                   (ok (= 2 (hash-table-count pg::*wal-replication-slots*)))
+                   (ok (equal '(:directory :file :directory :file :directory)
+                              (mapcar #'first (reverse (car events)))))))
+             (ok (every (complement #'open-stream-p) (car streams))))
+           :fail-at failure
+           :before-sync (lambda (stage)
+                          (when (member failure '(:file :directory))
+                            (ok (zerop (hash-table-count pg::*wal-replication-slots*))))
+                          (when (eq stage :file)
+                            (incf file-syncs)
+                            (when (and (eq failure :second-file) (= 2 file-syncs))
+                              (ok (gethash "logical_restore" pg::*wal-replication-slots*))
+                              (ok (null (gethash "public_physical" pg::*wal-replication-slots*)))
+                              (error "injected second metadata file sync failure")))))))))
+
+(deftest empty-state-inventory-syncs-deletion-before-trusting-absence
+    (with-physical-store-directory (root)
+      (let ((path (merge-pathnames "removed.slot" root)))
+        (pg::wal-atomic-write-bytes path (make-array 1 :element-type '(unsigned-byte 8)))
+        (delete-file path)
+        (call-with-metadata-sync-observer
+         (lambda (events streams)
+           (ok (null (pg::durable-state-file-paths root "slot")))
+           (ok (equal (list (list :directory root)) (reverse (car events))))
+           (ok (null (car streams)))))
+        (call-with-metadata-sync-observer
+         (lambda (events streams)
+           (declare (ignore events streams))
+           (ok (intake-fails-p (lambda () (pg::durable-state-file-paths root "slot")))))
+         :fail-at :directory))))
+
+(deftest absent-optional-state-directory-syncs-its-parent-without-creating-it
+    (with-physical-store-directory (root)
+      (let ((directory (merge-pathnames "absent/" root)))
+        (call-with-metadata-sync-observer
+         (lambda (events streams)
+           (ok (null (pg::durable-state-file-paths directory "pin")))
+           (ok (equal (list (list :directory directory) (list :directory root))
+                      (reverse (car events))))
+           (ok (null (car streams)))
+           (ok (not (probe-file directory))))))))
+
+(deftest state-inventory-keeps-raw-names-and-rejects-matching-nonregular-files
+    (dolist (kind '(:symlink :dangling :fifo :directory))
+      (with-physical-store-directory (root)
+        (let ((path (merge-pathnames "invalid.slot" root))
+              (target (merge-pathnames "target.data" root)))
+          (pg::wal-atomic-write-bytes target (make-array 1 :element-type '(unsigned-byte 8)))
+          (ecase kind
+            ((:symlink :dangling)
+             (sb-posix:symlink (namestring target) (namestring path))
+             (when (eq kind :dangling) (delete-file target)))
+            (:fifo (sb-posix:mkfifo (namestring path) #o600))
+            (:directory (sb-posix:mkdir (namestring path) #o700)))
+          (unwind-protect
+               (call-with-metadata-sync-observer
+                (lambda (events streams)
+                  (let ((paths (pg::durable-state-file-paths root "slot")))
+                    (ok (equal (list path) paths))
+                    (ok (intake-fails-p
+                         (lambda () (pg::read-bounded-regular-file (first paths) 1 :stabilize t)))))
+                  (ok (equal (list (list :directory root)) (reverse (car events))))
+                  (ok (null (car streams)))))
+            (unless (eq kind :directory) (delete-file path)))))))
+
+(deftest state-inventory-ignores-unrelated-and-temporary-aliases
+    (with-physical-store-directory (root)
+      (let ((path (merge-pathnames "state.slot.tmp" root)))
+        (sb-posix:symlink (namestring (merge-pathnames "missing" root)) (namestring path))
+        (unwind-protect
+             (ok (null (pg::durable-state-file-paths root "slot")))
+          (delete-file path)))))
+
 (deftest public-physical-slot-file-dispatch-keeps-owner-state-local
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)
