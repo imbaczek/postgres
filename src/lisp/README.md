@@ -260,8 +260,9 @@ may be reused only when it matches the corresponding attribute of the claimed
 old row and the assigned value remains unchanged.
 LATERAL joins also retain origins from their outer rows. Grouping and DISTINCT retain
 the first representative; MIN/MAX retain the first non-NULL input until another
-non-NULL input is compared. Other CTE producer shapes and explicit casts do not yet
-retain this provenance.
+non-NULL input is compared. Compatible binary casts and varchar/numeric typmod
+widening retain provenance; casts that transform the datum clear it. Other CTE
+producer shapes do not yet retain this provenance.
 For an interpreted SELECT plan with a projection over one base-table sequential
 or non-parameterized index scan, optionally with filters, sorting or top-N,
 and LIMIT, external values unused by the projection, filters, ordering, and

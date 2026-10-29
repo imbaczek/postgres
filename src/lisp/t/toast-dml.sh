@@ -431,6 +431,26 @@ run -c "insert into toast_inline_varchar values (1,'$index_suffix')" >/dev/null
 run -c 'alter table toast_inline_varchar alter column v set storage external' >/dev/null
 run -c 'update toast_inline_varchar set id=2, v=v where id=1' >/dev/null
 [ "$(run -c 'select id,length(v) from toast_inline_varchar')" = '2|20000' ]
+run -c 'create table toast_cast_result (v text)' >/dev/null
+run -c 'alter table toast_cast_result alter column v set storage plain' >/dev/null
+run -c 'insert into toast_cast_result select v::text from toast_inline_varchar' >/dev/null
+run -c 'insert into toast_cast_result select v::varchar(40000) from toast_inline_varchar' >/dev/null
+run -c "insert into toast_cast_result select case when true then v::varchar else '' end from toast_inline_varchar" >/dev/null
+[ "$(run -c 'select count(*) from toast_cast_result where length(v)=20000')" = 3 ]
+if run -v VERBOSITY=verbose -c 'insert into toast_cast_result select v::varchar(20000) from toast_inline_varchar' >"$TMP/cast-narrow.out" 2>&1; then
+    echo 'toast-dml: narrowing cast retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/cast-narrow.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: narrowing cast did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+if run -v VERBOSITY=verbose -c 'insert into toast_cast_result select v::varchar(30000) from toast_scalar_source where id=1' >"$TMP/cast-text-bounded.out" 2>&1; then
+    echo 'toast-dml: text to bounded varchar retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/cast-text-bounded.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: text to bounded varchar did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 run -c 'create table toast_select_wider (v varchar(40000))' >/dev/null
 run -c 'alter table toast_select_wider alter column v set storage plain' >/dev/null
 run -c 'insert into toast_select_wider select v from toast_inline_varchar' >/dev/null
@@ -454,6 +474,7 @@ awk 'BEGIN { printf "insert into toast_external_self values (1,\047"; for (i=0;i
 run -c 'alter table toast_external_self alter column v set storage plain' >/dev/null
 run -c 'update toast_external_self set v=(select v) where id=1' >/dev/null
 run -c "update toast_external_self set v=coalesce(v,'') where id=1" >/dev/null
+run -c 'update toast_external_self set v=(v::varchar)::text where id=1' >/dev/null
 run -c 'update toast_external_self t set v=s.v from toast_external_self s where t.id=1 and s.id=1' >/dev/null
 [ "$(run -c 'select length(v) from toast_external_self where id=1')" = 200000 ]
 run -c 'create table toast_conflict_external (id int primary key, a text, b text)' >/dev/null
@@ -884,6 +905,30 @@ run -c 'truncate toast_dml' >/dev/null
 run -c 'vacuum toast_dml' >/dev/null
 numeric_big=$(awk 'BEGIN { s=1; printf "7"; for (i=1;i<20000;i++) { s=(s*1664525+1013904223)%4294967296; printf "%d", int(s/16777216)%10 } }')
 numeric_repeat=$(awk 'BEGIN { for (i=0;i<20000;i++) printf "1" }')
+numeric_cast_value=$(awk 'BEGIN { for (i=0;i<700;i++) printf "1" }')
+numeric_cast_source_pad=$(awk 'BEGIN { for (i=0;i<1900;i++) printf "x" }')
+numeric_cast_target_pad=$(awk 'BEGIN { for (i=0;i<7900;i++) printf "x" }')
+run -c 'create table toast_numeric_cast_source (v numeric(900,0), pad text)' >/dev/null
+run -c 'alter table toast_numeric_cast_source alter column pad set storage plain' >/dev/null
+run -c "insert into toast_numeric_cast_source values ('$numeric_cast_value','$numeric_cast_source_pad')" >/dev/null
+run -c 'create table toast_numeric_cast_target (v numeric, pad text)' >/dev/null
+run -c 'alter table toast_numeric_cast_target alter column v set storage plain' >/dev/null
+run -c 'alter table toast_numeric_cast_target alter column pad set storage plain' >/dev/null
+run -c "insert into toast_numeric_cast_target select v::numeric(1000,0),'$numeric_cast_target_pad' from toast_numeric_cast_source" >/dev/null
+if run -v VERBOSITY=verbose -c "insert into toast_numeric_cast_target select v::numeric(800,0),'$numeric_cast_target_pad' from toast_numeric_cast_source" >"$TMP/numeric-cast-narrow.out" 2>&1; then
+    echo 'toast-dml: narrowing numeric cast retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/numeric-cast-narrow.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: narrowing numeric cast did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+if run -v VERBOSITY=verbose -c "insert into toast_numeric_cast_target select v::numeric(1000,1),'$numeric_cast_target_pad' from toast_numeric_cast_source" >"$TMP/numeric-cast-scale.out" 2>&1; then
+    echo 'toast-dml: numeric scale cast retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/numeric-cast-scale.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: numeric scale cast did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 run -c 'create table storage_restart (v text)' >/dev/null
 run -c 'alter table storage_restart alter column v set storage external' >/dev/null
 run -c "insert into storage_restart values ('$numeric_repeat')" >/dev/null

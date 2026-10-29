@@ -358,20 +358,10 @@
     (values new compressed descriptors)))
 
 (defun datum-origin-assignment-compatible-p (source column)
-  "Whether C's assignment coercion can pass SOURCE's datum without detoasting.
-Match varchar_support and numeric_support's typmod relabel conditions."
-  (let ((from (expr-type source))
-        (old (expr-typmod source))
-        (to (pg-column-type column))
-        (new (pg-column-typmod column)))
-    (cond ((and (member from '(:text :varchar)) (member to '(:text :varchar)))
-           (or (eq to :text) (< new 0) (and (>= old 0) (<= old new))))
-          ((and (eq from :numeric) (eq to :numeric))
-           (or (< new 4)
-               (and (>= old 4)
-                    (= (ldb (byte 11 0) (- old 4)) (ldb (byte 11 0) (- new 4)))
-                    (<= (ldb (byte 16 16) (- old 4)) (ldb (byte 16 16) (- new 4))))))
-          (t (and (eq from to) (= old new))))))
+  "Whether assignment coercion can pass SOURCE's datum without detoasting."
+  (datum-origin-coercion-compatible-p
+   (expr-type source) (expr-typmod source)
+   (pg-column-type column) (pg-column-typmod column)))
 
 (defun eval-dml-assignment-with-origin (expression environment column)
   "Evaluate once and return compatible compression and external descriptor bytes."

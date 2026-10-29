@@ -4242,16 +4242,41 @@ aliases share the corresponding numeric operator implementation."
 
 (defvar +subquery-frame-origins-key+ (gensym "SUBQUERY-FRAME-ORIGINS-"))
 
+(defun datum-origin-coercion-compatible-p (source-type source-typmod target-type target-typmod)
+  "Match PostgreSQL's binary relabel and varchar/numeric typmod support rules."
+  (cond ((and (member source-type '(:text :varchar)) (member target-type '(:text :varchar)))
+         (or (eq target-type :text) (< target-typmod 0)
+             (and (>= source-typmod 0) (<= source-typmod target-typmod))))
+        ((and (eq source-type :numeric) (eq target-type :numeric))
+         (or (< target-typmod 4)
+             (and (>= source-typmod 4)
+                  (= (ldb (byte 11 0) (- source-typmod 4)) (ldb (byte 11 0) (- target-typmod 4)))
+                  (<= (ldb (byte 16 16) (- source-typmod 4)) (ldb (byte 16 16) (- target-typmod 4))))))
+        (t (and (eq source-type target-type) (= source-typmod target-typmod)))))
+
 (defun eval-expr-with-origin (expression environment origins)
   "Evaluate once, returning a logical value and any preserved physical origin.
-Direct column and supported scalar subquery references, JOIN relabels, and the
-selected CASE or COALESCE branch retain origin. Computed expressions return none."
+Direct column and scalar subquery references, compatible relabels and casts,
+and the selected CASE or COALESCE branch retain origin. Other computations clear it."
   (case (first expression)
     (:col
      (let ((value (eval-expr expression environment))
            (slot (1- (second expression))))
        (values value (and origins (< -1 slot (length origins))
                           (not (eq value +null+)) (aref origins slot)))))
+    (:cast
+     (let ((argument (second expression)))
+       (multiple-value-bind (raw origin) (eval-expr-with-origin argument environment origins)
+         (let* ((type (expr-type expression))
+                (typmod (expr-typmod expression))
+                (value (sql-cast-value raw (expr-type argument) type typmod))
+                (column (and origin (make-pg-column :type type :typmod typmod))))
+           (values value
+                   (and origin
+                        (datum-origin-coercion-compatible-p (expr-type argument) (expr-typmod argument) type typmod)
+                        (equalp (aref (nth-value 2 (heap-tuple-layout (vector raw) (vector column))) 0)
+                                (aref (nth-value 2 (heap-tuple-layout (vector value) (vector column))) 0))
+                        origin))))))
     (:subplan
      (let ((*query-row-origins* origins))
        (eval-subquery-expression (second expression) environment)))
