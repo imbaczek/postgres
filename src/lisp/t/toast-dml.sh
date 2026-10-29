@@ -185,6 +185,21 @@ run -c 'insert into toast_lateral_result select s.id,q.v from toast_scalar_sourc
 run -c 'insert into toast_lateral_result select s.id,q.v from toast_scalar_source s left join lateral (select s.v where s.id=1) q on true' >/dev/null
 [ "$(run -c "select count(*) from toast_lateral_result where (id=1 and length(v)=20000 and substr(v,1,1)='a') or (id=2 and length(v)=20001 and substr(v,1,1)='b')")" = 3 ]
 [ "$(run -c 'select count(*) from toast_lateral_result where id=2 and v is null')" = 1 ]
+run -c 'create table toast_cte_join_result (id int, v text)' >/dev/null
+run -c 'alter table toast_cte_join_result alter column v set storage plain' >/dev/null
+run -c 'insert into toast_cte_join_result with q as materialized (select s.id,s.v from toast_scalar_source s full join toast_join_keys k on s.id=k.id) select id,v from q' >/dev/null
+run -c 'insert into toast_cte_join_result with q as materialized (select s.id,x.v from toast_scalar_source s cross join lateral (select s.v) x) select id,v from q' >/dev/null
+[ "$(run -c "select count(*) from toast_cte_join_result where (id=1 and length(v)=20000 and substr(v,1,1)='a') or (id=2 and length(v)=20001 and substr(v,1,1)='b')")" = 4 ]
+[ "$(run -c 'select count(*) from toast_cte_join_result where v is null')" = 1 ]
+run -c 'insert into toast_cte_join_result with q as materialized (select s.id,s.v from toast_join_keys k cross join toast_scalar_source s) select id,v from q' >/dev/null
+run -c 'insert into toast_cte_join_result with q as materialized (select s.id,s.v from toast_join_empty e full join toast_scalar_source s on false) select id,v from q' >/dev/null
+run -c 'insert into toast_cte_join_result with q as materialized (select s.id,x.v from toast_scalar_source s left join lateral (select s.v where s.id=1) x on true) select id,v from q' >/dev/null
+[ "$(run -c "select count(*) from toast_cte_join_result where (id=1 and length(v)=20000 and substr(v,1,1)='a') or (id=2 and length(v)=20001 and substr(v,1,1)='b')")" = 13 ]
+[ "$(run -c 'select count(*) from toast_cte_join_result where v is null')" = 2 ]
+run -c 'create table toast_recursive_join_result (v text)' >/dev/null
+run -c 'alter table toast_recursive_join_result alter column v set storage plain' >/dev/null
+run -c 'insert into toast_recursive_join_result with recursive q(v,n) as (select v,1 from toast_scalar_source union all select q.v,q.n+1 from q join toast_join_keys k on k.id=1 where q.n<2) select v from q' >/dev/null
+[ "$(run -c 'select count(*) from toast_recursive_join_result where length(v)=20000 or length(v)=20001')" = 4 ]
 if run -v VERBOSITY=verbose -c "insert into toast_lateral_result select s.id,q.v from toast_scalar_source s cross join lateral (select s.v || '' as v) q" >"$TMP/lateral-computed.out" 2>&1; then
     echo 'toast-dml: computed lateral datum retained compression' >&2; exit 1
 fi

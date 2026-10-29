@@ -1423,9 +1423,8 @@ on an abnormal exit."
      (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
     (:subquery-scan (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
     (:nested-loop-join
-     (and (not iterator-p)
-          (simple-datum-origin-plan-p (third node) relations)
-          (simple-datum-origin-plan-p (fourth node) relations)))
+     (and (simple-datum-origin-plan-p (third node) relations iterator-p worktable)
+          (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable)))
     (:with-ctes
         (and (not iterator-p)
              (simple-datum-origin-plan-p (third node) relations)))

@@ -244,7 +244,7 @@ values in its full-row size bound even when an unchanged marker makes the event
 small; a sufficiently large bound triggers full-row materialization and transport
 validation.
 For `INSERT ... SELECT` from supported scans, nested-loop joins, derived tables,
-and CTEs with supported single-scan producers and optional filters,
+and CTEs with supported scan and join producers and optional filters,
 sorting, top-N or LIMIT, direct projected columns
 and the selected CASE or COALESCE
 branch can retain compressed values through compatible assignments. This includes
@@ -255,7 +255,7 @@ duplicate elimination compares logical values. Scalar subqueries with supported
 plans retain the selected datum, including correlated outer references. Supported
 LATERAL joins also retain origins from their outer rows. Grouping and DISTINCT retain
 the first representative; MIN/MAX retain the first non-NULL input until another
-non-NULL input is compared. Other CTE producer shapes, iterator-based LATERAL joins,
+non-NULL input is compared. Other CTE producer shapes,
 explicit casts, and cross-column `excluded` assignments do not yet retain this provenance.
 For an interpreted SELECT plan with a projection over one base-table sequential
 or non-parameterized index scan, optionally with filters, sorting or top-N,

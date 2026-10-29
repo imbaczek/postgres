@@ -144,39 +144,45 @@
      (lambda () (setf sets nil environment nil) (close-sql-iterator input)))))
 
 (defun make-lateral-join-iterator (join left right-factory)
-  ;; Each left row owns a fresh right iterator and parameter epoch.  Close it
-  ;; before advancing the left input, including on early exit or error.
-  (let ((right nil) (current-left nil) (left-present nil) (matched nil)
+  ;; Each left row owns a fresh right iterator and parameter epoch.
+  (let ((right nil) (current-left nil) (left-origins nil) (left-present nil) (matched nil)
                     (null-right (make-array (getf join :right-width) :initial-element +null+)))
     (make-sql-iterator
      (lambda ()
        (loop
          (unless left-present
-           (multiple-value-setq (current-left left-present) (sql-iterator-next left))
+           (multiple-value-setq (current-left left-present left-origins) (sql-iterator-next left))
            (unless left-present (return (values nil nil)))
-           (setf matched nil right (funcall right-factory current-left)))
-         (multiple-value-bind (row present) (sql-iterator-next right)
+           (setf matched nil right (funcall right-factory current-left left-origins)))
+         (multiple-value-bind (row present right-origins) (sql-iterator-next right)
            (if present
-               (let ((joined (combine-select-join-environment current-left row join)))
+               (let* ((joined (combine-select-join-environment current-left row join))
+                      (origins (and *datum-origin-capture*
+                                    (combine-select-join-origins current-left left-origins row right-origins join)))
+                      (*query-row-origins* origins))
                  (when (true-p (eval-expr (getf join :qual) joined))
                    (setf matched t)
-                   (return (values joined t))))
+                   (return (values joined t origins))))
                (progn
                  (close-sql-iterator right)
                  (setf right nil left-present nil)
                  (when (and (not matched) (eq (getf join :type) :left))
-                   (return (values (concatenate 'vector current-left null-right) t))))))))
+                   (return (values (concatenate 'vector current-left null-right) t
+                                   (and *datum-origin-capture*
+                                        (concatenate 'vector
+                                                     (or left-origins (make-array (length current-left) :initial-element nil))
+                                                     (make-array (length null-right) :initial-element nil)))))))))))
      (lambda ()
        (close-sql-iterator right)
        (close-sql-iterator left)
-       (setf current-left nil)))))
+       (setf current-left nil left-origins nil)))))
 
 ;; The join owns LEFT and a replay store owning RIGHT.  A fresh reader scans
 ;; RIGHT for each left row; right/full joins make one final pass for unmatched
 ;; rows.  Closing the join closes the active reader, both inputs and match map.
 (defun make-nested-loop-iterator (join left right)
   (let* ((store (make-query-replay-store right))
-         (reader nil) (current-left nil) (left-present nil)
+         (reader nil) (current-left nil) (left-origins nil) (left-present nil)
          (left-done nil) (left-seen nil) (matched nil) (right-phase nil)
          (right-index 0)
          (outer-p (member (getf join :type) '(:right :full)))
@@ -187,7 +193,7 @@
      (lambda ()
        (loop
          (unless (or left-present left-done)
-           (multiple-value-setq (current-left left-present) (sql-iterator-next left))
+           (multiple-value-setq (current-left left-present left-origins) (sql-iterator-next left))
            (unless left-present (setf left-done t))
            (when left-present
              (setf left-seen t matched nil right-index 0 reader (make-query-replay-reader store))))
@@ -195,7 +201,7 @@
          (when (and left-done (not right-phase))
            (setf right-phase t right-index 0 reader (make-query-replay-reader store))
            (when left-seen (query-match-map-finish matches)))
-         (multiple-value-bind (row present) (sql-iterator-next reader)
+         (multiple-value-bind (row present right-origins) (sql-iterator-next reader)
            (when (and matches present)
              (loop while (<= (query-match-map-count matches) right-index)
                    do (query-match-map-append matches)))
@@ -205,20 +211,31 @@
               (let ((index right-index))
                 (incf right-index)
                 (unless (and left-seen (query-match-map-matched-p matches index))
-                  (return (values (concatenate 'vector null-left row) t)))))
+                  (return (values (concatenate 'vector null-left row) t
+                                  (and *datum-origin-capture*
+                                       (concatenate 'vector
+                                                    (make-array (length null-left) :initial-element nil)
+                                                    (or right-origins (make-array (length row) :initial-element nil)))))))))
              (present
-              (let ((index right-index)
-                    (joined (combine-select-join-environment current-left row join)))
+              (let* ((index right-index)
+                     (joined (combine-select-join-environment current-left row join))
+                     (origins (and *datum-origin-capture*
+                                   (combine-select-join-origins current-left left-origins row right-origins join)))
+                     (*query-row-origins* origins))
                 (incf right-index)
                 (when (true-p (eval-expr (getf join :qual) joined))
                   (setf matched t)
                   (when matches (query-match-map-mark matches index))
-                  (return (values joined t)))))
+                  (return (values joined t origins)))))
              (t
               (close-sql-iterator reader)
               (setf reader nil left-present nil)
               (when (and (not matched) (member (getf join :type) '(:left :full)))
-                (return (values (concatenate 'vector current-left null-right) t))))))))
+                (return (values (concatenate 'vector current-left null-right) t
+                                (and *datum-origin-capture*
+                                     (concatenate 'vector
+                                                  (or left-origins (make-array (length current-left) :initial-element nil))
+                                                  (make-array (length null-right) :initial-element nil)))))))))))
      (lambda ()
        (close-sql-iterator reader)
        (close-sql-iterator left)
@@ -227,7 +244,7 @@
          (close-query-match-map matches)
          (when (query-match-map-pathname matches)
            (delete-query-temp-file (query-match-map-pathname matches))))
-       (setf current-left nil)))))
+       (setf current-left nil left-origins nil)))))
 
 (defun make-physical-plan-iterator (node relations)
   (let* ((input (%make-physical-plan-iterator node relations))
@@ -274,6 +291,10 @@
                                     *lateral-outer-environment* #())
                                 (make-hash-table :test #'eq)) *subquery-outer-frames*))
             (input (let ((*subquery-outer-frames* frames))
+                     (when (and *datum-origin-capture*
+                                (getf (physical-scan-relation node relations) :lateral-dependent))
+                       (setf (gethash +subquery-frame-origins-key+ (cdar frames))
+                             (datum-origins-from-spill (datum-origins-for-spill *query-row-origins*))))
                      (make-physical-plan-iterator (fourth node) relations))))
        (make-sql-iterator
         (lambda ()
@@ -327,8 +348,9 @@
                    (physical-scan-path (fourth node) (physical-scan-relation (fourth node) relations)))))
          (make-lateral-join-iterator
           (second node) (make-physical-plan-iterator (third node) relations)
-          (lambda (environment)
-            (let ((*lateral-outer-environment* environment))
+          (lambda (environment origins)
+            (let ((*lateral-outer-environment* environment)
+                  (*query-row-origins* origins))
               (make-physical-plan-iterator (fourth node) relations))))
          (make-nested-loop-iterator
           (second node) (make-physical-plan-iterator (third node) relations)

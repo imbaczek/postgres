@@ -53,7 +53,8 @@
                (make-lateral-join-iterator
                 '(:type :left :qual (:bool t) :left-width 1 :right-width 1)
                 left
-                (lambda (row)
+                (lambda (row origins)
+                  (declare (ignore origins))
                   (let ((value (aref row 0)) (done nil))
                     (push value opens)
                     (make-sql-iterator
