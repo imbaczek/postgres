@@ -15,6 +15,8 @@
 
 (defconstant +db-in-production+ 6)
 
+(defvar *enable-hot-standby* t)
+
 (defvar *physical-recovery-state* nil
   "Verified native recovery image metadata, preserved across code reloads.")
 

@@ -165,6 +165,9 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
         (setf (backend-database *backend*) dbname)
         (setf (backend-application-name *backend*) app)
         (setf (backend-replication-mode *backend*) (startup-replication-mode replication))
+        (when (and (recovery-in-progress-p) (not *enable-hot-standby*))
+          (ereport-fatal "57P03" "the database system is not accepting connections"
+                         :detail "Hot standby mode is disabled."))
         (postmaster-admit-startup-backend *backend*)
         (send-auth-ok stream)
         (session-apply-startup-options params)

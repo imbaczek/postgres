@@ -18,6 +18,7 @@
     ("listen_addresses" :postmaster :string "127.0.0.1")
     ("data_directory" :postmaster :string nil)
     ("restore_command" :sighup :string "")
+    ("hot_standby" :postmaster :boolean "on")
     ("max_connections" :postmaster :integer "100" 1 262143 nil)
     ("max_wal_senders" :postmaster :integer "10" 0 262143 nil)
     ("reserved_connections" :postmaster :integer "0" 0 262143 nil)
@@ -87,11 +88,24 @@
         (error "configuration parameter ~a out of range: ~s" (first spec) text))
       integer)))
 
+(defun startup-parse-boolean-setting (text)
+  (when (or (zerop (length text))
+            (member (char-code (char text 0)) '(9 10 11 12 13 32))
+            (member (char-code (char text (1- (length text)))) '(9 10 11 12 13 32)))
+    (error "invalid boolean configuration value ~s" text))
+  (sql-cast-boolean-input text))
+
+(defun startup-setting-text (name value)
+  (if (eq :boolean (third (assoc name *startup-setting-specs* :test #'string=)))
+      (if value "on" "off")
+      (princ-to-string value)))
+
 (defun startup-normalize-setting (name text)
   (let ((spec (assoc name *startup-setting-specs* :test #'string=)))
     (unless spec (error "unrecognized configuration parameter ~s" name))
     (ecase (third spec)
       (:integer (startup-parse-integer-setting spec text))
+      (:boolean (startup-parse-boolean-setting text))
       (:string
        (when (and (string= name "restore_command") (not (equal text "")))
          (error "nonempty restore_command requires unimplemented archive recovery"))
@@ -441,6 +455,7 @@ Install wal_keep_size in MB on startup and on a successful reload."
         (slot-policy (startup-effective-slot-policy settings native)))
     (setf *startup-server-settings* settings
           *startup-native-inputs* native *startup-command-overrides* overrides
+          *enable-hot-standby* (startup-setting-value settings "hot_standby")
           *wal-keep-size-mb* (startup-setting-value settings "wal_keep_size")
           *physical-restartpoint-timeout* timeout
           *physical-restartpoint-wal-bytes* wal-bytes
@@ -506,9 +521,9 @@ Install wal_keep_size in MB on startup and on a successful reload."
         (when (or command environment)
           (setf value (or *max-slot-wal-keep-bytes* -1)
                 unit "B" source (if command :command-line :environment)))))
-    (vector name (princ-to-string value) unit
+    (vector name (startup-setting-text name value) unit
             (if spec (string-downcase (symbol-name (second spec))) "postmaster")
-            (if (eq (third spec) :integer) "integer" "string")
+            (case (third spec) (:integer "integer") (:boolean "bool") (t "string"))
             (ecase source
               (:default "default") (:file "configuration file") (:override "override")
               (:command-line "command line") (:environment "environment variable"))
@@ -536,7 +551,7 @@ Install wal_keep_size in MB on startup and on a successful reload."
                      (startup-format-unit (* value 1024 1024) :bytes))
                     (:max_slot_wal_keep_size
                      (if *max-slot-wal-keep-bytes* (startup-format-unit *max-slot-wal-keep-bytes* :bytes) "-1"))
-                    (t (princ-to-string value)))
+                    (t (startup-setting-text name value)))
                   t))))))
 
 (defun startup-configuration-output (argv)
@@ -554,7 +569,7 @@ installing settings, taking PGDATA ownership or starting listeners."
           (let ((value (getf entry :value)))
             (if (and (string-equal name "data_directory") (> (length value) 1))
                 (string-right-trim "/" value)
-                (princ-to-string value))))))))
+                (startup-setting-text (string-downcase name) value))))))))
 
 (defun startup-handle-meta-request (argv)
   "Print and exit for version or configuration requests before server startup."
