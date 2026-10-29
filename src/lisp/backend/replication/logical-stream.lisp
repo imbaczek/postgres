@@ -66,12 +66,12 @@ Discard the cursor after a read error; the stream may have advanced."
 (defun logical-transaction-map-changes (transaction function)
   "Visit each committed change while its owning reader scope is active."
   (if (logical-transaction-spool transaction)
-      (logical-spool-map-events
+      (logical-spool-map-event-cursors
        (logical-transaction-spool transaction)
-       (lambda (event)
+       (lambda (cursor)
          (let ((*logical-validation-only* nil))
            (declare (special *logical-validation-only*))
-           (funcall function (logical-decode-change event)))))
+           (funcall function (logical-decode-change-from-cursor cursor)))))
       (dolist (change (logical-transaction-changes transaction))
         (funcall function change)))
   (values))

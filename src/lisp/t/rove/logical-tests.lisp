@@ -1019,6 +1019,257 @@
         (close-logical-spool spool)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest test-logical-spool-cursors-verify-and-expire
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-cursor-visit-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 1)
+           (text-value (make-string 200000 :initial-element #\x))
+           (first (logical-encode-change
+                   (logical-test-change :insert 7 701 :new-values (vector 1 2 text-value))))
+           (second (logical-encode-change
+                    (logical-test-change :insert 7 701 :new-values #(3 4 "tail"))))
+           (spool (make-logical-spool))
+           (values nil) (retained nil) (nested nil))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (logical-spool-append spool first)
+             (logical-spool-append spool second)
+             (logical-spool-seal spool)
+             (logical-spool-map-event-cursors
+              spool
+              (lambda (cursor)
+                (rove:ok (streamp (logical-cursor-stream cursor)))
+                (setf retained cursor)
+                (push (logical-change-new-values (logical-decode-change-from-cursor cursor)) values)
+                (setf nested
+                      (handler-case
+                          (progn (logical-spool-map-events spool #'identity) nil)
+                        (error (condition) (search "already being visited" (princ-to-string condition)))))
+                (rove:ok (handler-case (progn (close-logical-spool spool) nil)
+                           (error (condition) (search "already being visited" (princ-to-string condition)))))))
+             (rove:ok nested)
+             (rove:ok (equalp (nreverse values) (list (vector 1 2 text-value) #(3 4 "tail"))))
+             (rove:ok (handler-case (progn (logical-read-u8 retained) nil) (error () t)))
+             (rove:ok (not (logical-spool-failed-p spool))))
+        (close-logical-spool spool)
+        (rove:ok (null (uiop:directory-files directory)))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-logical-spool-cursor-corruption-and-bounds
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-cursor-fault-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 1)
+           (event (logical-encode-change
+                   (logical-test-change :insert 7 701
+                                        :new-values (vector 1 2 (make-string 200000 :initial-element #\x)))))
+           (spool (make-logical-spool)) (calls 0))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (logical-spool-append spool event)
+             (logical-spool-seal spool)
+             (let ((stream (logical-spool-stream spool)))
+               (file-position stream (+ 8 100000))
+               (write-byte 99 stream)
+               (finish-output stream))
+             (rove:ok
+              (handler-case
+                  (progn (logical-spool-map-event-cursors
+                          spool (lambda (cursor) (declare (ignore cursor)) (incf calls))) nil)
+                (error (condition) (search "checksum mismatch" (princ-to-string condition)))))
+             (rove:ok (zerop calls))
+             (rove:ok (logical-spool-failed-p spool))
+             (close-logical-spool spool)
+             (setf spool (make-logical-spool))
+             (logical-spool-append spool event)
+             (logical-spool-seal spool)
+             (rove:ok
+              (handler-case
+                  (progn (logical-spool-map-event-cursors spool (lambda (cursor) (logical-read-u8 cursor))) nil)
+                (error (condition) (search "did not consume" (princ-to-string condition)))))
+             (rove:ok (logical-spool-failed-p spool)))
+        (close-logical-spool spool)
+        (rove:ok (null (uiop:directory-files directory)))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-logical-spool-memory-cursor-bounds
+    (let* ((*logical-capture-memory-bytes* 1024)
+           (spool (make-logical-spool))
+           (events nil) (retained nil))
+      (unwind-protect
+           (progn
+             (logical-spool-append spool (make-array 2 :element-type '(unsigned-byte 8)
+                                                       :initial-contents '(1 2)))
+             (logical-spool-append spool (make-array 1 :element-type '(unsigned-byte 8)
+                                                       :initial-contents '(3)))
+             (logical-spool-seal spool)
+             (logical-spool-map-event-cursors
+              spool
+              (lambda (cursor)
+                (setf retained cursor)
+                (let* ((length (logical-cursor-limit cursor))
+                       (bytes (logical-read-octets cursor length)))
+                  (rove:ok (handler-case (progn (logical-read-u8 cursor) nil) (error () t)))
+                  (push bytes events))))
+             (rove:ok (equalp (nreverse events) (list #(1 2) #(3))))
+             (rove:ok (handler-case (progn (logical-read-u8 retained) nil) (error () t))))
+        (close-logical-spool spool))))
+
+(rove:deftest test-logical-spool-concurrent-visitor-rejected
+    (let* ((*logical-capture-memory-bytes* 1024)
+           (spool (make-logical-spool))
+           (entered (sb-thread:make-semaphore :count 0))
+           (release (sb-thread:make-semaphore :count 0))
+           (thread nil))
+      (unwind-protect
+           (progn
+             (logical-spool-append spool (make-array 1 :element-type '(unsigned-byte 8)
+                                                       :initial-contents '(7)))
+             (logical-spool-seal spool)
+             (setf thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (logical-spool-map-event-cursors
+                       spool
+                       (lambda (cursor)
+                         (sb-thread:signal-semaphore entered)
+                         (sb-thread:wait-on-semaphore release)
+                         (logical-read-u8 cursor))))))
+             (rove:ok (sb-thread:wait-on-semaphore entered :timeout 5))
+             (rove:ok (handler-case (progn (logical-spool-map-events spool #'identity) nil)
+                        (error (condition) (search "already being visited" (princ-to-string condition)))))
+             (sb-thread:signal-semaphore release)
+             (sb-thread:join-thread thread)
+             (setf thread nil)
+             (rove:ok (not (logical-spool-failed-p spool))))
+        (when thread
+          (sb-thread:signal-semaphore release)
+          (sb-thread:join-thread thread))
+        (close-logical-spool spool))))
+
+(rove:deftest test-logical-spool-cursor-callback-remains-interruptible
+    (let* ((*logical-capture-memory-bytes* 1024)
+           (spool (make-logical-spool))
+           (entered (sb-thread:make-semaphore :count 0))
+           (release (sb-thread:make-semaphore :count 0))
+           (thread nil) (retained nil))
+      (unwind-protect
+           (progn
+             (logical-spool-append spool (make-array 1 :element-type '(unsigned-byte 8)
+                                                       :initial-contents '(7)))
+             (logical-spool-seal spool)
+             (setf thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (progn
+                            (logical-spool-map-event-cursors
+                             spool
+                             (lambda (cursor)
+                               (setf retained cursor)
+                               (rove:ok sb-sys:*interrupts-enabled*)
+                               (sb-thread:signal-semaphore entered)
+                               (sb-thread:wait-on-semaphore release)
+                               (logical-read-u8 cursor)))
+                            :completed)
+                        (error (condition)
+                          (if (search "injected visitor interrupt" (princ-to-string condition))
+                              :interrupted :unexpected))))))
+             (rove:ok (sb-thread:wait-on-semaphore entered :timeout 5))
+             (sb-thread:interrupt-thread thread (lambda () (error "injected visitor interrupt")))
+             (let ((result (sb-thread:join-thread thread :timeout 2 :default :timed-out)))
+               (when (eq result :timed-out)
+                 (sb-thread:signal-semaphore release)
+                 (sb-thread:join-thread thread))
+               (setf thread nil)
+               (rove:ok (eq :interrupted result)))
+             (rove:ok (logical-spool-failed-p spool))
+             (rove:ok (handler-case (progn (logical-read-u8 retained) nil) (error () t))))
+        (when thread
+          (sb-thread:signal-semaphore release)
+          (sb-thread:join-thread thread))
+        (close-logical-spool spool))))
+
+(rove:deftest test-logical-spool-cursor-respects-outer-interrupt-mask
+    (let* ((*logical-capture-memory-bytes* 1024)
+           (spool (make-logical-spool))
+           (was-masked nil))
+      (unwind-protect
+           (progn
+             (logical-spool-append spool (make-array 1 :element-type '(unsigned-byte 8)
+                                                       :initial-contents '(7)))
+             (logical-spool-seal spool)
+             (sb-sys:without-interrupts
+               (logical-spool-map-event-cursors
+                spool (lambda (cursor)
+                        (setf was-masked (not sb-sys:*interrupts-enabled*))
+                        (logical-read-u8 cursor))))
+             (rove:ok was-masked))
+        (close-logical-spool spool))))
+
+(rove:deftest test-logical-spool-cursor-framing-and-unwind
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-cursor-frame-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (event (make-array 1024 :element-type '(unsigned-byte 8) :initial-element 7)))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (dolist (mode '(:header :payload :length :trailing :seek :unwind))
+             (let ((spool (make-logical-spool)) (calls 0) (retained nil))
+               (unwind-protect
+                    (progn
+                      (logical-spool-append spool event)
+                      (logical-spool-seal spool)
+                      (let ((stream (logical-spool-stream spool)))
+                        (case mode
+                          (:header (sb-posix:ftruncate (sb-sys:fd-stream-fd stream) 4))
+                          (:payload (sb-posix:ftruncate (sb-sys:fd-stream-fd stream) (+ 8 1023)))
+                          (:length (file-position stream 0)
+                           (write-byte 255 stream)
+                           (write-byte 255 stream)
+                           (write-byte 255 stream)
+                           (write-byte 127 stream)
+                           (finish-output stream))
+                          (:trailing (file-position stream (+ 8 1024))
+                           (write-byte 9 stream)
+                           (finish-output stream))))
+                      (if (eq mode :unwind)
+                          (rove:ok
+                           (eq :escaped
+                               (block escaped
+                                 (logical-spool-map-event-cursors
+                                  spool (lambda (cursor)
+                                          (setf retained cursor)
+                                          (return-from escaped :escaped)))
+                                 :not-escaped)))
+                          (rove:ok
+                           (handler-case
+                               (progn
+                                 (logical-spool-map-event-cursors
+                                  spool (lambda (cursor)
+                                          (incf calls)
+                                          (setf retained cursor)
+                                          (logical-read-octets cursor 1024)
+                                          (when (eq mode :seek)
+                                            (file-position (logical-cursor-stream cursor) 0))))
+                                 nil)
+                             (error () t))))
+                      (rove:ok (logical-spool-failed-p spool))
+                      (when (member mode '(:header :payload :length))
+                        (rove:ok (zerop calls)))
+                      (when retained
+                        (rove:ok (handler-case (progn (logical-read-u8 retained) nil) (error () t)))))
+                 (close-logical-spool spool))))
+        (rove:ok (null (uiop:directory-files directory)))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest test-logical-fragment-payload-from-bounded-buffer
     (let* ((event (make-array 32 :element-type '(unsigned-byte 8)
                                  :initial-contents (loop for i below 32 collect i)))

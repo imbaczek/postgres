@@ -8,7 +8,8 @@
 (defvar *logical-spool-test-after-wal-record* nil)
 
 (defstruct (logical-spool (:constructor %make-logical-spool))
-  owner (events '()) (bytes 0) (count 0) path stream sealed-p closed-p failed-p)
+  owner (events '()) (bytes 0) (count 0) path stream sealed-p closed-p failed-p
+  (visit-lock (sb-thread:make-mutex :name "logical spool visitor")) visiting-p)
 
 (defun make-logical-spool ()
   "Create an owner whose lifetime is the transaction, not a query scope."
@@ -160,6 +161,16 @@ The caller must not mutate EVENT after passing it to this function."
         do (unless byte (error "truncated logical spool header"))
         sum (ash byte (* 8 shift))))
 
+(defun call-with-logical-spool-visit (spool function)
+  "Prevent another visitor from changing this spool's shared stream position."
+  (sb-sys:without-interrupts
+    (sb-thread:with-mutex ((logical-spool-visit-lock spool))
+      (when (logical-spool-visiting-p spool) (error "logical spool is already being visited"))
+      (setf (logical-spool-visiting-p spool) t))
+    (unwind-protect (sb-sys:with-local-interrupts (funcall function))
+      (sb-thread:with-mutex ((logical-spool-visit-lock spool))
+        (setf (logical-spool-visiting-p spool) nil)))))
+
 (defun %logical-spool-map-events (spool function)
   "Read and validate each event, retaining only one spilled event at a time."
   (unless (and (logical-spool-sealed-p spool) (not (logical-spool-closed-p spool)))
@@ -187,11 +198,83 @@ The caller must not mutate EVENT after passing it to this function."
 
 (defun logical-spool-map-events (spool function)
   "Visit verified events in order, permanently rejecting this spool after an error."
-  (when (logical-spool-failed-p spool) (error "logical spool has failed"))
-  (let ((complete nil))
-    (unwind-protect
-         (progn (%logical-spool-map-events spool function) (setf complete t))
-      (unless complete (setf (logical-spool-failed-p spool) t))))
+  (call-with-logical-spool-visit
+   spool
+   (lambda ()
+     (when (logical-spool-failed-p spool) (error "logical spool has failed"))
+     (let ((complete nil))
+       (unwind-protect
+            (progn (%logical-spool-map-events spool function) (setf complete t))
+         (unless complete (setf (logical-spool-failed-p spool) t))))))
+  (values))
+
+(defun logical-spool-map-event-cursors (spool function)
+  "Visit CRC-verified bounded cursors; each cursor expires when FUNCTION returns."
+  (call-with-logical-spool-visit
+   spool
+   (lambda ()
+     (when (or (logical-spool-failed-p spool) (not (logical-spool-sealed-p spool))
+               (logical-spool-closed-p spool))
+       (error "logical spool is not readable"))
+     (let ((complete nil) (stream (logical-spool-stream spool)))
+       (unwind-protect
+            (progn
+              (labels ((visit (cursor length &optional expected-position)
+                         (unwind-protect
+                              (progn
+                                (funcall function cursor)
+                                (unless (and (= (logical-cursor-offset cursor) length)
+                                             (or (null expected-position)
+                                                 (eql (file-position stream) expected-position)))
+                                  (error "logical spool cursor did not consume its event")))
+                           ;; A callback must not retain a live cursor into the next frame.
+                           (setf (logical-cursor-stream cursor) nil
+                                 (logical-cursor-bytes cursor) #()
+                                 (logical-cursor-size cursor) nil
+                                 (logical-cursor-offset cursor) 0))))
+                (if (null stream)
+                    (let ((events (reverse (logical-spool-events spool))))
+                      (unless (and (= (length events) (logical-spool-count spool))
+                                   (every (lambda (event)
+                                            (and (typep event '(vector (unsigned-byte 8)))
+                                                 (plusp (length event))))
+                                          events)
+                                   (= (loop for event in events sum (length event))
+                                      (logical-spool-bytes spool)))
+                        (error "invalid logical spool contents"))
+                      (dolist (event events)
+                        (visit (make-logical-cursor :bytes event) (length event))))
+                    (let ((total 0)
+                          (buffer (make-array 65536 :element-type '(unsigned-byte 8))))
+                      (unless (file-position stream 0) (error "cannot seek logical spool"))
+                      (dotimes (index (logical-spool-count spool))
+                        (let* ((length (logical-spool-read-u32 stream))
+                               (expected (logical-spool-read-u32 stream))
+                               (start (file-position stream))
+                               (crc #xffffffff))
+                          (unless (and (integerp start) (plusp length)
+                                       (<= (+ total length) (logical-spool-bytes spool)))
+                            (error "invalid logical spool event length"))
+                          (loop for remaining = length then (- remaining n)
+                                while (plusp remaining)
+                                for n = (min remaining (length buffer))
+                                do (unless (= (read-sequence buffer stream :end n) n)
+                                     (error "truncated logical spool event"))
+                                   (loop for i below n for byte = (aref buffer i)
+                                         do (setf crc (logxor (ash crc -8)
+                                                              (aref *wal-crc32-table*
+                                                                    (logand (logxor crc byte) #xff))))))
+                          (unless (= (logxor crc #xffffffff) expected)
+                            (error "logical spool checksum mismatch"))
+                          (unless (file-position stream start) (error "cannot seek logical spool event"))
+                          (visit (make-logical-cursor :stream stream :size length)
+                                 length (+ start length))
+                          (incf total length)))
+                      (unless (and (= total (logical-spool-bytes spool))
+                                   (null (read-byte stream nil nil)))
+                        (error "invalid logical spool contents")))))
+              (setf complete t))
+         (unless complete (setf (logical-spool-failed-p spool) t))))))
   (values))
 
 (defun logical-spool-events-in-order (spool)
@@ -200,8 +283,8 @@ The caller must not mutate EVENT after passing it to this function."
     (logical-spool-map-events spool (lambda (event) (push event events)))
     (nreverse events)))
 
-(defun logical-spool-map-event-blocks (spool start-function block-function end-function
-                                       &key (block-size 65536))
+(defun %logical-spool-map-event-blocks (spool start-function block-function end-function
+                                        &key (block-size 65536))
   "Validate events and visit bounded byte ranges without constructing an event vector.
 BLOCK-FUNCTION must consume its byte range before returning; file buffers are reused."
   (when (or (logical-spool-failed-p spool) (not (logical-spool-sealed-p spool))
@@ -246,6 +329,14 @@ BLOCK-FUNCTION must consume its byte range before returning; file buffers are re
            (setf complete t))
       (unless complete (setf (logical-spool-failed-p spool) t))))
   (values))
+
+(defun logical-spool-map-event-blocks (spool start-function block-function end-function
+                                       &key (block-size 65536))
+  (call-with-logical-spool-visit
+   spool
+   (lambda ()
+     (%logical-spool-map-event-blocks spool start-function block-function end-function
+                                      :block-size block-size))))
 
 (defstruct logical-spool-wal-plan spool mode count)
 
@@ -349,13 +440,15 @@ A second read failure is a WAL critical-section failure, like other WAL I/O."
 
 (defun close-logical-spool (spool)
   "Transfer cleanup ownership before forgetting any transaction resources."
-  (sb-sys:without-interrupts
-    (unless (logical-spool-closed-p spool)
-      (call-with-logical-spool-owner
-       spool (lambda () (finish-query-temp-scope)))
-      (setf (logical-spool-closed-p spool) t
-            (logical-spool-events spool) nil
-            (logical-spool-stream spool) nil)))
+  (call-with-logical-spool-visit
+   spool
+   (lambda ()
+     (sb-sys:without-interrupts
+       (unless (logical-spool-closed-p spool)
+         (call-with-logical-spool-owner spool (lambda () (finish-query-temp-scope)))
+         (setf (logical-spool-closed-p spool) t
+               (logical-spool-events spool) nil
+               (logical-spool-stream spool) nil)))))
   (values))
 
 (defstruct (logical-recovery-assembler

@@ -646,9 +646,10 @@ text, varchar, JSON text, or bytea values, but still constructs JSONB and
 numeric values. The scoped slot sender stages committed changes in a
 transaction spool, spilling above 4 MiB without the SQL temporary-file quota.
 It validates the staged changes before sending and iterates them again for
-output; the spool is cleaned up when the reader scope ends. Each iteration
-still materializes a whole encoded event and its decoded values, and protocol
-output may allocate a full row message. The 4 MiB threshold is not a bound on
+output; the spool is cleaned up when the reader scope ends. For spilled events,
+each iteration checks the event CRC in bounded blocks before decoding through a
+bounded stream cursor, without allocating the complete encoded event. Decoded
+values and protocol output may still allocate a full row message. The 4 MiB threshold is not a bound on
 the size of an individual event. The 64 MiB capture and 65 MiB WAL limits still
 apply.
 
