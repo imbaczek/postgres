@@ -336,6 +336,13 @@ reuse_pointer() {
 }
 original_pointer=$(reuse_pointer)
 [ -n "$original_pointer" ]
+toast_reuse_chunk_count() {
+    printf '%s\n(quit)\n' "(let* ((db (gethash \"postgres\" (catalog-databases *catalog*))) (table (gethash \"toast_reuse\" (database-tables db))) (node (pg-toast-index-relfilenode (pg-class-toast table)))) (call-with-btree-relation-read-lock node (lambda () (format t \"CHUNKS=~d~%\" (length (btree-prefix-entries-unlocked node (encode-index-key (list $1) '(:oid))))))))" | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/reuse-chunks.out"
+    if grep -q ';; error:' "$TMP/reuse-chunks.out"; then cat "$TMP/reuse-chunks.out" >&2; exit 1; fi
+    awk -F= '/CHUNKS=/{print $2}' "$TMP/reuse-chunks.out"
+}
+original_chunks=$(toast_reuse_chunk_count "$original_pointer")
+[ "$original_chunks" -gt 1 ]
 # An optimized INSERT SELECT omits v from the source projection; conflict
 # handling must still materialize v from the existing target row.
 [ "$(run -c "insert into toast_reuse (id, marker) select id, marker from toast_reuse on conflict (id) do update set marker = excluded.marker + 1 returning v = '$big'")" = t ]
@@ -437,12 +444,15 @@ replacement_pointer=$(reuse_pointer)
 [ "$replacement_pointer" != "$original_pointer" ]
 run -c 'vacuum toast_reuse' >/dev/null
 [ "$(run -c "select marker, v = '$other' from toast_reuse where id = 1")" = '4|t' ]
+[ "$(toast_reuse_chunk_count "$original_pointer")" = "$original_chunks" ]
 printf "select v = '%s' from toast_reuse where id = 1; commit;\n\\q\n" "$big" >&3
 exec 3>&-
 wait "$READER"
 READER=
 [ "$(grep -Fxc 't' "$TMP/reuse-reader.out")" = 2 ]
 run -c 'vacuum toast_reuse' >/dev/null
+[ "$(toast_reuse_chunk_count "$original_pointer")" = 0 ]
+[ "$(toast_reuse_chunk_count "$replacement_pointer")" -gt 1 ]
 [ "$(run -c "select marker, v = '$other' from toast_reuse where id = 1")" = '4|t' ]
 # A concurrent updater must follow the latest committed tuple before reusing
 # the external value; its scan starts while the replacement is uncommitted.
