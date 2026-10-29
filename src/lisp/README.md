@@ -696,8 +696,8 @@ and bytea, checking slice CRCs and emitting bytes or bytea hex in bounded blocks
 Slices expire when the event callback returns. Recovery validation and scoped
 senders also scan canonical JSONB values of at least 64 KiB without constructing
 the value, including nested arrays and objects, strings, literals and decimal
-numbers. Object keys must be in canonical order and at most 4096 decoded UTF-8
-bytes; nesting and decimal digit bounds also apply to this fast path. Smaller
+numbers. Object keys must be in canonical order; their comparisons use bounded
+buffers even for long keys. Nesting and decimal digit bounds apply to this fast path. Smaller
 values, noncanonical forms and values outside those bounds fall back to the
 materializing parser for validation and normalization; malformed values are
 rejected. SQL numeric values and ordinary list-based reader values still

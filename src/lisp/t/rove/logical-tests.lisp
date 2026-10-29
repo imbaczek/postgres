@@ -1888,8 +1888,8 @@
       (rove:ok (not (recognized (make-string 131073 :initial-element #\1))))
       (rove:ok (recognized (concatenate 'string "0." (make-string 16383 :initial-element #\0))))
       (rove:ok (not (recognized (concatenate 'string "0." (make-string 16384 :initial-element #\0)))))
-      (rove:ok (not (recognized (concatenate 'string "{\"" (make-string 4097 :initial-element #\x)
-                                             "\": 1}"))))))
+      (rove:ok (recognized (concatenate 'string "{\"" (make-string 4097 :initial-element #\x)
+                                        "\": 1}")))))
 
 (rove:deftest test-jsonb-canonical-object-differential
     (dolist (text '("{\"\": 0, \"a\": 1, \"zz\": 2, \"é\": 3, \"aaa\": 4}"
@@ -1907,6 +1907,89 @@
         (when (or (search "\"b\": {\"z\": 1}, \"a\"" text)
                   (search "\"a\": 1, \"a\": 2" text))
           (rove:ok (not accepted))))))
+
+(rove:deftest test-jsonb-long-key-order-and-stream-position
+    (let* ((prefix (make-string 8191 :initial-element #\x))
+           (a (concatenate 'string prefix "\\n"))
+           (b (concatenate 'string prefix "A"))
+           (canonical (format nil "{\"~a\": 1, \"~a\": 2}" a b))
+           (reversed (format nil "{\"~a\": 1, \"~a\": 2}" b a))
+           (duplicate (format nil "{\"~a\": 1, \"~a\": 2}" a a))
+           (path (merge-pathnames (format nil "jsonb-keys-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory))))
+      (unwind-protect
+           (dolist (entry (list (list canonical t) (list reversed nil) (list duplicate nil)))
+             (let ((bytes (string->bytes (first entry))))
+               (rove:ok (eq (not (null (logical-jsonb-canonical-simple-p
+                                        (make-logical-cursor :bytes bytes) (length bytes))))
+                            (second entry)))
+               (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                         :if-exists :supersede)
+                 (write-byte 42 out) (write-sequence bytes out))
+               (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+                 (file-position in 1)
+                 (let ((cursor (make-logical-cursor :stream in :size (length bytes))))
+                   (rove:ok (eq (not (null (logical-jsonb-canonical-simple-p cursor (length bytes))))
+                                (second entry)))
+                   (rove:ok (and (= (file-position in) 1) (zerop (logical-cursor-offset cursor))))))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-jsonb-long-multibyte-key-order
+    (let* ((prefix (make-string 8191 :initial-element #\x))
+           (good (format nil "{\"~aé\": true, \"~aê\": null}" prefix prefix))
+           (bad (format nil "{\"~aê\": true, \"~aé\": null}" prefix prefix)))
+      (dolist (entry (list (list good t) (list bad nil)))
+        (let* ((bytes (string->bytes (first entry)))
+               (cursor (make-logical-cursor :bytes bytes)))
+          (rove:ok (eq (not (null (logical-jsonb-canonical-simple-p cursor (length bytes))))
+                       (second entry)))
+          (rove:ok (zerop (logical-cursor-offset cursor)))))))
+
+(rove:deftest test-jsonb-key-comparator-restores-position-on-error
+    (let ((path (merge-pathnames (format nil "jsonb-key-error-~d-~d"
+                                         (sb-posix:getpid) (random 1000000))
+                                 (uiop:temporary-directory))))
+      (unwind-protect
+           (progn
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede)
+               (write-sequence #(1 2 3 4) out))
+             (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+               (file-position in 2)
+               (let ((cursor (make-logical-cursor :stream in :size 8 :offset 2)))
+                 (rove:ok (handler-case
+                              (progn (logical-jsonb-key-descriptor-less-p
+                                      cursor 0 0 '(0 2 2) '(6 8 2)) nil)
+                            (error () t)))
+                 (rove:ok (and (= (file-position in) 2) (= (logical-cursor-offset cursor) 2))))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-publisher-jsonb-large-keys-use-slices
+    (let* ((*query-temp-directory* (uiop:temporary-directory))
+           (*logical-capture-memory-bytes* 1)
+           (prefix (make-string 70000 :initial-element #\x))
+           (value (make-sql-jsonb
+                   (cons :object (list (cons (concatenate 'string prefix "a") :json-true)
+                                       (cons (concatenate 'string prefix "b") :json-null)))))
+           (change (logical-test-change :insert 7 701 :new-values (vector 1 2 value)))
+           (spool (make-logical-spool)))
+      (setf (getf (third (logical-change-columns change)) :type) :jsonb)
+      (unwind-protect
+           (progn
+             (logical-spool-append spool (logical-encode-change change))
+             (logical-spool-seal spool)
+             (logical-transaction-map-send-changes
+              (make-logical-transaction :spool spool)
+              (lambda (decoded)
+                (let ((output (make-array 0 :element-type '(unsigned-byte 8)
+                                            :adjustable t :fill-pointer 0)))
+                  (rove:ok (logical-event-slice-p (aref (logical-change-new-values decoded) 2)))
+                  (pgoutput-emit-row-change
+                   decoded (lambda (part)
+                             (if (integerp part) (vector-push-extend part output)
+                                 (loop for byte across part do (vector-push-extend byte output)))))
+                  (rove:ok (equalp output (pgoutput-build-row-change change)))))))
+        (close-logical-spool spool))))
 
 (rove:deftest test-publisher-jsonb-object-slice-and-unsorted-fallback
     (let* ((*query-temp-directory* (uiop:temporary-directory))
