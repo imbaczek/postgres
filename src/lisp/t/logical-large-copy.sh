@@ -92,6 +92,19 @@ fi
 grep -F 'one logical row change exceeds the maximum WAL record size' "$TMP/oversize.out" >/dev/null
 [ "$(sql "$SOURCE_PORT" 'SELECT length(payload) FROM big_copy WHERE id=1')" = 8388736 ]
 [ "$(sql "$SOURCE_PORT" 'SELECT count(*) FROM big_copy WHERE id=3')" = 0 ]
+# After a failed explicit COMMIT, ROLLBACK must release the transaction in the
+# same session without relying on connection teardown.
+psql -X -qAt -h 127.0.0.1 -p "$SOURCE_PORT" -U postgres -d postgres >"$TMP/same-session.out" 2>"$TMP/same-session.err" <<'SQL'
+BEGIN;
+UPDATE big_copy SET payload = payload || payload WHERE id=1;
+COMMIT;
+ROLLBACK;
+INSERT INTO big_copy VALUES (4, 'same session');
+SELECT payload FROM big_copy WHERE id=4;
+SQL
+grep -F 'one logical row change exceeds the maximum WAL record size' "$TMP/same-session.err" >/dev/null
+[ "$(grep -c '^ERROR:' "$TMP/same-session.err")" = 1 ]
+grep -Fx 'same session' "$TMP/same-session.out" >/dev/null
 sql "$SOURCE_PORT" "INSERT INTO big_copy VALUES (2,'still writable')" >/dev/null
 kill "$SOURCE_PID"
 wait "$SOURCE_PID" 2>/dev/null || true
@@ -103,4 +116,5 @@ test_wait_owned_sql_server "$SOURCE_PID" "$SOURCE_PORT" psql 300
 [ "$(psql -X -qAt -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$SOURCE_PORT" -U postgres -d postgres -f "$TMP/check.sql")" = t ]
 [ "$(sql "$SOURCE_PORT" 'SELECT count(*) FROM big_copy WHERE id=3')" = 0 ]
 [ "$(sql "$SOURCE_PORT" 'SELECT payload FROM big_copy WHERE id=2')" = 'still writable' ]
+[ "$(sql "$SOURCE_PORT" 'SELECT payload FROM big_copy WHERE id=4')" = 'same session' ]
 echo 'logical-large-copy: PASS'
