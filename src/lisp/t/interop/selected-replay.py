@@ -255,6 +255,30 @@ def exercise_controller(promoted, sibling):
     print("follow-controller: public retarget, child receipt/replay and asynchronous bootstrap retirement PASS", flush=True)
 
 
+def exercise_receiver_only_stop(promoted, sibling):
+    load_helper("sibling.sock")
+    control("sibling.sock", '(defparameter *receiver-only-replay-thread* (physical-follow-runtime-replay-thread *physical-follow-runtime*))')
+    query(sibling, "SELECT pg_wal_replay_pause()")
+    query(promoted, "DELETE FROM promotion_sql_items WHERE id=6")
+    delete_flush = query(promoted, "SELECT pg_current_wal_flush_lsn()::text")[0][0]
+    wait(lambda: query(sibling, "SELECT pg_last_wal_receive_lsn()>='" + delete_flush + "'::pg_lsn") == [(True,)])
+    assert query(sibling, "SELECT count(*) FROM promotion_sql_items") == [(4,)]
+    control("sibling.sock", '(selected-replay-receiver-action nil)')
+    wait(lambda: ':RUNNING' not in control("sibling.sock", '*selected-replay-receiver-result*'))
+    control("sibling.sock", '(assert (eq :done *selected-replay-receiver-result*))')
+    assert query(sibling, "SELECT pid,status,received_tli FROM pg_catalog.pg_stat_get_wal_receiver()") == [(None, None, None)]
+    assert query(sibling, "SELECT pg_is_wal_replay_paused()") == [(True,)]
+    query(sibling, "SELECT pg_wal_replay_resume()")
+    wait(lambda: query(sibling, "SELECT count(*) FROM promotion_sql_items") == [(3,)])
+    control("sibling.sock", '(assert (and (eq *receiver-only-replay-thread* (physical-follow-runtime-replay-thread *physical-follow-runtime*)) (sb-thread:thread-alive-p *receiver-only-replay-thread*) (not *physical-recovery-failed-p*)))')
+    control("sibling.sock", '(selected-replay-receiver-action t)')
+    wait(lambda: ':RUNNING' not in control("sibling.sock", '*selected-replay-receiver-result*'))
+    control("sibling.sock", '(assert (eq :done *selected-replay-receiver-result*))')
+    query(promoted, "INSERT INTO promotion_sql_items VALUES (6,'receiver-resumed')")
+    wait(lambda: query(sibling, "SELECT count(*) FROM promotion_sql_items") == [(4,)])
+    print("follow-controller: receiver-only stop preserves pause and replays buffered WAL, then resumes receipt PASS", flush=True)
+
+
 def exercise_controller_parent_catchup():
     directory = root / "controller-lagging"
     process, identity = start_peer(directory, replica_port + 1, "lagging.sock", "lagging.log")
@@ -309,6 +333,7 @@ try:
     query(promoted, "INSERT INTO promotion_sql_items VALUES (3,'selected-child')")
     if os.environ.get("SELECTED_REPLAY_CONTROLLER") == "1":
         exercise_controller(promoted, sibling)
+        exercise_receiver_only_stop(promoted, sibling)
         exercise_controller_parent_catchup()
         sibling.close()
         assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL

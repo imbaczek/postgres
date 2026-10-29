@@ -526,6 +526,12 @@ publication failures fence recovery for restart reconciliation."
 
 (declaim (special *physical-follow-prepare-timeout*))
 
+(defun physical-follow-operation-cancelled-condition-p (operation condition)
+  (or (typep condition 'physical-follow-controller-cancelled)
+      (and (typep condition 'physical-client-stopped)
+           (sb-thread:with-mutex (*physical-follow-lock*)
+             (physical-follow-operation-cancelled-p operation)))))
+
 (defun physical-follow-operation-run (operation)
   (let ((client nil))
     (unwind-protect
@@ -552,8 +558,8 @@ publication failures fence recovery for restart reconciliation."
            ((or error sb-ext:timeout) (condition)
              (setf (physical-follow-operation-error operation) condition)
              (when (and (getf (physical-follow-operation-context operation) :committed)
-                        (not (typep condition '(or physical-follow-controller-cancelled
-                                                physical-recovery-worker-shutdown))))
+                        (not (or (physical-follow-operation-cancelled-condition-p operation condition)
+                                 (typep condition 'physical-recovery-worker-shutdown))))
                (setf *physical-recovery-failed-p* t))
              (handler-case (physical-follow-operation-recover operation)
                (error (recovery-error)
@@ -561,7 +567,7 @@ publication failures fence recovery for restart reconciliation."
                  (admin-log "native follow transition recovery failed: ~a" recovery-error)))
              (physical-follow-controller-record-error :transition condition)
              (unless (or (physical-client-retryable-condition-p condition)
-                         (typep condition 'physical-follow-controller-cancelled))
+                         (physical-follow-operation-cancelled-condition-p operation condition))
                (setf *physical-follow-auto-error*
                      (list (and (physical-follow-operation-config operation)
                                 (physical-follow-effective-config (physical-follow-operation-config operation)))
@@ -839,7 +845,7 @@ An empty cleanup-only configuration stops the worker but remains on disk."
       ((and (physical-follow-cleanup-only-p config)
             (null (getf (physical-follow-controller-state config) :cleanup))) :idle)
       ((and runtime (physical-follow-runtime-transition runtime)
-            (not (physical-follow-runtime-stopped-p runtime))
+            (not (physical-follow-receiver-stopped-p runtime))
             (physical-follow-controller-enabled-p config)
             (not (equal (first auto-error) (physical-follow-effective-config config)))
             (<= *physical-follow-auto-retry-after* (get-internal-real-time)))

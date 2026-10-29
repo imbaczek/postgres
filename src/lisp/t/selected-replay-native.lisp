@@ -101,6 +101,28 @@
       (when (and thread (sb-thread:thread-alive-p thread))
         (sb-thread:join-thread thread :timeout 5 :default :timeout)))))
 
+(defvar *selected-replay-receiver-result* nil)
+
+(defun selected-replay-receiver-action (restart-p)
+  (setf *selected-replay-receiver-result* :running)
+  (sb-thread:make-thread
+   (lambda ()
+     (handler-case
+         (progn
+           (physical-follow-call-with-controller-blocked
+            (lambda ()
+              (sb-thread:with-mutex (*physical-follow-command-lock*)
+                (if restart-p
+                    (let ((config (physical-follow-read-config)))
+                      (physical-follow-quiesce-runtime)
+                      (physical-follow-launch config))
+                    (physical-follow-quiesce-receiver)))))
+           (setf *selected-replay-receiver-result* :done))
+       (error (condition)
+         (setf *selected-replay-receiver-result* (list :failed (princ-to-string condition))))))
+   :name "selected replay receiver lifecycle")
+  :started)
+
 (defun selected-replay-export-follow-request (directory source)
   (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
     (let* ((state *physical-recovery-state*) (store *physical-receive-store*)

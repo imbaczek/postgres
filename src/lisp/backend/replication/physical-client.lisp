@@ -3,6 +3,8 @@
 ;;; Checked native physical follow exchanges. The caller owns transport and
 ;;; lifecycle; these helpers do not admit a receiver.
 
+(define-condition physical-client-stopped (error) ())
+
 (defconstant +physical-client-proof-frame-maximum+
   (+ +physical-store-history-maximum-bytes+ 65536)
   "Per-command frame bound for a 16 MiB history and result framing.")

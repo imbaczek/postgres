@@ -6,7 +6,14 @@
   "CONFIG is the runtime's private saved configuration; TRANSITION requests a
 controller handoff. Lifecycle and client ownership use the follow lock."
   host port pin config transition limit next-timeline
-  (stopped-p nil) (connected-p nil) last-error client receiver-thread replay-thread)
+  (stopped-p nil) (receiver-stopped-p nil) (connected-p nil) last-error client receiver-thread replay-thread)
+
+(define-condition physical-follow-receiver-stopped (physical-client-stopped) ())
+
+(defun physical-follow-receiver-stopped-p (runtime)
+  (or (physical-follow-runtime-stopped-p runtime)
+      (physical-follow-runtime-receiver-stopped-p runtime)))
+
 (defvar *physical-follow-runtime* nil)
 (defvar *physical-follow-lock* (sb-thread:make-mutex :name "native physical follow lifecycle"))
 
@@ -1001,10 +1008,11 @@ Validation checks coherence, not durable state or source proof."
 
 (defun physical-follow-register-runtime-client (runtime client)
   (sb-thread:with-mutex (*physical-follow-lock*)
-    (unless (and (eq runtime *physical-follow-runtime*)
-                 (not (physical-follow-runtime-stopped-p runtime)))
+    (unless (eq runtime *physical-follow-runtime*)
       (setf (physical-follow-runtime-stopped-p runtime) t)
-      (error "native physical receiver was stopped during connection"))
+      (error "native physical receiver no longer owns its runtime"))
+    (when (physical-follow-receiver-stopped-p runtime)
+      (error 'physical-follow-receiver-stopped))
     (setf (physical-follow-runtime-client runtime) client))
   client)
 
@@ -1071,7 +1079,7 @@ is not authentication or proof of source identity."
 
 (defun physical-follow-copy-stream (client runtime)
   (physical-follow-monitor-connected runtime)
-  (loop until (physical-follow-runtime-stopped-p runtime)
+  (loop until (physical-follow-receiver-stopped-p runtime)
         do (multiple-value-bind (kind payload)
                (physical-client-receive client)
              (case kind
@@ -1134,7 +1142,7 @@ is not authentication or proof of source identity."
              (physical-follow-runtime-last-error runtime)))
 
 (defun physical-follow-receiver-loop (runtime)
-  (loop until (or (physical-follow-runtime-stopped-p runtime) (shutdown-in-progress-p))
+  (loop until (or (physical-follow-receiver-stopped-p runtime) (shutdown-in-progress-p))
         do (handler-case
                (let ((cursor (with-live-operation
                                (check-recovery-available)
@@ -1142,26 +1150,31 @@ is not authentication or proof of source identity."
                  (let ((result (physical-follow-session runtime cursor)))
                    (when result
                      (sb-thread:with-mutex (*physical-follow-lock*)
-                       (when (eq runtime *physical-follow-runtime*)
+                       (when (and (eq runtime *physical-follow-runtime*)
+                                  (not (physical-follow-receiver-stopped-p runtime)))
                          (setf (physical-follow-runtime-transition runtime) result)))
                      (return-from physical-follow-receiver-loop :switch))))
              (physical-follow-source-changed (condition)
                (sb-thread:with-mutex (*physical-follow-lock*)
-                 (when (eq runtime *physical-follow-runtime*)
+                 (when (and (eq runtime *physical-follow-runtime*)
+                            (not (physical-follow-receiver-stopped-p runtime)))
                    (setf (physical-follow-runtime-transition runtime)
                          (list :refresh (physical-follow-changed-timeline condition)))))
                (return-from physical-follow-receiver-loop :refresh))
              (physical-follow-route-changed ()
                (sb-thread:with-mutex (*physical-follow-lock*)
-                 (when (eq runtime *physical-follow-runtime*)
+                 (when (and (eq runtime *physical-follow-runtime*)
+                            (not (physical-follow-receiver-stopped-p runtime)))
                    (setf (physical-follow-runtime-transition runtime) '(:refresh-route))))
                (return-from physical-follow-receiver-loop :refresh))
+             (physical-client-stopped ()
+               (return-from physical-follow-receiver-loop :stopped))
              ((or error sb-ext:timeout) (condition)
                (let ((terminal (physical-follow-terminal-p condition)))
-                 (when (or (not (physical-follow-runtime-stopped-p runtime))
+                 (when (or (not (physical-follow-receiver-stopped-p runtime))
                            (and terminal (not *physical-recovery-failed-p*)))
                    (physical-follow-note-error runtime condition terminal)))))
-           (unless (physical-follow-runtime-stopped-p runtime) (sleep 0.2))))
+           (unless (physical-follow-receiver-stopped-p runtime) (sleep 0.2))))
 
 (defun physical-follow-replay-loop (runtime)
   (loop until (or (physical-follow-runtime-stopped-p runtime) (shutdown-in-progress-p))
@@ -1251,27 +1264,43 @@ Validate before creating workers and publish only a complete worker pair."
   (physical-follow-controller-start-worker)
   :started)
 
+(defun physical-follow-quiesce-receiver ()
+  (when (plusp *live-operation-depth*)
+    (error "receiver quiescence must join outside admission"))
+  (unless (sb-thread:holding-mutex-p *physical-follow-command-lock*)
+    (error "receiver quiescence requires follow command exclusion"))
+  (let ((runtime *physical-follow-runtime*))
+    (when runtime
+      (let ((client (sb-thread:with-mutex (*physical-follow-lock*)
+                      (setf (physical-follow-runtime-receiver-stopped-p runtime) t
+                            (physical-follow-runtime-transition runtime) nil)
+                      (physical-follow-runtime-client runtime))))
+        (when client (ignore-errors (physical-client-stop client))))
+      (let ((thread (physical-follow-runtime-receiver-thread runtime)))
+        (when thread
+          (sb-thread:join-thread thread :timeout 15 :default :timeout)
+          (when (sb-thread:thread-alive-p thread)
+            (error "native physical receiver has not stopped"))))
+      (physical-follow-flush-on-exit runtime)
+      (physical-follow-check-exit)
+      (physical-follow-monitor-stop runtime)))
+  :stopped)
+
 (defun physical-follow-quiesce-runtime ()
   "Caller owns the command mutex, outside admission; preserve durable follow configuration."
   (when (plusp *live-operation-depth*) (error "follow quiescence must join outside admission"))
   (let ((runtime *physical-follow-runtime*))
     (when runtime
-      (setf (physical-follow-runtime-stopped-p runtime) t)
-      (let ((client (sb-thread:with-mutex (*physical-follow-lock*)
-                      (physical-follow-runtime-client runtime))))
-        (when client
-          (ignore-errors
-           (physical-client-stop client))))
-      (let ((threads (list (physical-follow-runtime-receiver-thread runtime)
-                           (physical-follow-runtime-replay-thread runtime))))
-        (dolist (thread threads)
-          (when thread (sb-thread:join-thread thread :timeout 15 :default :timeout)))
-        (when (some (lambda (thread) (and thread (sb-thread:thread-alive-p thread))) threads)
-          (error "native physical workers have not stopped")))
-      ;; Older live stack frames may retain their pre-flush cleanup.
-      (physical-follow-flush-on-exit runtime)
-      (physical-follow-check-exit)
-      (sb-thread:with-mutex (*physical-follow-lock*) (setf *physical-follow-runtime* nil))))
+      (sb-thread:with-mutex (*physical-follow-lock*)
+        (setf (physical-follow-runtime-stopped-p runtime) t))
+      (physical-follow-quiesce-receiver)
+      (let ((thread (physical-follow-runtime-replay-thread runtime)))
+        (when thread
+          (sb-thread:join-thread thread :timeout 15 :default :timeout)
+          (when (sb-thread:thread-alive-p thread)
+            (error "native physical replay worker has not stopped"))))
+      (sb-thread:with-mutex (*physical-follow-lock*)
+        (setf *physical-follow-runtime* nil))))
   :stopped)
 
 (defun physical-follow-stop ()

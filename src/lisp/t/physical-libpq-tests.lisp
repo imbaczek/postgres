@@ -610,6 +610,57 @@
          (ok rejected)
          (ok (pg::physical-libpq-channel-stopped channel))))))
 
+(deftest physical-libpq-stopped-pipe-is-cancellation-but-unsolicited-eof-is-protocol-error
+    (dolist (stopped '(nil t))
+      (call-with-owned-libpq-test-process
+       "/bin/cat" nil
+       (lambda (channel)
+         (if stopped
+             (pg::physical-libpq-stop channel)
+             (sb-ext:process-kill (pg::physical-libpq-channel-process channel) 9))
+         (let ((condition
+                 (handler-case
+                     (pg::with-physical-libpq-operation (channel)
+                       (pg::physical-libpq-read-reply channel 0 '(#\D) 1))
+                   (error (condition) condition))))
+           (if stopped
+               (ok (typep condition 'pg::physical-client-stopped))
+               (progn
+                 (ok (typep condition 'pg::pg-client-error))
+                 (when (typep condition 'pg::pg-client-error)
+                   (ok (equal "08P01" (pg::pg-client-error-sqlstate condition))))))
+           (ok (pg::physical-libpq-channel-closed channel)))))))
+
+(deftest physical-libpq-stopped-write-is-cancellation
+    (call-with-owned-libpq-test-process
+     "/bin/cat" nil
+     (lambda (channel)
+       (pg::physical-libpq-stop channel)
+       (ok (signals (pg::physical-libpq-write-request channel #\Q #())
+                    'pg::physical-client-stopped)))))
+
+(deftest physical-follow-controller-stop-is-expected-only-for-cancelled-operation
+    (dolist (cancelled '(nil t))
+      (dolist (committed '(nil t))
+        (let* ((operation (pg::make-physical-follow-operation
+                           :cancelled-p cancelled :context (list :committed committed)))
+               (pg::*physical-follow-operation* operation)
+               (pg::*physical-follow-auto-error* nil)
+               (pg::*physical-follow-auto-retry-after* 0)
+               (pg::*physical-follow-controller-errors* (make-hash-table :test #'equal))
+               (pg::*physical-recovery-failed-p* nil)
+               (original (symbol-function 'pg::physical-follow-operation-initial-config)))
+          (unwind-protect
+               (progn
+                 (setf (symbol-function 'pg::physical-follow-operation-initial-config)
+                       (lambda (ignored) (declare (ignore ignored))
+                         (error 'pg::physical-client-stopped)))
+                 (pg::physical-follow-operation-run operation)
+                 (ok (eql cancelled (null pg::*physical-follow-auto-error*)))
+                 (ok (eql (and committed (not cancelled)) pg::*physical-recovery-failed-p*))
+                 (ok (null pg::*physical-follow-operation*)))
+            (setf (symbol-function 'pg::physical-follow-operation-initial-config) original))))))
+
 (deftest physical-client-transport-receives-full-native-fragment-and-completion
     (let ((payload (make-array (+ 25 65536) :element-type '(unsigned-byte 8) :initial-element 0)))
       (setf (aref payload 0) (char-code #\w))

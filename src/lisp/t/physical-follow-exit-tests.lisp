@@ -101,3 +101,66 @@
          (ok (= (length record) (pg::physical-store-flushed-lsn store)))
          (ok (= (length record) (getf pg::*physical-recovery-state* :receive-lsn)))
          (ok (null pg::*physical-follow-runtime*))))))
+
+(deftest receiver-only-quiescence-flushes-and-keeps-replay-running
+    (call-with-exit-flush-store
+     (lambda (root store runtime)
+       (declare (ignore root))
+       (let* ((pg::*physical-follow-runtime* runtime)
+              (record (sample-physical-record))
+              (allow-replay (sb-thread:make-semaphore))
+              (replayed (sb-thread:make-semaphore))
+              (old-replay (symbol-function 'pg::physical-recovery-replay))
+              (receiver nil) (replay nil))
+         (pg::physical-store-input store 0 record)
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-recovery-replay)
+                      (lambda ()
+                        (setf pg::*last-replay-lsn* (pg::physical-store-flushed-lsn store))
+                        (sb-thread:signal-semaphore replayed)))
+                (setf receiver
+                      (sb-thread:make-thread
+                       (lambda ()
+                         (loop until (pg::physical-follow-receiver-stopped-p runtime)
+                               do (sleep 0.005))))
+                      replay
+                      (sb-thread:make-thread
+                       (lambda ()
+                         (let ((pg::*physical-receive-store* store)
+                               (pg::*last-replay-lsn* 0)
+                               (pg::*physical-replay-paused-p* nil)
+                               (pg::*shutdown* pg::+no-shutdown+))
+                           (sb-thread:wait-on-semaphore allow-replay)
+                           (pg::physical-follow-replay-loop runtime))))
+                      (pg::physical-follow-runtime-receiver-thread runtime) receiver
+                      (pg::physical-follow-runtime-replay-thread runtime) replay)
+                (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                  (ok (eq :stopped (pg::physical-follow-quiesce-receiver))))
+                (ok (not (sb-thread:thread-alive-p receiver)))
+                (ok (sb-thread:thread-alive-p replay))
+                (ok (eq runtime pg::*physical-follow-runtime*))
+                (ok (not (pg::physical-follow-runtime-stopped-p runtime)))
+                (ok (= (length record) (pg::physical-store-flushed-lsn store)))
+                (sb-thread:signal-semaphore allow-replay)
+                (ok (sb-thread:wait-on-semaphore replayed :timeout 2))
+                (ok (sb-thread:thread-alive-p replay)))
+           (setf (pg::physical-follow-runtime-stopped-p runtime) t)
+           (sb-thread:signal-semaphore allow-replay)
+           (dolist (thread (list receiver replay))
+             (when thread (sb-thread:join-thread thread :timeout 2 :default :timeout)))
+           (setf (symbol-function 'pg::physical-recovery-replay) old-replay))))))
+
+(deftest receiver-only-quiescence-rejects-late-client-without-stopping-replay
+    (let* ((runtime (pg::make-physical-follow-runtime))
+           (pg::*physical-follow-runtime* runtime))
+      (sb-thread:with-mutex (pg::*physical-follow-lock*)
+        (setf (pg::physical-follow-runtime-receiver-stopped-p runtime) t))
+      (ok (signals (pg::physical-follow-register-runtime-client runtime :late-client)
+                   'pg::physical-follow-receiver-stopped))
+      (ok (null (pg::physical-follow-runtime-client runtime)))
+      (ok (not (pg::physical-follow-runtime-stopped-p runtime)))))
+
+(deftest receiver-only-quiescence-cannot-join-inside-admission
+    (let ((pg::*live-operation-depth* 1))
+      (ok (intake-fails-p #'pg::physical-follow-quiesce-receiver))))
