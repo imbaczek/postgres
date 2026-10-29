@@ -382,6 +382,20 @@ result is text for typeof and int4 for array_length."
     (list :func name (list (coerce-common-expression (first arguments) input-type))
           :type (if (search "_typeof" name) :text :int4) :typmod -1)))
 
+(defun analyze-jsonb-set-function (name arguments)
+  "Resolve jsonb_set(jsonb, text[], jsonb [, boolean])."
+  (let ((types '(:jsonb :text-array :jsonb :bool)))
+    (unless (and (member (length arguments) '(3 4))
+                 (loop for argument in arguments for type in types
+                       always (or (eq (expr-type argument) type)
+                                  (in-unknown-constant-p argument)
+                                  (sql-implicit-coercion-p (expr-type argument) type))))
+      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+    (list :func name
+          (loop for argument in arguments for type in types
+                collect (coerce-common-expression argument type))
+          :type :jsonb :typmod -1)))
+
 (defun analyze-substr-function (name arguments)
   "Resolve text and bytea substring overloads."
   (unless (and (member (length arguments) '(2 3))
@@ -1294,6 +1308,11 @@ so a nested argument error keeps its own diagnostics."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature)))
+      ((string= name "jsonb_set")
+       (let ((*defer-function-constant-coercion-p*
+               (or (getf (cdddr expr) :call-distinct)
+                   (getf (cdddr expr) :call-order))))
+         (analyze-jsonb-set-function name args)))
       ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
       ((string= name "pg_stat_get_wal_receiver") (analyze-wal-receiver-function name args))
       ((member name '("json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length")
@@ -3105,7 +3124,7 @@ candidate selection."
                          (member (second form)
                                  '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                    "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
-                                   "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length"
+                                   "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set"
                                    "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid"
                                    "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                                    "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
@@ -4022,6 +4041,10 @@ Map float catalog names and dispatch integer catalog names only here, after
 expression identity has been resolved."
   (setf name (or (second (float-catalog-alias name)) name))
   (cond
+    ((string= name "jsonb_set")
+     (if (member +null+ arguments) +null+
+         (sql-jsonb-set (first arguments) (second arguments) (third arguments)
+                        (if (fourth arguments) (fourth arguments) (= (length arguments) 3)))))
     ((integer-catalog-alias-p name)
      (if (member +null+ arguments) +null+
          (let ((suffix (subseq name 4)))

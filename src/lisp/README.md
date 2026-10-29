@@ -267,6 +267,15 @@ scalar, so its type is the text `null` and it is not an array.
 JSONB `||` merges top-level objects with right-hand keys winning. Otherwise it
 concatenates arrays, treating each non-array root as a single element. The merge
 is not recursive. Generated values obey the 512-level nesting limit.
+`jsonb_set(jsonb, text[], jsonb [, boolean])` returns a copy with the specified
+object key or array element replaced; the optional create flag defaults to true.
+Earlier path steps must exist. At the final step, creation can add an object key
+or prepend/append for an out-of-range negative/positive array index. Negative
+indices count from the end. Scalar roots raise an error, as do NULL path elements
+and invalid array indices reached during traversal; unreachable later elements
+are not validated. An empty path leaves a container unchanged. Paths use the
+supported one-dimensional text array representation. JSONB values remain
+materialized; unchanged tree branches are shared without mutating inputs.
 
 Decimal literals and numeric casts support finite values; numeric casts also
 accept NaN, infinities, and signed hexadecimal, octal, and binary integer input
