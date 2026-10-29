@@ -55,18 +55,27 @@ Discard the cursor after a read error; the stream may have advanced."
       (dolist (spool (car *logical-reader-spool-scope*))
         (close-logical-spool spool)))))
 
+(defun logical-reader-owned-spool (state)
+  (unless *logical-reader-spool-scope* (error "logical reader has no spool scope"))
+  (or (logical-reader-state-spool state)
+      (sb-sys:without-interrupts
+        (let* ((*query-temp-file-limit-bytes* nil)
+               (spool (make-logical-spool)))
+          (setf (logical-reader-state-spool state) spool)
+          (push spool (car *logical-reader-spool-scope*))
+          spool))))
+
+(defun logical-reader-store-validated-event (state change event)
+  "Store original bytes after validating their complete decoded metadata."
+  (when (= (logical-change-database-oid change) (logical-reader-state-database-oid state))
+    (logical-spool-append (logical-reader-owned-spool state) event))
+  (values))
+
 (defun logical-reader-store-change (state change)
   (if *logical-reader-spool-scope*
       (when (= (logical-change-database-oid change) (logical-reader-state-database-oid state))
-        (let ((spool (logical-reader-state-spool state)))
-          (unless spool
-            (sb-sys:without-interrupts
-              (let ((*query-temp-file-limit-bytes* nil))
-                (setf spool (make-logical-spool)
-                      (logical-reader-state-spool state) spool))
-              (push spool (car *logical-reader-spool-scope*))))
-          (logical-spool-append-change
-           spool change +max-logical-wal-event-bytes+)))
+        (logical-spool-append-change (logical-reader-owned-spool state)
+                                     change +max-logical-wal-event-bytes+))
       (progn
         (when (> (logical-reader-state-change-bytes state) +max-unscoped-logical-materialization-bytes+)
           (error "unscoped logical reader exceeds its materialization limit"))
@@ -996,13 +1005,13 @@ executor, so capture the same operation before transaction commit."
                                           (logical-encode-chunk index chunk-count chunk))))))))
   (values))
 
-(defun wal-decode-logical-change-chunk (payload)
+(defun wal-decode-logical-change-chunk (payload &optional raw-events-p)
   (let* ((cursor (make-logical-cursor :bytes payload))
          (index (logical-read-u32 cursor))
          (count (logical-read-u32 cursor))
          (event-count (logical-read-u32 cursor))
          (change-bytes 0)
-         (changes '()))
+         (changes '()) (events '()))
     (unless (and (plusp count) (< index count) (plusp event-count))
       (error "invalid logical WAL chunk header"))
     (loop repeat event-count
@@ -1012,10 +1021,12 @@ executor, so capture the same operation before transaction commit."
                           (error "invalid logical WAL event length"))
                         (logical-read-octets cursor length))
           do (incf change-bytes length)
-             (push (logical-decode-change event) changes))
+             (let ((*logical-validation-only* (and raw-events-p t)))
+               (push (logical-decode-change event) changes))
+             (when raw-events-p (push event events)))
     (unless (= (logical-cursor-offset cursor) (length payload))
       (error "logical WAL chunk has trailing bytes"))
-    (values index count (nreverse changes) change-bytes)))
+    (values index count (nreverse changes) change-bytes (nreverse events))))
 
 (defun wal-recovery-reset-logical-change-batch ()
   (when (and (logical-fragment-batch-p *wal-recovery-logical-xid*)
@@ -1030,10 +1041,10 @@ executor, so capture the same operation before transaction commit."
   (values))
 
 (defun wal-advance-logical-change-chunk
-    (record expected-xid expected-count expected-index change-bytes)
+    (record expected-xid expected-count expected-index change-bytes &optional raw-events-p)
   "Validate one chunk and return its updated transaction progress."
-  (multiple-value-bind (index count changes event-bytes)
-      (wal-decode-logical-change-chunk (wal-record-payload record))
+  (multiple-value-bind (index count changes event-bytes events)
+      (wal-decode-logical-change-chunk (wal-record-payload record) raw-events-p)
     (let ((xid (wal-record-xid record)))
       (unless (plusp xid)
         (error "logical row-change record has no transaction ID"))
@@ -1051,7 +1062,7 @@ executor, so capture the same operation before transaction commit."
         (error "logical WAL chunks are out of order or change transaction"))
       (let ((next-index (1+ expected-index))
             (next-bytes (+ change-bytes event-bytes)))
-        (values expected-xid expected-count next-index next-bytes changes)))))
+        (values expected-xid expected-count next-index next-bytes changes events)))))
 
 (defun wal-recovery-accept-logical-change-chunk (record)
   (unless *wal-recovery-group-active*
@@ -1145,11 +1156,12 @@ executor, so capture the same operation before transaction commit."
       (progn
         (when (logical-reader-state-fragment-batch state)
           (error "logical WAL batch mixes fragment and legacy records"))
-        (multiple-value-bind (xid count next-index change-bytes changes)
+        (multiple-value-bind (xid count next-index change-bytes changes events)
             (let ((*logical-validation-only* nil))
               (wal-advance-logical-change-chunk
                record (logical-reader-state-xid state) (logical-reader-state-chunk-count state)
-               (logical-reader-state-next-chunk state) (logical-reader-state-change-bytes state)))
+               (logical-reader-state-next-chunk state) (logical-reader-state-change-bytes state)
+               (not (null *logical-reader-spool-scope*))))
           (setf (logical-reader-state-xid state) xid
                 (logical-reader-state-chunk-count state) count
                 (logical-reader-state-next-chunk state) next-index
@@ -1158,9 +1170,11 @@ executor, so capture the same operation before transaction commit."
                            (member (logical-change-kind change) '(:insert :update :delete :truncate)))
                          changes)
             (error "catalog event appears in a transactional row-change record"))
-          (dolist (change changes)
-            (setf (logical-reader-state-row-p state) t)
-            (logical-reader-store-change state change)))))
+          (loop for change in changes
+                for event in (if events events (make-list (length changes))) do
+                  (setf (logical-reader-state-row-p state) t)
+                  (if events (logical-reader-store-validated-event state change event)
+                      (logical-reader-store-change state change))))))
   (values))
 
 (defun wal-logical-reader-add-catalog-event (state record)

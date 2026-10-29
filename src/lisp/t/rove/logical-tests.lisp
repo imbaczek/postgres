@@ -2358,6 +2358,95 @@
         (wal-logical-reader-reset-batch state nil)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest test-scoped-legacy-reader-retains-validated-raw-events
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-raw-reader-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (*query-temp-file-limit-bytes* 0)
+           (text-change (logical-test-change :insert 7 701 :new-values #(1 2 "ż🙂")))
+           (other (logical-test-change :insert 8 701 :new-values #(4 5 "excluded")))
+           (update (logical-test-change :update 7 701 :old-values #(1 2 "old")
+                                                      :new-values (vector 1 3 +logical-unchanged-toast+)))
+           (bytes (logical-test-change :insert 7 701 :new-values (vector 8 9 (make-array 3 :element-type '(unsigned-byte 8)
+                                                                                           :initial-contents '(0 128 255)))))
+           (json (logical-test-change :insert 7 701
+                                      :new-values (vector 10 11 (sql-jsonb-input "{\"b\":1.00,\"a\":null}"))))
+           (null-row (logical-test-change :insert 7 701 :new-values (vector 12 13 +null+)))
+           (original (symbol-function 'logical-spool-append-change))
+           (events nil))
+      (ensure-directories-exist directory)
+      (setf (getf (third (logical-change-columns bytes)) :type) :bytea
+            (getf (third (logical-change-columns bytes)) :typmod) -1
+            (getf (third (logical-change-columns json)) :type) :jsonb
+            (getf (third (logical-change-columns json)) :typmod) -1)
+      (let* ((encoded (mapcar #'logical-encode-change (list text-change other update bytes json null-row)))
+             (record (make-wal-record :type +wal-record-logical-changes+ :xid 88
+                                      :payload (logical-encode-chunk 0 1 encoded)))
+             (state (make-logical-reader-state :database-oid 7 :batch-open-p t :next-chunk 0)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'logical-spool-append-change)
+                     (lambda (&rest args) (declare (ignore args)) (error "unexpected re-encoding")))
+               (call-with-logical-reader-spools
+                (lambda ()
+                  (wal-logical-reader-add-chunk state record)
+                  (logical-spool-seal (logical-reader-state-spool state))
+                  (logical-spool-map-events (logical-reader-state-spool state)
+                                            (lambda (event) (push event events)))
+                  (setf events (nreverse events))
+                  (rove:ok (equalp events (list (first encoded) (third encoded) (fourth encoded) (fifth encoded) (sixth encoded))))
+                  (let ((decoded (mapcar #'logical-decode-change events)))
+                    (rove:ok (equalp (logical-change-new-values (first decoded)) #(1 2 "ż🙂")))
+                    (rove:ok (eq (aref (logical-change-new-values (second decoded)) 2)
+                                 +logical-unchanged-toast+))
+                    (rove:ok (equalp (aref (logical-change-new-values (third decoded)) 2)
+                                     #(0 128 255)))
+                    (rove:ok (zerop (sql-jsonb-compare
+                                     (aref (logical-change-new-values (fourth decoded)) 2)
+                                     (aref (logical-change-new-values json) 2))))
+                    (rove:ok (eq (aref (logical-change-new-values (fifth decoded)) 2) +null+))))))
+          (setf (symbol-function 'logical-spool-append-change) original)
+          (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore)))))
+
+(rove:deftest test-scoped-legacy-reader-rejects-invalid-late-event
+    (let* ((valid (logical-encode-change (logical-test-change :insert 7 701 :new-values #(1 2 "ok"))))
+           (bad (logical-encode-change (logical-test-change :insert 8 701 :new-values #(4 5 "excluded"))))
+           (position (search (string->bytes "excluded") bad))
+           (state (make-logical-reader-state :database-oid 7 :batch-open-p t :next-chunk 0)))
+      (rove:ok position)
+      (setf (aref bad position) #xff)
+      (let ((record (make-wal-record :type +wal-record-logical-changes+ :xid 88
+                                     :payload (logical-encode-chunk 0 1 (list valid bad)))))
+        (call-with-logical-reader-spools
+         (lambda ()
+           (rove:ok (handler-case (progn (wal-logical-reader-add-chunk state record) nil)
+                      (error () t)))
+           (rove:ok (null (logical-reader-state-spool state)))
+           (rove:ok (null (logical-reader-state-transactions state))))))))
+
+(rove:deftest test-scoped-legacy-reader-late-chunk-failure-cleans-spool
+    (let* ((valid (logical-encode-change (logical-test-change :insert 7 701 :new-values #(1 2 "ok"))))
+           (bad (logical-encode-change (logical-test-change :insert 8 701 :new-values #(4 5 "excluded"))))
+           (position (search (string->bytes "excluded") bad))
+           (first (make-wal-record :type +wal-record-logical-changes+ :xid 88
+                                   :payload (logical-encode-chunk 0 2 (list valid))))
+           (state (make-logical-reader-state :database-oid 7 :batch-open-p t :next-chunk 0))
+           (spool nil))
+      (setf (aref bad position) #xff)
+      (let ((second (make-wal-record :type +wal-record-logical-changes+ :xid 88
+                                     :payload (logical-encode-chunk 1 2 (list bad)))))
+        (call-with-logical-reader-spools
+         (lambda ()
+           (wal-logical-reader-add-chunk state first)
+           (setf spool (logical-reader-state-spool state))
+           (rove:ok (= 1 (logical-spool-count spool)))
+           (rove:ok (handler-case (progn (wal-logical-reader-add-chunk state second) nil)
+                      (error () t)))
+           (rove:ok (null (logical-reader-state-transactions state)))))
+        (rove:ok (logical-spool-closed-p spool)))))
+
 (rove:deftest test-logical-scoped-committed-transaction-spool
     (let* ((directory (merge-pathnames
                        (format nil "pg-slot-iterator-~d-~d/" (sb-posix:getpid) (random 1000000))
