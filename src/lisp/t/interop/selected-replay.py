@@ -30,6 +30,7 @@ def control(socket, form, expect_error=False):
                             input=form + "\n(quit)\n", capture_output=True, text=True,
                             timeout=30, check=True)
     text = result.stdout + result.stderr
+    assert ";; read error:" not in text, text
     assert (";; error:" in text) == expect_error, text
     return text
 
