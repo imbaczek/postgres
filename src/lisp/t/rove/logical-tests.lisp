@@ -227,6 +227,118 @@
         (setf (symbol-function 'pg-client-send-query) original)
         (when (probe-file path) (delete-file path)))))
 
+(rove:deftest test-initial-copy-owned-field-chunks
+    (let* ((path (merge-pathnames (format nil "pg-copy-owned-~d-~d"
+                                          (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (original-send (symbol-function 'pg-client-send-query))
+           (original-chunk (symbol-function 'logical-copy-target-chunk))
+           (original-limit (symbol-function 'logical-copy-chunk-limit-bytes))
+           (original-capture (symbol-function 'logical-wire-field-capture))
+           (*logical-wire-field-spill-threshold* 1)
+           (owners nil) (seen nil) (fail-chunk nil) (chunk-limit 55)
+           (description (make-payload)))
+      (payload-push-u16 description 1)
+      (payload-push-cstring description "a")
+      (dotimes (i 6) (payload-push-byte description 0))
+      (payload-push-u32 description 25)
+      (payload-push-u16 description #xffff)
+      (payload-push-u32 description #xffffffff)
+      (payload-push-u16 description 0)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg-client-send-query)
+                   (lambda (&rest args) (declare (ignore args)))
+                   (symbol-function 'logical-copy-chunk-limit-bytes) (lambda () chunk-limit)
+                   (symbol-function 'logical-wire-field-capture)
+                   (lambda (owner cursor size)
+                     (push owner owners)
+                     (funcall original-capture owner cursor size))
+                   (symbol-function 'logical-copy-target-chunk)
+                   (lambda (target table columns rows)
+                     (declare (ignore target table columns))
+                     (when fail-chunk (error "injected copy chunk failure"))
+                     (dolist (row (reverse rows))
+                       (let ((field (aref row 0)))
+                         (rove:ok (logical-wire-field-p field))
+                         (push (with-output-to-string (out)
+                                 (logical-wire-field-visit field out)) seen)))))
+             (dolist (failure '(nil target source singleton))
+               (setf owners nil seen nil fail-chunk (eq failure 'target)
+                     chunk-limit (if (eq failure 'singleton) 53 55))
+               (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                         :if-exists :supersede :if-does-not-exist :create)
+                 (write-message out #\T description)
+                 (dolist (value '("ż'abc" "🙂abc"))
+                   (let ((row (make-payload)) (bytes (string->bytes value)))
+                     (payload-push-u16 row 1)
+                     (payload-push-u32 row (length bytes))
+                     (payload-push row bytes)
+                     (write-message out #\D row)))
+                 (if (eq failure 'source)
+                     (let ((err (make-payload)))
+                       (payload-push-byte err (char-code #\M))
+                       (payload-push-cstring err "failed")
+                       (payload-push-byte err 0)
+                       (write-message out #\E err))
+                     (write-message out #\C #(83 69 76 69 67 84 0)))
+                 (write-message out #\Z #(73)))
+               (with-open-file (in path :element-type '(unsigned-byte 8))
+                 (let ((source (make-pg-client :stream in)))
+                   (if (member failure '(target source))
+                       (rove:ok (handler-case
+                                    (progn
+                                      (logical-copy-source-table
+                                       source nil "copy_rows"
+                                       (lambda (&rest args) (declare (ignore args)) nil))
+                                      nil)
+                                  (error () t)))
+                       (logical-copy-source-table
+                        source nil "copy_rows" (lambda (&rest args) (declare (ignore args)) nil)))))
+               (rove:ok (= (length owners) 2))
+               (rove:ok (every (lambda (owner)
+                                 (and (not (logical-wire-field-owner-active-p owner))
+                                      (not (open-stream-p (logical-wire-field-owner-stream owner))))) owners))
+               (when (member failure '(nil singleton))
+                 (rove:ok (equal (nreverse seen) '("ż'abc" "🙂abc"))))))
+        (setf (symbol-function 'pg-client-send-query) original-send
+              (symbol-function 'logical-copy-target-chunk) original-chunk
+              (symbol-function 'logical-copy-chunk-limit-bytes) original-limit
+              (symbol-function 'logical-wire-field-capture) original-capture)
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-initial-copy-attempts-all-owner-closes
+    (let* ((original-query (symbol-function 'pg-client-query))
+           (original-chunk (symbol-function 'logical-copy-target-chunk))
+           (original-close (symbol-function 'close-logical-wire-field-owner))
+           (owners (list (make-logical-wire-field-owner) (make-logical-wire-field-owner)))
+           (closed nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg-client-query)
+                   (lambda (client query &key on-row-with-owner)
+                     (declare (ignore client query))
+                     (dolist (owner owners)
+                       (funcall on-row-with-owner #("value") nil owner)))
+                   (symbol-function 'logical-copy-target-chunk)
+                   (lambda (&rest args) (declare (ignore args)))
+                   (symbol-function 'close-logical-wire-field-owner)
+                   (lambda (owner)
+                     (funcall original-close owner)
+                     (push owner closed)
+                     (when (eq owner (second owners))
+                       (error "injected close failure"))))
+             (rove:ok (handler-case
+                          (progn (logical-copy-source-table
+                                  nil nil "copy_rows" (lambda (&rest args) (declare (ignore args)) nil))
+                                 nil)
+                        (error () t)))
+             (rove:ok (= (length closed) 2))
+             (rove:ok (every (lambda (owner) (not (logical-wire-field-owner-active-p owner))) owners)))
+        (setf (symbol-function 'pg-client-query) original-query
+              (symbol-function 'logical-copy-target-chunk) original-chunk
+              (symbol-function 'close-logical-wire-field-owner) original-close))))
+
 (rove:deftest test-streamed-datarow-short-header-and-adjacent-frame
     (let ((path (merge-pathnames (format nil "pg-copy-adjacent-~d-~d" (sb-posix:getpid) (random 1000000))
                                  (uiop:temporary-directory)))

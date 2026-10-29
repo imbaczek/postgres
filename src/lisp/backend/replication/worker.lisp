@@ -472,7 +472,9 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
 
 (defun logical-copy-row-size (row)
   (+ 32 (* 16 (length row))
-     (loop for value across row when value sum (logical-utf8-size-bounded value))))
+     (loop for value across row when value sum (if (logical-wire-field-p value)
+                                                   (logical-wire-field-size value)
+                                                   (logical-utf8-size-bounded value)))))
 
 (defun logical-copy-chunk-limit (test-limit failpoint action)
   (if (null test-limit)
@@ -557,30 +559,42 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
 
 (defun logical-copy-source-table (source target table &optional (validate-schema #'logical-validate-copy-schema) (source-table table))
   (let ((columns (funcall validate-schema source target table))
-        (rows '())
-        (chunk-bytes 0)
+        (rows '()) (owners '()) (chunk-bytes 0)
         (chunk-limit (logical-copy-chunk-limit-bytes)))
-    (labels ((flush-chunk ()
+    (labels ((release-owners ()
+               (sb-sys:without-interrupts
+                 (let ((failure nil))
+                   (unwind-protect
+                        (dolist (owner owners)
+                          (handler-case (close-logical-wire-field-owner owner)
+                            (error (condition) (unless failure (setf failure condition)))))
+                     (setf owners nil rows nil chunk-bytes 0))
+                   (when failure (error failure)))))
+             (flush-chunk ()
                (when rows
-                 (logical-copy-target-chunk target table columns rows)
-                 (setf rows '() chunk-bytes 0)))
-             (consume-row (row row-columns)
+                 (unwind-protect
+                      (logical-copy-target-chunk target table columns rows)
+                   (release-owners))))
+             (consume-row (row row-columns owner)
                (declare (ignore row-columns))
                (let ((row-bytes (logical-copy-row-size row)))
-                 (when (and rows
-                            (> (+ chunk-bytes row-bytes) chunk-limit))
+                 (when (and rows (> (+ chunk-bytes row-bytes) chunk-limit))
                    (flush-chunk))
-                 (push row rows)
-                 (incf chunk-bytes row-bytes)
-                 ;; A row larger than the batching target is a singleton, not
-                 ;; an unbounded batch waiting for the next source frame.
+                 ;; Publish both references before the reader can transfer ownership.
+                 (sb-sys:without-interrupts
+                   (push owner owners)
+                   (push row rows)
+                   (incf chunk-bytes row-bytes))
                  (when (> row-bytes chunk-limit)
-                   (flush-chunk)))))
-      ;; Executor SELECT streams DataRow frames; the callback commits each
-      ;; bounded chunk while this source Repeatable Read snapshot remains open.
-      (pg-client-query source (format nil "SELECT * FROM ~a" source-table)
-                       :on-row #'consume-row)
-      (flush-chunk))))
+                   (flush-chunk))
+                 :retain)))
+      (unwind-protect
+           (progn
+             ;; Each source row owns its slices through its target chunk commit.
+             (pg-client-query source (format nil "SELECT * FROM ~a" source-table)
+                              :on-row-with-owner #'consume-row)
+             (flush-chunk))
+        (release-owners)))))
 
 (defun logical-copy-delay-if-configured ()
   (let ((delay (logical-copy-delay-seconds)))
@@ -831,8 +845,6 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
   character)
 
 (defvar *logical-wire-field-owner* nil)
-
-(defparameter *logical-wire-field-spill-threshold* (* 1024 1024))
 
 (defun logical-write-value-literal (stream type value &optional (context :pgoutput))
   (cond
@@ -1371,13 +1383,8 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                      (#\n nil)
                      (#\u :unchanged-toast)
                      (#\t (let ((size (logical-wire-uint cursor 4)))
-                            (if (and *logical-wire-field-owner*
-                                     (> size *logical-wire-field-spill-threshold*)
-                                     (not (and column
-                                               (member (pgoutput-column-type-oid column)
-                                                       '(20 21 23)))))
-                                (logical-wire-field-capture *logical-wire-field-owner* cursor size)
-                                (logical-wire-text cursor size))))
+                            (logical-wire-received-field cursor size *logical-wire-field-owner*
+                                                         (and column (pgoutput-column-type-oid column)))))
                      (otherwise (error "unsupported pgoutput tuple value kind"))))
      'vector)))
 
@@ -1499,10 +1506,8 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                  (logical-progress-keepalive runtime (second operation))
                  (logical-pgoutput-apply-operation runtime operation))))
       (sb-sys:without-interrupts
-        (setf (logical-wire-field-owner-active-p *logical-wire-field-owner*) nil)
         (unwind-protect
-             (when (logical-wire-field-owner-stream *logical-wire-field-owner*)
-               (close (logical-wire-field-owner-stream *logical-wire-field-owner*) :abort t))
+             (close-logical-wire-field-owner *logical-wire-field-owner*)
           (unless complete (pg-client-close source)))))))
 
 (defun logical-run-stream (options target marker)

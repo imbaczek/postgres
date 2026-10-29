@@ -100,6 +100,18 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
 
 (defstruct logical-wire-field owner offset size crc)
 
+(defparameter *logical-wire-field-spill-threshold* (* 1024 1024))
+
+(defun close-logical-wire-field-owner (owner)
+  "Expire OWNER and close its anonymous file once, including on nonlocal exits."
+  (when owner
+    (sb-sys:without-interrupts
+      (when (logical-wire-field-owner-active-p owner)
+        (setf (logical-wire-field-owner-active-p owner) nil)
+        (when (logical-wire-field-owner-stream owner)
+          (close (logical-wire-field-owner-stream owner) :abort t)))))
+  (values))
+
 (defun logical-wire-field-open (owner)
   "Open an anonymous, process-owned scratch file for OWNER."
   (unless (logical-wire-field-owner-active-p owner)
@@ -149,6 +161,13 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
         (unless (= written size) (error "invalid logical receiver field size"))
         (setf (logical-wire-field-owner-size owner) (+ offset size))
         (make-logical-wire-field :owner owner :offset offset :size size :crc crc)))))
+
+(defun logical-wire-received-field (cursor size owner type-oid)
+  "Return a string or a scoped slice for one text-format field."
+  (if (and owner (> size *logical-wire-field-spill-threshold*)
+           (not (member type-oid '(20 21 23))))
+      (logical-wire-field-capture owner cursor size)
+      (logical-wire-text cursor size)))
 
 (defun logical-wire-field-visit (field output)
   "Verify FIELD and optionally write its decoded characters to OUTPUT."
@@ -367,7 +386,7 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
       (error "DataRow has trailing bytes"))
     (coerce (nreverse values) 'vector)))
 
-(defun pg-client-streamed-query-frame (client columns)
+(defun pg-client-streamed-query-frame (client columns &optional field-owner)
   "Read a complete query frame, decoding DataRow fields without a frame copy."
   (let ((stream (pg-client-stream client)) (complete nil))
     (unwind-protect
@@ -386,10 +405,11 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
                           (let ((count (logical-wire-uint cursor 2)))
                             (unless (= count (length columns))
                               (error "DataRow width does not match RowDescription"))
-                            (coerce (loop repeat count
+                            (coerce (loop for column in columns
                                           for size = (logical-wire-uint cursor 4)
                                           collect (if (= size #xffffffff) nil
-                                                      (logical-wire-text cursor size)))
+                                                      (logical-wire-received-field cursor size field-owner
+                                                                                   (pg-client-column-type-oid column))))
                                     'vector)))
                         (logical-wire-octets cursor (logical-wire-cursor-remaining cursor)))))
              (unless (zerop (logical-wire-cursor-remaining cursor))
@@ -398,42 +418,50 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
              (values (code-char type) payload decoded-p)))
       (unless complete (pg-client-close client)))))
 
-(defun pg-client-query (client query &key on-row)
+(defun pg-client-query (client query &key on-row on-row-with-owner)
   "Send one simple query and return ROWS, COLUMNS, and the completion tag.
 
-When ON-ROW is supplied, call it for each streamed row without retaining the
-result set. This is used by the initial copy so its memory bound is the worker's
-8 MiB apply chunk rather than the complete source table."
+ON-ROW receives each streamed row. ON-ROW-WITH-OWNER receives a row, columns,
+and its temporary field owner; returning :RETAIN transfers that owner's lifetime
+to the callback. Otherwise the owner expires as soon as the callback returns."
+  (when (and on-row on-row-with-owner)
+    (error "only one row callback may be supplied"))
   (if (pg-client-query-plan-p query)
       (pg-client-send-query-plan client query)
       (pg-client-send-query client query))
-  (let ((columns nil)
-        (rows '())
-        (tag nil)
-        (server-error nil))
+  (let ((columns nil) (rows '()) (tag nil) (server-error nil))
     (loop
-      (multiple-value-bind (type payload decoded-p)
-          (if on-row (pg-client-streamed-query-frame client columns)
-              (pg-client-frame (pg-client-stream client)))
-        (case type
-          (#\T (setf columns (pg-client-read-column-description payload)))
-          (#\D
-           (unless columns (error "DataRow arrived without RowDescription"))
-           (let ((row (if decoded-p payload (pg-client-read-data-row payload columns))))
-             (if on-row
-                 (funcall on-row row columns)
-                 (push row rows))))
-          (#\C
-           (multiple-value-bind (value end) (pg-client-cstring payload 0)
-             (declare (ignore end))
-             (setf tag value)))
-          (#\E (setf server-error (pg-client-error-from-payload payload)))
-          ((#\N #\S) nil)
-          (#\Z
-           (when server-error (error server-error))
-           (return (values (nreverse rows) columns tag)))
-          (otherwise
-           (error "unexpected simple-query response ~s" type)))))))
+      (let ((owner (and on-row-with-owner (make-logical-wire-field-owner)))
+            (transferred nil))
+        (sb-sys:without-interrupts
+          (unwind-protect
+               (sb-sys:with-local-interrupts
+                 (multiple-value-bind (type payload decoded-p)
+                     (if (or on-row on-row-with-owner)
+                         (pg-client-streamed-query-frame client columns owner)
+                         (pg-client-frame (pg-client-stream client)))
+                   (case type
+                     (#\T (setf columns (pg-client-read-column-description payload)))
+                     (#\D
+                      (unless columns (error "DataRow arrived without RowDescription"))
+                      (let ((row (if decoded-p payload (pg-client-read-data-row payload columns))))
+                        (cond
+                          (on-row-with-owner
+                           (when (eq :retain (funcall on-row-with-owner row columns owner))
+                             (setf transferred t)))
+                          (on-row (funcall on-row row columns))
+                          (t (push row rows)))))
+                     (#\C
+                      (multiple-value-bind (value end) (pg-client-cstring payload 0)
+                        (declare (ignore end))
+                        (setf tag value)))
+                     (#\E (setf server-error (pg-client-error-from-payload payload)))
+                     ((#\N #\S) nil)
+                     (#\Z
+                      (when server-error (error server-error))
+                      (return-from pg-client-query (values (nreverse rows) columns tag)))
+                     (otherwise (error "unexpected simple-query response ~s" type)))))
+            (unless transferred (close-logical-wire-field-owner owner))))))))
 
 (defun pg-client-start-replication (client query)
   (pg-client-send-query client query)
