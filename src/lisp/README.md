@@ -289,6 +289,15 @@ indices from the end. `#- text[]` deletes an existing nested path, leaving
 missing paths unchanged. Scalar roots and integer deletion from objects raise
 errors; path traversal rejects reached NULL elements and invalid array indices.
 These operations preserve their inputs and operate on materialized JSONB trees.
+`to_jsonb` accepts typed text, varchar, name, boolean, integer, numeric, float,
+JSON and JSONB values, plus the existing supported arrays of applicable element
+types. SQL `json[]` and `jsonb[]` array types are not supported; JSON documents
+with array roots are supported. SQL NULL input returns SQL NULL;
+NULL array elements become JSON null. JSON input is parsed as JSON, while text
+becomes a JSON string. Finite floats use session-controlled float output before
+numeric conversion; NaN and infinities become strings. Temporal and other
+unsupported types raise `0A000`. The result is materialized and subject to the
+JSON nesting limit.
 
 Decimal literals and numeric casts support finite values; numeric casts also
 accept NaN, infinities, and signed hexadecimal, octal, and binary integer input

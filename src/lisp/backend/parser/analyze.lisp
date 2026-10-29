@@ -396,6 +396,21 @@ result is text for typeof and int4 for array_length."
                 collect (coerce-common-expression argument type))
           :type :jsonb :typmod -1)))
 
+(defun analyze-to-jsonb-function (name arguments)
+  "Resolve to_jsonb's polymorphic argument within supported scalar and array types."
+  (unless (= (length arguments) 1)
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+  (let* ((argument (first arguments))
+         (type (expr-type argument))
+         (element-type (or (sql-array-element-type type) type)))
+    (when (and (in-unknown-constant-p argument) (not *defer-function-constant-coercion-p*))
+      (ereport "42804" "could not determine polymorphic type because input has type unknown"))
+    (unless (or *defer-function-constant-coercion-p*
+                (member element-type '(:text :varchar :name :bool :int2 :int4 :int8
+                                       :numeric :float4 :float8 :json :jsonb)))
+      (ereport "0A000" "to_jsonb for type ~a is not supported" type))
+    (list :func name arguments :type :jsonb :typmod -1)))
+
 (defun analyze-substr-function (name arguments)
   "Resolve text and bytea substring overloads."
   (unless (and (member (length arguments) '(2 3))
@@ -1308,6 +1323,11 @@ so a nested argument error keeps its own diagnostics."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature)))
+      ((string= name "to_jsonb")
+       (let ((*defer-function-constant-coercion-p*
+               (or (getf (cdddr expr) :call-distinct)
+                   (getf (cdddr expr) :call-order))))
+         (analyze-to-jsonb-function name args)))
       ((member name '("jsonb_set" "jsonb_insert") :test #'string=)
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
@@ -3165,7 +3185,7 @@ candidate selection."
                          (member (second form)
                                  '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                    "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
-                                   "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set" "jsonb_insert"
+                                   "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set" "jsonb_insert" "to_jsonb"
                                    "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid"
                                    "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                                    "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
@@ -4171,6 +4191,8 @@ truncate and interpret the result at TYPE's signed width."
          (unsigned (ldb (byte bits 0) raw)))
     (if (logbitp (1- bits) unsigned) (- unsigned (ash 1 bits)) unsigned)))
 
+(declaim (ftype function sql-to-jsonb))
+
 (defun eval-expr (expr env)
   (case (first expr)
     (:parameter (query-parameter-slot (second expr) *query-parameter-values*))
@@ -4309,7 +4331,9 @@ truncate and interpret the result at TYPE's signed width."
      (let* ((name (second expr))
             (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr)))
             (type (expr-type expr)))
-       (eval-analyzed-function name arguments type)))
+       (if (string= name "to_jsonb")
+           (sql-to-jsonb (first arguments) (expr-type (first (third expr))))
+           (eval-analyzed-function name arguments type))))
     (t
      (ereport "XX000" "cannot evaluate expression ~a" expr))))
 
@@ -4397,3 +4421,49 @@ truncate and interpret the result at TYPE's signed width."
      (sql-numeric-output v))
     ((stringp v) v)
     (t (princ-to-string v))))
+
+(defun sql-to-jsonb (value type)
+  "Convert a supported typed SQL value to JSONB without mutating its input."
+  (when (eq value +null+) (return-from sql-to-jsonb +null+))
+  (let ((element-type (sql-array-element-type type)))
+    (labels ((scalar (item scalar-type)
+               (cond
+                 ((eq item +null+) :json-null)
+                 ((eq scalar-type :bool) (if item :json-true :json-false))
+                 ((member scalar-type '(:int2 :int4 :int8)) item)
+                 ((eq scalar-type :numeric)
+                  (if (sql-numeric-special-p item) (sql-numeric-output item) item))
+                 ((member scalar-type '(:float4 :float8))
+                  ;; datum_to_jsonb_internal routes float output through numeric input.
+                  (let ((text (value->text item scalar-type)))
+                    (if (or (sb-ext:float-nan-p item) (sb-ext:float-infinity-p item))
+                        text (sql-numeric-input text))))
+                 ((member scalar-type '(:text :varchar :name)) (copy-seq item))
+                 ((eq scalar-type :json) (sql-jsonb-value (sql-jsonb-input item)))
+                 ((eq scalar-type :jsonb) (sql-jsonb-value item))
+                 (t (ereport "0A000" "to_jsonb for type ~a is not supported" scalar-type))))
+             (array-value (array)
+               (let ((elements (sql-array-elements array)) (position 0))
+                 (labels ((dimension (dimensions depth)
+                            (when (> depth 512) (ereport "54001" "JSON nesting exceeds supported depth"))
+                            (let ((result (make-array (first dimensions))))
+                              (dotimes (i (length result) result)
+                                (when (zerop (mod position 4096)) (check-for-interrupts))
+                                (setf (aref result i)
+                                      (if (rest dimensions)
+                                          (dimension (rest dimensions) (1+ depth))
+                                          (prog1 (scalar (aref elements position) element-type)
+                                            (incf position))))))))
+                   (if (null (sql-array-dimensions array)) #()
+                       (dimension (sql-array-dimensions array) 0))))))
+      (let* ((root (if element-type (array-value value) (scalar value type)))
+             (pending (list (cons root 0)))
+             (visited 0))
+        (loop while pending for (item . depth) = (pop pending)
+              do (when (> depth 512) (ereport "54001" "JSON nesting exceeds supported depth"))
+                 (when (zerop (mod (incf visited) 4096)) (check-for-interrupts))
+                 (cond ((jsonb-object-value-p item)
+                        (dolist (pair (cdr item)) (push (cons (cdr pair) (1+ depth)) pending)))
+                       ((jsonb-array-value-p item)
+                        (loop for child across item do (push (cons child (1+ depth)) pending)))))
+        (make-sql-jsonb root)))))
