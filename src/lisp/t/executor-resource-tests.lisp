@@ -651,7 +651,8 @@
                 (pg::delete-query-temp-file path)
                 (ok (not (probe-file path)))
                 (ok (zerop (pg::query-temp-quota-used-bytes pg::*query-temp-quota*))))
-           (setf (symbol-function 'pg::unlink-query-temp-file) unlink))))))
+           (setf (symbol-function 'pg::unlink-query-temp-file) unlink)
+           (pg::with-query-temp-files :cleanup-retry))))))
 
 (deftest a-new-scope-retries-failed-cleanup-without-an-externally-retained-quota
     (call-with-detachment-test-state
