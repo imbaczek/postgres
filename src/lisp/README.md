@@ -592,9 +592,11 @@ exceeds 4 MiB, then spills all events to a transaction-owned temporary file.
 The spool has its own quota using the `--temp-file-limit-bytes` setting,
 separate from query spill quotas; its length and checksum framing also counts
 against that quota. It is cleaned up when the transaction ends. At commit the
-spool is read and validated in full and all encoded events are materialized in
-memory before WAL publication, so the spill threshold is not a commit-time
-memory bound. The 64 MiB capture and 65 MiB WAL limits still apply.
+spool is validated and its WAL records planned before publication. A second
+pass writes events as fragments or bounded chunks, keeping memory proportional
+to the largest event plus a WAL record rather than the whole spilled transaction.
+The 4 MiB threshold is not a bound on the size of an individual event. The
+64 MiB capture and 65 MiB WAL limits still apply.
 
 When an encoded row event exceeds one WAL record, the transaction's events
 are written as ordered fragments and reassembled by recovery and logical slot

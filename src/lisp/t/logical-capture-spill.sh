@@ -48,7 +48,7 @@ spill_count() {
 }
 start_server
 sql 'CREATE TABLE spool_rows (id integer PRIMARY KEY, value text)' >/dev/null
-printf '%s\n(quit)\n' '(setf *logical-capture-memory-bytes* 0)' |
+printf '%s\n(quit)\n' "(progn (setf *logical-capture-memory-bytes* 0) (setf (symbol-function 'logical-spool-events-in-order) (lambda (spool) (declare (ignore spool)) (error \"unexpected whole-spool materialization\"))))" |
     sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/control.log"
 if grep -q ';; error:' "$TMP/control.log"; then cat "$TMP/control.log" >&2; exit 1; fi
 start_client

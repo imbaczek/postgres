@@ -1783,14 +1783,18 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
     (if (backend-xid b)
         (let ((changes
                 (when *wal-ready*
-                  (append (reverse (backend-logical-changes b))
-                          (when (backend-logical-spool b)
-                            (logical-spool-seal (backend-logical-spool b))
-                            (logical-spool-events-in-order (backend-logical-spool b)))))))
-          ;; Restore, validate and preflight before publishing any WAL batch.
-          (when changes (logical-preflight-event-fragments changes))
-          ;; WAL reaches stable storage before CLOG makes the commit visible.
-          ;; Reset remains interrupt-free so a durable commit cannot be aborted.
+                  (if (backend-logical-changes b)
+                      ;; Compatibility for internal callers that supply the old list.
+                      (let ((events (append (reverse (backend-logical-changes b))
+                                            (when (backend-logical-spool b)
+                                              (logical-spool-seal (backend-logical-spool b))
+                                              (logical-spool-events-in-order (backend-logical-spool b))))))
+                        (logical-preflight-event-fragments events)
+                        events)
+                      (when (backend-logical-spool b)
+                        (logical-preflight-spool (backend-logical-spool b)))))))
+          ;; Validate the spool before publishing any WAL batch. Subsequent I/O
+          ;; failure during WAL insertion follows the normal critical-failure path.
           (sb-sys:without-interrupts
             (wal-commit-transaction
              (backend-xid b)

@@ -92,13 +92,13 @@ The caller must not mutate EVENT after passing it to this function."
         do (unless byte (error "truncated logical spool header"))
         sum (ash byte (* 8 shift))))
 
-(defun %logical-spool-events-in-order (spool)
-  "Restore and validate all events before WAL publication begins."
+(defun %logical-spool-map-events (spool function)
+  "Read and validate each event, retaining only one spilled event at a time."
   (unless (and (logical-spool-sealed-p spool) (not (logical-spool-closed-p spool)))
     (error "logical spool is not readable"))
   (if (null (logical-spool-stream spool))
-      (reverse (logical-spool-events spool))
-      (let ((stream (logical-spool-stream spool)) (events '()) (total 0))
+      (dolist (event (reverse (logical-spool-events spool))) (funcall function event))
+      (let ((stream (logical-spool-stream spool)) (total 0))
         (unless (file-position stream 0) (error "cannot seek logical spool"))
         (dotimes (index (logical-spool-count spool))
           (let ((length (logical-spool-read-u32 stream))
@@ -111,20 +111,93 @@ The caller must not mutate EVENT after passing it to this function."
               (unless (= (wal-crc32 event) checksum)
                 (error "logical spool checksum mismatch"))
               (incf total length)
-              (push event events))))
+              (funcall function event))))
         (unless (and (= total (logical-spool-bytes spool))
                      (null (read-byte stream nil nil)))
-          (error "invalid logical spool contents"))
-        (nreverse events))))
+          (error "invalid logical spool contents"))))
+  (values))
 
-(defun logical-spool-events-in-order (spool)
-  "Materialize verified events, permanently rejecting this spool after an error."
+(defun logical-spool-map-events (spool function)
+  "Visit verified events in order, permanently rejecting this spool after an error."
   (when (logical-spool-failed-p spool) (error "logical spool has failed"))
   (let ((complete nil))
     (unwind-protect
-         (multiple-value-prog1 (%logical-spool-events-in-order spool)
-           (setf complete t))
-      (unless complete (setf (logical-spool-failed-p spool) t)))))
+         (progn (%logical-spool-map-events spool function) (setf complete t))
+      (unless complete (setf (logical-spool-failed-p spool) t))))
+  (values))
+
+(defun logical-spool-events-in-order (spool)
+  "Materialize verified events for callers that explicitly require a list."
+  (let ((events '()))
+    (logical-spool-map-events spool (lambda (event) (push event events)))
+    (nreverse events)))
+
+(defstruct logical-spool-wal-plan spool mode count)
+
+(defun logical-preflight-spool (spool)
+  "Validate SPOOL and plan bounded WAL records before publishing a batch."
+  (logical-spool-seal spool)
+  (when (> (logical-spool-bytes spool) +max-logical-wal-transaction-bytes+)
+    (error "logical transaction exceeds its WAL change limit"))
+  (let ((payload-limit (- +wal-segment-size+ +wal-header-size+
+                          +logical-change-chunk-header-size+))
+        (fragment-limit (- +wal-segment-size+ +wal-header-size+
+                           +logical-fragment-header-size+))
+        (chunk-bytes 0) (chunks 0) (fragments 0) (fragment-p nil))
+    (logical-spool-map-events
+     spool
+     (lambda (event)
+       (let ((entry (+ 4 (length event))))
+         (incf fragments (ceiling (length event) fragment-limit))
+         (when (> entry payload-limit) (setf fragment-p t))
+         (when (and (plusp chunk-bytes) (> (+ chunk-bytes entry) payload-limit))
+           (incf chunks)
+           (setf chunk-bytes 0))
+         (incf chunk-bytes entry))))
+    (when (plusp chunk-bytes) (incf chunks))
+    (let ((count (if fragment-p fragments chunks)))
+      (unless (<= 1 count #xffffffff) (error "invalid logical WAL chunk count"))
+      (make-logical-spool-wal-plan :spool spool
+                                   :mode (if fragment-p :fragment :legacy)
+                                   :count count))))
+
+(defun logical-append-spool-wal (xid plan)
+  "Append a preflighted spool while retaining at most a bounded record's events.
+A second read failure is a WAL critical-section failure, like other WAL I/O."
+  (let ((spool (logical-spool-wal-plan-spool plan))
+        (count (logical-spool-wal-plan-count plan))
+        (index 0))
+    (ecase (logical-spool-wal-plan-mode plan)
+      (:fragment
+       (let ((limit (- +wal-segment-size+ +wal-header-size+ +logical-fragment-header-size+)))
+         (logical-spool-map-events
+          spool
+          (lambda (event)
+            (loop for start from 0 below (length event) by limit
+                  for end = (min (length event) (+ start limit))
+                  for fragment = (make-logical-fragment :event event :start start :end end)
+                  do (wal-append-record +wal-record-logical-changes+ xid
+                                        (logical-encode-fragment index count fragment))
+                     (incf index))))))
+      (:legacy
+       (let ((limit (- +wal-segment-size+ +wal-header-size+ +logical-change-chunk-header-size+))
+             (bytes 0) (events '()))
+         (flet ((flush-chunk ()
+                  (when events
+                    (wal-append-record +wal-record-logical-changes+ xid
+                                       (logical-encode-chunk index count (nreverse events)))
+                    (incf index)
+                    (setf events nil bytes 0))))
+           (logical-spool-map-events
+            spool
+            (lambda (event)
+              (let ((entry (+ 4 (length event))))
+                (when (and events (> (+ bytes entry) limit)) (flush-chunk))
+                (push event events)
+                (incf bytes entry))))
+           (flush-chunk)))))
+    (unless (= index count) (error "logical WAL spool plan changed during commit")))
+  (values))
 
 (defun close-logical-spool (spool)
   "Transfer cleanup ownership before forgetting any transaction resources."

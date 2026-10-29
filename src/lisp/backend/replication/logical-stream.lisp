@@ -731,6 +731,9 @@ executor, so capture the same operation before transaction commit."
   (when encoded-changes
     (unless (and (integerp xid) (plusp xid))
       (error "logical row changes require a transaction ID"))
+    (unless (listp encoded-changes)
+      (logical-append-spool-wal xid encoded-changes)
+      (return-from wal-append-logical-changes (values)))
     (let* ((events encoded-changes)
            (event-bytes (reduce #'+ events :key #'length :initial-value 0)))
       (when (> event-bytes +max-logical-wal-transaction-bytes+)

@@ -726,6 +726,41 @@
         (retry-pending-query-temp-cleanup)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest test-logical-spool-wal-plan-boundaries
+    (let* ((*logical-capture-memory-bytes* (* 64 1024 1024))
+           (legacy-limit (- +wal-segment-size+ +wal-header-size+
+                            +logical-change-chunk-header-size+ 4))
+           (small (make-array 1 :element-type '(unsigned-byte 8) :initial-element 1))
+           (exact (make-array legacy-limit :element-type '(unsigned-byte 8) :initial-element 2))
+           (larger (make-array (1+ legacy-limit) :element-type '(unsigned-byte 8) :initial-element 3)))
+      (let ((spool (make-logical-spool)))
+        (unwind-protect
+             (progn
+               (logical-spool-append spool exact)
+               (let ((plan (logical-preflight-spool spool)))
+                 (rove:ok (eq (logical-spool-wal-plan-mode plan) :legacy))
+                 (rove:ok (= (logical-spool-wal-plan-count plan) 1))))
+          (close-logical-spool spool)))
+      (let ((spool (make-logical-spool)))
+        (unwind-protect
+             (progn
+               (logical-spool-append spool small)
+               (logical-spool-append spool larger)
+               (logical-spool-append spool small)
+               (let ((plan (logical-preflight-spool spool)))
+                 (rove:ok (eq (logical-spool-wal-plan-mode plan) :fragment))
+                 (rove:ok (= (logical-spool-wal-plan-count plan) 4))))
+          (close-logical-spool spool)))
+      (let ((spool (make-logical-spool)))
+        (unwind-protect
+             (progn
+               (logical-spool-append spool small)
+               (logical-spool-append spool exact)
+               (let ((plan (logical-preflight-spool spool)))
+                 (rove:ok (eq (logical-spool-wal-plan-mode plan) :legacy))
+                 (rove:ok (= (logical-spool-wal-plan-count plan) 2))))
+          (close-logical-spool spool)))))
+
 (rove:deftest test-logical-fragment-assembly
     (let* ((first (make-array 10 :element-type '(unsigned-byte 8)
                                  :initial-contents '(0 1 2 3 4 5 6 7 8 9)))
