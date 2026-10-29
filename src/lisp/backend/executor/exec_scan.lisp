@@ -101,7 +101,8 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
 (defstruct select-top-n-item
   row
   keys
-  sequence)
+  sequence
+  origins)
 
 (defstruct (select-top-n-collector (:constructor %make-select-top-n-collector))
   limit
@@ -167,6 +168,7 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
          (sequence (select-top-n-collector-next-sequence collector))
          (item (make-select-top-n-item
                 :row row
+                :origins (and *datum-origin-capture* *query-row-origins*)
                 :keys (map 'vector
                            (lambda (entry)
                              (select-order-value (car entry) row))
@@ -184,19 +186,21 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
        (setf (aref heap 0) item)
        (select-top-n-sift-down heap order 0)))))
 
-(defun select-top-n-collector-rows (collector)
-  (mapcar #'select-top-n-item-row
+(defun select-top-n-collector-rows (collector &optional with-origins)
+  (mapcar (if with-origins
+              (lambda (item) (cons (select-top-n-item-row item) (select-top-n-item-origins item)))
+              #'select-top-n-item-row)
           (stable-sort (coerce (select-top-n-collector-heap collector) 'list)
                        (lambda (a b)
                          (select-top-n-item-less-p
                           a b (select-top-n-collector-order collector))))))
 
-(defun collect-select-top-n (streamer order limit)
+(defun collect-select-top-n (streamer order limit &optional with-origins)
   "Consume STREAMER while retaining at most LIMIT rows in ORDER BY order."
   (let ((collector (make-select-top-n-collector limit order)))
     (unless (zerop limit)
       (funcall streamer (lambda (row) (offer-select-top-n-row collector row))))
-    (select-top-n-collector-rows collector)))
+    (select-top-n-collector-rows collector with-origins)))
 
 (defstruct select-scan-path
   (kind :seq-scan)

@@ -91,6 +91,17 @@
         (rove:ok (datum-origin-assignment-compatible-p (expression :numeric old) (column :numeric wider)))
         (rove:ok (not (datum-origin-assignment-compatible-p (expression :numeric old) (column :numeric other-scale)))))))
 
+(rove:deftest sorted-origin-payload-is-owned
+    (let* ((bytes (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3)))
+           (origin (make-datum-origin :external-p t :compressed (make-heap-compressed-varlena :payload bytes)))
+           (packed (datum-origins-for-spill (vector origin nil)))
+           (restored (datum-origins-from-spill packed))
+           (copy (datum-origin-compressed (aref restored 0))))
+      (setf (aref bytes 0) 9)
+      (rove:ok (= 1 (aref (heap-compressed-varlena-payload copy) 0)))
+      (rove:ok (datum-origin-external-p (aref restored 0)))
+      (rove:ok (null (aref restored 1)))))
+
 (rove:deftest test-toast-catalog-ownership-roundtrip
     (let* ((toast (make-pg-toast :oid 100 :relfilenode 101 :index-oid 102
                                  :index-relfilenode 103 :relfrozenxid 20))

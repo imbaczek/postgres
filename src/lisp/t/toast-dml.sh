@@ -78,6 +78,14 @@ run -c 'alter table toast_select_mixed alter column b set storage plain' >/dev/n
 run -c "insert into toast_select_mixed select 'fixed', v from toast_inline_build" >/dev/null
 [ "$(run -c "select count(*) from toast_select_mixed where a = 'fixed' and length(b) = 20000")" = 1 ]
 [ "$(run -c "select count(*) from toast_select_mixed where a = 'fixed' and b = 'short'")" = 1 ]
+# The ordered path must retain each row's detached origin through disk spill.
+printf '%s\n' '(setf pg::*query-work-memory-bytes* 1024)' '(quit)' | \
+    "${SBCL:-sbcl}" --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/sort-work-mem.out"
+run -c 'insert into toast_select_plain select v from toast_inline_build order by v' >/dev/null
+run -c 'insert into toast_select_plain select v from toast_inline_build order by v limit 1' >/dev/null
+[ "$(run -c 'select count(*) from toast_select_plain where length(v)=20000')" = 5 ]
+printf '%s\n' '(setf pg::*query-work-memory-bytes* (* 4 1024 1024))' '(quit)' | \
+    "${SBCL:-sbcl}" --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/sort-work-mem-reset.out"
 run -c 'create table toast_select_conflict (id int primary key, v text)' >/dev/null
 run -c 'alter table toast_select_conflict alter column v set storage plain' >/dev/null
 run -c "insert into toast_select_conflict values (1,'small')" >/dev/null

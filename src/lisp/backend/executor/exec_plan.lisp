@@ -786,6 +786,26 @@ if a registered TOAST index is missing."
    (lambda (arena)
      (stream-select-sort-with-arena streamer order callback arena on-complete))))
 
+(defun datum-origins-for-spill (origins)
+  "Represent detached origins with ordinary vectors and lists for sort/spill."
+  (when origins
+    (map 'vector
+         (lambda (origin)
+           (when origin
+             (list (datum-origin-external-p origin)
+                   (heap-compressed-varlena-payload (datum-origin-compressed origin)))))
+         origins)))
+
+(defun datum-origins-from-spill (origins)
+  "Restore detached origins after a sorted row has been copied or spilled."
+  (when origins
+    (map 'vector
+         (lambda (origin)
+           (when origin
+             (make-datum-origin :external-p (first origin)
+                                :compressed (make-heap-compressed-varlena :payload (copy-seq (second origin))))))
+         origins)))
+
 (defun stream-select-sort-with-arena (streamer order callback arena &optional on-complete)
   "Sort streamed rows in memory or owned temporary runs and pass them to CALLBACK."
   (with-query-temp-files ()
@@ -814,14 +834,18 @@ if a registered TOAST index is missing."
                                               (map 'vector
                                                    (lambda (entry) (select-order-value (car entry) row))
                                                    order)
-                                              row)))
+                                              row
+                                              (and *datum-origin-capture*
+                                                   (datum-origins-for-spill *query-row-origins*)))))
                                     (emit-run (pathname)
                                       (with-query-temp-input (stream pathname)
                                         (loop for item = (query-spill-read-record stream)
                                               until (eq item +query-spill-eof+)
                                               do (check-for-interrupts)
-                                                 (when (eq (funcall callback (fourth item)) :stop)
-                                                   (return-from stream-select-sort-with-arena :stop))))))
+                                                 (let ((*query-row-origins* (and *datum-origin-capture*
+                                                                                 (datum-origins-from-spill (fifth item)))))
+                                                   (when (eq (funcall callback (fourth item)) :stop)
+                                                     (return-from stream-select-sort-with-arena :stop)))))))
                              (unwind-protect
                                   (progn
                                     (funcall
@@ -847,12 +871,14 @@ if a registered TOAST index is missing."
                                                       (select-sort-item-less-p left right order))))
                                             (check-for-interrupts)
                                             ;; Consumers, including instrumentation, can retain rows.
-                                            (when (eq (funcall callback
-                                                               (if arena
-                                                                   (copy-query-sort-value (fourth item))
-                                                                   (fourth item)))
-                                                      :stop)
-                                              (return-from stream-select-sort-with-arena :stop))))
+                                            (let ((*query-row-origins* (and *datum-origin-capture*
+                                                                            (datum-origins-from-spill (fifth item)))))
+                                              (when (eq (funcall callback
+                                                                 (if arena
+                                                                     (copy-query-sort-value (fourth item))
+                                                                     (fourth item)))
+                                                        :stop)
+                                                (return-from stream-select-sort-with-arena :stop)))))
                                         (progn
                                           (flush-run)
                                           (setf runs (nreverse runs))
@@ -1331,11 +1357,12 @@ on an abnormal exit."
       (when stopped-p (return :stop)))))
 
 (defun simple-datum-origin-plan-p (node)
-  "Recognize synchronous scan/filter/project/limit plans that retain row origin."
+  "Recognize single-scan plans that retain row origin, including sort and top-N."
   (case (first node)
     ((:seq-scan :index-scan) t)
-    ((:filter :project) (simple-datum-origin-plan-p (third node)))
+    ((:filter :project :sort) (simple-datum-origin-plan-p (third node)))
     (:limit (simple-datum-origin-plan-p (third node)))
+    (:top-n (simple-datum-origin-plan-p (fourth node)))
     (otherwise nil)))
 
 (defun execute-physical-plan-node (node registered-relations outer-environment
@@ -1467,10 +1494,11 @@ on an abnormal exit."
             (rows (collect-select-top-n
                    (lambda (callback)
                      (funcall run-child input callback))
-                   order limit)))
+                   order limit *datum-origin-capture*)))
        (loop for row in rows
-             when (eq (funcall emit row) :stop)
-               do (return :stop))))
+             do (let ((*query-row-origins* (and *datum-origin-capture* (cdr row))))
+                  (when (eq (funcall emit (if *datum-origin-capture* (car row) row)) :stop)
+                    (return :stop))))))
     (:limit
      (let ((limit (second node))
            (count 0))
