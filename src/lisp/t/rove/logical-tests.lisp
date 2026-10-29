@@ -2249,6 +2249,248 @@
         (logical-close-recovery-assembler assembler)
         (logical-close-recovery-assembler too-small))))
 
+(rove:deftest test-retained-slot-scan-pins-fixed-horizon
+    (let* ((directory (merge-pathnames (format nil "pg-retained-scan-~d-~d/" (sb-posix:getpid) (random 1000000))
+                                       (uiop:temporary-directory)))
+           (*pgdata* directory)
+           (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+           (*wal-replication-slots* (make-hash-table :test #'equal))
+           (*wal-poisoned* nil)
+           (owner (list :owner)) (*wal-logical-slot-owner* owner)
+           (slot (make-wal-replication-slot :name "scan" :database-oid 7 :restart-lsn 0
+                                            :consistent-lsn 0 :confirmed-flush-lsn 0 :active-owner owner))
+           (first (wal-encode-record +wal-record-batch-start+ 0 0 #()))
+           (end (length first))
+           (*wal-durable-lsn* end)
+           (second (wal-encode-record +wal-record-commit+ 88 end #())))
+      (setf (gethash "scan" *wal-replication-slots*) slot)
+      (ensure-directories-exist (wal-segment-path 0))
+      (unwind-protect
+           (progn
+             (with-open-file (out (wal-segment-path 0) :direction :output :element-type '(unsigned-byte 8)
+                                                       :if-exists :supersede :if-does-not-exist :create)
+               (write-sequence first out))
+             (call-with-wal-retained-slot-scan
+              "scan" nil nil
+              (lambda (scan)
+                (rove:ok (= 1 (hash-table-count *wal-snapshot-retention-pins*)))
+                (with-open-file (out (wal-segment-path 0) :direction :output :element-type '(unsigned-byte 8)
+                                                          :if-exists :append)
+                  (write-sequence second out))
+                (let ((record (wal-retained-slot-scan-next scan)))
+                  (rove:ok (= (wal-record-type record) +wal-record-batch-start+))
+                  (rove:ok (= (wal-retained-slot-scan-cursor scan) end)))
+                (rove:ok (null (wal-retained-slot-scan-next scan)))))
+             (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*))))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-retained-slot-scan-decodes-outside-wal-lock
+    (let* ((directory (merge-pathnames (format nil "pg-retained-unlock-~d-~d/" (sb-posix:getpid) (random 1000000))
+                                       (uiop:temporary-directory)))
+           (*pgdata* directory) (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+           (*wal-replication-slots* (make-hash-table :test #'equal)) (*wal-poisoned* nil)
+           (owner (list :owner)) (*wal-logical-slot-owner* owner)
+           (slot (make-wal-replication-slot :name "scan" :database-oid 7 :restart-lsn 0
+                                            :consistent-lsn 0 :confirmed-flush-lsn 0 :active-owner owner))
+           (first (wal-encode-record +wal-record-batch-start+ 0 0 #()))
+           (end (length first)) (*wal-durable-lsn* end)
+           (next (wal-encode-record +wal-record-commit+ 88 end #()))
+           (path (wal-segment-path 0)) (lock *wal-lock*)
+           (original (symbol-function 'wal-decode-record)) (acquired nil) (thread nil))
+      (setf (gethash "scan" *wal-replication-slots*) slot)
+      (ensure-directories-exist path)
+      (unwind-protect
+           (progn
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede :if-does-not-exist :create)
+               (write-sequence first out))
+             (setf (symbol-function 'wal-decode-record)
+                   (lambda (bytes lsn)
+                     (progn
+                       (setf thread (sb-thread:make-thread
+                                     (lambda ()
+                                       (sb-thread:with-mutex (lock)
+                                         (setf acquired t)
+                                         (with-open-file (out path :direction :output
+                                                                   :element-type '(unsigned-byte 8)
+                                                                   :if-exists :append)
+                                           (write-sequence next out))))))
+                       (sb-ext:with-timeout 5 (sb-thread:join-thread thread))
+                       (setf thread nil))
+                     (funcall original bytes lsn)))
+             (call-with-wal-retained-slot-scan
+              "scan" nil nil
+              (lambda (scan)
+                (rove:ok (wal-retained-slot-scan-next scan))
+                (rove:ok acquired)
+                (rove:ok (null (wal-retained-slot-scan-next scan)))))
+             (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*))))
+        (unwind-protect
+             (when thread
+               (ignore-errors (sb-thread:terminate-thread thread))
+               (ignore-errors (sb-thread:join-thread thread)))
+          (setf (symbol-function 'wal-decode-record) original))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-retained-slot-scan-revalidates-and-releases-pin
+    (let* ((*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+           (*wal-replication-slots* (make-hash-table :test #'equal))
+           (*wal-poisoned* nil) (*wal-durable-lsn* 0)
+           (owner (list :owner)) (*wal-logical-slot-owner* owner)
+           (slot (make-wal-replication-slot :name "scan" :database-oid 7 :restart-lsn 0
+                                            :consistent-lsn 0 :confirmed-flush-lsn 0 :active-owner owner)))
+      (setf (gethash "scan" *wal-replication-slots*) slot)
+      (rove:ok (eq :escaped (catch 'leave
+                              (call-with-wal-retained-slot-scan "scan" nil nil
+                                                                (lambda (scan) (declare (ignore scan)) (throw 'leave :escaped))))))
+      (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*)))
+      (dolist (action '(:lost :replace :owner))
+        (setf (wal-replication-slot-wal-status slot) :reserved
+              (wal-replication-slot-active-owner slot) owner
+              (gethash "scan" *wal-replication-slots*) slot)
+        (call-with-wal-retained-slot-scan
+         "scan" nil nil
+         (lambda (scan)
+           (ecase action
+             (:lost (setf (wal-replication-slot-wal-status slot) :lost))
+             (:replace (setf (gethash "scan" *wal-replication-slots*) (copy-wal-replication-slot slot)))
+             (:owner (setf (wal-replication-slot-active-owner slot) (list :new-owner))))
+           (rove:ok (handler-case (progn (wal-retained-slot-scan-next scan) nil) (error () t)))))
+        (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*))))))
+
+(rove:deftest test-retained-slot-scan-corruption-never-repairs
+    (let* ((directory (merge-pathnames (format nil "pg-retained-corrupt-~d-~d/" (sb-posix:getpid) (random 1000000))
+                                       (uiop:temporary-directory)))
+           (*pgdata* directory) (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+           (*wal-replication-slots* (make-hash-table :test #'equal)) (*wal-poisoned* nil)
+           (owner (list :owner)) (*wal-logical-slot-owner* owner)
+           (slot (make-wal-replication-slot :name "scan" :database-oid 7 :restart-lsn 0
+                                            :consistent-lsn 0 :confirmed-flush-lsn 0 :active-owner owner))
+           (bytes (wal-encode-record +wal-record-batch-start+ 0 0 #()))
+           (*wal-durable-lsn* (length bytes)))
+      (ensure-directories-exist (wal-segment-path 0))
+      (setf (gethash "scan" *wal-replication-slots*) slot)
+      (unwind-protect
+           (dolist (mode '(:crc :short :horizon))
+             (let ((data (copy-seq bytes)))
+               (when (eq mode :crc) (setf (aref data 28) (logxor 1 (aref data 28))))
+               (with-open-file (out (wal-segment-path 0) :direction :output :element-type '(unsigned-byte 8)
+                                                         :if-exists :supersede :if-does-not-exist :create)
+                 (write-sequence data out :end (if (eq mode :short) (1- (length data)) (length data))))
+               (let ((before (with-open-file (in (wal-segment-path 0) :element-type '(unsigned-byte 8))
+                               (file-length in))))
+                 (rove:ok (handler-case
+                              (progn (call-with-wal-retained-slot-scan
+                                      "scan" nil (if (eq mode :horizon) (1- (length bytes)) nil)
+                                      (lambda (scan) (wal-retained-slot-scan-next scan))) nil)
+                            (error () t)))
+                 (rove:ok (= before (with-open-file (in (wal-segment-path 0) :element-type '(unsigned-byte 8))
+                                      (file-length in))))
+                 (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*))))))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-retained-slot-scan-rotation-and-missing-segment
+    (let* ((directory (merge-pathnames (format nil "pg-retained-rotate-~d-~d/" (sb-posix:getpid) (random 1000000))
+                                       (uiop:temporary-directory)))
+           (*pgdata* directory) (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+           (*wal-replication-slots* (make-hash-table :test #'equal)) (*wal-poisoned* nil)
+           (owner (list :owner)) (*wal-logical-slot-owner* owner)
+           (slot (make-wal-replication-slot :name "scan" :database-oid 7 :restart-lsn 0
+                                            :consistent-lsn 0 :confirmed-flush-lsn 0 :active-owner owner))
+           (first (wal-encode-record +wal-record-batch-start+ 0 0
+                                     (make-array (- +wal-segment-size+ +wal-header-size+ 8)
+                                                 :element-type '(unsigned-byte 8) :initial-element 0)))
+           (second (wal-encode-record +wal-record-commit+ 88 +wal-segment-size+ #()))
+           (*wal-durable-lsn* (+ +wal-segment-size+ (length second))))
+      (ensure-directories-exist (wal-segment-path 0))
+      (setf (gethash "scan" *wal-replication-slots*) slot)
+      (unwind-protect
+           (progn
+             (loop for path in (list (wal-segment-path 0) (wal-segment-path 1))
+                   for bytes in (list first second) do
+                     (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                               :if-exists :supersede :if-does-not-exist :create)
+                       (write-sequence bytes out)))
+             (call-with-wal-retained-slot-scan
+              "scan" nil nil
+              (lambda (scan)
+                (rove:ok (= (wal-record-start (wal-retained-slot-scan-next scan)) 0))
+                (rove:ok (= (wal-record-start (wal-retained-slot-scan-next scan)) +wal-segment-size+))
+                (rove:ok (null (wal-retained-slot-scan-next scan)))))
+             (with-open-file (out (wal-segment-path 0) :direction :output :element-type '(unsigned-byte 8)
+                                                       :if-exists :supersede)
+               (write-sequence (wal-encode-record +wal-record-batch-start+ 0 0 #()) out))
+             (rove:ok (handler-case
+                          (progn (call-with-wal-retained-slot-scan
+                                  "scan" nil nil
+                                  (lambda (scan) (wal-retained-slot-scan-next scan)
+                                    (wal-retained-slot-scan-next scan))) nil)
+                        (error () t)))
+             (delete-file (wal-segment-path 1))
+             (rove:ok (handler-case
+                          (progn (call-with-wal-retained-slot-scan
+                                  "scan" nil nil
+                                  (lambda (scan) (wal-retained-slot-scan-next scan)
+                                    (wal-retained-slot-scan-next scan))) nil)
+                        (error () t)))
+             (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*))))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-retained-slot-scan-pin-survives-loss-and-checkpoint
+    (let* ((directory (merge-pathnames (format nil "pg-retained-pin-~d-~d/" (sb-posix:getpid) (random 1000000))
+                                       (uiop:temporary-directory)))
+           (*pgdata* directory) (*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+           (*wal-replication-slots* (make-hash-table :test #'equal))
+           (*wal-xid-first-lsn* (make-hash-table :test #'eql)) (*wal-poisoned* nil)
+           (*wal-output-stream* nil) (*wal-output-segment* nil) (*max-slot-wal-keep-bytes* nil)
+           (owner (list :owner)) (*wal-logical-slot-owner* owner)
+           (slot (make-wal-replication-slot :name "scan" :database-oid 7 :restart-lsn 0
+                                            :consistent-lsn 0 :confirmed-flush-lsn 0 :active-owner owner))
+           (*wal-durable-lsn* (* 2 +wal-segment-size+)))
+      (ensure-directories-exist (wal-segment-path 0))
+      (setf (gethash "scan" *wal-replication-slots*) slot)
+      (unwind-protect
+           (progn
+             (dolist (segment '(0 1))
+               (with-open-file (out (wal-segment-path segment) :direction :output :element-type '(unsigned-byte 8)
+                                                               :if-exists :supersede :if-does-not-exist :create)
+                 (write-byte 0 out)))
+             (call-with-wal-retained-slot-scan
+              "scan" nil nil
+              (lambda (scan)
+                (setf (wal-replication-slot-wal-status slot) :lost)
+                (sb-thread:with-mutex (*wal-lock*)
+                  (wal-remove-checkpointed-segments-under-wal-lock (* 2 +wal-segment-size+)))
+                (rove:ok (probe-file (wal-segment-path 0)))
+                (rove:ok (handler-case (progn (wal-retained-slot-scan-next scan) nil) (error () t)))))
+             (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*)))
+             (sb-thread:with-mutex (*wal-lock*)
+               (wal-remove-checkpointed-segments-under-wal-lock (* 2 +wal-segment-size+)))
+             (rove:ok (not (probe-file (wal-segment-path 0)))))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-retained-slot-scan-final-validation-rejects-loss
+    (let* ((*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+           (*wal-replication-slots* (make-hash-table :test #'equal))
+           (*wal-poisoned* nil) (*wal-durable-lsn* 100)
+           (*wal-logical-slot-read-progress* nil)
+           (owner (list :owner)) (*wal-logical-slot-owner* owner)
+           (slot (make-wal-replication-slot :name "scan" :database-oid 7 :restart-lsn 0
+                                            :consistent-lsn 0 :confirmed-flush-lsn 0 :active-owner owner))
+           (original (symbol-function 'wal-logical-slot-read-transactions-from-scan)))
+      (setf (gethash "scan" *wal-replication-slots*) slot)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'wal-logical-slot-read-transactions-from-scan)
+                   (lambda (&rest args) (declare (ignore args))
+                     (setf (wal-replication-slot-wal-status slot) :lost)
+                     (values (list :candidate) 100)))
+             (rove:ok (handler-case (progn (wal-logical-slot-read-transactions "scan") nil)
+                        (error () t)))
+             (rove:ok (null *wal-logical-slot-read-progress*))
+             (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*))))
+        (setf (symbol-function 'wal-logical-slot-read-transactions-from-scan) original))))
+
 (rove:deftest test-unscoped-logical-reader-remains-bounded
     (let* ((state (make-logical-reader-state :database-oid 7
                                              :change-bytes (1+ +max-unscoped-logical-materialization-bytes+)))
@@ -2696,34 +2938,38 @@
                                       :payload (logical-encode-fragment
                                                 0 2 (make-logical-fragment
                                                      :event event :start 0 :end middle))))
-           (original-scan (symbol-function 'wal-scan))
+           (original-scan (symbol-function 'wal-retained-slot-scan-next))
+           (next-index 0)
            (fail-scan nil)
            (saw-spool nil))
       (setf (gethash "scan" *wal-replication-slots*) slot)
       (ensure-directories-exist directory)
       (unwind-protect
            (progn
-             (setf (symbol-function 'wal-scan)
-                   (lambda (function &rest options)
-                     (declare (ignore options))
-                     (funcall function start)
-                     (funcall function fragment)
-                     (setf saw-spool (= 1 (length (uiop:directory-files directory))))
-                     (when fail-scan (error "injected scan failure"))))
+             (setf (symbol-function 'wal-retained-slot-scan-next)
+                   (lambda (scan)
+                     (declare (ignore scan))
+                     (case (incf next-index)
+                       (1 start)
+                       (2 fragment)
+                       (otherwise
+                        (setf saw-spool (= 1 (length (uiop:directory-files directory))))
+                        (when fail-scan (error "injected scan failure"))
+                        nil))))
              (multiple-value-bind (transactions progress)
                  (wal-logical-slot-read-transactions "scan")
                (rove:ok saw-spool)
                (rove:ok (null transactions))
                (rove:ok (= progress 0))
                (rove:ok (null (uiop:directory-files directory))))
-             (setf saw-spool nil fail-scan t)
+             (setf saw-spool nil fail-scan t next-index 0)
              (rove:ok (handler-case (progn (wal-logical-slot-read-transactions "scan") nil)
                         (error (condition)
                           (search "injected scan failure" (princ-to-string condition)))))
              (rove:ok saw-spool)
              (rove:ok (null (uiop:directory-files directory)))
              (rove:ok (= 0 (wal-replication-slot-confirmed-flush-lsn slot))))
-        (setf (symbol-function 'wal-scan) original-scan)
+        (setf (symbol-function 'wal-retained-slot-scan-next) original-scan)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (rove:deftest test-logical-fragment-assembly

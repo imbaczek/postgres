@@ -633,8 +633,8 @@ transaction size is controlled by the capture spool's temporary-file quota,
 which is unlimited by default. Unscoped logical readers that materialize changes
 retain a 65 MiB encoded-byte limit, checked after decoding the event or legacy
 chunk that crosses it; peak memory can therefore include that additional decoded
-data. Scoped slot readers use temporary spools instead. Large
-transactions can hold the WAL lock for their full scan or publication.
+data. Scoped slot readers use temporary spools instead. Large transaction
+publication can hold the WAL lock for the full batch.
 These event limits do not guarantee that a value of that size will fit.
 
 Logical capture keeps encoded events in memory until their cumulative size
@@ -659,7 +659,12 @@ transaction spool, spilling above 4 MiB without the SQL temporary-file quota.
 For legacy WAL chunks, the scoped reader validates each event and stages its
 original encoded bytes, avoiding re-encoding and retaining decoded text or
 bytea values during staging. Fragmented events still use their existing
-assembly and decoding path; the WAL scan remains under the WAL lock.
+assembly and decoding path. A slot scan captures a fixed durable horizon and
+pins its retained start under the WAL lock. It copies one WAL record at a time
+under that lock, then validates and stages it outside the lock. The pin prevents
+recycling during the scan, but does not prevent slot invalidation; slot identity,
+ownership and retention are rechecked before returning progress. The pin is
+released when the scan ends or unwinds.
 It validates the staged changes before sending and iterates them again for
 output; the spool is cleaned up when the reader scope ends. For spilled events,
 each iteration checks the event CRC in bounded blocks before decoding through a
