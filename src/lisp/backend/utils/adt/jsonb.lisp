@@ -230,6 +230,85 @@ TEXT-P requests the text form, for which JSON null becomes SQL NULL."
                           (loop for child across item do (push (cons child (1+ depth)) pending))))))
         (make-sql-jsonb result)))))
 
+(defun jsonb-array-without-index (array index)
+  "Copy ARRAY without its INDEX, allocating only the result vector."
+  (let ((result (make-array (1- (length array)))))
+    (replace result array :end1 index)
+    (replace result array :start1 index :start2 (1+ index))
+    result))
+
+(defun sql-jsonb-delete (jsonb operand kind)
+  "Delete top-level keys, string elements, or one array index."
+  (when (and (eq kind :keys) (sql-array-p operand))
+    (when (> (length (sql-array-dimensions operand)) 1)
+      (ereport "2202E" "wrong number of array subscripts"))
+    (setf operand (sql-array-elements operand)))
+  (let ((root (sql-jsonb-value jsonb)))
+    (unless (or (jsonb-object-value-p root) (jsonb-array-value-p root))
+      (ereport "22023" "cannot delete from scalar"))
+    (when (and (eq kind :index) (jsonb-object-value-p root))
+      (ereport "22023" "cannot delete from object using integer index"))
+    (cond
+      ((eq kind :index)
+       (let* ((count (length root))
+              (index (if (minusp operand) (+ count operand) operand)))
+         (if (<= 0 index (1- count))
+             (make-sql-jsonb (jsonb-array-without-index root index))
+             jsonb)))
+      (t
+       (let ((keys (make-hash-table :test #'equal)))
+         (if (eq kind :key)
+             (setf (gethash operand keys) t)
+             (loop for key across operand unless (eq key +null+)
+                   do (setf (gethash key keys) t)))
+         (if (jsonb-object-value-p root)
+             (make-sql-jsonb
+              (cons :object (remove-if (lambda (pair) (gethash (car pair) keys)) (cdr root))))
+             (make-sql-jsonb
+              (remove-if (lambda (item) (and (stringp item) (gethash item keys))) root))))))))
+
+(defun sql-jsonb-delete-path (jsonb path)
+  "Delete an existing JSONB path, preserving the original tree."
+  (when (sql-array-p path)
+    (when (> (length (sql-array-dimensions path)) 1)
+      (ereport "2202E" "wrong number of array subscripts"))
+    (setf path (sql-array-elements path)))
+  (let ((root (sql-jsonb-value jsonb)) (path-length (length path)))
+    (unless (or (jsonb-object-value-p root) (jsonb-array-value-p root))
+      (ereport "22023" "cannot delete path in scalar"))
+    (when (or (zerop path-length)
+              (if (jsonb-object-value-p root) (null (cdr root)) (zerop (length root))))
+      (return-from sql-jsonb-delete-path jsonb))
+    (labels ((visit (value level)
+               (let ((key (aref path level)) (last-p (= level (1- path-length))))
+                 (when (eq key +null+)
+                   (ereport "22004" "path element at position ~d is null" (1+ level)))
+                 (cond
+                   ((jsonb-object-value-p value)
+                    (let ((entry (assoc key (cdr value) :test #'string=)))
+                      (cond ((null entry) value)
+                            (last-p (cons :object (remove entry (cdr value) :test #'eq)))
+                            (t (let ((changed (visit (cdr entry) (1+ level))))
+                                 (if (eq changed (cdr entry)) value
+                                     (cons :object
+                                           (mapcar (lambda (pair)
+                                                     (if (eq pair entry) (cons (car pair) changed) pair))
+                                                   (cdr value)))))))))
+                   ((jsonb-array-value-p value)
+                    (let* ((count (length value))
+                           (index (sql-jsonb-set-index key (1+ level)))
+                           (actual (if (minusp index) (+ count index) index)))
+                      (if (<= 0 actual (1- count))
+                          (if last-p
+                              (jsonb-array-without-index value actual)
+                              (let ((changed (visit (aref value actual) (1+ level))))
+                                (if (eq changed (aref value actual)) value
+                                    (let ((copy (copy-seq value)))
+                                      (setf (aref copy actual) changed) copy))))
+                          value)))
+                   (t value)))))
+      (make-sql-jsonb (visit root 0)))))
+
 (defun sql-jsonb-concat (left right)
   "Concatenate JSONB roots as IteratorConcat does, preserving immutable inputs."
   (let* ((a (sql-jsonb-value left)) (b (sql-jsonb-value right))

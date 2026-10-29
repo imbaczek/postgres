@@ -2354,6 +2354,26 @@ candidate selection."
   (list :binop operator left right :type (if (string= operator "#>") (expr-type left) :text)
         :typmod -1))
 
+(defun analyze-jsonb-delete (operator left right)
+  "Resolve JSONB deletion without changing numeric subtraction."
+  (unless (or (eq (expr-type left) :jsonb) (in-unknown-constant-p left))
+    (report-operator-resolution-error operator (list left right)))
+  (let ((target
+          (cond
+            ((string= operator "#-") :text-array)
+            ((in-unknown-constant-p right) :text)
+            ((member (expr-type right) '(:int2 :int4)) :int4)
+            ((sql-implicit-coercion-p (expr-type right) :text-array) :text-array)
+            ((sql-implicit-coercion-p (expr-type right) :text) :text)
+            (t nil))))
+    (unless (and target (or (in-unknown-constant-p right)
+                            (eq (expr-type right) target)
+                            (sql-implicit-coercion-p (expr-type right) target)))
+      (report-operator-resolution-error operator (list left right)))
+    (when (in-unknown-constant-p left)
+      (setf left (coerce-in-constant left :jsonb)))
+    (list :binop operator left (coerce-common-expression right target) :type :jsonb :typmod -1)))
+
 (defun analyze-jsonb-predicate (operator left right)
   "Resolve JSONB containment and top-level existence operators."
   (let ((original-arguments (list left right))
@@ -2396,6 +2416,20 @@ candidate selection."
     (when (and (> (length operator) 1) (char= (char operator 0) #\^))
       (ereport "42883" "operator does not exist: ~a ~a ~a"
                (typed-arg-name left) operator (typed-arg-name right)))
+    (when (and (string= operator "-") (in-unknown-constant-p left)
+               (in-unknown-constant-p right))
+      (report-operator-resolution-error operator (list left right) t))
+    (when (and (string= operator "-") (in-unknown-constant-p left)
+               (eq (expr-type right) :jsonb))
+      (report-operator-resolution-error operator (list left right)))
+    (when (or (string= operator "#-")
+              (and (string= operator "-")
+                   (or (eq (expr-type left) :jsonb)
+                       (and (in-unknown-constant-p left)
+                            (not (in-unknown-constant-p right))
+                            (or (sql-implicit-coercion-p (expr-type right) :text)
+                                (sql-implicit-coercion-p (expr-type right) :text-array))))))
+      (return-from analyze-binop-expression (analyze-jsonb-delete operator left right)))
     (when (member operator '("@>" "<@" "?" "?|" "?&") :test #'string=)
       (return-from analyze-binop-expression (analyze-jsonb-predicate operator left right)))
     (when (member operator '("#>" "#>>") :test #'string=)
@@ -4184,6 +4218,10 @@ truncate and interpret the result at TYPE's signed width."
                                (sql-jsonb-exists-keys-p
                                 l (if (sql-array-p r) (sql-array-elements r) r)
                                 (string= op "?&")))
+                              ((string= op "#-") (sql-jsonb-delete-path l r))
+                              ((and (string= op "-") (eq (expr-type (third expr)) :jsonb))
+                               (sql-jsonb-delete l r (case (expr-type (fourth expr))
+                                                       (:int4 :index) (:text-array :keys) (otherwise :key))))
                               ((member op '("#>" "#>>") :test #'string=)
                                (sql-json-path-extract
                                 l (if (sql-array-p r) (sql-array-elements r) r)

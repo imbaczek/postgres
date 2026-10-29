@@ -276,6 +276,13 @@ and invalid array indices reached during traversal; unreachable later elements
 are not validated. An empty path leaves a container unchanged. Paths use the
 supported one-dimensional text array representation. JSONB values remain
 materialized; unchanged tree branches are shared without mutating inputs.
+JSONB `-` accepts text or one-dimensional `text[]` to remove top-level object
+keys or matching string elements of a top-level array; NULL entries in the key
+array are ignored. With an integer it removes an array element, counting negative
+indices from the end. `#- text[]` deletes an existing nested path, leaving
+missing paths unchanged. Scalar roots and integer deletion from objects raise
+errors; path traversal rejects reached NULL elements and invalid array indices.
+These operations preserve their inputs and operate on materialized JSONB trees.
 
 Decimal literals and numeric casts support finite values; numeric casts also
 accept NaN, infinities, and signed hexadecimal, octal, and binary integer input
