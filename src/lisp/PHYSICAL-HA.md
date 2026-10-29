@@ -621,6 +621,35 @@ path before claiming Patroni `follow` support. Synchronous commit waits and an
 independent acknowledgment-loss oracle remain separate required work; these
 tests do not establish zero-loss failover.
 
+### Libpq profile receiver integration — completed milestone
+
+The physical receiver can retarget an existing native bootstrap or active follow
+configuration using a libpq profile. Normal reconnects resolve the original
+profile again. Cleanup uses the frozen selected route and, when a password was
+used, the private effective password, preserving option bytes to retire the
+original pin. A route change
+requires a fresh PREPARE before source queries or WAL; route equality is not a
+source or authentication proof. Connection and transport failures `08001` and `08006` are
+retryable, while protocol violation `08P01` is terminal.
+
+Validation: the physical suite passed 1023 tests with zero failures and zero
+pending (`/tmp/pg-libpq-profile-physical-suite.log`); strict compilation passed
+(`/tmp/pg-libpq-receiver-final-compile.log`). The actual API end-to-end run
+(`/tmp/pg-libpq-follow-retry-final.log`, artifacts in
+`/tmp/pg-operation-parking.zPZ6lf`) covered retarget, child receipt and replay,
+automatic handoff, SIGKILL restart, promotion cleanup transfer, cleanup-only
+restart, typed SQL status redaction and mode 0600. The helper run
+(`/tmp/pg-libpq-unix-scram-frozen.log`) passed 14 helper unit and eight Lisp bridge
+checks, plus Unix SCRAM frozen reconnect after alias and passfile removal and
+password revocation returning `08001`. Luna max and Sol high code reviews were
+clear; Sol medium's refactor review was addressed and clear.
+
+The route-change guard has not yet been exercised end to end with a DNS or
+service reroute followed by re-PREPARE. Retarget does not provide first bootstrap.
+Patroni configuration integration, synchronous replication, rejoin, the full
+acceptance matrix and cold audit remain unfinished; this milestone adds no
+coordinator. The earlier libpq references below describe the prior checkpoint.
+
 ### Standard follow configuration integration — in progress
 
 The next integrated milestone is startup and upstream replacement through
@@ -643,8 +672,9 @@ emitted and recovery settings with C `postgres -C`. It verifies passfile mode
 and escaping, connection options, slot name, local configuration and signal
 files. The C run passes; the full native comparison currently fails on unsupported
 `cluster_name`. This is a writer and metadata oracle, not a `Postgresql.follow`
-or receiver test. Full GUC behavior, desired-generation reconciliation, libpq,
-first attachment, same-timeline follow and the follow acceptance matrix remain open.
+or receiver test. Full GUC behavior, desired-generation reconciliation, automatic
+Patroni conninfo wiring through libpq, first attachment, same-timeline follow and
+the follow acceptance matrix remain open.
 
 Native startup now installs independent `max_connections` (default 100) and
 `max_wal_senders` (default 10) session quotas before listening. Startup packets

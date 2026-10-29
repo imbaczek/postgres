@@ -4,8 +4,8 @@
   (declare (ignore depth))
   (print-unreadable-object (object stream :type t :identity t)))
 
-;; The helper owns libpq in an isolated child. This transport is not yet wired
-;; into the physical receiver; Lisp remains responsible for WAL validation,
+;; The helper owns libpq in an isolated child used by saved receiver profiles.
+;; Lisp remains responsible for WAL validation,
 ;; durability, and deciding when feedback and frontend CopyDone may be sent.
 ;; The largest COPY payload admits stock 128 KiB WAL data plus its 25-byte
 ;; header (and the smaller 65561-byte native payload).
@@ -71,6 +71,7 @@ are unsupported by the helper."
   host hostaddr port database user parameters)
 
 (defun physical-libpq-decode-connection-info (body)
+  "Decode private connection metadata as bytes, preserving null and empty values."
   (let ((position 0))
     (labels ((take-bytes (size)
                (unless (<= 0 size (- (length body) position))
@@ -108,6 +109,7 @@ are unsupported by the helper."
            :database database :user user :parameters parameters))))))
 
 (defun physical-libpq-public-connection-info (info)
+  "Render only allowlisted options for status, escaping nonprintable bytes."
   (with-output-to-string (out)
     (loop with firstp = t
           for (key value) in (physical-libpq-connection-info-parameters info)
@@ -132,6 +134,7 @@ are unsupported by the helper."
             (:constructor %make-physical-libpq-frozen-profile (parameters))
             (:conc-name %physical-libpq-frozen-profile-)
             (:print-function physical-libpq-print-private-object))
+  "Private effective options and selected route for retiring the original pin."
   (parameters nil :read-only t))
 
 (defun physical-libpq-push-octets (payload bytes)
@@ -162,6 +165,7 @@ are unsupported by the helper."
   datum)
 
 (defun physical-libpq-check-profile-datum (datum)
+  "Validate the private profile and its 32 KiB durable representation budget."
   (let ((tail datum) (seen nil) (size 2))
     (loop repeat 128
           while (consp tail)
@@ -194,6 +198,8 @@ are unsupported by the helper."
       bytes)))
 
 (defun physical-libpq-frozen-profile-datum (profile)
+  "Return a bounded, EQUAL-stable private datum for durable cleanup.
+Its canonical hexadecimal bytes are reversible, not encrypted; treat as secret."
   (physical-libpq-check-profile-datum
    (loop for (key value) in (%physical-libpq-frozen-profile-parameters profile)
          collect (list (copy-seq key) (physical-libpq-octets-datum value)))))
@@ -630,6 +636,7 @@ supported. A failed open attempts to close the reserved channel."
         channel))))
 
 (defun physical-libpq-connect-frozen (helper profile &key on-spawn)
+  "Connect to the saved cleanup route without service or environment redirects."
   (let ((channel (physical-libpq-open-channel helper :on-spawn on-spawn)))
     (with-physical-libpq-operation (channel)
       (multiple-value-bind (kind bytes)

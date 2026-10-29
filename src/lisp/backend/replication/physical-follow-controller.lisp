@@ -330,6 +330,7 @@ state before validating an active binding. Protect the store and retained root."
         config))))
 
 (defun physical-follow-operation-register-client (operation client)
+  "Publish the child early so cancellation can stop it, checking for late cancellation."
   (sb-thread:with-mutex (*physical-follow-lock*)
     (when (or (physical-follow-operation-cancelled-p operation)
               *physical-follow-controller-blocked-p* *physical-follow-controller-stopping-p*)
@@ -407,7 +408,9 @@ state before validating an active binding. Protect the store and retained root."
 
 (defun physical-follow-operation-intent (operation view)
   "Stop the old runtime and save preparation intent before contacting PREPARE.
-Hold command exclusion; snapshot under reload and live-operation quiescence."
+Hold command exclusion; snapshot under reload and live-operation quiescence.
+The preparation entry records the selected owner before the RPC. Once accepted,
+that owner stays with the pin until a new publication, not a later reconnect."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (physical-follow-operation-check operation)
     (let* ((current (physical-follow-read-config))
@@ -646,6 +649,7 @@ The caller must not hold command, reload or live-operation admission locks."
     (physical-follow-operation-result operation)))
 
 (defun physical-follow-retarget-conninfo (conninfo &key (prefix "follow") (fallback "walreceiver"))
+  "Retarget an existing native follow configuration using a libpq profile."
   (when (plusp *live-operation-depth*)
     (error "native follow retarget requires its own operation admission"))
   (let ((profile (make-physical-libpq-profile conninfo :fallback fallback)))
@@ -676,6 +680,7 @@ The caller must not hold command, reload or live-operation admission locks."
   client)
 
 (defun physical-follow-cleanup-connect (entry)
+  "Reconnect using the retired pin's frozen owner, including its saved credential."
   (let ((client nil) (accepted nil))
     (unwind-protect
          (progn
@@ -704,7 +709,8 @@ The caller must not hold command, reload or live-operation admission locks."
 
 (defun physical-follow-controller-cleanup (entry)
   "Retry exact remote retirement outside command exclusion. Remove the durable
-queue entry only after acknowledgment and a fresh local state check."
+queue entry only after acknowledgment and a fresh local state check. A revoked
+old credential leaves the entry queued for a later retry."
   (let ((client nil))
     (unwind-protect
          (handler-case

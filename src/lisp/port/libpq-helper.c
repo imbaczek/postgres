@@ -4,8 +4,8 @@
  * Run libpq in a child process for the Lisp physical replication transport.
  * The child owns the PGconn and translates bounded requests and replies over
  * stdin and stdout. It does not interpret WAL, decide durable progress, or
- * choose feedback; those decisions belong to Lisp. This API is not yet wired
- * into the physical receiver.
+ * choose feedback; those decisions belong to Lisp. The physical receiver uses
+ * this transport for saved libpq connection profiles.
  */
 #define _GNU_SOURCE
 #include <libpq-fe.h>
@@ -276,6 +276,8 @@ finish_connection(int64_t deadline)
 static void
 open_connection(const unsigned char *body, uint32_t size)
 {
+	/* Resolve conninfo afresh on each normal connection. The fallback
+	 * application name is a separate libpq option, not an override. */
 	if (connection)
 		fail("08P01", "helper connection is already open");
 	const unsigned char *next = body;
@@ -309,6 +311,9 @@ clear_connection_environment(void)
 static void
 open_frozen_connection(const unsigned char *body, uint32_t size)
 {
+	/* Cleanup uses the saved route and options. A literal dbname, cleared
+	 * libpq environment, and disabled service and host selection prevent a
+	 * new lookup from redirecting the old pin's retirement. */
 	if (connection || size < 4 || get32(body) > 128)
 		fail("08P01", "helper frozen open has invalid state or count");
 	uint32_t count = get32(body);
@@ -428,6 +433,8 @@ selected_host(void)
 static void
 snapshot_password(const char **value, const char *keyword)
 {
+	/* Preserve the password actually used, including one found in a passfile.
+	 * A canonical Unix socket host need not match the original passfile key. */
 	if (!strcmp(keyword, "password") && PQconnectionUsedPassword(connection))
 	{
 		const char *used = PQpass(connection);
@@ -439,6 +446,8 @@ snapshot_password(const char **value, const char *keyword)
 static void
 emit_connection_info(void)
 {
+	/* O replies carry private option bytes, distinguishing NULL from empty.
+	 * Lisp keeps them private and constructs its own allowlisted status text. */
 	PQconninfoOption *options = PQconninfo(connection);
 	if (!options)
 		fail("53000", "helper connection metadata unavailable");

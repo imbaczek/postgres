@@ -1009,6 +1009,9 @@ Validation checks coherence, not durable state or source proof."
   client)
 
 (defun physical-follow-open-runtime-client (runtime publish)
+  "Reconnect using the original settings, then compare the selected route.
+A changed route forces fresh preparation before queries or WAL. Route equality
+is not authentication or proof of source identity."
   (let ((source (physical-follow-config-source (physical-follow-runtime-config runtime))))
     (if source
         (let* ((profile (make-physical-libpq-profile (getf source :conninfo)

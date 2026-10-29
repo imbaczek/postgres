@@ -419,6 +419,15 @@ this mode.
 
 ### SBCL descriptor streams and global variables
 
+- On the local SBCL, `run-program :use-posix-spawn t` with its default NULL
+  environment passes an empty environment. Regular exec inherits raw environment
+  bytes; do not decode `posix-environ`, which can contain non-UTF-8 bytes.
+- Libpq private option values are raw bytes; canonical hex preserves them
+  losslessly and is not encryption. Do not print profiles or credentials. A
+  canonical Unix socket host can change the `.pgpass` lookup key, so save the
+  private `PQpass` value only when `PQconnectionUsedPassword` confirms its use.
+  Child ownership assumes `run-program` returns normally; the project installs
+  no status hooks, and an unrelated hook throwing before return is unsupported.
 - Adding a missing key with `(setf (getf state ...))` can replace a plist's head.
   Mutating a function's local parameter does not install that head in its caller.
   Persistent-control helpers return a copied state after durable publication;

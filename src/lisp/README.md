@@ -57,6 +57,38 @@ trusted, and `postgres` is always the effective role. Only the simple query
 protocol (`Q`) is implemented, which is all `psql` uses for the supported
 statements.
 
+## Physical follow with libpq
+
+On Linux, a saved libpq connection profile requires a separately built helper
+linked with libpq 17 or later. From `src/lisp`, build it at an absolute path and
+provide that path to the server on every start that may use the profile:
+
+```sh
+PG_CONFIG=/path/to/pg_config t/build-libpq-helper.sh /absolute/path/libpq-helper
+PG_LIBPQ_HELPER=/absolute/path/libpq-helper ./pg-lisp.sh -p 5439 -D /tmp/pgdata --control-port 7439
+```
+
+With an existing native bootstrap or active follow configuration, a private
+control REPL can request a transition using a literal conninfo, for example:
+
+```lisp
+(physical-follow-retarget-conninfo "host=127.0.0.1 port=5432 dbname=postgres user=replicator"
+                                  :prefix "follow" :fallback "walreceiver")
+```
+
+This retargets the existing configuration; it does not perform the first
+bootstrap or provide a coordinator. Effective multihost profiles are unsupported.
+The original conninfo is resolved again on normal reconnects. If the selected
+route changes, the receiver prepares a new binding before querying or receiving
+WAL. Cleanup uses the saved selected route and credential; if that credential is
+revoked, the cleanup entry remains queued. Saved profiles contain secrets and
+are stored in control files created with mode 0600 before writing. The private
+frozen profile has a 32 KiB budget within a control envelope of about 70 MiB. The SQL
+status interface is
+`pg_catalog.pg_stat_get_wal_receiver()`.
+
+`t/libpq-follow.sh` is the integration acceptance wrapper for this path.
+
 ## Write-ahead logging
 
 The server keeps append-only WAL segments under `PGDATA/pg_wal`. Each transaction

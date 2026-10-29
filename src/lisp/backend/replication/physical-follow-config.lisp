@@ -49,6 +49,7 @@ The tuple identifies a pin; it does not authenticate the remote endpoint."
       result)))
 
 (defun physical-follow-cleanup-with-owner (entry source)
+  "Attach the saved owner to a retirement entry, preserving the old credential."
   (physical-follow-cleanup-copy
    (append entry
            (when source

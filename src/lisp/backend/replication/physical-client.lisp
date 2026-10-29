@@ -12,6 +12,7 @@
   (error 'pg-client-error :sqlstate "08P01" :message message))
 
 (defun physical-client-retryable-condition-p (condition)
+  "Classify transport failures for both clients; protocol violation 08P01 is not retryable."
   (or (typep condition '(or stream-error sb-bsd-sockets:socket-error sb-ext:timeout))
       (and (typep condition 'pg-client-error)
            (member (pg-client-error-sqlstate condition)
@@ -176,6 +177,8 @@ or transport failure. Do not perform network I/O under recovery quiescence."
   (handler-case (parse-replication-lsn text)
     (error () (pg-client-native-reject "native result has an invalid WAL position"))))
 
+;; Both transports use these exchanges; changing transport does not relax the
+;; caller's source, timeline, WAL, and durability checks.
 (defgeneric physical-client-query (client query schema tag &key maximum command-only))
 
 (defmethod physical-client-query ((client pg-client) query schema tag
