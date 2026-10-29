@@ -6,11 +6,15 @@ TMP=$(mktemp -d /tmp/pg-toast-dml.XXXXXX)
 LOG="$TMP/server.log"
 SRV=
 READER=
+WRITER=
 . "$BASE/t/test-support.sh"
 test_debug_setup toast-dml "$PORT" "$TMP" "$LOG"
 cleanup() {
+    exec 3>&-
+    [ -z "$WRITER" ] || kill "$WRITER" 2>/dev/null || true
     [ -z "$READER" ] || kill "$READER" 2>/dev/null || true
     [ -z "$SRV" ] || kill "$SRV" 2>/dev/null || true
+    [ -z "$WRITER" ] || wait "$WRITER" 2>/dev/null || true
     [ -z "$READER" ] || wait "$READER" 2>/dev/null || true
     [ -z "$SRV" ] || wait "$SRV" 2>/dev/null || true
     rm -rf "$TMP"
@@ -20,7 +24,7 @@ run() {
     PGPASSWORD=x psql -X -q -A -t -h 127.0.0.1 -p "$PORT" \
         -U postgres -d postgres -v ON_ERROR_STOP=1 "$@"
 }
-test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-socket "$TMP/control.sock"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
 # Keep the long text incompressible so snapshot and deletion checks exercise
 # external TOAST chunks as well as the separate inline-compression cases below.
@@ -50,7 +54,7 @@ run -c 'vacuum full toast_jsonb' >/dev/null
 kill "$SRV"
 wait "$SRV" || true
 SRV=
-test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-socket "$TMP/control.sock"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
 [ "$(run -c "select id from toast_jsonb where v = '{\"long\":\"$big\",\"key\":3}'::jsonb")" = 1 ]
 run -c "update toast_jsonb set v = '{\"changed\":true}' where id = 1" >/dev/null
@@ -232,7 +236,7 @@ fi
 kill "$SRV"
 wait "$SRV" || true
 SRV=
-test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-socket "$TMP/control.sock"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
 [ "$(run -c 'select length(v) from storage_restart')" = 20000 ]
 [ "$(run -c "select v = '$big' from rewrite_plain")" = t ]
@@ -245,6 +249,90 @@ run -c 'create table vacuum_inline_text (v text)' >/dev/null
 run -c "insert into vacuum_inline_text values ('$numeric_repeat')" >/dev/null
 run -c 'vacuum full vacuum_inline_text' >/dev/null
 [ "$(run -c 'select length(v) from vacuum_inline_text')" = 20000 ]
+# Keep an old snapshot across updates which retain the external value, then
+# replace and roll back the value while VACUUM must preserve the old version.
+run -c 'create table toast_reuse (id int primary key, marker int, v text)' >/dev/null
+run -c 'alter table toast_reuse alter column v set storage external' >/dev/null
+run -c "insert into toast_reuse values (1, 0, '$big')" >/dev/null
+reuse_pointer() {
+    printf '%s\n(quit)\n' '(let* ((db (gethash "postgres" (catalog-databases *catalog*))) (table (gethash "toast_reuse" (database-tables db))) (snapshot (make-snapshot 0)) (ids nil)) (heapam-scan (pg-class-relfilenode table) (pg-class-columns table) snapshot (lambda (tuple) (let ((value (aref (htup-values tuple) 2))) (unless (heap-external-varlena-p value) (error "value is not external")) (push (heap-external-varlena-value-id value) ids)))) (unless (= (length ids) 1) (error "unexpected visible row count")) (format t "VALUE-ID=~d~%" (first ids)))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/reuse-pointer.out"
+    if grep -q ';; error:' "$TMP/reuse-pointer.out"; then cat "$TMP/reuse-pointer.out" >&2; exit 1; fi
+    awk -F= '/VALUE-ID=/{print $2}' "$TMP/reuse-pointer.out"
+}
+original_pointer=$(reuse_pointer)
+[ -n "$original_pointer" ]
+mkfifo "$TMP/reuse-reader.sql"
+run < "$TMP/reuse-reader.sql" > "$TMP/reuse-reader.out" 2>&1 &
+READER=$!
+exec 3> "$TMP/reuse-reader.sql"
+printf "%s\n" "begin isolation level repeatable read; select v = '$big' from toast_reuse where id = 1;" '\echo reuse-ready' >&3
+i=0
+until grep -Fxq 'reuse-ready' "$TMP/reuse-reader.out"; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || { cat "$TMP/reuse-reader.out" >&2; exit 1; }
+    sleep 0.1
+done
+run -c 'update toast_reuse set marker = 1 where id = 1' >/dev/null
+[ "$(reuse_pointer)" = "$original_pointer" ]
+run -c "insert into toast_reuse values (1, 2, '$other') on conflict (id) do update set marker = excluded.marker" >/dev/null
+[ "$(run -c "select marker, v = '$big' from toast_reuse where id = 1")" = '2|t' ]
+[ "$(reuse_pointer)" = "$original_pointer" ]
+run -c "begin; update toast_reuse set v = '$other', marker = 3 where id = 1; rollback" >/dev/null
+[ "$(run -c "select marker, v = '$big' from toast_reuse where id = 1")" = '2|t' ]
+[ "$(reuse_pointer)" = "$original_pointer" ]
+run -c "update toast_reuse set v = '$other', marker = 4 where id = 1" >/dev/null
+replacement_pointer=$(reuse_pointer)
+[ -n "$replacement_pointer" ]
+[ "$replacement_pointer" != "$original_pointer" ]
+run -c 'vacuum toast_reuse' >/dev/null
+[ "$(run -c "select marker, v = '$other' from toast_reuse where id = 1")" = '4|t' ]
+printf "select v = '%s' from toast_reuse where id = 1; commit;\n\\q\n" "$big" >&3
+exec 3>&-
+wait "$READER"
+READER=
+[ "$(grep -Fxc 't' "$TMP/reuse-reader.out")" = 2 ]
+run -c 'vacuum toast_reuse' >/dev/null
+[ "$(run -c "select marker, v = '$other' from toast_reuse where id = 1")" = '4|t' ]
+# A concurrent updater must follow the latest committed tuple before reusing
+# the external value; its scan starts while the replacement is uncommitted.
+mkfifo "$TMP/reuse-writer.sql"
+run < "$TMP/reuse-writer.sql" > "$TMP/reuse-writer.out" 2>&1 &
+READER=$!
+exec 3> "$TMP/reuse-writer.sql"
+printf '%s\n' "begin; update toast_reuse set v = '$big', marker = 5 where id = 1;" '\echo replacement-ready' >&3
+i=0
+until grep -Fxq 'replacement-ready' "$TMP/reuse-writer.out"; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || { cat "$TMP/reuse-writer.out" >&2; exit 1; }
+    sleep 0.1
+done
+toast_next_id() {
+    printf '%s\n(quit)\n' '(format t "NEXT-ID=~d~%" *toast-next-value-id*)' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/reuse-next-id.out"
+    if grep -q ';; error:' "$TMP/reuse-next-id.out"; then cat "$TMP/reuse-next-id.out" >&2; exit 1; fi
+    awk -F= '/NEXT-ID=/{print $2}' "$TMP/reuse-next-id.out"
+}
+replacement_next_id=$(toast_next_id)
+[ -n "$replacement_next_id" ]
+run -c 'select pg_backend_pid()' -c 'update toast_reuse set marker = 6 where id = 1' >"$TMP/reuse-waiter.out" 2>&1 &
+WRITER=$!
+i=0
+until waiter_pid=$(awk '/^[0-9]+$/{print; exit}' "$TMP/reuse-waiter.out") && [ -n "$waiter_pid" ]; do
+    kill -0 "$WRITER" 2>/dev/null || { cat "$TMP/reuse-waiter.out" >&2; exit 1; }
+    i=$((i + 1)); [ "$i" -lt 100 ] || exit 1; sleep 0.1
+done
+printf '%s\n(quit)\n' "(loop repeat 100 for backend = (lookup-backend $waiter_pid) when (and backend (backend-waiting-xid backend)) return :waiting do (sleep 0.05) finally (return :timeout))" | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/reuse-wait.out"
+grep -Fq ':WAITING' "$TMP/reuse-wait.out" || { cat "$TMP/reuse-wait.out" >&2; exit 1; }
+printf '%s\n' 'commit;' '\q' >&3
+exec 3>&-
+wait "$READER"
+READER=
+wait "$WRITER"
+WRITER=
+[ "$(run -c "select marker, v = '$big' from toast_reuse where id = 1")" = '6|t' ]
+[ "$(toast_next_id)" = "$replacement_next_id" ]
+latest_pointer=$(reuse_pointer)
+[ -n "$latest_pointer" ]
+[ "$latest_pointer" != "$replacement_pointer" ]
 run -c 'create table toast_numeric (id int primary key, v numeric)' >/dev/null
 numeric_toast_oid=$(run -c "select reltoastrelid from pg_class where relname = 'toast_numeric'")
 [ "$numeric_toast_oid" -gt 0 ]
@@ -266,10 +354,12 @@ run -c 'vacuum full toast_numeric' >/dev/null
 kill "$SRV"
 wait "$SRV" || true
 SRV=
-test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-socket "$TMP/control.sock"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
 [ "$(run -c "select a.attstorage from pg_attribute a join pg_class c on a.attrelid = c.oid where c.relname = 'storage_restart' and a.attname = 'v'")" = m ]
 [ "$(run -c 'select length(v) from storage_restart')" = 20000 ]
+[ "$(run -c "select marker, v = '$big' from toast_reuse where id = 1")" = '6|t' ]
+[ "$(reuse_pointer)" = "$latest_pointer" ]
 [ "$(run -c "select reltoastrelid from pg_class where relname = 'toast_numeric'")" = "$numeric_toast_oid" ]
 [ "$(run -c "select v = '$numeric_big'::numeric from toast_numeric where id = 1")" = t ]
 [ "$(run -c 'select length(v::text) from toast_numeric where id = 2')" = 20000 ]

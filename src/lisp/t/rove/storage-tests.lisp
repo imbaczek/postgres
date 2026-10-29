@@ -386,6 +386,21 @@
                                                  (sql-jsonb-input "1.00"))
                "statistics compare JSONB numerics by value")))
 
+(rove:deftest test-unchanged-toast-pointer-planning
+    (let* ((pointer (make-heap-external-varlena :raw-size 5004 :external-info 5000
+                                                :value-id 42 :relation-id 7 :id-width 4))
+           (columns (vector (make-pg-column :name "v" :type :text :attnum 1 :typmod -1)
+                            (make-pg-column :name "n" :type :int4 :attnum 2 :typmod -1)))
+           (tuple (make-htup :values (vector pointer 1)))
+           (reuse (unchanged-tuple-toast-pointers tuple (list (cons (aref columns 1) nil))))
+           (changed (unchanged-tuple-toast-pointers tuple (list (cons (aref columns 0) nil))))
+           (logical (vector (make-string 5000 :initial-element #\x) 2)))
+      (rove:ok (eq pointer (aref reuse 0)))
+      (rove:ok (null (aref changed 0)))
+      (let ((physical (toast-externalize-tuple-unlocked nil logical columns 10 0 reuse)))
+        (rove:ok (eq pointer (aref physical 0)))
+        (rove:ok (stringp (aref logical 0))))))
+
 (rove:deftest test-tuple-roundtrip
     (let* ((cols (coerce
                   (list (make-pg-column :name "a" :type :int4 :typmod -1

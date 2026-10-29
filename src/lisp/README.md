@@ -197,6 +197,11 @@ TOAST selection defaults to `MAIN` for `numeric` and `EXTENDED` for text,
 varchar, bytea, JSON and JSONB. `ALTER TABLE ... ALTER COLUMN ... SET STORAGE`
 accepts `PLAIN`, `EXTERNAL`, `EXTENDED`, `MAIN`, and `DEFAULT`. The policy
 applies to subsequent writes; existing values remain readable after a change.
+An UPDATE, including `ON CONFLICT DO UPDATE`, reuses external TOAST pointers
+for columns omitted from its assignments. The pointer comes from the physical
+row version actually claimed after any concurrent-update recheck; its chunks
+are retained for the new version. Assigned columns are written using the
+current storage policy, even when the assigned value is equal to the old one.
 Fixed-width types accept only `PLAIN` or `DEFAULT`. `VACUUM FULL` rewrites
 existing values using the current policy; it fails if a `PLAIN` value cannot
 fit on a heap page, leaving the original table intact.

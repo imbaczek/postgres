@@ -1464,12 +1464,28 @@ TOAST chunk visibility follows the parent and is not independently filtered."
                            (otherwise (ereport "XX001" "external value has unsupported type")))))))
     tuple))
 
-(defun delete-tuple-toast-values (table tuple xid cid)
+(defun unchanged-tuple-toast-pointers (tuple assignments)
+  "Return pointers for columns not assigned by this update.
+TUPLE is the physical version actually claimed, including after an EPQ recheck."
+  (let* ((values (htup-values tuple))
+         (reuse (make-array (length values) :initial-element nil)))
+    (loop for value across values for i from 0
+          when (and (heap-external-varlena-p value)
+                    (notany (lambda (assignment)
+                              (= (pg-column-attnum (car assignment)) (1+ i)))
+                            assignments))
+            do (setf (aref reuse i) value))
+    reuse))
+
+(defun delete-tuple-toast-values (table tuple xid cid &optional reuse)
   "Mark the physical external attributes of a claimed parent tuple deleted.
 TUPLE must still contain its physical pointers: materialization replaces them
 with SQL values. Detach scan leases before taking the TOAST index lock, and take
 that lock before the write lock. The transaction must abort on partial failure."
-  (let ((pointers (remove-if-not #'heap-external-varlena-p (htup-values tuple))))
+  (let ((pointers (loop for pointer across (htup-values tuple) for i from 0
+                        when (and (heap-external-varlena-p pointer)
+                                  (not (and reuse (aref reuse i))))
+                          collect pointer)))
     (when (plusp (length pointers))
       (let ((toast (pg-class-toast table)))
         (unless toast
@@ -1478,7 +1494,7 @@ that lock before the write lock. The transaction must abort on partial failure."
         (with-btree-relation-locks ((list (pg-toast-index-relfilenode toast)))
           (with-write-lock
             (ensure-current-table table)
-            (loop for pointer across pointers
+            (loop for pointer in pointers
                   do (toast-delete-value-unlocked toast pointer xid cid))))))))
 
 (defun scan-select-index (table path snapshot callback &optional environment)

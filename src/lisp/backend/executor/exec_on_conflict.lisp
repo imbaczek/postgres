@@ -219,16 +219,18 @@
                                    xid (backend-command-id *backend*))
               (check-heapam-write-status write-status)
               (when deleted
-                (delete-tuple-toast-values table actual xid (backend-command-id *backend*))
-                (materialize-select-tuple table actual protected-snapshot)
-                (multiple-value-bind (new-block new-offnum selection)
-                    (insert-tuple-with-unique
-                     table new :exclude-tid (cons old-block old-offnum) :publication-kind :update
-                     :on-success
-                     (lambda (next-block next-offnum)
-                       (unless (heapam-set-ctid-unlocked rel old-block old-offnum next-block next-offnum)
-                         (ereport "XX000" "could not link updated heap tuple"))))
-                  (declare (ignore new-block new-offnum))
-                  (logical-note-row-change :update table :old-values (htup-values actual)
-                                           :new-values new :publication-selection selection))
-                (return-from insert-tuple-on-conflict (values :update new (htup-values actual)))))))))))
+                (let ((reuse (unchanged-tuple-toast-pointers actual (getf conflict :sets))))
+                  (delete-tuple-toast-values table actual xid (backend-command-id *backend*) reuse)
+                  (materialize-select-tuple table actual protected-snapshot)
+                  (multiple-value-bind (new-block new-offnum selection)
+                      (insert-tuple-with-unique
+                       table new :exclude-tid (cons old-block old-offnum) :publication-kind :update
+                       :toast-reuse reuse
+                       :on-success
+                       (lambda (next-block next-offnum)
+                         (unless (heapam-set-ctid-unlocked rel old-block old-offnum next-block next-offnum)
+                           (ereport "XX000" "could not link updated heap tuple"))))
+                    (declare (ignore new-block new-offnum))
+                    (logical-note-row-change :update table :old-values (htup-values actual)
+                                             :new-values new :publication-selection selection))
+                  (return-from insert-tuple-on-conflict (values :update new (htup-values actual))))))))))))

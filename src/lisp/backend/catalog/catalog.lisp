@@ -1698,21 +1698,23 @@ VALUES remains unchanged; EXTERNAL-P says whether the relation has a TOAST table
               while best do (externalize best)))
       (values physical (nreverse selected) compressed-selected))))
 
-(defun toast-externalize-tuple-unlocked (toast values columns xid cid)
-  "Return a physical copy of VALUES, compressing inline or storing in TOAST.
-The caller holds *WRITE-LOCK* and, when TOAST is present, its index writer
-lock acquired first. This function does not acquire either lock.
-Abort XID after any error once storage begins. VALUES remains suitable for SQL
-index keys, RETURNING, and replication. The planner may leave the tuple above
-its target. Selected external payloads use PGLZ when it meets the size threshold."
-  (multiple-value-bind (physical indexes compressed-indexes) (toast-plan-tuple values columns :external-p (not (null toast)))
-    (when indexes
-      (let ((raw-payloads (nth-value 2 (heap-tuple-layout values columns))))
-        (dolist (index indexes)
-          (setf (aref physical index)
-                (toast-store-value-unlocked toast (aref raw-payloads index)
-                                            nil xid cid :compress (member index compressed-indexes))))))
-    physical))
+(defun toast-externalize-tuple-unlocked (toast values columns xid cid &optional reuse)
+  "Return a physical tuple while keeping VALUES usable for SQL and replication.
+REUSE holds external pointers from the claimed old tuple for unchanged columns.
+The caller holds the TOAST index and write locks and must abort after errors."
+  (let ((planning-values (copy-seq values)))
+    (when reuse
+      (loop for pointer across reuse for i from 0
+            when pointer do (setf (aref planning-values i) pointer)))
+    (multiple-value-bind (physical indexes compressed-indexes)
+        (toast-plan-tuple planning-values columns :external-p (not (null toast)))
+      (when indexes
+        (let ((raw-payloads (nth-value 2 (heap-tuple-layout values columns))))
+          (dolist (index indexes)
+            (setf (aref physical index)
+                  (toast-store-value-unlocked toast (aref raw-payloads index)
+                                              nil xid cid :compress (member index compressed-indexes))))))
+      physical)))
 
 (defun toast-fetch-value (toast pointer snapshot &key (index-reader #'call-with-btree-relation-read-lock))
   "Return the uncompressed bytes named by POINTER in the owning TOAST storage.

@@ -453,21 +453,22 @@
                      nil t candidate)
                   (check-heapam-write-status status)
                   (when deleted
-                    (delete-tuple-toast-values table tuple xid (backend-command-id *backend*))
-                    (materialize-select-tuple table tuple *current-snapshot*)
-                    (multiple-value-bind (block off publications)
-                        (insert-tuple-with-unique
-                         table new :exclude-tid (cons old-block old-offnum)
-                         :publication-kind :update
-                         :on-success
-                         (lambda (block off)
-                           (unless (heapam-set-ctid-unlocked rel old-block old-offnum block off)
-                             (ereport "XX000" "could not link updated heap tuple"))))
-                      (declare (ignore block off))
-                      (logical-note-row-change :update table :old-values (htup-values tuple)
-                                               :new-values new :publication-selection publications)
-                      (emit-dml-returning stream (getf prepared :returning) new
-                                          :old-values (htup-values tuple) :new-values new :source-values source))
-                    (incf count))
+                    (let ((reuse (unchanged-tuple-toast-pointers tuple sets)))
+                      (delete-tuple-toast-values table tuple xid (backend-command-id *backend*) reuse)
+                      (materialize-select-tuple table tuple *current-snapshot*)
+                      (multiple-value-bind (block off publications)
+                          (insert-tuple-with-unique
+                           table new :exclude-tid (cons old-block old-offnum)
+                           :toast-reuse reuse :publication-kind :update
+                           :on-success
+                           (lambda (block off)
+                             (unless (heapam-set-ctid-unlocked rel old-block old-offnum block off)
+                               (ereport "XX000" "could not link updated heap tuple"))))
+                        (declare (ignore block off))
+                        (logical-note-row-change :update table :old-values (htup-values tuple)
+                                                 :new-values new :publication-selection publications)
+                        (emit-dml-returning stream (getf prepared :returning) new
+                                            :old-values (htup-values tuple) :new-values new :source-values source))
+                      (incf count)))
                   deleted)))))
          (finish-dml-command stream (getf prepared :returning) (format nil "UPDATE ~a" count)))))))
