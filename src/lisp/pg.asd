@@ -35,6 +35,7 @@
                    (:file "bufmgr")))
      (:file "utils/adt/json")
      (:file "utils/adt/numeric")
+     (:file "utils/adt/jsonb")
      (:file "utils/adt/float")
      (:file "utils/adt/timezone")
      (:file "utils/adt/datetime")

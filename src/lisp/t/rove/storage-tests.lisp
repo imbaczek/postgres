@@ -314,6 +314,42 @@
                            "0" (make-string 20000 :initial-element #\]))))
     (rove:ok (string= deep (sql-json-input deep)) "deep JSON uses an explicit stack")))
 
+(rove:deftest test-jsonb-normalization
+    (dolist (pair '(("{}" "{}")
+                    ("[1,{\"x\":2},[]]" "[1, {\"x\": 2}, []]")
+                    ("{\"long\":1,\"a\":2,\"a\":3}" "{\"a\": 3, \"long\": 1}")
+                    ("\"\\u001b\\u000f\"" "\"\\u001b\\u000f\"")
+                    ("{\"é\":1,\"aa\":2,\"z\":3}" "{\"z\": 3, \"aa\": 2, \"é\": 1}")
+                    ("{\"a\":1,\"\\u0061\":2}" "{\"a\": 2}")
+                    ("1e2" "100")
+                    ("[true,false,null]" "[true, false, null]")))
+      (rove:ok (string= (second pair) (sql-jsonb-output (sql-jsonb-input (first pair))))
+               "JSONB canonicalizes values and retains the last duplicate key"))
+  (let ((smile (format nil "~c" (code-char #x1f600))))
+    (rove:ok (string= (format nil "\"~a\"" smile)
+                      (sql-jsonb-output (sql-jsonb-input "\"\\uD83D\\uDE00\"")))
+             "surrogate pairs decode to a scalar"))
+  (let ((deep (concatenate 'string (make-string 514 :initial-element #\[)
+                           "0" (make-string 514 :initial-element #\]))))
+    (rove:ok (handler-case (progn (sql-jsonb-input deep) nil) (error () t))
+             "JSONB rejects nesting beyond its guarded recursion depth"))
+  (dolist (text '("\"\\u0000\"" "\"\\uD800\"" "\"\\uDC00\""))
+    (rove:ok (handler-case (progn (sql-jsonb-input text) nil) (error () t))
+             "JSONB rejects invalid Unicode escapes")))
+
+(rove:deftest test-jsonb-comparison
+    (let ((ordered (mapcar #'sql-jsonb-input
+                           '("[]" "null" "\"a\"" "1" "false" "true" "[1]" "{}"))))
+      (loop for (left right) on ordered while right
+            do (rove:ok (minusp (sql-jsonb-compare left right))
+                        "JSONB values follow type and scalar order")))
+  (rove:ok (zerop (sql-jsonb-compare (sql-jsonb-input "{\"x\":1.0,\"x\":2}")
+                                     (sql-jsonb-input "{\"x\":2.00}")))
+           "duplicate keys and numeric scale normalize for equality")
+  (rove:ok (minusp (sql-jsonb-compare (sql-jsonb-input "[2]")
+                                      (sql-jsonb-input "[1,0]")))
+           "array length precedes element comparison"))
+
 (rove:deftest test-tuple-roundtrip
     (let* ((cols (coerce
                   (list (make-pg-column :name "a" :type :int4 :typmod -1
