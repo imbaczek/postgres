@@ -208,6 +208,11 @@ and LIMIT, external values unused by the projection, filters, ordering, and
 index qualification are not fetched. Demand analysis recognizes columns, constants, casts, Boolean and
 arithmetic operators, and function calls with recognized arguments. Other plan
 or expression shapes fall back to full tuple materialization.
+An internal TOAST byte-slice API reads only intersecting chunks of an
+uncompressed external value under an active snapshot protecting its parent.
+It validates the pointer and requested chunks, but does not check unrequested
+chunks; compressed values use a full validated fetch. SQL expressions do not
+yet use this slice API.
 Fixed-width types accept only `PLAIN` or `DEFAULT`. `VACUUM FULL` rewrites
 existing values using the current policy; it fails if a `PLAIN` value cannot
 fit on a heap page, leaving the original table intact.

@@ -352,6 +352,116 @@
                  (ok (equalp toast (pg::pg-class-toast saved)))))
           (pg::smgr-close-all)))))
 
+(deftest toast-fetch-slices-validate-selected-chunks
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*relation-streams* (make-hash-table :test #'equal))
+             (pg::*wal-page-cache* (make-hash-table :test #'equal))
+             (pg::*wal-ready* nil)
+             (pg::*clog-stream* nil)
+             (pg::*active-xids* nil)
+             (pg::*catalog* (pg::make-catalog))
+             (pg::*backend* (pg::make-backend))
+             (database (pg::make-database :name "postgres"))
+             (snapshot (pg::make-snapshot-struct :xmin 3 :xmax 50 :xip nil :curcid 0))
+             (registration (pg::make-snapshot-registration))
+             (bytes (make-array 5000 :element-type '(unsigned-byte 8)
+                                     :initial-contents (loop for i below 5000 collect (mod i 251))))
+             (compressible (make-array 5000 :element-type '(unsigned-byte 8) :initial-element 42)))
+        (setf (gethash "postgres" (pg::catalog-databases pg::*catalog*)) database)
+        (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
+        (unwind-protect
+             (let* ((table (pg::create-table* database "slices" (list (list :name "v" :type :bytea :typmod -1))))
+                    (toast (pg::pg-class-toast table))
+                    (pointer nil) (compressed nil))
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (pg::with-write-lock
+                   (setf pointer (pg::toast-store-value-unlocked toast bytes nil 42 0)
+                         compressed (pg::toast-store-value-unlocked toast compressible nil 42 0 :compress t))))
+               (ok (intake-fails-p (lambda () (pg::toast-fetch-value-slice toast pointer snapshot 0 1))))
+               (pg::register-active-snapshot snapshot registration)
+               (dolist (bounds '((0 1) (1990 30) (4990 30) (5000 20) (9999 2) (0 0)))
+                 (let ((start (min (first bounds) (length bytes))))
+                   (ok (equalp (subseq bytes start (min (length bytes) (+ start (second bounds))))
+                               (pg::toast-fetch-value-slice toast pointer snapshot (first bounds) (second bounds))))))
+               (ok (nth-value 2 (pg::toast-pointer-storage-size toast compressed)))
+               (ok (equalp (subseq compressible 1900 2100)
+                           (pg::toast-fetch-value-slice toast compressed snapshot 1900 200)))
+               (let ((original (symbol-function 'pg::btree-search-unlocked))
+                     (calls 0))
+                 (unwind-protect
+                      (progn
+                        (setf (symbol-function 'pg::btree-search-unlocked)
+                              (lambda (&rest args) (incf calls) (apply original args)))
+                        (ok (equalp (subseq bytes 2000 2020)
+                                    (pg::toast-fetch-value-slice toast pointer snapshot 2000 20)))
+                        (ok (= calls 1)))
+                   (setf (symbol-function 'pg::btree-search-unlocked) original)))
+               (let ((leases 0))
+                 (ok (equalp (subseq bytes 1900 2100)
+                             (pg::toast-fetch-value-slice
+                              toast pointer snapshot 1900 200
+                              :index-reader (lambda (node thunk)
+                                              (incf leases)
+                                              (pg::call-with-btree-relation-read-lock node thunk)))))
+                 (ok (= leases 1)))
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (pg::with-write-lock (pg::toast-delete-value-unlocked toast pointer 44 0)))
+               (ok (equalp (subseq bytes 1900 2100)
+                           (pg::toast-fetch-value-slice toast pointer snapshot 1900 200)))
+               (let ((missing (pg::copy-heap-external-varlena pointer)))
+                 (setf (pg::heap-external-varlena-value-id missing) 999999)
+                 (ok (equal "XX001" (recovery-state-of
+                                     (lambda () (pg::toast-fetch-value-slice toast missing snapshot 0 1))))))
+               (ok (intake-fails-p (lambda () (pg::toast-fetch-value-slice toast pointer snapshot -1 1))))
+               (let ((bad (pg::copy-heap-external-varlena pointer)))
+                 (incf (pg::heap-external-varlena-relation-id bad))
+                 (ok (equal "XX001" (recovery-state-of (lambda () (pg::toast-fetch-value-slice toast bad snapshot 0 1))))))
+               ;; A selected chunk with the right key but wrong length is corrupt.
+               (let ((malformed (pg::copy-heap-external-varlena pointer)))
+                 (setf (pg::heap-external-varlena-value-id malformed) 999998)
+                 (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                   (pg::with-write-lock
+                     (multiple-value-bind (block offset)
+                         (pg::heapam-insert (pg::pg-toast-relfilenode toast) pg::*toast-chunk-columns*
+                                            (vector 999998 0 (subseq bytes 0 1)) 42 0)
+                       (pg::btree-insert-unlocked (pg::pg-toast-index-relfilenode toast)
+                                                  (pg::toast-chunk-key 999998 0) block offset))))
+                 (ok (equal "XX001" (recovery-state-of
+                                     (lambda () (pg::toast-fetch-value-slice toast malformed snapshot 0 1))))))
+               ;; An aborted insertion may leave a stale index entry beside the real chunk.
+               (pg::clog-set 43 pg::+clog-aborted+)
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (pg::with-write-lock
+                   (multiple-value-bind (block offset)
+                       (pg::heapam-insert (pg::pg-toast-relfilenode toast) pg::*toast-chunk-columns*
+                                          (vector (pg::heap-external-varlena-value-id pointer) 0
+                                                  (subseq bytes 0 pg::+toast-oid-chunk-size+)) 43 0)
+                     (pg::btree-insert-unlocked (pg::pg-toast-index-relfilenode toast)
+                                                (pg::toast-chunk-key (pg::heap-external-varlena-value-id pointer) 0)
+                                                block offset)
+                     (pg::with-heap-tuple-edit (page at (pg::pg-toast-relfilenode toast) block offset)
+                       (pg::page-set-u16 page (+ at pg::+heap-tuple-infomask-off+)
+                                         pg::+heap-xmin-invalid+)))))
+               (ok (equalp (subseq bytes 0 1)
+                           (pg::toast-fetch-value-slice toast pointer snapshot 0 1)))
+               ;; Duplicate an indexed selected chunk; exact lookup must reject it.
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (pg::with-write-lock
+                   (multiple-value-bind (block offset)
+                       (pg::heapam-insert (pg::pg-toast-relfilenode toast) pg::*toast-chunk-columns*
+                                          (vector (pg::heap-external-varlena-value-id pointer) 0
+                                                  (subseq bytes 0 pg::+toast-oid-chunk-size+)) 42 0)
+                     (pg::btree-insert-unlocked (pg::pg-toast-index-relfilenode toast)
+                                                (pg::toast-chunk-key (pg::heap-external-varlena-value-id pointer) 0)
+                                                block offset))))
+               (ok (equal "XX001" (recovery-state-of (lambda () (pg::toast-fetch-value-slice toast pointer snapshot 0 1)))))
+               (ok (equalp (subseq bytes 4500 4510)
+                           (pg::toast-fetch-value-slice toast pointer snapshot 4500 10))))
+          (pg::release-snapshot-registration registration)
+          (when pg::*clog-stream* (close pg::*clog-stream*))
+          (pg::smgr-close-all)))))
+
 (deftest toast-stores-and-fetches-binary-chunks
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)

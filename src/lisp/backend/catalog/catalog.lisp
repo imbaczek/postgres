@@ -1757,6 +1757,65 @@ misordered, or malformed chunks signal corruption."
                        (toast-decompress-payload payload raw-size)
                        payload)))))))
 
+(defun toast-fetch-value-slice (toast pointer snapshot start length
+                                &key (index-reader #'call-with-btree-relation-read-lock))
+  "Fetch up to LENGTH bytes from START, clamped to the logical value.
+SNAPSHOT must protect the owning parent throughout the call. Uncompressed
+values read only intersecting chunk keys under one index lease; compressed
+values use the full validated fetch. Corruption in unrequested chunks is not
+checked by a partial fetch."
+  (unless (and (integerp start) (>= start 0) (integerp length) (>= length 0))
+    (error "TOAST slice offset and length must be nonnegative integers"))
+  (unless (and snapshot
+               (sb-thread:with-mutex (*snapshot-count-lock*)
+                 (gethash snapshot *active-snapshot-set*)))
+    (error "TOAST fetch requires an active snapshot"))
+  (multiple-value-bind (size raw-size compressed-p) (toast-pointer-storage-size toast pointer)
+    (let* ((id (heap-external-varlena-value-id pointer))
+           (index-node (pg-toast-index-relfilenode toast))
+           (heap-node (pg-toast-relfilenode toast))
+           (begin (min start raw-size))
+           (end (min raw-size (+ begin length)))
+           (result nil))
+      (unless (typep id '(integer 1 4294967295))
+        (ereport "XX001" "invalid TOAST pointer"))
+      (when (< (buf-nblocks index-node) 2)
+        (ereport "XX001" "TOAST index is missing"))
+      (when (= begin end)
+        (return-from toast-fetch-value-slice (make-array 0 :element-type '(unsigned-byte 8))))
+      (when compressed-p
+        (return-from toast-fetch-value-slice
+          (subseq (toast-fetch-value toast pointer snapshot :index-reader index-reader) begin end)))
+      (setf result (make-array (- end begin) :element-type '(unsigned-byte 8)))
+      (funcall index-reader index-node
+               (lambda ()
+                 (loop for sequence from (floor begin +toast-oid-chunk-size+)
+                         to (floor (1- end) +toast-oid-chunk-size+)
+                       for key = (toast-chunk-key id sequence)
+                       for tids = (btree-search-unlocked index-node key)
+                       do (let* ((tuples (loop for tid in tids
+                                               for tuple = (heapam-get-tuple heap-node (car tid) (cdr tid)
+                                                                             *toast-chunk-columns* t)
+                                               when tuple collect tuple))
+                                 (tuple (first tuples)))
+                            (unless (= (length tuples) 1)
+                              (ereport "XX001" "missing or duplicate TOAST chunk"))
+                            (let* ((values (htup-values tuple))
+                                   (bytes (aref values 2))
+                                   (chunk-start (* sequence +toast-oid-chunk-size+))
+                                   (expected (min +toast-oid-chunk-size+ (- size chunk-start))))
+                              (unless (and (eql (aref values 0) id)
+                                           (eql (aref values 1) sequence)
+                                           (typep bytes '(vector (unsigned-byte 8)))
+                                           (= (length bytes) expected))
+                                (ereport "XX001" "invalid TOAST chunk"))
+                              (let ((from (max begin chunk-start))
+                                    (to (min end (+ chunk-start expected))))
+                                (replace result bytes :start1 (- from begin)
+                                                      :start2 (- from chunk-start)
+                                                      :end2 (- to chunk-start))))))))
+      result)))
+
 (defun toast-delete-value-unlocked (toast pointer xid cid)
   "Mark the chunks referenced by POINTER deleted by XID and CID.
 The caller must own the parent tuple and hold the TOAST index writer lock,
