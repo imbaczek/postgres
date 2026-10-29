@@ -15,7 +15,8 @@
 
 (defconstant +db-in-production+ 6)
 
-(defvar *enable-hot-standby* t)
+(defvar *enable-hot-standby* t
+  "Installed hot_standby setting; controls client startup during recovery.")
 
 (defvar *physical-recovery-state* nil
   "Verified native recovery image metadata, preserved across code reloads.")

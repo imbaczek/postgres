@@ -143,7 +143,8 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
     (when report (send-parameter-status stream "in_hot_standby" (if standby "on" "off")))))
 
 (defun process-startup (stream body)
-  "Parse startup mode and reserve its quota before sending authentication success."
+  "Parse startup mode, reject disabled hot standby, then reserve its quota.
+When hot_standby is off, reject every startup mode during recovery before authentication."
   (with-live-operation
     (let* ((code (bytes-to-u32 body 0))
            (major (ash code -16)))

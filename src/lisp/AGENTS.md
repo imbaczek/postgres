@@ -214,6 +214,16 @@ appropriate instead of replacing the native C peer or adding a message relay.
   `cl-mcp/src/lisp-patch-form` in the PG worker and call its exported structural
   `lisp-patch-form` with `:readtable :standard`, first as a dry run and then for
   the edit. It retains structural validation and locking; do not use a raw writer.
+- cl-mcp accepted valid SBCL `#\Null` and `#\Vt` in an insertion, but its
+  Eclector reader later refused to edit the file. Use portable `(code-char N)` or numeric codes. Custom
+  readtables are resolved in the MCP server, not the worker; a package loaded in
+  the worker can still be missing there. A recovery used the same structural
+  `lisp-patch-form` API through the loaded worker, with the verified source
+  readtable and project root bound there. Serialize this with server edits because
+  locks are image-local. Do not bypass reader evaluation restrictions.
+- Review parinfer's repair report and resulting source, not only balance. A repair
+  of balanced but misindented input moved closing parentheses and changed a list
+  binding and call arity.
 - Balanced parentheses do not establish the intended top-level structure. After
   inserting multiple definitions, inspect the collapsed outline and test names;
   a misplaced close once nested a `deftest` inside another form in this session.

@@ -89,6 +89,7 @@
       integer)))
 
 (defun startup-parse-boolean-setting (text)
+  "Parse a GUC Boolean, rejecting edge ASCII whitespace unlike SQL casts."
   (when (or (zerop (length text))
             (member (char-code (char text 0)) '(9 10 11 12 13 32))
             (member (char-code (char text (1- (length text)))) '(9 10 11 12 13 32)))
@@ -96,6 +97,7 @@
   (sql-cast-boolean-input text))
 
 (defun startup-setting-text (name value)
+  "Render Boolean settings as on or off for SHOW, -C and pg_settings."
   (if (eq :boolean (third (assoc name *startup-setting-specs* :test #'string=)))
       (if value "on" "off")
       (princ-to-string value)))
@@ -448,7 +450,8 @@ The other worker pools use their C defaults in the process-budget calculation."
 
 (defun startup-install-settings (settings native overrides)
   "Validate and install settings, including session quotas before listen.
-Install wal_keep_size in MB on startup and on a successful reload."
+Install wal_keep_size in MB on successful reload; postmaster settings such as
+hot_standby retain their active values until restart."
   (startup-check-connection-limits settings)
   (let ((timeout (startup-setting-value settings "checkpoint_timeout"))
         (wal-bytes (* 1024 1024 (startup-setting-value settings "max_wal_size")))

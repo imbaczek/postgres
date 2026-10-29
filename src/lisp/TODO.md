@@ -41,6 +41,10 @@
   dead-end handling and authentication timeout. The current independent session
   quotas apply after startup packet parsing and do not bound pending raw sockets.
 
+- [ ] Fix cl-mcp character-name alias acceptance and custom-reader handling of
+  unknown packages across server and worker images; add regressions for parinfer
+  repairs that alter balanced but misindented forms. Keep reader evaluation disabled.
+
 - [ ] Fix cold test declarations in `t/promotion-intent-tests.lisp`.
   `call-with-promotion-fixture` binds `pg::*shutdown-mode*` and
   `pg::*shutdown-requested*` lexically before their declarations, producing four

@@ -1588,12 +1588,19 @@ configuration precedence, SIGHUP and the pinned ConfigHandler's settings queries
 through real psycopg2. The configuration subset supports `port`,
 `listen_addresses`, `data_directory`, `checkpoint_timeout`, `max_wal_size`,
 `max_slot_wal_keep_size`, `wal_keep_size`, `max_connections`, `max_wal_senders`,
-`reserved_connections`, `superuser_reserved_connections` and the empty
+`reserved_connections`, `superuser_reserved_connections`, `hot_standby` and the empty
 `restore_command` default, with includes,
 auto.conf and CLI overrides. Nonempty restore commands are rejected until archive
 recovery exists. SHOW,
 current_setting and typed pg_settings rows expose the actual installed values.
 Unknown settings fail visibly; empty or multiple listen addresses are unsupported.
+`hot_standby` is a postmaster Boolean, defaulting to on. When off during native
+recovery, SQL and both replication startup modes receive FATAL 57P03 before
+authentication or quota reservation; replay, receipt and control remain active.
+Reload reports a changed value as pending restart and keeps the active setting.
+After promotion, connections and writes are available even when it is off.
+Run `PATRONI_PYTHON=/path/to/pinned-venv/bin/python3 ./t/hot-standby.sh`, with
+optional `REFERENCE_POSTGRES` for the C wire comparison.
 After startup packet parsing and before authentication success, independent
 `max_connections` and `max_wal_senders` quotas limit SQL sessions and physical or
 database replication sessions respectively. Defaults are 100 and 10. These are

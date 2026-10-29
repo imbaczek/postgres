@@ -663,8 +663,24 @@ zero senders, saturated cancellation and a pending raw handshake. Native control
 checks observed reload preserving the active caps. Fresh full physical tests passed
 975, interop 185, legacy 1,155 checks and strict cold compilation passed. The
 seeded admission property passed with input-coverage and rejection-count gaps
-unmeasured. Full writer GUC behavior, hot standby, libraries and
+unmeasured. Full writer GUC behavior, libraries and
 effective follow remain open; the writer oracle still first rejects `cluster_name`.
+
+`hot_standby` is a postmaster Boolean, default on, reported as canonical on/off
+with Boolean type and NULL unit. GUC Boolean prefixes are accepted, but edge
+ASCII whitespace is rejected. When off during recovery, SQL, physical and
+database replication startup packets receive FATAL 57P03 with detail "Hot standby
+mode is disabled." before quota admission or AuthOK. Internal replay, receiver
+and control continue. Reload retains the active value and reports pending restart;
+promotion permits connections and writes even with the setting off.
+
+The owned native and C wire oracle passed both reload directions and restart,
+all three startup modes, replay while disabled and promotion into writable primary.
+Native `pg_ctl` now recognizes the current 17-field retained-reference control
+while retaining its checksum and ownership checks. Focused control-reader tests,
+990 physical tests, 185 interop tests, 1,155 legacy checks and strict cold
+compilation passed. Seed 42 and 43 properties passed 200 trials each; input
+coverage and rejection counts remain unmeasured.
 
 A Sol xhigh source audit identified these connected requirements:
 

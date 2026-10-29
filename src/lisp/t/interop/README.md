@@ -79,6 +79,10 @@ safe size and unlimited caps, not actual C file recycling; native file recycling
 is covered by the physical Rove suite. `t/config-output.sh` also compares the
 setting's `-C` base-unit output when a C reference is available.
 
+Run `PATRONI_PYTHON=/path/to/pinned-venv/bin/python3 ./t/hot-standby.sh` for
+recovery admission, reload, restart, replay and promotion checks. Set
+`REFERENCE_POSTGRES` to include the pinned C wire oracle.
+
 ## Verification
 
 - Primary Rove: 134 pass; live apply/SQL/wire: 21 pass; native C subscriber: 3 pass.
