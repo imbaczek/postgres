@@ -889,6 +889,7 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                            (every #'having-literal-expression-p branch))
                          (second expression))
                   (having-literal-expression-p (third expression))))
+         (:array-subscript nil)
          (:in
           (and (having-literal-expression-p (second expression))
                (every #'having-literal-expression-p (third expression))))
@@ -924,6 +925,10 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                           (second expression))
                   (third copy) (having-gate-skeleton (third expression)))
             copy))
+      (:array-subscript
+       (let ((copy (children 1)))
+         (setf (third copy) (mapcar #'having-gate-skeleton (third expression)))
+         copy))
       (:in
        (let ((copy (children 1)))
          (setf (third copy) (mapcar #'having-gate-skeleton (third expression))

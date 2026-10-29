@@ -2685,6 +2685,44 @@ candidate selection."
                     items)
             :type array-type :typmod -1 :multidims multidims))))
 
+(defun analyze-array-subscript (expression scope)
+  "Analyze a scalar, possibly multidimensional array reference."
+  (let* ((array (analyze-expr (second expression) scope))
+         (element-type (sql-array-element-type (expr-type array))))
+    (unless element-type
+      (ereport "42804" "cannot subscript type ~a because it does not support subscripting"
+               (expr-type array)))
+    (let ((indices
+            (mapcar (lambda (raw)
+                      (let ((index (analyze-expr raw scope)))
+                        (cond ((in-unknown-constant-p index) (coerce-in-constant index :int4))
+                              ((eq (expr-type index) :int4) index)
+                              ((member (expr-type index) '(:int2 :int8 :oid :numeric :float4 :float8))
+                               (list :cast index :type :int4 :typmod -1))
+                              (t (ereport "42804" "array subscript must have type integer")))))
+                    (third expression))))
+      (when (> (length indices) 6)
+        (ereport "54000" "number of array dimensions exceeds the maximum allowed"))
+      (list :array-subscript array indices :type element-type :typmod (expr-typmod array)))))
+
+(defun eval-array-subscript (expression env)
+  "Read an array element using its actual dimensions and lower bounds."
+  (let ((array (eval-expr (second expression) env)))
+    (when (eq array +null+) (return-from eval-array-subscript +null+))
+    (let* ((indices (mapcar (lambda (index) (eval-expr index env)) (third expression)))
+           (dimensions (sql-array-dimensions array))
+           (bounds (sql-array-lower-bounds array))
+           (offset 0))
+      (unless (and (= (length indices) (length dimensions))
+                   (notany (lambda (index) (eq index +null+)) indices))
+        (return-from eval-array-subscript +null+))
+      (loop for index in indices for dimension in dimensions for lower in bounds
+            for relative = (- index lower)
+            do (unless (<= 0 relative (1- dimension))
+                 (return-from eval-array-subscript +null+))
+               (setf offset (+ (* offset dimension) relative)))
+      (aref (sql-array-elements array) offset))))
+
 (defun analyze-scalar-array-argument (raw scope)
   (let ((array (analyze-expr raw scope)))
     (if (and (in-unknown-constant-p array) (stringp (second array)))
@@ -2755,6 +2793,7 @@ candidate selection."
     (:coalesce (analyze-coalesce-expression expr table))
     (:case (analyze-case-expression expr table))
     (:array-literal (analyze-array-literal expr table))
+    (:array-subscript (analyze-array-subscript expr table))
     ((:any :all) (analyze-any-expression expr table))
     (:cast (analyze-cast-expression expr table))
     (:record-field (analyze-record-field expr table))
@@ -2862,7 +2901,7 @@ candidate selection."
 
 (defun target-default-name (ast)
   (case (first ast)
-    (:window (target-default-name (second ast)))
+    ((:window :array-subscript) (target-default-name (second ast)))
     (:column
      (if (third ast) (third ast) (second ast)))
     (:array-literal "array")
@@ -4240,6 +4279,7 @@ truncate and interpret the result at TYPE's signed width."
                            (expr-type (second expr)) (expr-type expr) (expr-typmod expr)))
     (:bool (second expr))
     (:array (eval-array-constructor expr env))
+    (:array-subscript (eval-array-subscript expr env))
     (:record-field
      (let ((record (eval-expr (second expr) env)))
        (if (eq record +null+) +null+ (aref (sql-record-values record) (third expr)))))

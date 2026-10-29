@@ -507,6 +507,17 @@ reordered tree, and each parameterized path can reference only joined Vars."
       (:unary (fold-children '(2)))
       ((:binop :any :all) (fold-children '(2 3)))
       ((:concat :array-length :join-coalesce) (fold-children '(1 2)))
+      (:array-subscript
+       (multiple-value-bind (array array-known) (having-gate-value (second expression))
+         (let ((copy (copy-list expression)) (known-p array-known))
+           (when array-known (setf (second copy) (constant array (second expression))))
+           (setf (third copy)
+                 (mapcar (lambda (index)
+                           (multiple-value-bind (value known) (having-gate-value index)
+                             (unless known (setf known-p nil))
+                             (if known (constant value index) index)))
+                         (third expression)))
+           (if known-p (values (eval-expr copy #()) t) (values nil nil)))))
       (:in
        (let ((copy (copy-list expression)) (known-p t))
          (labels ((fold (part)

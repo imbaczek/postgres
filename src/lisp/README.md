@@ -328,6 +328,11 @@ equality predicate may still use a sequential scan. These arrays materialize
 for text output and logical replication. Each has an element-count limit of
 the query frame budget divided by eight, even when all elements are NULL; a
 logical event also applies that limit across its materialized array elements.
+Scalar read subscripts on registered SQL array types use actual dimensions and
+lower bounds, with up to six indices coerced to int4. A NULL array or index,
+wrong number of indices, or out-of-range index returns SQL NULL. The array is
+materialized for access. Slices, subscript assignment and direct `int2vector`
+subscripting are unsupported.
 
 Typed array input accepts brace-delimited values, quoted and backslash-escaped
 elements, unquoted `NULL`, rectangular nested arrays, and explicit bounds such

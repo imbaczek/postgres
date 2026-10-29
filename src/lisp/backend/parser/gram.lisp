@@ -1528,6 +1528,11 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
         ((match-op p "::")
          (multiple-value-bind (type typmod) (parse-cast-type p)
            (setf expression (list :cast expression type typmod))))
+        ((match-punct p #\[)
+         (let ((indices (list (prog1 (parse-expr p) (expect-punct p #\])))))
+           (loop while (match-punct p #\[)
+                 do (push (prog1 (parse-expr p) (expect-punct p #\])) indices))
+           (setf expression (list :array-subscript expression (nreverse indices)))))
         ((match-punct p #\.)
          (setf expression
                (if (match-op p "*") (list :record-expand expression)

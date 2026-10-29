@@ -1117,6 +1117,8 @@ from advancing the shared WAL generation between a failed save and rollback."
                                               (field (nth (third node) fields)))
                   (unless field (ereport "0A000" "cannot serialize stored record field"))
                   (format nil "(~a).~a" (render record) (catalog-sql-quote-ident (first field)))))
+               (:array-subscript (format nil "(~a)~{[~a]~}" (render (second node))
+                                         (mapcar #'render (third node))))
                (:array-length (format nil "array_length(~a, ~a)" (render (second node)) (render (third node))))
                ((:func :single-record) (format nil "~a(~{~a~^, ~})" (catalog-sql-quote-ident (second node))
                                                (mapcar #'render (third node))))
