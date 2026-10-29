@@ -305,6 +305,66 @@
         (wal-clear-page-cache)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest test-wal-dirty-scratch-seeded-batch-model
+    ;; Fixed LCG seed makes every failed batch and overwritten slot reproducible.
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-dirty-model-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*pgdata* directory)
+           (*query-temp-directory* directory)
+           (*query-temp-file-limit-bytes* 0)
+           (*wal-dirty-resident-limit-pages* 0)
+           (*wal-dirty-store* nil)
+           (*wal-page-cache* (make-hash-table :test #'equal))
+           (*wal-page-cache-xids* (make-hash-table :test #'equal))
+           (*wal-ready* t) (*wal-poisoned* nil)
+           (*backend* (make-backend :xid 44))
+           (*wal-row-page-write-p* t)
+           (model (make-array 12 :initial-element nil))
+           (seed 1299709)
+           (rolled-back 0))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (labels ((draw (bound)
+                      (setf seed (mod (+ (* seed 1664525) 1013904223) 4294967296))
+                      (mod (ash seed -8) bound))
+                    (page-with (value)
+                      (let ((page (page-init (make-page))))
+                        (setf (aref page 100) value)
+                        page)))
+             (dotimes (batch 300)
+               (let ((updates nil)
+                     (abort-p (zerop (draw 4))))
+                 (dotimes (i (1+ (draw 5)))
+                   (push (cons (draw 12) (draw 256)) updates))
+                 (setf updates (nreverse updates))
+                 (catch 'rollback
+                   (with-wal-page-batch
+                     (dolist (update updates)
+                       (wal-buffer-write 7310 (car update) (page-with (cdr update))))
+                     (when abort-p (throw 'rollback nil))))
+                 (if abort-p
+                     (incf rolled-back)
+                     (dolist (update updates)
+                       (setf (aref model (car update)) (cdr update))))
+                 (dotimes (key 12)
+                   (multiple-value-bind (reference present)
+                       (gethash (wal-page-key 7310 key) *wal-page-cache*)
+                     (declare (ignore reference))
+                     (rove:ok (eql present (not (null (aref model key)))))
+                     (when present
+                       (rove:ok (= (aref model key) (aref (wal-buffer-read 7310 key) 100))))))))
+             (rove:ok (> rolled-back 0))
+             (rove:ok (= 0 (wal-dirty-store-resident *wal-dirty-store*)))
+             (rove:ok (= (hash-table-count *wal-page-cache*) (wal-dirty-store-disk-refs *wal-dirty-store*)))
+             ;; At most 12 shared and five private references coexist.
+             (rove:ok (<= (wal-dirty-store-next-slot *wal-dirty-store*) 17))
+             (wal-clear-page-cache)
+             (rove:ok (null *wal-dirty-store*))
+             (rove:ok (null (uiop:directory-files directory))))
+        (wal-clear-page-cache)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest test-wal-dirty-scratch-resident-budget
     (let* ((directory (merge-pathnames
                        (format nil "pg-dirty-budget-~d-~d/" (sb-posix:getpid) (random 1000000))
