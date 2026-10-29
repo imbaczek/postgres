@@ -146,6 +146,7 @@
                    (:file "../replication/protocol")
                    (:file "../replication/physical-stream")
                    (:file "../replication/physical-client")
+                   (:file "../replication/physical-libpq")
                    (:file "../replication/physical-follow-config")
                    (:file "../replication/physical-follow")
                    (:file "../replication/physical-follow-controller")
