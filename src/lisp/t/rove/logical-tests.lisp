@@ -1126,6 +1126,55 @@
                                                     (vector nil small)))
       (rove:ok (logical-full-row-admission-needed-p (1+ +max-logical-transaction-bytes+) table columns nil))))
 
+(rove:deftest test-logical-varlena-array-values
+    (dolist (type '(:bytea-array :json-array :jsonb-array))
+      (let* ((element (heap-varlena-array-element-type type))
+             (item (ecase element
+                     (:bytea (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(0 255)))
+                     (:json "{ \"a\": 1 }")
+                     (:jsonb (sql-jsonb-input "{\"b\":2}"))))
+             (array (make-sql-array :element-type-id element :elements (vector item +null+)
+                                    :dimensions '(2) :lower-bounds '(-1)))
+             (column (list :attnum 1 :name "v" :type type :typmod -1 :notnull nil))
+             (change (make-logical-change :kind :insert :database-oid 1 :relation-oid 2
+                                          :relation-name "a" :columns (list column)
+                                          :key-attnums nil :new-values (vector array)))
+             (encoded (logical-encode-change change))
+             (decoded (logical-decode-change encoded))
+             (actual (aref (logical-change-new-values decoded) 0)))
+        (rove:ok (= (pgoutput-type-oid type) (ecase type (:bytea-array 1001) (:json-array 199) (:jsonb-array 3807))))
+        (rove:ok (string= (sql-array-output array) (pgoutput-value-text array type)))
+        (let* ((payload (sql-varlena-array-encode array element))
+               (position (search payload encoded))
+               (bad (copy-seq encoded)))
+          (rove:ok position)
+          (when position
+            (page-set-u32 bad (+ position 8) 0)
+            (rove:ok (handler-case
+                         (progn (logical-validate-change-from-cursor (make-logical-cursor :bytes bad)) nil)
+                       (error () t)))))
+        (rove:ok (eq type (getf (first (logical-change-columns decoded)) :type)))
+        (rove:ok (equalp (sql-varlena-array-encode array element)
+                         (sql-varlena-array-encode actual element)))
+        (rove:ok (equal '(-1) (sql-array-lower-bounds actual))))))
+
+(rove:deftest test-logical-array-aggregate-budget
+    (let* ((array (make-sql-array :element-type-id :bytea :elements (vector +null+ +null+)
+                                  :dimensions '(2) :lower-bounds '(1)))
+           (columns (list (list :attnum 1 :name "a" :type :bytea-array :typmod -1)
+                          (list :attnum 2 :name "b" :type :bytea-array :typmod -1)))
+           (change (make-logical-change :kind :insert :database-oid 1 :relation-oid 2
+                                        :relation-name "a" :columns columns
+                                        :key-attnums nil :new-values (vector array array)))
+           (encoded (logical-encode-change change))
+           (*logical-array-element-limit* 3))
+      (dolist (operation (list (lambda () (logical-encode-change change))
+                               (lambda () (logical-decode-change encoded))
+                               (lambda () (logical-validate-change-from-cursor
+                                           (make-logical-cursor :bytes encoded)))))
+        (rove:ok (handler-case (progn (funcall operation) nil)
+                   (pg-error (condition) (string= (pg-error-sqlstate condition) "54000")))))))
+
 (rove:deftest test-logical-capture-reused-toast-images
     (let* ((pointer (make-heap-external-varlena :raw-size 5004 :external-info 5000
                                                 :value-id 5 :relation-id 7 :id-width 4))
@@ -2578,6 +2627,42 @@
                            (zerop (logical-spool-count (backend-logical-spool *backend*))))))
         (setf (symbol-function 'logical-table-replica-identity) old-identity
               (symbol-function 'logical-validate-large-row-change) old-validator)
+        (when (backend-logical-spool *backend*) (close-logical-spool (backend-logical-spool *backend*))))))
+
+(rove:deftest test-small-array-event-overlarge-transport-rejected
+    (let* ((*backend* (make-backend :xid 42))
+           (*logical-capture-xid-modes* (make-hash-table :test #'eql))
+           (*catalog* (make-catalog))
+           (database (make-database :name "postgres" :oid 42))
+           (table (make-pg-class :oid 10 :name "t"
+                                 :columns (vector (make-pg-column :name "id" :type :int4 :attnum 1 :typmod -1)
+                                                  (make-pg-column :name "a" :type :jsonb-array :attnum 2 :typmod -1))))
+           (array (make-sql-array :element-type-id :jsonb :elements (vector (sql-jsonb-input "1"))
+                                  :dimensions '(1) :lower-bounds '(1)))
+           (old-identity (symbol-function 'logical-table-replica-identity))
+           (old-measure (symbol-function 'logical-admission-measure-value))
+           (measured 0))
+      (setf (gethash 42 *logical-capture-xid-modes*) :capture-written
+            (gethash "postgres" (catalog-databases *catalog*)) database
+            (backend-database *backend*) "postgres")
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-table-replica-identity)
+                   (lambda (table) (declare (ignore table)) '(1))
+                   (symbol-function 'logical-admission-measure-value)
+                   (lambda (value type)
+                     (if (eq type :jsonb-array)
+                         (progn (incf measured)
+                                (make-logical-admission-value :bytes (1+ +max-query-message-size+) :quotes 0))
+                         (funcall old-measure value type))))
+             (rove:ok (handler-case
+                          (progn (logical-note-row-change :insert table :new-values (vector 1 array)) nil)
+                        (logical-transport-frame-overflow () t)))
+             (rove:ok (plusp measured))
+             (rove:ok (and (logical-spool-failed-p (backend-logical-spool *backend*))
+                           (zerop (logical-spool-count (backend-logical-spool *backend*))))))
+        (setf (symbol-function 'logical-table-replica-identity) old-identity
+              (symbol-function 'logical-admission-measure-value) old-measure)
         (when (backend-logical-spool *backend*) (close-logical-spool (backend-logical-spool *backend*))))))
 
 (rove:deftest test-client-streamed-query-failure-closes-connection

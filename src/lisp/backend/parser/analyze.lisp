@@ -168,6 +168,7 @@
 (defparameter +sql-expression-types+
   '((:jsonb 3802 -1) (:json 114 -1) (:bytea 17 -1) (:bool 16 1) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
     (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1)
+    (:bytea-array 1001 -1) (:json-array 199 -1) (:jsonb-array 3807 -1)
     (:text-array 1009 -1) (:int2-array 1005 -1) (:int2vector-array 1006 -1) (:int4-array 1007 -1) (:int8-array 1016 -1)
     (:numeric-array 1231 -1) (:float4-array 1021 -1) (:float8-array 1022 -1)
     (:bool-array 1000 -1) (:char-array 1002 -1) (:name-array 1003 -1)
@@ -1798,7 +1799,7 @@ syntax is checked before the final signed-width range check for TYPE."
 Convert each element using ELEMENT-TYPE and TYPMOD. Explicit bounds must
 match the contents; empty arrays have no dimensions. At most six dimensions
 are supported."
-  (let ((position 0) (size (length text)) (bounds nil) (values nil))
+  (let ((position 0) (size (length text)) (bounds nil) (values nil) (item-count 0))
     (labels ((space () (loop while (and (< position size) (sql-array-space-p (char text position)))
                              do (incf position)))
              (peek () (and (< position size) (char text position)))
@@ -1823,6 +1824,9 @@ are supported."
                        (progn
                          (when (eql (peek) #\{) (fail))
                          (multiple-value-bind (value next) (sql-text-array-element text position)
+                           (when (and (member element-type '(:bytea :json :jsonb))
+                                      (> (incf item-count) +max-varlena-array-elements+))
+                             (ereport "54000" "array element count exceeds supported maximum"))
                            (push (sql-cast-value value :text element-type typmod) values)
                            (setf position next))))
                    (incf count) (space)
@@ -3125,12 +3129,19 @@ candidate selection."
 (defun group-column-position (expr group-keys)
   (position expr group-keys :test #'same-group-column-p))
 
-(defun analyze-group-keys (group-asts scope)
+(defun analyze-group-keys (group-asts scope &optional targets)
   "Resolve a GROUP BY list and keep its first occurrence of each column."
   (let ((keys '()))
     (dolist (ast group-asts)
+      ;; Diagnose unsupported JSON equality even when GROUP BY uses an ordinal.
+      (when (and targets (eq (first ast) :const) (integerp (second ast))
+                 (<= 1 (second ast) (length targets)))
+        (let ((target-expr (getf (nth (1- (second ast)) targets) :expr)))
+          (when (and target-expr
+                     (member (expr-type (analyze-expr target-expr scope)) '(:json :json-array)))
+            (ereport "42883" "could not identify an equality operator for type json"))))
       (let ((expr (analyze-expr ast scope)))
-        (when (eq (expr-type expr) :json)
+        (when (member (expr-type expr) '(:json :json-array))
           (ereport "42883" "could not identify an equality operator for type json"))
         (unless (or (eq (first expr) :col)
                     (and (eq (first expr) :outer-ref) (eq (first ast) :column)))
@@ -3516,7 +3527,7 @@ candidate selection."
                  (ereport "42P01" "missing FROM-clause entry for table ~a" (second raw))
                  (ereport "42703" "column ~a does not exist" (second raw))))
            (ereport "0A000" "only result column names can be used in UNION ORDER BY")))
-       (when (eq (getf (nth position targets) :type) :json)
+       (when (member (getf (nth position targets) :type) '(:json :json-array))
          (ereport "42883" "could not identify an ordering operator for type json"))
        (cons (getf (nth position targets) :expr) (getf item :desc))))
    order))
@@ -3640,6 +3651,8 @@ candidate selection."
      (compare-3way (make-sql-array :element-type-id :int2 :elements a
                                    :dimensions (list (length a)) :lower-bounds '(0)) b))
     ((and (sql-array-p a) (sql-array-p b))
+     (when (or (eq (sql-array-element-type-id a) :json) (eq (sql-array-element-type-id b) :json))
+       (ereport "42883" "could not identify a comparison function for type json"))
      (let ((comparison (compare-sql-array-values (sql-array-elements a) (sql-array-elements b))))
        (if (zerop comparison)
            (let ((rank-comparison (- (length (sql-array-dimensions a)) (length (sql-array-dimensions b)))))
@@ -3659,6 +3672,18 @@ candidate selection."
 
 (defun sql-compare (op a b)
   (sql-strict-let ((left a) (right b))
+    (when (and (member op '("=" "<>") :test #'string=)
+               (sql-array-p left) (sql-array-p right)
+               (or (eq (sql-array-element-type-id left) :json)
+                   (eq (sql-array-element-type-id right) :json))
+               (or (not (equal (sql-array-dimensions left) (sql-array-dimensions right)))
+                   (not (equal (sql-array-lower-bounds left) (sql-array-lower-bounds right)))))
+      (return-from sql-compare (string= op "<>")))
+    (when (and (member op '("=" "<>") :test #'string=)
+               (sql-array-p left) (sql-array-p right)
+               (or (eq (sql-array-element-type-id left) :json)
+                   (eq (sql-array-element-type-id right) :json)))
+      (ereport "42883" "could not identify an equality operator for type json"))
     (let ((c (compare-3way left right)))
       (cond
         ((string= op "=") (zerop c))
@@ -4359,32 +4384,90 @@ truncate and interpret the result at TYPE's signed width."
                    (when quote-p (write-char (code-char 34) stream)))))
     (write-char #\} stream)))
 
+(defvar *sql-array-output-max-bytes* (- #x3fffffff 4)
+  "Maximum UTF-8 bytes in an array's textual output.")
+
+(defclass sql-array-jsonb-count-stream (logical-utf8-output-stream)
+  ((limit :initarg :limit :reader sql-array-jsonb-count-limit)))
+
+(defmethod sb-gray:stream-write-char ((stream sql-array-jsonb-count-stream) character)
+  (prog1 (call-next-method)
+    (when (zerop (length (logical-utf8-characters stream)))
+      (check-for-interrupts)
+      (when (> (logical-utf8-size stream) (sql-array-jsonb-count-limit stream))
+        (ereport "54000" "array output exceeds maximum size")))))
+
 (defun sql-array-output (array)
+  "Render an array while enforcing the PostgreSQL varlena output bound."
   (let ((elements (sql-array-elements array))
         (element-type (sql-array-element-type-id array))
         (dimensions (sql-array-dimensions array))
         (bounds (sql-array-lower-bounds array))
-        (position 0))
+        (position 0)
+        (used 0))
     (with-output-to-string (stream)
-      (when (and (plusp (length elements))
-                 (some (lambda (bound) (/= bound 1)) bounds))
-        (loop for bound in bounds for dimension in dimensions
-              do (format stream "[~d:~d]" bound (+ bound dimension -1)))
-        (write-char #\= stream))
-      (labels ((emit-level (shape)
-                 (write-char #\{ stream)
+      (labels ((reserve (bytes)
+                 (incf used bytes)
+                 (when (> used *sql-array-output-max-bytes*)
+                   (ereport "54000" "array output exceeds maximum size")))
+               (emit-ascii (text)
+                 (reserve (length text))
+                 (write-string text stream))
+               (element (value)
+                 (if (eq value +null+)
+                     (emit-ascii "NULL")
+                     (progn
+                       ;; JSONB numeric text can be much larger than its compact storage.
+                       ;; Count it before materializing an individual element.
+                       (when (eq element-type :jsonb)
+                         (let ((counter (make-instance 'sql-array-jsonb-count-stream :buffer nil
+                                                                                     :limit (- *sql-array-output-max-bytes* used))))
+                           (sql-jsonb-write value counter)
+                           (logical-flush-utf8-output counter)
+                           (when (> (+ used (logical-utf8-size counter)) *sql-array-output-max-bytes*)
+                             (ereport "54000" "array output exceeds maximum size"))))
+                       (when (eq element-type :bytea)
+                         (let ((format (or (session-extra-setting-value "bytea_output") "hex")))
+                           (let ((size (if (string= format "escape")
+                                           (loop for byte across value for index from 0
+                                                 do (when (zerop (mod index 4096)) (check-for-interrupts))
+                                                 sum (cond ((= byte 92) 2)
+                                                           ((or (< byte 32) (> byte 126)) 4)
+                                                           (t 1)))
+                                           (+ 2 (* 2 (length value))))))
+                             (when (> (+ used size) *sql-array-output-max-bytes*)
+                               (ereport "54000" "array output exceeds maximum size")))))
+                       (let* ((text (value->text value element-type))
+                              (quote-p (or (zerop (length text)) (string-equal text "NULL")))
+                              (escapes 0))
+                         (loop for character across text for index from 0
+                               do (when (zerop (mod index 4096)) (check-for-interrupts))
+                                  (when (or (find character "{},")
+                                            (member (char-code character) '(9 10 11 12 13 32 34 92)))
+                                    (setf quote-p t))
+                                  (when (member (char-code character) '(34 92)) (incf escapes)))
+                         (reserve (+ (pgoutput-string-utf8-size text) escapes (if quote-p 2 0)))
+                         (when quote-p (write-char (code-char 34) stream))
+                         (loop for character across text for index from 0
+                               do (when (zerop (mod index 4096)) (check-for-interrupts))
+                                  (when (member (char-code character) '(34 92))
+                                    (write-char (code-char 92) stream))
+                                  (write-char character stream))
+                         (when quote-p (write-char (code-char 34) stream))))))
+               (emit-level (shape)
+                 (emit-ascii "{")
                  (when shape
                    (dotimes (index (first shape))
-                     (when (plusp index) (write-char #\, stream))
+                     (when (zerop (mod index 4096)) (check-for-interrupts))
+                     (when (plusp index) (emit-ascii ","))
                      (if (rest shape)
                          (emit-level (rest shape))
-                         (let* ((value (aref elements position))
-                                (rendered (sql-text-array-output
-                                           (vector (if (eq value +null+) value
-                                                       (value->text value element-type))))))
-                           (write-string rendered stream :start 1 :end (1- (length rendered)))
-                           (incf position)))))
-                 (write-char #\} stream)))
+                         (progn (element (aref elements position)) (incf position)))))
+                 (emit-ascii "}")))
+        (when (and (plusp (length elements)) (some (lambda (bound) (/= bound 1)) bounds))
+          (loop for bound in bounds for dimension in dimensions
+                do (emit-ascii (format nil "[~d:~d]" bound (+ bound dimension -1))))
+          (emit-ascii "="))
         (emit-level dimensions)))))
 
 (defun sql-timestamptz-output (timestamp)

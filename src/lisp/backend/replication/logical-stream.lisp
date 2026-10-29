@@ -245,6 +245,9 @@ Discard the cursor after a read error; the stream may have advanced."
     (:bytea 15)
     (:json 16)
     (:jsonb 17)
+    (:bytea-array 18)
+    (:json-array 19)
+    (:jsonb-array 20)
     (otherwise (error "logical replication does not support type ~a" type))))
 
 (defun logical-type-from-code (code)
@@ -266,6 +269,9 @@ Discard the cursor after a read error; the stream may have advanced."
     (15 :bytea)
     (16 :json)
     (17 :jsonb)
+    (18 :bytea-array)
+    (19 :json-array)
+    (20 :jsonb-array)
     (otherwise (error "invalid logical column type code ~a" code))))
 
 (defun logical-kind-code (kind)
@@ -414,6 +420,11 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
      (unless (sql-numeric-p value) (error "invalid numeric logical row value ~s" value))
      (logical-write-u8 buffer 4)
      (logical-write-string-u32 buffer (sql-numeric-output value)))
+    ((heap-varlena-array-element-type type)
+     (let ((payload (sql-varlena-array-encode value (heap-varlena-array-element-type type))))
+       (logical-write-u8 buffer (case type (:bytea-array 19) (:json-array 20) (:jsonb-array 21)))
+       (logical-write-u32 buffer (length payload))
+       (logical-write-octets buffer payload)))
     ((eq type :jsonb)
      (unless (sql-jsonb-p value) (error "invalid jsonb logical row value"))
      (logical-write-u8 buffer 17)
@@ -551,15 +562,28 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
                      when (eq value +logical-unchanged-toast+)
                        do (unless (and (eq kind :update) new-p keys
                                        (not (member (getf column :attnum) keys))
-                                       (member (getf column :type) '(:text :varchar :bytea :json :jsonb :numeric)))
+                                       (member (getf column :type) '(:text :varchar :bytea :json :jsonb :numeric
+                                                                     :bytea-array :json-array :jsonb-array)))
                             (error "invalid unchanged TOAST marker")))))
   change)
+
+(defvar *logical-array-element-limit* +max-varlena-array-elements+
+  "Maximum total array elements materialized within one logical event.")
+
+(defun logical-array-element-reserver ()
+  "Return a per-event aggregate array element budget."
+  (let ((remaining *logical-array-element-limit*))
+    (lambda (count)
+      (when (> count remaining)
+        (ereport "54000" "logical event array element count exceeds supported maximum"))
+      (decf remaining count))))
 
 (defun logical-encode-change (change &optional (buffer (make-array 0 :element-type '(unsigned-byte 8)
                                                                      :adjustable t :fill-pointer 0)))
   (logical-validate-change-publications change)
   (logical-validate-unchanged-toast change)
-  (let ((columns (logical-change-columns change))
+  (let ((*sql-varlena-array-element-reserver* (logical-array-element-reserver))
+        (columns (logical-change-columns change))
         (key-attnums (logical-change-key-attnums change)))
     (when (member (logical-change-kind change)
                   '(:truncate :ddl :sequence-state))
@@ -878,7 +902,7 @@ length-prefixed bytea octets; reject mismatched column types. JSON text is not
 revalidated by this codec."
   (let ((tag (logical-read-u8 cursor)))
     (case tag
-      (18 (unless (member type '(:varchar :text :bytea :json :jsonb :numeric))
+      (18 (unless (member type '(:varchar :text :bytea :json :jsonb :numeric :bytea-array :json-array :jsonb-array))
             (error "logical unchanged TOAST tag does not match its column type"))
        +logical-unchanged-toast+)
       (0 +null+)
@@ -919,6 +943,11 @@ revalidated by this codec."
        (make-sql-interval (logical-u32-signed (logical-read-u32 cursor))
                           (logical-u32-signed (logical-read-u32 cursor))
                           (logical-u64-signed (logical-read-u64 cursor))))
+      ((19 20 21)
+       (unless (eq type (case tag (19 :bytea-array) (20 :json-array) (21 :jsonb-array)))
+         (error "logical value tag does not match its column type"))
+       (let ((payload (logical-read-octets cursor (logical-read-u32 cursor))))
+         (sql-varlena-array-decode payload (heap-varlena-array-element-type type))))
       (17 (unless (eq type :jsonb)
             (error "logical value tag does not match its column type"))
        (let ((length (logical-read-u32 cursor)))
@@ -981,7 +1010,8 @@ revalidated by this codec."
   change)
 
 (defun logical-decode-change-from-cursor (cursor)
-  (let* ((marker (logical-read-u8 cursor))
+  (let* ((*sql-varlena-array-element-reserver* (logical-array-element-reserver))
+         (marker (logical-read-u8 cursor))
          (event-version (if (zerop marker) (logical-read-u8 cursor) 0))
          (kind (logical-kind-from-code
                 (if (zerop marker) (logical-read-u8 cursor) marker)))
@@ -1268,7 +1298,13 @@ executor, so capture the same operation before transaction commit."
       (logical-capture-change
        *backend* change limit
        :after-measure (lambda (size)
-                        (when (logical-full-row-admission-needed-p size table columns toast-reuse)
+                        (when (or (logical-full-row-admission-needed-p size table columns toast-reuse)
+                                  ;; Binary JSONB arrays can expand dramatically when rendered as text.
+                                  (loop for row in (list old-image new-image)
+                                          thereis (and row
+                                                       (loop for column in columns for value across row
+                                                               thereis (and (heap-varlena-array-element-type (getf column :type))
+                                                                            (not (member value (list +null+ +logical-unchanged-toast+) :test #'eq)))))))
                           (let ((full-new (if full-new-values (funcall full-new-values) new-values)))
                             (handler-case
                                 (logical-validate-large-row-change change full-new)

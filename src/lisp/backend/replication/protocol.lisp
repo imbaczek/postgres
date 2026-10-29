@@ -6,7 +6,8 @@
   type slot-name plugin snapshot-action requested-lsn protocol-version options)
 
 (defparameter +logical-replication-type-oids+
-  '((:int2 . 21) (:int4 . 23) (:int8 . 20) (:varchar . 1043) (:text . 25) (:bytea . 17) (:json . 114) (:jsonb . 3802) (:numeric . 1700) (:float4 . 700) (:float8 . 701) (:date . 1082) (:time . 1083) (:timestamp . 1114) (:timestamptz . 1184) (:interval . 1186) (:timetz . 1266)))
+  '((:int2 . 21) (:int4 . 23) (:int8 . 20) (:varchar . 1043) (:text . 25) (:bytea . 17) (:json . 114) (:jsonb . 3802) (:numeric . 1700) (:float4 . 700) (:float8 . 701) (:date . 1082) (:time . 1083) (:timestamp . 1114) (:timestamptz . 1184) (:interval . 1186) (:timetz . 1266)
+    (:bytea-array . 1001) (:json-array . 199) (:jsonb-array . 3807)))
 
 (defun replication-command-words (query)
   "Tokenize repl_scanner-style quoted words, C whitespace and command punctuation."
@@ -378,6 +379,8 @@ and an empty Terminate as EOF. Other malformed messages remain protocol errors."
       (payload-push-u32 payload (logand (getf column :typmod) #xFFFFFFFF)))
     payload))
 
+(declaim (ftype function sql-array-output))
+
 (defun pgoutput-value-text (value type)
   "Format pgoutput text values; bytea uses lowercase hex, and NULL has no text."
   (if (eq value +null+)
@@ -387,6 +390,7 @@ and an empty Terminate as EOF. Other malformed messages remain protocol errors."
         ((:varchar :text :json) value)
         (:bytea (sql-bytea-output value))
         (:jsonb (sql-jsonb-output value))
+        ((:bytea-array :json-array :jsonb-array) (sql-array-output value))
         (:numeric (sql-numeric-output value))
         (:date (sql-date-output value))
         (:time (sql-time-output value))
@@ -409,6 +413,7 @@ and an empty Terminate as EOF. Other malformed messages remain protocol errors."
 (defun pgoutput-string-utf8-size (string)
   (loop for start from 0 below (length string) by 4096
         for end = (min (length string) (+ start 4096))
+        do (check-for-interrupts)
         sum (length (sb-ext:string-to-octets string :external-format :utf-8 :start start :end end))))
 
 (defun pgoutput-emit-string (sink string)

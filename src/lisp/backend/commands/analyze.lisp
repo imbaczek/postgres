@@ -21,8 +21,16 @@
                               (row-major-aref array index)))
            0))))
 
+(declaim (notinline sql-array-p sql-array-elements sql-array-dimensions sql-array-lower-bounds))
+
+(declaim (ftype function compare-3way sql-group-value-payload))
+
 (defun analyze-value-memory-estimate (value)
   (cond
+    ((sql-array-p value)
+     (+ 64 (analyze-value-memory-estimate (sql-array-elements value))
+        (analyze-value-memory-estimate (sql-array-dimensions value))
+        (analyze-value-memory-estimate (sql-array-lower-bounds value))))
     ((sql-jsonb-p value) (+ 32 (analyze-value-memory-estimate (sql-jsonb-value value))))
     ((stringp value)
      ;; Use total size, not LENGTH, so adjustable/fill-pointer strings are
@@ -165,7 +173,9 @@ exact SBCL heap cap and does not include transient decode allocations."
   ;; PostgreSQL's analyze.c:compute_distinct_stats calls the column's equality
   ;; operator; bytea's byteaeq compares length and contents (bytea.c:814-844).
   ;; Keep EQUAL for other values so text remains case-sensitive.
-  (cond ((and (sql-jsonb-p left) (sql-jsonb-p right))
+  (cond ((and (sql-array-p left) (sql-array-p right))
+         (zerop (compare-3way left right)))
+        ((and (sql-jsonb-p left) (sql-jsonb-p right))
          (zerop (sql-jsonb-compare left right)))
         ((and (sql-timetz-p left) (sql-timetz-p right)) (zerop (sql-timetz-compare left right)))
         ((and (sql-interval-p left) (sql-interval-p right))
@@ -178,7 +188,8 @@ exact SBCL heap cap and does not include transient decode allocations."
         (t (equal left right))))
 
 (defun analyze-statistics-value-hash (value)
-  (cond ((sql-jsonb-p value) (sxhash (sql-jsonb-equality-key value)))
+  (cond ((sql-array-p value) (sxhash (sql-group-value-payload value)))
+        ((sql-jsonb-p value) (sxhash (sql-jsonb-equality-key value)))
         ((sql-timetz-p value) (sxhash (multiple-value-list (sql-timetz-comparison-values value))))
         ((sql-interval-p value) (sxhash (sql-interval-comparison-value value)))
         ((floatp value) (sxhash (sql-float-group-key value)))
@@ -248,7 +259,12 @@ collision test without changing the production hash implementation."
      :row-count row-count
      :sample-count (length sample)
      :columns (loop for index below (length (pg-class-columns table))
-                    collect (analyze-column-statistics
-                             sample index row-count)
+                    collect (if (eq (pg-column-type (aref (pg-class-columns table) index)) :json-array)
+                                (make-pg-column-statistics
+                                 :null-fraction (if (zerop (length sample)) 0.0d0
+                                                    (/ (float (count +null+ sample :key (lambda (row) (aref row index))) 1.0d0)
+                                                       (length sample)))
+                                 :distinct-count 0 :most-common-values nil)
+                                (analyze-column-statistics sample index row-count))
                       into columns
                     finally (return (coerce columns 'vector))))))

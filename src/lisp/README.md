@@ -292,8 +292,8 @@ These operations preserve their inputs and operate on materialized JSONB trees.
 `to_jsonb` accepts typed text, varchar, name, boolean, integer, numeric, float,
 JSON, JSONB, bytea, oid, internal char, bit, date/time types, interval, pg_lsn
 and int2vector, plus existing supported arrays of applicable element types.
-SQL `bytea[]`, `json[]` and `jsonb[]` array types are not supported; JSON documents
-with array roots are supported. SQL NULL input returns SQL NULL;
+SQL `bytea[]`, `json[]` and `jsonb[]` are supported, as are JSON documents
+with array roots. SQL NULL input returns SQL NULL;
 NULL array elements become JSON null. JSON input is parsed as JSON, while text
 becomes a JSON string. Finite floats use session-controlled float output before
 numeric conversion; NaN and infinities become strings. Dates and timestamps use
@@ -313,14 +313,21 @@ and precision modifiers are supported. These are subsets of PostgreSQL's full
 type and operator catalog, not a promise that every input spelling or function
 is implemented.
 
-SQL array expressions support text, varchar, name, internal `"char"`, bool,
+SQL array expressions support bytea, JSON, JSONB, text, varchar, name, internal `"char"`, bool,
 int2, int4, int8, numeric, float4, float8, oid, date, time, timetz, timestamp,
 timestamptz, interval, pg_lsn, bit and int2vector elements. `ARRAY[...]` chooses a common element type; an empty
 constructor needs a type supplied by context or a cast. Nested constructors
 must have matching dimensions and lower bounds, and support up to six
 dimensions. `array_length`, comparisons, scalar `ANY`/`ALL`, and text
-`array_agg` are supported in the implemented expression subset. These array
-expression types do not imply support for array-valued table columns.
+`array_agg` are supported in the implemented expression subset. Table columns
+support `bytea[]`, `json[]` and `jsonb[]` with PostgreSQL ArrayType encoding
+and TOAST; other array expression types do not imply table-column support.
+`json[]` has no equality or ordering operations, grouping or B-tree indexes;
+`bytea[]` and `jsonb[]` support comparisons and B-tree indexes, although an
+equality predicate may still use a sequential scan. These arrays materialize
+for text output and logical replication. Each has an element-count limit of
+the query frame budget divided by eight, even when all elements are NULL; a
+logical event also applies that limit across its materialized array elements.
 
 Typed array input accepts brace-delimited values, quoted and backslash-escaped
 elements, unquoted `NULL`, rectangular nested arrays, and explicit bounds such

@@ -6,6 +6,8 @@
 ;; pg-column is defined by the later catalog component in pg.asd.
 (declaim (notinline pg-column-type))
 
+(declaim (ftype function sql-varlena-array-encode sql-varlena-array-decode))
+
 (defstruct htup
   block
   offnum
@@ -124,11 +126,15 @@
           (or (gethash relfilenode *heap-fsms*)
               (setf (gethash relfilenode *heap-fsms*) fsm))))))
 
+(defun heap-varlena-array-element-type (type)
+  "Return the element type for the supported physical varlena arrays."
+  (case type (:bytea-array :bytea) (:json-array :json) (:jsonb-array :jsonb)))
+
 (defun column-align (col)
   (case (pg-column-type col)
     ((:int8 :float8 :time :timestamp :timestamptz :interval :timetz) 8)
     (:int2 2)
-    ((:int4 :oid :numeric :varchar :text :json :jsonb :bytea :float4 :date) 4)
+    ((:int4 :oid :numeric :varchar :text :json :jsonb :bytea :bytea-array :json-array :jsonb-array :float4 :date) 4)
     (t 1)))
 
 (defun column-fixed-size (col)
@@ -185,7 +191,8 @@ must remain stable while the layout is used."
                ((eq v +null+) (setf has-null t))
                (t
                 (let ((al (column-align col)))
-                  (when (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea :numeric))
+                  (when (or (heap-varlena-array-element-type (pg-column-type col))
+                            (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea :numeric)))
                     (setf (aref varlena-data i)
                           (if (heap-external-varlena-p v)
                               (heap-encode-external-varlena v)
@@ -195,8 +202,11 @@ must remain stable while the layout is used."
                                     (:bytea (check-type v (vector (unsigned-byte 8))) v)
                                     (:jsonb (sql-jsonb-to-octets v))
                                     (:numeric (sql-numeric-to-varlena-payload v))
+                                    ((:bytea-array :json-array :jsonb-array)
+                                     (sql-varlena-array-encode v (heap-varlena-array-element-type (pg-column-type col))))
                                     (otherwise (string->bytes v)))))))
-                  (unless (and (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea :numeric))
+                  (unless (and (or (heap-varlena-array-element-type (pg-column-type col))
+                                   (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea :numeric)))
                                (or (heap-external-varlena-p v)
                                    (and (not (heap-compressed-varlena-p v))
                                         (not (char= (pg-column-effective-storage col) #\p))
@@ -205,7 +215,7 @@ must remain stable while the layout is used."
                   (setf (aref offsets i) cursor)
                   (incf cursor
                         (case (pg-column-type col)
-                          ((:varchar :text :json :jsonb :bytea :numeric)
+                          ((:varchar :text :json :jsonb :bytea :numeric :bytea-array :json-array :jsonb-array)
                            (let ((size (length (aref varlena-data i))))
                              (if (heap-external-varlena-p v) size
                                  (+ size (if (and (not (heap-compressed-varlena-p v))
@@ -215,7 +225,8 @@ must remain stable while the layout is used."
     (when has-null (setf infomask (logior infomask +heap-hasnull+)))
     (when (some #'heap-external-varlena-p values)
       (setf infomask (logior infomask +heap-hasexternal+)))
-    (when (some (lambda (c) (member (pg-column-type c) '(:varchar :text :json :jsonb :bytea :numeric))) columns)
+    (when (some (lambda (c) (or (heap-varlena-array-element-type (pg-column-type c))
+                                (member (pg-column-type c) '(:varchar :text :json :jsonb :bytea :numeric)))) columns)
       (setf infomask (logior infomask +heap-hasvarwidth+)))
     (values cursor offsets varlena-data infomask)))
 
@@ -277,7 +288,7 @@ This codec does not create or fetch TOAST data."
                     (page-set-u32 bytes off (logand v #xFFFFFFFF)))
                    ((:int8 :time :timestamp :timestamptz)
                     (page-set-u64 bytes off (logand v #xFFFFFFFFFFFFFFFF)))
-                   ((:varchar :text :json :jsonb :bytea :numeric)
+                   ((:varchar :text :json :jsonb :bytea :numeric :bytea-array :json-array :jsonb-array)
                     (let ((data (aref varlena-data i)))
                       (if (heap-external-varlena-p v)
                           (replace bytes data :start1 off)
@@ -458,7 +469,8 @@ external decompression are deferred."
                                                   (floor i 8)))))))
                (unless is-null
                  (let ((al (column-align col)))
-                   (unless (and (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea :numeric))
+                   (unless (and (or (heap-varlena-array-element-type (pg-column-type col))
+                                    (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea :numeric)))
                                 (not (zerop (aref bytes cursor))))
                      (setf cursor (align-up cursor al)))
                    (case (pg-column-type col)
@@ -502,7 +514,7 @@ external decompression are deferred."
                           (decf v #x10000000000000000))
                         (setf (aref values i) v))
                       (incf cursor 8))
-                     ((:varchar :text :json :jsonb :bytea :numeric)
+                     ((:varchar :text :json :jsonb :bytea :numeric :bytea-array :json-array :jsonb-array)
                       (if (= (aref bytes cursor) 1)
                           (multiple-value-bind (pointer end)
                               (heap-decode-external-varlena bytes cursor)
@@ -513,6 +525,8 @@ external decompression are deferred."
                                                     (:bytea payload)
                                                     (:jsonb (sql-jsonb-from-octets payload))
                                                     (:numeric (sql-numeric-from-varlena-payload payload))
+                                                    ((:bytea-array :json-array :jsonb-array)
+                                                     (sql-varlena-array-decode payload (heap-varlena-array-element-type (pg-column-type col))))
                                                     (otherwise (bytes->string payload)))
                                   cursor end)))))))))
     (values values xmin xmax cid infomask ctid-block ctid-offnum)))

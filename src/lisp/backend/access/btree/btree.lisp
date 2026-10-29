@@ -827,6 +827,8 @@ nest and share this lease; relation writers wait until all scans finish."
       (emit (sql-jsonb-value jsonb) t))
     (coerce out '(simple-array (unsigned-byte 8) (*)))))
 
+(declaim (notinline sql-array-elements sql-array-dimensions sql-array-lower-bounds))
+
 (defun encode-index-key (values types)
   "Encode index column values so that byte-wise order matches SQL order for
 supported types. Null sorts before any non-null value; ints are sign-flipped.
@@ -903,6 +905,25 @@ order, including prefixes, in composite keys."
                                       (loop for i below end
                                             do (ordered-byte (1+ (digit-char-p (char digits i)))))
                                       (ordered-byte 0)))))))))
+                 ((member ty '(:bytea-array :jsonb-array))
+                  (push-byte (if (eq ty :bytea-array) 17 18))
+                  (loop for item across (sql-array-elements v)
+                        do (if (eq item +null+)
+                               (push-byte 2)
+                               (progn
+                                 (push-byte 1)
+                                 (let ((bytes (if (eq ty :bytea-array) item (encode-jsonb-index-value item))))
+                                   (loop for byte across bytes
+                                         do (if (zerop byte)
+                                                (progn (push-byte 0) (push-byte 255))
+                                                (push-byte byte)))
+                                   (push-byte 0) (push-byte 0)))))
+                  (push-byte 0)
+                  (push-int-be (length (sql-array-dimensions v)) 4)
+                  (dolist (dimension (sql-array-dimensions v))
+                    (push-int-be dimension 4))
+                  (dolist (lower (sql-array-lower-bounds v))
+                    (push-int-be (logxor (logand lower #xffffffff) #x80000000) 4)))
                  ((eq ty :jsonb)
                   (push-byte 16)
                   (loop for byte across (encode-jsonb-index-value v) do (push-byte byte)))

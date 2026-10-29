@@ -782,6 +782,53 @@
           (when pg::*clog-stream* (close pg::*clog-stream*))
           (pg::smgr-close-all)))))
 
+(deftest internal-varlena-array-external-toast-roundtrip
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*relation-streams* (make-hash-table :test #'equal))
+             (pg::*wal-page-cache* (make-hash-table :test #'equal))
+             (pg::*wal-ready* nil) (pg::*clog-stream* nil)
+             (pg::*active-xids* nil) (pg::*catalog* (pg::make-catalog))
+             (pg::*backend* (pg::make-backend :database "postgres"))
+             (database (pg::make-database :name "postgres"))
+             (snapshot (pg::make-snapshot-struct :xmin 3 :xmax 50 :xip nil :curcid 0))
+             (registration (pg::make-snapshot-registration))
+             (bytes (make-array 10000 :element-type '(unsigned-byte 8)))
+             (state 12345))
+        (setf (gethash "postgres" (pg::catalog-databases pg::*catalog*)) database)
+        (dotimes (i (length bytes))
+          (setf state (logand #xffffffff (+ (* state 1664525) 1013904223))
+                (aref bytes i) (ldb (byte 8 24) state)))
+        (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
+        (unwind-protect
+             (let* ((table (pg::create-table* database "array_toast"
+                                              (list (list :name "v" :type :bytea :typmod -1))))
+                    (columns (pg::pg-class-columns table))
+                    (toast (pg::pg-class-toast table))
+                    (array (pg::make-sql-array :element-type-id :bytea :elements (vector bytes pg::+null+)
+                                               :dimensions '(2) :lower-bounds '(1)))
+                    (physical nil))
+               ;; Exercise the internal storage path without enabling SQL array DDL.
+               (setf (pg::pg-column-type (aref columns 0)) :bytea-array)
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (pg::with-write-lock
+                   (setf physical (pg::toast-externalize-tuple-unlocked toast (vector array) columns 42 0))
+                   (pg::heapam-insert (pg::pg-class-relfilenode table) columns physical 42 0)))
+               (ok (pg::heap-external-varlena-p (aref physical 0)))
+               (pg::clog-set 42 pg::+clog-committed+)
+               (pg::register-active-snapshot snapshot registration)
+               (let ((found nil))
+                 (pg::heapam-scan (pg::pg-class-relfilenode table) columns snapshot
+                                  (lambda (tuple) (push tuple found)))
+                 (ok (= 1 (length found)))
+                 (pg::materialize-select-tuple table (first found) snapshot)
+                 (let ((result (aref (pg::htup-values (first found)) 0)))
+                   (ok (equalp bytes (aref (pg::sql-array-elements result) 0)))
+                   (ok (eq pg::+null+ (aref (pg::sql-array-elements result) 1))))))
+          (pg::release-snapshot-registration registration)
+          (when pg::*clog-stream* (close pg::*clog-stream*))
+          (pg::smgr-close-all)))))
+
 (deftest toast-stores-and-fetches-binary-chunks
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)

@@ -186,6 +186,31 @@
                        (pg-error (error) error))))
       (rove:ok (and condition (string= (pg-error-sqlstate condition) "54001"))))))
 
+(rove:deftest test-to-jsonb-varlena-arrays
+    (dolist (case '(("select to_jsonb(ARRAY['{\"b\":2,\"a\":1}'::jsonb,NULL])" "[{\"a\": 1, \"b\": 2}, null]")
+                    ("select to_jsonb(ARRAY['[1,2]'::json, 'null'::json])" "[[1, 2], null]")
+                    ("select to_jsonb(ARRAY[['1'::jsonb, '2'::jsonb],['3'::jsonb, '4'::jsonb]])" "[[1, 2], [3, 4]]")))
+      (multiple-value-bind (value type) (json-test-evaluate (first case))
+        (rove:ok (eq type :jsonb))
+        (rove:ok (string= (sql-jsonb-output value) (second case))))))
+
+(rove:deftest test-json-array-comparison-semantics
+    (rove:ok (eq +null+ (json-test-evaluate "select null::json[] = null::json[]")))
+  (rove:ok (null (json-test-evaluate "select ARRAY['1'::json] = ARRAY['1'::json,'2'::json]")))
+  (rove:ok (json-test-evaluate "select ARRAY['1'::json] <> ARRAY['1'::json,'2'::json]"))
+  (let ((condition (handler-case
+                       (progn (json-test-evaluate "select ARRAY['1'::json] = ARRAY['1'::json]") nil)
+                     (pg-error (error) error))))
+    (rove:ok (and condition (string= (pg-error-sqlstate condition) "42883"))))
+  (rove:ok (json-test-evaluate "select ARRAY['1.0'::jsonb] = ARRAY['1.00'::jsonb]")))
+
+(rove:deftest test-json-array-group-ordinal-error
+    (let* ((statement (first (parse-statements "select ARRAY['null'::json] group by 1")))
+           (condition (handler-case
+                          (progn (analyze-group-keys (getf statement :group-by) nil (getf statement :targets)) nil)
+                        (pg-error (error) error))))
+      (rove:ok (and condition (string= (pg-error-sqlstate condition) "42883")))))
+
 (rove:deftest test-jsonb-set
     (dolist (case '(("select jsonb_set('{\"a\":{\"b\":1}}', '{a,b}', '2')" "{\"a\": {\"b\": 2}}")
                     ("select jsonb_set('{\"a\":1}', '{z}', '2')" "{\"a\": 1, \"z\": 2}")

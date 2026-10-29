@@ -17,6 +17,8 @@
     (unless (or (sql-implicit-coercion-p source target)
                 (and (member source '(:json :jsonb))
                      (member target '(:json :jsonb)))
+                (and (member source '(:json-array :jsonb-array))
+                     (member target '(:json-array :jsonb-array)))
                 (member target '(:text :varchar))
                 (and (member target '(:int2 :int4 :int8 :numeric :oid :float4 :float8))
                      (member source '(:int2 :int4 :int8 :numeric :oid :float4 :float8))))

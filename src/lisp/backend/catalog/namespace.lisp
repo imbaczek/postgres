@@ -24,7 +24,8 @@
   lower-bounds)
 
 (defparameter +sql-array-types+
-  '((:text . :text-array) (:int2 . :int2-array) (:int4 . :int4-array)
+  '((:text . :text-array) (:bytea . :bytea-array) (:json . :json-array) (:jsonb . :jsonb-array)
+    (:int2 . :int2-array) (:int4 . :int4-array)
     (:int8 . :int8-array) (:numeric . :numeric-array) (:float4 . :float4-array)
     (:float8 . :float8-array) (:bool . :bool-array) (:char . :char-array)
     (:name . :name-array) (:varchar . :varchar-array) (:oid . :oid-array)
@@ -38,6 +39,169 @@
 
 (defun sql-array-element-type (array-type)
   (car (rassoc array-type +sql-array-types+)))
+
+(defconstant +max-varlena-array-elements+ (floor +max-query-message-size+ 8)
+  "Limit the resident element vector for these arrays to the query frame budget.")
+
+(defvar *sql-varlena-array-element-reserver* nil
+  "Optional aggregate element-budget callback, called before array allocations.")
+
+(defun sql-varlena-array-element-oid (type)
+  "Return the PostgreSQL element OID for supported variable-width arrays."
+  (ecase type (:bytea 17) (:json 114) (:jsonb 3802)))
+
+(defun sql-varlena-array-element-octets (value type)
+  (ecase type
+    (:bytea (check-type value (vector (unsigned-byte 8))) value)
+    (:json (sql-json-input value) (string->bytes value))
+    (:jsonb (sql-jsonb-to-octets value))))
+
+(defun sql-varlena-array-encode (array element-type)
+  "Encode an ArrayType payload, excluding its outer four-byte varlena header."
+  (unless (and (sql-array-p array) (eq (sql-array-element-type-id array) element-type))
+    (error "invalid array element type"))
+  (let* ((dimensions (sql-array-dimensions array))
+         (bounds (sql-array-lower-bounds array))
+         (items (sql-array-elements array))
+         (ndim (length dimensions))
+         (count (length items))
+         (has-null nil)
+         (data-start 0)
+         (cursor 0)
+         (encoded nil))
+    (when (> count +max-varlena-array-elements+)
+      (ereport "54000" "array element count exceeds supported maximum"))
+    (unless (and (<= 0 ndim 6) (= ndim (length bounds))
+                 (if (zerop ndim) (zerop count)
+                     (and (every (lambda (dimension) (typep dimension '(integer 1 #x7fffffff))) dimensions)
+                          (= count (reduce #'* dimensions :initial-value 1))))
+                 (loop for lower in bounds for dimension in dimensions
+                       always (and (typep lower '(signed-byte 32))
+                                   (<= (+ lower dimension -1) #x7fffffff))))
+      (error "invalid array dimensions"))
+    (when *sql-varlena-array-element-reserver*
+      (funcall *sql-varlena-array-element-reserver* count))
+    (setf has-null (loop for item across items for index from 0
+                         do (when (zerop (mod index 4096)) (check-for-interrupts))
+                           thereis (eq item +null+))
+          data-start (maxalign (+ 16 (* 8 ndim) (if has-null (ceiling count 8) 0)))
+          cursor (- data-start 4)
+          encoded (make-array count :initial-element nil))
+    (loop for item across items for index from 0
+          do (when (zerop (mod index 4096)) (check-for-interrupts))
+          unless (eq item +null+) do
+            (let ((bytes (sql-varlena-array-element-octets item element-type)))
+              (setf (aref encoded index) bytes
+                    cursor (+ cursor (align-up (+ 4 (length bytes)) 4)))
+              (when (> (+ cursor 4) #x3fffffff)
+                (ereport "54000" "array value exceeds maximum size"))))
+    (let ((result (make-array cursor :element-type '(unsigned-byte 8) :initial-element 0)))
+      (page-set-u32 result 0 ndim)
+      (page-set-u32 result 4 (if has-null data-start 0))
+      (page-set-u32 result 8 (sql-varlena-array-element-oid element-type))
+      (loop for dimension in dimensions for i from 0
+            do (page-set-u32 result (+ 12 (* i 4)) dimension))
+      (loop for lower in bounds for i from 0
+            do (page-set-u32 result (+ 12 (* ndim 4) (* i 4)) (logand lower #xffffffff)))
+      (let ((position (- data-start 4)) (bitmap (+ 12 (* 8 ndim))))
+        (loop for item across items for bytes across encoded for index from 0
+              do (when (zerop (mod index 4096)) (check-for-interrupts))
+              unless (eq item +null+) do
+                (when has-null
+                  (setf (aref result (+ bitmap (floor index 8)))
+                        (logior (aref result (+ bitmap (floor index 8))) (ash 1 (mod index 8)))))
+                (setf position (align-up position 4))
+                (page-set-u32 result position (ash (+ 4 (length bytes)) 2))
+                (replace result bytes :start1 (+ position 4))
+                (incf position (align-up (+ 4 (length bytes)) 4))))
+      result)))
+
+(defun sql-varlena-array-decode (bytes element-type)
+  "Decode a PostgreSQL ArrayType payload, validating all bounds and elements."
+  (labels ((bad () (ereport "XX001" "invalid stored array")))
+    (unless (and (typep bytes '(vector (unsigned-byte 8))) (>= (length bytes) 12))
+      (bad))
+    (let* ((length (length bytes))
+           (ndim (page-u32 bytes 0))
+           (offset (page-u32 bytes 4))
+           (oid (page-u32 bytes 8)))
+      (unless (and (<= ndim 6) (= oid (sql-varlena-array-element-oid element-type))
+                   (<= (+ 12 (* ndim 8)) length))
+        (bad))
+      (let ((dimensions nil) (bounds nil) (count (if (zerop ndim) 0 1)))
+        (dotimes (i ndim)
+          (let* ((dimension (page-u32 bytes (+ 12 (* i 4))))
+                 (raw-bound (page-u32 bytes (+ 12 (* ndim 4) (* i 4))))
+                 (lower (if (logbitp 31 raw-bound) (- raw-bound #x100000000) raw-bound)))
+            (unless (and (<= 1 dimension #x7fffffff)
+                         (<= (+ lower dimension -1) #x7fffffff))
+              (bad))
+            (setf count (* count dimension))
+            (push dimension dimensions)
+            (push lower bounds)))
+        (let* ((has-null (plusp offset))
+               (header (+ 16 (* ndim 8)))
+               (minimum (maxalign (+ header (if has-null (ceiling count 8) 0))))
+               (start (if has-null offset (maxalign header)))
+               (bitmap (+ 12 (* ndim 8))))
+          (unless (and (>= start minimum) (zerop (mod start 8)) (<= start (+ length 4)))
+            (bad))
+          (when (and (not has-null) (> count (floor (- length (- start 4)) 4)))
+            (bad))
+          (when (> count +max-varlena-array-elements+)
+            (ereport "54000" "array element count exceeds supported maximum"))
+          ;; Each non-null varlena consumes at least four aligned bytes.
+          ;; Reject impossible counts before allocating the element vector.
+          (let ((non-null-count
+                  (if has-null
+                      (loop for index below (ceiling count 8)
+                            for remaining = (- count (* index 8))
+                            for byte = (aref bytes (+ bitmap index))
+                            do (when (zerop (mod index 4096)) (check-for-interrupts))
+                            sum (logcount (if (< remaining 8)
+                                              (logand byte (1- (ash 1 remaining))) byte)))
+                      count)))
+            (when (> non-null-count (floor (- length (- start 4)) 4)) (bad)))
+          (when *sql-varlena-array-element-reserver*
+            (funcall *sql-varlena-array-element-reserver* count))
+          (let ((values (make-array count :initial-element +null+))
+                (position (- start 4)))
+            (dotimes (i count)
+              (when (zerop (mod i 4096)) (check-for-interrupts))
+              (when (or (not has-null)
+                        (logbitp (mod i 8) (aref bytes (+ bitmap (floor i 8)))))
+                (when (>= position length) (bad))
+                (let* ((first (aref bytes position))
+                       (short-p (logbitp 0 first))
+                       (size (if short-p (ash first -1)
+                                 (progn
+                                   (when (> (+ position 4) length) (bad))
+                                   (let ((word (page-u32 bytes position)))
+                                     (unless (zerop (logand word 3)) (bad))
+                                     (ash word -2)))))
+                       (header-size (if short-p 1 4)))
+                  (when (or (< size header-size) (= first 1)
+                            (> (+ position size) length))
+                    (bad))
+                  (let ((payload (subseq bytes (+ position header-size) (+ position size))))
+                    (setf (aref values i)
+                          (ecase element-type
+                            (:bytea payload)
+                            (:json (handler-case
+                                       (let ((text (bytes->string payload)))
+                                         (sql-json-input text) text)
+                                     (sb-int:character-decoding-error () (bad))
+                                     (pg-error (condition)
+                                       (if (or (and (>= (length (pg-error-sqlstate condition)) 2)
+                                                    (string= "22" (pg-error-sqlstate condition) :end2 2))
+                                               (string= "54001" (pg-error-sqlstate condition)))
+                                           (bad) (error condition)))))
+                            (:jsonb (sql-jsonb-from-octets payload)))))
+                  (incf position (align-up size 4))
+                  (when (> position length) (bad)))))
+            (unless (= position length) (bad))
+            (make-sql-array :element-type-id element-type :elements values
+                            :dimensions (nreverse dimensions) :lower-bounds (nreverse bounds))))))))
 
 (defparameter +publication-table-result-fields+
   '(("pubid" :oid) ("relid" :oid) ("attrs" :int2vector) ("qual" :pg-node-tree)))
@@ -427,7 +591,8 @@ The retained-byte extension measures from the durable or flushed endpoint."
   "Return PostgreSQL's default typstorage code for a supported TYPE."
   (cond ((eq type :numeric) #\m)
         ((or (sql-array-element-type type)
-             (member type '(:text :varchar :bytea :json :jsonb :bit :pg-node-tree :record)))
+             (member type '(:text :varchar :bytea :json :jsonb :bit :pg-node-tree :record
+                            :bytea-array :json-array :jsonb-array)))
          #\x)
         (t #\p)))
 

@@ -158,10 +158,18 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
                            `(funcall ,decode (getf sexp ,key ,default))
                            `(getf sexp ,key ,default))))))))))
 
+(declaim (notinline sql-array-p sql-array-element-type-id sql-array-elements sql-array-dimensions sql-array-lower-bounds make-sql-array))
+
 (defun catalog-expression-to-sexp (expression)
   ;; Encode decimals explicitly so persisted expression trees round-trip without
   ;; relying on a Lisp structure reader or losing their display scale.
-  (cond ((sql-jsonb-p expression)
+  (cond ((sql-array-p expression)
+         (list :pg-catalog-array (sql-array-element-type-id expression)
+               (copy-list (sql-array-dimensions expression)) (copy-list (sql-array-lower-bounds expression))
+               (map 'list #'catalog-expression-to-sexp (sql-array-elements expression))))
+        ((typep expression '(vector (unsigned-byte 8)))
+         (list :pg-catalog-octets (coerce expression 'list)))
+        ((sql-jsonb-p expression)
          (list :pg-catalog-jsonb (sql-jsonb-output expression)))
         ((sql-timetz-p expression)
          (list :pg-catalog-timetz (sql-timetz-microseconds expression) (sql-timetz-zone-west expression)))
@@ -179,7 +187,13 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
         (t expression)))
 
 (defun catalog-expression-from-sexp (expression)
-  (cond ((and (consp expression) (eq (first expression) :pg-catalog-jsonb))
+  (cond ((and (consp expression) (eq (first expression) :pg-catalog-array))
+         (make-sql-array :element-type-id (second expression)
+                         :dimensions (third expression) :lower-bounds (fourth expression)
+                         :elements (map 'vector #'catalog-expression-from-sexp (fifth expression))))
+        ((and (consp expression) (eq (first expression) :pg-catalog-octets))
+         (coerce (second expression) '(vector (unsigned-byte 8))))
+        ((and (consp expression) (eq (first expression) :pg-catalog-jsonb))
          (sql-jsonb-input (second expression)))
         ((and (consp expression) (eq (first expression) :pg-catalog-timetz))
          (make-sql-timetz (second expression) (third expression)))
@@ -1014,6 +1028,7 @@ from advancing the shared WAL generation between a failed save and rollback."
     (:float8 "double precision") (:bool "boolean") (:text "text") (:json "json") (:jsonb "jsonb") (:bytea "bytea") (:name "name")
     (:oid "oid") (:pg-lsn "pg_lsn") (:bit (if (minusp typmod) "\"bit\"" (format nil "bit(~d)" typmod)))
     (:char "\"char\"") (:int2vector "int2vector") (:text-array "text[]")
+    (:bytea-array "bytea[]") (:json-array "json[]") (:jsonb-array "jsonb[]")
     (otherwise (ereport "0A000" "cannot serialize stored expression type ~a" type))))
 
 (defun catalog-temporal-value-text (value type)
@@ -1142,6 +1157,7 @@ from advancing the shared WAL generation between a failed save and rollback."
                                      (scale (- (logxor (logand packed #x7ff) #x400) #x400)))
                                 (format nil "numeric(~d,~d)" precision scale)))))
               (:text "text") (:json "json") (:jsonb "jsonb") (:bytea "bytea")
+              (:bytea-array "bytea[]") (:json-array "json[]") (:jsonb-array "jsonb[]")
               (:varchar (if (< (pg-column-typmod column) 4) "varchar"
                             (format nil "varchar(~a)" (- (pg-column-typmod column) 4))))
               (otherwise (error "cannot publish unsupported type ~a" (pg-column-type column)))))
@@ -1385,7 +1401,7 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
                           &key unique primary constraint nulls-not-distinct)
   "Create detached INDEX metadata with a previously reserved object ID."
   (when (some (lambda (attnum)
-                (eq (pg-column-type (aref (pg-class-columns table) (1- attnum))) :json))
+                (member (pg-column-type (aref (pg-class-columns table) (1- attnum))) '(:json :json-array)))
               cols)
     (ereport "42704" "data type json has no default operator class for access method btree"))
   (make-pg-index :oid oid
@@ -1451,7 +1467,8 @@ heap tuple exceeding the four-tuples-per-page threshold then warrants TOAST."
           for type = (pg-column-type column)
           for typmod = (pg-column-typmod column)
           do (setf data-length (align-up data-length
-                                         (if (member type '(:varchar :numeric :text :bytea :json :jsonb))
+                                         (if (or (heap-varlena-array-element-type type)
+                                                 (member type '(:varchar :numeric :text :bytea :json :jsonb)))
                                              4 (column-align column))))
              (let ((size
                      (case type
@@ -1462,7 +1479,7 @@ heap tuple exceeding the four-tuples-per-page threshold then warrants TOAST."
                         (setf has-toastable t)
                         (and (>= typmod 4)
                              (+ 8 (* 2 (floor (+ (ldb (byte 16 16) (- typmod 4)) 6) 4)))))
-                       ((:text :bytea :json :jsonb)
+                       ((:text :bytea :json :jsonb :bytea-array :json-array :jsonb-array)
                         (setf has-toastable t)
                         nil)
                        (otherwise (column-fixed-size column)))))
@@ -1651,7 +1668,8 @@ VALUES remains unchanged; EXTERNAL-P says whether the relation has a TOAST table
                        for column = (aref columns i)
                        for type = (pg-column-type column)
                        for storage = (pg-column-effective-storage column)
-                       when (and (member type '(:varchar :text :json :jsonb :bytea :numeric))
+                       when (and (or (heap-varlena-array-element-type type)
+                                     (member type '(:varchar :text :json :jsonb :bytea :numeric)))
                                  (if main-p (char= storage #\m) (find storage "xe"))
                                  (not (eq value +null+))
                                  (not (heap-external-varlena-p value))

@@ -807,7 +807,7 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
     (multiple-value-bind (targets coercions)
         (analyze-union-targets (or frozen (getf left :targets)) (getf right :targets))
       (when (and (not (eq (getf ast :set-operation) :union-all))
-                 (some (lambda (target) (eq (getf target :type) :json)) targets))
+                 (some (lambda (target) (member (getf target :type) '(:json :json-array))) targets))
         (ereport "42883" "could not identify an equality operator for type json"))
       (when definition
         (loop for seed in frozen for target in targets for position from 1
@@ -1040,7 +1040,7 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                (mapcar #'having-gate-skeleton (where-conjuncts where))))
            (group-keys (progn (setf (getf *select-analysis-frame* :kind) :group-by)
                               (when (getf ast :group-by)
-                                (analyze-group-keys (getf ast :group-by) scope))))
+                                (analyze-group-keys (getf ast :group-by) scope (getf ast :targets)))))
            (aggregate-analysis
              (progn
                (setf (getf *select-analysis-frame* :kind) (if (getf ast :from-function) :from-function :select-target)
@@ -1091,9 +1091,9 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                (+ width (length *select-window-functions*))
                (getf ast :distinct)))))
       (when (and (getf ast :distinct)
-                 (some (lambda (target) (eq (getf target :type) :json)) targets))
+                 (some (lambda (target) (member (getf target :type) '(:json :json-array))) targets))
         (ereport "42883" "could not identify an equality operator for type json"))
-      (when (some (lambda (item) (eq (expr-type (car item)) :json))
+      (when (some (lambda (item) (member (expr-type (car item)) '(:json :json-array)))
                   (second set-analysis))
         (ereport "42883" "could not identify an ordering operator for type json"))
       (list :window-validation-keys
@@ -1466,6 +1466,8 @@ chunk visibility follows the parent and is not independently filtered."
                                (:bytea bytes)
                                (:jsonb (sql-jsonb-from-octets bytes))
                                (:numeric (sql-numeric-from-varlena-payload bytes))
+                               ((:bytea-array :json-array :jsonb-array)
+                                (sql-varlena-array-decode bytes (heap-varlena-array-element-type type)))
                                (otherwise (ereport "XX001" "external value has unsupported type"))))))))
     tuple))
 

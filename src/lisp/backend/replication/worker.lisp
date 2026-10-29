@@ -357,7 +357,7 @@
         (/ value 1000.0)))))
 
 (defun logical-type-supported-p (type-oid)
-  (member type-oid '(17 20 21 23 25 114 3802 700 701 1043 1082 1083 1114 1184 1186 1266 1700)))
+  (member type-oid '(17 20 21 23 25 114 199 1001 3802 3807 700 701 1043 1082 1083 1114 1184 1186 1266 1700)))
 
 (defun logical-validate-client-schema (table source-columns target-columns)
   (unless (= (length source-columns) (length target-columns))
@@ -554,7 +554,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
            (error "source returned a malformed integer value")
            (error "pgoutput integer value is malformed")))
      value)
-    ((member type-oid '(17 25 114 3802 700 701 1043 1082 1083 1114 1184 1186 1266 1700)) (logical-sql-literal value))
+    ((member type-oid '(17 25 114 199 1001 3802 3807 700 701 1043 1082 1083 1114 1184 1186 1266 1700)) (logical-sql-literal value))
     (t (error "unsupported ~a type OID ~a"
               (if (eq context :copy) "logical copy" "pgoutput") type-oid))))
 
@@ -897,7 +897,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
   (loop for value across tuple for column in (pgoutput-relation-columns relation)
         when (eq value :unchanged-toast)
           do (unless (and unchanged-allowed-p
-                          (member (pgoutput-column-type-oid column) '(17 25 1043 114 3802 1700)))
+                          (member (pgoutput-column-type-oid column) '(17 25 1043 114 3802 1700 199 1001 3807)))
                (error "invalid pgoutput unchanged TOAST marker")))
   (loop for value across tuple for column in (pgoutput-relation-columns relation)
         when (and (logical-binary-bytea-p value) (/= (pgoutput-column-type-oid column) 17))
@@ -1069,7 +1069,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
      (logical-write-integer-field stream value context))
     ((or (null value) (eq value :unchanged-toast) (member type '(20 21 23)))
      (write-string (logical-source-value-literal type value context) stream))
-    ((member type '(17 25 114 3802 700 701 1043 1082 1083 1114 1184 1186 1266 1700))
+    ((member type '(17 25 114 199 1001 3802 3807 700 701 1043 1082 1083 1114 1184 1186 1266 1700))
      (write-char #\' stream)
      (if (logical-wire-field-p value)
          (logical-wire-field-visit value
