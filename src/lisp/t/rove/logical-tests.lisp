@@ -1322,6 +1322,129 @@
              (rove:ok seen))
         (setf (symbol-function 'logical-pgoutput-dispatch) original))))
 
+(rove:deftest test-select-streamed-datarow-matches-legacy
+    (let* ((base (format nil "pg-select-row-~d-~d" (sb-posix:getpid) (random 1000000)))
+           (path-a (merge-pathnames (concatenate 'string base "-a") (uiop:temporary-directory)))
+           (path-b (merge-pathnames (concatenate 'string base "-b") (uiop:temporary-directory)))
+           (bytes (make-array 5 :element-type '(unsigned-byte 8) :initial-contents '(0 92 127 128 255)))
+           (values (vector +null+ nil "" (concatenate 'string (make-string 4095 :initial-element #\x) "🙂")
+                           bytes (sql-jsonb-input "{\"b\": [1.00, null], \"a\": \"🙂\"}")))
+           (targets (mapcar (lambda (type) (list :type type)) '(:int4 :bool :text :text :bytea :jsonb))))
+      (unwind-protect
+           (progn
+             (with-open-file (out path-a :direction :output :element-type '(unsigned-byte 8)
+                                         :if-exists :supersede)
+               (send-select-data-row out values targets))
+             (with-open-file (out path-b :direction :output :element-type '(unsigned-byte 8)
+                                         :if-exists :supersede)
+               (send-data-row-text out
+                                   (loop for value across values for target in targets
+                                         collect (value->text value (getf target :type)))))
+             (flet ((read-bytes (path)
+                      (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+                        (let ((result (make-array (file-length in) :element-type '(unsigned-byte 8))))
+                          (read-sequence result in) result))))
+               (rove:ok (equalp (read-bytes path-a) (read-bytes path-b))))
+             (rove:ok (string= (with-output-to-string (out) (select-write-bytea-text out bytes "escape"))
+                               (sql-bytea-output bytes "escape"))))
+        (when (probe-file path-a) (delete-file path-a))
+        (when (probe-file path-b) (delete-file path-b)))))
+
+(rove:deftest test-select-streamed-datarow-preflight-and-partial-failure
+    (let* ((path (merge-pathnames (format nil "pg-select-fault-~d-~d"
+                                          (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (original (symbol-function 'select-row-field-writer))
+           (original-write (symbol-function 'select-row-utf8-write))
+           (stream nil))
+      (unwind-protect
+           (progn
+             (setf stream (open path :direction :output :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede))
+             (setf (symbol-function 'select-row-field-writer)
+                   (lambda (value type)
+                     (if (eq type :bad) (error "late preflight error")
+                         (funcall original value type))))
+             (rove:ok (handler-case
+                          (progn (send-select-data-row stream #(1 2) '((:type :int4) (:type :bad))) nil)
+                        (error () t)))
+             (rove:ok (and (open-stream-p stream) (zerop (file-position stream))))
+             (setf (symbol-function 'select-row-field-writer)
+                   (lambda (value type)
+                     (declare (ignore value type))
+                     (let ((calls 0))
+                       (lambda (out) (incf calls)
+                         (write-string (if (= calls 1) "abc" "xyz") out)))))
+             (setf (symbol-function 'select-row-utf8-write)
+                   (lambda (writer sink &optional (limit #x7fffffff))
+                     (funcall original-write writer
+                              (and sink (lambda (bytes) (funcall sink bytes) (force-output stream)))
+                              limit)))
+             (rove:ok (handler-case
+                          (progn (send-select-data-row stream #(1) '((:type :int4))) nil)
+                        (error (condition) (search "changed during output" (princ-to-string condition)))))
+             (rove:ok (not (open-stream-p stream)))
+             (when (probe-file path)
+               (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+                 (rove:ok (< (file-length in) 14)))))
+        (setf (symbol-function 'select-row-field-writer) original
+              (symbol-function 'select-row-utf8-write) original-write)
+        (when (and stream (open-stream-p stream)) (close stream :abort t))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-select-datarow-rejects-signed-frame-overflow
+    (let* ((path (merge-pathnames (format nil "pg-row-limit-~d-~d"
+                                          (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (original (symbol-function 'select-row-utf8-write)))
+      (unwind-protect
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede)
+             (setf (symbol-function 'select-row-utf8-write)
+                   (lambda (&rest args) (declare (ignore args)) (values #x40000000 0)))
+             (rove:ok (handler-case
+                          (progn (send-select-data-row out #(1 2) '((:type :int4) (:type :int4))) nil)
+                        (error (condition) (search "frame too large" (princ-to-string condition)))))
+             (rove:ok (and (open-stream-p out) (zerop (file-position out)))))
+        (setf (symbol-function 'select-row-utf8-write) original)
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-select-datarow-growing-field-closes-before-overrun
+    (let* ((path (merge-pathnames (format nil "pg-row-overrun-~d-~d"
+                                          (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (original (symbol-function 'select-row-field-writer))
+           (original-write (symbol-function 'select-row-utf8-write))
+           (stream nil))
+      (unwind-protect
+           (progn
+             (setf stream (open path :direction :output :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede))
+             (setf (symbol-function 'select-row-field-writer)
+                   (lambda (value type)
+                     (declare (ignore value type))
+                     (let ((calls 0))
+                       (lambda (out)
+                         (incf calls)
+                         (write-string (if (= calls 1) "abc" (make-string 5000 :initial-element #\x)) out)))))
+             (setf (symbol-function 'select-row-utf8-write)
+                   (lambda (writer sink &optional (limit #x7fffffff))
+                     (when sink (force-output stream))
+                     (funcall original-write writer
+                              (and sink (lambda (bytes) (funcall sink bytes) (force-output stream)))
+                              limit)))
+             (rove:ok (handler-case
+                          (progn (send-select-data-row stream #(1) '((:type :int4))) nil)
+                        (error () t)))
+             (rove:ok (not (open-stream-p stream)))
+             (when (probe-file path)
+               (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+                 (rove:ok (< (file-length in) 14)))))
+        (setf (symbol-function 'select-row-field-writer) original
+              (symbol-function 'select-row-utf8-write) original-write)
+        (when (and stream (open-stream-p stream)) (close stream :abort t))
+        (when (probe-file path) (delete-file path)))))
+
 (rove:deftest test-client-streamed-query-frame
     (let* ((path (merge-pathnames (format nil "pg-query-frame-~d-~d" (sb-posix:getpid) (random 1000000))
                                   (uiop:temporary-directory)))

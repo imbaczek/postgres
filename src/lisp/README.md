@@ -595,6 +595,14 @@ Client startup and SQL `application_name` support SET, SHOW, RESET and
 settings remain unsupported. Parameter reports are coalesced before ReadyForQuery.
 Unsupported setting names and values return errors.
 
+SELECT text DataRows preflight every field's encoded length and checksum before
+writing the frame. Text, JSON, JSONB and bytea output use bounded UTF-8 blocks;
+bytea honors `bytea_output`, and other types retain their session-dependent
+formatting and are formatted once. Emission checks the lengths and checksums
+again, withholds the last frame byte until validation succeeds, and closes the
+connection if emission fails. Source SQL values, including detoasted values,
+still occupy memory, as can values and frames at the receiving client.
+
 Idle simple-query messages containing only supported ordinary settings and MVCC
 statements commit or roll back together. DDL, maintenance and transaction-control
 messages retain the prior per-statement behavior; see the staged boundary in

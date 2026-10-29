@@ -1797,12 +1797,92 @@ for another left row.  LEFT joins null-extend only after that input is exhausted
        (push row rows)))
     (nreverse rows)))
 
+(defun select-write-bytea-text (out bytes format)
+  "Write PostgreSQL bytea text without building a value-sized string."
+  (check-type bytes (vector (unsigned-byte 8)))
+  (if (string= format "escape")
+      (loop for byte across bytes
+            do (cond ((= byte 92) (write-char #\\ out) (write-char #\\ out))
+                     ((or (< byte 32) (> byte 126))
+                      (write-char #\\ out)
+                      (write-char (digit-char (ldb (byte 2 6) byte)) out)
+                      (write-char (digit-char (ldb (byte 3 3) byte)) out)
+                      (write-char (digit-char (ldb (byte 3 0) byte)) out))
+                     (t (write-char (code-char byte) out))))
+      (let ((digits "0123456789abcdef"))
+        (write-char #\\ out) (write-char #\x out)
+        (loop for byte across bytes
+              do (write-char (char digits (ash byte -4)) out)
+                 (write-char (char digits (logand byte 15)) out)))))
+
+(defun select-row-field-writer (value type)
+  "Return a repeatable character writer, or NIL for SQL NULL."
+  (cond ((eq value +null+) nil)
+        ((eq type :bytea)
+         (let ((format (or (session-extra-setting-value "bytea_output") "hex")))
+           (lambda (out) (select-write-bytea-text out value format))))
+        ((eq type :jsonb) (lambda (out) (sql-jsonb-write value out)))
+        ((and (member type '(:text :varchar :json)) (stringp value))
+         (lambda (out) (write-string value out)))
+        (t (let ((text (value->text value type)))
+             (unless (stringp text) (error "invalid DataRow field"))
+             (lambda (out) (write-string text out))))))
+
+(defun select-row-utf8-write (writer sink &optional (limit #x7fffffff))
+  (multiple-value-bind (counter metrics) (logical-encoding-sink limit)
+    (let ((out (make-instance 'logical-utf8-output-stream
+                              :buffer (lambda (octets)
+                                        (funcall counter octets)
+                                        (when sink (funcall sink octets))))))
+      (funcall writer out)
+      (logical-flush-utf8-output out)
+      (multiple-value-bind (count checksum) (funcall metrics)
+        (unless (= count (logical-utf8-size out)) (error "invalid DataRow field count"))
+        (values count checksum)))))
+
+(defun send-select-data-row (stream values targets)
+  "Preflight every field, then write one bounded text DataRow."
+  (unless (and (= (length values) (length targets)) (<= (length targets) #xffff))
+    (error "invalid DataRow width"))
+  (let ((fields nil) (size (+ 6 (* 4 (length targets)))))
+    (loop for value across values for target in targets
+          for writer = (select-row-field-writer value (getf target :type))
+          do (multiple-value-bind (length checksum)
+                 (if writer (select-row-utf8-write writer nil) (values nil nil))
+               (when (and length (> length #x7fffffff)) (error "DataRow field too large"))
+               (when length (incf size length))
+               (push (list writer length checksum) fields)))
+    (when (> size #x7fffffff) (error "DataRow frame too large"))
+    (let ((complete nil) (last-byte nil))
+      (labels ((emit (octets)
+                 (when (plusp (length octets))
+                   (when last-byte (write-byte last-byte stream))
+                   (when (> (length octets) 1)
+                     (write-sequence octets stream :end (1- (length octets))))
+                   (setf last-byte (aref octets (1- (length octets)))))))
+        (sb-sys:without-interrupts
+          (unwind-protect
+               (sb-sys:with-local-interrupts
+                 (emit (vector (char-code #\D)))
+                 (emit (u32-to-bytes size))
+                 (emit (u16-to-bytes (length targets)))
+                 (dolist (field (nreverse fields))
+                   (destructuring-bind (writer length checksum) field
+                     (emit (u32-to-bytes (if writer length #xffffffff)))
+                     (when writer
+                       (multiple-value-bind (actual actual-checksum)
+                           (select-row-utf8-write writer #'emit length)
+                         (unless (and (= length actual) (= checksum actual-checksum))
+                           (error "DataRow field changed during output"))))))
+                 (unless last-byte (error "empty DataRow frame"))
+                 (write-byte last-byte stream)
+                 (force-output stream)
+                 (setf complete t))
+            (unless complete (ignore-errors (close stream :abort t))))))))
+  (values))
+
 (defun send-select-row (stream row targets)
-  (send-data-row-text
-   stream
-   (loop for value across (car row)
-         for target in targets
-         collect (value->text value (getf target :type)))))
+  (send-select-data-row stream (car row) targets))
 
 (defun select-path-description (table path)
   (case (select-scan-path-kind path)
