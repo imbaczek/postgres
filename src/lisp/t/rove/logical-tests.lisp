@@ -1545,6 +1545,32 @@
              (rove:ok (null (uiop:directory-files directory))))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest test-logical-spool-quota-after-former-transaction-limit
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-logical-quota-large-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (event (logical-encode-change
+                   (logical-test-change :insert 7 701
+                                        :new-values (vector 1 2 (make-string 1048576 :initial-element #\x)))))
+           (*query-temp-file-limit-bytes* (* 66 (+ 8 (length event))))
+           (spool (make-logical-spool)))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (dotimes (i 66) (logical-spool-append spool event))
+             (rove:ok (> (logical-spool-bytes spool) +max-logical-wal-transaction-bytes+))
+             (rove:ok (= 66 (logical-spool-count spool)))
+             (rove:ok (handler-case (progn (logical-spool-append spool event) nil)
+                        (pg-error (condition) (string= (pg-error-sqlstate condition) "53400"))))
+             (rove:ok (logical-spool-failed-p spool))
+             (rove:ok (= 66 (logical-spool-count spool)))
+             (rove:ok (handler-case (progn (logical-preflight-spool spool) nil) (error () t))))
+        (close-logical-spool spool)
+        (rove:ok (null (uiop:directory-files directory)))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest test-logical-spool-outlives-query-and-ends-with-transaction
     (let* ((directory (merge-pathnames
                        (format nil "pg-logical-xact-~d-~d/" (sb-posix:getpid) (random 1000000))

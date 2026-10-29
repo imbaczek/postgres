@@ -631,7 +631,9 @@ headroom; transactional utility events retain the 64 MiB event limit. WAL
 recovery and slot readers accept individual events up to 65 MiB. The aggregate
 transaction size is controlled by the capture spool's temporary-file quota,
 which is unlimited by default. Unscoped logical readers that materialize changes
-retain a 65 MiB limit; scoped slot readers use temporary spools instead. Large
+retain a 65 MiB encoded-byte limit, checked after decoding the event or legacy
+chunk that crosses it; peak memory can therefore include that additional decoded
+data. Scoped slot readers use temporary spools instead. Large
 transactions can hold the WAL lock for their full scan or publication.
 These event limits do not guarantee that a value of that size will fit.
 
