@@ -817,6 +817,35 @@
     (rove:ok (= (length encoded) 12))
     (rove:ok (equalp #() (sql-array-elements (sql-varlena-array-decode encoded :bytea))))))
 
+(rove:deftest test-varlena-array-c-arraytype-fixtures
+    ;; PostgreSQL 20devel on little-endian x86-64 (MAXALIGN 8): a C helper
+    ;; copies VARSIZE(PG_GETARG_ARRAYTYPE_P(0)) minus the outer four-byte
+    ;; header. Inputs match the element values, dimensions and bounds below.
+    ;; These physical bytes are not the array_send format.
+    (flet ((octets (hex) (sql-bytea-input (concatenate 'string "\\x" hex))))
+      (dolist (fixture
+               (list
+                (list :bytea '(3) '(1)
+                      (vector (octets "00ff") +null+ (octets "01"))
+                      "010000002000000011000000030000000100000005000000000000001800000000ff00001400000001000000")
+                (list :json '(2) '(0) (vector " {\"a\":1} " +null+)
+                      "0100000020000000720000000200000000000000010000000000000034000000207b2261223a317d20000000")
+                (list :jsonb '(2) '(1) (vector (sql-jsonb-input "{\"a\":1}") +null+)
+                      "0100000020000000da0e0000020000000100000001000000000000007000000001000020010000800b000010610000002000000000800100")
+                (list :bytea nil nil #() "000000000000000011000000")
+                (list :bytea '(3 3) '(1 1)
+                      (vector (octets "01") +null+ (octets "0203")
+                              (octets "04") (octets "05") +null+
+                              (octets "06") +null+ (octets "07"))
+                      "020000002800000011000000030000000300000001000000010000005d01000000000000140000000100000018000000020300001400000004000000140000000500000014000000060000001400000007000000")))
+        (destructuring-bind (type dimensions bounds elements hex) fixture
+          (let* ((array (make-sql-array :element-type-id type :elements elements
+                                        :dimensions dimensions :lower-bounds bounds))
+                 (expected (octets hex))
+                 (decoded (sql-varlena-array-decode expected type)))
+            (rove:ok (equalp expected (sql-varlena-array-encode array type)))
+            (rove:ok (equalp expected (sql-varlena-array-encode decoded type))))))))
+
 (rove:deftest test-varlena-array-catalog-expression-roundtrip
     (dolist (case (list (list :bytea (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(0 255)))
                         (list :json "{ \"a\": 1 }")
