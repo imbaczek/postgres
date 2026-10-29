@@ -907,6 +907,75 @@
         (rove:ok (equal (list index count total offset) '(1 3 32 3)))
         (rove:ok (equalp bytes (subseq event 3 19))))))
 
+(rove:deftest test-logical-change-stream-backed-cursor
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-logical-cursor-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (change (logical-test-change :update 7 701 :old-values #(1 2 "old🙂")
+                                                      :new-values #(1 3 "new🙂")))
+           (event (logical-encode-change change))
+           (spool (make-logical-spool)))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (logical-spool-append spool event)
+             (logical-spool-seal spool)
+             (file-position (logical-spool-stream spool) 8)
+             (let* ((cursor (make-logical-cursor :stream (logical-spool-stream spool)
+                                                 :size (length event)))
+                    (decoded (logical-decode-change-from-cursor cursor)))
+               (rove:ok (eq (logical-change-kind decoded) :update))
+               (rove:ok (equalp (logical-change-old-values decoded) #(1 2 "old🙂")))
+               (rove:ok (equalp (logical-change-new-values decoded) #(1 3 "new🙂")))
+               (rove:ok (= (logical-cursor-offset cursor) (length event))))
+             (file-position (logical-spool-stream spool) 8)
+             (rove:ok (handler-case
+                          (progn (logical-decode-change-from-cursor
+                                  (make-logical-cursor :stream (logical-spool-stream spool)
+                                                       :size (1- (length event)))) nil)
+                        (error () t))))
+        (close-logical-spool spool)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-logical-stream-cursor-codec-equivalence
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-logical-cursor-cases-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (spool (make-logical-spool))
+           (octets (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(0 128 255)))
+           (binary (logical-test-change :insert 7 701 :new-values (vector -7 -9 octets)))
+           (jsonb (logical-test-change :insert 7 702 :new-values (vector 4 5 (sql-jsonb-input "{\"a\":[1,true]}"))))
+           (truncate (make-logical-change :kind :truncate :database-oid 7 :event-payload "(:tables (\"x\"))"))
+           (events nil))
+      (setf (getf (third (logical-change-columns binary)) :type) :bytea
+            (getf (third (logical-change-columns binary)) :typmod) -1
+            (getf (third (logical-change-columns jsonb)) :type) :jsonb
+            (getf (third (logical-change-columns jsonb)) :typmod) -1
+            events (mapcar #'logical-encode-change (list binary jsonb truncate)))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (dolist (event events) (logical-spool-append spool event))
+             (logical-spool-seal spool)
+             (file-position (logical-spool-stream spool) 0)
+             (dolist (event events)
+               (let* ((size (logical-spool-read-u32 (logical-spool-stream spool)))
+                      (checksum (logical-spool-read-u32 (logical-spool-stream spool)))
+                      (cursor (make-logical-cursor :stream (logical-spool-stream spool) :size size))
+                      (decoded (logical-decode-change-from-cursor cursor)))
+                 (rove:ok (= checksum (wal-crc32 event)))
+                 (rove:ok (equalp (logical-encode-change decoded) event))))
+             (let ((stream (logical-spool-stream spool)))
+               (rove:ok (handler-case
+                            (progn (logical-read-u8 (make-logical-cursor :stream stream :size 1)) nil)
+                          (error () t)))))
+        (close-logical-spool spool)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest test-logical-fragment-assembly
     (let* ((first (make-array 10 :element-type '(unsigned-byte 8)
                                  :initial-contents '(0 1 2 3 4 5 6 7 8 9)))

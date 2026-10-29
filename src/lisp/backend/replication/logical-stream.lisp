@@ -23,7 +23,9 @@
   xid commit-lsn commit-record-lsn commit-timestamp changes)
 
 (defstruct logical-cursor
-  bytes (offset 0))
+  "Bounded logical event reader over octets or a positioned binary stream.
+Discard the cursor after a read error; the stream may have advanced."
+  bytes stream size (offset 0))
 
 (defstruct logical-reader-state
   database-oid batch-open-p xid chunk-count next-chunk fragment-batch
@@ -354,37 +356,58 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
       (error "logical row change has inconsistent old/new images"))
     buffer))
 
+(defun logical-cursor-limit (cursor)
+  "Return the known byte bound of a vector- or stream-backed cursor."
+  (if (logical-cursor-stream cursor)
+      (logical-cursor-size cursor)
+      (length (logical-cursor-bytes cursor))))
+
 (defun logical-cursor-require (cursor count)
-  (unless (<= (+ (logical-cursor-offset cursor) count)
-              (length (logical-cursor-bytes cursor)))
+  (unless (and (integerp count) (not (minusp count))
+               (<= (+ (logical-cursor-offset cursor) count) (logical-cursor-limit cursor)))
     (error "truncated logical row-change payload")))
 
 (defun logical-read-u8 (cursor)
   (logical-cursor-require cursor 1)
-  (prog1 (aref (logical-cursor-bytes cursor) (logical-cursor-offset cursor))
-    (incf (logical-cursor-offset cursor))))
+  (let ((byte (if (logical-cursor-stream cursor)
+                  (read-byte (logical-cursor-stream cursor) nil nil)
+                  (aref (logical-cursor-bytes cursor) (logical-cursor-offset cursor)))))
+    (unless byte (error "truncated logical row-change payload"))
+    (incf (logical-cursor-offset cursor))
+    byte))
 
 (defun logical-read-u16 (cursor)
   (logical-cursor-require cursor 2)
-  (prog1 (wal-u16 (logical-cursor-bytes cursor) (logical-cursor-offset cursor))
-    (incf (logical-cursor-offset cursor) 2)))
+  (if (logical-cursor-stream cursor)
+      (loop for shift below 2 sum (ash (logical-read-u8 cursor) (* 8 shift)))
+      (prog1 (wal-u16 (logical-cursor-bytes cursor) (logical-cursor-offset cursor))
+        (incf (logical-cursor-offset cursor) 2))))
 
 (defun logical-read-u32 (cursor)
   (logical-cursor-require cursor 4)
-  (prog1 (wal-u32 (logical-cursor-bytes cursor) (logical-cursor-offset cursor))
-    (incf (logical-cursor-offset cursor) 4)))
+  (if (logical-cursor-stream cursor)
+      (loop for shift below 4 sum (ash (logical-read-u8 cursor) (* 8 shift)))
+      (prog1 (wal-u32 (logical-cursor-bytes cursor) (logical-cursor-offset cursor))
+        (incf (logical-cursor-offset cursor) 4))))
 
 (defun logical-read-u64 (cursor)
   (logical-cursor-require cursor 8)
-  (prog1 (wal-u64 (logical-cursor-bytes cursor) (logical-cursor-offset cursor))
-    (incf (logical-cursor-offset cursor) 8)))
+  (if (logical-cursor-stream cursor)
+      (loop for shift below 8 sum (ash (logical-read-u8 cursor) (* 8 shift)))
+      (prog1 (wal-u64 (logical-cursor-bytes cursor) (logical-cursor-offset cursor))
+        (incf (logical-cursor-offset cursor) 8))))
 
 (defun logical-read-octets (cursor count)
   (logical-cursor-require cursor count)
-  (prog1 (subseq (logical-cursor-bytes cursor)
-                 (logical-cursor-offset cursor)
-                 (+ (logical-cursor-offset cursor) count))
-    (incf (logical-cursor-offset cursor) count)))
+  (let ((bytes (if (logical-cursor-stream cursor)
+                   (let ((result (make-array count :element-type '(unsigned-byte 8))))
+                     (unless (= (read-sequence result (logical-cursor-stream cursor)) count)
+                       (error "truncated logical row-change payload"))
+                     result)
+                   (subseq (logical-cursor-bytes cursor) (logical-cursor-offset cursor)
+                           (+ (logical-cursor-offset cursor) count)))))
+    (incf (logical-cursor-offset cursor) count)
+    bytes))
 
 (defun logical-read-string-u32 (cursor)
   (sb-ext:octets-to-string (logical-read-octets cursor (logical-read-u32 cursor))
@@ -483,9 +506,8 @@ revalidated by this codec."
           (error "historic publication relation identities do not match the change")))))
   change)
 
-(defun logical-decode-change (bytes)
-  (let* ((cursor (make-logical-cursor :bytes bytes))
-         (marker (logical-read-u8 cursor))
+(defun logical-decode-change-from-cursor (cursor)
+  (let* ((marker (logical-read-u8 cursor))
          (event-version (if (zerop marker) (logical-read-u8 cursor) 0))
          (kind (logical-kind-from-code
                 (if (zerop marker) (logical-read-u8 cursor) marker)))
@@ -497,9 +519,9 @@ revalidated by this codec."
                   (member kind '(:truncate :ddl :sequence-state)))
         (error "invalid logical catalog-event kind ~a" kind))
       (let ((payload (logical-read-string-u32 cursor)))
-        (unless (= (logical-cursor-offset cursor) (length bytes))
+        (unless (= (logical-cursor-offset cursor) (logical-cursor-limit cursor))
           (error "logical event payload has trailing bytes"))
-        (return-from logical-decode-change
+        (return-from logical-decode-change-from-cursor
           (logical-validate-change-publications
            (make-logical-change :kind kind :database-oid database-oid
                                 :publication-selection selection :event-payload payload)))))
@@ -541,7 +563,7 @@ revalidated by this codec."
                                         :old-values (first rows)
                                         :new-values (second rows)
                                         :publication-selection selection)))
-      (unless (= (logical-cursor-offset cursor) (length bytes))
+      (unless (= (logical-cursor-offset cursor) (logical-cursor-limit cursor))
         (error "logical row-change payload has trailing bytes"))
       (unless (and (<= (length key-attnums) (length columns))
                    (= (length key-attnums) (length (remove-duplicates key-attnums)))
@@ -560,6 +582,10 @@ revalidated by this codec."
                               (null (logical-change-new-values change)))))
         (error "logical row change has inconsistent old/new images"))
       (logical-validate-change-publications change))))
+
+(defun logical-decode-change (bytes)
+  "Decode a complete vector-backed logical WAL event."
+  (logical-decode-change-from-cursor (make-logical-cursor :bytes bytes)))
 
 (defun logical-encode-catalog-event (database-oid ast)
   (let* ((text (catalog-readable-data-string
