@@ -198,6 +198,53 @@ The caller must not mutate EVENT after passing it to this function."
     (logical-spool-map-events spool (lambda (event) (push event events)))
     (nreverse events)))
 
+(defun logical-spool-map-event-blocks (spool start-function block-function end-function
+                                       &key (block-size 65536))
+  "Validate events and visit bounded byte ranges without constructing an event vector.
+BLOCK-FUNCTION must consume its byte range before returning; file buffers are reused."
+  (when (or (logical-spool-failed-p spool) (not (logical-spool-sealed-p spool))
+            (logical-spool-closed-p spool) (not (and (integerp block-size) (plusp block-size))))
+    (error "logical spool is not readable"))
+  (let ((complete nil) (stream (logical-spool-stream spool)))
+    (unwind-protect
+         (progn
+           (if (null stream)
+               (dolist (event (reverse (logical-spool-events spool)))
+                 (funcall start-function (length event))
+                 (loop for start from 0 below (length event) by block-size
+                       for end = (min (length event) (+ start block-size))
+                       do (funcall block-function event start end))
+                 (funcall end-function))
+               (let ((buffer (make-array block-size :element-type '(unsigned-byte 8)))
+                     (total 0))
+                 (unless (file-position stream 0) (error "cannot seek logical spool"))
+                 (dotimes (index (logical-spool-count spool))
+                   (let* ((length (logical-spool-read-u32 stream))
+                          (expected (logical-spool-read-u32 stream))
+                          (crc #xffffffff))
+                     (unless (and (plusp length) (<= (+ total length) (logical-spool-bytes spool)))
+                       (error "invalid logical spool event length"))
+                     (funcall start-function length)
+                     (loop for remaining = length then (- remaining n)
+                           while (plusp remaining)
+                           for n = (min remaining block-size)
+                           do (unless (= (read-sequence buffer stream :end n) n)
+                                (error "truncated logical spool event"))
+                              (loop for i below n for byte = (aref buffer i)
+                                    do (setf crc (logxor (ash crc -8)
+                                                         (aref *wal-crc32-table*
+                                                               (logand (logxor crc byte) #xff)))))
+                              (funcall block-function buffer 0 n))
+                     (unless (= (logxor crc #xffffffff) expected)
+                       (error "logical spool checksum mismatch"))
+                     (incf total length)
+                     (funcall end-function)))
+                 (unless (and (= total (logical-spool-bytes spool)) (null (read-byte stream nil nil)))
+                   (error "invalid logical spool contents"))))
+           (setf complete t))
+      (unless complete (setf (logical-spool-failed-p spool) t))))
+  (values))
+
 (defstruct logical-spool-wal-plan spool mode count)
 
 (defun logical-preflight-spool (spool)
@@ -210,16 +257,18 @@ The caller must not mutate EVENT after passing it to this function."
         (fragment-limit (- +wal-segment-size+ +wal-header-size+
                            +logical-fragment-header-size+))
         (chunk-bytes 0) (chunks 0) (fragments 0) (fragment-p nil))
-    (logical-spool-map-events
+    (logical-spool-map-event-blocks
      spool
-     (lambda (event)
-       (let ((entry (+ 4 (length event))))
-         (incf fragments (ceiling (length event) fragment-limit))
+     (lambda (size)
+       (let ((entry (+ 4 size)))
+         (incf fragments (ceiling size fragment-limit))
          (when (> entry payload-limit) (setf fragment-p t))
          (when (and (plusp chunk-bytes) (> (+ chunk-bytes entry) payload-limit))
            (incf chunks)
            (setf chunk-bytes 0))
-         (incf chunk-bytes entry))))
+         (incf chunk-bytes entry)))
+     (lambda (buffer start end) (declare (ignore buffer start end)))
+     (lambda ()))
     (when (plusp chunk-bytes) (incf chunks))
     (let ((count (if fragment-p fragments chunks)))
       (unless (<= 1 count #xffffffff) (error "invalid logical WAL chunk count"))
@@ -228,39 +277,61 @@ The caller must not mutate EVENT after passing it to this function."
                                    :count count))))
 
 (defun logical-append-spool-wal (xid plan)
-  "Append a preflighted spool while retaining at most a bounded record's events.
+  "Append a preflighted spool with bounded event and WAL record buffers.
 A second read failure is a WAL critical-section failure, like other WAL I/O."
   (let ((spool (logical-spool-wal-plan-spool plan))
         (count (logical-spool-wal-plan-count plan))
         (index 0))
     (ecase (logical-spool-wal-plan-mode plan)
       (:fragment
-       (let ((limit (- +wal-segment-size+ +wal-header-size+ +logical-fragment-header-size+)))
-         (logical-spool-map-events
+       (let ((limit (- +wal-segment-size+ +wal-header-size+ +logical-fragment-header-size+))
+             (total 0) (offset 0) (used 0) (fragment nil))
+         (logical-spool-map-event-blocks
           spool
-          (lambda (event)
-            (loop for start from 0 below (length event) by limit
-                  for end = (min (length event) (+ start limit))
-                  for fragment = (make-logical-fragment :event event :start start :end end)
-                  do (wal-append-record +wal-record-logical-changes+ xid
-                                        (logical-encode-fragment index count fragment))
-                     (incf index))))))
+          (lambda (size) (setf total size offset 0 used 0 fragment nil))
+          (lambda (buffer start end)
+            (loop while (< start end)
+                  do (unless fragment
+                       (setf fragment (make-array (min limit (- total offset))
+                                                  :element-type '(unsigned-byte 8))
+                             used 0))
+                     (let ((n (min (- end start) (- (length fragment) used))))
+                       (replace fragment buffer :start1 used :start2 start :end2 (+ start n))
+                       (incf used n)
+                       (incf start n))
+                     (when (= used (length fragment))
+                       (wal-append-record +wal-record-logical-changes+ xid
+                                          (logical-encode-fragment-bytes index count total offset fragment))
+                       (incf index)
+                       (incf offset used)
+                       (setf fragment nil))))
+          (lambda ()
+            (unless (and (= offset total) (null fragment))
+              (error "incomplete logical WAL fragment"))))))
       (:legacy
        (let ((limit (- +wal-segment-size+ +wal-header-size+ +logical-change-chunk-header-size+))
-             (bytes 0) (events '()))
+             (bytes 0) (events '()) (current nil) (offset 0))
          (flet ((flush-chunk ()
                   (when events
                     (wal-append-record +wal-record-logical-changes+ xid
                                        (logical-encode-chunk index count (nreverse events)))
                     (incf index)
                     (setf events nil bytes 0))))
-           (logical-spool-map-events
+           (logical-spool-map-event-blocks
             spool
-            (lambda (event)
-              (let ((entry (+ 4 (length event))))
+            (lambda (size)
+              (let ((entry (+ 4 size)))
+                (when (> entry limit) (error "logical WAL spool plan changed during commit"))
                 (when (and events (> (+ bytes entry) limit)) (flush-chunk))
-                (push event events)
-                (incf bytes entry))))
+                (incf bytes entry)
+                (setf current (make-array size :element-type '(unsigned-byte 8)) offset 0)))
+            (lambda (buffer start end)
+              (replace current buffer :start1 offset :start2 start :end2 end)
+              (incf offset (- end start)))
+            (lambda ()
+              (unless (= offset (length current)) (error "incomplete logical WAL event"))
+              (push current events)
+              (setf current nil)))
            (flush-chunk)))))
     (unless (= index count) (error "logical WAL spool plan changed during commit")))
   (values))

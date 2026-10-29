@@ -856,6 +856,57 @@
         (close-logical-spool spool)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest test-logical-spool-bounded-block-reader
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-logical-blocks-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (event (make-array 1000 :element-type '(unsigned-byte 8)
+                                   :initial-contents (loop for i below 1000 collect (mod i 256))))
+           (second (make-array 513 :element-type '(unsigned-byte 8) :initial-element 42))
+           (spool (make-logical-spool))
+           (actual (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+           (starts '()) (ends 0) (maximum 0))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (logical-spool-append spool event)
+             (logical-spool-append spool second)
+             (logical-spool-seal spool)
+             (logical-spool-map-event-blocks
+              spool (lambda (size) (push size starts))
+              (lambda (bytes start end)
+                (setf maximum (max maximum (- end start)))
+                (loop for i from start below end do (vector-push-extend (aref bytes i) actual)))
+              (lambda () (incf ends)) :block-size 127)
+             (rove:ok (equal (nreverse starts) '(1000 513)))
+             (rove:ok (= ends 2))
+             (rove:ok (<= maximum 127))
+             (rove:ok (equalp actual (concatenate '(vector (unsigned-byte 8)) event second)))
+             (file-position (logical-spool-stream spool) 18)
+             (write-byte 99 (logical-spool-stream spool))
+             (finish-output (logical-spool-stream spool))
+             (rove:ok (handler-case
+                          (progn (logical-spool-map-event-blocks spool (lambda (size) (declare (ignore size)))
+                                                                 (lambda (bytes start end) (declare (ignore bytes start end)))
+                                                                 (lambda ()) :block-size 127) nil)
+                        (error (condition) (search "checksum mismatch" (princ-to-string condition)))))
+             (rove:ok (logical-spool-failed-p spool)))
+        (close-logical-spool spool)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-logical-fragment-payload-from-bounded-buffer
+    (let* ((event (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-contents (loop for i below 32 collect i)))
+           (fragment (make-logical-fragment :event event :start 3 :end 19))
+           (whole (logical-encode-fragment 1 3 fragment))
+           (bounded (logical-encode-fragment-bytes 1 3 32 3 (subseq event 3 19))))
+      (rove:ok (equalp whole bounded))
+      (multiple-value-bind (index count total offset bytes) (logical-decode-fragment bounded)
+        (rove:ok (equal (list index count total offset) '(1 3 32 3)))
+        (rove:ok (equalp bytes (subseq event 3 19))))))
+
 (rove:deftest test-logical-fragment-assembly
     (let* ((first (make-array 10 :element-type '(unsigned-byte 8)
                                  :initial-contents '(0 1 2 3 4 5 6 7 8 9)))

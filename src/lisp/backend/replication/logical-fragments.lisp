@@ -46,6 +46,25 @@ Reject oversized transactions before any WAL record is published."
           do (vector-push-extend (aref event position) buffer))
     buffer))
 
+(defun logical-encode-fragment-bytes (index count total offset bytes)
+  "Encode one fragment without retaining the other bytes of its event."
+  (let ((size (length bytes)))
+    (unless (and (integerp index) (integerp count) (<= 0 index) (< index count)
+                 (integerp total) (plusp total) (integerp offset) (not (minusp offset))
+                 (typep bytes '(vector (unsigned-byte 8))) (plusp size)
+                 (<= (+ offset size) total) (<= count #xffffffff) (<= total #xffffffff))
+      (error "invalid logical WAL fragment"))
+    (let ((buffer (make-array (+ +logical-fragment-header-size+ size)
+                              :element-type '(unsigned-byte 8))))
+      (wal-set-u32 buffer 0 +logical-fragment-tag+)
+      (wal-set-u32 buffer 4 index)
+      (wal-set-u32 buffer 8 count)
+      (wal-set-u32 buffer 12 total)
+      (wal-set-u32 buffer 16 offset)
+      (wal-set-u32 buffer 20 size)
+      (replace buffer bytes :start1 +logical-fragment-header-size+)
+      buffer)))
+
 (defun logical-fragment-payload-p (payload)
   "Recognize the reserved fragment tag, which cannot be a valid legacy index."
   (and (>= (length payload) 4)
