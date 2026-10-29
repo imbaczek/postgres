@@ -114,6 +114,20 @@ run -c 'insert into toast_cte_result with q as not materialized (select v from t
 run -c 'insert into toast_cte_result with q as materialized (select v from toast_inline_build) select a.v from q a join q b on a.v=b.v' >/dev/null
 [ "$(run -c 'select count(*) from toast_cte_result where length(v)=20000')" = 3 ]
 [ "$(run -c "select count(*) from toast_cte_result where v='short'")" = 2 ]
+run -c 'create table toast_recursive_result (v text)' >/dev/null
+run -c 'alter table toast_recursive_result alter column v set storage plain' >/dev/null
+run -c 'insert into toast_recursive_result with recursive q(v,n) as (select v,1 from toast_inline_build union all select v,n+1 from q where n<3) select v from q' >/dev/null
+[ "$(run -c 'select count(*) from toast_recursive_result where length(v)=20000')" = 3 ]
+[ "$(run -c "select count(*) from toast_recursive_result where v='short'")" = 3 ]
+run -c 'insert into toast_recursive_result with recursive q(v) as (select v from toast_inline_build union select v from q) select v from q' >/dev/null
+[ "$(run -c 'select count(*) from toast_recursive_result where length(v)=20000')" = 4 ]
+if run -v VERBOSITY=verbose -c "insert into toast_recursive_result with recursive q(v,n) as (select v,1 from toast_inline_build union all select v || '',n+1 from q where n<2) select v from q" >"$TMP/recursive-computed.out" 2>&1; then
+    echo 'toast-dml: computed recursive datum retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/recursive-computed.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: computed recursive datum did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 if run -v VERBOSITY=verbose -c "insert into toast_cte_result with q as materialized (select v || '' as v from toast_inline_build) select v from q" >"$TMP/cte-computed.out" 2>&1; then
     echo 'toast-dml: computed CTE datum retained compression' >&2; exit 1
 fi

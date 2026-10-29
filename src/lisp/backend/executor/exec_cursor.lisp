@@ -109,11 +109,19 @@
            (let ((arm (pop remaining)))
              (setf coercions (first arm)
                    input (make-physical-plan-iterator (second arm) relations))))
-         (multiple-value-bind (row present) (sql-iterator-next input)
+         (multiple-value-bind (row present origins) (sql-iterator-next input)
            (if present
-               (let ((values (map 'vector (lambda (expression) (eval-expr expression (car row)))
-                                  coercions)))
-                 (return (values (cons values values) t)))
+               (let ((values (make-array (length coercions)))
+                     (result-origins (and *datum-origin-capture*
+                                          (make-array (length coercions) :initial-element nil))))
+                 (loop for expression in coercions for i from 0
+                       do (multiple-value-bind (value origin)
+                              (if *datum-origin-capture*
+                                  (eval-expr-with-origin expression (car row) origins)
+                                  (values (eval-expr expression (car row)) nil))
+                            (setf (aref values i) value)
+                            (when result-origins (setf (aref result-origins i) origin))))
+                 (return (values (cons values values) t result-origins)))
                (progn (close-sql-iterator input) (setf input nil))))))
      (lambda () (close-sql-iterator input)))))
 

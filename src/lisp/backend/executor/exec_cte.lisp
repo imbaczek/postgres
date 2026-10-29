@@ -155,15 +155,15 @@
          (loop
            (when done (return (values nil nil)))
            (unless input (open-input))
-           (multiple-value-bind (row present)
+           (multiple-value-bind (row present origins)
                (let ((*recursive-cte-worktables* (worktables))
                      (*recursive-cte-generation-caches* (generation-caches)))
                  (sql-iterator-next input))
              (if present
                  (let ((values (car row)))
                    (when (or all-p (recursive-cte-seen-new-p seen (recursive-cte-seen-key values targets)))
-                     (append-query-replay-row (if recursing intermediate working) values)
-                     (return (values row t))))
+                     (append-query-replay-row (if recursing intermediate working) values origins)
+                     (return (values row t origins))))
                  (next-generation)))))
        (lambda ()
          (unwind-protect (unwind-protect (close-input) (close-recursive-cte-generation generation-cache))

@@ -1356,14 +1356,14 @@ on an abnormal exit."
                      :stop))))
       (when stopped-p (return :stop)))))
 
-(defun simple-datum-origin-plan-p (node &optional relations iterator-p)
+(defun simple-datum-origin-plan-p (node &optional relations iterator-p worktable)
   "Recognize plans whose execution retains detached row origins."
   (case (first node)
-    ((:seq-scan :index-scan) t)
+    ((:result :seq-scan :index-scan) t)
     ((:filter :project :sort :limit)
-     (simple-datum-origin-plan-p (third node) relations iterator-p))
-    (:top-n (simple-datum-origin-plan-p (fourth node) relations iterator-p))
-    (:subquery-scan (simple-datum-origin-plan-p (fourth node) relations iterator-p))
+     (simple-datum-origin-plan-p (third node) relations iterator-p worktable))
+    (:top-n (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
+    (:subquery-scan (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
     (:nested-loop-join
      (and (not iterator-p)
           (simple-datum-origin-plan-p (third node) relations)
@@ -1380,6 +1380,13 @@ on an abnormal exit."
             (and plan
                  (simple-datum-origin-plan-p (query-plan-physical plan)
                                              (subquery-registered-relations plan) t)))))
+    (:recursive-union
+     (and iterator-p
+          (simple-datum-origin-plan-p (third node) relations t (second node))
+          (simple-datum-origin-plan-p (fourth node) relations t (second node))))
+    (:worktable-scan
+     (and iterator-p worktable relations
+          (eq (getf (physical-scan-relation node relations) :cte) worktable)))
     (otherwise nil)))
 
 (defun execute-physical-plan-node (node registered-relations outer-environment
