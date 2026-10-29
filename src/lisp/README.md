@@ -223,6 +223,9 @@ text: `object`, `array`, `string`, `number`, `boolean`, or `null`.
 top-level array elements as an integer; objects and scalars raise SQLSTATE
 `22023`. All four return SQL NULL for SQL NULL input. JSON null is a JSON
 scalar, so its type is the text `null` and it is not an array.
+JSONB `||` merges top-level objects with right-hand keys winning. Otherwise it
+concatenates arrays, treating each non-array root as a single element. The merge
+is not recursive. Generated values obey the 512-level nesting limit.
 
 Decimal literals and numeric casts support finite values; numeric casts also
 accept NaN, infinities, and signed hexadecimal, octal, and binary integer input
@@ -853,6 +856,7 @@ cd src/lisp
 ./t/logical-replication.sh # exported snapshot, row/DDL/sequence stream, restart recovery
 ./t/logical-large-json.sh # fragmented external JSON/JSONB capture, apply, and restarts
 ./t/logical-large-bytea.sh # exact external bytea, fragmented replication, and restarts
+./t/logical-unchanged-toast.sh # retained marker replay after source crash and subscriber resume
 ./t/logical-private-metadata-ddl.sh # rejects replicated DDL targeting subscriber metadata
 ./t/index-stress.sh       # repeated updates to one unique value (slow; UPDATES=n to tune)
 ./t/hot-reload.sh         # SIGHUP reloads code in a running server

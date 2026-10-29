@@ -150,6 +150,38 @@ TEXT-P requests the text form, for which JSON null becomes SQL NULL."
 (defun jsonb-array-value-p (value)
   (and (vectorp value) (not (stringp value))))
 
+(defun sql-jsonb-concat (left right)
+  "Concatenate JSONB roots as IteratorConcat does, preserving immutable inputs."
+  (let* ((a (sql-jsonb-value left)) (b (sql-jsonb-value right))
+                                    (value
+                                      (if (and (jsonb-object-value-p a) (jsonb-object-value-p b))
+                                          (let ((left-pairs (cdr a)) (right-pairs (cdr b)) (result nil))
+                                            (loop while (and left-pairs right-pairs)
+                                                  for left-key = (caar left-pairs)
+                                                  for right-key = (caar right-pairs)
+                                                  do (cond ((string= left-key right-key)
+                                                            (push (pop right-pairs) result) (pop left-pairs))
+                                                           ((sql-jsonb-key-less-p left-key right-key)
+                                                            (push (pop left-pairs) result))
+                                                           (t (push (pop right-pairs) result))))
+                                            (dolist (pair left-pairs) (push pair result))
+                                            (dolist (pair right-pairs) (push pair result))
+                                            (cons :object (nreverse result)))
+                                          (concatenate 'vector
+                                                       (if (jsonb-array-value-p a) a (vector a))
+                                                       (if (jsonb-array-value-p b) b (vector b))))))
+    ;; A wrapped scalar/object can add a level. Keep generated values readable
+    ;; by the same JSONB input and logical-WAL paths.
+    (let ((pending (list (cons value 0))))
+      (loop while pending
+            for (item . depth) = (pop pending)
+            do (when (> depth 512) (ereport "54001" "JSON nesting exceeds supported depth"))
+               (cond ((jsonb-object-value-p item)
+                      (dolist (pair (cdr item)) (push (cons (cdr pair) (1+ depth)) pending)))
+                     ((jsonb-array-value-p item)
+                      (loop for child across item do (push (cons child (1+ depth)) pending))))))
+    (make-sql-jsonb value)))
+
 (defun jsonb-scalar-equal-p (left right)
   "Compare JSONB scalar values, preserving type and ignoring numeric scale."
   (cond ((and (sql-numeric-p left) (sql-numeric-p right))

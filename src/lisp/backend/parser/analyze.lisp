@@ -2060,6 +2060,15 @@ are supported."
 
 (defun analyze-text-concatenation (left right)
   "Resolve textcat and text/anynonarray overloads without treating arrays as text."
+  (when (and (or (and (eq (expr-type left) :jsonb) (not (in-unknown-constant-p left)))
+                 (and (eq (expr-type right) :jsonb) (not (in-unknown-constant-p right))))
+             (every (lambda (argument)
+                      (or (in-unknown-constant-p argument)
+                          (eq (expr-type argument) :jsonb)))
+                    (list left right)))
+    (return-from analyze-text-concatenation
+      (list :concat (coerce-common-expression left :jsonb)
+            (coerce-common-expression right :jsonb) :type :jsonb :typmod -1)))
   (when (and (or (and (eq (expr-type left) :bytea) (not (in-unknown-constant-p left)))
                  (and (eq (expr-type right) :bytea) (not (in-unknown-constant-p right))))
              (every (lambda (argument)
@@ -2074,7 +2083,8 @@ are supported."
   (when (some (lambda (argument) (or (eq (expr-type argument) :int2vector)
                                      (sql-array-element-type (expr-type argument))))
               (list left right))
-    (if (or (eq (expr-type left) :bytea) (eq (expr-type right) :bytea))
+    (if (or (member (expr-type left) '(:bytea :jsonb))
+            (member (expr-type right) '(:bytea :jsonb)))
         (report-operator-resolution-error "||" (list left right))
         (ereport "0A000" "array concatenation is not implemented")))
   (unless (some (lambda (argument) (sql-implicit-coercion-p (expr-type argument) :text))
@@ -3973,9 +3983,10 @@ truncate and interpret the result at TYPE's signed width."
     (:concat
      (sql-strict-let ((left (eval-expr (second expr) env))
                       (right (eval-expr (third expr) env)))
-       (if (eq (expr-type expr) :bytea)
-           (sql-bytea-concat left right)
-           (concatenate 'string left right))))
+       (case (expr-type expr)
+         (:bytea (sql-bytea-concat left right))
+         (:jsonb (sql-jsonb-concat left right))
+         (otherwise (concatenate 'string left right)))))
     (:binop
      (let ((op (second expr))
            (l (eval-expr (third expr) env))
