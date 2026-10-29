@@ -301,7 +301,7 @@ long_bytes=$(awk 'BEGIN { for (i=0;i<1500;i++) printf "00ff" }')
 sql "$SOURCE_PORT" "UPDATE nullable_rows SET label = '\\x$long_bytes' WHERE nullable_key = 2" >/dev/null
 sql "$SOURCE_PORT" "UPDATE nullable_rows SET j = '{\"k\":\"$long_text\", \"k\":2}' WHERE nullable_key = 2" >/dev/null
 sql "$SOURCE_PORT" "UPDATE nullable_rows SET b = '{\"v\":\"$long_text\",\"v\":\"$long_text\"}' WHERE nullable_key = 2" >/dev/null
-long_numeric=$(awk 'BEGIN { s=1; printf "7"; for (i=1;i<8000;i++) { s=(s*1664525+1013904223)%4294967296; printf "%d", int(s/16777216)%10 } }')
+long_numeric=$(awk 'BEGIN { s=1; printf "7"; for (i=1;i<20000;i++) { s=(s*1664525+1013904223)%4294967296; printf "%d", int(s/16777216)%10 } }')
 sql "$SOURCE_PORT" "UPDATE nullable_rows SET n = '$long_numeric'::numeric WHERE nullable_key = 2" >/dev/null
 
 # Isolate the failed initial-copy slot on a disposable publisher. Its exported

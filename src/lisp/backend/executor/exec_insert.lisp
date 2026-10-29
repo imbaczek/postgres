@@ -183,9 +183,7 @@ can claim an ON CONFLICT tuple or ask the released-lock loop to wait."
                   ((eq check :ok)
                    (let* ((columns (pg-class-columns table))
                           (cid (backend-command-id *backend*))
-                          (physical (if toast
-                                        (toast-externalize-tuple-unlocked toast values columns xid cid)
-                                        values)))
+                          (physical (toast-externalize-tuple-unlocked toast values columns xid cid)))
                      (multiple-value-bind (block off)
                          (heapam-insert relfilenode columns physical xid cid)
                        (dolist (idx indexes)

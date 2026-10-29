@@ -22,8 +22,10 @@ run() {
 }
 test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
-big=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "a" }')
-other=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "b" }')
+# Keep the long text incompressible so snapshot and deletion checks exercise
+# external TOAST chunks as well as the separate inline-compression cases below.
+big=$(awk 'BEGIN { s=1; for (i=0;i<3000;i++) { s=(s*1664525+1013904223)%4294967296; printf "%c", 97+int(s/16777216)%26 } }')
+other=$(awk 'BEGIN { s=2; for (i=0;i<3000;i++) { s=(s*1664525+1013904223)%4294967296; printf "%c", 97+int(s/16777216)%26 } }')
 json_value=" { \"key\": \"$big\", \"key\": 2 } "
 jsonb_value=" { \"key\": 2, \"long\": \"$big\", \"key\": 3 } "
 run -c 'create table toast_jsonb (id int primary key, v jsonb)' >/dev/null
@@ -151,7 +153,7 @@ run -c 'begin; truncate toast_dml; rollback' >/dev/null
 run -c 'truncate toast_dml' >/dev/null
 [ -z "$(run -c 'select id from toast_dml')" ]
 run -c 'vacuum toast_dml' >/dev/null
-numeric_big=$(awk 'BEGIN { s=1; printf "7"; for (i=1;i<8000;i++) { s=(s*1664525+1013904223)%4294967296; printf "%d", int(s/16777216)%10 } }')
+numeric_big=$(awk 'BEGIN { s=1; printf "7"; for (i=1;i<20000;i++) { s=(s*1664525+1013904223)%4294967296; printf "%d", int(s/16777216)%10 } }')
 numeric_repeat=$(awk 'BEGIN { for (i=0;i<20000;i++) printf "1" }')
 run -c 'create table vacuum_inline_text (v text)' >/dev/null
 run -c "insert into vacuum_inline_text values ('$numeric_repeat')" >/dev/null
@@ -166,7 +168,7 @@ numeric_toast_oid=$(run -c "select reltoastrelid from pg_class where relname = '
 [ "$(run -c "select a.attstorage from pg_attribute a join pg_class c on a.attrelid = c.oid where c.relname = 'toast_numeric' and a.attname = 'v'")" = m ]
 [ "$(run -c "select count(*) from pg_type where typname in ('text','bytea','json','jsonb','numeric')")" = 5 ]
 run -c "insert into toast_numeric values (1, '$numeric_big'::numeric), (2, '$numeric_repeat'::numeric), (3, 'NaN'::numeric)" >/dev/null
-[ "$(run -c 'select length(v::text) from toast_numeric where id = 1')" = 8000 ]
+[ "$(run -c 'select length(v::text) from toast_numeric where id = 1')" = 20000 ]
 [ "$(run -c "select v = '$numeric_big'::numeric from toast_numeric where id = 1")" = t ]
 [ "$(run -c "select v = '$numeric_repeat'::numeric from toast_numeric where id = 2")" = t ]
 [ "$(run -c 'select v from toast_numeric where id = 3')" = NaN ]
@@ -184,7 +186,7 @@ test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
 [ "$(run -c "select v = '$numeric_big'::numeric from toast_numeric where id = 1")" = t ]
 [ "$(run -c 'select length(v::text) from toast_numeric where id = 2')" = 20000 ]
 [ "$(run -c "select v = '$numeric_repeat'::numeric from toast_numeric where id = 2")" = t ]
-[ "$(run -c 'delete from toast_numeric where id = 1 returning length(v::text)')" = 8000 ]
+[ "$(run -c 'delete from toast_numeric where id = 1 returning length(v::text)')" = 20000 ]
 run -c 'drop table toast_numeric' >/dev/null
 [ "$(run -c "select count(*) from pg_class where oid = $numeric_toast_oid")" = 0 ]
 [ "$(run -c "select count(*) from pg_attribute where attrelid = $numeric_toast_oid")" = 0 ]

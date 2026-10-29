@@ -192,6 +192,8 @@ Table columns support `smallint`/`int2`, `int`/`integer`/`int4`, `bigint`/`int8`
 zone, `interval`, `varchar` / `character varying`, `text`, `bytea`, `json`,
 and `jsonb`. Unbounded variable-width values, including `numeric`, can use
 inline compression or the table's TOAST storage when needed.
+TOAST selection treats `numeric` as `MAIN` and text, varchar, bytea, JSON and
+JSONB as `EXTENDED`; per-column storage overrides are not implemented.
 
 Decimal literals and numeric casts support finite values; numeric casts also
 accept NaN, infinities, and signed hexadecimal, octal, and binary integer input

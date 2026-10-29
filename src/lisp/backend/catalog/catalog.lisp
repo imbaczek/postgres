@@ -1513,44 +1513,10 @@ The OID encoding alone is a byte prefix of every key for that value."
     (- space (mod space +maxalign+)))
   "Default target heap tuple size, based on four tuples per page.")
 
-(defun toast-externalization-plan (values columns &optional (target +toast-tuple-target+))
-  "Select inline varchar, text, json, jsonb, bytea and numeric attributes to externalize.
-Return (index . raw-payload) pairs in largest-first order; VALUES and COLUMNS are
-unchanged. Storage may subsequently compress each selected payload. Payloads may
-alias inline bytea values and must remain stable until used. The target is a goal,
-not a guarantee: selection stops when the tuple fits or no eligible value exceeds
-the external-pointer size threshold. Existing external descriptors are left alone.
-Per-column storage policies and other variable-width types are not supported."
-  (let ((physical (copy-seq values))
-        (selected nil)
-        (cached-varlena nil))
-    (loop
-      (multiple-value-bind (size offsets encoded infomask)
-          (heap-tuple-layout physical columns cached-varlena)
-        (declare (ignore offsets infomask))
-        (setf cached-varlena encoded)
-        (when (<= size target) (return (nreverse selected)))
-        (let ((best nil)
-              (best-size (maxalign (+ 4 +external-varlena-fixed-size+))))
-          (loop for i below (length columns)
-                for value = (aref physical i)
-                for type = (pg-column-type (aref columns i))
-                when (and (member type '(:varchar :text :json :jsonb :bytea :numeric))
-                          (not (eq value +null+))
-                          (not (heap-external-varlena-p value)))
-                  do (let* ((payload (aref encoded i))
-                            (payload-size (length payload))
-                            (size (+ payload-size (if (<= payload-size 126) 1 4))))
-                       (when (> size best-size)
-                         (setf best i best-size size))))
-          (unless best (return (nreverse selected)))
-          (let* ((payload (aref encoded best))
-                 (length (length payload)))
-            (push (cons best payload) selected)
-            (setf (aref physical best)
-                  (make-heap-external-varlena :raw-size (+ length 4)
-                                              :external-info length
-                                              :value-id 1 :relation-id 1 :id-width 4))))))))
+(defconstant +toast-tuple-target-main+
+  (let ((space (- +blcksz+ (maxalign (+ +size-of-page-header+ +size-of-item-id+)))))
+    (- space (mod space +maxalign+)))
+  "Largest heap tuple target used before externalizing MAIN attributes.")
 
 (defun toast-allocate-value-id-unlocked (toast)
   "Choose an unused nonzero OID in TOAST while its index and *WRITE-LOCK* are held.
@@ -1638,81 +1604,93 @@ chunks are copied. Abort the transaction after any partial write."
                                 :external-info (length payload) :value-id value-id
                                 :relation-id (pg-toast-oid toast) :id-width 4)))
 
-(defun toast-compress-inline-values (values columns &optional (target +toast-tuple-target+))
-  "Return a physical copy of VALUES with largest eligible values compressed.
-Attempt each attribute at most once and stop once the tuple fits TARGET."
-  (let ((physical (copy-seq values))
-        (attempted (make-array (length columns) :initial-element nil))
-        (cached nil))
-    (loop
-      (multiple-value-bind (size offsets encoded infomask)
-          (heap-tuple-layout physical columns cached)
-        (declare (ignore offsets infomask))
-        (setf cached encoded)
-        (when (<= size target) (return physical))
-        (let ((best nil) (best-size (maxalign (+ 4 +external-varlena-fixed-size+))))
-          (loop for i below (length columns)
-                for value = (aref physical i)
-                for type = (pg-column-type (aref columns i))
-                when (and (member type '(:varchar :text :json :jsonb :bytea :numeric))
-                          (not (eq value +null+))
-                          (not (heap-external-varlena-p value))
-                          (not (aref attempted i)))
-                  do (let ((length (length (aref encoded i))))
-                       (when (> (+ length 4) best-size)
-                         (setf best i best-size (+ length 4)))))
-          (unless best (return physical))
-          (setf (aref attempted best) t)
-          (let* ((raw (aref encoded best))
-                 (compressed (toast-compressed-payload raw)))
-            ;; toast_compress_datum requires space savings after header/alignment.
-            (when (and compressed (< (+ 4 (length compressed)) (- (length raw) 2)))
-              (setf (aref physical best) (make-heap-compressed-varlena :payload compressed)
-                    (aref cached best) nil))))))))
-
-(defun toast-compressed-externalization-plan (values columns &optional (target +toast-tuple-target+))
-  "Return attribute indexes to externalize, accounting for inline compression."
-  (let ((physical (copy-seq values))
-        (selected nil)
-        (cached nil))
-    (loop
-      (multiple-value-bind (size offsets encoded infomask)
-          (heap-tuple-layout physical columns cached)
-        (declare (ignore offsets infomask))
-        (setf cached encoded)
-        (when (<= size target) (return (nreverse selected)))
-        (let ((best nil) (best-size (maxalign (+ 4 +external-varlena-fixed-size+))))
-          (loop for i below (length columns)
-                for value = (aref physical i)
-                for type = (pg-column-type (aref columns i))
-                when (and (member type '(:varchar :text :json :jsonb :bytea :numeric))
-                          (not (eq value +null+))
-                          (not (heap-external-varlena-p value)))
-                  do (let* ((length (length (aref encoded i)))
-                            (size (+ length
-                                     (if (and (not (heap-compressed-varlena-p value))
-                                              (<= length 126))
-                                         1 4))))
-                       (when (> size best-size)
-                         (setf best i best-size size))))
-          (unless best (return (nreverse selected)))
-          (push best selected)
-          ;; The placeholder has the same physical size as an OID pointer.
-          (setf (aref physical best)
-                (make-heap-external-varlena :raw-size 5 :external-info 1
-                                            :value-id 1 :relation-id 1 :id-width 4)))))))
+(defun toast-plan-tuple (values columns &key (external-p t))
+  "Plan EXTENDED and MAIN compression and externalization phases.
+Numeric uses MAIN; varchar, text, JSON, JSONB and bytea use EXTENDED. Per-column
+storage overrides are not supported. Return physical values and selected indexes;
+selected values contain placeholder pointers that the caller must replace.
+VALUES remains unchanged; EXTERNAL-P says whether the relation has a TOAST table."
+  (let* ((physical (copy-seq values))
+         (attempted (make-array (length columns) :initial-element nil))
+         (selected nil)
+         (cached nil)
+         (header (maxalign (+ +size-of-heap-tuple-header+ (ceiling (length columns) 8))))
+         (max-data (- +toast-tuple-target+ header)))
+    (labels ((layout ()
+               (multiple-value-bind (size offsets encoded mask)
+                   (heap-tuple-layout physical columns cached)
+                 (declare (ignore offsets mask))
+                 (setf cached encoded)
+                 size))
+             (size-at (i)
+               (let* ((value (aref physical i))
+                      (size (length (aref cached i))))
+                 (+ size (if (and (not (heap-compressed-varlena-p value))
+                                  (<= size 126)) 1 4))))
+             (candidate (main-p compress-p)
+               (let ((best nil) (best-size (maxalign (+ 4 +external-varlena-fixed-size+))))
+                 (loop for i below (length columns)
+                       for value = (aref physical i)
+                       for type = (pg-column-type (aref columns i))
+                       when (and (member type '(:varchar :text :json :jsonb :bytea :numeric))
+                                 (eq (eq type :numeric) main-p)
+                                 (not (eq value +null+))
+                                 (not (heap-external-varlena-p value))
+                                 (or (not compress-p)
+                                     (and (not (aref attempted i))
+                                          (not (heap-compressed-varlena-p value)))))
+                         do (let ((size (size-at i)))
+                              (when (> size best-size)
+                                (setf best i best-size size))))
+                 best))
+             (compress-value (index)
+               (setf (aref attempted index) t)
+               (let* ((raw (aref cached index))
+                      (compressed (toast-compressed-payload raw)))
+                 (when (and compressed (< (+ 4 (length compressed)) (- (length raw) 2)))
+                   (setf (aref physical index) (make-heap-compressed-varlena :payload compressed)
+                         (aref cached index) nil))))
+             (externalize (index)
+               (push index selected)
+               (setf (aref physical index)
+                     (make-heap-external-varlena :raw-size 5 :external-info 1
+                                                 :value-id 1 :relation-id 1 :id-width 4))))
+      ;; Phase 1: EXTENDED compression, with immediate externalization of an
+      ;; individual value that still exceeds the normal data target.
+      (loop while (> (layout) +toast-tuple-target+)
+            for best = (candidate nil t)
+            while best
+            do (compress-value best)
+               (layout)
+               (when (and external-p (> (size-at best) max-data))
+                 (externalize best)))
+      ;; Phase 2: move remaining EXTENDED values to TOAST.
+      (when external-p
+        (loop while (> (layout) +toast-tuple-target+)
+              for best = (candidate nil nil)
+              while best do (externalize best)))
+      ;; Phase 3: try compression of MAIN values.
+      (loop while (> (layout) +toast-tuple-target+)
+            for best = (candidate t t)
+            while best do (compress-value best))
+      ;; Phase 4: move MAIN values only above the page-derived MAIN target.
+      (when external-p
+        (loop while (> (layout) +toast-tuple-target-main+)
+              for best = (candidate t nil)
+              while best do (externalize best)))
+      (values physical (nreverse selected)))))
 
 (defun toast-externalize-tuple-unlocked (toast values columns xid cid)
   "Return a physical copy of VALUES, compressing inline or storing in TOAST.
-The caller must hold the TOAST index writer lock before acquiring *WRITE-LOCK*
-and keep both held for this call; this function does not acquire either lock.
+The caller holds *WRITE-LOCK* and, when TOAST is present, its index writer
+lock acquired first. This function does not acquire either lock.
 Abort XID after any error once storage begins. VALUES remains suitable for SQL
 index keys, RETURNING, and replication. The planner may leave the tuple above
 its target. Selected external payloads use PGLZ when it meets the size threshold."
-  (let ((physical (toast-compress-inline-values values columns)))
-    (when (> (heap-tuple-layout physical columns) +toast-tuple-target+)
+  (multiple-value-bind (physical indexes) (toast-plan-tuple values columns :external-p (not (null toast)))
+    (when indexes
       (let ((raw-payloads (nth-value 2 (heap-tuple-layout values columns))))
-        (dolist (index (toast-compressed-externalization-plan physical columns))
+        (dolist (index indexes)
           (setf (aref physical index)
                 (toast-store-value-unlocked toast (aref raw-payloads index)
                                             nil xid cid :compress t)))))
