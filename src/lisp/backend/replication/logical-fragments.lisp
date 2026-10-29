@@ -138,8 +138,8 @@ LIMIT bounds the total declared bytes across the batch before allocation."
             (:constructor make-logical-fragment-batch (limit)))
   limit xid count (next 0) assembler)
 
-(defun logical-fragment-batch-accept (batch xid payload)
-  "Validate one ordered fragment and decode a completed event if present."
+(defun logical-fragment-batch-accept (batch xid payload &key validate-only)
+  "Validate an ordered fragment; decode completed events unless VALIDATE-ONLY."
   (multiple-value-bind (index count total offset bytes) (logical-decode-fragment payload)
     (unless (and (integerp xid) (plusp xid))
       (error "logical row-change record has no transaction ID"))
@@ -153,7 +153,12 @@ LIMIT bounds the total declared bytes across the batch before allocation."
     (let* ((assembler (or (logical-fragment-batch-assembler batch)
                           (make-logical-fragment-assembler (logical-fragment-batch-limit batch))))
            (encoded (logical-assemble-event-fragment assembler total offset bytes))
-           (change (and encoded (logical-decode-change encoded))))
+           (change (and encoded
+                        (if validate-only
+                            (progn (logical-validate-change-from-cursor
+                                    (make-logical-cursor :bytes encoded))
+                                   nil)
+                            (logical-decode-change encoded)))))
       (when (and change (not (member (logical-change-kind change) '(:insert :update :delete :truncate))))
         (error "catalog event appears in a transactional row-change record"))
       (setf (logical-fragment-batch-assembler batch) assembler

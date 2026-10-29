@@ -976,6 +976,65 @@
         (close-logical-spool spool)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest test-logical-validation-utf8-matches-sbcl
+    (dolist (bytes '((0) (65 195 169) (240 159 153 130) (192 128) (224 128 128)
+                     (237 160 128) (244 144 128 128) (245 128 128 128)
+                     (226 130) (128) (255) (239 191 191)))
+      (let* ((vector (make-array (length bytes) :element-type '(unsigned-byte 8) :initial-contents bytes))
+             (reference (handler-case (stringp (sb-ext:octets-to-string vector :external-format :utf-8))
+                          (error () nil)))
+             (actual (handler-case (progn (logical-validate-utf8 (make-logical-cursor :bytes vector)
+                                                                 (length vector)) t)
+                       (error () nil))))
+        (rove:ok (eq actual reference)))))
+
+(rove:deftest test-logical-validation-discarded-fields
+    (dolist (case (list (list :text (concatenate 'string "ą🙂" (make-string 70000 :initial-element #\x)))
+                        (list :bytea (make-array 70000 :element-type '(unsigned-byte 8) :initial-element 255))))
+      (let* ((event (logical-test-change :insert 7 701 :new-values (vector 1 2 (second case)))))
+        (setf (getf (third (logical-change-columns event)) :type) (first case)
+              (getf (third (logical-change-columns event)) :typmod) -1)
+        (let* ((bytes (logical-encode-change event))
+               (cursor (make-logical-cursor :bytes bytes)))
+          (logical-validate-change-from-cursor cursor)
+          (rove:ok (= (logical-cursor-offset cursor) (length bytes)))
+          (rove:ok (equalp (logical-change-new-values (logical-decode-change bytes))
+                           (logical-change-new-values event)))))))
+
+(rove:deftest test-logical-recovery-validates-fragmented-values
+    (let* ((change (logical-test-change :insert 7 701 :new-values #(1 2 "abc")))
+           (good (logical-encode-change change))
+           (bad-utf8 (copy-seq good))
+           (bad-tag (copy-seq good))
+           (truncated (subseq good 0 (1- (length good))))
+           (binary (logical-test-change :insert 7 701
+                                        :new-values (vector 1 2 (make-array 3 :element-type '(unsigned-byte 8)
+                                                                              :initial-contents '(1 2 3)))))
+           (truncated-binary nil))
+      (setf (getf (third (logical-change-columns binary)) :type) :bytea
+            (getf (third (logical-change-columns binary)) :typmod) -1)
+      (let ((encoded (logical-encode-change binary)))
+        (setf truncated-binary (subseq encoded 0 (1- (length encoded)))))
+      (setf (aref bad-utf8 (1- (length bad-utf8))) #xff
+            (aref bad-tag (- (length bad-tag) 8)) 15)
+      (flet ((accepts (event)
+               (let* ((*wal-recovery-group-active* t)
+                      (*wal-recovery-logical-xid* nil)
+                      (*wal-recovery-logical-chunk-count* nil)
+                      (*wal-recovery-logical-next-chunk* 0)
+                      (*wal-recovery-logical-bytes* 0)
+                      (fragment (make-logical-fragment :event event :start 0 :end (length event)))
+                      (record (make-wal-record :type +wal-record-logical-changes+ :xid 55
+                                               :payload (logical-encode-fragment 0 1 fragment))))
+                 (handler-case (progn (wal-recovery-accept-logical-change-chunk record)
+                                      (wal-recovery-finish-logical-change-batch 55) t)
+                   (error () nil)))))
+        (rove:ok (accepts good))
+        (rove:ok (not (accepts bad-utf8)))
+        (rove:ok (not (accepts bad-tag)))
+        (rove:ok (not (accepts truncated)))
+        (rove:ok (not (accepts truncated-binary))))))
+
 (rove:deftest test-logical-fragment-assembly
     (let* ((first (make-array 10 :element-type '(unsigned-byte 8)
                                  :initial-contents '(0 1 2 3 4 5 6 7 8 9)))

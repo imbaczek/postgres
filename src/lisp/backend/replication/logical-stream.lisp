@@ -419,6 +419,46 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
 (defun logical-u64-signed (value)
   (if (logbitp 63 value) (- value #x10000000000000000) value))
 
+(defvar *logical-validation-only* nil)
+
+(defun logical-validate-utf8 (cursor count)
+  "Consume COUNT UTF-8 bytes, rejecting overlong, surrogate and out-of-range forms."
+  (logical-cursor-require cursor count)
+  (let ((end (+ (logical-cursor-offset cursor) count)))
+    (labels ((next-byte ()
+               (when (>= (logical-cursor-offset cursor) end)
+                 (error "truncated UTF-8 in logical row-change payload"))
+               (logical-read-u8 cursor))
+             (continuation (minimum maximum)
+               (let ((byte (next-byte)))
+                 (unless (<= minimum byte maximum)
+                   (error "invalid UTF-8 in logical row-change payload")))))
+      (loop while (< (logical-cursor-offset cursor) end)
+            for lead = (next-byte)
+            do (cond
+                 ((<= lead #x7f))
+                 ((<= #xc2 lead #xdf) (continuation #x80 #xbf))
+                 ((<= #xe0 lead #xef)
+                  (continuation (if (= lead #xe0) #xa0 #x80)
+                                (if (= lead #xed) #x9f #xbf))
+                  (continuation #x80 #xbf))
+                 ((<= #xf0 lead #xf4)
+                  (continuation (if (= lead #xf0) #x90 #x80)
+                                (if (= lead #xf4) #x8f #xbf))
+                  (continuation #x80 #xbf)
+                  (continuation #x80 #xbf))
+                 (t (error "invalid UTF-8 in logical row-change payload"))))))
+  (values))
+
+(defun logical-skip-value-octets (cursor count)
+  "Consume a length-prefixed binary value without retaining its bytes."
+  (logical-cursor-require cursor count)
+  (loop while (plusp count)
+        for size = (min count 65536)
+        do (logical-read-octets cursor size)
+           (decf count size))
+  (values))
+
 (defun logical-read-value (cursor type)
   "Decode a value, accepting tag 3 for text, varchar or json and tag 15 for
 length-prefixed bytea octets; reject mismatched column types. JSON text is not
@@ -434,9 +474,11 @@ revalidated by this codec."
        (logical-u64-signed (logical-read-u64 cursor)))
       (3 (unless (member type '(:varchar :text :json))
            (error "logical value tag does not match its column type"))
-       (sb-ext:octets-to-string
-        (logical-read-octets cursor (logical-read-u32 cursor))
-        :external-format :utf-8))
+       (let ((length (logical-read-u32 cursor)))
+         (if *logical-validation-only*
+             (progn (logical-validate-utf8 cursor length) "")
+             (sb-ext:octets-to-string (logical-read-octets cursor length)
+                                      :external-format :utf-8))))
       (4 (unless (eq type :numeric)
            (error "logical value tag does not match its column type"))
        (sql-numeric-input (logical-read-string-u32 cursor)))
@@ -465,7 +507,10 @@ revalidated by this codec."
        (sql-jsonb-input (logical-read-string-u32 cursor)))
       (15 (unless (eq type :bytea)
             (error "logical value tag does not match its column type"))
-       (logical-read-octets cursor (logical-read-u32 cursor)))
+       (let ((length (logical-read-u32 cursor)))
+         (if *logical-validation-only*
+             (progn (logical-skip-value-octets cursor length) #())
+             (logical-read-octets cursor length))))
       (13 (unless (eq type :timetz) (error "logical value tag does not match its column type"))
        (make-sql-timetz (logical-u64-signed (logical-read-u64 cursor))
                         (logical-u32-signed (logical-read-u32 cursor))))
@@ -586,6 +631,15 @@ revalidated by this codec."
 (defun logical-decode-change (bytes)
   "Decode a complete vector-backed logical WAL event."
   (logical-decode-change-from-cursor (make-logical-cursor :bytes bytes)))
+
+(defun logical-validate-change-from-cursor (cursor)
+  "Validate an event while discarding text and binary values during recovery.
+Other types retain their normal semantic checks and may allocate their values."
+  (let* ((*logical-validation-only* t)
+         (change (logical-decode-change-from-cursor cursor)))
+    (unless (member (logical-change-kind change) '(:insert :update :delete :truncate))
+      (error "catalog event appears in a transactional row-change record")))
+  (values))
 
 (defun logical-encode-catalog-event (database-oid ast)
   (let* ((text (catalog-readable-data-string
@@ -849,7 +903,8 @@ executor, so capture the same operation before transaction commit."
                        (make-logical-fragment-batch +max-logical-wal-transaction-bytes+))))
         (unless (logical-fragment-batch-p batch)
           (error "logical WAL batch mixes fragment and legacy records"))
-        (logical-fragment-batch-accept batch (wal-record-xid record) (wal-record-payload record))
+        (logical-fragment-batch-accept batch (wal-record-xid record) (wal-record-payload record)
+                                       :validate-only t)
         (setf *wal-recovery-logical-xid* batch
               *wal-recovery-logical-chunk-count* (logical-fragment-batch-count batch)
               *wal-recovery-logical-next-chunk* (logical-fragment-batch-next batch)
