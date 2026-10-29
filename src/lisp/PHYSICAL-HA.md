@@ -692,8 +692,8 @@ time as C does. Reserved positions use checked retained ancestry and eligible
 live timeline files. Physical slot validation permits parent files before the
 fork; private follow pins retain their stricter source-file requirement. Native
 rotation gaps need a complete predecessor record and a following record that
-could not fit. Standby loading is described below; promotion carryover remains
-open. A decoder's
+could not fit. Standby loading and subsequent promotion carryover are described
+below. A decoder's
 numeric validity alone does not prove WAL availability. The full physical suite
 passed 869 tests before the final predecessor-record and archive-prefix fixes.
 All 14 focused tests passed on the final source, as did 170 interop tests and
@@ -735,8 +735,8 @@ A separate pinned C standby probe confirms the replay bound with replay paused
 and newer WAL already received. Reservation remained below replay, an interior
 byte advance succeeded, and a future target clamped to replay. Evidence:
 `/tmp/pg-config-slot-probe.nWMDyQ/standby-slot-contract.log`.
-This completed internal standby loading. Public SQL and named native streaming
-followed; promotion carryover and standard Patroni follow remain open.
+This completed internal standby loading. Public SQL, named native streaming and
+bounded physical-slot promotion carryover followed; standard Patroni follow remains open.
 
 ### Public physical slot SQL checkpoint
 
@@ -767,7 +767,7 @@ its earlier save-loss-then-cleanup behavior. A validated generation and owner
 check authorizes captured backend termination; release after that claim does not
 revoke it. A self-owner receives FATAL outside locks before loss is saved.
 Named native physical streaming now owns a public slot alongside its distinct
-private proof pin. Standard follow configuration and promotion carryover remain open.
+private proof pin. Standard follow configuration remains open.
 
 A named START requires an existing usable physical slot and claims its exact
 generation; a temporary slot may be claimed by its creator. Resume proof alone
@@ -831,8 +831,33 @@ real native and C temporary-creator termination and slot deletion. The Patroni
 SlotsHandler oracle uses a transport adapter; it is not a full Patroni HA,
 election or follow acceptance test. Standard SIGHUP follow integration, libpq
 transport and unmodified `Postgresql.follow`/configuration writer acceptance
-remain open, as does physical-slot promotion carryover. There is no coordinator,
+remain open. There is no coordinator,
 DCS, routing or authority journal, and native WAL is not C disk-compatible.
+
+### Physical slots across promotion
+
+Live promotion requires a canonical physical-only disk inventory matching the
+live registry exactly. It compares durable fields after normalizing only
+`inactive_since`, retaining the existing slot objects and their creator and runtime
+ownership. Phase 2 uses the standby batch proof. Pending promotion after a crash
+validates the disk inventory and skips valid temporary orphans before identity and
+WAL checks, as their owners did not survive. Persistent slots must match system
+identity. Reserved floors must belong to parent history and lie at or before the
+fork; floors before the fork require retained WAL coverage. Null and lost slots
+need no WAL coverage.
+Without a retained root, only the copied fork segment is available;
+committed child WAL must contain the proven prefix. Cold primary startup registers
+the retained root before loading slots. Logical slots and private source pins keep
+their existing promotion restrictions.
+
+Live and pending/committed child crash wire tests preserved persistent floors and
+unreserved NULL state through timeline 3 and a primary crash; the committed-child
+test removed retired receive and restartpoint directories and the manifest.
+The live test included a temporary owner and repeatable-read reader. A fresh pinned
+C standby promotion oracle passed. The fresh full physical suite passed 962 tests,
+interop 185, legacy 1,155 checks and strict cold compilation passed. Standard
+`primary_conninfo`/`primary_slot_name` follow integration, libpq transport, first
+attachment and same-timeline follow, and unmodified Patroni follow acceptance remain open.
 
 ### Historical WAL retention implementation order
 

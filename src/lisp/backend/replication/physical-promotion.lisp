@@ -349,7 +349,8 @@ handoff.  Failure during publication fences recovery."
 (declaim (ftype function physical-promotion-check-pending-slots))
 
 (defun physical-promotion-check-pending (state metadata prefix generation &key allow-history)
-  "Revalidate durable ownership; history publication ends prefix-install eligibility."
+  "Revalidate durable promotion ownership and persistent slot floors before the
+child state is published. History publication ends prefix-install eligibility."
   (let ((control (physical-recovery-read-control *pgdata*)))
     (unless (equal (getf state :retained-reference) (getf control :retained-reference))
       (error "retained promotion archive pending reference changed"))

@@ -1588,6 +1588,9 @@ using a separate private proof pin. Actual validated positive flush feedback
 updates the public slot; resume proof alone updates the private pin.
 Startup stabilizes slot and private source-pin files and inventories before
 restoring retention; a real power-cut recovery oracle remains open.
+Physical slots carry across supported live and crash-recovered promotion after
+inventory, identity and retained-prefix checks; logical slots and private source
+pins retain their existing promotion restrictions.
 Full generated Patroni
 configurations, recovery parameters, session GUC catalog coverage and control
 interfaces remain unfinished, as does C physical data compatibility; see

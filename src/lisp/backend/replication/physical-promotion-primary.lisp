@@ -155,9 +155,10 @@ allocation. All four values must be canonical counters or the exhaustion sentine
            (= floor (min +max-xid-one-past+ (xid-next-epoch-boundary actual))))))
 
 (defun physical-promotion-read-physical-slots (&key reconcile-live)
-  "Read a physical-only slot inventory without replacing live generations.
-Under promotion exclusion, reconcile durable fields when live slots are present.
-Inactivity time may differ because releasing a slot updates it only in memory."
+  "Read the canonical physical-only disk inventory under promotion exclusion.
+For live promotion require an exact registry match, normalizing only inactivity
+time before comparing durable fields. Return the existing objects so creator and
+runtime ownership survive; do not replace live generations."
   (let* ((directory (wal-replication-slot-directory))
          (entries (directory-entry-names directory))
          (paths (durable-state-file-paths directory "slot"))
@@ -184,9 +185,9 @@ Inactivity time may differ because releasing a slot updates it only in memory."
     slots))
 
 (defun physical-promotion-check-slot-prefix (slots state &key committed)
-  "Prove physical restart floors against the immutable prefix through the fork.
-Use the selected archive when present. Legacy rootless promotion can retain
-only the copied fork-segment prefix. A committed child must contain that prefix."
+  "Check physical identity and prove reserved restart floors through STATE's fork.
+Null and lost slots need no WAL coverage. With no archive, only the copied fork
+segment is available. A committed child must contain the same fork prefix."
   (let* ((fork (getf state :applied))
          (system-id (getf state :system-id))
          (parent (physical-recovery-replay-timeline state))
@@ -225,14 +226,16 @@ only the copied fork-segment prefix. A committed child must contain that prefix.
     t))
 
 (defun physical-promotion-check-pending-slots (state)
-  "Check persistent disk slots before pending promotion can publish child state.
-Temporary slots have no surviving owner after a crash and are removed at startup."
+  "Check persistent disk slots before pending promotion publishes child state.
+Skip valid temporary images here; cold startup removes them before resource
+checks. Live promotion separately validates and preserves temporary owners."
   (let ((slots (physical-promotion-read-physical-slots)))
     (physical-promotion-check-slot-prefix
      (remove-if #'wal-replication-slot-temporary-p slots) state)))
 
 (defun physical-promotion-check-live-retention (fork)
-  "Check public physical slots and ordinary snapshot pins before promotion.
+  "Check live public physical slots and ordinary snapshot pins before promotion.
+Phase 2 uses the standby batch proof; a committed child checks its fork prefix.
 Logical slots and private source pins require separate ownership rules."
   (unless (and (zerop (hash-table-count *physical-source-pins*))
                (null (directory-entry-names (physical-source-pin-directory))))
@@ -405,10 +408,10 @@ caller must keep admission closed and fence any failure."
 
 (defun physical-promotion-start-child-primary ()
   "Initialize a committed child as an ordinary primary under closed admission.
-Close standby storage first. Hide the recovery role only in the initializer's
-dynamic scope; the outer pending role still excludes writers. Retire recovery
-triggers before clearing that outer role and declaring the primary ready.
-The caller must fence any failure and restart from durable child control."
+Register the primary retained root before storage initialization loads slots.
+Close standby storage, then hide recovery only in the initializer's dynamic
+scope; the outer pending role still excludes writers. Retire recovery triggers
+before declaring the primary ready. On failure restart from durable child control."
   (physical-promotion-restore-primary-retained)
   (when *physical-receive-store* (physical-store-close *physical-receive-store*))
   (setf *physical-receive-store* nil)
