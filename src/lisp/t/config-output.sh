@@ -11,6 +11,7 @@ data_directory = '$TMP/empty-data'
 include = 'included.conf'
 checkpoint_timeout = '90s'
 max_wal_size = '2GB'
+wal_keep_size = '1GB'
 EOF
 cat >"$TMP/included.conf" <<EOF
 port = 5540
@@ -21,13 +22,14 @@ test "$(native -Cport -c port=5541)" = 5541
 test "$(native -c port=5542 -C PORT)" = 5542
 test "$(native -C checkpoint_timeout)" = 90
 test "$(native -C max_wal_size)" = 2048
+test "$(native -C wal_keep_size)" = 1024
 test "$(native -C restore_command)" = ''
 if native -C missing_setting >"$TMP/unknown.out" 2>"$TMP/unknown.err"; then
     echo 'config-output: unknown parameter unexpectedly succeeded' >&2
     exit 1
 fi
 if [ -x "$REFERENCE_POSTGRES" ]; then
-    for name in port checkpoint_timeout max_wal_size restore_command data_directory; do
+    for name in port checkpoint_timeout max_wal_size wal_keep_size restore_command data_directory; do
         expected=$("$REFERENCE_POSTGRES" -D "$TMP/empty-data" -c "config_file=$TMP/server.conf" -C "$name")
         actual=$(native -C "$name")
         if [ "$actual" != "$expected" ]; then
