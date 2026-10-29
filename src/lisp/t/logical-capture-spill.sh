@@ -81,4 +81,31 @@ wait "$SERVER" 2>/dev/null || :
 SERVER=
 start_server
 [ "$(sql 'SELECT id,value FROM spool_rows ORDER BY id')" = "$(printf '1|first\n2|second')" ]
+# Corrupt the second event only after the first fragment is in WAL. The reader
+# must detect the changed spool and leave the transaction without a terminal.
+printf '%s\n(quit)\n' '(progn (setf *logical-capture-memory-bytes* 0) (setf *logical-spool-test-after-wal-record* (lambda (spool index) (cond ((= index 1) (wal-flush) (let* ((stream (logical-spool-stream spool)) (resume (file-position stream))) (file-position stream 0) (let* ((first-size (logical-spool-read-u32 stream)) (position (+ 16 first-size))) (file-position stream position) (let ((byte (read-byte stream))) (file-position stream position) (write-byte (logxor byte 255) stream) (finish-output stream))) (file-position stream resume))) ((= index 2) (setf *logical-spool-test-after-wal-record* nil) (wal-flush) (with-open-file (out "'"$TMP"'/fragment-durable" :direction :output :if-exists :supersede) (write-line "durable" out)))))))' |
+    sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/control-fault.log"
+if grep -q ';; error:' "$TMP/control-fault.log"; then cat "$TMP/control-fault.log" >&2; exit 1; fi
+awk 'BEGIN { print "BEGIN; INSERT INTO spool_rows VALUES (10, \047first fragment\047);"; printf "INSERT INTO spool_rows VALUES (11, \047"; for (i=0;i<16778240;i++) printf "x"; print "\047); COMMIT;" }' >"$TMP/corrupt.sql"
+if PGCONNECT_TIMEOUT=2 psql -X -qAt -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$PORT" -U postgres -d postgres -f "$TMP/corrupt.sql" >"$TMP/corrupt.out" 2>&1; then
+    echo 'logical-capture-spill: corrupted spool unexpectedly committed' >&2
+    exit 1
+fi
+grep -F 'logical spool checksum mismatch' "$TMP/corrupt.out" >/dev/null
+[ "$(cat "$TMP/fragment-durable")" = durable ]
+if sql "INSERT INTO spool_rows VALUES (12, 'must fail')" >"$TMP/poison.out" 2>&1; then
+    echo 'logical-capture-spill: WAL did not fail-stop after partial publication' >&2
+    exit 1
+fi
+i=0
+until grep -Fq 'WAL I/O previously failed' "$TMP/poison.out" || grep -Fq 'WAL I/O previously failed' "$TMP/server.log"; do
+    i=$((i + 1)); [ "$i" -lt 300 ] || exit 1; sleep 0.1
+done
+kill -KILL "$SERVER" 2>/dev/null || :
+wait "$SERVER" 2>/dev/null || :
+SERVER=
+start_server
+[ "$(sql 'SELECT count(*) FROM spool_rows WHERE id >= 10')" = 0 ]
+sql "INSERT INTO spool_rows VALUES (12, 'recovered')" >/dev/null
+[ "$(sql 'SELECT value FROM spool_rows WHERE id=12')" = recovered ]
 echo 'logical-capture-spill: PASS'

@@ -5,6 +5,8 @@
 
 (defvar *logical-spool-test-after-measure* nil)
 
+(defvar *logical-spool-test-after-wal-record* nil)
+
 (defstruct (logical-spool (:constructor %make-logical-spool))
   owner (events '()) (bytes 0) (count 0) path stream sealed-p closed-p failed-p)
 
@@ -299,15 +301,24 @@ A second read failure is a WAL critical-section failure, like other WAL I/O."
                        (replace fragment buffer :start1 used :start2 start :end2 (+ start n))
                        (incf used n)
                        (incf start n))
-                     (when (= used (length fragment))
+                     ;; Keep the final fragment private until the walker has
+                     ;; validated the complete event's checksum.
+                     (when (and (= used (length fragment)) (< (+ offset used) total))
                        (wal-append-record +wal-record-logical-changes+ xid
                                           (logical-encode-fragment-bytes index count total offset fragment))
                        (incf index)
+                       (when *logical-spool-test-after-wal-record*
+                         (funcall *logical-spool-test-after-wal-record* spool index))
                        (incf offset used)
                        (setf fragment nil))))
           (lambda ()
-            (unless (and (= offset total) (null fragment))
-              (error "incomplete logical WAL fragment"))))))
+            (unless (and fragment (= used (length fragment)) (= (+ offset used) total))
+              (error "incomplete logical WAL fragment"))
+            (wal-append-record +wal-record-logical-changes+ xid
+                               (logical-encode-fragment-bytes index count total offset fragment))
+            (incf index)
+            (when *logical-spool-test-after-wal-record*
+              (funcall *logical-spool-test-after-wal-record* spool index))))))
       (:legacy
        (let ((limit (- +wal-segment-size+ +wal-header-size+ +logical-change-chunk-header-size+))
              (bytes 0) (events '()) (current nil) (offset 0))
