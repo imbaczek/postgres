@@ -132,6 +132,31 @@ run -c 'create table toast_scalar_mixed (id int, v text)' >/dev/null
 run -c 'alter table toast_scalar_mixed alter column v set storage plain' >/dev/null
 run -c 'insert into toast_scalar_mixed select id,(select (select v)) from toast_scalar_source' >/dev/null
 [ "$(run -c "select count(*) from toast_scalar_mixed where (id=1 and length(v)=20000 and substr(v,1,1)='a') or (id=2 and length(v)=20001 and substr(v,1,1)='b')")" = 2 ]
+run -c 'create table toast_union_result (v text)' >/dev/null
+run -c 'alter table toast_union_result alter column v set storage plain' >/dev/null
+run -c 'insert into toast_union_result select v from toast_scalar_source where id=1 union all select v from toast_scalar_source where id=2' >/dev/null
+run -c 'insert into toast_union_result with q as materialized (select v from toast_scalar_source where id=1 union all select v from toast_scalar_source where id=2) select v from q' >/dev/null
+[ "$(run -c "select count(*) from toast_union_result where (length(v)=20000 and substr(v,1,1)='a') or (length(v)=20001 and substr(v,1,1)='b')")" = 4 ]
+run -c 'create table toast_union_varchar (v varchar(30000))' >/dev/null
+run -c "insert into toast_union_varchar values ('$index_suffix')" >/dev/null
+run -c 'insert into toast_union_result select v from toast_union_varchar union all select v from toast_scalar_source where id=2' >/dev/null
+run -c 'insert into toast_union_result select v from toast_scalar_source where id=2 union all select v from toast_union_varchar' >/dev/null
+[ "$(run -c "select count(*) from toast_union_result where (length(v)=20000 and substr(v,1,1)='a') or (length(v)=20001 and substr(v,1,1)='b')")" = 8 ]
+run -c "insert into toast_union_result select v from toast_scalar_source where id=1 union select v || '' from toast_scalar_source where id=1" >/dev/null
+if run -v VERBOSITY=verbose -c "insert into toast_union_result select v || '' from toast_scalar_source where id=1 union select v from toast_scalar_source where id=1" >"$TMP/union-first-plain.out" 2>&1; then
+    echo 'toast-dml: union replaced the first representative origin' >&2; exit 1
+fi
+case $(cat "$TMP/union-first-plain.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: union representative did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+if run -v VERBOSITY=verbose -c "insert into toast_union_result select v from toast_scalar_source where id=1 union all select v || '' from toast_scalar_source where id=2" >"$TMP/union-computed.out" 2>&1; then
+    echo 'toast-dml: computed union arm retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/union-computed.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: computed union arm did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 run -c 'create table toast_aggregate_result (v text)' >/dev/null
 run -c 'alter table toast_aggregate_result alter column v set storage plain' >/dev/null
 run -c 'insert into toast_aggregate_result select min(v) from toast_scalar_source where id=1' >/dev/null

@@ -1403,12 +1403,20 @@ on an abnormal exit."
     (dolist (arm arms)
       (funcall run-child (second arm)
                (lambda (row)
-                 (let ((values (map 'vector
-                                    (lambda (expression) (eval-expr expression (car row)))
-                                    (first arm))))
-                   (when (eq (funcall emit (cons values values)) :stop)
-                     (setf stopped-p t)
-                     :stop))))
+                 (let ((values (make-array (length (first arm))))
+                       (origins (and *datum-origin-capture*
+                                     (make-array (length (first arm)) :initial-element nil))))
+                   (loop for expression in (first arm) for i from 0
+                         do (multiple-value-bind (value origin)
+                                (if *datum-origin-capture*
+                                    (eval-expr-with-origin expression (car row) *query-row-origins*)
+                                    (values (eval-expr expression (car row)) nil))
+                              (setf (aref values i) value)
+                              (when origins (setf (aref origins i) origin))))
+                   (let ((*query-row-origins* origins))
+                     (when (eq (funcall emit (cons values values)) :stop)
+                       (setf stopped-p t)
+                       :stop)))))
       (when stopped-p (return :stop)))))
 
 (defun simple-datum-origin-plan-p (node &optional relations iterator-p worktable)
@@ -1419,6 +1427,10 @@ on an abnormal exit."
      (simple-datum-origin-plan-p (third node) relations iterator-p worktable))
     (:top-n (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
     (:hash-distinct (simple-datum-origin-plan-p (third node) relations iterator-p worktable))
+    (:append
+     (every (lambda (arm)
+              (simple-datum-origin-plan-p (second arm) relations iterator-p worktable))
+            (second node)))
     ((:sorted-aggregate :hash-aggregate)
      (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
     (:subquery-scan (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))

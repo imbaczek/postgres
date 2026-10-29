@@ -244,7 +244,7 @@ values in its full-row size bound even when an unchanged marker makes the event
 small; a sufficiently large bound triggers full-row materialization and transport
 validation.
 For `INSERT ... SELECT` from supported scans, nested-loop joins, derived tables,
-and CTEs with supported scan and join producers and optional filters,
+and CTEs with supported scan and join producers, UNION arms, and optional filters,
 sorting, top-N or LIMIT, direct projected columns
 and the selected CASE or COALESCE
 branch can retain compressed values through compatible assignments. This includes

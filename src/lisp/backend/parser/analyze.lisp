@@ -3725,6 +3725,9 @@ candidate selection."
        (list :const (sql-cast-value (second expression) :text type -1)
              :type type :typmod -1 :explicit-cast t))
       ((eq source type) (list :col slot :type type :typmod typmod))
+      ((and (member source '(:text :varchar)) (member type '(:text :varchar)))
+       (list :join-relabel (list :col slot :type source :typmod (getf target :typmod))
+             :type type :typmod -1))
       (t (list :cast (list :col slot :type source :typmod (getf target :typmod))
                :type type :typmod -1)))))
 
