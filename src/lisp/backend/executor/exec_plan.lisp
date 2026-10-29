@@ -895,11 +895,19 @@ if a registered TOAST index is missing."
 (defparameter +hash-aggregate-max-partition-depth+ 8)
 
 (defun hash-aggregate-group (group-keys environment)
-  (let* ((values (mapcar (lambda (expr) (eval-expr expr environment)) group-keys))
-         (key (loop for expr in group-keys
-                    for value in values
-                    collect (sql-group-value-key value (expr-type expr)))))
-    (values values key)))
+  (let ((values nil) (origins nil))
+    (dolist (expr group-keys)
+      (multiple-value-bind (value origin)
+          (if *datum-origin-capture*
+              (eval-expr-with-origin expr environment *query-row-origins*)
+              (values (eval-expr expr environment) nil))
+        (push value values)
+        (push origin origins)))
+    (setf values (nreverse values) origins (nreverse origins))
+    (values values
+            (loop for expr in group-keys for value in values
+                  collect (sql-group-value-key value (expr-type expr)))
+            (and *datum-origin-capture* (coerce origins 'vector)))))
 
 (defun hash-aggregate-state-row (state)
   (concatenate 'vector (car state) (cdr state)))
@@ -907,12 +915,19 @@ if a registered TOAST index is missing."
 (defun hash-aggregate-spill-file (pathname callback)
   "Read spill rows through an owned input stream until EOF or CALLBACK stops."
   (with-query-temp-input (stream pathname)
-    (loop for row = (query-spill-read-record stream)
-          until (eq row +query-spill-eof+)
+    (loop for record = (query-spill-read-record stream)
+          until (eq record +query-spill-eof+)
           do (check-for-interrupts)
-             (when (eq (funcall callback row) :stop)
-               (return-from hash-aggregate-spill-file :stop))))
+             (let ((*query-row-origins* (and *datum-origin-capture*
+                                             (datum-origins-from-spill (second record)))))
+               (when (eq (funcall callback (if *datum-origin-capture* (first record) record)) :stop)
+                 (return-from hash-aggregate-spill-file :stop)))))
   (values))
+
+(defun hash-aggregate-spill-record (row)
+  (if *datum-origin-capture*
+      (list row (datum-origins-for-spill *query-row-origins*))
+      row))
 
 (defun hash-aggregate-partition-index (key depth)
   (mod (sxhash (cons depth key)) +hash-aggregate-partition-count+))
@@ -936,7 +951,7 @@ if a registered TOAST index is missing."
                                  (setf (aref paths partition) path
                                        (aref streams partition) output)
                                  output))))
-              (query-spill-write-record stream environment)
+              (query-spill-write-record stream (hash-aggregate-spill-record environment))
               (incf (aref counts partition)))))))
      (lambda (normal-p)
        (dotimes (index (length streams))
@@ -953,30 +968,26 @@ if a registered TOAST index is missing."
 (defun hash-aggregate-sort-spill (pathname group-keys aggregate-count callback)
   "Sort one non-shrinking spill batch and reduce adjacent equal groups."
   (let ((order (mapcar (lambda (expr) (cons expr nil)) group-keys))
-        (current-key nil)
-        (current-state nil)
-        (saw-row nil))
+        (current-key nil) (current-state nil) (current-origins nil) (saw-row nil))
     (labels ((emit-current ()
                (when current-state
-                 (prog1 (funcall callback (hash-aggregate-state-row current-state))
-                   (setf current-state nil))))
+                 (let ((*query-row-origins*
+                         (and *datum-origin-capture*
+                              (concatenate 'vector (or current-origins #())
+                                           (make-array aggregate-count :initial-element nil)))))
+                   (prog1 (funcall callback (hash-aggregate-state-row current-state))
+                     (setf current-state nil current-origins nil)))))
              (consume (environment)
-               (multiple-value-bind (values key)
+               (multiple-value-bind (values key origins)
                    (hash-aggregate-group group-keys (cdr environment))
-                 (cond
-                   ((and saw-row (not (equal key current-key)))
-                    (when (eq (emit-current) :stop)
-                      (return-from consume :stop))
-                    (setf current-state
-                          (cons (coerce values 'vector)
-                                (make-array aggregate-count :initial-element 0))))
-                   ((not saw-row)
-                    (setf current-state
-                          (cons (coerce values 'vector)
-                                (make-array aggregate-count :initial-element 0)))))
+                 (when (and saw-row (not (equal key current-key)))
+                   (when (eq (emit-current) :stop) (return-from consume :stop)))
+                 (unless current-state
+                   (setf current-state (cons (coerce values 'vector)
+                                             (make-array aggregate-count :initial-element 0))
+                         current-origins origins))
                  (setf saw-row t current-key key)
-                 (dotimes (index aggregate-count)
-                   (incf (aref (cdr current-state) index)))))
+                 (dotimes (index aggregate-count) (incf (aref (cdr current-state) index)))))
              (source (row-callback)
                (hash-aggregate-spill-file
                 pathname (lambda (row) (funcall row-callback (cons nil row))))))
@@ -984,8 +995,7 @@ if a registered TOAST index is missing."
         (when (eq result :stop)
           (return-from hash-aggregate-sort-spill :stop)))
       (when (and (not saw-row) (null group-keys))
-        (setf current-state
-              (cons #() (make-array aggregate-count :initial-element 0))))
+        (setf current-state (cons #() (make-array aggregate-count :initial-element 0))))
       (emit-current))))
 
 (defun hash-aggregate-process-rows
@@ -996,21 +1006,23 @@ The spill stream closes normally after the source returns and is abort-cleaned
 on an abnormal exit."
   (let ((groups (make-hash-table :test #'equal))
         (group-order nil)
+        (state-origins (make-hash-table :test #'eq))
         (memory-used 0)
         (spill-path nil)
         (spill-stream nil)
         (spill-count 0))
-    (labels ((make-state (values)
+    (labels ((make-state (values origins)
                (let ((state (cons (coerce values 'vector)
                                   (make-array aggregate-count :initial-element 0))))
                  (push state group-order)
+                 (when origins (setf (gethash state state-origins) origins))
                  state))
              (start-spill ()
                (multiple-value-setq (spill-path spill-stream)
                  (open-query-temp-output)))
              (consume (environment)
                (check-for-interrupts)
-               (multiple-value-bind (values key)
+               (multiple-value-bind (values key origins)
                    (hash-aggregate-group group-keys environment)
                  (let ((state (gethash key groups)))
                    (cond
@@ -1018,38 +1030,43 @@ on an abnormal exit."
                       (dotimes (index aggregate-count)
                         (incf (aref (cdr state) index))))
                      ((and spill-stream group-keys)
-                      (query-spill-write-record spill-stream environment)
+                      (query-spill-write-record spill-stream (hash-aggregate-spill-record environment))
                       (incf spill-count))
                      (t
                       (let ((entry-size
                               (+ +hash-aggregate-entry-overhead-bytes+
-                                 (query-spill-record-size (list key values)))))
+                                 (query-spill-record-size (list key values (datum-origins-for-spill origins))))))
                         (when (and group-keys group-order
                                    (> (+ memory-used entry-size) memory-limit))
                           (start-spill))
                         (if spill-stream
                             (progn
-                              (query-spill-write-record spill-stream environment)
+                              (query-spill-write-record spill-stream (hash-aggregate-spill-record environment))
                               (incf spill-count))
-                            (let ((new-state (make-state values)))
+                            (let ((new-state (make-state values origins)))
                               (setf (gethash key groups) new-state)
                               (incf memory-used entry-size)
                               (dotimes (index aggregate-count)
                                 (incf (aref (cdr new-state) index))))))))))))
       ;; COUNT(*) without GROUP BY has one state even when the child is empty.
       (unless group-keys
-        (setf (gethash nil groups) (make-state nil)))
+        (setf (gethash nil groups) (make-state nil nil)))
       (call-with-query-temp-stream-cleanup
        (lambda () (funcall source #'consume))
        (lambda (normal-p) (finish-query-temp-stream spill-stream normal-p)))
       (dolist (state (nreverse group-order))
-        (when (eq (funcall callback (hash-aggregate-state-row state)) :stop)
+        (when (eq (let ((*query-row-origins*
+                          (and *datum-origin-capture*
+                               (concatenate 'vector (or (gethash state state-origins) #())
+                                            (make-array aggregate-count :initial-element nil)))))
+                    (funcall callback (hash-aggregate-state-row state))) :stop)
           (return-from hash-aggregate-process-rows :stop)))
       (when spill-path
         ;; Drop this batch's keys and states before processing child batches.
         ;; PostgreSQL resets its hash table between batches for the same reason.
         (setf groups (make-hash-table :test #'equal)
               group-order nil
+              state-origins (make-hash-table :test #'eq)
               memory-used 0)
         (when (and (> spill-count 0)
                    (>= depth +hash-aggregate-max-partition-depth+))
@@ -1086,9 +1103,19 @@ on an abnormal exit."
 
 (defun stream-hash-aggregate (source group-keys aggregate-count callback)
   "Run bounded hash aggregation with partitioned spill and sort fallback."
-  (with-query-temp-files ()
-                         (hash-aggregate-process-rows source group-keys aggregate-count callback
-                                                      (max 1 *query-work-memory-bytes*) 0)))
+  (let ((keys (loop for key in group-keys for slot from 1
+                    collect (list :col slot :type (expr-type key) :typmod (expr-typmod key)))))
+    (with-query-temp-files ()
+                           (hash-aggregate-process-rows
+                            (lambda (emit)
+                              (funcall source
+                                       (lambda (environment)
+                                         (multiple-value-bind (values key origins)
+                                             (hash-aggregate-group group-keys environment)
+                                           (declare (ignore key))
+                                           (let ((*query-row-origins* origins))
+                                             (funcall emit (coerce values 'vector)))))))
+                            keys aggregate-count callback (max 1 *query-work-memory-bytes*) 0))))
 
 (defstruct average-transition (sum 0) (count 0))
 
@@ -1391,7 +1418,8 @@ on an abnormal exit."
     ((:filter :project :sort :limit)
      (simple-datum-origin-plan-p (third node) relations iterator-p worktable))
     (:top-n (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
-    (:sorted-aggregate
+    (:hash-distinct (simple-datum-origin-plan-p (third node) relations iterator-p worktable))
+    ((:sorted-aggregate :hash-aggregate)
      (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
     (:subquery-scan (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
     (:nested-loop-join

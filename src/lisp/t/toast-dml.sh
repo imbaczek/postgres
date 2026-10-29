@@ -144,6 +144,26 @@ run -c "insert into toast_aggregate_source values (null),('$index_suffix'),(null
 run -c 'insert into toast_aggregate_result select min(v) from toast_aggregate_source' >/dev/null
 run -c 'insert into toast_aggregate_result with q as materialized (select min(v) as v from toast_aggregate_source) select v from q' >/dev/null
 [ "$(run -c 'select count(*) from toast_aggregate_result where length(v)=20000')" = 4 ]
+run -c 'create table toast_hash_source (id int, v text)' >/dev/null
+run -c "insert into toast_hash_source values (1,'$index_suffix'),(2,'$index_suffix')" >/dev/null
+run -c "insert into toast_aggregate_result select distinct v from (select case when id=1 then v else v || '' end as v from toast_hash_source order by id) s" >/dev/null
+run -c "insert into toast_aggregate_result select v from (select case when id=1 then v else v || '' end as v from toast_hash_source order by id) s group by v" >/dev/null
+run -c 'insert into toast_aggregate_result with q as materialized (select distinct v from toast_hash_source) select v from q' >/dev/null
+[ "$(run -c 'select count(*) from toast_aggregate_result where length(v)=20000')" = 7 ]
+run -c 'create table toast_hash_spill_result (v text)' >/dev/null
+run -c 'alter table toast_hash_spill_result alter column v set storage plain' >/dev/null
+run -c 'insert into toast_hash_spill_result select distinct v from toast_scalar_source' >/dev/null
+run -c 'insert into toast_hash_spill_result select v from toast_scalar_source group by v' >/dev/null
+run -c 'insert into toast_hash_spill_result with q as materialized (select distinct v from toast_scalar_source) select v from q' >/dev/null
+[ "$(run -c 'select count(*) from toast_hash_spill_result where length(v)=20000')" = 3 ]
+[ "$(run -c 'select count(*) from toast_hash_spill_result where length(v)=20001')" = 3 ]
+if run -v VERBOSITY=verbose -c "insert into toast_aggregate_result select distinct v from (select case when id=1 then v || '' else v end as v from toast_hash_source order by id) s" >"$TMP/hash-first-plain.out" 2>&1; then
+    echo 'toast-dml: hash distinct replaced the first representative origin' >&2; exit 1
+fi
+case $(cat "$TMP/hash-first-plain.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: hash distinct did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 run -c "insert into toast_aggregate_source values ('$index_suffix')" >/dev/null
 if run -v VERBOSITY=verbose -c 'insert into toast_aggregate_result select max(v) from toast_aggregate_source' >"$TMP/aggregate-equal.out" 2>&1; then
     echo 'toast-dml: equal aggregate inputs retained compression' >&2; exit 1
