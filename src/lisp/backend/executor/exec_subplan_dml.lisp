@@ -27,26 +27,31 @@
     (list :assignment expression :type target :typmod typmod)))
 
 (defun analyze-array-update-assignments (items column scope qualifier)
-  "Build nested element updates while every input expression reads the old row."
+  "Build nested array updates while input expressions read the old row."
   (when (> (length items) 512)
     (ereport "54000" "too many assignments to one array column"))
   (let* ((type (pg-column-type column))
          (element (sql-array-element-type type))
          (element-column (copy-pg-column column))
-         (base (analyze-expr (list :column qualifier (pg-column-name column)) scope)))
+         (reference (list :column qualifier (pg-column-name column)))
+         (base (analyze-expr reference scope)))
     (unless element
       (ereport "42804" "cannot subscript type ~a because it does not support subscripting" type))
     (setf (pg-column-type element-column) element)
     (dolist (item items base)
-      (let* ((reference (analyze-array-subscript
-                         (list :array-subscript (list :column qualifier (pg-column-name column))
-                               (getf item :indices)) scope))
-             (raw (getf item :expr)))
+      (let ((raw (getf item :expr)) (slice (getf item :slice)))
         (when (eq (first raw) :default)
           (ereport "0A000" "DEFAULT for an array element is not supported"))
-        (setf base (list :array-assign base (third reference)
-                         (analyze-subquery-assignment (analyze-expr raw scope) element-column)
-                         :type type :typmod (pg-column-typmod column)))))))
+        (if slice
+            (let ((target (analyze-array-slice (list :array-slice reference slice) scope)))
+              (setf base (list :array-slice-assign base (third target)
+                               (analyze-subquery-assignment (analyze-expr raw scope) column)
+                               :type type :typmod (pg-column-typmod column))))
+            (let ((target (analyze-array-subscript
+                           (list :array-subscript reference (getf item :indices)) scope)))
+              (setf base (list :array-assign base (third target)
+                               (analyze-subquery-assignment (analyze-expr raw scope) element-column)
+                               :type type :typmod (pg-column-typmod column)))))))))
 
 (defun eval-subquery-assignment (expression environment)
   (let* ((argument (second expression))
@@ -214,7 +219,7 @@
                                   (let* ((column (resolve-column-or-error table (car group)))
                                          (items (nreverse (cdr group))))
                                     (cond
-                                      ((every (lambda (item) (getf item :indices)) items)
+                                      ((every (lambda (item) (or (getf item :indices) (getf item :slice))) items)
                                        (let ((expression (analyze-array-update-assignments items column scope (or (getf ast :alias) (getf ast :table)))))
                                          (push (list :expr expression) targets)
                                          (cons column expression)))

@@ -816,7 +816,7 @@
                (with-open-file (out out-path :direction :output :if-exists :supersede :element-type '(unsigned-byte 8))
                  (pg::exec-update-subqueries
                   out (first (pg::parse-statements
-                              "UPDATE array_target AS t SET a[1]=t.a[2],a[2]=t.a[1] FROM array_source AS s WHERE t.id=s.id"))))
+                              "UPDATE array_target AS t SET a[1:1]=ARRAY[t.a[2]],a[2]=t.a[1] FROM array_source AS s WHERE t.id=s.id"))))
                (let ((sql (format nil "UPDATE array_target SET ~{~a~^,~}"
                                   (loop for i from 1 to 512 collect (format nil "a[1]='~a'::jsonb" i)))))
                  (incf (pg::backend-command-id pg::*backend*))

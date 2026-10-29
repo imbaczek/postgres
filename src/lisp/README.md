@@ -341,7 +341,14 @@ read the original row. A NULL or empty array is initialized at the assigned
 indices; one-dimensional arrays can expand with NULL-filled gaps, while existing
 multidimensional arrays require in-range indices. NULL assignment indices error.
 An UPDATE supports at most 512 element assignments to the same array column.
-Slice assignment, element DEFAULT and direct `int2vector` subscripting are unsupported.
+UPDATE also supports slice assignment, including mixed scalar and slice groups.
+It consumes a row-major prefix of the source array regardless of source shape;
+too few elements error. A NULL source leaves the destination unchanged (a NULL
+destination becomes empty). Explicit NULL bounds error, and omitted bounds on an
+empty destination must be supplied. One-dimensional destinations can extend;
+existing multidimensional destinations require in-range bounds. At most 512
+element and slice assignments combined may target one column. Element DEFAULT
+and direct `int2vector` subscripting are unsupported.
 
 Typed array input accepts brace-delimited values, quoted and backslash-escaped
 elements, unquoted `NULL`, rectangular nested arrays, and explicit bounds such
