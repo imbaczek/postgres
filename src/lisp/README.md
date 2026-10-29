@@ -348,7 +348,9 @@ destination becomes empty). Explicit NULL bounds error, and omitted bounds on an
 empty destination must be supplied. One-dimensional destinations can extend;
 existing multidimensional destinations require in-range bounds. At most 512
 element and slice assignments combined may target one column. Element DEFAULT
-and direct `int2vector` subscripting are unsupported.
+and direct `int2vector` subscripting are unsupported. The same scalar and slice
+assignments are supported in `ON CONFLICT DO UPDATE`; their expressions can
+refer to the claimed row and `excluded` values.
 
 Typed array input accepts brace-delimited values, quoted and backslash-escaped
 elements, unquoted `NULL`, rectangular nested arrays, and explicit bounds such

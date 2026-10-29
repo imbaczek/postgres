@@ -113,6 +113,25 @@
          (rove:ok (and caught (string= "42702" (pg-error-sqlstate caught)))
                   "Unqualified names shared by target and EXCLUDED are ambiguous")))))
 
+(rove:deftest on-conflict-array-partial-assignments
+    (call-with-on-conflict-analysis-fixture
+     (lambda (table)
+       (setf (pg-column-type (aref (pg-class-columns table) 1)) :jsonb-array)
+       (let* ((ast (first (parse-statements
+                           "INSERT INTO upsert_fixture AS t VALUES(1,ARRAY['1'::jsonb,'2'::jsonb]) ON CONFLICT(id) DO UPDATE SET value[1:1]=ARRAY[excluded.value[2]],value[2]=t.value[1]")))
+              (conflict (prepare-on-conflict table (getf ast :on-conflict) "t"))
+              (old-array (make-sql-array :element-type-id :jsonb
+                                         :elements (vector (sql-jsonb-input "1") (sql-jsonb-input "2"))
+                                         :dimensions '(2) :lower-bounds '(1)))
+              (excluded-array (make-sql-array :element-type-id :jsonb
+                                              :elements (vector (sql-jsonb-input "8") (sql-jsonb-input "9"))
+                                              :dimensions '(2) :lower-bounds '(1)))
+              (new (on-conflict-update-values table conflict (vector 1 old-array) (vector 1 excluded-array)))
+              (elements (sql-array-elements (aref new 1))))
+         (rove:ok (string= "9" (sql-jsonb-output (aref elements 0))))
+         (rove:ok (string= "1" (sql-jsonb-output (aref elements 1))))
+         (rove:ok (string= "1" (sql-jsonb-output (aref (sql-array-elements old-array) 0))))))))
+
 (rove:deftest on-conflict-excluded-alias-is-ambiguous
     (call-with-on-conflict-analysis-fixture
      (lambda (table)
