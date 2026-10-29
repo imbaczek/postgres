@@ -86,7 +86,7 @@
                    (:file "analyze")))
      (:module "parser"
       :serial t
-      :components ((:file "scan")
+      :components ((:file "scan-core")
                    (:file "../utils/adt/varbit")
                    (:file "gram")
                    (:file "cte")

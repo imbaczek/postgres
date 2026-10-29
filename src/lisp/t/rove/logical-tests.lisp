@@ -1322,6 +1322,34 @@
              (rove:ok seen))
         (setf (symbol-function 'logical-pgoutput-dispatch) original))))
 
+(rove:deftest test-large-quoted-token-exact-decoding
+    (dolist (entry (list (list "''" #\' "" 2)
+                         (list "'a''🙂''b' tail" #\' "a'🙂'b" 9)
+                         (list "\"a\"\"b\" tail" #\" "a\"b" 6)
+                         (list (concatenate 'string "'" (make-string 1000000 :initial-element #\x)
+                                            "''🙂'")
+                               #\' (concatenate 'string (make-string 1000000 :initial-element #\x) "'🙂")
+                               1000005)))
+      (destructuring-bind (sql delimiter expected end) entry
+        (multiple-value-bind (value position) (scan-quoted-text sql 0 delimiter)
+          (rove:ok (string= value expected))
+          (rove:ok (= position end)))))
+  (rove:ok (handler-case (progn (scan-quoted-text "'bad''" 0 #\') nil) (error () t)))
+  (rove:ok (handler-case (progn (scan-quoted-text "\"bad" 0 #\") nil) (error () t))))
+
+(rove:deftest test-quoted-token-positions-and-bit-errors
+    (let ((tokens (tokenize "b'101' \"a\"\"b\" 'a''b'")))
+      (rove:ok (eq (token-kind (first tokens)) :bit-string))
+      (rove:ok (string= (token-value (first tokens)) "b101"))
+      (rove:ok (= (token-pos (first tokens)) 0))
+      (rove:ok (string= (token-value (second tokens)) "a\"b"))
+      (rove:ok (= (token-pos (second tokens)) 7))
+      (rove:ok (string= (token-value (third tokens)) "a'b"))
+      (rove:ok (= (token-pos (third tokens)) 14)))
+  (rove:ok (handler-case
+               (progn (tokenize "b'101") nil)
+             (error (condition) (search "unterminated quoted string" (princ-to-string condition))))))
+
 (rove:deftest test-select-streamed-datarow-matches-legacy
     (let* ((base (format nil "pg-select-row-~d-~d" (sb-posix:getpid) (random 1000000)))
            (path-a (merge-pathnames (concatenate 'string base "-a") (uiop:temporary-directory)))

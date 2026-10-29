@@ -646,7 +646,9 @@ target counts the original UTF-8 field bytes. Row metadata and other allocations
 remain in memory, and the target still receives and parses the complete Simple
 Query frame.
 Frontend query message lengths are limited to 132 MiB, including the four-byte
-length word. When capture is enabled, each encoded row change is limited to
+length word. The lexer counts quoted string and identifier contents before
+allocating their exact-sized decoded strings, avoiding a growable literal buffer;
+the incoming frame and complete query string still materialize. When capture is enabled, each encoded row change is limited to
 128 MiB, including encoding overhead; transactional utility events retain a
 64 MiB limit. Row changes made by the `pg-lisp-subscribe-apply` application have an extra 1 MiB of headroom; WAL
 recovery and slot readers accept individual events up to 129 MiB. Captured row
