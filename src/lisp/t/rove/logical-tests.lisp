@@ -1211,6 +1211,64 @@
         (rove:ok (handler-case (progn (wal-validate-logical-binary-capability-under-lock 101) nil)
                    (wal-input-validation-error () t))))))
 
+(rove:deftest test-transaction-exported-snapshot-independent-import
+    (let* ((*active-snapshots* 0) (*active-snapshot-set* (make-hash-table :test #'eq))
+                                  (*schema-read-lock-count* 1)
+                                  (*transaction-exported-snapshots* (make-hash-table :test #'equal))
+                                  (*transaction-exported-snapshot-owners* (make-hash-table :test #'eq))
+                                  (*exported-logical-snapshots* (make-hash-table :test #'equal))
+                                  (*catalog* (make-catalog))
+                                  (database (make-database :name "postgres" :oid 7))
+                                  (exporter (make-backend :database "postgres" :state :in-progress :explicit t
+                                                          :isolation-level :repeatable-read :read-only t))
+                                  (importer (make-backend :database "postgres" :state :in-progress :explicit t
+                                                          :isolation-level :repeatable-read :read-only t))
+                                  (source (make-snapshot-struct :xmin 3 :xmax 50 :xip (list 3 49) :curcid 8))
+                                  (pin (make-snapshot-registration)) (token nil) (second-token nil))
+      (setf (gethash "postgres" (catalog-databases *catalog*)) database)
+      (sb-thread:with-mutex (*xid-lock*) (register-active-snapshot source pin))
+      (setf (backend-transaction-snapshot exporter) source
+            (backend-transaction-snapshot-registration exporter) pin
+            (backend-transaction-schema-read-lock-held-p exporter) t)
+      (unwind-protect
+           (progn
+             (let ((*backend* exporter)) (setf token (export-transaction-snapshot)))
+             (let ((original (symbol-function 'new-exported-logical-snapshot-token)))
+               (unwind-protect
+                    (progn
+                      (setf (symbol-function 'new-exported-logical-snapshot-token)
+                            (lambda () token))
+                      (let ((*backend* exporter))
+                        (rove:ok (handler-case (progn (export-transaction-snapshot) nil)
+                                   (error () t))))
+                      (rove:ok (= *schema-read-lock-count* 2))
+                      (rove:ok (= *active-snapshots* 2)))
+                 (setf (symbol-function 'new-exported-logical-snapshot-token) original)))
+             (let ((*backend* exporter)) (setf second-token (export-transaction-snapshot)))
+             (setf (gethash "other" (catalog-databases *catalog*))
+                   (make-database :name "other" :oid 8))
+             (let ((*backend* (make-backend :database "other" :state :in-progress :explicit t
+                                            :isolation-level :repeatable-read :read-only t))
+                   (before *active-snapshots*) (leases *schema-read-lock-count*))
+               (rove:ok (handler-case (progn (import-exported-logical-snapshot token) nil)
+                          (pg-error () t)))
+               (rove:ok (and (= before *active-snapshots*) (= leases *schema-read-lock-count*))))
+             (let ((*backend* importer)) (import-exported-logical-snapshot token))
+             (reset-backend-transaction exporter)
+             (rove:ok (null (gethash second-token *transaction-exported-snapshots*)))
+             (rove:ok (= *schema-read-lock-count* 1))
+             (rove:ok (equal (snapshot-xip (backend-transaction-snapshot importer)) '(3 49)))
+             (rove:ok (= (snapshot-curcid (backend-transaction-snapshot importer)) 0))
+             (let ((*backend* (make-backend :database "postgres" :state :in-progress :explicit t
+                                            :isolation-level :repeatable-read :read-only t)))
+               (rove:ok (handler-case (progn (import-exported-logical-snapshot token) nil)
+                          (pg-error () t))))
+             (release-backend-transaction-snapshot importer)
+             (rove:ok (zerop *schema-read-lock-count*)))
+        (expire-transaction-exported-snapshots exporter)
+        (release-backend-transaction-snapshot exporter)
+        (release-backend-transaction-snapshot importer))))
+
 (rove:deftest test-logical-capture-gate-unknown-mirror-captures
     (let ((*logical-capture-xid-modes* (make-hash-table :test #'eql))
           (*logical-capture-arming* (make-hash-table :test #'eq))
@@ -1853,6 +1911,8 @@
 
 (rove:deftest test-extended-select-guard-and-schema-drift
     (rove:ok (extended-copy-select-p (first (parse-statements "SELECT * FROM t"))))
+  (rove:ok (extended-copy-select-p (first (parse-statements "SELECT * FROM public.t"))))
+  (rove:ok (not (extended-copy-select-p (first (parse-statements "SELECT * FROM other.t")))))
   (rove:ok (not (extended-copy-select-p (first (parse-statements "WITH q AS (SELECT 1) SELECT * FROM q")))))
   (rove:ok (not (extended-copy-select-p (first (parse-statements "SELECT * FROM t ORDER BY x")))))
   (let* ((path (merge-pathnames (format nil "pg-select-drift-~d-~d" (sb-posix:getpid) (random 1000000)) (uiop:temporary-directory)))

@@ -1166,7 +1166,7 @@ so a nested argument error keeps its own diagnostics."
                       "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn"
                       "pg_wal_replay_pause" "pg_wal_replay_resume"
                       "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state"
-                      "pg_lisp_cluster_identity"
+                      "pg_lisp_cluster_identity" "pg_export_snapshot"
                       "current_database" "current_schema"
                       "current_catalog" "current_user" "session_user" "user")
                :test #'string=)
@@ -3676,6 +3676,7 @@ aliases share the corresponding numeric operator implementation."
      (physical-replay-pause-command name))
     ((string= name "pg_lisp_cluster_identity")
      (catalog-cluster-identity *catalog*))
+    ((string= name "pg_export_snapshot") (export-transaction-snapshot))
     ((string= name "nextval")
      (unless (and (= (length args) 1) (stringp (first args)))
        (ereport "42883" "nextval expects one sequence name string"))

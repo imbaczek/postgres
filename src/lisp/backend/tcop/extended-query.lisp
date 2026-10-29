@@ -227,7 +227,9 @@
   "Accept only the plain table scan needed by initial copy."
   (and (eq (getf ast :type) :select)
        (equal (getf ast :targets) '((:star t)))
-       (stringp (getf ast :from))
+       (or (stringp (getf ast :from))
+           (and (sql-relation-name-p (getf ast :from))
+                (string= (sql-relation-name-schema (getf ast :from)) "public")))
        (null (getf ast :from-alias))
        (every (lambda (key) (null (getf ast key)))
               '(:joins :where :group-by :having :distinct :windows :order-by :limit :offset :with :with-recursive :set-operation))))

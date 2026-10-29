@@ -1370,10 +1370,90 @@ between snapshot capture and this durable publication."
         release-exported-logical-snapshot-for-slot))
 
 (defun new-exported-logical-snapshot-token ()
-  (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
-    (incf *exported-logical-snapshot-counter*)
-    (format nil "pg_lisp_~X_~X"
-            (get-internal-real-time) *exported-logical-snapshot-counter*)))
+  (let ((bytes (make-array 16 :element-type '(unsigned-byte 8))))
+    (with-open-file (input #p"/dev/urandom" :element-type '(unsigned-byte 8))
+      (unless (= (length bytes) (read-sequence bytes input))
+        (error "could not read snapshot token entropy")))
+    (format nil "pg_lisp_~{~2,'0X~}" (coerce bytes 'list))))
+
+(defun export-transaction-snapshot ()
+  "Export the current read-only RR snapshot until this transaction ends."
+  (let* ((backend *backend*)
+         (source (and backend (backend-transaction-snapshot backend)))
+         (source-registration (and backend (backend-transaction-snapshot-registration backend)))
+         (registration (make-snapshot-registration))
+         (lease nil) (published nil) (state nil)
+         (token (new-exported-logical-snapshot-token)))
+    (unless (and backend (eq (backend-state backend) :in-progress)
+                 (backend-explicit backend)
+                 (backend-read-only backend)
+                 (eq (backend-isolation-level backend) :repeatable-read)
+                 source source-registration
+                 (snapshot-registration-active-p source-registration)
+                 (backend-transaction-schema-read-lock-held-p backend))
+      (ereport "25001" "snapshot export requires a read-only REPEATABLE READ transaction"))
+    (unwind-protect
+         (let ((snapshot (copy-snapshot source)))
+           (setf (snapshot-xip snapshot) (copy-list (snapshot-xip source))
+                 (snapshot-sequence-states snapshot) (copy-tree (snapshot-sequence-states source)))
+           (sb-sys:without-interrupts
+             ;; The exporter already owns the read side; clone its lease without
+             ;; queuing behind a writer that is waiting for that very lease.
+             (sb-thread:with-mutex (*schema-lock-mutex*)
+               (unless (backend-transaction-schema-read-lock-held-p backend)
+                 (error "exporter schema lease expired"))
+               (incf *schema-read-lock-count*)
+               (setf lease t))
+             (sb-thread:with-mutex (*xid-lock*)
+               (register-active-snapshot snapshot registration))
+             (setf state (make-exported-logical-snapshot
+                          :token token :database-oid (database-oid (current-database))
+                          :snapshot snapshot :registration registration
+                          :schema-read-lock-held-p t))
+             (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
+               (when (or (gethash token *transaction-exported-snapshots*)
+                         (gethash token *exported-logical-snapshots*)
+                         (gethash token *expired-exported-logical-snapshots*))
+                 (error "duplicate exported snapshot token"))
+               (push state (gethash backend *transaction-exported-snapshot-owners*))
+               (setf (gethash token *transaction-exported-snapshots*) state)
+               (setf lease nil published t)))
+           token)
+      (unless published
+        (sb-sys:without-interrupts
+          (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
+            (when (eq state (gethash token *transaction-exported-snapshots*))
+              (remhash token *transaction-exported-snapshots*))
+            (when state
+              (let ((remaining (delete state (gethash backend *transaction-exported-snapshot-owners*) :test #'eq)))
+                (if remaining
+                    (setf (gethash backend *transaction-exported-snapshot-owners*) remaining)
+                    (remhash backend *transaction-exported-snapshot-owners*)))))
+          (unwind-protect
+               (when (snapshot-registration-active-p registration)
+                 (release-snapshot-registration registration))
+            (when lease (release-schema-read-lock))))))))
+
+(defun expire-transaction-exported-snapshots (backend)
+  "Expire BACKEND's tokens while retaining leases for already-imported snapshots."
+  (let ((states nil))
+    (sb-sys:without-interrupts
+      (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
+        (setf states (gethash backend *transaction-exported-snapshot-owners*))
+        (remhash backend *transaction-exported-snapshot-owners*)
+        (dolist (state states)
+          (remhash (exported-logical-snapshot-token state) *transaction-exported-snapshots*)))
+      (let ((failure nil) (pending nil))
+        (dolist (state states)
+          (handler-case (expire-exported-logical-snapshot-state state)
+            (error (condition)
+              (push state pending)
+              (unless failure (setf failure condition)))))
+        (when pending
+          (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
+            (setf (gethash backend *transaction-exported-snapshot-owners*) pending)))
+        (when failure (error failure)))))
+  (values))
 
 (defun validate-standard-snapshot-use (backend)
   "Match CreateReplicationSlot's checks before retaining a transaction snapshot."
@@ -1573,13 +1653,15 @@ snapshot owns copies of XIP and sequence states."
              "SET TRANSACTION SNAPSHOT requires an unused read-only REPEATABLE READ transaction"))
   (let ((registration nil)
         (installed nil)
+        (schema-lease nil)
         (database-id (database-oid (current-database))))
     (unwind-protect
          ;; Keep token validation and publication of the independent MVCC pin
          ;; serialized with invalidation. Importers take registry -> XID ->
          ;; snapshot locks, matching PostgreSQL's exported snapshot handoff.
          (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
-           (let ((state (gethash token *exported-logical-snapshots*)))
+           (let* ((generic-state (gethash token *transaction-exported-snapshots*))
+                  (state (or (gethash token *exported-logical-snapshots*) generic-state)))
              (unless (and state
                           (snapshot-registration-active-p
                            (exported-logical-snapshot-registration state)))
@@ -1595,7 +1677,15 @@ snapshot owns copies of XIP and sequence states."
                      (snapshot-sequence-states snapshot)
                      (copy-tree (snapshot-sequence-states source-snapshot))
                      registration (make-snapshot-registration))
+               (when generic-state
+                 (setf (snapshot-curcid snapshot) (backend-command-id *backend*)))
                (sb-sys:without-interrupts
+                 (when generic-state
+                   (sb-thread:with-mutex (*schema-lock-mutex*)
+                     (unless (exported-logical-snapshot-schema-read-lock-held-p state)
+                       (error "exported snapshot schema lease expired"))
+                     (incf *schema-read-lock-count*)
+                     (setf schema-lease t)))
                  (sb-thread:with-mutex (*xid-lock*)
                    (register-active-snapshot snapshot registration))
                  (setf (backend-transaction-snapshot *backend*) snapshot
@@ -1603,12 +1693,17 @@ snapshot owns copies of XIP and sequence states."
                        registration
                        (backend-first-snapshot-set *backend*) t
                        (backend-snapshot *backend*) snapshot
+                       (backend-transaction-schema-read-lock-held-p *backend*) schema-lease
+                       schema-lease nil
                        installed t)
-                 (register-exported-logical-snapshot-importer
-                  state registration *backend*))
+                 (unless generic-state
+                   (register-exported-logical-snapshot-importer
+                    state registration *backend*)))
                (logical-test-failpoint :after-snapshot-import token))))
-      (when (and registration (not installed))
-        (release-snapshot-registration registration)))))
+      (unless installed
+        (unwind-protect
+             (when registration (release-snapshot-registration registration))
+          (when schema-lease (release-schema-read-lock)))))))
 
 (defun ensure-exported-snapshot-scope-can-end (backend)
   (when (and (eq backend *exported-snapshot-backend*)
@@ -1809,6 +1904,16 @@ transaction cleanup; otherwise obtain a real XID outside recovery."
 In recovery, enroll the virtual reader even if it has not accessed a relation."
   (when (recovery-in-progress-p)
     (ensure-recovery-reader-identity backend))
+  (when (and (null (backend-transaction-snapshot backend))
+             (backend-explicit backend) (backend-read-only backend)
+             (not (backend-transaction-schema-read-lock-held-p backend)))
+    (if *schema-read-lock-held*
+        (sb-sys:without-interrupts
+          (sb-thread:with-mutex (*schema-lock-mutex*)
+            (incf *schema-read-lock-count*)
+            (setf (backend-transaction-schema-read-lock-held-p backend) t)))
+        (acquire-schema-read-lock
+         (lambda () (setf (backend-transaction-schema-read-lock-held-p backend) t)))))
   (or (backend-transaction-snapshot backend)
       (let ((registration (make-snapshot-registration))
             (installed nil))
@@ -1900,6 +2005,7 @@ can discard the owner of a virtual ID or its remaining relation locks."
     (when (backend-logical-spool b)
       (close-logical-spool (backend-logical-spool b))
       (setf (backend-logical-spool b) nil))
+    (expire-transaction-exported-snapshots b)
     (release-backend-transaction-snapshot b)
     (when (backend-virtual-reader-xid b)
       (release-xid (backend-virtual-reader-xid b) b))

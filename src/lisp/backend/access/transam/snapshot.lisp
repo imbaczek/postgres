@@ -54,6 +54,12 @@ does not park admission or authorize replay.")
 (defvar *logical-test-after-snapshot-capture-hook* nil)
 (defvar *exported-logical-snapshots* (make-hash-table :test #'equal))
 
+(defvar *transaction-exported-snapshots* (make-hash-table :test #'equal)
+  "Transaction-owned export tokens, protected by *EXPORTED-LOGICAL-SNAPSHOT-LOCK*.")
+
+(defvar *transaction-exported-snapshot-owners* (make-hash-table :test #'eq)
+  "Export states by backend, protected by *EXPORTED-LOGICAL-SNAPSHOT-LOCK*.")
+
 (defvar *expired-exported-logical-snapshots* (make-hash-table :test #'equal))
 
 (defvar *exported-logical-snapshot-counter* 0)

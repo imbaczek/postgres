@@ -255,11 +255,17 @@
     ;; Reject generated/dropped columns before SELECT * can silently change its
     ;; projection relative to Relation messages.
     (dolist (table names)
-      (when (pg-client-query
-             source
-             (format nil "SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid=~a::regclass AND attnum>0 AND (attisdropped OR attgenerated!='')"
-                     (logical-sql-literal (format nil "public.~a" table))))
-        (error "standard source table ~a has unsupported dropped/generated columns" table)))))
+      (let* ((relations (pg-client-query
+                         source
+                         (format nil "SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=~a"
+                                 (logical-sql-literal table))))
+             (oid (and (= 1 (length relations))
+                       (parse-integer (aref (first relations) 0) :junk-allowed nil))))
+        (unless oid (error "standard source table ~a is missing or ambiguous" table))
+        (when (pg-client-query
+               source
+               (format nil "SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid=~d AND attnum>0 AND (attisdropped OR attgenerated!='')" oid))
+          (error "standard source table ~a has unsupported dropped/generated columns" table))))))
 
 (defun logical-standard-resume-slot-safe-p (row marker)
   (and row (= 10 (length row))

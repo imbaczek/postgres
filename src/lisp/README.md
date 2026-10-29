@@ -613,6 +613,13 @@ Client startup and SQL `application_name` support SET, SHOW, RESET and
 settings remain unsupported. Parameter reports are coalesced before ReadyForQuery.
 Unsupported setting names and values return errors.
 
+`pg_export_snapshot()` exports the snapshot of an explicit read-only REPEATABLE
+READ transaction. Another unused explicit read-only REPEATABLE READ transaction
+in the same database can import its token with `SET TRANSACTION SNAPSHOT` before
+its first snapshot. The token expires when the exporter ends, while an existing
+importer retains its own snapshot and schema lease until its transaction ends;
+the lease can delay incompatible schema changes.
+
 SELECT text DataRows preflight every field's encoded length and checksum before
 writing the frame. Text, JSON, JSONB and bytea output use bounded UTF-8 blocks;
 bytea honors `bytea_output`, and other types retain their session-dependent
@@ -820,8 +827,9 @@ bytea streaming from a supporting pg-lisp source. Older sources that do not
 recognize the option fail rather than silently switching formats. Separately,
 `--binary-copy` requests binary bytea and text for other columns through an
 extended SELECT during initial copy. It works with the native private snapshot
-and with C standard sources using an exported snapshot bridge. Standard mode
-requires source `pg_export_snapshot()`, which native pgoutput does not implement.
+and with C or native standard sources using an exported snapshot bridge on a
+normal connection. Standard discovery uses catalog projections. Standard mode
+requires source `pg_export_snapshot()`.
 This is not binary COPY and does not request
 arbitrary C global binary output or change admission and copy limits. DDL/sequence
 automation remains in extension mode. UPDATE messages may omit unchanged

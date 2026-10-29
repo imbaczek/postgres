@@ -180,7 +180,8 @@
     (sb-sys:without-interrupts
       (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
         (when (or (gethash token *exported-logical-snapshots*)
-                  (gethash token *expired-exported-logical-snapshots*))
+                  (gethash token *expired-exported-logical-snapshots*)
+                  (gethash token *transaction-exported-snapshots*))
           (error "duplicate exported logical snapshot token"))
         (sb-thread:with-mutex (*wal-lock*)
           (unless (and (eq slot-object (gethash slot-name *wal-replication-slots*))

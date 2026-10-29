@@ -2435,7 +2435,9 @@ src/backend/access/transam/xlogreader.c."
                       (max 0 (- *wal-durable-lsn*
                                 (wal-replication-slot-restart-lsn slot))))
                   (string-downcase
-                   (symbol-name (wal-replication-slot-wal-status slot)))))))
+                   (symbol-name (wal-replication-slot-wal-status slot)))
+                  (wal-replication-slot-plugin slot)
+                  (or (wal-replication-slot-database-oid slot) +null+)))))
 
 (defun wal-load-replication-slots ()
   "Load durable WAL restart points before any checkpoint can recycle WAL."

@@ -473,19 +473,25 @@
 
 (deftest catalog-slot-lsn-values-are-numeric
     (let* ((row (pg::sql-replication-slot-row
-                 (vector "test_slot" nil "F/FFFFFFFF" pg::+null+ 123 "reserved")))
+                 (vector "test_slot" nil "F/FFFFFFFF" pg::+null+ 123 "reserved" "pg_lisp" 42)))
            (restart (aref row 2)))
       (ok (= restart #xfffffffff))
       (ok (eq (aref row 3) pg::+null+))
       (ok (string= (aref row 4) "reserved"))
       (ok (= (aref row 5) 123))
-      (ok (equal '(1 7 11 12 13 23)
+      (ok (equal '(1 7 11 12 13 23 2 3 4 6 19 15 20)
                  (mapcar #'fourth (getf (pg::sql-system-relation-definition "pg_replication_slots") :fields))))
       (ok (= -1 (pg::compare-3way restart (pg::sql-pg-lsn-input "10/0")))))
   (ok (equalp '(#(t)) (derived-query-rows "SELECT 'F/FFFFFFFF'::pg_lsn<'10/0'::pg_lsn")))
   (ok (equalp '(#("0/00000001")) (derived-query-rows "SELECT '0/1'::pg_lsn::text")))
   (dolist (text '(" 0/1" "+0/1" "0x1/1" "000000000/1" "0/1 " "١/1"))
     (ok (equal "22P02" (sqlstate-of (pg::sql-pg-lsn-input text))))))
+
+(deftest standard-copy-catalog-column-identities
+    (let* ((class-fields (getf (pg::sql-system-relation-definition "pg_class") :fields))
+           (database-fields (getf (pg::sql-system-relation-definition "pg_database") :fields)))
+      (ok (= 28 (fourth (assoc "relispartition" class-fields :test #'string=))))
+      (ok (equal '(("oid" :oid t 1) ("datname" :name t 2)) database-fields))))
 
 (deftest star-expansion-keeps-merged-join-expressions
     (ok (equalp '(#(1) #(2))

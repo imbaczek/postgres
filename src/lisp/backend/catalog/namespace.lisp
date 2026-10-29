@@ -252,11 +252,13 @@ Reject unsupported parameters and unsupported local settings."
   (list
    (list :oid 12109 :name "pg_settings" :kind #\v
          :rows 'startup-settings-rows :fields +sql-settings-fields+)
+   (list :oid 1262 :name "pg_database" :kind #\r :rows 'sql-database-rows
+         :fields '(("oid" :oid t 1) ("datname" :name t 2)))
    (list :oid 1259 :name "pg_class" :kind #\r :rows 'sql-class-rows
          :fields '(("oid" :oid t 1) ("relname" :name t 2)
                    ("relnamespace" :oid t 3) ("relkind" :char t 18)
                    ("relnatts" :int2 t 19) ("relreplident" :char t 27)
-                   ("reltoastrelid" :oid t 14)))
+                   ("reltoastrelid" :oid t 14) ("relispartition" :bool t 28)))
    (list :oid 1249 :name "pg_attribute" :kind #\r :rows 'sql-attribute-rows
          :fields '(("attrelid" :oid t 1) ("attname" :name t 2)
                    ("atttypid" :oid t 3) ("attnum" :int2 t 5)
@@ -284,7 +286,10 @@ Reject unsupported parameters and unsupported local settings."
          :rows 'sql-replication-slot-rows
          :fields '(("slot_name" :name nil 1) ("active" :bool nil 7)
                    ("restart_lsn" :pg-lsn nil 11) ("confirmed_flush_lsn" :pg-lsn nil 12)
-                   ("wal_status" :text nil 13) ("retained_wal_bytes" :int8 t 23)))))
+                   ("wal_status" :text nil 13) ("retained_wal_bytes" :int8 t 23)
+                   ("plugin" :name nil 2) ("slot_type" :text nil 3) ("datoid" :oid nil 4)
+                   ("temporary" :bool nil 6) ("invalidation_reason" :text nil 19)
+                   ("two_phase" :bool nil 15) ("failover" :bool nil 20)))))
 
 (defun sql-system-relation-definition (identity)
   (find identity +sql-system-relations+
@@ -295,6 +300,15 @@ Reject unsupported parameters and unsupported local settings."
 (defun sql-system-row-source (table)
   (getf (sql-system-relation-definition (pg-class-oid table)) :rows))
 
+(defun sql-database-rows ()
+  "Expose durable database identities to standard replication discovery."
+  (with-write-lock
+    (let ((rows nil))
+      (maphash (lambda (name database)
+                 (push (vector (database-oid database) name) rows))
+               (catalog-databases *catalog*))
+      rows)))
+
 (defun sql-namespace-rows ()
   "Return public, catalog, and internal TOAST namespace metadata."
   (list (vector 11 "pg_catalog") (vector 99 "pg_toast") (vector 2200 "public")))
@@ -304,7 +318,9 @@ Reject unsupported parameters and unsupported local settings."
   (flet ((lsn (slot)
            (let ((value (aref row slot)))
              (if (eq value +null+) value (sql-pg-lsn-input value)))))
-    (vector (aref row 0) (aref row 1) (lsn 2) (lsn 3) (aref row 5) (aref row 4))))
+    (vector (aref row 0) (aref row 1) (lsn 2) (lsn 3) (aref row 5) (aref row 4)
+            (aref row 6) "logical" (aref row 7) nil
+            (if (string= (aref row 5) "lost") "wal_removed" +null+) nil nil)))
 
 (defun sql-replication-slot-rows ()
   (mapcar #'sql-replication-slot-row (wal-replication-slot-rows)))
@@ -317,10 +333,10 @@ Reject unsupported parameters and unsupported local settings."
                       collect (vector (getf entry :oid) (getf entry :name) 11
                                       (char-code (getf entry :kind))
                                       (reduce #'max (getf entry :fields) :key #'fourth)
-                                      (char-code #\d) 0))))
+                                      (char-code #\d) 0 nil))))
       (labels ((add-object (oid name kind columns &optional (toast-oid 0) (namespace 2200) (identity #\d))
                  (push (vector oid name namespace (char-code kind) columns
-                               (char-code identity) toast-oid) rows)))
+                               (char-code identity) toast-oid nil) rows)))
         (maphash (lambda (name table)
                    (let* ((toast (pg-class-toast table))
                           (parent-oid (pg-class-oid table)))
