@@ -1132,6 +1132,59 @@
         (wal-logical-reader-reset-batch state nil)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest test-logical-slot-scan-spool-cleanup
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-slot-scan-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 1)
+           (*wal-replication-slots* (make-hash-table :test #'equal))
+           (*wal-logical-slot-owner* (list :owner))
+           (*wal-logical-slot-read-progress* nil)
+           (*wal-poisoned* nil)
+           (*wal-durable-lsn* 100)
+           (slot (make-wal-replication-slot :name "scan" :database-oid 7
+                                            :restart-lsn 0 :consistent-lsn 0
+                                            :confirmed-flush-lsn 0
+                                            :active-owner *wal-logical-slot-owner*))
+           (event (logical-encode-change
+                   (logical-test-change :insert 7 701 :new-values #(1 2 "scan"))))
+           (middle (floor (length event) 2))
+           (start (make-wal-record :type +wal-record-batch-start+ :xid 0 :payload #()))
+           (fragment (make-wal-record :type +wal-record-logical-changes+ :xid 91
+                                      :payload (logical-encode-fragment
+                                                0 2 (make-logical-fragment
+                                                     :event event :start 0 :end middle))))
+           (original-scan (symbol-function 'wal-scan))
+           (fail-scan nil)
+           (saw-spool nil))
+      (setf (gethash "scan" *wal-replication-slots*) slot)
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'wal-scan)
+                   (lambda (function &rest options)
+                     (declare (ignore options))
+                     (funcall function start)
+                     (funcall function fragment)
+                     (setf saw-spool (= 1 (length (uiop:directory-files directory))))
+                     (when fail-scan (error "injected scan failure"))))
+             (multiple-value-bind (transactions progress)
+                 (wal-logical-slot-read-transactions "scan")
+               (rove:ok saw-spool)
+               (rove:ok (null transactions))
+               (rove:ok (= progress 0))
+               (rove:ok (null (uiop:directory-files directory))))
+             (setf saw-spool nil fail-scan t)
+             (rove:ok (handler-case (progn (wal-logical-slot-read-transactions "scan") nil)
+                        (error (condition)
+                          (search "injected scan failure" (princ-to-string condition)))))
+             (rove:ok saw-spool)
+             (rove:ok (null (uiop:directory-files directory)))
+             (rove:ok (= 0 (wal-replication-slot-confirmed-flush-lsn slot))))
+        (setf (symbol-function 'wal-scan) original-scan)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest test-logical-fragment-assembly
     (let* ((first (make-array 10 :element-type '(unsigned-byte 8)
                                  :initial-contents '(0 1 2 3 4 5 6 7 8 9)))
