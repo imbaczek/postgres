@@ -369,6 +369,61 @@
     (declare (ignore overrides))
     (ok (equal "second" (gethash "config_file" native)))))
 
+(deftest startup-config-output-distinguishes-settings-from-the-legacy-control-port
+    (dolist (args '(("-C" "port") ("-Cport")))
+      (multiple-value-bind (native overrides) (pg::startup-cli-inputs args)
+        (declare (ignore overrides))
+        (ok (equal "port" (gethash "config-output" native)))
+        (ok (null (gethash "control-port" native)))))
+  (multiple-value-bind (native overrides) (pg::startup-cli-inputs '("-C" "6433"))
+    (declare (ignore overrides))
+    (ok (equal "6433" (gethash "control-port" native)))
+    (ok (null (gethash "config-output" native))))
+  (dolist (args '(("-C" "port" "-C" "6433") ("-Cport" "-C6433")))
+    (multiple-value-bind (native overrides) (pg::startup-cli-inputs args)
+      (declare (ignore overrides))
+      (ok (equal "6433" (gethash "control-port" native)))
+      (ok (null (gethash "config-output" native)))))
+  (dolist (args '(("-C" "6433" "-C" "port") ("-C6433" "-Cport")))
+    (multiple-value-bind (native overrides) (pg::startup-cli-inputs args)
+      (declare (ignore overrides))
+      (ok (equal "port" (gethash "config-output" native)))
+      (ok (null (gethash "control-port" native)))))
+  (multiple-value-bind (native overrides) (pg::startup-cli-inputs '("--control-port" "6434"))
+    (declare (ignore overrides))
+    (ok (equal "6434" (gethash "control-port" native)))))
+
+(deftest startup-config-output-uses-file-auto-and-command-line-precedence
+    (with-physical-store-directory (root)
+      (let* ((configuration (merge-pathnames "postgresql.conf" root))
+             (auto (merge-pathnames "postgresql.auto.conf" root))
+             (pg::*startup-server-settings* :unchanged)
+             (pg::*pgdata* :unchanged)
+             (args (list "-D" (namestring root))))
+        (write-startup-config configuration (format nil "port=5540~%checkpoint_timeout='90s'~%"))
+        (write-startup-config auto (format nil "port=5541~%"))
+        (ok (equal "5541" (pg::startup-configuration-output (append args '("-C" "port")))))
+        (ok (equal "5542" (pg::startup-configuration-output
+                           (append args '("-c" "port=5542" "-C" "PORT")))))
+        (ok (equal "90" (pg::startup-configuration-output
+                         (append args '("-C" "checkpoint_timeout")))))
+        (ok (equal "" (pg::startup-configuration-output (append args '("-C" "restore_command")))))
+        (ok (equal (string-right-trim "/" (namestring root))
+                   (pg::startup-configuration-output (append args '("-C" "data_directory")))))
+        (ok (intake-fails-p
+             (lambda () (pg::startup-configuration-output (append args '("-C" "unknown_setting"))))))
+        (ok (eq :unchanged pg::*startup-server-settings*))
+        (ok (eq :unchanged pg::*pgdata*))
+        (ok (null (pg::startup-configuration-output (append args '("--control-port" "6433")))))
+        (ok (not (probe-file (merge-pathnames "postmaster.pid" root)))))))
+
+(deftest startup-config-output-does-not-create-a-missing-data-directory
+    (with-physical-store-directory (root)
+      (let* ((missing (merge-pathnames "absent/" root))
+             (args (list "-D" (namestring missing) "-C" "port")))
+        (ok (intake-fails-p (lambda () (pg::startup-configuration-output args))))
+        (ok (not (probe-file missing))))))
+
 (deftest startup-integer-conversion-matches-pinned-c-rounding
     (dolist (case '(("port" "0x1538" 5432) ("port" "012470" 5432)
                     ("port" "5432.5" 5432) ("port" "5433.5" 5434)
