@@ -652,6 +652,8 @@ CL's RENAME-FILE merges a relative target with the source's directory."
   (wal-recover)
   (note-primary-startup-replay)
   (wal-load-replication-slots)
+  (sb-thread:with-mutex (*wal-lock*)
+    (wal-refresh-logical-capture-slot-mirror-under-wal-lock))
   (catalog-init)
   (physical-source-pin-load)
   (catalog-remove-orphan-relations)

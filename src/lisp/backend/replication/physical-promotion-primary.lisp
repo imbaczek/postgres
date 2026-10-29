@@ -296,6 +296,8 @@ recovery; restart must classify durable control."
   "Retire recovery triggers before clearing the recovery role and declaring readiness."
   (physical-promotion-test-point :after-child-primary-initialization)
   (physical-promotion-retire-recovery)
+  (sb-thread:with-mutex (*wal-lock*)
+    (wal-refresh-logical-capture-slot-mirror-under-wal-lock))
   (setf *physical-recovery-state* nil *physical-recovery-failed-p* nil
         *physical-replay-seen-relfilenodes* nil)
   (wal-note-primary-ready)

@@ -813,6 +813,8 @@ from advancing the shared WAL generation between a failed save and rollback."
   (prevent-recovery-write "nextval")
   (when (and *backend* (backend-read-only *backend*))
     (ereport "25006" "cannot execute nextval in a read-only transaction"))
+  (when (and *backend* (eq (backend-state *backend*) :in-progress))
+    (logical-note-xid-mutation-needs-capture-p (get-current-xid)))
   (with-write-lock
     (let* ((sequence (lookup-sequence name))
            (old-value (and sequence (pg-sequence-last-value sequence)))
@@ -860,6 +862,8 @@ from advancing the shared WAL generation between a failed save and rollback."
     (ereport "25006" "cannot execute setval in a read-only transaction"))
   (unless (sequence-value-range-p value)
     (ereport "22003" "sequence value is out of range"))
+  (when (and *backend* (eq (backend-state *backend*) :in-progress))
+    (logical-note-xid-mutation-needs-capture-p (get-current-xid)))
   (with-write-lock
     (let* ((sequence (lookup-sequence name))
            (old-value (and sequence (pg-sequence-last-value sequence)))

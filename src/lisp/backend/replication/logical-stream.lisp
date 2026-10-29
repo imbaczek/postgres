@@ -866,7 +866,8 @@ Other types retain their normal semantic checks and may allocate their values."
 
 (defun logical-note-transaction-event (kind payload &key (publication-selection :unknown))
   "Capture a transactional utility event such as TRUNCATE before XID commit."
-  (when (and *backend* (backend-xid *backend*))
+  (when (and *backend* (backend-xid *backend*)
+             (logical-note-xid-mutation-needs-capture-p (backend-xid *backend*)))
     (unless (eq kind :truncate)
       (error "unsupported logical transaction event ~a" kind))
     (let* ((text (with-output-to-string (stream)
@@ -917,7 +918,8 @@ Other types retain their normal semantic checks and may allocate their values."
 PostgreSQL's logical decode path queues heap changes in DecodeInsert,
 DecodeUpdate, and DecodeDelete; this subset already has decoded values in the
 executor, so capture the same operation before transaction commit."
-  (when (and *backend* (backend-xid *backend*))
+  (when (and *backend* (backend-xid *backend*)
+             (logical-note-xid-mutation-needs-capture-p (backend-xid *backend*)))
     (logical-test-failpoint :before-logical-row-encode kind (pg-class-name table))
     (let* ((columns
              (logical-relation-columns table))

@@ -25,6 +25,7 @@
            (when *wal-replication-slot-loss-collector*
              (push slot (car *wal-replication-slot-loss-collector*))))))
      *wal-replication-slots*))
+  (wal-refresh-logical-capture-slot-mirror-under-wal-lock)
   (physical-source-invalidate-lagging-pins-under-wal-lock)
   (values))
 
@@ -101,7 +102,8 @@
               (ereport "55006" "replication slot \"~a\" is active" name))
             (wal-delete-replication-slot-file name)
             (setf removed-slot slot)
-            (remhash name *wal-replication-slots*)))
+            (remhash name *wal-replication-slots*)
+            (wal-refresh-logical-capture-slot-mirror-under-wal-lock)))
         (when removed-slot
           (detach-exported-logical-snapshots-for-slots-under-registry-lock
            (list removed-slot))

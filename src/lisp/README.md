@@ -616,6 +616,15 @@ applies committed row transactions and supported DDL/sequence events. Each targe
 stores a durable source-LSN marker in the same catalog commit as an applied event;
 the worker sends replication feedback only after that commit. The worker explicitly
 requests the `pg_lisp` output plugin for its snapshot lifecycle and private events.
+When no live logical slot or slot creation is active, newly assigned transactions
+can skip logical row and transactional-event capture. Capture mode remains fixed
+for a transaction that has already written. Slot creation first enables capture
+for new transactions and waits for older uncaptured writers to finish before
+establishing its boundary. It rejects creation by a transaction already admitted
+as a writer or changed by row, TRUNCATE or sequence work, and rejects a wait
+that would deadlock on its retained schema lease. Dropping or losing the last
+slot permits new transactions to skip capture; already captured transactions
+remain captured. Unknown capture state is handled conservatively.
 Initial copy batches rows to an 8 MiB target; a larger row uses a separate
 transaction and must still fit the source/target protocol and logical WAL limits.
 For extension-mode initial copy, each target INSERT is counted and emitted in
@@ -629,7 +638,7 @@ target counts the original UTF-8 field bytes. Row metadata and other allocations
 remain in memory, and the target still receives and parses the complete Simple
 Query frame.
 Frontend query message lengths are limited to 132 MiB, including the four-byte
-length word. Logical capture normally limits each encoded row change or
+length word. When capture is enabled, it normally limits each encoded row change or
 transactional event to 64 MiB, including its encoding overhead. Row changes
 made by the `pg-lisp-subscribe-apply` application have an extra 1 MiB of
 headroom; transactional utility events retain the 64 MiB event limit. WAL

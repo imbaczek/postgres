@@ -216,6 +216,16 @@ or :QUERY-STATE for the wire dispatch's existing reload/shutdown cleanup lane."
 (defvar *xid-lock* (sb-thread:make-mutex :name "pg xid lock"))
 (defvar *next-xid* +first-normal-xid+)
 (defvar *active-xids* '())
+
+;; All three structures are protected by *XID-LOCK*.  Capture mode is chosen
+;; once per XID; arming a slot enables new XIDs before old uncaptured XIDs drain.
+(defvar *logical-capture-xid-modes* (make-hash-table :test #'eql))
+
+(defvar *logical-capture-arming* (make-hash-table :test #'eq))
+
+(defvar *logical-capture-live-slots* nil
+  "Live slot count, or NIL until authoritatively refreshed under WAL lock.")
+
 (defvar *xid-wrap-lock* (sb-thread:make-mutex :name "pg xid wrap gate"))
 (defvar *xid-wrap-work-lock* (sb-thread:make-mutex :name "pg xid wrap worker"))
 (defvar *xid-wrap-cv* (sb-thread:make-waitqueue :name "pg xid wrap waitqueue"))
@@ -648,9 +658,16 @@ Both wraparound waiting and coordinator selection use this test."
     (ereport "55000" "transaction ID wraparound is waiting for a safe tuple freeze; retry the statement")))
 
 (defun xid-allocate-under-lock ()
-  (let ((xid *next-xid*))
-    (setf *next-xid* (advance-full-xid xid))
-    (push xid *active-xids*)
+  (let* ((xid *next-xid*)
+         (next (advance-full-xid xid))
+         (link (list xid))
+         (capture (or (not (eql *logical-capture-live-slots* 0))
+                      (plusp (hash-table-count *logical-capture-arming*)))))
+    (sb-sys:without-interrupts
+      (setf (gethash xid *logical-capture-xid-modes*) (if capture :capture :skip)
+            (cdr link) *active-xids*
+            *active-xids* link
+            *next-xid* next))
     xid))
 
 (defun assign-xid ()
@@ -688,8 +705,21 @@ Both wraparound waiting and coordinator selection use this test."
         (member xid (gethash relfilenode *relation-writers*) :test #'=)
         (relation-build-group-has-user-p token xid t (and group (second group))))))
 
+(defun logical-note-xid-mutation-needs-capture-p (xid)
+  "Record the first row or transactional utility change and return capture mode."
+  (sb-thread:with-mutex (*xid-lock*)
+    (case (gethash xid *logical-capture-xid-modes*)
+      ((:skip :skip-written)
+       (setf (gethash xid *logical-capture-xid-modes*) :skip-written)
+       nil)
+      (otherwise
+       (setf (gethash xid *logical-capture-xid-modes*) :capture-written)
+       t))))
+
 (defun register-relation-accesses (write-relfilenodes read-relfilenodes xid)
   "Admit a mutation and all subquery reads atomically, with writes taking precedence."
+  (when (and write-relfilenodes *backend* (eql xid (backend-xid *backend*)))
+    (logical-note-xid-mutation-needs-capture-p xid))
   ;; Admission waits under the relation mutex without publishing a partial set;
   ;; callers must not hold the writer lock while waiting for relation gates.
   (let* ((writes (sort (remove-duplicates (copy-list write-relfilenodes) :test #'=) #'<))
@@ -709,6 +739,8 @@ Both wraparound waiting and coordinator selection use this test."
 
 (defun register-relation-writer (relfilenode xid)
   "Register XID as a writer, waiting if an index build owns the relation."
+  (when (and *backend* (eql xid (backend-xid *backend*)))
+    (logical-note-xid-mutation-needs-capture-p xid))
   (sb-thread:with-mutex (*relation-lock-mutex*)
     (loop
       (let* ((writers (gethash relfilenode *relation-writers*))
@@ -976,7 +1008,8 @@ XID lock.  Relation waiters are notified after the registrations are removed."
       (setf *active-xids* (delete xid *active-xids* :test #'=))
       ;; WAL snapshot-boundary state shares the XID lock so removal from the
       ;; active set and removal of its retained LSN remain one atomic change.
-      (wal-forget-xid-under-xid-lock xid))
+      (wal-forget-xid-under-xid-lock xid)
+      (remhash xid *logical-capture-xid-modes*))
     (dolist (registrations (list *relation-writers* *relation-readers*))
       (let ((empty-relations '()))
         (maphash (lambda (relfilenode xids)
@@ -1054,6 +1087,55 @@ Pass BACKEND when releasing its virtual reader ID."
         (when (relation-user-active-p xid)
           (condition-wait-with-timeout *xact-cv* *xact-cv-mutex*)))))
   (values))
+
+(defun logical-capture-xid-needed-p (xid)
+  "Return XID's capture decision, conservatively capturing unknown IDs."
+  (sb-thread:with-mutex (*xid-lock*)
+    (not (member (gethash xid *logical-capture-xid-modes* :capture)
+                 '(:skip :skip-written)))))
+
+(defun wal-refresh-logical-capture-slot-mirror-under-wal-lock ()
+  "Publish the live slot count under the established WAL-to-XID lock order."
+  (let ((count (loop for slot being the hash-values of *wal-replication-slots*
+                     count (not (eq (wal-replication-slot-wal-status slot) :lost)))))
+    (sb-thread:with-mutex (*xid-lock*)
+      (setf *logical-capture-live-slots* count)))
+  (values))
+
+(defun call-with-logical-capture-armed (function)
+  "Enable capture for new XIDs, then drain older uncaptured XIDs before FUNCTION."
+  (let ((token (gensym "LOGICAL-CAPTURE-ARM-")) (old-xids nil) (registered nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (progn
+             (sb-thread:with-mutex (*xid-lock*)
+               ;; Reads allocate XIDs in this server. A known clean XID has no
+               ;; prefix to lose and can begin capturing before the boundary.
+               (when (and *backend* (backend-xid *backend*))
+                 (let* ((xid (backend-xid *backend*))
+                        (mode (gethash xid *logical-capture-xid-modes*)))
+                   (case mode
+                     (:skip (setf (gethash xid *logical-capture-xid-modes*) :capture))
+                     (:capture nil)
+                     (otherwise
+                      (ereport "25001"
+                               "cannot create logical replication slot in transaction that has performed writes")))))
+               (setf (gethash token *logical-capture-arming*) t
+                     registered t
+                     old-xids (loop for xid in *active-xids*
+                                    when (member (gethash xid *logical-capture-xid-modes* :capture) '(:skip :skip-written))
+                                      collect xid)))
+             (sb-sys:with-local-interrupts
+               ;; A retained schema lease can prevent an old writer from ending.
+               (when (and old-xids
+                          (or (backend-holds-schema-read-lock-p)
+                              *schema-read-lock-held* *schema-write-lock-held*))
+                 (ereport "55000" "cannot wait for uncaptured transactions while holding a schema lock"))
+               (dolist (xid old-xids) (wait-for-xid xid))
+               (funcall function)))
+        (when registered
+          (sb-thread:with-mutex (*xid-lock*)
+            (remhash token *logical-capture-arming*)))))))
 
 (declaim (ftype function running-xacts-check-state))
 
@@ -1164,6 +1246,12 @@ excluded, so a sequence advance before slot publication remains streamable."
     (name boundary-lsn restart-lsn register active-owner
      &optional active-xids database-oid (plugin "pg_lisp"))
   "Persist and publish a slot while *WAL-LOCK* protects its retention point."
+  (sb-thread:with-mutex (*xid-lock*)
+    (unless (plusp (hash-table-count *logical-capture-arming*))
+      (error "logical slot publication requires an armed capture gate"))
+    (when (loop for xid in *active-xids*
+                  thereis (member (gethash xid *logical-capture-xid-modes* :capture) '(:skip :skip-written)))
+      (error "logical slot publication requires uncaptured XIDs to drain")))
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid replication slot name \"~a\"" name))
   (unless (and (snapshot-registration-p register)
@@ -1191,10 +1279,12 @@ excluded, so a sequence advance before slot publication remains streamable."
            ;; this temporary snapshot pin keeps one retention owner and lets
            ;; the configured slot cap invalidate it atomically at checkpoint.
            (release-snapshot-registration-wal-pin-under-wal-lock register))
-      (unless (handler-case
-                  (probe-file (wal-replication-slot-path name))
-                (error () t))
-        (remhash name *wal-replication-slots*)))
+      (sb-sys:without-interrupts
+        (unless (handler-case
+                    (probe-file (wal-replication-slot-path name))
+                  (error () t))
+          (remhash name *wal-replication-slots*))
+        (wal-refresh-logical-capture-slot-mirror-under-wal-lock)))
     slot))
 
 (defun wal-create-replication-slot-under-writer-lock
@@ -1259,7 +1349,7 @@ between snapshot capture and this durable publication."
             (backend-holds-schema-read-lock-p backend))
     (ereport "XX000" "SNAPSHOT 'use' must be called before any query")))
 
-(defun create-standard-logical-slot (slot-name snapshot-action)
+(defun %create-standard-logical-slot (slot-name snapshot-action)
   "Publish a confirmed slot; only USE transfers MVCC and schema ownership to SQL."
   (unless *backend* (ereport "55000" "slot creation requires an active backend"))
   (unless (member snapshot-action '(:nothing :use))
@@ -1319,7 +1409,15 @@ between snapshot capture and this durable publication."
            (release-snapshot-registration registration))))
       (when schema-lease (release-schema-read-lock)))))
 
-(defun create-exported-logical-snapshot-slot (slot-name)
+(defun create-standard-logical-slot (slot-name snapshot-action)
+  (unless *backend* (ereport "55000" "slot creation requires an active backend"))
+  (unless (member snapshot-action '(:nothing :use))
+    (ereport "0A000" "standard snapshot export is not implemented"))
+  (when (eq snapshot-action :use) (validate-standard-snapshot-use *backend*))
+  (call-with-logical-capture-armed
+   (lambda () (%create-standard-logical-slot slot-name snapshot-action))))
+
+(defun %create-exported-logical-snapshot-slot (slot-name)
   "Create an unconfirmed logical slot and return its copy boundary and token.
 
 Unlike the in-process WITH-EXPORTED-SNAPSHOT helper, this keeps the snapshot
@@ -1412,6 +1510,13 @@ snapshot lifecycle."
       (ignore-errors
        (wal-release-logical-catalog-event-interest registration)))))
 
+(defun create-exported-logical-snapshot-slot (slot-name)
+  (unless *backend* (ereport "55000" "logical snapshot export requires an active backend"))
+  (unless (eq (backend-state *backend*) :idle)
+    (ereport "25001" "cannot export a replication snapshot inside a transaction"))
+  (call-with-logical-capture-armed
+   (lambda () (%create-exported-logical-snapshot-slot slot-name))))
+
 (defun import-exported-logical-snapshot (token)
   "Import TOKEN into the current read-only RR transaction as an independent pin.
 
@@ -1472,7 +1577,7 @@ snapshot owns copies of XIP and sequence states."
     (ereport "25001"
              "cannot end the transaction inside an exported snapshot scope")))
 
-(defun call-with-exported-snapshot (slot-name function)
+(defun %call-with-exported-snapshot (slot-name function)
   "Run FUNCTION against a read-only RR snapshot and retain SLOT-NAME's WAL.
 
 Like PostgreSQL's logical snapbuild path, this owns a read-only REPEATABLE READ
@@ -1585,6 +1690,13 @@ VACUUM FULL wait for this scope."
                       (sb-sys:without-interrupts
                         (wal-release-replication-slot-owner
                          slot-name slot-owner))))))))))))
+
+(defun call-with-exported-snapshot (slot-name function)
+  (unless *backend* (ereport "55000" "exported snapshots require an active backend"))
+  (unless (eq (backend-state *backend*) :idle)
+    (ereport "25001" "cannot export a snapshot from inside a transaction"))
+  (call-with-logical-capture-armed
+   (lambda () (%call-with-exported-snapshot slot-name function))))
 
 (defmacro with-exported-snapshot
     ((snapshot-var start-lsn-var &key slot-name) &body body)

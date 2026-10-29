@@ -857,14 +857,17 @@ keepalive's WAL-end field, which may include changes not yet applied."
   (let ((name (logical-replication-command-slot-name command))
         (plugin (logical-replication-command-plugin command))
         (snapshot (logical-replication-command-snapshot-action command)))
-    ;; Serialize DROP until the success row is sent, as C retains the slot's
-    ;; active owner through do_tup_output. Sending failure still unlocks.
-    (sb-thread:with-mutex (*logical-slot-lifecycle-lock*)
-      (multiple-value-bind (boundary token)
-          (if (equal plugin "pg_lisp")
-              (create-exported-logical-snapshot-slot name)
-              (create-standard-logical-slot name snapshot))
-        (send-create-replication-slot-result stream name boundary token plugin)))))
+    ;; Drain uncaptured XIDs before taking the lifecycle mutex: an older writer
+    ;; may itself need that mutex before it can finish.
+    (call-with-logical-capture-armed
+     (lambda ()
+       ;; Serialize DROP until the success row is sent.
+       (sb-thread:with-mutex (*logical-slot-lifecycle-lock*)
+         (multiple-value-bind (boundary token)
+             (if (equal plugin "pg_lisp")
+                 (create-exported-logical-snapshot-slot name)
+                 (create-standard-logical-slot name snapshot))
+           (send-create-replication-slot-result stream name boundary token plugin)))))))
 
 (defun drop-replication-slot-command (stream command)
   (let ((name (logical-replication-command-slot-name command))

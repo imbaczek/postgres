@@ -363,8 +363,9 @@
     (call-with-live-child-fixture
      (lambda (root store)
        (declare (ignore store))
-       (let ((catalog pg::*catalog*) (clog pg::*clog-stream*)
-                                     (snapshot (pg::ensure-transaction-snapshot pg::*backend* 1)))
+       (let ((pg::*logical-capture-live-slots* nil)
+             (catalog pg::*catalog*) (clog pg::*clog-stream*)
+             (snapshot (pg::ensure-transaction-snapshot pg::*backend* 1)))
          (call-with-current-promotion-owner
           (lambda ()
             (call-with-promotion-exclusion #'pg::physical-promotion-start-live-child-primary)))
@@ -374,6 +375,7 @@
          (ok (eq snapshot (pg::backend-transaction-snapshot pg::*backend*)))
          (ok (= 50 (pg::snapshot-xmax snapshot)))
          (ok (not (pg::recovery-in-progress-p)))
+         (ok (eql 0 pg::*logical-capture-live-slots*))
          (ok (pg::backend-transaction-read-only-p))
          (ok (null pg::*physical-receive-store*))
          (ok (not (probe-file (merge-pathnames "physical-recovery.control" root))))
