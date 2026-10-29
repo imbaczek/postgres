@@ -3355,6 +3355,11 @@ candidate selection."
 (defun group-column-position (expr group-keys)
   (position expr group-keys :test #'same-group-column-p))
 
+(defun json-equality-or-order-error (type ordering-p)
+  (ereport "42883" "could not identify an ~a operator for type ~a"
+           (if ordering-p "ordering" "equality")
+           (if (eq type :json-array) "json[]" "json")))
+
 (defun analyze-group-keys (group-asts scope &optional targets)
   "Resolve a GROUP BY list and keep its first occurrence of each column."
   (let ((keys '()))
@@ -3362,13 +3367,13 @@ candidate selection."
       ;; Diagnose unsupported JSON equality even when GROUP BY uses an ordinal.
       (when (and targets (eq (first ast) :const) (integerp (second ast))
                  (<= 1 (second ast) (length targets)))
-        (let ((target-expr (getf (nth (1- (second ast)) targets) :expr)))
-          (when (and target-expr
-                     (member (expr-type (analyze-expr target-expr scope)) '(:json :json-array)))
-            (ereport "42883" "could not identify an equality operator for type json"))))
+        (let* ((target-expr (getf (nth (1- (second ast)) targets) :expr))
+               (type (and target-expr (expr-type (analyze-expr target-expr scope)))))
+          (when (member type '(:json :json-array))
+            (json-equality-or-order-error type nil))))
       (let ((expr (analyze-expr ast scope)))
         (when (member (expr-type expr) '(:json :json-array))
-          (ereport "42883" "could not identify an equality operator for type json"))
+          (json-equality-or-order-error (expr-type expr) nil))
         (unless (or (eq (first expr) :col)
                     (and (eq (first expr) :outer-ref) (eq (first ast) :column)))
           (ereport "0A000" "GROUP BY currently supports column references only"))
@@ -3757,7 +3762,7 @@ candidate selection."
                  (ereport "42703" "column ~a does not exist" (second raw))))
            (ereport "0A000" "only result column names can be used in UNION ORDER BY")))
        (when (member (getf (nth position targets) :type) '(:json :json-array))
-         (ereport "42883" "could not identify an ordering operator for type json"))
+         (json-equality-or-order-error (getf (nth position targets) :type) t))
        (cons (getf (nth position targets) :expr) (getf item :desc))))
    order))
 

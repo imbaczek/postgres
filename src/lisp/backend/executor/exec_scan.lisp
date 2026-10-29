@@ -810,9 +810,9 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
     (when definition (validate-recursive-term-aggregates right))
     (multiple-value-bind (targets coercions)
         (analyze-union-targets (or frozen (getf left :targets)) (getf right :targets))
-      (when (and (not (eq (getf ast :set-operation) :union-all))
-                 (some (lambda (target) (member (getf target :type) '(:json :json-array))) targets))
-        (ereport "42883" "could not identify an equality operator for type json"))
+      (when (not (eq (getf ast :set-operation) :union-all))
+        (let ((target (find-if (lambda (item) (member (getf item :type) '(:json :json-array))) targets)))
+          (when target (json-equality-or-order-error (getf target :type) nil))))
       (when definition
         (loop for seed in frozen for target in targets for position from 1
               unless (and (eq (getf seed :type) (getf target :type))
@@ -1105,12 +1105,12 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                targets order
                (+ width (length *select-window-functions*))
                (getf ast :distinct)))))
-      (when (and (getf ast :distinct)
-                 (some (lambda (target) (member (getf target :type) '(:json :json-array))) targets))
-        (ereport "42883" "could not identify an equality operator for type json"))
-      (when (some (lambda (item) (member (expr-type (car item)) '(:json :json-array)))
-                  (second set-analysis))
-        (ereport "42883" "could not identify an ordering operator for type json"))
+      (let ((item (find-if (lambda (item) (member (expr-type (car item)) '(:json :json-array)))
+                           (second set-analysis))))
+        (when item (json-equality-or-order-error (expr-type (car item)) t)))
+      (when (getf ast :distinct)
+        (let ((target (find-if (lambda (item) (member (getf item :type) '(:json :json-array))) targets)))
+          (when target (json-equality-or-order-error (getf target :type) nil))))
       (list :window-validation-keys
             (when *cte-definition-analysis-p*
               (mapcar (lambda (target) (getf target :expr)) *window-key-targets*))

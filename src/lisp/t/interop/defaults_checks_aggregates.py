@@ -831,6 +831,34 @@ class NumericErrorConnection(QueryConnection):
         return self.numeric_error
 
 
+def check_json_array_diagnostics(reference, native):
+    cases = (
+        ("SELECT DISTINCT 'null'::json", "equality", "json"),
+        ("SELECT DISTINCT ARRAY['null'::json]", "equality", "json[]"),
+        ("SELECT ARRAY['null'::json] GROUP BY 1", "equality", "json[]"),
+        ("SELECT ARRAY['null'::json] UNION SELECT ARRAY['null'::json]", "equality", "json[]"),
+        ("SELECT ARRAY['null'::json] ORDER BY 1", "ordering", "json[]"),
+        ("SELECT DISTINCT ARRAY['null'::json] ORDER BY 1", "ordering", "json[]"),
+        ("SELECT row_number() OVER (PARTITION BY ARRAY['null'::json])", "equality", "json[]"),
+        ("SELECT row_number() OVER (PARTITION BY ARRAY['null'::json] ORDER BY 'null'::json)", "ordering", "json"),
+        ("SELECT ARRAY['null'::json] = ARRAY['null'::json]", "equality", "json"),
+        ("SELECT ARRAY['null'::json] < ARRAY['null'::json]", "comparison function", "json"),
+    )
+    peers = [NumericErrorConnection(port, "json-array-diagnostics")
+             for port in (reference, native)]
+    try:
+        for sql, operation, type_name in cases:
+            message = (f"could not identify a {operation} for type {type_name}"
+                       if operation == "comparison function" else
+                       f"could not identify an {operation} operator for type {type_name}")
+            outcomes = [peer.observe_numeric_error(sql)[:2] for peer in peers]
+            assert outcomes == [("42883", message)] * 2, (sql, outcomes)
+        print(f"json-array: {len(cases)} C diagnostic comparisons PASS", flush=True)
+    finally:
+        for peer in peers:
+            peer.close()
+
+
 def check_numeric_prefix_errors(reference, native):
     peers = [NumericErrorConnection(port, "numeric-prefix-errors")
              for port in (reference, native)]
@@ -1159,6 +1187,7 @@ if __name__ == "__main__":
         check_restart(int(sys.argv[1]), int(sys.argv[2]))
     else:
         check(int(sys.argv[1]), int(sys.argv[2]))
+        check_json_array_diagnostics(int(sys.argv[1]), int(sys.argv[2]))
         check_numeric_prefix_errors(int(sys.argv[1]), int(sys.argv[2]))
         check_smallint_casts(int(sys.argv[1]), int(sys.argv[2]))
         check_integer_input_errors(int(sys.argv[1]), int(sys.argv[2]))
