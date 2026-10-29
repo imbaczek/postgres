@@ -1813,6 +1813,108 @@
                  (error () t))
                "logical slot command parser rejects pgoutput v1 for v2 Message support")))
 
+(rove:deftest test-logical-jsonb-canonical-string-recognizer
+    (dolist (entry '(("\"\"" t) ("\"a🙂\\n\\u0001\"" t)
+                     ("\"a\\/\"" nil) ("\"\\u0000\"" nil)
+                     ("\"\\u0061\"" nil) ("\"\\u000A\"" nil)
+                     ("\"\\u000a\"" nil) ("[1]" nil) ("\"x\" " nil)
+                     ("[\"x\", [true, null], false]" t) ("[\"x\",true]" nil)
+                     ("[\"x\", 1]" nil) ("[\"x\", {\"a\": true}]" nil)))
+      (let* ((bytes (string->bytes (first entry)))
+             (cursor (make-logical-cursor :bytes bytes)))
+        (rove:ok (eq (not (null (logical-jsonb-canonical-simple-p cursor (length bytes))))
+                     (second entry)))
+        (rove:ok (zerop (logical-cursor-offset cursor))))))
+
+(rove:deftest test-publisher-large-jsonb-string-slice
+    (let* ((*query-temp-directory* (uiop:temporary-directory))
+           (*logical-capture-memory-bytes* 1)
+           (value (make-sql-jsonb (concatenate 'string
+                                               (make-string 70000 :initial-element #\x)
+                                               "🙂")))
+           (change (logical-test-change :insert 7 701 :new-values (vector 1 2 value)))
+           (spool (make-logical-spool)))
+      (setf (getf (third (logical-change-columns change)) :type) :jsonb)
+      (unwind-protect
+           (progn
+             (logical-spool-append spool (logical-encode-change change))
+             (logical-spool-seal spool)
+             (logical-transaction-map-send-changes
+              (make-logical-transaction :spool spool)
+              (lambda (decoded)
+                (let ((output (make-array 0 :element-type '(unsigned-byte 8)
+                                            :adjustable t :fill-pointer 0)))
+                  (rove:ok (logical-event-slice-p (aref (logical-change-new-values decoded) 2)))
+                  (pgoutput-emit-row-change
+                   decoded (lambda (part)
+                             (if (integerp part) (vector-push-extend part output)
+                                 (loop for byte across part do (vector-push-extend byte output)))))
+                  (rove:ok (equalp output (pgoutput-build-row-change change)))))))
+        (close-logical-spool spool))))
+
+(rove:deftest test-logical-jsonb-simple-arrays-and-depth
+    (flet ((recognized (text)
+             (let* ((bytes (string->bytes text)) (cursor (make-logical-cursor :bytes bytes)))
+               (prog1 (logical-jsonb-canonical-simple-p cursor (length bytes))
+                 (rove:ok (zerop (logical-cursor-offset cursor)))))))
+      (rove:ok (recognized "[]"))
+      (rove:ok (recognized "[\"🙂\", [true, null], false]"))
+      (rove:ok (recognized (concatenate 'string (make-string 512 :initial-element #\[)
+                                        "\"x\"" (make-string 512 :initial-element #\]))))
+      (rove:ok (not (recognized (concatenate 'string (make-string 513 :initial-element #\[)
+                                             "\"x\"" (make-string 513 :initial-element #\])))))
+      (rove:ok (not (recognized "[1.00, \"x\"]")))
+      (rove:ok (not (recognized "{\"x\": true}"))))
+  (let* ((bytes (make-array 65540 :element-type '(unsigned-byte 8) :initial-element 120))
+         (cursor (make-logical-cursor :bytes bytes)))
+    (setf (aref bytes 0) 34 (aref bytes 65535) #xc2 (aref bytes 65536) #x20
+          (aref bytes (1- (length bytes))) 34)
+    (rove:ok (handler-case (progn (logical-jsonb-canonical-simple-p cursor (length bytes)) nil)
+               (error () t)))
+    (rove:ok (zerop (logical-cursor-offset cursor)))))
+
+(rove:deftest test-jsonb-recognizer-propagates-cancel
+    (let* ((bytes (string->bytes "\"test\""))
+           (cursor (make-logical-cursor :bytes bytes))
+           (original (symbol-function 'logical-validate-utf8)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-validate-utf8)
+                   (lambda (&rest args) (apply original args) (error "injected cancellation")))
+             (rove:ok (handler-case
+                          (progn (logical-jsonb-canonical-simple-p cursor (length bytes)) nil)
+                        (error (condition) (search "injected cancellation" (princ-to-string condition)))))
+             (rove:ok (zerop (logical-cursor-offset cursor))))
+        (setf (symbol-function 'logical-validate-utf8) original))))
+
+(rove:deftest test-publisher-jsonb-array-slice-and-numeric-fallback
+    (let* ((*query-temp-directory* (uiop:temporary-directory))
+           (*logical-capture-memory-bytes* 1)
+           (large (make-string 70000 :initial-element #\x)))
+      (dolist (entry (list (list (make-sql-jsonb (vector large (vector :json-true :json-null))) t)
+                           (list (make-sql-jsonb (vector large (sql-numeric-input "1.2300"))) nil)))
+        (let* ((value (first entry))
+               (change (logical-test-change :insert 7 701 :new-values (vector 1 2 value)))
+               (spool (make-logical-spool)))
+          (setf (getf (third (logical-change-columns change)) :type) :jsonb)
+          (unwind-protect
+               (progn
+                 (logical-spool-append spool (logical-encode-change change))
+                 (logical-spool-seal spool)
+                 (logical-transaction-map-send-changes
+                  (make-logical-transaction :spool spool)
+                  (lambda (decoded)
+                    (let ((actual (aref (logical-change-new-values decoded) 2))
+                          (output (make-array 0 :element-type '(unsigned-byte 8)
+                                                :adjustable t :fill-pointer 0)))
+                      (rove:ok (eq (not (null (logical-event-slice-p actual))) (second entry)))
+                      (pgoutput-emit-row-change
+                       decoded (lambda (part)
+                                 (if (integerp part) (vector-push-extend part output)
+                                     (loop for byte across part do (vector-push-extend byte output)))))
+                      (rove:ok (equalp output (pgoutput-build-row-change change)))))))
+            (close-logical-spool spool))))))
+
 (rove:deftest test-publisher-spool-slices-match-materialized-and-expire
     (let* ((*query-temp-directory* (uiop:temporary-directory))
            (*logical-capture-memory-bytes* 1)

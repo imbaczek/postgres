@@ -678,8 +678,8 @@ For legacy WAL chunks, the scoped reader validates each event and stages its
 original encoded bytes, avoiding re-encoding and retaining decoded text or
 bytea values during staging. For fragmented events, the scoped reader validates
 the complete event and copies its original bytes into the transaction spool in
-bounded blocks. Validation avoids materializing text and bytea, but still
-constructs JSONB and numeric values; later output decoding can materialize
+bounded blocks. Validation avoids materializing text and bytea, but may still
+construct JSONB and numeric values; later output decoding can materialize
 individual values. The unscoped reader retains its materialization behavior.
 Commit and terminal validation still precede output. A slot scan captures a fixed durable horizon and
 pins its retained start under the WAL lock. It copies one WAL record at a time
@@ -693,9 +693,13 @@ each iteration checks the event CRC in bounded blocks before decoding through a
 bounded stream cursor, without allocating the complete encoded event. Scoped
 standard and private senders use event-lifetime slices for text, varchar, JSON
 and bytea, checking slice CRCs and emitting bytes or bytea hex in bounded blocks.
-Slices expire when the event callback returns. JSONB, numeric and ordinary
-list-based reader values still materialize; complete transaction validation
-precedes output. The sender measures each INSERT, UPDATE, or DELETE row before writing one pgoutput
+Slices expire when the event callback returns. Recovery validation and scoped
+senders also scan canonical JSONB values of at least 64 KiB without constructing
+the value when they consist of strings, booleans, nulls, or nested arrays of
+those values. Objects, numbers, smaller values, and valid noncanonical forms
+fall back to materialization for normalization. Numeric and ordinary list-based
+reader values still materialize; complete transaction validation precedes
+output. The sender measures each INSERT, UPDATE, or DELETE row before writing one pgoutput
 CopyData frame through a bounded buffer. The subscriber reads replication frames
 directly through a length-bounded stream cursor and completes decoding before
 applying an operation. Pgoutput row text-format fields above 1 MiB or beyond

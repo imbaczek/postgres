@@ -709,6 +709,71 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
            (decf count size))
   (values))
 
+(defun logical-jsonb-canonical-simple-p (cursor length)
+  "Recognize canonical JSONB strings and simple arrays without materializing them.
+Leave CURSOR unchanged. Objects and numbers use the ordinary parser."
+  (let* ((offset (logical-cursor-offset cursor))
+         (stream (logical-cursor-stream cursor))
+         (position (and stream (file-position stream)))
+         (end (+ offset length)))
+    (unwind-protect
+         (catch 'logical-jsonb-noncanonical
+           (progn
+             (logical-cursor-require cursor length)
+             (logical-validate-utf8 cursor length)
+             (when stream (unless (file-position stream position) (error "cannot rewind JSONB")))
+             (setf (logical-cursor-offset cursor) offset)
+             (labels ((take-byte ()
+                        (when (>= (logical-cursor-offset cursor) end)
+                          (throw 'logical-jsonb-noncanonical nil))
+                        (logical-read-u8 cursor))
+                      (expect (byte)
+                        (unless (= (take-byte) byte) (throw 'logical-jsonb-noncanonical nil)))
+                      (hex (byte)
+                        (cond ((<= 48 byte 57) (- byte 48))
+                              ((<= 97 byte 102) (+ 10 (- byte 97)))
+                              (t (throw 'logical-jsonb-noncanonical nil))))
+                      (string-value ()
+                        (loop for byte = (take-byte)
+                              do (cond
+                                   ((= byte 34) (return))
+                                   ((< byte 32) (throw 'logical-jsonb-noncanonical nil))
+                                   ((= byte 92)
+                                    (let ((escape (take-byte)))
+                                      (cond
+                                        ((member escape '(34 92 98 102 110 114 116)) nil)
+                                        ((= escape 117)
+                                         (expect 48) (expect 48)
+                                         (let ((code (+ (* 16 (hex (take-byte))) (hex (take-byte)))))
+                                           (unless (and (<= 1 code 31)
+                                                        (not (member code '(8 9 10 12 13))))
+                                             (throw 'logical-jsonb-noncanonical nil))))
+                                        (t (throw 'logical-jsonb-noncanonical nil))))))))
+                      (word (text)
+                        (loop for character across text do (expect (char-code character))))
+                      (value (first depth)
+                        (when (> depth 512) (throw 'logical-jsonb-noncanonical nil))
+                        (case first
+                          (34 (string-value))
+                          (116 (word "rue"))
+                          (102 (word "alse"))
+                          (110 (word "ull"))
+                          (91 (let ((next (take-byte)))
+                                (unless (= next 93)
+                                  (loop
+                                    (value next (1+ depth))
+                                    (case (take-byte)
+                                      (93 (return))
+                                      (44 (expect 32) (setf next (take-byte)))
+                                      (otherwise (throw 'logical-jsonb-noncanonical nil)))))))
+                          (otherwise (throw 'logical-jsonb-noncanonical nil)))))
+               (value (take-byte) 0)
+               (= (logical-cursor-offset cursor) end)))
+           )
+      (when stream
+        (unless (file-position stream position) (error "cannot restore JSONB cursor")))
+      (setf (logical-cursor-offset cursor) offset))))
+
 (defun logical-read-value (cursor type)
   "Decode a value, accepting tag 3 for text, varchar or json and tag 15 for
 length-prefixed bytea octets; reject mismatched column types. JSON text is not
@@ -758,7 +823,18 @@ revalidated by this codec."
                           (logical-u64-signed (logical-read-u64 cursor))))
       (17 (unless (eq type :jsonb)
             (error "logical value tag does not match its column type"))
-       (sql-jsonb-input (logical-read-string-u32 cursor)))
+       (let ((length (logical-read-u32 cursor)))
+         (if (and (>= length 65536)
+                  (or *logical-validation-only*
+                      (and *logical-event-lease*
+                           (eq cursor (logical-event-lease-cursor *logical-event-lease*))))
+                  (logical-jsonb-canonical-simple-p cursor length))
+             (if *logical-validation-only*
+                 (progn (logical-skip-value-octets cursor length) (make-sql-jsonb ""))
+                 (logical-make-event-slice cursor length :jsonb))
+             (sql-jsonb-input
+              (sb-ext:octets-to-string (logical-read-octets cursor length)
+                                       :external-format :utf-8)))))
       (15 (unless (eq type :bytea)
             (error "logical value tag does not match its column type"))
        (let ((length (logical-read-u32 cursor)))
