@@ -60,6 +60,111 @@
                 (pg::physical-promotion-check-child-control child checkpoint-child)
                 t))))))
 
+(deftest pending-promotion-proves-persistent-disk-slots-without-a-live-registry
+    (dolist (kind '(:reserved :unreserved :lost :temporary-orphan :foreign :future :wrong-timeline))
+      (with-promotion-fixture (root store)
+        (declare (ignore root store))
+        (with-retained-root-registry
+            (prepare-promotion-child)
+          (let* ((reference (handoff-test-reference))
+                 (slot (pg::make-wal-replication-slot
+                        :name "pending_public" :kind :physical
+                        :system-id (if (member kind '(:foreign :temporary-orphan)) 456 123)
+                        :restart-lsn (unless (eq kind :unreserved)
+                                       (if (member kind '(:future :temporary-orphan)) 999 153))
+                        :restart-timeline (unless (eq kind :unreserved)
+                                            (if (eq kind :wrong-timeline) 2 1))
+                        :consistent-lsn nil :confirmed-flush-lsn nil :plugin nil
+                        :temporary-p (eq kind :temporary-orphan)
+                        :wal-status (if (eq kind :lost) :lost :reserved))))
+            (handoff-test-select-pending-reference reference)
+            (pg::wal-save-replication-slot slot)
+            (ok (zerop (hash-table-count pg::*wal-replication-slots*)))
+            (let* ((before (lineage-test-bytes (pg::wal-control-path)))
+                   (result (handler-case
+                               (call-with-promotion-exclusion #'pg::physical-promotion-publish-child-control)
+                             (error () nil))))
+              (if (member kind '(:foreign :future :wrong-timeline))
+                  (progn
+                    (ok (null result) (format nil "~a" kind))
+                    (ok (equalp before (lineage-test-bytes (pg::wal-control-path)))))
+                  (progn
+                    (ok (eql 424 result) (format nil "~a" kind))
+                    (ok (= 2 (nth-value 3 (pg::wal-read-control-fields))))))
+              (ok (zerop (hash-table-count pg::*wal-replication-slots*)))))))))
+
+(deftest cold-child-slot-loading-registers-the-primary-archive-first
+    (call-with-live-child-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (prepare-promotion-child)
+       (let* ((reference (handoff-test-reference))
+              (system-id (pg::catalog-system-identifier))
+              (slot (pg::make-wal-replication-slot
+                     :name "cold_public" :kind :physical :system-id system-id
+                     :restart-lsn 153 :restart-timeline 1
+                     :consistent-lsn nil :confirmed-flush-lsn nil :plugin nil))
+              (temporary (pg::make-wal-replication-slot
+                          :name "cold_temporary" :kind :physical :system-id 456
+                          :restart-lsn 999 :restart-timeline 9 :temporary-p t
+                          :consistent-lsn nil :confirmed-flush-lsn nil :plugin nil))
+              (initializer (symbol-function 'pg::initialize-primary-storage)))
+         (handoff-test-select-pending-reference reference)
+         (pg::wal-save-replication-slot slot)
+         (pg::wal-save-replication-slot temporary)
+         (call-with-promotion-exclusion #'pg::physical-promotion-publish-child-control)
+         (ok (null (pg::physical-retained-root-current (pg::physical-promotion-retained-owner :primary))))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::initialize-primary-storage)
+                      (lambda ()
+                        (let* ((fields (multiple-value-list (pg::wal-read-control-fields)))
+                               (pg::*wal-insert-timeline* (fourth fields))
+                               (pg::*wal-checkpoint-timeline* (fifth fields))
+                               (pg::*wal-segment-namespace* (sixth fields))
+                               (pg::*wal-durable-lsn* (second fields)))
+                          (pg::wal-load-replication-slots)
+                          (throw 'cold-slots-loaded :loaded))))
+                (ok (eq :loaded
+                        (catch 'cold-slots-loaded
+                          (pg::physical-promotion-start-child-primary))))
+                (ok (= 153 (pg::wal-replication-slot-restart-lsn
+                            (gethash "cold_public" pg::*wal-replication-slots*))))
+                (ok (= 1 (hash-table-count pg::*wal-replication-slots*)))
+                (ok (not (probe-file (pg::wal-replication-slot-path "cold_temporary")))))
+           (setf (symbol-function 'pg::initialize-primary-storage) initializer))))
+     :committed-child nil))
+
+(deftest public-slot-carryover-rejects-a-divergent-committed-child-prefix
+    (call-with-live-child-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (prepare-promotion-child)
+       (let* ((reference (handoff-test-reference))
+              (slot (pg::make-wal-replication-slot
+                     :name "divergent_public" :kind :physical
+                     :system-id (pg::catalog-system-identifier)
+                     :restart-lsn 153 :restart-timeline 1
+                     :consistent-lsn nil :confirmed-flush-lsn nil :plugin nil)))
+         (handoff-test-select-pending-reference reference)
+         (pg::wal-save-replication-slot slot)
+         (setf (gethash "divergent_public" pg::*wal-replication-slots*) slot)
+         (call-with-promotion-exclusion #'pg::physical-promotion-publish-child-control)
+         (let* ((path (pg::wal-segment-path 0 2 :timeline))
+                (bytes (lineage-test-bytes path))
+                (before (lineage-test-bytes (pg::wal-control-path))))
+           (setf (aref bytes 160) (logxor 1 (aref bytes 160)))
+           (pg::wal-atomic-write-bytes path bytes)
+           (let ((message (handler-case
+                              (progn (call-with-live-child-adoption) nil)
+                            (error (condition) (princ-to-string condition)))))
+             (ok (and message (search "public slot prefix differs" message))))
+           (ok pg::*physical-recovery-failed-p*)
+           (ok (eq slot (gethash "divergent_public" pg::*wal-replication-slots*)))
+           (ok (= 153 (pg::wal-replication-slot-restart-lsn slot)))
+           (ok (equalp before (lineage-test-bytes (pg::wal-control-path)))))))
+     :committed-child nil))
+
 (cl-spec:defproperty retained-parent-history-derivation-preserves-ancestry
     ((parent (range integer 2 4294967294)) (fork (range integer 64 18446744073709551615)))
   (:about pg::physical-promotion-retained-parent-history)

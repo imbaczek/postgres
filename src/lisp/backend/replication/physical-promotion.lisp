@@ -346,6 +346,8 @@ handoff.  Failure during publication fences recovery."
         (unless (= child (physical-promotion-select-child parent))
           (error "pending child selection changed")))))
 
+(declaim (ftype function physical-promotion-check-pending-slots))
+
 (defun physical-promotion-check-pending (state metadata prefix generation &key allow-history)
   "Revalidate durable ownership; history publication ends prefix-install eligibility."
   (let ((control (physical-recovery-read-control *pgdata*)))
@@ -367,7 +369,9 @@ handoff.  Failure during publication fences recovery."
              (equal (getf metadata :source-checkpoint) (getf state :source-checkpoint))
              (equal (getf metadata :source-reservation) (getf state :source-reservation)))
       (error "pending promotion ownership or generation proof changed"))
-    (physical-promotion-check-progress state metadata prefix generation 3)))
+    (multiple-value-prog1
+        (physical-promotion-check-progress state metadata prefix generation 3)
+      (physical-promotion-check-pending-slots state))))
 
 (defun physical-promotion-install-prefix ()
   "Install the verified pending child prefix before history/EOR; never admit writes.

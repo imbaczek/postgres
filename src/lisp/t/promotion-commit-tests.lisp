@@ -447,6 +447,111 @@
            (ok (= (if (eq point :after-live-child-xid-floor) 50 1003) pg::*next-xid*))
            (ok (eq snapshot (pg::backend-transaction-snapshot pg::*backend*))))))))
 
+(deftest public-physical-slots-survive-the-complete-live-promotion-path
+    (call-with-live-child-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (let* ((reserved (pg::with-live-operation
+                          (pg::wal-create-physical-replication-slot "retained_public" :immediately-reserve t)))
+              (unreserved (pg::with-live-operation
+                            (pg::wal-create-physical-replication-slot "future_public")))
+              (temporary (pg::with-live-operation
+                           (pg::wal-create-physical-replication-slot "temporary_public"
+                                                                     :immediately-reserve t :temporary t)))
+              (registry pg::*wal-replication-slots*)
+              (owner pg::*backend*)
+              (restart (pg::wal-replication-slot-restart-lsn reserved)))
+         (ok (<= restart pg::*last-replay-lsn*))
+         (call-with-current-promotion-owner
+          (lambda ()
+            (call-with-promotion-exclusion
+             (lambda ()
+               (let ((pending (pg::physical-promotion-publish-intent)))
+                 (ok (pg::wal-retained-reference-valid-p (getf pending :retained-reference))))
+               (pg::physical-promotion-install-prefix)
+               (ok (= 424 (pg::physical-promotion-publish-child-control)))
+               (ok (= 424 (pg::physical-promotion-adopt-live-child-runtime)))))))
+         (ok (eq registry pg::*wal-replication-slots*))
+         (ok (eq reserved (gethash "retained_public" registry)))
+         (ok (eq unreserved (gethash "future_public" registry)))
+         (ok (eq temporary (gethash "temporary_public" registry)))
+         (ok (= restart (pg::wal-replication-slot-restart-lsn reserved)))
+         (ok (null (pg::wal-replication-slot-restart-lsn unreserved)))
+         (ok (eq owner (pg::wal-replication-slot-active-owner temporary)))
+         (ok (eq owner (pg::wal-replication-slot-temporary-owner temporary)))
+         (ok (= 2 pg::*wal-insert-timeline*))))
+     :committed-child nil))
+
+(deftest promotion-preflight-rejects-unproven-public-slot-state
+    (dolist (kind '(:foreign :future :timeline :logical :missing :orphan :changed :temporary-entry))
+      (call-with-live-child-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (let* ((slot (pg::with-live-operation
+                        (pg::wal-create-physical-replication-slot "checked_public")))
+                (state pg::*physical-recovery-state*)
+                (parent (lineage-test-bytes (pg::wal-control-path)))
+                (control (lineage-test-bytes (pg::physical-recovery-control-path))))
+           (case kind
+             (:foreign (incf (pg::wal-replication-slot-system-id slot)))
+             (:future (setf (pg::wal-replication-slot-restart-lsn slot) (1+ pg::*last-replay-lsn*)
+                            (pg::wal-replication-slot-restart-timeline slot) 1))
+             (:timeline (setf (pg::wal-replication-slot-restart-lsn slot) 153
+                              (pg::wal-replication-slot-restart-timeline slot) 2)))
+           (when (member kind '(:foreign :future :timeline))
+             (pg::wal-save-replication-slot slot))
+           (case kind
+             (:logical (setf (pg::wal-replication-slot-kind slot) :logical))
+             (:missing (delete-file (pg::wal-replication-slot-path "checked_public")))
+             (:orphan (remhash "checked_public" pg::*wal-replication-slots*))
+             (:changed (setf (pg::wal-replication-slot-restart-lsn slot) 153
+                             (pg::wal-replication-slot-restart-timeline slot) 1))
+             (:temporary-entry
+              (with-open-file
+                  (stream (merge-pathnames ".pending.tmp" (pg::wal-replication-slot-directory))
+                          :direction :output :element-type '(unsigned-byte 8))
+                (finish-output stream))))
+           (ok (intake-fails-p
+                (lambda () (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent)))
+               (format nil "~a" kind))
+           (ok (eq state pg::*physical-recovery-state*))
+           (ok (= 2 (getf state :phase)))
+           (ok (not pg::*physical-recovery-failed-p*))
+           (ok (equalp parent (lineage-test-bytes (pg::wal-control-path))))
+           (ok (equalp control (lineage-test-bytes (pg::physical-recovery-control-path))))))
+       :committed-child nil)))
+
+(deftest live-child-adoption-preserves-public-physical-slot-generations
+    (dolist (kind '(:unreserved :reserved :lost :temporary))
+      (call-with-live-child-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (let* ((owner (when (eq kind :temporary) pg::*backend*))
+                (slot (pg::make-wal-replication-slot
+                       :name "promotion_public" :kind :physical
+                       :system-id (pg::catalog-system-identifier)
+                       :restart-lsn (unless (eq kind :unreserved) 153)
+                       :restart-timeline (unless (eq kind :unreserved) 1)
+                       :consistent-lsn nil :confirmed-flush-lsn nil :plugin nil
+                       :wal-status (if (eq kind :lost) :lost :reserved)
+                       :temporary-p (eq kind :temporary) :temporary-owner owner
+                       :active-owner owner :active-owner-backend owner)))
+           (pg::wal-save-replication-slot slot)
+           (setf (pg::wal-replication-slot-inactive-since slot) 123456
+                 (gethash "promotion_public" pg::*wal-replication-slots*) slot)
+           (let ((before (lineage-test-bytes
+                          (pg::wal-replication-slot-path "promotion_public"))))
+             (ok (= 424 (call-with-live-child-adoption)))
+             (ok (eq slot (gethash "promotion_public" pg::*wal-replication-slots*)))
+             (ok (eq owner (pg::wal-replication-slot-active-owner slot)))
+             (ok (eq owner (pg::wal-replication-slot-temporary-owner slot)))
+             (ok (eql (unless (eq kind :unreserved) 153)
+                      (pg::wal-replication-slot-restart-lsn slot)))
+             (ok (eql (unless (eq kind :unreserved) 1)
+                      (pg::wal-replication-slot-restart-timeline slot)))
+             (ok (equalp before (lineage-test-bytes
+                                 (pg::wal-replication-slot-path "promotion_public"))))))))))
+
 (deftest live-child-adoption-rejects-unproven-retention-inventories
     (dolist (kind '(:slot :pin :temporary :dangling :directory-link :live-slot :live-pin))
       (call-with-live-child-fixture
@@ -494,6 +599,18 @@
           (ok (= 32 (gethash owner pg::*wal-snapshot-retention-pins*)))
           (setf (gethash owner pg::*wal-snapshot-retention-pins*) pg::+wal-segment-size+)
           (ok (progn (pg::physical-promotion-check-live-retention fork) t))))))
+
+(deftest rootless-promotion-rejects-a-public-slot-before-the-copied-fork-segment
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (fork (+ pg::+wal-segment-size+ 216))
+             (state (list :phase 3 :timeline 1 :promotion-child 2 :applied fork :system-id 123))
+             (slot (physical-slot-test-object :restart 32 :system-id 123))
+             (message (handler-case
+                          (progn (pg::physical-promotion-check-slot-prefix (list slot) state) nil)
+                        (error (condition) (princ-to-string condition)))))
+        (ok (and message (search "predates the copied promotion prefix" message)))
+        (ok (= 32 (pg::wal-replication-slot-restart-lsn slot))))))
 
 (deftest live-child-adoption-rejects-pending-runtime-state
     (dolist (kind (list :completed-wrap :pending-wrap :failed-wrap :wrap-marker :parent-output

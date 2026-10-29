@@ -154,16 +154,100 @@ allocation. All four values must be canonical counters or the exhaustion sentine
        (or (= (floor actual +xid-cycle+) (floor floor +xid-cycle+))
            (= floor (min +max-xid-one-past+ (xid-next-epoch-boundary actual))))))
 
-(defun physical-promotion-check-live-retention (fork)
-  "Check that retained state can use the copied child prefix.
+(defun physical-promotion-read-physical-slots (&key reconcile-live)
+  "Read a physical-only slot inventory without replacing live generations.
+Under promotion exclusion, reconcile durable fields when live slots are present.
+Inactivity time may differ because releasing a slot updates it only in memory."
+  (let* ((directory (wal-replication-slot-directory))
+         (entries (directory-entry-names directory))
+         (paths (durable-state-file-paths directory "slot"))
+         (slots nil))
+    (unless (= (length entries) (length paths))
+      (error "promotion found an unrecognized slot inventory entry"))
+    (dolist (path paths)
+      (let* ((name (pathname-name path))
+             (slot (physical-slot-decode (read-bounded-regular-file path 2048 :stabilize t) name)))
+        (unless (string= (file-namestring path) (format nil "~a.slot" name))
+          (error "promotion found a noncanonical slot filename"))
+        (when reconcile-live
+          (let ((live (gethash name *wal-replication-slots*)))
+            (unless (and (wal-replication-slot-p live) (wal-physical-slot-p live))
+              (error "promotion slot registry differs from its physical inventory"))
+            (setf (wal-replication-slot-inactive-since slot)
+                  (wal-replication-slot-inactive-since live))
+            (unless (equalp (physical-slot-encode slot) (physical-slot-encode live))
+              (error "promotion slot durable state differs from its live generation"))
+            (setf slot live)))
+        (push slot slots)))
+    (when (and reconcile-live (/= (length slots) (hash-table-count *wal-replication-slots*)))
+      (error "promotion slot registry has unpersisted generations"))
+    slots))
 
-Logical slot and source-pin inventories must be empty in memory and on disk.
-Each ordinary snapshot WAL pin must lie within the copied fork segment prefix."
-  (unless (and (zerop (hash-table-count *wal-replication-slots*))
-               (zerop (hash-table-count *physical-source-pins*))
-               (null (directory-entry-names (wal-replication-slot-directory)))
+(defun physical-promotion-check-slot-prefix (slots state &key committed)
+  "Prove physical restart floors against the immutable prefix through the fork.
+Use the selected archive when present. Legacy rootless promotion can retain
+only the copied fork-segment prefix. A committed child must contain that prefix."
+  (let* ((fork (getf state :applied))
+         (system-id (getf state :system-id))
+         (parent (physical-recovery-replay-timeline state))
+         (history (timeline-check-lineage
+                   (timeline-parse-history
+                    parent (if (= parent 1) "" (bytes->string (timeline-history-bytes parent))))))
+         (reference (getf state :retained-reference))
+         (identity (when reference (physical-promotion-retained-identity system-id reference)))
+         (first (* (floor fork +wal-segment-size+) +wal-segment-size+)))
+    (when reference
+      (physical-promotion-check-retained-reference system-id reference parent history :end fork))
+    (dolist (slot slots)
+      (physical-slot-check-retained-range
+       slot system-id history fork
+       (lambda (segment cursor)
+         (declare (ignore cursor))
+         (let* ((origin (* segment +wal-segment-size+))
+                (bytes
+                  (if reference
+                      (physical-follow-retained-segment reference identity history segment)
+                      (progn
+                        (unless (= origin first)
+                          (error "physical slot predates the copied promotion prefix"))
+                        (let ((prefix (getf state :wal-prefix-bytes)))
+                          (unless (and (typep prefix '(vector (unsigned-byte 8)))
+                                       (= (length prefix) (- fork origin)))
+                            (error "promotion lacks its exact saved fork prefix"))
+                          prefix)))))
+           (when (and committed (= origin first))
+             (let ((child (physical-promotion-read-file
+                           (wal-segment-path segment (getf state :promotion-child) :timeline))))
+               (unless (and (<= (length bytes) (length child))
+                            (equalp bytes (subseq child 0 (length bytes))))
+                 (error "public slot prefix differs from committed child WAL"))))
+           bytes))))
+    t))
+
+(defun physical-promotion-check-pending-slots (state)
+  "Check persistent disk slots before pending promotion can publish child state.
+Temporary slots have no surviving owner after a crash and are removed at startup."
+  (let ((slots (physical-promotion-read-physical-slots)))
+    (physical-promotion-check-slot-prefix
+     (remove-if #'wal-replication-slot-temporary-p slots) state)))
+
+(defun physical-promotion-check-live-retention (fork)
+  "Check public physical slots and ordinary snapshot pins before promotion.
+Logical slots and private source pins require separate ownership rules."
+  (unless (and (zerop (hash-table-count *physical-source-pins*))
                (null (directory-entry-names (physical-source-pin-directory))))
-    (error "live promotion requires empty standby slot and source-pin inventories"))
+    (error "live promotion requires an empty private source-pin inventory"))
+  (let ((slots (physical-promotion-read-physical-slots :reconcile-live t)))
+    (when slots
+      (unless (and *physical-recovery-state*
+                   (= fork (if (= 2 (getf *physical-recovery-state* :phase))
+                               *last-replay-lsn*
+                               (getf *physical-recovery-state* :applied))))
+        (error "promotion physical slots require the exact applied fork"))
+      (if (= 2 (getf *physical-recovery-state* :phase))
+          (physical-slot-check-standby-slots slots (catalog-system-identifier))
+          (physical-promotion-check-slot-prefix
+           slots *physical-recovery-state* :committed t))))
   (let ((first (* (floor fork +wal-segment-size+) +wal-segment-size+)))
     (maphash (lambda (owner lsn)
                (declare (ignore owner))
@@ -325,6 +409,7 @@ Close standby storage first. Hide the recovery role only in the initializer's
 dynamic scope; the outer pending role still excludes writers. Retire recovery
 triggers before clearing that outer role and declaring the primary ready.
 The caller must fence any failure and restart from durable child control."
+  (physical-promotion-restore-primary-retained)
   (when *physical-receive-store* (physical-store-close *physical-receive-store*))
   (setf *physical-receive-store* nil)
   (when *clog-stream* (close *clog-stream*) (setf *clog-stream* nil))
