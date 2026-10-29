@@ -233,8 +233,10 @@ For a simple UPDATE, unassigned external columns that are neither referenced
 nor indexed can defer detoasting; SET and WHERE inputs, assigned columns and
 index keys remain materialized. Captured updates also materialize replica
 identity columns, and updates without a usable identity fall back to full-row
-materialization. CHECK constraints, RETURNING, joins, subqueries and unrecognized
-expressions also fall back. A concurrent-update recheck uses the row version
+materialization. Recognized simple CHECK and RETURNING expressions demand their
+referenced columns, including OLD and NEW references. Joins, subqueries and
+unrecognized expressions, including in CHECK or RETURNING, fall back to full
+materialization. A concurrent-update recheck uses the row version
 actually claimed. Logical admission conservatively includes reused external
 values in its full-row size bound even when an unchanged marker makes the event
 small; a sufficiently large bound triggers full-row materialization and transport

@@ -729,14 +729,35 @@
                                       (pg::pg-class-columns table) (vector 1 2 pointer) 42 0)))
                (pg::clog-set 42 pg::+clog-committed+)
                (pg::register-active-snapshot snapshot registration)
+               (setf (pg::pg-class-checks table)
+                     (list (list :name "negative" :validated nil :expression
+                                 '(:binop "<" (:col 2 :type :int4) (:const 0 :type :int4)))))
                (setf (symbol-function 'pg::toast-fetch-value)
                      (lambda (&rest args) (declare (ignore args))
                        (error "unchanged payload was fetched")))
                (with-open-file (out out-path :direction :output :if-exists :supersede
                                              :element-type '(unsigned-byte 8))
+                 (ok (handler-case
+                         (progn (pg::exec-update-subqueries
+                                 out (first (pg::parse-statements "UPDATE update_slice SET n=n+1 WHERE id=1")))
+                                nil)
+                       (pg::pg-error (condition)
+                         (string= "23514" (pg::pg-error-sqlstate condition))))))
+               (setf (pg::pg-class-checks table)
+                     (list (list :name "positive" :validated nil :expression
+                                 '(:binop ">" (:col 2 :type :int4) (:const 0 :type :int4)))))
+               (with-open-file (out out-path :direction :output :if-exists :supersede
+                                             :element-type '(unsigned-byte 8))
                  (pg::exec-update-subqueries
-                  out (first (pg::parse-statements "UPDATE update_slice SET n=n+1 WHERE id=1"))))
+                  out (first (pg::parse-statements "UPDATE update_slice SET n=n+1 WHERE id=1 RETURNING old.n,new.n"))))
                (with-open-file (in out-path :direction :input :element-type '(unsigned-byte 8))
+                 (multiple-value-bind (type size payload) (pg::read-message-frame in)
+                   (declare (ignore size payload))
+                   (ok (= type (char-code #\T))))
+                 (multiple-value-bind (type size payload) (pg::read-message-frame in)
+                   (declare (ignore size))
+                   (ok (= type (char-code #\D)))
+                   (ok (equalp payload #(0 2 0 0 0 1 50 0 0 0 1 51))))
                  (multiple-value-bind (type size payload) (pg::read-message-frame in)
                    (declare (ignore size))
                    (ok (= type (char-code #\C)))
