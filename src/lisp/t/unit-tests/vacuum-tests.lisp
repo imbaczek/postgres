@@ -157,7 +157,10 @@
          (*backend* (make-backend))
          (*wal-ready* nil)
          (*wal-page-cache* (make-hash-table :test #'equal))
+         (*wal-page-cache-xids* (make-hash-table :test #'equal))
+         (*wal-dirty-store* nil)
          (*wal-page-batch* nil)
+         (*wal-page-batch-xids* nil)
          (*wal-pending-deletes* '())
          (*wal-pending-btree-split* nil)
          (*wal-catalog-flush-generation* 0)
@@ -224,6 +227,9 @@
                     (vacuum-full-test-read-file (catalog-path))))
       (setf (symbol-function 'request-fast-shutdown)
             original-fast-shutdown)
+      (sb-thread:with-mutex (*wal-lock*) (wal-clear-page-cache))
+      (check (null *wal-dirty-store*) "VACUUM FULL fixture releases all dirty-page ownership")
+      (smgr-close-all)
       (when *wal-output-stream*
         (ignore-errors (close *wal-output-stream*)))
       (ignore-errors
@@ -547,7 +553,10 @@
 (defun test-vacuum-page-publication-is-atomic ()
   (let* ((*wal-ready* nil)
          (*wal-page-cache* (make-hash-table :test #'equal))
+         (*wal-page-cache-xids* (make-hash-table :test #'equal))
+         (*wal-dirty-store* nil)
          (*wal-page-batch* nil)
+         (*wal-page-batch-xids* nil)
          (*wal-test-pause-at* nil)
          (relfilenode 918273657)
          (heap-block 0)
@@ -579,7 +588,9 @@
                                    *wal-page-batch*))))
                        (setf staged-heap-write-seen
                              (and staged-page
-                                  (= (aref staged-page 100) #x22))))
+                                  (= (aref (wal-dirty-read-reference
+                                            (wal-page-key relfilenode heap-block) staged-page) 100)
+                                     #x22))))
                      (error "injected failure before visibility-map clear")))
              (unwind-protect
                   (progn
@@ -630,6 +641,8 @@
                     "successful VACUUM publication clears visibility bits")))
       (setf (symbol-function 'visibilitymap-clear)
             original-visibilitymap-clear)
+      (sb-thread:with-mutex (*wal-lock*) (wal-clear-page-cache))
+      (check (null *wal-dirty-store*) "VACUUM fixture releases all dirty-page ownership")
       (smgr-forget relfilenode :delete t))))
 
 (defun test-vacuum-page-read-releases-global-write-lock ()
