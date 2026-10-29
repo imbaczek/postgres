@@ -284,7 +284,7 @@
   (and (not (member name
                     '("lower" "current_setting" "array_length"
                       "pg_get_expr" "pg_get_replica_identity_index"
-                      "pg_stat_get_wal_receiver" "pg_get_publication_tables"
+                      "pg_stat_get_wal_receiver" "pg_get_publication_tables" "pg_get_replication_slots"
                       "pg_wal_lsn_diff" "pg_walfile_name")
                     :test #'string=))
        (analyzed-expression-volatile-p (list :func name nil))))

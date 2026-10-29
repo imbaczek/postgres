@@ -42,6 +42,10 @@
 (defparameter *max-slot-wal-keep-bytes* (* 1024 1024 1024)
   "Maximum WAL retained by one replication slot at checkpoint; NIL disables the cap.")
 
+(defstruct wal-slot-retention-policy mode limit (max-wal-bytes 1073741824))
+
+(defvar *wal-slot-retention-policy* nil)
+
 (defvar *wal-replication-slot-loss-collector* nil
   "Dynamically bound list receiving durably invalidated slots during WAL maintenance.")
 
@@ -100,6 +104,11 @@ Owners are process-local; the appropriate codec stores durable slot fields."
   "Test the explicit slot kind; a nullable database alone does not identify it."
   (eq :logical (wal-replication-slot-kind slot)))
 
+(defun wal-require-logical-slot (slot)
+  (unless (wal-logical-slot-p slot)
+    (ereport "55000" "physical replication slot cannot use logical acknowledgment or decoding"))
+  slot)
+
 (defun wal-physical-slot-p (slot)
   "Test the explicit physical kind, not the database field."
   (eq :physical (wal-replication-slot-kind slot)))
@@ -136,6 +145,16 @@ Owners are process-local; the appropriate codec stores durable slot fields."
 (defvar *wal-xid-first-lsn* (make-hash-table :test #'eql))
 (defvar *wal-snapshot-retention-pins* (make-hash-table :test #'eq))
 (defvar *wal-replication-slots* (make-hash-table :test #'equal))
+
+(defvar *max-replication-slots* 10)
+
+(defun wal-check-replication-slot-capacity ()
+  (when (zerop *max-replication-slots*)
+    (ereport "55000" "replication slots require max_replication_slots greater than zero"))
+  (when (>= (hash-table-count *wal-replication-slots*) *max-replication-slots*)
+    (ereport "53400" "all replication slots are in use"))
+  (values))
+
 (defvar *wal-logical-catalog-event-interests* (make-hash-table :test #'eq))
 (defvar *wal-logical-slot-owner* nil)
 (defvar *wal-pending-btree-split* nil)
@@ -2103,6 +2122,86 @@ src/backend/access/transam/xlogreader.c."
                        :element-type '(unsigned-byte 8))
     (write-sequence bytes stream)))
 
+(defun wal-slot-retention-mode ()
+  (if *wal-slot-retention-policy* (wal-slot-retention-policy-mode *wal-slot-retention-policy*) :bytes))
+
+(defun wal-slot-retention-limit ()
+  (if (eq :segments (wal-slot-retention-mode))
+      (wal-slot-retention-policy-limit *wal-slot-retention-policy*)
+      *max-slot-wal-keep-bytes*))
+
+(defun wal-slot-reserved-p (slot)
+  (and (eq :reserved (wal-replication-slot-wal-status slot))
+       (wal-replication-slot-restart-lsn slot)))
+
+(defun wal-independent-retention-segment (redo-segment)
+  (let ((positions
+          (append
+           (sb-thread:with-mutex (*xid-lock*)
+             (loop for lsn being the hash-values of *wal-xid-first-lsn* collect lsn))
+           (loop for lsn being the hash-values of *wal-snapshot-retention-pins* collect lsn))))
+    (if positions (min redo-segment (floor (reduce #'min positions) +wal-segment-size+))
+        redo-segment)))
+
+(defun wal-slot-removal-segment (redo-segment independent-segment &optional (current *wal-durable-lsn*))
+  (let* ((positions (loop for slot being the hash-values of *wal-replication-slots*
+                          when (wal-slot-reserved-p slot)
+                            collect (wal-replication-slot-restart-lsn slot)))
+         (limit (wal-slot-retention-limit))
+         (slot-segment (when positions (floor (reduce #'min positions) +wal-segment-size+))))
+    (when (and slot-segment limit (eq :segments (wal-slot-retention-mode)))
+      (setf slot-segment
+            (max slot-segment (- (floor current +wal-segment-size+)
+                                 (floor limit +wal-segment-size+)))))
+    (min redo-segment independent-segment (or slot-segment redo-segment))))
+
+(declaim (ftype function physical-slot-recovery-write-lsn))
+
+(declaim (ftype function physical-slot-recovery-durable-lsn))
+
+(defun wal-slot-safe-wal-bytes (slot)
+  (let* ((restart (wal-replication-slot-restart-lsn slot))
+         (limit (wal-slot-retention-limit))
+         (mode (wal-slot-retention-mode))
+         (write (if (recovery-in-progress-p) (physical-slot-recovery-write-lsn) *wal-end-lsn*)))
+    (if (or (null limit) (eq :lost (wal-replication-slot-wal-status slot))
+            (and (eq mode :bytes) (null restart)))
+        +null+
+        (- (ecase mode
+             (:segments (* (+ (floor (or restart 0) +wal-segment-size+)
+                              (floor limit +wal-segment-size+) 1)
+                           +wal-segment-size+))
+             (:bytes (+ restart limit 1)))
+           write))))
+
+(defun wal-slot-byte-limit-exceeded-p (slot current)
+  (and (integerp *max-slot-wal-keep-bytes*)
+       (> (- current (wal-replication-slot-restart-lsn slot)) *max-slot-wal-keep-bytes*)))
+
+(defun wal-slot-within-normal-window-p (restart write)
+  (let* ((maximum (if *wal-slot-retention-policy*
+                      (wal-slot-retention-policy-max-wal-bytes *wal-slot-retention-policy*)
+                      1073741824))
+         (oldest (max 0 (- (floor write +wal-segment-size+)
+                           (1+ (floor maximum +wal-segment-size+))))))
+    (>= (floor restart +wal-segment-size+) oldest)))
+
+(defun wal-slot-catalog-status (slot)
+  (when (eq :lost (wal-replication-slot-wal-status slot))
+    (return-from wal-slot-catalog-status "lost"))
+  (let ((restart (wal-replication-slot-restart-lsn slot)))
+    (unless restart (return-from wal-slot-catalog-status +null+))
+    (let* ((write (if (recovery-in-progress-p) (physical-slot-recovery-write-lsn) *wal-end-lsn*))
+           (current (floor write +wal-segment-size+))
+           (unreserved
+             (ecase (wal-slot-retention-mode)
+               (:bytes (wal-slot-byte-limit-exceeded-p slot write))
+               (:segments (< (floor restart +wal-segment-size+)
+                             (wal-slot-removal-segment current current write))))))
+      (cond (unreserved "unreserved")
+            ((wal-slot-within-normal-window-p restart write) "reserved")
+            (t "extended")))))
+
 (defun wal-valid-replication-slot-name-p (name)
   (and (stringp name)
        (<= 1 (length name) 63)
@@ -2361,6 +2460,7 @@ src/backend/access/transam/xlogreader.c."
 (defun wal-persist-replication-slot-ack-under-lock (slot acknowledged-lsn
                                                     &optional (restart-floor acknowledged-lsn))
   "Persist an already-validated slot acknowledgment while *WAL-LOCK* is held."
+  (wal-require-logical-slot slot)
   (let* ((pending (wal-slot-pending-after-ack slot acknowledged-lsn))
          (restart-lsn (wal-slot-restart-for-ack restart-floor pending))
          (candidate (wal-copy-replication-slot-with-profile slot)))
@@ -2388,6 +2488,7 @@ src/backend/access/transam/xlogreader.c."
                            (wal-replication-slot-confirmed-flush-lsn slot))))
       (unless slot
         (ereport "42704" "replication slot \"~a\" does not exist" name))
+      (wal-require-logical-slot slot)
       (when (and expected-owner
                  (not (eq (wal-replication-slot-active-owner slot)
                           expected-owner)))
@@ -2425,6 +2526,7 @@ src/backend/access/transam/xlogreader.c."
     (let ((slot (gethash name *wal-replication-slots*)))
       (unless slot
         (ereport "42704" "replication slot \"~a\" does not exist" name))
+      (wal-require-logical-slot slot)
       (unless (and expected-owner
                    (eq (wal-replication-slot-active-owner slot) expected-owner))
         (ereport "55006" "initial replication slot finalization requires its active owner"))
@@ -2488,6 +2590,7 @@ recovery is unsupported. Standby loading requires startup quiescence."
                     (when (recovery-in-progress-p)
                       (error "logical slot restoration during native recovery is unsupported"))
                     (wal-validate-replication-slot-wal slot segments)))
+          (wal-check-replication-slot-capacity)
           (setf (gethash name *wal-replication-slots*) slot))))
     (when (and (recovery-in-progress-p) (plusp (hash-table-count *wal-replication-slots*)))
       (physical-slot-check-standby-slots
@@ -2721,6 +2824,8 @@ Refresh its modification time. Update memory only after atomic publication."
             (wal-remove-checkpointed-segments-under-wal-lock checkpoint-end))))))
   (values))
 
+(declaim (ftype function wal-prepare-slot-recycling-under-lock))
+
 (defun wal-remove-checkpointed-segments-under-wal-lock (checkpoint-lsn)
   "Recycle WAL while preserving active XID, snapshot, and slot restart points.
 
@@ -2730,40 +2835,9 @@ being removed. XID completion can race with recycling; reading the retention
 map under *XID-LOCK* makes that race conservative and safe. Lagging slots are
 durably invalidated here when they exceed max-slot-wal-keep-bytes, matching
 PostgreSQL's checkpoint-time invalidation policy."
-  (wal-invalidate-lagging-replication-slots-under-wal-lock)
-  (let* ((checkpoint-segment (if (zerop checkpoint-lsn)
-                                 0
-                                 (floor (1- checkpoint-lsn)
-                                        +wal-segment-size+)))
-         (oldest-active-first-lsn
-           (sb-thread:with-mutex (*xid-lock*)
-             (when (plusp (hash-table-count *wal-xid-first-lsn*))
-               (loop for lsn being the hash-values of *wal-xid-first-lsn*
-                     minimize lsn))))
-         (oldest-snapshot-pin-lsn
-           (when (plusp (hash-table-count *wal-snapshot-retention-pins*))
-             (loop for lsn being the hash-values
-                     of *wal-snapshot-retention-pins*
-                   minimize lsn)))
-         (oldest-slot-restart-lsn
-           (let ((positions
-                   (loop for slot being the hash-values of *wal-replication-slots*
-                         when (and (eq (wal-replication-slot-wal-status slot) :reserved)
-                                   (wal-replication-slot-restart-lsn slot))
-                           collect
-                           (wal-replication-slot-restart-lsn slot))))
-             (and positions (reduce #'min positions))))
-         (oldest-retained-lsn
-           (let ((positions
-                   (remove nil (list oldest-active-first-lsn
-                                     oldest-snapshot-pin-lsn
-                                     oldest-slot-restart-lsn))))
-             (and positions (reduce #'min positions))))
-         (xid-retention-segment
-           (if oldest-retained-lsn
-               (floor oldest-retained-lsn +wal-segment-size+)
-               checkpoint-segment))
-         (keep-segment (min checkpoint-segment xid-retention-segment))
+  (let* ((checkpoint-segment (if (zerop checkpoint-lsn) 0
+                                 (floor (1- checkpoint-lsn) +wal-segment-size+)))
+         (keep-segment (wal-prepare-slot-recycling-under-lock checkpoint-segment))
          (removed nil))
     (dolist (segment (wal-discover-segments))
       (when (< segment keep-segment)

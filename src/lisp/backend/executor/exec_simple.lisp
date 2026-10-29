@@ -468,7 +468,8 @@ rolled back immediately."
     (when (eq (backend-state *backend*) :in-progress)
       (if (backend-explicit *backend*)
           (abort-transaction-block)
-          (abort-transaction)))))
+          (abort-transaction)))
+    (wal-cleanup-backend-physical-slots *backend*)))
 
 ;;; ---- transaction commands ----
 

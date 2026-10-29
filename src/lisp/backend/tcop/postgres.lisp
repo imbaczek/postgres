@@ -673,6 +673,7 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
         (unwind-protect
              (when backend
                (forget-extended-query-state backend)
+               (wal-cleanup-backend-physical-slots backend)
                (logical-release-subscription-owner backend)
                (unregister-backend backend))
           (connection-finished))))))

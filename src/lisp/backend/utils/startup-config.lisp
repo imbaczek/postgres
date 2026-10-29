@@ -18,9 +18,10 @@
     ("listen_addresses" :postmaster :string "127.0.0.1")
     ("data_directory" :postmaster :string nil)
     ("restore_command" :sighup :string "")
+    ("max_replication_slots" :postmaster :integer "10" 0 262143 nil)
     ("checkpoint_timeout" :sighup :integer "300" 30 86400 :seconds)
     ("max_wal_size" :sighup :integer "1024" 2 2147483647 :megabytes)
-    ("max_slot_wal_keep_size" :sighup :integer "1024" -1 2147483647 :megabytes)))
+    ("max_slot_wal_keep_size" :sighup :integer "-1" -1 2147483647 :megabytes)))
 
 (sb-alien:define-alien-routine ("strtol" startup-strtol) sb-alien:long
   (text (* sb-alien:char)) (end (* (* sb-alien:char))) (base sb-alien:int))
@@ -374,6 +375,13 @@
     (if bytes (parse-slot-wal-keep-bytes bytes)
         (unless (= megabytes -1) (* megabytes 1024 1024)))))
 
+(defun startup-effective-slot-policy (settings native)
+  (make-wal-slot-retention-policy
+   :mode (if (or (gethash "max-slot-wal-keep-bytes" native)
+                 (uiop:getenv "PG_MAX_SLOT_WAL_KEEP_BYTES")) :bytes :segments)
+   :limit (startup-effective-slot-limit settings native)
+   :max-wal-bytes (* 1024 1024 (startup-setting-value settings "max_wal_size"))))
+
 (defun startup-argument-values (argv)
   (multiple-value-bind (native overrides) (startup-cli-inputs argv)
     (let* ((settings (startup-load-settings native overrides))
@@ -398,12 +406,14 @@
 (defun startup-install-settings (settings native overrides)
   (let ((timeout (startup-setting-value settings "checkpoint_timeout"))
         (wal-bytes (* 1024 1024 (startup-setting-value settings "max_wal_size")))
-        (slot-bytes (startup-effective-slot-limit settings native)))
+        (slot-policy (startup-effective-slot-policy settings native)))
     (setf *startup-server-settings* settings
           *startup-native-inputs* native *startup-command-overrides* overrides
           *physical-restartpoint-timeout* timeout
           *physical-restartpoint-wal-bytes* wal-bytes
-          *max-slot-wal-keep-bytes* slot-bytes))
+          *max-slot-wal-keep-bytes* (wal-slot-retention-policy-limit slot-policy)
+          *wal-slot-retention-policy* slot-policy
+          *max-replication-slots* (startup-setting-value settings "max_replication_slots")))
   settings)
 
 (defun startup-reload-settings ()

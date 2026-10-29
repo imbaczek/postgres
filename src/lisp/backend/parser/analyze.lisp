@@ -174,7 +174,7 @@
     (:varchar-array 1015 -1) (:oid-array 1028 -1) (:date-array 1182 -1)
     (:time-array 1183 -1) (:timetz-array 1270 -1) (:timestamp-array 1115 -1)
     (:timestamptz-array 1185 -1) (:interval-array 1187 -1) (:pg-lsn-array 3221 -1)
-    (:bit-array 1561 -1) (:oid 26 4) (:pg-node-tree 194 -1) (:record 2249 -1)
+    (:bit-array 1561 -1) (:oid 26 4) (:xid 28 4) (:pg-node-tree 194 -1) (:record 2249 -1)
     (:void 2278 4) (:pg-lsn 3220 8) (:numeric 1700 -1) (:float4 700 4)
     (:float8 701 8) (:date 1082 4) (:time 1083 8) (:timetz 1266 12)
     (:timestamp 1114 8) (:interval 1186 16) (:bit 1560 -1)))
@@ -602,9 +602,90 @@ then argument types. Only ambiguity and type failures carry the cast hint."
      name analyzed :schema schema :named-p t
      :signature (random-call-signature analyzed (nreverse argument-names)))))
 
+(defun physical-slot-function-signature (name)
+  (cond
+    ((string= name "pg_create_physical_replication_slot")
+     '(("slot_name" :name :required) ("immediately_reserve" :bool nil) ("temporary" :bool nil)))
+    ((string= name "pg_replication_slot_advance")
+     '(("slot_name" :name :required) ("upto_lsn" :pg-lsn :required)))
+    ((string= name "pg_drop_replication_slot") '((nil :name :required)))))
+
+(defun analyze-catalog-call-inputs (arguments table)
+  (let ((analyzed (mapcar (lambda (raw)
+                            (analyze-expr (if (eq (first raw) :named-arg) (third raw) raw) table))
+                          arguments))
+        (names nil))
+    (dolist (raw arguments)
+      (let ((name (and (eq (first raw) :named-arg) (second raw))))
+        (when (and (null name) names)
+          (ereport "42601" "positional argument cannot follow named argument"))
+        (when (and name (member name names :test #'equal))
+          (ereport "42601" "argument name ~s used more than once" name))
+        (when name (push name names))))
+    (values analyzed names)))
+
+(defun analyze-physical-slot-arguments (name arguments table variadic)
+  (multiple-value-bind (analyzed names) (analyze-catalog-call-inputs arguments table)
+    (let* ((signature (physical-slot-function-signature name))
+           (assigned (make-array (length signature) :initial-element nil))
+           (slots (make-array (length signature) :initial-element nil))
+           (position 0) (bindings nil))
+      (loop for raw in arguments for expression in analyzed
+            for named = (eq (first raw) :named-arg)
+            for index = (if named (position (second raw) signature :key #'first :test #'equal)
+                            (prog1 position (incf position)))
+            for type = (and index (< index (length signature)) (second (nth index signature)))
+            do (unless (and type (not (aref assigned index))
+                            (or (in-unknown-constant-p expression)
+                                (sql-implicit-coercion-p (expr-type expression) type)))
+                 (ereport "42883" "function ~a with these arguments does not exist" name))
+               (setf (aref assigned index) t)
+               (push (list index expression type) bindings))
+      (when (and variadic names (/= (caar bindings) (1- (length arguments))))
+        (ereport "42883" "function ~a with these arguments does not exist" name))
+      (loop for (parameter type default) in signature for index from 0
+            unless (aref assigned index)
+              do (when (eq default :required)
+                   (ereport "42883" "function ~a(~a) does not exist" name (call-signature analyzed)))
+                 (setf (aref slots index) (list :const default :type type :typmod -1)))
+      (dolist (binding (nreverse bindings))
+        (destructuring-bind (index expression type) binding
+          (setf (aref slots index) (coerce-common-expression expression type))))
+      (coerce slots 'list))))
+
+(defun analyze-physical-slot-function (name arguments)
+  (if (string= name "pg_drop_replication_slot")
+      (list :func name arguments :type :void :typmod -1)
+      (list :func name arguments :type :record :typmod -1
+                                 :fields (if (string= name "pg_create_physical_replication_slot")
+                                             +physical-slot-create-result-fields+ +physical-slot-advance-result-fields+))))
+
+(defun eval-physical-slot-function (name arguments)
+  (if (some (lambda (argument) (eq argument +null+)) arguments)
+      +null+
+      (cond
+        ((string= name "pg_create_physical_replication_slot")
+         (let ((slot (wal-create-physical-replication-slot
+                      (first arguments) :immediately-reserve (second arguments)
+                      :temporary (third arguments))))
+           (make-sql-record
+            :fields +physical-slot-create-result-fields+
+            :values (vector (wal-replication-slot-name slot)
+                            (or (wal-replication-slot-restart-lsn slot) +null+)))))
+        ((string= name "pg_replication_slot_advance")
+         (make-sql-record
+          :fields +physical-slot-advance-result-fields+
+          :values (vector (first arguments)
+                          (wal-advance-physical-replication-slot (first arguments) (second arguments)))))
+        (t (wal-drop-replication-slot (first arguments)) nil))))
+
 (defun analyze-call-argument-list (name arguments table &optional variadic schema)
   "Analyze call arguments, binding supported named arguments."
-  (cond ((string= name "pg_promote")
+  (cond ((physical-slot-function-signature name)
+         (analyze-physical-slot-arguments name arguments table variadic))
+        ((string= name "pg_get_replication_slots")
+         (analyze-catalog-call-inputs arguments table))
+        ((string= name "pg_promote")
          (analyze-promotion-arguments arguments table variadic))
         ((member name '("random" "setseed") :test #'string=)
          (analyze-random-arguments arguments table name schema))
@@ -1109,15 +1190,50 @@ so a nested argument error keeps its own diagnostics."
              :hint (when (> (length order) 1)
                      "Perhaps you misplaced ORDER BY; ORDER BY must appear after all regular arguments of the aggregate."))))
 
-(defun analyze-function-expression (expr table)
-  "Resolve a supported scalar or administrative function call."
+(defun logical-helper-function-p (name)
+  (member name '("pg_lisp_acquire_subscription" "pg_lisp_replica_identity_columns"
+                 "pg_lisp_publication_definition" "pg_lisp_table_definition"
+                 "pg_lisp_sequence_state" "pg_lisp_replication_bootstrap")
+          :test #'string=))
+
+(defun analyze-logical-helper-function (name args)
+  (cond
+    ((string= name "pg_lisp_acquire_subscription")
+     (unless (and (= (length args) 1) (eq (expr-type (first args)) :text))
+       (ereport "42883" "pg_lisp_acquire_subscription requires one text key"))
+     (list :func name args :type :bool :typmod -1))
+    ((string= name "pg_lisp_replica_identity_columns")
+     (unless (= (length args) 1)
+       (ereport "42883" "function ~a(~a) does not exist"
+                name (call-signature args)))
+     (list :func name args :type :varchar :typmod -1))
+    ((member name '("pg_lisp_publication_definition"
+                    "pg_lisp_table_definition"
+                    "pg_lisp_sequence_state")
+             :test #'string=)
+     (unless (= (length args) 1)
+       (ereport "42883" "function ~a(~a) does not exist"
+                name (call-signature args)))
+     (list :func name args :type :varchar :typmod -1))
+    ((string= name "pg_lisp_replication_bootstrap")
+     (unless (null args)
+       (ereport "42883" "function ~a(~a) does not exist"
+                name (call-signature args)))
+     (list :func name args :type :varchar :typmod -1))
+    ))
+
+(defun check-qualified-numeric-function-call (expr table)
   (let ((schema (getf (cdddr expr) :schema))
         (name (second expr)))
     (when (and schema (not (string= schema "pg_catalog"))
                (or (numeric-function-p name)
                    (member name '("random" "setseed") :test #'string=)))
       (report-qualified-numeric-call-error name schema (third expr) table
-                                           (getf (cdddr expr) :call-order))))
+                                           (getf (cdddr expr) :call-order)))))
+
+(defun analyze-function-expression (expr table)
+  "Resolve a supported scalar or administrative function call."
+  (check-qualified-numeric-function-call expr table)
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
          (random-signature nil)
          (args (multiple-value-bind (arguments signature)
@@ -1133,6 +1249,8 @@ so a nested argument error keeps its own diagnostics."
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     (cond
+      ((string= name "pg_get_replication_slots") (analyze-replication-slot-call name args))
+      ((physical-slot-function-signature name) (analyze-physical-slot-function name args))
       ((or (numeric-function-p name)
            (member name '("random" "setseed") :test #'string=))
        ;; ParseFuncOrColumn selects the candidate before rejecting decorations,
@@ -1171,28 +1289,7 @@ so a nested argument error keeps its own diagnostics."
                       "current_catalog" "current_user" "session_user" "user")
                :test #'string=)
        (analyze-nullary-function name args))
-      ((string= name "pg_lisp_acquire_subscription")
-       (unless (and (= (length args) 1) (eq (expr-type (first args)) :text))
-         (ereport "42883" "pg_lisp_acquire_subscription requires one text key"))
-       (list :func name args :type :bool :typmod -1))
-      ((string= name "pg_lisp_replica_identity_columns")
-       (unless (= (length args) 1)
-         (ereport "42883" "function ~a(~a) does not exist"
-                  name (call-signature args)))
-       (list :func name args :type :varchar :typmod -1))
-      ((member name '("pg_lisp_publication_definition"
-                      "pg_lisp_table_definition"
-                      "pg_lisp_sequence_state")
-               :test #'string=)
-       (unless (= (length args) 1)
-         (ereport "42883" "function ~a(~a) does not exist"
-                  name (call-signature args)))
-       (list :func name args :type :varchar :typmod -1))
-      ((string= name "pg_lisp_replication_bootstrap")
-       (unless (null args)
-         (ereport "42883" "function ~a(~a) does not exist"
-                  name (call-signature args)))
-       (list :func name args :type :varchar :typmod -1))
+      ((logical-helper-function-p name) (analyze-logical-helper-function name args))
       ((member name '("nextval" "currval") :test #'string=)
        (unless (and (= (length args) 1)
                     (eq (expr-type (first args)) :text))
@@ -2697,6 +2794,9 @@ candidate selection."
   (let ((name (builtin-function-name (second raw) (getf (cdddr raw) :schema))))
     (cond ((string= name "pg_get_publication_tables") +publication-table-result-fields+)
           ((string= name "pg_stat_get_wal_receiver") +wal-receiver-result-fields+)
+          ((string= name "pg_get_replication_slots") +replication-slot-result-fields+)
+          ((string= name "pg_create_physical_replication_slot") +physical-slot-create-result-fields+)
+          ((string= name "pg_replication_slot_advance") +physical-slot-advance-result-fields+)
           (t (ereport "42809" "expression is not a supported composite type")))))
 
 (defun qualified-star-targets (qualifier scope)
@@ -2739,6 +2839,15 @@ candidate selection."
        (or (eq (first form) :set-func)
            (analyzed-expression-contains-set-p (car form))
            (analyzed-expression-contains-set-p (cdr form)))))
+
+(defun analyze-replication-slot-call (name arguments)
+  (when arguments
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+  (unless *select-set-functions-allowed-p*
+    (ereport "0A000" "set-returning functions are not allowed in this context"))
+  (when *inside-aggregate-input-p*
+    (ereport "0A000" "aggregate function calls cannot contain set-returning functions"))
+  (list :set-func name nil :type :record :typmod -1 :fields +replication-slot-result-fields+))
 
 (defun analyze-publication-table-call (name arguments variadic)
   (unless *select-set-functions-allowed-p*
@@ -3634,6 +3743,7 @@ aliases share the corresponding numeric operator implementation."
 
 (defun eval-func (name args)
   (cond
+    ((physical-slot-function-signature name) (eval-physical-slot-function name args))
     ((string= name "width_bucket") (sql-width-bucket args))
     ((and (member name '("nextval" "currval" "setval") :test #'string=)
           (member +null+ args))
@@ -3697,9 +3807,7 @@ aliases share the corresponding numeric operator implementation."
                 "setval expects a sequence name, int8 value, and optional boolean"))
      (sequence-setval (first args) (second args)
                       (if (= (length args) 3) (third args) t)))
-    ((member name '("pg_lisp_acquire_subscription" "pg_lisp_replica_identity_columns"
-                    "pg_lisp_publication_definition" "pg_lisp_table_definition"
-                    "pg_lisp_sequence_state" "pg_lisp_replication_bootstrap") :test #'string=)
+    ((logical-helper-function-p name)
      (eval-logical-helper-function name args))
     ((string= name "current_database")
      (backend-database *backend*))

@@ -479,7 +479,7 @@
       (ok (eq (aref row 3) pg::+null+))
       (ok (string= (aref row 4) "reserved"))
       (ok (= (aref row 5) 123))
-      (ok (equal '(1 7 11 12 13 23 2 3 4 6 19 15 20)
+      (ok (equal (loop for n from 1 to 23 collect n)
                  (mapcar #'fourth (getf (pg::sql-system-relation-definition "pg_replication_slots") :fields))))
       (ok (= -1 (pg::compare-3way restart (pg::sql-pg-lsn-input "10/0")))))
   (ok (equalp '(#(t)) (derived-query-rows "SELECT 'F/FFFFFFFF'::pg_lsn<'10/0'::pg_lsn")))

@@ -8,6 +8,12 @@
 
 (defstruct sql-record fields values)
 
+(defparameter +physical-slot-create-result-fields+
+  '(("slot_name" :name) ("lsn" :pg-lsn)))
+
+(defparameter +physical-slot-advance-result-fields+
+  '(("slot_name" :name) ("end_lsn" :pg-lsn)))
+
 (defstruct sql-array
   ;; Elements are flat in row-major order and may contain +null+. Dimensions
   ;; and lower bounds have equal lengths; their dimension product is the element
@@ -246,6 +252,23 @@ Reject unsupported parameters and unsupported local settings."
     ("sourcefile" :text nil 15) ("sourceline" :int4 nil 16)
     ("pending_restart" :bool nil 17)))
 
+(defparameter +sql-replication-slot-fields+
+  '(("slot_name" :name nil 1) ("plugin" :name nil 2) ("slot_type" :text nil 3)
+    ("datoid" :oid nil 4) ("database" :name nil 5) ("temporary" :bool nil 6)
+    ("active" :bool nil 7) ("active_pid" :int4 nil 8) ("xmin" :xid nil 9)
+    ("catalog_xmin" :xid nil 10) ("restart_lsn" :pg-lsn nil 11)
+    ("confirmed_flush_lsn" :pg-lsn nil 12) ("wal_status" :text nil 13)
+    ("safe_wal_size" :int8 nil 14) ("two_phase" :bool nil 15)
+    ("two_phase_at" :pg-lsn nil 16) ("inactive_since" :timestamptz nil 17)
+    ("conflicting" :bool nil 18) ("invalidation_reason" :text nil 19)
+    ("failover" :bool nil 20) ("synced" :bool nil 21)
+    ("slotsync_skip_reason" :text nil 22) ("retained_wal_bytes" :int8 t 23)))
+
+(defparameter +replication-slot-result-fields+
+  (loop for (name type) in +sql-replication-slot-fields+
+        unless (member name '("database" "retained_wal_bytes") :test #'string=)
+          collect (list name type)))
+
 (defparameter +sql-system-relations+
   ;; Catalog OIDs and original attribute numbers follow the pinned C tree.
   ;; The sequence view OID is from that tree's unmodified initdb catalog.
@@ -284,12 +307,7 @@ Reject unsupported parameters and unsupported local settings."
                    ("sequencename" :name nil 3)))
    (list :oid 12283 :name "pg_replication_slots" :kind #\v
          :rows 'sql-replication-slot-rows
-         :fields '(("slot_name" :name nil 1) ("active" :bool nil 7)
-                   ("restart_lsn" :pg-lsn nil 11) ("confirmed_flush_lsn" :pg-lsn nil 12)
-                   ("wal_status" :text nil 13) ("retained_wal_bytes" :int8 t 23)
-                   ("plugin" :name nil 2) ("slot_type" :text nil 3) ("datoid" :oid nil 4)
-                   ("temporary" :bool nil 6) ("invalidation_reason" :text nil 19)
-                   ("two_phase" :bool nil 15) ("failover" :bool nil 20)))))
+         :fields +sql-replication-slot-fields+)))
 
 (defun sql-system-relation-definition (identity)
   (find identity +sql-system-relations+
@@ -322,8 +340,52 @@ Reject unsupported parameters and unsupported local settings."
             (aref row 6) "logical" (aref row 7) nil
             (if (string= (aref row 5) "lost") "wal_removed" +null+) nil nil)))
 
+(defun sql-public-replication-slot-row (slot)
+  (let* ((physical (wal-physical-slot-p slot))
+         (restart (wal-replication-slot-restart-lsn slot))
+         (lost (eq :lost (wal-replication-slot-wal-status slot)))
+         (database-oid (wal-replication-slot-database-oid slot))
+         (database (when database-oid
+                     (loop for database being the hash-values of (catalog-databases *catalog*)
+                           when (eql database-oid (database-oid database))
+                             return (database-name database))))
+         (backend (wal-replication-slot-active-owner-backend slot))
+         (inactive (wal-replication-slot-inactive-since slot))
+         (durable (if (recovery-in-progress-p) (physical-slot-recovery-durable-lsn) *wal-durable-lsn*)))
+    (flet ((nullable (value) (if (null value) +null+ value)))
+      (vector (wal-replication-slot-name slot) (nullable (wal-replication-slot-plugin slot))
+              (if physical "physical" "logical") (nullable database-oid) (nullable database)
+              (wal-replication-slot-temporary-p slot)
+              (not (null (wal-replication-slot-active-owner slot)))
+              (if backend (backend-pid backend) +null+)
+              +null+ +null+ (if lost +null+ (nullable restart))
+              (nullable (wal-replication-slot-confirmed-flush-lsn slot))
+              (wal-slot-catalog-status slot)
+              (wal-slot-safe-wal-bytes slot)
+              nil +null+ (if (zerop inactive) +null+ inactive)
+              (if physical +null+ nil) (if lost "wal_removed" +null+)
+              nil nil +null+ (if (or lost (null restart)) 0 (max 0 (- durable restart)))))))
+
 (defun sql-replication-slot-rows ()
-  (mapcar #'sql-replication-slot-row (wal-replication-slot-rows)))
+  (with-write-lock
+    (sb-thread:with-mutex (*wal-lock*)
+      (loop for slot being the hash-values of *wal-replication-slots*
+            collect (sql-public-replication-slot-row slot)))))
+
+(defun make-replication-slot-result-iterator ()
+  (let ((rows (sql-replication-slot-rows))
+        (positions (mapcar (lambda (field)
+                             (position (first field) +sql-replication-slot-fields+
+                                       :key #'first :test #'string=))
+                           +replication-slot-result-fields+)))
+    (lambda ()
+      (if rows
+          (let ((row (pop rows)))
+            (values (make-sql-record
+                     :fields +replication-slot-result-fields+
+                     :values (map 'vector (lambda (position) (aref row position)) positions))
+                    t))
+          (values nil nil)))))
 
 (defun sql-class-rows ()
   "Snapshot implemented catalog relations and persisted user objects."

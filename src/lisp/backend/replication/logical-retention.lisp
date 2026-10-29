@@ -2,31 +2,39 @@
 
 (in-package #:pg)
 
-(defun wal-invalidate-lagging-replication-slots-under-wal-lock ()
-  "Durably lose over-limit slots before checkpoint recycling removes their WAL."
-  (when (integerp *max-slot-wal-keep-bytes*)
-    (maphash
-     (lambda (name slot)
-       (declare (ignore name))
-       (when (and (eq (wal-replication-slot-wal-status slot) :reserved)
-                  (wal-replication-slot-restart-lsn slot)
-                  (> (- *wal-durable-lsn*
-                        (wal-replication-slot-restart-lsn slot))
-                     *max-slot-wal-keep-bytes*))
-         (let ((candidate (wal-copy-replication-slot-with-profile slot)))
-           (setf (wal-replication-slot-wal-status candidate) :lost
-                 (wal-replication-slot-pending-xids candidate)
-                 (make-hash-table :test #'eql))
-           ;; Like InvalidatePossiblyObsoleteSlot() in slot.c, persist loss
-           ;; before dropping the live retention pin.
-           (wal-save-replication-slot candidate)
-           (setf (wal-replication-slot-wal-status slot) :lost
-                 (wal-replication-slot-pending-xids slot)
-                 (wal-replication-slot-pending-xids candidate))
-           (when (and (wal-logical-slot-p slot) *wal-replication-slot-loss-collector*)
-             (push slot (car *wal-replication-slot-loss-collector*))))))
-     *wal-replication-slots*))
+(defun wal-invalidate-replication-slots-matching-under-lock (predicate)
+  (maphash
+   (lambda (name slot)
+     (declare (ignore name))
+     (when (and (wal-slot-reserved-p slot) (funcall predicate slot))
+       (let ((candidate (wal-copy-replication-slot-with-profile slot)))
+         (setf (wal-replication-slot-wal-status candidate) :lost
+               (wal-replication-slot-pending-xids candidate) (make-hash-table :test #'eql))
+         (wal-save-replication-slot candidate)
+         (setf (wal-replication-slot-wal-status slot) :lost
+               (wal-replication-slot-pending-xids slot) (wal-replication-slot-pending-xids candidate))
+         (when *wal-replication-slot-loss-collector*
+           (push slot (car *wal-replication-slot-loss-collector*))))))
+   *wal-replication-slots*)
   (wal-refresh-logical-capture-slot-mirror-under-wal-lock)
+  (values))
+
+(defun wal-prepare-slot-recycling-under-lock (redo-segment)
+  (ecase (wal-slot-retention-mode)
+    (:bytes (wal-invalidate-lagging-replication-slots-under-wal-lock))
+    (:segments (physical-source-invalidate-lagging-pins-under-wal-lock)))
+  (let ((independent (wal-independent-retention-segment redo-segment)))
+    (when (eq :segments (wal-slot-retention-mode))
+      (let ((keep (wal-slot-removal-segment redo-segment independent)))
+        (wal-invalidate-replication-slots-matching-under-lock
+         (lambda (slot) (< (wal-replication-slot-restart-lsn slot)
+                           (* keep +wal-segment-size+))))))
+    (wal-slot-removal-segment redo-segment independent)))
+
+(defun wal-invalidate-lagging-replication-slots-under-wal-lock ()
+  (wal-invalidate-replication-slots-matching-under-lock
+   (lambda (slot)
+     (wal-slot-byte-limit-exceeded-p slot *wal-durable-lsn*)))
   (physical-source-invalidate-lagging-pins-under-wal-lock)
   (values))
 
@@ -34,7 +42,7 @@
   "Return current lost generations so a later maintenance pass can retry cleanup."
   (sb-thread:with-mutex (*wal-lock*)
     (loop for slot being the hash-values of *wal-replication-slots*
-          when (and (wal-logical-slot-p slot) (eq (wal-replication-slot-wal-status slot) :lost))
+          when (eq (wal-replication-slot-wal-status slot) :lost)
             collect slot)))
 
 (defun call-with-invalidated-slot-cleanup (function)
@@ -85,7 +93,7 @@
           (setf (gethash token *expired-exported-logical-snapshots*) state))))
     (mapcar #'cdr entries)))
 
-(defun wal-drop-replication-slot (name)
+(defun wal-drop-replication-slot (name &optional expected-slot)
   "Durably remove NAME and adopt its exported snapshots for retryable cleanup."
   (unless (wal-valid-replication-slot-name-p name)
     (error "invalid replication slot name ~s" name))
@@ -97,19 +105,23 @@
       (sb-sys:without-interrupts
         (sb-thread:with-mutex (*wal-lock*)
           (let ((slot (gethash name *wal-replication-slots*)))
+            (when (and expected-slot (not (eq expected-slot slot)))
+              (return-from wal-drop-replication-slot (values)))
             (unless slot
               (ereport "42704" "replication slot \"~a\" does not exist" name))
-            (when (wal-replication-slot-active-owner slot)
+            (when (and (wal-replication-slot-active-owner slot)
+                       (not (physical-slot-owned-by-backend-p slot *backend*)))
               (ereport "55006" "replication slot \"~a\" is active" name))
             (wal-delete-replication-slot-file name)
             (setf removed-slot slot)
             (remhash name *wal-replication-slots*)
             (wal-refresh-logical-capture-slot-mirror-under-wal-lock)))
-        (when removed-slot
+        (when (and removed-slot (wal-logical-slot-p removed-slot))
+
           (detach-exported-logical-snapshots-for-slots-under-registry-lock
            (list removed-slot))
           (logical-test-failpoint :after-logical-slot-drop-detach name))))
-    (when removed-slot
+    (when (and removed-slot (wal-logical-slot-p removed-slot))
       (cleanup-invalidated-logical-replication-state (list removed-slot))))
   (values))
 
@@ -125,8 +137,12 @@
     (sb-thread:with-mutex (*wal-lock*)
       (let ((slot (gethash name *wal-replication-slots*)))
         (when (and slot (eq owner (wal-replication-slot-active-owner slot)))
-          (setf (wal-replication-slot-active-owner slot) nil
-                (wal-replication-slot-active-owner-backend slot) nil)
+          (let ((creator (when (wal-physical-slot-p slot)
+                           (wal-replication-slot-temporary-owner slot))))
+            (setf (wal-replication-slot-active-owner slot) creator
+                  (wal-replication-slot-active-owner-backend slot) creator)
+            (when (wal-physical-slot-p slot)
+              (setf (wal-replication-slot-inactive-since slot) (postgres-current-timestamp))))
           (sb-thread:with-mutex (*logical-slot-owner-termination-lock*)
             (remhash slot *logical-slot-owner-termination-requests*))))))
   (values))
@@ -144,6 +160,7 @@
                (setf slot (gethash name *wal-replication-slots*))
                (unless slot
                  (ereport "42704" "replication slot \"~a\" does not exist" name))
+               (wal-require-logical-slot slot)
                (unless (wal-replication-slot-database-oid slot)
                  (ereport "55000" "replication slot has no database binding"))
                (when (eq (wal-replication-slot-wal-status slot) :lost)
@@ -267,9 +284,14 @@
   (request-invalidated-backend-termination backend)
   (wait-for-invalidated-backend backend timeout))
 
+(defun wal-current-lost-slot-owner-p (slot backend)
+  (and (eq slot (gethash (wal-replication-slot-name slot) *wal-replication-slots*))
+       (eq :lost (wal-replication-slot-wal-status slot))
+       (eq backend (wal-replication-slot-active-owner-backend slot))))
+
 (defun request-lost-slot-owner-termination (slot backend)
   "Send one graceful termination to this current lost slot generation's owner."
-  (let ((claimed nil))
+  (let ((claimed nil) (current nil))
     (logical-test-failpoint
      :before-lost-slot-owner-termination-claim slot backend)
     (sb-sys:without-interrupts
@@ -277,12 +299,8 @@
       ;; pass let the owner release. Revalidate under WAL, then claim in WAL ->
       ;; termination-registry order, matching owner release's lock order.
       (sb-thread:with-mutex (*wal-lock*)
-        (when (and (eq slot
-                       (gethash (wal-replication-slot-name slot)
-                                *wal-replication-slots*))
-                   (eq (wal-replication-slot-wal-status slot) :lost)
-                   (eq backend
-                       (wal-replication-slot-active-owner-backend slot)))
+        (when (wal-current-lost-slot-owner-p slot backend)
+          (setf current t)
           (sb-thread:with-mutex (*logical-slot-owner-termination-lock*)
             (unless (gethash slot *logical-slot-owner-termination-requests*)
               (setf (gethash slot *logical-slot-owner-termination-requests*)
@@ -291,7 +309,7 @@
       ;; Signal after both locks are released, but before interrupts resume.
       (when claimed
         (request-invalidated-backend-termination backend)))
-    claimed))
+    (values claimed current)))
 
 (defun logical-pending-expired-snapshot-states ()
   (sb-thread:with-mutex (*exported-logical-snapshot-lock*)
@@ -323,51 +341,48 @@
               (push backend requested-backends))))))
     (nreverse requested-backends)))
 
-(defun cleanup-invalidated-logical-replication-state (slots)
-  "Revoke lost slot tokens and stop consumers after WAL locks are released.
+(defun slot-cleanup-current-backend-p (owner-requests states)
+  (and *backend*
+       (or (sb-thread:with-mutex (*wal-lock*)
+             (some (lambda (request)
+                     (and (eq (cdr request) *backend*)
+                          (wal-current-lost-slot-owner-p (car request) *backend*)))
+                   owner-requests))
+           (some (lambda (state)
+                   (member *backend* (copy-exported-logical-snapshot-importers state) :test #'eq))
+                 states))))
 
-PostgreSQL's slot.c invalidation path terminates the active walsender outside
-shared locks. SnapBuildClearExportedSnapshot() similarly retires the exported
-snapshot only after its importer transaction has ended."
-  (let* ((new-states (detach-exported-logical-snapshots-for-slots slots))
+(defun cleanup-invalidated-replication-state (slots)
+  (let* ((new-states (detach-exported-logical-snapshots-for-slots
+                      (remove-if-not #'wal-logical-slot-p slots)))
          (pending-states (logical-pending-expired-snapshot-states))
          (states (remove-duplicates (append new-states pending-states) :test #'eq))
          (importer-backends
-           (loop for state in states
-                 append (copy-exported-logical-snapshot-importers state)))
+           (loop for state in states append (copy-exported-logical-snapshot-importers state)))
          (owner-requests
            (loop for slot in slots
                  for backend = (wal-replication-slot-active-owner-backend slot)
-                 when (and backend
-                           (not (member backend importer-backends :test #'eq)))
+                 when (and backend (not (member backend importer-backends :test #'eq)))
                    collect (cons slot backend)))
-         (owner-backends (mapcar #'cdr owner-requests))
-         (newly-requested-owners
+         (owner-backends
            (loop for (slot . backend) in owner-requests
-                 when (request-lost-slot-owner-termination slot backend)
+                 when (nth-value 1 (request-lost-slot-owner-termination slot backend))
                    collect backend))
          (newly-requested-importers
-           (loop for state in states
-                 append (request-exported-snapshot-importer-termination state)))
-         (backends (remove-duplicates
-                    (append owner-backends importer-backends)
-                    :test #'eq))
-         (current-backend-p (member *backend* backends :test #'eq)))
+           (loop for state in states append (request-exported-snapshot-importer-termination state)))
+         (backends (remove-duplicates (append owner-backends newly-requested-importers) :test #'eq)))
     (unwind-protect
          (progn
            (dolist (backend backends)
              (unless (eq backend *backend*)
-               (when (or (member backend newly-requested-owners :test #'eq)
-                         (member backend newly-requested-importers :test #'eq)
-                         (member backend owner-backends :test #'eq))
-                 (wait-for-invalidated-backend backend))))
-           (dolist (state states)
-             (finish-expired-exported-logical-snapshot state))
-           ;; Self termination is last: its transaction unwind releases the
-           ;; imported MVCC pin and completes deferred schema cleanup.
-           (when current-backend-p
+               (wait-for-invalidated-backend backend)))
+           (dolist (state states) (finish-expired-exported-logical-snapshot state))
+           (when (slot-cleanup-current-backend-p owner-requests states)
              (terminate-backend *backend*)))
-      ;; Pending registry entries keep ownership if cleanup is interrupted.
       (dolist (state states)
         (ignore-errors (finish-expired-exported-logical-snapshot state)))))
   (values))
+
+(defun cleanup-invalidated-logical-replication-state (slots)
+  "Retain the existing cleanup entry point for both public slot kinds."
+  (cleanup-invalidated-replication-state slots))

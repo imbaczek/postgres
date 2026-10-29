@@ -1135,7 +1135,8 @@ Pass BACKEND when releasing its virtual reader ID."
 (defun wal-refresh-logical-capture-slot-mirror-under-wal-lock ()
   "Publish the live slot count under the established WAL-to-XID lock order."
   (let ((count (loop for slot being the hash-values of *wal-replication-slots*
-                     count (not (eq (wal-replication-slot-wal-status slot) :lost)))))
+                     count (and (wal-logical-slot-p slot)
+                                (not (eq (wal-replication-slot-wal-status slot) :lost))))))
     (sb-thread:with-mutex (*xid-lock*)
       (setf *logical-capture-live-slots* count)))
   (values))
@@ -1298,6 +1299,7 @@ excluded, so a sequence advance before slot publication remains streamable."
     (error "a replication slot must inherit an active snapshot WAL pin"))
   (when (gethash name *wal-replication-slots*)
     (ereport "42710" "replication slot \"~a\" already exists" name))
+  (wal-check-replication-slot-capacity)
   (let ((slot (make-wal-replication-slot
                :name name :restart-lsn restart-lsn
                :consistent-lsn boundary-lsn :plugin plugin
@@ -2095,9 +2097,11 @@ A backend that vanishes mid-transaction must not leave its XID in
 key would block forever, and aborted heap changes would never be
 reclaimable."
   (when *backend*
-    (when (or (backend-xid *backend*)
-              (not (eq (backend-state *backend*) :idle)))
-      (abort-transaction))))
+    (unwind-protect
+         (when (or (backend-xid *backend*)
+                   (not (eq (backend-state *backend*) :idle)))
+           (abort-transaction))
+      (wal-cleanup-backend-physical-slots *backend*))))
 
 (defun transaction-status-char ()
   (case (and *backend* (backend-state *backend*))

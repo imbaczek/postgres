@@ -1267,6 +1267,8 @@ on an abnormal exit."
              (lambda ()
                (if pending (progn (setf pending nil) (values value t))
                    (values nil nil)))))
+          ((string= (second call) "pg_get_replication_slots")
+           (make-replication-slot-result-iterator))
           ((string= (second call) "pg_get_publication_tables")
            (apply #'make-publication-table-result-iterator arguments))
           (t (ereport "0A000" "unsupported set-returning function ~a" (second call))))))
