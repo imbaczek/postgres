@@ -527,6 +527,62 @@
           (when pg::*clog-stream* (close pg::*clog-stream*))
           (pg::smgr-close-all)))))
 
+(deftest vacuum-full-rewrites-toast-with-parent-visibility
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*relation-streams* (make-hash-table :test #'equal))
+             (pg::*wal-page-cache* (make-hash-table :test #'equal))
+             (pg::*wal-ready* nil)
+             (pg::*clog-stream* nil)
+             (pg::*active-xids* nil)
+             (pg::*catalog* (pg::make-catalog))
+             (pg::*backend* (pg::make-backend))
+             (database (pg::make-database :name "postgres"))
+             (snapshot (pg::make-snapshot-struct :xmin 3 :xmax 50 :xip nil :curcid 0))
+             (pg::*current-snapshot* snapshot)
+             (registration (pg::make-snapshot-registration))
+             (bytes (make-array 3000 :element-type '(unsigned-byte 8) :initial-element 42)))
+        (setf (gethash "postgres" (pg::catalog-databases pg::*catalog*)) database)
+        (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
+        (unwind-protect
+             (let* ((source (pg::create-table* database "source"
+                                               (list (list :name "v" :type :bytea :typmod -1))))
+                    (target (pg::create-table* database "target"
+                                               (list (list :name "v" :type :bytea :typmod -1))))
+                    (source-toast (pg::pg-class-toast source))
+                    (target-toast (pg::pg-class-toast target))
+                    (pointer (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode source-toast)))
+                               (pg::with-write-lock
+                                 (pg::toast-store-value-unlocked source-toast bytes nil 42 0)))))
+               (pg::register-active-snapshot snapshot registration)
+               (setf (pg::pg-column-storage (aref (pg::pg-class-columns target) 0)) #\e)
+               (let* ((tuple (pg::make-htup :values (vector pointer) :cid 0))
+                      (rewritten (pg::vacuum-full-rewrite-values source target tuple 42 44))
+                      (new-pointer (aref rewritten 0)))
+                 (ok (pg::heap-external-varlena-p new-pointer))
+                 (ok (= (pg::heap-external-varlena-relation-id new-pointer)
+                        (pg::pg-toast-oid target-toast)))
+                 (ok (= (pg::heap-external-varlena-external-info new-pointer) (length bytes)))
+                 (ok (equalp bytes (pg::toast-fetch-value target-toast new-pointer snapshot)))
+                 (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode target-toast)))
+                   (dolist (entry (pg::btree-prefix-entries-unlocked
+                                   (pg::pg-toast-index-relfilenode target-toast)
+                                   (pg::encode-index-key
+                                    (list (pg::heap-external-varlena-value-id new-pointer)) '(:oid))))
+                     (let ((chunk (pg::heapam-get-tuple (pg::pg-toast-relfilenode target-toast)
+                                                        (second entry) (third entry)
+                                                        pg::*toast-chunk-columns*)))
+                       (ok (= (pg::htup-xmin chunk) 42))
+                       (ok (= (pg::htup-xmax chunk) 44))))))
+               (setf (pg::pg-column-storage (aref (pg::pg-class-columns target) 0)) #\p)
+               (let ((rewritten (pg::vacuum-full-rewrite-values
+                                 source target (pg::make-htup :values (vector pointer) :cid 0) 42 0)))
+                 (ok (equalp (aref rewritten 0) bytes))
+                 (ok (not (pg::heap-external-varlena-p (aref rewritten 0))))))
+          (pg::release-snapshot-registration registration)
+          (when pg::*clog-stream* (close pg::*clog-stream*))
+          (pg::smgr-close-all)))))
+
 (deftest toast-fetch-skips-invalid-tuple-before-decoding
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)

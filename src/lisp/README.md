@@ -196,9 +196,9 @@ TOAST selection defaults to `MAIN` for `numeric` and `EXTENDED` for text,
 varchar, bytea, JSON and JSONB. `ALTER TABLE ... ALTER COLUMN ... SET STORAGE`
 accepts `PLAIN`, `EXTERNAL`, `EXTENDED`, `MAIN`, and `DEFAULT`. The policy
 applies to subsequent writes; existing values remain readable after a change.
-Fixed-width types accept only `PLAIN` or `DEFAULT`.
-`VACUUM FULL` currently retains existing out-of-line values rather than
-rewriting them according to a changed policy.
+Fixed-width types accept only `PLAIN` or `DEFAULT`. `VACUUM FULL` rewrites
+existing values using the current policy; it fails if a `PLAIN` value cannot
+fit on a heap page, leaving the original table intact.
 
 Decimal literals and numeric casts support finite values; numeric casts also
 accept NaN, infinities, and signed hexadecimal, octal, and binary integer input

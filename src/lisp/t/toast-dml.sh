@@ -179,8 +179,52 @@ numeric_repeat=$(awk 'BEGIN { for (i=0;i<20000;i++) printf "1" }')
 run -c 'create table storage_restart (v text)' >/dev/null
 run -c 'alter table storage_restart alter column v set storage external' >/dev/null
 run -c "insert into storage_restart values ('$numeric_repeat')" >/dev/null
+run -c 'vacuum full storage_restart' >/dev/null
+[ "$(run -c 'select length(v) from storage_restart')" = 20000 ]
+run -c 'create table rewrite_plain (v text)' >/dev/null
+run -c 'alter table rewrite_plain alter column v set storage external' >/dev/null
+run -c "insert into rewrite_plain values ('$big')" >/dev/null
+run -c 'alter table rewrite_plain alter column v set storage plain' >/dev/null
+run -c 'vacuum full rewrite_plain' >/dev/null
+[ "$(run -c "select v = '$big' from rewrite_plain")" = t ]
+run -c 'create table rewrite_snapshot (id int primary key, v text)' >/dev/null
+run -c 'alter table rewrite_snapshot alter column v set storage external' >/dev/null
+run -c "insert into rewrite_snapshot values (1, '$big')" >/dev/null
+mkfifo "$TMP/rewrite-reader.sql"
+run < "$TMP/rewrite-reader.sql" > "$TMP/rewrite-reader.out" 2>&1 &
+READER=$!
+exec 3> "$TMP/rewrite-reader.sql"
+printf 'begin isolation level repeatable read; select 1;\n\\echo ready\n' >&3
+i=0
+until grep -q '^ready$' "$TMP/rewrite-reader.out"; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || { cat "$TMP/rewrite-reader.out" >&2; exit 1; }
+    sleep 0.1
+done
+run -c "update rewrite_snapshot set v = '$other' where id = 1" >/dev/null
+run -c 'vacuum full rewrite_snapshot' >/dev/null
+run -c 'vacuum rewrite_snapshot' >/dev/null
+printf "select v = '%s' from rewrite_snapshot where id = 1; commit;\n\\q\n" "$big" >&3
+exec 3>&-
+wait "$READER"
+READER=
+grep -q '^t$' "$TMP/rewrite-reader.out"
+run -c 'vacuum rewrite_snapshot' >/dev/null
+[ "$(run -c "select v = '$other' from rewrite_snapshot where id = 1")" = t ]
 run -c 'alter table storage_restart alter column v set storage plain' >/dev/null
 [ "$(run -c 'select length(v) from storage_restart')" = 20000 ]
+if run -c 'vacuum full storage_restart' >/dev/null 2>&1; then
+    echo 'toast-dml: VACUUM FULL accepted an oversized PLAIN tuple' >&2
+    exit 1
+fi
+[ "$(run -c 'select length(v) from storage_restart')" = 20000 ]
+kill "$SRV"
+wait "$SRV" || true
+SRV=
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
+test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
+[ "$(run -c 'select length(v) from storage_restart')" = 20000 ]
+[ "$(run -c "select v = '$big' from rewrite_plain")" = t ]
 if run -c "insert into storage_restart values ('$numeric_repeat')" >/dev/null 2>&1; then
     echo 'toast-dml: PLAIN accepted a tuple exceeding a heap page' >&2
     exit 1

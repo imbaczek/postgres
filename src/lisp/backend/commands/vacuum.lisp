@@ -204,7 +204,24 @@ implementation's replacement metadata transition atomic as well."
    (lambda (current)
      (funcall function (second current)))))
 
-(defun vacuum-full-copy-tuple (source-table source-relfilenode
+(defun vacuum-full-rewrite-values (source-table target-table tuple xmin xmax)
+  "Materialize TUPLE and apply current storage policies to detached TOAST."
+  (materialize-select-tuple source-table tuple (statement-protection-snapshot))
+  (let ((toast (pg-class-toast target-table))
+        (columns (pg-class-columns target-table)))
+    (if toast
+        (with-btree-relation-locks ((list (pg-toast-index-relfilenode toast)))
+          (with-write-lock
+            (let ((physical (toast-externalize-tuple-unlocked toast (htup-values tuple)
+                                                              columns xmin (htup-cid tuple))))
+              (unless (zerop xmax)
+                (loop for value across physical
+                      when (heap-external-varlena-p value)
+                        do (toast-delete-value-unlocked toast value xmax (htup-cid tuple))))
+              physical)))
+        (toast-plan-tuple (htup-values tuple) columns :external-p nil))))
+
+(defun vacuum-full-copy-tuple (source-table source-relfilenode target-table
                                target-relfilenode block offnum oldest-xmin
                                freeze-cutoff)
   (let ((tuple (heapam-get-tuple
@@ -222,8 +239,7 @@ implementation's replacement metadata transition atomic as well."
         (multiple-value-bind (target-block target-offnum)
             (heapam-insert target-relfilenode
                            (pg-class-columns source-table)
-                           (toast-plan-tuple (htup-values tuple)
-                                             (pg-class-columns source-table) :external-p nil)
+                           (vacuum-full-rewrite-values source-table target-table tuple copy-xmin copy-xmax)
                            copy-xmin (htup-cid tuple))
           (unless (zerop copy-xmax)
             (let ((page (buf-read target-relfilenode target-block)))
@@ -237,7 +253,7 @@ implementation's replacement metadata transition atomic as well."
                 (visibilitymap-clear target-relfilenode target-block))
               (mark-dirty target-relfilenode))))))))
 
-(defun vacuum-full-copy-heap (table target-relfilenode oldest-xmin
+(defun vacuum-full-copy-heap (table target-table target-relfilenode oldest-xmin
                               freeze-cutoff)
   "Copy every non-prunable tuple version to compact detached storage."
   (let* ((source-relfilenode (pg-class-relfilenode table))
@@ -252,7 +268,7 @@ implementation's replacement metadata transition atomic as well."
                      (declare (ignore off len))
                      (when (= flags +lp-normal+)
                        (vacuum-full-copy-tuple
-                        table source-relfilenode target-relfilenode
+                        table source-relfilenode target-table target-relfilenode
                         block offnum oldest-xmin freeze-cutoff)))))))
     (buf-nblocks target-relfilenode)))
 
@@ -266,6 +282,11 @@ implementation's replacement metadata transition atomic as well."
     (setf (pg-class-relfilenode new-table) (allocate-oid))
     (setf (pg-class-indexes new-table)
           (copy-list (pg-class-indexes table)))
+    (when (pg-class-toast table)
+      (let ((toast (copy-pg-toast (pg-class-toast table))))
+        (setf (pg-toast-relfilenode toast) (allocate-oid)
+              (pg-toast-index-relfilenode toast) (allocate-oid)
+              (pg-class-toast new-table) toast)))
     (loop for old-index in indexes
           for new-index in new-indexes
           do (setf (pg-index-relfilenode new-index) (allocate-oid)))
@@ -276,8 +297,12 @@ implementation's replacement metadata transition atomic as well."
                             &key on-wal-appended)
   "Publish replacement metadata, retaining files once its WAL record is complete."
   (let ((old-relfilenodes
-          (cons (pg-class-relfilenode table)
-                (mapcar #'pg-index-relfilenode indexes))))
+          (append (list (pg-class-relfilenode table))
+                  (mapcar #'pg-index-relfilenode indexes)
+                  (when (and (pg-class-toast table)
+                             (not (eq (pg-class-toast table) (pg-class-toast new-table))))
+                    (list (pg-toast-relfilenode (pg-class-toast table))
+                          (pg-toast-index-relfilenode (pg-class-toast table)))))))
     (with-current-table-index-set (table indexes)
       (let ((old-flush-generation (wal-catalog-flush-generation))
             (wal-appended nil))
@@ -352,13 +377,19 @@ implementation's replacement metadata transition atomic as well."
            (vacuum-full-reserve-storage
             table indexes new-table new-indexes)
            (setf new-relfilenodes
-                 (cons (pg-class-relfilenode new-table)
-                       (mapcar #'pg-index-relfilenode new-indexes)))
+                 (append (list (pg-class-relfilenode new-table))
+                         (mapcar #'pg-index-relfilenode new-indexes)
+                         (when (pg-class-toast new-table)
+                           (list (pg-toast-relfilenode (pg-class-toast new-table))
+                                 (pg-toast-index-relfilenode (pg-class-toast new-table))))))
+           (when (pg-class-toast new-table)
+             (smgr-create (pg-toast-relfilenode (pg-class-toast new-table)))
+             (btree-init (pg-toast-index-relfilenode (pg-class-toast new-table))))
            (let* ((new-heap-relfilenode
                     (pg-class-relfilenode new-table))
                   (nblocks
                     (vacuum-full-copy-heap
-                     table new-heap-relfilenode oldest-xmin freeze-cutoff)))
+                     table new-table new-heap-relfilenode oldest-xmin freeze-cutoff)))
              (heap-vacuum-update-visibility-map
               new-heap-relfilenode nblocks oldest-xmin freeze-cutoff)
              (loop for old-index in indexes
@@ -376,10 +407,16 @@ implementation's replacement metadata transition atomic as well."
                (fsync-index new-index))
              (smgr-fsync new-heap-relfilenode)
              (smgr-fsync new-heap-relfilenode :visibility)
+             (when (pg-class-toast new-table)
+               (smgr-fsync (pg-toast-relfilenode (pg-class-toast new-table)))
+               (smgr-fsync (pg-toast-index-relfilenode (pg-class-toast new-table))))
              (setf (pg-class-relfrozenxid new-table)
                    (max (or (pg-class-relfrozenxid table)
                             +first-normal-xid+)
-                        freeze-cutoff)))
+                        freeze-cutoff))
+             (when (pg-class-toast new-table)
+               (setf (pg-toast-relfrozenxid (pg-class-toast new-table))
+                     (pg-class-relfrozenxid new-table))))
            (vacuum-full-publish
             db table indexes new-table new-indexes
             :on-wal-appended

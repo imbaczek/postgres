@@ -181,14 +181,17 @@
          (table (make-pg-class :oid 991001 :name "vac_full_fault"
                                :relfilenode 991002
                                :relfrozenxid +first-normal-xid+
-                               :columns #() :indexes '(991003)))
+                               :columns #() :indexes '(991003)
+                               :toast (make-pg-toast :oid 991008 :relfilenode 991009
+                                                     :index-oid 991010 :index-relfilenode 991011
+                                                     :relfrozenxid +first-normal-xid+)))
          (index (make-pg-index :oid 991003 :name "vac_full_fault_idx"
                                :relfilenode 991004 :table-oid 991001
                                :columns '(1) :valid-p t))
          (new-table nil)
          (new-index nil)
-         (new-relfilenodes '(991005 991006))
-         (old-relfilenodes '(991002 991004))
+         (new-relfilenodes '(991005 991006 991012 991013))
+         (old-relfilenodes '(991002 991004 991009 991011))
          (original-fast-shutdown (symbol-function 'request-fast-shutdown)))
     (ignore-errors
      (uiop:delete-directory-tree test-pgdata :validate t
@@ -200,7 +203,10 @@
           new-table (copy-pg-class table)
           new-index (copy-pg-index index)
           (pg-class-relfilenode new-table) (first new-relfilenodes)
-          (pg-index-relfilenode new-index) (second new-relfilenodes))
+          (pg-index-relfilenode new-index) (second new-relfilenodes)
+          (pg-class-toast new-table) (copy-pg-toast (pg-class-toast table))
+          (pg-toast-relfilenode (pg-class-toast new-table)) (third new-relfilenodes)
+          (pg-toast-index-relfilenode (pg-class-toast new-table)) (fourth new-relfilenodes))
     (dolist (relfilenode (append old-relfilenodes new-relfilenodes))
       (vacuum-full-test-write-relation-marker relfilenode))
     (unwind-protect
