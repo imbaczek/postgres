@@ -136,7 +136,7 @@ LIMIT bounds the total declared bytes across the batch before allocation."
 
 (defstruct (logical-fragment-batch
             (:constructor make-logical-fragment-batch (limit)))
-  limit xid count (next 0) assembler)
+  limit xid count (next 0) assembler validate-only)
 
 (defun logical-fragment-batch-accept (batch xid payload &key validate-only)
   "Validate an ordered fragment; decode completed events unless VALIDATE-ONLY."
@@ -146,26 +146,29 @@ LIMIT bounds the total declared bytes across the batch before allocation."
     (if (logical-fragment-batch-count batch)
         (unless (and (= xid (logical-fragment-batch-xid batch))
                      (= count (logical-fragment-batch-count batch))
-                     (= index (logical-fragment-batch-next batch)))
+                     (= index (logical-fragment-batch-next batch))
+                     (eq (not (null validate-only)) (logical-fragment-batch-validate-only batch)))
           (error "logical WAL fragments are out of order or change transaction"))
         (unless (zerop index)
           (error "logical WAL fragments do not start at index zero")))
-    (let* ((assembler (or (logical-fragment-batch-assembler batch)
-                          (make-logical-fragment-assembler (logical-fragment-batch-limit batch))))
-           (encoded (logical-assemble-event-fragment assembler total offset bytes))
-           (change (and encoded
-                        (if validate-only
-                            (progn (logical-validate-change-from-cursor
-                                    (make-logical-cursor :bytes encoded))
-                                   nil)
-                            (logical-decode-change encoded)))))
-      (when (and change (not (member (logical-change-kind change) '(:insert :update :delete :truncate))))
-        (error "catalog event appears in a transactional row-change record"))
+    (let ((assembler (or (logical-fragment-batch-assembler batch)
+                         (if validate-only
+                             (make-logical-recovery-assembler (logical-fragment-batch-limit batch))
+                             (make-logical-fragment-assembler (logical-fragment-batch-limit batch))))))
+      ;; Publish the assembler before it can acquire a recovery spool.
       (setf (logical-fragment-batch-assembler batch) assembler
-            (logical-fragment-batch-xid batch) xid
-            (logical-fragment-batch-count batch) count
-            (logical-fragment-batch-next batch) (1+ index))
-      change)))
+            (logical-fragment-batch-validate-only batch) (not (null validate-only)))
+      (let ((change
+              (if validate-only
+                  (progn (logical-recovery-assembler-append assembler total offset bytes) nil)
+                  (let ((encoded (logical-assemble-event-fragment assembler total offset bytes)))
+                    (and encoded (logical-decode-change encoded))))))
+        (when (and change (not (member (logical-change-kind change) '(:insert :update :delete :truncate))))
+          (error "catalog event appears in a transactional row-change record"))
+        (setf (logical-fragment-batch-xid batch) xid
+              (logical-fragment-batch-count batch) count
+              (logical-fragment-batch-next batch) (1+ index))
+        change))))
 
 (defun logical-fragment-batch-finish (batch xid)
   "Validate that XID commits the complete fragment sequence at an event boundary."
@@ -173,5 +176,7 @@ LIMIT bounds the total declared bytes across the batch before allocation."
                (= xid (logical-fragment-batch-xid batch))
                (= (logical-fragment-batch-next batch) (logical-fragment-batch-count batch)))
     (error "logical WAL fragments do not match their commit record"))
-  (logical-finish-fragment-assembly (logical-fragment-batch-assembler batch))
+  (if (logical-fragment-batch-validate-only batch)
+      (logical-recovery-assembler-finish (logical-fragment-batch-assembler batch))
+      (logical-finish-fragment-assembly (logical-fragment-batch-assembler batch)))
   (values))

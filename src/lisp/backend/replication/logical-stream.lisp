@@ -35,6 +35,10 @@ Discard the cursor after a read error; the stream may have advanced."
                     logical-fragment-batch-xid logical-fragment-batch-count
                     logical-fragment-batch-next logical-fragment-batch-assembler))
 
+(declaim (notinline logical-recovery-assembler-bytes))
+
+(declaim (notinline logical-fragment-batch-validate-only))
+
 (defun logical-type-code (type)
   "Map a column type to its logical schema code; text, varchar and json are distinct."
   (case type
@@ -863,6 +867,11 @@ executor, so capture the same operation before transaction commit."
     (values index count (nreverse changes) change-bytes)))
 
 (defun wal-recovery-reset-logical-change-batch ()
+  (when (and (logical-fragment-batch-p *wal-recovery-logical-xid*)
+             (logical-fragment-batch-validate-only *wal-recovery-logical-xid*)
+             (logical-fragment-batch-assembler *wal-recovery-logical-xid*))
+    (logical-close-recovery-assembler
+     (logical-fragment-batch-assembler *wal-recovery-logical-xid*)))
   (setf *wal-recovery-logical-xid* nil
         *wal-recovery-logical-chunk-count* nil
         *wal-recovery-logical-next-chunk* 0
@@ -903,13 +912,14 @@ executor, so capture the same operation before transaction commit."
                        (make-logical-fragment-batch +max-logical-wal-transaction-bytes+))))
         (unless (logical-fragment-batch-p batch)
           (error "logical WAL batch mixes fragment and legacy records"))
+        ;; The staging cleanup must own BATCH before it can acquire a file.
+        (setf *wal-recovery-logical-xid* batch)
         (logical-fragment-batch-accept batch (wal-record-xid record) (wal-record-payload record)
                                        :validate-only t)
-        (setf *wal-recovery-logical-xid* batch
-              *wal-recovery-logical-chunk-count* (logical-fragment-batch-count batch)
+        (setf *wal-recovery-logical-chunk-count* (logical-fragment-batch-count batch)
               *wal-recovery-logical-next-chunk* (logical-fragment-batch-next batch)
               *wal-recovery-logical-bytes*
-              (logical-fragment-assembler-bytes (logical-fragment-batch-assembler batch))))
+              (logical-recovery-assembler-bytes (logical-fragment-batch-assembler batch))))
       (progn
         (when (logical-fragment-batch-p *wal-recovery-logical-xid*)
           (error "logical WAL batch mixes fragment and legacy records"))

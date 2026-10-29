@@ -73,7 +73,7 @@ anchors; line numbers will move during implementation.
 | Publication catalogs do not select the stream | `LOGICAL-REPLICATION.md` documents database-wide source events and target-side row allowlists | Implement explicit publication table selection and supported publish actions on the source. A target allowlist does not replace source selection. |
 | Source bootstrap requires private SQL | `worker.lisp:logical-read-source-identity`, `logical-table-identity-signature`, and `logical-copy-from-exported-snapshot` call `pg_lisp_*` functions | Use standard identity/metadata for a C source; precreate target schema for standard mode. Keep private bootstrap in explicit extension mode. |
 | Snapshot lifetime and completion are private | `logical-create-source-slot` closes the exporting connection before import; pg-lisp retains a token until its private copy-complete feedback handshake | Follow C exporter lifetime and slot snapshot semantics. Ordinary clients must not need the private first-feedback handshake to begin streaming. Preserve snapshot/WAL safety while changing the mechanism. |
-| Physical WAL and logical capture are custom | `backend/storage/wal.lisp` has page after-images/private records; executor changes feed logical records | Preserve logical correctness while fixing the external protocol. This milestone does not claim C WAL, backup, recovery, or rewind compatibility. |
+| Physical WAL and logical capture are custom | `backend/storage/wal-core.lisp` has page after-images/private records; executor changes feed logical records | Preserve logical correctness while fixing the external protocol. This milestone does not claim C WAL, backup, recovery, or rewind compatibility. |
 
 Also audit rather than assume compatible:
 

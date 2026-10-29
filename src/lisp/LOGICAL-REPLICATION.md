@@ -33,7 +33,7 @@ authority transfer remain distinct follow-on work.
 
 ## Current state: implemented subset
 
-`backend/storage/wal.lisp` stores physical page after-images. Page records can
+`backend/storage/wal-core.lisp` stores physical page after-images. Page records can
 carry several contributing XIDs, and the commit record makes a page batch
 durable before CLOG publishes the transaction. This is enough for redo and WAL
 retention, but it cannot recover the SQL row operations that produced those

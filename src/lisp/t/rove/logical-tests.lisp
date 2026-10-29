@@ -1035,6 +1035,68 @@
         (rove:ok (not (accepts truncated)))
         (rove:ok (not (accepts truncated-binary))))))
 
+(rove:deftest test-logical-recovery-spool-lifetime
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-recovery-spool-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*query-temp-file-limit-bytes* 0)
+           (*logical-capture-memory-bytes* 1)
+           (event (logical-encode-change (logical-test-change :insert 7 701 :new-values #(1 2 "recover🙂"))))
+           (middle (floor (length event) 2))
+           (first (make-logical-fragment :event event :start 0 :end middle))
+           (second (make-logical-fragment :event event :start middle :end (length event)))
+           (one (make-wal-record :type +wal-record-logical-changes+ :xid 91
+                                 :payload (logical-encode-fragment 0 2 first)))
+           (two (make-wal-record :type +wal-record-logical-changes+ :xid 91
+                                 :payload (logical-encode-fragment 1 2 second))))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (with-wal-replay-staging ()
+               (setf *wal-recovery-group-active* t)
+               (wal-recovery-accept-logical-change-chunk one)
+               (let ((assembler (logical-fragment-batch-assembler *wal-recovery-logical-xid*)))
+                 (rove:ok (null (logical-recovery-assembler-buffer assembler)))
+                 (rove:ok (logical-recovery-assembler-spool assembler)))
+               (rove:ok (= 1 (length (uiop:directory-files directory))))
+               (wal-recovery-accept-logical-change-chunk two)
+               (rove:ok (null (uiop:directory-files directory)))
+               (wal-recovery-finish-logical-change-batch 91))
+             (with-wal-replay-staging ()
+               (setf *wal-recovery-group-active* t)
+               (wal-recovery-accept-logical-change-chunk one)
+               (rove:ok (= 1 (length (uiop:directory-files directory)))))
+             (rove:ok (null (uiop:directory-files directory)))
+             (with-wal-replay-staging ()
+               (setf *wal-recovery-group-active* t)
+               (wal-recovery-accept-logical-change-chunk one)
+               (wal-recovery-reset-logical-change-batch)
+               (rove:ok (null (uiop:directory-files directory))))
+             (rove:ok (handler-case
+                          (with-wal-replay-staging ()
+                            (setf *wal-recovery-group-active* t)
+                            (wal-recovery-accept-logical-change-chunk one)
+                            (wal-recovery-accept-logical-change-chunk one)
+                            nil)
+                        (error () t)))
+             (rove:ok (null (uiop:directory-files directory)))
+             (let* ((bad (copy-seq event)))
+               (setf (aref bad (1- (length bad))) #xff)
+               (let ((bad-two (make-wal-record
+                               :type +wal-record-logical-changes+ :xid 91
+                               :payload (logical-encode-fragment
+                                         1 2 (make-logical-fragment :event bad :start middle :end (length bad))))))
+                 (rove:ok (handler-case
+                              (with-wal-replay-staging ()
+                                (setf *wal-recovery-group-active* t)
+                                (wal-recovery-accept-logical-change-chunk one)
+                                (wal-recovery-accept-logical-change-chunk bad-two)
+                                nil)
+                            (error () t)))))
+             (rove:ok (null (uiop:directory-files directory))))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest test-logical-fragment-assembly
     (let* ((first (make-array 10 :element-type '(unsigned-byte 8)
                                  :initial-contents '(0 1 2 3 4 5 6 7 8 9)))

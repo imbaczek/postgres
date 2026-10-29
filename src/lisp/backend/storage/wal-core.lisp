@@ -1530,8 +1530,8 @@ src/backend/access/transam/xlogreader.c."
 (defun wal-replay-record (record)
   (when (> (wal-record-end record) *wal-checkpoint-lsn*)
     (wal-note-recovery-batch-record record)
-    (case (wal-record-type record)
-      (#.+wal-record-batch-start+
+    (cond
+      ((= (wal-record-type record) +wal-record-batch-start+)
        ;; A prior group without a terminal record is a crash tail. Ignore its
        ;; accumulated images and begin staging the next post-restart batch.
        (setf *wal-recovery-group-active* t
@@ -1541,7 +1541,7 @@ src/backend/access/transam/xlogreader.c."
              *wal-recovery-catalog-next-chunk* 0)
        (wal-recovery-reset-logical-change-batch)
        (setf *wal-recovery-logical-catalog-event-p* nil))
-      (#.+wal-record-pages+
+      ((= (wal-record-type record) +wal-record-pages+)
        (unless *wal-recovery-group-active*
          (error "WAL page images appear outside a batch"))
        (when *wal-recovery-catalog-chunk-count*
@@ -1552,13 +1552,13 @@ src/backend/access/transam/xlogreader.c."
                                              (wal-record-end record)
                                              (wal-record-version record)))
                     *wal-recovery-page-images*)))
-      (#.+wal-record-logical-changes+
+      ((= (wal-record-type record) +wal-record-logical-changes+)
        (when *wal-recovery-logical-catalog-event-p*
          (error "logical row changes follow a catalog event in the same batch"))
        (when *wal-recovery-catalog-chunk-count*
          (error "logical WAL changes follow catalog chunks in a batch"))
        (wal-recovery-accept-logical-change-chunk record))
-      (#.+wal-record-logical-catalog-event+
+      ((= (wal-record-type record) +wal-record-logical-catalog-event+)
        (unless *wal-recovery-group-active*
          (error "logical catalog event appears outside a WAL batch"))
        (when (/= (wal-record-xid record) 0)
@@ -1572,7 +1572,7 @@ src/backend/access/transam/xlogreader.c."
                       (plusp (wal-u32 payload 0))
                       (= (+ 8 (wal-u32 payload 4)) (length payload)))
            (error "logical catalog event has an invalid payload"))))
-      (#.+wal-record-commit+
+      ((= (wal-record-type record) +wal-record-commit+)
        (wal-decode-commit-timestamp (wal-record-payload record))
        (wal-recovery-validate-logical-terminal
         :commit (wal-record-xid record))
@@ -1580,12 +1580,12 @@ src/backend/access/transam/xlogreader.c."
         (lambda ()
           (lambda ()
             (clog-set (wal-record-xid record) 1)))))
-      (#.+wal-record-catalog+
+      ((= (wal-record-type record) +wal-record-catalog+)
        (wal-recovery-validate-logical-terminal :catalog)
        (wal-replay-finish-batch
         (lambda ()
           (wal-prepare-catalog-record (wal-record-payload record)))))
-      (#.+wal-record-catalog-chunk+
+      ((= (wal-record-type record) +wal-record-catalog-chunk+)
        (unless *wal-recovery-group-active*
          (error "WAL catalog chunks appear outside a batch"))
        (when (or *wal-recovery-logical-catalog-event-p*
@@ -1602,7 +1602,7 @@ src/backend/access/transam/xlogreader.c."
          (setf *wal-recovery-catalog-chunk-count* count)
          (push bytes *wal-recovery-catalog-chunks*)
          (incf *wal-recovery-catalog-next-chunk*)))
-      (#.+wal-record-catalog-commit+
+      ((= (wal-record-type record) +wal-record-catalog-commit+)
        (wal-recovery-validate-logical-terminal :catalog)
        (multiple-value-bind (count length)
            (wal-decode-catalog-commit-payload (wal-record-payload record))
@@ -1611,17 +1611,17 @@ src/backend/access/transam/xlogreader.c."
             (wal-prepare-catalog-record
              (wal-reassemble-catalog-chunks count length)))
           t)))
-      (#.+wal-record-checkpoint+
+      ((= (wal-record-type record) +wal-record-checkpoint+)
        (wal-recovery-validate-logical-terminal :other)
        (wal-checkpoint-record-snapshot record)
        (wal-replay-finish-batch (lambda () #'values)))
-      (#.+wal-record-running-xacts+
+      ((= (wal-record-type record) +wal-record-running-xacts+)
        (wal-recovery-validate-logical-terminal :other)
        (unless *wal-recovery-reservation-batch-clean-p*
          (error "running transaction snapshot requires an empty metadata batch"))
        (wal-running-xacts-record-info record)
        (wal-replay-finish-batch (lambda () #'values)))
-      (#.+wal-record-xid-reservation+
+      ((= (wal-record-type record) +wal-record-xid-reservation+)
        (wal-recovery-validate-logical-terminal :other)
        (unless *wal-recovery-reservation-batch-clean-p*
          (error "XID reservation must be the sole record after its batch marker"))
@@ -1630,14 +1630,14 @@ src/backend/access/transam/xlogreader.c."
           (lambda ()
             (lambda ()
               (unless (recovery-in-progress-p) (xid-restore-reservation-floor bound)))))))
-      (#.+wal-record-maintenance+
+      ((= (wal-record-type record) +wal-record-maintenance+)
        (wal-recovery-validate-logical-terminal :other)
        (unless (zerop (wal-record-xid record))
          (error "WAL maintenance record must not carry a transaction ID"))
        (unless (zerop (length (wal-record-payload record)))
          (error "WAL maintenance record has an invalid payload"))
        (wal-replay-finish-batch (lambda () #'values)))
-      (#.+wal-record-clog-reset+
+      ((= (wal-record-type record) +wal-record-clog-reset+)
        (wal-recovery-validate-logical-terminal :other)
        (wal-read-u64-payload (wal-record-payload record))
        (wal-replay-finish-batch
@@ -1656,7 +1656,9 @@ src/backend/access/transam/xlogreader.c."
          (*wal-recovery-logical-next-chunk* 0)
          (*wal-recovery-logical-bytes* 0)
          (*wal-recovery-logical-catalog-event-p* nil))
-     ,@body))
+     (unwind-protect
+          (progn ,@body)
+       (wal-recovery-reset-logical-change-batch))))
 
 (defun wal-recover ()
   "Redo durable complete batches before loading the catalog."
@@ -1821,10 +1823,10 @@ src/backend/access/transam/xlogreader.c."
                            (wal-replication-slot-restart-lsn slot))))
     (wal-scan
      (lambda (record)
-       (case (wal-record-type record)
-         (#.+wal-record-batch-start+
+       (cond
+         ((= (wal-record-type record) +wal-record-batch-start+)
           (setf batch-open t))
-         (otherwise
+         (t
           (when (and batch-open
                      (wal-terminal-record-type-p (wal-record-type record)))
             (when (= (wal-record-end record) target-lsn)
@@ -1851,10 +1853,10 @@ src/backend/access/transam/xlogreader.c."
                          *wal-durable-lsn*)))
       (wal-scan
        (lambda (record)
-         (case (wal-record-type record)
-           (#.+wal-record-batch-start+
+         (cond
+           ((= (wal-record-type record) +wal-record-batch-start+)
             (setf batch-start-lsn (wal-record-start record)))
-           (#.+wal-record-pages+
+           ((= (wal-record-type record) +wal-record-pages+)
             (let ((images (wal-decode-page-images
                            (wal-record-payload record) (wal-record-end record)
                            (wal-record-version record))))
@@ -1866,7 +1868,7 @@ src/backend/access/transam/xlogreader.c."
                   (when (and batch-start-lsn
                              (null legacy-first-lsn))
                     (setf legacy-first-lsn batch-start-lsn)))))
-           (#.+wal-record-commit+
+           ((= (wal-record-type record) +wal-record-commit+)
             (let* ((xid (wal-record-xid record))
                    (first-lsn (or (gethash xid first-lsns)
                                   legacy-first-lsn)))

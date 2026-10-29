@@ -3084,7 +3084,7 @@ Do not infer complete Patroni monitoring compatibility from the four controls.
 | --- | --- | --- |
 | Streaming | Explicit native physical START, separate receive/replay workers and durable-prefix reconnect implemented | Scalable physical slots/restartpoints and full C-compatible control contract remain |
 | Identity/history | `identify-replication-system` uses durable catalog identity but literal timeline `1` | Shared bootstrap identity, real timeline/history, wrong-cluster and divergent-history rejection |
-| WAL storage | `backend/storage/wal.lisp` has custom versioned full-page after-image records, local durable LSN and recovery state | Audit replay atomicity, catalog/CLOG reconstruction, retention, restart and interrupted-record handling before continuous recovery |
+| WAL storage | `backend/storage/wal-core.lisp` has custom versioned full-page after-image records, local durable LSN and recovery state | Audit replay atomicity, catalog/CLOG reconstruction, retention, restart and interrupted-record handling before continuous recovery |
 | Physical bootstrap | Durable source pins and a source-pausing coherent copy implemented; online copy remains missing | Consistent replica while primary writes; retention pin until copy/stream handoff completes |
 | Standby write exclusion | Static/streaming role guards and coarse reader-conflict deferral implemented; C targeted conflict cancellation remains missing | Recovery owns role; all application mutation paths reject writes, including attempts to disable read-only |
 | Promotion/rejoin | Not yet audited comprehensively | Durable promotion boundary/history, restart-safe completion, rebuild/rejoin of old primary |

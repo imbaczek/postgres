@@ -29,7 +29,7 @@
       :serial t
       :components ((:file "bufpage")
                    (:file "smgr")
-                   (:file "wal")
+                   (:file "wal" :pathname "wal-core")
                    (:file "wal-eor")
                    (:file "wal-checkpoint")
                    (:file "bufmgr")))

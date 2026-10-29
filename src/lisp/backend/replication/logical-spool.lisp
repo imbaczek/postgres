@@ -357,3 +357,70 @@ A second read failure is a WAL critical-section failure, like other WAL I/O."
             (logical-spool-events spool) nil
             (logical-spool-stream spool) nil)))
   (values))
+
+(defstruct (logical-recovery-assembler
+            (:constructor make-logical-recovery-assembler (limit)))
+  limit (bytes 0) total (received 0) buffer spool)
+
+(defun logical-close-recovery-assembler (assembler)
+  "Release any incomplete recovery event and its temporary-file owner."
+  (when (logical-recovery-assembler-spool assembler)
+    (close-logical-spool (logical-recovery-assembler-spool assembler))
+    (setf (logical-recovery-assembler-spool assembler) nil))
+  (setf (logical-recovery-assembler-buffer assembler) nil
+        (logical-recovery-assembler-total assembler) nil
+        (logical-recovery-assembler-received assembler) 0)
+  (values))
+
+(defun logical-recovery-assembler-append (assembler total offset bytes)
+  "Validate and store one recovery fragment, spilling large encoded events."
+  (let ((size (length bytes)))
+    (unless (and (typep bytes '(vector (unsigned-byte 8)))
+                 (integerp total) (plusp total) (integerp offset) (not (minusp offset))
+                 (plusp size) (<= (+ offset size) total))
+      (error "invalid logical WAL fragment bounds"))
+    (if (logical-recovery-assembler-total assembler)
+        (unless (and (= total (logical-recovery-assembler-total assembler))
+                     (= offset (logical-recovery-assembler-received assembler)))
+          (error "logical WAL fragments are out of order"))
+        (progn
+          (unless (zerop offset) (error "logical WAL event does not start at offset zero"))
+          (when (> (+ total (logical-recovery-assembler-bytes assembler))
+                   (logical-recovery-assembler-limit assembler))
+            (error "logical WAL transaction exceeds its change limit"))
+          (setf (logical-recovery-assembler-total assembler) total)
+          (incf (logical-recovery-assembler-bytes assembler) total)
+          (if (<= total *logical-capture-memory-bytes*)
+              (setf (logical-recovery-assembler-buffer assembler)
+                    (make-array total :element-type '(unsigned-byte 8)))
+              ;; Recovery must not inherit a SQL query's temporary-file quota.
+              (sb-sys:without-interrupts
+                (let ((*query-temp-file-limit-bytes* nil))
+                  (setf (logical-recovery-assembler-spool assembler) (make-logical-spool)))))))
+    (if (logical-recovery-assembler-spool assembler)
+        (let ((spool (logical-recovery-assembler-spool assembler)))
+          (call-with-logical-spool-owner
+           spool (lambda ()
+                   (logical-spool-ensure-file spool)
+                   (query-temp-account-space (logical-spool-path spool) size)
+                   (write-sequence bytes (logical-spool-stream spool)))))
+        (replace (logical-recovery-assembler-buffer assembler) bytes :start1 offset))
+    (incf (logical-recovery-assembler-received assembler) size)
+    (when (= (logical-recovery-assembler-received assembler) total)
+      (unwind-protect
+           (if (logical-recovery-assembler-spool assembler)
+               (let* ((spool (logical-recovery-assembler-spool assembler))
+                      (stream (logical-spool-stream spool)))
+                 (finish-output stream)
+                 (unless (file-position stream 0) (error "cannot seek logical recovery spool"))
+                 (logical-validate-change-from-cursor
+                  (make-logical-cursor :stream stream :size total)))
+               (logical-validate-change-from-cursor
+                (make-logical-cursor :bytes (logical-recovery-assembler-buffer assembler))))
+        (logical-close-recovery-assembler assembler))))
+  (values))
+
+(defun logical-recovery-assembler-finish (assembler)
+  (when (logical-recovery-assembler-total assembler)
+    (error "logical WAL transaction ends within an event"))
+  (values))
