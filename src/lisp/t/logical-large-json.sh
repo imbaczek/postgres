@@ -81,8 +81,12 @@ awk 'BEGIN {
   printf "\",\"a\":1,\"a\":2}\047::jsonb); INSERT INTO big_json VALUES (2,NULL,\047null\047::jsonb),(3,\047null\047::json,NULL),(4,\047null\047::json,NULL); UPDATE big_json SET b=\047null\047::jsonb WHERE id=3; COMMIT;\n"
 }' >"$TMP/change.sql"
 psql -X -q -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$SOURCE_PORT" -U postgres -d postgres -f "$TMP/change.sql" >/dev/null
+# Update the external JSONB by a shallow merge while the worker is stopped.
+# This changes the duplicate key's value but preserves the large unmodified field.
+sql "$SOURCE_PORT" "UPDATE big_json SET b = b || '{\"a\":{\"inner\":3.00},\"n\":null}'::jsonb WHERE id=1" >/dev/null
+sql "$SOURCE_PORT" 'INSERT INTO big_json VALUES (5,NULL,NULL)' >/dev/null
 awk 'BEGIN { printf " { \"z\" : \""; for (i=0;i<8400000;i++) printf "x"; printf "\", \"a\":1, \"a\":2 } \n" }' >"$TMP/expected-json"
-awk 'BEGIN { printf "{\"a\": 2, \"z\": \""; for (i=0;i<8400000;i++) printf "y"; printf "\"}\n" }' >"$TMP/expected-jsonb"
+awk 'BEGIN { printf "{\"a\": {\"inner\": 3.00}, \"n\": null, \"z\": \""; for (i=0;i<8400000;i++) printf "y"; printf "\"}\n" }' >"$TMP/expected-jsonb"
 kill "$SOURCE_PID"; wait "$SOURCE_PID" 2>/dev/null || true; SOURCE_PID=
 start_source
 sql "$SOURCE_PORT" 'SELECT j::text FROM big_json WHERE id=1' >"$TMP/source-json"
@@ -92,7 +96,7 @@ cmp "$TMP/expected-jsonb" "$TMP/source-jsonb"
 assert_external "$TMP/source.sock"
 start_worker
 i=0
-until [ "$(sql "$TARGET_PORT" 'SELECT count(*) FROM big_json' 2>/dev/null || true)" = 4 ]; do
+until [ "$(sql "$TARGET_PORT" 'SELECT count(*) FROM big_json' 2>/dev/null || true)" = 5 ]; do
     kill -0 "$WORKER_PID" 2>/dev/null || { cat "$TMP/worker.log" >&2; exit 1; }
     i=$((i + 1)); [ "$i" -lt 1200 ] || { echo 'logical-large-json: apply timed out' >&2; exit 1; }
     sleep 0.25

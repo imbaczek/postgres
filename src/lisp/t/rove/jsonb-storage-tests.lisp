@@ -24,6 +24,52 @@
         (rove:ok (string= (sql-jsonb-output value)
                           (sql-jsonb-output (sql-jsonb-from-octets expected)))))))
 
+(rove:deftest test-jsonb-concat-storage-spill-and-logical
+    (dolist (fixture '(("{\"z\":0,\"a\":{\"x\":1},\"é\":null}"
+                        "{\"a\":{\"y\":2.00},\"é\":\"雪\"}"
+                        "{\"a\": {\"y\": 2.00}, \"z\": 0, \"é\": \"雪\"}"
+                        "{\"a\": {\"x\": 1}, \"z\": 0, \"é\": null}"
+                        "{\"a\": {\"y\": 2.00}, \"é\": \"雪\"}")
+                       ("[null,\"雪\",1.20]" "{\"a\":false}"
+                        "[null, \"雪\", 1.20, {\"a\": false}]"
+                        "[null, \"雪\", 1.20]" "{\"a\": false}")
+                       ("null" "1.00" "[null, 1.00]" "null" "1.00")))
+      (destructuring-bind (left-text right-text expected left-expected right-expected) fixture
+        (let* ((left (sql-jsonb-input left-text))
+               (right (sql-jsonb-input right-text))
+               (value (sql-jsonb-concat left right))
+               (stored (sql-jsonb-from-octets (sql-jsonb-to-octets value)))
+               (spill (with-output-to-string (out) (query-spill-write-value out value)))
+               (spilled (let ((*read-eval* nil)) (query-spill-decode (read-from-string spill))))
+               (event (logical-test-change :insert 7 701 :new-values (vector 1 2 value))))
+          (setf (getf (third (logical-change-columns event)) :type) :jsonb
+                (getf (third (logical-change-columns event)) :typmod) -1)
+          (let* ((encoded (logical-encode-change event))
+                 (streamed (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+                 (decoded (logical-decode-change encoded)))
+            (logical-encode-change event
+                                   (lambda (part)
+                                     (if (integerp part) (vector-push-extend part streamed)
+                                         (loop for byte across part do (vector-push-extend byte streamed)))))
+            (rove:ok (equalp encoded streamed))
+            (dolist (actual (list value stored spilled (aref (logical-change-new-values decoded) 2)))
+              (rove:ok (string= expected (sql-jsonb-output actual)) expected))
+            (let* ((directory (merge-pathnames
+                               (format nil "pg-jsonb-spill-~d-~d/" (sb-posix:getpid) (random 1000000))
+                               (uiop:temporary-directory)))
+                   (*query-temp-directory* directory))
+              (ensure-directories-exist directory)
+              (unwind-protect
+                   (with-query-temp-files
+                     (with-query-temp-output (pathname out)
+                       (query-spill-write-record out value)
+                       (finish-output out)
+                       (with-query-temp-input (in pathname)
+                         (rove:ok (string= expected (sql-jsonb-output (query-spill-read-record in)))))))
+                (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore)))
+            (rove:ok (string= left-expected (sql-jsonb-output left)))
+            (rove:ok (string= right-expected (sql-jsonb-output right))))))))
+
 (rove:deftest test-jsonb-binary-corrupt-framing
     (dolist (hex '("" "00000000" "01000050000000d0" "0100004001000080"
                    "01000050010000b0" "0100004001000090ff"
