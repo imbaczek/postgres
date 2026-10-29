@@ -159,6 +159,9 @@
 (defstruct heap-external-varlena
   raw-size external-info value-id relation-id id-width)
 
+;; PAYLOAD is the PostgreSQL tcinfo word followed by a PGLZ stream.
+(defstruct heap-compressed-varlena payload)
+
 (defun heap-tuple-layout (values columns &optional cached-varlena)
   "Compute the exact physical layout used to form a heap tuple.
 Return size, attribute offsets, encoded varlena data and infomask.
@@ -186,14 +189,16 @@ must remain stable while the layout is used."
                     (setf (aref varlena-data i)
                           (if (heap-external-varlena-p v)
                               (heap-encode-external-varlena v)
-                              (or (aref varlena-data i)
+                              (or (and (heap-compressed-varlena-p v) (heap-compressed-varlena-payload v))
+                                  (aref varlena-data i)
                                   (case (pg-column-type col)
                                     (:bytea (check-type v (vector (unsigned-byte 8))) v)
                                     (:jsonb (sql-jsonb-to-octets v))
                                     (otherwise (string->bytes v)))))))
                   (unless (and (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea))
                                (or (heap-external-varlena-p v)
-                                   (<= (length (aref varlena-data i)) 126)))
+                                   (and (not (heap-compressed-varlena-p v))
+                                        (<= (length (aref varlena-data i)) 126))))
                     (setf cursor (align-up cursor al)))
                   (setf (aref offsets i) cursor)
                   (incf cursor
@@ -201,7 +206,7 @@ must remain stable while the layout is used."
                           ((:varchar :text :json :jsonb :bytea)
                            (let ((size (length (aref varlena-data i))))
                              (if (heap-external-varlena-p v) size
-                                 (+ size (if (<= size 126) 1 4)))))
+                                 (+ size (if (and (not (heap-compressed-varlena-p v)) (<= size 126)) 1 4)))))
                           (:numeric (+ 4 (length (sql-numeric-output v))))
                           (otherwise (column-fixed-size col))))))))
     (when has-null (setf infomask (logior infomask +heap-hasnull+)))
@@ -278,13 +283,14 @@ This codec does not create or fetch TOAST data."
                     (let ((data (aref varlena-data i)))
                       (if (heap-external-varlena-p v)
                           (replace bytes data :start1 off)
-                          (if (<= (length data) 126)
+                          (if (and (not (heap-compressed-varlena-p v)) (<= (length data) 126))
                               (progn
                                 (setf (aref bytes off)
                                       (logior (ash (1+ (length data)) 1) 1))
                                 (replace bytes data :start1 (1+ off)))
                               (progn
-                                (page-set-u32 bytes off (ash (+ 4 (length data)) 2))
+                                (page-set-u32 bytes off (logior (ash (+ 4 (length data)) 2)
+                                                                (if (heap-compressed-varlena-p v) 2 0)))
                                 (replace bytes data :start1 (+ off 4))))))))))
       bytes)))
 
@@ -405,11 +411,34 @@ reject external and compressed datums and lengths outside BYTES."
         (error "Invalid varlena length"))
       (values (+ offset header-size) end))))
 
+(defun heap-decode-inline-compressed (bytes offset)
+  "Decode one aligned inline PGLZ datum and return its bytes and physical end."
+  (unless (<= (+ offset 8) (length bytes))
+    (ereport "XX001" "truncated compressed varlena"))
+  (let* ((header (page-u32 bytes offset))
+         (total (ash header -2))
+         (end (+ offset total))
+         (info (page-u32 bytes (+ offset 4)))
+         (raw-size (logand info #x3fffffff)))
+    (unless (and (= (logand header 3) 2) (> total 8)
+                 (<= end (length bytes)) (zerop (ash info -30))
+                 (> raw-size 0))
+      (ereport "XX001" "invalid compressed varlena"))
+    (values (pglz-decompress (subseq bytes (+ offset 8) end) raw-size) end)))
+
+(defun heap-inline-varlena-bytes (bytes offset)
+  "Return a fresh uncompressed payload and the physical end of an inline datum."
+  (if (= (logand (aref bytes offset) 3) 2)
+      (heap-decode-inline-compressed bytes offset)
+      (multiple-value-bind (start end) (heap-inline-varlena-range bytes offset)
+        (values (subseq bytes start end) end))))
+
 (defun deform-heap-tuple (bytes columns)
   "Return values, XIDs, command ID, infomask, and successor TID.
-Inline :bytea attributes are fresh octet vectors independent of BYTES.
-External :varchar, :text, :json and :bytea attributes become physical descriptors; TOAST
-fetching, decompression, and SQL-level materialization are not done here."
+Inline compressed attributes are decompressed, and inline :bytea values are
+fresh octet vectors independent of BYTES. External :varchar, :text, :json,
+:jsonb and :bytea attributes remain physical descriptors; TOAST fetching and
+external decompression are deferred."
   (let* ((natts (length columns))
          (xmin (page-u32 bytes +heap-tuple-xmin-off+))
          (xmax (page-u32 bytes +heap-tuple-xmax-off+))
@@ -484,12 +513,12 @@ fetching, decompression, and SQL-level materialization are not done here."
                           (multiple-value-bind (pointer end)
                               (heap-decode-external-varlena bytes cursor)
                             (setf (aref values i) pointer cursor end))
-                          (multiple-value-bind (start end)
-                              (heap-inline-varlena-range bytes cursor)
+                          (multiple-value-bind (payload end)
+                              (heap-inline-varlena-bytes bytes cursor)
                             (setf (aref values i) (case (pg-column-type col)
-                                                    (:bytea (subseq bytes start end))
-                                                    (:jsonb (sql-jsonb-from-octets (subseq bytes start end)))
-                                                    (otherwise (bytes->string bytes :start start :end end)))
+                                                    (:bytea payload)
+                                                    (:jsonb (sql-jsonb-from-octets payload))
+                                                    (otherwise (bytes->string payload)))
                                   cursor end)))))))))
     (values values xmin xmax cid infomask ctid-block ctid-offnum)))
 

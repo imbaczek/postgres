@@ -407,8 +407,15 @@
                                     (pg::toast-externalize-tuple-unlocked
                                      toast logical (pg::pg-class-columns table) 42 0)))))
                  (ok (eq (aref logical 0) bytes))
-                 (ok (pg::heap-external-varlena-p (aref physical 0)))
-                 (let ((compressed-pointer (aref physical 0)))
+                 (ok (pg::heap-compressed-varlena-p (aref physical 0)))
+                 (ok (equalp bytes (aref (pg::deform-heap-tuple
+                                             (pg::form-heap-tuple physical (pg::pg-class-columns table)
+                                                                  42 0 0 0 1)
+                                             (pg::pg-class-columns table)) 0)))
+                 (let ((compressed-pointer
+                         (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                           (pg::with-write-lock
+                             (pg::toast-store-value-unlocked toast bytes nil 42 0 :compress t)))))
                    (ok (< (pg::heap-external-varlena-external-info compressed-pointer)
                           (length bytes)))
                    (ok (equalp bytes (pg::toast-fetch-value toast compressed-pointer snapshot)))

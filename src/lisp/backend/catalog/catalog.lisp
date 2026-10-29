@@ -1638,17 +1638,84 @@ chunks are copied. Abort the transaction after any partial write."
                                 :external-info (length payload) :value-id value-id
                                 :relation-id (pg-toast-oid toast) :id-width 4)))
 
+(defun toast-compress-inline-values (values columns &optional (target +toast-tuple-target+))
+  "Return a physical copy of VALUES with largest eligible values compressed.
+Attempt each attribute at most once and stop once the tuple fits TARGET."
+  (let ((physical (copy-seq values))
+        (attempted (make-array (length columns) :initial-element nil))
+        (cached nil))
+    (loop
+      (multiple-value-bind (size offsets encoded infomask)
+          (heap-tuple-layout physical columns cached)
+        (declare (ignore offsets infomask))
+        (setf cached encoded)
+        (when (<= size target) (return physical))
+        (let ((best nil) (best-size (maxalign (+ 4 +external-varlena-fixed-size+))))
+          (loop for i below (length columns)
+                for value = (aref physical i)
+                for type = (pg-column-type (aref columns i))
+                when (and (member type '(:varchar :text :json :jsonb :bytea))
+                          (not (eq value +null+))
+                          (not (heap-external-varlena-p value))
+                          (not (aref attempted i)))
+                  do (let ((length (length (aref encoded i))))
+                       (when (> (+ length 4) best-size)
+                         (setf best i best-size (+ length 4)))))
+          (unless best (return physical))
+          (setf (aref attempted best) t)
+          (let* ((raw (aref encoded best))
+                 (compressed (toast-compressed-payload raw)))
+            ;; toast_compress_datum requires space savings after header/alignment.
+            (when (and compressed (< (+ 4 (length compressed)) (- (length raw) 2)))
+              (setf (aref physical best) (make-heap-compressed-varlena :payload compressed)
+                    (aref cached best) nil))))))))
+
+(defun toast-compressed-externalization-plan (values columns &optional (target +toast-tuple-target+))
+  "Return attribute indexes to externalize, accounting for inline compression."
+  (let ((physical (copy-seq values))
+        (selected nil)
+        (cached nil))
+    (loop
+      (multiple-value-bind (size offsets encoded infomask)
+          (heap-tuple-layout physical columns cached)
+        (declare (ignore offsets infomask))
+        (setf cached encoded)
+        (when (<= size target) (return (nreverse selected)))
+        (let ((best nil) (best-size (maxalign (+ 4 +external-varlena-fixed-size+))))
+          (loop for i below (length columns)
+                for value = (aref physical i)
+                for type = (pg-column-type (aref columns i))
+                when (and (member type '(:varchar :text :json :jsonb :bytea))
+                          (not (eq value +null+))
+                          (not (heap-external-varlena-p value)))
+                  do (let* ((length (length (aref encoded i)))
+                            (size (+ length
+                                     (if (and (not (heap-compressed-varlena-p value))
+                                              (<= length 126))
+                                         1 4))))
+                       (when (> size best-size)
+                         (setf best i best-size size))))
+          (unless best (return (nreverse selected)))
+          (push best selected)
+          ;; The placeholder has the same physical size as an OID pointer.
+          (setf (aref physical best)
+                (make-heap-external-varlena :raw-size 5 :external-info 1
+                                            :value-id 1 :relation-id 1 :id-width 4)))))))
+
 (defun toast-externalize-tuple-unlocked (toast values columns xid cid)
-  "Return a physical copy of VALUES with selected attributes stored in TOAST.
+  "Return a physical copy of VALUES, compressing inline or storing in TOAST.
 The caller must hold the TOAST index writer lock before acquiring *WRITE-LOCK*
 and keep both held for this call; this function does not acquire either lock.
 Abort XID after any error once storage begins. VALUES remains suitable for SQL
 index keys, RETURNING, and replication. The planner may leave the tuple above
 its target. Selected external payloads use PGLZ when it meets the size threshold."
-  (let ((physical (copy-seq values)))
-    (dolist (entry (toast-externalization-plan values columns))
-      (setf (aref physical (car entry))
-            (toast-store-value-unlocked toast (cdr entry) nil xid cid :compress t)))
+  (let ((physical (toast-compress-inline-values values columns)))
+    (when (> (heap-tuple-layout physical columns) +toast-tuple-target+)
+      (let ((raw-payloads (nth-value 2 (heap-tuple-layout values columns))))
+        (dolist (index (toast-compressed-externalization-plan physical columns))
+          (setf (aref physical index)
+                (toast-store-value-unlocked toast (aref raw-payloads index)
+                                            nil xid cid :compress t)))))
     physical))
 
 (defun toast-fetch-value (toast pointer snapshot &key (index-reader #'call-with-btree-relation-read-lock))
