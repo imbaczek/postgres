@@ -44,7 +44,7 @@ mkdir -m 700 "$TMP/copy"
 "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" --control-socket "$TMP/source.sock" >"$TMP/source.log" 2>&1 &
 SOURCE=$!
 test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
-sql "$PORT" "CREATE TABLE promotion_sql_items (id integer PRIMARY KEY,label text); INSERT INTO promotion_sql_items VALUES (1,'before'); CREATE TABLE row_barriers (id integer)"
+sql "$PORT" "CREATE TABLE promotion_sql_items (id integer PRIMARY KEY,label text); INSERT INTO promotion_sql_items VALUES (1,'before'); CREATE TABLE row_barriers (id integer); CREATE TABLE row_spill (id integer, value text)"
 checked source "(physical-base-backup \"$TMP/copy/\" \"row_readers\")" backup
 start_target
 checked target "(physical-follow-start \"127.0.0.1\" $PORT \"row_readers\")" follow

@@ -84,27 +84,42 @@ A violation is an error; the outer replay path fences recovery."
           0
           (error condition)))))
 
-(defun physical-row-replay-preflight-images (images)
-  ;; Validate the whole batch before applying any image: known relation,
-  ;; allowed fork, no duplicate pages and only contiguous extension.
+(defun physical-row-replay-preflight-with-map (map-images)
+  "Check a whole ordered batch using state shared across all record visits."
   (let ((nodes (catalog-physical-relfilenodes))
         (sizes (make-hash-table :test #'equal))
         (seen (make-hash-table :test #'equal)))
-    (dolist (image images)
-      (let* ((node (wal-page-image-relfilenode image)) (fork (wal-page-image-fork image))
-                                                       (block (wal-page-image-block image)) (key (list node fork))
-                                                       (page-key (list node fork block)))
-        (unless (and (member node nodes :test #'eql) (member fork '(:main :visibility))
-                     (typep block '(unsigned-byte 32)) (not (gethash page-key seen)))
-          (error "unknown or duplicate row replay page"))
-        (setf (gethash page-key seen) t)
-        (unless (gethash (list node :main) sizes)
-          (setf (gethash (list node :main) sizes) (physical-row-replay-file-blocks node :main)))
-        (multiple-value-bind (size present) (gethash key sizes)
-          (unless present (setf size (physical-row-replay-file-blocks node fork)))
-          (when (> block size) (error "row replay page skips a relation block"))
-          (setf (gethash key sizes) (max size (1+ block)))))))
+    (funcall
+     map-images
+     (lambda (images)
+       (dolist (image images)
+         (let* ((node (wal-page-image-relfilenode image))
+                (fork (wal-page-image-fork image))
+                (block (wal-page-image-block image))
+                (key (list node fork))
+                (page-key (list node fork block)))
+           (unless (and (member node nodes :test #'eql) (member fork '(:main :visibility))
+                        (typep block '(unsigned-byte 32)) (not (gethash page-key seen)))
+             (error "unknown or duplicate row replay page"))
+           (setf (gethash page-key seen) t)
+           (unless (gethash (list node :main) sizes)
+             (setf (gethash (list node :main) sizes) (physical-row-replay-file-blocks node :main)))
+           (multiple-value-bind (size present) (gethash key sizes)
+             (unless present (setf size (physical-row-replay-file-blocks node fork)))
+             (when (> block size) (error "row replay page skips a relation block"))
+             (setf (gethash key sizes) (max size (1+ block)))))))))
   (values))
+
+(defun physical-row-replay-preflight-images (images)
+  (physical-row-replay-preflight-with-map (lambda (visit) (funcall visit images))))
+
+(defun physical-row-replay-spool-allowed-p (horizon)
+  (let ((allowed t))
+    (wal-recovery-map-page-spool
+     (lambda (images)
+       (unless (physical-row-replay-images-allowed-p images horizon)
+         (setf allowed nil))))
+    allowed))
 
 ;;; The reader-safe replay path uses the same durable terminal publication as
 ;;; full replay; prospective per-record membership is not visible before it.
@@ -142,9 +157,11 @@ A violation is an error; the outer replay path fences recovery."
          (if (wal-terminal-record-type-p (wal-record-type record))
              (sb-thread:with-mutex (*wal-lock*)
                (physical-row-replay-check-covered-commit record covered)
-               (unless (physical-row-replay-images-allowed-p *wal-recovery-page-images* horizon)
+               (when *wal-recovery-page-spool*
+                 (logical-spool-seal *wal-recovery-page-spool*))
+               (unless (physical-row-replay-spool-allowed-p horizon)
                  (return-from physical-row-replay-prefix :deferred))
-               (physical-row-replay-preflight-images (reverse *wal-recovery-page-images*))
+               (physical-row-replay-preflight-with-map #'wal-recovery-map-page-spool)
                (wal-replay-record record)
                (physical-row-replay-publish-terminal record next-xid reservation source-xids))
              (wal-replay-record record)))

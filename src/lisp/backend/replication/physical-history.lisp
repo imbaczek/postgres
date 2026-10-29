@@ -2,9 +2,11 @@
 (in-package #:pg)
 
 (defmacro with-physical-replay-staging (() &body body)
-  `(with-wal-replay-staging () ,@body))
+  `(let ((*wal-recovery-page-spool-enabled* t))
+     (with-wal-replay-staging () ,@body)))
 
 (defun physical-history-reset (active)
+  (wal-recovery-close-page-spool)
   (unless active (setf *wal-recovery-reservation-batch-clean-p* nil))
   (setf *wal-recovery-page-images* nil
         *wal-recovery-group-active* active

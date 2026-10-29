@@ -58,6 +58,42 @@
           (with-open-file (in (pg::relation-file-path 900) :element-type '(unsigned-byte 8))
             (ok (= pg::+blcksz+ (file-length in))))))))
 
+(deftest row-replay-spooled-preflight-shares-state-across-records
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root) (pg::*query-temp-directory* root)
+                                 (pg::*logical-capture-memory-bytes* 0)
+                                 (pg::*catalog* (pg::make-catalog))
+                                 (database (pg::make-database :name "postgres"))
+                                 (table (pg::make-pg-class :oid 900 :relfilenode 900 :name "items")))
+        (setf (gethash "postgres" (pg::catalog-databases pg::*catalog*)) database
+              (gethash "items" (pg::database-tables database)) table)
+        (ensure-directories-exist (pg::relation-file-path 900))
+        (with-open-file (out (pg::relation-file-path 900)
+                             :direction :output :element-type '(unsigned-byte 8))
+          (write-sequence (pg::make-page) out))
+        (labels ((record (block lsn &optional (provenance :row) (xids '(100)))
+                   (let ((image (pg::make-wal-page-image
+                                 :relfilenode 900 :fork :main :block block
+                                 :page (pg::page-init (pg::make-page))
+                                 :provenance provenance :xids xids)))
+                     (pg::make-wal-record :version 7 :end lsn
+                                          :payload (pg::wal-encode-page-images (list image) lsn))))
+                 (check (records horizon expected-allowed expected-error)
+                   (pg::with-physical-replay-staging ()
+                     (dolist (record records) (pg::wal-recovery-stage-page-record record))
+                     (pg::logical-spool-seal pg::*wal-recovery-page-spool*)
+                     (ok (eql expected-allowed (pg::physical-row-replay-spool-allowed-p horizon)))
+                     (ok (eql expected-error
+                              (intake-fails-p
+                               (lambda ()
+                                 (pg::physical-row-replay-preflight-with-map
+                                  #'pg::wal-recovery-map-page-spool))))))))
+          (check (list (record 0 100) (record 1 200) (record 2 300)) 100 t nil)
+          (check (list (record 0 100) (record 0 200)) 100 t t)
+          (check (list (record 0 100) (record 2 200)) 100 t t)
+          (check (list (record 0 100) (record 1 200 :maintenance)) 100 nil nil)
+          (check (list (record 0 100) (record 1 200 :row '(99))) 100 nil nil)))))
+
 (deftest streaming-clog-replacement-keeps-the-readable-stream-on-open-error
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root) (pg::*clog-stream* nil)

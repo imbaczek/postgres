@@ -169,6 +169,8 @@
     (dolist (horizon '(nil 0 56))
       (with-restartpoint-fixture (root store)
         (let* ((pg::*physical-replay-restarting-p* t)
+               (pg::*logical-capture-memory-bytes* 0)
+               (pg::*query-temp-directory* (merge-pathnames "redo-spool/" root))
                (pg::*catalog* (pg::load-catalog))
                (pg::*wal-page-cache* (make-hash-table :test #'equal))
                (pg::*wal-page-cache-xids* (make-hash-table :test #'equal))
@@ -183,6 +185,7 @@
                                           (pg::wal-encode-page-images
                                            (list image) (+ end 32 pg::+wal-header-size+
                                                            (pg::wal-page-payload-length (list image)))))))
+          (ensure-directories-exist (merge-pathnames "redo-spool/probe" root))
           (pg::wal-atomic-write-bytes (merge-pathnames "base/900" root) page)
           (pg::clog-init)
           (unwind-protect
@@ -210,6 +213,7 @@
                        (let ((result (pg::physical-row-replay-prefix horizon)))
                          (when (= horizon 56)
                            (ok (eq :deferred result))
+                           (ok (null (uiop:directory-files pg::*query-temp-directory*)))
                            (ok (= end pg::*last-replay-lsn*))
                            (ok (= 50 pg::*next-xid*))
                            (ok (equal '(3 49)
@@ -224,3 +228,54 @@
                    (ok (= 1 (pg::clog-get 55)))
                    (ok (equal '(999) pg::*active-xids*))))
             (close pg::*clog-stream*) (setf pg::*clog-stream* nil))))))
+
+(deftest row-replay-late-unsafe-page-defers-without-publishing
+    (with-restartpoint-fixture (root store)
+      (let* ((pg::*physical-replay-restarting-p* t)
+             (pg::*logical-capture-memory-bytes* 0)
+             (pg::*query-temp-directory* (merge-pathnames "redo-spool/" root))
+             (pg::*catalog* (pg::load-catalog))
+             (pg::*wal-page-cache* (make-hash-table :test #'equal))
+             (pg::*wal-page-cache-xids* (make-hash-table :test #'equal))
+             (original (pg::make-page))
+             (changed (pg::make-page))
+             (start (source-xids-record pg::+wal-record-batch-start+ 96 (empty-octets)))
+             (first-image (pg::make-wal-page-image :relfilenode 900 :block 0
+                                                   :page changed :xids '(55) :provenance :row))
+             (second-image (pg::make-wal-page-image :relfilenode 900 :block 0
+                                                    :page (pg::make-page) :xids '(55)
+                                                    :provenance :maintenance)))
+        (setf (aref changed 100) 17)
+        (ensure-directories-exist (merge-pathnames "redo-spool/probe" root))
+        (pg::wal-atomic-write-bytes (merge-pathnames "base/900" root) original)
+        (pg::clog-init)
+        (unwind-protect
+             (let* ((first-start (pg::wal-record-end start))
+                    (first-end (+ first-start pg::+wal-header-size+
+                                  (pg::wal-page-payload-length (list first-image))))
+                    (first (source-xids-record pg::+wal-record-pages+ first-start
+                                               (pg::wal-encode-page-images (list first-image) first-end)))
+                    (second-start (pg::wal-record-end first))
+                    (second-end (+ second-start pg::+wal-header-size+
+                                   (pg::wal-page-payload-length (list second-image))))
+                    (second (source-xids-record pg::+wal-record-pages+ second-start
+                                                (pg::wal-encode-page-images (list second-image) second-end)))
+                    (commit (source-xids-record pg::+wal-record-commit+ (pg::wal-record-end second)
+                                                (empty-octets) 55))
+                    (old-progress pg::*last-replay-lsn*)
+                    (old-next pg::*next-xid*))
+               (dolist (record (list start first second commit))
+                 (pg::physical-store-input store (pg::wal-record-start record)
+                                           (pg::wal-encode-record
+                                            (pg::wal-record-type record) (pg::wal-record-xid record)
+                                            (pg::wal-record-start record) (pg::wal-record-payload record))))
+               (pg::physical-store-flush store)
+               (ok (eq :deferred (pg::physical-row-replay-prefix 0)))
+               (ok (= old-progress pg::*last-replay-lsn*))
+               (ok (= old-next pg::*next-xid*))
+               (ok (/= 1 (pg::clog-get 55)))
+               (with-open-file (input (merge-pathnames "base/900" root) :element-type '(unsigned-byte 8))
+                 (file-position input 100)
+                 (ok (zerop (read-byte input))))
+               (ok (null (uiop:directory-files pg::*query-temp-directory*))))
+          (close pg::*clog-stream*) (setf pg::*clog-stream* nil)))))

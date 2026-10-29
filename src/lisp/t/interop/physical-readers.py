@@ -102,6 +102,26 @@ def check(base, root, source, target, readers, older):
         reader.commit()
     print("physical-readers: safe commits advance with two retained RR views PASS", flush=True)
 
+    # Keep a snapshot open while a single transaction produces more than one
+    # page WAL record and exceeds the normal recovery spool memory threshold.
+    assert scalar(readers[0], "SELECT count(*) FROM row_spill") == 0
+    control(base, root, "(setf *logical-capture-memory-bytes* 1)")
+    before_spill = scalar(source, "SELECT pg_current_wal_lsn()")
+    rows = ",".join(f"({i},'{('x' * 900)}')" for i in range(5000))
+    query(source, "INSERT INTO row_spill VALUES " + rows)
+    after_spill = scalar(source, "SELECT pg_current_wal_lsn()")
+    assert scalar(source, f"SELECT pg_wal_lsn_diff('{after_spill}'::pg_lsn, '{before_spill}'::pg_lsn) > 4194304")
+    position = received(source, target)
+    deadline = time.monotonic() + 120
+    while scalar(target, f"SELECT pg_last_wal_replay_lsn() >= '{position}'::pg_lsn") is not True:
+        assert time.monotonic() < deadline
+        time.sleep(0.1)
+    assert scalar(target, "SELECT count(*) FROM row_spill") == 5000
+    assert scalar(readers[0], "SELECT count(*) FROM row_spill") == 0
+    readers[0].commit()
+    control(base, root, "(setf *logical-capture-memory-bytes* (* 4 1024 1024))")
+    print("physical-readers: multi-record spilled batch preserves retained snapshot PASS", flush=True)
+
     query(older, "UPDATE promotion_sql_items SET label='older-pending' WHERE id=1")
     query(source, "INSERT INTO row_barriers VALUES (1)")
     applied(source, target)
