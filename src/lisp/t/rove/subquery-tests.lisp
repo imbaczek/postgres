@@ -50,6 +50,23 @@
                  (rove:ok (null seen) (format nil "~a consumer sees no scan demand" kind)))))
         (setf (symbol-function 'simple-select-toast-demand) original))))
 
+(rove:deftest bytea-substring-overloads
+    (dolist (case '(("SELECT substr('\\x01020304'::bytea,2,2)::text" "\\x0203")
+                    ("SELECT substring('\\x01020304'::bytea,3)::text" "\\x0304")
+                    ("SELECT substr('\\x01020304'::bytea,0,2)::text" "\\x01")
+                    ("SELECT substr('\\x01020304'::bytea,100,2)::text" "\\x")
+                    ("SELECT substr('\\x01020304'::bytea,2,2147483647)::text" "\\x020304")
+                    ("SELECT substr('\\x01020304'::bytea,2147483647,2147483647)::text" "\\x")))
+      (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case)))
+               (first case)))
+  (rove:ok (equal (list (list +null+)) (subquery-test-rows "SELECT substr(NULL::bytea,1,1)")))
+  (dolist (case '(("SELECT substr('\\x01'::bytea,1,-1)" "22011")
+                  ("SELECT substr(DISTINCT '\\x01'::bytea,'bad')" "42809")
+                  ("SELECT substr('\\x01'::bytea,'bad' ORDER BY 1)" "42809")))
+    (let ((error (handler-case (progn (subquery-test-rows (first case)) nil)
+                   (pg-error (error) error))))
+      (rove:ok (and error (string= (second case) (pg-error-sqlstate error))) (first case)))))
+
 (rove:deftest subquery-parser-forms
     (dolist (sql '("SELECT (SELECT 1)" "SELECT ((SELECT 1))"
                    "SELECT ((SELECT 1) UNION ALL SELECT 2)"

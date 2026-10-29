@@ -798,7 +798,9 @@ on process restart. These functions reject a primary with SQLSTATE `55000`.
 outside signed int64; `::bigint` checks overflow.
 Text `||` and `substr(text, start [, length])` support the string operations used
 by Patroni's status expression. Substring positions count Unicode characters,
-including SQL's adjusted zero/negative starts. Array concatenation remains unsupported.
+including SQL's adjusted zero/negative starts. The `substr` and `substring`
+function forms also accept `bytea`, where positions count bytes; they currently
+materialize an external value before slicing it. Array concatenation remains unsupported.
 Fixed `bit(N)` expression casts and `B'...'`/`X'...'` literals support binary/hex
 input, explicit padding/truncation, and C-compatible integer/bigint conversion.
 Varying-bit types, bitwise operations, bit concatenation and bit table storage

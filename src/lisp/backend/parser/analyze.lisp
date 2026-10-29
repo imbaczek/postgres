@@ -383,18 +383,22 @@ result is text for typeof and int4 for array_length."
           :type (if (search "_typeof" name) :text :int4) :typmod -1)))
 
 (defun analyze-substr-function (name arguments)
+  "Resolve text and bytea substring overloads."
   (unless (and (member (length arguments) '(2 3))
-               (sql-implicit-coercion-p (expr-type (first arguments)) :text)
+               (or (eq (expr-type (first arguments)) :bytea)
+                   (sql-implicit-coercion-p (expr-type (first arguments)) :text))
                (every (lambda (argument)
                         (or (in-unknown-constant-p argument)
                             (member (expr-type argument) '(:int2 :int4))))
                       (rest arguments)))
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-  (list :func name
-        (cons (cast-expression-to-text (first arguments))
-              (mapcar (lambda (argument) (coerce-common-expression argument :int4))
-                      (rest arguments)))
-        :type :text :typmod -1))
+  (let ((type (if (eq (expr-type (first arguments)) :bytea) :bytea :text)))
+    (list :func name
+          (cons (if (eq type :bytea) (first arguments)
+                    (cast-expression-to-text (first arguments)))
+                (mapcar (lambda (argument) (coerce-common-expression argument :int4))
+                        (rest arguments)))
+          :type type :typmod -1)))
 
 (defun eval-substr-function (arguments)
   "Match text_substring's character positions, negative starts and overflow-to-tail."
@@ -1123,7 +1127,11 @@ so a nested argument error keeps its own diagnostics."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-json-inspection-function name args)))
-      ((string= name "substr") (analyze-substr-function name args))
+      ((member name '("substr" "substring") :test #'string=)
+       (let ((*defer-function-constant-coercion-p*
+               (or (getf (cdddr expr) :call-distinct)
+                   (getf (cdddr expr) :call-order))))
+         (analyze-substr-function name args)))
       ((string= name "pg_wal_lsn_diff") (analyze-wal-lsn-diff name args))
       ((string= name "pg_walfile_name") (analyze-wal-filename name args))
       ((member name '("lower" "current_setting") :test #'string=)
@@ -2882,7 +2890,7 @@ candidate selection."
                                  '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                    "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
                                    "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length"
-                                   "substr" "length" "char_length" "character_length" "octet_length" "pg_backend_pid"
+                                   "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid"
                                    "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                                    "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                                    "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
@@ -3573,7 +3581,7 @@ aliases share the corresponding numeric operator implementation."
              ((string= name "jsonb_typeof") (sql-jsonb-kind value))
              ((string= name "json_array_length") (sql-json-source-array-length value))
              (t (sql-jsonb-array-length value)))))
-    ((string= name "substr") (eval-substr-function args))
+    ((member name '("substr" "substring") :test #'string=) (eval-substr-function args))
     ((string= name "pg_wal_lsn_diff") (eval-wal-lsn-diff args))
     ((string= name "pg_walfile_name") (eval-wal-filename args))
     ((member name '("lower" "current_setting") :test #'string=)

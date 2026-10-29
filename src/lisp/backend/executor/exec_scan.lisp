@@ -859,7 +859,7 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
       (numeric-arithmetic-function-p name)
       (numeric-helper-function-p name)
       (member name '("json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length"
-                     "lower" "substr" "length" "char_length" "character_length" "octet_length"
+                     "lower" "substr" "substring" "length" "char_length" "character_length" "octet_length"
                      "pg_wal_lsn_diff" "pg_walfile_name"
                      "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
