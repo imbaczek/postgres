@@ -240,6 +240,42 @@
          (physical-client-test-result out (physical-client-test-prepare-schema)
                                       (list (physical-client-test-prepare-row)) "PREPARE_FOLLOW")))))
 
+(deftest physical-client-prepares-same-timeline-proof-with-null-descendant-fields
+    (dolist (timeline '(1 2))
+      (call-with-same-timeline-follow-source
+       (lambda (root anchor wal)
+         (declare (ignore root wal))
+         (let* ((coordinates (follow-anchor-receiver-request anchor))
+                (command (pg::parse-replication-command (follow-prepare-query anchor "bound")))
+                (row (pg::physical-follow-prepare-row command)))
+           (ok (every #'null (nthcdr 12 row)))
+           (call-with-physical-client-wire
+            (lambda (client request)
+              (declare (ignore request))
+              (ok (equal anchor (pg::pg-client-native-prepare client "bound" coordinates))))
+            (lambda (out)
+              (physical-client-test-result out (physical-client-test-prepare-schema)
+                                           (list row) "PREPARE_FOLLOW")))))
+       timeline)))
+
+(deftest physical-client-same-timeline-proof-rejects-fake-fork-and-null-coordinates
+    (dolist (change '((0 nil) (8 nil) (11 nil) (11 "# ignored")
+                      (12 "1") (13 "0/00000060") (14 "")))
+      (let* ((anchor (same-timeline-follow-anchor 96 123 456))
+             (coordinates (follow-anchor-receiver-request anchor))
+             (row (list "bound" "42" "1" "0/00000000" "77" "1" "1"
+                        "0/00000060" "123" "0/00000000" "456" "" nil nil nil)))
+        (setf (nth (first change) row) (second change))
+        (call-with-physical-client-wire
+         (lambda (client request)
+           (declare (ignore request))
+           (ok (physical-client-test-protocol-error-p
+                (lambda () (pg::pg-client-native-prepare client "bound" coordinates)))
+               (format nil "~s" change)))
+         (lambda (out)
+           (physical-client-test-result out (physical-client-test-prepare-schema)
+                                        (list row) "PREPARE_FOLLOW"))))))
+
 (deftest physical-client-fetches-exact-immediate-child-history
     (let ((text (getf (follow-anchor-request 123 456) :history-text)))
       (call-with-physical-client-wire

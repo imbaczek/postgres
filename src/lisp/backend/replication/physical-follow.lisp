@@ -187,7 +187,7 @@ still require comparison with durable recovery state."
           :target child :history-text history :fork-digest digest
           :previous-digest (ninth before) :eor-octets (getf anchor :eor-octets)))))
 
-(defun physical-follow-binding-transition-check (anchor text before after)
+(defun physical-follow-descendant-binding-transition-check (anchor text before after)
   "Check the catch-up or rewind plan and its immediate child history.
 The source history can extend beyond that child. Preserve the base, floor,
 manifest and root fields, and validate the proposed selection digest."
@@ -211,6 +211,18 @@ manifest and root fields, and validate the proposed selection digest."
             (error "follow binding has a foreign post-transition selection")))
       child-history)))
 
+(defun physical-follow-binding-transition-check (anchor text before after)
+  (ecase (physical-follow-anchor-kind anchor)
+    (:descendant (physical-follow-descendant-binding-transition-check anchor text before after))
+    (:same-timeline
+     (let ((history (physical-follow-anchor-check anchor)))
+       (unless (and (null text) (equal before after)
+                    (= (or (eighth before) (second before)) (getf anchor :receive-timeline))
+                    (= (fourth before) (getf anchor :receive-lsn))
+                    (= (fifth before) (getf anchor :receive-digest)))
+         (error "same-timeline follow binding changes receive state or its proven cursor"))
+       history))))
+
 (defun physical-follow-binding-check (binding)
   "Validate the shape and internal coherence of a version 1 follow binding.
 The anchor, immediate child history, before and after control tuples, applied and
@@ -223,7 +235,10 @@ Neither binding phase is admitted by the current receiver."
                                          (applied (getf binding :applied)) (required (getf binding :required))
                                          (witness (getf binding :recovery)))
     (unless (and (eql 1 (getf binding :version)) (member (getf binding :phase) '(:pending :active))
-                 (stringp text) (<= (length (string->bytes text)) +physical-store-history-maximum-bytes+)
+                 (if (eq :same-timeline (physical-follow-anchor-kind anchor))
+                     (null text)
+                     (and (stringp text)
+                          (<= (length (string->bytes text)) +physical-store-history-maximum-bytes+)))
                  (stringp (getf anchor :history-text))
                  (<= (length (string->bytes (getf anchor :history-text))) +physical-store-history-maximum-bytes+)
                  (physical-follow-binding-pair-p applied) (physical-follow-binding-pair-p required)
@@ -391,9 +406,10 @@ caller owns the candidate and keeps its input stable during the scan."
    (getf (getf binding :recovery) :observed-next-xid)
    (getf (getf binding :recovery) :restartpoint)
    :allow-open-tail
-   (and (equal (getf binding :before) (getf binding :after))
-        (< (physical-store-flushed-lsn candidate)
-           (nth-value 1 (physical-follow-anchor-check (getf binding :anchor)))))))
+   (or (eq :same-timeline (physical-follow-anchor-kind (getf binding :anchor)))
+       (and (equal (getf binding :before) (getf binding :after))
+            (< (physical-store-flushed-lsn candidate)
+               (nth-value 1 (physical-follow-anchor-check (getf binding :anchor))))))))
 
 (defun physical-follow-pending-recovery-position (base binding control)
   "Match durable recovery provenance, required pair and XID to the witness.
@@ -484,7 +500,8 @@ floor digests even when compaction has moved them into retained extents."
                      (= (seventh saved) (seventh current))))
       (error "active follow receive identity, selection or floor regressed"))
     (physical-follow-check-source-history store (nth-value 0 (physical-follow-anchor-check anchor)))
-    (when (equal (getf binding :before) saved)
+    (when (and (eq :descendant (physical-follow-anchor-kind anchor))
+               (equal (getf binding :before) saved))
       (unless (<= (fourth current)
                   (nth-value 1 (physical-follow-anchor-check anchor)))
         (error "active parent receipt crossed its unselected child fork")))
@@ -663,8 +680,7 @@ The caller must exclude recovery and reload and protect the selected root."
   (when *physical-follow-test-hook* (funcall *physical-follow-test-hook* point)))
 
 (defun physical-follow-check-history-files (store binding)
-  "Preflight published history files, including the proposed immediate child.
-Reject conflicting bytes or changes to immutable base ancestry before mutation."
+  "Preflight published history files before mutation."
   (labels ((check-file (target text)
              (let ((path (timeline-history-path target *pgdata*)))
                (when (wal-namespace-file-stat path t)
@@ -677,10 +693,14 @@ Reject conflicting bytes or changes to immutable base ancestry before mutation."
           (error "pending follow changes immutable base ancestry"))
         (loop for item = selection then (getf item :previous) while item
               do (check-file (getf item :target) (getf item :history-text)))))
-    (multiple-value-bind (history fork eor) (physical-follow-anchor-check (getf binding :anchor))
-      (declare (ignore fork))
-      (check-file (timeline-check-end-of-recovery eor (getf (getf binding :anchor) :receive-timeline) history)
-                  (getf binding :child-history)))))
+    (let ((anchor (getf binding :anchor)))
+      (multiple-value-bind (history fork eor) (physical-follow-anchor-check anchor)
+        (declare (ignore fork))
+        (if (eq :same-timeline (physical-follow-anchor-kind anchor))
+            (when (> (getf anchor :source-timeline) 1)
+              (check-file (getf anchor :source-timeline) (getf anchor :history-text)))
+            (check-file (timeline-check-end-of-recovery eor (getf anchor :receive-timeline) history)
+                        (getf binding :child-history)))))))
 
 (defun physical-follow-publish-pending-recovery (base binding)
   "Publish the required recovery pair and witnessed XID with the selected history.

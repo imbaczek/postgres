@@ -232,6 +232,21 @@ def retarget_form(port, prefix):
     return f'(physical-follow-retarget "127.0.0.1" {port} "{prefix}")'
 
 
+def exercise_same_timeline(upstream, sibling, port, timeline, count, other=None):
+    control("sibling.sock", '(defparameter *same-follow-selection* (copy-tree (physical-store-selection *physical-receive-store*)))')
+    control("sibling.sock", retarget_form(port, f'same_{timeline}'))
+    control("sibling.sock", f'(let* ((binding (fifth (physical-follow-read-config))) (anchor (getf binding :anchor))) (assert (and (eq :same-timeline (physical-follow-anchor-kind anchor)) (= {timeline} (getf anchor :source-timeline) (getf anchor :receive-timeline) (physical-store-selected-timeline *physical-receive-store*)) (equal (getf binding :before) (getf binding :after)) (equal *same-follow-selection* (physical-store-selection *physical-receive-store*)))))')
+    query(upstream, "INSERT INTO promotion_sql_items VALUES (9,'same-timeline-probe')")
+    readers = [sibling] + ([other] if other is not None else [])
+    for reader in readers:
+        wait(lambda: query(reader, "SELECT count(*) FROM promotion_sql_items") == [(count + 1,)])
+    query(upstream, "DELETE FROM promotion_sql_items WHERE id=9")
+    for reader in readers:
+        wait(lambda: query(reader, "SELECT count(*) FROM promotion_sql_items") == [(count,)])
+    wait(lambda: ':CLEANUP-COUNT 0' in control("sibling.sock", '(physical-follow-controller-status)'))
+    print(f"follow-controller: same-timeline {timeline} retarget preserves selection and streams new WAL PASS", flush=True)
+
+
 def exercise_controller(promoted, sibling):
     control("sibling.sock", '(defparameter *controller-original-runtime* *physical-follow-runtime*)')
     control("sibling.sock", retarget_form(1, 'unreachable'), expect_error=True)
@@ -253,7 +268,8 @@ def exercise_controller(promoted, sibling):
     query(promoted, "INSERT INTO promotion_sql_items VALUES (6,'controller-live')")
     wait(lambda: query(sibling, "SELECT count(*) FROM promotion_sql_items") == [(4,)])
     wait(lambda: ':CLEANUP-COUNT 0' in control("sibling.sock", '(physical-follow-controller-status)'))
-    print("follow-controller: public retarget, child receipt/replay and asynchronous bootstrap retirement PASS", flush=True)
+    print("follow-controller: public retarget, child receipt/replay and asynchronous pin retirement PASS", flush=True)
+    exercise_same_timeline(promoted, sibling, promoted_port, 2, 4)
 
 
 def exercise_receiver_only_stop(promoted, sibling):
@@ -322,6 +338,8 @@ try:
     parent_end = query(source, "SELECT pg_current_wal_flush_lsn()")[0][0]
     for connection in (promoted, sibling):
         wait(lambda: query(connection, f"SELECT pg_last_wal_replay_lsn() >= '{parent_end}'::pg_lsn") == [(True,)])
+    if os.environ.get("SELECTED_REPLAY_CONTROLLER") == "1":
+        exercise_same_timeline(source, sibling, source_port, 1, 2, promoted)
     if os.environ.get("SELECTED_REPLAY_CONTROLLER") != "1":
         control("sibling.sock", '(physical-follow-stop)')
     query(sibling, "CHECKPOINT")

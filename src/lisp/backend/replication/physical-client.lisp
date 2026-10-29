@@ -92,6 +92,20 @@ A malformed response or transport failure requires the caller to close the clien
   "Signal a streaming source error immediately; the caller must close the client."
   (error (pg-client-native-error-condition payload)))
 
+(defun physical-client-check-row (row schema)
+  (unless (and (or (vectorp row) (and (null row) (null schema)))
+               (= (length row) (length schema)))
+    (pg-client-native-reject "native result row has an unexpected width"))
+  (let ((result (copy-seq row)))
+    (loop for expected in schema for index from 0
+          for value = (aref row index)
+          unless (stringp value)
+            do (unless (and (eq :nullable (third expected))
+                            (or (null value) (eq value +null+)))
+                 (pg-client-native-reject "native result contains an unexpected null field"))
+               (setf (aref result index) nil))
+    result))
+
 (defun pg-client-native-read-result (client schema tag &key (maximum 4096) first-frame command-only)
   "Read one checked native result in protocol order.
 A row result requires T, D, C and Z; COMMAND-ONLY requires C and Z with no row.
@@ -111,7 +125,7 @@ Z before signalling; protocol or transport failure requires the caller to close.
            (setf row (handler-case (pg-client-read-data-row payload columns)
                        (error () (pg-client-native-reject "native result has a malformed row")))
                  state :complete)
-           (unless (every #'stringp row) (pg-client-native-reject "native result contains a null field")))
+           (setf row (physical-client-check-row row schema)))
           (#\C
            (unless (eq state :complete) (pg-client-native-reject "native result completed before its row"))
            (multiple-value-bind (value end) (pg-client-native-cstring payload 0)
@@ -283,23 +297,26 @@ The copied fields are shape-checked, not proof of source identity or history."
 
 (defun pg-client-native-prepare (client slot coordinates)
   "Prepare and return a checked source anchor for the supplied coordinates.
-Check the typed row, echoes, history, EOR, next timeline and fork. The caller
-must independently verify source identity and local durable witnesses, and
-compare the actual immediate-child history with the source ancestry. This helper
-does not install history, redo WAL, update recovery state or admit a receiver.
+The caller must independently verify source identity and local durable witnesses.
+This helper does not install history, redo WAL, update recovery state or admit a receiver.
 The caller owns network deadlines, cancellation and client cleanup; it must not
 perform network I/O under recovery quiescence."
-  (let* ((schema (append (list (list "slot_name" +textoid+))
+  (let* ((same (eq :same-timeline (physical-follow-request-kind coordinates)))
+         (schema (append (list (list "slot_name" +textoid+))
                          (loop for (name key kind) in *physical-follow-wire-fields*
                                collect (list name (if (eq kind :timeline) +int8oid+ +textoid+)))
-                         (list (list "history" +textoid+) (list "next_tli" +int8oid+)
-                               (list "next_tli_startpos" +textoid+) (list "eor_hex" +textoid+))))
+                         (list (list "history" +textoid+))
+                         (loop for (name oid) in (list (list "next_tli" +int8oid+)
+                                                       (list "next_tli_startpos" +textoid+)
+                                                       (list "eor_hex" +textoid+))
+                               collect (if same (list name oid :nullable) (list name oid)))))
          (row (physical-client-query client (pg-client-native-prepare-query slot coordinates)
                                      schema "PREPARE_FOLLOW"
                                      :maximum +physical-client-proof-frame-maximum+))
-         (anchor (append (copy-tree coordinates)
-                         (list :history-text (aref row 11) :eor-octets (pg-client-native-eor (aref row 14))))))
-    (unless (<= 1 (length (string->bytes (aref row 11))) +physical-store-history-maximum-bytes+)
+         (anchor (append (copy-tree coordinates) (list :history-text (aref row 11))
+                         (if same (list :kind :same-timeline)
+                             (list :eor-octets (pg-client-native-eor (aref row 14)))))))
+    (unless (<= (if same 0 1) (length (string->bytes (aref row 11))) +physical-store-history-maximum-bytes+)
       (pg-client-native-reject "native preparation history exceeds its file bound"))
     (unless (equal slot (aref row 0)) (pg-client-native-reject "native source prepared a different pin"))
     (loop for (name key kind) in *physical-follow-wire-fields* for index from 1
@@ -309,13 +326,16 @@ perform network I/O under recovery quiescence."
             do (pg-client-native-reject "native source changed a prepared receive coordinate"))
     (handler-case
         (multiple-value-bind (history fork eor) (physical-follow-anchor-check anchor)
-          (unless (and (= fork (pg-client-native-lsn (aref row 13)))
-                       (= (pg-client-native-u64 (aref row 12) t)
-                          (timeline-check-end-of-recovery eor (getf anchor :receive-timeline) history)))
-            (pg-client-native-reject "native preparation next timeline or fork differs from its anchor")))
+          (if same
+              (unless (every #'null (subseq row 12))
+                (pg-client-native-reject "same-timeline preparation returned descendant fields"))
+              (unless (and (= fork (pg-client-native-lsn (aref row 13)))
+                           (= (pg-client-native-u64 (aref row 12) t)
+                              (timeline-check-end-of-recovery eor (getf anchor :receive-timeline) history)))
+                (pg-client-native-reject "native preparation next timeline or fork differs from its anchor"))))
       (pg-client-error (condition) (error condition))
       (error () (pg-client-native-reject "native preparation returned an invalid source anchor")))
-    anchor))
+    (physical-follow-anchor-copy anchor)))
 
 (defun pg-client-native-release (client slot expected-digest)
   "Request checked release of SLOT using its canonical anchor digest.

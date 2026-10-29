@@ -346,10 +346,7 @@ Its canonical hexadecimal bytes are reversible, not encrypted; treat as secret."
                             (if (= (second expected) +int8oid+) 8 #xffffffff)
                             #xffffffff 0))
           do (pg-client-native-reject "unexpected libpq column metadata"))
-  (let ((row (first (physical-libpq-result-rows result))))
-    (unless (every #'stringp row)
-      (pg-client-native-reject "libpq result contains a null field"))
-    row))
+  (physical-client-check-row (first (physical-libpq-result-rows result)) schema))
 
 (defstruct (physical-libpq-channel (:constructor %make-physical-libpq-channel))
   "One child and its request stream. The owning transport API performs I/O and

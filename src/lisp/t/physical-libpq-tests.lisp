@@ -463,6 +463,19 @@
            (pg::physical-libpq-check-result
             (pg::physical-libpq-decode-result #\T body) '(("systemid" 25)) "IDENTIFY_SYSTEM"))))))
 
+(deftest physical-libpq-result-nullability-is-explicit-and-normalized
+    (let ((result (pg::physical-libpq-decode-result
+                   #\T (libpq-test-result-body :value pg::+null+))))
+      (ok
+       (equalp #(nil)
+               (pg::physical-libpq-check-result
+                result '(("systemid" 25 :nullable)) "IDENTIFY_SYSTEM")))
+      (ok
+       (physical-client-test-protocol-error-p
+        (lambda ()
+          (pg::physical-libpq-check-result
+           result '(("systemid" 25)) "IDENTIFY_SYSTEM"))))))
+
 (deftest physical-libpq-result-rejects-truncation-and-trailing-bytes
     (let ((body (libpq-test-result-body)))
       (dolist (bad (list (subseq body 0 (1- (length body)))

@@ -83,7 +83,8 @@ pin; an ambiguous save fences the source and keeps retention until restart."
               (progn
                 (physical-follow-pin-check-source candidate)
                 (physical-follow-pin-check-retained-wal candidate)
-                (physical-follow-pin-check-source-eor candidate))
+                (when (eq :descendant (physical-follow-anchor-kind anchor))
+                  (physical-follow-pin-check-source-eor candidate)))
             (wal-input-validation-error (condition) (error condition))
             (error (condition)
               (wal-invalid-input "physical follow source WAL is unavailable; reseed is required: ~a"
@@ -200,7 +201,22 @@ before publishing the ready state in memory; a save failure fences the source."
                 (physical-source-pin-test-point :after-follow-ready pin)))))))
     pin))
 
-(defun physical-source-follow-anchor (request)
+(defun physical-source-follow-same-timeline-anchor (request)
+  (with-live-operation
+    (prevent-recovery-primary-operation "physical follow source descriptor")
+    (sb-thread:with-mutex (*wal-lock*)
+      (wal-check-healthy)
+      (let* ((text (if (= *wal-insert-timeline* 1) ""
+                       (bytes->string (timeline-history-bytes *wal-insert-timeline*))))
+             (anchor (physical-follow-anchor-copy
+                      (append (copy-list request) (list :kind :same-timeline :history-text text))))
+             (pin (make-physical-follow-pin
+                   :system-id (getf request :system-id) :timeline (getf request :source-timeline)
+                   :consistent-lsn (getf request :receive-lsn) :anchor anchor)))
+        (physical-follow-pin-check-source pin)
+        anchor))))
+
+(defun physical-source-follow-descendant-anchor (request)
   "Build an anchor from receiver coordinates and the current source's history.
 Read the exact end-of-recovery record for the receiver's immediate next timeline
 under WAL exclusion. The provisional pin is only a read context; it is never
@@ -237,6 +253,12 @@ registered or serialized. Reservation and proof revalidate retention afterward."
             (wal-invalid-input "physical follow source end-of-recovery is unavailable"))
           (setf (getf anchor :eor-octets) (coerce (subseq bytes offset end) 'list))
           (physical-follow-anchor-copy anchor))))))
+
+(defun physical-source-follow-anchor (request)
+  (setf request (physical-follow-request-copy request))
+  (ecase (physical-follow-request-kind request)
+    (:descendant (physical-source-follow-descendant-anchor request))
+    (:same-timeline (physical-source-follow-same-timeline-anchor request))))
 
 (defun physical-source-follow-existing-anchor (name request)
   "Return a copy of the live saved anchor for an exact request retry.

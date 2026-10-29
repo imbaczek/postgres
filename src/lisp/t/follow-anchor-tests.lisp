@@ -7,6 +7,76 @@
         :history-text (format nil "1~c0/00000060~cpromotion~%" #\Tab #\Tab)
         :eor-octets (coerce (pg::wal-encode-end-of-recovery-record 96 42 2 1 1) 'list)))
 
+(defun same-timeline-follow-anchor (cursor carried overlap &optional (timeline 1))
+  (list :version 1 :kind :same-timeline :system-id 42 :base-timeline 1 :base 0
+        :manifest-digest 77 :source-timeline timeline :receive-timeline timeline
+        :receive-lsn cursor :receive-digest carried
+        :overlap-start (* (floor (1- cursor) pg::+wal-segment-size+) pg::+wal-segment-size+)
+        :overlap-digest overlap
+        :history-text (if (= timeline 1) "" (format nil "1~c0/00000040~cpromotion~%" #\Tab #\Tab))))
+
+(deftest same-timeline-anchor-keeps-history-without-a-fork-or-eor
+    (dolist (timeline '(1 2))
+      (let ((anchor (same-timeline-follow-anchor 96 123 456 timeline)))
+        (multiple-value-bind (history fork eor) (pg::physical-follow-anchor-check anchor)
+          (ok (= timeline (pg::timeline-history-entry-timeline (first history))))
+          (ok (null fork))
+          (ok (null eor)))
+        (ok (equal anchor (pg::physical-follow-anchor-copy anchor)))
+        (ok (not (member :eor-octets anchor))))))
+
+(deftest same-timeline-anchor-copy-owns-its-history-bytes
+    (let* ((anchor (same-timeline-follow-anchor 96 123 456 2))
+           (saved (copy-seq (getf anchor :history-text)))
+           (copy (pg::physical-follow-anchor-copy anchor)))
+      (setf (char (getf anchor :history-text) 0) #\9)
+      (ok (equal saved (getf copy :history-text)))
+      (setf (char (getf copy :history-text) 0) #\8)
+      (ok (char= #\9 (char (getf anchor :history-text) 0)))))
+
+(deftest same-timeline-anchor-rejects-foreign-coordinates-and-descendant-fields
+    (dolist (change '((:kind :unknown) (:kind nil) (:source-timeline 2) (:base 97)
+                      (:base-timeline 2) (:receive-timeline 2) (:receive-lsn 0) (:overlap-start 96)
+                      (:history-text "# ignored") (:eor-octets nil)))
+      (let ((anchor (same-timeline-follow-anchor 96 123 456)))
+        (setf (getf anchor (first change)) (second change))
+        (ok (signals (pg::physical-follow-anchor-check anchor) 'error)
+            (format nil "~s" change))))
+  (let ((anchor (same-timeline-follow-anchor 96 123 456)))
+    (remf anchor :kind)
+    (ok (signals (pg::physical-follow-anchor-check anchor) 'error))))
+
+(deftest same-timeline-proof-extension-preserves-descendant-anchor-identity
+    (ok (= 15144333420950785491
+           (pg::physical-follow-anchor-digest (follow-anchor-request 123 456))))
+  (ok (= 15813853048420144424
+         (pg::physical-follow-anchor-digest (same-timeline-follow-anchor 96 123 456)))))
+
+(cl-spec:defproperty same-timeline-follow-pin-roundtrips-full-width-proof
+    ((cursor (range integer 1 18446744073709551615))
+     (carried (range integer 0 18446744073709551615))
+     (overlap (range integer 0 18446744073709551615))
+     (ready boolean))
+  (:about pg::physical-follow-pin-decode)
+  (:trials (:normal 200))
+  (let* ((anchor (same-timeline-follow-anchor cursor carried overlap))
+         (pin (pg::make-physical-follow-pin
+               :name "same_timeline" :system-id 42 :timeline 1 :manifest-digest 77
+               :consistent-lsn cursor :restart-lsn (if ready cursor (getf anchor :overlap-start))
+               :confirmed-lsn (when ready cursor) :prefix-digest carried
+               :stage (if ready :ready :retaining) :anchor anchor))
+         (restored (pg::physical-follow-pin-decode (pg::physical-follow-pin-encode pin))))
+    (and (equal anchor (pg::physical-follow-pin-anchor restored))
+         (eql (pg::physical-follow-pin-stage pin) (pg::physical-follow-pin-stage restored))
+         (= (pg::physical-follow-anchor-digest anchor)
+            (pg::physical-follow-anchor-digest (pg::physical-follow-pin-anchor restored))))))
+
+(deftest generated-same-timeline-follow-pin-proof-roundtrip
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'same-timeline-follow-pin-roundtrips-full-width-proof :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (ok (= 200 (getf data :trials)))))
+
 (defun follow-anchor-pin (seed overlap &optional ready)
   (pg::make-physical-follow-pin
    :name "sibling" :system-id 42 :timeline 2 :manifest-digest 77
@@ -37,6 +107,36 @@
                   :recovery (list :phase 2 :cluster-identity "binding-probe" :checkpoint 64
                                   :observed-next-xid 9 :history-target nil :history-digest nil
                                   :restartpoint nil))))))
+
+(defun same-timeline-follow-binding-config ()
+  (let* ((config (follow-binding-test-config))
+         (binding (fifth config)) (before (getf binding :before))
+         (anchor (same-timeline-follow-anchor (fourth before) (fifth before) 456)))
+    (setf (getf anchor :base) (third before)
+          (getf binding :anchor) anchor
+          (getf binding :child-history) nil
+          (getf binding :after) (copy-list before))
+    config))
+
+(deftest same-timeline-binding-preserves-every-receive-control-field
+    (let* ((config (same-timeline-follow-binding-config))
+           (binding (fifth config))
+           (runtime (pg::make-physical-follow-runtime :config config)))
+      (ok (eq config (pg::physical-follow-check-config config)))
+      (ok (equal config (pg::physical-follow-decode-config (pg::physical-follow-config-image config))))
+      (ok (equal (getf binding :before) (getf binding :after)))
+      (multiple-value-bind (limit next) (pg::physical-follow-runtime-boundary runtime)
+        (ok (null limit))
+        (ok (null next))))
+  (dotimes (index 11)
+    (let* ((config (same-timeline-follow-binding-config))
+           (after (getf (fifth config) :after)))
+      (setf (nth index after) (if (integerp (nth index after)) (1+ (nth index after)) 1))
+      (ok (signals (pg::physical-follow-check-config config) 'error)
+          (format nil "changed receive field ~d" index))))
+  (let ((config (same-timeline-follow-binding-config)))
+    (setf (getf (fifth config) :child-history) "")
+    (ok (signals (pg::physical-follow-check-config config) 'error))))
 
 (deftest follow-binding-config-roundtrips-pending-proof-with-existing-envelope
     (dolist (padding '(nil 8192))
@@ -811,6 +911,62 @@
     (ok (probe-file (merge-pathnames "pending-crash.marker" root))
         (format nil "~a: ~a ~a" point output errors))))
 
+(defun same-timeline-pending-proof-config (store config)
+  (let* ((result (copy-tree config))
+         (binding (fifth result))
+         (before (pg::physical-store-control-tuple store))
+         (old (getf binding :anchor))
+         (anchor (same-timeline-follow-anchor (fourth before) (fifth before) 456)))
+    (setf (getf anchor :system-id) (first before)
+          (getf anchor :base-timeline) (second before)
+          (getf anchor :base) (third before)
+          (getf anchor :manifest-digest) (getf old :manifest-digest)
+          (getf binding :anchor) anchor
+          (getf binding :child-history) nil
+          (getf binding :before) before
+          (getf binding :after) (copy-list before))
+    (pg::physical-follow-check-config result)
+    result))
+
+(deftest same-timeline-pending-sigkill-preserves-the-existing-receive-selection
+    (dolist (point '(:after-pending-preflight :after-pending-receive
+                     :after-pending-history :after-pending-recovery
+                     :before-follow-config-rename :after-follow-config-rename
+                     :after-pending-active))
+      (call-with-follow-pending-proof
+       (lambda (root store candidate base config)
+         (declare (ignore candidate))
+         (let* ((pending (same-timeline-pending-proof-config store config))
+                (before (copy-list (getf (fifth pending) :before))))
+           (pg::physical-follow-save-config pending)
+           (follow-pending-proof-run-crash root store base point)
+           (multiple-value-bind (output errors status)
+               (uiop:run-program
+                (list (or (uiop:getenv "SBCL") "sbcl") "--noinform" "--no-sysinit" "--no-userinit" "--script"
+                      (namestring (asdf:system-relative-pathname "pg" "t/follow-pending-crash-child.lisp"))
+                      (namestring root) (namestring (pg::physical-store-directory store)) "VERIFY-SAME")
+                :output :string :error-output :string :ignore-error-status t)
+             (ok (zerop status) (format nil "~a: ~a ~a" point output errors))
+             (ok (search "same-timeline pending cold verification PASS" output)))
+           (let* ((saved (pg::physical-follow-read-config))
+                  (reopened
+                    (pg::physical-store-open
+                     root 42 1 :discard-tail nil :create-lock nil
+                     :retained-identity (pg::physical-recovery-retained-identity base))))
+             (unwind-protect
+                  (progn
+                    (when (eq :pending (getf (fifth saved) :phase))
+                      (pg::physical-follow-reconcile-pending-store reopened base saved))
+                    (let ((active (pg::physical-follow-read-config))
+                          (control (pg::physical-recovery-read-control root)))
+                      (ok (eq :active (getf (fifth active) :phase)))
+                      (ok (equal before (pg::physical-store-control-tuple reopened)))
+                      (ok (null (pg::physical-store-selection reopened)))
+                      (ok (null (getf control :history-target)))
+                      (ok (= (getf control :applied) (first (getf (fifth pending) :required))))
+                      (ok (pg::physical-follow-check-active-state reopened base active))))
+               (pg::physical-store-close reopened))))))))
+
 (deftest follow-pending-sigkill-reconciles-receive-recovery-and-active-publication
     (dolist (point '(:after-pending-preflight :after-history-publication :before-control-rename :after-control-rename
                      :after-control-directory-fsync :after-follow-control-readback :before-follow-tail-cleanup
@@ -1037,9 +1193,97 @@
       (pg::timeline-write-history 2 1 64 "promotion")
       (funcall function root request eor))))
 
+(defun call-with-same-timeline-follow-source (function timeline)
+  (with-physical-store-directory (root)
+    (let* ((pg::*pgdata* root) (pg::*catalog* (pg::make-catalog))
+                               (pg::*physical-recovery-state* nil) (pg::*physical-recovery-failed-p* nil)
+                               (pg::*physical-source-pins* (make-hash-table :test #'equal))
+                               (pg::*physical-source-senders* (make-hash-table :test #'equal))
+                               (pg::*physical-follow-aborted-attempts* (make-hash-table :test #'equal))
+                               (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+                               (pg::*wal-insert-timeline* timeline) (pg::*wal-checkpoint-timeline* timeline)
+                               (pg::*wal-segment-namespace* (if (= timeline 1) :legacy :timeline))
+                               (pg::*wal-poisoned* nil) (pg::*pm-requested-mode* pg::+no-shutdown+)
+                               (pg::*max-slot-wal-keep-bytes* nil)
+                               (prefix (concatenate '(vector (unsigned-byte 8))
+                                                    (legacy-checkpoint-record 0) (legacy-checkpoint-record 32)
+                                                    (if (= timeline 1) #()
+                                                        (pg::wal-encode-end-of-recovery-record 64 42 2 1 1))))
+                               (cursor (length prefix))
+                               (wal (concatenate '(vector (unsigned-byte 8)) prefix (legacy-checkpoint-record cursor)))
+                               (pg::*wal-durable-lsn* (length wal))
+                               (anchor (same-timeline-follow-anchor
+                                        cursor (pg::physical-store-update-digest #xCBF29CE484222325 (subseq prefix 32))
+                                        (pg::physical-store-update-digest #xCBF29CE484222325 prefix) timeline)))
+      (setf (getf anchor :base) 32 (getf anchor :system-id) (pg::catalog-system-identifier))
+      (pg::wal-ensure-directory-durable (pg::wal-directory))
+      (pg::wal-atomic-write-bytes (pg::wal-segment-path 0) wal)
+      (when (= timeline 2) (pg::timeline-write-history 2 1 64 "promotion"))
+      (funcall function root anchor wal))))
+
+(deftest same-timeline-source-preparation-proves-real-wal-and-reopens-ready-pin
+    (dolist (timeline '(1 2))
+      (call-with-same-timeline-follow-source
+       (lambda (root anchor wal)
+         (declare (ignore root wal))
+         (let* ((coordinates (follow-anchor-receiver-request anchor))
+                (pin (pg::physical-source-follow-prepare "same_ready" coordinates)))
+           (ok (pg::physical-follow-pin-ready-p pin))
+           (ok (equal anchor (pg::physical-follow-pin-anchor pin)))
+           (ok (= (getf anchor :receive-lsn) (pg::physical-source-pin-restart-lsn pin)))
+           (ok (eq pin (pg::physical-source-follow-prepare "same_ready" coordinates)))
+           (clrhash pg::*physical-source-pins*)
+           (clrhash pg::*wal-snapshot-retention-pins*)
+           (pg::physical-source-pin-load)
+           (ok (pg::physical-follow-pin-ready-p (gethash "same_ready" pg::*physical-source-pins*)))
+           (ok (equal anchor (pg::physical-follow-pin-anchor
+                              (gethash "same_ready" pg::*physical-source-pins*))))))
+       timeline)))
+
+(deftest same-timeline-source-rejects-unproved-bytes-and-incomplete-records
+    (dolist (kind '(:digest :boundary :future))
+      (call-with-same-timeline-follow-source
+       (lambda (root anchor wal)
+         (declare (ignore root))
+         (ecase kind
+           (:digest (incf (getf anchor :overlap-digest)))
+           (:boundary
+            (let ((cursor (1- (getf anchor :receive-lsn))))
+              (setf (getf anchor :receive-lsn) cursor
+                    (getf anchor :overlap-digest)
+                    (pg::physical-store-update-digest #xCBF29CE484222325 (subseq wal 0 cursor)))))
+           (:future (setf (getf anchor :receive-lsn) (1+ pg::*wal-durable-lsn*))))
+         (ok (intake-fails-p
+              (lambda () (pg::physical-source-follow-prepare
+                          "same_rejected" (follow-anchor-receiver-request anchor)))))
+         (let ((pin (gethash "same_rejected" pg::*physical-source-pins*)))
+           (if (eq kind :future)
+               (ok (null pin))
+               (progn (ok pin) (ok (not (pg::physical-follow-pin-ready-p pin))))))
+         (ok (not pg::*wal-poisoned*)))
+       1)))
+
+(deftest legacy-source-namespace-is-limited-to-same-timeline-one
+    (call-with-follow-anchor-source
+     (lambda (root anchor eor)
+       (declare (ignore root eor))
+       (let ((pg::*wal-segment-namespace* :legacy))
+         (ok (intake-fails-p
+              (lambda () (pg::physical-source-follow-reserve "legacy_descendant" anchor))))
+         (ok (zerop (hash-table-count pg::*physical-source-pins*))))))
+  (call-with-same-timeline-follow-source
+   (lambda (root anchor wal)
+     (declare (ignore root wal))
+     (let ((pg::*wal-segment-namespace* :legacy))
+       (ok (intake-fails-p
+            (lambda () (pg::physical-source-follow-prepare
+                        "legacy_two" (follow-anchor-receiver-request anchor)))))
+       (ok (zerop (hash-table-count pg::*physical-source-pins*)))))
+   2))
+
 (defun follow-anchor-receiver-request (request)
   (loop for (key value) on request by #'cddr
-        unless (member key '(:history-text :eor-octets))
+        unless (member key '(:kind :history-text :eor-octets))
           append (list key value)))
 
 (defun follow-prepare-query (request &optional (name "wire_prepare"))
@@ -1222,7 +1466,7 @@
                 (list (lambda (r) (append r (list :history-text "")))
                       (lambda (r) (append r (list :eor-octets nil)))
                       (lambda (r) (setf (getf r :source-timeline) 3) r)
-                      (lambda (r) (setf (getf r :receive-timeline) 2) r)
+                      (lambda (r) (setf (getf r :receive-timeline) 3) r)
                       (lambda (r) (setf (getf r :receive-lsn) 65) r)
                       (lambda (r) (setf (getf r :system-id) 0) r)
                       (lambda (r) (setf (getf r :receive-lsn) "64") r)))

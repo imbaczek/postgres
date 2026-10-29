@@ -105,7 +105,9 @@ The receive timeline can differ from the applied replay timeline."
          (applied (list *last-replay-lsn* (physical-recovery-replay-timeline)))
          (required (list (getf control :applied)
                          (getf control :applied-timeline (getf control :timeline))))
-         (fork (getf view :fork)) (cursor (min (fourth before) fork))
+         (limit (if (= (getf view :source) (getf view :parent))
+                    (fourth before) (getf view :fork)))
+         (cursor (min (fourth before) limit))
          (index (physical-follow-controller-index store))
          (coordinates nil))
     (unless (and (eql 2 (getf control :phase)) (eql 3 (getf control :control-version)))
@@ -114,8 +116,8 @@ The receive timeline can differ from the applied replay timeline."
       (error "receive selection changed during source discovery"))
     (sb-thread:with-mutex ((physical-store-mutex store))
       (physical-follow-check-source-history store (getf view :history))
-      (physical-store-check-follow-frontier store applied (getf view :history) fork :applied t)
-      (physical-store-check-follow-frontier store required (getf view :history) fork)
+      (physical-store-check-follow-frontier store applied (getf view :history) limit :applied t)
+      (physical-store-check-follow-frontier store required (getf view :history) limit)
       (unless (<= (physical-store-floor-lsn store) cursor) (error "source fork precedes receive floor"))
       (setf coordinates
             (list :version 1 :system-id (getf base :system-id)
@@ -139,7 +141,9 @@ The receive timeline can differ from the applied replay timeline."
 (defun physical-follow-controller-plan (snapshot anchor view)
   (let* ((before (getf snapshot :before)) (fork (getf view :fork))
                                           (after
-                                            (if (< (fourth before) fork) (copy-list before)
+                                            (if (or (eq :same-timeline (physical-follow-anchor-kind anchor))
+                                                    (< (fourth before) fork))
+                                                (copy-list before)
                                                 (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
                                                   (physical-store-control-tuple
                                                    (physical-store-follow-candidate
@@ -154,7 +158,7 @@ The receive timeline can differ from the applied replay timeline."
     binding))
 
 (defun physical-follow-controller-source-view (client)
-  "Read source identity and validated remote history; select receipt's next child.
+  "Read source identity and validated remote history.
 The later snapshot checks exact local ancestry. System identifier and timeline
 cannot distinguish endpoint remaps or clones; the direct endpoint must continue
 to identify the same PGDATA."
@@ -163,11 +167,16 @@ to identify the same PGDATA."
                     (unless (= system-id (getf *physical-recovery-state* :system-id))
                       (physical-follow-reject "follow target has a different system identifier"))
                     (physical-store-selected-timeline *physical-receive-store*))))
-      (unless (> source parent) (error "follow target has no descendant timeline to select"))
-      (let* ((text (sb-ext:with-timeout 10 (pg-client-native-history client source)))
+      (unless (>= source parent) (error "follow target timeline precedes the receive selection"))
+      (let* ((text (if (= source 1) (string->bytes "")
+                       (sb-ext:with-timeout 10 (pg-client-native-history client source))))
              (history (timeline-check-lineage (timeline-parse-history source (bytes->string text))))
              (position (position parent history :key #'timeline-history-entry-timeline)))
-        (unless (and position (plusp position)) (error "follow target does not contain receive ancestry"))
+        (unless position (error "follow target does not contain receive ancestry"))
+        (when (= source parent)
+          (return-from physical-follow-controller-source-view
+            (list :source source :parent parent :history history :history-text (bytes->string text))))
+        (unless (plusp position) (error "follow target has no descendant timeline to select"))
         (let* ((child (timeline-history-entry-timeline (nth (1- position) history)))
                (child-text (if (= child source) text
                                (sb-ext:with-timeout 10 (pg-client-native-history client child)))))

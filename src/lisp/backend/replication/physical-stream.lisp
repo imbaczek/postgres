@@ -220,6 +220,18 @@ and report unexpected failures as XX000."
     (pg-error (condition) (error condition))
     (error (condition) (ereport "XX000" "physical bootstrap release failed: ~a" condition))))
 
+(defun physical-follow-prepare-result-tail (anchor)
+  (cons (copy-seq (getf anchor :history-text))
+        (if (eq :same-timeline (physical-follow-anchor-kind anchor))
+            (list nil nil nil)
+            (multiple-value-bind (history fork eor) (physical-follow-anchor-check anchor)
+              (declare (ignore eor))
+              (let* ((position (position (getf anchor :receive-timeline) history
+                                         :key #'timeline-history-entry-timeline))
+                     (next (timeline-history-entry-timeline (nth (1- position) history))))
+                (list (format nil "~d" next) (wal-format-lsn fork)
+                      (format nil "~(~{~2,'0X~}~)" (getf anchor :eor-octets))))))))
+
 (defun physical-follow-prepare-row (command)
   "Prepare and recheck a live ready pin, then copy its source-owned result.
 WAL input validation errors report 55000; preserve PostgreSQL errors and report
@@ -234,20 +246,13 @@ other preparation failures as XX000."
             (unless (physical-follow-pin-ready-p pin)
               (wal-invalid-input "physical follow pin is not ready"))
             (let ((anchor (physical-follow-anchor-copy (physical-follow-pin-anchor pin))))
-              (multiple-value-bind (history fork eor) (physical-follow-anchor-check anchor)
-                (declare (ignore eor))
-                (let* ((position (position (getf anchor :receive-timeline) history
-                                           :key #'timeline-history-entry-timeline))
-                       (next (timeline-history-entry-timeline (nth (1- position) history))))
-                  (append
-                   (list (copy-seq (physical-source-pin-name pin)))
-                   (loop for (name key kind) in *physical-follow-wire-fields*
-                         for value = (getf anchor key)
-                         collect (if (eq kind :lsn) (wal-format-lsn value)
-                                     (format nil "~d" value)))
-                   (list (copy-seq (getf anchor :history-text)) (format nil "~d" next)
-                         (wal-format-lsn fork)
-                         (format nil "~(~{~2,'0X~}~)" (getf anchor :eor-octets))))))))))
+              (append
+               (list (copy-seq (physical-source-pin-name pin)))
+               (loop for (name key kind) in *physical-follow-wire-fields*
+                     for value = (getf anchor key)
+                     collect (if (eq kind :lsn) (wal-format-lsn value)
+                                 (format nil "~d" value)))
+               (physical-follow-prepare-result-tail anchor))))))
     (wal-input-validation-error (condition) (ereport "55000" "~a" condition))
     (pg-error (condition) (error condition))
     (error (condition) (ereport "XX000" "physical follow preparation failed: ~a" condition))))

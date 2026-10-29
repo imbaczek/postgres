@@ -13,6 +13,12 @@ eligibility for a future follow path; bootstrap START does not accept this pin."
   '(:version :system-id :base-timeline :base :manifest-digest :source-timeline
     :receive-timeline :receive-lsn :receive-digest :overlap-start :overlap-digest
     :history-text :eor-octets))
+
+(defparameter *physical-follow-same-timeline-anchor-keys*
+  '(:version :kind :system-id :base-timeline :base :manifest-digest :source-timeline
+    :receive-timeline :receive-lsn :receive-digest :overlap-start :overlap-digest
+    :history-text))
+
 (defparameter *physical-follow-pin-keys*
   '(:version :mode :name :system-id :timeline :manifest-digest :restart :consistent
     :confirmed :digest :lost :stage :anchor))
@@ -55,7 +61,42 @@ source history or WAL."
       (error "invalid native bootstrap retirement identity"))
     (loop for key in keys append (list key (getf request key)))))
 
-(defun physical-follow-anchor-check (request)
+(defun physical-follow-request-kind (request)
+  (physical-follow-request-copy request)
+  (let ((source (getf request :source-timeline))
+        (receive (getf request :receive-timeline)))
+    (cond ((= source receive) :same-timeline)
+          ((> source receive) :descendant)
+          (t (wal-invalid-input "follow source timeline precedes the receive timeline")))))
+
+(defun physical-follow-anchor-kind (anchor)
+  (ecase (getf anchor :kind :descendant)
+    (:descendant :descendant)
+    (:same-timeline :same-timeline)))
+
+(defun physical-follow-same-timeline-anchor-check (anchor)
+  (physical-follow-check-plist anchor *physical-follow-same-timeline-anchor-keys*)
+  (let* ((request
+           (loop for key in *physical-follow-anchor-keys*
+                 unless (member key '(:history-text :eor-octets))
+                   append (list key (getf anchor key))))
+         (source (getf anchor :source-timeline))
+         (cursor (getf anchor :receive-lsn))
+         (start (getf anchor :overlap-start))
+         (text (getf anchor :history-text)))
+    (unless (and (eq :same-timeline (physical-follow-request-kind request))
+                 (plusp cursor) (<= (getf anchor :base) cursor)
+                 (= start (* (floor (1- cursor) +wal-segment-size+) +wal-segment-size+))
+                 (stringp text) (or (/= source 1) (string= text "")))
+      (error "invalid same-timeline follow anchor"))
+    (let ((history (timeline-check-lineage (timeline-parse-history source text))))
+      (unless (and (timeline-prefix-boundary-p source cursor history)
+                   (timeline-prefix-boundary-p (getf anchor :base-timeline)
+                                               (getf anchor :base) history))
+        (error "same-timeline follow anchor is outside source ancestry"))
+      (values history nil nil))))
+
+(defun physical-follow-descendant-anchor-check (request)
   "Validate anchor fields, ancestry and the proposed end-of-recovery record.
 
 Return the parsed history, fork and record. This checks the request, not its
@@ -98,10 +139,17 @@ which may differ from the source's retained archive base and manifest."
           (error "physical follow anchor has foreign end-of-recovery WAL"))
         (values history fork record)))))
 
+(defun physical-follow-anchor-check (anchor)
+  (ecase (physical-follow-anchor-kind anchor)
+    (:descendant (physical-follow-descendant-anchor-check anchor))
+    (:same-timeline (physical-follow-same-timeline-anchor-check anchor))))
+
 (defun physical-follow-anchor-copy (request)
   "Validate REQUEST and copy its mutable anchor values for pin ownership."
   (physical-follow-anchor-check request)
-  (loop for key in *physical-follow-anchor-keys*
+  (loop for key in (if (eq :same-timeline (physical-follow-anchor-kind request))
+                       *physical-follow-same-timeline-anchor-keys*
+                       *physical-follow-anchor-keys*)
         for value = (getf request key)
         append (list key (typecase value
                            (string (copy-seq value))
@@ -218,13 +266,18 @@ are not. This checksum identifies an anchor; it is not authentication."
   "Check PIN against the current source identity, timeline and durable WAL."
   (unless (and (= (physical-source-pin-system-id pin) (catalog-system-identifier))
                (= (physical-source-pin-timeline pin) *wal-insert-timeline*)
-               (eq *wal-segment-namespace* :timeline)
+               (or (eq *wal-segment-namespace* :timeline)
+                   (and (eq *wal-segment-namespace* :legacy)
+                        (= *wal-insert-timeline* 1)
+                        (eq :same-timeline (physical-follow-anchor-kind
+                                            (physical-follow-pin-anchor pin)))))
                (<= (or (physical-source-pin-confirmed-lsn pin)
                        (physical-source-pin-consistent-lsn pin))
                    *wal-durable-lsn*))
     (wal-invalid-input "physical follow anchor belongs to another source or future WAL"))
   (unless (equal (getf (physical-follow-pin-anchor pin) :history-text)
-                 (bytes->string (timeline-history-bytes *wal-insert-timeline*)))
+                 (if (= *wal-insert-timeline* 1) ""
+                     (bytes->string (timeline-history-bytes *wal-insert-timeline*))))
     (wal-invalid-input "physical follow anchor history differs from its source")))
 
 (defun physical-follow-pin-check-retained-wal (pin)
