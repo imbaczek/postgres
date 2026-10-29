@@ -31,6 +31,8 @@ run -c "insert into toast_jsonb values (1, '$jsonb_value')" >/dev/null
 [ "$(run -c 'select v from toast_jsonb where id = 1')" = "{\"key\": 3, \"long\": \"$big\"}" ]
 [ "$(run -c "select v ->> 'long' from toast_jsonb where id = 1")" = "$big" ]
 [ "$(run -c "select v #>> '{long}' from toast_jsonb where id = 1")" = "$big" ]
+[ "$(run -c "select v @> '{\"key\":3}'::jsonb from toast_jsonb where id = 1")" = t ]
+[ "$(run -c "select v ? 'long' from toast_jsonb where id = 1")" = t ]
 [ "$(run -c "select v -> 'key' from toast_jsonb where id = 1")" = 3 ]
 [ "$(run -c "select v = '{\"long\":\"$big\",\"key\":3}'::jsonb from toast_jsonb where id = 1")" = t ]
 run -c 'create index toast_jsonb_v_idx on toast_jsonb(v)' >/dev/null

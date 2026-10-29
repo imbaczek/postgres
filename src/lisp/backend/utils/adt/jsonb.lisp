@@ -174,6 +174,70 @@ TEXT-P requests the text form, for which JSON null becomes SQL NULL."
           ((stringp result) result)
           (t (sql-jsonb-output (make-sql-jsonb result))))))
 
+(defun jsonb-object-value-p (value)
+  (and (consp value) (eq (car value) :object)))
+
+(defun jsonb-array-value-p (value)
+  (and (vectorp value) (not (stringp value))))
+
+(defun jsonb-scalar-equal-p (left right)
+  "Compare JSONB scalar values, preserving type and ignoring numeric scale."
+  (cond ((and (sql-numeric-p left) (sql-numeric-p right))
+         (zerop (sql-numeric-compare left right)))
+        ((and (stringp left) (stringp right)) (string= left right))
+        (t (and (keywordp left) (eq left right)))))
+
+(defun jsonb-value-contains-p (left right)
+  "Test containment at one JSONB tree level, following JsonbDeepContains."
+  (cond
+    ((and (jsonb-object-value-p left) (jsonb-object-value-p right))
+     (and (>= (length (cdr left)) (length (cdr right)))
+          (let ((remaining (cdr left)))
+            ;; JSONB object keys are unique and sorted in storage order.
+            (every (lambda (pair)
+                     (loop while (and remaining
+                                      (sql-jsonb-key-less-p (caar remaining) (car pair)))
+                           do (pop remaining))
+                     (and remaining
+                          (string= (caar remaining) (car pair))
+                          (jsonb-value-contains-p (cdar remaining) (cdr pair))
+                          (progn (pop remaining) t)))
+                   (cdr right)))))
+    ((and (jsonb-array-value-p left) (jsonb-array-value-p right))
+     (loop for needle across right
+           always (loop for candidate across left
+                          thereis (jsonb-value-contains-p candidate needle))))
+    ((or (jsonb-object-value-p left) (jsonb-object-value-p right)
+         (jsonb-array-value-p left) (jsonb-array-value-p right))
+     nil)
+    (t (jsonb-scalar-equal-p left right))))
+
+(defun sql-jsonb-contains-p (left right)
+  "Return whether LEFT contains RIGHT, including the top-level scalar exception."
+  (let ((container (sql-jsonb-value left)) (contained (sql-jsonb-value right)))
+    (if (and (jsonb-array-value-p container)
+             (not (jsonb-array-value-p contained))
+             (not (jsonb-object-value-p contained)))
+        (loop for candidate across container
+                thereis (jsonb-scalar-equal-p candidate contained))
+        (jsonb-value-contains-p container contained))))
+
+(defun sql-jsonb-exists-p (jsonb key)
+  "Match KEY against a top-level object key, string array element, or string scalar."
+  (let ((value (sql-jsonb-value jsonb)))
+    (cond ((jsonb-object-value-p value) (not (null (assoc key (cdr value) :test #'string=))))
+          ((jsonb-array-value-p value)
+           (loop for element across value
+                   thereis (and (stringp element) (string= element key))))
+          ((stringp value) (string= value key))
+          (t nil))))
+
+(defun sql-jsonb-exists-keys-p (jsonb keys all-p)
+  "Check any or all non-NULL KEYS against object keys, array strings, or a string scalar."
+  (if all-p
+      (every (lambda (key) (or (eq key +null+) (sql-jsonb-exists-p jsonb key))) keys)
+      (some (lambda (key) (and (not (eq key +null+)) (sql-jsonb-exists-p jsonb key))) keys)))
+
 (defun sql-jsonb-equality-key (jsonb)
   "Return an EQUAL-comparable key that ignores JSONB numeric display scale.
 Numeric values are compared by value recursively, so 1 and 1.0 are equal even

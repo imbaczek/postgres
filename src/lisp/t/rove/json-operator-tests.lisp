@@ -138,3 +138,56 @@
                               "1" (make-string depth :initial-element #\])))
            (path (make-array depth :initial-element "0")))
       (rove:ok (equal (sql-json-path-extract json path nil t) "1"))))
+
+(rove:deftest test-jsonb-containment-and-existence
+    (dolist (case '(("select '{\"a\":{\"b\":1,\"c\":2}}'::jsonb @> '{\"a\":{\"b\":1.00}}'" t)
+                    ("select '{\"a\":[1,2]}'::jsonb @> '{\"a\":1}'" nil)
+                    ("select '{\"z\":1,\"aa\":2,\"b\":3}'::jsonb @> '{\"aa\":2,\"b\":3}'" t)
+                    ("select '{\"z\":1,\"aa\":2}'::jsonb @> '{\"b\":3}'" nil)
+                    ("select '[1,2,3]'::jsonb @> '2'::jsonb" t)
+                    ("select '2'::jsonb @> '[2]'::jsonb" nil)
+                    ("select '[1,2]'::jsonb @> '[2,2,1]'" t)
+                    ("select '[{\"a\":1,\"b\":2}]'::jsonb @> '[{\"a\":1},{\"b\":2}]'" t)
+                    ("select '{\"a\":1}'::jsonb <@ '{\"a\":1,\"b\":2}'" t)
+                    ("select '{\"a\":1}'::jsonb ? 'a'" t)
+                    ("select '[\"a\",{\"b\":1}]'::jsonb ? 'b'" nil)
+                    ("select '\"a\"'::jsonb ? 'a'" t)
+                    ("select '{\"a\":1}'::jsonb ?| array[null,'a']" t)
+                    ("select '{\"a\":1}'::jsonb ?& array[null,'a']" t)
+                    ("select '{}'::jsonb ?| array[null]::text[]" nil)
+                    ("select '{}'::jsonb ?& array[null]::text[]" t)
+                    ("select null::jsonb @> '{}'::jsonb" :null)))
+      (multiple-value-bind (value type) (json-test-evaluate (first case))
+        (rove:ok (eq type :bool))
+        (rove:ok (eq value (if (eq (second case) :null) +null+ (second case)))))))
+
+(rove:deftest test-jsonb-predicate-resolution
+    (dolist (case '(("select '{}' @> '{}'" "42725")
+                    ("select '{}' ?| '{a}'" "42725")
+                    ("select 'not json' ? true" "42883")
+                    ("select '{}'::jsonb @> true" "42883")
+                    ("select '{}'::jsonb ?| array[1]" "42883")))
+      (let ((condition (handler-case (progn (json-test-evaluate (first case)) nil)
+                         (pg-error (error) error))))
+        (rove:ok (and condition (string= (pg-error-sqlstate condition) (second case))))))
+  (rove:ok (null (json-test-evaluate "select '{}' ? 'a'")))
+  (rove:ok (null (json-test-evaluate "select '{}' ?& '{a}'"))))
+
+(rove:deftest test-jsonb-predicate-original-error-types
+    (dolist (case '(("select 1 ? 'x'::name" "operator does not exist: integer ? name")
+                    ("select '{}'::json ?| array['x'::varchar]"
+                     "operator does not exist: json ?| character varying[]")))
+      (let ((condition (handler-case (progn (json-test-evaluate (first case)) nil)
+                         (pg-error (error) error))))
+        (rove:ok (and condition
+                      (string= (pg-error-sqlstate condition) "42883")
+                      (string= (pg-error-message condition) (second case)))))))
+
+(rove:deftest test-jsonb-existence-catalog-text-coercion
+    (let* ((left (list :const (sql-jsonb-input "{\"a\":1}") :type :jsonb :typmod -1))
+           (right (list :col 1 :type :pg-node-tree :typmod -1))
+           (expr (analyze-jsonb-predicate "?" left right)))
+      (rove:ok (eq (expr-type (fourth expr)) :text))
+      (rove:ok (eval-expr expr (vector "a")))
+      (let ((extract (analyze-json-extraction "->>" left right)))
+        (rove:ok (equal (eval-expr extract (vector "a")) "1")))))
