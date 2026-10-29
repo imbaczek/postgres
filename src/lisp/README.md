@@ -253,6 +253,9 @@ values are detached from their original table; PLAIN targets flatten them.
 Recursive UNION retains origins through supported working-table plans while
 duplicate elimination compares logical values. Scalar subqueries with supported
 plans retain the selected datum, including correlated outer references. Supported
+scalar subqueries also retain compatible compressed values in INSERT VALUES and
+UPDATE assignments. UPDATE FROM source columns and same-row external descriptors
+inside computed expressions do not yet carry their physical origin.
 LATERAL joins also retain origins from their outer rows. Grouping and DISTINCT retain
 the first representative; MIN/MAX retain the first non-NULL input until another
 non-NULL input is compared. Other CTE producer shapes,

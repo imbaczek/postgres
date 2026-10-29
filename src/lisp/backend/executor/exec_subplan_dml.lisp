@@ -53,20 +53,21 @@
                                (analyze-subquery-assignment (analyze-expr raw scope) element-column)
                                :type type :typmod (pg-column-typmod column)))))))))
 
-(defun eval-subquery-assignment (expression environment)
+(defun coerce-subquery-assignment-value (expression input-value)
   (let* ((argument (second expression))
          (target (expr-type expression))
          (typmod (expr-typmod expression))
-         (value (sql-cast-value (eval-expr argument environment)
-                                (expr-type argument) target (if (eq target :varchar) -1 typmod))))
+         (value (sql-cast-value input-value (expr-type argument) target (if (eq target :varchar) -1 typmod))))
     (when (and (eq target :varchar) (not (eq value +null+)) (>= typmod 4))
       (let ((maximum (- typmod 4)))
         (when (> (length value) maximum)
-          (unless (every (lambda (character) (char= character #\Space))
-                         (subseq value maximum))
+          (unless (every (lambda (character) (char= character #\Space)) (subseq value maximum))
             (ereport "22001" "value too long for type character varying(~a)" maximum))
           (setf value (subseq value 0 maximum)))))
     value))
+
+(defun eval-subquery-assignment (expression environment)
+  (coerce-subquery-assignment-value expression (eval-expr (second expression) environment)))
 
 (defun prepare-dml-returning (ast table &optional source)
   (when (getf ast :returning)
@@ -332,20 +333,28 @@
                   (analyze-subquery-assignment (list :const value :type :int8 :typmod -1) column) #()))))))
 
 (defun subquery-update-values (table sets old &optional (environment old))
-  ;; Analysis orders SET assignments by physical attribute; evaluate each against
-  ;; the same old row, including volatile expressions and defaults.
+  ;; All assignments read the same old row, including volatile expressions.
   (let* ((columns (pg-class-columns table))
-         (new (copy-seq old)))
+         (new (copy-seq old))
+         (compressed (make-array (length columns) :initial-element nil)))
     (dolist (assignment sets)
       (let* ((column (car assignment))
              (expression (cdr assignment))
-             (value (if (eq expression :default) (coerce-dml-column-default column)
-                        (eval-expr expression environment))))
-        (setf (aref new (1- (pg-column-attnum column)))
-              (coerce-value value (pg-column-type column) (pg-column-typmod column)))))
+             (i (1- (pg-column-attnum column))))
+        (multiple-value-bind (value origin)
+            (if (eq expression :default)
+                (values (coerce-dml-column-default column) nil)
+                (eval-dml-assignment-with-origin expression environment column))
+          (let ((coerced (coerce-value value (pg-column-type column) (pg-column-typmod column))))
+            (setf (aref new i) coerced
+                  (aref compressed i)
+                  (and origin
+                       (equalp (aref (nth-value 2 (heap-tuple-layout (vector value) (vector column))) 0)
+                               (aref (nth-value 2 (heap-tuple-layout (vector coerced) (vector column))) 0))
+                       origin))))))
     (check-not-null new columns)
     (check-table-constraints table new)
-    new))
+    (values new compressed)))
 
 (defun datum-origin-assignment-compatible-p (source column)
   "Whether C's assignment coercion can pass SOURCE's datum without detoasting.
@@ -363,22 +372,21 @@ Match varchar_support and numeric_support's typmod relabel conditions."
                     (<= (ldb (byte 16 16) (- old 4)) (ldb (byte 16 16) (- new 4))))))
           (t (and (eq from to) (= old new))))))
 
-(defun insert-source-compressed-values (columns attnums expressions origins)
-  "Map projected origins to target columns for assignments that preserve the physical datum under C's coercion rules.
-External-origin values are flattened for PLAIN targets; no source TOAST pointer
-is ever installed into the destination relation."
-  (when origins
-    (let ((result (make-array (length columns) :initial-element nil)))
-      (loop for attnum in attnums for expression in expressions
-            for column = (aref columns (1- attnum))
-            for input = (and (consp expression) (eq (first expression) :assignment) (second expression))
-            for slot = (and (consp input) (eq (first input) :col) (second input))
-            for origin = (and slot (<= 1 slot (length origins)) (aref origins (1- slot)))
-            when (and origin (datum-origin-assignment-compatible-p input column)
-                      (or (not (datum-origin-external-p origin))
-                          (not (char= (pg-column-effective-storage column) #\p))))
-              do (setf (aref result (1- attnum)) (datum-origin-compressed origin)))
-      result)))
+(defun eval-dml-assignment-with-origin (expression environment column)
+  "Evaluate an assignment once and return its compatible detached compression."
+  (if (and (consp expression) (eq (first expression) :assignment))
+      (let ((input (second expression)))
+        (multiple-value-bind (raw origin)
+            (eval-expr-with-origin input environment *query-row-origins*)
+          (let ((value (coerce-subquery-assignment-value expression raw)))
+            (values value
+                    (and origin (datum-origin-assignment-compatible-p input column)
+                         (or (not (datum-origin-external-p origin))
+                             (not (char= (pg-column-effective-storage column) #\p)))
+                         (equalp (aref (nth-value 2 (heap-tuple-layout (vector raw) (vector column))) 0)
+                                 (aref (nth-value 2 (heap-tuple-layout (vector value) (vector column))) 0))
+                         (datum-origin-compressed origin))))))
+      (values (eval-expr expression environment) nil)))
 
 (defun exec-insert-subqueries (stream ast)
   (let ((*datum-origin-capture* nil) (*query-row-origins* nil)
@@ -394,54 +402,56 @@ is ever installed into the destination relation."
          (labels
              ((insert-row (expressions environment)
                 (check-for-interrupts)
-                (let ((values
-                        (call-with-dml-expression-evaluation
-                         (lambda ()
-                           (let ((values (make-array (length columns) :initial-element +null+))
-                                 ;; Multi-row VALUES evaluates supplied expressions in source order
-                                 ;; before omitted defaults in physical attribute order.
-                                 (source-values
-                                   (when (cdr (getf prepared :rows))
-                                     (coerce
-                                      (loop for expression in expressions
-                                            for attnum in (getf prepared :attnums)
-                                            collect (if (eq expression :default)
-                                                        (coerce-dml-column-default
-                                                         (aref columns (1- attnum)))
-                                                        (eval-expr expression environment)))
-                                      'vector))))
-                             (loop for column across columns for attnum from 1
-                                   for source-position = (position attnum (getf prepared :attnums))
-                                   for expression = (when source-position
-                                                      (nth source-position expressions))
-                                   do (setf (aref values (1- attnum))
-                                            (cond ((and source-values source-position)
-                                                   (aref source-values source-position))
-                                                  ((or (null source-position) (eq expression :default))
-                                                   (coerce-dml-column-default column))
-                                                  (t (eval-expr expression environment)))))
-                             (check-not-null values columns)
-                             (check-table-constraints table values)
-                             values)))))
-                  (detach-select-index-scans)
-                  (multiple-value-bind (action actual old)
-                      (if (getf prepared :conflict)
-                          (insert-tuple-on-conflict table values (getf prepared :conflict) state
-                                                    :compressed-reuse (insert-source-compressed-values
-                                                                       columns (getf prepared :attnums)
-                                                                       expressions *query-row-origins*))
-                          (multiple-value-bind (block off publications)
-                              (insert-tuple-with-unique table values :publication-kind :insert
-                                                                     :compressed-reuse (insert-source-compressed-values
-                                                                                        columns (getf prepared :attnums)
-                                                                                        expressions *query-row-origins*))
-                            (declare (ignore block off))
-                            (logical-note-row-change :insert table :new-values values
-                                                     :publication-selection publications)
-                            (values :insert values nil)))
-                    (unless (eq action :nothing)
-                      (incf count)
-                      (emit-dml-returning stream returning actual :old-values old :new-values actual))))))
+                (let ((compressed (make-array (length columns) :initial-element nil)))
+                  (flet ((eval-assignment (expression column)
+                           (multiple-value-bind (value origin)
+                               (eval-dml-assignment-with-origin expression environment column)
+                             (setf (aref compressed (1- (pg-column-attnum column))) origin)
+                             value)))
+                    (let ((values
+                            (call-with-dml-expression-evaluation
+                             (lambda ()
+                               (let ((values (make-array (length columns) :initial-element +null+))
+                                     ;; Multi-row VALUES evaluates supplied expressions in source order
+                                     ;; before omitted defaults in physical attribute order.
+                                     (source-values
+                                       (when (cdr (getf prepared :rows))
+                                         (coerce
+                                          (loop for expression in expressions
+                                                for attnum in (getf prepared :attnums)
+                                                collect (if (eq expression :default)
+                                                            (coerce-dml-column-default
+                                                             (aref columns (1- attnum)))
+                                                            (eval-assignment expression (aref columns (1- attnum)))))
+                                          'vector))))
+                                 (loop for column across columns for attnum from 1
+                                       for source-position = (position attnum (getf prepared :attnums))
+                                       for expression = (when source-position
+                                                          (nth source-position expressions))
+                                       do (setf (aref values (1- attnum))
+                                                (cond ((and source-values source-position)
+                                                       (aref source-values source-position))
+                                                      ((or (null source-position) (eq expression :default))
+                                                       (coerce-dml-column-default column))
+                                                      (t (eval-assignment expression column)))))
+                                 (check-not-null values columns)
+                                 (check-table-constraints table values)
+                                 values)))))
+                      (detach-select-index-scans)
+                      (multiple-value-bind (action actual old)
+                          (if (getf prepared :conflict)
+                              (insert-tuple-on-conflict table values (getf prepared :conflict) state
+                                                        :compressed-reuse compressed)
+                              (multiple-value-bind (block off publications)
+                                  (insert-tuple-with-unique table values :publication-kind :insert
+                                                                         :compressed-reuse compressed)
+                                (declare (ignore block off))
+                                (logical-note-row-change :insert table :new-values values
+                                                         :publication-selection publications)
+                                (values :insert values nil)))
+                        (unless (eq action :nothing)
+                          (incf count)
+                          (emit-dml-returning stream returning actual :old-values old :new-values actual))))))))
            ;; Stream the independent SELECT projection under the original snapshot,
            ;; including when source and target are the same relation.
            (let ((source (getf prepared :insert-source-plan)))
@@ -454,7 +464,8 @@ is ever installed into the destination relation."
                       (insert-row (mapcar (lambda (target) (getf target :expr))
                                           (getf prepared :source-assignments))
                                   (car row)))))
-                 (dolist (row (getf prepared :rows)) (insert-row row nil)))))
+                 (let ((*datum-origin-capture* t))
+                   (dolist (row (getf prepared :rows)) (insert-row row nil))))))
          (finish-dml-command stream returning (format nil "INSERT 0 ~a" count)))))))
 
 (defun exec-delete-subqueries (stream ast)
@@ -556,8 +567,17 @@ is ever installed into the destination relation."
             (pushnew slot slots))))
       (when (< (length slots) width) (cons table slots)))))
 
+(defun dml-target-row-origins (tuple environment)
+  "Map detached target origins into the DML environment, leaving source slots empty."
+  (let* ((origins (htup-origins tuple))
+         (result (make-array (length environment) :initial-element nil)))
+    (when origins (replace result origins :end1 (min (length result) (length origins))))
+    result))
+
 (defun exec-update-subqueries (stream ast)
-  (let* ((prepared (prepare-dml-subqueries ast))
+  (let* ((*datum-origin-capture* t)
+         (*query-row-origins* nil)
+         (prepared (prepare-dml-subqueries ast))
          (where (or (getf prepared :dml-row-where) (getf prepared :where)))
          (sets (getf prepared :sets)))
     (call-with-dml-subqueries
@@ -572,8 +592,11 @@ is ever installed into the destination relation."
             (check-for-interrupts)
             ;; Project every qualifying match before suppressing duplicate mutations,
             ;; as C evaluates the plan output before TM_SelfModified handling.
-            (let ((new (call-with-dml-expression-evaluation
-                        (lambda () (subquery-update-values table sets (htup-values candidate) environment)))))
+            (multiple-value-bind (new compressed)
+                (call-with-dml-expression-evaluation
+                 (lambda ()
+                   (let ((*query-row-origins* (dml-target-row-origins candidate environment)))
+                     (subquery-update-values table sets (htup-values candidate) environment))))
               (unless modified-p
                 (multiple-value-bind (deleted tuple old-block old-offnum status)
                     (heapam-delete-tid
@@ -586,9 +609,11 @@ is ever installed into the destination relation."
                         (lambda ()
                           ;; EPQ replaces only the target version; the matched source values
                           ;; remain those captured by the original candidate.
-                          (let ((environment (concatenate 'vector (htup-values tuple) source)))
+                          (let* ((environment (concatenate 'vector (htup-values tuple) source))
+                                 (*query-row-origins* (dml-target-row-origins tuple environment)))
                             (when (or (null where) (true-p (eval-expr where environment)))
-                              (setf new (subquery-update-values table sets (htup-values tuple) environment))
+                              (multiple-value-setq (new compressed)
+                                (subquery-update-values table sets (htup-values tuple) environment))
                               t)))))
                      nil t candidate)
                   (check-heapam-write-status status)
@@ -600,7 +625,15 @@ is ever installed into the destination relation."
                       (multiple-value-bind (block off publications)
                           (insert-tuple-with-unique
                            table new :exclude-tid (cons old-block old-offnum)
-                           :toast-reuse reuse :compressed-reuse (unchanged-tuple-compressed-values tuple sets new)
+                           :toast-reuse reuse :compressed-reuse
+                           (let ((old-compressed (unchanged-tuple-compressed-values tuple sets new)))
+                             (when old-compressed
+                               (dotimes (i (length compressed))
+                                 (unless (or (aref compressed i) (aref reuse i))
+                                   (setf (aref compressed i) (aref old-compressed i)))))
+                             (dotimes (i (length compressed))
+                               (when (aref reuse i) (setf (aref compressed i) nil)))
+                             compressed)
                            :publication-kind :update
                            :on-success
                            (lambda (block off)

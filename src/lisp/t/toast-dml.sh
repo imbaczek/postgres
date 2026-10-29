@@ -128,6 +128,57 @@ run -c 'insert into toast_scalar_result select (select (select v)) from toast_in
 [ "$(run -c "select count(*) from toast_scalar_result where v='short'")" = 2 ]
 run -c 'create table toast_scalar_source (id int, v text)' >/dev/null
 run -c "insert into toast_scalar_source values (1,'$index_suffix'),(2,'b$index_suffix')" >/dev/null
+run -c 'create table toast_scalar_dml (id int primary key, v text)' >/dev/null
+run -c 'alter table toast_scalar_dml alter column v set storage plain' >/dev/null
+run -c 'insert into toast_scalar_dml values (1,(select v from toast_scalar_source where id=1)),(2,(select v from toast_scalar_source where id=2))' >/dev/null
+run -c "insert into toast_scalar_dml values (3,case when true then (select v from toast_scalar_source where id=1) else '' end)" >/dev/null
+run -c 'update toast_scalar_dml set v=(select v from toast_scalar_source where id=2) where id=1' >/dev/null
+run -c 'update toast_scalar_dml set v=(select v) where id=3' >/dev/null
+[ "$(run -c "select count(*) from toast_scalar_dml where (id=1 and length(v)=20001 and substr(v,1,1)='b') or (id=2 and length(v)=20001 and substr(v,1,1)='b') or (id=3 and length(v)=20000 and substr(v,1,1)='a')")" = 3 ]
+run -c 'create table toast_scalar_narrow (v varchar(30000))' >/dev/null
+run -c 'alter table toast_scalar_narrow alter column v set storage plain' >/dev/null
+if run -v VERBOSITY=verbose -c 'insert into toast_scalar_narrow values ((select v from toast_scalar_source where id=1))' >"$TMP/dml-scalar-narrow.out" 2>&1; then
+    echo 'toast-dml: narrowing scalar assignment retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/dml-scalar-narrow.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: narrowing scalar assignment did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+if run -v VERBOSITY=verbose -c "update toast_scalar_dml set v=(select v || '' from toast_scalar_source where id=1) where id=1" >"$TMP/dml-scalar-computed.out" 2>&1; then
+    echo 'toast-dml: computed scalar assignment retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/dml-scalar-computed.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: computed scalar assignment did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+# The waiting updater must recompute both its scalar value and its origin after
+# following the committed row version through EvalPlanQual.
+run -c 'create table toast_scalar_epq (id int primary key, v text)' >/dev/null
+run -c 'alter table toast_scalar_epq alter column v set storage plain' >/dev/null
+run -c "insert into toast_scalar_epq values (1,'short')" >/dev/null
+mkfifo "$TMP/scalar-epq.sql"
+run < "$TMP/scalar-epq.sql" > "$TMP/scalar-epq.out" 2>&1 &
+READER=$!
+exec 3> "$TMP/scalar-epq.sql"
+printf '%s\n' 'begin; update toast_scalar_epq set id=2 where id=1;' '\echo ready' >&3
+i=0
+until grep -Fxq ready "$TMP/scalar-epq.out"; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || { cat "$TMP/scalar-epq.out" >&2; exit 1; }; sleep 0.1
+done
+run -c 'select pg_backend_pid()' -c 'update toast_scalar_epq set v=(select v from toast_scalar_source s where s.id=toast_scalar_epq.id) where id<=2' >"$TMP/scalar-epq-waiter.out" 2>&1 &
+WRITER=$!
+i=0
+until waiter_pid=$(awk '/^[0-9]+$/{print; exit}' "$TMP/scalar-epq-waiter.out") && [ -n "$waiter_pid" ]; do
+    kill -0 "$WRITER" 2>/dev/null || { cat "$TMP/scalar-epq-waiter.out" >&2; exit 1; }
+    i=$((i + 1)); [ "$i" -lt 100 ] || exit 1; sleep 0.1
+done
+printf '%s\n(quit)\n' "(loop repeat 100 for backend = (lookup-backend $waiter_pid) when (and backend (backend-waiting-xid backend)) return :waiting do (sleep 0.05) finally (return :timeout))" | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/scalar-epq-wait.out"
+grep -Fq ':WAITING' "$TMP/scalar-epq-wait.out" || { cat "$TMP/scalar-epq-wait.out" >&2; exit 1; }
+printf '%s\n' 'commit;' '\q' >&3
+exec 3>&-
+wait "$READER"; READER=
+wait "$WRITER"; WRITER=
+[ "$(run -c 'select id,length(v),substr(v,1,1) from toast_scalar_epq')" = '2|20001|b' ]
 run -c 'create table toast_scalar_mixed (id int, v text)' >/dev/null
 run -c 'alter table toast_scalar_mixed alter column v set storage plain' >/dev/null
 run -c 'insert into toast_scalar_mixed select id,(select (select v)) from toast_scalar_source' >/dev/null
@@ -306,6 +357,13 @@ run -c 'alter table toast_external_compressed alter column v set storage externa
 run -c 'update toast_external_compressed set v=v' >/dev/null
 run -c 'vacuum full toast_external_compressed' >/dev/null
 [ "$(run -c 'select length(v) from toast_external_compressed')" = 200000 ]
+if run -v VERBOSITY=verbose -c 'insert into toast_scalar_dml values (4,(select v from toast_external_compressed))' >"$TMP/dml-scalar-external.out" 2>&1; then
+    echo 'toast-dml: external scalar datum was retained under PLAIN' >&2; exit 1
+fi
+case $(cat "$TMP/dml-scalar-external.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: external scalar datum did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 if run -v VERBOSITY=verbose -c 'insert into toast_select_plain select v from toast_external_compressed' >"$TMP/select-external-plain.out" 2>&1; then
     echo 'toast-dml: foreign external datum was retained under PLAIN' >&2; exit 1
 fi
