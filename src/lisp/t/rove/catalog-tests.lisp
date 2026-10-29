@@ -25,6 +25,18 @@
       (rove:ok (plusp (key-compare (k "b" :varchar) (k "aa" :varchar)))
                "varchar keys follow lexical order")))
 
+(rove:deftest heap-header-bitmap-depends-on-actual-nulls
+    (let* ((columns (coerce (loop for i from 1 to 9
+                                  collect (make-pg-column :type :int4 :typmod -1 :attnum i)) 'vector))
+           (values (make-array 9 :initial-element 1))
+           (without-null (form-heap-tuple values columns 1 0 0 0 1)))
+      (rove:ok (= 24 (aref without-null +heap-tuple-hoff-off+)))
+      (rove:ok (equalp values (nth-value 0 (deform-heap-tuple without-null columns))))
+      (setf (aref values 0) +null+)
+      (let ((with-null (form-heap-tuple values columns 1 0 0 0 1)))
+        (rove:ok (= 32 (aref with-null +heap-tuple-hoff-off+)))
+        (rove:ok (equalp values (nth-value 0 (deform-heap-tuple with-null columns)))))))
+
 (rove:deftest test-btree-split-balances-bytes
     (flet ((key (n) (make-array n :element-type '(unsigned-byte 8) :initial-element 1)))
       (dolist (internal-p '(nil t))

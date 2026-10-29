@@ -178,6 +178,11 @@
 ;; PAYLOAD is the PostgreSQL tcinfo word followed by a PGLZ stream.
 (defstruct heap-compressed-varlena payload)
 
+(defun heap-tuple-header-size (values)
+  "Reserve a null bitmap only when the tuple actually contains SQL NULL."
+  (maxalign (+ +size-of-heap-tuple-header+
+               (if (find +null+ values :test #'eq) (ceiling (length values) 8) 0))))
+
 (defun heap-tuple-layout (values columns &optional cached-varlena)
   "Compute the exact physical layout used to form a heap tuple.
 Return size, attribute offsets, encoded varlena data and infomask.
@@ -187,7 +192,7 @@ changes; external descriptors are always encoded afresh. The cache vector is
 copied, but its payloads are not: inline bytea payloads may alias VALUES and
 must remain stable while the layout is used."
   (let* ((natts (length columns))
-         (hoff (maxalign (+ +size-of-heap-tuple-header+ (ceiling natts 8))))
+         (hoff (heap-tuple-header-size values))
          (offsets (make-array natts :initial-element nil))
          (varlena-data (if cached-varlena (copy-seq cached-varlena)
                            (make-array natts :initial-element nil)))
@@ -247,7 +252,7 @@ must keep them stable during this call. :varchar, :text, :json, :jsonb, :bytea a
 physical external descriptors, written unaligned with HEAP_HASEXTERNAL set.
 This codec does not create or fetch TOAST data."
   (let* ((natts (length columns))
-         (hoff (maxalign (+ +size-of-heap-tuple-header+ (ceiling natts 8))))
+         (hoff (heap-tuple-header-size values))
          (layout (multiple-value-list (heap-tuple-layout values columns)))
          (cursor (first layout))
          (offsets (second layout))

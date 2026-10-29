@@ -1689,7 +1689,7 @@ VALUES remains unchanged; EXTERNAL-P says whether the relation has a TOAST table
          (selected nil)
          (compressed-selected nil)
          (cached nil)
-         (header (maxalign (+ +size-of-heap-tuple-header+ (ceiling (length columns) 8))))
+         (header (heap-tuple-header-size values))
          (max-data (- +toast-tuple-target+ header)))
     (labels ((layout ()
                (multiple-value-bind (size offsets encoded mask)

@@ -26,6 +26,20 @@ run() {
 }
 test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-socket "$TMP/control.sock"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
+# A non-NULL nine-column row has no bitmap and fits where an otherwise similar
+# row with a NULL needs the larger header and no longer fits.
+wide_payload=$(awk 'BEGIN { for (i=0;i<8100;i++) printf "x" }')
+run -c 'create table toast_wide_header (a int,b int,c int,d int,e int,f int,g int,h int,v text)' >/dev/null
+run -c 'alter table toast_wide_header alter column v set storage plain' >/dev/null
+run -c "insert into toast_wide_header values (1,1,1,1,1,1,1,1,'$wide_payload')" >/dev/null
+[ "$(run -c 'select length(v) from toast_wide_header')" = 8100 ]
+if run -v VERBOSITY=verbose -c "insert into toast_wide_header values (null,1,1,1,1,1,1,1,'$wide_payload')" >"$TMP/wide-header-null.out" 2>&1; then
+    echo 'toast-dml: oversized row with null bitmap was accepted' >&2; exit 1
+fi
+case $(cat "$TMP/wide-header-null.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: oversized bitmap row did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 # A count-based split puts all three large keys on one page even though a
 # boundary exists where both pages fit. Keep the values distinct and indexable.
 "${PYTHON:-python3}" - >"$TMP/uneven-index.sql" <<'PY'
@@ -666,6 +680,7 @@ SRV=
 test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-socket "$TMP/control.sock"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
 [ "$(run -c "select count(*) from toast_long_index where v = '039$index_suffix'")" = 1 ]
+[ "$(run -c 'select length(v) from toast_wide_header')" = 8100 ]
 if run -v VERBOSITY=verbose -c "insert into toast_long_index values ('039$index_suffix')" >"$TMP/duplicate.out" 2>&1; then
     echo 'toast-dml: duplicate compressed key accepted' >&2; exit 1
 fi
