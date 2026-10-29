@@ -839,20 +839,25 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (unless (eql count 1)
       (error "logical ~a expected one target row, got ~a" operation (or tag "no command tag")))))
 
-(defun logical-apply-insert (runtime relation payload position)
+(defun logical-apply-insert-tuple (runtime relation tuple)
+  (when (logical-relation-selected-p runtime relation)
+    (logical-validate-pgoutput-tuple relation tuple nil)
+    (unless (= (length tuple) (length (pgoutput-relation-columns relation)))
+      (error "pgoutput INSERT tuple is not a full row"))
+    (logical-target-query (logical-subscription-runtime-target runtime)
+                          (logical-row-insert-sql relation tuple))))
+
+(defun logical-pgoutput-read-insert (payload position)
   (unless (and (< position (length payload))
                (= (aref payload position) (char-code #\N)))
     (error "pgoutput INSERT lacks a new tuple"))
-  (multiple-value-bind (tuple end)
-      (logical-pgoutput-read-tuple payload (1+ position))
+  (multiple-value-bind (tuple end) (logical-pgoutput-read-tuple payload (1+ position))
     (unless (= end (length payload)) (error "pgoutput INSERT has trailing bytes"))
-    (when (logical-relation-selected-p runtime relation)
-      (logical-validate-pgoutput-tuple relation tuple nil)
-      (unless (= (length tuple) (length (pgoutput-relation-columns relation)))
-        (error "pgoutput INSERT tuple is not a full row"))
-      (logical-target-query
-       (logical-subscription-runtime-target runtime)
-       (logical-row-insert-sql relation tuple)))))
+    tuple))
+
+(defun logical-apply-insert (runtime relation payload position)
+  (logical-apply-insert-tuple runtime relation
+                              (logical-pgoutput-read-insert payload position)))
 
 (defun logical-pgoutput-read-update (payload position)
   "Read nonstreamed UPDATE tuples in C logicalrep_read_update field order."
@@ -903,47 +908,54 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                       (pgoutput-column-name key)) assignments)))
     (format nil "~{~a~^, ~}" assignments)))
 
+(defun logical-apply-update-tuples (runtime relation old-tuple new-tuple kind)
+  (when (logical-relation-selected-p runtime relation)
+    (when old-tuple (logical-validate-pgoutput-tuple relation old-tuple nil))
+    (logical-validate-pgoutput-tuple relation new-tuple t)
+    (when (char= kind #\O)
+      (error "REPLICA IDENTITY FULL is not supported"))
+    (unless (= (length new-tuple) (length (pgoutput-relation-columns relation)))
+      (error "pgoutput UPDATE tuple is not a full row"))
+    (let* ((set-clause (logical-update-set-clause relation new-tuple))
+           (where (logical-row-key-predicate
+                   (logical-pgoutput-key-values relation (or old-tuple new-tuple))
+                   (pgoutput-relation-key-columns relation)))
+           (tag (nth-value 2 (logical-target-query
+                              (logical-subscription-runtime-target runtime)
+                              (format nil "UPDATE ~a SET ~a WHERE ~a"
+                                      (pgoutput-relation-name relation) set-clause where)))))
+      (logical-assert-one-row-affected tag "UPDATE"))))
+
 (defun logical-apply-update (runtime relation payload position)
   (multiple-value-bind (old-tuple new-tuple kind)
       (logical-pgoutput-read-update payload position)
-    (when (logical-relation-selected-p runtime relation)
-      (when old-tuple (logical-validate-pgoutput-tuple relation old-tuple nil))
-      (logical-validate-pgoutput-tuple relation new-tuple t)
-      (when (char= kind #\O)
-        (error "REPLICA IDENTITY FULL is not supported"))
-      (unless (= (length new-tuple) (length (pgoutput-relation-columns relation)))
-        (error "pgoutput UPDATE tuple is not a full row"))
-      (let* ((set-clause (logical-update-set-clause relation new-tuple))
-             (where (logical-row-key-predicate
-                     (logical-pgoutput-key-values relation (or old-tuple new-tuple))
-                     (pgoutput-relation-key-columns relation)))
-             (tag (nth-value
-                   2 (logical-target-query
-                      (logical-subscription-runtime-target runtime)
-                      (format nil "UPDATE ~a SET ~a WHERE ~a"
-                              (pgoutput-relation-name relation) set-clause where)))))
-        (logical-assert-one-row-affected tag "UPDATE")))))
+    (logical-apply-update-tuples runtime relation old-tuple new-tuple kind)))
 
-(defun logical-apply-delete (runtime relation payload position)
+(defun logical-pgoutput-read-delete (payload position)
   (when (>= position (length payload)) (error "truncated pgoutput DELETE"))
   (let ((kind (code-char (aref payload position))))
-    (multiple-value-bind (tuple end)
-        (logical-pgoutput-read-tuple payload (1+ position))
+    (multiple-value-bind (tuple end) (logical-pgoutput-read-tuple payload (1+ position))
       (unless (= end (length payload)) (error "pgoutput DELETE has trailing bytes"))
-      (when (logical-relation-selected-p runtime relation)
-        (logical-validate-pgoutput-tuple relation tuple nil)
-        (unless (char= kind #\K)
-          (error "allowlisted table ~a requires a pgoutput K identity tuple"
-                 (pgoutput-relation-name relation)))
-        (let* ((where (logical-row-key-predicate
-                       (logical-pgoutput-key-values relation tuple)
-                       (pgoutput-relation-key-columns relation)))
-               (tag (nth-value
-                     2 (logical-target-query
-                        (logical-subscription-runtime-target runtime)
-                        (format nil "DELETE FROM ~a WHERE ~a"
-                                (pgoutput-relation-name relation) where)))))
-          (logical-assert-one-row-affected tag "DELETE"))))))
+      (values tuple kind))))
+
+(defun logical-apply-delete-tuple (runtime relation tuple kind)
+  (when (logical-relation-selected-p runtime relation)
+    (logical-validate-pgoutput-tuple relation tuple nil)
+    (unless (char= kind #\K)
+      (error "allowlisted table ~a requires a pgoutput K identity tuple"
+             (pgoutput-relation-name relation)))
+    (let* ((where (logical-row-key-predicate
+                   (logical-pgoutput-key-values relation tuple)
+                   (pgoutput-relation-key-columns relation)))
+           (tag (nth-value 2 (logical-target-query
+                              (logical-subscription-runtime-target runtime)
+                              (format nil "DELETE FROM ~a WHERE ~a"
+                                      (pgoutput-relation-name relation) where)))))
+      (logical-assert-one-row-affected tag "DELETE"))))
+
+(defun logical-apply-delete (runtime relation payload position)
+  (multiple-value-bind (tuple kind) (logical-pgoutput-read-delete payload position)
+    (logical-apply-delete-tuple runtime relation tuple kind)))
 
 (defun logical-progress-transaction-commit (runtime commit-lsn)
   (let* ((options (logical-subscription-runtime-options runtime))

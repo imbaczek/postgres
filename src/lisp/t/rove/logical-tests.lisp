@@ -1,6 +1,39 @@
 ;;;; logical-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(rove:deftest test-row-decoders-reject-malformed-before-apply
+    (let ((insert (symbol-function 'logical-apply-insert-tuple))
+          (update (symbol-function 'logical-apply-update-tuples))
+          (delete (symbol-function 'logical-apply-delete-tuple))
+          (calls 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-apply-insert-tuple)
+                   (lambda (&rest args) (declare (ignore args)) (incf calls))
+                   (symbol-function 'logical-apply-update-tuples)
+                   (lambda (&rest args) (declare (ignore args)) (incf calls))
+                   (symbol-function 'logical-apply-delete-tuple)
+                   (lambda (&rest args) (declare (ignore args)) (incf calls)))
+             (dolist (entry (list (list #'logical-apply-insert #(78 0 0 1))
+                                  (list #'logical-apply-update #(78 0 0 1))
+                                  (list #'logical-apply-delete #(75 0 0 1))
+                                  (list #'logical-apply-insert #(78 0))
+                                  (list #'logical-apply-update #(78 0))
+                                  (list #'logical-apply-update #(75 0 0 78 0))
+                                  (list #'logical-apply-update #(75 0 0 78 0 0 1))
+                                  (list #'logical-apply-delete #(75 0))))
+               (rove:ok (handler-case
+                            (progn (funcall (first entry) nil nil (second entry) 0) nil)
+                          (error () t))))
+             (rove:ok (zerop calls))
+             (logical-apply-insert nil nil #(78 0 0) 0)
+             (logical-apply-update nil nil #(78 0 0) 0)
+             (logical-apply-delete nil nil #(75 0 0) 0)
+             (rove:ok (= calls 3)))
+        (setf (symbol-function 'logical-apply-insert-tuple) insert
+              (symbol-function 'logical-apply-update-tuples) update
+              (symbol-function 'logical-apply-delete-tuple) delete))))
+
 (rove:deftest test-logical-row-change-codec
     ;; These are the executor-boundary equivalents of DecodeInsert,
     ;; DecodeUpdate, and DecodeDelete in src/backend/replication/logical/decode.c.
