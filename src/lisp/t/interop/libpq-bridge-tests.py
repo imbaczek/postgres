@@ -41,6 +41,31 @@ def switch_row(connection):
     wire.wire_frame(connection, b'Z', b'I')
 
 
+def identity(connection):
+    assert frame(connection) == (b'Q', b'IDENTIFY_SYSTEM\0')
+    columns = b''
+    for name, oid, size in ((b'systemid', 25, -1), (b'timeline', 20, 8),
+                            (b'xlogpos', 25, -1), (b'dbname', 25, -1)):
+        columns += name + b'\0' + struct.pack('!IhIhih', 0, 0, oid, size, -1, 0)
+    wire.wire_frame(connection, b'T', struct.pack('!H', 4) + columns)
+    wire.wire_frame(connection, b'D', struct.pack('!H', 4)
+                    + b''.join(wire.string(value) for value in ('42', '1', '0/40', 'postgres')))
+    wire.wire_frame(connection, b'C', b'IDENTIFY_SYSTEM\0')
+    wire.wire_frame(connection, b'Z', b'I')
+    assert frame(connection) == (b'X', b'')
+
+
+def idle(connection):
+    assert frame(connection) == (b'Q', b'START_STREAMING\0')
+    wire.wire_frame(connection, b'W', b'\0\0\0')
+    assert frame(connection) == (b'd', b'idle-feedback')
+    wire.wire_frame(connection, b'c')
+    assert frame(connection) == (b'd', b'final-feedback')
+    assert frame(connection) == (b'c', b'')
+    switch_row(connection)
+    assert frame(connection) == (b'X', b'')
+
+
 def immediate(connection):
     assert frame(connection) == (b'Q', b'START_STREAMING\0')
     switch_row(connection)
@@ -58,9 +83,23 @@ def copy(connection):
     assert frame(connection) == (b'X', b'')
 
 
-for mode, script in (('query', query), ('copy', copy), ('immediate', immediate)):
-    with wire.source(script, timeout=30) as (port, parameters):
-        environment = dict(os.environ, PG_LIBPQ_TEST_MODE=mode, PG_LIBPQ_TEST_PORT=str(port))
+frozen_connections = 0
+
+
+def frozen(connection):
+    global frozen_connections
+    frozen_connections += 1
+    if frozen_connections == 1:
+        assert frame(connection) == (b'X', b'')
+    else:
+        query(connection)
+
+
+for mode, script in (('query', query), ('copy', copy), ('immediate', immediate),
+                     ('identity', identity), ('idle', idle), ('frozen', frozen)):
+    with wire.source(script, timeout=30, connections=2 if mode == 'frozen' else 1) as (port, parameters):
+        environment = dict(os.environ, PG_LIBPQ_TEST_MODE=mode, PG_LIBPQ_TEST_PORT=str(port),
+                           PGPASSFILE=b'/tmp/pg-libpq-nonutf8-\xff')
         result = subprocess.run(
             shlex.split(os.environ.get('SBCL', 'sbcl'))
             + ['--script', str(HERE.parent / 'libpq-bridge-runner.lisp')],

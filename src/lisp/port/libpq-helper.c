@@ -21,6 +21,8 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -243,24 +245,11 @@ check_multihost(void)
 		fail("0A000", "native physical follow requires a single endpoint");
 }
 
+static void emit_connection_info(void);
+
 static void
-open_connection(const unsigned char *body, uint32_t size)
+finish_connection(int64_t deadline)
 {
-	if (connection)
-		fail("08P01", "helper connection is already open");
-	const unsigned char *next = body;
-	char *conninfo = read_string(&next, body + size);
-	char *fallback = read_string(&next, body + size);
-	if (next != body + size)
-		fail("08P01", "helper open request has trailing bytes");
-	/* Expand conninfo using libpq, then force replication and UTF-8. The
-	 * application name is only a fallback; effective multihost is rejected. */
-	const char *keys[] = {"dbname", "replication", "client_encoding", "fallback_application_name", NULL};
-	const char *values[] = {conninfo, "database", "UTF8", fallback, NULL};
-	int64_t deadline = milliseconds() + OPERATION_MS;
-	connection = PQconnectStartParams(keys, values, 1);
-	free(conninfo);
-	free(fallback);
 	if (!connection)
 		fail("08001", "libpq connection failed");
 	PQsetNoticeProcessor(connection, discard_notice, NULL);
@@ -281,7 +270,92 @@ open_connection(const unsigned char *body, uint32_t size)
 	}
 	if (PQsetnonblocking(connection, 1) != 0)
 		fail("08006", "libpq nonblocking setup failed");
-	reply('O', NULL, 0);
+	emit_connection_info();
+}
+
+static void
+open_connection(const unsigned char *body, uint32_t size)
+{
+	if (connection)
+		fail("08P01", "helper connection is already open");
+	const unsigned char *next = body;
+	char *conninfo = read_string(&next, body + size);
+	char *fallback = read_string(&next, body + size);
+	if (next != body + size)
+		fail("08P01", "helper open request has trailing bytes");
+	const char *keys[] = {"dbname", "replication", "client_encoding", "fallback_application_name", NULL};
+	const char *values[] = {conninfo, "database", "UTF8", fallback, NULL};
+	int64_t deadline = milliseconds() + OPERATION_MS;
+	connection = PQconnectStartParams(keys, values, 1);
+	free(conninfo);
+	free(fallback);
+	finish_connection(deadline);
+}
+
+static void
+clear_connection_environment(void)
+{
+	char *error = NULL;
+	PQconninfoOption *schema = PQconninfoParse("", &error);
+	PQfreemem(error);
+	if (!schema)
+		fail("53000", "helper connection option schema unavailable");
+	for (PQconninfoOption *option = schema; option->keyword; option++)
+		if (option->envvar && unsetenv(option->envvar) != 0)
+			fail("58000", "helper connection environment could not be cleared");
+	PQconninfoFree(schema);
+}
+
+static void
+open_frozen_connection(const unsigned char *body, uint32_t size)
+{
+	if (connection || size < 4 || get32(body) > 128)
+		fail("08P01", "helper frozen open has invalid state or count");
+	uint32_t count = get32(body);
+	char *keys[133] = {0};
+	char *values[133] = {0};
+	const unsigned char *next = body + 4;
+	const char *host = NULL, *address = NULL, *port = NULL;
+	for (uint32_t i = 0; i < count; i++)
+	{
+		keys[i] = read_string(&next, body + size);
+		if (!strcmp(keys[i], "service"))
+			fail("08P01", "helper frozen open cannot resolve a service");
+		for (uint32_t previous = 0; previous < i; previous++)
+			if (!strcmp(keys[i], keys[previous]))
+				fail("08P01", "helper frozen open has duplicate options");
+		if ((size_t) (body + size - next) < 4)
+			fail("08P01", "helper frozen value is truncated");
+		if (get32(next) == UINT32_MAX)
+			next += 4;
+		else
+			values[i] = read_string(&next, body + size);
+		if (!strcmp(keys[i], "host")) host = values[i];
+		if (!strcmp(keys[i], "hostaddr")) address = values[i];
+		if (!strcmp(keys[i], "port")) port = values[i];
+	}
+	if (next != body + size || !host || !*host || !port || !*port ||
+		strchr(host, ',') || strchr(port, ',') || (address && strchr(address, ',')))
+		fail("08P01", "helper frozen route is incomplete or ambiguous");
+	int local = host[0] == '/' || host[0] == '@';
+	if ((!local && (!address || !*address)) || (local && address && *address))
+		fail("08P01", "helper frozen route lacks its selected address");
+	const char *forced_keys[] = {"replication", "client_encoding", "target_session_attrs", "load_balance_hosts"};
+	const char *forced_values[] = {"database", "UTF8", "any", "disable"};
+	for (int i = 0; i < 4; i++)
+	{
+		keys[count + i] = (char *) forced_keys[i];
+		values[count + i] = (char *) forced_values[i];
+	}
+	clear_connection_environment();
+	int64_t deadline = milliseconds() + OPERATION_MS;
+	connection = PQconnectStartParams((const char **) keys, (const char **) values, 0);
+	for (uint32_t i = 0; i < count; i++)
+	{
+		free(keys[i]);
+		free(values[i]);
+	}
+	finish_connection(deadline);
 }
 
 static void
@@ -320,6 +394,94 @@ append_string(unsigned char *next, const char *value, uint32_t size)
 	put32(next, size);
 	memcpy(next + 4, value, size);
 	return next + 4 + size;
+}
+
+static const char *
+selected_host(void)
+{
+	const char *host = PQhost(connection);
+	struct sockaddr_un address;
+	socklen_t length = sizeof(address);
+	memset(&address, 0, sizeof(address));
+	if (getpeername(PQsocket(connection), (struct sockaddr *) &address, &length) != 0)
+		fail("08006", "helper selected socket route is unavailable");
+	if (address.sun_family != AF_UNIX)
+	{
+		if (!host || !*host)
+			fail("08006", "helper selected host is unavailable");
+		return host;
+	}
+	static char directory[sizeof(address.sun_path) + 1];
+	memcpy(directory, address.sun_path, sizeof(address.sun_path));
+	if (directory[0] == '\0')
+		directory[0] = '@';
+	char *slash = strrchr(directory, '/');
+	if (!slash)
+		fail("08006", "helper selected socket directory is unavailable");
+	if (slash == directory)
+		slash[1] = '\0';
+	else
+		*slash = '\0';
+	return directory;
+}
+
+static void
+snapshot_password(const char **value, const char *keyword)
+{
+	if (!strcmp(keyword, "password") && PQconnectionUsedPassword(connection))
+	{
+		const char *used = PQpass(connection);
+		if (used && *used)
+			*value = used;
+	}
+}
+
+static void
+emit_connection_info(void)
+{
+	PQconninfoOption *options = PQconninfo(connection);
+	if (!options)
+		fail("53000", "helper connection metadata unavailable");
+	const char *selected[] = {selected_host(), PQhostaddr(connection), PQport(connection),
+		PQdb(connection), PQuser(connection)};
+	uint32_t count = 0;
+	size_t size = 4;
+	for (int i = 0; i < 5; i++)
+		size = add_size(size, 4 + (selected[i] ? strlen(selected[i]) : 0), REQUEST_MAX);
+	for (PQconninfoOption *option = options; option->keyword; option++)
+	{
+		const char *value = option->val;
+		snapshot_password(&value, option->keyword);
+		if (++count > 128)
+			fail("08P01", "helper connection option count exceeds its bound");
+		size = add_size(size, 8 + strlen(option->keyword)
+						+ (value ? strlen(value) : 0), REQUEST_MAX);
+	}
+	unsigned char *body = malloc(size);
+	if (!body)
+		fail("53000", "helper memory exhausted");
+	unsigned char *next = body;
+	for (int i = 0; i < 5; i++)
+		next = append_string(next, selected[i] ? selected[i] : "",
+						 selected[i] ? strlen(selected[i]) : 0);
+	put32(next, count);
+	next += 4;
+	for (PQconninfoOption *option = options; option->keyword; option++)
+	{
+		const char *value = option->val;
+		snapshot_password(&value, option->keyword);
+		next = append_string(next, option->keyword, strlen(option->keyword));
+		if (value)
+			next = append_string(next, value, strlen(value));
+		else
+		{
+			put32(next, UINT32_MAX);
+			next += 4;
+		}
+	}
+	PQconninfoFree(options);
+	reply('O', body, size);
+	free(body);
 }
 
 static void
@@ -588,6 +750,7 @@ main(int argc, char **argv)
 		switch (header[20])
 		{
 			case 'O': open_connection(request_body, size); break;
+			case 'P': open_frozen_connection(request_body, size); break;
 			case 'Q': query(request_body, size); break;
 			case 'R': receive_copy(request_body, size); break;
 			case 'S': send_copy(request_body, size); break;

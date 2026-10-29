@@ -1,5 +1,9 @@
 (in-package #:pg)
 
+(defun physical-libpq-print-private-object (object stream depth)
+  (declare (ignore depth))
+  (print-unreadable-object (object stream :type t :identity t)))
+
 ;; The helper owns libpq in an isolated child. This transport is not yet wired
 ;; into the physical receiver; Lisp remains responsible for WAL validation,
 ;; durability, and deciding when feedback and frontend CopyDone may be sent.
@@ -33,17 +37,13 @@
 (defstruct (physical-libpq-profile
             (:constructor %make-physical-libpq-profile (conninfo fallback))
             (:conc-name %physical-libpq-profile-)
-            (:print-function physical-libpq-print-profile))
+            (:print-function physical-libpq-print-private-object))
   "Copied connection settings; printing the profile does not expose secrets.
 FALLBACK supplies libpq's fallback application name. Libpq resolves service and
 environment settings for each connection attempt. Effective multihost connections
 are unsupported by the helper."
   (conninfo "" :type string :read-only t)
   (fallback "" :type string :read-only t))
-
-(defun physical-libpq-print-profile (profile stream depth)
-  (declare (ignore depth))
-  (print-unreadable-object (profile stream :type t :identity t)))
 
 (defun make-physical-libpq-profile (conninfo &key (fallback "walreceiver"))
   (unless (and (stringp conninfo) (stringp fallback))
@@ -64,6 +64,226 @@ are unsupported by the helper."
 
 (defun physical-libpq-profile-fallback (profile)
   (copy-seq (%physical-libpq-profile-fallback profile)))
+
+(defstruct (physical-libpq-connection-info
+            (:constructor %make-physical-libpq-connection-info)
+            (:print-function physical-libpq-print-private-object))
+  host hostaddr port database user parameters)
+
+(defun physical-libpq-decode-connection-info (body)
+  (let ((position 0))
+    (labels ((take-bytes (size)
+               (unless (<= 0 size (- (length body) position))
+                 (pg-client-native-reject "truncated libpq connection metadata"))
+               (prog1 (subseq body position (+ position size))
+                 (incf position size)))
+             (number () (bytes-to-u32 (take-bytes 4) 0))
+             (octets (&optional nullable)
+               (let ((size (number)))
+                 (unless (and nullable (= size #xffffffff))
+                   (let ((value (take-bytes size)))
+                     (when (find 0 value)
+                       (pg-client-native-reject "null character in libpq metadata"))
+                     value))))
+             (keyword-text ()
+               (let ((bytes (octets)))
+                 (unless (and (<= 1 (length bytes) 64)
+                              (every (lambda (byte)
+                                       (or (<= 97 byte 122) (<= 48 byte 57) (= byte 95)))
+                                     bytes))
+                   (pg-client-native-reject "invalid libpq option name"))
+                 (map 'string #'code-char bytes))))
+      (let* ((host (octets)) (hostaddr (octets)) (port (octets))
+                             (database (octets)) (user (octets)) (count (number)))
+        (unless (and (<= count 128) (<= 1 (length host) 4096)
+                     (<= 1 (length port) 5) (every (lambda (byte) (<= 48 byte 57)) port))
+          (pg-client-native-reject "invalid libpq selected endpoint"))
+        (let ((port-number (parse-integer (map 'string #'code-char port)))
+              (parameters (loop repeat count collect (list (keyword-text) (octets t)))))
+          (unless (and (<= 1 port-number 65535) (= position (length body))
+                       (= count (length (remove-duplicates parameters :key #'first :test #'equal))))
+            (pg-client-native-reject "invalid or duplicate libpq connection metadata"))
+          (%make-physical-libpq-connection-info
+           :host host :hostaddr hostaddr :port port-number
+           :database database :user user :parameters parameters))))))
+
+(defun physical-libpq-public-connection-info (info)
+  (with-output-to-string (out)
+    (loop with firstp = t
+          for (key value) in (physical-libpq-connection-info-parameters info)
+          when (and value
+                    (member key '("host" "hostaddr" "port" "dbname" "user" "application_name"
+                                  "fallback_application_name"
+                                  "sslmode" "sslnegotiation" "channel_binding" "gssencmode"
+                                  "connect_timeout" "target_session_attrs" "load_balance_hosts")
+                            :test #'equal))
+            do (unless firstp (write-char #\Space out))
+               (setf firstp nil)
+               (format out "~a='" key)
+               (loop for byte across value
+                     do (cond
+                          ((member byte '(39 92))
+                           (write-char #\\ out) (write-char (code-char byte) out))
+                          ((<= 32 byte 126) (write-char (code-char byte) out))
+                          (t (format out "\\x~(~2,'0x~)" byte))))
+               (write-char #\' out))))
+
+(defstruct (physical-libpq-frozen-profile
+            (:constructor %make-physical-libpq-frozen-profile (parameters))
+            (:conc-name %physical-libpq-frozen-profile-)
+            (:print-function physical-libpq-print-private-object))
+  (parameters nil :read-only t))
+
+(defun physical-libpq-push-octets (payload bytes)
+  (unless (and (typep bytes '(vector (unsigned-byte 8))) (not (find 0 bytes)))
+    (error "invalid frozen libpq option bytes"))
+  (payload-push-u32 payload (length bytes))
+  (loop for byte across bytes do (vector-push-extend byte payload))
+  payload)
+
+(defun physical-libpq-octets-datum (bytes)
+  (when bytes
+    (list :bytes
+          (let ((text (make-string (* 2 (length bytes))))
+                (digits "0123456789abcdef"))
+            (loop for byte across bytes for index from 0 by 2
+                  do (setf (char text index) (char digits (ash byte -4))
+                           (char text (1+ index)) (char digits (logand byte 15))))
+            text))))
+
+(defun physical-libpq-check-byte-datum (datum)
+  (when datum
+    (unless (and (consp datum) (eq (first datum) :bytes)
+                 (consp (cdr datum)) (null (cddr datum)) (stringp (second datum))
+                 (<= (length (second datum)) 32768)
+                 (evenp (length (second datum)))
+                 (every (lambda (char) (find char "0123456789abcdef")) (second datum)))
+      (error "invalid frozen libpq byte datum")))
+  datum)
+
+(defun physical-libpq-check-profile-datum (datum)
+  (let ((tail datum) (seen nil) (size 2))
+    (loop repeat 128
+          while (consp tail)
+          for entry = (pop tail)
+          do (unless (and (consp entry) (consp (cdr entry)) (null (cddr entry))
+                          (stringp (first entry)) (<= 1 (length (first entry)) 64)
+                          (every (lambda (char)
+                                   (find char "abcdefghijklmnopqrstuvwxyz0123456789_"))
+                                 (first entry))
+                          (not (equal (first entry) "service"))
+                          (not (member (first entry) seen :test #'equal)))
+               (error "invalid frozen libpq profile datum"))
+             (physical-libpq-check-byte-datum (second entry))
+             (push (first entry) seen)
+             (incf size (+ 24 (length (first entry))
+                           (if (second entry) (length (second (second entry))) 0)))
+             (when (> size 32768) (error "frozen libpq profile exceeds its durable bound")))
+    (unless (null tail) (error "frozen libpq profile has an invalid option list")))
+  datum)
+
+(defun physical-libpq-datum-octets (datum)
+  (physical-libpq-check-byte-datum datum)
+  (when datum
+    (let* ((text (second datum))
+           (bytes (make-array (/ (length text) 2) :element-type '(unsigned-byte 8))))
+      (loop for index from 0 below (length bytes)
+            do (setf (aref bytes index)
+                     (+ (ash (digit-char-p (char text (* 2 index)) 16) 4)
+                        (digit-char-p (char text (1+ (* 2 index))) 16))))
+      bytes)))
+
+(defun physical-libpq-frozen-profile-datum (profile)
+  (physical-libpq-check-profile-datum
+   (loop for (key value) in (%physical-libpq-frozen-profile-parameters profile)
+         collect (list (copy-seq key) (physical-libpq-octets-datum value)))))
+
+(defun physical-libpq-check-frozen-route (parameters)
+  (let ((host (second (assoc "host" parameters :test #'equal)))
+        (address (second (assoc "hostaddr" parameters :test #'equal)))
+        (port (second (assoc "port" parameters :test #'equal)))
+        (database (second (assoc "dbname" parameters :test #'equal)))
+        (user (second (assoc "user" parameters :test #'equal))))
+    (unless (and (typep host '(vector (unsigned-byte 8))) (<= 1 (length host) 4096)
+                 (not (find 44 host))
+                 (or (null address)
+                     (and (typep address '(vector (unsigned-byte 8)))
+                          (<= (length address) 255) (not (find 44 address))))
+                 (if (member (aref host 0) '(47 64))
+                     (not (and address (plusp (length address))))
+                     (and address (plusp (length address))))
+                 (typep port '(vector (unsigned-byte 8))) (<= 1 (length port) 5)
+                 (every (lambda (byte) (<= 48 byte 57)) port)
+                 (<= 1 (parse-integer (map 'string #'code-char port)) 65535)
+                 (typep database '(vector (unsigned-byte 8))) (plusp (length database))
+                 (typep user '(vector (unsigned-byte 8))) (plusp (length user)))
+      (error "invalid frozen libpq selected route"))))
+
+(defun physical-libpq-frozen-profile-body (profile)
+  (let* ((parameters (%physical-libpq-frozen-profile-parameters profile))
+         (body (make-payload)))
+    (physical-libpq-check-frozen-route parameters)
+    (unless (<= (length parameters) 128)
+      (error "frozen libpq profile has too many options"))
+    (payload-push-u32 body (length parameters))
+    (dolist (parameter parameters)
+      (physical-libpq-push-text body (first parameter))
+      (if (second parameter)
+          (physical-libpq-push-octets body (second parameter))
+          (payload-push-u32 body #xffffffff)))
+    (unless (<= (length body) 32768)
+      (error "frozen libpq profile exceeds its durable bound"))
+    body))
+
+(defun physical-libpq-copy-profile-datum (datum)
+  (let ((tail datum) (result nil))
+    (loop repeat 128
+          while (consp tail)
+          for entry = (pop tail)
+          do (unless (and (consp entry) (consp (cdr entry)) (null (cddr entry))
+                          (stringp (first entry)) (<= (length (first entry)) 64))
+               (error "invalid frozen libpq profile datum"))
+             (let ((value (second entry)))
+               (when value
+                 (unless (and (consp value) (eq (first value) :bytes)
+                              (consp (cdr value)) (null (cddr value))
+                              (stringp (second value)) (<= (length (second value)) 32768))
+                   (error "invalid frozen libpq byte datum")))
+               (push (list (copy-seq (first entry))
+                           (when value (list :bytes (copy-seq (second value))))) result)))
+    (unless (null tail) (error "frozen libpq profile has an invalid option list"))
+    (nreverse result)))
+
+(defun physical-libpq-frozen-profile-from-datum (datum)
+  (let ((saved (physical-libpq-copy-profile-datum datum)))
+    (physical-libpq-check-profile-datum saved)
+    (let ((profile
+            (%make-physical-libpq-frozen-profile
+             (loop for (key value) in saved
+                   collect (list key (physical-libpq-datum-octets value))))))
+      (physical-libpq-frozen-profile-body profile)
+      profile)))
+
+(defun make-physical-libpq-frozen-profile (info)
+  (let ((parameters
+          (loop for (key value) in (physical-libpq-connection-info-parameters info)
+                unless (equal key "service")
+                  collect (list (copy-seq key) (when value (copy-seq value))))))
+    (flet ((replace-option (key value)
+             (let ((entry (assoc key parameters :test #'equal)))
+               (if entry (setf (second entry) (copy-seq value))
+                   (push (list key (copy-seq value)) parameters)))))
+      (replace-option "host" (physical-libpq-connection-info-host info))
+      (replace-option "hostaddr" (physical-libpq-connection-info-hostaddr info))
+      (replace-option "port" (string->bytes (format nil "~d" (physical-libpq-connection-info-port info))))
+      (replace-option "dbname" (physical-libpq-connection-info-database info))
+      (replace-option "user" (physical-libpq-connection-info-user info))
+      (replace-option "target_session_attrs" (string->bytes "any"))
+      (replace-option "load_balance_hosts" (string->bytes "disable")))
+    (let ((profile (%make-physical-libpq-frozen-profile parameters)))
+      (physical-libpq-frozen-profile-body profile)
+      (physical-libpq-frozen-profile-datum profile)
+      profile)))
 
 (defstruct physical-libpq-result
   "A bounded helper result, including metadata to check against the expected schema."
@@ -132,6 +352,7 @@ reply to its exchange. A stopped channel cannot be reused; failed exchanges clos
   process
   pidfd
   owner
+  info
   (session 0 :type (unsigned-byte 64))
   (request 0 :type (unsigned-byte 64))
   (stopped nil)
@@ -248,7 +469,8 @@ cannot be established, so another child cannot silently exceed the limit."
 (defun physical-libpq-check-success (kind body)
   (unless (case kind
             (#\H (= 16 (length body)))
-            ((#\O #\A #\F #\I) (zerop (length body)))
+            (#\O (<= 24 (length body) 1048576))
+            ((#\A #\F #\I) (zerop (length body)))
             (#\B (equalp body #(0 0 0 0 0)))
             (#\D (<= 1 (length body) +physical-libpq-copy-maximum+))
             ((#\T #\C) t)
@@ -305,6 +527,44 @@ On failure or timeout, close the channel instead of reusing a partial exchange."
           (setf failure "libpq helper exited before process handle acquisition")))
     (when failure (error failure))))
 
+(defun physical-libpq-helper-path ()
+  (let ((path (uiop:getenv "PG_LIBPQ_HELPER")))
+    (unless (and path (plusp (length path)))
+      (error "physical libpq helper is not installed"))
+    (namestring (truename path))))
+
+(defun physical-libpq-display-octets (bytes)
+  (with-output-to-string (out)
+    (loop for byte across bytes
+          do (cond
+               ((= byte 92) (write-string (format nil "~c~c" (code-char 92) (code-char 92)) out))
+               ((<= 32 byte 126) (write-char (code-char byte) out))
+               (t (format out "~c~c~(~2,'0x~)" (code-char 92) #\x byte))))))
+
+(defun physical-libpq-frozen-display-endpoint (profile)
+  (let* ((parameters (%physical-libpq-frozen-profile-parameters profile))
+         (host (physical-libpq-display-octets (second (assoc "host" parameters :test #'equal))))
+         (port (map 'string #'code-char (second (assoc "port" parameters :test #'equal)))))
+    (values (subseq host 0 (min 255 (length host))) (parse-integer port))))
+
+(defun physical-libpq-route-key (host address port database user)
+  (list (physical-libpq-octets-datum host)
+        (physical-libpq-octets-datum (or address (make-array 0 :element-type '(unsigned-byte 8))))
+        port (physical-libpq-octets-datum database) (physical-libpq-octets-datum user)))
+
+(defun physical-libpq-connection-route (info)
+  (physical-libpq-route-key
+   (physical-libpq-connection-info-host info) (physical-libpq-connection-info-hostaddr info)
+   (physical-libpq-connection-info-port info) (physical-libpq-connection-info-database info)
+   (physical-libpq-connection-info-user info)))
+
+(defun physical-libpq-frozen-route (profile)
+  (let ((parameters (%physical-libpq-frozen-profile-parameters profile)))
+    (flet ((value (key) (second (assoc key parameters :test #'equal))))
+      (physical-libpq-route-key (value "host") (value "hostaddr")
+                                (parse-integer (map 'string #'code-char (value "port")))
+                                (value "dbname") (value "user")))))
+
 (defun physical-libpq-open-channel (helper &key on-spawn)
   "Reserve one of two slots, spawn HELPER, and verify its identity and hello.
 Ownership assumes RUN-PROGRAM returns normally. This project installs no process
@@ -323,8 +583,8 @@ supported. A failed open attempts to close the reserved channel."
         (unwind-protect
              (progn
                (setf (physical-libpq-channel-process channel)
-                     (sb-ext:run-program path (list parent nonce) :use-posix-spawn t
-                                                                  :wait nil :input :stream :output :stream :error :stream))
+                     (sb-ext:run-program path (list parent nonce)
+                                         :wait nil :input :stream :output :stream :error :stream))
                (physical-libpq-acquire-process-handle channel)
                (sb-sys:with-local-interrupts
                  (sb-ext:with-timeout 5
@@ -362,8 +622,23 @@ supported. A failed open attempts to close the reserved channel."
       (let ((body (make-payload)))
         (physical-libpq-push-text body (%physical-libpq-profile-conninfo profile))
         (physical-libpq-push-text body (%physical-libpq-profile-fallback profile))
-        (physical-libpq-exchange channel #\O body '(#\O) 0)
+        (multiple-value-bind (kind bytes)
+            (physical-libpq-exchange channel #\O body '(#\O) 1048576)
+          (declare (ignore kind))
+          (setf (physical-libpq-channel-info channel)
+                (physical-libpq-decode-connection-info bytes)))
         channel))))
+
+(defun physical-libpq-connect-frozen (helper profile &key on-spawn)
+  (let ((channel (physical-libpq-open-channel helper :on-spawn on-spawn)))
+    (with-physical-libpq-operation (channel)
+      (multiple-value-bind (kind bytes)
+          (physical-libpq-exchange channel #\P (physical-libpq-frozen-profile-body profile)
+                                   '(#\O) 1048576)
+        (declare (ignore kind))
+        (setf (physical-libpq-channel-info channel)
+              (physical-libpq-decode-connection-info bytes)))
+      channel)))
 
 (defun physical-libpq-query (channel query schema tag &key (maximum 4096) command-only)
   "Run a command and require its bounded result to match SCHEMA and TAG."
@@ -375,6 +650,10 @@ supported. A failed open attempts to close the reserved channel."
           (physical-libpq-exchange channel #\Q body '(#\T #\C) maximum)
         (physical-libpq-check-result (physical-libpq-decode-result kind bytes)
                                      schema tag :command-only command-only)))))
+
+(defmethod physical-client-query ((client physical-libpq-channel) query schema tag
+                                  &key (maximum 4096) command-only)
+  (physical-libpq-query client query schema tag :maximum maximum :command-only command-only))
 
 (defun physical-libpq-switch-result (kind bytes)
   (let* ((row (physical-libpq-check-result
@@ -427,3 +706,25 @@ The caller must first flush local receipt and send truthful durability feedback.
           (unless (equal result (list :switch next fork))
             (pg-client-native-reject "native switch differs from preparation"))
           result)))))
+
+(defmethod physical-client-start ((client physical-libpq-channel) query)
+  (physical-libpq-start client query))
+
+(defmethod physical-client-finish ((client physical-libpq-channel) next fork)
+  (physical-libpq-finish client next fork))
+
+(defmethod physical-client-receive ((client physical-libpq-channel))
+  (multiple-value-bind (kind body) (physical-libpq-receive client)
+    (ecase kind
+      (#\D (values :data body))
+      (#\F (values :done nil))
+      (#\I (values :idle nil)))))
+
+(defmethod physical-client-feedback ((client physical-libpq-channel) payload)
+  (physical-libpq-feedback client payload))
+
+(defmethod physical-client-stop ((client physical-libpq-channel))
+  (physical-libpq-stop client))
+
+(defmethod physical-client-close ((client physical-libpq-channel))
+  (physical-libpq-close client))

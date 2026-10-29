@@ -47,6 +47,90 @@ def query(helper, statement):
     return rows(body)[1]
 
 
+def connection_metadata(body):
+    position = 0
+
+    def text():
+        nonlocal position
+        assert position + 4 <= len(body)
+        size = struct.unpack_from('!I', body, position)[0]
+        position += 4
+        if size == 0xffffffff:
+            return None
+        assert position + size <= len(body)
+        value = body[position:position + size]
+        position += size
+        return value
+
+    selected = [text() for _ in range(5)]
+    count = struct.unpack_from('!I', body, position)[0]
+    position += 4
+    assert count <= 128
+    options = {text().decode('ascii'): text() for _ in range(count)}
+    assert position == len(body) and len(options) == count
+    return selected, options
+
+
+def unix_default_and_frozen(root, port, env, observer, password):
+    default_socket = Path('/tmp') / f'.s.PGSQL.{port}'
+    default_socket.symlink_to(root / f'.s.PGSQL.{port}')
+    identity = default_socket.lstat()
+    saved_passfile = root / 'passfile.saved'
+
+    def remove_alias():
+        try:
+            current = default_socket.lstat()
+        except FileNotFoundError:
+            return
+        assert (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino)
+        default_socket.unlink()
+
+    try:
+        helper = ipc.Helper(env=env)
+        try:
+            kind, body = helper.call(b'O', ipc.string(f'port={port} user=transport_receiver '
+                                                     f'dbname=postgres passfile={password}')
+                                     + ipc.string('unix-default'))
+            assert kind == b'O'
+            selected, options = connection_metadata(body)
+            assert selected == [os.fsencode(root), b'', str(port).encode(),
+                                b'postgres', b'transport_receiver'], selected
+            assert options['password'] == b'public-fixture-password'
+            assert helper.call(b'X') == (b'A', b'')
+            helper.process.wait(timeout=2)
+        finally:
+            helper.close()
+        remove_alias()
+        password.rename(saved_passfile)
+        options.pop('service', None)
+        options.update(zip(('host', 'hostaddr', 'port', 'dbname', 'user'), selected))
+        helper = ipc.Helper(env=dict(env, PGHOST='wrong.invalid', PGSERVICE='missing-service'))
+        try:
+            body = struct.pack('!I', len(options)) + b''.join(
+                ipc.string(key) + (struct.pack('!I', 0xffffffff) if value is None else ipc.string(value))
+                for key, value in options.items())
+            kind, response = helper.call(b'P', body)
+            assert kind == b'O'
+            assert connection_metadata(response)[0] == selected
+            assert helper.call(b'X') == (b'A', b'')
+            helper.process.wait(timeout=2)
+        finally:
+            helper.close()
+        observer.query("ALTER ROLE transport_receiver PASSWORD 'revoked-fixture-password'")
+        helper = ipc.Helper(env=env)
+        try:
+            kind, error = helper.call(b'P', body)
+            assert kind == b'!' and error[:5] == b'08001'
+        finally:
+            helper.close()
+    finally:
+        observer.query("ALTER ROLE transport_receiver PASSWORD 'public-fixture-password'")
+        if saved_passfile.exists():
+            saved_passfile.rename(password)
+        remove_alias()
+    print('libpq-helper: Unix SCRAM frozen replay without alias/passfile, revoked password rejection PASS', flush=True)
+
+
 def exercise(observer, conninfo, expected_name, env, *, success=True):
     helper = ipc.Helper(env=env)
     try:
@@ -84,6 +168,8 @@ def run(base, root, executable, port, processes):
     (directory / 'postgresql.conf').write_text(
         f"ssl=on\nssl_cert_file='{root / 'server.crt'}'\nssl_key_file='{root / 'server.key'}'\n")
     (directory / 'pg_hba.conf').write_text(
+        'local all postgres trust\n'
+        'local all transport_receiver scram-sha-256\n'
         'host all postgres 127.0.0.1/32 trust\n'
         'host all transport_receiver 127.0.0.1/32 scram-sha-256\n')
     process = peer.start(base, root, executable, port, 'server', False, processes)
@@ -95,6 +181,7 @@ def run(base, root, executable, port, processes):
                             f'other.invalid:{port}:postgres:transport_receiver:public-fixture-password\n')
         password.chmod(0o600)
         env = {key: value for key, value in os.environ.items() if not key.startswith('PG')}
+        unix_default_and_frozen(root, port, env, observer, password)
         common = (f'host=localhost hostaddr=127.0.0.1 port={port} dbname=postgres '
                   f'user=transport_receiver passfile={password} sslmode=verify-full '
                   f"sslrootcert={root / 'server.crt'} options='-c statement_timeout=1234'")

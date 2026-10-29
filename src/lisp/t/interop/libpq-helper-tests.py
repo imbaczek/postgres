@@ -100,7 +100,7 @@ def wire_read(connection, size):
 
 
 @contextlib.contextmanager
-def source(script, startup_notice=None, timeout=5):
+def source(script, startup_notice=None, timeout=5, connections=1):
     listener = socket.socket()
     listener.bind(('127.0.0.1', 0))
     listener.listen()
@@ -109,21 +109,22 @@ def source(script, startup_notice=None, timeout=5):
 
     def serve():
         try:
-            with listener.accept()[0] as connection:
-                connection.settimeout(timeout)
-                size = struct.unpack('!I', wire_read(connection, 4))[0]
-                body = wire_read(connection, size - 4)
-                assert body[:4] == struct.pack('!I', 196608)
-                values = body[4:].rstrip(b'\0').split(b'\0')
-                parameters.update(zip(values[::2], values[1::2]))
-                wire_frame(connection, b'R', struct.pack('!I', 0))
-                for name, value in ((b'server_version', b'20devel'), (b'client_encoding', b'UTF8')):
-                    wire_frame(connection, b'S', name + b'\0' + value + b'\0')
-                wire_frame(connection, b'K', struct.pack('!II', 4242, 99))
-                if startup_notice:
-                    wire_frame(connection, b'N', b'SNOTICE\0VNOTICE\0C00000\0M' + startup_notice + b'\0\0')
-                wire_frame(connection, b'Z', b'I')
-                script(connection)
+            for _ in range(connections):
+                with listener.accept()[0] as connection:
+                    connection.settimeout(timeout)
+                    size = struct.unpack('!I', wire_read(connection, 4))[0]
+                    body = wire_read(connection, size - 4)
+                    assert body[:4] == struct.pack('!I', 196608)
+                    values = body[4:].rstrip(b'\0').split(b'\0')
+                    parameters.update(zip(values[::2], values[1::2]))
+                    wire_frame(connection, b'R', struct.pack('!I', 0))
+                    for name, value in ((b'server_version', b'20devel'), (b'client_encoding', b'UTF8')):
+                        wire_frame(connection, b'S', name + b'\0' + value + b'\0')
+                    wire_frame(connection, b'K', struct.pack('!II', 4242, 99))
+                    if startup_notice:
+                        wire_frame(connection, b'N', b'SNOTICE\0VNOTICE\0C00000\0M' + startup_notice + b'\0\0')
+                    wire_frame(connection, b'Z', b'I')
+                    script(connection)
         except BaseException as error:
             failures.append(error)
 
@@ -309,6 +310,50 @@ class HelperProtocol(unittest.TestCase):
                             self.assertEqual(kind, b'!')
                             self.assertEqual(body[:5], b'08P01')
                         helper.close()
+                finally:
+                    helper.close()
+
+    def test_frozen_open_ignores_service_environment_and_keeps_database_literal(self):
+        def answer(connection):
+            self.assertEqual(wire_read(connection, 1), b'Q')
+            size = struct.unpack('!I', wire_read(connection, 4))[0]
+            self.assertEqual(wire_read(connection, size - 4), b'IDENTIFY_SYSTEM\0')
+            field = b'systemid\0' + struct.pack('!IhIhih', 0, 0, 25, -1, -1, 0)
+            wire_frame(connection, b'T', struct.pack('!H', 1) + field)
+            wire_frame(connection, b'D', struct.pack('!H', 1) + string('42'))
+            wire_frame(connection, b'C', b'IDENTIFY_SYSTEM\0')
+            wire_frame(connection, b'Z', b'I')
+            self.assertEqual(wire_read(connection, 1), b'X')
+            self.assertEqual(wire_read(connection, 4), struct.pack('!I', 4))
+
+        helper = Helper(env=dict(os.environ, PGSERVICE='missing-service-must-not-resolve',
+                                 PGHOST='wrong.invalid', PGAPPNAME='wrong-name'))
+        self.addCleanup(helper.close)
+        with source(answer) as (port, parameters):
+            options = [('host', 'tls-host.invalid'), ('hostaddr', '127.0.0.1'),
+                       ('port', str(port)), ('dbname', 'db=literal'), ('user', 'postgres'),
+                       ('sslmode', 'disable'), ('gssencmode', 'disable'),
+                       ('application_name', 'frozen-name'), ('target_session_attrs', 'read-write')]
+            body = struct.pack('!I', len(options)) + b''.join(string(key) + string(value)
+                                                            for key, value in options)
+            self.assertEqual(helper.call(b'P', body)[0], b'O')
+            self.assertEqual(parameters[b'database'], b'db=literal')
+            self.assertEqual(parameters[b'application_name'], b'frozen-name')
+            self.assertEqual(parameters[b'replication'], b'database')
+            self.assertEqual(helper.call(b'Q', struct.pack('!I', 4096) + string('IDENTIFY_SYSTEM'))[0], b'T')
+            self.assertEqual(helper.call(b'X'), (b'A', b''))
+            helper.process.wait(timeout=2)
+
+    def test_frozen_open_rejects_service_and_missing_selected_address(self):
+        for options in ([('service', 'must-not-resolve')], [('host', 'localhost'), ('port', '5432')]):
+            with self.subTest(options=options):
+                helper = Helper()
+                try:
+                    body = struct.pack('!I', len(options)) + b''.join(string(key) + string(value)
+                                                                    for key, value in options)
+                    kind, error = helper.call(b'P', body)
+                    self.assertEqual(kind, b'!')
+                    self.assertEqual(error[:5], b'08P01')
                 finally:
                     helper.close()
 

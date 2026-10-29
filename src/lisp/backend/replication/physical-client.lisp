@@ -11,6 +11,12 @@
   "Signal a protocol violation; the caller must close the client."
   (error 'pg-client-error :sqlstate "08P01" :message message))
 
+(defun physical-client-retryable-condition-p (condition)
+  (or (typep condition '(or stream-error sb-bsd-sockets:socket-error sb-ext:timeout))
+      (and (typep condition 'pg-client-error)
+           (member (pg-client-error-sqlstate condition)
+                   '("08001" "08006" "57P01" "57P03" "53300" "55006") :test #'equal))))
+
 (defun pg-client-native-frame (client maximum)
   "Read one complete frame within this command's bound.
 Malformed or interrupted framing leaves cleanup and client closure to the caller."
@@ -170,15 +176,69 @@ or transport failure. Do not perform network I/O under recovery quiescence."
   (handler-case (parse-replication-lsn text)
     (error () (pg-client-native-reject "native result has an invalid WAL position"))))
 
+(defgeneric physical-client-query (client query schema tag &key maximum command-only))
+
+(defmethod physical-client-query ((client pg-client) query schema tag
+                                  &key (maximum 4096) command-only)
+  (pg-client-send-query client query)
+  (pg-client-native-read-result client schema tag :maximum maximum :command-only command-only))
+
+(defgeneric physical-client-start (client query))
+
+(defmethod physical-client-start ((client pg-client) query)
+  (pg-client-native-start client query))
+
+(defgeneric physical-client-finish (client next fork))
+
+(defmethod physical-client-finish ((client pg-client) next fork)
+  (pg-client-native-finish client next fork))
+
+(defgeneric physical-client-receive (client))
+
+(defmethod physical-client-receive ((client pg-client))
+  (multiple-value-bind (kind payload)
+      (sb-ext:with-timeout 10 (pg-client-native-frame client (+ 4 25 65536)))
+    (case kind
+      (#\d (values :data payload))
+      (#\c
+       (unless (zerop (length payload))
+         (pg-client-native-reject "native CopyDone has trailing bytes"))
+       (values :done nil))
+      (#\E (pg-client-native-source-error payload))
+      (otherwise (pg-client-native-reject "unexpected native replication response")))))
+
+(defgeneric physical-client-feedback (client payload))
+
+(defmethod physical-client-feedback ((client pg-client) payload)
+  (write-message (pg-client-stream client) #\d payload))
+
+(defgeneric physical-client-stop (client))
+
+(defmethod physical-client-stop ((client pg-client))
+  (sb-bsd-sockets:socket-shutdown (pg-client-socket client) :direction :io))
+
+(defgeneric physical-client-close (client))
+
+(defmethod physical-client-close ((client pg-client))
+  (pg-client-close client))
+
+(defmethod physical-client-close ((client null))
+  (values))
+
+(defun physical-client-identity-row (client)
+  (physical-client-query client "IDENTIFY_SYSTEM"
+                         '(("systemid" 25) ("timeline" 20) ("xlogpos" 25) ("dbname" 25))
+                         "IDENTIFY_SYSTEM"))
+
 (defun pg-client-native-history (client timeline)
   "Fetch and validate the requested child history and return its UTF-8 bytes.
 Preserve valid UTF-8 bytes and check filename, bound and lineage; the caller
 must compare the history with the source anchor."
   (unless (typep timeline '(integer 2 4294967295))
     (error "native history request requires a child timeline"))
-  (pg-client-send-query client (format nil "TIMELINE_HISTORY ~d" timeline))
-  (let* ((row (pg-client-native-read-result
-               client (list (list "filename" +textoid+) (list "content" +textoid+))
+  (let* ((row (physical-client-query
+               client (format nil "TIMELINE_HISTORY ~d" timeline)
+               (list (list "filename" +textoid+) (list "content" +textoid+))
                "TIMELINE_HISTORY" :maximum +physical-client-proof-frame-maximum+))
          (bytes (string->bytes (aref row 1))))
     (unless (and (equal (aref row 0) (format nil "~8,'0X.history" timeline))
@@ -223,14 +283,14 @@ compare the actual immediate-child history with the source ancestry. This helper
 does not install history, redo WAL, update recovery state or admit a receiver.
 The caller owns network deadlines, cancellation and client cleanup; it must not
 perform network I/O under recovery quiescence."
-  (pg-client-send-query client (pg-client-native-prepare-query slot coordinates))
   (let* ((schema (append (list (list "slot_name" +textoid+))
                          (loop for (name key kind) in *physical-follow-wire-fields*
                                collect (list name (if (eq kind :timeline) +int8oid+ +textoid+)))
                          (list (list "history" +textoid+) (list "next_tli" +int8oid+)
                                (list "next_tli_startpos" +textoid+) (list "eor_hex" +textoid+))))
-         (row (pg-client-native-read-result client schema "PREPARE_FOLLOW"
-                                            :maximum +physical-client-proof-frame-maximum+))
+         (row (physical-client-query client (pg-client-native-prepare-query slot coordinates)
+                                     schema "PREPARE_FOLLOW"
+                                     :maximum +physical-client-proof-frame-maximum+))
          (anchor (append (copy-tree coordinates)
                          (list :history-text (aref row 11) :eor-octets (pg-client-native-eor (aref row 14))))))
     (unless (<= 1 (length (string->bytes (aref row 11))) +physical-store-history-maximum-bytes+)
@@ -258,17 +318,17 @@ explicit operator action; automated handoff and retirement are not integrated."
   (unless (and (wal-valid-replication-slot-name-p slot)
                (typep expected-digest '(unsigned-byte 64)))
     (error "invalid native follow retirement identity"))
-  (pg-client-send-query
+  (physical-client-query
    client (format nil "RELEASE_FOLLOW SLOT ~a (native_format '~a', anchor_digest '~d')"
-                  slot +physical-native-format+ expected-digest))
-  (pg-client-native-read-result client nil "RELEASE_FOLLOW" :command-only t)
+                  slot +physical-native-format+ expected-digest)
+   nil "RELEASE_FOLLOW" :command-only t)
   t)
 
 (defun pg-client-native-abort (client slot coordinates)
   "Cancel an attempt by its saved request, even if PREPARE returned no anchor.
 The caller must retain cleanup intent if completion is uncertain."
-  (pg-client-send-query client (pg-client-native-request-query "RELEASE_FOLLOW" slot coordinates))
-  (pg-client-native-read-result client nil "RELEASE_FOLLOW" :command-only t)
+  (physical-client-query client (pg-client-native-request-query "RELEASE_FOLLOW" slot coordinates)
+                         nil "RELEASE_FOLLOW" :command-only t)
   t)
 
 (declaim (ftype function physical-follow-bootstrap-request-copy))
@@ -283,6 +343,6 @@ The caller must retain cleanup intent if completion is uncertain."
 
 (defun pg-client-native-release-bootstrap (client slot coordinates)
   "Request checked bootstrap retirement and wait for command completion."
-  (pg-client-send-query client (pg-client-native-release-bootstrap-query slot coordinates))
-  (pg-client-native-read-result client nil "RELEASE_BOOTSTRAP" :command-only t)
+  (physical-client-query client (pg-client-native-release-bootstrap-query slot coordinates)
+                         nil "RELEASE_BOOTSTRAP" :command-only t)
   t)
