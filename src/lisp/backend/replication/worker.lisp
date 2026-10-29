@@ -18,7 +18,7 @@
 (defstruct logical-subscription-runtime
   options target (relations (make-hash-table :test #'eql))
   (validated-relations (make-hash-table :test #'equal))
-  source-client current-lsn transaction-open-p source-xid)
+  source-client current-lsn transaction-open-p source-xid final-lsn)
 
 (defun logical-simple-identifier-p (value)
   (and (stringp value) (plusp (length value))
@@ -1119,23 +1119,71 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                 (member name (logical-subscription-options-tables options) :test #'string=))
               tables))))
 
+(defun logical-pgoutput-read-control (runtime payload)
+  "Decode a complete control message without applying it."
+  (when (zerop (length payload)) (error "empty pgoutput message"))
+  (case (code-char (aref payload 0))
+    (#\B
+     (when (logical-subscription-runtime-transaction-open-p runtime)
+       (error "nested pgoutput transaction"))
+     (unless (= (length payload) 21) (error "invalid pgoutput Begin message"))
+     (let ((final-lsn (pg-client-u64 payload 1)))
+       (when (zerop final-lsn) (error "invalid pgoutput Begin final LSN"))
+       (list #\B (bytes-to-u32 payload 17) final-lsn (pg-client-i64 payload 9))))
+    (#\C
+     (unless (and (= (length payload) 26) (zerop (aref payload 1)))
+       (error "invalid pgoutput Commit message"))
+     (list #\C (pg-client-u64 payload 10) (pg-client-u64 payload 2)
+           (pg-client-i64 payload 18)))
+    (#\R
+     (list #\R (logical-pgoutput-read-relation
+                payload (eq (logical-subscription-options-mode
+                             (logical-subscription-runtime-options runtime)) :standard))))
+    (#\T
+     (unless (logical-subscription-runtime-transaction-open-p runtime)
+       (error "pgoutput TRUNCATE appeared outside a transaction"))
+     (list #\T (logical-pgoutput-read-truncate payload)))
+    (#\M
+     (when (eq (logical-subscription-options-mode
+                (logical-subscription-runtime-options runtime)) :standard)
+       (error "standard subscriber does not accept extension Message events"))
+     (multiple-value-bind (prefix lsn content transactional-p)
+         (logical-pgoutput-read-message runtime payload)
+       (list #\M prefix lsn content transactional-p)))
+    (otherwise (error "unsupported pgoutput control message"))))
+
+(defun logical-pgoutput-read-keepalive (payload)
+  (unless (= (length payload) 18) (error "invalid logical keepalive frame"))
+  (pg-client-u64 payload 1))
+
+(defun logical-apply-truncate-relations (runtime oids)
+  (unless (logical-subscription-runtime-transaction-open-p runtime)
+    (error "pgoutput TRUNCATE appeared outside a transaction"))
+  (let ((relations (loop for oid in oids
+                         collect (or (gethash oid (logical-subscription-runtime-relations runtime))
+                                     (error "pgoutput TRUNCATE has no Relation metadata")))))
+    (logical-truncate-target-tables
+     runtime (loop for relation in relations
+                   when (logical-relation-selected-p runtime relation)
+                     collect (pgoutput-relation-name relation)))))
+
 (defun logical-pgoutput-dispatch (runtime payload)
   (when (zerop (length payload)) (error "empty pgoutput message"))
-  (let ((kind (code-char (aref payload 0))))
+  (let* ((kind (code-char (aref payload 0)))
+         (operation (when (member kind '(#\B #\C #\R #\T #\M))
+                      (logical-pgoutput-read-control runtime payload))))
     (case kind
       (#\B
        (when (logical-subscription-runtime-transaction-open-p runtime)
          (error "nested pgoutput transaction"))
-       (unless (= (length payload) 21)
-         (error "invalid pgoutput Begin message"))
        (logical-target-query (logical-subscription-runtime-target runtime) "BEGIN")
        (setf (logical-subscription-runtime-transaction-open-p runtime) t
              (logical-subscription-runtime-source-xid runtime)
-             (bytes-to-u32 payload 17)))
+             (second operation)
+             (logical-subscription-runtime-final-lsn runtime)
+             (third operation)))
       (#\R
-       (let ((relation (logical-pgoutput-read-relation
-                        payload (eq (logical-subscription-options-mode
-                                     (logical-subscription-runtime-options runtime)) :standard))))
+       (let ((relation (second operation)))
          (setf (gethash (pgoutput-relation-oid relation)
                         (logical-subscription-runtime-relations runtime)) relation)
          (logical-validate-stream-relation runtime relation)))
@@ -1155,13 +1203,13 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
            (#\D (logical-apply-delete runtime relation payload 5)))
          (logical-test-failpoint
           :after-row-change kind (pgoutput-relation-name relation))))
-      (#\T (logical-apply-truncate runtime payload))
+      (#\T (logical-apply-truncate-relations runtime (second operation)))
       (#\M
        (when (eq (logical-subscription-options-mode
                   (logical-subscription-runtime-options runtime)) :standard)
          (error "standard subscriber does not accept extension Message events"))
-       (multiple-value-bind (prefix lsn content transactional-p)
-           (logical-pgoutput-read-message runtime payload)
+       (destructuring-bind (message-kind prefix lsn content transactional-p) operation
+         (declare (ignore message-kind))
          (cond
            ((string= prefix "pg_lisp/truncate")
             (unless (logical-subscription-runtime-transaction-open-p runtime)
@@ -1187,9 +1235,12 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                     (= (length payload) 26)
                     (zerop (aref payload 1)))
          (error "invalid pgoutput Commit message"))
+       (unless (eql (logical-subscription-runtime-final-lsn runtime) (third operation))
+         (error "pgoutput Commit LSN does not match Begin final LSN"))
        ;; logicalrep_write_commit() carries flags, commit LSN, end LSN, and time.
        (logical-progress-transaction-commit
-        runtime (pg-client-u64 payload 10)))
+        runtime (second operation))
+       (setf (logical-subscription-runtime-final-lsn runtime) nil))
       (otherwise (error "unsupported pgoutput message ~s" kind)))))
 
 (defun logical-stream-frame (runtime payload)
@@ -1203,7 +1254,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                           :displaced-to payload :displaced-index-offset 25)))
     (#\k
      (unless (= (length payload) 18) (error "invalid logical keepalive frame"))
-     (logical-progress-keepalive runtime (pg-client-u64 payload 1)))
+     (logical-progress-keepalive runtime (logical-pgoutput-read-keepalive payload)))
     (otherwise (error "unexpected replication CopyData message ~s"
                       (code-char (aref payload 0))))))
 

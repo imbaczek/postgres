@@ -34,6 +34,101 @@
               (symbol-function 'logical-apply-update-tuples) update
               (symbol-function 'logical-apply-delete-tuple) delete))))
 
+(rove:deftest test-control-decoders-reject-malformed-before-effects
+    (let* ((runtime (make-logical-subscription-runtime
+                     :options (make-logical-subscription-options)
+                     :relations (make-hash-table)))
+           (calls 0)
+           (original (symbol-function 'logical-target-query))
+           (keepalive (symbol-function 'logical-progress-keepalive)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-target-query)
+                   (lambda (&rest args) (declare (ignore args)) (incf calls))
+                   (symbol-function 'logical-progress-keepalive)
+                   (lambda (&rest args) (declare (ignore args)) (incf calls)))
+             (dolist (payload (list #(66) #(67) #(82) #(84 0 0 0 0 0 1) #(77)
+                                    (concatenate 'vector #(66) (make-array 21 :initial-element 0))
+                                    (concatenate 'vector #(67) (make-array 26 :initial-element 0))))
+               (rove:ok (handler-case (progn (logical-pgoutput-dispatch runtime payload) nil)
+                          (error () t))))
+             (rove:ok (handler-case (progn (logical-stream-frame runtime #(107)) nil)
+                        (error () t)))
+             (rove:ok (zerop calls))
+             (rove:ok (zerop (hash-table-count (logical-subscription-runtime-relations runtime))))
+             (rove:ok (not (logical-subscription-runtime-transaction-open-p runtime))))
+        (setf (symbol-function 'logical-target-query) original
+              (symbol-function 'logical-progress-keepalive) keepalive))))
+
+(rove:deftest test-control-begin-commit-lsn-agreement
+    (dolist (mode '(:standard :private))
+      (let* ((runtime (make-logical-subscription-runtime
+                       :options (make-logical-subscription-options :mode mode)))
+             (begin (make-array 21 :element-type '(unsigned-byte 8) :initial-element 0))
+             (commit (make-array 26 :element-type '(unsigned-byte 8) :initial-element 0))
+             (target (symbol-function 'logical-target-query))
+             (finish (symbol-function 'logical-progress-transaction-commit))
+             (queries 0) (commits 0))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'logical-target-query)
+                     (lambda (&rest args) (declare (ignore args)) (incf queries))
+                     (symbol-function 'logical-progress-transaction-commit)
+                     (lambda (&rest args) (declare (ignore args)) (incf commits))
+                     (aref begin 0) (char-code #\B)
+                     (aref commit 0) (char-code #\C))
+               (rove:ok (handler-case (progn (logical-pgoutput-dispatch runtime begin) nil)
+                          (error () t)))
+               (rove:ok (zerop queries))
+               (setf (aref begin 8) 100)
+               (logical-pgoutput-dispatch runtime begin)
+               (rove:ok (= queries 1))
+               (setf (aref commit 9) 101 (aref commit 17) 102)
+               (rove:ok (handler-case (progn (logical-pgoutput-dispatch runtime commit) nil)
+                          (error () t)))
+               (rove:ok (zerop commits))
+               (setf (aref commit 9) 100)
+               (logical-pgoutput-dispatch runtime commit)
+               (rove:ok (= commits 1)))
+          (setf (symbol-function 'logical-target-query) target
+                (symbol-function 'logical-progress-transaction-commit) finish)))))
+
+(rove:deftest test-control-decodes-signed-timestamps
+    (let* ((runtime (make-logical-subscription-runtime
+                     :options (make-logical-subscription-options)))
+           (begin (make-array 21 :element-type '(unsigned-byte 8) :initial-element 0))
+           (commit (make-array 26 :element-type '(unsigned-byte 8) :initial-element 0)))
+      (setf (aref begin 0) (char-code #\B) (aref begin 8) 1
+            (aref commit 0) (char-code #\C))
+      (fill begin 255 :start 9 :end 17)
+      (fill commit 255 :start 18 :end 26)
+      (rove:ok (= -1 (fourth (logical-pgoutput-read-control runtime begin))))
+      (rove:ok (= -1 (fourth (logical-pgoutput-read-control runtime commit))))))
+
+(rove:deftest test-malformed-open-transaction-controls-have-no-effects
+    (let* ((runtime (make-logical-subscription-runtime
+                     :options (make-logical-subscription-options)
+                     :transaction-open-p t :final-lsn 100))
+           (commit (make-array 27 :element-type '(unsigned-byte 8) :initial-element 0))
+           (finish (symbol-function 'logical-progress-transaction-commit))
+           (truncate (symbol-function 'logical-apply-truncate-relations))
+           (calls 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-progress-transaction-commit)
+                   (lambda (&rest args) (declare (ignore args)) (incf calls))
+                   (symbol-function 'logical-apply-truncate-relations)
+                   (lambda (&rest args) (declare (ignore args)) (incf calls))
+                   (aref commit 0) (char-code #\C) (aref commit 9) 100)
+             (rove:ok (handler-case (progn (logical-pgoutput-dispatch runtime commit) nil)
+                        (error () t)))
+             (rove:ok (handler-case
+                          (progn (logical-pgoutput-dispatch runtime #(84 0 0 0 0 0 1)) nil)
+                        (error () t)))
+             (rove:ok (zerop calls)))
+        (setf (symbol-function 'logical-progress-transaction-commit) finish
+              (symbol-function 'logical-apply-truncate-relations) truncate))))
+
 (rove:deftest test-logical-row-change-codec
     ;; These are the executor-boundary equivalents of DecodeInsert,
     ;; DecodeUpdate, and DecodeDelete in src/backend/replication/logical/decode.c.
