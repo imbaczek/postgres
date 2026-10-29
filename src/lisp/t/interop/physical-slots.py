@@ -230,6 +230,58 @@ def exercise_active_owner_oracle(connection, prefix):
             query(connection, "SELECT pg_drop_replication_slot(%s)", (name,))
 
 
+def exercise_physical_feedback_oracle(connection, prefix):
+    from psycopg2.extras import PhysicalReplicationConnection
+
+    name = prefix + "_feedback"
+    sender = None
+
+    def wait_state(restart, active=True):
+        deadline = time.monotonic() + 10
+        while True:
+            row = query(connection, "SELECT restart_lsn,active FROM pg_replication_slots WHERE slot_name=%s", (name,))[0]
+            if (None if row[0] is None else lsn_number(row[0])) == restart and row[1] == active:
+                return
+            assert time.monotonic() < deadline, row
+            time.sleep(0.02)
+
+    try:
+        query(connection, "CHECKPOINT")
+        start = lsn_number(query(connection, "SELECT pg_current_wal_flush_lsn()")[0][0])
+        query(connection, "SELECT * FROM pg_create_physical_replication_slot(%s)", (name,))
+        sender = psycopg2.connect(connection.dsn, connection_factory=PhysicalReplicationConnection)
+        cursor = sender.cursor()
+        cursor.start_replication(slot_name=name, start_lsn=start)
+        wait_state(None)
+        query(connection, "SELECT pg_create_restore_point('physical_feedback')")
+        query(connection, "CHECKPOINT")
+        high = lsn_number(query(connection, "SELECT pg_current_wal_flush_lsn()")[0][0])
+        assert high > start
+        cursor.send_feedback(write_lsn=high, flush_lsn=start, apply_lsn=start, force=True)
+        wait_state(start)
+        cursor.send_feedback(write_lsn=high, flush_lsn=high, apply_lsn=start, force=True)
+        wait_state(high)
+        sender.close()
+        sender = None
+        wait_state(high, active=False)
+        query(connection, "CHECKPOINT")
+        sender = psycopg2.connect(connection.dsn, connection_factory=PhysicalReplicationConnection)
+        cursor = sender.cursor()
+        cursor.start_replication(slot_name=name, start_lsn=start)
+        wait_state(high)
+        cursor.send_feedback(write_lsn=high, flush_lsn=start, apply_lsn=start, force=True)
+        wait_state(start)
+        sender.close()
+        sender = None
+        wait_state(start, active=False)
+        print("physical-slots: C START leaves unreserved state, flush drives retention, and reconnect accepts backward feedback PASS", flush=True)
+    finally:
+        if sender is not None:
+            sender.close()
+        if query(connection, "SELECT slot_name FROM pg_replication_slots WHERE slot_name=%s", (name,)):
+            query(connection, "SELECT pg_drop_replication_slot(%s)", (name,))
+
+
 def exercise_retention_oracle(connection, prefix):
     """Check the pinned C oracle on a dedicated 16 MB-segment peer with a 1 MB cap."""
     assert query(connection, "SELECT current_setting('max_slot_wal_keep_size'),"
@@ -266,6 +318,7 @@ def exercise_retention_oracle(connection, prefix):
         print("physical-slots: C subsegment-cap, exact-boundary, negative-safe-size and checkpoint loss PASS", observations, flush=True)
         exercise_temporary_slot_loss(connection, prefix, switch_wal=True)
         exercise_active_owner_oracle(connection, prefix)
+        exercise_physical_feedback_oracle(connection, prefix)
     finally:
         if query(connection, "SELECT slot_name FROM pg_catalog.pg_replication_slots WHERE slot_name=%s", (name,)):
             query(connection, "SELECT pg_catalog.pg_drop_replication_slot(%s)", (name,))
