@@ -151,4 +151,30 @@ run -c 'begin; truncate toast_dml; rollback' >/dev/null
 run -c 'truncate toast_dml' >/dev/null
 [ -z "$(run -c 'select id from toast_dml')" ]
 run -c 'vacuum toast_dml' >/dev/null
+numeric_big=$(awk 'BEGIN { s=1; printf "7"; for (i=1;i<8000;i++) { s=(s*1664525+1013904223)%4294967296; printf "%d", int(s/16777216)%10 } }')
+numeric_repeat=$(awk 'BEGIN { for (i=0;i<20000;i++) printf "1" }')
+run -c 'create table vacuum_inline_text (v text)' >/dev/null
+run -c "insert into vacuum_inline_text values ('$numeric_repeat')" >/dev/null
+run -c 'vacuum full vacuum_inline_text' >/dev/null
+[ "$(run -c 'select length(v) from vacuum_inline_text')" = 20000 ]
+run -c 'create table toast_numeric (id int primary key, v numeric)' >/dev/null
+run -c "insert into toast_numeric values (1, '$numeric_big'::numeric), (2, '$numeric_repeat'::numeric), (3, 'NaN'::numeric)" >/dev/null
+[ "$(run -c 'select length(v::text) from toast_numeric where id = 1')" = 8000 ]
+[ "$(run -c "select v = '$numeric_big'::numeric from toast_numeric where id = 1")" = t ]
+[ "$(run -c "select v = '$numeric_repeat'::numeric from toast_numeric where id = 2")" = t ]
+[ "$(run -c 'select v from toast_numeric where id = 3')" = NaN ]
+run -c "begin; update toast_numeric set v = '$numeric_repeat'::numeric where id = 1; rollback" >/dev/null
+[ "$(run -c "select v = '$numeric_big'::numeric from toast_numeric where id = 1")" = t ]
+run -c 'vacuum full toast_numeric' >/dev/null
+[ "$(run -c 'select length(v::text) from toast_numeric where id = 2')" = 20000 ]
+[ "$(run -c "select v = '$numeric_repeat'::numeric from toast_numeric where id = 2")" = t ]
+kill "$SRV"
+wait "$SRV" || true
+SRV=
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
+test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
+[ "$(run -c "select v = '$numeric_big'::numeric from toast_numeric where id = 1")" = t ]
+[ "$(run -c 'select length(v::text) from toast_numeric where id = 2')" = 20000 ]
+[ "$(run -c "select v = '$numeric_repeat'::numeric from toast_numeric where id = 2")" = t ]
+[ "$(run -c 'delete from toast_numeric where id = 1 returning length(v::text)')" = 8000 ]
 echo 'toast-dml: PASS'

@@ -82,3 +82,34 @@ special values. Noncanonical zero digits and weights are accepted."
                        q)
                      (* accumulator (expt 10 decimal-exponent)))))
           (make-sql-decimal (if negative (- coefficient) coefficient) scale))))))
+
+(defun sql-numeric-to-varlena-payload (value)
+  "Encode numeric VALUE without its outer varlena header, including specials."
+  (let ((special (case value
+                   (:numeric-nan #xc000)
+                   (:numeric-positive-infinity #xd000)
+                   (:numeric-negative-infinity #xf000))))
+    (if special
+        (let ((bytes (make-array 2 :element-type '(unsigned-byte 8))))
+          (page-set-u16 bytes 0 special)
+          bytes)
+        (subseq (sql-numeric-to-packed-octets value) 4))))
+
+(defun sql-numeric-from-varlena-payload (payload)
+  "Decode finite or special numeric PAYLOAD without an outer varlena header."
+  (check-type payload (vector (unsigned-byte 8)))
+  (when (< (length payload) 2) (ereport "XX001" "invalid packed numeric"))
+  (let ((header (page-u16 payload 0)))
+    (when (= (logand header #xc000) #xc000)
+      (unless (= (length payload) 2) (ereport "XX001" "invalid packed numeric"))
+      (return-from sql-numeric-from-varlena-payload
+        (case header
+          (#xc000 :numeric-nan)
+          (#xd000 :numeric-positive-infinity)
+          (#xf000 :numeric-negative-infinity)
+          (otherwise (ereport "XX001" "invalid packed numeric"))))))
+  (let ((bytes (make-array (+ 4 (length payload))
+                           :element-type '(unsigned-byte 8))))
+    (page-set-u32 bytes 0 (ash (length bytes) 2))
+    (replace bytes payload :start1 4)
+    (sql-numeric-from-packed-octets bytes)))

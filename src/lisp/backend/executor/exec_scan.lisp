@@ -1437,7 +1437,8 @@ scopes to clean up."
 
 (defun materialize-select-tuple (table tuple snapshot &key (index-reader #'select-toast-index-reader))
   "Replace external attributes of parent TUPLE with SQL values in place.
-Varchar and text payloads become strings; bytea payloads remain octet vectors.
+Textual payloads become strings; bytea remains octets, and JSONB and numeric
+payloads are decoded into their SQL values.
 For a normal scan the caller checks parent visibility and keeps SNAPSHOT active
 through the fetch. An index build may also fetch retained dead versions; its
 removal horizon and the active protection snapshot keep their chunks available.
@@ -1458,6 +1459,7 @@ TOAST chunk visibility follows the parent and is not independently filtered."
                            ((:varchar :text :json) (bytes->string bytes))
                            (:bytea bytes)
                            (:jsonb (sql-jsonb-from-octets bytes))
+                           (:numeric (sql-numeric-from-varlena-payload bytes))
                            (otherwise (ereport "XX001" "external value has unsupported type")))))))
     tuple))
 

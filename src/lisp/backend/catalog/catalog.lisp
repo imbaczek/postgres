@@ -1514,7 +1514,7 @@ The OID encoding alone is a byte prefix of every key for that value."
   "Default target heap tuple size, based on four tuples per page.")
 
 (defun toast-externalization-plan (values columns &optional (target +toast-tuple-target+))
-  "Select inline varchar, text, json, jsonb and bytea attributes to externalize.
+  "Select inline varchar, text, json, jsonb, bytea and numeric attributes to externalize.
 Return (index . raw-payload) pairs in largest-first order; VALUES and COLUMNS are
 unchanged. Storage may subsequently compress each selected payload. Payloads may
 alias inline bytea values and must remain stable until used. The target is a goal,
@@ -1535,7 +1535,7 @@ Per-column storage policies and other variable-width types are not supported."
           (loop for i below (length columns)
                 for value = (aref physical i)
                 for type = (pg-column-type (aref columns i))
-                when (and (member type '(:varchar :text :json :jsonb :bytea))
+                when (and (member type '(:varchar :text :json :jsonb :bytea :numeric))
                           (not (eq value +null+))
                           (not (heap-external-varlena-p value)))
                   do (let* ((payload (aref encoded i))
@@ -1654,7 +1654,7 @@ Attempt each attribute at most once and stop once the tuple fits TARGET."
           (loop for i below (length columns)
                 for value = (aref physical i)
                 for type = (pg-column-type (aref columns i))
-                when (and (member type '(:varchar :text :json :jsonb :bytea))
+                when (and (member type '(:varchar :text :json :jsonb :bytea :numeric))
                           (not (eq value +null+))
                           (not (heap-external-varlena-p value))
                           (not (aref attempted i)))
@@ -1685,7 +1685,7 @@ Attempt each attribute at most once and stop once the tuple fits TARGET."
           (loop for i below (length columns)
                 for value = (aref physical i)
                 for type = (pg-column-type (aref columns i))
-                when (and (member type '(:varchar :text :json :jsonb :bytea))
+                when (and (member type '(:varchar :text :json :jsonb :bytea :numeric))
                           (not (eq value +null+))
                           (not (heap-external-varlena-p value)))
                   do (let* ((length (length (aref encoded i)))

@@ -111,7 +111,7 @@ replicated_rows() {
 }
 
 nullable_rows() {
-    sql "$1" "SELECT nullable_key, label, j, b FROM nullable_rows ORDER BY nullable_key"
+    sql "$1" "SELECT nullable_key, label, j, b, n FROM nullable_rows ORDER BY nullable_key"
 }
 
 sequence_state() {
@@ -293,7 +293,7 @@ REPLICA_TWO_PID=$SERVER_PID
 
 seed_copy_stress_table
 sql "$SOURCE_PORT" "SET DateStyle TO 'ISO, DMY'; SET TimeZone TO 'Europe/Warsaw'; CREATE TABLE bootstrap_temporal (id integer PRIMARY KEY, d date DEFAULT '01/02/2024' CHECK(d >= '01/02/2024') CHECK(d = ANY('{01/02/2024,04/03/2024}')), z timestamptz DEFAULT '01/02/2024 12:00:00', created timestamp DEFAULT 'now')" >/dev/null
-sql "$SOURCE_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label text); CREATE TABLE bootstrap_constraint_order (a integer DEFAULT '1.5'::numeric CHECK(a > '0.25'::numeric), b integer, c integer, CONSTRAINT bootstrap_constraint_order_pkey PRIMARY KEY (a), CONSTRAINT bootstrap_constraint_order_b_key UNIQUE (b), CONSTRAINT bootstrap_constraint_order_c_key UNIQUE (c)); CREATE TABLE nullable_rows (nullable_key integer, label bytea, j json, b jsonb); CREATE UNIQUE INDEX nullable_rows_key_idx ON nullable_rows (nullable_key) NULLS NOT DISTINCT; CREATE TABLE ignored_rows (id integer PRIMARY KEY, label varchar(64)); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; ALTER SEQUENCE bootstrap_counter INCREMENT BY -2; SELECT setval('bootstrap_counter', 100, true); INSERT INTO replicated_rows VALUES (1, 10, 'initial'), (9, 90, 'remove'); INSERT INTO nullable_rows VALUES (NULL, 'initial-null'), (2, 'two'); INSERT INTO ignored_rows VALUES (1, 'before')"
+sql "$SOURCE_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label text); CREATE TABLE bootstrap_constraint_order (a integer DEFAULT '1.5'::numeric CHECK(a > '0.25'::numeric), b integer, c integer, CONSTRAINT bootstrap_constraint_order_pkey PRIMARY KEY (a), CONSTRAINT bootstrap_constraint_order_b_key UNIQUE (b), CONSTRAINT bootstrap_constraint_order_c_key UNIQUE (c)); CREATE TABLE nullable_rows (nullable_key integer, label bytea, j json, b jsonb, n numeric); CREATE UNIQUE INDEX nullable_rows_key_idx ON nullable_rows (nullable_key) NULLS NOT DISTINCT; CREATE TABLE ignored_rows (id integer PRIMARY KEY, label varchar(64)); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; ALTER SEQUENCE bootstrap_counter INCREMENT BY -2; SELECT setval('bootstrap_counter', 100, true); INSERT INTO replicated_rows VALUES (1, 10, 'initial'), (9, 90, 'remove'); INSERT INTO nullable_rows VALUES (NULL, 'initial-null'), (2, 'two'); INSERT INTO ignored_rows VALUES (1, 'before')"
 
 long_text=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "x" }')
 sql "$SOURCE_PORT" "UPDATE replicated_rows SET label = '$long_text' WHERE id = 1" >/dev/null
@@ -301,6 +301,8 @@ long_bytes=$(awk 'BEGIN { for (i=0;i<1500;i++) printf "00ff" }')
 sql "$SOURCE_PORT" "UPDATE nullable_rows SET label = '\\x$long_bytes' WHERE nullable_key = 2" >/dev/null
 sql "$SOURCE_PORT" "UPDATE nullable_rows SET j = '{\"k\":\"$long_text\", \"k\":2}' WHERE nullable_key = 2" >/dev/null
 sql "$SOURCE_PORT" "UPDATE nullable_rows SET b = '{\"v\":\"$long_text\",\"v\":\"$long_text\"}' WHERE nullable_key = 2" >/dev/null
+long_numeric=$(awk 'BEGIN { s=1; printf "7"; for (i=1;i<8000;i++) { s=(s*1664525+1013904223)%4294967296; printf "%d", int(s/16777216)%10 } }')
+sql "$SOURCE_PORT" "UPDATE nullable_rows SET n = '$long_numeric'::numeric WHERE nullable_key = 2" >/dev/null
 
 # Isolate the failed initial-copy slot on a disposable publisher. Its exported
 # snapshot intentionally remains available for retry, so it must not hold the
@@ -539,6 +541,7 @@ long_bytes_stream=$(awk 'BEGIN { for (i=0;i<1500;i++) printf "ff00" }')
 sql "$SOURCE_PORT" "UPDATE nullable_rows SET label = '\\x$long_bytes_stream' WHERE nullable_key = 2" >/dev/null
 sql "$SOURCE_PORT" "UPDATE nullable_rows SET j = '{\"k\":\"$long_text_stream\"}' WHERE nullable_key = 2" >/dev/null
 sql "$SOURCE_PORT" "UPDATE nullable_rows SET b = '{\"v\":\"$long_text_stream\"}' WHERE nullable_key = 2" >/dev/null
+sql "$SOURCE_PORT" "UPDATE nullable_rows SET n = -'$long_numeric'::numeric WHERE nullable_key = 2" >/dev/null
 disconnected_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
 expected_final=$(sql "$SOURCE_PORT" "SELECT id, amount, label FROM replicated_rows ORDER BY id")
 "$BASE/pg-lisp-subscribe" --slot logical_replica_two \

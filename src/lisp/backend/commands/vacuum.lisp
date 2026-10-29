@@ -222,7 +222,9 @@ implementation's replacement metadata transition atomic as well."
         (multiple-value-bind (target-block target-offnum)
             (heapam-insert target-relfilenode
                            (pg-class-columns source-table)
-                           (htup-values tuple) copy-xmin (htup-cid tuple))
+                           (toast-compress-inline-values (htup-values tuple)
+                                                         (pg-class-columns source-table))
+                           copy-xmin (htup-cid tuple))
           (unless (zerop copy-xmax)
             (let ((page (buf-read target-relfilenode target-block)))
               (multiple-value-bind (offset flags len)

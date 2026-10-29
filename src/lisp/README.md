@@ -189,10 +189,9 @@ smart/fast/immediate shutdown and escalation.
 Table columns support `smallint`/`int2`, `int`/`integer`/`int4`, `bigint`/`int8`,
 `numeric`/`decimal` (including precision and scale), `real`/`float4`,
 `double precision`/`float8`, `date`, `time` and `timestamp` with or without time
-zone, `interval`, and `varchar(n)` / `character varying(n)` with `n <= 126`.
-For now, `text` is an alias for `varchar(126)`; distinct text/varchar type
-semantics and OIDs are a TODO.
-`varchar` without a length is also treated as 126.
+zone, `interval`, `varchar` / `character varying`, `text`, `bytea`, `json`,
+and `jsonb`. Unbounded variable-width values, including `numeric`, can use
+inline compression or the table's TOAST storage when needed.
 
 Decimal literals and numeric casts support finite values; numeric casts also
 accept NaN, infinities, and signed hexadecimal, octal, and binary integer input
@@ -720,8 +719,7 @@ waits for exclusive redo to finish and acknowledges `paused` synchronously;
 C can return earlier with `pause requested`. Pause survives reload and clears
 on process restart. These functions reject a primary with SQLSTATE `55000`.
 `pg_wal_lsn_diff()` returns an exact integral `numeric`, including differences
-outside signed int64; `::bigint` checks overflow. This does not add general
-decimal numeric input, storage or arithmetic.
+outside signed int64; `::bigint` checks overflow.
 Text `||` and `substr(text, start [, length])` support the string operations used
 by Patroni's status expression. Substring positions count Unicode characters,
 including SQL's adjusted zero/negative starts. Array concatenation remains unsupported.

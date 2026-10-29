@@ -185,7 +185,7 @@ must remain stable while the layout is used."
                ((eq v +null+) (setf has-null t))
                (t
                 (let ((al (column-align col)))
-                  (when (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea))
+                  (when (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea :numeric))
                     (setf (aref varlena-data i)
                           (if (heap-external-varlena-p v)
                               (heap-encode-external-varlena v)
@@ -194,8 +194,9 @@ must remain stable while the layout is used."
                                   (case (pg-column-type col)
                                     (:bytea (check-type v (vector (unsigned-byte 8))) v)
                                     (:jsonb (sql-jsonb-to-octets v))
+                                    (:numeric (sql-numeric-to-varlena-payload v))
                                     (otherwise (string->bytes v)))))))
-                  (unless (and (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea))
+                  (unless (and (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea :numeric))
                                (or (heap-external-varlena-p v)
                                    (and (not (heap-compressed-varlena-p v))
                                         (<= (length (aref varlena-data i)) 126))))
@@ -203,11 +204,10 @@ must remain stable while the layout is used."
                   (setf (aref offsets i) cursor)
                   (incf cursor
                         (case (pg-column-type col)
-                          ((:varchar :text :json :jsonb :bytea)
+                          ((:varchar :text :json :jsonb :bytea :numeric)
                            (let ((size (length (aref varlena-data i))))
                              (if (heap-external-varlena-p v) size
                                  (+ size (if (and (not (heap-compressed-varlena-p v)) (<= size 126)) 1 4)))))
-                          (:numeric (+ 4 (length (sql-numeric-output v))))
                           (otherwise (column-fixed-size col))))))))
     (when has-null (setf infomask (logior infomask +heap-hasnull+)))
     (when (some #'heap-external-varlena-p values)
@@ -219,7 +219,7 @@ must remain stable while the layout is used."
 (defun form-heap-tuple (values columns xmin xmax cid block off)
   "Build a HeapTupleHeaderData + null bitmap + attribute data byte vector.
 Inline :bytea values are octet vectors copied into the returned tuple; callers
-must keep them stable during this call. :varchar, :text, :json and :bytea may instead be
+must keep them stable during this call. :varchar, :text, :json, :jsonb, :bytea and :numeric may instead be
 physical external descriptors, written unaligned with HEAP_HASEXTERNAL set.
 This codec does not create or fetch TOAST data."
   (let* ((natts (length columns))
@@ -274,12 +274,7 @@ This codec does not create or fetch TOAST data."
                     (page-set-u32 bytes off (logand v #xFFFFFFFF)))
                    ((:int8 :time :timestamp :timestamptz)
                     (page-set-u64 bytes off (logand v #xFFFFFFFFFFFFFFFF)))
-                   (:numeric
-                    (let* ((data (string->bytes (sql-numeric-output v)))
-                           (size (+ 4 (length data))))
-                      (page-set-u32 bytes off size)
-                      (replace bytes data :start1 (+ off 4))))
-                   ((:varchar :text :json :jsonb :bytea)
+                   ((:varchar :text :json :jsonb :bytea :numeric)
                     (let ((data (aref varlena-data i)))
                       (if (heap-external-varlena-p v)
                           (replace bytes data :start1 off)
@@ -437,7 +432,7 @@ reject external and compressed datums and lengths outside BYTES."
   "Return values, XIDs, command ID, infomask, and successor TID.
 Inline compressed attributes are decompressed, and inline :bytea values are
 fresh octet vectors independent of BYTES. External :varchar, :text, :json,
-:jsonb and :bytea attributes remain physical descriptors; TOAST fetching and
+:jsonb, :bytea and :numeric attributes remain physical descriptors; TOAST fetching and
 external decompression are deferred."
   (let* ((natts (length columns))
          (xmin (page-u32 bytes +heap-tuple-xmin-off+))
@@ -458,7 +453,7 @@ external decompression are deferred."
                                                   (floor i 8)))))))
                (unless is-null
                  (let ((al (column-align col)))
-                   (unless (and (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea))
+                   (unless (and (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea :numeric))
                                 (not (zerop (aref bytes cursor))))
                      (setf cursor (align-up cursor al)))
                    (case (pg-column-type col)
@@ -502,13 +497,7 @@ external decompression are deferred."
                           (decf v #x10000000000000000))
                         (setf (aref values i) v))
                       (incf cursor 8))
-                     (:numeric
-                      (let ((size (page-u32 bytes cursor)))
-                        (setf (aref values i)
-                              (sql-numeric-input (bytes->string bytes :start (+ cursor 4)
-                                                                      :end (+ cursor size))))
-                        (incf cursor size)))
-                     ((:varchar :text :json :jsonb :bytea)
+                     ((:varchar :text :json :jsonb :bytea :numeric)
                       (if (= (aref bytes cursor) 1)
                           (multiple-value-bind (pointer end)
                               (heap-decode-external-varlena bytes cursor)
@@ -518,6 +507,7 @@ external decompression are deferred."
                             (setf (aref values i) (case (pg-column-type col)
                                                     (:bytea payload)
                                                     (:jsonb (sql-jsonb-from-octets payload))
+                                                    (:numeric (sql-numeric-from-varlena-payload payload))
                                                     (otherwise (bytes->string payload)))
                                   cursor end)))))))))
     (values values xmin xmax cid infomask ctid-block ctid-offnum)))
