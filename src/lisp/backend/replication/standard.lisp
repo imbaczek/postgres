@@ -174,28 +174,31 @@
                                    (lambda (change) (push change changes)))
     (nreverse changes)))
 
-(defun standard-map-selected-changes (transaction names function)
+(defun standard-map-selected-changes (transaction names function &optional (mapper #'logical-transaction-map-changes))
   "Apply historic publication selection one change at a time."
-  (logical-transaction-map-changes
-   transaction
-   (lambda (change)
-     (let ((kind (logical-change-kind change)))
-       (case kind
-         ((:ddl :sequence-state) nil)
-         (:truncate
-          (let ((relations (standard-truncate-relations
-                            change (standard-selected-actions names change))))
-            (when relations (funcall function (cons :truncate relations)))))
-         ((:insert :update :delete)
-          (when (member kind (gethash (logical-change-relation-oid change)
-                                      (standard-selected-actions names change)))
-            (funcall function change)))
-         (otherwise (ereport "0A000" "unsupported logical row operation")))))))
+  (funcall mapper
+           transaction
+           (lambda (change)
+             (let ((kind (logical-change-kind change)))
+               (case kind
+                 ((:ddl :sequence-state) nil)
+                 (:truncate
+                  (let ((relations (standard-truncate-relations
+                                    change (standard-selected-actions names change))))
+                    (when relations (funcall function (cons :truncate relations)))))
+                 ((:insert :update :delete)
+                  (when (member kind (gethash (logical-change-relation-oid change)
+                                              (standard-selected-actions names change)))
+                    (funcall function change)))
+                 (otherwise (ereport "0A000" "unsupported logical row operation")))))))
+
+(defun standard-map-selected-send-changes (transaction names function)
+  (standard-map-selected-changes transaction names function #'logical-transaction-map-send-changes))
 
 (defun standard-send-scoped-transaction (state transaction names)
   "Preflight selection, then send without retaining the selected changes."
   (let ((selected nil))
-    (standard-map-selected-changes
+    (standard-map-selected-send-changes
      transaction names
      (lambda (change)
        (setf selected t)
@@ -207,7 +210,7 @@
     (unless selected (return-from standard-send-scoped-transaction t))
     (unless (standard-xlog-data state (pgoutput-standard-begin transaction))
       (return-from standard-send-scoped-transaction nil))
-    (standard-map-selected-changes
+    (standard-map-selected-send-changes
      transaction names
      (lambda (change)
        (when (standard-stream-stop-reason state)

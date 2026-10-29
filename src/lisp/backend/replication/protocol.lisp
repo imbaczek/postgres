@@ -393,8 +393,32 @@ On a standby, receipt ahead of replay is reported only on the replay timeline."
         do (funcall sink (sb-ext:string-to-octets string :external-format :utf-8 :start start :end end)))
   (values))
 
+(defun pgoutput-emit-event-slice (sink slice type)
+  (unless (eq type (logical-event-slice-type slice))
+    (error "logical event slice type mismatch"))
+  (let ((length (logical-event-slice-length slice)))
+    (if (eq type :bytea)
+        (let ((digits #(48 49 50 51 52 53 54 55 56 57 97 98 99 100 101 102)))
+          (pgoutput-emit-u32 sink (+ 2 (* 2 length)))
+          (funcall sink 92)
+          (funcall sink 120)
+          (logical-event-slice-visit
+           slice
+           (lambda (bytes)
+             (let ((hex (make-array (* 2 (length bytes)) :element-type '(unsigned-byte 8))))
+               (loop for byte across bytes for offset from 0 by 2
+                     do (setf (aref hex offset) (aref digits (ash byte -4))
+                              (aref hex (1+ offset)) (aref digits (logand byte 15))))
+               (funcall sink hex)))))
+        (progn
+          (pgoutput-emit-u32 sink length)
+          (logical-event-slice-visit slice sink))))
+  (values))
+
 (defun pgoutput-emit-text-value (sink value type)
   "Write one pgoutput text field without constructing its full encoded text."
+  (when (logical-event-slice-p value)
+    (return-from pgoutput-emit-text-value (pgoutput-emit-event-slice sink value type)))
   (case type
     (:bytea
      (check-type value (vector (unsigned-byte 8)))
@@ -649,7 +673,7 @@ keepalive's WAL-end field, which may include changes not yet applied."
 
 (defun send-logical-transaction (stream transaction wal-end)
   ;; Validate the entire staged spool before emitting a transaction frame.
-  (logical-transaction-map-changes
+  (logical-transaction-map-send-changes
    transaction
    (lambda (change)
      (when (member (logical-change-kind change) '(:insert :update :delete))
@@ -657,7 +681,7 @@ keepalive's WAL-end field, which may include changes not yet applied."
        (pgoutput-row-change-size change))))
   (if (zerop (logical-transaction-xid transaction))
       (let ((count 0))
-        (logical-transaction-map-changes
+        (logical-transaction-map-send-changes
          transaction
          (lambda (change)
            (incf count)
@@ -672,7 +696,7 @@ keepalive's WAL-end field, which may include changes not yet applied."
       (progn
         (send-logical-xlog-data stream (logical-transaction-commit-lsn transaction) wal-end
                                 (pgoutput-build-begin transaction))
-        (logical-transaction-map-changes
+        (logical-transaction-map-send-changes
          transaction
          (lambda (change)
            (if (eq (logical-change-kind change) :truncate)

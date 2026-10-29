@@ -1813,6 +1813,124 @@
                  (error () t))
                "logical slot command parser rejects pgoutput v1 for v2 Message support")))
 
+(rove:deftest test-publisher-spool-slices-match-materialized-and-expire
+    (let* ((*query-temp-directory* (uiop:temporary-directory))
+           (*logical-capture-memory-bytes* 1)
+           (text (concatenate 'string (make-string 4095 :initial-element #\x) "🙂'"))
+           (change (logical-test-change :insert 7 701 :new-values (vector 1 2 text)))
+           (spool (make-logical-spool))
+           (saved nil))
+      (unwind-protect
+           (progn
+             (logical-spool-append spool (logical-encode-change change))
+             (logical-spool-seal spool)
+             (let ((transaction (make-logical-transaction :spool spool)))
+               (logical-transaction-map-send-changes
+                transaction
+                (lambda (decoded)
+                  (let ((slice (aref (logical-change-new-values decoded) 2))
+                        (output (make-array 0 :element-type '(unsigned-byte 8)
+                                              :adjustable t :fill-pointer 0)))
+                    (setf saved slice)
+                    (rove:ok (logical-event-slice-p slice))
+                    (pgoutput-emit-row-change
+                     decoded (lambda (part)
+                               (if (integerp part) (vector-push-extend part output)
+                                   (loop for byte across part do (vector-push-extend byte output)))))
+                    (rove:ok (equalp output (pgoutput-build-row-change change))))))
+               (rove:ok (handler-case
+                            (progn (logical-event-slice-visit saved (lambda (x) (declare (ignore x)))) nil)
+                          (error () t)))
+               (logical-transaction-map-changes
+                transaction
+                (lambda (decoded)
+                  (rove:ok (equal text (aref (logical-change-new-values decoded) 2)))))))
+        (close-logical-spool spool))))
+
+(rove:deftest test-publisher-bytea-slice-and-corruption
+    (let* ((*query-temp-directory* (uiop:temporary-directory))
+           (*logical-capture-memory-bytes* 1)
+           (bytes (make-array 70000 :element-type '(unsigned-byte 8)
+                                    :initial-element 255))
+           (change (logical-test-change :insert 7 701 :new-values (vector 1 2 bytes)))
+           (spool (make-logical-spool)))
+      (setf (getf (third (logical-change-columns change)) :type) :bytea)
+      (unwind-protect
+           (progn
+             (logical-spool-append spool (logical-encode-change change))
+             (logical-spool-seal spool)
+             (logical-transaction-map-send-changes
+              (make-logical-transaction :spool spool)
+              (lambda (decoded)
+                (let ((slice (aref (logical-change-new-values decoded) 2))
+                      (output (make-array 0 :element-type '(unsigned-byte 8)
+                                            :adjustable t :fill-pointer 0)))
+                  (pgoutput-emit-row-change
+                   decoded (lambda (part)
+                             (if (integerp part) (vector-push-extend part output)
+                                 (loop for byte across part do (vector-push-extend byte output)))))
+                  (rove:ok (equalp output (pgoutput-build-row-change change)))
+                  (rove:ok (handler-case
+                               (progn
+                                 (logical-event-slice-visit
+                                  slice (lambda (part) (declare (ignore part))
+                                          (logical-event-slice-visit slice #'identity)))
+                                 nil)
+                             (error () t)))
+                  (incf (logical-event-slice-checksum slice))
+                  (rove:ok (handler-case
+                               (progn (pgoutput-row-change-size decoded) nil)
+                             (error () t)))))))
+        (close-logical-spool spool))))
+
+(rove:deftest test-publisher-rechecks-event-after-decode
+    (let* ((*query-temp-directory* (uiop:temporary-directory))
+           (*logical-capture-memory-bytes* 1)
+           (change (logical-test-change :insert 7 701 :new-values (vector 1 2 "original")))
+           (spool (make-logical-spool))
+           (original (symbol-function 'logical-decode-change-from-cursor))
+           (called nil))
+      (unwind-protect
+           (progn
+             (logical-spool-append spool (logical-encode-change change))
+             (logical-spool-seal spool)
+             (setf (symbol-function 'logical-decode-change-from-cursor)
+                   (lambda (cursor)
+                     (prog1 (funcall original cursor)
+                       (let* ((stream (logical-cursor-stream cursor))
+                              (end (file-position stream)))
+                         (file-position stream (1- end))
+                         (write-byte 65 stream)
+                         (finish-output stream)
+                         (file-position stream end)))))
+             (rove:ok (handler-case
+                          (progn (logical-transaction-map-send-changes
+                                  (make-logical-transaction :spool spool)
+                                  (lambda (change) (declare (ignore change)) (setf called t))) nil)
+                        (error () t)))
+             (rove:ok (not called)))
+        (setf (symbol-function 'logical-decode-change-from-cursor) original)
+        (close-logical-spool spool))))
+
+(rove:deftest test-publisher-nested-decode-does-not-borrow-outer-lease
+    (let* ((*query-temp-directory* (uiop:temporary-directory))
+           (*logical-capture-memory-bytes* 1)
+           (outer (logical-test-change :insert 7 701 :new-values (vector 1 2 "outer")))
+           (inner (logical-encode-change
+                   (logical-test-change :insert 7 701 :new-values (vector 3 4 "inner"))))
+           (spool (make-logical-spool)))
+      (unwind-protect
+           (progn
+             (logical-spool-append spool (logical-encode-change outer))
+             (logical-spool-seal spool)
+             (logical-transaction-map-send-changes
+              (make-logical-transaction :spool spool)
+              (lambda (change)
+                (rove:ok (logical-event-slice-p (aref (logical-change-new-values change) 2)))
+                (let ((nested (logical-decode-change inner)))
+                  (rove:ok (equal "inner" (aref (logical-change-new-values nested) 2)))))))
+        (close-logical-spool spool))))
+
 (rove:deftest test-pgoutput-streamed-row-matches-builder
     (let* ((columns '((:attnum 1 :name "id" :type :int4 :typmod -1)
                       (:attnum 2 :name "b" :type :bytea :typmod -1)
@@ -1889,6 +2007,40 @@
              (rove:ok (not (open-stream-p stream))))
         (setf (symbol-function 'call-with-pgoutput-buffered-sink) original)
         (when (and stream (open-stream-p stream)) (close stream :abort t))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-private-slice-corruption-after-frame-header-closes
+    (let* ((*query-temp-directory* (uiop:temporary-directory))
+           (*logical-capture-memory-bytes* 1)
+           (path (merge-pathnames (format nil "pg-slice-frame-~d-~d"
+                                          (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (change (logical-test-change :insert 7 701
+                                        :new-values (vector 1 2 (make-string 70000 :initial-element #\x))))
+           (spool (make-logical-spool))
+           (original (symbol-function 'call-with-pgoutput-buffered-sink))
+           (stream nil))
+      (unwind-protect
+           (progn
+             (logical-spool-append spool (logical-encode-change change))
+             (logical-spool-seal spool)
+             (setf stream (open path :direction :output :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede :if-does-not-exist :create))
+             (logical-transaction-map-send-changes
+              (make-logical-transaction :spool spool)
+              (lambda (decoded)
+                (let ((slice (aref (logical-change-new-values decoded) 2)))
+                  (setf (symbol-function 'call-with-pgoutput-buffered-sink)
+                        (lambda (&rest args)
+                          (incf (logical-event-slice-checksum slice))
+                          (apply original args)))
+                  (rove:ok (handler-case
+                               (progn (send-logical-row-xlog-data stream 10 20 decoded) nil)
+                             (error (condition) (search "checksum" (princ-to-string condition)))))
+                  (rove:ok (not (open-stream-p stream)))))))
+        (setf (symbol-function 'call-with-pgoutput-buffered-sink) original)
+        (when (and stream (open-stream-p stream)) (close stream :abort t))
+        (close-logical-spool spool)
         (when (probe-file path) (delete-file path)))))
 
 (rove:deftest test-private-streamed-row-frame-matches-builder

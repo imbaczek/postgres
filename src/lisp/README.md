@@ -690,8 +690,12 @@ released when the scan ends or unwinds.
 It validates the staged changes before sending and iterates them again for
 output; the spool is cleaned up when the reader scope ends. For spilled events,
 each iteration checks the event CRC in bounded blocks before decoding through a
-bounded stream cursor, without allocating the complete encoded event. The
-sender measures each INSERT, UPDATE, or DELETE row before writing one pgoutput
+bounded stream cursor, without allocating the complete encoded event. Scoped
+standard and private senders use event-lifetime slices for text, varchar, JSON
+and bytea, checking slice CRCs and emitting bytes or bytea hex in bounded blocks.
+Slices expire when the event callback returns. JSONB, numeric and ordinary
+list-based reader values still materialize; complete transaction validation
+precedes output. The sender measures each INSERT, UPDATE, or DELETE row before writing one pgoutput
 CopyData frame through a bounded buffer. The subscriber reads replication frames
 directly through a length-bounded stream cursor and completes decoding before
 applying an operation. Pgoutput row text-format fields above 1 MiB or beyond

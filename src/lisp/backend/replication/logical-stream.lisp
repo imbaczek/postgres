@@ -36,7 +36,68 @@
 (defstruct logical-cursor
   "Bounded logical event reader over octets or a positioned binary stream.
 Discard the cursor after a read error; the stream may have advanced."
-  bytes stream size (offset 0))
+  bytes stream size (offset 0) expected-crc)
+
+(defstruct logical-event-lease cursor start (active-p t) (visiting-p nil))
+
+(defstruct logical-event-slice lease offset length type checksum)
+
+(defvar *logical-event-lease* nil)
+
+(defun logical-event-slice-visit (slice function &key (check-crc t))
+  "Visit a slice in bounded blocks while its event callback owns the cursor."
+  (let* ((lease (logical-event-slice-lease slice))
+         (cursor (logical-event-lease-cursor lease))
+         (stream (logical-cursor-stream cursor))
+         (offset (logical-event-slice-offset slice))
+         (length (logical-event-slice-length slice))
+         (saved (and stream (file-position stream)))
+         (crc #xffffffff))
+    (unless (and (logical-event-lease-active-p lease) (not (logical-event-lease-visiting-p lease))
+                 (<= (+ offset length) (logical-cursor-limit cursor)))
+      (error "logical event slice is expired or busy"))
+    (sb-sys:without-interrupts
+      (setf (logical-event-lease-visiting-p lease) t)
+      (unwind-protect
+           (sb-sys:with-local-interrupts
+             (progn
+               (when stream
+                 (unless (and saved (file-position stream (+ (logical-event-lease-start lease) offset)))
+                   (error "cannot seek logical event slice")))
+               (loop for position from offset below (+ offset length) by 65536
+                     for count = (min 65536 (- (+ offset length) position))
+                     for bytes = (if stream
+                                     (let ((buffer (make-array count :element-type '(unsigned-byte 8))))
+                                       (unless (= (read-sequence buffer stream) count)
+                                         (error "truncated logical event slice"))
+                                       buffer)
+                                     (subseq (logical-cursor-bytes cursor) position (+ position count)))
+                     do (loop for byte across bytes
+                              do (setf crc (logxor (ash crc -8)
+                                                   (aref *wal-crc32-table*
+                                                         (logand (logxor crc byte) #xff)))))
+                        (funcall function bytes))
+               (let ((checksum (logxor crc #xffffffff)))
+                 (when (and check-crc (/= checksum (logical-event-slice-checksum slice)))
+                   (error "logical event slice checksum mismatch"))
+                 checksum)))
+        (unwind-protect
+             (when (and stream saved)
+               (unless (file-position stream saved) (error "cannot restore logical event position")))
+          (setf (logical-event-lease-visiting-p lease) nil))))))
+
+(defun logical-make-event-slice (cursor length type)
+  (let* ((offset (logical-cursor-offset cursor))
+         (slice (make-logical-event-slice :lease *logical-event-lease*
+                                          :offset offset :length length :type type)))
+    (logical-cursor-require cursor length)
+    (setf (logical-event-slice-checksum slice)
+          (logical-event-slice-visit slice (lambda (bytes) (declare (ignore bytes))) :check-crc nil))
+    (if (member type '(:text :varchar :json))
+        (logical-validate-utf8 cursor length)
+        (logical-skip-value-octets cursor length))
+    (logical-event-slice-visit slice (lambda (bytes) (declare (ignore bytes))))
+    slice))
 
 (defstruct logical-reader-state
   database-oid batch-open-p xid chunk-count next-chunk fragment-batch
@@ -123,18 +184,36 @@ Discard the cursor after a read error; the stream may have advanced."
               (nconc (logical-reader-state-changes state) (list change)))))
   (values))
 
-(defun logical-transaction-map-changes (transaction function)
+(defun logical-transaction-map-changes (transaction function &key slices)
   "Visit each committed change while its owning reader scope is active."
   (if (logical-transaction-spool transaction)
       (logical-spool-map-event-cursors
        (logical-transaction-spool transaction)
        (lambda (cursor)
-         (let ((*logical-validation-only* nil))
+         (let* ((*logical-validation-only* nil)
+                (lease (and slices (make-logical-event-lease
+                                    :cursor cursor
+                                    :start (if (logical-cursor-stream cursor)
+                                               (file-position (logical-cursor-stream cursor))
+                                               0))))
+                (*logical-event-lease* lease))
            (declare (special *logical-validation-only*))
-           (funcall function (logical-decode-change-from-cursor cursor)))))
+           (unwind-protect
+                (let ((change (logical-decode-change-from-cursor cursor)))
+                  (when lease
+                    (logical-event-slice-visit
+                     (make-logical-event-slice :lease lease :offset 0
+                                               :length (logical-cursor-limit cursor)
+                                               :checksum (logical-cursor-expected-crc cursor))
+                     (lambda (bytes) (declare (ignore bytes)))))
+                  (funcall function change))
+             (when lease (setf (logical-event-lease-active-p lease) nil))))))
       (dolist (change (logical-transaction-changes transaction))
         (funcall function change)))
   (values))
+
+(defun logical-transaction-map-send-changes (transaction function)
+  (logical-transaction-map-changes transaction function :slices t))
 
 (declaim (notinline logical-fragment-assembler-bytes logical-fragment-batch-p
                     logical-fragment-batch-xid logical-fragment-batch-count
@@ -649,10 +728,11 @@ revalidated by this codec."
       (3 (unless (member type '(:varchar :text :json))
            (error "logical value tag does not match its column type"))
        (let ((length (logical-read-u32 cursor)))
-         (if *logical-validation-only*
-             (progn (logical-validate-utf8 cursor length) "")
-             (sb-ext:octets-to-string (logical-read-octets cursor length)
-                                      :external-format :utf-8))))
+         (cond (*logical-validation-only* (logical-validate-utf8 cursor length) "")
+               ((and *logical-event-lease* (eq cursor (logical-event-lease-cursor *logical-event-lease*)))
+                (logical-make-event-slice cursor length type))
+               (t (sb-ext:octets-to-string (logical-read-octets cursor length)
+                                           :external-format :utf-8)))))
       (4 (unless (eq type :numeric)
            (error "logical value tag does not match its column type"))
        (sql-numeric-input (logical-read-string-u32 cursor)))
@@ -682,9 +762,10 @@ revalidated by this codec."
       (15 (unless (eq type :bytea)
             (error "logical value tag does not match its column type"))
        (let ((length (logical-read-u32 cursor)))
-         (if *logical-validation-only*
-             (progn (logical-skip-value-octets cursor length) #())
-             (logical-read-octets cursor length))))
+         (cond (*logical-validation-only* (logical-skip-value-octets cursor length) #())
+               ((and *logical-event-lease* (eq cursor (logical-event-lease-cursor *logical-event-lease*)))
+                (logical-make-event-slice cursor length type))
+               (t (logical-read-octets cursor length)))))
       (13 (unless (eq type :timetz) (error "logical value tag does not match its column type"))
        (make-sql-timetz (logical-u64-signed (logical-read-u64 cursor))
                         (logical-u32-signed (logical-read-u32 cursor))))
