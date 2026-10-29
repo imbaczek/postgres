@@ -1587,11 +1587,23 @@ These tests check process discovery, start-time validation, direct startup, fast
 configuration precedence, SIGHUP and the pinned ConfigHandler's settings queries
 through real psycopg2. The configuration subset supports `port`,
 `listen_addresses`, `data_directory`, `checkpoint_timeout`, `max_wal_size`,
-`max_slot_wal_keep_size` and the empty `restore_command` default, with includes,
+`max_slot_wal_keep_size`, `max_connections`, `max_wal_senders`,
+`reserved_connections`, `superuser_reserved_connections` and the empty
+`restore_command` default, with includes,
 auto.conf and CLI overrides. Nonempty restore commands are rejected until archive
 recovery exists. SHOW,
 current_setting and typed pg_settings rows expose the actual installed values.
 Unknown settings fail visibly; empty or multiple listen addresses are unsupported.
+After startup packet parsing and before authentication success, independent
+`max_connections` and `max_wal_senders` quotas limit SQL sessions and physical or
+database replication sessions respectively. Defaults are 100 and 10. These are
+postmaster settings: reload reports pending restart and keeps the installed caps
+until restart. The reserved settings participate in startup validation, but the
+native server currently authenticates SQL as superuser and does not implement
+non-superuser reserved-slot policy. These quotas do not cap raw sockets or threads
+before startup packets; C-style pre-authentication pooling and timeout remain open.
+Run `PATRONI_PYTHON=/path/to/pinned-venv/bin/python3 ./t/backend-admission.sh`;
+set `REFERENCE_POSTGRES` to also run the wire oracle against C.
 Session startup `options` accept `application_name`, `statement_timeout` and dotted custom GUC
 placeholders, including Patroni's defaults. Statement deadlines apply at safe
 interrupt points and bounded lock waits, with independent budgets for statements

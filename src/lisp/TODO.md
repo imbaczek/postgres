@@ -37,6 +37,10 @@
 - [ ] Audit server-file and command-line defaults for `application_name`; client
   startup and SQL settings are implemented.
 
+- [ ] Implement and verify C-style pre-authentication connection pooling,
+  dead-end handling and authentication timeout. The current independent session
+  quotas apply after startup packet parsing and do not bound pending raw sockets.
+
 - [ ] Fix cold test declarations in `t/promotion-intent-tests.lisp`.
   `call-with-promotion-fixture` binds `pg::*shutdown-mode*` and
   `pg::*shutdown-requested*` lexically before their declarations, producing four

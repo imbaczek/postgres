@@ -81,11 +81,15 @@ The registry lock protects this queue. MAIN retires it after all clients leave."
 (defvar *n-backends* 0)
 (defvar *n-connections* 0)
 
-(defvar *max-connections* 100)
+(defvar *max-connections* 100
+  "Installed SQL session quota, selected at startup.")
 
-(defvar *max-wal-senders* 10)
+(defvar *max-wal-senders* 10
+  "Installed quota shared by physical and database WAL-sender sessions.")
 
-(defvar *backend-admission-classes* (make-hash-table :test #'eq))
+(defvar *backend-admission-classes* (make-hash-table :test #'eq)
+  "Backend-generation quota reservations, protected by the registry lock.
+DEFVAR preserves reservations across function reloads.")
 
 (declaim (special *live-operation-lock* *live-operation-cv*
                   *live-operation-backend-query-tokens*
@@ -102,7 +106,9 @@ The registry lock protects this queue. MAIN retires it after all clients leave."
     (gethash pid *backend-registry*)))
 
 (defun postmaster-admit-startup-backend (backend)
-  "Reserve the SQL or WAL-sender session quota for this registered generation."
+  "Reserve the SQL or WAL-sender quota for this registered backend generation.
+Check exact PID ownership before accepting a repeated reservation; the class
+cannot change. Exhaustion raises FATAL before authentication succeeds."
   (let* ((mode (backend-replication-mode backend))
          (kind (if mode :walsender :sql))
          (limit (if mode *max-wal-senders* *max-connections*)))
@@ -128,6 +134,7 @@ The registry lock protects this queue. MAIN retires it after all clients leave."
   backend)
 
 (defun register-backend (backend)
+  "Register a unique PID and enroll late arrivals for closed-gate cleanup."
   ;; Serialize with the reload snapshot. A provisional backend registered after
   ;; admission closes may finish teardown during drain, but must not gain SQL
   ;; transaction-drain eligibility merely by arriving late.
@@ -170,6 +177,8 @@ already recorded in CLOG while releasing the backend's remaining registrations."
   (values))
 
 (defun unregister-backend (backend)
+  "Remove BACKEND's reservation even if its PID now names another generation.
+Registry removal is conditional on exact ownership; repeated cleanup is safe."
   ;; The query finalizer can itself be interrupted while it waits for reload
   ;; admission. Remove its token here as a final guarantee that teardown cannot
   ;; retain the backend. Acquire the live-operation lock before the registry

@@ -143,6 +143,7 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
     (when report (send-parameter-status stream "in_hot_standby" (if standby "on" "off")))))
 
 (defun process-startup (stream body)
+  "Parse startup mode and reserve its quota before sending authentication success."
   (with-live-operation
     (let* ((code (bytes-to-u32 body 0))
            (major (ash code -16)))
@@ -667,7 +668,9 @@ Preserve all dispatch values, including secondary values, for the caller."
                   (return)))))))))
 
 (defun finish-backend-connection (backend sock stream)
-  "Send final connection cleanup through the backend's captured cleanup lane."
+  "Finish through the backend's captured cleanup lane.
+Always unregister after backend cleanup, even if cleanup exits abnormally, and
+finish outer connection accounting after unregistering."
   (with-live-operation-backend-shutdown-cleanup (backend)
     (unwind-protect
          (close-connection sock stream)

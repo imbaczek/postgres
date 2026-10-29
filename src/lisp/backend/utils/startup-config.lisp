@@ -418,6 +418,8 @@ other values request configuration output. The last -C selects between these use
               settings native overrides))))
 
 (defun startup-check-connection-limits (settings)
+  "Check reserved-slot and C process-budget bounds before installing settings.
+The other worker pools use their C defaults in the process-budget calculation."
   (let ((connections (startup-setting-value settings "max_connections"))
         (senders (startup-setting-value settings "max_wal_senders"))
         (reserved (startup-setting-value settings "reserved_connections"))
@@ -430,6 +432,7 @@ other values request configuration output. The last -C selects between these use
       (error "too many server processes configured"))))
 
 (defun startup-install-settings (settings native overrides)
+  "Validate and install startup settings, including session quotas before listen."
   (startup-check-connection-limits settings)
   (let ((timeout (startup-setting-value settings "checkpoint_timeout"))
         (wal-bytes (* 1024 1024 (startup-setting-value settings "max_wal_size")))

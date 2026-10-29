@@ -62,6 +62,16 @@ Pass `--native /path/to/pg-lisp.sh` to compare native metadata as well; the full
 comparison currently fails on unsupported `cluster_name`. This oracle does not
 run `Postgresql.follow`, a receiver, a coordinator or DCS.
 
+From `src/lisp`, run the native session quota, reload, restart and raw-wire checks:
+
+```sh
+PATRONI_PYTHON=/path/to/pinned-venv/bin/python3 ./t/backend-admission.sh
+```
+
+Set `REFERENCE_POSTGRES` to the pinned C executable to run the same driver
+against C. The script owns and cleans up its peers; these checks do not establish
+a pre-authentication socket or thread limit.
+
 ## Verification
 
 - Primary Rove: 134 pass; live apply/SQL/wire: 21 pass; native C subscriber: 3 pass.

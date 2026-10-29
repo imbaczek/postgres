@@ -646,6 +646,26 @@ files. The C run passes; the full native comparison currently fails on unsupport
 or receiver test. Full GUC behavior, desired-generation reconciliation, libpq,
 first attachment, same-timeline follow and the follow acceptance matrix remain open.
 
+Native startup now installs independent `max_connections` (default 100) and
+`max_wal_senders` (default 10) session quotas before listening. Startup packets
+select SQL or physical/database replication class before admission and AuthOK;
+quota exhaustion returns FATAL 53300. Reservations are keyed by backend generation
+and released on failed startup or connection cleanup. Reload retains installed
+postmaster limits and reports pending restart. The reserved-connection settings
+participate in the startup sum check. `max_connections` and `max_wal_senders`
+participate in the C process-budget check. Native SQL currently authenticates as
+superuser and does not implement reserved-role policy.
+These quotas do not bound raw sockets or threads awaiting a startup packet; C's
+pre-authentication pool, dead-end handling and authentication timeout remain open.
+
+The native and C wire oracle passed all six configurations, including restart,
+zero senders, saturated cancellation and a pending raw handshake. Native control
+checks observed reload preserving the active caps. Fresh full physical tests passed
+975, interop 185, legacy 1,155 checks and strict cold compilation passed. The
+seeded admission property passed with input-coverage and rejection-count gaps
+unmeasured. Full writer GUC behavior, `wal_keep_size`, hot standby, libraries and
+effective follow remain open; the writer oracle still first rejects `cluster_name`.
+
 A Sol xhigh source audit identified these connected requirements:
 
 - Add an explicit logical/physical discriminator to the shared public slot
