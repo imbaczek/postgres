@@ -99,6 +99,33 @@
               (otherwise (prog1 (copy-query-sort-value (aref results aggregate-index))
                            (incf aggregate-index))))))))
 
+(defun window-pad-origins (origins width)
+  (when *datum-origin-capture*
+    (let ((result (make-array width :initial-element nil)))
+      (when origins (replace result origins :end1 (min width (length origins))))
+      result)))
+
+(defun window-output-origins (origins width functions)
+  (let ((result (window-pad-origins origins width)))
+    (when result
+      (dolist (function functions)
+        (setf (aref result (getf function :slot)) nil)))
+    result))
+
+(defun window-input-with-origins (environment expressions origins)
+  (let* ((width (length environment))
+         (values (make-array (+ width (length expressions))))
+         (result-origins (window-pad-origins origins (length values))))
+    (replace values environment)
+    (loop for expression in expressions for i from width
+          do (multiple-value-bind (value origin)
+                 (if *datum-origin-capture*
+                     (eval-expr-with-origin expression environment origins)
+                     (values (eval-expr expression environment) nil))
+               (setf (aref values i) value)
+               (when result-origins (setf (aref result-origins i) origin))))
+    (values values result-origins)))
+
 (defun stream-window-stage (source stage emit)
   ;; Ranking streams independently of the frame. Aggregate ROWS prefixes emit
   ;; per row; RANGE peers and whole partitions buffer until their result is known.
@@ -129,8 +156,9 @@
                                   (let ((inputs (window-aggregate-inputs aggregates environment)))
                                     (step-aggregate-transition-states states aggregates inputs 0)))
                                 (output (environment results row-position row-rank row-dense)
-                                  (funcall emit (window-project-row environment width functions results
-                                                                    row-position row-rank row-dense)))
+                                  (let ((*query-row-origins* (window-output-origins *query-row-origins* width functions)))
+                                    (funcall emit (window-project-row environment width functions results
+                                                                      row-position row-rank row-dense))))
                                 (flush-buffer ()
                                   (when buffer
                                     (query-row-spool-seal buffer)
@@ -178,7 +206,8 @@
                                              (let* ((padded (make-array width :initial-element +null+))
                                                     (values (map 'vector (lambda (key) (eval-expr key environment)) keys)))
                                                (replace padded environment :end2 (min width (length environment)))
-                                               (funcall callback (cons values padded))))))
+                                               (let ((*query-row-origins* (window-pad-origins *query-row-origins* width)))
+                                                 (funcall callback (cons values padded)))))))
                                 (finish () (flush-buffer)))
                              (unwind-protect
                                   (if (and keys (getf stage :sort-required t))

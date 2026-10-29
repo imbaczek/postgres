@@ -143,6 +143,12 @@ run -c 'insert into toast_scalar_result select (select (select v)) from toast_in
 [ "$(run -c "select count(*) from toast_scalar_result where v='short'")" = 2 ]
 run -c 'create table toast_scalar_source (id int, v text)' >/dev/null
 run -c "insert into toast_scalar_source values (1,'$index_suffix'),(2,'b$index_suffix')" >/dev/null
+run -c 'create table toast_window_result (v text, n int)' >/dev/null
+run -c 'alter table toast_window_result alter column v set storage plain' >/dev/null
+run -c 'insert into toast_window_result select v,row_number() over (order by id) from toast_scalar_source' >/dev/null
+run -c 'insert into toast_window_result select v,rank() over (order by v) from toast_scalar_source' >/dev/null
+run -c 'insert into toast_window_result with q as materialized (select v,dense_rank() over (order by id) as n from toast_scalar_source) select v,n from q' >/dev/null
+[ "$(run -c "select count(*) from toast_window_result where (n=1 and length(v)=20000 and substr(v,1,1)='a') or (n=2 and length(v)=20001 and substr(v,1,1)='b')")" = 6 ]
 run -c 'create table toast_conflict_origins (id int primary key, a text, b text)' >/dev/null
 run -c 'alter table toast_conflict_origins alter column a set storage external' >/dev/null
 run -c 'alter table toast_conflict_origins alter column b set storage plain' >/dev/null

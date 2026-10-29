@@ -325,7 +325,9 @@
      (make-mapping-sql-iterator
       (make-physical-plan-iterator (third node) relations)
       (lambda (row)
-        (values (concatenate 'vector row (map 'vector (lambda (expr) (eval-expr expr row)) (second node))) t))))
+        (multiple-value-bind (values origins)
+            (window-input-with-origins row (second node) *query-row-origins*)
+          (values values t origins)))))
     (:window
      (make-window-plan-iterator (make-physical-plan-iterator (third node) relations) (second node)))
     (:project-set

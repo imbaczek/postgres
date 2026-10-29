@@ -1427,8 +1427,12 @@ on an abnormal exit."
   "Recognize plans whose execution retains detached row origins."
   (case (first node)
     ((:result :seq-scan :index-scan) t)
-    ((:filter :project :sort :limit)
+    ((:filter :project :sort :limit :window-input)
      (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
+    (:window
+     (and (every (lambda (function) (member (getf function :kind) '(:row-number :rank :dense-rank)))
+                 (getf (second node) :functions))
+          (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen)))
     (:top-n (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable seen))
     (:hash-distinct (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
     (:append
@@ -1552,10 +1556,10 @@ on an abnormal exit."
     (:window-input
      (funcall run-child (third node)
               (lambda (environment)
-                (funcall emit
-                         (concatenate 'vector environment
-                                      (map 'vector (lambda (expression) (eval-expr expression environment))
-                                           (second node)))))))
+                (multiple-value-bind (values origins)
+                    (window-input-with-origins environment (second node) *query-row-origins*)
+                  (let ((*query-row-origins* origins))
+                    (funcall emit values))))))
     (:window
      (stream-window-stage (lambda (callback) (funcall run-child (third node) callback))
                           (second node) emit))

@@ -14,7 +14,8 @@
                      (lambda (row)
                        (let ((padded (make-array (getf stage :width) :initial-element +null+)))
                          (replace padded row :end2 (min (length row) (length padded)))
-                         (values (cons (map 'vector (lambda (key) (eval-expr key row)) keys) padded) t)))))
+                         (values (cons (map 'vector (lambda (key) (eval-expr key row)) keys) padded) t
+                                 (window-pad-origins *query-row-origins* (length padded)))))))
          (source (if (and keys (getf stage :sort-required t))
                      (make-buffered-sql-iterator
                       (lambda (emit)
@@ -74,11 +75,12 @@
              (multiple-value-bind (row present) (sql-iterator-next reader)
                (when present (return (values (project row results) t))))
              (close-buffer))
-           (multiple-value-bind (first present) (take-item)
+           (multiple-value-bind (first present origins) (take-item)
              (unless present (return (values nil nil)))
              (unless (or whole-p peers-p)
                (let ((row (advance first)))
-                 (return (values (project row (window-transition-results states)) t))))
+                 (return (values (project row (window-transition-results states)) t
+                                 (window-output-origins origins (getf stage :width) functions)))))
              (setf buffer (make-query-replay-store nil))
              (let ((group-partition (row-partition first)) (group-peer (row-peer first)))
                (append-query-replay-row buffer (advance first))
