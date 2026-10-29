@@ -1167,11 +1167,28 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                    when (logical-relation-selected-p runtime relation)
                      collect (pgoutput-relation-name relation)))))
 
-(defun logical-pgoutput-dispatch (runtime payload)
+(defun logical-pgoutput-read-operation (runtime payload)
+  "Decode a complete pgoutput message before performing any effects."
   (when (zerop (length payload)) (error "empty pgoutput message"))
-  (let* ((kind (code-char (aref payload 0)))
-         (operation (when (member kind '(#\B #\C #\R #\T #\M))
-                      (logical-pgoutput-read-control runtime payload))))
+  (let ((kind (code-char (aref payload 0))))
+    (if (member kind '(#\I #\U #\D))
+        (progn
+          (unless (logical-subscription-runtime-transaction-open-p runtime)
+            (error "pgoutput row change appeared outside a transaction"))
+          (when (< (length payload) 5) (error "truncated pgoutput row message"))
+          (let ((oid (bytes-to-u32 payload 1)))
+            (ecase kind
+              (#\I (list kind oid (logical-pgoutput-read-insert payload 5)))
+              (#\U (multiple-value-bind (old new tuple-kind)
+                       (logical-pgoutput-read-update payload 5)
+                     (list kind oid old new tuple-kind)))
+              (#\D (multiple-value-bind (tuple tuple-kind)
+                       (logical-pgoutput-read-delete payload 5)
+                     (list kind oid tuple tuple-kind))))))
+        (logical-pgoutput-read-control runtime payload))))
+
+(defun logical-pgoutput-apply-operation (runtime operation)
+  (let ((kind (first operation)))
     (case kind
       (#\B
        (when (logical-subscription-runtime-transaction-open-p runtime)
@@ -1190,17 +1207,16 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
       ((#\I #\U #\D)
        (unless (logical-subscription-runtime-transaction-open-p runtime)
          (error "pgoutput row change appeared outside a transaction"))
-       (when (< (length payload) 5) (error "truncated pgoutput row message"))
-       (let* ((oid (bytes-to-u32 payload 1))
+       (let* ((oid (second operation))
               (relation (gethash oid
                                  (logical-subscription-runtime-relations runtime))))
          (unless relation (error "pgoutput row message has no Relation metadata"))
          (logical-test-failpoint
           :before-row-change kind (pgoutput-relation-name relation))
          (ecase kind
-           (#\I (logical-apply-insert runtime relation payload 5))
-           (#\U (logical-apply-update runtime relation payload 5))
-           (#\D (logical-apply-delete runtime relation payload 5)))
+           (#\I (logical-apply-insert-tuple runtime relation (third operation)))
+           (#\U (logical-apply-update-tuples runtime relation (third operation) (fourth operation) (fifth operation)))
+           (#\D (logical-apply-delete-tuple runtime relation (third operation) (fourth operation))))
          (logical-test-failpoint
           :after-row-change kind (pgoutput-relation-name relation))))
       (#\T (logical-apply-truncate-relations runtime (second operation)))
@@ -1231,9 +1247,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
             (logical-advance-progress-from-scan runtime lsn))
            (t (error "unsupported pgoutput Message prefix ~s" prefix)))))
       (#\C
-       (unless (and (logical-subscription-runtime-transaction-open-p runtime)
-                    (= (length payload) 26)
-                    (zerop (aref payload 1)))
+       (unless (logical-subscription-runtime-transaction-open-p runtime)
          (error "invalid pgoutput Commit message"))
        (unless (eql (logical-subscription-runtime-final-lsn runtime) (third operation))
          (error "pgoutput Commit LSN does not match Begin final LSN"))
@@ -1242,6 +1256,9 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
         runtime (second operation))
        (setf (logical-subscription-runtime-final-lsn runtime) nil))
       (otherwise (error "unsupported pgoutput message ~s" kind)))))
+
+(defun logical-pgoutput-dispatch (runtime payload)
+  (logical-pgoutput-apply-operation runtime (logical-pgoutput-read-operation runtime payload)))
 
 (defun logical-stream-frame (runtime payload)
   (when (zerop (length payload)) (error "empty replication CopyData payload"))
@@ -1257,6 +1274,165 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
      (logical-progress-keepalive runtime (logical-pgoutput-read-keepalive payload)))
     (otherwise (error "unexpected replication CopyData message ~s"
                       (code-char (aref payload 0))))))
+
+(defstruct logical-wire-cursor stream remaining)
+
+(defun logical-wire-byte (cursor)
+  (when (zerop (logical-wire-cursor-remaining cursor))
+    (error "truncated logical replication frame"))
+  (let ((byte (read-byte (logical-wire-cursor-stream cursor) nil nil)))
+    (unless byte (error "logical replication connection ended during a frame"))
+    (decf (logical-wire-cursor-remaining cursor))
+    byte))
+
+(defun logical-wire-uint (cursor size)
+  (loop repeat size for value = (logical-wire-byte cursor)
+        for result = value then (logior (ash result 8) value)
+        finally (return result)))
+
+(defun logical-wire-octets (cursor size)
+  (unless (<= size (logical-wire-cursor-remaining cursor))
+    (error "truncated logical replication value"))
+  (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
+    (loop for position = 0 then next
+          while (< position size)
+          for next = (read-sequence bytes (logical-wire-cursor-stream cursor) :start position)
+          do (when (= next position) (error "logical replication connection ended during a value"))
+             (decf (logical-wire-cursor-remaining cursor) (- next position)))
+    bytes))
+
+(defun logical-wire-cstring (cursor)
+  (let ((bytes (make-array 0 :element-type '(unsigned-byte 8)
+                             :adjustable t :fill-pointer 0)))
+    (loop for byte = (logical-wire-byte cursor)
+          until (zerop byte) do (vector-push-extend byte bytes))
+    (bytes->string bytes)))
+
+(defun logical-wire-tuple (cursor)
+  (let ((count (logical-wire-uint cursor 2)))
+    (coerce (loop repeat count
+                  collect (case (code-char (logical-wire-byte cursor))
+                            (#\n nil)
+                            (#\u :unchanged-toast)
+                            (#\t (bytes->string
+                                  (logical-wire-octets cursor (logical-wire-uint cursor 4))))
+                            (otherwise (error "unsupported pgoutput tuple value kind"))))
+            'vector)))
+
+(defun logical-wire-relation (cursor standard-p)
+  (let* ((oid (logical-wire-uint cursor 4))
+         (namespace (logical-wire-cstring cursor))
+         (name (logical-wire-cstring cursor))
+         (identity (logical-wire-byte cursor))
+         (count nil)
+         (columns nil) (keys nil))
+    (when (and standard-p (/= identity (char-code #\d)))
+      (error "standard replication requires default replica identity"))
+    (setf count (logical-wire-uint cursor 2))
+    (dotimes (i count)
+      (let ((flags (logical-wire-byte cursor)))
+        (unless (member flags '(0 1)) (error "unsupported pgoutput Relation column flags"))
+        (let* ((column-name (logical-wire-cstring cursor))
+               (type-oid (logical-wire-uint cursor 4))
+               (typmod (logical-u32-signed (logical-wire-uint cursor 4)))
+               (column (make-pgoutput-column :name column-name :key-p (= flags 1)
+                                             :type-oid type-oid :typmod typmod)))
+          (push column columns)
+          (when (= flags 1) (push column keys)))))
+    (make-pgoutput-relation :oid oid :namespace namespace :name name
+                            :columns (nreverse columns) :key-columns (nreverse keys))))
+
+(defun logical-wire-operation (runtime cursor)
+  (let ((kind (code-char (logical-wire-byte cursor))))
+    (case kind
+      (#\B
+       (when (logical-subscription-runtime-transaction-open-p runtime)
+         (error "nested pgoutput transaction"))
+       (let* ((lsn (logical-wire-uint cursor 8)) (time (logical-wire-uint cursor 8))
+                                                 (xid (logical-wire-uint cursor 4)))
+         (when (zerop lsn) (error "invalid pgoutput Begin final LSN"))
+         (list kind xid lsn (if (logbitp 63 time) (- time #x10000000000000000) time))))
+      (#\C
+       (unless (zerop (logical-wire-byte cursor)) (error "invalid pgoutput Commit flags"))
+       (let* ((commit (logical-wire-uint cursor 8)) (end (logical-wire-uint cursor 8))
+                                                    (time (logical-wire-uint cursor 8)))
+         (list kind end commit (if (logbitp 63 time) (- time #x10000000000000000) time))))
+      (#\R (list kind (logical-wire-relation
+                       cursor (eq (logical-subscription-options-mode
+                                   (logical-subscription-runtime-options runtime)) :standard))))
+      ((#\I #\U #\D)
+       (unless (logical-subscription-runtime-transaction-open-p runtime)
+         (error "pgoutput row change appeared outside a transaction"))
+       (let ((oid (logical-wire-uint cursor 4)) (tag (code-char (logical-wire-byte cursor))))
+         (ecase kind
+           (#\I (unless (char= tag #\N) (error "pgoutput INSERT lacks a new tuple"))
+            (list kind oid (logical-wire-tuple cursor)))
+           (#\D (list kind oid (logical-wire-tuple cursor) tag))
+           (#\U (let ((old nil) (initial tag))
+                  (when (member tag '(#\K #\O))
+                    (setf old (logical-wire-tuple cursor) tag (code-char (logical-wire-byte cursor))))
+                  (unless (char= tag #\N) (error "pgoutput UPDATE lacks a new tuple"))
+                  (list kind oid old (logical-wire-tuple cursor) initial))))))
+      (#\T
+       (unless (logical-subscription-runtime-transaction-open-p runtime)
+         (error "pgoutput TRUNCATE appeared outside a transaction"))
+       (let ((count (logical-wire-uint cursor 4)) (flags (logical-wire-byte cursor)))
+         (unless (zerop flags) (error "unsupported pgoutput TRUNCATE flags"))
+         (unless (= (logical-wire-cursor-remaining cursor) (* count 4))
+           (error "invalid pgoutput TRUNCATE relation count"))
+         (list kind (loop repeat count collect (logical-wire-uint cursor 4)))))
+      (#\M
+       (when (eq (logical-subscription-options-mode
+                  (logical-subscription-runtime-options runtime)) :standard)
+         (error "standard subscriber does not accept extension Message events"))
+       (let* ((flags (logical-wire-byte cursor)) (lsn (logical-wire-uint cursor 8)))
+         (unless (member flags '(0 1)) (error "unsupported pgoutput Message flags"))
+         (when (and (= flags 1) (not (logical-subscription-runtime-transaction-open-p runtime)))
+           (error "transactional pgoutput Message outside a transaction"))
+         (let ((prefix (logical-wire-cstring cursor)) (size (logical-wire-uint cursor 4)))
+           (unless (and (<= size +max-logical-transaction-bytes+)
+                        (= size (logical-wire-cursor-remaining cursor)))
+             (error "invalid pgoutput Message content length"))
+           (list kind prefix lsn (bytes->string (logical-wire-octets cursor size)) (= flags 1)))))
+      (otherwise (error "unsupported pgoutput message ~s" kind)))))
+
+(defun logical-read-stream-operation (runtime source)
+  "Read one complete replication frame before applying its decoded operation."
+  (let ((stream (pg-client-stream source)) (complete nil))
+    (unwind-protect
+         (let* ((type (read-byte stream nil nil))
+                (header (make-logical-wire-cursor :stream stream :remaining 4))
+                (length (logical-wire-uint header 4)))
+           (unless (<= 4 length +max-query-message-size+)
+             (error "invalid replication frame length"))
+           (when (eql type (char-code #\E))
+             (let ((cursor (make-logical-wire-cursor :stream stream :remaining (- length 4))))
+               (error (pg-client-error-from-payload
+                       (logical-wire-octets cursor (logical-wire-cursor-remaining cursor))))))
+           (unless (and type (= type (char-code #\d)))
+             (error "unexpected CopyBoth frontend response ~s" (and type (code-char type))))
+           (let* ((cursor (make-logical-wire-cursor :stream stream :remaining (- length 4)))
+                  (kind (code-char (logical-wire-byte cursor)))
+                  (operation
+                    (case kind
+                      (#\w
+                       (logical-wire-uint cursor 8)
+                       (logical-wire-uint cursor 8)
+                       (logical-wire-uint cursor 8)
+                       (logical-wire-operation runtime cursor))
+                      (#\k
+                       (let ((wal-end (logical-wire-uint cursor 8)))
+                         (logical-wire-uint cursor 8)
+                         (logical-wire-byte cursor)
+                         (list #\k wal-end)))
+                      (otherwise (error "unexpected replication CopyData message ~s" kind)))))
+             (unless (zerop (logical-wire-cursor-remaining cursor))
+               (error "replication frame has trailing bytes"))
+             (setf complete t)
+             (if (char= (first operation) #\k)
+                 (logical-progress-keepalive runtime (second operation))
+                 (logical-pgoutput-apply-operation runtime operation))))
+      (unless complete (pg-client-close source)))))
 
 (defun logical-run-stream (options target marker)
   (let* ((source (logical-startup-replication-client options))
@@ -1282,11 +1458,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                    (wal-format-lsn marker))
            (finish-output *error-output*)
            (loop
-             (multiple-value-bind (type payload)
-                 (pg-client-replication-frame source)
-               (unless (char= type #\d)
-                 (error "unexpected CopyBoth frontend response ~s" type))
-               (logical-stream-frame runtime payload)))
+             (logical-read-stream-operation runtime source))
            (values))
       (pg-client-close source))))
 

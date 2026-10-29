@@ -258,6 +258,40 @@
            (setf (symbol-function 'pg::standard-send-socket-chunk) original
                  (symbol-function 'pg::standard-poll-feedback) poll))))))
 
+(deftest subscriber-reads-fragmented-socket-frame
+    (call-with-standard-socket-pair
+     (lambda (state input)
+       (let* ((payload (pg::make-payload))
+              (frame (pg::make-payload))
+              (runtime (pg::make-logical-subscription-runtime
+                        :options (pg::make-logical-subscription-options) :transaction-open-p t))
+              (original (symbol-function 'pg::logical-pgoutput-apply-operation))
+              (seen nil) (writer nil))
+         (unwind-protect
+              (progn
+                (pg::payload-push-byte payload (char-code #\w))
+                (dotimes (i 24) (pg::payload-push-byte payload 0))
+                (pg::payload-push payload #(73 0 0 0 7 78 0 1 116 0 0 0 4 240 159 153 130))
+                (pg::payload-push-byte frame (char-code #\d))
+                (pg::payload-push frame (pg::u32-to-bytes (+ 4 (length payload))))
+                (pg::payload-push frame payload)
+                (setf (symbol-function 'pg::logical-pgoutput-apply-operation)
+                      (lambda (receiver operation) (declare (ignore receiver)) (setf seen operation))
+                      writer (sb-thread:make-thread
+                              (lambda ()
+                                (loop for byte across frame do
+                                  (write-byte byte (pg::standard-stream-stream state))
+                                  (force-output (pg::standard-stream-stream state))
+                                  (sleep 0.001)))))
+                (sb-ext:with-timeout 5
+                  (pg::logical-read-stream-operation runtime (pg::make-pg-client :stream input)))
+                (sb-thread:join-thread writer)
+                (setf writer nil)
+                (ok (equalp seen (list #\I 7 (vector "🙂")))))
+           (unwind-protect
+                (when writer (sb-thread:join-thread writer))
+             (setf (symbol-function 'pg::logical-pgoutput-apply-operation) original)))))))
+
 (deftest standard-streamed-row-matches-existing-frame
     (call-with-standard-socket-pair
      (lambda (state input)

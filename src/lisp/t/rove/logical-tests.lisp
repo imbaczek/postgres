@@ -34,6 +34,208 @@
               (symbol-function 'logical-apply-update-tuples) update
               (symbol-function 'logical-apply-delete-tuple) delete))))
 
+(rove:deftest test-pgoutput-vector-adapter-applies-only-decoded-operations
+    (let* ((runtime (make-logical-subscription-runtime
+                     :options (make-logical-subscription-options) :transaction-open-p t))
+           (original (symbol-function 'logical-pgoutput-apply-operation))
+           (operations nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-pgoutput-apply-operation)
+                   (lambda (receiver operation)
+                     (rove:ok (eq receiver runtime))
+                     (push operation operations)))
+             (logical-pgoutput-dispatch runtime #(73 0 0 0 7 78 0 0))
+             (logical-pgoutput-dispatch runtime #(85 0 0 0 7 78 0 0))
+             (logical-pgoutput-dispatch runtime #(68 0 0 0 7 75 0 0))
+             (rove:ok (equalp (nreverse operations)
+                              (list (list #\I 7 #()) (list #\U 7 nil #() #\N)
+                                    (list #\D 7 #() #\K))))
+             (setf operations nil)
+             (rove:ok (handler-case
+                          (progn (logical-pgoutput-dispatch runtime #(73 0 0 0 7 78 0 0 1)) nil)
+                        (error () t)))
+             (rove:ok (null operations)))
+        (setf (symbol-function 'logical-pgoutput-apply-operation) original))))
+
+(rove:deftest test-logical-wire-cursor-applies-only-complete-frame
+    (let* ((path (merge-pathnames (format nil "pg-wire-cursor-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (runtime (make-logical-subscription-runtime
+                     :options (make-logical-subscription-options) :transaction-open-p t))
+           (original (symbol-function 'logical-pgoutput-apply-operation))
+           (seen nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-pgoutput-apply-operation)
+                   (lambda (receiver operation) (declare (ignore receiver)) (push operation seen)))
+             (dolist (extra '(nil t))
+               (let* ((payload (make-payload))
+                      (row #(73 0 0 0 7 78 0 0)))
+                 (payload-push-byte payload (char-code #\w))
+                 (dotimes (i 24) (payload-push-byte payload 0))
+                 (payload-push payload row)
+                 (when extra (payload-push-byte payload 1))
+                 (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                              :if-exists :supersede :if-does-not-exist :create)
+                   (write-byte (char-code #\d) stream)
+                   (write-sequence (u32-to-bytes (+ 4 (length payload))) stream)
+                   (write-sequence payload stream))
+                 (let* ((stream (open path :element-type '(unsigned-byte 8)))
+                        (client (make-pg-client :stream stream)))
+                   (unwind-protect
+                        (if extra
+                            (rove:ok (handler-case (progn (logical-read-stream-operation runtime client) nil)
+                                       (error () t)))
+                            (logical-read-stream-operation runtime client))
+                     (when (open-stream-p stream) (close stream))))))
+             (rove:ok (equalp seen (list (list #\I 7 #())))))
+        (setf (symbol-function 'logical-pgoutput-apply-operation) original)
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-logical-wire-error-response-preserves-sqlstate
+    (let* ((path (merge-pathnames (format nil "pg-wire-error-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (payload (make-payload)))
+      (unwind-protect
+           (progn
+             (payload-push-byte payload (char-code #\C))
+             (payload-push-cstring payload "22011")
+             (payload-push-byte payload (char-code #\M))
+             (payload-push-cstring payload "failed")
+             (payload-push-byte payload 0)
+             (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede :if-does-not-exist :create)
+               (write-byte (char-code #\E) stream)
+               (write-sequence (u32-to-bytes (+ 4 (length payload))) stream)
+               (write-sequence payload stream))
+             (let ((stream (open path :element-type '(unsigned-byte 8))))
+               (rove:ok (handler-case
+                            (progn (logical-read-stream-operation nil (make-pg-client :stream stream)) nil)
+                          (pg-client-error (error) (string= "22011" (pg-client-error-sqlstate error)))))
+               (rove:ok (not (open-stream-p stream)))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-logical-wire-truncation-never-applies
+    (let* ((path (merge-pathnames (format nil "pg-wire-short-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (runtime (make-logical-subscription-runtime
+                     :options (make-logical-subscription-options) :transaction-open-p t))
+           (frame (make-payload))
+           (original (symbol-function 'logical-pgoutput-apply-operation))
+           (calls 0))
+      (unwind-protect
+           (progn
+             (payload-push-byte frame (char-code #\d))
+             (payload-push frame (u32-to-bytes 37))
+             (payload-push-byte frame (char-code #\w))
+             (dotimes (i 24) (payload-push-byte frame 0))
+             (payload-push frame #(73 0 0 0 7 78 0 0))
+             (setf (symbol-function 'logical-pgoutput-apply-operation)
+                   (lambda (&rest args) (declare (ignore args)) (incf calls)))
+             (loop for end from 0 below (length frame) do
+               (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                            :if-exists :supersede :if-does-not-exist :create)
+                 (write-sequence frame stream :end end))
+               (let ((stream (open path :element-type '(unsigned-byte 8))))
+                 (rove:ok (handler-case
+                              (progn (logical-read-stream-operation runtime (make-pg-client :stream stream)) nil)
+                            (error () t)))
+                 (rove:ok (not (open-stream-p stream)))))
+             (rove:ok (zerop calls)))
+        (setf (symbol-function 'logical-pgoutput-apply-operation) original)
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-logical-wire-rejects-invalid-utf8-and-oversize
+    (let* ((path (merge-pathnames (format nil "pg-wire-invalid-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (runtime (make-logical-subscription-runtime
+                     :options (make-logical-subscription-options) :transaction-open-p t))
+           (original (symbol-function 'logical-pgoutput-apply-operation))
+           (calls 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-pgoutput-apply-operation)
+                   (lambda (&rest args) (declare (ignore args)) (incf calls)))
+             (dolist (invalid '(nil t))
+               (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                            :if-exists :supersede :if-does-not-exist :create)
+                 (write-byte (char-code #\d) stream)
+                 (if invalid
+                     (write-sequence (u32-to-bytes (1+ +max-query-message-size+)) stream)
+                     (progn
+                       (write-sequence (u32-to-bytes 43) stream)
+                       (write-byte (char-code #\w) stream)
+                       (dotimes (i 24) (write-byte 0 stream))
+                       (write-sequence #(73 0 0 0 7 78 0 1 116 0 0 0 1 255) stream))))
+               (let ((stream (open path :element-type '(unsigned-byte 8))))
+                 (rove:ok (handler-case
+                              (progn (logical-read-stream-operation runtime (make-pg-client :stream stream)) nil)
+                            (error () t)))
+                 (rove:ok (not (open-stream-p stream)))))
+             (rove:ok (zerop calls)))
+        (setf (symbol-function 'logical-pgoutput-apply-operation) original)
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-logical-wire-operations-match-vector-decoder
+    (let* ((path (merge-pathnames (format nil "pg-wire-diff-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (runtime (make-logical-subscription-runtime
+                     :options (make-logical-subscription-options :mode :private)))
+           (transaction (make-logical-transaction :xid 5 :commit-lsn 100))
+           (relation (make-payload))
+           (fixtures nil))
+      (payload-push-byte relation (char-code #\R))
+      (payload-push-u32 relation 7)
+      (payload-push-cstring relation "public")
+      (payload-push-cstring relation "ż")
+      (payload-push-byte relation (char-code #\d))
+      (payload-push-u16 relation 0)
+      (setf fixtures (list (pgoutput-build-begin transaction) (pgoutput-build-commit transaction)
+                           relation #(73 0 0 0 7 78 0 0) #(85 0 0 0 7 75 0 2 110 110 78 0 2 110 117)
+                           #(68 0 0 0 7 75 0 0) (pgoutput-build-truncate '(7))
+                           (pgoutput-build-safe-progress-message 100)))
+      (unwind-protect
+           (dolist (payload fixtures)
+             (setf (logical-subscription-runtime-transaction-open-p runtime)
+                   (not (member (code-char (aref payload 0)) '(#\B #\M))))
+             (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede :if-does-not-exist :create)
+               (write-sequence payload stream))
+             (with-open-file (stream path :element-type '(unsigned-byte 8))
+               (let* ((cursor (make-logical-wire-cursor :stream stream :remaining (length payload)))
+                      (actual (logical-wire-operation runtime cursor))
+                      (expected (logical-pgoutput-read-operation runtime payload)))
+                 (rove:ok (zerop (logical-wire-cursor-remaining cursor)))
+                 (rove:ok (equalp actual expected)))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-logical-wire-adjacent-keepalive-frames
+    (let* ((path (merge-pathnames (format nil "pg-wire-adjacent-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (original (symbol-function 'logical-progress-keepalive))
+           (received nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-progress-keepalive)
+                   (lambda (runtime lsn) (declare (ignore runtime)) (push lsn received)))
+             (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede :if-does-not-exist :create)
+               (dolist (lsn '(1 2))
+                 (write-byte (char-code #\d) stream)
+                 (write-sequence (u32-to-bytes 22) stream)
+                 (write-byte (char-code #\k) stream)
+                 (dotimes (i 7) (write-byte 0 stream))
+                 (write-byte lsn stream)
+                 (dotimes (i 9) (write-byte 0 stream))))
+             (with-open-file (stream path :element-type '(unsigned-byte 8))
+               (let ((client (make-pg-client :stream stream)))
+                 (logical-read-stream-operation nil client)
+                 (logical-read-stream-operation nil client)))
+             (rove:ok (equal (nreverse received) '(1 2))))
+        (setf (symbol-function 'logical-progress-keepalive) original)
+        (when (probe-file path) (delete-file path)))))
+
 (rove:deftest test-control-decoders-reject-malformed-before-effects
     (let* ((runtime (make-logical-subscription-runtime
                      :options (make-logical-subscription-options)
