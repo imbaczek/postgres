@@ -280,6 +280,9 @@ try:
     query(sibling, "CHECKPOINT")
     original_base = {name: (data / name).read_bytes()
                      for name in ("global/pg_wal_control", "global/pg_control")}
+    promotion_slot_restart = query(
+        sibling, "SELECT lsn FROM pg_create_physical_replication_slot('promotion_reserved',true)")[0][0]
+    query(sibling, "SELECT pg_create_physical_replication_slot('promotion_unreserved')")
     assert query(promoted, "SELECT pg_promote(true,30)") == [(True,)]
     query(promoted, "INSERT INTO promotion_sql_items VALUES (3,'selected-child')")
     if os.environ.get("SELECTED_REPLAY_CONTROLLER") == "1":
@@ -494,6 +497,7 @@ try:
         assert all((data / name).read_bytes() == value for name, value in original_base.items())
         print("selected-replay: child checkpoint, replay, restartpoint and SIGKILL restart preserve original base PASS", flush=True)
         point = os.environ.get("SELECTED_REPLAY_PROMOTION_CRASH")
+        query(sibling, "SELECT pg_create_physical_replication_slot('promotion_temporary',true,true)")
         retained = None
         if point:
             assert point in ("after-online-intent", "after-child-control")
@@ -524,6 +528,14 @@ try:
             connections.append(retained)
             assert query(retained, "SELECT count(*) FROM promotion_sql_items") == [(3,)]
             assert query(sibling, "SELECT pg_promote(true,30)") == [(True,)]
+    assert query(sibling, "SELECT slot_name,restart_lsn,active FROM pg_replication_slots "
+                 "WHERE slot_name IN ('promotion_reserved','promotion_unreserved') ORDER BY slot_name") == [
+                     ("promotion_reserved", promotion_slot_restart, False),
+                     ("promotion_unreserved", None, False)]
+    if not sql_wait:
+        assert query(sibling, "SELECT active FROM pg_replication_slots "
+                     "WHERE slot_name='promotion_temporary'") == ([] if point else [(True,)])
+    print("selected-replay: physical slot restart floors and temporary ownership survive promotion PASS", flush=True)
     assert query(sibling, "SELECT substr(pg_walfile_name(pg_current_wal_lsn()),1,8)") == [("00000003",)]
     query(sibling, "INSERT INTO promotion_sql_items VALUES (4,'own-child-three')")
     if retained:
@@ -539,6 +551,12 @@ try:
     sibling = connect(replica_port)
     connections.append(sibling)
     assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(False, 4)]
+    assert query(sibling, "SELECT slot_name,restart_lsn,active FROM pg_replication_slots "
+                 "WHERE slot_name IN ('promotion_reserved','promotion_unreserved') ORDER BY slot_name") == [
+                     ("promotion_reserved", promotion_slot_restart, False),
+                     ("promotion_unreserved", None, False)]
+    assert query(sibling, "SELECT slot_name FROM pg_replication_slots "
+                 "WHERE slot_name='promotion_temporary'") == []
     query(sibling, "INSERT INTO promotion_sql_items VALUES (5,'own-restarted-three')")
     print("selected-replay: original base 1, applied child 2, promotion 3 and primary crash restart/write PASS", flush=True)
 except BaseException as error:
