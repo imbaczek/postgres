@@ -55,6 +55,42 @@
       (let ((conflict (cons column (list :expr (cdr assignment)))))
         (rove:ok (eq compressed (aref (unchanged-tuple-compressed-values tuple (list conflict) (vector "abc")) 0))))))
 
+(rove:deftest query-origin-follows-selected-branch
+    (let* ((origin (make-datum-origin :compressed (make-heap-compressed-varlena :payload #(1 2))))
+           (origins (vector origin))
+           (environment (vector "abc"))
+           (column (list :col 1 :type :text :typmod -1))
+           (empty (list :const "" :type :text :typmod -1))
+           (null (list :const +null+ :type :text :typmod -1)))
+      (multiple-value-bind (value selected)
+          (eval-expr-with-origin (list :coalesce (list null column) :type :text :typmod -1)
+                                 environment origins)
+        (rove:ok (string= value "abc"))
+        (rove:ok (eq selected origin)))
+      (multiple-value-bind (value selected)
+          (eval-expr-with-origin (list :case (list (list (list :bool t) column)) empty :type :text :typmod -1)
+                                 environment origins)
+        (rove:ok (string= value "abc"))
+        (rove:ok (eq selected origin)))
+      (multiple-value-bind (value selected)
+          (eval-expr-with-origin (list :concat column empty :type :text :typmod -1)
+                                 environment origins)
+        (rove:ok (string= value "abc"))
+        (rove:ok (null selected)))))
+
+(rove:deftest query-origin-assignment-typmods
+    (flet ((expression (type typmod) (list :col 1 :type type :typmod typmod))
+           (column (type typmod) (make-pg-column :type type :typmod typmod)))
+      (rove:ok (datum-origin-assignment-compatible-p (expression :text -1) (column :varchar -1)))
+      (rove:ok (not (datum-origin-assignment-compatible-p (expression :text -1) (column :varchar 30004))))
+      (rove:ok (datum-origin-assignment-compatible-p (expression :varchar 30004) (column :varchar 40004)))
+      (rove:ok (not (datum-origin-assignment-compatible-p (expression :varchar 30004) (column :varchar 20004))))
+      (let ((old (+ 4 (ash 20 16) 2))
+            (wider (+ 4 (ash 30 16) 2))
+            (other-scale (+ 4 (ash 30 16) 3)))
+        (rove:ok (datum-origin-assignment-compatible-p (expression :numeric old) (column :numeric wider)))
+        (rove:ok (not (datum-origin-assignment-compatible-p (expression :numeric old) (column :numeric other-scale)))))))
+
 (rove:deftest test-toast-catalog-ownership-roundtrip
     (let* ((toast (make-pg-toast :oid 100 :relfilenode 101 :index-oid 102
                                  :index-relfilenode 103 :relfrozenxid 20))

@@ -8,6 +8,14 @@
 
 (declaim (ftype function sql-varlena-array-encode sql-varlena-array-decode))
 
+(defvar *datum-origin-capture* nil
+  "When true, retain detached compression provenance for query projection.")
+
+(defvar *query-row-origins* nil
+  "Per-slot compression provenance for the row currently emitted.")
+
+(defstruct datum-origin compressed external-p)
+
 (defstruct htup
   block
   offnum
@@ -18,7 +26,8 @@
   cid
   infomask
   values
-  physical-compressed)
+  physical-compressed
+  origins)
 
 ;;; The PostgreSQL FSM is persisted in a separate relation fork. Keep the MVP's
 ;;; page-space candidates in memory and rebuild them once per relation after a

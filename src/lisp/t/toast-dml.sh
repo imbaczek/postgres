@@ -65,17 +65,72 @@ run -c 'create table toast_inline_build (v text)' >/dev/null
 run -c "insert into toast_inline_build values ('$index_suffix')" >/dev/null
 run -c 'alter table toast_inline_build alter column v set storage external' >/dev/null
 run -c 'create unique index toast_inline_build_v on toast_inline_build(v)' >/dev/null
+run -c 'create table toast_select_plain (v text)' >/dev/null
+run -c 'alter table toast_select_plain alter column v set storage plain' >/dev/null
+run -c 'insert into toast_select_plain select v from toast_inline_build' >/dev/null
+run -c "insert into toast_select_plain select coalesce(v, '') from toast_inline_build" >/dev/null
+run -c "insert into toast_select_plain select case when true then v else '' end from toast_inline_build" >/dev/null
+[ "$(run -c 'select count(*) from toast_select_plain')" = 3 ]
+run -c "insert into toast_inline_build values ('short')" >/dev/null
+run -c 'create table toast_select_mixed (a text, b text)' >/dev/null
+run -c 'alter table toast_select_mixed alter column a set storage plain' >/dev/null
+run -c 'alter table toast_select_mixed alter column b set storage plain' >/dev/null
+run -c "insert into toast_select_mixed select 'fixed', v from toast_inline_build" >/dev/null
+[ "$(run -c "select count(*) from toast_select_mixed where a = 'fixed' and length(b) = 20000")" = 1 ]
+[ "$(run -c "select count(*) from toast_select_mixed where a = 'fixed' and b = 'short'")" = 1 ]
+run -c 'create table toast_select_conflict (id int primary key, v text)' >/dev/null
+run -c 'alter table toast_select_conflict alter column v set storage plain' >/dev/null
+run -c "insert into toast_select_conflict values (1,'small')" >/dev/null
+run -c "insert into toast_select_conflict select 1,v from toast_inline_build where v <> 'short' on conflict (id) do update set v=excluded.v" >/dev/null
+[ "$(run -c 'select length(v) from toast_select_conflict')" = 20000 ]
+run -c 'create table toast_select_varchar (v varchar)' >/dev/null
+run -c 'alter table toast_select_varchar alter column v set storage plain' >/dev/null
+run -c "insert into toast_select_varchar select v from toast_inline_build where v <> 'short'" >/dev/null
+run -c 'create table toast_select_bounded (v varchar(30000))' >/dev/null
+run -c 'alter table toast_select_bounded alter column v set storage plain' >/dev/null
+if run -v VERBOSITY=verbose -c "insert into toast_select_bounded select v from toast_inline_build where v <> 'short'" >"$TMP/select-coercion.out" 2>&1; then
+    echo 'toast-dml: narrowing coercion incorrectly retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/select-coercion.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: narrowing coercion did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+if run -v VERBOSITY=verbose -c "insert into toast_select_plain select v || '' from toast_inline_build" >"$TMP/select-computed.out" 2>&1; then
+    echo 'toast-dml: computed INSERT SELECT retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/select-computed.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: computed INSERT SELECT did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 run -c 'create table toast_inline_varchar (id int primary key, v varchar(30000) unique)' >/dev/null
 run -c "insert into toast_inline_varchar values (1,'$index_suffix')" >/dev/null
 run -c 'alter table toast_inline_varchar alter column v set storage external' >/dev/null
 run -c 'update toast_inline_varchar set id=2, v=v where id=1' >/dev/null
 [ "$(run -c 'select id,length(v) from toast_inline_varchar')" = '2|20000' ]
+run -c 'create table toast_select_wider (v varchar(40000))' >/dev/null
+run -c 'alter table toast_select_wider alter column v set storage plain' >/dev/null
+run -c 'insert into toast_select_wider select v from toast_inline_varchar' >/dev/null
+run -c 'insert into toast_select_wider select v from toast_inline_varchar where id=2' >/dev/null
+[ "$(run -c 'select count(*) from toast_select_wider where length(v)=20000')" = 2 ]
 run -c 'create table toast_external_compressed (v text unique)' >/dev/null
 awk 'BEGIN { printf "insert into toast_external_compressed values (\047"; for (i=0;i<200000;i++) printf "a"; print "\047);" }' | run >/dev/null
 run -c 'alter table toast_external_compressed alter column v set storage external' >/dev/null
 run -c 'update toast_external_compressed set v=v' >/dev/null
 run -c 'vacuum full toast_external_compressed' >/dev/null
 [ "$(run -c 'select length(v) from toast_external_compressed')" = 200000 ]
+if run -v VERBOSITY=verbose -c 'insert into toast_select_plain select v from toast_external_compressed' >"$TMP/select-external-plain.out" 2>&1; then
+    echo 'toast-dml: foreign external datum was retained under PLAIN' >&2; exit 1
+fi
+case $(cat "$TMP/select-external-plain.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: external datum under PLAIN did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+run -c 'create table toast_select_external (v text)' >/dev/null
+run -c 'alter table toast_select_external alter column v set storage external' >/dev/null
+run -c 'insert into toast_select_external select v from toast_external_compressed' >/dev/null
+[ "$(run -c 'select length(v) from toast_select_external')" = 200000 ]
+run -c 'drop table toast_external_compressed' >/dev/null
+[ "$(run -c 'select length(v) from toast_select_external')" = 200000 ]
 run -c 'create table toast_long_index (v text)' >/dev/null
 i=0
 while [ "$i" -lt 80 ]; do

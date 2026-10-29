@@ -1330,6 +1330,14 @@ on an abnormal exit."
                      :stop))))
       (when stopped-p (return :stop)))))
 
+(defun simple-datum-origin-plan-p (node)
+  "Recognize synchronous scan/filter/project/limit plans that retain row origin."
+  (case (first node)
+    ((:seq-scan :index-scan) t)
+    ((:filter :project) (simple-datum-origin-plan-p (third node)))
+    (:limit (simple-datum-origin-plan-p (third node)))
+    (otherwise nil)))
+
 (defun execute-physical-plan-node (node registered-relations outer-environment
                                    emit run-child run-node)
   "Execute one physical node using the instrumented callbacks from RUN-NODE."
@@ -1355,9 +1363,12 @@ on an abnormal exit."
         relation path *current-snapshot*
         (lambda (row)
           (check-for-interrupts)
-          (let ((environment (if (getf relation :row-source)
-                                 row
-                                 (htup-values row))))
+          (let* ((environment (if (getf relation :row-source)
+                                  row
+                                  (htup-values row)))
+                 (*query-row-origins*
+                   (and *datum-origin-capture* (not (getf relation :row-source))
+                        (not (getf relation :join-order-base)) (htup-origins row))))
             (funcall emit
                      (if (getf relation :join-order-base)
                          (make-select-relation-environment
@@ -1426,8 +1437,17 @@ on an abnormal exit."
        (funcall run-child
                 (third node)
                 (lambda (environment)
-                  (let ((row (make-select-result-row environment nil targets)))
-                    (when row (funcall emit row)))))))
+                  (if *datum-origin-capture*
+                      (let ((values (make-array (length targets)))
+                            (origins (make-array (length targets) :initial-element nil)))
+                        (loop for target in targets for i from 0
+                              do (multiple-value-bind (value origin)
+                                     (eval-expr-with-origin (getf target :expr) environment *query-row-origins*)
+                                   (setf (aref values i) value (aref origins i) origin)))
+                        (let ((*query-row-origins* origins))
+                          (funcall emit (cons values environment))))
+                      (let ((row (make-select-result-row environment nil targets)))
+                        (when row (funcall emit row))))))))
     (:hash-distinct
      (stream-hash-aggregate
       (lambda (callback)

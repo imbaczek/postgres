@@ -1459,6 +1459,11 @@ The parent is visible and SNAPSHOT remains active throughout the fetch. TOAST
 chunk visibility follows the parent and is not independently filtered."
   (let ((values (htup-values tuple))
         (columns (pg-class-columns table)))
+    (when *datum-origin-capture*
+      (let ((compressed (htup-physical-compressed tuple)))
+        (when compressed
+          (setf (htup-origins tuple)
+                (map 'vector (lambda (value) (when value (make-datum-origin :compressed value))) compressed)))))
     (loop for i below (length values)
           for value = (aref values i)
           when (heap-external-varlena-p value)
@@ -1470,6 +1475,13 @@ chunk visibility follows the parent and is not independently filtered."
                           (type (pg-column-type (aref columns i))))
                      (unless toast
                        (ereport "XX001" "external value has no owning TOAST relation"))
+                     (when *datum-origin-capture*
+                       (let ((compressed (toast-fetch-compressed-value toast value snapshot :index-reader index-reader)))
+                         (when compressed
+                           (unless (htup-origins tuple)
+                             (setf (htup-origins tuple) (make-array (length values) :initial-element nil)))
+                           (setf (aref (htup-origins tuple) i)
+                                 (make-datum-origin :compressed compressed :external-p t)))))
                      (let ((bytes (toast-fetch-value toast value snapshot :index-reader index-reader)))
                        (setf (aref values i)
                              (case type

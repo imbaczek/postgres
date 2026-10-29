@@ -347,8 +347,42 @@
     (check-table-constraints table new)
     new))
 
+(defun datum-origin-assignment-compatible-p (source column)
+  "Whether C's assignment coercion can pass SOURCE's datum without detoasting.
+Match varchar_support and numeric_support's typmod relabel conditions."
+  (let ((from (expr-type source))
+        (old (expr-typmod source))
+        (to (pg-column-type column))
+        (new (pg-column-typmod column)))
+    (cond ((and (member from '(:text :varchar)) (member to '(:text :varchar)))
+           (or (eq to :text) (< new 0) (and (>= old 0) (<= old new))))
+          ((and (eq from :numeric) (eq to :numeric))
+           (or (< new 4)
+               (and (>= old 4)
+                    (= (ldb (byte 11 0) (- old 4)) (ldb (byte 11 0) (- new 4)))
+                    (<= (ldb (byte 16 16) (- old 4)) (ldb (byte 16 16) (- new 4))))))
+          (t (and (eq from to) (= old new))))))
+
+(defun insert-source-compressed-values (columns attnums expressions origins)
+  "Map projected origins to target columns for assignments that preserve the physical datum under C's coercion rules.
+External-origin values are flattened for PLAIN targets; no source TOAST pointer
+is ever installed into the destination relation."
+  (when origins
+    (let ((result (make-array (length columns) :initial-element nil)))
+      (loop for attnum in attnums for expression in expressions
+            for column = (aref columns (1- attnum))
+            for input = (and (consp expression) (eq (first expression) :assignment) (second expression))
+            for slot = (and (consp input) (eq (first input) :col) (second input))
+            for origin = (and slot (<= 1 slot (length origins)) (aref origins (1- slot)))
+            when (and origin (datum-origin-assignment-compatible-p input column)
+                      (or (not (datum-origin-external-p origin))
+                          (not (char= (pg-column-effective-storage column) #\p))))
+              do (setf (aref result (1- attnum)) (datum-origin-compressed origin)))
+      result)))
+
 (defun exec-insert-subqueries (stream ast)
-  (let ((prepared (prepare-dml-subqueries ast)))
+  (let ((*datum-origin-capture* nil) (*query-row-origins* nil)
+                                     (prepared (prepare-dml-subqueries ast)))
     (call-with-dml-subqueries
      prepared
      (lambda (table rel xid)
@@ -392,9 +426,15 @@
                   (detach-select-index-scans)
                   (multiple-value-bind (action actual old)
                       (if (getf prepared :conflict)
-                          (insert-tuple-on-conflict table values (getf prepared :conflict) state)
+                          (insert-tuple-on-conflict table values (getf prepared :conflict) state
+                                                    :compressed-reuse (insert-source-compressed-values
+                                                                       columns (getf prepared :attnums)
+                                                                       expressions *query-row-origins*))
                           (multiple-value-bind (block off publications)
-                              (insert-tuple-with-unique table values :publication-kind :insert)
+                              (insert-tuple-with-unique table values :publication-kind :insert
+                                                                     :compressed-reuse (insert-source-compressed-values
+                                                                                        columns (getf prepared :attnums)
+                                                                                        expressions *query-row-origins*))
                             (declare (ignore block off))
                             (logical-note-row-change :insert table :new-values values
                                                      :publication-selection publications)
@@ -406,12 +446,14 @@
            ;; including when source and target are the same relation.
            (let ((source (getf prepared :insert-source-plan)))
              (if source
-                 (execute-query-plan
-                  source (subquery-registered-relations source)
-                  (lambda (row)
-                    (insert-row (mapcar (lambda (target) (getf target :expr))
-                                        (getf prepared :source-assignments))
-                                (car row))))
+                 (let ((*datum-origin-capture* (simple-datum-origin-plan-p (query-plan-physical source)))
+                       (*query-row-origins* nil))
+                   (execute-query-plan
+                    source (subquery-registered-relations source)
+                    (lambda (row)
+                      (insert-row (mapcar (lambda (target) (getf target :expr))
+                                          (getf prepared :source-assignments))
+                                  (car row)))))
                  (dolist (row (getf prepared :rows)) (insert-row row nil)))))
          (finish-dml-command stream returning (format nil "INSERT 0 ~a" count)))))))
 

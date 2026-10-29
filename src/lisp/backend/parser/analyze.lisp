@@ -4237,6 +4237,28 @@ aliases share the corresponding numeric operator implementation."
       (return-from eval-case-expression (eval-expr (second branch) environment))))
   (eval-expr (third expression) environment))
 
+(defun eval-expr-with-origin (expression environment origins)
+  "Evaluate once, returning a logical value and any preserved physical origin.
+Only direct column references and the selected CASE or COALESCE branch retain
+origin. Computed expressions return no origin."
+  (case (first expression)
+    (:col
+     (let ((value (eval-expr expression environment))
+           (slot (1- (second expression))))
+       (values value (and origins (< -1 slot (length origins))
+                          (not (eq value +null+)) (aref origins slot)))))
+    (:coalesce
+     (dolist (argument (second expression) (values +null+ nil))
+       (multiple-value-bind (value origin) (eval-expr-with-origin argument environment origins)
+         (unless (eq value +null+) (return (values value origin))))))
+    (:case
+        (dolist (branch (second expression))
+          (when (eq (eval-expr (first branch) environment) t)
+            (return-from eval-expr-with-origin
+              (eval-expr-with-origin (second branch) environment origins))))
+      (eval-expr-with-origin (third expression) environment origins))
+    (otherwise (values (eval-expr expression environment) nil))))
+
 (defun eval-any-expression (expression environment)
   "Match C ScalarArrayOp's ANY/ALL identity, short circuit and NULL semantics."
   (let ((left (eval-expr (third expression) environment))

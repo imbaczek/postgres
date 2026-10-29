@@ -185,6 +185,28 @@
     (check-table-constraints table new)
     new))
 
+(defun on-conflict-compressed-values (table conflict actual new excluded excluded-reuse)
+  "Preserve claimed-row or direct EXCLUDED compressed values for an update."
+  (let* ((columns (pg-class-columns table))
+         (result (or (unchanged-tuple-compressed-values actual (getf conflict :sets) new)
+                     (make-array (length columns) :initial-element nil)))
+         (width (length columns)))
+    (when excluded-reuse
+      (dolist (assignment (getf conflict :sets))
+        (let* ((column (car assignment))
+               (target (cdr assignment))
+               (expr (getf target :expr))
+               (input (and (consp expr) (eq (first expr) :assignment) (second expr)))
+               (slot (and (consp input) (eq (first input) :col) (- (second input) width)))
+               (i (1- (pg-column-attnum column))))
+          (when (and slot (= slot (1+ i)) (<= 1 slot width)
+                     (aref excluded-reuse (1- slot))
+                     (datum-origin-assignment-compatible-p input column)
+                     (equalp (aref (nth-value 2 (heap-tuple-layout (vector (aref new i)) (vector column))) 0)
+                             (aref (nth-value 2 (heap-tuple-layout (vector (aref excluded (1- slot))) (vector column))) 0)))
+            (setf (aref result i) (aref excluded-reuse (1- slot)))))))
+    result))
+
 (defun claim-on-conflict-candidate (table values conflict indexes)
   ;; Claim before WHERE, retaining ownership to transaction end even when WHERE
   ;; rejects the row. Visibility and cardinality errors also precede WHERE.
@@ -202,12 +224,12 @@
           (when owner (return-from claim-on-conflict-candidate (values :wait owner))))))
     (values status candidate)))
 
-(defun insert-tuple-on-conflict (table values conflict state)
+(defun insert-tuple-on-conflict (table values conflict state &key compressed-reuse)
   (declare (ignore state))
   (loop
     (multiple-value-bind (block off publications action tuple)
         (insert-tuple-with-unique
-         table values :publication-kind :insert
+         table values :publication-kind :insert :compressed-reuse compressed-reuse
          :before-check
          (when conflict
            (lambda (indexes) (claim-on-conflict-candidate table values conflict indexes))))
@@ -246,7 +268,7 @@
                   (multiple-value-bind (new-block new-offnum selection)
                       (insert-tuple-with-unique
                        table new :exclude-tid (cons old-block old-offnum) :publication-kind :update
-                       :toast-reuse reuse :compressed-reuse (unchanged-tuple-compressed-values actual (getf conflict :sets) new)
+                       :toast-reuse reuse :compressed-reuse (on-conflict-compressed-values table conflict actual new values compressed-reuse)
                        :on-success
                        (lambda (next-block next-offnum)
                          (unless (heapam-set-ctid-unlocked rel old-block old-offnum next-block next-offnum)
