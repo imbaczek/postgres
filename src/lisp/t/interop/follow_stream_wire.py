@@ -8,9 +8,9 @@ def lsn(value):
     return f"{value >> 32:X}/{value & 0xffffffff:08X}"
 
 
-def start_query(slot, system_id, base, cursor, timeline, manifest, seed):
-    return (f"START_REPLICATION SLOT {slot} PHYSICAL {lsn(cursor)} "
-            f"(native_format 'pg_lisp_wal_7', mode 'follow', system_id '{system_id}', "
+def start_query(proof_pin, system_id, base, cursor, timeline, manifest, seed):
+    return (f"START_REPLICATION PHYSICAL {lsn(cursor)} "
+            f"(native_format 'pg_lisp_wal_7', proof_pin '{proof_pin}', mode 'follow', system_id '{system_id}', "
             f"timeline '{timeline}', base_lsn '{lsn(base)}', prefix_digest '{seed}', "
             f"manifest_digest '{manifest}')")
 
@@ -162,7 +162,7 @@ def rejects_unbound_requests(port, system_id, base, fork, manifest, seed):
     cases = [dict(system_id=system_id ^ 1), dict(manifest=manifest ^ 1),
              dict(cursor=fork + 1), dict(timeline=3), dict(seed=seed ^ 1)]
     for changes in cases:
-        arguments = dict(slot="selected_follow", system_id=system_id, base=base,
+        arguments = dict(proof_pin="selected_follow", system_id=system_id, base=base,
                          cursor=fork, timeline=1, manifest=manifest, seed=seed)
         arguments.update(changes)
         client = RawConnection(port, "follow-rejected-identity", replication=True)

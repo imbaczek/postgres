@@ -1,8 +1,95 @@
 (in-package #:pg-physical-tests)
 
 (defun native-test-start-query (&optional (cursor 64) (base 32) (identity 123))
-  (format nil "START_REPLICATION SLOT copy PHYSICAL ~a (native_format 'pg_lisp_wal_7', system_id '~d', timeline '1', base_lsn '~a', prefix_digest '14695981039346656037')"
+  (format nil "START_REPLICATION PHYSICAL ~a (proof_pin 'copy', native_format 'pg_lisp_wal_7', system_id '~d', timeline '1', base_lsn '~a', prefix_digest '14695981039346656037')"
           (pg::wal-format-lsn cursor) identity (pg::wal-format-lsn base)))
+
+(cl-spec:defproperty native-start-keeps-public-slot-and-proof-identities-separate
+    ((public-id (range integer 0 1024))
+     (proof-id (range integer 0 1024))
+     (named (range integer 0 1))
+     (shared (range integer 0 1)))
+  (:about pg::parse-native-physical-start)
+  (:trials (:normal 200))
+  (let* ((public (format nil "slot_~d" public-id))
+         (proof (if (zerop shared) (format nil "proof_~d" proof-id) public))
+         (query (format nil
+                        "START_REPLICATION ~aPHYSICAL 0/40 (native_format '~a', proof_pin '~a', system_id '123', timeline '1', base_lsn '0/20', prefix_digest '14695981039346656037')"
+                        (if (zerop named) "" (format nil "SLOT ~a " public))
+                        pg::+physical-native-format+ proof))
+         (command (pg::parse-replication-command query)))
+    (and (equal (unless (zerop named) public) (pg::logical-replication-command-slot-name command))
+         (equal proof (pg::physical-stream-proof-pin command))
+         (= 64 (pg::logical-replication-command-requested-lsn command)))))
+
+(deftest generated-native-start-identities-stay-separate
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'native-start-keeps-public-slot-and-proof-identities-separate :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest native-start-requires-one-explicit-private-proof-pin
+    (let ((old "START_REPLICATION SLOT copy PHYSICAL 0/40 (native_format 'pg_lisp_wal_7', system_id '123', timeline '1', base_lsn '0/20', prefix_digest '14695981039346656037')"))
+      (ok (equal "0A000" (recovery-state-of (lambda () (pg::parse-replication-command old))))))
+  (dolist (options '("proof_pin 'first', proof_pin 'second'"
+                     "proof_pin 'Invalid-Proof'"
+                     "proof_pin ''"))
+    (let ((query (format nil
+                         "START_REPLICATION PHYSICAL 0/40 (native_format '~a', system_id '123', timeline '1', base_lsn '0/20', prefix_digest '14695981039346656037', ~a)"
+                         pg::+physical-native-format+ options)))
+      (ok (intake-fails-p (lambda () (pg::parse-replication-command query)))))))
+
+(deftest named-native-streams-fail-explicitly-until-public-ownership-is-wired
+    (let ((pg::*physical-recovery-state* nil)
+          (pg::*physical-recovery-failed-p* nil)
+          (pg::*physical-source-pins* (make-hash-table :test #'equal))
+          (pg::*physical-source-senders* (make-hash-table :test #'equal))
+          (command (pg::make-logical-replication-command :type :physical-start :slot-name "public_slot"
+                                                         :options '(("proof_pin" . "'private_proof'")))))
+      (ok (equal "0A000" (recovery-state-of (lambda () (pg::physical-source-acquire-sender command)))))
+      (ok (zerop (hash-table-count pg::*physical-source-senders*)))))
+
+(deftest native-default-receiver-start-uses-private-proof-only
+    (with-physical-store-directory (root)
+      (let* ((store (pg::physical-store-open root 123 1 :create t :start-lsn 32))
+             (pg::*physical-receive-store* store)
+             (pg::*physical-recovery-state* (list :system-id 123 :timeline 1 :end 32))
+             (runtime (pg::make-physical-follow-runtime :pin "copy")))
+        (unwind-protect
+             (let ((command (pg::parse-replication-command (pg::physical-follow-start-query runtime 32))))
+               (ok (null (pg::logical-replication-command-slot-name command)))
+               (ok (equal "copy" (pg::physical-stream-proof-pin command))))
+          (pg::physical-store-close store)))))
+
+(deftest unnamed-native-stream-keeps-same-spelled-public-slot-unclaimed
+    (call-with-physical-source-fixture
+     (lambda ()
+       (let* ((pg::*physical-recovery-state* nil)
+              (pg::*physical-recovery-failed-p* nil)
+              (pg::*wal-insert-timeline* 1)
+              (pg::*wal-segment-namespace* :legacy)
+              (pg::*physical-source-senders* (make-hash-table :test #'equal))
+              (public (pg::wal-create-physical-replication-slot "copy"))
+              (pin (pg::physical-source-pin-create "copy"))
+              (base (pg::physical-source-pin-consistent-lsn pin))
+              (command
+                (pg::parse-replication-command
+                 (format nil
+                         "START_REPLICATION PHYSICAL ~a (native_format '~a', proof_pin 'copy', system_id '~d', timeline '1', base_lsn '~a', prefix_digest '~d')"
+                         (pg::wal-format-lsn base) pg::+physical-native-format+
+                         (pg::catalog-system-identifier) (pg::wal-format-lsn base)
+                         (pg::physical-source-pin-prefix-digest pin))))
+              (owner (pg::physical-source-acquire-sender command)))
+         (unwind-protect
+              (progn
+                (ok (eq owner (gethash "copy" pg::*physical-source-senders*)))
+                (ok (eq public (gethash "copy" pg::*wal-replication-slots*)))
+                (ok (null (pg::wal-replication-slot-active-owner public)))
+                (ok (null (pg::wal-replication-slot-restart-lsn public))))
+           (pg::physical-source-release-sender "copy" owner))
+         (ok (null (gethash "copy" pg::*physical-source-senders*)))
+         (ok (eq pin (gethash "copy" pg::*physical-source-pins*)))
+         (ok (eq public (gethash "copy" pg::*wal-replication-slots*)))
+         (ok (probe-file (pg::wal-replication-slot-path "copy")))))))
 
 (deftest native-physical-start-requires-format-and-base
     (let ((command (pg::parse-replication-command (native-test-start-query))))
@@ -11,11 +98,11 @@
       (ok (equal "pg_lisp_wal_7" (pg::physical-stream-option command "native_format"))))
   (dolist (query '("START_REPLICATION PHYSICAL 0/0"
                    "START_REPLICATION SLOT copy PHYSICAL 0/0"
-                   "START_REPLICATION SLOT copy PHYSICAL 0/0 (native_format 'other')"
-                   "START_REPLICATION SLOT copy PHYSICAL 0/0 (native_format 'pg_lisp_wal_7', system_id '123', timeline '2', base_lsn '0/0')"
-                   "START_REPLICATION SLOT copy PHYSICAL 0/0 (native_format 'pg_lisp_wal_7', system_id '123', timeline '1', timeline '1')"
-                   "START_REPLICATION SLOT copy PHYSICAL 0/0 (native_format 'pg_lisp_wal_6', system_id '123', timeline '1', base_lsn '0/0', prefix_digest '14695981039346656037')"
-                   "START_REPLICATION SLOT copy PHYSICAL 0/0 (native_format 'pg_lisp_wal_5', system_id '123', timeline '1', base_lsn '0/0', prefix_digest '14695981039346656037')"))
+                   "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'other')"
+                   "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'pg_lisp_wal_7', system_id '123', timeline '2', base_lsn '0/0')"
+                   "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'pg_lisp_wal_7', system_id '123', timeline '1', timeline '1')"
+                   "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'pg_lisp_wal_6', system_id '123', timeline '1', base_lsn '0/0', prefix_digest '14695981039346656037')"
+                   "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'pg_lisp_wal_5', system_id '123', timeline '1', base_lsn '0/0', prefix_digest '14695981039346656037')"))
     (ok (intake-fails-p (lambda () (pg::parse-replication-command query))))))
 
 (deftest native-physical-start-rejects-transaction-blocks

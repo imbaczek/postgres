@@ -938,9 +938,9 @@ Validation checks coherence, not durable state or source proof."
 (defun physical-follow-start-query (runtime cursor)
   (with-live-operation
     (format nil
-            "START_REPLICATION SLOT ~a PHYSICAL ~a (native_format '~a', system_id '~d', timeline '~d', base_lsn '~a', prefix_digest '~d'~a~a)"
-            (physical-follow-runtime-pin runtime) (wal-format-lsn cursor)
-            +physical-native-format+ (getf *physical-recovery-state* :system-id)
+            "START_REPLICATION PHYSICAL ~a (native_format '~a', proof_pin '~a', system_id '~d', timeline '~d', base_lsn '~a', prefix_digest '~d'~a~a)"
+            (wal-format-lsn cursor) +physical-native-format+
+            (physical-follow-runtime-pin runtime) (getf *physical-recovery-state* :system-id)
             (physical-follow-runtime-receive-timeline runtime)
             (wal-format-lsn (getf *physical-recovery-state* :end))
             (physical-store-flushed-digest *physical-receive-store*)

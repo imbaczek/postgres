@@ -1406,7 +1406,7 @@
        (let ((command
                (pg::parse-replication-command
                 (format nil
-                        "START_REPLICATION SLOT sibling PHYSICAL 0/00000040 (native_format '~a', system_id '~d', timeline '2', base_lsn '0/00000040', prefix_digest '~d', manifest_digest '77')"
+                        "START_REPLICATION PHYSICAL 0/00000040 (proof_pin 'sibling', native_format '~a', system_id '~d', timeline '2', base_lsn '0/00000040', prefix_digest '~d', manifest_digest '77')"
                         pg::+physical-native-format+ (getf request :system-id)
                         (getf request :receive-digest)))))
          (ok (signals (pg::physical-source-acquire-sender command) 'error))
@@ -1418,7 +1418,7 @@
 (defun follow-anchor-start-command (request &optional mode)
   (pg::parse-replication-command
    (format nil
-           "START_REPLICATION SLOT sibling PHYSICAL ~a (native_format '~a', system_id '~d', timeline '2', base_lsn '~a', prefix_digest '~d', manifest_digest '77'~a)"
+           "START_REPLICATION PHYSICAL ~a (proof_pin 'sibling', native_format '~a', system_id '~d', timeline '2', base_lsn '~a', prefix_digest '~d', manifest_digest '77'~a)"
            (pg::wal-format-lsn (getf request :receive-lsn))
            pg::+physical-native-format+ (getf request :system-id)
            (pg::wal-format-lsn (if (equal mode "follow") (getf request :base) 64))
@@ -1626,7 +1626,7 @@
       (dolist (mode '("" "other" "FOLLOW" "bootstrap follow"))
         (ok (signals (follow-anchor-start-command request mode) 'error)))
       (let* ((query (format nil
-                            "START_REPLICATION SLOT sibling PHYSICAL 0/40 (native_format '~a', system_id '42', timeline '2', base_lsn '0/40', prefix_digest '123', manifest_digest '77', mode 'follow', mode 'follow')"
+                            "START_REPLICATION PHYSICAL 0/40 (proof_pin 'sibling', native_format '~a', system_id '42', timeline '2', base_lsn '0/40', prefix_digest '123', manifest_digest '77', mode 'follow', mode 'follow')"
                             pg::+physical-native-format+)))
         (ok (signals (pg::parse-replication-command query) 'error)))))
 

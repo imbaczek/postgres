@@ -544,7 +544,7 @@
                 (let ((command
                         (pg::parse-replication-command
                          (format nil
-                                 "START_REPLICATION SLOT old_sibling PHYSICAL 0/00000060 (native_format '~a', mode 'follow', system_id '~d', timeline '2', base_lsn '0/00000020', prefix_digest '91', manifest_digest '88')"
+                                 "START_REPLICATION PHYSICAL 0/00000060 (proof_pin 'old_sibling', native_format '~a', mode 'follow', system_id '~d', timeline '2', base_lsn '0/00000020', prefix_digest '91', manifest_digest '88')"
                                  pg::+physical-native-format+ (pg::catalog-system-identifier)))))
                   (ok (equal "55000" (recovery-state-of (lambda () (pg::physical-source-acquire-sender command)))))
                   (ok (null (gethash "old_sibling" pg::*physical-source-senders*)))

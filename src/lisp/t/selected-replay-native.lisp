@@ -199,10 +199,10 @@
    :name "selected follow pin experiment")
   t)
 
-(defun selected-replay-native-client-start-query (slot request cursor digest)
+(defun selected-replay-native-client-start-query (proof-pin request cursor digest)
   (format nil
-          "START_REPLICATION SLOT ~a PHYSICAL ~a (native_format '~a', mode 'follow', system_id '~d', timeline '~d', base_lsn '~a', prefix_digest '~d', manifest_digest '~d')"
-          slot (wal-format-lsn cursor) +physical-native-format+ (getf request :system-id)
+          "START_REPLICATION PHYSICAL ~a (native_format '~a', proof_pin '~a', mode 'follow', system_id '~d', timeline '~d', base_lsn '~a', prefix_digest '~d', manifest_digest '~d')"
+          (wal-format-lsn cursor) +physical-native-format+ proof-pin (getf request :system-id)
           (getf request :receive-timeline) (wal-format-lsn (getf request :base))
           digest (getf request :manifest-digest)))
 

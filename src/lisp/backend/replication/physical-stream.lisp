@@ -14,6 +14,9 @@
   (let ((value (cdr (assoc name (logical-replication-command-options command) :test #'equal))))
     (when value (replication-command-value value))))
 
+(defun physical-stream-proof-pin (command)
+  (physical-stream-option command "proof_pin"))
+
 (defun physical-stream-u64 (text)
   (unless (and (stringp text) (<= 1 (length text) 20)
                (every (lambda (char) (find char "0123456789")) text))
@@ -49,35 +52,40 @@ the requested timeline may be an ancestor."
                     (timeline-history-entry-timeline (nth (1- position) history))))))
 
 (defun parse-native-physical-start (words)
-  "Parse the explicitly negotiated native physical START and validate its options.
-Follow mode is explicit; a failed bootstrap request never falls back to it."
-  (unless (and (>= (length words) 5) (string-equal (second words) "SLOT")
-               (string-equal (fourth words) "PHYSICAL"))
-    (ereport "0A000" "native physical replication requires an explicit format negotiation"))
-  (let* ((name (replication-command-identifier (third words)))
-         (options (parse-replication-generic-options (nthcdr 5 words)))
-         (keys '("native_format" "system_id" "timeline" "base_lsn" "prefix_digest")))
-    (when (assoc "manifest_digest" options :test #'equal) (push "manifest_digest" keys))
-    (when (assoc "mode" options :test #'equal) (push "mode" keys))
-    (unless (wal-valid-replication-slot-name-p name) (ereport "42602" "invalid source pin name"))
-    (unless (and (= (length keys) (length options))
-                 (every (lambda (key) (= 1 (count key options :key #'car :test #'equal))) keys))
-      (ereport "0A000" "native physical stream requires native_format, system_id, timeline, base_lsn, prefix_digest and optional manifest_digest and mode"))
-    (let ((command (make-logical-replication-command
-                    :type :physical-start :slot-name name :options options
-                    :requested-lsn (parse-replication-lsn (fifth words)))))
-      (unless (equal +physical-native-format+ (physical-stream-option command "native_format"))
-        (ereport "0A000" "unsupported native physical WAL format"))
-      (physical-stream-u64 (physical-stream-option command "system_id"))
-      (physical-stream-u64 (physical-stream-option command "prefix_digest"))
-      (when (physical-stream-option command "manifest_digest")
-        (physical-stream-u64 (physical-stream-option command "manifest_digest")))
-      (unless (typep (physical-stream-u64 (physical-stream-option command "timeline"))
-                     '(integer 1 4294967295))
-        (ereport "22023" "invalid native physical timeline"))
-      (parse-replication-lsn (physical-stream-option command "base_lsn"))
-      (physical-stream-mode command)
-      command)))
+  (let* ((named (string-equal (second words) "SLOT"))
+         (physical-position (if named 3 1))
+         (lsn-position (1+ physical-position))
+         (options-position (1+ lsn-position)))
+    (unless (and (> (length words) lsn-position)
+                 (string-equal (nth physical-position words) "PHYSICAL"))
+      (ereport "0A000" "native physical replication requires an explicit format negotiation"))
+    (let* ((name (when named (replication-command-identifier (third words))))
+           (options (parse-replication-generic-options (nthcdr options-position words)))
+           (keys '("native_format" "proof_pin" "system_id" "timeline" "base_lsn" "prefix_digest")))
+      (when (assoc "manifest_digest" options :test #'equal) (push "manifest_digest" keys))
+      (when (assoc "mode" options :test #'equal) (push "mode" keys))
+      (when (and named (not (wal-valid-replication-slot-name-p name)))
+        (ereport "42602" "invalid public replication slot name"))
+      (unless (and (= (length keys) (length options))
+                   (every (lambda (key) (= 1 (count key options :key #'car :test #'equal))) keys))
+        (ereport "0A000" "native physical stream requires native_format, proof_pin, system_id, timeline, base_lsn, prefix_digest and optional manifest_digest and mode"))
+      (let ((command (make-logical-replication-command
+                      :type :physical-start :slot-name name :options options
+                      :requested-lsn (parse-replication-lsn (nth lsn-position words)))))
+        (unless (equal +physical-native-format+ (physical-stream-option command "native_format"))
+          (ereport "0A000" "unsupported native physical WAL format"))
+        (unless (wal-valid-replication-slot-name-p (physical-stream-proof-pin command))
+          (ereport "42602" "invalid private physical proof pin name"))
+        (physical-stream-u64 (physical-stream-option command "system_id"))
+        (physical-stream-u64 (physical-stream-option command "prefix_digest"))
+        (when (physical-stream-option command "manifest_digest")
+          (physical-stream-u64 (physical-stream-option command "manifest_digest")))
+        (unless (typep (physical-stream-u64 (physical-stream-option command "timeline"))
+                       '(integer 1 4294967295))
+          (ereport "22023" "invalid native physical timeline"))
+        (parse-replication-lsn (physical-stream-option command "base_lsn"))
+        (physical-stream-mode command)
+        command))))
 
 (defparameter *physical-follow-wire-fields*
   '(("system_id" :system-id :u64) ("base_timeline" :base-timeline :timeline)
@@ -265,8 +273,10 @@ A follow pin must be ready and bound to the current writer timeline; START may
 request an eligible ancestor. In follow mode base_lsn is the receiver's immutable
 base and bounds apply feedback, not the anchor cursor."
   (prevent-recovery-primary-operation "native physical walsender")
+  (when (logical-replication-command-slot-name command)
+    (ereport "0A000" "named native physical streams require public slot ownership support"))
   (sb-thread:with-mutex (*wal-lock*)
-    (let* ((name (logical-replication-command-slot-name command))
+    (let* ((name (physical-stream-proof-pin command))
            (pin (gethash name *physical-source-pins*))
            (follow (equal "follow" (physical-stream-mode command)))
            (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
@@ -389,7 +399,7 @@ Explicit follow START admission acquires a ready follow pin."
 
 (defun physical-source-confirm-status (command owner status)
   "Advance retention from validated flush, independently of write and apply."
-  (let ((name (logical-replication-command-slot-name command))
+  (let ((name (physical-stream-proof-pin command))
         (received (getf status :flush)))
     (multiple-value-bind (floor digest)
         (with-live-operation (physical-source-sender-floor name owner))
@@ -401,7 +411,7 @@ Explicit follow START admission acquires a ready follow pin."
 
 (defun physical-source-validate-resume (command owner &optional progress)
   "Prove a resume suffix from the durable confirmed floor, never the old base."
-  (let ((name (logical-replication-command-slot-name command))
+  (let ((name (physical-stream-proof-pin command))
         (requested (logical-replication-command-requested-lsn command)))
     (multiple-value-bind (floor digest)
         (with-live-operation (physical-source-sender-floor name owner))
@@ -442,7 +452,7 @@ Explicit follow START admission acquires a ready follow pin."
   "Release the sender before the completion result and ReadyForQuery.
 Captured-backend cleanup also permits release when admission has closed."
   (with-live-operation-captured-backend-cleanup
-    (physical-source-release-sender (logical-replication-command-slot-name command) owner))
+    (physical-source-release-sender (physical-stream-proof-pin command) owner))
   (if next
       (physical-stream-switch-result stream next limit)
       (progn
@@ -478,7 +488,7 @@ Validate and confirm any status messages received before that completion."
 The cache belongs to this sender loop; reuse requires the same source selection.
 A historic stream stops at its fork before sending child end-of-recovery WAL."
   (let* ((*physical-follow-source-read-cache* (list nil))
-         (name (logical-replication-command-slot-name command))
+         (name (physical-stream-proof-pin command))
          (cursor (logical-replication-command-requested-lsn command))
          (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
          (status (list :write cursor :flush cursor :apply base)))
@@ -518,7 +528,7 @@ finish CopyBoth before the switch result. Early exact CopyDone ends normally
 without confirming an unproved receipt. Always release the sender on exit."
   (multiple-value-bind (owner limit next)
       (with-live-operation (physical-source-acquire-sender command))
-    (let ((name (logical-replication-command-slot-name command))
+    (let ((name (physical-stream-proof-pin command))
           (cursor (logical-replication-command-requested-lsn command))
           (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
           (copy-mode nil))
