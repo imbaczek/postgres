@@ -19,51 +19,19 @@ including strings, pairs and vectors, as immutable while the value is in use."
 
 (defun sql-jsonb-input (text)
   "Parse JSON into normalized JSONB, retaining the last duplicate key.
-A first pass validates the complete JSON syntax; only then does a second pass
-check JSONB-specific escapes, numeric range, and nesting. Thus a syntax error
-anywhere takes precedence over errors found during JSONB conversion. Values at
-depth greater than 512 are rejected with SQLSTATE 54001; the root has depth zero."
-  (sql-json-input text)
-  (let ((position 0) (length (length text)))
+Scalar conversion occurs during syntax validation, in parser callback order.
+Values at depth greater than 512 are rejected with SQLSTATE 54001; the root has depth zero."
+  (let ((position 0) (length (length text)) (scalar-cache (make-hash-table)))
+    (sql-json-input text :jsonb-p t :scalar-cache scalar-cache)
     (labels ((peek () (and (< position length) (char text position)))
              (take () (prog1 (peek) (incf position)))
              (space-p (c) (and c (find c '(#\Space #\Tab #\Newline #\Return))))
              (skip-space () (loop while (space-p (peek)) do (incf position)))
-             (hex-unit ()
-               (let ((n 0))
-                 (dotimes (i 4 n)
-                   (setf n (+ (* n 16) (digit-char-p (take) 16))))))
-             (unicode-character ()
-               (let ((high (hex-unit)))
-                 (cond
-                   ((zerop high)
-                    (ereport "22P05" "unsupported Unicode escape sequence"))
-                   ((<= #xd800 high #xdbff)
-                    (unless (and (eql (take) (code-char 92)) (eql (take) #\u))
-                      (ereport "22P02" "invalid Unicode surrogate pair"))
-                    (let ((low (hex-unit)))
-                      (unless (<= #xdc00 low #xdfff)
-                        (ereport "22P02" "invalid Unicode surrogate pair"))
-                      (code-char (+ #x10000 (* (- high #xd800) 1024) (- low #xdc00)))))
-                   ((<= #xdc00 high #xdfff)
-                    (ereport "22P02" "invalid Unicode surrogate pair"))
-                   (t (code-char high)))))
              (string-token ()
-               (take)
-               (with-output-to-string (out)
-                 (loop for c = (take)
-                       until (eql c #\")
-                       do (if (eql c (code-char 92))
-                              (let ((escaped (take)))
-                                (write-char
-                                 (case escaped
-                                   (#\u (unicode-character))
-                                   (#\b (code-char 8)) (#\f (code-char 12))
-                                   (#\n (code-char 10)) (#\r (code-char 13))
-                                   (#\t (code-char 9))
-                                   (otherwise escaped))
-                                 out))
-                              (write-char c out)))))
+               (let ((cached (gethash position scalar-cache)))
+                 (unless cached (error "missing validated JSONB string"))
+                 (setf position (car cached))
+                 (cdr cached)))
              (object-token (depth)
                (take)
                (skip-space)
@@ -101,12 +69,10 @@ depth greater than 512 are rejected with SQLSTATE 54001; the root has depth zero
                  (#\f (incf position 5) :json-false)
                  (#\n (incf position 4) :json-null)
                  (otherwise
-                  (let ((start position))
-                    (loop while (and (peek)
-                                     (not (space-p (peek)))
-                                     (not (find (peek) '(#\, #\] #\}))))
-                          do (incf position))
-                    (sql-numeric-input (subseq text start position)))))))
+                  (let ((cached (gethash position scalar-cache)))
+                    (unless cached (error "missing validated JSONB number"))
+                    (setf position (car cached))
+                    (cdr cached))))))
       (make-sql-jsonb (value-token 0)))))
 
 (defun sql-jsonb-write-string (value out)
