@@ -149,22 +149,6 @@ depth greater than 512 are rejected with SQLSTATE 54001; the root has depth zero
                (t (write-string (sql-numeric-output value) out)))))
     (with-output-to-string (out) (emit (sql-jsonb-value jsonb) out))))
 
-(defun sql-jsonb-to-octets (jsonb)
-  "Serialize JSONB for on-disk storage as version byte 1 and canonical UTF-8 JSON.
-This text-based representation is private to this implementation and is not
-binary-compatible with PostgreSQL's internal JSONB representation."
-  (let* ((text (string->bytes (sql-jsonb-output jsonb)))
-         (bytes (make-array (1+ (length text)) :element-type '(unsigned-byte 8))))
-    (setf (aref bytes 0) 1)
-    (replace bytes text :start1 1)
-    bytes))
-
-(defun sql-jsonb-from-octets (bytes)
-  "Decode the versioned JSONB representation, rejecting unknown versions."
-  (unless (and (plusp (length bytes)) (= (aref bytes 0) 1))
-    (ereport "XX001" "invalid JSONB storage version"))
-  (sql-jsonb-input (bytes->string bytes :start 1)))
-
 (defun sql-jsonb-equality-key (jsonb)
   "Return an EQUAL-comparable key that ignores JSONB numeric display scale.
 Numeric values are compared by value recursively, so 1 and 1.0 are equal even

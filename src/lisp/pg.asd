@@ -38,6 +38,7 @@
      (:file "utils/adt/numeric")
      (:file "utils/adt/numeric-storage")
      (:file "utils/adt/jsonb")
+     (:file "utils/adt/jsonb-storage")
      (:file "utils/adt/float")
      (:file "utils/adt/timezone")
      (:file "utils/adt/datetime")
