@@ -1339,61 +1339,6 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (otherwise (error "unexpected replication CopyData message ~s"
                       (code-char (aref payload 0))))))
 
-(defstruct logical-wire-cursor stream remaining)
-
-(defun logical-wire-byte (cursor)
-  (when (zerop (logical-wire-cursor-remaining cursor))
-    (error "truncated logical replication frame"))
-  (let ((byte (read-byte (logical-wire-cursor-stream cursor) nil nil)))
-    (unless byte (error "logical replication connection ended during a frame"))
-    (decf (logical-wire-cursor-remaining cursor))
-    byte))
-
-(defun logical-wire-uint (cursor size)
-  (loop repeat size for value = (logical-wire-byte cursor)
-        for result = value then (logior (ash result 8) value)
-        finally (return result)))
-
-(defun logical-wire-octets (cursor size)
-  (unless (<= size (logical-wire-cursor-remaining cursor))
-    (error "truncated logical replication value"))
-  (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
-    (loop for position = 0 then next
-          while (< position size)
-          for next = (read-sequence bytes (logical-wire-cursor-stream cursor) :start position)
-          do (when (= next position) (error "logical replication connection ended during a value"))
-             (decf (logical-wire-cursor-remaining cursor) (- next position)))
-    bytes))
-
-(defun logical-wire-text (cursor size)
-  "Decode a bounded UTF-8 field without retaining its complete octet vector."
-  (unless (<= size (logical-wire-cursor-remaining cursor))
-    (error "truncated logical replication value"))
-  (with-output-to-string (output)
-    (let ((remaining size) (needed 0) (code 0) (minimum 0))
-      (loop while (plusp remaining) do
-        (let* ((count (min remaining 65536))
-               (bytes (logical-wire-octets cursor count)))
-          (decf remaining count)
-          (loop for byte across bytes do
-            (if (zerop needed)
-                (cond
-                  ((< byte #x80) (write-char (code-char byte) output))
-                  ((<= #xc2 byte #xdf) (setf needed 1 code (logand byte #x1f) minimum #x80))
-                  ((<= #xe0 byte #xef) (setf needed 2 code (logand byte #x0f) minimum #x800))
-                  ((<= #xf0 byte #xf4) (setf needed 3 code (logand byte #x07) minimum #x10000))
-                  (t (error "invalid UTF-8 in logical replication value")))
-                (progn
-                  (unless (<= #x80 byte #xbf)
-                    (error "invalid UTF-8 in logical replication value"))
-                  (setf code (logior (ash code 6) (logand byte #x3f)))
-                  (decf needed)
-                  (when (zerop needed)
-                    (unless (and (<= minimum code #x10ffff) (not (<= #xd800 code #xdfff)))
-                      (error "invalid UTF-8 in logical replication value"))
-                    (write-char (code-char code) output)))))))
-      (unless (zerop needed) (error "truncated UTF-8 in logical replication value")))))
-
 (defun logical-wire-cstring (cursor)
   (let ((bytes (make-array 0 :element-type '(unsigned-byte 8)
                              :adjustable t :fill-pointer 0)))

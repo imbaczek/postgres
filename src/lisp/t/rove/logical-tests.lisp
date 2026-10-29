@@ -146,6 +146,140 @@
         (setf (symbol-function 'logical-pgoutput-apply-operation) original)
         (when (probe-file path) (delete-file path)))))
 
+(rove:deftest test-streamed-datarow-boundaries-and-values
+    (let* ((path (merge-pathnames (format nil "pg-copy-row-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (columns (list (make-pg-client-column :name "a") (make-pg-client-column :name "b")
+                          (make-pg-client-column :name "c")))
+           (payload (make-payload)))
+      (payload-push-u16 payload 3)
+      (payload-push-u32 payload 4)
+      (payload-push payload #(240 159 153 130))
+      (payload-push-u32 payload #xffffffff)
+      (payload-push-u32 payload 0)
+      (unwind-protect
+           (dolist (extra '(nil t))
+             (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede :if-does-not-exist :create)
+               (write-byte (char-code #\D) stream)
+               (write-sequence (u32-to-bytes (+ 4 (length payload) (if extra 1 0))) stream)
+               (write-sequence payload stream)
+               (when extra (write-byte 42 stream)))
+             (let ((stream (open path :element-type '(unsigned-byte 8))))
+               (unwind-protect
+                    (if extra
+                        (rove:ok (handler-case
+                                     (progn (pg-client-streamed-query-frame
+                                             (make-pg-client :stream stream) columns) nil)
+                                   (error () t)))
+                        (multiple-value-bind (kind row decoded)
+                            (pg-client-streamed-query-frame (make-pg-client :stream stream) columns)
+                          (rove:ok (and (char= kind #\D) decoded (equalp row #("🙂" nil ""))))))
+                 (if extra (rove:ok (not (open-stream-p stream))) (close stream)))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-streamed-datarow-rejects-corrupt-input
+    (let ((path (merge-pathnames (format nil "pg-copy-bad-~d-~d" (sb-posix:getpid) (random 1000000))
+                                 (uiop:temporary-directory)))
+          (columns (list (make-pg-client-column :name "a"))))
+      (unwind-protect
+           (dolist (payload (list #(0 2) #(0 1 255 255 255 254)
+                                  #(0 1 0 0 0 1 255) #(0 1 0 0 0 2 97)))
+             (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede :if-does-not-exist :create)
+               (write-byte (char-code #\D) stream)
+               (write-sequence (u32-to-bytes (+ 4 (length payload))) stream)
+               (write-sequence payload stream))
+             (let ((stream (open path :element-type '(unsigned-byte 8))))
+               (rove:ok (handler-case
+                            (progn (pg-client-streamed-query-frame (make-pg-client :stream stream) columns) nil)
+                          (error () t)))
+               (rove:ok (not (open-stream-p stream)))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-streamed-query-rejects-row-before-callback
+    (let* ((path (merge-pathnames (format nil "pg-copy-callback-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (original (symbol-function 'pg-client-send-query))
+           (description (make-payload)) (calls 0))
+      (payload-push-u16 description 1)
+      (payload-push-cstring description "a")
+      (dotimes (i 6) (payload-push-byte description 0))
+      (payload-push-u32 description 25)
+      (payload-push-u16 description #xffff)
+      (payload-push-u32 description #xffffffff)
+      (payload-push-u16 description 0)
+      (unwind-protect
+           (progn
+             (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede :if-does-not-exist :create)
+               (write-message stream #\T description)
+               (write-message stream #\D #(0 1 0 0 0 1 97 42)))
+             (setf (symbol-function 'pg-client-send-query) (lambda (&rest args) (declare (ignore args))))
+             (let ((stream (open path :element-type '(unsigned-byte 8))))
+               (rove:ok (handler-case
+                            (progn (pg-client-query (make-pg-client :stream stream) "SELECT"
+                                                    :on-row (lambda (&rest args) (declare (ignore args)) (incf calls)))
+                                   nil)
+                          (error () t)))
+               (rove:ok (not (open-stream-p stream)))
+               (rove:ok (zerop calls))))
+        (setf (symbol-function 'pg-client-send-query) original)
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-streamed-datarow-short-header-and-adjacent-frame
+    (let ((path (merge-pathnames (format nil "pg-copy-adjacent-~d-~d" (sb-posix:getpid) (random 1000000))
+                                 (uiop:temporary-directory)))
+          (columns (list (make-pg-client-column :name "a"))))
+      (unwind-protect
+           (progn
+             (loop for prefix from 0 below 5 do
+               (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                         :if-exists :supersede :if-does-not-exist :create)
+                 (write-sequence #(68 0 0 0 10) out :end prefix))
+               (let ((in (open path :element-type '(unsigned-byte 8))))
+                 (rove:ok (handler-case
+                              (progn (pg-client-streamed-query-frame (make-pg-client :stream in) columns) nil)
+                            (error () t)))
+                 (rove:ok (not (open-stream-p in)))))
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede :if-does-not-exist :create)
+               (write-message out #\D #(0 1 0 0 0 1 97))
+               (write-message out #\Z #(73)))
+             (with-open-file (in path :element-type '(unsigned-byte 8))
+               (let ((client (make-pg-client :stream in)))
+                 (multiple-value-bind (kind row decoded) (pg-client-streamed-query-frame client columns)
+                   (rove:ok (and (char= kind #\D) decoded (equalp row #("a")))))
+                 (multiple-value-bind (kind payload decoded) (pg-client-streamed-query-frame client columns)
+                   (rove:ok (and (char= kind #\Z) (not decoded) (equalp payload #(73))))))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-streamed-query-drains-error-to-ready
+    (let* ((path (merge-pathnames (format nil "pg-copy-error-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (original (symbol-function 'pg-client-send-query))
+           (payload (make-payload)))
+      (payload-push-byte payload (char-code #\C))
+      (payload-push-cstring payload "22011")
+      (payload-push-byte payload (char-code #\M))
+      (payload-push-cstring payload "failed")
+      (payload-push-byte payload 0)
+      (unwind-protect
+           (progn
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede :if-does-not-exist :create)
+               (write-message out #\E payload)
+               (write-message out #\Z #(73)))
+             (setf (symbol-function 'pg-client-send-query) (lambda (&rest args) (declare (ignore args))))
+             (with-open-file (in path :element-type '(unsigned-byte 8))
+               (rove:ok (handler-case
+                            (progn (pg-client-query (make-pg-client :stream in) "SELECT"
+                                                    :on-row (lambda (&rest args) (declare (ignore args)))) nil)
+                          (pg-client-error (error) (string= "22011" (pg-client-error-sqlstate error)))))
+               (rove:ok (and (open-stream-p in) (= (file-position in) (file-length in))))))
+        (setf (symbol-function 'pg-client-send-query) original)
+        (when (probe-file path) (delete-file path)))))
+
 (rove:deftest test-logical-wire-rejects-invalid-utf8-and-oversize
     (let* ((path (merge-pathnames (format nil "pg-wire-invalid-~d-~d" (sb-posix:getpid) (random 1000000))
                                   (uiop:temporary-directory)))

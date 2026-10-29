@@ -620,7 +620,8 @@ Initial copy batches rows to an 8 MiB target; a larger row uses a separate
 transaction and must still fit the source/target protocol and logical WAL limits.
 For extension-mode initial copy, each target INSERT is counted and emitted in
 bounded UTF-8 blocks without constructing a complete query string. The source
-DataRow and its decoded values are still materialized, and the target still
+DataRow is read through a bounded cursor without a complete frame copy, but
+decoded fields and the current row batch remain in memory. The target still
 receives and parses the complete Simple Query frame.
 Frontend query message lengths are limited to 132 MiB, including the four-byte
 length word. Logical capture normally limits the sum of encoded row changes
