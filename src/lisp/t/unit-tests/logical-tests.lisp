@@ -957,7 +957,8 @@
                      pg-client-query
                      logical-copy-target-chunk)))
          (source-rows '())
-         (chunk-sizes '()))
+         (chunk-sizes '())
+         (chunk-ids '()))
     (setf (symbol-function 'logical-validate-copy-schema)
           (lambda (source target table)
             (declare (ignore source target table))
@@ -971,7 +972,8 @@
           (lambda (target table columns rows)
             (declare (ignore target table columns))
             (push (loop for row in rows sum (logical-copy-row-size row))
-                  chunk-sizes)))
+                  chunk-sizes)
+            (push (mapcar (lambda (row) (aref row 0)) (reverse rows)) chunk-ids)))
     (unwind-protect
          (flet ((run-copy (bytes)
                   (setf source-rows
@@ -991,8 +993,20 @@
                         "initial copy accepts a row below or exactly at 8 MiB"))))
            (multiple-value-bind (copied-p sizes)
                (run-copy (1+ +logical-copy-chunk-bytes+))
-             (check (and (not copied-p) (null sizes))
-                    "initial copy rejects a row one byte above its chunk cap")))
+             (check (and copied-p (equal sizes (list (1+ +logical-copy-chunk-bytes+))))
+                    "initial copy accepts an oversized row as a singleton"))
+           (setf source-rows
+                 (list (vector "1" "small")
+                       (vector "2" (make-string +logical-copy-chunk-bytes+ :initial-element #\x))
+                       (vector "3" "small")
+                       (vector "4" (make-string +logical-copy-chunk-bytes+ :initial-element #\y)))
+                 chunk-sizes '() chunk-ids '())
+           (logical-copy-source-table :source :target "copy_rows")
+           (check (equal (nreverse chunk-sizes)
+                         (mapcar #'logical-copy-row-size source-rows))
+                  "large rows flush separately")
+           (check (equal (nreverse chunk-ids) '(("1") ("2") ("3") ("4")))
+                  "small and large singleton chunks preserve source order"))
       (dolist (entry originals)
         (setf (symbol-function (car entry)) (cdr entry))))))
 

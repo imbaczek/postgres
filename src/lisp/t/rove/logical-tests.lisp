@@ -43,6 +43,47 @@
                            (logical-decode-change (logical-encode-change event))))
                  "logical schema names use lengths large enough for valid identifiers"))))
 
+(rove:deftest test-logical-copy-target-query-frame-boundary
+    (let* ((within (make-string (- +max-query-message-size+ 5) :initial-element #\a))
+           (over (concatenate 'string within "a")))
+      (rove:ok (eq within (logical-copy-check-query-size within)))
+      (rove:ok (handler-case (progn (logical-copy-check-query-size over) nil)
+                 (error () t)))
+      (setf (char within 0) #\ż)
+      (rove:ok (handler-case (progn (logical-copy-check-query-size within) nil)
+                 (error () t)))))
+
+(rove:deftest test-logical-copy-frame-counts-sql-escaping
+    (let* ((column (make-pg-client-column :name "payload" :type-oid 25))
+           (row (vector (make-string (floor +max-query-message-size+ 2) :initial-element #\')))
+           (query (logical-copy-insert-query "t" (list column) row)))
+      (rove:ok (handler-case (progn (logical-copy-check-query-size query) nil)
+                 (error () t))
+               "doubling quotes cannot bypass the actual target-frame limit")))
+
+(rove:deftest test-logical-copy-oversize-query-rolls-back
+    (let ((original (symbol-function 'logical-target-query))
+          (queries nil)
+          (column (make-pg-client-column :name "payload" :type-oid 25)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-target-query)
+                   (lambda (target query)
+                     (declare (ignore target))
+                     (push query queries)))
+             (rove:ok
+              (handler-case
+                  (progn
+                    (logical-copy-target-chunk
+                     :target "t" (list column)
+                     (list (vector (make-string (floor +max-query-message-size+ 2)
+                                                :initial-element #\'))))
+                    nil)
+                (error () t)))
+             (rove:ok (equal (nreverse queries) '("BEGIN" "ROLLBACK"))
+                      "frame rejection rolls back before sending the oversized INSERT"))
+        (setf (symbol-function 'logical-target-query) original))))
+
 (rove:deftest test-logical-text-row-change
     (let* ((value (format nil "~a~a" "Zażółć " (make-string 3000 :initial-element #\x)))
            (event (logical-test-change :insert 7 701 :new-values (vector 10 120 value))))

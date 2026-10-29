@@ -514,6 +514,13 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (t (error "unsupported ~a type OID ~a"
               (if (eq context :copy) "logical copy" "pgoutput") type-oid))))
 
+(defun logical-copy-check-query-size (query)
+  "Reject a Simple Query frame that the target cannot accept."
+  (when (> (+ 5 (length (string->bytes query))) +max-query-message-size+)
+    (error "initial-copy row exceeds the target query frame limit (~d bytes)"
+           +max-query-message-size+))
+  query)
+
 (defun logical-copy-target-chunk (target table columns rows)
   (when rows
     (logical-target-transaction
@@ -522,7 +529,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
        (dolist (row (nreverse rows))
          (logical-test-failpoint :before-copy-row-change table)
          (logical-target-query
-          target (logical-copy-insert-query table columns row))
+          target (logical-copy-check-query-size (logical-copy-insert-query table columns row)))
          (logical-test-failpoint :after-copy-row-change table)))
      :before-commit
      (lambda ()
@@ -537,19 +544,21 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
         (chunk-bytes 0)
         (chunk-limit (logical-copy-chunk-limit-bytes)))
     (labels ((flush-chunk ()
-               (logical-copy-target-chunk target table columns rows)
-               (setf rows '() chunk-bytes 0))
+               (when rows
+                 (logical-copy-target-chunk target table columns rows)
+                 (setf rows '() chunk-bytes 0)))
              (consume-row (row row-columns)
                (declare (ignore row-columns))
                (let ((row-bytes (logical-copy-row-size row)))
-                 (when (> row-bytes chunk-limit)
-                   (error "one source row exceeds the initial-copy chunk limit (~d bytes)"
-                          chunk-limit))
                  (when (and rows
                             (> (+ chunk-bytes row-bytes) chunk-limit))
                    (flush-chunk))
                  (push row rows)
-                 (incf chunk-bytes row-bytes))))
+                 (incf chunk-bytes row-bytes)
+                 ;; A row larger than the batching target is a singleton, not
+                 ;; an unbounded batch waiting for the next source frame.
+                 (when (> row-bytes chunk-limit)
+                   (flush-chunk)))))
       ;; Executor SELECT streams DataRow frames; the callback commits each
       ;; bounded chunk while this source Repeatable Read snapshot remains open.
       (pg-client-query source (format nil "SELECT * FROM ~a" source-table)

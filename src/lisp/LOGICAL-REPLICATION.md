@@ -229,7 +229,9 @@ upgrades.
    bootstrap; those DDL commits stream after the copy. The worker creates the
    supported source table, standalone btree index, and sequence definitions on
    the target, validates matching definitions, and copies selected table rows
-   in chunks capped at 8 MiB of logical row changes. Sequence state is captured
+    in chunks targeting 8 MiB of estimated row data. A larger row is copied in
+    its own chunk; source and target protocol frames and individual logical WAL
+    events still have separate size limits. Sequence state is captured
    alongside the slot boundary because it is not MVCC-versioned. Target chunks
    commit independently, while a `copying` state and pending snapshot token in
    the target progress table prevent partial copies from being treated as ready.

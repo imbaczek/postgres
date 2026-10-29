@@ -569,6 +569,8 @@ applies committed row transactions and supported DDL/sequence events. Each targe
 stores a durable source-LSN marker in the same catalog commit as an applied event;
 the worker sends replication feedback only after that commit. The worker explicitly
 requests the `pg_lisp` output plugin for its snapshot lifecycle and private events.
+Initial copy batches rows to an 8 MiB target; a larger row uses a separate
+transaction and must still fit the source/target protocol and logical WAL limits.
 `t/logical-replication.sh`
 exercises initial copy, DDL and sequence changes, two independent replicas, and
 restart after a lost feedback message.
