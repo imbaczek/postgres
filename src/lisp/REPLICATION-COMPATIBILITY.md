@@ -99,7 +99,7 @@ Also audit rather than assume compatible:
 
 - One database, `public` ordinary tables, explicit publication table lists,
   and matching precreated schemas on both endpoints.
-- `int4`, `int8`, and supported bounded `varchar`; explicit non-null primary
+- `int4`, `int8`, `numeric`, and supported bounded `varchar`; explicit non-null primary
   keys, text tuples, UTF8, and values within pg-lisp's current limits.
 - INSERT, UPDATE of a non-key column, UPDATE of the primary key, DELETE,
   multi-statement committed transactions, aborted transactions, and plain
@@ -117,7 +117,9 @@ Also audit rather than assume compatible:
   covered separately by the pg-lisp extension suite. No private event may
   silently replace a supported standard row operation.
 
-Unsupported types, TOAST, partitions, row filters, column lists, generated
+Unchanged out-of-line values in C UPDATE messages are retained on the target;
+the C-peer test checks the `u` marker for large numeric values with unchanged
+and changed replica keys. Unsupported types, partitions, row filters, column lists, generated
 columns, REPLICA IDENTITY FULL, arbitrary schema transformations, and cascading
 origins are subsequent scope. Where a peer can request an unsupported feature,
 refuse safely before claiming progress for data that was not applied. This

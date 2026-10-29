@@ -605,8 +605,10 @@ Ready subscriptions resume without resetting target data.
 
 Standard mode uses explicit publication table lists and text tuples with
 streaming, binary, two-phase, and failover options disabled. DDL/sequence
-automation remains in extension mode. Row filters, column lists, partitions,
-generated columns, TOAST, and replica identity FULL remain outside the subset.
+automation remains in extension mode. UPDATE messages may omit unchanged
+out-of-line values; the subscriber preserves those values on the target. Row
+filters, column lists, partitions, generated columns, and replica identity FULL
+remain outside the subset.
 See [C-peer acceptance and limits](REPLICATION-COMPATIBILITY.md) for the pinned
 reference, test matrix, recovery evidence, and exact options.
 

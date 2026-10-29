@@ -370,7 +370,8 @@ compatibility rules in `src/test/subscription/t/008_diff_schema.pl`.
 - The worker does not implement PostgreSQL publication selection or row filters;
   publication catalog objects do not control this stream. It does not track
   replication origins or prevent loops in cascaded replication. Arbitrary DDL,
-  unsupported types/storage, large objects/TOAST values, partition routing,
+  unsupported types/storage, large objects, TOAST values beyond the supported
+  type and replication size limits, partition routing,
   two-phase transactions, and conflict resolution are outside the implemented
   subset. These remain follow-on work before claiming general-purpose blue-green
   upgrade support.

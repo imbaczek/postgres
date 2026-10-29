@@ -502,6 +502,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
   (unless (member context '(:copy :pgoutput))
     (error "unknown logical value conversion context ~s" context))
   (cond
+    ((eq value :unchanged-toast) (error "unchanged TOAST value cannot be used here"))
     ((null value) "NULL")
     ((member type-oid '(20 21 23))
      (unless (ignore-errors (parse-integer value :junk-allowed nil))
@@ -761,6 +762,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
         (incf position)
         (case kind
           (#\n (push nil values))
+          (#\u (push :unchanged-toast values))
           (#\t
            (when (> (+ position 4) (length payload))
              (error "truncated pgoutput text value length"))
@@ -856,6 +858,23 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                 when (pgoutput-column-key-p column) collect value)
           'vector))
 
+(defun logical-update-set-clause (relation new-tuple)
+  "Render changed fields, retaining the target's unchanged external values."
+  (let ((assignments
+          (loop for column in (pgoutput-relation-columns relation)
+                for value across new-tuple
+                unless (eq value :unchanged-toast)
+                  collect (format nil "~a = ~a"
+                                  (pgoutput-column-name column)
+                                  (logical-source-value-literal
+                                   (pgoutput-column-type-oid column) value :pgoutput)))))
+    (unless assignments
+      (let ((key (first (pgoutput-relation-key-columns relation))))
+        (unless key (error "pgoutput relation has no replica identity"))
+        (push (format nil "~a = ~a" (pgoutput-column-name key)
+                      (pgoutput-column-name key)) assignments)))
+    (format nil "~{~a~^, ~}" assignments)))
+
 (defun logical-apply-update (runtime relation payload position)
   (multiple-value-bind (old-tuple new-tuple kind)
       (logical-pgoutput-read-update payload position)
@@ -864,16 +883,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
         (error "REPLICA IDENTITY FULL is not supported"))
       (unless (= (length new-tuple) (length (pgoutput-relation-columns relation)))
         (error "pgoutput UPDATE tuple is not a full row"))
-      (let* ((all-columns (pgoutput-relation-columns relation))
-             (set-clause
-               (format nil "~{~a~^, ~}"
-                       (loop for column in all-columns
-                             for value across new-tuple
-                             collect (format nil "~a = ~a"
-                                             (pgoutput-column-name column)
-                                             (logical-source-value-literal
-                                              (pgoutput-column-type-oid column)
-                                              value :pgoutput)))))
+      (let* ((set-clause (logical-update-set-clause relation new-tuple))
              (where (logical-row-key-predicate
                      (logical-pgoutput-key-values relation (or old-tuple new-tuple))
                      (pgoutput-relation-key-columns relation)))

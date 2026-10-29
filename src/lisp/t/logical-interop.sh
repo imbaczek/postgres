@@ -633,6 +633,23 @@ run_direction() {
     wait_rows "$target" "$(sql "$source" 'SELECT id, amount, label FROM interop_rows ORDER BY id')"
     wait_rows "$target" '5|50|after truncate' 'SELECT id, amount, label FROM interop_other ORDER BY id'
     test "$(sql "$target" 'SELECT count(*) FROM interop_unpublished')" = 0
+    if [ "$direction" = c-to-lisp ]; then
+        # EXTERNAL guarantees this 20000-digit value remains out of line on C.
+        # Updating only amount or the replica key makes pgoutput send 'u'.
+        sql "$C_PORT" 'ALTER TABLE interop_rows ALTER COLUMN price SET STORAGE EXTERNAL' >/dev/null
+        toast_number=$(awk 'BEGIN { s=1; printf "7"; for (i=1;i<20000;i++) { s=(s*1664525+1013904223)%4294967296; printf "%d", int(s/16777216)%10 } }')
+        sql "$C_PORT" "INSERT INTO interop_rows (id,amount,price) VALUES (71,710,'$toast_number'::numeric)" >/dev/null
+        wait_rows "$LISP_PORT" '710|20000|t' "SELECT amount, length(price::text), price = '$toast_number'::numeric FROM interop_rows WHERE id=71"
+        test "$(sql "$C_PORT" 'SELECT pg_column_size(price) > 8160 FROM interop_rows WHERE id=71')" = t
+        sql "$C_PORT" "SELECT slot_name FROM pg_create_logical_replication_slot('toast_observe','pgoutput')" >/dev/null
+        sql "$C_PORT" 'UPDATE interop_rows SET amount=711 WHERE id=71' >/dev/null
+        wait_rows "$LISP_PORT" '711|20000|t' "SELECT amount, length(price::text), price = '$toast_number'::numeric FROM interop_rows WHERE id=71"
+        sql "$C_PORT" 'UPDATE interop_rows SET id=72, amount=720 WHERE id=71' >/dev/null
+        wait_rows "$LISP_PORT" '720|20000|t' "SELECT amount, length(price::text), price = '$toast_number'::numeric FROM interop_rows WHERE id=72"
+        observed=$(sql "$C_PORT" "SELECT count(*) FROM pg_logical_slot_get_binary_changes('toast_observe',NULL,NULL,'proto_version','1','publication_names','interop_pub') WHERE substring(data,1,1)=decode('55','hex') AND position(decode('6e756e6e6e6e6e6e6e','hex') in data)>0")
+        test "$observed" = 2 || { echo "logical-interop: expected two unchanged TOAST markers, got $observed" >&2; return 1; }
+        sql "$C_PORT" "SELECT pg_drop_replication_slot('toast_observe')" >/dev/null
+    fi
     if [ "$direction" = lisp-to-c ]; then
         native_apply_recovery
         restart_native_publisher

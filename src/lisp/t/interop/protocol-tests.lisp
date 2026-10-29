@@ -1289,9 +1289,48 @@
             (simple-error () t)))))
 
 (deftest unsupported-tuple-representations
-    (dolist (kind '(98 117)) ; binary and unchanged TOAST
+    (dolist (kind '(98)) ; binary output remains unsupported
       (ok (handler-case
               (progn (pg::logical-pgoutput-read-tuple (octets (list 0 1 kind)) 0) nil)
+            (simple-error () t)))))
+
+(deftest unchanged-toast-marker-decoding
+    (multiple-value-bind (values end)
+        (pg::logical-pgoutput-read-tuple (octets '(0 3 110 117 116 0 0 0 1 120)) 0)
+      (ok (equalp values #(nil :unchanged-toast "x")))
+      (ok (= end 10)))
+  (ok (handler-case
+          (progn (pg::logical-source-value-literal 25 :unchanged-toast :pgoutput) nil)
+        (simple-error () t))))
+
+(deftest unchanged-toast-update-assignments
+    (let* ((id (pg::make-pgoutput-column :name "id" :type-oid 23 :key-p t))
+           (body (pg::make-pgoutput-column :name "body" :type-oid 25))
+           (note (pg::make-pgoutput-column :name "note" :type-oid 25))
+           (relation (pg::make-pgoutput-relation :columns (list id body note) :key-columns (list id))))
+      (ok (equal (pg::logical-update-set-clause relation #("7" :unchanged-toast nil))
+                 "id = 7, note = NULL"))
+      (ok (equal (pg::logical-update-set-clause relation #(:unchanged-toast :unchanged-toast :unchanged-toast))
+                 "id = id"))
+      (ok (handler-case
+              (progn (pg::logical-row-key-predicate #(:unchanged-toast) (list id)) nil)
+            (simple-error () t)))
+      (ok (handler-case
+              (progn (pg::logical-row-insert-sql relation #("7" :unchanged-toast nil)) nil)
+            (simple-error () t)))))
+
+(deftest unchanged-toast-old-key-and-malformed-update
+    (let* ((id (pg::make-pgoutput-column :name "id" :type-oid 23 :key-p t))
+           (body (pg::make-pgoutput-column :name "body" :type-oid 25))
+           (relation (pg::make-pgoutput-relation :columns (list id body) :key-columns (list id)))
+           (payload (octets #(75 0 2 116 0 0 0 1 55 110 78 0 2 117 117))))
+      (multiple-value-bind (old new kind) (pg::logical-pgoutput-read-update payload 0)
+        (ok (char= kind #\K))
+        (ok (equal (pg::logical-row-key-predicate
+                    (pg::logical-pgoutput-key-values relation old) (list id)) "id = 7"))
+        (ok (equal (pg::logical-update-set-clause relation new) "id = id")))
+      (ok (handler-case
+              (progn (pg::logical-pgoutput-read-update (subseq payload 0 14) 0) nil)
             (simple-error () t)))))
 
 (deftest invalid-message-flags
