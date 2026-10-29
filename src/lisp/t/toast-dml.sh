@@ -53,6 +53,8 @@ run -c "update toast_jsonb set v = '{\"changed\":true}' where id = 1" >/dev/null
 run -c 'create table toast_json (id int primary key, v json)' >/dev/null
 run -c "insert into toast_json values (1, '$json_value')" >/dev/null
 [ "$(run -c 'select v from toast_json where id = 1')" = "$json_value" ]
+[ "$(run -c "select v -> 'key' from toast_json where id = 1")" = 2 ]
+[ "$(run -c "select v ->> 'key' from toast_json where id = 1")" = 2 ]
 run -c 'insert into toast_jsonb select 4, v from toast_json where id = 1' >/dev/null
 [ "$(run -c 'select v from toast_jsonb where id = 4')" = '{"key": 2}' ]
 run -c 'insert into toast_json select 2, v from toast_jsonb where id = 4' >/dev/null

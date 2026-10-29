@@ -40,3 +40,50 @@
         (rove:ok (and condition
                       (string= (pg-error-sqlstate condition) (second case))
                       (string= (pg-error-message condition) (third case)))))))
+
+(rove:deftest test-json-source-preserving-extraction
+    (flet ((check (sql expected type)
+             (multiple-value-bind (value actual-type) (json-test-evaluate sql)
+               (rove:ok (eq actual-type type))
+               (rove:ok (equal value expected)))))
+      (check "select '{ \"a\" : 1, \"a\" : [ 2, 3 ] }'::json -> 'a'" "[ 2, 3 ]" :json)
+      (check "select '{ \"a\" : 1, \"a\" : [ 2, 3 ] }'::json -> 'a' ->> -1" "3" :text)
+      (check "select '{\"a\":1.00e+2}'::json ->> 'a'" "1.00e+2" :text)
+      (check "select '{\"a\":\"hi\\nthere\"}'::json -> 'a'" "\"hi\\nthere\"" :json)
+      (check "select '{\"a\":\"hi\\nthere\"}'::json ->> 'a'" (format nil "hi~%there") :text)
+      (check "select '{\"a\":null}'::json -> 'a'" "null" :json)
+      (check "select '{\"a\":null}'::json ->> 'a'" +null+ :text)
+      (check "select '[1,2]'::json -> -3" +null+ :json)
+      (check "select '1'::json -> 0" +null+ :json)
+      (check "select '{} '::json -> null" +null+ :json)))
+
+(rove:deftest test-json-extraction-escapes-and-large-numbers
+    (let ((slash (string (code-char 92))))
+      (let ((json (format nil "{\"~au0061\": \"~au0062\", \"n\":1e999999}" slash slash)))
+        (rove:ok (equal (sql-json-extract json "a" t) "b"))
+        (rove:ok (equal (sql-json-extract json "n" t) "1e999999")))
+      (dolist (bad '("u0000" "ud800" "udc00"))
+        (let* ((json (format nil "{\"other\":\"~a~a\"}" slash bad))
+               (condition (handler-case (progn (sql-json-extract json "missing" nil) nil)
+                            (pg-error (error) error))))
+          (rove:ok (and condition
+                        (string= (pg-error-sqlstate condition)
+                                 (if (string= bad "u0000") "22P05" "22P02"))))))))
+
+(rove:deftest test-json-extraction-unicode-error-details
+    (let ((slash (string (code-char 92))))
+      (dolist (case '(("u0000" "22P05" "unsupported Unicode escape sequence"
+                       "\\u0000 cannot be converted to text.")
+                      ("ud800" "22P02" "invalid input syntax for type json"
+                       "Unicode low surrogate must follow a high surrogate.")
+                      ("udc00" "22P02" "invalid input syntax for type json"
+                       "Unicode low surrogate must follow a high surrogate.")
+                      ("ud800\\ud800" "22P02" "invalid input syntax for type json"
+                       "Unicode high surrogate must not follow a high surrogate.")))
+        (let* ((json (format nil "{\"a\":\"~a~a\"}" slash (first case)))
+               (condition (handler-case (progn (sql-json-extract json "x" nil) nil)
+                            (pg-error (error) error))))
+          (rove:ok (and condition
+                        (string= (pg-error-sqlstate condition) (second case))
+                        (string= (pg-error-message condition) (third case))
+                        (string= (pg-error-detail condition) (fourth case))))))))
