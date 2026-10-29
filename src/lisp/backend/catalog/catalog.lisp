@@ -156,7 +156,9 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
 (defun catalog-expression-to-sexp (expression)
   ;; Encode decimals explicitly so persisted expression trees round-trip without
   ;; relying on a Lisp structure reader or losing their display scale.
-  (cond ((sql-timetz-p expression)
+  (cond ((sql-jsonb-p expression)
+         (list :pg-catalog-jsonb (sql-jsonb-output expression)))
+        ((sql-timetz-p expression)
          (list :pg-catalog-timetz (sql-timetz-microseconds expression) (sql-timetz-zone-west expression)))
         ((sql-interval-p expression)
          (list :pg-catalog-interval (sql-interval-months expression)
@@ -172,7 +174,9 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
         (t expression)))
 
 (defun catalog-expression-from-sexp (expression)
-  (cond ((and (consp expression) (eq (first expression) :pg-catalog-timetz))
+  (cond ((and (consp expression) (eq (first expression) :pg-catalog-jsonb))
+         (sql-jsonb-input (second expression)))
+        ((and (consp expression) (eq (first expression) :pg-catalog-timetz))
          (make-sql-timetz (second expression) (third expression)))
         ((and (consp expression) (eq (first expression) :pg-catalog-interval))
          (make-sql-interval (second expression) (third expression) (fourth expression)))
@@ -997,7 +1001,7 @@ from advancing the shared WAL generation between a failed save and rollback."
                             (- (logxor (logand packed #x7ff) #x400) #x400)))))
     (:varchar (if (< typmod 4) "varchar" (format nil "varchar(~d)" (- typmod 4))))
     (:int2 "smallint") (:int4 "integer") (:int8 "bigint") (:float4 "real")
-    (:float8 "double precision") (:bool "boolean") (:text "text") (:json "json") (:bytea "bytea") (:name "name")
+    (:float8 "double precision") (:bool "boolean") (:text "text") (:json "json") (:jsonb "jsonb") (:bytea "bytea") (:name "name")
     (:oid "oid") (:pg-lsn "pg_lsn") (:bit (if (minusp typmod) "\"bit\"" (format nil "bit(~d)" typmod)))
     (:char "\"char\"") (:int2vector "int2vector") (:text-array "text[]")
     (otherwise (ereport "0A000" "cannot serialize stored expression type ~a" type))))
@@ -1127,7 +1131,7 @@ from advancing the shared WAL generation between a failed save and rollback."
                                      (precision (ldb (byte 16 16) packed))
                                      (scale (- (logxor (logand packed #x7ff) #x400) #x400)))
                                 (format nil "numeric(~d,~d)" precision scale)))))
-              (:text "text") (:json "json") (:bytea "bytea")
+              (:text "text") (:json "json") (:jsonb "jsonb") (:bytea "bytea")
               (:varchar (if (< (pg-column-typmod column) 4) "varchar"
                             (format nil "varchar(~a)" (- (pg-column-typmod column) 4))))
               (otherwise (error "cannot publish unsupported type ~a" (pg-column-type column)))))
@@ -1531,7 +1535,7 @@ and externalization of other variable-width types are not implemented."
           (loop for i below (length columns)
                 for value = (aref physical i)
                 for type = (pg-column-type (aref columns i))
-                when (and (member type '(:varchar :text :json :bytea))
+                when (and (member type '(:varchar :text :json :jsonb :bytea))
                           (not (eq value +null+))
                           (not (heap-external-varlena-p value)))
                   do (let* ((payload (aref encoded i))

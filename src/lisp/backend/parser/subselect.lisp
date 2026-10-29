@@ -208,7 +208,8 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
 
 (defun subquery-semantic-key (form)
   "Compare analyzed query meaning without scopes, plans or descriptor identity."
-  (cond ((sql-decimal-p form) (list :numeric (sql-numeric-coefficient form) (sql-numeric-scale form)))
+  (cond ((sql-jsonb-p form) (list :jsonb (sql-jsonb-output form)))
+        ((sql-decimal-p form) (list :numeric (sql-numeric-coefficient form) (sql-numeric-scale form)))
         ((sql-subplan-p form)
          (list :subplan (sql-subplan-kind form)
                (prepared-query-semantic-key (sql-subplan-prepared form))

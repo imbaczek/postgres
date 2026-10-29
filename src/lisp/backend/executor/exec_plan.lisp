@@ -613,6 +613,7 @@ reordered tree, and each parameterized path can reference only joined Vars."
   ;; Equal numeric values group together regardless of their display scale,
   ;; including when nested in records or arrays.
   (cond
+    ((sql-jsonb-p value) (list :jsonb (sql-jsonb-equality-key value)))
     ((sql-decimal-p value) (sql-numeric-rational value))
     ((floatp value) (sql-float-group-key value))
     ((sql-interval-p value) (sql-interval-comparison-value value))
@@ -624,6 +625,8 @@ reordered tree, and each parameterized path can reference only joined Vars."
     ((sql-record-p value)
      (list :record (mapcar #'second (sql-record-fields value))
            (map 'list #'sql-group-value-payload (sql-record-values value))))
+    ((consp value) (cons (sql-group-value-payload (car value))
+                         (sql-group-value-payload (cdr value))))
     ((and (vectorp value) (not (stringp value)))
      (map 'list #'sql-group-value-payload value))
     (t value)))

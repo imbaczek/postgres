@@ -251,6 +251,7 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
          (:float8 (typep value 'double-float))
          ((:varchar :text) (stringp value))
          (:bytea (typep value '(vector (unsigned-byte 8))))
+         (:jsonb (sql-jsonb-p value))
          (t nil))))
 
 (defun table-statistics-column (table attnum)
@@ -1456,6 +1457,7 @@ TOAST chunk visibility follows the parent and is not independently filtered."
                          (case type
                            ((:varchar :text :json) (bytes->string bytes))
                            (:bytea bytes)
+                           (:jsonb (sql-jsonb-from-octets bytes))
                            (otherwise (ereport "XX001" "external value has unsupported type")))))))
     tuple))
 

@@ -830,6 +830,7 @@
               ((string= name "text") (values :text -1))
               ((string= name "bytea") (values :bytea -1))
               ((string= name "json") (values :json -1))
+              ((string= name "jsonb") (values :jsonb -1))
               (t (ereport "0A000" "unsupported storage type \"~a\"" name))))))
   (cond
     ((match-kw p "date") (values :date -1))
@@ -857,6 +858,7 @@
     ((match-kw p "text") (values :text -1))
     ((match-kw p "bytea") (values :bytea -1))
     ((match-kw p "json") (values :json -1))
+    ((match-kw p "jsonb") (values :jsonb -1))
     ((match-kw p "serial")
      (ereport "0A000" "type serial is not supported"))
     (t
@@ -1473,6 +1475,7 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
       ((string= name "text") (values :text -1))
       ((string= name "bytea") (values :bytea -1))
       ((string= name "json") (values :json -1))
+      ((string= name "jsonb") (values :jsonb -1))
       ((string= name "name") (values :name -1))
       ((string= name "oid") (values :oid -1))
       ((string= name "pg_lsn") (values :pg-lsn -1))

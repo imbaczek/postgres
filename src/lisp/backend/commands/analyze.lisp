@@ -23,6 +23,7 @@
 
 (defun analyze-value-memory-estimate (value)
   (cond
+    ((sql-jsonb-p value) (+ 32 (analyze-value-memory-estimate (sql-jsonb-value value))))
     ((stringp value)
      ;; Use total size, not LENGTH, so adjustable/fill-pointer strings are
      ;; charged for the storage retained by the sampled row.
@@ -164,7 +165,9 @@ exact SBCL heap cap and does not include transient decode allocations."
   ;; PostgreSQL's analyze.c:compute_distinct_stats calls the column's equality
   ;; operator; bytea's byteaeq compares length and contents (bytea.c:814-844).
   ;; Keep EQUAL for other values so text remains case-sensitive.
-  (cond ((and (sql-timetz-p left) (sql-timetz-p right)) (zerop (sql-timetz-compare left right)))
+  (cond ((and (sql-jsonb-p left) (sql-jsonb-p right))
+         (zerop (sql-jsonb-compare left right)))
+        ((and (sql-timetz-p left) (sql-timetz-p right)) (zerop (sql-timetz-compare left right)))
         ((and (sql-interval-p left) (sql-interval-p right))
          (= (sql-interval-comparison-value left) (sql-interval-comparison-value right)))
         ((and (floatp left) (floatp right)) (zerop (sql-float-compare left right)))
@@ -175,7 +178,8 @@ exact SBCL heap cap and does not include transient decode allocations."
         (t (equal left right))))
 
 (defun analyze-statistics-value-hash (value)
-  (cond ((sql-timetz-p value) (sxhash (multiple-value-list (sql-timetz-comparison-values value))))
+  (cond ((sql-jsonb-p value) (sxhash (sql-jsonb-equality-key value)))
+        ((sql-timetz-p value) (sxhash (multiple-value-list (sql-timetz-comparison-values value))))
         ((sql-interval-p value) (sxhash (sql-interval-comparison-value value)))
         ((floatp value) (sxhash (sql-float-group-key value)))
         ((sql-numeric-special-p value) (sxhash value))

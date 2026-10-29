@@ -3,8 +3,9 @@
 (in-package #:pg)
 
 (defstruct (sql-jsonb (:constructor make-sql-jsonb (value)))
-  "Parsed JSONB value. Objects are (:OBJECT . sorted-pairs), arrays are vectors.
-This representation is currently standalone and is not connected to SQL or storage."
+  "Parsed SQL JSONB value. Objects are (:OBJECT . sorted-pairs), arrays are vectors.
+The constructor retains VALUE without copying; callers must treat its tree,
+including strings, pairs and vectors, as immutable while the value is in use."
   value)
 
 (defun sql-jsonb-key-less-p (left right)
@@ -147,6 +148,34 @@ depth greater than 512 are rejected with SQLSTATE 54001; the root has depth zero
                 (write-char #\] out))
                (t (write-string (sql-numeric-output value) out)))))
     (with-output-to-string (out) (emit (sql-jsonb-value jsonb) out))))
+
+(defun sql-jsonb-to-octets (jsonb)
+  "Serialize JSONB for on-disk storage as version byte 1 and canonical UTF-8 JSON.
+This text-based representation is private to this implementation and is not
+binary-compatible with PostgreSQL's internal JSONB representation."
+  (let* ((text (string->bytes (sql-jsonb-output jsonb)))
+         (bytes (make-array (1+ (length text)) :element-type '(unsigned-byte 8))))
+    (setf (aref bytes 0) 1)
+    (replace bytes text :start1 1)
+    bytes))
+
+(defun sql-jsonb-from-octets (bytes)
+  "Decode the versioned JSONB representation, rejecting unknown versions."
+  (unless (and (plusp (length bytes)) (= (aref bytes 0) 1))
+    (ereport "XX001" "invalid JSONB storage version"))
+  (sql-jsonb-input (bytes->string bytes :start 1)))
+
+(defun sql-jsonb-equality-key (jsonb)
+  "Return an EQUAL-comparable key that ignores JSONB numeric display scale.
+Numeric values are compared by value recursively, so 1 and 1.0 are equal even
+though their canonical output retains the display scale."
+  (labels ((key (value)
+             (cond ((sql-numeric-p value) (sql-numeric-rational value))
+                   ((and (vectorp value) (not (stringp value)))
+                    (map 'list #'key value))
+                   ((consp value) (cons (key (car value)) (key (cdr value))))
+                   (t value))))
+    (key (sql-jsonb-value jsonb))))
 
 (defun sql-jsonb-compare (left right)
   "Compare normalized JSONB values in PostgreSQL's B-tree type order.

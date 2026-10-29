@@ -166,7 +166,7 @@
          (progn ,@body))))
 
 (defparameter +sql-expression-types+
-  '((:json 114 -1) (:bytea 17 -1) (:bool 16 1) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
+  '((:jsonb 3802 -1) (:json 114 -1) (:bytea 17 -1) (:bool 16 1) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
     (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1)
     (:text-array 1009 -1) (:int2-array 1005 -1) (:int2vector-array 1006 -1) (:int4-array 1007 -1) (:int8-array 1016 -1)
     (:numeric-array 1231 -1) (:float4-array 1021 -1) (:float8-array 1022 -1)
@@ -1333,6 +1333,9 @@ JSON has no comparison operators, even though its stored value is text."
 (defun sql-cast-allowed-p (source target)
   "Supported explicit casts from pg_cast and CoerceViaIO's string rules."
   (or (eq source target)
+      (and (eq source :jsonb)
+           (member target '(:bool :numeric :int2 :int4 :int8 :float4 :float8)))
+      (and (member source '(:json :jsonb)) (member target '(:json :jsonb)))
       (and (eq source :bytea) (member target '(:int2 :int4 :int8)))
       (and (eq target :bytea) (member source '(:int2 :int4 :int8)))
       (and (eq source :int2vector) (sql-array-element-type target)
@@ -1737,6 +1740,20 @@ are supported."
 
 (defun sql-cast-value (value source target typmod &optional interval-literal-p)
   (when (eq value +null+) (return-from sql-cast-value +null+))
+  (when (and (eq source :jsonb)
+             (member target '(:bool :numeric :int2 :int4 :int8 :float4 :float8)))
+    (let ((scalar (sql-jsonb-value value)))
+      (return-from sql-cast-value
+        (cond ((eq scalar :json-null) +null+)
+              ((eq target :bool)
+               (case scalar (:json-true t) (:json-false nil)
+                     (otherwise (ereport "22023" "cannot cast jsonb value to boolean"))))
+              ((sql-numeric-p scalar)
+               (sql-cast-value scalar :numeric target typmod))
+              (t (ereport "22023" "cannot cast jsonb value to ~a" target))))))
+  (when (eq target :jsonb)
+    (return-from sql-cast-value
+      (if (eq source :jsonb) value (sql-jsonb-input (value->text value source)))))
   (when (eq target :json)
     (return-from sql-cast-value
       (if (eq source :json) value (sql-json-input (value->text value source)))))
@@ -2590,7 +2607,9 @@ candidate selection."
 (defun analyzed-expression-identical-p (left right)
   "Compare executable expressions while preserving aggregate transition slots."
   ;; ProjectSet sharing must not merge distinct volatile aggregate transitions.
-  (cond ((and (sql-decimal-p left) (sql-decimal-p right))
+  (cond ((and (sql-jsonb-p left) (sql-jsonb-p right))
+         (string= (sql-jsonb-output left) (sql-jsonb-output right)))
+        ((and (sql-decimal-p left) (sql-decimal-p right))
          (and (= (sql-decimal-scale left) (sql-decimal-scale right))
               (= (sql-decimal-coefficient left) (sql-decimal-coefficient right))))
         ((and (sql-expression-key-p left) (sql-expression-key-p right))
@@ -3088,6 +3107,8 @@ candidate selection."
 (defun selected-expression-equal-p (left right)
   ;; SQL99 target matching compares meaning, independent of transition slots.
   (cond ((equal left right) t)
+        ((and (sql-jsonb-p left) (sql-jsonb-p right))
+         (string= (sql-jsonb-output left) (sql-jsonb-output right)))
         ((and (sql-decimal-p left) (sql-decimal-p right))
          (and (= (sql-decimal-coefficient left) (sql-decimal-coefficient right))
               (= (sql-decimal-scale left) (sql-decimal-scale right))))
@@ -3173,6 +3194,7 @@ candidate selection."
 
 (defun compare-3way (a b)
   (cond
+    ((and (sql-jsonb-p a) (sql-jsonb-p b)) (sql-jsonb-compare a b))
     ((and (member a '(t nil)) (member b '(t nil)))
      (cond ((eq a b) 0) (a 1) (t -1)))
     ((and (sql-numeric-p a) (sql-numeric-p b))
@@ -3909,6 +3931,7 @@ truncate and interpret the result at TYPE's signed width."
     ((eq v +null+) nil)
     ((eq type :void) "")
     ((eq type :bytea) (sql-bytea-output v))
+    ((eq type :jsonb) (sql-jsonb-output v))
     ((member type '(:float4 :float8))
      (sql-float-output v type (if *backend* (parse-integer (session-extra-setting-value "extra_float_digits")) 1)))
     ((eq type :bool) (if v "t" "f"))

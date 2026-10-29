@@ -25,9 +25,36 @@ test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
 big=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "a" }')
 other=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "b" }')
 json_value=" { \"key\": \"$big\", \"key\": 2 } "
+jsonb_value=" { \"key\": 2, \"long\": \"$big\", \"key\": 3 } "
+run -c 'create table toast_jsonb (id int primary key, v jsonb)' >/dev/null
+run -c "insert into toast_jsonb values (1, '$jsonb_value')" >/dev/null
+[ "$(run -c 'select v from toast_jsonb where id = 1')" = "{\"key\": 3, \"long\": \"$big\"}" ]
+[ "$(run -c "select v = '{\"long\":\"$big\",\"key\":3}'::jsonb from toast_jsonb where id = 1")" = t ]
+run -c 'create index toast_jsonb_v_idx on toast_jsonb(v)' >/dev/null
+[ "$(run -c "select id from toast_jsonb where v = '{\"long\":\"$big\",\"key\":3}'::jsonb")" = 1 ]
+[ "$(run -c 'select count(*) from (select distinct v from toast_jsonb) s')" = 1 ]
+[ "$(run -c "select distinct '1'::jsonb order by '1'::jsonb")" = 1 ]
+[ "$(run -c "select '1.5'::jsonb::int")" = 2 ]
+[ "$(run -c "select 'true'::jsonb::boolean")" = t ]
+run -c "insert into toast_jsonb values (2, '{\"n\":1.0}'), (3, '{\"n\":1.00}')" >/dev/null
+[ "$(run -c 'select count(*) from (select distinct v from toast_jsonb where id > 1) s')" = 1 ]
+run -c 'analyze toast_jsonb' >/dev/null
+run -c 'vacuum full toast_jsonb' >/dev/null
+kill "$SRV"
+wait "$SRV" || true
+SRV=
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
+test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
+[ "$(run -c "select id from toast_jsonb where v = '{\"long\":\"$big\",\"key\":3}'::jsonb")" = 1 ]
+run -c "update toast_jsonb set v = '{\"changed\":true}' where id = 1" >/dev/null
+[ "$(run -c 'delete from toast_jsonb where id = 1 returning v')" = '{"changed": true}' ]
 run -c 'create table toast_json (id int primary key, v json)' >/dev/null
 run -c "insert into toast_json values (1, '$json_value')" >/dev/null
 [ "$(run -c 'select v from toast_json where id = 1')" = "$json_value" ]
+run -c 'insert into toast_jsonb select 4, v from toast_json where id = 1' >/dev/null
+[ "$(run -c 'select v from toast_jsonb where id = 4')" = '{"key": 2}' ]
+run -c 'insert into toast_json select 2, v from toast_jsonb where id = 4' >/dev/null
+[ "$(run -c 'select v from toast_json where id = 2')" = '{"key": 2}' ]
 if run -c 'select v = v from toast_json' >/dev/null 2>&1; then
     echo 'toast-dml: JSON equality was accepted' >&2
     exit 1

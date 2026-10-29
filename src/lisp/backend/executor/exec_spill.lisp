@@ -904,6 +904,7 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
 (defun query-spill-value-size (value)
   "Estimate retained row memory without building its printed representation."
   (cond
+    ((sql-jsonb-p value) (+ 32 (query-spill-value-size (sql-jsonb-value value))))
     ((sql-decimal-p value) (+ 32 (query-spill-value-size (sql-decimal-coefficient value))))
     ((sql-array-p value)
      (+ 64 (query-spill-value-size (sql-array-element-type-id value))
@@ -939,6 +940,8 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
 
 (defun query-spill-decode (value)
   (cond
+    ((and (consp value) (eq (first value) :pg-query-spill-jsonb))
+     (make-sql-jsonb (query-spill-decode (second value))))
     ((and (consp value) (eq (first value) :pg-query-spill-timetz))
      (make-sql-timetz (second value) (third value)))
     ((and (consp value) (eq (first value) :pg-query-spill-interval))
@@ -980,6 +983,12 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
   ;; Preserve coefficient and display scale across spill and replay, including
   ;; decimals nested in composite rows, without evaluating reader forms.
   (cond
+    ;; Spill the parsed tree recursively, preserving nested decimal scale for
+    ;; replay; this temporary encoding is distinct from JSONB's storage bytes.
+    ((sql-jsonb-p value)
+     (write-string "(:pg-query-spill-jsonb " stream)
+     (query-spill-write-value stream (sql-jsonb-value value))
+     (write-char #\) stream))
     ((sql-timetz-p value)
      (format stream "(:pg-query-spill-timetz ~d ~d)" (sql-timetz-microseconds value) (sql-timetz-zone-west value)))
     ((sql-interval-p value)

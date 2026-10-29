@@ -350,6 +350,48 @@
                                       (sql-jsonb-input "[1,0]")))
            "array length precedes element comparison"))
 
+(rove:deftest test-jsonb-index-comparison
+    (let ((values (mapcar #'sql-jsonb-input
+                          '("[]" "null" "\"a\"" "\"\"" "-10" "-1.00" "0" "0.0" "1"
+                            "10" "false" "true" "[null]" "[1]" "[1,2]"
+                            "{}" "{\"a\":1}" "{\"b\":0}" "{\"a\":1,\"c\":2}"))))
+      (dolist (a values)
+        (dolist (b values)
+          (let ((expected (signum (sql-jsonb-compare a b)))
+                (actual (signum (key-compare (encode-index-key (list a) '(:jsonb))
+                                             (encode-index-key (list b) '(:jsonb))))))
+            (rove:ok (= expected actual) "JSONB index byte order matches value comparison"))))))
+
+(rove:deftest test-jsonb-query-spill-roundtrip
+    (let* ((original (sql-jsonb-input "{\"a\":[1.00,{\"v\":false}],\"long\":\"text\"}"))
+           (encoded (with-output-to-string (out) (query-spill-write-value out original)))
+           (decoded (let ((*read-eval* nil))
+                      (query-spill-decode (read-from-string encoded)))))
+      (rove:ok (sql-jsonb-p decoded) "spill restores JSONB type")
+      (rove:ok (zerop (sql-jsonb-compare original decoded)) "spill preserves JSONB values")
+      (rove:ok (string= (sql-jsonb-output original) (sql-jsonb-output decoded))
+               "spill preserves numeric display scale")
+      (rove:ok (> (query-spill-value-size original) 64)
+               "spill accounting includes parsed JSONB contents")))
+
+(rove:deftest test-jsonb-storage-and-catalog-roundtrip
+    (let* ((original (sql-jsonb-input "{\"a\":[1.00,{\"v\":false}]}"))
+           (column (make-pg-column :name "j" :type :jsonb :typmod -1 :attnum 1))
+           (columns (vector column))
+           (tuple (form-heap-tuple (vector original) columns 3 0 0 0 0))
+           (decoded (aref (deform-heap-tuple tuple columns) 0))
+           (catalog-value (catalog-expression-from-sexp (catalog-expression-to-sexp original))))
+      (rove:ok (string= (sql-jsonb-output original) (sql-jsonb-output decoded))
+               "heap JSONB serialization preserves canonical data")
+      (rove:ok (string= (sql-jsonb-output original) (sql-jsonb-output catalog-value))
+               "catalog constants preserve JSONB and numeric scale")
+      (rove:ok (= (analyze-statistics-value-hash (sql-jsonb-input "1.0"))
+                  (analyze-statistics-value-hash (sql-jsonb-input "1.00")))
+               "statistics hash equal JSONB numbers identically")
+      (rove:ok (analyze-statistics-value-equal-p (sql-jsonb-input "1.0")
+                                                 (sql-jsonb-input "1.00"))
+               "statistics compare JSONB numerics by value")))
+
 (rove:deftest test-tuple-roundtrip
     (let* ((cols (coerce
                   (list (make-pg-column :name "a" :type :int4 :typmod -1

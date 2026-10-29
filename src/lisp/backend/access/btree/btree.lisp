@@ -787,6 +787,44 @@ nest and share this lease; relation writers wait until all scans finish."
 
 ;;; ---- key encoding ----
 
+(declaim (ftype function encode-index-key))
+
+(defun encode-jsonb-index-value (jsonb)
+  "Encode JSONB in the same ordering as SQL-JSONB-COMPARE."
+  (let ((out (make-array 0 :element-type '(unsigned-byte 8)
+                           :adjustable t :fill-pointer 0)))
+    (labels ((byte-out (byte) (vector-push-extend byte out))
+             (count-out (number)
+               (loop for shift from 24 downto 0 by 8
+                     do (byte-out (ldb (byte 8 shift) number))))
+             (string-out (value)
+               (loop for byte across (string->bytes value)
+                     do (if (zerop byte) (progn (byte-out 0) (byte-out 255))
+                            (byte-out byte)))
+               (byte-out 0) (byte-out 0))
+             (emit (value root-p)
+               (cond
+                 ((eq value :json-null) (byte-out 1))
+                 ((stringp value) (byte-out 2) (string-out value))
+                 ((sql-numeric-p value)
+                  (byte-out 3)
+                  (loop for byte across (encode-index-key (list value) '(:numeric))
+                        do (byte-out byte)))
+                 ((member value '(:json-false :json-true))
+                  (byte-out 4) (byte-out (if (eq value :json-true) 1 0)))
+                 ((vectorp value)
+                  (if (and root-p (zerop (length value)))
+                      (byte-out 0)
+                      (progn (byte-out 5) (count-out (length value))
+                             (loop for child across value do (emit child nil)))))
+                 ((and (consp value) (eq (car value) :object))
+                  (byte-out 6) (count-out (length (cdr value)))
+                  (dolist (pair (cdr value))
+                    (string-out (car pair)) (emit (cdr pair) nil)))
+                 (t (error "invalid JSONB index value")))))
+      (emit (sql-jsonb-value jsonb) t))
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
 (defun encode-index-key (values types)
   "Encode index column values so that byte-wise order matches SQL order for
 supported types. Null sorts before any non-null value; ints are sign-flipped.
@@ -863,6 +901,9 @@ order, including prefixes, in composite keys."
                                       (loop for i below end
                                             do (ordered-byte (1+ (digit-char-p (char digits i)))))
                                       (ordered-byte 0)))))))))
+                 ((eq ty :jsonb)
+                  (push-byte 16)
+                  (loop for byte across (encode-jsonb-index-value v) do (push-byte byte)))
                  ((eq ty :bytea)
                   (check-type v (vector (unsigned-byte 8)))
                   (push-byte 15)

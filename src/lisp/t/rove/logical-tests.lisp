@@ -85,6 +85,19 @@
       (rove:ok (= 114 (pgoutput-type-oid :json)) "pgoutput advertises JSON OID 114")
       (rove:ok (logical-type-supported-p 114) "subscriber accepts JSON OID 114")))
 
+(rove:deftest test-logical-jsonb-row-change
+    (let* ((value (sql-jsonb-input "{\"b\":[null,1.00], \"a\":true}"))
+           (event (logical-test-change :insert 7 701 :new-values (vector 10 120 value))))
+      (setf (getf (third (logical-change-columns event)) :type) :jsonb
+            (getf (third (logical-change-columns event)) :typmod) -1)
+      (let* ((decoded (logical-decode-change (logical-encode-change event)))
+             (restored (aref (logical-change-new-values decoded) 2)))
+        (rove:ok (eq :jsonb (getf (third (logical-change-columns decoded)) :type))
+                 "logical WAL preserves JSONB type")
+        (rove:ok (zerop (sql-jsonb-compare value restored)) "logical WAL preserves JSONB value"))
+      (rove:ok (= 3802 (pgoutput-type-oid :jsonb)) "pgoutput advertises JSONB OID 3802")
+      (rove:ok (logical-type-supported-p 3802) "subscriber accepts JSONB OID 3802")))
+
 (rove:deftest test-logical-pgoutput-v2-codec
     ;; Compare the v2 message shapes with pgoutput.c's Relation/Begin/Commit and
     ;; logicalrep_write_insert/update/delete in src/backend/replication/.
