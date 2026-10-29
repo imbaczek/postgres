@@ -488,9 +488,19 @@ Do not perform wire I/O while restoring transaction state."
               (backend-settings-transaction-start *backend*) nil)
         (session-publish-application-name)))))
 
+(declaim (ftype function exec-set-transaction))
+
 (defun command-begin (stream ast)
   (when (and (member :read-only ast) (not (getf ast :read-only)))
     (recovery-check-read-write))
+  (when (and (eq (backend-state *backend*) :in-progress)
+             (backend-implicit-query-block *backend*)
+             (not (backend-explicit *backend*)))
+    (setf (backend-explicit *backend*) t
+          (backend-implicit-query-block *backend*) nil)
+    (exec-set-transaction ast)
+    (send-command-complete stream "BEGIN")
+    (return-from command-begin))
   (if (eq (backend-state *backend*) :idle)
       (progn
         (setf (backend-explicit *backend*) t
@@ -1576,11 +1586,25 @@ Transaction options and session characteristics are excluded."
                      (not (getf statement :session-characteristics-p))))
               statements)))
 
+(defvar *extended-simple-multi-p* nil)
+
+(defun begin-extended-implicit-query-block ()
+  (sb-sys:without-interrupts
+    (setf (backend-read-only *backend*) (backend-transaction-read-only-p *backend*)
+          (backend-settings-transaction-start *backend*) (copy-session-settings (backend-settings *backend*))
+          (backend-implicit-query-block *backend*) t
+          (backend-command-id *backend*) 0)
+    (set-backend-state *backend* :in-progress)))
+
 (defun execute-query-statements (stream statements implicit-block-p)
   "Execute statements in order, deferring the last command tag in an implicit block."
   (loop for tail on statements
         for ast = (first tail)
-        do (arm-statement-timeout)
+        do (when (and *extended-simple-multi-p*
+                      (eq (backend-state *backend*) :idle)
+                      (not (member (getf ast :type) '(:begin :commit :rollback))))
+             (begin-extended-implicit-query-block))
+           (arm-statement-timeout)
            (let ((*defer-command-complete-p* (and implicit-block-p (null (rest tail)))))
              (unwind-protect
                   (progn (check-for-interrupts) (execute-statement stream ast))
@@ -1591,6 +1615,9 @@ Transaction options and session characteristics are excluded."
 Protect setup, commit completion and abort cleanup from interrupts; statement
 execution and final network output remain interruptible. The last command tag
 is sent only after commit."
+  (when *extended-simple-multi-p*
+    (return-from execute-simple-query-statements
+      (execute-query-statements stream statements t)))
   (if (and (eq (backend-state *backend*) :idle)
            (implicit-query-block-statements-p statements))
       (let ((*deferred-command-completes* nil)

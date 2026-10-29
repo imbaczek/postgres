@@ -313,6 +313,8 @@ The admitted decoder repeats these checks authoritatively."
                       (query-string
                        (decode-frontend-message
                         type-byte length-bytes payload)))
+                (when *extended-query-state*
+                  (remhash "" (extended-query-state-statements *extended-query-state*)))
                 (if (eq *live-operation-current-lane* :drain)
                     (multiple-value-bind (statements parsed-p)
                         ;; Parse the entire message before executing anything so
@@ -423,9 +425,147 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                    :message "extended query protocol is not supported by this server"))
   (send-ready-for-query stream (transaction-status-char)))
 
-(defun dispatch-frontend-frame (stream type-byte length-bytes payload)
+(defun handle-extended-query-frame (stream type-byte length-bytes payload)
+  (let ((state *extended-query-state*))
+    (with-backend-query-execution (:cleanup :query-state)
+      (with-live-operation-query-dispatch
+          (or (= type-byte (char-code #\S))
+              (not (frontend-frame-envelope-valid-p length-bytes payload)))
+        (handler-case
+            (progn
+              (when (extended-query-state-statement-deadline state)
+                (setf (backend-statement-deadline *backend*)
+                      (extended-query-state-statement-deadline state)))
+              (decode-frontend-message type-byte length-bytes payload)
+              (arm-statement-timeout)
+              (check-for-interrupts)
+              (unless (= type-byte (char-code #\S))
+                (setf (extended-query-state-in-cycle-p state) t))
+              (unless (and (extended-query-state-ignore-until-sync state)
+                           (/= type-byte (char-code #\S)))
+                (extended-apply-operation stream
+                                          (extended-parse-frame (code-char type-byte) payload)
+                                          payload))
+              (setf (extended-query-state-statement-deadline state)
+                    (unless (member (code-char type-byte) '(#\E #\S))
+                      (backend-statement-deadline *backend*))))
+          (pg-error (condition)
+            (when (fatal-error-p condition) (error condition))
+            (let ((implicit (extended-query-state-implicit-p state)))
+              (note-query-error)
+              (setf (extended-query-state-statement-deadline state) nil
+                    (extended-query-state-executed-in-cycle-p state) nil)
+              (clrhash (extended-query-state-portals state))
+              (when implicit
+                (unless (eq (backend-state *backend*) :idle) (abort-transaction))
+                (restore-session-settings stream))
+              (setf (extended-query-state-implicit-p state) nil
+                    (extended-query-state-ignore-until-sync state) t)
+              (send-error-response stream condition)
+              (when (= type-byte (char-code #\S))
+                (setf (extended-query-state-ignore-until-sync state) nil
+                      (extended-query-state-in-cycle-p state) nil)
+                (send-ready-for-query stream (transaction-status-char)))))
+          (error (condition)
+            (let ((implicit (extended-query-state-implicit-p state)))
+              (note-query-error)
+              (setf (extended-query-state-statement-deadline state) nil
+                    (extended-query-state-executed-in-cycle-p state) nil)
+              (clrhash (extended-query-state-portals state))
+              (when implicit
+                (unless (eq (backend-state *backend*) :idle) (abort-transaction))
+                (restore-session-settings stream))
+              (setf (extended-query-state-implicit-p state) nil
+                    (extended-query-state-ignore-until-sync state) t)
+              (send-error-response stream (make-condition 'pg-error :sqlstate "XX000"
+                                                                    :message (princ-to-string condition)))
+              (when (= type-byte (char-code #\S))
+                (setf (extended-query-state-ignore-until-sync state) nil
+                      (extended-query-state-in-cycle-p state) nil)
+                (send-ready-for-query stream (transaction-status-char)))))))))
+  :continue)
+
+(defun handle-extended-implicit-simple-query (stream type-byte length-bytes payload)
+  "Run a Simple Query while an extended implicit transaction is still open."
+  (let ((state *extended-query-state*) (backend *backend*) (completed nil) (cleaned nil))
+    (with-backend-query-execution (:backend backend :cleanup :query-state)
+      (with-live-operation-query-dispatch t
+        (let* ((message (decode-frontend-message type-byte length-bytes payload))
+               (query (query-string message)))
+          (remhash "" (extended-query-state-statements state))
+          (setf (extended-query-state-statement-deadline state) nil)
+          (multiple-value-bind (statements parsed-p)
+              (exec-simple-query stream query :prepare-only-p t
+                                              :start-execution-p nil :finish-execution-p nil)
+            (when (and parsed-p
+                       (not (every (lambda (statement)
+                                     (member (getf statement :type)
+                                             '(:select :insert :update :delete :set :reset :show
+                                               :begin :commit :rollback)))
+                                   statements)))
+              (setf parsed-p nil)
+              (send-error-response stream
+                                   (make-condition 'pg-error :sqlstate "0A000"
+                                                             :message "utility command in an extended implicit transaction is not supported")))
+            (when (and parsed-p (eq *live-operation-current-lane* :drain))
+              (let ((ending (position-if #'transaction-ending-statement-p statements)))
+                (when (and ending (< (1+ ending) (length statements)))
+                  (setf parsed-p nil)
+                  (send-error-response stream
+                                       (make-condition 'pg-error :sqlstate "0A000"
+                                                                 :message "mixed query suffix cannot run during reload drain")))))
+            (when parsed-p
+              (let ((*extended-simple-multi-p* (not (null (rest statements))))
+                    (*deferred-command-completes* nil))
+                (multiple-value-bind (result ok)
+                    (exec-simple-query stream query :statements statements
+                                                    :start-execution-p nil :finish-execution-p nil)
+                  (declare (ignore result))
+                  (setf completed ok))
+                (when completed
+                  (handler-case
+                      (progn
+                        (when (and *extended-simple-multi-p*
+                                   (eq (backend-state backend) :in-progress)
+                                   (not (backend-explicit backend)))
+                          (commit-transaction))
+                        (dolist (response (nreverse *deferred-command-completes*))
+                          (apply #'send-command-complete response)))
+                    (error (condition)
+                      (when (fatal-error-p condition) (error condition))
+                      (setf completed nil)
+                      (unless (backend-explicit backend)
+                        (unless (eq (backend-state backend) :idle) (abort-transaction))
+                        (restore-session-settings stream))
+                      (clrhash (extended-query-state-portals state))
+                      (setf (extended-query-state-implicit-p state) nil cleaned t)
+                      (send-error-response stream
+                                           (if (typep condition 'pg-error) condition
+                                               (make-condition 'pg-error :sqlstate "XX000"
+                                                                         :message (princ-to-string condition)))))))))
+            (unless (or completed cleaned)
+              (unless (backend-explicit backend)
+                (unless (eq (backend-state backend) :idle) (abort-transaction))
+                (restore-session-settings stream)))
+            (when (or (not completed) (eq (backend-state backend) :idle)
+                      (backend-explicit backend))
+              (setf (extended-query-state-implicit-p state) nil
+                    (extended-query-state-executed-in-cycle-p state) nil)
+              (when (or (not completed) (eq (backend-state backend) :idle))
+                (clrhash (extended-query-state-portals state))))
+            (send-ready-for-query stream (transaction-status-char)))))))
+  :continue)
+
+(defun %dispatch-frontend-frame (stream type-byte length-bytes payload)
   "Admit a raw frame before protocol validation and message construction."
   (cond
+    ((and *extended-query-state*
+          (extended-query-state-ignore-until-sync *extended-query-state*)
+          (not (member (code-char type-byte) '(#\S #\X))))
+     (unless (frontend-frame-envelope-valid-p length-bytes payload)
+       (with-live-operation-query-dispatch t
+         (decode-frontend-message type-byte length-bytes payload)))
+     :continue)
     ;; Query dispatch needs its byte-only classifier first so an already-active
     ;; transaction can still send COMMIT/ROLLBACK while reload drains.
     ((and (= type-byte (char-code #\Q))
@@ -435,13 +575,34 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
      (handle-replication-query-frame stream type-byte length-bytes payload)
      :continue)
     ((= type-byte (char-code #\Q))
-     (handle-simple-query-frame stream type-byte length-bytes payload))
+     (when (and *extended-query-state* (extended-query-state-implicit-p *extended-query-state*)
+                (not (extended-query-state-executed-in-cycle-p *extended-query-state*)))
+       (with-live-operation-query-dispatch t
+         (decode-frontend-message type-byte length-bytes payload)
+         (when (eq (backend-state *backend*) :in-progress) (commit-transaction))
+         (setf (extended-query-state-implicit-p *extended-query-state*) nil
+               (extended-query-state-executed-in-cycle-p *extended-query-state*) nil)
+         (clrhash (extended-query-state-portals *extended-query-state*))))
+     (if (and *extended-query-state* (extended-query-state-implicit-p *extended-query-state*))
+         (handle-extended-implicit-simple-query stream type-byte length-bytes payload)
+         (prog1 (handle-simple-query-frame stream type-byte length-bytes payload)
+           (when *extended-query-state*
+             (setf (extended-query-state-statement-deadline *extended-query-state*) nil))
+           (when (and *extended-query-state*
+                      (member (backend-state *backend*) '(:idle :aborted)))
+             (when (eq (backend-state *backend*) :idle)
+               (setf (extended-query-state-implicit-p *extended-query-state*) nil))
+             (clrhash (extended-query-state-portals *extended-query-state*))))))
+    ((find (code-char type-byte) "PBESCHD")
+     (handle-extended-query-frame stream type-byte length-bytes payload))
     ;; A captured active session may terminate during drain so its transaction
     ;; cleanup can complete. Idle sessions wait for ordinary admission.
     ((= type-byte (char-code #\X))
      (with-live-operation-query-dispatch t
        (decode-frontend-message type-byte length-bytes payload)
        :terminate))
+    ((and *extended-query-state* (extended-query-state-in-cycle-p *extended-query-state*))
+     (handle-extended-query-frame stream type-byte length-bytes payload))
     ((not (frontend-frame-envelope-valid-p length-bytes payload))
      ;; Bad frame shape must reach fatal validation during drain so it can
      ;; release any transaction holding up the reload.
@@ -450,9 +611,13 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
        :continue))
     (t
      (with-live-operation
-       (handle-unsupported-message
-        stream (decode-frontend-message type-byte length-bytes payload))
-       :continue))))
+       (decode-frontend-message type-byte length-bytes payload)
+       (malformed-protocol-message "unsupported frontend message type")))))
+
+(defun dispatch-frontend-frame (stream type-byte length-bytes payload)
+  (let ((*extended-query-state*
+          (or *extended-query-state* (extended-query-state-for-backend *backend*))))
+    (%dispatch-frontend-frame stream type-byte length-bytes payload)))
 
 ;;; ---- backend loop ----
 
@@ -460,13 +625,8 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
   (loop
     (multiple-value-bind (type-byte length-bytes payload)
         (read-message-frame stream)
-      (when (null type-byte)
-        (return))
-      ;; Reading socket bytes and selecting the query path stay outside
-      ;; admission. Validation, object construction and other dispatch enter it.
-      (when (eq (dispatch-frontend-frame
-                 stream type-byte length-bytes payload)
-                :terminate)
+      (when (null type-byte) (return))
+      (when (eq (dispatch-frontend-frame stream type-byte length-bytes payload) :terminate)
         (return)))))
 
 (defun finish-backend-connection (backend sock stream)
@@ -481,6 +641,7 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
       (sb-sys:without-interrupts
         (unwind-protect
              (when backend
+               (forget-extended-query-state backend)
                (logical-release-subscription-owner backend)
                (unregister-backend backend))
           (connection-finished))))))

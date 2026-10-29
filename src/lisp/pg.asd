@@ -157,5 +157,6 @@
                    (:file "../replication/standard")
                    (:file "../replication/worker")
                    (:file "../replication/standard-subscriber")
+                   (:file "extended-query")
                    (:file "postgres")))
      (:file "replication/logical-retention")))))

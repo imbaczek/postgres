@@ -590,6 +590,17 @@ MDY, DMY and YMD input order; `IntervalStyle` supports only `postgres`.
 hexadecimal (the default) or traditional escape output. Supported isolation levels
 are `READ COMMITTED` and `REPEATABLE READ`; client encoding is UTF8 and
 `standard_conforming_strings = on`.
+The extended query protocol supports Parse, Bind, Execute, Sync, Describe,
+Close and Flush for a single INSERT, UPDATE or DELETE without RETURNING.
+Parse requires explicit supported built-in expression type OIDs for parameters;
+string literals in these statements are rejected in favor of parameters.
+Parameters use text format, except that bytea also supports binary format;
+binary result formats and limited portal execution are unsupported; each portal
+can execute only once. This is a restricted DML interface, not general
+extended-query support. During reload drain, a Simple Query sent while an
+extended implicit transaction is open is rejected if it has statements after a
+transaction-ending statement. An old protocol handler also fails closed for
+extended message suffixes during a mixed live reload.
 Client startup and SQL `application_name` support SET, SHOW, RESET and
 `current_setting`/`set_config`, including transaction-local values. Other LOCAL
 settings remain unsupported. Parameter reports are coalesced before ReadyForQuery.
@@ -635,16 +646,16 @@ slot permits new transactions to skip capture; already captured transactions
 remain captured. Unknown capture state is handled conservatively.
 Initial copy batches rows to an 8 MiB target; a larger row uses a separate
 transaction and must still fit the source/target protocol and logical WAL limits.
-For extension-mode initial copy, each target INSERT is counted and emitted in
-bounded UTF-8 blocks without constructing a complete query string. The source
+For extension-mode initial copy, each target INSERT uses typed Bind parameters
+emitted in bounded blocks. The source
 DataRow is read through a bounded cursor without a complete frame copy. Text-format
 fields above 1 MiB, or fields that would exceed the shared 4 MiB conservative
 resident-field budget, use row-owned temporary slices, retained through their
 target chunk commit and released on completion or error. This includes integer
 fields. A chunk flushes after 32 rows with spilled owners; the 8 MiB batching
 target counts the original UTF-8 field bytes. Row metadata and other allocations
-remain in memory, and the target still receives and parses the complete Simple
-Query frame.
+remain in memory, and the target still buffers the complete Bind frame and
+materializes parameter values.
 Frontend query message lengths are limited to 132 MiB, including the four-byte
 length word. The lexer counts quoted string and identifier contents before
 allocating their exact-sized decoded strings, avoiding a growable literal buffer;
@@ -653,8 +664,9 @@ the incoming frame and complete query string still materialize. When capture is 
 64 MiB limit. Row changes made by the `pg-lisp-subscribe-apply` application have an extra 1 MiB of headroom; WAL
 recovery and slot readers accept individual events up to 129 MiB. Captured row
 events above 64 MiB require a supported replica identity and schema and must
-pass preflight checks for pgoutput, subscriber apply SQL, and full-new-row
-initial-copy DataRow and SQL frames. Values written before a slot existed may
+pass preflight checks for pgoutput, subscriber apply Bind, and full-new-row
+initial-copy DataRow and Bind frames. This permits a 65 MiB quote-heavy text
+value when the other limits and checks are met. Values written before a slot existed may
 still be too large for a later initial copy. Individual decoded values and JSONB
 trees can still require substantial memory. The aggregate
 transaction size is controlled by the capture spool's temporary-file quota,
@@ -720,9 +732,8 @@ the frame's conservative 4 MiB resident-field budget, including integer fields,
 are validated as UTF-8 and stored in an unlinked, process-owned temporary file
 for synchronous apply; their CRC is checked during SQL preflight and emission.
 Extension Message contents and other allocations still materialize. INSERT, UPDATE and DELETE apply
-queries use producers that count and then emit SQL in bounded UTF-8 blocks
-without building a full query string; the target still receives and parses the
-complete Simple Query. A malformed or incomplete
+uses typed Bind parameters, counted and emitted in bounded blocks; the target
+still buffers the complete Bind frame and materializes parameter values. A malformed or incomplete
 incoming frame closes the source connection; a partial row-frame or query write
 closes its connection. Other message types use their existing encoders. The 4 MiB
 threshold is not a bound on the size of an individual event. The 128 MiB capture

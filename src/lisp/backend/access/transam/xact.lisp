@@ -1884,6 +1884,8 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
   (sb-sys:without-interrupts
     (let ((*backend* backend))
       (reset-backend-transaction backend)
+      (when (fboundp 'extended-clear-portals-for-backend)
+        (funcall 'extended-clear-portals-for-backend backend))
       (session-finish-application-name commit-p)
       (when commit-p
         (setf (backend-settings-transaction-start backend) nil))))

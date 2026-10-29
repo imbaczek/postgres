@@ -1634,6 +1634,8 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
 
 (defun parse-primary (p)
   (cond
+    ((eq (pkind p) :parameter)
+     (list :parameter (token-value (pnext p))))
     ((eq (pkind p) :numeric)
      (list :numeric-literal (token-value (pnext p))))
     ((eq (pkind p) :bit-string) (list :bit-literal (token-value (pnext p))))

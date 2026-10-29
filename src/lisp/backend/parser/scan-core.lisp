@@ -133,6 +133,16 @@
                  (push (make-token :kind :bit-string
                                    :value (concatenate 'string (string c) value) :pos start)
                        out))))
+            ((and (char= c #\$) (sql-number-digit-p (peek 1) 10))
+             (let ((start i) (index 0))
+               (incf i)
+               (loop for digit = (sql-number-digit-p (peek) 10)
+                     while digit
+                     do (setf index (min 65536 (+ (* index 10) digit))) (incf i))
+               (when (and (peek) (or (alphanumericp (peek))
+                                     (member (peek) '(#\_ #\$))))
+                 (scan-error "trailing junk after parameter" start))
+               (push (make-token :kind :parameter :value index :pos start) out)))
             ((or (alpha-char-p c) (char= c #\_))
              (let ((start i))
                (incf i)

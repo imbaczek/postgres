@@ -2501,9 +2501,22 @@ candidate selection."
             :element-source element :element-target (expr-type (second operands))
             :type :bool :typmod -1))))
 
+(defvar *query-parameter-types* nil)
+
+(defvar *query-parameter-values* nil)
+
+(defun query-parameter-slot (index vector)
+  (unless (and (integerp index) (<= 1 index) (vectorp vector) (<= index (length vector)))
+    (ereport "42P02" "there is no parameter $~a" index))
+  (aref vector (1- index)))
+
 (defun analyze-expr (expr table)
   "Resolve column references and annotate expression types."
   (case (first expr)
+    (:parameter
+     (let ((type (query-parameter-slot (second expr) *query-parameter-types*)))
+       (unless type (ereport "42P18" "could not determine data type of parameter $~a" (second expr)))
+       (list :parameter (second expr) :type type :typmod -1)))
     (:sublink (analyze-sublink expr table))
     (:window (analyze-window-call expr table))
     (:const
@@ -3948,6 +3961,7 @@ truncate and interpret the result at TYPE's signed width."
 
 (defun eval-expr (expr env)
   (case (first expr)
+    (:parameter (query-parameter-slot (second expr) *query-parameter-values*))
     (:subplan (eval-subquery-expression (second expr) env))
     (:assignment (eval-subquery-assignment expr env))
     (:subquery-output *subquery-output-value*)

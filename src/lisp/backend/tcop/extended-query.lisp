@@ -1,0 +1,228 @@
+;;;; Extended query protocol state and bounded frame parsing.
+
+(in-package #:pg)
+
+(defstruct extended-statement ast types)
+(defstruct extended-portal statement values (executed-p nil))
+(defstruct extended-query-state
+  (statements (make-hash-table :test #'equal))
+  (portals (make-hash-table :test #'equal))
+  (ignore-until-sync nil)
+  (in-cycle-p nil)
+  (statement-deadline nil)
+  (executed-in-cycle-p nil)
+  (implicit-p nil))
+
+(defvar *extended-query-state* nil)
+
+(defvar *extended-query-state-registry* (make-hash-table :test #'eq :weakness :key))
+
+(defvar *extended-query-state-registry-lock* (sb-thread:make-mutex :name "extended query state"))
+
+(defun extended-query-state-for-backend (backend)
+  (unless backend (error "extended query requires a backend"))
+  (sb-thread:with-mutex (*extended-query-state-registry-lock*)
+    (or (gethash backend *extended-query-state-registry*)
+        (setf (gethash backend *extended-query-state-registry*) (make-extended-query-state)))))
+
+(defun extended-clear-portals-for-backend (backend)
+  (when backend
+    (sb-thread:with-mutex (*extended-query-state-registry-lock*)
+      (let ((state (gethash backend *extended-query-state-registry*)))
+        (when state
+          (clrhash (extended-query-state-portals state))
+          (setf (extended-query-state-executed-in-cycle-p state) nil)))))
+  (values))
+
+(defun forget-extended-query-state (backend)
+  (when backend
+    (sb-thread:with-mutex (*extended-query-state-registry-lock*)
+      (remhash backend *extended-query-state-registry*)))
+  (values))
+
+(defun extended-read-cstring (payload position)
+  (multiple-value-bind (value end) (pg-client-cstring payload position)
+    (values value end)))
+
+(defun extended-type-from-oid (oid)
+  (let ((entry (find oid +sql-expression-types+ :key #'second)))
+    (unless entry (ereport "0A000" "unsupported parameter type OID ~a" oid))
+    (first entry)))
+
+(defun extended-parse-frame (type payload)
+  "Parse the complete frame before changing prepared or portal state."
+  (let ((position 0) (length (length payload)))
+    (labels ((need (n) (unless (<= (+ position n) length) (malformed-protocol-message "truncated extended query message")))
+             (u16 () (need 2) (prog1 (bytes-to-u16 payload position) (incf position 2)))
+             (u32 () (need 4) (prog1 (bytes-to-u32 payload position) (incf position 4)))
+             (cstring () (multiple-value-bind (value next) (extended-read-cstring payload position)
+                           (setf position next) value))
+             (done () (unless (= position length) (malformed-protocol-message "extended query message has trailing bytes"))))
+      (case type
+        (#\P (let* ((name (cstring)) (query (cstring)) (count (u16))
+                                     (oids (loop repeat count collect (u32))))
+               (done) (list :parse name query oids)))
+        (#\B (let* ((portal (cstring)) (statement (cstring))
+                                       (formats (loop repeat (u16) collect (u16)))
+                                       (values (loop repeat (u16)
+                                                     collect (let ((size (u32)))
+                                                               (if (= size #xffffffff) nil
+                                                                   (progn (need size)
+                                                                          (prog1 (cons position size) (incf position size)))))))
+                                       (results (loop repeat (u16) collect (u16))))
+               (done) (list :bind portal statement formats values results)))
+        (#\E (let ((portal (cstring)) (limit (u32)))
+               (done) (list :execute portal limit)))
+        ((#\C #\D) (need 1) (let ((kind (code-char (aref payload position))))
+                              (incf position)
+                              (let ((name (cstring)))
+                                (done) (list (if (char= type #\C) :close :describe) kind name))))
+        (#\S (done) '(:sync))
+        (#\H (done) '(:flush))
+        (otherwise (ereport "0A000" "unsupported extended query message"))))))
+
+(defun extended-parameter-format (formats index count)
+  (case (length formats)
+    (0 0)
+    (1 (aref formats 0))
+    (otherwise (unless (= (length formats) count)
+                 (ereport "08P01" "invalid parameter format count"))
+     (aref formats index))))
+
+(defun extended-context-sensitive-literal-p (tree)
+  "Identify string literals whose parse-time coercion cannot yet be retained."
+  (let ((pending (list tree)))
+    (loop while pending
+          for item = (pop pending)
+          when (consp item)
+            do (when (and (eq (first item) :const) (consp (rest item))
+                          (stringp (second item)))
+                 (return-from extended-context-sensitive-literal-p t))
+               (push (cdr item) pending)
+               (push (car item) pending))
+    nil))
+
+(defun extended-apply-operation (stream operation payload)
+  (let ((state *extended-query-state*))
+    (case (first operation)
+      (:parse
+       (destructuring-bind (kind name sql oids) operation
+         (declare (ignore kind))
+         (when (eq (backend-state *backend*) :idle)
+           (sb-sys:without-interrupts
+             (begin-extended-implicit-query-block)
+             (setf (extended-query-state-implicit-p state) t)))
+         (when (zerop (length name))
+           (remhash "" (extended-query-state-statements state)))
+         (when (and (plusp (length name)) (gethash name (extended-query-state-statements state)))
+           (ereport "42P05" "prepared statement already exists"))
+         (let* ((statements (parse-statements sql))
+                (types (map 'vector #'extended-type-from-oid oids)))
+           (unless (and (= (length statements) 1)
+                        (member (getf (first statements) :type) '(:insert :update :delete))
+                        (null (getf (first statements) :returning)))
+             (ereport "0A000" "extended query supports one DML statement"))
+           (when (extended-context-sensitive-literal-p (first statements))
+             (ereport "0A000" "string literals in extended statements are not supported; use parameters"))
+           (when (eq (backend-state *backend*) :aborted)
+             (ereport "25P02" "current transaction is aborted, commands ignored until end of transaction block"))
+           (let ((*query-parameter-types* types))
+             (prepare-dml-subqueries (first statements)))
+           (setf (gethash name (extended-query-state-statements state))
+                 (make-extended-statement :ast (first statements) :types types))
+           (write-message stream #\1 #()))))
+      (:bind
+       (destructuring-bind (kind portal name formats ranges results) operation
+         (declare (ignore kind))
+         (let ((statement (gethash name (extended-query-state-statements state))))
+           (unless statement (ereport "26000" "prepared statement does not exist"))
+           (when (eq (backend-state *backend*) :aborted)
+             (ereport "25P02" "current transaction is aborted, commands ignored until end of transaction block"))
+           (when (eq (backend-state *backend*) :idle)
+             (sb-sys:without-interrupts
+               (begin-extended-implicit-query-block)
+               (setf (extended-query-state-implicit-p state) t)))
+           (when (and (plusp (length portal)) (gethash portal (extended-query-state-portals state)))
+             (ereport "42P03" "portal already exists"))
+           (unless (= (length ranges) (length (extended-statement-types statement)))
+             (ereport "08P01" "bind parameter count mismatch"))
+           (unless (and (member (length formats) (list 0 1 (length ranges)))
+                        (every (lambda (format) (member format '(0 1))) formats))
+             (ereport "08P01" "invalid parameter formats"))
+           (unless (or (null results) (and (= (length results) 1) (= (first results) 0)))
+             (ereport "0A000" "binary result format is not supported"))
+           (let* ((types (extended-statement-types statement))
+                  (format-vector (coerce formats 'vector))
+                  (values (make-array (length ranges))))
+             (loop for range in ranges for index from 0
+                   for type = (aref types index)
+                   for format = (extended-parameter-format format-vector index (length values))
+                   do (when (and (= format 1) (not (eq type :bytea)))
+                        (ereport "0A000" "unsupported binary parameter format"))
+                      (setf (aref values index)
+                            (cond ((null range) +null+)
+                                  ((= format 0)
+                                   (when (position 0 payload :start (car range)
+                                                             :end (+ (car range) (cdr range)))
+                                     (ereport "22021" "null byte in text parameter"))
+                                   (sql-cast-value (sb-ext:octets-to-string
+                                                    payload :start (car range)
+                                                            :end (+ (car range) (cdr range))
+                                                            :external-format :utf-8)
+                                                   :text type -1))
+                                  ((and (= format 1) (eq type :bytea))
+                                   (subseq payload (car range) (+ (car range) (cdr range))))
+                                  (t (ereport "0A000" "unsupported binary parameter format")))))
+             (setf (gethash portal (extended-query-state-portals state))
+                   (make-extended-portal :statement statement :values values))
+             (write-message stream #\2 #())))))
+      (:execute
+       (destructuring-bind (kind name limit) operation
+         (declare (ignore kind))
+         (unless (zerop limit) (ereport "0A000" "limited portal execution is not supported"))
+         (let ((portal (gethash name (extended-query-state-portals state))))
+           (unless portal (ereport "34000" "portal does not exist"))
+           (when (extended-portal-executed-p portal) (ereport "55000" "portal already executed"))
+           (when (eq (backend-state *backend*) :idle)
+             (begin-extended-implicit-query-block)
+             (setf (extended-query-state-implicit-p state) t))
+           (let ((*query-parameter-types* (extended-statement-types (extended-portal-statement portal)))
+                 (*query-parameter-values* (extended-portal-values portal)))
+             (execute-statement stream (extended-statement-ast (extended-portal-statement portal))))
+           (setf (extended-portal-executed-p portal) t
+                 (extended-query-state-executed-in-cycle-p state) t))))
+      (:describe
+       (destructuring-bind (kind target name) operation
+         (declare (ignore kind))
+         (case target
+           (#\S (let ((statement (gethash name (extended-query-state-statements state))))
+                  (unless statement (ereport "26000" "prepared statement does not exist"))
+                  (let ((response (make-payload)))
+                    (payload-push-u16 response (length (extended-statement-types statement)))
+                    (loop for type across (extended-statement-types statement)
+                          do (payload-push-u32 response (type-oid type)))
+                    (write-message stream #\t response))))
+           (#\P (unless (gethash name (extended-query-state-portals state))
+                  (ereport "34000" "portal does not exist")))
+           (otherwise (ereport "08P01" "invalid describe target")))
+         (write-message stream #\n #())))
+      (:close
+       (destructuring-bind (kind target name) operation
+         (declare (ignore kind))
+         (case target
+           (#\S (remhash name (extended-query-state-statements state)))
+           (#\P (remhash name (extended-query-state-portals state)))
+           (otherwise (ereport "08P01" "invalid close target")))
+         (write-message stream #\3 #())))
+      (:sync
+       (when (extended-query-state-implicit-p state)
+         (when (eq (backend-state *backend*) :in-progress) (commit-transaction))
+         (setf (extended-query-state-implicit-p state) nil)
+         (clrhash (extended-query-state-portals state)))
+       (when (eq (backend-state *backend*) :idle)
+         (clrhash (extended-query-state-portals state)))
+       (setf (extended-query-state-ignore-until-sync state) nil
+             (extended-query-state-in-cycle-p state) nil
+             (extended-query-state-executed-in-cycle-p state) nil)
+       (send-ready-for-query stream (transaction-status-char)))
+      (:flush (force-output stream)))))

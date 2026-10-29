@@ -302,6 +302,74 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
 
 (defstruct pg-client-query-plan writer)
 
+(defstruct pg-client-bound-query sql parameters)
+
+(defun pg-client-bound-field-write (writer sink &optional (limit +max-query-message-size+))
+  (multiple-value-bind (counting metrics) (logical-encoding-sink limit)
+    (let ((out (make-instance 'pg-client-query-output-stream
+                              :buffer (lambda (bytes)
+                                        (funcall counting bytes)
+                                        (when sink (funcall sink bytes))))))
+      (funcall writer out)
+      (logical-flush-utf8-output out)
+      (funcall metrics))))
+
+(defun pg-client-send-bound-query (client query)
+  "Send Parse/Bind/Execute/Sync, preflighting every parameter before Parse."
+  (let* ((sql (pg-client-bound-query-sql query))
+         (params (pg-client-bound-query-parameters query))
+         (stream (pg-client-stream client))
+         (lengths nil) (checksums nil)
+         (bind-length (+ 12 (* 4 (length params))))
+         (started nil) (complete nil))
+    (unless (<= (length params) #xffff) (error "too many bind parameters"))
+    (when (find (code-char 0) sql) (error "SQL query contains a null byte"))
+    (let ((sql-size (loop for start from 0 below (length sql) by 4096
+                          sum (length (string->bytes (subseq sql start (min (length sql) (+ start 4096))))))))
+      (when (> (+ 8 (* 4 (length params)) sql-size) +max-query-message-size+)
+        (error "Parse frame exceeds size limit")))
+    (unless (every (lambda (param)
+                     (and (consp param) (typep (car param) '(unsigned-byte 32))
+                          (functionp (cdr param))))
+                   params)
+      (error "invalid bind parameter descriptor"))
+    (dolist (param params)
+      (multiple-value-bind (size checksum) (pg-client-bound-field-write (cdr param) nil)
+        (incf bind-length size)
+        (push size lengths) (push checksum checksums)))
+    (when (> bind-length +max-query-message-size+) (error "Bind frame exceeds size limit"))
+    (let ((parse (make-payload)) (execute (make-payload)))
+      (payload-push-byte parse 0)
+      (payload-push-cstring parse sql)
+      (payload-push-u16 parse (length params))
+      (dolist (param params) (payload-push-u32 parse (car param)))
+      (when (> (+ 4 (length parse)) +max-query-message-size+)
+        (error "Parse frame exceeds size limit"))
+      (payload-push-byte execute 0) (payload-push-u32 execute 0)
+      (unwind-protect
+           (progn
+             (setf started t)
+             (write-message stream #\P parse)
+             (write-byte (char-code #\B) stream)
+             (write-sequence (u32-to-bytes bind-length) stream)
+             (write-byte 0 stream) (write-byte 0 stream)
+             (write-sequence (u16-to-bytes 0) stream)
+             (write-sequence (u16-to-bytes (length params)) stream)
+             (loop for param in params for size in (nreverse lengths)
+                   for expected in (nreverse checksums)
+                   do (write-sequence (u32-to-bytes size) stream)
+                      (multiple-value-bind (actual checksum)
+                          (pg-client-bound-field-write
+                           (cdr param)
+                           (lambda (bytes) (write-sequence bytes stream)) size)
+                        (unless (and (= actual size) (= checksum expected))
+                          (error "Bind parameter changed while sending"))))
+             (write-sequence (u16-to-bytes 0) stream)
+             (write-message stream #\E execute)
+             (write-message stream #\S #())
+             (setf complete t))
+        (when (and started (not complete)) (pg-client-close client))))))
+
 (defclass pg-client-query-output-stream (logical-utf8-output-stream) ())
 
 (defmethod sb-gray:stream-write-char :before ((stream pg-client-query-output-stream) character)
@@ -453,9 +521,9 @@ and its temporary field owner; returning :RETAIN transfers that owner's lifetime
 to the callback. Otherwise the owner expires as soon as the callback returns."
   (when (and on-row on-row-with-owner)
     (error "only one row callback may be supplied"))
-  (if (pg-client-query-plan-p query)
-      (pg-client-send-query-plan client query)
-      (pg-client-send-query client query))
+  (cond ((pg-client-bound-query-p query) (pg-client-send-bound-query client query))
+        ((pg-client-query-plan-p query) (pg-client-send-query-plan client query))
+        (t (pg-client-send-query client query)))
   (let ((columns nil) (rows '()) (tag nil) (server-error nil))
     (loop
       (let ((owner (and on-row-with-owner (if field-budget
@@ -485,7 +553,7 @@ to the callback. Otherwise the owner expires as soon as the callback returns."
                         (declare (ignore end))
                         (setf tag value)))
                      (#\E (setf server-error (pg-client-error-from-payload payload)))
-                     ((#\N #\S) nil)
+                     ((#\N #\S #\1 #\2 #\3) nil)
                      (#\Z
                       (when server-error (error server-error))
                       (return-from pg-client-query (values (nreverse rows) columns tag)))

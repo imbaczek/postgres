@@ -1372,7 +1372,14 @@
                      (values nil nil "UPDATE 1")))
              ;; A varlena key may be unchanged when an old K tuple supplies it.
              (pg::logical-apply-update runtime relation valid 0)
-             (ok (equal (first queries) "UPDATE t SET n = 1 WHERE id = '7'"))
+             (let ((query (first queries)))
+               (ok (pg::pg-client-bound-query-p query))
+               (ok (equal (pg::pg-client-bound-query-sql query) "UPDATE t SET n = $1 WHERE id = $2"))
+               (ok (equal (mapcar #'car (pg::pg-client-bound-query-parameters query)) '(23 25)))
+               (ok (equal (mapcar (lambda (param)
+                                    (with-output-to-string (out) (funcall (cdr param) out)))
+                                  (pg::pg-client-bound-query-parameters query))
+                          '("1" "7"))))
              (setf queries nil)
              ;; Without K, the new tuple supplies the key, so a key marker is unusable.
              (ok (handler-case

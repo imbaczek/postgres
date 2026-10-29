@@ -1322,6 +1322,237 @@
              (rove:ok seen))
         (setf (symbol-function 'logical-pgoutput-dispatch) original))))
 
+(rove:deftest test-typed-parameter-expressions
+    (let* ((tokens (tokenize "$1 + $2"))
+           (*query-parameter-types* #(:int4 :text))
+           (*query-parameter-values* (vector 17 "hello")))
+      (rove:ok (eq (token-kind (first tokens)) :parameter))
+      (rove:ok (= (token-value (first tokens)) 1))
+      (let ((first (analyze-expr '(:parameter 1) nil))
+            (second (analyze-expr '(:parameter 2) nil)))
+        (rove:ok (eq (expr-type first) :int4))
+        (rove:ok (= (eval-expr first nil) 17))
+        (rove:ok (string= (eval-expr second nil) "hello"))
+        (setf (aref *query-parameter-values* 1) +null+)
+        (rove:ok (eq (eval-expr second nil) +null+))))
+  (let ((*query-parameter-types* nil))
+    (rove:ok (handler-case (progn (analyze-expr '(:parameter 1) nil) nil)
+               (pg-error (condition) (string= (pg-error-sqlstate condition) "42P02"))))))
+
+(rove:deftest test-typed-parameter-query-plan-reuses-bindings
+    (let* ((*query-parameter-types* #(:int4 :text))
+           (*query-parameter-values* (vector 3 "one"))
+           (plan (plan-select-query (first (parse-statements "select $1, $2"))))
+           (rows nil))
+      (execute-query-plan plan nil (lambda (row) (push (copy-seq (car row)) rows)))
+      (setf *query-parameter-values* (vector 8 +null+))
+      (execute-query-plan plan nil (lambda (row) (push (copy-seq (car row)) rows)))
+      (rove:ok (equalp (nreverse rows) (list (vector 3 "one") (vector 8 +null+)))))
+  (rove:ok (handler-case (progn (tokenize "$1junk") nil) (error () t)))
+  (rove:ok (handler-case (progn (analyze-expr '(:parameter 0) nil) nil)
+             (pg-error (condition) (string= (pg-error-sqlstate condition) "42P02")))))
+
+(rove:deftest test-extended-dml-bind-and-sync
+    (let* ((*extended-query-state* (make-extended-query-state))
+           (*backend* (make-backend))
+           (path (merge-pathnames (format nil "pg-extended-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (original-execute (symbol-function 'execute-statement))
+           (original-prepare (symbol-function 'prepare-dml-subqueries))
+           (original-commit (symbol-function 'commit-transaction))
+           (observed nil) (committed nil))
+      (unwind-protect
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede)
+             (setf (symbol-function 'prepare-dml-subqueries) (lambda (ast) (declare (ignore ast)) nil)
+                   (symbol-function 'execute-statement)
+                   (lambda (stream ast) (declare (ignore stream ast))
+                     (setf observed (list *query-parameter-types* *query-parameter-values*)))
+                   (symbol-function 'commit-transaction)
+                   (lambda () (setf committed t) (set-backend-state *backend* :idle)))
+             (extended-apply-operation out '(:parse "" "insert into t values ($1, $2)" (23 25)) #())
+             (extended-apply-operation out '(:bind "" "" (0) ((0 . 2) (2 . 5)) ())
+                                       (string->bytes "42hello"))
+             (extended-apply-operation out '(:execute "" 0) #())
+             (rove:ok (equalp (second observed) #(42 "hello")))
+             (rove:ok (not committed))
+             (extended-apply-operation out '(:sync) #())
+             (rove:ok committed)
+             (rove:ok (eq :idle (backend-state *backend*))))
+        (setf (symbol-function 'prepare-dml-subqueries) original-prepare
+              (symbol-function 'execute-statement) original-execute
+              (symbol-function 'commit-transaction) original-commit)
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-extended-context-sensitive-literals-fail-closed
+    (rove:ok (extended-context-sensitive-literal-p
+              '(:type :insert :rows (((:cast (:const "now") :timestamptz -1))))))
+  (rove:ok (not (extended-context-sensitive-literal-p
+                 '(:type :insert :rows (((:parameter 1)))))))
+  (rove:ok (extended-context-sensitive-literal-p
+            '(:type :insert :rows (((:const "now"))))))
+  (rove:ok (not (extended-context-sensitive-literal-p
+                 '(:type :insert :rows (((:const 1))))))))
+
+(rove:deftest test-extended-query-cycle-deadline-survives-frames
+    (let* ((*backend* (make-backend))
+           (*extended-query-state*
+             (make-extended-query-state :in-cycle-p t
+                                        :statement-deadline (1- (get-internal-real-time))))
+           (path (merge-pathnames (format nil "pg-timeout-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (types nil))
+      (unwind-protect
+           (progn
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+               (handle-extended-query-frame out (char-code #\H) #(0 0 0 4) #()))
+             (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+               (loop for (type length payload) = (multiple-value-list (read-message-frame in))
+                     while type do (push (code-char type) types)))
+             (rove:ok (member #\E types))
+             (rove:ok (extended-query-state-ignore-until-sync *extended-query-state*))
+             (rove:ok (null (extended-query-state-statement-deadline *extended-query-state*))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-extended-malformed-frame-precedes-timeout
+    (let* ((*backend* (make-backend))
+           (*extended-query-state*
+             (make-extended-query-state :in-cycle-p t
+                                        :statement-deadline (1- (get-internal-real-time))))
+           (path (merge-pathnames (format nil "pg-malformed-timeout-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory))))
+      (unwind-protect
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+             (rove:ok (handler-case
+                          (progn (handle-extended-query-frame out (char-code #\H) #(0 0 0 3) nil) nil)
+                        (pg-error (condition)
+                          (and (fatal-error-p condition)
+                               (string= (pg-error-sqlstate condition) "08P01")))))
+             (rove:ok (zerop (file-position out))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-extended-bind-rejects-text-nul-and-accepts-binary-bytea
+    (let* ((*extended-query-state* (make-extended-query-state))
+           (*backend* (make-backend))
+           (path (merge-pathnames (format nil "pg-bind-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (statement (make-extended-statement :types #(:text))))
+      (setf (gethash "s" (extended-query-state-statements *extended-query-state*)) statement)
+      (unwind-protect
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+             (rove:ok (handler-case
+                          (progn (extended-apply-operation out '(:bind "p" "s" (0) ((0 . 3)) ())
+                                                           #(65 0 66)) nil)
+                        (pg-error (condition) (string= (pg-error-sqlstate condition) "22021"))))
+             (rove:ok (null (gethash "p" (extended-query-state-portals *extended-query-state*))))
+             (setf (extended-statement-types statement) #(:bytea))
+             (extended-apply-operation out '(:bind "p" "s" (1) ((0 . 3)) ()) #(65 0 66))
+             (rove:ok (equalp (aref (extended-portal-values
+                                     (gethash "p" (extended-query-state-portals *extended-query-state*))) 0)
+                              #(65 0 66))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-extended-bind-in-aborted-transaction-does-not-convert
+    (let* ((*extended-query-state* (make-extended-query-state))
+           (*backend* (make-backend :state :aborted :explicit t))
+           (path (merge-pathnames (format nil "pg-bind-aborted-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory))))
+      (setf (gethash "s" (extended-query-state-statements *extended-query-state*))
+            (make-extended-statement :types #(:int4)))
+      (unwind-protect
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+             (rove:ok (handler-case
+                          (progn (extended-apply-operation out '(:bind "p" "s" (0) ((0 . 3)) ())
+                                                           (string->bytes "bad")) nil)
+                        (pg-error (condition) (string= (pg-error-sqlstate condition) "25P02"))))
+             (rove:ok (null (gethash "p" (extended-query-state-portals *extended-query-state*)))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-extended-reused-bind-starts-transaction-clock
+    (let* ((*backend* (make-backend))
+           (*extended-query-state* (make-extended-query-state))
+           (path (merge-pathnames (format nil "pg-bind-clock-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory))))
+      (setf (gethash "s" (extended-query-state-statements *extended-query-state*))
+            (make-extended-statement :types #(:timestamptz)))
+      (unwind-protect
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+             (extended-apply-operation out '(:bind "p" "s" (0) ((0 . 3)) ()) (string->bytes "now"))
+             (rove:ok (eq (backend-state *backend*) :in-progress))
+             (rove:ok (extended-query-state-implicit-p *extended-query-state*))
+             (rove:ok (not (extended-query-state-executed-in-cycle-p *extended-query-state*)))
+             (rove:ok (= (aref (extended-portal-values
+                                (gethash "p" (extended-query-state-portals *extended-query-state*))) 0)
+                         (- (backend-transaction-start-unix-microseconds *backend*) 946684800000000))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-extended-failed-unnamed-parse-preserves-portal
+    (let* ((*extended-query-state* (make-extended-query-state))
+           (*backend* (make-backend))
+           (prior (make-extended-statement :types #(:int4)))
+           (portal (make-extended-portal :statement prior :values #(42)))
+           (path (merge-pathnames (format nil "pg-parse-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory))))
+      (setf (gethash "" (extended-query-state-statements *extended-query-state*)) prior
+            (gethash "" (extended-query-state-portals *extended-query-state*)) portal)
+      (unwind-protect
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+             (rove:ok (handler-case
+                          (progn (extended-apply-operation out '(:parse "" "invalid nonsense" ()) #()) nil)
+                        (error () t)))
+             (rove:ok (null (gethash "" (extended-query-state-statements *extended-query-state*))))
+             (rove:ok (eq portal (gethash "" (extended-query-state-portals *extended-query-state*)))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-extended-implicit-begin-preserves-xid-and-read-only
+    (let* ((*backend* (make-backend :state :in-progress :implicit-query-block t :xid 97))
+           (path (merge-pathnames (format nil "pg-begin-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory))))
+      (unwind-protect
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+             (command-begin out '(:type :begin :read-only t))
+             (rove:ok (backend-explicit *backend*))
+             (rove:ok (backend-read-only *backend*))
+             (rove:ok (not (backend-implicit-query-block *backend*)))
+             (rove:ok (= (backend-xid *backend*) 97)))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-extended-mixed-commit-failure-defers-final-tag
+    (let* ((*backend* (make-backend :state :in-progress :implicit-query-block t))
+           (*extended-query-state* (make-extended-query-state :implicit-p t))
+           (path (merge-pathnames (format nil "pg-mixed-error-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory)))
+           (original-execute (symbol-function 'execute-statement))
+           (original-commit (symbol-function 'commit-transaction))
+           (original-abort (symbol-function 'abort-transaction))
+           (original-restore (symbol-function 'restore-session-settings))
+           (query "select 1; select 2")
+           (aborted nil) (types nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'execute-statement)
+                   (lambda (stream ast) (declare (ignore ast)) (send-command-complete stream "SELECT 1"))
+                   (symbol-function 'commit-transaction) (lambda () (error "injected commit failure"))
+                   (symbol-function 'abort-transaction) (lambda () (setf aborted t) (set-backend-state *backend* :idle))
+                   (symbol-function 'restore-session-settings) (lambda (&rest ignored) (declare (ignore ignored))))
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+               (let* ((bytes (string->bytes query))
+                      (payload (make-array (1+ (length bytes)) :element-type '(unsigned-byte 8)
+                                                               :initial-element 0)))
+                 (replace payload bytes)
+                 (handle-extended-implicit-simple-query out (char-code #\Q)
+                                                        (u32-to-bytes (+ 4 (length payload))) payload)))
+             (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+               (loop for (type length payload) = (multiple-value-list (read-message-frame in))
+                     while type do (push (code-char type) types)))
+             (rove:ok aborted)
+             (rove:ok (equal (remove #\S (nreverse types)) '(#\C #\E #\Z))))
+        (setf (symbol-function 'execute-statement) original-execute
+              (symbol-function 'commit-transaction) original-commit
+              (symbol-function 'abort-transaction) original-abort
+              (symbol-function 'restore-session-settings) original-restore)
+        (when (probe-file path) (delete-file path)))))
+
 (rove:deftest test-large-quoted-token-exact-decoding
     (dolist (entry (list (list "''" #\' "" 2)
                          (list "'a''🙂''b' tail" #\' "a'🙂'b" 9)
@@ -1695,6 +1926,91 @@
                            (lambda (out) (logical-write-value-literal out 25 over-limit))) nil)
                  (error () t)))))
 
+(rove:deftest test-large-row-admission-bind-boundary
+    (let* ((at-limit (make-logical-admission-value :bytes (- +max-query-message-size+ 16)
+                                                   :quotes (- +max-query-message-size+ 16)))
+           (over (make-logical-admission-value :bytes (- +max-query-message-size+ 15) :quotes 0))
+           (writer (lambda (value)
+                     (lambda (out)
+                       (write-string "INSERT INTO t (v) VALUES (" out)
+                       (logical-write-value-literal out 25 value)
+                       (write-char #\) out)))))
+      (rove:ok (= +max-query-message-size+ (logical-admission-bound-query-size (funcall writer at-limit))))
+      (rove:ok (handler-case (progn (logical-admission-bound-query-size (funcall writer over)) nil)
+                 (error () t)))))
+
+(rove:deftest test-large-row-admission-matches-bind-wire-lengths
+    (let* ((columns (logical-test-columns))
+           (subscriber-columns
+             (mapcar (lambda (column)
+                       (make-pgoutput-column :name (getf column :name)
+                                             :type-oid (pgoutput-type-oid (getf column :type))
+                                             :key-p (= (getf column :attnum) 1)))
+                     columns))
+           (relation (make-pgoutput-relation :name "t" :columns subscriber-columns
+                                             :key-columns (list (first subscriber-columns))))
+           (client-columns (mapcar (lambda (column)
+                                     (make-pg-client-column :name (pgoutput-column-name column)
+                                                            :type-oid (pgoutput-column-type-oid column)))
+                                   subscriber-columns))
+           (proxy (logical-admission-row columns (vector 7 2 "🙂'x")))
+           (text (vector "7" "2" "🙂'x"))
+           (old-proxy (logical-admission-row columns (vector 6 +null+ +null+)))
+           (old-text (vector "6" nil nil))
+           (null-key-proxy (logical-admission-row columns (vector +null+ +null+ +null+)))
+           (null-key-text (vector nil nil nil))
+           (unchanged-proxy (logical-admission-row columns (vector 7 +null+ +logical-unchanged-toast+)))
+           (unchanged-text (vector "7" nil :unchanged-toast))
+           (cases (list (list (lambda (s) (logical-write-insert s relation proxy))
+                              (lambda (s) (logical-write-insert s relation text)))
+                        (list (lambda (s) (logical-write-update s relation old-proxy proxy))
+                              (lambda (s) (logical-write-update s relation old-text text)))
+                        (list (lambda (s) (logical-write-update s relation nil proxy))
+                              (lambda (s) (logical-write-update s relation nil text)))
+                        (list (lambda (s) (logical-write-delete s relation old-proxy))
+                              (lambda (s) (logical-write-delete s relation old-text)))
+                        (list (lambda (s) (logical-write-update s relation null-key-proxy unchanged-proxy))
+                              (lambda (s) (logical-write-update s relation null-key-text unchanged-text)))
+                        (list (lambda (s) (logical-write-copy-insert s "t" client-columns proxy))
+                              (lambda (s) (logical-write-copy-insert s "t" client-columns text)))))
+           (path (merge-pathnames (format nil "pg-admission-bind-~d-~d"
+                                          (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory))))
+      (unwind-protect
+           (dolist (case cases)
+             (let ((expected (logical-admission-bound-query-size (first case)))
+                   (query (logical-bound-query (second case))))
+               (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                         :if-exists :supersede)
+                 (pg-client-send-bound-query (make-pg-client :stream out) query))
+               (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+                 (multiple-value-bind (type length payload) (read-message-frame in)
+                   (declare (ignore length payload))
+                   (rove:ok (= type (char-code #\P))))
+                 (multiple-value-bind (type length payload) (read-message-frame in)
+                   (declare (ignore payload))
+                   (rove:ok (= type (char-code #\B)))
+                   (rove:ok (= expected (bytes-to-u32 length 0)))))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-bound-query-preflight-rejects-before-parse
+    (let ((path (merge-pathnames (format nil "pg-bound-preflight-~d-~d"
+                                         (sb-posix:getpid) (random 1000000))
+                                 (uiop:temporary-directory))))
+      (unwind-protect
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+             (let ((client (make-pg-client :stream out)))
+               (dolist (query (list (make-pg-client-bound-query :sql (concatenate 'string "x" (string (code-char 0)))
+                                                                :parameters nil)
+                                    (make-pg-client-bound-query :sql "x" :parameters (list (cons -1 #'identity)))
+                                    (make-pg-client-bound-query :sql "x"
+                                                                :parameters (list (cons 25 (lambda (stream)
+                                                                                             (write-char (code-char 0) stream)))))))
+                 (rove:ok (handler-case (progn (pg-client-send-bound-query client query) nil)
+                            (error () t)))
+                 (rove:ok (and (open-stream-p out) (zerop (file-position out)))))))
+        (when (probe-file path) (delete-file path)))))
+
 (rove:deftest test-large-row-admission-checks-full-unchanged-copy-row
     (let* ((original (symbol-function 'logical-admission-measure-value))
            (new (vector 1 2 +logical-unchanged-toast+))
@@ -1779,28 +2095,32 @@
                  (error (condition) (search "source returned a malformed integer" (princ-to-string condition)))))))
 
 (rove:deftest test-logical-copy-oversize-query-rolls-back
-    (let ((original (symbol-function 'logical-target-query))
-          (queries nil)
-          (column (make-pg-client-column :name "payload" :type-oid 25)))
+    (let* ((original-target (symbol-function 'logical-target-query))
+           (original-size (symbol-function 'pg-client-bound-field-write))
+           (queries nil)
+           (column (make-pg-client-column :name "payload" :type-oid 25))
+           (path (merge-pathnames (format nil "pg-copy-bound-~d-~d" (sb-posix:getpid) (random 1000000))
+                                  (uiop:temporary-directory))))
       (unwind-protect
-           (progn
-             (setf (symbol-function 'logical-target-query)
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+             (setf (symbol-function 'pg-client-bound-field-write)
+                   (lambda (&rest args) (declare (ignore args))
+                     (values +max-query-message-size+ 0))
+                   (symbol-function 'logical-target-query)
                    (lambda (target query)
                      (declare (ignore target))
-                     (when (pg-client-query-plan-p query) (pg-client-query-plan-size query))
-                     (push query queries)))
-             (rove:ok
-              (handler-case
-                  (progn
-                    (logical-copy-target-chunk
-                     :target "t" (list column)
-                     (list (vector (make-string (floor +max-query-message-size+ 2)
-                                                :initial-element #\'))))
-                    nil)
-                (error () t)))
-             (rove:ok (equal (nreverse queries) '("BEGIN" "ROLLBACK"))
-                      "frame rejection rolls back before sending the oversized INSERT"))
-        (setf (symbol-function 'logical-target-query) original))))
+                     (if (pg-client-bound-query-p query)
+                         (pg-client-send-bound-query (make-pg-client :stream out) query)
+                         (push query queries))))
+             (rove:ok (handler-case
+                          (progn (logical-copy-target-chunk :target "t" (list column)
+                                                            (list (vector "payload"))) nil)
+                        (error () t)))
+             (rove:ok (equal (nreverse queries) '("BEGIN" "ROLLBACK")))
+             (rove:ok (zerop (file-position out))))
+        (setf (symbol-function 'logical-target-query) original-target
+              (symbol-function 'pg-client-bound-field-write) original-size)
+        (when (probe-file path) (delete-file path)))))
 
 (rove:deftest test-logical-text-row-change
     (let* ((value (format nil "~a~a" "Zażółć " (make-string 3000 :initial-element #\x)))

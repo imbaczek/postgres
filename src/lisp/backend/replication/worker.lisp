@@ -543,6 +543,8 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (logical-write-value-literal stream (pg-client-column-type-oid column) value :copy))
   (write-char #\) stream))
 
+(declaim (ftype function logical-bound-query))
+
 (defun logical-copy-target-chunk (target table columns rows)
   (when rows
     (logical-target-transaction
@@ -551,8 +553,8 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
        (dolist (row (nreverse rows))
          (logical-test-failpoint :before-copy-row-change table)
          (logical-target-query
-          target (make-pg-client-query-plan
-                  :writer (lambda (stream) (logical-write-copy-insert stream table columns row))))
+          target (logical-bound-query
+                  (lambda (stream) (logical-write-copy-insert stream table columns row))))
          (logical-test-failpoint :after-copy-row-change table)))
      :before-commit
      (lambda ()
@@ -888,10 +890,33 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (unless (member (logical-field-integer-state stream) '(:digits :trailing))
       (logical-field-integer-error context))))
 
+(defvar *logical-bind-parameters* nil)
+
+(defvar *logical-admission-bind-state* nil)
+
+(defun logical-bound-query (writer)
+  "Render a small parameterized statement and retain scoped field writers."
+  (let ((*logical-bind-parameters* (make-array 0 :adjustable t :fill-pointer 0)))
+    (let ((sql (with-output-to-string (out) (funcall writer out))))
+      (make-pg-client-bound-query :sql sql :parameters (coerce *logical-bind-parameters* 'list)))))
+
 (defstruct logical-admission-value bytes quotes)
 
 (defun logical-write-value-literal (stream type value &optional (context :pgoutput))
   (cond
+    ((and *logical-admission-bind-state* (logical-admission-value-p value))
+     (incf (car *logical-admission-bind-state*))
+     (incf (cdr *logical-admission-bind-state*) (logical-admission-value-bytes value))
+     (format stream "$~d" (car *logical-admission-bind-state*)))
+    ((and *logical-bind-parameters* value (not (eq value :unchanged-toast)))
+     (let ((index (1+ (length *logical-bind-parameters*))))
+       (vector-push-extend
+        (cons type (lambda (out)
+                     (if (logical-wire-field-p value)
+                         (logical-wire-field-visit value out)
+                         (write-string value out))))
+        *logical-bind-parameters*)
+       (format stream "$~d" index)))
     ((logical-admission-value-p value)
      (unless (and (typep stream 'pg-client-query-output-stream)
                   (null (logical-utf8-buffer stream)))
@@ -992,6 +1017,19 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
   "Measure WRITER with exactly the same SQL grammar as the subscriber."
   (pg-client-query-plan-size (make-pg-client-query-plan :writer writer)))
 
+(defun logical-admission-bound-query-size (writer)
+  "Measure the Parse and Bind frames used by the native subscriber."
+  (let* ((*logical-admission-bind-state* (cons 0 0))
+         (sql (with-output-to-string (stream) (funcall writer stream)))
+         (count (car *logical-admission-bind-state*))
+         (bytes (cdr *logical-admission-bind-state*))
+         (parse-size (+ 8 (* 4 count) (logical-utf8-size-bounded sql)))
+         (bind-size (+ 12 (* 4 count) bytes)))
+    (unless (and (<= count #xffff) (<= parse-size +max-query-message-size+)
+                 (<= bind-size +max-query-message-size+))
+      (error "large logical row exceeds subscriber Bind frame limit"))
+    bind-size))
+
 (defun logical-validate-large-row-change (change full-new)
   "Reject a large row that cannot fit the native replication and copy frames."
   (let* ((columns (logical-change-columns change))
@@ -1019,7 +1057,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
            (copy-row (logical-admission-row columns full-new)))
       (when (> (+ 4 25 wire-size) +max-query-message-size+)
         (error "large logical row exceeds the subscriber replication frame limit"))
-      (logical-admission-query-size
+      (logical-admission-bound-query-size
        (lambda (stream)
          (case (logical-change-kind change)
            (:insert (logical-write-insert stream relation new))
@@ -1038,7 +1076,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                         subscriber-columns)))
           (when (> data-row-size +max-query-message-size+)
             (error "large logical row exceeds the initial copy frame limit"))
-          (logical-admission-query-size
+          (logical-admission-bound-query-size
            (lambda (stream) (logical-write-copy-insert stream name client-columns copy-row)))))))
   (values))
 
@@ -1078,8 +1116,8 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (unless (= (length tuple) (length (pgoutput-relation-columns relation)))
       (error "pgoutput INSERT tuple is not a full row"))
     (logical-target-query (logical-subscription-runtime-target runtime)
-                          (make-pg-client-query-plan
-                           :writer (lambda (stream) (logical-write-insert stream relation tuple))))))
+                          (logical-bound-query
+                           (lambda (stream) (logical-write-insert stream relation tuple))))))
 
 (defun logical-pgoutput-read-insert (payload position)
   (unless (and (< position (length payload))
@@ -1154,9 +1192,9 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (let ((tag (nth-value 2
                           (logical-target-query
                            (logical-subscription-runtime-target runtime)
-                           (make-pg-client-query-plan
-                            :writer (lambda (stream)
-                                      (logical-write-update stream relation old-tuple new-tuple)))))))
+                           (logical-bound-query
+                            (lambda (stream)
+                              (logical-write-update stream relation old-tuple new-tuple)))))))
       (logical-assert-one-row-affected tag "UPDATE"))))
 
 (defun logical-apply-update (runtime relation payload position)
@@ -1180,8 +1218,8 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
     (let ((tag (nth-value 2
                           (logical-target-query
                            (logical-subscription-runtime-target runtime)
-                           (make-pg-client-query-plan
-                            :writer (lambda (stream) (logical-write-delete stream relation tuple)))))))
+                           (logical-bound-query
+                            (lambda (stream) (logical-write-delete stream relation tuple)))))))
       (logical-assert-one-row-affected tag "DELETE"))))
 
 (defun logical-apply-delete (runtime relation payload position)
