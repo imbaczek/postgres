@@ -202,10 +202,12 @@ for columns omitted from its assignments. The pointer comes from the physical
 row version actually claimed after any concurrent-update recheck; its chunks
 are retained for the new version. Assigned columns are written using the
 current storage policy, even when the assigned value is equal to the old one.
-For an interpreted SELECT plan consisting of a direct projection of columns or
-constants over one base-table sequential scan, optionally with LIMIT, external
-values in unprojected columns are not fetched. Other plan and expression
-shapes use full tuple materialization.
+For an interpreted SELECT plan with a projection over one base-table sequential
+scan, optionally with filters and LIMIT, external values unused by the
+projection and filters are not fetched. Demand analysis recognizes columns,
+constants, casts, Boolean and arithmetic operators, and function calls with
+recognized arguments. Other plan or expression shapes fall back to full tuple
+materialization.
 Fixed-width types accept only `PLAIN` or `DEFAULT`. `VACUUM FULL` rewrites
 existing values using the current policy; it fails if a `PLAIN` value cannot
 fit on a heap page, leaving the original table intact.

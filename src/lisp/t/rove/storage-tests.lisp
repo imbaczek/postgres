@@ -425,10 +425,21 @@
                      nil)
                  (pg-error () t)))
       (rove:ok (null (simple-select-toast-demand (list :sort nil node) relations)))
+      (let ((filtered (simple-select-toast-demand
+                       (list :project
+                             (list (list :expr '(:binop "+" (:col 1) (:const 1))))
+                             (list :filter '(:is-null (:col 2) nil) scan))
+                       relations)))
+        (rove:ok (and filtered (member 1 (cdr filtered)) (member 2 (cdr filtered)))))
+      (rove:ok (equal '(1)
+                      (cdr (simple-select-toast-demand
+                            (list :project (list (list :expr '(:func "abs" ((:col 1)))))
+                                  (list :filter '(:binop "=" (:col 1) (:const 3)) scan))
+                            relations))))
       (rove:ok (null (simple-select-toast-demand
-                      (list :project targets (list :filter '(:const t) scan)) relations)))
+                      (list :project targets (list :filter '(:subplan opaque) scan)) relations)))
       (rove:ok (null (simple-select-toast-demand
-                      (list :project (list (list :expr '(:func "length" nil))) scan)
+                      (list :project (list (list :expr '(:func "f" ((:subplan opaque))))) scan)
                       relations)))
       (let ((selected (make-htup :values (vector 3 pointer))))
         (rove:ok (handler-case

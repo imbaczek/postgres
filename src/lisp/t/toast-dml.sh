@@ -277,11 +277,20 @@ toast_fetch_count() {
 }
 [ "$(run -c 'select id from toast_reuse')" = 1 ]
 [ "$(toast_fetch_count)" = 0 ]
+[ "$(run -c 'select id + 1 from toast_reuse where id + 0 = 1')" = 2 ]
+[ "$(toast_fetch_count)" = 0 ]
+[ "$(run -c 'select abs(id) from toast_reuse where id + 0 = 1')" = 1 ]
+[ "$(toast_fetch_count)" = 0 ]
 [ "$(run -c "select v = '$big' from toast_reuse where id = 1")" = t ]
 fetch_after_projection=$(toast_fetch_count)
 [ "$fetch_after_projection" -gt 0 ]
 [ "$(run -c "select id from toast_reuse where v = '$big'")" = 1 ]
-[ "$(toast_fetch_count)" -gt "$fetch_after_projection" ]
+fetch_after_filter=$(toast_fetch_count)
+[ "$fetch_after_filter" -gt "$fetch_after_projection" ]
+# A subquery expression is not analyzed for demand, so it must fall back to
+# full materialization even though its result does not use the large value.
+[ "$(run -c 'select (select 1) from toast_reuse')" = 1 ]
+[ "$(toast_fetch_count)" -gt "$fetch_after_filter" ]
 printf '%s\n(quit)\n' '(setf (symbol-function (quote toast-fetch-value)) (symbol-value (intern "*TOAST-TEST-FETCH-ORIGINAL*")))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/toast-fetch-restore.out"
 ! grep -q ';; error:' "$TMP/toast-fetch-restore.out"
 mkfifo "$TMP/reuse-reader.sql"
