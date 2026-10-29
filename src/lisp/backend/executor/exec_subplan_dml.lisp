@@ -446,7 +446,7 @@ is ever installed into the destination relation."
            ;; including when source and target are the same relation.
            (let ((source (getf prepared :insert-source-plan)))
              (if source
-                 (let ((*datum-origin-capture* (simple-datum-origin-plan-p (query-plan-physical source)))
+                 (let ((*datum-origin-capture* (simple-datum-origin-plan-p (query-plan-physical source) (subquery-registered-relations source)))
                        (*query-row-origins* nil))
                    (execute-query-plan
                     source (subquery-registered-relations source)

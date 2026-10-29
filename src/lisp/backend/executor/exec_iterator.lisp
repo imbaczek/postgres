@@ -36,9 +36,10 @@
 
 (defun map-sql-iterator (iterator callback)
   (loop
-    (multiple-value-bind (row present) (sql-iterator-next iterator)
+    (multiple-value-bind (row present origins) (sql-iterator-next iterator)
       (unless present (return))
-      (when (eq (funcall callback row) :stop) (return :stop)))))
+      (let ((*query-row-origins* (and *datum-origin-capture* origins)))
+        (when (eq (funcall callback row) :stop) (return :stop))))))
 
 ;; A store owns its producer, spool, and all readers.  Each reader has an
 ;; independent position; only a reader at the shared frontier advances the
@@ -49,11 +50,11 @@
 ;; The spool can spill while readers are active, so readers open and seek their
 ;; own input streams when disk storage first becomes necessary.
 (defstruct (query-replay-store (:constructor %make-query-replay-store))
-  producer spool eof-p readers closed-p
+  producer spool eof-p readers closed-p capture-origins-p
   (memory-rows (make-array 0 :adjustable t :fill-pointer 0)))
 
 (defun make-query-replay-store (producer &optional (memory-limit *query-work-memory-bytes*))
-  (%make-query-replay-store :producer producer :spool (make-query-row-spool memory-limit)))
+  (%make-query-replay-store :producer producer :spool (make-query-row-spool memory-limit) :capture-origins-p *datum-origin-capture*))
 
 (defun close-query-replay-store (store)
   (sb-sys:without-interrupts
@@ -77,9 +78,12 @@
                     (query-replay-store-producer store) nil)))))))
   (values))
 
-(defun append-query-replay-row (store row)
+(defun append-query-replay-row (store row &optional (origins *query-row-origins*))
   (let* ((spool (query-replay-store-spool store))
-         (copy (copy-query-sort-value row)))
+         (copy (copy-query-sort-value
+                (if (query-replay-store-capture-origins-p store)
+                    (list row (datum-origins-for-spill origins))
+                    row))))
     (unless (query-row-spool-pathname spool)
       (incf (query-row-spool-memory-bytes spool) 16))
     (query-row-spool-append spool copy)
@@ -97,10 +101,10 @@
              (let ((spool (query-replay-store-spool store)))
                (when (and (= index (query-row-spool-count spool))
                           (not (query-replay-store-eof-p store)))
-                 (multiple-value-bind (row present)
+                 (multiple-value-bind (row present origins)
                      (sql-iterator-next (query-replay-store-producer store))
                    (if present
-                       (append-query-replay-row store row)
+                       (append-query-replay-row store row origins)
                        (progn
                          (setf (query-replay-store-eof-p store) t)
                          (close-sql-iterator (query-replay-store-producer store))
@@ -120,7 +124,10 @@
                                  (setf offset (file-position input))))
                              (aref (query-replay-store-memory-rows store) index))))
                    (incf index)
-                   (values (copy-query-sort-value value) t)))))
+                   (if (query-replay-store-capture-origins-p store)
+                       (values (copy-query-sort-value (first value)) t
+                               (datum-origins-from-spill (second value)))
+                       (values (copy-query-sort-value value) t nil))))))
            (lambda ()
              (when input (finish-query-temp-stream input nil))
              (setf (query-replay-store-readers store)

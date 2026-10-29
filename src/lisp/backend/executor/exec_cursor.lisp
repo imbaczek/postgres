@@ -5,24 +5,25 @@
   (make-sql-iterator
    (lambda ()
      (loop
-       (multiple-value-bind (row present) (sql-iterator-next input)
-         (unless present (return (values nil nil)))
-         (multiple-value-bind (result keep) (funcall function row)
-           (when keep (return (values result t)))))))
+       (multiple-value-bind (row present origins) (sql-iterator-next input)
+         (unless present (return (values nil nil nil)))
+         (let ((*query-row-origins* (and *datum-origin-capture* origins)))
+           (multiple-value-bind (result keep result-origins) (funcall function row)
+             (when keep (return (values result t result-origins))))))))
    (lambda () (close-sql-iterator input))))
 
 (defun make-buffered-sql-iterator (producer &optional input)
-  (let ((store nil) (reader nil))
+  (let ((store nil) (reader nil) (capture-p *datum-origin-capture*))
     (make-sql-iterator
      (lambda ()
-       (unless store
-         (setf store (make-query-replay-store nil))
-         (funcall producer (lambda (row)
-                             (append-query-replay-row store row)))
-         (query-row-spool-seal (query-replay-store-spool store))
-         (setf (query-replay-store-eof-p store) t
-               reader (make-query-replay-reader store)))
-       (sql-iterator-next reader))
+       (let ((*datum-origin-capture* capture-p))
+         (unless store
+           (setf store (make-query-replay-store nil))
+           (funcall producer (lambda (row) (append-query-replay-row store row)))
+           (query-row-spool-seal (query-replay-store-spool store))
+           (setf (query-replay-store-eof-p store) t
+                 reader (make-query-replay-reader store)))
+         (sql-iterator-next reader)))
      (lambda ()
        (when reader (close-sql-iterator reader))
        (when store (close-query-replay-store store))
@@ -39,7 +40,8 @@
          (environment (copy-query-sort-value *lateral-outer-environment*))
          (source (getf relation :row-source))
          (block 0) (nblocks nil) (rows nil) (initialized nil)
-         (snapshot *current-snapshot*))
+         (snapshot *current-snapshot*)
+         (capture-p *datum-origin-capture*))
     ;; Buffer base heap values for the complete key before yielding. The bounded
     ;; store can spill even under a small upper LIMIT; filters and projections
     ;; remain above it and evaluate lazily as rows are consumed.
@@ -50,7 +52,11 @@
            (scan-select-index
             table path snapshot
             (lambda (tuple)
-              (let ((row (htup-values tuple)))
+              (let ((row (htup-values tuple))
+                    (*query-row-origins* (and capture-p
+                                              (if (getf relation :join-order-base)
+                                                  (make-select-relation-origins relations relation (htup-origins tuple))
+                                                  (htup-origins tuple)))))
                 ;; Reordered joins still require values in source-order slots.
                 (funcall emit (if (getf relation :join-order-base)
                                   (make-select-relation-environment relations relation row)
@@ -69,17 +75,26 @@
              (setf nblocks (buf-nblocks (pg-class-relfilenode table)))))
        (loop
          (when rows
-           (let ((row (pop rows)))
+           (let* ((item (pop rows))
+                  (row (if (and capture-p (not source)) (car item) item))
+                  (origins (and capture-p (not source) (cdr item))))
              (return
                (values (if (getf relation :join-order-base)
                            (make-select-relation-environment relations relation row)
-                           row) t))))
+                           row) t
+                       (if (getf relation :join-order-base)
+                           (make-select-relation-origins relations relation origins)
+                           origins)))))
          (when (or source (>= block nblocks)) (return (values nil nil)))
          (let ((page (buf-read (pg-class-relfilenode table) block)))
            (when page
              (heapam-scan-page page block (pg-class-columns table) snapshot
                                (lambda (tuple)
-                                 (push (htup-values (materialize-select-tuple table tuple snapshot)) rows)))))
+                                 (materialize-select-tuple table tuple snapshot)
+                                 (push (if capture-p
+                                           (cons (htup-values tuple) (htup-origins tuple))
+                                           (htup-values tuple))
+                                       rows)))))
          (incf block)
          (setf rows (nreverse rows))))
      (lambda () (setf rows nil)))))
@@ -220,13 +235,13 @@
                  (incf (plan-node-metadata-actual-loops metadata))
                  (setf started-p t)))
              (unwind-protect
-                  (multiple-value-bind (row present) (sql-iterator-next input)
+                  (multiple-value-bind (row present origins) (sql-iterator-next input)
                     (when (and started present)
                       (incf (plan-node-metadata-actual-row-count metadata))
                       (setf (plan-node-metadata-actual-rows metadata)
                             (/ (plan-node-metadata-actual-row-count metadata)
                                (plan-node-metadata-actual-loops metadata))))
-                    (values row present))
+                    (values row present origins))
                (when started
                  (let ((elapsed (- (get-internal-real-time) started)))
                    (incf (plan-node-metadata-actual-total-time-ticks metadata) elapsed)
@@ -255,19 +270,28 @@
        (make-sql-iterator
         (lambda ()
           (let ((*subquery-outer-frames* frames))
-            (multiple-value-bind (row present) (sql-iterator-next input)
-              (values (car row) present))))
+            (multiple-value-bind (row present origins) (sql-iterator-next input)
+              (values (car row) present origins))))
         (lambda ()
           (close-sql-iterator input)
           (close-cte-frame-cache (cdar frames))))))
     (:filter
      (make-mapping-sql-iterator
       (make-physical-plan-iterator (third node) relations)
-      (lambda (row) (values row (true-p (eval-expr (second node) row))))))
+      (lambda (row) (values row (true-p (eval-expr (second node) row)) *query-row-origins*))))
     (:project
      (make-mapping-sql-iterator
       (make-physical-plan-iterator (third node) relations)
-      (lambda (row) (values (make-select-result-row row nil (second node)) t))))
+      (lambda (row)
+        (if *datum-origin-capture*
+            (let ((values (make-array (length (second node))))
+                  (origins (make-array (length (second node)) :initial-element nil)))
+              (loop for target in (second node) for i from 0
+                    do (multiple-value-bind (value origin)
+                           (eval-expr-with-origin (getf target :expr) row *query-row-origins*)
+                         (setf (aref values i) value (aref origins i) origin)))
+              (values (cons values row) t origins))
+            (values (make-select-result-row row nil (second node)) t nil)))))
     (:window-input
      (make-mapping-sql-iterator
       (make-physical-plan-iterator (third node) relations)
@@ -310,8 +334,9 @@
           (flet ((source (callback) (map-sql-iterator input callback)))
             (case (first node)
               (:sort (stream-select-sort #'source (second node) emit))
-              (:top-n (dolist (row (collect-select-top-n #'source (second node) (third node)))
-                        (funcall emit row)))
+              (:top-n (dolist (row (collect-select-top-n #'source (second node) (third node) *datum-origin-capture*))
+                        (let ((*query-row-origins* (and *datum-origin-capture* (cdr row))))
+                          (funcall emit (if *datum-origin-capture* (car row) row)))))
               ((:hash-aggregate :sorted-aggregate)
                (stream-select-aggregates #'source (second node) (third node) emit))
               (:hash-distinct

@@ -102,6 +102,39 @@
       (rove:ok (datum-origin-external-p (aref restored 0)))
       (rove:ok (null (aref restored 1)))))
 
+(rove:deftest replay-origin-readers-own-payloads
+    (let ((*query-temp-directory* (uiop:temporary-directory)))
+      (with-query-temp-files
+        (dolist (limit '(1 100000))
+          (let* ((*datum-origin-capture* t)
+                 (bytes (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3)))
+                 (origin (make-datum-origin :external-p t
+                                            :compressed (make-heap-compressed-varlena :payload bytes)))
+                 (done nil)
+                 (producer (make-sql-iterator
+                            (lambda ()
+                              (unless done
+                                (setf done t)
+                                (values (vector "row") t (vector origin))))))
+                 (store (make-query-replay-store producer limit))
+                 (first-reader (make-query-replay-reader store))
+                 (second-reader (make-query-replay-reader store)))
+            (unwind-protect
+                 (let ((*datum-origin-capture* nil))
+                   (multiple-value-bind (row present origins) (sql-iterator-next first-reader)
+                     (rove:ok present)
+                     (rove:ok (equal "row" (aref row 0)))
+                     (setf (aref (heap-compressed-varlena-payload
+                                  (datum-origin-compressed (aref origins 0))) 0) 9))
+                   (multiple-value-bind (row present origins) (sql-iterator-next second-reader)
+                     (declare (ignore row))
+                     (rove:ok present)
+                     (rove:ok (datum-origin-external-p (aref origins 0)))
+                     (rove:ok (= 1 (aref (heap-compressed-varlena-payload
+                                          (datum-origin-compressed (aref origins 0))) 0)))
+                     (rove:ok (= 1 (aref bytes 0)))))
+              (close-query-replay-store store)))))))
+
 (rove:deftest test-toast-catalog-ownership-roundtrip
     (let* ((toast (make-pg-toast :oid 100 :relfilenode 101 :index-oid 102
                                  :index-relfilenode 103 :relfrozenxid 20))

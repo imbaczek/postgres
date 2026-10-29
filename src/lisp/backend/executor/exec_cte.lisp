@@ -271,14 +271,16 @@
   prepared)
 
 (defun make-cte-producer-state (definition frames context cache &optional reference-plan)
-  (let* ((own-frame (cons #() (make-hash-table :test #'eq)))
+  (let* ((capture-p *datum-origin-capture*)
+         (own-frame (cons #() (make-hash-table :test #'eq)))
          (producer-frames (cons own-frame frames))
          (worktables *recursive-cte-worktables*)
          (generation-caches *recursive-cte-generation-caches*)
          (plan (or reference-plan (sql-cte-plan definition)))
          (relations (subquery-registered-relations plan))
          (input
-           (let ((*subquery-outer-frames* producer-frames)
+           (let ((*datum-origin-capture* capture-p)
+                 (*subquery-outer-frames* producer-frames)
                  (*cte-execution-context* context)
                  (*recursive-cte-worktables* worktables)
                  (*recursive-cte-generation-caches* generation-caches)
@@ -287,13 +289,14 @@
          (producer
            (make-sql-iterator
             (lambda ()
-              (let ((*subquery-outer-frames* producer-frames)
+              (let ((*datum-origin-capture* capture-p)
+                    (*subquery-outer-frames* producer-frames)
                     (*cte-execution-context* context)
                     (*recursive-cte-worktables* worktables)
                     (*recursive-cte-generation-caches* generation-caches)
                     (*cte-active-plan* plan))
-                (multiple-value-bind (row present) (sql-iterator-next input)
-                  (values (when present (car row)) present))))
+                (multiple-value-bind (row present origins) (sql-iterator-next input)
+                  (values (when present (car row)) present origins))))
             (lambda ()
               (unwind-protect
                    (close-sql-iterator input)

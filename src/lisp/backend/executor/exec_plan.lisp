@@ -1356,17 +1356,30 @@ on an abnormal exit."
                      :stop))))
       (when stopped-p (return :stop)))))
 
-(defun simple-datum-origin-plan-p (node)
-  "Recognize single-scan plans that retain row origin, including sort and top-N."
+(defun simple-datum-origin-plan-p (node &optional relations iterator-p)
+  "Recognize plans whose execution retains detached row origins."
   (case (first node)
     ((:seq-scan :index-scan) t)
-    ((:filter :project :sort) (simple-datum-origin-plan-p (third node)))
-    (:limit (simple-datum-origin-plan-p (third node)))
-    (:top-n (simple-datum-origin-plan-p (fourth node)))
-    (:subquery-scan (simple-datum-origin-plan-p (fourth node)))
+    ((:filter :project :sort :limit)
+     (simple-datum-origin-plan-p (third node) relations iterator-p))
+    (:top-n (simple-datum-origin-plan-p (fourth node) relations iterator-p))
+    (:subquery-scan (simple-datum-origin-plan-p (fourth node) relations iterator-p))
     (:nested-loop-join
-     (and (simple-datum-origin-plan-p (third node))
-          (simple-datum-origin-plan-p (fourth node))))
+     (and (not iterator-p)
+          (simple-datum-origin-plan-p (third node) relations)
+          (simple-datum-origin-plan-p (fourth node) relations)))
+    (:with-ctes
+        (and (not iterator-p)
+             (simple-datum-origin-plan-p (third node) relations)))
+    (:cte-scan
+     (and (not iterator-p) relations
+          (let* ((relation (physical-scan-relation node relations))
+                 (definition (getf relation :cte))
+                 (plan (or (getf relation :cte-reference-plan)
+                           (and definition (sql-cte-plan definition)))))
+            (and plan
+                 (simple-datum-origin-plan-p (query-plan-physical plan)
+                                             (subquery-registered-relations plan) t)))))
     (otherwise nil)))
 
 (defun execute-physical-plan-node (node registered-relations outer-environment

@@ -107,6 +107,20 @@ run -c 'create table toast_derived_result (v text)' >/dev/null
 run -c 'alter table toast_derived_result alter column v set storage plain' >/dev/null
 run -c 'insert into toast_derived_result select q.v from (select v from toast_inline_build) q' >/dev/null
 [ "$(run -c 'select count(*) from toast_derived_result where length(v)=20000')" = 1 ]
+run -c 'create table toast_cte_result (v text)' >/dev/null
+run -c 'alter table toast_cte_result alter column v set storage plain' >/dev/null
+run -c 'insert into toast_cte_result with q as materialized (select v from toast_inline_build order by v) select v from q' >/dev/null
+run -c 'insert into toast_cte_result with q as not materialized (select v from toast_inline_build order by v limit 1) select v from q' >/dev/null
+run -c 'insert into toast_cte_result with q as materialized (select v from toast_inline_build) select a.v from q a join q b on a.v=b.v' >/dev/null
+[ "$(run -c 'select count(*) from toast_cte_result where length(v)=20000')" = 3 ]
+[ "$(run -c "select count(*) from toast_cte_result where v='short'")" = 2 ]
+if run -v VERBOSITY=verbose -c "insert into toast_cte_result with q as materialized (select v || '' as v from toast_inline_build) select v from q" >"$TMP/cte-computed.out" 2>&1; then
+    echo 'toast-dml: computed CTE datum retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/cte-computed.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: computed CTE did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 printf '%s\n' '(setf pg::*query-work-memory-bytes* (* 4 1024 1024))' '(quit)' | \
     "${SBCL:-sbcl}" --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/sort-work-mem-reset.out"
 run -c 'create table toast_select_conflict (id int primary key, v text)' >/dev/null
