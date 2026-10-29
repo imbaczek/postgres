@@ -224,6 +224,12 @@ appropriate instead of replacing the native C peer or adding a message relay.
 - Review parinfer's repair report and resulting source, not only balance. A repair
   of balanced but misindented input moved closing parentheses and changed a list
   binding and call arity.
+  Another repair closed a function call before its arguments beside a `#(nil)`
+  literal. It also moved fixture `:applied` and `:system-id` arguments outside
+  their call.
+  Use structural patching without autorepair, then inspect the AST and read back
+  fixture values. The existing TODO tracks regression coverage; this does not
+  claim the repair behavior is fixed.
 - Balanced parentheses do not establish the intended top-level structure. After
   inserting multiple definitions, inspect the collapsed outline and test names;
   a misplaced close once nested a `deftest` inside another form in this session.

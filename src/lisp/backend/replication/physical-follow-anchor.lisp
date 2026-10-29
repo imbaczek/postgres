@@ -125,9 +125,9 @@ the receiver's digest or the independently compared overlap."
        #xCBF29CE484222325 (subseq bytes 0 (- end start))))))
 
 (defun physical-follow-pin-check-suffix (pin)
-  "Validate selected ancestry and child WAL through a captured durable endpoint.
+  "Validate selected ancestry and WAL through a captured durable endpoint.
 Use the source root and live segments independently of the receiver's base;
-require complete records and the end-of-recovery transition at the fork."
+require complete records and check any end-of-recovery transition at its fork."
   (let* ((history (physical-follow-pin-history pin))
          (cursor (physical-source-pin-consistent-lsn pin))
          (end (with-live-operation
@@ -202,6 +202,9 @@ before publishing the ready state in memory; a save failure fences the source."
     pin))
 
 (defun physical-source-follow-same-timeline-anchor (request)
+  "Build a same-timeline anchor under WAL exclusion; no EOR is needed.
+The provisional pin checks source identity and durable position, but is not
+published. Reservation and the independent overlap and suffix proof follow."
   (with-live-operation
     (prevent-recovery-primary-operation "physical follow source descriptor")
     (sb-thread:with-mutex (*wal-lock*)
@@ -255,6 +258,7 @@ registered or serialized. Reservation and proof revalidate retention afterward."
           (physical-follow-anchor-copy anchor))))))
 
 (defun physical-source-follow-anchor (request)
+  "Choose the anchor shape from the validated source and receive timelines."
   (setf request (physical-follow-request-copy request))
   (ecase (physical-follow-request-kind request)
     (:descendant (physical-source-follow-descendant-anchor request))

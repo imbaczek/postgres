@@ -139,6 +139,7 @@ The receive timeline can differ from the applied replay timeline."
                             :restartpoint (when metadata (list (getf metadata :lsn) digest)))))))
 
 (defun physical-follow-controller-plan (snapshot anchor view)
+  "Build a binding; same-timeline follow keeps the entire receive tuple."
   (let* ((before (getf snapshot :before)) (fork (getf view :fork))
                                           (after
                                             (if (or (eq :same-timeline (physical-follow-anchor-kind anchor))
@@ -158,7 +159,8 @@ The receive timeline can differ from the applied replay timeline."
     binding))
 
 (defun physical-follow-controller-source-view (client)
-  "Read source identity and validated remote history.
+  "Read source identity and validated remote history, allowing equal timelines.
+Timeline 1 has no history file and uses empty history.
 The later snapshot checks exact local ancestry. System identifier and timeline
 cannot distinguish endpoint remaps or clones; the direct endpoint must continue
 to identify the same PGDATA."

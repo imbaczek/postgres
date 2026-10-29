@@ -212,6 +212,8 @@ manifest and root fields, and validate the proposed selection digest."
       child-history)))
 
 (defun physical-follow-binding-transition-check (anchor text before after)
+  "Check the transition implied by the anchor kind.
+Same-timeline bindings retain all eleven control fields and have no child history."
   (ecase (physical-follow-anchor-kind anchor)
     (:descendant (physical-follow-descendant-binding-transition-check anchor text before after))
     (:same-timeline
@@ -225,9 +227,9 @@ manifest and root fields, and validate the proposed selection digest."
 
 (defun physical-follow-binding-check (binding)
   "Validate the shape and internal coherence of a version 1 follow binding.
-The anchor, immediate child history, before and after control tuples, applied and
-required pairs and recovery witness describe a plan, not durable proof.
-Neither binding phase is admitted by the current receiver."
+The anchor, optional child history, control tuples, applied and required pairs
+and recovery witness describe a plan, not durable proof. Pending bindings need
+reconciliation; active bindings require durable-state checks before admission."
   (physical-follow-check-plist binding *physical-follow-binding-keys*)
   (let* ((anchor (getf binding :anchor)) (text (getf binding :child-history))
                                          (before (physical-follow-binding-control-check (getf binding :before)))
@@ -390,7 +392,8 @@ caller owns the candidate and keeps its input stable during the scan."
   t)
 
 (defun physical-follow-validate-candidate-replay (candidate verified-base binding)
-  "Validate a private pending candidate without redo or publication."
+  "Validate a private pending candidate without redo or publication.
+Same-timeline receipt may have an open tail; complete records are still checked."
   (physical-follow-binding-check binding)
   (physical-follow-check-source-history candidate (nth-value 0 (physical-follow-anchor-check (getf binding :anchor))))
   (unless (and (equal (physical-store-control-tuple candidate) (getf binding :after))
@@ -487,8 +490,9 @@ This preserves proof of the saved anchor and floor after spool compaction."
 
 (defun physical-follow-check-active-receive (store base binding)
   "Check the exact saved receive selection and any later retained prefix.
-A different child selection needs a new binding. Check the saved anchor and
-floor digests even when compaction has moved them into retained extents."
+A different child selection needs a new binding. Same-timeline receipt may
+advance beyond the saved cursor. Check the anchor and floor digests even when
+compaction has moved them into retained extents."
   (let* ((saved (getf binding :after)) (current (physical-store-control-tuple store))
                                        (anchor (getf binding :anchor)) (cursor (getf anchor :receive-lsn)))
     (unless (and (every (lambda (index) (eql (nth index saved) (nth index current)))
@@ -730,7 +734,7 @@ Protect a retained root with a reader lease. Preflight the candidate and history
 before mutation, then publish receive state, history files, recovery control and
 active config in order, with readbacks.
 A failure after mutation begins latches STORE failed; reopen to resolve durable
-state. The active config is not yet admitted by startup or a bound client."
+state. The active config still needs durable-state validation before admission."
   (labels ((reconcile ()
              (let ((started nil) (finished nil))
                (unwind-protect

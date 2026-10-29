@@ -333,6 +333,7 @@ Its canonical hexadecimal bytes are reversible, not encrypted; treat as secret."
                                       :columns columns :rows rows))))))
 
 (defun physical-libpq-check-result (result schema tag &key command-only)
+  "Check result shape and metadata, then apply the shared schema null rules."
   (unless (and (zerop (physical-libpq-result-status result))
                (equal tag (physical-libpq-result-tag result))
                (char= (physical-libpq-result-kind result) (if command-only #\C #\T))

@@ -62,6 +62,7 @@ source history or WAL."
     (loop for key in keys append (list key (getf request key)))))
 
 (defun physical-follow-request-kind (request)
+  "Classify checked coordinates; a source behind receipt is invalid."
   (physical-follow-request-copy request)
   (let ((source (getf request :source-timeline))
         (receive (getf request :receive-timeline)))
@@ -70,11 +71,14 @@ source history or WAL."
           (t (wal-invalid-input "follow source timeline precedes the receive timeline")))))
 
 (defun physical-follow-anchor-kind (anchor)
+  "An absent kind means the legacy descendant shape and preserves its digest."
   (ecase (getf anchor :kind :descendant)
     (:descendant :descendant)
     (:same-timeline :same-timeline)))
 
 (defun physical-follow-same-timeline-anchor-check (anchor)
+  "Check the exact same-timeline fields, boundaries and ancestry without EOR.
+Timeline 1 has canonical empty history. Source WAL proof is performed separately."
   (physical-follow-check-plist anchor *physical-follow-same-timeline-anchor-keys*)
   (let* ((request
            (loop for key in *physical-follow-anchor-keys*
@@ -140,6 +144,8 @@ which may differ from the source's retained archive base and manifest."
         (values history fork record)))))
 
 (defun physical-follow-anchor-check (anchor)
+  "Validate the anchor's kind and fields; return history, fork and EOR.
+Same-timeline anchors return NIL for fork and EOR. WAL bytes are checked separately."
   (ecase (physical-follow-anchor-kind anchor)
     (:descendant (physical-follow-descendant-anchor-check anchor))
     (:same-timeline (physical-follow-same-timeline-anchor-check anchor))))
@@ -160,8 +166,8 @@ which may differ from the source's retained archive base and manifest."
   "Return the canonical immutable anchor identity checksum.
 Apply FNV-1a 64 with seed #xCBF29CE484222325 to the UTF-8 bytes of
 physical-bootstrap-manifest-text of physical-follow-anchor-copy of ANCHOR.
-The full history and EOR are included; mutable stage, progress and lost state
-are not. This checksum identifies an anchor; it is not authentication."
+The full history and, for descendant anchors, EOR are included; mutable stage,
+progress and lost state are not. This checksum identifies an anchor; it is not authentication."
   (physical-store-update-digest
    #xCBF29CE484222325
    (string->bytes (physical-bootstrap-manifest-text (physical-follow-anchor-copy anchor)))))
@@ -263,7 +269,8 @@ are not. This checksum identifies an anchor; it is not authentication."
                            (getf (physical-follow-pin-anchor pin) :history-text))))
 
 (defun physical-follow-pin-check-source (pin)
-  "Check PIN against the current source identity, timeline and durable WAL."
+  "Check PIN against the current source identity, timeline and durable WAL.
+Legacy WAL names are accepted only for same-timeline follow on timeline 1."
   (unless (and (= (physical-source-pin-system-id pin) (catalog-system-identifier))
                (= (physical-source-pin-timeline pin) *wal-insert-timeline*)
                (or (eq *wal-segment-namespace* :timeline)

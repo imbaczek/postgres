@@ -221,6 +221,8 @@ and report unexpected failures as XX000."
     (error (condition) (ereport "XX000" "physical bootstrap release failed: ~a" condition))))
 
 (defun physical-follow-prepare-result-tail (anchor)
+  "Return history and the descendant fields for a PREPARE result.
+Same-timeline anchors return SQL NULL for next timeline, fork and EOR."
   (cons (copy-seq (getf anchor :history-text))
         (if (eq :same-timeline (physical-follow-anchor-kind anchor))
             (list nil nil nil)

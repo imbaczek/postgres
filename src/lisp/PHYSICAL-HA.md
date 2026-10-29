@@ -670,6 +670,38 @@ after mutex refinement. Strict compilation passed
 Sol medium found no further refactor needed, and functions remained under 120
 lines.
 
+### Same-timeline follow — completed milestone
+
+An existing native follow configuration can be retargeted to a source on its
+current timeline as well as to a descendant. The same-timeline preparation
+checks independent overlap and a record boundary, then requires the retained
+suffix and WAL readiness. It preserves the current receive selection and allows
+receipt to advance. Timeline 1 uses canonical empty history; legacy WAL
+namespace support for same-timeline follow is limited to timeline 1. PostgreSQL's
+`timeline.c:88` and `xlogrecovery.c:4131-4198` are references for timeline 1 history
+and descendant history checks.
+
+Both raw and libpq end-to-end runs passed same-timeline 1 and 2 transitions with
+SQL insert/delete, followed by descendant catch-up, receiver-only stop, crash
+restart and promotion: `/tmp/pg-same-timeline-raw-checked.log` (artifacts
+`/tmp/pg-operation-parking.qIJ4uq`) and `/tmp/pg-same-timeline-libpq-checked.log`
+(artifacts `/tmp/pg-operation-parking.IUIPuA`). The physical suite passed 1042
+tests with zero failures or pending (`/tmp/pg-same-timeline-physical-suite.log`)
+before the additional crash test. That test passed seven actual SIGKILL cuts and
+reconciliation in a second fresh SBCL (5490 ms); it is not a full server startup
+admission test. Three existing descendant, rooted-cold and controller tests passed
+(10928 ms). Strict cold compilation passed (`/tmp/pg-same-timeline-compile.log`),
+and a fresh worker loaded PG without warnings after deleting 196 FASLs.
+
+The new cl-spec property passed 200 trials for each of seeds 42, 43 and
+3374323980364780765. No Function Spec is registered for
+`physical-follow-pin-decode`; rejection counts and input coverage were not
+measured. Luna, Sol high and Sol medium reviews were clear; all production
+definitions remained under 120 lines. Initial attachment without
+an existing follow configuration, standard Patroni GUC desired-generation
+handling and receiver use of persistent public slots remain unwired. This does
+not provide a coordinator.
+
 ### Standard follow configuration integration — in progress
 
 The next integrated milestone is startup and upstream replacement through
@@ -693,8 +725,8 @@ and escaping, connection options, slot name, local configuration and signal
 files. The C run passes; the full native comparison currently fails on unsupported
 `cluster_name`. This is a writer and metadata oracle, not a `Postgresql.follow`
 or receiver test. Full GUC behavior, desired-generation reconciliation, automatic
-Patroni conninfo wiring through libpq, first attachment, same-timeline follow and
-the follow acceptance matrix remain open.
+Patroni conninfo wiring through libpq, first attachment, standard GUC-driven
+same-timeline follow and the follow acceptance matrix remain open.
 
 Native startup now installs independent `max_connections` (default 100) and
 `max_wal_senders` (default 10) session quotas before listening. Startup packets

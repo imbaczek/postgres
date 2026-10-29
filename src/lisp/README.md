@@ -76,8 +76,11 @@ control REPL can request a transition using a literal conninfo, for example:
                                   :prefix "follow" :fallback "walreceiver")
 ```
 
-This retargets the existing configuration; it does not perform the first
-bootstrap or provide a coordinator. Effective multihost profiles are unsupported.
+This retargets an existing configuration to a source on the same timeline or a
+descendant timeline. Initial attachment without a follow configuration is not
+provided; standard Patroni GUC desired-generation handling and use of persistent
+public slots by the receiver are not wired. There is no coordinator. Effective
+multihost profiles are unsupported.
 The original conninfo is resolved again on normal reconnects. If the selected
 route changes, the receiver prepares a new binding before querying or receiving
 WAL. Cleanup uses the saved selected route and credential; if that credential is
