@@ -111,6 +111,7 @@ test "$(sql "$TARGET_PORT" 'SELECT pg_last_wal_replay_lsn()')" = "$paused_replay
 test "$(sql "$TARGET_PORT" 'SELECT label FROM data WHERE id=1')" = base
 "$PATRONI_PYTHON" "$BASE/t/interop/patroni-tl-lsn.py" "$TARGET_PORT" standby paused
 "$PATRONI_PYTHON" "$BASE/t/interop/receiver-sql.py" "$TARGET_PORT" paused native "$PORT"
+"$PATRONI_PYTHON" "$BASE/t/interop/physical-slots.py" --port "$TARGET_PORT" --standby
 checked target '(physical-recovery-replay)' paused-direct-replay
 grep -q '^:PAUSED$' "$TMP/paused-direct-replay.log"
 checked target '(reload)' paused-reload
