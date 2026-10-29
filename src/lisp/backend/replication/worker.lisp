@@ -16,16 +16,19 @@
   (target-host "127.0.0.1") (target-port 5433) (target-database "postgres")
   slot-name (tables '()))
 
+(defvar *logical-subscription-binary-copy* (make-hash-table :test #'eq :weakness :key))
+
+(defvar *logical-subscription-binary-copy-lock* (sb-thread:make-mutex :name "subscription binary copy"))
+
+(defun logical-subscription-options-binary-copy-p (options)
+  (sb-thread:with-mutex (*logical-subscription-binary-copy-lock*)
+    (gethash options *logical-subscription-binary-copy*)))
+
+(defun (setf logical-subscription-options-binary-copy-p) (value options)
+  (sb-thread:with-mutex (*logical-subscription-binary-copy-lock*)
+    (setf (gethash options *logical-subscription-binary-copy*) value)))
+
 (defstruct pgoutput-column name type-oid key-p (typmod -1))
-
-(defstruct logical-binary-bytea data)
-
-(defun logical-binary-bytea-visit (value sink)
-  (let ((data (logical-binary-bytea-data value)))
-    (if (logical-wire-binary-field-p data)
-        (logical-wire-binary-field-visit data sink)
-        (loop for start from 0 below (length data) by 65536
-              do (funcall sink (subseq data start (min (length data) (+ start 65536))))))))
 
 (defstruct pgoutput-relation oid namespace name columns key-columns)
 
@@ -64,6 +67,8 @@
                               ((string= (first remaining) "extension") :extension)
                               (t (error "--mode expects standard or extension"))))
                   (next-value arg))
+                 ((string= arg "--binary-copy")
+                  (setf (logical-subscription-options-binary-copy-p options) t))
                  ((string= arg "--binary-bytea")
                   (setf (logical-subscription-options-binary-bytea-p options) t))
                  ((string= arg "--publication")
@@ -491,9 +496,12 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
 
 (defun logical-copy-row-size (row)
   (+ 32 (* 16 (length row))
-     (loop for value across row when value sum (if (logical-wire-field-p value)
-                                                   (logical-wire-field-size value)
-                                                   (logical-utf8-size-bounded value)))))
+     (loop for value across row when value
+           sum (cond ((logical-wire-field-p value) (logical-wire-field-size value))
+                     ((logical-binary-bytea-p value)
+                      (let ((data (logical-binary-bytea-data value)))
+                        (if (logical-wire-binary-field-p data) (logical-wire-binary-field-size data) (length data))))
+                     (t (logical-utf8-size-bounded value))))))
 
 (defun logical-copy-chunk-limit (test-limit failpoint action)
   (if (null test-limit)
@@ -578,6 +586,21 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
      (lambda ()
        (logical-test-failpoint :after-copy-chunk-commit table)))))
 
+(defvar *logical-copy-binary-bytea* nil)
+
+(defvar *logical-copy-exporter* nil)
+
+(defun logical-copy-validate-description (columns actual)
+  (unless (and (= (length columns) (length actual))
+               (every (lambda (expected column)
+                        (and (equal (pg-client-column-name expected) (pg-client-column-name column))
+                             (= (pg-client-column-type-oid expected) (pg-client-column-type-oid column))
+                             (= (pg-client-column-typmod expected) (pg-client-column-typmod column))
+                             (= (pg-client-column-format column)
+                                (if (and *logical-copy-binary-bytea* (= (pg-client-column-type-oid expected) 17)) 1 0))))
+                      columns actual))
+    (error "initial copy RowDescription changed")))
+
 (defun logical-copy-source-table (source target table &optional (validate-schema #'logical-validate-copy-schema) (source-table table))
   (let ((columns (funcall validate-schema source target table))
         (rows '()) (owners '()) (chunk-bytes 0) (spilled-owners 0)
@@ -598,7 +621,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                       (logical-copy-target-chunk target table columns rows)
                    (release-owners))))
              (consume-row (row row-columns owner)
-               (declare (ignore row-columns))
+               (logical-copy-validate-description columns row-columns)
                (let ((row-bytes (logical-copy-row-size row)))
                  (when (and rows (> (+ chunk-bytes row-bytes) chunk-limit))
                    (flush-chunk))
@@ -615,8 +638,16 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
       (unwind-protect
            (progn
              ;; Each source row owns its slices through its target chunk commit.
-             (pg-client-query source (format nil "SELECT * FROM ~a" source-table)
-                              :on-row-with-owner #'consume-row :field-budget field-budget)
+             (multiple-value-bind (rows description)
+                 (pg-client-query source
+                                  (if *logical-copy-binary-bytea*
+                                      (make-pg-client-select-query
+                                       (format nil "SELECT * FROM ~a" source-table)
+                                       (mapcar (lambda (column) (if (= (pg-client-column-type-oid column) 17) 1 0)) columns))
+                                      (format nil "SELECT * FROM ~a" source-table))
+                                  :on-row-with-owner #'consume-row :field-budget field-budget)
+               (declare (ignore rows))
+               (logical-copy-validate-description columns description))
              (flush-chunk))
         (release-owners)))))
 
@@ -654,7 +685,8 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
 (defun logical-copy-data-and-finish (options target source boundary
                                      &optional (validate-schema #'logical-validate-copy-schema))
   "Keep reset/copy/snapshot commit/durable READY ordering shared across modes."
-  (let ((slot (logical-subscription-options-slot-name options)))
+  (let ((slot (logical-subscription-options-slot-name options))
+        (*logical-copy-binary-bytea* (logical-subscription-options-binary-copy-p options)))
     (logical-test-failpoint :before-copy-reset slot boundary)
     (logical-reset-target-tables target (logical-subscription-options-tables options))
     (logical-test-failpoint :after-copy-reset slot boundary)
@@ -663,6 +695,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                                  (if (eq (logical-subscription-options-mode options) :standard)
                                      (format nil "public.~a" table) table)))
     (pg-client-query source "COMMIT")
+    (when *logical-copy-exporter* (pg-client-query *logical-copy-exporter* "COMMIT"))
     (logical-test-failpoint :after-copy-snapshot-transaction-commit slot boundary)
     (logical-persist-copy-ready options target boundary))
   :ready)
@@ -1857,7 +1890,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
       (let ((options (parse-logical-subscription-args
                       (cdr sb-ext:*posix-argv*))))
         (if (eq options :help)
-            (format t "usage: pg-lisp-subscribe --slot NAME --table TABLE [--table TABLE] [--mode extension|standard] [--publication NAME] [--binary-bytea] [--source-host HOST] [--source-port PORT] [--source-database DB] [--target-host HOST] [--target-port PORT] [--target-database DB]~%")
+            (format t "usage: pg-lisp-subscribe --slot NAME --table TABLE [--table TABLE] [--mode extension|standard] [--publication NAME] [--binary-bytea] [--binary-copy] [--source-host HOST] [--source-port PORT] [--source-database DB] [--target-host HOST] [--target-port PORT] [--target-database DB]~%")
             (logical-subscription-run options)))
     (error (condition)
       (format *error-output* "pg-lisp-subscribe: ~a~%" condition)

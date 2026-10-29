@@ -320,7 +320,24 @@
              (logical-test-failpoint :after-source-slot-created-before-copying-progress slot boundary)
              (logical-standard-persist-state target options "copying" boundary)
              (logical-test-failpoint :after-copying-progress-commit slot boundary)
-             (logical-standard-copy-snapshot options target source boundary)))
+             (if (logical-subscription-options-binary-copy-p options)
+                 (let* ((snapshot-rows (pg-client-query source "SELECT pg_export_snapshot()"))
+                        (snapshot-row (first snapshot-rows))
+                        (token (and snapshot-row (= (length snapshot-row) 1) (aref snapshot-row 0)))
+                        (copy-source nil))
+                   (unless (and (stringp token) (plusp (length token)))
+                     (error "source did not export its copy snapshot"))
+                   (unwind-protect
+                        (progn
+                          (sb-sys:without-interrupts
+                            (setf copy-source (sb-sys:allow-with-interrupts
+                                                (logical-startup-source-client options))))
+                          (unless (eq (logical-import-copy-snapshot copy-source token) :imported)
+                            (error "exported copy snapshot expired"))
+                          (let ((*logical-copy-exporter* source))
+                            (logical-standard-copy-snapshot options target copy-source boundary)))
+                     (when copy-source (pg-client-close copy-source))))
+                 (logical-standard-copy-snapshot options target source boundary))))
       (pg-client-close source))))
 
 (defun logical-standard-resume-copy (options target progress)

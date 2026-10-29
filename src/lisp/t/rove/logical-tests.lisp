@@ -290,11 +290,11 @@
                                     (progn
                                       (logical-copy-source-table
                                        source nil "copy_rows"
-                                       (lambda (&rest args) (declare (ignore args)) nil))
+                                       (lambda (&rest args) (declare (ignore args)) (list (make-pg-client-column :name "a" :type-oid 25))))
                                       nil)
                                   (error () t)))
                        (logical-copy-source-table
-                        source nil "copy_rows" (lambda (&rest args) (declare (ignore args)) nil)))))
+                        source nil "copy_rows" (lambda (&rest args) (declare (ignore args)) (list (make-pg-client-column :name "a" :type-oid 25)))))))
                (rove:ok (= (length owners) 2))
                (rove:ok (every (lambda (owner)
                                  (and (not (logical-wire-field-owner-active-p owner))
@@ -831,7 +831,7 @@
                        (rove:ok (<= spilled 32)))))
              (with-open-file (in path :element-type '(unsigned-byte 8))
                (logical-copy-source-table (make-pg-client :stream in) nil "copy_rows"
-                                          (lambda (&rest args) (declare (ignore args)) nil)))
+                                          (lambda (&rest args) (declare (ignore args)) (list (make-pg-client-column :name "a" :type-oid 25)))))
              (rove:ok (= field-count 100))
              (rove:ok (> (length chunk-sizes) 1))
              (rove:ok (find 32 chunk-sizes)))
@@ -1747,6 +1747,150 @@
                                (sql-bytea-output bytes "escape"))))
         (when (probe-file path-a) (delete-file path-a))
         (when (probe-file path-b) (delete-file path-b)))))
+
+(rove:deftest test-select-mixed-binary-bytea-datarow
+    (let* ((path (merge-pathnames (format nil "pg-select-binary-~d-~d" (sb-posix:getpid) (random 1000000)) (uiop:temporary-directory)))
+           (*select-result-formats* #(0 1 0))
+           (targets '((:type :int4) (:type :bytea) (:type :text)))
+           (values (vector 42 (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(0 128 255)) +null+)))
+      (unwind-protect
+           (progn
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+               (send-select-data-row out values targets))
+             (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+               (multiple-value-bind (type length payload) (read-message-frame in)
+                 (rove:ok (= type (char-code #\D)))
+                 (rove:ok (= (bytes-to-u32 length 0) 23))
+                 (rove:ok (equalp payload #(0 3 0 0 0 2 52 50 0 0 0 3 0 128 255 255 255 255 255)))))
+             (let ((*select-result-formats* #(0 1 1)))
+               (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+                 (rove:ok (handler-case (progn (send-select-data-row out values targets) nil) (error () t)))
+                 (rove:ok (zerop (file-position out))))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-extended-select-portal-formats-and-description
+    (let* ((*backend* (make-backend)) (*extended-query-state* (make-extended-query-state))
+                                      (path (merge-pathnames (format nil "pg-select-portal-~d-~d" (sb-posix:getpid) (random 1000000)) (uiop:temporary-directory)))
+                                      (old-columns (symbol-function 'extended-select-result-columns))
+                                      (old-execute (symbol-function 'execute-statement))
+                                      (observed nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'extended-select-result-columns)
+                   (lambda (ast) (declare (ignore ast))
+                     (list (make-result-column :name "i" :type-oid 23)
+                           (make-result-column :name "b" :type-oid 17)))
+                   (symbol-function 'execute-statement)
+                   (lambda (stream ast) (declare (ignore stream ast))
+                     (setf observed (list *select-suppress-description* (copy-seq *select-result-formats*)))))
+             (with-open-file (out path :direction :io :element-type '(unsigned-byte 8) :if-exists :supersede :if-does-not-exist :create)
+               (extended-apply-operation out '(:parse "s" "SELECT * FROM t" ()) #())
+               (extended-apply-operation out '(:bind "p" "s" () () (0 1)) #())
+               (extended-apply-operation out '(:describe #\P "p") #())
+               (extended-apply-operation out '(:execute "p" 0) #())
+               (rove:ok (and (first observed) (equalp (second observed) #(0 1))))
+               (finish-output out) (file-position out 0)
+               (multiple-value-bind (type length payload) (read-message-frame out) (declare (ignore length payload)) (rove:ok (= type (char-code #\1))))
+               (multiple-value-bind (type length payload) (read-message-frame out) (declare (ignore length payload)) (rove:ok (= type (char-code #\2))))
+               (multiple-value-bind (type length payload) (read-message-frame out)
+                 (declare (ignore length))
+                 (rove:ok (= type (char-code #\T)))
+                 (let ((columns (pg-client-read-column-description payload)))
+                   (rove:ok (equal (mapcar #'pg-client-column-format columns) '(0 1)))))))
+        (setf (symbol-function 'extended-select-result-columns) old-columns
+              (symbol-function 'execute-statement) old-execute)
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-extended-select-describe-aborted-transaction
+    (let* ((*backend* (make-backend)) (*extended-query-state* (make-extended-query-state))
+                                      (path (merge-pathnames (format nil "pg-describe-aborted-~d-~d" (sb-posix:getpid) (random 1000000)) (uiop:temporary-directory)))
+                                      (statement (make-extended-statement :ast (first (parse-statements "SELECT * FROM t")) :types #())))
+      (set-backend-state *backend* :aborted)
+      (setf (gethash "s" (extended-query-state-statements *extended-query-state*)) statement
+            (gethash "p" (extended-query-state-portals *extended-query-state*))
+            (make-extended-query-portal statement #() t nil #()))
+      (unwind-protect
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+             (dolist (operation '((:describe #\S "s") (:describe #\P "p")))
+               (rove:ok (handler-case (progn (extended-apply-operation out operation #()) nil)
+                          (pg-error (condition) (string= (pg-error-sqlstate condition) "25P02")))))
+             (rove:ok (zerop (file-position out))))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-extended-select-guard-and-schema-drift
+    (rove:ok (extended-copy-select-p (first (parse-statements "SELECT * FROM t"))))
+  (rove:ok (not (extended-copy-select-p (first (parse-statements "WITH q AS (SELECT 1) SELECT * FROM q")))))
+  (rove:ok (not (extended-copy-select-p (first (parse-statements "SELECT * FROM t ORDER BY x")))))
+  (let* ((path (merge-pathnames (format nil "pg-select-drift-~d-~d" (sb-posix:getpid) (random 1000000)) (uiop:temporary-directory)))
+         (old-plan (symbol-function 'plan-select-query))
+         (old-column (symbol-function 'target->result-column))
+         (old-run (symbol-function 'execute-query-plan))
+         (*select-suppress-description* t)
+         (*select-expected-result-columns* (list (make-result-column :name "old" :type-oid 17)))
+         (calls 0))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'plan-select-query)
+                 (lambda (ast) (declare (ignore ast))
+                   (%make-query-plan :prepared '(:relations nil :targets ((:type :bytea)))))
+                 (symbol-function 'target->result-column)
+                 (lambda (target) (declare (ignore target)) (make-result-column :name "new" :type-oid 17))
+                 (symbol-function 'execute-query-plan)
+                 (lambda (&rest args) (declare (ignore args)) (incf calls)))
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+             (rove:ok (handler-case (progn (exec-select out nil) nil) (error () t)))
+             (rove:ok (zerop calls)) (rove:ok (zerop (file-position out)))))
+      (setf (symbol-function 'plan-select-query) old-plan
+            (symbol-function 'target->result-column) old-column
+            (symbol-function 'execute-query-plan) old-run)
+      (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-empty-copy-row-description-validation
+    (let ((columns (list (make-pg-client-column :name "b" :type-oid 17)))
+          (*logical-copy-binary-bytea* t))
+      (rove:ok (handler-case (progn (logical-copy-validate-description columns nil) nil) (error () t)))
+      (rove:ok (handler-case (progn (logical-copy-validate-description columns (list (make-pg-client-column :name "b" :type-oid 17))) nil) (error () t)))
+      (rove:ok (not (handler-case (progn (logical-copy-validate-description columns (list (make-pg-client-column-with-format :name "b" :type-oid 17 :format 1))) nil) (error () t))))))
+
+(rove:deftest test-empty-copy-validates-returned-description
+    (let ((old (symbol-function 'pg-client-query))
+          (columns (list (make-pg-client-column :name "b" :type-oid 17)))
+          (*logical-copy-binary-bytea* t))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg-client-query)
+                   (lambda (client query &key on-row-with-owner field-budget)
+                     (declare (ignore client query on-row-with-owner field-budget))
+                     (values nil (list (make-pg-client-column :name "b" :type-oid 17)))))
+             (rove:ok
+              (handler-case
+                  (progn (logical-copy-source-table nil nil "t"
+                                                    (lambda (source target table)
+                                                      (declare (ignore source target table))
+                                                      columns))
+                         nil)
+                (error () t))))
+        (setf (symbol-function 'pg-client-query) old))))
+
+(rove:deftest test-client-mixed-binary-bytea-datarow
+    (let* ((path (merge-pathnames (format nil "pg-client-binary-~d-~d" (sb-posix:getpid) (random 1000000)) (uiop:temporary-directory)))
+           (columns (list (make-pg-client-column :name "i" :type-oid 23)
+                          (make-pg-client-column-with-format :name "b" :type-oid 17 :format 1)
+                          (make-pg-client-column :name "t" :type-oid 25)))
+           (owner (make-logical-wire-field-owner)) (*logical-wire-field-spill-threshold* 2))
+      (unwind-protect
+           (progn
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+               (write-message out #\D #(0 3 0 0 0 2 52 50 0 0 0 3 0 128 255 255 255 255 255)))
+             (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+               (multiple-value-bind (type row decoded) (pg-client-streamed-query-frame (make-pg-client :stream in) columns owner)
+                 (rove:ok (and (char= type #\D) decoded (string= (aref row 0) "42") (null (aref row 2))))
+                 (let ((value (aref row 1)) (actual (make-payload)))
+                   (rove:ok (logical-wire-binary-field-p (logical-binary-bytea-data value)))
+                   (logical-binary-bytea-visit value (lambda (part) (payload-push actual part)))
+                   (rove:ok (equalp actual #(0 128 255)))))))
+        (close-logical-wire-field-owner owner)
+        (when (probe-file path) (delete-file path)))))
 
 (rove:deftest test-select-streamed-datarow-preflight-and-partial-failure
     (let* ((path (merge-pathnames (format nil "pg-select-fault-~d-~d"

@@ -3,7 +3,34 @@
 (in-package #:pg)
 
 (defstruct extended-statement ast types)
+
 (defstruct extended-portal statement values (executed-p nil))
+
+(defstruct extended-select-portal-metadata columns formats)
+
+(defvar *extended-select-portal-metadata* (make-hash-table :test #'eq :weakness :key))
+
+(defvar *extended-select-portal-metadata-lock* (sb-thread:make-mutex :name "extended SELECT portal metadata"))
+
+(defun extended-select-portal-info (portal)
+  (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
+    (gethash portal *extended-select-portal-metadata*)))
+
+(defun extended-portal-select-p (portal) (not (null (extended-select-portal-info portal))))
+
+(defun extended-portal-result-columns (portal)
+  (let ((info (extended-select-portal-info portal))) (and info (extended-select-portal-metadata-columns info))))
+
+(defun extended-portal-result-formats (portal)
+  (let ((info (extended-select-portal-info portal))) (and info (extended-select-portal-metadata-formats info))))
+
+(defun make-extended-query-portal (statement values select-p columns formats)
+  (let ((portal (make-extended-portal :statement statement :values values)))
+    (when select-p
+      (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
+        (setf (gethash portal *extended-select-portal-metadata*)
+              (make-extended-select-portal-metadata :columns columns :formats formats))))
+    portal))
 
 (defun call-with-extended-bind-spool (input size function)
   "Read SIZE bytes into a checksummed anonymous spool, scoped to FUNCTION."
@@ -196,6 +223,31 @@
                (push (car item) pending))
     nil))
 
+(defun extended-copy-select-p (ast)
+  "Accept only the plain table scan needed by initial copy."
+  (and (eq (getf ast :type) :select)
+       (equal (getf ast :targets) '((:star t)))
+       (stringp (getf ast :from))
+       (null (getf ast :from-alias))
+       (every (lambda (key) (null (getf ast key)))
+              '(:joins :where :group-by :having :distinct :windows :order-by :limit :offset :with :with-recursive :set-operation))))
+
+(defun extended-select-result-columns (ast)
+  (mapcar #'target->result-column (getf (query-plan-prepared (plan-select-query ast)) :targets)))
+
+(defun extended-select-result-formats (formats columns)
+  (let ((count (length columns)))
+    (unless (member (length formats) (list 0 1 count))
+      (ereport "08P01" "invalid result format count"))
+    (let ((result (make-array count)) (format-vector (coerce formats 'vector)))
+      (loop for column in columns for index from 0
+            for format = (case (length formats) (0 0) (1 (first formats)) (otherwise (aref format-vector index)))
+            do (unless (or (= format 0) (and (= format 1) (= (result-column-type-oid column) 17)))
+                 (ereport "0A000" "binary result format is supported only for bytea"))
+               (setf (aref result index) format
+                     (result-column-format column) format))
+      result)))
+
 (defun extended-apply-operation (stream operation payload)
   (let ((state *extended-query-state*))
     (case (first operation)
@@ -213,15 +265,18 @@
          (let* ((statements (parse-statements sql))
                 (types (map 'vector #'extended-type-from-oid oids)))
            (unless (and (= (length statements) 1)
-                        (member (getf (first statements) :type) '(:insert :update :delete))
-                        (null (getf (first statements) :returning)))
-             (ereport "0A000" "extended query supports one DML statement"))
+                        (or (and (member (getf (first statements) :type) '(:insert :update :delete))
+                                 (null (getf (first statements) :returning)))
+                            (and (zerop (length types)) (extended-copy-select-p (first statements)))))
+             (ereport "0A000" "extended query supports DML or a plain table SELECT"))
            (when (extended-context-sensitive-literal-p (first statements))
              (ereport "0A000" "string literals in extended statements are not supported; use parameters"))
            (when (eq (backend-state *backend*) :aborted)
              (ereport "25P02" "current transaction is aborted, commands ignored until end of transaction block"))
            (let ((*query-parameter-types* types))
-             (prepare-dml-subqueries (first statements)))
+             (if (extended-copy-select-p (first statements))
+                 (extended-select-result-columns (first statements))
+                 (prepare-dml-subqueries (first statements))))
            (setf (gethash name (extended-query-state-statements state))
                  (make-extended-statement :ast (first statements) :types types))
            (write-message stream #\1 #()))))
@@ -243,11 +298,14 @@
            (unless (and (member (length formats) (list 0 1 (length ranges)))
                         (every (lambda (format) (member format '(0 1))) formats))
              (ereport "08P01" "invalid parameter formats"))
-           (unless (or (null results) (and (= (length results) 1) (= (first results) 0)))
-             (ereport "0A000" "binary result format is not supported"))
-           (let* ((types (extended-statement-types statement))
+           (let* ((select-p (extended-copy-select-p (extended-statement-ast statement)))
+                  (columns (when select-p (extended-select-result-columns (extended-statement-ast statement))))
+                  (result-formats (when select-p (extended-select-result-formats results columns)))
+                  (types (extended-statement-types statement))
                   (format-vector (coerce formats 'vector))
                   (values (make-array (length ranges))))
+             (unless (or select-p (null results) (and (= (length results) 1) (= (first results) 0)))
+               (ereport "0A000" "binary result format is not supported"))
              (loop for range in ranges for index from 0
                    for type = (aref types index)
                    for format = (extended-parameter-format format-vector index (length values))
@@ -269,7 +327,7 @@
                                       (if spooled bytes (subseq bytes start end)))))))
              (when (extended-bind-spool-p payload) (extended-verify-bind-spool payload))
              (setf (gethash portal (extended-query-state-portals state))
-                   (make-extended-portal :statement statement :values values))
+                   (make-extended-query-portal statement values select-p columns result-formats))
              (write-message stream #\2 #())))))
       (:execute
        (destructuring-bind (kind name limit) operation
@@ -282,25 +340,37 @@
              (begin-extended-implicit-query-block)
              (setf (extended-query-state-implicit-p state) t))
            (let ((*query-parameter-types* (extended-statement-types (extended-portal-statement portal)))
-                 (*query-parameter-values* (extended-portal-values portal)))
+                 (*query-parameter-values* (extended-portal-values portal))
+                 (*select-result-formats* (extended-portal-result-formats portal))
+                 (*select-expected-result-columns* (extended-portal-result-columns portal))
+                 (*select-suppress-description* (extended-portal-select-p portal)))
              (execute-statement stream (extended-statement-ast (extended-portal-statement portal))))
            (setf (extended-portal-executed-p portal) t
                  (extended-query-state-executed-in-cycle-p state) t))))
       (:describe
        (destructuring-bind (kind target name) operation
          (declare (ignore kind))
-         (case target
-           (#\S (let ((statement (gethash name (extended-query-state-statements state))))
-                  (unless statement (ereport "26000" "prepared statement does not exist"))
-                  (let ((response (make-payload)))
-                    (payload-push-u16 response (length (extended-statement-types statement)))
-                    (loop for type across (extended-statement-types statement)
-                          do (payload-push-u32 response (type-oid type)))
-                    (write-message stream #\t response))))
-           (#\P (unless (gethash name (extended-query-state-portals state))
-                  (ereport "34000" "portal does not exist")))
-           (otherwise (ereport "08P01" "invalid describe target")))
-         (write-message stream #\n #())))
+         (multiple-value-bind (columns select-p)
+             (case target
+               (#\S (let ((statement (gethash name (extended-query-state-statements state))))
+                      (unless statement (ereport "26000" "prepared statement does not exist"))
+                      (when (and (eq (backend-state *backend*) :aborted)
+                                 (extended-copy-select-p (extended-statement-ast statement)))
+                        (ereport "25P02" "current transaction is aborted, commands ignored until end of transaction block"))
+                      (let ((response (make-payload)))
+                        (payload-push-u16 response (length (extended-statement-types statement)))
+                        (loop for type across (extended-statement-types statement)
+                              do (payload-push-u32 response (type-oid type)))
+                        (write-message stream #\t response))
+                      (when (extended-copy-select-p (extended-statement-ast statement))
+                        (values (extended-select-result-columns (extended-statement-ast statement)) t))))
+               (#\P (let ((portal (gethash name (extended-query-state-portals state))))
+                      (unless portal (ereport "34000" "portal does not exist"))
+                      (when (and (eq (backend-state *backend*) :aborted) (extended-portal-select-p portal))
+                        (ereport "25P02" "current transaction is aborted, commands ignored until end of transaction block"))
+                      (values (extended-portal-result-columns portal) (extended-portal-select-p portal))))
+               (otherwise (ereport "08P01" "invalid describe target")))
+           (if select-p (send-row-description stream columns) (write-message stream #\n #())))))
       (:close
        (destructuring-bind (kind target name) operation
          (declare (ignore kind))

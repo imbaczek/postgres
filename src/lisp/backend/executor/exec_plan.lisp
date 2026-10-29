@@ -1784,24 +1784,32 @@ projection or filter forms fall back to ordinary full materialization."
           (terpri stream)
           (format stream "Execution Time: ~,3f ms" (or execution-time 0.0d0)))))))
 
+(defun select-result-column-signature (column)
+  (list (result-column-name column) (result-column-table-oid column)
+        (result-column-attnum column) (result-column-type-oid column)
+        (result-column-typlen column) (result-column-typmod column)))
+
 (defun exec-select (stream ast)
   (let* ((plan (plan-select-query ast))
          (prepared (query-plan-prepared plan))
          (relations (getf prepared :relations))
          (targets (getf prepared :targets))
+         (columns (mapcar #'target->result-column targets))
          (row-count 0))
+    (when (and *select-suppress-description*
+               (not (equal (mapcar #'select-result-column-signature columns)
+                           (mapcar #'select-result-column-signature *select-expected-result-columns*))))
+      (error "SELECT result metadata changed after Bind"))
     (labels ((send-row (row)
                (send-select-row stream row targets)
                (incf row-count)))
       (if relations
           (with-registered-select-relations (registered relations)
             (reconcile-query-plan-access-paths plan registered)
-            (send-row-description stream
-                                  (mapcar #'target->result-column targets))
+            (unless *select-suppress-description* (send-row-description stream columns))
             (execute-query-plan plan registered #'send-row))
           (progn
-            (send-row-description stream
-                                  (mapcar #'target->result-column targets))
+            (unless *select-suppress-description* (send-row-description stream columns))
             (execute-query-plan plan nil #'send-row)))
       (send-command-complete stream (format nil "SELECT ~a" row-count)))))
 

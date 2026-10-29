@@ -591,11 +591,12 @@ hexadecimal (the default) or traditional escape output. Supported isolation leve
 are `READ COMMITTED` and `REPEATABLE READ`; client encoding is UTF8 and
 `standard_conforming_strings = on`.
 The extended query protocol supports Parse, Bind, Execute, Sync, Describe,
-Close and Flush for a single INSERT, UPDATE or DELETE without RETURNING.
+Close and Flush for a single INSERT, UPDATE or DELETE without RETURNING, and
+the plain `SELECT * FROM table` scan used for initial copy.
 Parse requires explicit supported built-in expression type OIDs for parameters;
 string literals in these statements are rejected in favor of parameters.
 Parameters use text format, except that bytea also supports binary format;
-binary result formats and limited portal execution are unsupported; each portal
+SELECT result columns may use binary format only for bytea; limited portal execution is unsupported; each portal
 can execute only once. This is a restricted DML interface, not general
 extended-query support. During reload drain, a Simple Query sent while an
 extended implicit transaction is open is rejected if it has statements after a
@@ -741,7 +742,7 @@ uses typed Bind parameters, counted and emitted in bounded blocks; the target
 still materializes parameter values. For bytea fields, canonical hex text over
 262144 characters is decoded in bounded blocks to a binary Bind parameter;
 other spellings and smaller fields use text Bind. Initial-copy source fields
-remain text, and this conversion does not raise the source bytea,
+default to text, and this conversion does not raise the source bytea,
 event or frame limits. A malformed or incomplete
 incoming frame closes the source connection; a partial row-frame or query write
 closes its connection. Other message types use their existing encoders. The 4 MiB
@@ -807,9 +808,12 @@ disabled. A pg-lisp publisher also accepts standard `binary 'true'` and emits
 binary tuple fields for bytea only, retaining text for other types. Extension
 mode defaults to text; `--binary-bytea` opts the bundled subscriber into binary
 bytea streaming from a supporting pg-lisp source. Older sources that do not
-recognize the option fail rather than silently switching formats. This does not
-add C binary COPY initial-copy support, request arbitrary C global binary output,
-or change admission and copy limits. DDL/sequence
+recognize the option fail rather than silently switching formats. Separately,
+`--binary-copy` requests binary bytea and text for other columns through an
+extended SELECT during initial copy. It works with the native private snapshot
+and with C standard sources using an exported snapshot bridge; native standard
+snapshot export is not supported. This is not binary COPY and does not request
+arbitrary C global binary output or change admission and copy limits. DDL/sequence
 automation remains in extension mode. UPDATE messages may omit unchanged
 out-of-line values; the subscriber preserves those values on the target. Row
 filters, column lists, partitions, generated columns, and replica identity FULL

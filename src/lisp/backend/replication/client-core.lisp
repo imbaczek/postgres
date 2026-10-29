@@ -15,7 +15,23 @@
                      (pg-client-error-message condition)))))
 
 (defstruct pg-client socket stream)
+
 (defstruct pg-client-column name type-oid (typmod -1))
+
+(defvar *pg-client-column-formats* (make-hash-table :test #'eq :weakness :key))
+
+(defvar *pg-client-column-formats-lock* (sb-thread:make-mutex :name "client column formats"))
+
+(defun pg-client-column-format (column)
+  (sb-thread:with-mutex (*pg-client-column-formats-lock*)
+    (gethash column *pg-client-column-formats* 0)))
+
+(defun make-pg-client-column-with-format (&key name type-oid (typmod -1) (format 0))
+  (let ((column (make-pg-client-column :name name :type-oid type-oid :typmod typmod)))
+    (unless (zerop format)
+      (sb-thread:with-mutex (*pg-client-column-formats-lock*)
+        (setf (gethash column *pg-client-column-formats*) format)))
+    column))
 
 (defun pg-client-cstring (bytes offset)
   (let ((end (position 0 bytes :start offset)))
@@ -200,6 +216,15 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
           (error "logical binary field checksum mismatch")))))
   (values))
 
+(defstruct logical-binary-bytea data)
+
+(defun logical-binary-bytea-visit (value sink)
+  (let ((data (logical-binary-bytea-data value)))
+    (if (logical-wire-binary-field-p data)
+        (logical-wire-binary-field-visit data sink)
+        (loop for start from 0 below (length data) by 65536
+              do (funcall sink (subseq data start (min (length data) (+ start 65536))))))))
+
 (defun logical-wire-field-capture (owner cursor size)
   "Validate and spool one field in OWNER, publishing only a complete slice."
   (unless (and (logical-wire-field-owner-active-p owner)
@@ -238,6 +263,14 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
          (not (logical-wire-reserve-field owner size)))
      (logical-wire-field-capture owner cursor size))
     (t (logical-wire-text cursor size))))
+
+(defun logical-wire-received-binary-bytea (cursor size owner)
+  "Read a binary bytea as an owned bounded field or a small octet vector."
+  (make-logical-binary-bytea
+   :data (if (and owner (or (> size *logical-wire-field-spill-threshold*)
+                            (not (logical-wire-reserve-field owner size))))
+             (logical-wire-binary-field-capture owner cursor size)
+             (logical-wire-octets cursor size))))
 
 (defun logical-wire-field-visit (field output)
   "Verify FIELD and optionally write its decoded characters to OUTPUT."
@@ -347,6 +380,29 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
 
 (defstruct pg-client-bound-query sql parameters)
 
+(defstruct pg-client-select-query-metadata result-formats describe-p)
+
+(defvar *pg-client-select-query-metadata* (make-hash-table :test #'eq :weakness :key))
+
+(defvar *pg-client-select-query-metadata-lock* (sb-thread:make-mutex :name "client SELECT query metadata"))
+
+(defun pg-client-select-query-info (query)
+  (sb-thread:with-mutex (*pg-client-select-query-metadata-lock*)
+    (gethash query *pg-client-select-query-metadata*)))
+
+(defun pg-client-bound-query-result-formats (query)
+  (let ((info (pg-client-select-query-info query))) (and info (pg-client-select-query-metadata-result-formats info))))
+
+(defun pg-client-bound-query-describe-p (query)
+  (let ((info (pg-client-select-query-info query))) (and info (pg-client-select-query-metadata-describe-p info))))
+
+(defun make-pg-client-select-query (sql result-formats)
+  (let ((query (make-pg-client-bound-query :sql sql)))
+    (sb-thread:with-mutex (*pg-client-select-query-metadata-lock*)
+      (setf (gethash query *pg-client-select-query-metadata*)
+            (make-pg-client-select-query-metadata :result-formats result-formats :describe-p t)))
+    query))
+
 (defstruct pg-client-binary-parameter writer)
 
 (defun pg-client-bound-field-write (writer sink &optional (limit +max-query-message-size+))
@@ -374,11 +430,16 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
   (let* ((sql (pg-client-bound-query-sql query))
          (params (pg-client-bound-query-parameters query))
          (stream (pg-client-stream client))
+         (result-formats (pg-client-bound-query-result-formats query))
          (lengths nil) (checksums nil)
          (binary-p (some (lambda (param) (pg-client-binary-parameter-p (cdr param))) params))
-         (bind-length (+ 12 (* 4 (length params)) (if binary-p (* 2 (length params)) 0)))
+         (bind-length (+ 12 (* 4 (length params)) (if binary-p (* 2 (length params)) 0)
+                         (* 2 (length result-formats))))
          (started nil) (complete nil))
     (unless (<= (length params) #xffff) (error "too many bind parameters"))
+    (unless (and (<= (length result-formats) #xffff)
+                 (every (lambda (format) (member format '(0 1))) result-formats))
+      (error "invalid result formats"))
     (when (find (code-char 0) sql) (error "SQL query contains a null byte"))
     (let ((sql-size (loop for start from 0 below (length sql) by 4096
                           sum (length (string->bytes (subseq sql start (min (length sql) (+ start 4096))))))))
@@ -426,7 +487,10 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
                            (lambda (bytes) (write-sequence bytes stream)) size)
                         (unless (and (= actual size) (= checksum expected))
                           (error "Bind parameter changed while sending"))))
-             (write-sequence (u16-to-bytes 0) stream)
+             (write-sequence (u16-to-bytes (length result-formats)) stream)
+             (dolist (format result-formats) (write-sequence (u16-to-bytes format) stream))
+             (when (pg-client-bound-query-describe-p query)
+               (write-message stream #\D #(80 0)))
              (write-message stream #\E execute)
              (write-message stream #\S #())
              (setf complete t))
@@ -512,11 +576,14 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
         (setf position (+ next 6)) ; table OID and attribute number
         (let ((type-oid (bytes-to-u32 payload position))
               (typmod (logical-u32-signed
-                       (bytes-to-u32 payload (+ position 6)))))
+                       (bytes-to-u32 payload (+ position 6))))
+              (format (bytes-to-u16 payload (+ position 10))))
+          (unless (or (= format 0) (and (= format 1) (= type-oid 17)))
+            (error "unsupported RowDescription format"))
           (incf position 4)
           (incf position 8) ; typlen, typmod, format
-          (push (make-pg-client-column :name name :type-oid type-oid
-                                       :typmod typmod)
+          (push (make-pg-client-column-with-format :name name :type-oid type-oid
+                                                   :typmod typmod :format format)
                 columns))))
     (unless (= position (length payload))
       (error "RowDescription has trailing bytes"))
@@ -529,14 +596,16 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
     (unless (= count (length columns))
       (error "DataRow width does not match RowDescription"))
     (dotimes (i count)
-      (let ((size (bytes-to-u32 payload position)))
+      (let ((size (bytes-to-u32 payload position)) (column (pop columns)))
         (incf position 4)
         (if (= size #xFFFFFFFF)
             (push nil values)
             (progn
               (unless (<= (+ position size) (length payload))
                 (error "truncated DataRow value"))
-              (push (bytes->string payload :start position :end (+ position size))
+              (push (if (= (pg-client-column-format column) 1)
+                        (make-logical-binary-bytea :data (subseq payload position (+ position size)))
+                        (bytes->string payload :start position :end (+ position size)))
                     values)
               (incf position size)))))
     (unless (= position (length payload))
@@ -565,8 +634,10 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
                             (coerce (loop for column in columns
                                           for size = (logical-wire-uint cursor 4)
                                           collect (if (= size #xffffffff) nil
-                                                      (logical-wire-received-field cursor size field-owner
-                                                                                   (pg-client-column-type-oid column))))
+                                                      (if (= (pg-client-column-format column) 1)
+                                                          (logical-wire-received-binary-bytea cursor size field-owner)
+                                                          (logical-wire-received-field cursor size field-owner
+                                                                                       (pg-client-column-type-oid column)))))
                                     'vector)))
                         (logical-wire-octets cursor (logical-wire-cursor-remaining cursor)))))
              (unless (zerop (logical-wire-cursor-remaining cursor))

@@ -1840,18 +1840,43 @@ for another left row.  LEFT joins null-extend only after that input is exhausted
         (unless (= count (logical-utf8-size out)) (error "invalid DataRow field count"))
         (values count checksum)))))
 
+(defvar *select-result-formats* nil
+  "Optional per-column PostgreSQL result format codes for SELECT rows.")
+
+(defvar *select-suppress-description* nil)
+
+(defvar *select-expected-result-columns* nil)
+
+(defun select-row-binary-bytea-write (value sink &optional (limit #x7fffffff))
+  "Count, checksum and optionally emit a bytea value in bounded blocks."
+  (check-type value (vector (unsigned-byte 8)))
+  (multiple-value-bind (counting metrics) (logical-encoding-sink limit)
+    (loop for start from 0 below (length value) by 65536
+          for part = (subseq value start (min (length value) (+ start 65536)))
+          do (funcall counting part) (when sink (funcall sink part)))
+    (funcall metrics)))
+
 (defun send-select-data-row (stream values targets)
-  "Preflight every field, then write one bounded text DataRow."
+  "Preflight every field, then write one bounded DataRow."
   (unless (and (= (length values) (length targets)) (<= (length targets) #xffff))
     (error "invalid DataRow width"))
   (let ((fields nil) (size (+ 6 (* 4 (length targets)))))
-    (loop for value across values for target in targets
-          for writer = (select-row-field-writer value (getf target :type))
-          do (multiple-value-bind (length checksum)
-                 (if writer (select-row-utf8-write writer nil) (values nil nil))
+    (when (and *select-result-formats* (/= (length *select-result-formats*) (length targets)))
+      (error "DataRow result format count mismatch"))
+    (loop for value across values for target in targets for index from 0
+          for format = (if *select-result-formats* (aref *select-result-formats* index) 0)
+          for binary = (= format 1)
+          for writer = (if (and binary (not (eq value +null+))) value
+                           (select-row-field-writer value (getf target :type)))
+          do (unless (or (= format 0) (and binary (eq (getf target :type) :bytea)))
+               (error "unsupported DataRow result format"))
+             (multiple-value-bind (length checksum)
+                 (cond ((null writer) (values nil nil))
+                       (binary (select-row-binary-bytea-write writer nil))
+                       (t (select-row-utf8-write writer nil)))
                (when (and length (> length #x7fffffff)) (error "DataRow field too large"))
                (when length (incf size length))
-               (push (list writer length checksum) fields)))
+               (push (list writer length checksum binary) fields)))
     (when (> size #x7fffffff) (error "DataRow frame too large"))
     (let ((complete nil) (last-byte nil))
       (labels ((emit (octets)
@@ -1867,11 +1892,12 @@ for another left row.  LEFT joins null-extend only after that input is exhausted
                  (emit (u32-to-bytes size))
                  (emit (u16-to-bytes (length targets)))
                  (dolist (field (nreverse fields))
-                   (destructuring-bind (writer length checksum) field
+                   (destructuring-bind (writer length checksum binary) field
                      (emit (u32-to-bytes (if writer length #xffffffff)))
                      (when writer
                        (multiple-value-bind (actual actual-checksum)
-                           (select-row-utf8-write writer #'emit length)
+                           (if binary (select-row-binary-bytea-write writer #'emit length)
+                               (select-row-utf8-write writer #'emit length))
                          (unless (and (= length actual) (= checksum actual-checksum))
                            (error "DataRow field changed during output"))))))
                  (unless last-byte (error "empty DataRow frame"))
