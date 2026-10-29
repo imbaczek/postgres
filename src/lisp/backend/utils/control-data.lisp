@@ -76,6 +76,9 @@ published clean state."
     (native-control-test-point :after-primary-shutdown-dirty)
     (postmaster-retire-abandoned-backends)
     (wal-checkpoint)
+    (sb-thread:with-mutex (*wal-lock*)
+      (when *wal-slot-recycling-pending*
+        (error "primary shutdown left an active replication slot owner")))
     (native-control-test-point :after-primary-shutdown-checkpoint)
     (wal-set-primary-state +db-shutdowned+)
     (native-control-test-point :after-primary-shutdown-clean))

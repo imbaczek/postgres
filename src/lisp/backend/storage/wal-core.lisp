@@ -56,6 +56,10 @@ MAX-WAL-BYTES sets the normal WAL window used by catalog status."
 (defvar *wal-replication-slot-loss-collector* nil
   "Dynamically bound list receiving durably invalidated slots during WAL maintenance.")
 
+(defvar *wal-slot-recycling-pending* nil)
+
+(declaim (ftype function wal-capture-slot-recycling-work))
+
 (declaim (ftype function cleanup-invalidated-logical-replication-state))
 
 (defstruct wal-record
@@ -2851,32 +2855,32 @@ Refresh its modification time. Update memory only after atomic publication."
 
 (declaim (ftype function wal-prepare-slot-recycling-under-lock))
 
-(defun wal-remove-checkpointed-segments-under-wal-lock (checkpoint-lsn)
-  "Recycle a contiguous WAL prefix after applying retention constraints.
+(defun wal-checkpoint-recycling-segment (checkpoint-lsn)
+  (if (zerop checkpoint-lsn) 0 (floor (1- checkpoint-lsn) +wal-segment-size+)))
 
-The caller holds *WAL-LOCK*; the checkpoint path also holds *WRITE-LOCK* to
-protect snapshot boundaries. The XID map is read under *XID-LOCK*. Independent
-XID and snapshot floors constrain removal alongside slot floors. The selected
-standard policy invalidates slots behind the C-style removal horizon; the native
-policy instead tests the exact byte cap before recycling."
-  (let* ((checkpoint-segment (if (zerop checkpoint-lsn) 0
-                                 (floor (1- checkpoint-lsn) +wal-segment-size+)))
-         (keep-segment (wal-prepare-slot-recycling-under-lock checkpoint-segment))
-         (removed nil))
-    (dolist (segment (wal-discover-segments))
-      (when (< segment keep-segment)
-        (when (and *wal-output-stream*
-                   (eql segment *wal-output-segment*))
-          (close *wal-output-stream*)
-          (setf *wal-output-stream* nil *wal-output-segment* nil))
-        ;; Delete only a contiguous prefix. Continuing after a failed unlink
-        ;; could leave a hole before a retained segment and block startup.
-        (handler-case
-            (progn
-              (delete-file (wal-segment-path segment))
-              (setf removed t))
-          (file-error () (return)))))
-    (when removed (fsync-directory (wal-directory))))
+(defun wal-remove-checkpointed-segments-under-wal-lock (checkpoint-lsn &optional (current *wal-durable-lsn*))
+  (let ((checkpoint-segment (wal-checkpoint-recycling-segment checkpoint-lsn)))
+    (multiple-value-bind (keep-segment requests)
+        (wal-prepare-slot-recycling-under-lock checkpoint-segment current)
+      (when requests
+        (setf *wal-slot-recycling-pending*
+              (wal-capture-slot-recycling-work checkpoint-lsn current requests))
+        (return-from wal-remove-checkpointed-segments-under-wal-lock
+          (values nil requests)))
+      (logical-test-failpoint :before-slot-wal-removal keep-segment)
+      (setf *wal-slot-recycling-pending* nil)
+      (let ((removed nil))
+        (dolist (segment (wal-discover-segments))
+          (when (< segment keep-segment)
+            (when (and *wal-output-stream* (eql segment *wal-output-segment*))
+              (close *wal-output-stream*)
+              (setf *wal-output-stream* nil *wal-output-segment* nil))
+            (handler-case
+                (progn
+                  (delete-file (wal-segment-path segment))
+                  (setf removed t))
+              (file-error () (return)))))
+        (when removed (fsync-directory (wal-directory))))))
   (values))
 
 (defun wal-log-clog-reset ()

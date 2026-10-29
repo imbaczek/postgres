@@ -627,9 +627,12 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
        (malformed-protocol-message "unsupported frontend message type")))))
 
 (defun dispatch-frontend-frame (stream type-byte length-bytes payload)
-  (let ((*extended-query-state*
-          (or *extended-query-state* (extended-query-state-for-backend *backend*))))
-    (%dispatch-frontend-frame stream type-byte length-bytes payload)))
+  (let* ((*extended-query-state*
+           (or *extended-query-state* (extended-query-state-for-backend *backend*)))
+         (results (multiple-value-list
+                   (%dispatch-frontend-frame stream type-byte length-bytes payload))))
+    (unless (eq (first results) :terminate) (wal-finish-pending-slot-recycling))
+    (values-list results)))
 
 ;;; ---- backend loop ----
 

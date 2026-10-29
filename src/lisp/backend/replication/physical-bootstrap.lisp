@@ -221,9 +221,9 @@ duration. It is not the final online base-backup protocol."
     (error "physical base backup must start outside a live operation"))
   (unless (wal-valid-replication-slot-name-p pin-name)
     (error "invalid physical base backup pin name"))
-  (sb-thread:with-mutex (*reload-run-lock*)
-    (call-with-invalidated-slot-cleanup
-     (lambda ()
+  (call-with-invalidated-slot-cleanup
+   (lambda ()
+     (sb-thread:with-mutex (*reload-run-lock*)
        (with-live-operation-quiescence
          (physical-bootstrap-copy-under-quiescence
           (physical-bootstrap-target directory) pin-name))))))

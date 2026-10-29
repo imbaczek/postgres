@@ -1,5 +1,8 @@
 """Public physical-slot contract shared by native and pinned C peers."""
 import argparse
+import os
+import signal
+import threading
 import time
 
 import psycopg2
@@ -147,6 +150,82 @@ def exercise_temporary_slot_loss(connection, prefix, switch_wal=False):
         wait_absent(connection, name)
 
 
+def exercise_active_owner_oracle(connection, prefix):
+    """Freeze this C peer's sender and observe CHECKPOINT waiting for release."""
+    from psycopg2.extras import PhysicalReplicationConnection
+
+    name = prefix + "_active_owner"
+    sender = None
+    sender_fd = None
+    sender_stopped = False
+    checkpoint = None
+    finished = threading.Event()
+    errors = []
+
+    def checkpoint_query():
+        try:
+            with psycopg2.connect(connection.dsn) as check_connection:
+                check_connection.autocommit = True
+                query(check_connection, "CHECKPOINT")
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    def parent_pid(pid):
+        with open(f"/proc/{pid}/stat", encoding="ascii") as stat:
+            return int(stat.read().rsplit(")", 1)[1].split()[1])
+
+    try:
+        query(connection, "CHECKPOINT")
+        restart = query(connection, "SELECT lsn FROM pg_create_physical_replication_slot(%s,true)", (name,))[0][0]
+        sender = psycopg2.connect(connection.dsn, connection_factory=PhysicalReplicationConnection)
+        sender.cursor().start_replication(slot_name=name, start_lsn=restart)
+        sender_pid = sender.get_backend_pid()
+        assert query(connection, "SELECT active_pid FROM pg_replication_slots WHERE slot_name=%s", (name,)) == [(sender_pid,)]
+        sender_fd = os.pidfd_open(sender_pid)
+        assert os.stat(f"/proc/{sender_pid}").st_uid == os.geteuid()
+        assert parent_pid(sender_pid) == parent_pid(connection.get_backend_pid())
+        signal.pidfd_send_signal(sender_fd, signal.SIGSTOP)
+        sender_stopped = True
+        for step in range(2):
+            query(connection, "SELECT pg_create_restore_point(%s)", (f"active_owner_{step}",))
+            query(connection, "SELECT pg_switch_wal()")
+        checkpoint = threading.Thread(target=checkpoint_query, name="C active-slot checkpoint")
+        checkpoint.start()
+        deadline = time.monotonic() + 10
+        while not query(connection, "SELECT pid FROM pg_stat_activity WHERE backend_type='checkpointer' "
+                        "AND wait_event='ReplicationSlotDrop'"):
+            assert not finished.is_set(), errors
+            assert time.monotonic() < deadline, "checkpoint did not wait for the stopped slot owner"
+            time.sleep(0.02)
+        assert query(connection, "SELECT active_pid,restart_lsn IS NOT NULL,invalidation_reason "
+                     "FROM pg_replication_slots WHERE slot_name=%s", (name,)) == [(sender_pid, True, None)]
+        assert not finished.wait(5.2), ("checkpoint returned while the sender was stopped", errors)
+        signal.pidfd_send_signal(sender_fd, signal.SIGCONT)
+        sender_stopped = False
+        assert finished.wait(10), "checkpoint did not finish after sender release"
+        checkpoint.join()
+        assert not errors, errors
+        assert query(connection, "SELECT active,restart_lsn,wal_status,invalidation_reason "
+                     "FROM pg_replication_slots WHERE slot_name=%s", (name,)) == [(False, None, "lost", "wal_removed")]
+        print("physical-slots: C CHECKPOINT waits beyond five seconds for active sender release before loss PASS", flush=True)
+    finally:
+        if sender_fd is not None:
+            try:
+                if sender_stopped:
+                    signal.pidfd_send_signal(sender_fd, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+            os.close(sender_fd)
+        if sender is not None:
+            sender.close()
+        if checkpoint is not None:
+            checkpoint.join(timeout=10)
+        if query(connection, "SELECT slot_name FROM pg_replication_slots WHERE slot_name=%s", (name,)):
+            query(connection, "SELECT pg_drop_replication_slot(%s)", (name,))
+
+
 def exercise_retention_oracle(connection, prefix):
     """Check the pinned C oracle on a dedicated 16 MB-segment peer with a 1 MB cap."""
     assert query(connection, "SELECT current_setting('max_slot_wal_keep_size'),"
@@ -182,6 +261,7 @@ def exercise_retention_oracle(connection, prefix):
                          (None, "lost", None, "wal_removed")]
         print("physical-slots: C subsegment-cap, exact-boundary, negative-safe-size and checkpoint loss PASS", observations, flush=True)
         exercise_temporary_slot_loss(connection, prefix, switch_wal=True)
+        exercise_active_owner_oracle(connection, prefix)
     finally:
         if query(connection, "SELECT slot_name FROM pg_catalog.pg_replication_slots WHERE slot_name=%s", (name,)):
             query(connection, "SELECT pg_catalog.pg_drop_replication_slot(%s)", (name,))

@@ -7,6 +7,8 @@
           (pg::*physical-recovery-state* nil)
           (pg::*physical-recovery-failed-p* nil)
           (pg::*wal-replication-slots* (make-hash-table :test #'equal))
+          (pg::*wal-slot-recycling-pending* nil)
+          (pg::*wal-slot-recycling-termination-requests* (make-hash-table :test #'eq))
           (pg::*max-replication-slots* 10)
           (pg::*wal-slot-retention-policy* nil)
           (pg::*logical-capture-live-slots* 0)
@@ -23,6 +25,25 @@
 (defun physical-slot-test-analyze-call (sql)
   (pg::analyze-expr
    (getf (first (getf (first (pg::parse-statements sql)) :targets)) :expr) nil))
+
+(cl-spec:defproperty checkpoint-recycling-keeps-the-segment-containing-the-last-byte
+    ((segment (range integer 0 #xfffffffffe))
+     (edge (range integer 0 3)))
+  (:about pg::wal-checkpoint-recycling-segment)
+  (:trials (:normal 200))
+  (let* ((size pg::+wal-segment-size+)
+         (lsn (+ (* segment size)
+                 (case edge (0 0) (1 1) (2 (1- size)) (3 size))))
+         (result (pg::wal-checkpoint-recycling-segment lsn)))
+    (if (zerop lsn)
+        (zerop result)
+        (<= (* result size) (1- lsn) (1- (* (1+ result) size))))))
+
+(deftest generated-checkpoint-recycling-boundaries
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property
+                  'checkpoint-recycling-keeps-the-segment-containing-the-last-byte :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
 (deftest slot-retention-policy-follows-standard-and-native-configuration-provenance
     (with-physical-store-directory (root)
@@ -67,6 +88,616 @@
          (ok (not (probe-file (pg::wal-segment-path 0))))
          (ok (eq :lost (pg::wal-replication-slot-wal-status
                         (pg::wal-read-replication-slot (pg::wal-replication-slot-path "public_physical")))))))))
+
+(deftest standard-slot-recycling-keeps-active-owners-reserved
+    (dolist (backend-present '(nil t))
+      (call-with-physical-slot-api-fixture
+       (lambda (root)
+         (declare (ignore root))
+         (let* ((size pg::+wal-segment-size+)
+                (pg::*wal-durable-lsn* (+ (* 4 size) 32))
+                (pg::*wal-slot-retention-policy*
+                  (pg::make-wal-slot-retention-policy :mode :segments :limit 0))
+                (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+                (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+                (pg::*wal-output-stream* nil)
+                (pg::*wal-output-segment* nil)
+                (owner (gensym "ACTIVE-PHYSICAL-"))
+                (backend (when backend-present pg::*backend*))
+                (slot (physical-slot-test-object :restart 1)))
+           (pg::wal-ensure-directory-durable (pg::wal-directory))
+           (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
+           (pg::wal-atomic-write-bytes (pg::wal-segment-path 0) #(0))
+           (setf (pg::wal-replication-slot-active-owner slot) owner
+                 (pg::wal-replication-slot-active-owner-backend slot) backend
+                 (gethash "public_physical" pg::*wal-replication-slots*) slot)
+           (pg::wal-save-replication-slot slot)
+           (sb-thread:with-mutex (pg::*wal-lock*)
+             (pg::wal-remove-checkpointed-segments-under-wal-lock (+ size 32)))
+           (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+           (ok (eq owner (pg::wal-replication-slot-active-owner slot)))
+           (ok (eq backend (pg::wal-replication-slot-active-owner-backend slot)))
+           (ok (probe-file (pg::wal-segment-path 0)))
+           (ok (eq :reserved
+                   (pg::wal-replication-slot-wal-status
+                    (pg::wal-read-replication-slot
+                     (pg::wal-replication-slot-path "public_physical"))))))))))
+
+(deftest standard-slot-recycling-returns-the-exact-owner-for-unlocked-work
+    (call-with-physical-slot-api-fixture
+     (lambda (root)
+       (declare (ignore root))
+       (let* ((size pg::+wal-segment-size+)
+              (pg::*wal-durable-lsn* (+ (* 4 size) 32))
+              (pg::*wal-slot-retention-policy*
+                (pg::make-wal-slot-retention-policy :mode :segments :limit 0))
+              (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+              (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+              (slot (physical-slot-test-object :restart 1))
+              (owner (gensym "ACTIVE-PHYSICAL-")))
+         (setf (pg::wal-replication-slot-active-owner slot) owner
+               (pg::wal-replication-slot-active-owner-backend slot) pg::*backend*
+               (gethash "public_physical" pg::*wal-replication-slots*) slot)
+         (sb-thread:with-mutex (pg::*wal-lock*)
+           (multiple-value-bind (floor requests)
+               (pg::wal-prepare-slot-recycling-under-lock 1)
+             (ok (= 1 floor))
+             (ok (equal (list (list slot owner pg::*backend*)) requests))
+             (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))))))))
+
+(defun call-with-active-slot-recycling-fixture (function)
+  (call-with-physical-slot-api-fixture
+   (lambda (root)
+     (declare (ignore root))
+     (let* ((size pg::+wal-segment-size+)
+            (checkpoint (+ (* 4 size) 32))
+            (pg::*wal-checkpoint-lsn* checkpoint)
+            (pg::*wal-ready* t) (pg::*wal-poisoned* nil)
+            (pg::*wal-durable-lsn* checkpoint)
+            (pg::*wal-control-metadata* nil)
+            (pg::*wal-slot-retention-policy*
+              (pg::make-wal-slot-retention-policy :mode :segments :limit size))
+            (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+            (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+            (pg::*wal-output-stream* nil) (pg::*wal-output-segment* nil)
+            (owner (gensym "ACTIVE-PHYSICAL-"))
+            (backend pg::*backend*)
+            (slot (physical-slot-test-object :restart 1)))
+       (pg::wal-ensure-directory-durable (pg::wal-directory))
+       (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
+       (dolist (segment '(0 1 2 3))
+         (pg::wal-atomic-write-bytes (pg::wal-segment-path segment) #(0)))
+       (setf (pg::wal-replication-slot-active-owner slot) owner
+             (pg::wal-replication-slot-active-owner-backend slot) backend
+             (gethash "public_physical" pg::*wal-replication-slots*) slot)
+       (pg::wal-save-replication-slot slot)
+       (funcall function slot owner backend checkpoint)))))
+
+(deftest standard-slot-recycling-preserves-pending-work-until-owner-release
+    (call-with-active-slot-recycling-fixture
+     (lambda (slot owner backend checkpoint)
+       (let* ((requests 0)
+              (pg::*backend* nil)
+              (pg::*logical-test-invalidated-backend-hook*
+                (lambda (target) (ok (eq backend target)) (incf requests))))
+         (pg::wal-remove-checkpointed-segments checkpoint)
+         (ok (= 1 requests))
+         (ok pg::*wal-slot-recycling-pending*)
+         (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+         (ok (probe-file (pg::wal-segment-path 0)))
+         (pg::wal-finish-pending-slot-recycling)
+         (ok (= 1 requests))
+         (ok pg::*wal-slot-recycling-pending*)
+         (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+         (pg::wal-release-replication-slot-owner "public_physical" owner)
+         (pg::wal-finish-pending-slot-recycling)
+         (ok (= checkpoint pg::*wal-checkpoint-lsn*))
+         (ok (null pg::*wal-slot-recycling-pending*))
+         (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))
+         (ok (not (probe-file (pg::wal-segment-path 0))))))))
+
+(deftest standard-slot-recycling-freezes-the-retention-endpoint
+    (call-with-active-slot-recycling-fixture
+     (lambda (slot owner backend checkpoint)
+       (let ((pg::*backend* nil)
+             (pg::*logical-test-invalidated-backend-hook*
+               (lambda (target)
+                 (ok (eq backend target))
+                 (sb-thread:with-mutex (pg::*wal-lock*)
+                   (setf pg::*wal-durable-lsn* (* 20 pg::+wal-segment-size+)
+                         (pg::wal-replication-slot-restart-lsn slot) (* 3 pg::+wal-segment-size+))
+                   (pg::wal-save-replication-slot slot))
+                 (pg::wal-release-replication-slot-owner "public_physical" owner))))
+         (pg::wal-remove-checkpointed-segments checkpoint)
+         (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+         (ok (null pg::*wal-slot-recycling-pending*))
+         (ok (not (probe-file (pg::wal-segment-path 0))))
+         (ok (probe-file (pg::wal-segment-path 3)))
+         (ok (= checkpoint pg::*wal-checkpoint-lsn*))))))
+
+(deftest standard-slot-recycling-revalidates-before-signaling
+    (dolist (change '(:owner :generation :catchup :policy :native-policy :control-system :recovery :failed :checkpoint :registry :timeline :namespace :root))
+      (call-with-active-slot-recycling-fixture
+       (lambda (slot owner backend checkpoint)
+         (declare (ignore owner backend))
+         (let* ((requests 0)
+                (replacement nil)
+                (pg::*backend* nil)
+                (pg::*logical-test-invalidated-backend-hook*
+                  (lambda (target) (declare (ignore target)) (incf requests)))
+                (pg::*logical-test-failpoint-hook*
+                  (lambda (point &rest details)
+                    (declare (ignore details))
+                    (when (eq point :before-recycling-owner-termination-claim)
+                      (ecase change
+                        (:owner (setf (pg::wal-replication-slot-active-owner slot) (gensym "NEW-OWNER-")))
+                        (:generation
+                         (setf replacement (pg::copy-wal-replication-slot slot)
+                               (gethash "public_physical" pg::*wal-replication-slots*) replacement))
+                        (:catchup
+                         (setf (pg::wal-replication-slot-restart-lsn slot) (* 3 pg::+wal-segment-size+)))
+                        (:policy
+                         (setf pg::*wal-slot-retention-policy*
+                               (pg::make-wal-slot-retention-policy :mode :segments :limit nil)))
+                        (:native-policy
+                         (setf pg::*wal-slot-retention-policy*
+                               (pg::make-wal-slot-retention-policy :mode :bytes :limit 0)))
+                        (:control-system (setf pg::*wal-control-metadata* (list :system-id 999)))
+                        (:recovery (setf pg::*physical-recovery-state* (list :phase 2)))
+                        (:failed (setf pg::*physical-recovery-failed-p* t))
+                        (:checkpoint (incf pg::*wal-checkpoint-lsn*))
+                        (:registry (setf pg::*wal-replication-slots* (make-hash-table :test #'equal)))
+                        (:timeline (incf pg::*wal-insert-timeline*))
+                        (:namespace (setf pg::*wal-segment-namespace* :timeline))
+                        (:root (setf pg::*wal-control-metadata* (list :retained-reference '(1 2 3)))))))))
+           (pg::wal-remove-checkpointed-segments checkpoint)
+           (ok (zerop requests))
+           (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+           (when replacement
+             (ok (eq :reserved (pg::wal-replication-slot-wal-status replacement))))
+           (when (member change '(:owner :generation :native-policy :control-system :recovery :failed :checkpoint :registry :timeline :namespace :root))
+             (let ((pg::*wal-insert-timeline* 1) (pg::*wal-segment-namespace* :legacy))
+               (ok (probe-file (pg::wal-segment-path 0))))))))))
+
+(deftest standard-slot-recycling-defers-inherited-resources
+    (dolist (scope '(:schema-read :schema-write :transaction-schema :reload))
+      (call-with-active-slot-recycling-fixture
+       (lambda (slot owner backend checkpoint)
+         (let* ((requests 0)
+                (pg::*logical-test-invalidated-backend-hook*
+                  (lambda (target)
+                    (ok (eq backend target))
+                    (incf requests)
+                    (pg::wal-release-replication-slot-owner "public_physical" owner))))
+           (flet ((collect ()
+                    (pg::wal-remove-checkpointed-segments checkpoint)
+                    (ok (zerop requests))
+                    (ok pg::*wal-slot-recycling-pending*)
+                    (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+                    (ok (probe-file (pg::wal-segment-path 0)))))
+             (ecase scope
+               (:schema-read (let ((pg::*schema-read-lock-held* t)) (collect)))
+               (:schema-write (let ((pg::*schema-write-lock-held* t)) (collect)))
+               (:transaction-schema
+                (setf (pg::backend-transaction-schema-read-lock-held-p backend) t)
+                (unwind-protect (collect)
+                  (setf (pg::backend-transaction-schema-read-lock-held-p backend) nil)))
+               (:reload (sb-thread:with-mutex (pg::*reload-run-lock*) (collect)))))
+           (let ((pg::*backend* nil))
+             (pg::wal-finish-pending-slot-recycling))
+           (ok (= 1 requests))
+           (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))
+           (ok (null pg::*wal-slot-recycling-pending*)))))))
+
+(deftest standard-slot-recycling-self-owner-is-fatal-before-durable-loss
+    (call-with-physical-slot-api-fixture
+     (lambda (root)
+       (declare (ignore root))
+       (let* ((size pg::+wal-segment-size+)
+              (checkpoint (+ size 32))
+              (pg::*wal-checkpoint-lsn* checkpoint)
+              (pg::*wal-ready* t) (pg::*wal-poisoned* nil)
+              (pg::*wal-durable-lsn* (+ (* 4 size) 32))
+              (pg::*wal-slot-retention-policy*
+                (pg::make-wal-slot-retention-policy :mode :segments :limit 0))
+              (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+              (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+              (pg::*wal-output-stream* nil) (pg::*wal-output-segment* nil)
+              (backend pg::*backend*)
+              (slot (pg::wal-create-physical-replication-slot "self_temporary" :temporary t))
+              (fatal nil))
+         (pg::wal-ensure-directory-durable (pg::wal-directory))
+         (pg::wal-atomic-write-bytes (pg::wal-segment-path 0) #(0))
+         (setf (pg::wal-replication-slot-restart-lsn slot) 1
+               (pg::wal-replication-slot-restart-timeline slot) 1)
+         (pg::wal-save-replication-slot slot)
+         (handler-case (pg::wal-remove-checkpointed-segments checkpoint)
+           (pg::pg-error (condition) (setf fatal (pg::fatal-error-p condition))))
+         (ok fatal)
+         (ok pg::*wal-slot-recycling-pending*)
+         (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+         (ok (eq backend (pg::wal-replication-slot-active-owner slot)))
+         (ok (probe-file (pg::wal-segment-path 0)))
+         (ok (eq :reserved
+                 (pg::wal-replication-slot-wal-status
+                  (pg::wal-read-replication-slot
+                   (pg::wal-replication-slot-path "self_temporary")))))
+         (pg::wal-cleanup-backend-physical-slots backend)
+         (let ((pg::*backend* nil))
+           (pg::wal-finish-pending-slot-recycling))
+         (ok (null (gethash "self_temporary" pg::*wal-replication-slots*)))
+         (ok (null pg::*wal-slot-recycling-pending*))
+         (ok (not (probe-file (pg::wal-segment-path 0))))))))
+
+(deftest standard-slot-recycling-nonwaiting-pass-does-not-park-or-remove-active-wal
+    (call-with-active-slot-recycling-fixture
+     (lambda (slot owner backend checkpoint)
+       (let* ((release (sb-thread:make-semaphore :count 0))
+              (thread (sb-thread:make-thread (lambda () (sb-thread:wait-on-semaphore release))
+                                             :name "slot recycling timeout owner"))
+              (requests 0) (parks 0)
+              (pg::*backend* nil)
+              (pg::*wal-slot-owner-wait-seconds* 0.01)
+              (pg::*logical-test-invalidated-backend-hook*
+                (lambda (target) (ok (eq backend target)) (incf requests)))
+              (pg::*live-operation-parking-test-hook*
+                (lambda (point token)
+                  (declare (ignore token))
+                  (when (eq point :after-park)
+                    (incf parks)
+                    (ok pg::*live-operation-parked-p*)
+                    (ok (zerop pg::*live-operation-depth*))
+                    (ok (not (sb-thread:holding-mutex-p pg::*wal-lock*)))
+                    (ok (not (sb-thread:holding-mutex-p pg::*write-lock*)))))))
+         (setf (pg::backend-thread backend) thread)
+         (unwind-protect
+              (progn
+                (pg::wal-remove-checkpointed-segments checkpoint :wait nil)
+                (ok (= 1 requests))
+                (ok (zerop parks))
+                (ok pg::*wal-slot-recycling-pending*)
+                (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+                (ok (probe-file (pg::wal-segment-path 0)))
+                (ok (sb-thread:thread-alive-p thread))
+                (pg::wal-finish-pending-slot-recycling)
+                (ok (= 1 requests))
+                (ok (zerop parks))
+                (ok (zerop (pg::live-operation-parked-count))))
+           (sb-thread:signal-semaphore release)
+           (sb-thread:join-thread thread :timeout 2))
+         (pg::wal-release-replication-slot-owner "public_physical" owner)
+         (pg::wal-finish-pending-slot-recycling)
+         (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))
+         (ok (null pg::*wal-slot-recycling-pending*))))))
+
+(deftest standard-slot-recycling-cancellation-retains-discoverable-work
+    (call-with-active-slot-recycling-fixture
+     (lambda (slot owner backend checkpoint)
+       (let* ((requests 0) (cancelled nil)
+                           (pg::*backend* nil)
+                           (pg::*logical-test-invalidated-backend-hook*
+                             (lambda (target) (ok (eq backend target)) (incf requests)))
+                           (pg::*live-operation-parking-test-hook*
+                             (lambda (point token)
+                               (declare (ignore token))
+                               (when (eq point :after-park)
+                                 (pg::ereport "57014" "cancel recycling wait")))))
+         (handler-case (pg::wal-remove-checkpointed-segments checkpoint)
+           (pg::pg-error (condition) (setf cancelled (string= "57014" (pg::pg-error-sqlstate condition)))))
+         (ok cancelled)
+         (ok (= 1 requests))
+         (ok pg::*wal-slot-recycling-pending*)
+         (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+         (ok (probe-file (pg::wal-segment-path 0)))
+         (ok (zerop (pg::live-operation-parked-count)))
+         (pg::wal-release-replication-slot-owner "public_physical" owner)
+         (let ((pg::*live-operation-parking-test-hook* nil))
+           (pg::wal-finish-pending-slot-recycling))
+         (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))
+         (ok (null pg::*wal-slot-recycling-pending*))
+         (ok (= 1 requests))))))
+
+(deftest standard-slot-recycling-does-not-resume-after-shutdown
+    (call-with-active-slot-recycling-fixture
+     (lambda (slot owner backend checkpoint)
+       (let* ((pg::*shutdown* pg::+no-shutdown+)
+              (pg::*backend* nil)
+              (pg::*logical-test-invalidated-backend-hook*
+                (lambda (target)
+                  (ok (eq backend target))
+                  (pg::wal-release-replication-slot-owner "public_physical" owner)
+                  (setf pg::*shutdown* pg::+fast-shutdown+))))
+         (pg::wal-remove-checkpointed-segments checkpoint)
+         (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+         (ok pg::*wal-slot-recycling-pending*)
+         (ok (probe-file (pg::wal-segment-path 0)))))))
+
+(deftest standard-slot-checkpoint-waits-across-timeouts-without-repeating-core
+    (call-with-active-slot-recycling-fixture
+     (lambda (slot owner backend checkpoint)
+       (let* ((release (sb-thread:make-semaphore :count 0))
+              (slots pg::*wal-replication-slots*)
+              (claims pg::*logical-slot-owner-termination-requests*)
+              (thread
+                (sb-thread:make-thread
+                 (lambda ()
+                   (sb-thread:wait-on-semaphore release)
+                   (let ((pg::*wal-replication-slots* slots)
+                         (pg::*logical-slot-owner-termination-requests* claims))
+                     (pg::with-live-operation
+                       (pg::wal-release-replication-slot-owner "public_physical" owner))))
+                 :name "slot owner released during checkpoint"))
+              (original-core (symbol-function 'pg::wal-checkpoint-core))
+              (core-calls 0) (requests 0) (parks 0)
+              (pg::*backend* nil)
+              (pg::*wal-slot-owner-wait-seconds* 0.01)
+              (pg::*logical-test-invalidated-backend-hook*
+                (lambda (target) (ok (eq backend target)) (incf requests)))
+              (pg::*live-operation-parking-test-hook*
+                (lambda (point token)
+                  (declare (ignore token))
+                  (when (eq point :after-park)
+                    (incf parks)
+                    (when (= 2 parks) (sb-thread:signal-semaphore release))))))
+         (setf (pg::backend-thread backend) thread)
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::wal-checkpoint-core)
+                      (lambda ()
+                        (incf core-calls)
+                        (pg::with-write-lock
+                          (pg::with-wal-critical
+                            (pg::wal-remove-checkpointed-segments-under-wal-lock checkpoint)))))
+                (pg::wal-checkpoint)
+                (ok (= 1 core-calls))
+                (ok (= 1 requests))
+                (ok (>= parks 2))
+                (ok (not (sb-thread:thread-alive-p thread)))
+                (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))
+                (ok (null pg::*wal-slot-recycling-pending*))
+                (ok (not (probe-file (pg::wal-segment-path 0))))
+                (ok (zerop (pg::live-operation-parked-count))))
+           (setf (symbol-function 'pg::wal-checkpoint-core) original-core)
+           (sb-thread:signal-semaphore release)
+           (sb-thread:join-thread thread :timeout 2))))))
+
+(deftest standard-slot-recycling-wait-allows-reload-to-defer-and-retry
+    (call-with-active-slot-recycling-fixture
+     (lambda (slot owner backend checkpoint)
+       (declare (ignore backend))
+       (let* ((reloads 0) (attempts 0)
+                          (pg::*backend* nil)
+                          (pg::*logical-test-invalidated-backend-hook* (lambda (target) (declare (ignore target))))
+                          (pg::*live-operation-parking-test-hook*
+                            (lambda (point token)
+                              (declare (ignore token))
+                              (when (eq point :after-park)
+                                (let ((thread
+                                        (sb-thread:make-thread
+                                         (lambda ()
+                                           (multiple-value-bind (finished values generation)
+                                               (pg::try-call-with-live-operation-reload
+                                                (lambda () (incf reloads)))
+                                             (declare (ignore values))
+                                             (ok (not finished))
+                                             (ok generation)
+                                             (incf attempts)))
+                                         :name "reload defers around parked slot recycling")))
+                                  (sb-thread:join-thread thread :timeout 2))))))
+         (pg::wal-remove-checkpointed-segments checkpoint)
+         (ok (= 1 attempts))
+         (ok (zerop reloads))
+         (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+         (ok (probe-file (pg::wal-segment-path 0)))
+         (ok (zerop (pg::live-operation-parked-count)))
+         (pg::call-with-live-operation-reload (lambda () (incf reloads)))
+         (ok (= 1 reloads))
+         (pg::wal-release-replication-slot-owner "public_physical" owner)
+         (let ((pg::*live-operation-parking-test-hook* nil))
+           (pg::wal-finish-pending-slot-recycling))
+         (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))))))
+
+(deftest standard-slot-recycling-drains-after-frontend-resource-scopes
+    (call-with-active-slot-recycling-fixture
+     (lambda (slot owner backend checkpoint)
+       (let* ((original (symbol-function 'pg::%dispatch-frontend-frame))
+              (requests 0)
+              (owner-backend (pg::make-backend :pid 4321))
+              (pg::*logical-test-invalidated-backend-hook*
+                (lambda (target)
+                  (ok (eq target owner-backend))
+                  (ok (not (pg::backend-holds-schema-read-lock-p)))
+                  (incf requests)
+                  (pg::wal-release-replication-slot-owner "public_physical" owner))))
+         (setf (pg::backend-transaction-schema-read-lock-held-p backend) t
+               (pg::wal-replication-slot-active-owner-backend slot) owner-backend)
+         (unwind-protect
+              (progn
+                (pg::wal-remove-checkpointed-segments checkpoint)
+                (ok (zerop requests))
+                (ok pg::*wal-slot-recycling-pending*)
+                (setf (symbol-function 'pg::%dispatch-frontend-frame)
+                      (lambda (&rest args)
+                        (declare (ignore args))
+                        (setf (pg::backend-transaction-schema-read-lock-held-p backend) nil)
+                        (values :continue :metadata)))
+                (ok (equal '(:continue :metadata)
+                           (multiple-value-list (pg::dispatch-frontend-frame nil nil nil nil))))
+                (ok (= 1 requests))
+                (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))
+                (ok (null pg::*wal-slot-recycling-pending*)))
+           (setf (symbol-function 'pg::%dispatch-frontend-frame) original
+                 (pg::backend-transaction-schema-read-lock-held-p backend) nil))))))
+
+(deftest standard-slot-recycling-bootstrap-drains-after-reload-and-quiescence
+    (call-with-active-slot-recycling-fixture
+     (lambda (slot owner backend checkpoint)
+       (with-physical-store-directory (target)
+         (let* ((original (symbol-function 'pg::physical-bootstrap-copy-under-quiescence))
+                (requests 0)
+                (pg::*backend* nil)
+                (pg::*logical-test-invalidated-backend-hook*
+                  (lambda (recipient)
+                    (ok (eq backend recipient))
+                    (ok (not (sb-thread:holding-mutex-p pg::*reload-run-lock*)))
+                    (ok (null pg::*live-operation-quiescence-owner-thread*))
+                    (incf requests)
+                    (pg::wal-release-replication-slot-owner "public_physical" owner))))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-bootstrap-copy-under-quiescence)
+                        (lambda (directory pin)
+                          (declare (ignore directory pin))
+                          (ok (sb-thread:holding-mutex-p pg::*reload-run-lock*))
+                          (ok (eq sb-thread:*current-thread* pg::*live-operation-quiescence-owner-thread*))
+                          (pg::with-write-lock
+                            (pg::with-wal-critical
+                              (pg::wal-remove-checkpointed-segments-under-wal-lock checkpoint)))
+                          (ok (zerop requests))
+                          (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+                          (ok (probe-file (pg::wal-segment-path 0)))
+                          :copied))
+                  (ok (eq :copied (pg::physical-base-backup (namestring target) "bootstrap_test")))
+                  (ok (= 1 requests))
+                  (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))
+                  (ok (null pg::*wal-slot-recycling-pending*)))
+             (setf (symbol-function 'pg::physical-bootstrap-copy-under-quiescence) original)))))))
+
+(deftest standard-slot-recycling-save-failures-retain-wal-and-fence
+    (dolist (after-save '(nil t))
+      (call-with-active-slot-recycling-fixture
+       (lambda (slot owner backend checkpoint)
+         (let* ((save (symbol-function 'pg::wal-save-replication-slot))
+                (pg::*backend* nil)
+                (pg::*pm-requested-mode* pg::+no-shutdown+)
+                (pg::*logical-test-invalidated-backend-hook*
+                  (lambda (target)
+                    (ok (eq backend target))
+                    (pg::wal-release-replication-slot-owner "public_physical" owner))))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::wal-save-replication-slot)
+                        (lambda (candidate)
+                          (when after-save (funcall save candidate))
+                          (error "injected slot loss publication failure")))
+                  (ok (intake-fails-p (lambda () (pg::wal-remove-checkpointed-segments checkpoint))))
+                  (ok pg::*wal-poisoned*)
+                  (ok (= pg::+fast-shutdown+ pg::*pm-requested-mode*))
+                  (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+                  (ok (probe-file (pg::wal-segment-path 0)))
+                  (ok (eq (if after-save :lost :reserved)
+                          (pg::wal-replication-slot-wal-status
+                           (pg::wal-read-replication-slot
+                            (pg::wal-replication-slot-path "public_physical"))))))
+             (setf (symbol-function 'pg::wal-save-replication-slot) save)))))))
+
+(deftest standard-slot-recycling-durable-loss-precedes-wal-removal
+    (call-with-active-slot-recycling-fixture
+     (lambda (slot owner backend checkpoint)
+       (let* ((pg::*backend* nil)
+              (pg::*pm-requested-mode* pg::+no-shutdown+)
+              (pg::*logical-test-invalidated-backend-hook*
+                (lambda (target)
+                  (ok (eq backend target))
+                  (pg::wal-release-replication-slot-owner "public_physical" owner)))
+              (pg::*logical-test-failpoint-hook*
+                (lambda (point &rest details)
+                  (declare (ignore details))
+                  (when (eq point :before-slot-wal-removal)
+                    (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))
+                    (ok (eq :lost
+                            (pg::wal-replication-slot-wal-status
+                             (pg::wal-read-replication-slot
+                              (pg::wal-replication-slot-path "public_physical")))))
+                    (ok (probe-file (pg::wal-segment-path 0)))
+                    (error "injected failure after saved loss before unlink")))))
+         (ok (intake-fails-p (lambda () (pg::wal-remove-checkpointed-segments checkpoint))))
+         (ok pg::*wal-poisoned*)
+         (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))
+         (ok (probe-file (pg::wal-segment-path 0)))))))
+
+(deftest standard-slot-recycling-optional-drain-does-not-wait-for-closed-admission
+    (call-with-active-slot-recycling-fixture
+     (lambda (slot owner backend checkpoint)
+       (declare (ignore backend))
+       (let* ((requests 0)
+              (pg::*backend* nil)
+              (pg::*logical-test-invalidated-backend-hook*
+                (lambda (target) (declare (ignore target)) (incf requests))))
+         (let ((pg::*schema-read-lock-held* t))
+           (pg::wal-remove-checkpointed-segments checkpoint))
+         (let ((thread nil) (pending pg::*wal-slot-recycling-pending*))
+           (pg::with-live-operation-quiescence
+             (setf thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (let ((pg::*wal-slot-recycling-pending* pending))
+                        (pg::wal-finish-pending-slot-recycling)
+                        :deferred))
+                    :name "optional recycling with closed admission"))
+             (ok (eq :deferred (sb-thread:join-thread thread :timeout 2)))))
+         (ok (zerop requests))
+         (ok pg::*wal-slot-recycling-pending*)
+         (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+         (pg::wal-release-replication-slot-owner "public_physical" owner)
+         (pg::wal-finish-pending-slot-recycling)
+         (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))))))
+
+(deftest standard-slot-recycling-stops-before-loss-and-rechecks-progress
+    (dolist (caught-up '(nil t))
+      (call-with-physical-slot-api-fixture
+       (lambda (root)
+         (declare (ignore root))
+         (let* ((size pg::+wal-segment-size+)
+                (checkpoint (+ size 32))
+                (pg::*wal-checkpoint-lsn* checkpoint)
+                (pg::*wal-ready* t) (pg::*wal-poisoned* nil)
+                (pg::*wal-durable-lsn* (+ (* 4 size) 32))
+                (pg::*wal-slot-retention-policy*
+                  (pg::make-wal-slot-retention-policy :mode :segments :limit 0))
+                (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+                (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+                (pg::*wal-output-stream* nil) (pg::*wal-output-segment* nil)
+                (owner (gensym "ACTIVE-PHYSICAL-"))
+                (backend pg::*backend*)
+                (slot (physical-slot-test-object :restart 1))
+                (requests 0)
+                (pg::*logical-test-invalidated-backend-hook*
+                  (lambda (target)
+                    (incf requests)
+                    (ok (eq backend target))
+                    (ok (not (sb-thread:holding-mutex-p pg::*wal-lock*)))
+                    (ok (not (sb-thread:holding-mutex-p pg::*write-lock*)))
+                    (ok (not pg::*live-operation-parked-p*))
+                    (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+                    (ok (probe-file (pg::wal-segment-path 0)))
+                    (ok (eq :reserved
+                            (pg::wal-replication-slot-wal-status
+                             (pg::wal-read-replication-slot
+                              (pg::wal-replication-slot-path "public_physical")))))
+                    (when caught-up
+                      (sb-thread:with-mutex (pg::*wal-lock*)
+                        (setf (pg::wal-replication-slot-restart-lsn slot) (* 2 size))
+                        (pg::wal-save-replication-slot slot)))
+                    (pg::wal-release-replication-slot-owner "public_physical" owner))))
+           (pg::wal-ensure-directory-durable (pg::wal-directory))
+           (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
+           (pg::wal-atomic-write-bytes (pg::wal-segment-path 0) #(0))
+           (setf (pg::wal-replication-slot-active-owner slot) owner
+                 (pg::wal-replication-slot-active-owner-backend slot) backend
+                 (gethash "public_physical" pg::*wal-replication-slots*) slot)
+           (pg::wal-save-replication-slot slot)
+           (let ((pg::*backend* nil))
+             (pg::wal-remove-checkpointed-segments checkpoint))
+           (ok (= 1 requests))
+           (ok (eq (if caught-up :reserved :lost)
+                   (pg::wal-replication-slot-wal-status slot)))
+           (ok (null (pg::wal-replication-slot-active-owner slot)))
+           (ok (not (probe-file (pg::wal-segment-path 0))))
+           (ok (eq (if caught-up :reserved :lost)
+                   (pg::wal-replication-slot-wal-status
+                    (pg::wal-read-replication-slot
+                     (pg::wal-replication-slot-path "public_physical"))))))))))
 
 (deftest c-slot-retention-rounds-segments-and-respects-independent-horizons
     (call-with-physical-slot-api-fixture

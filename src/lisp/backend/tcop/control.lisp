@@ -567,7 +567,7 @@ The primary finalizer separately holds reload exclusion."
          (sb-thread:condition-broadcast *live-operation-cv*)))))
   (values))
 
-(defmacro with-live-operation-internal ((drain-p &optional check-cancel-p) &body body)
+(defmacro with-live-operation-internal ((drain-p &optional check-cancel-p (wait-p t)) &body body)
   (let ((outermost (gensym "OUTERMOST-"))
         (admitted (gensym "ADMITTED-"))
         (backend (gensym "BACKEND-"))
@@ -584,9 +584,12 @@ The primary finalizer separately holds reload exclusion."
        (if ,outermost
            (block ,operation-block
              (loop
-               (wait-for-live-operation-admission ,drain-test ,backend)
+               (when ,wait-p
+                 (wait-for-live-operation-admission ,drain-test ,backend))
                (sb-sys:without-interrupts
                  (setf ,admitted (try-enter-live-operation ,drain-test ,backend))
+                 (unless (or ,admitted ,wait-p)
+                   (return-from ,operation-block nil))
                  (when ,admitted
                    (setf (live-operation-token-state ,token) :active
                          (live-operation-token-lane ,token) ,admitted)
@@ -604,6 +607,9 @@ The primary finalizer separately holds reload exclusion."
 (defmacro with-live-operation (&body body)
   "Run BODY while protecting its function definitions from a live reload."
   `(with-live-operation-internal (nil) ,@body))
+
+(defmacro with-live-operation-if-admitted (&body body)
+  `(with-live-operation-internal (nil nil nil) ,@body))
 
 (defmacro with-live-operation-shutdown-cleanup (&body body)
   "Run fatal connection cleanup without waiting during backend-terminating shutdown.

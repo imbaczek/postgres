@@ -2,6 +2,141 @@
 
 (in-package #:pg)
 
+(defstruct wal-slot-recycling-work
+  slots directory system-id control-system-id timeline namespace checkpoint-lsn durable-lsn retained-reference requests)
+
+(defun wal-capture-slot-recycling-work (checkpoint-lsn durable-lsn requests)
+  (make-wal-slot-recycling-work
+   :slots *wal-replication-slots* :directory (namestring *pgdata*)
+   :system-id (catalog-system-identifier)
+   :control-system-id (getf *wal-control-metadata* :system-id)
+   :timeline *wal-insert-timeline* :namespace *wal-segment-namespace*
+   :checkpoint-lsn checkpoint-lsn :durable-lsn durable-lsn
+   :retained-reference (copy-tree (getf *wal-control-metadata* :retained-reference))
+   :requests requests))
+
+(defun wal-slot-recycling-work-current-p (work)
+  (and *wal-ready* (not *wal-poisoned*)
+       (eq :segments (wal-slot-retention-mode))
+       (not (recovery-in-progress-p)) (not *physical-recovery-failed-p*)
+       (not *live-operation-terminal-shutdown*)
+       (not (shutdown-in-progress-p))
+       (eq (wal-slot-recycling-work-slots work) *wal-replication-slots*)
+       (equal (wal-slot-recycling-work-directory work) (namestring *pgdata*))
+       (= (wal-slot-recycling-work-system-id work) (catalog-system-identifier))
+       (eql (wal-slot-recycling-work-control-system-id work)
+            (getf *wal-control-metadata* :system-id))
+       (= (wal-slot-recycling-work-timeline work) *wal-insert-timeline*)
+       (eq (wal-slot-recycling-work-namespace work) *wal-segment-namespace*)
+       (= (wal-slot-recycling-work-checkpoint-lsn work) *wal-checkpoint-lsn*)
+       (<= (wal-slot-recycling-work-durable-lsn work) *wal-durable-lsn*)
+       (equal (wal-slot-recycling-work-retained-reference work)
+              (getf *wal-control-metadata* :retained-reference))))
+
+(defun wal-slot-recycling-can-wait-p ()
+  (and (not (sb-thread:holding-mutex-p *wal-lock*))
+       (not (sb-thread:holding-mutex-p *write-lock*))
+       (not (sb-thread:holding-mutex-p *reload-run-lock*))
+       (not (live-operation-lock-owned-p))
+       (not (sb-thread:holding-mutex-p *physical-retained-inventory-publish-lock*))
+       (not (and *physical-receive-store*
+                 (sb-thread:holding-mutex-p (physical-store-mutex *physical-receive-store*))))
+       (not *exported-snapshot-backend*)
+       (not *schema-read-lock-held*) (not *schema-write-lock-held*)
+       (not (backend-holds-schema-read-lock-p))
+       (not (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
+       (not *live-operation-terminal-shutdown*)
+       (not (shutdown-in-progress-p))))
+
+(defun wal-slot-recycling-owner-current-p (work slot owner backend)
+  (and (wal-slot-recycling-work-current-p work)
+       (eq :segments (wal-slot-retention-mode))
+       (eq slot (gethash (wal-replication-slot-name slot) *wal-replication-slots*))
+       (wal-slot-reserved-p slot)
+       (eq owner (wal-replication-slot-active-owner slot))
+       (eq backend (wal-replication-slot-active-owner-backend slot))
+       (let* ((redo (wal-checkpoint-recycling-segment (wal-slot-recycling-work-checkpoint-lsn work)))
+              (independent (wal-independent-retention-segment redo))
+              (keep (wal-slot-removal-segment
+                     redo independent (wal-slot-recycling-work-durable-lsn work))))
+         (< (wal-replication-slot-restart-lsn slot) (* keep +wal-segment-size+)))))
+
+(defvar *wal-slot-recycling-termination-requests*
+  (make-hash-table :test #'eq :weakness :key))
+
+(defvar *wal-slot-owner-wait-seconds* 5)
+
+(defun wal-request-recycling-owner-termination (work request)
+  (destructuring-bind (slot owner backend) request
+    (when backend
+      (logical-test-failpoint :before-recycling-owner-termination-claim slot owner backend)
+      (let ((current nil) (claimed nil))
+        (sb-sys:without-interrupts
+          (sb-thread:with-mutex (*wal-lock*)
+            (when (wal-slot-recycling-owner-current-p work slot owner backend)
+              (setf current t)
+              (unless (equal (gethash slot *wal-slot-recycling-termination-requests*)
+                             (list owner backend))
+                (setf (gethash slot *wal-slot-recycling-termination-requests*)
+                      (list owner backend)
+                      claimed t))))
+          (when claimed
+            (if (eq backend *backend*)
+                (terminate-backend backend)
+                (request-invalidated-backend-termination backend))))
+        (when current backend)))))
+
+(defun wal-finish-slot-recycling-work (work &key (wait t))
+  (when (wal-slot-recycling-can-wait-p)
+    (with-live-operation
+      (loop
+        (unless (and (eq :normal *live-operation-current-lane*)
+                     (wal-slot-recycling-can-wait-p)
+                     (wal-slot-recycling-work-current-p work))
+          (return))
+        (dolist (request (wal-slot-recycling-work-requests work))
+          (let ((backend (wal-request-recycling-owner-termination work request)))
+            (when (and wait backend (not (eq backend *backend*)))
+              (call-with-live-operation-parked
+               (lambda ()
+                 (wait-for-invalidated-backend
+                  backend *wal-slot-owner-wait-seconds*))))))
+        (let ((next nil))
+          (when (and (eq :normal *live-operation-current-lane*)
+                     (wal-slot-recycling-can-wait-p))
+            (with-write-lock
+              (with-wal-critical
+                (when (wal-slot-recycling-work-current-p work)
+                  (wal-remove-checkpointed-segments-under-wal-lock
+                   (wal-slot-recycling-work-checkpoint-lsn work)
+                   (wal-slot-recycling-work-durable-lsn work))
+                  (setf next *wal-slot-recycling-pending*)))))
+          (unless (and wait next
+                       (some (lambda (request)
+                               (let* ((backend (third request))
+                                      (thread (when backend (backend-thread backend))))
+                                 (and thread (sb-thread:thread-alive-p thread))))
+                             (wal-slot-recycling-work-requests next)))
+            (return))
+          (setf work next)))))
+  (values))
+
+(defun wal-finish-pending-slot-recycling (&key (wait nil))
+  (when (and *wal-slot-recycling-pending* (wal-slot-recycling-can-wait-p))
+    (flet ((drain ()
+             (when (eq :normal *live-operation-current-lane*)
+               (let ((work (sb-thread:with-mutex (*wal-lock*)
+                             (let ((pending *wal-slot-recycling-pending*))
+                               (when pending
+                                 (if (wal-slot-recycling-work-current-p pending)
+                                     pending
+                                     (setf *wal-slot-recycling-pending* nil)))))))
+                 (when work (wal-finish-slot-recycling-work work :wait wait))))))
+      (if wait
+          (with-live-operation (drain))
+          (with-live-operation-if-admitted (drain)))))
+  (values))
+
 (defun wal-invalidate-replication-slots-matching-under-lock (predicate)
   "Save loss before publishing it on each matching reserved slot under WAL.
 The saved restart floor remains internal; consumer cleanup runs after locks drain."
@@ -21,20 +156,31 @@ The saved restart floor remains internal; consumer cleanup runs after locks drai
   (wal-refresh-logical-capture-slot-mirror-under-wal-lock)
   (values))
 
-(defun wal-prepare-slot-recycling-under-lock (redo-segment)
-  "Invalidate slots beyond the selected policy and return the recycling floor.
-Named public physical streaming is not wired: before enabling it, stop its owner,
-recheck the loss predicate, save loss, and only then recycle WAL."
+(defun wal-prepare-standard-slot-recycling-under-lock (redo-segment current)
+  (let* ((independent (wal-independent-retention-segment redo-segment))
+         (keep (wal-slot-removal-segment redo-segment independent current))
+         (requests nil))
+    (wal-invalidate-replication-slots-matching-under-lock
+     (lambda (slot)
+       (when (< (wal-replication-slot-restart-lsn slot) (* keep +wal-segment-size+))
+         (if (wal-replication-slot-active-owner slot)
+             (progn
+               (push (list slot (wal-replication-slot-active-owner slot)
+                           (wal-replication-slot-active-owner-backend slot))
+                     requests)
+               nil)
+             t))))
+    (values (wal-slot-removal-segment redo-segment independent current) (nreverse requests))))
+
+(defun wal-prepare-slot-recycling-under-lock (redo-segment &optional (current *wal-durable-lsn*))
   (ecase (wal-slot-retention-mode)
-    (:bytes (wal-invalidate-lagging-replication-slots-under-wal-lock))
-    (:segments (physical-source-invalidate-lagging-pins-under-wal-lock)))
-  (let ((independent (wal-independent-retention-segment redo-segment)))
-    (when (eq :segments (wal-slot-retention-mode))
-      (let ((keep (wal-slot-removal-segment redo-segment independent)))
-        (wal-invalidate-replication-slots-matching-under-lock
-         (lambda (slot) (< (wal-replication-slot-restart-lsn slot)
-                           (* keep +wal-segment-size+))))))
-    (wal-slot-removal-segment redo-segment independent)))
+    (:bytes
+     (wal-invalidate-lagging-replication-slots-under-wal-lock)
+     (wal-slot-removal-segment
+      redo-segment (wal-independent-retention-segment redo-segment)))
+    (:segments
+     (physical-source-invalidate-lagging-pins-under-wal-lock)
+     (wal-prepare-standard-slot-recycling-under-lock redo-segment current))))
 
 (defun wal-invalidate-lagging-replication-slots-under-wal-lock ()
   "Apply the native byte cap at durable WAL, including private source pins.
@@ -52,13 +198,11 @@ The recycling dispatcher selects the standard segment policy separately."
           when (eq (wal-replication-slot-wal-status slot) :lost)
             collect slot)))
 
-(defun call-with-invalidated-slot-cleanup (function)
-  "Run WAL maintenance and retire lost-slot consumers after its locks drain."
+(defun call-with-invalidated-slot-cleanup (function &key (wait t))
   (let ((*wal-replication-slot-loss-collector* (list nil)))
     (unwind-protect
-         (funcall function)
-      ;; Re-scan durable runtime state: an interrupted cleanup may have lost its
-      ;; local collector after marking a slot lost but before token adoption.
+         (multiple-value-prog1 (funcall function)
+           (wal-finish-pending-slot-recycling :wait wait))
       (cleanup-invalidated-logical-replication-state
        (remove-duplicates
         (append (nreverse (car *wal-replication-slot-loss-collector*))
@@ -71,11 +215,12 @@ The recycling dispatcher selects the standard segment policy separately."
   (call-with-invalidated-slot-cleanup #'wal-checkpoint-core)
   (values))
 
-(defun wal-remove-checkpointed-segments (checkpoint-lsn)
+(defun wal-remove-checkpointed-segments (checkpoint-lsn &key (wait t))
   (call-with-invalidated-slot-cleanup
    (lambda ()
      (with-wal-critical
-       (wal-remove-checkpointed-segments-under-wal-lock checkpoint-lsn))))
+       (wal-remove-checkpointed-segments-under-wal-lock checkpoint-lsn)))
+   :wait wait)
   (values))
 
 (defun detach-exported-logical-snapshots-for-slots-under-registry-lock (slots)
@@ -277,14 +422,19 @@ The recycling dispatcher selects the standard segment policy separately."
 
 (defun wait-for-invalidated-backend (backend &optional (timeout 5))
   (let ((thread (backend-thread backend)))
-    (when (and thread
-               (not (eq thread sb-thread:*current-thread*))
+    (when (and (or (null timeout) (plusp timeout))
+               thread (not (eq thread sb-thread:*current-thread*))
                (sb-thread:thread-alive-p thread))
-      ;; Do not asynchronously abort an unwind already releasing MVCC and schema
-      ;; ownership. A timed-out backend retains its pins until its cleanup ends.
-      (handler-case
-          (sb-thread:join-thread thread :timeout timeout)
-        (sb-thread:join-thread-error () nil))))
+      (flet ((join ()
+               (handler-case
+                   (sb-thread:join-thread thread :timeout timeout)
+                 (sb-thread:join-thread-error () nil))))
+        (cond
+          (*live-operation-parked-p* (join))
+          ((wal-slot-recycling-can-wait-p)
+           (with-live-operation
+             (when (eq :normal *live-operation-current-lane*)
+               (call-with-live-operation-parked #'join))))))))
   (values))
 
 (defun terminate-invalidated-backend (backend &optional (timeout 5))
