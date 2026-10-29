@@ -451,6 +451,18 @@ result is text for typeof and int4 for array_length."
             (toast-fetch-text-slice toast pointer snapshot offset count
                                     :index-reader #'select-toast-index-reader))))))
 
+(defun eval-toast-length (expression context)
+  "Evaluate a direct external length projection without materializing the value."
+  (destructuring-bind (toast pointer snapshot environment) context
+    (declare (ignore environment))
+    (unless toast (ereport "XX001" "external value has no owning TOAST relation"))
+    (let ((type (expr-type (first (third expression))))
+          (name (second expression)))
+      (if (or (eq type :bytea) (string= name "octet_length"))
+          (toast-raw-value-size toast pointer snapshot)
+          (toast-map-text-characters toast pointer snapshot nil
+                                     :index-reader #'select-toast-index-reader)))))
+
 (defun analyze-wal-receiver-function (name arguments)
   (when arguments
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
@@ -4219,7 +4231,10 @@ truncate and interpret the result at TYPE's signed width."
     (:func
      (let ((slice (assoc expr *toast-slice-current* :test #'eq)))
        (when (and slice (eq env (fourth (cdr slice))))
-         (return-from eval-expr (eval-toast-substring (third expr) (cdr slice) (expr-type expr)))))
+         (return-from eval-expr
+           (if (member (second expr) '("length" "octet_length" "char_length" "character_length") :test #'string=)
+               (eval-toast-length expr (cdr slice))
+               (eval-toast-substring (third expr) (cdr slice) (expr-type expr))))))
      (let* ((name (second expr))
             (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr)))
             (type (expr-type expr)))

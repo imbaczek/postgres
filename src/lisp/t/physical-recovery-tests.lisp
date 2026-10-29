@@ -569,7 +569,8 @@
         (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
         (unwind-protect
              (let* ((table (pg::create-table* database "text_slice"
-                                              (list (list :name "v" :type :text :typmod -1))))
+                                              (list (list :name "v" :type :text :typmod -1)
+                                                    (list :name "b" :type :bytea :typmod -1))))
                     (toast (pg::pg-class-toast table))
                     (plain nil) (compressed nil) (bad nil))
                (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
@@ -587,7 +588,7 @@
                (pg::clog-set 42 pg::+clog-committed+)
                (pg::with-write-lock
                  (pg::heapam-insert (pg::pg-class-relfilenode table)
-                                    (pg::pg-class-columns table) (vector plain) 42 0))
+                                    (pg::pg-class-columns table) (vector plain plain) 42 0))
                (let ((old (symbol-function 'pg::toast-fetch-value)) (calls 0) (rows nil)
                                                                     (pg::*current-snapshot* snapshot))
                  (unwind-protect
@@ -595,7 +596,7 @@
                         (setf (symbol-function 'pg::toast-fetch-value)
                               (lambda (&rest args) (incf calls) (apply old args)))
                         (let* ((ast (first (pg::parse-statements
-                                            "SELECT substring(v,1996,3), v FROM text_slice")))
+                                            "SELECT substring(v,1996,3), octet_length(v), v FROM text_slice")))
                                (plan (pg::plan-select-query ast)))
                           (pg::interpret-query-plan
                            plan (getf (pg::query-plan-prepared plan) :relations)
@@ -603,7 +604,8 @@
                         (ok (= calls 1))
                         (ok (and (= (length rows) 1)
                                  (string= (aref (first rows) 0) (subseq text 1995 1998))
-                                 (string= (aref (first rows) 1) text))))
+                                 (= (aref (first rows) 1) (length raw))
+                                 (string= (aref (first rows) 2) text))))
                    (setf (symbol-function 'pg::toast-fetch-value) old)))
                (let ((old (symbol-function 'pg::toast-fetch-value)))
                  (unwind-protect
@@ -620,6 +622,31 @@
                            (lambda (row) (push (car row) rows)))
                           (ok (and (= (length rows) 1)
                                    (string= (aref (first rows) 0) (subseq text 1995 1998)))))
+                        (let* ((pg::*current-snapshot* snapshot)
+                               (ast (first (pg::parse-statements
+                                            "SELECT octet_length(v), length(v), char_length(v), character_length(v) FROM text_slice")))
+                               (plan (pg::plan-select-query ast)) (rows nil))
+                          (pg::interpret-query-plan
+                           plan (getf (pg::query-plan-prepared plan) :relations)
+                           (lambda (row) (push (car row) rows)))
+                          (ok (and (= (length rows) 1)
+                                   (= (aref (first rows) 0) (length raw))
+                                   (every (lambda (i) (= (aref (first rows) i) (length text))) '(1 2 3)))))
+                        (let ((old-map (symbol-function 'pg::toast-map-value-octets)))
+                          (unwind-protect
+                               (progn
+                                 (setf (symbol-function 'pg::toast-map-value-octets)
+                                       (lambda (&rest args) (declare (ignore args))
+                                         (error "byte count must not scan chunks")))
+                                 (ok (= (pg::toast-raw-value-size toast compressed snapshot) (length raw)))
+                                 (let* ((pg::*current-snapshot* snapshot)
+                                        (ast (first (pg::parse-statements "SELECT octet_length(v), length(b), octet_length(b) FROM text_slice")))
+                                        (plan (pg::plan-select-query ast)) (rows nil))
+                                   (pg::interpret-query-plan
+                                    plan (getf (pg::query-plan-prepared plan) :relations)
+                                    (lambda (row) (push (car row) rows)))
+                                   (ok (every (lambda (i) (= (aref (first rows) i) (length raw))) '(0 1 2)))))
+                            (setf (symbol-function 'pg::toast-map-value-octets) old-map)))
                         (dolist (pointer (list plain compressed))
                           (dolist (bounds '((0 0) (1994 6) (1995 1) (1996 1) (1997 2) (7000 100) (0 nil)))
                             (let* ((start (min (first bounds) (length text)))
@@ -636,6 +663,15 @@
                                  (list (cons expression (list toast plain snapshot environment)))))
                           (ok (string= (subseq text 1995 1998)
                                        (pg::eval-expr expression environment))))
+                        ;; Byte length follows pointer metadata even if contents
+                        ;; are corrupt; character count validates the full UTF-8.
+                        (ok (= (pg::toast-raw-value-size toast bad snapshot) (1+ (length raw))))
+                        (ok (intake-fails-p (lambda () (pg::toast-map-text-characters toast bad snapshot nil))))
+                        (ok (intake-fails-p (lambda () (pg::toast-raw-value-size toast bad nil))))
+                        (let ((wrong (pg::copy-heap-external-varlena plain)))
+                          (incf (pg::heap-external-varlena-relation-id wrong))
+                          (ok (equal "XX001" (recovery-state-of
+                                              (lambda () (pg::toast-raw-value-size toast wrong snapshot))))))
                         (ok (intake-fails-p (lambda () (pg::toast-fetch-text-slice toast bad snapshot 0 1))))
                         (ok (intake-fails-p (lambda () (pg::toast-fetch-text-slice toast bad snapshot 0 0))))
                         (dolist (suffix '((#x80) (#xc0 #x80) (#xe0 #x80 #x80)

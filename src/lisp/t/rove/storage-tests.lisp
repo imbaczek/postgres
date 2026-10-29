@@ -620,6 +620,29 @@
                                                                    (:col 1 :type :int4)) :type :text))) scan)
                       relations)))))
 
+(rove:deftest test-simple-select-toast-length-plan
+    (let* ((columns (vector (make-pg-column :name "t" :type :text :attnum 1)
+                            (make-pg-column :name "v" :type :varchar :attnum 2)
+                            (make-pg-column :name "b" :type :bytea :attnum 3)))
+           (table (make-pg-class :oid 42 :columns columns))
+           (relations (list (list :table table)))
+           (scan '(:seq-scan 0 42))
+           (text '(:func "length" ((:col 1 :type :text)) :type :int4))
+           (varchar '(:func "octet_length" ((:col 2 :type :varchar)) :type :int4))
+           (bytea '(:func "length" ((:col 3 :type :bytea)) :type :int4))
+           (targets (mapcar (lambda (expr) (list :expr expr)) (list text varchar bytea)))
+           (plan (simple-select-toast-slice (list :project targets scan) relations)))
+      (rove:ok (and plan (equal (mapcar #'cdr (cdr plan)) '(1 2 3))))
+      (let ((fallback (simple-select-toast-slice
+                       (list :project (append targets (list (list :expr '(:col 1 :type :text)))) scan)
+                       relations)))
+        (rove:ok (and fallback (equal (mapcar #'cdr (cdr fallback)) '(2 3)))))
+      ;; A saved pointer never replaces a value from a different row.
+      (let* ((saved (vector +null+ +null+ +null+))
+             (other (vector "é🙂" "abc" (make-array 3 :element-type '(unsigned-byte 8))))
+             (*toast-slice-current* (list (cons text (list nil nil nil saved)))))
+        (rove:ok (= 2 (eval-expr text other))))))
+
 (rove:deftest test-tuple-roundtrip
     (let* ((cols (coerce
                   (list (make-pg-column :name "a" :type :int4 :typmod -1

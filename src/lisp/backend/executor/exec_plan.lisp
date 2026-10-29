@@ -1530,7 +1530,7 @@ Unrecognized plans and expression forms require full materialization."
                 (cons table slots)))))))))
 
 (defun simple-select-toast-slice (node relations)
-  "Recognize direct bytea or text slices whose columns have no full-value uses.
+  "Recognize direct TOAST slice or length projections with no full-value uses.
 Return the owning table followed by expression/slot pairs; unrecognized
 projection or filter forms fall back to ordinary full materialization."
   (when (eq (first node) :limit) (setf node (third node)))
@@ -1551,14 +1551,21 @@ projection or filter forms fall back to ordinary full materialization."
                                 (eq (first (second input)) :col)
                                 (eq (expr-type (second input)) :varchar))
                            (second input) input)))
-          (if (and args (member (second expression) '("substr" "substring") :test #'string=)
-                   (member (expr-type expression) '(:bytea :text)) (member (length args) '(2 3))
-                   (consp column) (eq (first column) :col)
-                   (if (eq (expr-type expression) :bytea)
-                       (eq (expr-type column) :bytea)
-                       (member (expr-type column) '(:text :varchar)))
-                   (every (lambda (argument) (and (consp argument) (eq (first argument) :const)))
-                          (rest args)))
+          (if (and args (consp column) (eq (first column) :col)
+                   (or
+                    (and (member (second expression) '("substr" "substring") :test #'string=)
+                         (member (expr-type expression) '(:bytea :text)) (member (length args) '(2 3))
+                         (if (eq (expr-type expression) :bytea)
+                             (eq (expr-type column) :bytea)
+                             (member (expr-type column) '(:text :varchar)))
+                         (every (lambda (argument) (and (consp argument) (eq (first argument) :const)))
+                                (rest args)))
+                    (and (= (length args) 1) (eq input column)
+                         (member (expr-type column) '(:text :varchar :bytea))
+                         (member (second expression) '("length" "octet_length" "char_length" "character_length")
+                                 :test #'string=)
+                         (or (not (eq (expr-type column) :bytea))
+                             (member (second expression) '("length" "octet_length") :test #'string=)))))
               (push (cons expression (second column)) slices)
               (push target ordinary))))
       (let ((demand (and slices

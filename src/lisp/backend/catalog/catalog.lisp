@@ -1815,37 +1815,56 @@ misordered, extra or malformed chunks signal corruption."
                         (loop for byte across data do (funcall function byte)))))))))
   (values))
 
+(defun toast-raw-value-size (toast pointer snapshot)
+  "Return raw octet length from a validated pointer protected by SNAPSHOT.
+Like PostgreSQL toast_raw_datum_size, this does not inspect TOAST chunks."
+  (unless (and snapshot
+               (sb-thread:with-mutex (*snapshot-count-lock*)
+                 (gethash snapshot *active-snapshot-set*)))
+    (error "TOAST fetch requires an active snapshot"))
+  (nth-value 1 (toast-pointer-storage-size toast pointer)))
+
+(defun toast-map-text-characters (toast pointer snapshot function
+                                  &key (index-reader #'call-with-btree-relation-read-lock))
+  "Validate complete UTF-8 under one lease, visiting each decoded character."
+  (let ((needed 0) (code 0) (minimum 0) (position 0))
+    (labels ((emit (value)
+               (when function (funcall function (code-char value) position))
+               (incf position))
+             (consume (byte)
+               (if (zerop needed)
+                   (cond ((< byte #x80) (emit byte))
+                         ((<= #xc2 byte #xdf) (setf needed 1 code (logand byte #x1f) minimum #x80))
+                         ((<= #xe0 byte #xef) (setf needed 2 code (logand byte #x0f) minimum #x800))
+                         ((<= #xf0 byte #xf4) (setf needed 3 code (logand byte #x07) minimum #x10000))
+                         (t (error "invalid UTF-8 in TOAST text")))
+                   (progn
+                     (unless (<= #x80 byte #xbf) (error "invalid UTF-8 in TOAST text"))
+                     (setf code (logior (ash code 6) (logand byte #x3f)))
+                     (decf needed)
+                     (when (zerop needed)
+                       (unless (and (<= minimum code #x10ffff)
+                                    (not (<= #xd800 code #xdfff)))
+                         (error "invalid UTF-8 in TOAST text"))
+                       (emit code))))))
+      (toast-map-value-octets toast pointer snapshot #'consume :index-reader index-reader)
+      (unless (zerop needed) (error "truncated UTF-8 in TOAST text"))
+      position)))
+
 (defun toast-fetch-text-slice (toast pointer snapshot start count
                                &key (index-reader #'call-with-btree-relation-read-lock))
   "Return selected Unicode characters while validating the complete UTF-8 value."
   (unless (and (integerp start) (>= start 0)
                (or (null count) (and (integerp count) (>= count 0))))
     (error "invalid TOAST text slice bounds"))
-  (let ((needed 0) (code 0) (minimum 0) (position 0))
-    (with-output-to-string (output)
-      (labels ((emit (value)
-                 (when (and (>= position start)
-                            (or (null count) (< (- position start) count)))
-                   (write-char (code-char value) output))
-                 (incf position))
-               (consume (byte)
-                 (if (zerop needed)
-                     (cond ((< byte #x80) (emit byte))
-                           ((<= #xc2 byte #xdf) (setf needed 1 code (logand byte #x1f) minimum #x80))
-                           ((<= #xe0 byte #xef) (setf needed 2 code (logand byte #x0f) minimum #x800))
-                           ((<= #xf0 byte #xf4) (setf needed 3 code (logand byte #x07) minimum #x10000))
-                           (t (error "invalid UTF-8 in TOAST text")))
-                     (progn
-                       (unless (<= #x80 byte #xbf) (error "invalid UTF-8 in TOAST text"))
-                       (setf code (logior (ash code 6) (logand byte #x3f)))
-                       (decf needed)
-                       (when (zerop needed)
-                         (unless (and (<= minimum code #x10ffff)
-                                      (not (<= #xd800 code #xdfff)))
-                           (error "invalid UTF-8 in TOAST text"))
-                         (emit code))))))
-        (toast-map-value-octets toast pointer snapshot #'consume :index-reader index-reader)
-        (unless (zerop needed) (error "truncated UTF-8 in TOAST text"))))))
+  (with-output-to-string (output)
+    (toast-map-text-characters
+     toast pointer snapshot
+     (lambda (character position)
+       (when (and (>= position start)
+                  (or (null count) (< (- position start) count)))
+         (write-char character output)))
+     :index-reader index-reader)))
 
 (defun toast-fetch-value-slice (toast pointer snapshot start length
                                 &key (index-reader #'call-with-btree-relation-read-lock))
