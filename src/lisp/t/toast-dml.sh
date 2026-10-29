@@ -119,6 +119,28 @@ run -c 'alter table toast_recursive_result alter column v set storage plain' >/d
 run -c 'insert into toast_recursive_result with recursive q(v,n) as (select v,1 from toast_inline_build union all select v,n+1 from q where n<3) select v from q' >/dev/null
 [ "$(run -c 'select count(*) from toast_recursive_result where length(v)=20000')" = 3 ]
 [ "$(run -c "select count(*) from toast_recursive_result where v='short'")" = 3 ]
+run -c 'create table toast_scalar_result (v text)' >/dev/null
+run -c 'alter table toast_scalar_result alter column v set storage plain' >/dev/null
+run -c 'insert into toast_scalar_result select (select v) from toast_inline_build' >/dev/null
+run -c "insert into toast_scalar_result select (select v from toast_inline_build where v <> 'short') from toast_join_keys" >/dev/null
+run -c 'insert into toast_scalar_result select (select (select v)) from toast_inline_build' >/dev/null
+[ "$(run -c 'select count(*) from toast_scalar_result where length(v)=20000')" = 5 ]
+[ "$(run -c "select count(*) from toast_scalar_result where v='short'")" = 2 ]
+run -c 'create table toast_scalar_source (id int, v text)' >/dev/null
+run -c "insert into toast_scalar_source values (1,'$index_suffix'),(2,'b$index_suffix')" >/dev/null
+run -c 'create table toast_scalar_mixed (id int, v text)' >/dev/null
+run -c 'alter table toast_scalar_mixed alter column v set storage plain' >/dev/null
+run -c 'insert into toast_scalar_mixed select id,(select (select v)) from toast_scalar_source' >/dev/null
+[ "$(run -c "select count(*) from toast_scalar_mixed where (id=1 and length(v)=20000 and substr(v,1,1)='a') or (id=2 and length(v)=20001 and substr(v,1,1)='b')")" = 2 ]
+run -c 'insert into toast_scalar_result select (select v from toast_inline_build where false)' >/dev/null
+[ "$(run -c 'select count(*) from toast_scalar_result where v is null')" = 1 ]
+if run -v VERBOSITY=verbose -c "insert into toast_scalar_result select (select v || '') from toast_inline_build" >"$TMP/scalar-computed.out" 2>&1; then
+    echo 'toast-dml: computed scalar datum retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/scalar-computed.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: computed scalar datum did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 run -c 'insert into toast_recursive_result with recursive q(v) as (select v from toast_inline_build union select v from q) select v from q' >/dev/null
 [ "$(run -c 'select count(*) from toast_recursive_result where length(v)=20000')" = 4 ]
 if run -v VERBOSITY=verbose -c "insert into toast_recursive_result with recursive q(v,n) as (select v,1 from toast_inline_build union all select v || '',n+1 from q where n<2) select v from q" >"$TMP/recursive-computed.out" 2>&1; then

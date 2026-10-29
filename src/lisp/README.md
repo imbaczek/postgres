@@ -251,8 +251,9 @@ branch can retain compressed values through compatible assignments. This include
 same-column `excluded` assignments in `ON CONFLICT DO UPDATE`. External source
 values are detached from their original table; PLAIN targets flatten them.
 Recursive UNION retains origins through supported working-table plans while
-duplicate elimination compares logical values. Other CTE producer shapes,
-aggregates, scalar subqueries, lateral outer references,
+duplicate elimination compares logical values. Scalar subqueries with supported
+plans retain the selected datum, including correlated outer references. Other CTE
+producer shapes, aggregates, lateral outer references,
 explicit casts, and cross-column `excluded` assignments do not yet retain this provenance.
 For an interpreted SELECT plan with a projection over one base-table sequential
 or non-parameterized index scan, optionally with filters, sorting or top-N,

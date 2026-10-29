@@ -94,22 +94,40 @@
     (:any (sql-3val-or accumulated value))
     (:all (sql-3val-and accumulated value))))
 
+(defstruct scalar-subquery-cache-value value origin)
+
+(defun copy-owned-datum-origin (origin)
+  (when origin
+    (aref (datum-origins-from-spill (datum-origins-for-spill (vector origin))) 0)))
+
 (defun eval-subquery-expression (descriptor environment)
   (let* ((cache (subquery-cache-for descriptor))
          (key (and cache descriptor)))
     (when key
       (multiple-value-bind (value found) (gethash key cache)
-        (when found (return-from eval-subquery-expression value))))
+        (when found
+          (return-from eval-subquery-expression
+            (if (scalar-subquery-cache-value-p value)
+                (values (scalar-subquery-cache-value-value value)
+                        (copy-owned-datum-origin (scalar-subquery-cache-value-origin value)))
+                (values value nil))))))
     (let* ((kind (sql-subplan-kind descriptor))
            (plan (sql-subplan-plan descriptor))
            (registered (subquery-registered-relations plan))
            (caller-frames *subquery-outer-frames*)
            (frame (cons (map 'vector #'copy-subquery-value environment) (make-hash-table :test #'eq)))
            (found nil)
+           (origin nil)
            (result (case kind (:all t) (:scalar +null+) (t nil)))
            (array (when (eq kind :array) (make-array 0 :adjustable t :fill-pointer 0))))
+      (when *datum-origin-capture*
+        (setf (gethash +subquery-frame-origins-key+ (cdr frame))
+              (datum-origins-from-spill (datum-origins-for-spill *query-row-origins*))))
       (reconcile-query-plan-access-paths plan registered)
-      (let ((*subquery-outer-frames* (cons frame caller-frames)))
+      (let ((*subquery-outer-frames* (cons frame caller-frames))
+            (*datum-origin-capture* (and *datum-origin-capture* (eq kind :scalar)
+                                         (simple-datum-origin-plan-p (query-plan-physical plan) registered)))
+            (*query-row-origins* nil))
         (unwind-protect
              (execute-query-plan
               plan registered
@@ -119,7 +137,9 @@
                   (:exists (setf result t) :stop)
                   (:scalar
                    (when found (ereport "21000" "more than one row returned by a subquery used as an expression"))
-                   (setf found t result (copy-subquery-value (aref (car row) 0)))
+                   (setf found t result (copy-subquery-value (aref (car row) 0))
+                         origin (and *datum-origin-capture* *query-row-origins*
+                                     (copy-owned-datum-origin (aref *query-row-origins* 0))))
                    nil)
                   (:array (vector-push-extend (copy-subquery-value (aref (car row) 0)) array) nil)
                   ((:any :all)
@@ -136,5 +156,9 @@
                         :elements elements
                         :dimensions (and (plusp (length elements)) (list (length elements)))
                         :lower-bounds (and (plusp (length elements)) (list 1))))))
-      (when key (setf (gethash key cache) result))
-      result)))
+      (when key
+        (setf (gethash key cache)
+              (if (eq kind :scalar)
+                  (make-scalar-subquery-cache-value :value result :origin origin)
+                  result)))
+      (values result (copy-owned-datum-origin origin)))))

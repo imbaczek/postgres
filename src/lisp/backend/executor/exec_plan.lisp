@@ -1394,7 +1394,7 @@ on an abnormal exit."
   "Execute one physical node using the instrumented callbacks from RUN-NODE."
   (case (first node)
     (:result
-     (funcall emit #()))
+     (let ((*query-row-origins* nil)) (funcall emit #())))
     (:with-ctes
         (call-with-cte-definitions (second node) (lambda () (funcall run-child (third node) emit))))
     (:cte-scan

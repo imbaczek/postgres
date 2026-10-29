@@ -4237,16 +4237,28 @@ aliases share the corresponding numeric operator implementation."
       (return-from eval-case-expression (eval-expr (second branch) environment))))
   (eval-expr (third expression) environment))
 
+(defvar +subquery-frame-origins-key+ (gensym "SUBQUERY-FRAME-ORIGINS-"))
+
 (defun eval-expr-with-origin (expression environment origins)
   "Evaluate once, returning a logical value and any preserved physical origin.
-Only direct column references and the selected CASE or COALESCE branch retain
-origin. Computed expressions return no origin."
+Direct column and supported scalar subquery references, JOIN relabels, and the
+selected CASE or COALESCE branch retain origin. Computed expressions return none."
   (case (first expression)
     (:col
      (let ((value (eval-expr expression environment))
            (slot (1- (second expression))))
        (values value (and origins (< -1 slot (length origins))
                           (not (eq value +null+)) (aref origins slot)))))
+    (:subplan
+     (let ((*query-row-origins* origins))
+       (eval-subquery-expression (second expression) environment)))
+    (:outer-ref
+     (let* ((depth (second expression))
+            (frame (nth (1- depth) *subquery-outer-frames*))
+            (*subquery-outer-frames* (nthcdr depth *subquery-outer-frames*)))
+       (unless frame (error "Missing outer query parameter frame"))
+       (eval-expr-with-origin (third expression) (car frame)
+                              (gethash +subquery-frame-origins-key+ (cdr frame)))))
     (:join-coalesce
      (multiple-value-bind (value origin) (eval-expr-with-origin (second expression) environment origins)
        (if (eq value +null+)
