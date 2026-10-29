@@ -344,10 +344,21 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
       (logical-write-u64 buffer (getf publication :generation))
       (logical-write-u8 buffer (if (getf publication :unsupported) 1 0)))))
 
+(defun logical-validate-row-columns (columns)
+  "Require the relation descriptor to use physical slot order exactly."
+  (unless (and (listp columns)
+               (<= (length columns) #xffff)
+               (loop for column in columns for attnum from 1
+                     always (eql (getf column :attnum) attnum)))
+    (error "logical row change has noncanonical column numbers"))
+  columns)
+
 (defun logical-validate-unchanged-toast (change)
   "Reject unchanged markers outside non-key varlena UPDATE new images."
   (let ((kind (logical-change-kind change))
         (keys (logical-change-key-attnums change)))
+    (when (member kind '(:insert :update :delete))
+      (logical-validate-row-columns (logical-change-columns change)))
     (loop for row in (list (logical-change-old-values change) (logical-change-new-values change))
           for new-p in '(nil t)
           when row
@@ -642,18 +653,19 @@ revalidated by this codec."
            (relation-name (logical-read-string-u32 cursor))
            (column-count (logical-read-u16 cursor))
            (columns
-             (loop repeat column-count
-                   collect (list :attnum (logical-read-u16 cursor)
-                                 :name (logical-read-string-u32 cursor)
-                                 :type (logical-type-from-code
-                                        (logical-read-u8 cursor))
-                                 :typmod (logical-u32-signed
-                                          (logical-read-u32 cursor))
-                                 :notnull (case (logical-read-u8 cursor)
-                                            (0 nil)
-                                            (1 t)
-                                            (otherwise
-                                             (error "invalid logical column flags"))))))
+             (logical-validate-row-columns
+              (loop repeat column-count
+                    collect (list :attnum (logical-read-u16 cursor)
+                                  :name (logical-read-string-u32 cursor)
+                                  :type (logical-type-from-code
+                                         (logical-read-u8 cursor))
+                                  :typmod (logical-u32-signed
+                                           (logical-read-u32 cursor))
+                                  :notnull (case (logical-read-u8 cursor)
+                                             (0 nil)
+                                             (1 t)
+                                             (otherwise
+                                              (error "invalid logical column flags")))))))
            (key-attnums (loop repeat (logical-read-u16 cursor)
                               collect (logical-read-u16 cursor)))
            (rows

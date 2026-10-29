@@ -1316,6 +1316,10 @@
            (relation (pg::make-pgoutput-relation :columns (list id body note) :key-columns (list id))))
       (ok (equal (pg::logical-update-set-clause relation #("7" :unchanged-toast nil))
                  "id = 7, note = NULL"))
+      (ok (handler-case
+              (progn (pg::logical-update-set-clause relation #(:unchanged-toast :unchanged-toast :unchanged-toast)) nil)
+            (simple-error () t)))
+      (setf (pg::pgoutput-column-type-oid id) 25)
       (ok (equal (pg::logical-update-set-clause relation #(:unchanged-toast :unchanged-toast :unchanged-toast))
                  "id = id"))
       (ok (handler-case
@@ -1326,18 +1330,84 @@
             (simple-error () t)))))
 
 (deftest unchanged-toast-old-key-and-malformed-update
-    (let* ((id (pg::make-pgoutput-column :name "id" :type-oid 23 :key-p t))
+    (let* ((id (pg::make-pgoutput-column :name "id" :type-oid 25 :key-p t))
            (body (pg::make-pgoutput-column :name "body" :type-oid 25))
            (relation (pg::make-pgoutput-relation :columns (list id body) :key-columns (list id)))
            (payload (octets #(75 0 2 116 0 0 0 1 55 110 78 0 2 117 117))))
       (multiple-value-bind (old new kind) (pg::logical-pgoutput-read-update payload 0)
         (ok (char= kind #\K))
         (ok (equal (pg::logical-row-key-predicate
-                    (pg::logical-pgoutput-key-values relation old) (list id)) "id = 7"))
+                    (pg::logical-pgoutput-key-values relation old) (list id)) "id = '7'"))
         (ok (equal (pg::logical-update-set-clause relation new) "id = id")))
       (ok (handler-case
               (progn (pg::logical-pgoutput-read-update (subseq payload 0 14) 0) nil)
             (simple-error () t)))))
+
+(deftest unchanged-toast-marker-context-and-types
+    (let* ((id (pg::make-pgoutput-column :name "id" :type-oid 25 :key-p t))
+           (number (pg::make-pgoutput-column :name "n" :type-oid 23))
+           (body (pg::make-pgoutput-column :name "body" :type-oid 17))
+           (relation (pg::make-pgoutput-relation :name "t" :columns (list id number body)
+                                                 :key-columns (list id)))
+           (runtime (pg::make-logical-subscription-runtime
+                     :options (pg::make-logical-subscription-options :tables '("t"))))
+           (original (symbol-function 'pg::logical-target-query))
+           (queries nil)
+           (valid (octets #(75 0 3 116 0 0 0 1 55 110 110
+                            78 0 3 117 116 0 0 0 1 49 117)))
+           (bad-old (octets #(75 0 3 116 0 0 0 1 55 110 117
+                              78 0 3 117 116 0 0 0 1 49 117)))
+           (bad-fixed (octets #(75 0 3 116 0 0 0 1 55 110 110
+                                78 0 3 117 117 117))))
+      (setf (gethash "t" (pg::logical-subscription-runtime-validated-relations runtime)) t)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::logical-target-query)
+                   (lambda (target query) (declare (ignore target)) (push query queries)
+                           (values nil nil "UPDATE 1")))
+             ;; A varlena key may be unchanged when an old K tuple supplies it.
+             (pg::logical-apply-update runtime relation valid 0)
+             (ok (equal (first queries) "UPDATE t SET n = 1 WHERE id = '7'"))
+             (setf queries nil)
+             ;; Without K, the new tuple supplies the key, so a key marker is unusable.
+             (ok (handler-case
+                     (progn (pg::logical-apply-update
+                             runtime relation (octets #(78 0 3 117 116 0 0 0 1 49 117)) 0)
+                            nil)
+                   (error () t)))
+             (ok (null queries))
+             ;; Unselected relations can carry unsupported types and remain ignored.
+             (let ((excluded (pg::make-pgoutput-relation :name "excluded"
+                                                         :columns (list id number body)
+                                                         :key-columns (list id))))
+               (setf (pg::pgoutput-column-type-oid body) 999999)
+               (ok (null (pg::logical-apply-update runtime excluded bad-fixed 0)))
+               (ok (null queries))
+               (setf (pg::pgoutput-column-type-oid body) 17))
+             (dolist (payload (list bad-old bad-fixed))
+               (ok (handler-case (progn (pg::logical-apply-update runtime relation payload 0) nil)
+                     (error () t))))
+             (ok (handler-case
+                     (progn (pg::logical-apply-insert runtime relation
+                                                      (octets #(78 0 3 116 0 0 0 1 55 110 117)) 0) nil)
+                   (error () t)))
+             (ok (handler-case
+                     (progn (pg::logical-apply-delete runtime relation
+                                                      (octets #(75 0 3 116 0 0 0 1 55 110 117)) 0) nil)
+                   (error () t)))
+             (ok (handler-case
+                     (progn (pg::logical-validate-pgoutput-tuple relation #("7" "1" :unchanged-toast) nil) nil)
+                   (error () t)))
+             (ok (handler-case
+                     (progn (pg::logical-validate-pgoutput-tuple relation #("7" :unchanged-toast "v") t) nil)
+                   (error () t)))
+             (ok (pg::logical-validate-pgoutput-tuple relation #(:unchanged-toast "1" :unchanged-toast) t))
+             (ok (handler-case
+                     (progn (pg::logical-row-key-predicate
+                             (pg::logical-pgoutput-key-values relation #(:unchanged-toast "1" "v"))
+                             (list id)) nil)
+                   (error () t))))
+        (setf (symbol-function 'pg::logical-target-query) original))))
 
 (deftest invalid-message-flags
     (dolist (flags '(1 2 128))

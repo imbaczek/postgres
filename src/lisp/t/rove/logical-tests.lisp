@@ -82,6 +82,45 @@
                    (progn (logical-read-value (make-logical-cursor :bytes #(18)) :int4) nil)
                  (error () t)))))
 
+(rove:deftest test-logical-row-column-numbers-are-canonical
+    (let* ((change (logical-test-change :update 7 701 :old-values (vector 1 2 +null+)
+                                                      :new-values (vector 1 2 +logical-unchanged-toast+)))
+           (encoded (logical-encode-change change))
+           (cursor (make-logical-cursor :bytes encoded))
+           (offsets nil))
+      ;; Locate attribute numbers using the actual codec, rather than assuming
+      ;; relation or column-name lengths.
+      (logical-read-u8 cursor) (logical-read-u8 cursor) (logical-read-u8 cursor)
+      (logical-read-u32 cursor)
+      (rove:ok (= 0 (logical-read-u8 cursor)))
+      (logical-read-u32 cursor) (logical-read-string-u32 cursor)
+      (rove:ok (= 3 (logical-read-u16 cursor)))
+      (dotimes (i 3)
+        (push (logical-cursor-offset cursor) offsets)
+        (logical-read-u16 cursor) (logical-read-string-u32 cursor)
+        (logical-read-u8 cursor) (logical-read-u32 cursor) (logical-read-u8 cursor))
+      (setf offsets (nreverse offsets))
+      ;; The first two columns are swapped, duplicated, or gapped. In
+      ;; particular the marker must never be interpreted against another attnum.
+      (dolist (numbers '((2 1 3) (1 1 3) (1 3 4)))
+        (let ((bad (copy-seq encoded))
+              (bad-change (copy-logical-change change)))
+          (setf (logical-change-columns bad-change) (copy-tree (logical-change-columns change)))
+          (loop for number in numbers for offset in offsets
+                for column in (logical-change-columns bad-change)
+                do (page-set-u16 bad offset number)
+                   (setf (getf column :attnum) number))
+          (rove:ok (handler-case (progn (logical-encode-change bad-change) nil) (error () t)))
+          (rove:ok (handler-case (progn (pgoutput-build-row-change bad-change) nil) (error () t)))
+          (rove:ok (handler-case (progn (logical-decode-change bad) nil) (error () t)))
+          (rove:ok (handler-case
+                       (progn (logical-validate-change-from-cursor (make-logical-cursor :bytes bad)) nil)
+                     (error () t)))
+          (rove:ok (handler-case
+                       (progn (logical-recovery-assembler-append
+                               (make-logical-recovery-assembler 65536) (length bad) 0 bad) nil)
+                     (error () t)))))))
+
 (rove:deftest test-logical-capture-reused-toast-images
     (let* ((pointer (make-heap-external-varlena :raw-size 5004 :external-info 5000
                                                 :value-id 5 :relation-id 7 :id-width 4))

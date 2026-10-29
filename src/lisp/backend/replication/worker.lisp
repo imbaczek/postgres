@@ -785,6 +785,17 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
           (otherwise (error "unsupported pgoutput tuple value kind ~s" kind)))))
     (values (coerce (nreverse values) 'vector) position)))
 
+(defun logical-validate-pgoutput-tuple (relation tuple unchanged-allowed-p)
+  "Check tuple width and pgoutput's external marker against column types."
+  (unless (= (length tuple) (length (pgoutput-relation-columns relation)))
+    (error "pgoutput tuple width does not match relation metadata"))
+  (loop for value across tuple for column in (pgoutput-relation-columns relation)
+        when (eq value :unchanged-toast)
+          do (unless (and unchanged-allowed-p
+                          (member (pgoutput-column-type-oid column) '(17 25 1043 114 3802 1700)))
+               (error "invalid pgoutput unchanged TOAST marker")))
+  tuple)
+
 (defun logical-row-values-for-columns (tuple columns)
   (unless (= (length tuple) (length columns))
     (error "pgoutput tuple width does not match relation metadata"))
@@ -794,6 +805,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
                       (cons (pgoutput-column-type-oid column) value))))
 
 (defun logical-row-insert-sql (relation tuple)
+  (logical-validate-pgoutput-tuple relation tuple nil)
   (let* ((columns (pgoutput-relation-columns relation))
          (values (logical-row-values-for-columns tuple columns)))
     (format nil "INSERT INTO ~a (~{~a~^, ~}) VALUES (~{~a~^, ~})"
@@ -830,6 +842,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
       (logical-pgoutput-read-tuple payload (1+ position))
     (unless (= end (length payload)) (error "pgoutput INSERT has trailing bytes"))
     (when (logical-relation-selected-p runtime relation)
+      (logical-validate-pgoutput-tuple relation tuple nil)
       (unless (= (length tuple) (length (pgoutput-relation-columns relation)))
         (error "pgoutput INSERT tuple is not a full row"))
       (logical-target-query
@@ -869,6 +882,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
 
 (defun logical-update-set-clause (relation new-tuple)
   "Render changed fields, retaining the target's unchanged external values."
+  (logical-validate-pgoutput-tuple relation new-tuple t)
   (let ((assignments
           (loop for column in (pgoutput-relation-columns relation)
                 for value across new-tuple
@@ -888,6 +902,8 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
   (multiple-value-bind (old-tuple new-tuple kind)
       (logical-pgoutput-read-update payload position)
     (when (logical-relation-selected-p runtime relation)
+      (when old-tuple (logical-validate-pgoutput-tuple relation old-tuple nil))
+      (logical-validate-pgoutput-tuple relation new-tuple t)
       (when (char= kind #\O)
         (error "REPLICA IDENTITY FULL is not supported"))
       (unless (= (length new-tuple) (length (pgoutput-relation-columns relation)))
@@ -910,6 +926,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
         (logical-pgoutput-read-tuple payload (1+ position))
       (unless (= end (length payload)) (error "pgoutput DELETE has trailing bytes"))
       (when (logical-relation-selected-p runtime relation)
+        (logical-validate-pgoutput-tuple relation tuple nil)
         (unless (char= kind #\K)
           (error "allowlisted table ~a requires a pgoutput K identity tuple"
                  (pgoutput-relation-name relation)))
