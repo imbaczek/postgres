@@ -25,6 +25,26 @@
       (rove:ok (plusp (key-compare (k "b" :varchar) (k "aa" :varchar)))
                "varchar keys follow lexical order")))
 
+(rove:deftest test-btree-split-balances-bytes
+    (flet ((key (n) (make-array n :element-type '(unsigned-byte 8) :initial-element 1)))
+      (dolist (internal-p '(nil t))
+        (let* ((small (loop repeat 100 collect
+                                       (if internal-p (cons (key 3) 1) (list (key 3) 1 1))))
+               (large (loop repeat 3 collect
+                                     (if internal-p (cons (key 2600) 1) (list (key 2600) 1 1))))
+               (entries (append small large)))
+          (multiple-value-bind (left right) (btree-split-entries entries internal-p)
+            (rove:ok (and left right) "both split pages have entries")
+            (rove:ok (btree-page-build left internal-p) "left page fits")
+            (rove:ok (btree-page-build right internal-p) "right page fits")
+            (rove:ok (= 103 (+ (length left) (length right))) "all entries retained"))))
+      (rove:ok (handler-case
+                   (progn (btree-split-entries (list (list (key 9000) 1 1)
+                                                     (list (key 2) 1 2)) nil)
+                          nil)
+                 (pg-error (e) (string= (pg-error-sqlstate e) "54000")))
+               "an unsplittable entry reports 54000")))
+
 (rove:deftest test-toast-catalog-ownership-roundtrip
     (let* ((toast (make-pg-toast :oid 100 :relfilenode 101 :index-oid 102
                                  :index-relfilenode 103 :relfrozenxid 20))

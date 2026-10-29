@@ -681,12 +681,32 @@ nest and share this lease; relation writers wait until all scans finish."
 
 ;;; ---- insert ----
 
-(defun btree-split-entries (entries)
-  "Split ENTRIES in half; return (values first-half second-half)."
-  (let* ((n (length entries))
-         (k (max 1 (floor n 2))))
-    (when (>= k n) (setf k (1- n)))
-    (values (subseq entries 0 k) (subseq entries k))))
+(defun btree-split-entries (entries internal-p)
+  "Split ENTRIES at a fitting boundary that balances occupied page bytes.
+Include each encoded entry's alignment and line pointer, as page-add-item does.
+Both pages must be nonempty; signal 54000 if no boundary fits."
+  (let* ((sizes (mapcar (lambda (entry)
+                          (multiple-value-bind (payload field)
+                              (btree-pack-key (if internal-p (car entry) (first entry)))
+                            (declare (ignore field))
+                            (+ +size-of-item-id+
+                               (maxalign (+ (length payload) (if internal-p 6 8))))))
+                        entries))
+         (total (reduce #'+ sizes :initial-value 0))
+         (capacity (- +blcksz+ +size-of-page-header+))
+         (left 0)
+         (best nil)
+         (best-difference nil))
+    (loop for size in (butlast sizes)
+          for split from 1
+          do (incf left size)
+             (let ((right (- total left)))
+               (when (and (<= left capacity) (<= right capacity)
+                          (or (null best-difference)
+                              (< (abs (- left right)) best-difference)))
+                 (setf best split best-difference (abs (- left right))))))
+    (unless best (ereport "54000" "index entry is too large"))
+    (values (subseq entries 0 best) (subseq entries best))))
 
 (defun btree-insert-rec (relfilenode level block key tid-block tid-off)
   "Return (values split-p separator new-block)."
@@ -704,7 +724,7 @@ nest and share this lease; relation writers wait until all scans finish."
                 (mark-dirty relfilenode)
                 (values nil nil nil))
               (multiple-value-bind (old-entries new-entries)
-                  (btree-split-entries all)
+                  (btree-split-entries all nil)
                 (let ((old-page (btree-page-build old-entries nil))
                       (new-page (btree-page-build new-entries nil)))
                   (unless (and old-page new-page)
@@ -740,7 +760,7 @@ nest and share this lease; relation writers wait until all scans finish."
                         (mark-dirty relfilenode)
                         (values nil nil nil))
                       (multiple-value-bind (old-entries new-entries)
-                          (btree-split-entries all)
+                          (btree-split-entries all t)
                         (let ((old-page (btree-page-build old-entries t))
                               (new-page (btree-page-build new-entries t)))
                           (unless (and old-page new-page)

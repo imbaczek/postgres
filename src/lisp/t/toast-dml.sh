@@ -26,6 +26,21 @@ run() {
 }
 test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-socket "$TMP/control.sock"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
+# A count-based split puts all three large keys on one page even though a
+# boundary exists where both pages fit. Keep the values distinct and indexable.
+"${PYTHON:-python3}" - >"$TMP/uneven-index.sql" <<'PY'
+import random
+import string
+rng = random.Random(42)
+suffix = ''.join(rng.choice(string.ascii_letters + string.digits) for _ in range(2200))
+print('CREATE TABLE uneven_index (v text UNIQUE);')
+for i in range(100):
+    print(f"INSERT INTO uneven_index VALUES ('a{i:03d}');")
+for i in range(3):
+    print(f"INSERT INTO uneven_index VALUES ('{'z' * 10000}{suffix}{i}');")
+PY
+run -f "$TMP/uneven-index.sql" >/dev/null
+[ "$(run -c 'select count(*) from uneven_index')" = 103 ]
 # Force compressed leaf entries and internal separators with long logical keys.
 # Build the index after loading rows, then exercise its unique insert path.
 index_suffix=$(awk 'BEGIN { for (i=0;i<20000;i++) printf "a" }')
