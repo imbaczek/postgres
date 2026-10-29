@@ -1612,6 +1612,15 @@
                                                            #(65 0 66)) nil)
                         (pg-error (condition) (string= (pg-error-sqlstate condition) "22021"))))
              (rove:ok (null (gethash "p" (extended-query-state-portals *extended-query-state*))))
+             (dolist (invalid '(#(255) #(195) #(192 128) #(237 160 128)))
+               (rove:ok (handler-case
+                            (progn (extended-apply-operation
+                                    out (list :bind "p" "s" '(0)
+                                              (list (cons 0 (length invalid))) nil)
+                                    (coerce invalid '(vector (unsigned-byte 8))))
+                                   nil)
+                          (pg-error (condition) (string= (pg-error-sqlstate condition) "22021"))))
+               (rove:ok (null (gethash "p" (extended-query-state-portals *extended-query-state*)))))
              (setf (extended-statement-types statement) #(:bytea))
              (extended-apply-operation out '(:bind "p" "s" (1) ((0 . 3)) ()) #(65 0 66))
              (rove:ok (equalp (aref (extended-portal-values

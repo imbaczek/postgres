@@ -323,8 +323,9 @@
                                       (progn
                                         (when (position 0 bytes :start start :end end)
                                           (ereport "22021" "null byte in text parameter"))
-                                        (sql-cast-value (sb-ext:octets-to-string bytes :start start :end end
-                                                                                       :external-format :utf-8)
+                                        (sql-cast-value (handler-case (sb-ext:octets-to-string bytes :start start :end end :external-format :utf-8)
+                                                          (sb-int:character-decoding-error ()
+                                                            (ereport "22021" "invalid UTF-8 in text parameter")))
                                                         :text type -1))
                                       (if spooled bytes (subseq bytes start end)))))))
              (when (extended-bind-spool-p payload) (extended-verify-bind-spool payload))
