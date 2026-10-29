@@ -6,6 +6,7 @@
   :components ((:file "t/rove/support")
                (:file "t/rove/primitives-tests")
                (:file "t/rove/storage-tests")
+               (:file "t/rove/pglz-tests")
                (:file "t/rove/sql-tests")
                (:file "t/rove/catalog-tests")
                (:file "t/rove/protocol-tests")
