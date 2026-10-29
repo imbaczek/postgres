@@ -332,7 +332,7 @@ Reject unsupported parameters and unsupported local settings."
   (list (vector 11 "pg_catalog") (vector 99 "pg_toast") (vector 2200 "public")))
 
 (defun sql-replication-slot-row (row)
-  "Adapt the extension WAL snapshot to typed SQL values and catalog column order."
+  "Adapt the private logical WAL snapshot to typed SQL values and column order."
   (flet ((lsn (slot)
            (let ((value (aref row slot)))
              (if (eq value +null+) value (sql-pg-lsn-input value)))))
@@ -341,6 +341,9 @@ Reject unsupported parameters and unsupported local settings."
             (if (string= (aref row 5) "lost") "wal_removed" +null+) nil nil)))
 
 (defun sql-public-replication-slot-row (slot)
+  "Build a public view row while the caller holds write and WAL locks.
+Lost slots expose NULL restart while retaining their saved floor internally.
+The retained-byte extension measures from the durable or flushed endpoint."
   (let* ((physical (wal-physical-slot-p slot))
          (restart (wal-replication-slot-restart-lsn slot))
          (lost (eq :lost (wal-replication-slot-wal-status slot)))
@@ -367,12 +370,14 @@ Reject unsupported parameters and unsupported local settings."
               nil nil +null+ (if (or lost (null restart)) 0 (max 0 (- durable restart)))))))
 
 (defun sql-replication-slot-rows ()
+  "Snapshot both slot kinds under write-before-WAL locking."
   (with-write-lock
     (sb-thread:with-mutex (*wal-lock*)
       (loop for slot being the hash-values of *wal-replication-slots*
             collect (sql-public-replication-slot-row slot)))))
 
 (defun make-replication-slot-result-iterator ()
+  "Project the public snapshot to the 21 columns of pg_get_replication_slots."
   (let ((rows (sql-replication-slot-rows))
         (positions (mapcar (lambda (field)
                              (position (first field) +sql-replication-slot-fields+

@@ -40,11 +40,18 @@
 (defconstant +wal-version+ 7)
 
 (defparameter *max-slot-wal-keep-bytes* (* 1024 1024 1024)
-  "Maximum WAL retained by one replication slot at checkpoint; NIL disables the cap.")
+  "Native exact-byte slot cap; NIL disables it. Installed settings select the policy.
+The initial 1 GiB value is also the fallback before a policy is installed.")
 
-(defstruct wal-slot-retention-policy mode limit (max-wal-bytes 1073741824))
+(defstruct wal-slot-retention-policy
+  "MODE is :bytes or :segments. In :segments mode LIMIT is the standard cap
+in bytes, or NIL for unlimited; recycling rounds it down to whole segments.
+In :bytes mode the getter uses *MAX-SLOT-WAL-KEEP-BYTES* for native compatibility.
+MAX-WAL-BYTES sets the normal WAL window used by catalog status."
+  mode limit (max-wal-bytes 1073741824))
 
-(defvar *wal-slot-retention-policy* nil)
+(defvar *wal-slot-retention-policy* nil
+  "Installed slot retention policy, or NIL for the native byte-cap fallback.")
 
 (defvar *wal-replication-slot-loss-collector* nil
   "Dynamically bound list receiving durably invalidated slots during WAL maintenance.")
@@ -105,6 +112,7 @@ Owners are process-local; the appropriate codec stores durable slot fields."
   (eq :logical (wal-replication-slot-kind slot)))
 
 (defun wal-require-logical-slot (slot)
+  "Reject physical slots before logical decoding or acknowledgment."
   (unless (wal-logical-slot-p slot)
     (ereport "55000" "physical replication slot cannot use logical acknowledgment or decoding"))
   slot)
@@ -146,9 +154,11 @@ Owners are process-local; the appropriate codec stores durable slot fields."
 (defvar *wal-snapshot-retention-pins* (make-hash-table :test #'eq))
 (defvar *wal-replication-slots* (make-hash-table :test #'equal))
 
-(defvar *max-replication-slots* 10)
+(defvar *max-replication-slots* 10
+  "Shared capacity for all public slot names, including temporary and lost slots.")
 
 (defun wal-check-replication-slot-capacity ()
+  "Check shared capacity under WAL, counting temporary and lost slots too."
   (when (zerop *max-replication-slots*)
     (ereport "55000" "replication slots require max_replication_slots greater than zero"))
   (when (>= (hash-table-count *wal-replication-slots*) *max-replication-slots*)
@@ -2123,18 +2133,25 @@ src/backend/access/transam/xlogreader.c."
     (write-sequence bytes stream)))
 
 (defun wal-slot-retention-mode ()
+  "Return the installed mode, or native byte mode before policy installation."
   (if *wal-slot-retention-policy* (wal-slot-retention-policy-mode *wal-slot-retention-policy*) :bytes))
 
 (defun wal-slot-retention-limit ()
+  "Return the standard policy's byte limit or the native byte-cap global.
+NIL disables the selected cap."
   (if (eq :segments (wal-slot-retention-mode))
       (wal-slot-retention-policy-limit *wal-slot-retention-policy*)
       *max-slot-wal-keep-bytes*))
 
 (defun wal-slot-reserved-p (slot)
+  "Return the healthy internal restart floor, if any.
+This is distinct from the advisory public reserved, extended or unreserved status."
   (and (eq :reserved (wal-replication-slot-wal-status slot))
        (wal-replication-slot-restart-lsn slot)))
 
 (defun wal-independent-retention-segment (redo-segment)
+  "Combine redo, active XID and snapshot floors independent of slots.
+The caller holds WAL; take the XID lock to copy active positions."
   (let ((positions
           (append
            (sb-thread:with-mutex (*xid-lock*)
@@ -2144,6 +2161,8 @@ src/backend/access/transam/xlogreader.c."
         redo-segment)))
 
 (defun wal-slot-removal-segment (redo-segment independent-segment &optional (current *wal-durable-lsn*))
+  "Combine independent retention with reserved slot floors under the WAL lock.
+The standard policy rounds its limit down to whole WAL segments."
   (let* ((positions (loop for slot being the hash-values of *wal-replication-slots*
                           when (wal-slot-reserved-p slot)
                             collect (wal-replication-slot-restart-lsn slot)))
@@ -2160,6 +2179,7 @@ src/backend/access/transam/xlogreader.c."
 (declaim (ftype function physical-slot-recovery-durable-lsn))
 
 (defun wal-slot-safe-wal-bytes (slot)
+  "Report remaining safe bytes from the write endpoint, which can be negative."
   (let* ((restart (wal-replication-slot-restart-lsn slot))
          (limit (wal-slot-retention-limit))
          (mode (wal-slot-retention-mode))
@@ -2175,10 +2195,13 @@ src/backend/access/transam/xlogreader.c."
            write))))
 
 (defun wal-slot-byte-limit-exceeded-p (slot current)
+  "Test the native byte cap at CURRENT; the caller chooses write or durable WAL."
   (and (integerp *max-slot-wal-keep-bytes*)
        (> (- current (wal-replication-slot-restart-lsn slot)) *max-slot-wal-keep-bytes*)))
 
 (defun wal-slot-within-normal-window-p (restart write)
+  "Test whether RESTART lies within the normal max_wal_size window.
+Use 1 GiB when no policy is installed."
   (let* ((maximum (if *wal-slot-retention-policy*
                       (wal-slot-retention-policy-max-wal-bytes *wal-slot-retention-policy*)
                       1073741824))
@@ -2187,6 +2210,7 @@ src/backend/access/transam/xlogreader.c."
     (>= (floor restart +wal-segment-size+) oldest)))
 
 (defun wal-slot-catalog-status (slot)
+  "Compute advisory public WAL status at the write endpoint; do not invalidate."
   (when (eq :lost (wal-replication-slot-wal-status slot))
     (return-from wal-slot-catalog-status "lost"))
   (let ((restart (wal-replication-slot-restart-lsn slot)))
@@ -2547,6 +2571,7 @@ src/backend/access/transam/xlogreader.c."
   (format nil "~X/~8,'0X" (ash lsn -32) (logand lsn #xFFFFFFFF)))
 
 (defun wal-replication-slot-rows ()
+  "Return the private six-column logical-only snapshot for existing consumers."
   (sb-thread:with-mutex (*wal-lock*)
     (loop for slot being the hash-values of *wal-replication-slots*
           when (wal-logical-slot-p slot)
@@ -2827,14 +2852,13 @@ Refresh its modification time. Update memory only after atomic publication."
 (declaim (ftype function wal-prepare-slot-recycling-under-lock))
 
 (defun wal-remove-checkpointed-segments-under-wal-lock (checkpoint-lsn)
-  "Recycle WAL while preserving active XID, snapshot, and slot restart points.
+  "Recycle a contiguous WAL prefix after applying retention constraints.
 
-The caller holds *WAL-LOCK*. The checkpoint path also holds *WRITE-LOCK*, so a
-snapshot boundary cannot capture an active XID while its required segment is
-being removed. XID completion can race with recycling; reading the retention
-map under *XID-LOCK* makes that race conservative and safe. Lagging slots are
-durably invalidated here when they exceed max-slot-wal-keep-bytes, matching
-PostgreSQL's checkpoint-time invalidation policy."
+The caller holds *WAL-LOCK*; the checkpoint path also holds *WRITE-LOCK* to
+protect snapshot boundaries. The XID map is read under *XID-LOCK*. Independent
+XID and snapshot floors constrain removal alongside slot floors. The selected
+standard policy invalidates slots behind the C-style removal horizon; the native
+policy instead tests the exact byte cap before recycling."
   (let* ((checkpoint-segment (if (zerop checkpoint-lsn) 0
                                  (floor (1- checkpoint-lsn) +wal-segment-size+)))
          (keep-segment (wal-prepare-slot-recycling-under-lock checkpoint-segment))

@@ -10,7 +10,7 @@ and online promotion are implemented. Fresh backups from a promoted child can fo
 that same timeline. Pinned Patroni's full promotion method passes through native
 pg_ctl and pg_controldata, including its production-state wait. Locally selected
 ancestor-spool fork replay and later promotion now pass manual crash tests.
-Network fork following and rejoin, complete physical-slot interfaces, synchronous
+Network fork following and rejoin, named physical-slot streaming, synchronous
 durability and remaining Patroni interfaces are unfinished. C physical WAL/disk
 compatibility remains future work. Coordination is excluded. The repository's
 original C source is the behavior oracle.
@@ -636,12 +636,19 @@ A Sol xhigh source audit identified these connected requirements:
   registry. Legacy private logical slots may have no database OID, so a NULL
   database cannot identify physical slots. Preserve logical codecs and keep
   attempt-specific proof pins separate from persistent public slots.
-- Implement physical SQL creation, drop, advancement, catalog visibility,
+- Implemented physical SQL creation, drop, advancement, catalog visibility,
   temporary-session ownership, startup loading and WAL retention. A NULL restart
   position reserves no bytes but still occupies its name and capacity. SQL
   advancement accepts interior byte positions and clamps to primary flush or
   standby replay. Streaming feedback may move a physical restart position
   backward; logical terminal acknowledgments cannot implement that operation.
+  Future named streaming must protect `min(old, new)` through the save and any
+  ambiguous rename or directory sync failure: the old, higher live floor is not
+  conservative. Use an audited existing private proof-pin lifetime or an owned
+  process-local provisional pin; otherwise fence WAL maintenance. A process-local
+  pin protects only the running process: resolve an ambiguous save durably before
+  admitting restart, or fence startup and require reseeding. Forward-only SQL
+  advancement is unaffected. Named streaming is not implemented.
 - Validate physical slots against role-appropriate live WAL, base overlap and
   retained history. Preserve proven slots across promotion through the existing
   retained-root handoff. Do not relax logical-slot or private-proof restrictions
@@ -667,15 +674,15 @@ References: C `slotfuncs.c`, `slot.h:248-269`, `walsender.c:PhysicalConfirmRecei
 `config.py:_write_recovery_params`, `__init__.py:follow`, and
 `slots.py:_ensure_physical_slots`.
 
-The new `t/interop/physical-slots.py` contract passes on a clean pinned C build
-and fails on the current native server at physical-slot creation. It checks
+The `t/interop/physical-slots.py` contract originally passed on a clean pinned C build
+and failed on the then-current native server at physical-slot creation. It checks
 unreserved NULL state, catalog values, duplicates, invalid names, SQL NULL,
 byte-position advancement, future-position clamping and temporary ownership.
-This is a failing implementation baseline, not completed physical-slot support.
+This was the implementation baseline.
 Evidence: `/tmp/pg-config-slot-probe.nWMDyQ/reference-contract.log`,
-`native-contract-baseline.log`, and `native-control-baseline.log`. The native
-control REPL confirms that the SQL function is absent and the slot catalog still
-has only its earlier six supported fields.
+`native-contract-baseline.log`, and `native-control-baseline.log`. At that time,
+the native control REPL confirmed that the SQL function was absent and the slot
+catalog had only its earlier six supported fields.
 
 Commit `728fd92a99e` adds the explicit kind, a bounded physical state
 codec on the shared slot path, and guards against applying logical XID tracking
@@ -732,8 +739,48 @@ A separate pinned C standby probe confirms the replay bound with replay paused
 and newer WAL already received. Reservation remained below replay, an interior
 byte advance succeeded, and a future target clamped to replay. Evidence:
 `/tmp/pg-config-slot-probe.nWMDyQ/standby-slot-contract.log`.
-This completes internal standby loading. Public slot SQL, named-slot streaming,
-promotion carryover and standard Patroni follow configuration remain open.
+This completed internal standby loading. The public SQL milestone below followed;
+named-slot streaming, promotion carryover and standard Patroni follow remain open.
+
+### Public physical slot SQL checkpoint
+
+Public SQL supports physical slot creation, advancement and drop, and the
+21-column `pg_get_replication_slots` SRF. The view exposes the 22 pinned C
+columns plus native `retained_wal_bytes` at attribute 23. The private six-column
+`wal-replication-slot-rows` snapshot remains logical-only. Logical-only fields
+are NULL for physical slots; a lost slot exposes NULL restart LSN while its saved floor stays
+internal. Safe WAL size uses the write endpoint; retained bytes use the durable
+primary or flushed standby endpoint.
+
+Creation is durable; an ambiguous save retains the name and floor. Advancement
+saves a candidate before updating the stable object, clamps to durable WAL on a
+primary or replay on a standby, and permits interior standby positions. Immediate
+standby reservation proves the base or restartpoint floor with admission. When
+a receive store exists it is locked before WAL; the base-only branch needs no
+store lock. Temporary slots survive COMMIT and ROLLBACK, but a
+top-level SQL error or session exit removes them. Checkpoint invalidation requests
+creator termination after WAL and write locks drain; session cleanup removes the slot.
+
+The default standard `max_slot_wal_keep_size = -1` is unlimited. Its policy
+rounds the cap down to whole segments. Explicit `--max-slot-wal-keep-bytes` or
+`PG_MAX_SLOT_WAL_KEEP_BYTES` selects the native exact-byte policy. Capacity in
+`max_replication_slots` is shared by logical, physical, temporary and lost names.
+Native invalidation currently saves loss and then cleans consumers. A validated
+generation and owner check authorizes the captured backend termination; release
+after that claim does not revoke it. Before named public physical streaming is
+enabled, implement and review C's stop-owner, recheck-predicate, save-loss, then
+recycle sequence. Private follow proof pins remain distinct from public slots.
+
+Fresh runs passed 911 physical tests, 181 interop tests and 1,155 legacy checks.
+Strict cold compilation passed. Native and pinned C public SQL, SRF and unchanged Patroni
+SlotsHandler methods passed, as did native follow including paused standby SQL.
+Dedicated C 1 MiB cap boundary, negative safe-size and loss checks passed, as did
+real native and C temporary-creator termination and slot deletion. The Patroni
+SlotsHandler oracle uses a transport adapter; it is not a full Patroni HA,
+election or follow acceptance test. Standard SIGHUP follow integration, libpq
+transport and unmodified `Postgresql.follow`/configuration writer acceptance
+remain open, as does physical-slot promotion carryover. There is no coordinator,
+DCS, routing or authority journal, and native WAL is not C disk-compatible.
 
 ### Historical WAL retention implementation order
 
@@ -4034,8 +4081,8 @@ logical interop Rove cases. Automatic edit review once mistakenly treated a
 new test file as existing; direct file/Git checks proved it absent, and a minimal
 creation followed by structural test insertion preserved all existing work.
 
-Important remaining acceptance gaps: source holds now advance and obey caps as
-described below, but the full physical slot SQL/control contract is unfinished.
+Important remaining acceptance gaps at this historical checkpoint: source holds
+advanced and obeyed caps, but public physical slot SQL was then unfinished.
 Local restart still retains the whole post-base prefix, so receiver retention
 can grow without bound. Incremental replay, safe spool compaction and durable
 local restartpoints remain necessary before calling this a production HA path.
@@ -4088,7 +4135,7 @@ without requiring already recycled WAL, so they do not prevent primary startup.
 They remain lost after restart and native follow returns a reseed-required error.
 This is checkpoint-time per-pin byte-span behavior, matching the existing native
 logical cap; it is not a hard bound on total directory size or a claim that the
-full C physical slot SQL/statistics contract is implemented.
+full C physical streaming and control contract is implemented.
 
 `t/physical-retention.sh` passes with 1,800 SQL commits and over 30 MiB of real
 WAL. While a target transaction delays replay, durable receipt advances source

@@ -603,6 +603,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
      :signature (random-call-signature analyzed (nreverse argument-names)))))
 
 (defun physical-slot-function-signature (name)
+  "Return the supported public slot function's input names, types and defaults."
   (cond
     ((string= name "pg_create_physical_replication_slot")
      '(("slot_name" :name :required) ("immediately_reserve" :bool nil) ("temporary" :bool nil)))
@@ -611,6 +612,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
     ((string= name "pg_drop_replication_slot") '((nil :name :required)))))
 
 (defun analyze-catalog-call-inputs (arguments table)
+  "Analyze catalog call arguments in caller order before binding their names."
   (let ((analyzed (mapcar (lambda (raw)
                             (analyze-expr (if (eq (first raw) :named-arg) (third raw) raw) table))
                           arguments))
@@ -625,6 +627,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
     (values analyzed names)))
 
 (defun analyze-physical-slot-arguments (name arguments table variadic)
+  "Bind supported physical slot arguments and defaults to the catalog signature."
   (multiple-value-bind (analyzed names) (analyze-catalog-call-inputs arguments table)
     (let* ((signature (physical-slot-function-signature name))
            (assigned (make-array (length signature) :initial-element nil))
@@ -654,6 +657,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
       (coerce slots 'list))))
 
 (defun analyze-physical-slot-function (name arguments)
+  "Resolve the result type of a supported public slot function."
   (if (string= name "pg_drop_replication_slot")
       (list :func name arguments :type :void :typmod -1)
       (list :func name arguments :type :record :typmod -1
@@ -661,6 +665,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
                                              +physical-slot-create-result-fields+ +physical-slot-advance-result-fields+))))
 
 (defun eval-physical-slot-function (name arguments)
+  "Execute a bound public slot call using its evaluated SQL arguments."
   (if (some (lambda (argument) (eq argument +null+)) arguments)
       +null+
       (cond
@@ -2841,6 +2846,7 @@ candidate selection."
            (analyzed-expression-contains-set-p (cdr form)))))
 
 (defun analyze-replication-slot-call (name arguments)
+  "Resolve the nullary slot SRF and reject contexts that cannot accept a set."
   (when arguments
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
   (unless *select-set-functions-allowed-p*

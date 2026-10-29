@@ -3,6 +3,8 @@
 (in-package #:pg)
 
 (defun wal-invalidate-replication-slots-matching-under-lock (predicate)
+  "Save loss before publishing it on each matching reserved slot under WAL.
+The saved restart floor remains internal; consumer cleanup runs after locks drain."
   (maphash
    (lambda (name slot)
      (declare (ignore name))
@@ -20,6 +22,9 @@
   (values))
 
 (defun wal-prepare-slot-recycling-under-lock (redo-segment)
+  "Invalidate slots beyond the selected policy and return the recycling floor.
+Named public physical streaming is not wired: before enabling it, stop its owner,
+recheck the loss predicate, save loss, and only then recycle WAL."
   (ecase (wal-slot-retention-mode)
     (:bytes (wal-invalidate-lagging-replication-slots-under-wal-lock))
     (:segments (physical-source-invalidate-lagging-pins-under-wal-lock)))
@@ -32,6 +37,8 @@
     (wal-slot-removal-segment redo-segment independent)))
 
 (defun wal-invalidate-lagging-replication-slots-under-wal-lock ()
+  "Apply the native byte cap at durable WAL, including private source pins.
+The recycling dispatcher selects the standard segment policy separately."
   (wal-invalidate-replication-slots-matching-under-lock
    (lambda (slot)
      (wal-slot-byte-limit-exceeded-p slot *wal-durable-lsn*)))
@@ -285,12 +292,15 @@
   (wait-for-invalidated-backend backend timeout))
 
 (defun wal-current-lost-slot-owner-p (slot backend)
+  "Check the current lost generation and backend while the caller holds WAL."
   (and (eq slot (gethash (wal-replication-slot-name slot) *wal-replication-slots*))
        (eq :lost (wal-replication-slot-wal-status slot))
        (eq backend (wal-replication-slot-active-owner-backend slot))))
 
 (defun request-lost-slot-owner-termination (slot backend)
-  "Send one graceful termination to this current lost slot generation's owner."
+  "Claim one termination for the current lost slot generation under WAL.
+The captured backend is signaled after unlocking. A later release does not
+revoke a request already authorized by the generation and owner check."
   (let ((claimed nil) (current nil))
     (logical-test-failpoint
      :before-lost-slot-owner-termination-claim slot backend)
@@ -342,6 +352,8 @@
     (nreverse requested-backends)))
 
 (defun slot-cleanup-current-backend-p (owner-requests states)
+  "Recheck whether this backend still participates in cleanup before self-exit.
+An earlier authorized termination request is not revoked by a later release."
   (and *backend*
        (or (sb-thread:with-mutex (*wal-lock*)
              (some (lambda (request)
@@ -353,6 +365,7 @@
                  states))))
 
 (defun cleanup-invalidated-replication-state (slots)
+  "Retire lost slot owners and logical snapshot consumers outside WAL locks."
   (let* ((new-states (detach-exported-logical-snapshots-for-slots
                       (remove-if-not #'wal-logical-slot-p slots)))
          (pending-states (logical-pending-expired-snapshot-states))

@@ -184,6 +184,11 @@ appropriate instead of replacing the native C peer or adding a message relay.
   use `#.(char-code ...)`; a tool with `*read-eval*` disabled can reject those
   files even when their parentheses are balanced. That is a reader restriction,
   not proof of damaged parentheses or ignored vector data.
+- `#(...)` is a general vector, not a specialized `(vector (unsigned-byte 8))`.
+  A Describe fixture `#(83 0)` was read correctly, but its empty C-string slice
+  printed `#()` and failed a decoder requiring an octet vector. Construct raw
+  protocol fixtures with `make-array` and `:element-type '(unsigned-byte 8)` to
+  match the wire reader. Diagnose this failure at the decoder's type boundary.
 - On a reader error, inspect the exact raw source with `lisp-read-file`
   `collapsed=false` or `fs-read-file`. A documented `readtable` override changes
   parsing behavior and is not a universal workaround for `#.`. Preserve valid
@@ -429,6 +434,16 @@ this mode.
   reload gate, create a separate task-owned worker and use private file/semaphore
   barriers. Let the control client disconnect before releasing the worker to
   close admission; otherwise its `(quit)` can wait behind the gate it triggered.
+- A control evaluation itself holds live-operation admission; directly requesting
+  quiescence there errors `cannot reload from inside a live operation`. For a
+  task-owned debug configuration transition that needs quiescence, schedule a
+  separate owned worker, let the evaluation return, and poll its terminal status
+  from later control calls. The worker must finish without needing another control
+  call while the gate is closed, since those calls wait for admission. Never join
+  that worker while holding admission.
+  Restore the configuration and remove instrumentation afterwards. This allowed a
+  temporary one-byte slot policy to prove creator disconnection, slot deletion
+  and a witness `SELECT 1`, before restoring the policy and debug variables.
 - Check the exact C interrupt handler before making cancellation more aggressive.
   Pinned `ProcessClientWriteInterrupt` handles only ProcDiePending, deliberately
   deferring statement timeout during blocked partial output. Unwinding an SBCL

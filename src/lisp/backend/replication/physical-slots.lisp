@@ -308,6 +308,7 @@ The returned slot has fresh process-local ownership and transaction state."
       slot)))
 
 (defun wal-check-physical-slot-create (name)
+  "Check the shared slot namespace and capacity while holding the WAL lock."
   (unless (wal-valid-replication-slot-name-p name)
     (ereport "42602" "invalid replication slot name ~s" name))
   (when (gethash name *wal-replication-slots*)
@@ -315,11 +316,14 @@ The returned slot has fresh process-local ownership and transaction state."
   (wal-check-replication-slot-capacity))
 
 (defun physical-slot-owned-by-backend-p (slot backend)
+  "Test whether BACKEND is the temporary physical slot's creator."
   (and backend (wal-physical-slot-p slot)
        (wal-replication-slot-temporary-p slot)
        (eq backend (wal-replication-slot-temporary-owner slot))))
 
 (defun physical-slot-publish-create-under-lock (name restart timeline temporary)
+  "Publish and save a slot under the WAL lock. An ambiguous save keeps its name
+and retention floor until the durable state can be resolved."
   (wal-check-healthy)
   (wal-check-physical-slot-create name)
   (let ((slot (make-wal-replication-slot
@@ -341,6 +345,7 @@ The returned slot has fresh process-local ownership and transaction state."
     slot))
 
 (defun physical-slot-primary-reserve-under-lock ()
+  "Reserve the durable checkpoint redo position while holding the WAL lock."
   (let* ((snapshot *wal-checkpoint-snapshot*)
          (restart (getf snapshot :redo))
          (timeline (getf snapshot :timeline *wal-checkpoint-timeline*)))
@@ -350,6 +355,7 @@ The returned slot has fresh process-local ownership and transaction state."
     (values restart timeline)))
 
 (defun physical-slot-standby-reservation-under-store-lock (store)
+  "Prove the standby floor from the base or restartpoint under the store lock."
   (check-physical-recovery-work)
   (physical-store-check-live store)
   (let* ((state *physical-recovery-state*)
@@ -377,12 +383,16 @@ The returned slot has fresh process-local ownership and transaction state."
     (values floor (physical-store-prefix-timeline store floor))))
 
 (defun physical-slot-check-live-admission ()
+  "Require admitted work or owned, fully drained quiescence for recovery access."
   (unless (or (plusp *live-operation-depth*)
               (and (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
                    (not *live-operation-drain-open*)))
     (error "physical slot recovery operation requires admission or owned quiescence")))
 
 (defun physical-slot-create-standby (name temporary)
+  "Reserve a proven recovery floor under admission or owned quiescence.
+When a receive store exists, hold its lock before taking the WAL lock; otherwise
+verify the base floor before publishing under WAL."
   (physical-slot-check-live-admission)
   (check-physical-recovery-work)
   (let ((store *physical-receive-store*))
@@ -404,6 +414,7 @@ The returned slot has fresh process-local ownership and transaction state."
             (publish (getf state :end) (getf state :timeline)))))))
 
 (defun wal-create-physical-replication-slot (name &key immediately-reserve temporary)
+  "Create a durable physical slot, optionally reserving WAL and a session owner."
   (when (and temporary (null *backend*))
     (error "temporary physical slot requires a backend owner"))
   (sb-thread:with-mutex (*wal-lock*)
@@ -422,16 +433,19 @@ The returned slot has fresh process-local ownership and transaction state."
             (physical-slot-publish-create-under-lock name restart timeline temporary))))))
 
 (defun physical-slot-recovery-write-lsn ()
+  "Return the standby write endpoint, or the base end before a store exists."
   (if *physical-receive-store*
       (physical-store-written-lsn *physical-receive-store*)
       (getf *physical-recovery-state* :end)))
 
 (defun physical-slot-recovery-durable-lsn ()
+  "Return the standby flushed endpoint, or the base end before a store exists."
   (if *physical-receive-store*
       (physical-store-flushed-lsn *physical-receive-store*)
       (getf *physical-recovery-state* :end)))
 
 (defun physical-slot-current-prefix-timeline (lsn)
+  "Find the timeline containing the prefix ending at LSN for slot advancement."
   (if (recovery-in-progress-p)
       (if *physical-receive-store*
           (physical-store-prefix-timeline *physical-receive-store* lsn)
@@ -443,6 +457,9 @@ The returned slot has fresh process-local ownership and transaction state."
                       *wal-insert-timeline* (bytes->string (timeline-history-bytes *wal-insert-timeline*))))))))
 
 (defun wal-advance-physical-replication-slot (name target)
+  "Advance a reserved slot up to durable primary WAL or standby replay.
+Save the candidate before changing the stable slot object; TARGET may be an
+interior position on a standby."
   (unless (typep target '(integer 1 18446744073709551615))
     (ereport "22023" "invalid target WAL LSN"))
   (when (recovery-in-progress-p)
@@ -477,6 +494,7 @@ The returned slot has fresh process-local ownership and transaction state."
         target))))
 
 (defun wal-cleanup-backend-physical-slots (backend)
+  "Drop temporary slots owned by BACKEND, checking each captured generation."
   (when backend
     (let ((slots
             (sb-thread:with-mutex (*wal-lock*)

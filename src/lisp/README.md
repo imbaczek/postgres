@@ -1441,7 +1441,13 @@ placeholders, including Patroni's defaults. Statement deadlines apply at safe
 interrupt points and bounded lock waits, with independent budgets for statements
 in one simple-query frame. RESET restores startup values; ordinary timeout
 cancellation during blocked partial output is deferred as in C PostgreSQL.
-Native defaults remain port 5433 and a 1 GiB slot cap. Full generated Patroni
+Native defaults remain port 5433 and unlimited standard slot retention
+(`max_slot_wal_keep_size = -1`). An explicit `--max-slot-wal-keep-bytes` or
+`PG_MAX_SLOT_WAL_KEEP_BYTES` selects the native exact-byte cap; the standard cap
+uses whole segments. Public physical slot create, advance and drop, the
+21-column SRF and the 22 C view columns plus native `retained_wal_bytes` (23
+columns total) are
+implemented. Named physical slot streaming remains open. Full generated Patroni
 configurations, recovery parameters, session GUC catalog coverage and control
 interfaces remain unfinished, as does C physical data compatibility; see
 [the HA ledger](PHYSICAL-HA.md).

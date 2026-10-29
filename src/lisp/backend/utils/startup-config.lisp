@@ -369,6 +369,7 @@
     (if value (funcall parser value) fallback)))
 
 (defun startup-effective-slot-limit (settings native)
+  "Select the explicit native byte cap or the standard limit; NIL means unlimited."
   (let ((bytes (or (gethash "max-slot-wal-keep-bytes" native)
                    (uiop:getenv "PG_MAX_SLOT_WAL_KEEP_BYTES")))
         (megabytes (startup-setting-value settings "max_slot_wal_keep_size")))
@@ -376,6 +377,7 @@
         (unless (= megabytes -1) (* megabytes 1024 1024)))))
 
 (defun startup-effective-slot-policy (settings native)
+  "Choose exact-byte mode only for an explicit native option or environment value."
   (make-wal-slot-retention-policy
    :mode (if (or (gethash "max-slot-wal-keep-bytes" native)
                  (uiop:getenv "PG_MAX_SLOT_WAL_KEEP_BYTES")) :bytes :segments)
