@@ -479,15 +479,10 @@ to a single leaf."
                               key acc))))
             acc)))))
 
-(defun btree-prefix-entries-unlocked (relfilenode prefix)
-  "Return leaf entries whose encoded keys start with PREFIX, in index order.
-The caller must hold the relation read or write lock and ensure the index is
-initialized. The search visits the bytewise range [PREFIX, upper), where upper
-is the shortest successor of PREFIX, or unbounded when none exists. Equal
-separator boundaries are included so duplicate keys spanning pages are found."
+(defun btree-map-prefix-entries-unlocked (relfilenode prefix function)
+  "Visit matching leaf entries in index order under the caller's relation lease."
   (multiple-value-bind (level root) (btree-read-meta relfilenode)
-    (let ((matches nil)
-          (upper (copy-seq prefix)))
+    (let ((upper (copy-seq prefix)))
       (loop for i downfrom (1- (length upper)) to 0
             when (< (aref upper i) 255)
               do (incf (aref upper i))
@@ -503,7 +498,7 @@ separator boundaries are included so duplicate keys spanning pages are found."
                            (when (and (<= (length prefix) (length key))
                                       (loop for i below (length prefix)
                                             always (= (aref prefix i) (aref key i))))
-                             (push entry matches))))
+                             (funcall function entry))))
                        (let ((entries (btree-page-entries page t)))
                          (loop for remaining on entries
                                for entry = (first remaining)
@@ -511,8 +506,15 @@ separator boundaries are included so duplicate keys spanning pages are found."
                                when (and (or (null next) (not (key< (car next) prefix)))
                                          (or (null upper) (key< (car entry) upper)))
                                  do (walk (1- depth) (cdr entry))))))))
-        (walk level root))
-      (nreverse matches))))
+        (walk level root))))
+  (values))
+
+(defun btree-prefix-entries-unlocked (relfilenode prefix)
+  "Return matching leaf entries in index order under the caller's relation lease."
+  (let ((matches nil))
+    (btree-map-prefix-entries-unlocked relfilenode prefix
+                                       (lambda (entry) (push entry matches)))
+    (nreverse matches)))
 
 (defun btree-search-unlocked (relfilenode key)
   "Return a list of (block . off) heap TIDs for entries whose key equals KEY."

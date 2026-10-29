@@ -384,6 +384,29 @@
                  (let ((start (min (first bounds) (length bytes))))
                    (ok (equalp (subseq bytes start (min (length bytes) (+ start (second bounds))))
                                (pg::toast-fetch-value-slice toast pointer snapshot (first bounds) (second bounds))))))
+               (let ((old (symbol-function 'pg::btree-prefix-entries-unlocked)))
+                 (unwind-protect
+                      (progn
+                        (setf (symbol-function 'pg::btree-prefix-entries-unlocked)
+                              (lambda (&rest args) (declare (ignore args))
+                                (error "full fetch must use the visitor")))
+                        (ok (equalp bytes (pg::toast-fetch-value toast pointer snapshot)))
+                        (ok (equalp compressible (pg::toast-fetch-value toast compressed snapshot))))
+                   (setf (symbol-function 'pg::btree-prefix-entries-unlocked) old)))
+               (let ((old (symbol-function 'pg::btree-map-prefix-entries-unlocked)))
+                 (unwind-protect
+                      (progn
+                        (setf (symbol-function 'pg::btree-map-prefix-entries-unlocked)
+                              (lambda (node prefix callback)
+                                (funcall old node prefix
+                                         (lambda (entry)
+                                           (funcall callback entry)
+                                           (error "interrupted fetch")))))
+                        (ok (intake-fails-p (lambda () (pg::toast-fetch-value toast pointer snapshot)))))
+                   (setf (symbol-function 'pg::btree-map-prefix-entries-unlocked) old)))
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (ok t))
+               (ok (equalp bytes (pg::toast-fetch-value toast pointer snapshot)))
                (ok (nth-value 2 (pg::toast-pointer-storage-size toast compressed)))
                (ok (equalp (subseq compressible 1900 2100)
                            (pg::toast-fetch-value-slice toast compressed snapshot 1900 200)))
@@ -412,7 +435,9 @@
                (let ((missing (pg::copy-heap-external-varlena pointer)))
                  (setf (pg::heap-external-varlena-value-id missing) 999999)
                  (ok (equal "XX001" (recovery-state-of
-                                     (lambda () (pg::toast-fetch-value-slice toast missing snapshot 0 1))))))
+                                     (lambda () (pg::toast-fetch-value-slice toast missing snapshot 0 1)))))
+                 (ok (equal "XX001" (recovery-state-of
+                                     (lambda () (pg::toast-fetch-value toast missing snapshot))))))
                (ok (intake-fails-p (lambda () (pg::toast-fetch-value-slice toast pointer snapshot -1 1))))
                (let ((bad (pg::copy-heap-external-varlena pointer)))
                  (incf (pg::heap-external-varlena-relation-id bad))
@@ -428,7 +453,21 @@
                        (pg::btree-insert-unlocked (pg::pg-toast-index-relfilenode toast)
                                                   (pg::toast-chunk-key 999998 0) block offset))))
                  (ok (equal "XX001" (recovery-state-of
-                                     (lambda () (pg::toast-fetch-value-slice toast malformed snapshot 0 1))))))
+                                     (lambda () (pg::toast-fetch-value-slice toast malformed snapshot 0 1)))))
+                 (ok (equal "XX001" (recovery-state-of
+                                     (lambda () (pg::toast-fetch-value toast malformed snapshot))))))
+               ;; A matching index key must point to the same chunk identity.
+               (let ((wrong (pg::copy-heap-external-varlena pointer)))
+                 (setf (pg::heap-external-varlena-value-id wrong) 999996)
+                 (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                   (pg::with-write-lock
+                     (multiple-value-bind (block offset)
+                         (pg::heapam-insert (pg::pg-toast-relfilenode toast) pg::*toast-chunk-columns*
+                                            (vector 999997 0 (subseq bytes 0 pg::+toast-oid-chunk-size+)) 42 0)
+                       (pg::btree-insert-unlocked (pg::pg-toast-index-relfilenode toast)
+                                                  (pg::toast-chunk-key 999996 0) block offset))))
+                 (ok (equal "XX001" (recovery-state-of
+                                     (lambda () (pg::toast-fetch-value toast wrong snapshot))))))
                ;; An aborted insertion may leave a stale index entry beside the real chunk.
                (pg::clog-set 43 pg::+clog-aborted+)
                (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
@@ -445,6 +484,7 @@
                                          pg::+heap-xmin-invalid+)))))
                (ok (equalp (subseq bytes 0 1)
                            (pg::toast-fetch-value-slice toast pointer snapshot 0 1)))
+               (ok (equalp bytes (pg::toast-fetch-value toast pointer snapshot)))
                ;; Duplicate an indexed selected chunk; exact lookup must reject it.
                (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
                  (pg::with-write-lock
@@ -456,6 +496,7 @@
                                                 (pg::toast-chunk-key (pg::heap-external-varlena-value-id pointer) 0)
                                                 block offset))))
                (ok (equal "XX001" (recovery-state-of (lambda () (pg::toast-fetch-value-slice toast pointer snapshot 0 1)))))
+               (ok (equal "XX001" (recovery-state-of (lambda () (pg::toast-fetch-value toast pointer snapshot)))))
                (ok (equalp (subseq bytes 4500 4510)
                            (pg::toast-fetch-value-slice toast pointer snapshot 4500 10))))
           (pg::release-snapshot-registration registration)
@@ -511,6 +552,24 @@
                (ok (intake-fails-p (lambda () (pg::toast-fetch-value toast pointer snapshot))))
                (pg::register-active-snapshot snapshot registration)
                (ok (equalp bytes (pg::toast-fetch-value toast pointer snapshot)))
+               ;; One value spans many index leaves; a duplicate in its middle
+               ;; must remain visible to the prefix visitor after page splits.
+               (let* ((large (make-array 1000000 :element-type '(unsigned-byte 8)
+                                                 :initial-element 123))
+                      (large-pointer
+                        (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                          (pg::with-write-lock
+                            (pg::toast-store-value-unlocked toast large 999000 42 0)))))
+                 (ok (equalp large (pg::toast-fetch-value toast large-pointer snapshot)))
+                 (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                   (pg::with-write-lock
+                     (multiple-value-bind (block offset)
+                         (pg::heapam-insert (pg::pg-toast-relfilenode toast) pg::*toast-chunk-columns*
+                                            (vector 999000 200 (subseq large 0 pg::+toast-oid-chunk-size+)) 42 0)
+                       (pg::btree-insert-unlocked (pg::pg-toast-index-relfilenode toast)
+                                                  (pg::toast-chunk-key 999000 200) block offset))))
+                 (ok (equal "XX001" (recovery-state-of
+                                     (lambda () (pg::toast-fetch-value toast large-pointer snapshot))))))
                (let* ((logical (vector bytes))
                       (physical (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
                                   (pg::with-write-lock

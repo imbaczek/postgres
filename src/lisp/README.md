@@ -217,6 +217,11 @@ TOAST selection defaults to `MAIN` for `numeric` and `EXTENDED` for text,
 varchar, bytea, JSON and JSONB. `ALTER TABLE ... ALTER COLUMN ... SET STORAGE`
 accepts `PLAIN`, `EXTERNAL`, `EXTENDED`, `MAIN`, and `DEFAULT`. The policy
 applies to subsequent writes; existing values remain readable after a change.
+Full TOAST fetch walks the B-tree prefix under a read lease, validating and
+copying one chunk at a time into a complete stored-payload buffer. It rejects
+missing, misordered or malformed chunks and mismatched index entries. The full
+value still occupies memory, and compressed values require decompression and its
+output allocation.
 An UPDATE, including `ON CONFLICT DO UPDATE`, reuses external TOAST pointers
 for columns omitted from its assignments. The pointer comes from the physical
 row version actually claimed after any concurrent-update recheck; its chunks
