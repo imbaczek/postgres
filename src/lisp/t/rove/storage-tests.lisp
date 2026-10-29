@@ -445,6 +445,64 @@
       (rove:ok (> (query-spill-value-size original) 64)
                "spill accounting includes parsed JSONB contents")))
 
+(rove:deftest test-query-spill-large-array-group-key-size
+    (let* ((array (make-sql-array :element-type-id :bytea
+                                  :elements (make-array 100000 :initial-element +null+)
+                                  :dimensions '(100000) :lower-bounds '(1)))
+           (key (sql-group-value-key array :bytea-array))
+           (size (query-spill-value-size key)))
+      (rove:ok (> size 100000))
+      (rove:ok (= (query-spill-value-size '(a b . c))
+                  (+ 48 (query-spill-value-size 'a) 48
+                     (query-spill-value-size 'b) (query-spill-value-size 'c))))))
+
+(rove:deftest test-query-spill-large-list-decode
+    (let* ((array (make-sql-array :element-type-id :bytea
+                                  :elements (make-array 100000 :initial-element +null+)
+                                  :dimensions '(100000) :lower-bounds '(1)))
+           (key (sql-group-value-key array :bytea-array))
+           (encoded (with-output-to-string (out) (query-spill-write-value out key)))
+           (decoded (let ((*read-eval* nil))
+                      (query-spill-decode (read-from-string encoded)))))
+      (rove:ok (equal key decoded) "large array group keys survive spill decoding")
+      (rove:ok (not (eq key decoded)) "decoding copies the list spine"))
+  (flet ((encoded (value)
+           (let ((*read-eval* nil) (*readtable* *query-spill-readtable*))
+             (read-from-string
+              (with-output-to-string (out) (query-spill-write-value out value))))))
+    (dolist (value (list (sql-jsonb-input "{\"a\":1.00}")
+                         (make-sql-timetz 123 0)
+                         (make-sql-interval 1 2 3)
+                         1.25d0
+                         (make-sql-decimal 123 2)
+                         (make-sql-array :element-type-id :bytea :elements (vector +null+)
+                                         :dimensions '(1) :lower-bounds '(-2))
+                         (make-sql-record :fields '(("n" :numeric))
+                                          :values (vector (make-sql-decimal 123 2)))
+                         (vector (make-sql-decimal 123 2))))
+      (let ((decoded (query-spill-decode (cons :prefix (encoded value)))))
+        (rove:ok (eq :prefix (car decoded)))
+        (rove:ok (equalp value (cdr decoded))
+                 "a tagged cdr remains one decoded value"))))
+  (rove:ok (equal '(a (b . c) . d) (query-spill-decode '(a (b . c) . d)))
+           "nested dotted tails survive decoding")
+  (let ((original (symbol-function 'check-for-interrupts))
+        (polls 0)
+        (input (make-list 10000 :initial-element 1))
+        (caught nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'check-for-interrupts)
+                 (lambda ()
+                   (when (= (incf polls) 2)
+                     (ereport "57014" "injected spill decode cancellation"))))
+           (setf caught
+                 (handler-case (progn (query-spill-decode input) nil)
+                   (pg-error (condition) (string= "57014" (pg-error-sqlstate condition))))))
+      (setf (symbol-function 'check-for-interrupts) original))
+    (rove:ok caught "long list decoding polls after 4096 elements")
+    (rove:ok (= polls 2))))
+
 (rove:deftest test-jsonb-storage-and-catalog-roundtrip
     (let* ((original (sql-jsonb-input "{\"a\":[1.00,{\"v\":false}]}"))
            (column (make-pg-column :name "j" :type :jsonb :typmod -1 :attnum 1))

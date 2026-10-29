@@ -924,8 +924,13 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
      (+ 64 (loop for element across value
                  sum (query-spill-value-size element))))
     ((consp value)
-     (+ 48 (query-spill-value-size (car value))
-        (query-spill-value-size (cdr value))))
+     (let ((tail value) (size 0) (count 0))
+       (loop while (consp tail)
+             do (when (zerop (mod count 4096)) (check-for-interrupts))
+                (incf size (+ 48 (query-spill-value-size (car tail))))
+                (incf count)
+                (setf tail (cdr tail)))
+       (+ size (query-spill-value-size tail))))
     ((symbolp value)
      (+ 32 (* 2 (length (symbol-name value)))))
     ((integerp value)
@@ -974,8 +979,24 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
                        :initial-contents
                        (map 'vector #'query-spill-decode elements)))))
     ((consp value)
-     (cons (query-spill-decode (car value))
-           (query-spill-decode (cdr value))))
+     ;; Copy long list spines without consuming one control-stack frame per
+     ;; element. A tagged cdr must still be decoded as a whole value, just as
+     ;; in the recursive implementation; keep these tags in sync with above.
+     (let ((head nil) (last nil) (tail value) (count 0))
+       (loop while (and (consp tail)
+                        (not (member (car tail)
+                                     '(:pg-query-spill-jsonb :pg-query-spill-timetz
+                                       :pg-query-spill-interval :pg-query-spill-float
+                                       :pg-query-spill-numeric :pg-query-spill-array
+                                       :pg-query-spill-record :pg-query-spill-vector))))
+             do (when (zerop (mod count 4096)) (check-for-interrupts))
+                (let ((cell (cons (query-spill-decode (car tail)) nil)))
+                  (if last (setf (cdr last) cell) (setf head cell))
+                  (setf last cell))
+                (incf count)
+                (setf tail (cdr tail)))
+       (setf (cdr last) (query-spill-decode tail))
+       head))
     (t value)))
 
 (defun query-spill-record-size (value)
