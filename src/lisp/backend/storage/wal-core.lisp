@@ -73,6 +73,18 @@
 (defvar *wal-lock* (sb-thread:make-mutex :name "pg wal and page cache lock"))
 (defvar *wal-page-cache* (make-hash-table :test #'equal))
 (defvar *wal-page-cache-xids* (make-hash-table :test #'equal))
+
+(defparameter *wal-dirty-resident-limit-pages* 512
+  "Maximum dirty page vectors retained across the shared cache and private batch.")
+
+(defstruct wal-dirty-store spool (next-slot 0) (free-slots nil) (resident 0) (disk-refs 0))
+
+(defstruct wal-dirty-reference store key page slot checksum)
+
+(defvar *wal-dirty-store* nil)
+
+(declaim (notinline logical-spool-path logical-spool-stream))
+
 (defvar *wal-page-batch* nil)
 (defvar *wal-page-batch-xids* nil)
 
@@ -355,10 +367,149 @@ Legacy 16-hex segment names always belong to timeline 1."
     (page-set-u16 copy +pd-checksum-off+ 0)
     copy))
 
+(define-condition wal-dirty-store-error (error)
+  ((cause :initarg :cause :reader wal-dirty-store-error-cause))
+  (:report (lambda (condition stream)
+             (format stream "dirty page scratch failure: ~a"
+                     (wal-dirty-store-error-cause condition)))))
+
+(defun wal-dirty-checksum (key page)
+  "Bind scratch bytes to the exact relation, fork and block."
+  (let ((bytes (make-array (+ 12 +blcksz+) :element-type '(unsigned-byte 8))))
+    (wal-set-u32 bytes 0 (first key))
+    (wal-set-u32 bytes 4 (wal-page-fork-id (second key)))
+    (wal-set-u32 bytes 8 (third key))
+    (replace bytes page :start1 12)
+    (wal-crc32 bytes)))
+
+(defun wal-dirty-ensure-spool (store)
+  (unless (wal-dirty-store-spool store)
+    (sb-sys:without-interrupts
+      (let ((*query-temp-file-limit-bytes* nil))
+        (setf (wal-dirty-store-spool store) (make-logical-spool)))))
+  (let ((spool (wal-dirty-store-spool store)))
+    (call-with-logical-spool-owner spool (lambda () (logical-spool-ensure-file spool)))
+    spool))
+
+(defun wal-dirty-new-reference (key page)
+  "Own PAGE in memory or an immutable scratch slot before publishing it."
+  (unless (= (length page) +blcksz+)
+    (error 'wal-dirty-store-error :cause "invalid dirty page size"))
+  (sb-sys:without-interrupts
+    (let ((store (or *wal-dirty-store* (setf *wal-dirty-store* (make-wal-dirty-store)))))
+      (if (< (wal-dirty-store-resident store) *wal-dirty-resident-limit-pages*)
+          (progn
+            (incf (wal-dirty-store-resident store))
+            (make-wal-dirty-reference :store store :key key :page page))
+          (handler-case
+              (let* ((spool (wal-dirty-ensure-spool store))
+                     (free (wal-dirty-store-free-slots store))
+                     (slot (if free (pop (wal-dirty-store-free-slots store))
+                               (prog1 (wal-dirty-store-next-slot store)
+                                 (incf (wal-dirty-store-next-slot store)))))
+                     (checksum (wal-dirty-checksum key page)))
+                (call-with-logical-spool-owner
+                 spool
+                 (lambda ()
+                   (unless free
+                     (query-temp-account-space (logical-spool-path spool) +blcksz+))
+                   (unless (file-position (logical-spool-stream spool) (* slot +blcksz+))
+                     (error "cannot seek dirty page scratch"))
+                   (write-sequence page (logical-spool-stream spool))
+                   (finish-output (logical-spool-stream spool))))
+                (incf (wal-dirty-store-disk-refs store))
+                (make-wal-dirty-reference :store store :key key :slot slot :checksum checksum))
+            (error (condition) (error 'wal-dirty-store-error :cause condition)))))))
+
+(defun wal-dirty-read-reference (key reference)
+  "Read a validated transient page without retaining another resident copy."
+  (if (not (wal-dirty-reference-p reference))
+      reference
+      (progn
+        (unless (equal key (wal-dirty-reference-key reference))
+          (error 'wal-dirty-store-error :cause "scratch page key mismatch"))
+        (or (wal-dirty-reference-page reference)
+            (handler-case
+                (let* ((store (wal-dirty-reference-store reference))
+                       (spool (wal-dirty-store-spool store))
+                       (page (make-array +blcksz+ :element-type '(unsigned-byte 8))))
+                  (call-with-logical-spool-owner
+                   spool
+                   (lambda ()
+                     (unless (file-position (logical-spool-stream spool)
+                                            (* (wal-dirty-reference-slot reference) +blcksz+))
+                       (error "cannot seek dirty page scratch"))
+                     (unless (= +blcksz+ (read-sequence page (logical-spool-stream spool)))
+                       (error "truncated dirty page scratch"))))
+                  (unless (= (wal-dirty-checksum key page) (wal-dirty-reference-checksum reference))
+                    (error "dirty page scratch checksum mismatch"))
+                  page)
+              (error (condition) (error 'wal-dirty-store-error :cause condition)))))))
+
+(defun wal-dirty-release-reference (reference)
+  (when (wal-dirty-reference-p reference)
+    (let ((store (wal-dirty-reference-store reference)))
+      (if (wal-dirty-reference-page reference)
+          (decf (wal-dirty-store-resident store))
+          (progn
+            (decf (wal-dirty-store-disk-refs store))
+            (push (wal-dirty-reference-slot reference) (wal-dirty-store-free-slots store))))))
+  (values))
+
+(declaim (ftype function wal-note-page-xid-under-lock))
+
+(defun wal-dirty-install-page (key page)
+  "Publish a complete reference and transfer its ownership without interruption."
+  (sb-sys:without-interrupts
+    (handler-case
+        (let* ((reference (wal-dirty-new-reference key page))
+               (map (if *wal-page-batch* *wal-page-batch* *wal-page-cache*))
+               (old (gethash key map))
+               (installed nil))
+          (unwind-protect
+               (progn
+                 (wal-note-page-xid-under-lock key)
+                 (setf (gethash key map) reference
+                       installed t)
+                 (wal-dirty-release-reference old))
+            (unless installed (wal-dirty-release-reference reference))))
+      (wal-dirty-store-error (condition) (error condition))
+      (error (condition) (error 'wal-dirty-store-error :cause condition))))
+  (values))
+
+(defun wal-dirty-remove-page (key pages contributors)
+  "Retire a map entry and its owned reference as one uninterruptible operation."
+  (sb-sys:without-interrupts
+    (handler-case
+        (multiple-value-bind (reference present) (gethash key pages)
+          (when present
+            (remhash key pages)
+            (when (hash-table-p contributors) (remhash key contributors))
+            (wal-dirty-release-reference reference)))
+      (error (condition) (error 'wal-dirty-store-error :cause condition))))
+  (values))
+
+(defun wal-dirty-close-empty-store ()
+  "Release scratch after the last shared or private reference disappears."
+  (sb-sys:without-interrupts
+    (when (and *wal-dirty-store*
+               (zerop (wal-dirty-store-resident *wal-dirty-store*))
+               (zerop (wal-dirty-store-disk-refs *wal-dirty-store*)))
+      (handler-case
+          (let ((spool (wal-dirty-store-spool *wal-dirty-store*)))
+            (when spool
+              (close-logical-spool spool)
+              (unless (eq :resolved (query-temp-cleanup-owner-state (logical-spool-owner spool)))
+                (error "scratch cleanup failed")))
+            (setf *wal-dirty-store* nil))
+        (error (condition) (error 'wal-dirty-store-error :cause condition)))))
+  (values))
+
 (defun wal-visible-page-under-lock (relfilenode block fork)
-  (let ((key (wal-page-key relfilenode block fork)))
-    (or (and *wal-page-batch* (gethash key *wal-page-batch*))
-        (gethash key *wal-page-cache*)
+  (let* ((key (wal-page-key relfilenode block fork))
+         (reference (or (and *wal-page-batch* (gethash key *wal-page-batch*))
+                        (gethash key *wal-page-cache*))))
+    (if reference (wal-dirty-read-reference key reference)
         (smgr-read relfilenode block fork))))
 
 (defun wal-note-page-xid-under-lock (key)
@@ -388,12 +539,26 @@ Legacy 16-hex segment names always belong to timeline 1."
              source))
   (values))
 
+(defun wal-dirty-batch-contributors ()
+  "Build merged metadata for changed keys before publishing batch pages."
+  (let ((merged (make-hash-table :test #'equal)))
+    (maphash (lambda (key xids)
+               (setf (gethash key merged) (copy-list (gethash key *wal-page-cache-xids*)))
+               (dolist (xid xids) (pushnew xid (gethash key merged) :test #'eql)))
+             *wal-page-batch-xids*)
+    merged))
+
 (defmacro with-wal-page-state-lock (&body body)
-  "Use the current page batch, or lock the shared WAL page state."
+  "Use the current page batch, or lock and fail-stop a damaged dirty store."
   `(if *wal-page-batch*
        (progn ,@body)
-       (sb-thread:with-mutex (*wal-lock*)
-         ,@body)))
+       (handler-case
+           (sb-thread:with-mutex (*wal-lock*)
+             (handler-case (progn (wal-check-healthy) ,@body)
+               (wal-dirty-store-error (condition)
+                 (setf *wal-poisoned* t)
+                 (error condition))))
+         (wal-dirty-store-error (condition) (wal-fail-stop condition)))))
 
 (defun wal-buffer-read (relfilenode block &optional (fork :main))
   (if (not *wal-ready*)
@@ -409,11 +574,7 @@ Legacy 16-hex segment names always belong to timeline 1."
   (let ((key (wal-page-key relfilenode block fork))
         (copy (wal-copy-dirty-page page)))
     (with-wal-page-state-lock
-      (wal-note-page-xid-under-lock key)
-      (setf (gethash key (if *wal-page-batch*
-                             *wal-page-batch*
-                             *wal-page-cache*))
-            copy)))
+      (wal-dirty-install-page key copy)))
   (wal-test-pause :after-page-stage)
   (values))
 
@@ -441,34 +602,67 @@ Legacy 16-hex segment names always belong to timeline 1."
   (if (not *wal-ready*)
       (smgr-extend relfilenode page fork)
       (with-wal-page-state-lock
-        (let ((block (wal-visible-nblocks-under-lock relfilenode fork)))
-          (wal-note-page-xid-under-lock (wal-page-key relfilenode block fork))
-          (setf (gethash (wal-page-key relfilenode block fork)
-                         (if *wal-page-batch*
-                             *wal-page-batch*
-                             *wal-page-cache*))
-                (wal-copy-dirty-page page))
-          (unless *wal-page-batch*
-            (wal-test-pause :after-page-stage))
+        (let* ((block (wal-visible-nblocks-under-lock relfilenode fork))
+               (key (wal-page-key relfilenode block fork))
+               (copy (wal-copy-dirty-page page)))
+          (wal-dirty-install-page key copy)
+          (unless *wal-page-batch* (wal-test-pause :after-page-stage))
           block))))
 
 (defmacro with-wal-page-batch (&body body)
   "Stage related page edits privately and publish them together on success."
   `(if *wal-page-batch*
        (progn ,@body)
-       (sb-thread:with-mutex (*wal-lock*)
-         (let ((*wal-page-batch* (make-hash-table :test #'equal))
-               (*wal-page-batch-xids* (make-hash-table :test #'equal))
-               (*wal-page-batch-split* nil))
-           (multiple-value-prog1
-               (progn ,@body)
-             (maphash (lambda (key page)
-                        (setf (gethash key *wal-page-cache*) page))
-                      *wal-page-batch*)
-             (wal-merge-page-xids *wal-page-batch-xids*
-                                  *wal-page-cache-xids*)
-             (when *wal-page-batch-split*
-               (setf *wal-pending-btree-split* t)))))))
+       (handler-case
+           (sb-thread:with-mutex (*wal-lock*)
+             (handler-case
+                 (let ((*wal-page-batch* (make-hash-table :test #'equal))
+                       (*wal-page-batch-xids* (make-hash-table :test #'equal))
+                       (*wal-page-batch-split* nil)
+                       (published nil))
+                   (wal-check-healthy)
+                   (unwind-protect
+                        (multiple-value-prog1
+                            (progn ,@body)
+                          (sb-sys:without-interrupts
+                            (handler-case
+                                (let ((merged (wal-dirty-batch-contributors))
+                                      (replaced nil))
+                                  ;; Contributor lists are ready before shared entries change.
+                                  (maphash
+                                   (lambda (key reference)
+                                     (let ((old (gethash key *wal-page-cache*)))
+                                       (when old (push old replaced))
+                                       ;; An exceptional exit after this point fences WAL;
+                                       ;; keep both old and new handles owned until shutdown.
+                                       (setf published t
+                                             (gethash key *wal-page-cache*) reference)
+                                       (multiple-value-bind (xids present) (gethash key merged)
+                                         (when present (setf (gethash key *wal-page-cache-xids*) xids)))))
+                                   *wal-page-batch*)
+                                  (clrhash *wal-page-batch*)
+                                  (dolist (old replaced) (wal-dirty-release-reference old))
+                                  (when *wal-page-batch-split*
+                                    (setf *wal-pending-btree-split* t)))
+                              (error (condition)
+                                (setf *wal-poisoned* t)
+                                (error 'wal-dirty-store-error :cause condition)))))
+                     (sb-sys:without-interrupts
+                       (handler-case
+                           (progn
+                             (unless published
+                               (maphash (lambda (key reference)
+                                          (declare (ignore key))
+                                          (wal-dirty-release-reference reference))
+                                        *wal-page-batch*))
+                             (wal-dirty-close-empty-store))
+                         (wal-dirty-store-error (condition) (error condition))
+                         (error (condition)
+                           (error 'wal-dirty-store-error :cause condition))))))
+               (wal-dirty-store-error (condition)
+                 (setf *wal-poisoned* t)
+                 (error condition))))
+         (wal-dirty-store-error (condition) (wal-fail-stop condition)))))
 
 (defun wal-mark-btree-split ()
   (when *wal-page-batch*
@@ -477,16 +671,15 @@ Legacy 16-hex segment names always belong to timeline 1."
 
 (defun wal-forget-relation (relfilenode)
   (when *wal-ready*
-    (sb-thread:with-mutex (*wal-lock*)
-      (let ((keys '()))
-        (maphash (lambda (key page)
-                   (declare (ignore page))
-                   (when (eql (first key) relfilenode)
-                     (push key keys)))
+    (with-wal-page-state-lock
+      (let ((keys nil))
+        (maphash (lambda (key reference)
+                   (declare (ignore reference))
+                   (when (eql (first key) relfilenode) (push key keys)))
                  *wal-page-cache*)
         (dolist (key keys)
-          (remhash key *wal-page-cache*)
-          (remhash key *wal-page-cache-xids*)))))
+          (wal-dirty-remove-page key *wal-page-cache* *wal-page-cache-xids*))
+        (wal-dirty-close-empty-store))))
   (values))
 
 (defun wal-page-images (&optional excluded-relfilenodes)
@@ -496,7 +689,7 @@ Legacy 16-hex segment names always belong to timeline 1."
                  (push (make-wal-page-image :relfilenode (first key)
                                             :fork (second key)
                                             :block (third key)
-                                            :page (copy-seq page)
+                                            :page (copy-seq (wal-dirty-read-reference key page))
                                             :xids (remove-if (lambda (xid) (< xid 3))
                                                              (gethash key *wal-page-cache-xids*))
                                             :provenance
@@ -536,7 +729,8 @@ Legacy 16-hex segment names always belong to timeline 1."
 
 (defun wal-primary-page-image (key)
   "Copy one page and its contributor metadata while the WAL lock is held."
-  (let* ((page (gethash key *wal-page-cache*))
+  (let* ((reference (gethash key *wal-page-cache*))
+         (page (and reference (wal-dirty-read-reference key reference)))
          (xids (gethash key *wal-page-cache-xids*)))
     (unless page (error "planned WAL page disappeared"))
     (make-wal-page-image :relfilenode (first key) :fork (second key) :block (third key)
@@ -996,13 +1190,13 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
                  (push key keys)))
              *wal-page-cache*)
     (dolist (key keys)
-      (remhash key *wal-page-cache*)
-      (remhash key *wal-page-cache-xids*)))
+      (wal-dirty-remove-page key *wal-page-cache* *wal-page-cache-xids*)))
+  (wal-dirty-close-empty-store)
   (values))
 
 (defun wal-discard-relation-pages (relfilenodes)
   "Forget staged images for unpublished detached relations in RELFILENODES."
-  (sb-thread:with-mutex (*wal-lock*)
+  (with-wal-page-state-lock
     (dolist (pair (list (cons *wal-page-cache* *wal-page-cache-xids*)
                         (cons *wal-page-batch* *wal-page-batch-xids*)))
       (let ((pages (car pair))
@@ -1015,9 +1209,8 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
                          (push key keys)))
                      pages)
             (dolist (key keys)
-              (remhash key pages)
-              (when (hash-table-p contributors)
-                (remhash key contributors))))))))
+              (wal-dirty-remove-page key pages contributors))))))
+    (wal-dirty-close-empty-store))
   (values))
 
 (defun postgres-current-timestamp ()
@@ -2305,6 +2498,10 @@ Refresh its modification time. Update memory only after atomic publication."
       (when (and (null checkpoint-lsn) (wal-segment-entry-names))
         (error "WAL control file is missing while WAL segments exist"))
       (when checkpoint-lsn (wal-reconcile-namespace-at-startup))
+      (when *wal-dirty-store*
+        (wal-clear-page-cache)
+        (wal-dirty-close-empty-store)
+        (when *wal-dirty-store* (error "dirty page references remain at WAL initialization")))
       (setf *wal-insert-timeline* (or insertion 1)
             *wal-checkpoint-timeline* (or checkpoint-timeline 1)
             *wal-xid-reserved-through* (getf snapshot :xid-reserved-through)

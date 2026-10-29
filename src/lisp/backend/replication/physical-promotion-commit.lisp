@@ -230,7 +230,8 @@ must determine from durable control whether parent or child is authoritative."
                (files (physical-promotion-checkpoint-files plan prefix))
                (child (getf state :promotion-child))
                (history-p (wal-namespace-file-stat (timeline-history-path child *pgdata*) t)))
-          (unless (and (zerop (hash-table-count *wal-page-cache*)) (null *wal-page-batch*)
+          (unless (and (zerop (hash-table-count *wal-page-cache*)) (null *wal-dirty-store*)
+                       (null *wal-page-batch*)
                        (null *active-xids*))
             (error "child checkpoint requires an empty application write cache"))
           (unwind-protect

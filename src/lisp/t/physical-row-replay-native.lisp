@@ -62,7 +62,9 @@
 
 (defun row-replay-test-staged-dead-page-p (node block)
   (sb-thread:with-mutex (*wal-lock*)
-    (let ((page (gethash (wal-page-key node block) *wal-page-cache*)))
+    (let* ((key (wal-page-key node block))
+           (reference (gethash key *wal-page-cache*))
+           (page (and reference (wal-dirty-read-reference key reference))))
       (and page
            (loop for offnum from 1 to (page-lp-count page)
                    thereis (= +lp-dead+ (nth-value 1 (page-get-lp page offnum))))))))

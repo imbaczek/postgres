@@ -254,6 +254,273 @@
              (rove:ok (null (uiop:directory-files directory))))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest test-wal-dirty-scratch-shared-and-batch-lifecycle
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-dirty-store-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*pgdata* directory)
+           (*query-temp-directory* directory)
+           (*query-temp-file-limit-bytes* 0)
+           (*wal-dirty-resident-limit-pages* 0)
+           (*wal-dirty-store* nil)
+           (*wal-page-cache* (make-hash-table :test #'equal))
+           (*wal-page-cache-xids* (make-hash-table :test #'equal))
+           (*wal-ready* t) (*wal-poisoned* nil)
+           (*backend* (make-backend :xid 44))
+           (*wal-row-page-write-p* t)
+           (page (page-init (make-page))))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (setf (aref page 100) 1)
+             (wal-buffer-write 7310 0 page)
+             (rove:ok (= 0 (wal-dirty-store-resident *wal-dirty-store*)))
+             (rove:ok (= 1 (wal-dirty-store-disk-refs *wal-dirty-store*)))
+             (rove:ok (= 1 (aref (wal-buffer-read 7310 0) 100)))
+             (rove:ok (equal '(44 1) (gethash (wal-page-key 7310 0) *wal-page-cache-xids*)))
+             (rove:ok (handler-case
+                          (with-wal-page-batch
+                            (setf (aref page 100) 2)
+                            (wal-buffer-write 7310 0 page)
+                            (wal-buffer-write 7310 1 page)
+                            (error "discard batch"))
+                        (error (condition) (search "discard batch" (princ-to-string condition)))))
+             (rove:ok (= 1 (aref (wal-buffer-read 7310 0) 100)))
+             (rove:ok (= 1 (wal-dirty-store-disk-refs *wal-dirty-store*)))
+             (setf (backend-xid *backend*) 55)
+             (with-wal-page-batch
+               (wal-buffer-write 7310 0 page)
+               (wal-buffer-write 7310 1 page))
+             (rove:ok (= 2 (aref (wal-buffer-read 7310 0) 100)))
+             (rove:ok (= 2 (wal-buffer-nblocks 7310)))
+             (rove:ok (equal '(44 55) (sort (remove-if (lambda (xid) (< xid 3))
+                                                       (copy-list (gethash (wal-page-key 7310 0)
+                                                                           *wal-page-cache-xids*))) #'<)))
+             (let ((next (wal-dirty-store-next-slot *wal-dirty-store*)))
+               (dotimes (i 5) (wal-buffer-write 7310 0 page))
+               (rove:ok (<= (wal-dirty-store-next-slot *wal-dirty-store*) (1+ next))))
+             (wal-clear-page-cache)
+             (rove:ok (null *wal-dirty-store*))
+             (rove:ok (null (uiop:directory-files directory))))
+        (wal-clear-page-cache)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-wal-dirty-scratch-resident-budget
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-dirty-budget-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*wal-dirty-resident-limit-pages* 2)
+           (*wal-dirty-store* nil)
+           (*wal-page-cache* (make-hash-table :test #'equal))
+           (*wal-page-cache-xids* (make-hash-table :test #'equal))
+           (*wal-ready* t) (*wal-poisoned* nil))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (with-wal-page-batch
+               (dotimes (block 6)
+                 (let ((page (page-init (make-page))))
+                   (setf (aref page 100) block)
+                   (wal-buffer-write 7310 block page))))
+             (rove:ok (= 2 (wal-dirty-store-resident *wal-dirty-store*)))
+             (rove:ok (= 4 (wal-dirty-store-disk-refs *wal-dirty-store*)))
+             (dotimes (block 6)
+               (rove:ok (= block (aref (wal-buffer-read 7310 block) 100))))
+             (rove:ok (= 2 (wal-dirty-store-resident *wal-dirty-store*)))
+             (wal-clear-page-cache)
+             (rove:ok (null *wal-dirty-store*))
+             (rove:ok (null (uiop:directory-files directory))))
+        (wal-clear-page-cache)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-wal-dirty-scratch-corruption-fails-stop
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-dirty-corrupt-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*wal-dirty-resident-limit-pages* 0)
+           (*wal-dirty-store* nil)
+           (*wal-page-cache* (make-hash-table :test #'equal))
+           (*wal-page-cache-xids* (make-hash-table :test #'equal))
+           (*wal-ready* t) (*wal-poisoned* nil)
+           (old-fail (symbol-function 'wal-fail-stop))
+           (old-read (symbol-function 'smgr-read))
+           (fallback nil))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'wal-fail-stop) (lambda (condition) (error condition))
+                   (symbol-function 'smgr-read)
+                   (lambda (&rest args) (declare (ignore args)) (setf fallback t) nil))
+             (wal-buffer-write 7310 0 (page-init (make-page)))
+             (let ((file (logical-spool-stream (wal-dirty-store-spool *wal-dirty-store*))))
+               (file-position file 100)
+               (write-byte 99 file)
+               (finish-output file))
+             (rove:ok (handler-case
+                          (progn (wal-buffer-read 7310 0) nil)
+                        (wal-dirty-store-error (condition)
+                          (search "checksum mismatch" (princ-to-string condition)))))
+             (rove:ok *wal-poisoned*)
+             (rove:ok (not fallback))
+             (wal-clear-page-cache)
+             (rove:ok (null *wal-dirty-store*))
+             (rove:ok (null (uiop:directory-files directory))))
+        (setf (symbol-function 'wal-fail-stop) old-fail
+              (symbol-function 'smgr-read) old-read)
+        (wal-clear-page-cache)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-wal-dirty-scratch-write-and-batch-failures-preserve-shared
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-dirty-failure-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*wal-dirty-resident-limit-pages* 1)
+           (*wal-dirty-store* nil)
+           (*wal-page-cache* (make-hash-table :test #'equal))
+           (*wal-page-cache-xids* (make-hash-table :test #'equal))
+           (*wal-ready* t) (*wal-poisoned* nil)
+           (*backend* (make-backend :xid 44))
+           (*wal-row-page-write-p* t)
+           (old-fail (symbol-function 'wal-fail-stop))
+           (old-ensure (symbol-function 'wal-dirty-ensure-spool))
+           (old-merge (symbol-function 'wal-dirty-batch-contributors))
+           (page (page-init (make-page)))
+           (key (wal-page-key 7310 0)))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'wal-fail-stop) (lambda (condition) (error condition)))
+             (setf (aref page 100) 1)
+             (wal-buffer-write 7310 0 page)
+             (setf (aref page 100) 2
+                   (symbol-function 'wal-dirty-ensure-spool)
+                   (lambda (store) (declare (ignore store)) (error "injected scratch failure")))
+             (rove:ok (handler-case (progn (wal-buffer-write 7310 0 page) nil)
+                        (wal-dirty-store-error (condition)
+                          (search "injected scratch failure" (princ-to-string condition)))))
+             (rove:ok *wal-poisoned*)
+             (rove:ok (= 1 (aref (wal-dirty-read-reference key (gethash key *wal-page-cache*)) 100)))
+             (rove:ok (equal '(44 1) (gethash key *wal-page-cache-xids*)))
+             (setf (symbol-function 'wal-dirty-ensure-spool) old-ensure
+                   *wal-poisoned* nil)
+             (setf (symbol-function 'wal-dirty-batch-contributors)
+                   (lambda ()
+                     (error "injected batch publication failure")))
+             (rove:ok (handler-case
+                          (with-wal-page-batch
+                            (wal-buffer-write 7310 0 page)
+                            (wal-buffer-write 7310 1 page))
+                        (wal-dirty-store-error (condition)
+                          (search "injected batch publication failure" (princ-to-string condition)))))
+             (rove:ok *wal-poisoned*)
+             (rove:ok (= 1 (hash-table-count *wal-page-cache*)))
+             (rove:ok (= 1 (aref (wal-dirty-read-reference key (gethash key *wal-page-cache*)) 100)))
+             (rove:ok (= 1 (wal-dirty-store-resident *wal-dirty-store*)))
+             (rove:ok (zerop (wal-dirty-store-disk-refs *wal-dirty-store*))))
+        (setf (symbol-function 'wal-fail-stop) old-fail
+              (symbol-function 'wal-dirty-ensure-spool) old-ensure
+              (symbol-function 'wal-dirty-batch-contributors) old-merge)
+        (wal-clear-page-cache)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-wal-dirty-batch-publication-error-fails-stop-with-owned-pages
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-dirty-publish-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*wal-dirty-resident-limit-pages* 0)
+           (*wal-dirty-store* nil)
+           (*wal-page-cache* (make-hash-table :test #'equal))
+           (*wal-page-cache-xids* (make-hash-table :test #'equal))
+           (*wal-ready* t) (*wal-poisoned* nil)
+           (old-fail (symbol-function 'wal-fail-stop))
+           (old-release (symbol-function 'wal-dirty-release-reference))
+           (page (page-init (make-page)))
+           (key (wal-page-key 7310 0))
+           (previous nil))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'wal-fail-stop) (lambda (condition) (error condition)))
+             (setf (aref page 100) 1)
+             (wal-buffer-write 7310 0 page)
+             (setf previous (gethash key *wal-page-cache*)
+                   (aref page 100) 2
+                   (symbol-function 'wal-dirty-release-reference)
+                   (lambda (reference)
+                     (if (eq reference previous)
+                         (error "injected published-reference failure")
+                         (funcall old-release reference))))
+             (rove:ok
+              (handler-case
+                  (with-wal-page-batch
+                    (wal-buffer-write 7310 0 page)
+                    (wal-buffer-write 7310 1 page))
+                (wal-dirty-store-error (condition)
+                  (search "injected published-reference failure" (princ-to-string condition)))))
+             (rove:ok *wal-poisoned*)
+             (rove:ok (= 2 (hash-table-count *wal-page-cache*)))
+             (rove:ok (= 3 (wal-dirty-store-disk-refs *wal-dirty-store*)))
+             (dolist (block '(0 1))
+               (rove:ok (not (member (wal-dirty-reference-slot
+                                      (gethash (wal-page-key 7310 block) *wal-page-cache*))
+                                     (wal-dirty-store-free-slots *wal-dirty-store*)))))
+             (rove:ok (= 2 (aref (wal-dirty-read-reference key (gethash key *wal-page-cache*)) 100)))
+             (rove:ok (= 2 (aref (wal-dirty-read-reference
+                                  (wal-page-key 7310 1)
+                                  (gethash (wal-page-key 7310 1) *wal-page-cache*)) 100))))
+        (setf (symbol-function 'wal-fail-stop) old-fail
+              (symbol-function 'wal-dirty-release-reference) old-release)
+        (when previous (wal-dirty-release-reference previous))
+        (wal-clear-page-cache)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-wal-dirty-scratch-cross-thread-contributors
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-dirty-threads-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (names '(*query-temp-directory* *wal-dirty-resident-limit-pages* *wal-dirty-store*
+                    *wal-page-cache* *wal-page-cache-xids* *wal-ready* *wal-poisoned*))
+           (saved (mapcar (lambda (name) (cons name (symbol-value name))) names))
+           (key (wal-page-key 7310 0)))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             ;; Child threads use the same global WAL cache and scratch owner.
+             (setf *query-temp-directory* directory
+                   *wal-dirty-resident-limit-pages* 0
+                   *wal-dirty-store* nil
+                   *wal-page-cache* (make-hash-table :test #'equal)
+                   *wal-page-cache-xids* (make-hash-table :test #'equal)
+                   *wal-ready* t *wal-poisoned* nil)
+             (let* ((gate (sb-thread:make-semaphore :count 0))
+                    (threads
+                      (loop for xid in '(44 55)
+                            collect
+                            (let ((id xid))
+                              (sb-thread:make-thread
+                               (lambda ()
+                                 (let ((*backend* (make-backend :xid id))
+                                       (*wal-row-page-write-p* t)
+                                       (page (page-init (make-page))))
+                                   (setf (aref page 100) id)
+                                   (sb-thread:wait-on-semaphore gate)
+                                   (wal-buffer-write 7310 0 page))))))))
+               (sb-thread:signal-semaphore gate 2)
+               (dolist (thread threads) (sb-thread:join-thread thread)))
+             (rove:ok (member (aref (wal-buffer-read 7310 0) 100) '(44 55)))
+             (rove:ok (equal '(44 55) (sort (remove-if (lambda (xid) (< xid 3))
+                                                       (copy-list (gethash key *wal-page-cache-xids*))) #'<)))
+             (rove:ok (= 1 (wal-dirty-store-disk-refs *wal-dirty-store*)))
+             (wal-clear-page-cache)
+             (rove:ok (null (uiop:directory-files directory))))
+        (wal-clear-page-cache)
+        (dolist (entry saved) (setf (symbol-value (car entry)) (cdr entry)))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest test-wal-primary-spool-corruption-fails-stop-before-and-after-commit
     (let* ((directory (merge-pathnames
                        (format nil "pg-primary-corrupt-~d-~d/" (sb-posix:getpid) (random 1000000))

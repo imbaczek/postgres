@@ -219,6 +219,7 @@ recovery; restart must classify durable control."
                         (not *wal-poisoned*) (not *wal-output-stream*)
                         (not *wal-output-segment*) (null *wal-new-segments*)
                         (zerop (hash-table-count *wal-page-cache*))
+                        (null *wal-dirty-store*)
                         (zerop (hash-table-count *wal-page-cache-xids*))
                         (not *wal-page-batch*) (not *wal-page-batch-xids*)
                         (not *wal-page-batch-split*) (not *wal-pending-deletes*)

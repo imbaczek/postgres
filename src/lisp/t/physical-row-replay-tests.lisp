@@ -138,6 +138,7 @@
 (deftest row-page-provenance-never-loses-maintenance-or-legacy-taint
     (let* ((pg::*wal-ready* t)
            (pg::*backend* (pg::make-backend :xid 42))
+           (pg::*wal-dirty-store* nil)
            (pg::*wal-page-cache* (make-hash-table :test #'equal))
            (pg::*wal-page-cache-xids* (make-hash-table :test #'equal))
            (pg::*wal-page-batch* nil) (pg::*wal-page-batch-xids* nil)
@@ -155,8 +156,7 @@
         (ok (equal '(42 43) (sort (pg::wal-page-image-xids (image)) #'<)))
         (pg::with-wal-page-batch (stage 44 t))
         (ok (eq :maintenance (pg::wal-page-image-provenance (image))))
-        (clrhash pg::*wal-page-cache*)
-        (clrhash pg::*wal-page-cache-xids*)
+        (pg::wal-clear-page-cache)
         (pg::with-wal-page-batch (stage 45 t))
         (ok (eq :row (pg::wal-page-image-provenance (image))))
         (pg::with-wal-page-batch (stage 46 t))
