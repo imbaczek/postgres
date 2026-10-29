@@ -187,8 +187,7 @@ can claim an ON CONFLICT tuple or ask the released-lock loop to wait."
                      (multiple-value-bind (block off)
                          (heapam-insert relfilenode columns physical xid cid)
                        (dolist (idx indexes)
-                         (let* ((types (index-types idx table))
-                                (key (encode-index-key (index-values idx values) types)))
+                         (let ((key (index-storage-key idx table (index-values idx values))))
                            (btree-insert-unlocked (pg-index-relfilenode idx) key block off)))
                        (when on-success (funcall on-success block off))
                        (return-from insert-tuple-with-unique

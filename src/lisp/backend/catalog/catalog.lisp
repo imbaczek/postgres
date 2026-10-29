@@ -1375,6 +1375,35 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
   (loop for attnum in (pg-index-columns idx)
         collect (aref values (1- attnum))))
 
+(defun index-storage-key (index table values)
+  "Encode VALUES, retaining independently compressed eligible column segments.
+The segments preserve their storage representation across B-tree page rewrites."
+  (let ((parts nil) (compressed-p nil))
+    (loop for value in values
+          for attnum in (pg-index-columns index)
+          for column = (aref (pg-class-columns table) (1- attnum))
+          for raw = (encode-index-key (list value) (list (pg-column-type column)))
+          for compressed = (and (> (length raw) 1024)
+                                (find (pg-column-effective-storage column) "xm")
+                                (pglz-compress raw))
+          do (when compressed (setf compressed-p t))
+             (push (list raw compressed) parts))
+    (setf parts (nreverse parts))
+    (let ((logical (apply #'concatenate '(vector (unsigned-byte 8)) (mapcar #'first parts))))
+      (if (not compressed-p)
+          logical
+          (let* ((size (loop for (raw compressed) in parts sum (+ 9 (length (or compressed raw)))))
+                 (payload (make-array size :element-type '(unsigned-byte 8)))
+                 (position 0))
+            (loop for (raw compressed) in parts
+                  for bytes = (or compressed raw)
+                  do (setf (aref payload position) (if compressed 1 0))
+                     (page-set-u32 payload (+ position 1) (length bytes))
+                     (page-set-u32 payload (+ position 5) (length raw))
+                     (replace payload bytes :start1 (+ position 9))
+                     (incf position (+ 9 (length bytes))))
+            (make-btree-storage-key :logical logical :payload payload))))))
+
 ;;; ---- DDL helpers (caller holds the write lock) ----
 
 (defun check-new-relation-name (db name)

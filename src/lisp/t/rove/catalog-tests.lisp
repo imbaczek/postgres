@@ -22,10 +22,8 @@
                "null sorts first")
       (rove:ok (minusp (key-compare (k "abc" :varchar) (k "abd" :varchar)))
                "varchar order")
-      ;; Index keys carry a length prefix, so ordering is length-first.  This
-      ;; is internal only: SQL comparisons and ORDER BY use compare-3way.
-      (rove:ok (minusp (key-compare (k "b" :varchar) (k "aa" :varchar)))
-               "varchar key encoding is length-first")))
+      (rove:ok (plusp (key-compare (k "b" :varchar) (k "aa" :varchar)))
+               "varchar keys follow lexical order")))
 
 (rove:deftest test-toast-catalog-ownership-roundtrip
     (let* ((toast (make-pg-toast :oid 100 :relfilenode 101 :index-oid 102

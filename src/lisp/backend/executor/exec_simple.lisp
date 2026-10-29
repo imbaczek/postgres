@@ -783,7 +783,6 @@ before this removal horizon is captured."
   (let* ((heap-relfilenode (pg-class-relfilenode table))
          (index-relfilenode (pg-index-relfilenode idx))
          (columns (pg-class-columns table))
-         (types (index-types idx table))
          (snapshot *current-snapshot*)
          (removal-horizon (oldest-xmin)))
     (loop for block below (buf-nblocks heap-relfilenode)
@@ -801,7 +800,7 @@ before this removal horizon is captured."
                       (statement-protection-snapshot snapshot)
                       :index-reader #'index-build-toast-reader)
                      (let* ((vals (index-values idx (htup-values tuple)))
-                            (key (encode-index-key vals types)))
+                            (key (index-storage-key idx table vals)))
                        ;; Retain recently dead versions for old snapshots, but
                        ;; don't let those versions create unique violations.
                        (when (and unique

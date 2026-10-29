@@ -26,6 +26,76 @@ run() {
 }
 test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-socket "$TMP/control.sock"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
+# Force compressed leaf entries and internal separators with long logical keys.
+# Build the index after loading rows, then exercise its unique insert path.
+index_suffix=$(awk 'BEGIN { for (i=0;i<20000;i++) printf "a" }')
+run -c 'create table toast_long_index (v text)' >/dev/null
+i=0
+while [ "$i" -lt 80 ]; do
+    prefix=$(printf '%03d' "$i")
+    run -c "insert into toast_long_index values ('$prefix$index_suffix')" >/dev/null
+    i=$((i + 1))
+done
+run -c 'create unique index toast_long_index_v on toast_long_index(v)' >/dev/null
+[ "$(run -c "select count(*) from toast_long_index where v = '039$index_suffix'")" = 1 ]
+kill -INT "$SRV"
+wait "$SRV"
+SRV=
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-socket "$TMP/control.sock"
+test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
+[ "$(run -c "select count(*) from toast_long_index where v = '039$index_suffix'")" = 1 ]
+if run -v VERBOSITY=verbose -c "insert into toast_long_index values ('039$index_suffix')" >"$TMP/duplicate.out" 2>&1; then
+    echo 'toast-dml: duplicate compressed key accepted' >&2; exit 1
+fi
+case $(cat "$TMP/duplicate.out") in
+    *23505*) ;;
+    *) echo 'toast-dml: duplicate compressed key did not report SQLSTATE 23505' >&2; exit 1 ;;
+esac
+run -c "insert into toast_long_index values ('080$index_suffix')" >/dev/null
+[ "$(run -c "select count(*) from toast_long_index where v = '080$index_suffix'")" = 1 ]
+run -c 'create table toast_external_index (v text)' >/dev/null
+run -c 'alter table toast_external_index alter column v set storage external' >/dev/null
+run -c 'create index toast_external_index_v on toast_external_index(v)' >/dev/null
+if run -v VERBOSITY=verbose -c "insert into toast_external_index values ('$index_suffix')" >"$TMP/external-index.out" 2>&1; then
+    echo 'toast-dml: oversized EXTERNAL index key accepted' >&2; exit 1
+fi
+case $(cat "$TMP/external-index.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: oversized EXTERNAL key did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+run -c 'create table toast_composite_index (a text, b text)' >/dev/null
+run -c 'alter table toast_composite_index alter column b set storage external' >/dev/null
+run -c 'create unique index toast_composite_index_ab on toast_composite_index(a,b)' >/dev/null
+run -c "insert into toast_composite_index values ('$index_suffix','small')" >/dev/null
+[ "$(run -c "select count(*) from toast_composite_index where a = '$index_suffix' and b = 'small'")" = 1 ]
+long_index_suffix=$(awk 'BEGIN { for (i=0;i<70000;i++) printf "a" }')
+run -c 'create table toast_large_composite (a text, b text, unique(a,b))' >/dev/null
+printf "insert into toast_large_composite values ('%s','x'), ('%s','y');\n" "$long_index_suffix" "$long_index_suffix" | run >/dev/null
+[ "$(run -c "select count(*) from toast_large_composite where a = '$long_index_suffix' and b = 'y'")" = 1 ]
+run -c 'alter table toast_long_index alter column v set storage external' >/dev/null
+index_blocks() {
+    printf '%s\n' '(let* ((db (gethash "postgres" (catalog-databases *catalog*))) (idx (gethash "toast_long_index_v" (database-indexes db)))) (format t "BLOCKS=~D~%" (buf-nblocks (pg-index-relfilenode idx))))' '(quit)' | \
+        "${SBCL:-sbcl}" --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock"
+}
+index_blocks >"$TMP/index-blocks-before"
+i=100
+while [ "$i" -lt 400 ]; do
+    run -c "insert into toast_long_index values ('$i-abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz')" >/dev/null
+    i=$((i + 1))
+done
+index_blocks >"$TMP/index-blocks-after"
+"${PYTHON:-python3}" - "$TMP/index-blocks-before" "$TMP/index-blocks-after" <<'PY'
+import re
+import sys
+counts = []
+for path in sys.argv[1:]:
+    with open(path, encoding="utf-8") as stream:
+        match = re.search(r"BLOCKS=(\d+)", stream.read())
+    assert match, f"missing index block count in {path}"
+    counts.append(int(match.group(1)))
+assert counts[1] > counts[0], f"index did not split after ALTER STORAGE: {counts}"
+PY
+[ "$(run -c "select count(*) from toast_long_index where v = '039$index_suffix'")" = 1 ]
 # Keep the long text incompressible so snapshot and deletion checks exercise
 # external TOAST chunks as well as the separate inline-compression cases below.
 big=$(awk 'BEGIN { s=1; for (i=0;i<3000;i++) { s=(s*1664525+1013904223)%4294967296; printf "%c", 97+int(s/16777216)%26 } }')

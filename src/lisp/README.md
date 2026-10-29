@@ -211,10 +211,11 @@ Table columns support `smallint`/`int2`, `int`/`integer`/`int4`, `bigint`/`int8`
 `numeric`/`decimal` (including precision and scale), `real`/`float4`,
 `double precision`/`float8`, `date`, `time` and `timestamp` with or without time
 zone, `interval`, `varchar` / `character varying`, `text`, `bytea`, `json`,
-and `jsonb`. Unbounded variable-width values, including `numeric`, can use
+`jsonb`, `bytea[]`, `json[]`, and `jsonb[]`. Unbounded variable-width values, including `numeric`, can use
 inline compression or the table's TOAST storage when needed.
 TOAST selection defaults to `MAIN` for `numeric` and `EXTENDED` for text,
-varchar, bytea, JSON and JSONB. `ALTER TABLE ... ALTER COLUMN ... SET STORAGE`
+varchar, bytea, JSON, JSONB and the supported bytea, JSON and JSONB arrays.
+`ALTER TABLE ... ALTER COLUMN ... SET STORAGE`
 accepts `PLAIN`, `EXTERNAL`, `EXTENDED`, `MAIN`, and `DEFAULT`. The policy
 applies to subsequent writes; existing values remain readable after a change.
 Full TOAST fetch walks the B-tree prefix under a read lease, validating and
@@ -942,6 +943,9 @@ compares scalar-array and `width_bucket` cases, result metadata and errors with
 an isolated C peer. It honors `PYTHON`, `PORT`, `REFERENCE_PORT`, `PG_C_LIBDIR`
 and `PSQL`; its `timetz` comparisons cover the local C build's layout.
 
+From `src/lisp`, `./t/toast-dml.sh` exercises TOAST storage policies, DML,
+partial reads and `VACUUM` with variable-width values.
+
 From `src/lisp`, `PG_C_BINDIR=/path/to/installed/postgres/bin ./t/subqueries.sh`
 compares the native server with the repository's installed C PostgreSQL and owns
 its peers and ports. It honors `SBCL` and `PYTHON` (default `python3`, standard
@@ -1451,9 +1455,9 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   reusable, freezes eligible tuples, and updates the visibility map and volatile
   free-space map. Its first FSM rebuild after restart scans the existing heap
   once.
-- Byte-wise comparison only, i.e. C-like collation for ASCII. Index key
-  encoding is length-first and is safe for equality lookups; text range ordering
-  and ordered index iteration are not implemented.
+- Byte-wise comparison only, i.e. C-like collation for ASCII. Text index keys
+  preserve byte-wise lexical order; range scans and ordered index iteration are
+  not implemented.
 - Boolean and other unlisted table column types are unsupported. `text` and
   unbounded `varchar` are distinct supported types; `varchar(n)` accepts lengths
   from 1 through 10485760.
