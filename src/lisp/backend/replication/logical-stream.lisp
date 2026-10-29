@@ -15,6 +15,9 @@
 
 (defvar *wal-logical-slot-read-progress* nil)
 
+(defconstant +logical-unchanged-toast+ :logical-unchanged-toast
+  "Internal row-codec marker for an unchanged external non-key value.")
+
 (defstruct logical-change
   kind database-oid relation-oid relation-name columns key-attnums
   old-values new-values event-payload (publication-selection :unknown))
@@ -182,6 +185,7 @@ Discard the cursor after a read error; the stream may have advanced."
   "Encode a value; text, varchar and json share UTF-8 tag 3. Their schema codes
 remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
   (cond
+    ((eq value +logical-unchanged-toast+) (logical-write-u8 buffer 18))
     ((eq value +null+)
      (logical-write-u8 buffer 0))
     ((eq type :timetz)
@@ -340,9 +344,27 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
       (logical-write-u64 buffer (getf publication :generation))
       (logical-write-u8 buffer (if (getf publication :unsupported) 1 0)))))
 
+(defun logical-validate-unchanged-toast (change)
+  "Reject unchanged markers outside non-key varlena UPDATE new images."
+  (let ((kind (logical-change-kind change))
+        (keys (logical-change-key-attnums change)))
+    (loop for row in (list (logical-change-old-values change) (logical-change-new-values change))
+          for new-p in '(nil t)
+          when row
+            do (unless (= (length row) (length (logical-change-columns change)))
+                 (error "logical row width does not match its relation description"))
+               (loop for value across row for column in (logical-change-columns change)
+                     when (eq value +logical-unchanged-toast+)
+                       do (unless (and (eq kind :update) new-p keys
+                                       (not (member (getf column :attnum) keys))
+                                       (member (getf column :type) '(:text :varchar :bytea :json :jsonb :numeric)))
+                            (error "invalid unchanged TOAST marker")))))
+  change)
+
 (defun logical-encode-change (change &optional (buffer (make-array 0 :element-type '(unsigned-byte 8)
                                                                      :adjustable t :fill-pointer 0)))
   (logical-validate-change-publications change)
+  (logical-validate-unchanged-toast change)
   (let ((columns (logical-change-columns change))
         (key-attnums (logical-change-key-attnums change)))
     (when (member (logical-change-kind change)
@@ -357,13 +379,13 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
         (logical-write-publication-selection buffer (logical-change-publication-selection change)))
       (logical-write-string-u32 buffer (logical-change-event-payload change))
       (return-from logical-encode-change buffer))
-    ;; Row format 3 adds per-change publication selection to format 1's keys.
-    ;; TRUNCATE format 4 extends event format 2 similarly. Legacy formats keep
-    ;; :unknown history; a zero marker distinguishes versions from old kind tags.
+    ;; Row format 5 carries a publication-selection presence flag and supports
+    ;; the unchanged external value marker.
     (logical-write-u8 buffer 0)
-    (logical-write-u8 buffer (if (eq (logical-change-publication-selection change) :unknown) 1 3))
+    (logical-write-u8 buffer 5)
     (logical-write-u8 buffer (logical-kind-code (logical-change-kind change)))
     (logical-write-u32 buffer (logical-change-database-oid change))
+    (logical-write-u8 buffer (if (eq (logical-change-publication-selection change) :unknown) 0 1))
     (unless (eq (logical-change-publication-selection change) :unknown)
       (logical-write-publication-selection buffer (logical-change-publication-selection change)))
     (logical-write-u32 buffer (logical-change-relation-oid change))
@@ -501,6 +523,9 @@ length-prefixed bytea octets; reject mismatched column types. JSON text is not
 revalidated by this codec."
   (let ((tag (logical-read-u8 cursor)))
     (case tag
+      (18 (unless (member type '(:varchar :text :bytea :json :jsonb :numeric))
+            (error "logical unchanged TOAST tag does not match its column type"))
+       +logical-unchanged-toast+)
       (0 +null+)
       (1 (unless (eq type :int4)
            (error "logical value tag does not match its column type"))
@@ -593,8 +618,13 @@ revalidated by this codec."
          (kind (logical-kind-from-code
                 (if (zerop marker) (logical-read-u8 cursor) marker)))
          (database-oid (logical-read-u32 cursor))
-         (selection (if (member event-version '(3 4))
-                        (logical-read-publication-selection cursor) :unknown)))
+         (selection (case event-version
+                      (4 (logical-read-publication-selection cursor))
+                      (5 (case (logical-read-u8 cursor)
+                           (0 :unknown)
+                           (1 (logical-read-publication-selection cursor))
+                           (otherwise (error "invalid logical publication-selection flag"))))
+                      (otherwise :unknown))))
     (when (member event-version '(2 4))
       (unless (if (= event-version 4) (eq kind :truncate)
                   (member kind '(:truncate :ddl :sequence-state)))
@@ -606,7 +636,7 @@ revalidated by this codec."
           (logical-validate-change-publications
            (make-logical-change :kind kind :database-oid database-oid
                                 :publication-selection selection :event-payload payload)))))
-    (unless (member event-version '(0 1 3))
+    (unless (= event-version 5)
       (error "unsupported logical row-change event version"))
     (let* ((relation-oid (logical-read-u32 cursor))
            (relation-name (logical-read-string-u32 cursor))
@@ -624,11 +654,8 @@ revalidated by this codec."
                                             (1 t)
                                             (otherwise
                                              (error "invalid logical column flags"))))))
-           (key-attnums (if (member event-version '(1 3))
-                            (loop repeat (logical-read-u16 cursor)
-                                  collect (logical-read-u16 cursor))
-                            (progn
-                              nil)))
+           (key-attnums (loop repeat (logical-read-u16 cursor)
+                              collect (logical-read-u16 cursor)))
            (rows
              (loop repeat 2
                    collect (case (logical-read-u8 cursor)
@@ -662,6 +689,7 @@ revalidated by this codec."
                 (:delete (and (logical-change-old-values change)
                               (null (logical-change-new-values change)))))
         (error "logical row change has inconsistent old/new images"))
+      (logical-validate-unchanged-toast change)
       (logical-validate-change-publications change))))
 
 (defun logical-decode-change (bytes)
@@ -792,7 +820,24 @@ Other types retain their normal semantic checks and may allocate their values."
         :columns (logical-relation-columns table)
         :key-attnums (copy-list (logical-table-replica-identity table))))
 
-(defun logical-note-row-change (kind table &key old-values new-values (publication-selection :unknown))
+(defun logical-capture-row-images (kind keys old-values new-values toast-reuse)
+  "Copy SQL images, keeping identity fields and marking proven external reuse."
+  (let ((old-image (and old-values (copy-seq old-values)))
+        (new-image (and new-values (copy-seq new-values))))
+    (when (and old-image keys)
+      (loop for i below (length old-image)
+            unless (member (1+ i) keys) do (setf (aref old-image i) +null+)))
+    (when (and (eq kind :update) keys toast-reuse new-image)
+      (unless (= (length toast-reuse) (length new-image))
+        (error "logical TOAST reuse width does not match row"))
+      (loop for pointer across toast-reuse for i from 0
+            when (and pointer (not (member (1+ i) keys)))
+              do (unless (heap-external-varlena-p pointer)
+                   (error "invalid logical TOAST reuse pointer"))
+                 (setf (aref new-image i) +logical-unchanged-toast+)))
+    (values old-image new-image)))
+
+(defun logical-note-row-change (kind table &key old-values new-values toast-reuse (publication-selection :unknown))
   "Capture a successful executor row operation for its current transaction.
 
 PostgreSQL's logical decode path queues heap changes in DecodeInsert,
@@ -803,6 +848,8 @@ executor, so capture the same operation before transaction commit."
     (let* ((columns
              (logical-relation-columns table))
            (key-attnums (logical-table-replica-identity table))
+           (old-image nil)
+           (new-image nil)
            (change (make-logical-change
                     :kind kind
                     :database-oid (database-oid (current-database))
@@ -811,13 +858,17 @@ executor, so capture the same operation before transaction commit."
                     :columns columns
                     :key-attnums key-attnums
                     :publication-selection publication-selection
-                    :old-values (and old-values (copy-seq old-values))
-                    :new-values (and new-values (copy-seq new-values))))
+                    :old-values old-image
+                    :new-values new-image))
            (limit (+ +max-logical-transaction-bytes+
                      (if (string= (or (backend-application-name *backend*) "")
                                   "pg-lisp-subscribe-apply")
                          +max-logical-apply-headroom-bytes+
                          0))))
+      (multiple-value-setq (old-image new-image)
+        (logical-capture-row-images kind key-attnums old-values new-values toast-reuse))
+      (setf (logical-change-old-values change) old-image
+            (logical-change-new-values change) new-image)
       (logical-capture-change *backend* change limit)))
   (values))
 

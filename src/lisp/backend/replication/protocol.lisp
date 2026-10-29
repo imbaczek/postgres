@@ -373,7 +373,7 @@ On a standby, receipt ahead of replay is reported only on the replay timeline."
         ((:float4 :float8) (sql-float-output value type))
         (otherwise (error "unsupported pgoutput value type ~a" type)))))
 
-(defun pgoutput-build-tuple (columns values &optional key-attnums)
+(defun pgoutput-build-tuple (columns values &optional key-attnums unchanged-allowed-p)
   ;; logicalrep_write_tuple() preserves relation width for old key images.
   ;; ReorderBuffer's identity tuple has NULL in non-key attributes.
   (let ((payload (make-payload)))
@@ -385,16 +385,21 @@ On a standby, receipt ahead of replay is reported only on the replay timeline."
              (value (if (or (null key-attnums) (member attnum key-attnums))
                         (aref values (1- attnum))
                         +null+))
-             (text (pgoutput-value-text value (getf column :type))))
-        (if text
-            (let ((bytes (string->bytes text)))
-              (payload-push-byte payload (char-code #\t))
-              (payload-push-u32 payload (length bytes))
-              (payload-push payload bytes))
-            (payload-push-byte payload (char-code #\n)))))
+             (text (unless (eq value +logical-unchanged-toast+)
+                     (pgoutput-value-text value (getf column :type)))))
+        (cond ((eq value +logical-unchanged-toast+)
+               (unless unchanged-allowed-p (error "invalid unchanged TOAST marker in pgoutput tuple"))
+               (payload-push-byte payload (char-code #\u)))
+              (text
+               (let ((bytes (string->bytes text)))
+                 (payload-push-byte payload (char-code #\t))
+                 (payload-push-u32 payload (length bytes))
+                 (payload-push payload bytes)))
+              (t (payload-push-byte payload (char-code #\n))))))
     payload))
 
 (defun pgoutput-build-row-change (change)
+  (logical-validate-unchanged-toast change)
   (let* ((payload (make-payload))
          (keys (logical-change-key-attnums change))
          (relation-oid (logical-change-relation-oid change))
@@ -420,7 +425,7 @@ On a standby, receipt ahead of replay is reported only on the replay timeline."
        (payload-push-byte payload (char-code #\N))
        (payload-push payload
                      (pgoutput-build-tuple
-                      columns (logical-change-new-values change))))
+                      columns (logical-change-new-values change) nil t)))
       (:delete
        (payload-push-byte payload (char-code #\D))
        (payload-push-u32 payload relation-oid)

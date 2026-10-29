@@ -634,6 +634,15 @@ writing its logical records.
 exercises initial copy, DDL and sequence changes, two independent replicas, and
 restart after a lost feedback message.
 
+For a keyed UPDATE, logical capture marks a reused external non-key value as
+unchanged instead of encoding it again. Key values remain in the identity
+image; apply omits marked columns so the target retains their existing values.
+Without a usable key, capture retains full row images and does not use this
+marker. New private logical WAL row events use format version 5, and the current
+reader rejects pre-version-5 row events; compatibility is not limited to rows
+containing the new marker. This optimization applies to proven pointer reuse,
+not every equal value.
+
 Extension table definitions and supported DDL cover the SQL subset listed
 above. Initial bootstrap mirrors supported schema objects in `public`; `--table`
 selects which tables have rows copied and whose row changes are applied. DDL and

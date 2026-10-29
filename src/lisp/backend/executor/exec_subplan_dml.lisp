@@ -466,7 +466,7 @@
                                (ereport "XX000" "could not link updated heap tuple"))))
                         (declare (ignore block off))
                         (logical-note-row-change :update table :old-values (htup-values tuple)
-                                                 :new-values new :publication-selection publications)
+                                                 :new-values new :toast-reuse reuse :publication-selection publications)
                         (emit-dml-returning stream (getf prepared :returning) new
                                             :old-values (htup-values tuple) :new-values new :source-values source))
                       (incf count)))

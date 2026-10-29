@@ -345,6 +345,15 @@ compatibility rules in `src/test/subscription/t/008_diff_schema.pl`.
 
 ## Invariants and limits
 
+- Keyed UPDATE capture records reused external non-key values as unchanged in
+  the new image. The old image retains identity fields, and pgoutput sends the
+  unchanged marker (`u`); the subscriber omits those columns from its UPDATE.
+  Key columns are never marked. Without a usable key, full images are retained
+  and the marker is not used. Only proven external pointer reuse qualifies;
+  equal values assigned anew are not inferred unchanged. New private logical
+  WAL row events use format version 5; the current reader rejects all earlier
+  row event versions, whether or not a marker is present.
+
 - A subscriber never sees an uncommitted or aborted transaction.
 - All row events from a committed transaction are returned together and in
   executor order; transactions are returned in durable commit order.

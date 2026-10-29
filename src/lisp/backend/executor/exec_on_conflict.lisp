@@ -232,5 +232,5 @@
                            (ereport "XX000" "could not link updated heap tuple"))))
                     (declare (ignore new-block new-offnum))
                     (logical-note-row-change :update table :old-values (htup-values actual)
-                                             :new-values new :publication-selection selection))
+                                             :new-values new :toast-reuse reuse :publication-selection selection))
                   (return-from insert-tuple-on-conflict (values :update new (htup-values actual))))))))))))

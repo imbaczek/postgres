@@ -213,12 +213,12 @@ setup_tables() {
     for port in "$LISP_PORT" "$C_PORT"; do
         if [ "$DIRECTION" = c-to-lisp ] && [ "$port" = "$C_PORT" ]; then
             # INCLUDE attributes must not become replica-identity key columns.
-            sql "$port" 'CREATE TABLE interop_rows (id integer NOT NULL, amount bigint, label varchar(100), price numeric, rate double precision, units smallint, workday date, at_time time, stamp timestamp, span interval day to second(2), zoned_time timetz, PRIMARY KEY(id) INCLUDE(label)); CREATE TABLE interop_other (id integer NOT NULL, amount bigint, label varchar(100), PRIMARY KEY(id) INCLUDE(label)); CREATE TABLE interop_unpublished (id integer PRIMARY KEY, amount bigint, label varchar(100))' >/dev/null
+            sql "$port" 'CREATE TABLE interop_rows (id integer NOT NULL, amount bigint, label varchar(100), price numeric, rate double precision, units smallint, workday date, at_time time, stamp timestamp, span interval day to second(2), zoned_time timetz, payload bytea, PRIMARY KEY(id) INCLUDE(label)); CREATE TABLE interop_other (id integer NOT NULL, amount bigint, label varchar(100), PRIMARY KEY(id) INCLUDE(label)); CREATE TABLE interop_unpublished (id integer PRIMARY KEY, amount bigint, label varchar(100))' >/dev/null
             # Worker connections inherit a path that shadows public tables.
             # Harness SQL explicitly selects public through PGOPTIONS above.
             sql "$port" "CREATE SCHEMA shadow; CREATE TABLE shadow.interop_rows (id integer PRIMARY KEY, amount bigint, label varchar(100)); INSERT INTO shadow.interop_rows VALUES (404,404,'wrong namespace'); ALTER ROLE postgres SET search_path=shadow,public" >/dev/null
         else
-            sql "$port" 'CREATE TABLE interop_rows (id integer PRIMARY KEY, amount bigint, label varchar(100), price numeric, rate double precision, units smallint, workday date, at_time time, stamp timestamp, span interval day to second(2), zoned_time timetz); CREATE TABLE interop_other (id integer PRIMARY KEY, amount bigint, label varchar(100)); CREATE TABLE interop_unpublished (id integer PRIMARY KEY, amount bigint, label varchar(100))' >/dev/null
+            sql "$port" 'CREATE TABLE interop_rows (id integer PRIMARY KEY, amount bigint, label varchar(100), price numeric, rate double precision, units smallint, workday date, at_time time, stamp timestamp, span interval day to second(2), zoned_time timetz, payload bytea); CREATE TABLE interop_other (id integer PRIMARY KEY, amount bigint, label varchar(100)); CREATE TABLE interop_unpublished (id integer PRIMARY KEY, amount bigint, label varchar(100))' >/dev/null
         fi
         for table in interop_rows interop_other interop_unpublished; do
             sql "$port" "ALTER TABLE $table ALTER amount SET DEFAULT 40+2; ALTER TABLE $table ADD CONSTRAINT ${table}_amount_check CHECK(amount IS NULL OR amount >= '-9223372036854775808'::bigint)" >/dev/null
@@ -627,7 +627,32 @@ run_direction() {
         grep -F "proto_version '1'" "$TMP/c.log" >"$TMP/standard-protocol.log"
         echo 'logical-interop: direction=c-to-lisp protocol=1 observed in C publisher log before applied transaction'
     fi
-    if [ "$direction" = lisp-to-c ]; then native_publication_capture_race; fi
+    if [ "$direction" = lisp-to-c ]; then
+        native_publication_capture_race
+        # An unchanged external bytea larger than 32 MiB must fit a small
+        # marker update and remain intact on the native pgoutput subscriber.
+        sql "$LISP_PORT" 'ALTER TABLE interop_rows ALTER COLUMN payload SET STORAGE EXTERNAL' >/dev/null
+        awk 'BEGIN { printf "INSERT INTO interop_rows (id,amount,payload) VALUES (73,730,\047\\x"; for(i=0;i<11184811;i++) printf "0080ff"; printf "\047::bytea);\n" }' >"$TMP/large-bytea.sql"
+        "$C_PG_BINDIR/psql" -X -h 127.0.0.1 -p "$LISP_PORT" -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -f "$TMP/large-bytea.sql" >"$TMP/large-bytea-insert.log" 2>&1
+        attempt=0
+        until [ "$(sql "$C_PORT" 'SELECT count(*) FROM interop_rows WHERE id=73' 2>/dev/null || true)" = 1 ]; do
+            kill -0 "$LISP_PID" 2>/dev/null || { cat "$TMP/lisp.log" >&2; return 1; }
+            attempt=$((attempt + 1)); test "$attempt" -lt 1200 || { echo 'logical-interop: large bytea insert timed out' >&2; return 1; }; sleep 0.5
+        done
+        sql "$LISP_PORT" 'UPDATE interop_rows SET amount=731 WHERE id=73' >/dev/null
+        attempt=0
+        until [ "$(sql "$C_PORT" 'SELECT amount FROM interop_rows WHERE id=73' 2>/dev/null || true)" = 731 ]; do
+            kill -0 "$LISP_PID" 2>/dev/null || { cat "$TMP/lisp.log" >&2; return 1; }
+            attempt=$((attempt + 1)); test "$attempt" -lt 1200 || { echo 'logical-interop: unchanged bytea update timed out' >&2; return 1; }; sleep 0.5
+        done
+        test "$(sql "$C_PORT" "SELECT length(payload) = 33554433 AND payload = decode(repeat('0080ff',11184811),'hex') FROM interop_rows WHERE id=73")" = t
+        sql "$LISP_PORT" 'DELETE FROM interop_rows WHERE id=73' >/dev/null
+        attempt=0
+        until [ "$(sql "$C_PORT" 'SELECT count(*) FROM interop_rows WHERE id=73')" = 0 ]; do
+            attempt=$((attempt + 1)); test "$attempt" -lt 1200 || return 1; sleep 0.5
+        done
+        echo 'logical-interop: native subscriber preserved unchanged external bytea above 32 MiB'
+    fi
     echo "logical-interop: direction=$direction phase=live-stream"
     workload "$source"
     wait_rows "$target" "$(sql "$source" 'SELECT id, amount, label FROM interop_rows ORDER BY id')"
