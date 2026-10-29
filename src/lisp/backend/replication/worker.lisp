@@ -526,6 +526,17 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
            +max-query-message-size+))
   query)
 
+(defun logical-write-copy-insert (stream table columns row)
+  (format stream "INSERT INTO ~a (" table)
+  (loop for column in columns for first = t then nil do
+    (unless first (write-string ", " stream))
+    (write-string (pg-client-column-name column) stream))
+  (write-string ") VALUES (" stream)
+  (loop for column in columns for value across row for first = t then nil do
+    (unless first (write-string ", " stream))
+    (logical-write-value-literal stream (pg-client-column-type-oid column) value :copy))
+  (write-char #\) stream))
+
 (defun logical-copy-target-chunk (target table columns rows)
   (when rows
     (logical-target-transaction
@@ -534,7 +545,8 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
        (dolist (row (nreverse rows))
          (logical-test-failpoint :before-copy-row-change table)
          (logical-target-query
-          target (logical-copy-check-query-size (logical-copy-insert-query table columns row)))
+          target (make-pg-client-query-plan
+                  :writer (lambda (stream) (logical-write-copy-insert stream table columns row))))
          (logical-test-failpoint :after-copy-row-change table)))
      :before-commit
      (lambda ()
@@ -809,17 +821,17 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
         collect (cons (pgoutput-column-name column)
                       (cons (pgoutput-column-type-oid column) value))))
 
-(defun logical-write-value-literal (stream type value)
+(defun logical-write-value-literal (stream type value &optional (context :pgoutput))
   (cond
     ((or (null value) (eq value :unchanged-toast) (member type '(20 21 23)))
-     (write-string (logical-source-value-literal type value :pgoutput) stream))
+     (write-string (logical-source-value-literal type value context) stream))
     ((member type '(17 25 114 3802 700 701 1043 1082 1083 1114 1184 1186 1266 1700))
      (write-char #\' stream)
      (loop for character across value do
        (when (char= character #\') (write-char #\' stream))
        (write-char character stream))
      (write-char #\' stream))
-    (t (logical-source-value-literal type value :pgoutput))))
+    (t (logical-source-value-literal type value context))))
 
 (defun logical-write-insert (stream relation tuple)
   (logical-validate-pgoutput-tuple relation tuple nil)

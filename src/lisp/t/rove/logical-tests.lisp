@@ -679,6 +679,21 @@
                  (error () t))
                "doubling quotes cannot bypass the actual target-frame limit")))
 
+(rove:deftest test-streamed-copy-sql-matches-existing-builder
+    (let* ((columns (list (make-pg-client-column :name "id" :type-oid 23)
+                          (make-pg-client-column :name "body" :type-oid 25)
+                          (make-pg-client-column :name "bin" :type-oid 17)
+                          (make-pg-client-column :name "doc" :type-oid 3802)))
+           (row (vector "-42" "🙂'\\" "\\x00ff" nil))
+           (writer (lambda (stream) (logical-write-copy-insert stream "t" columns row)))
+           (plan (make-pg-client-query-plan :writer writer))
+           (expected (logical-copy-insert-query "t" columns row)))
+      (rove:ok (string= expected (with-output-to-string (stream) (funcall writer stream))))
+      (rove:ok (= (length (string->bytes expected)) (pg-client-query-plan-size plan)))
+      (setf (aref row 0) "bad")
+      (rove:ok (handler-case (progn (pg-client-query-plan-size plan) nil)
+                 (error (condition) (search "source returned a malformed integer" (princ-to-string condition)))))))
+
 (rove:deftest test-logical-copy-oversize-query-rolls-back
     (let ((original (symbol-function 'logical-target-query))
           (queries nil)
@@ -688,6 +703,7 @@
              (setf (symbol-function 'logical-target-query)
                    (lambda (target query)
                      (declare (ignore target))
+                     (when (pg-client-query-plan-p query) (pg-client-query-plan-size query))
                      (push query queries)))
              (rove:ok
               (handler-case

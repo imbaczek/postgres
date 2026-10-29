@@ -127,17 +127,22 @@
   (declare (ignore stream))
   (when (char= character (code-char 0)) (error "SQL query contains a null byte")))
 
+(defun pg-client-query-plan-size (plan)
+  "Validate the complete producer and return its UTF-8 byte length."
+  (let ((counter (make-instance 'pg-client-query-output-stream :buffer nil)))
+    (funcall (pg-client-query-plan-writer plan) counter)
+    (logical-flush-utf8-output counter)
+    (let ((size (logical-utf8-size counter)))
+      (when (> (+ size 5) +max-query-message-size+)
+        (error "SQL query exceeds PostgreSQL message length"))
+      size)))
+
 (defun pg-client-send-query-plan (client plan)
   "Preflight and emit a deterministic query producer without a full SQL string."
-  (let* ((counter (make-instance 'pg-client-query-output-stream :buffer nil))
-         (writer (pg-client-query-plan-writer plan)))
-    (funcall writer counter)
-    (logical-flush-utf8-output counter)
-    (let* ((size (logical-utf8-size counter))
+  (let* ((writer (pg-client-query-plan-writer plan)))
+    (let* ((size (pg-client-query-plan-size plan))
            (length (+ size 5)) (stream (pg-client-stream client))
            (started nil) (complete nil) (written 0))
-      (when (> length +max-query-message-size+)
-        (error "SQL query exceeds PostgreSQL message length"))
       (unwind-protect
            (progn
              (setf started t)

@@ -618,6 +618,10 @@ the worker sends replication feedback only after that commit. The worker explici
 requests the `pg_lisp` output plugin for its snapshot lifecycle and private events.
 Initial copy batches rows to an 8 MiB target; a larger row uses a separate
 transaction and must still fit the source/target protocol and logical WAL limits.
+For extension-mode initial copy, each target INSERT is counted and emitted in
+bounded UTF-8 blocks without constructing a complete query string. The source
+DataRow and its decoded values are still materialized, and the target still
+receives and parses the complete Simple Query frame.
 Frontend query message lengths are limited to 132 MiB, including the four-byte
 length word. Logical capture normally limits the sum of encoded row changes
 and transactional events to 64 MiB per transaction, including their encoding
