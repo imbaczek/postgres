@@ -168,7 +168,15 @@ TEXT-P requests the text form, for which JSON null becomes SQL NULL."
 
 (declaim (notinline sql-array-p sql-array-dimensions sql-array-elements))
 
-(defun sql-jsonb-set (jsonb path replacement create-p)
+(defun jsonb-array-insert-at (array index value)
+  "Copy ARRAY, inserting VALUE before INDEX."
+  (let ((result (make-array (1+ (length array)))))
+    (replace result array :end1 index)
+    (setf (aref result index) value)
+    (replace result array :start1 (1+ index) :start2 index)
+    result))
+
+(defun sql-jsonb-set (jsonb path replacement create-p &key insert-p after-p)
   "Return JSONB with PATH changed without mutating either input."
   (when (sql-array-p path)
     (when (> (length (sql-array-dimensions path)) 1)
@@ -194,6 +202,9 @@ TEXT-P requests the text form, for which JSON null becomes SQL NULL."
                            (entry (assoc key pairs :test #'string=)))
                       (cond
                         (entry
+                         (when (and insert-p last-p)
+                           (ereport "22023" "cannot replace existing key"
+                                    :hint "Try using the function jsonb_set to replace key value."))
                          (let ((changed (if last-p new-value (visit (cdr entry) (1+ level)))))
                            (if (eq changed (cdr entry)) value
                                (cons :object
@@ -210,10 +221,12 @@ TEXT-P requests the text form, for which JSON null becomes SQL NULL."
                            (actual (if (minusp index) (+ count index) index)))
                       (cond
                         ((<= 0 actual (1- count))
-                         (let ((changed (if last-p new-value (visit (aref value actual) (1+ level)))))
-                           (if (eq changed (aref value actual)) value
-                               (let ((copy (copy-seq value)))
-                                 (setf (aref copy actual) changed) copy))))
+                         (if (and insert-p last-p)
+                             (jsonb-array-insert-at value (if after-p (1+ actual) actual) new-value)
+                             (let ((changed (if last-p new-value (visit (aref value actual) (1+ level)))))
+                               (if (eq changed (aref value actual)) value
+                                   (let ((copy (copy-seq value)))
+                                     (setf (aref copy actual) changed) copy)))))
                         ((and last-p create-p)
                          (if (minusp actual)
                              (concatenate 'vector (vector new-value) value)

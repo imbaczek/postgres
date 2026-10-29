@@ -276,6 +276,12 @@ and invalid array indices reached during traversal; unreachable later elements
 are not validated. An empty path leaves a container unchanged. Paths use the
 supported one-dimensional text array representation. JSONB values remain
 materialized; unchanged tree branches are shared without mutating inputs.
+`jsonb_insert(jsonb, text[], jsonb [, boolean])` uses the same path traversal
+and inserts before an existing array element by default, or after it when the
+optional flag is true. Out-of-range negative and positive indices prepend and
+append respectively. For objects it inserts a missing final key and errors if
+that key already exists. Earlier path steps must exist. Inputs remain unchanged
+and the JSONB trees remain materialized.
 JSONB `-` accepts text or one-dimensional `text[]` to remove top-level object
 keys or matching string elements of a top-level array; NULL entries in the key
 array are ignored. With an integer it removes an array element, counting negative

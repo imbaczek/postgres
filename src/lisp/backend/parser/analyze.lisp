@@ -1308,7 +1308,7 @@ so a nested argument error keeps its own diagnostics."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature)))
-      ((string= name "jsonb_set")
+      ((member name '("jsonb_set" "jsonb_insert") :test #'string=)
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
@@ -2498,6 +2498,13 @@ candidate selection."
                 (ereport "42883" "operator ~a does not exist for ~a and ~a" operator left-type right-type))
               (return-from analyze-binop-expression
                 (list :binop operator left right :type (if date-difference :int4 :date) :typmod -1))))
+          ;; binary_oper_exact uses the known integer type for an unknown literal.
+          (when (and (string= operator "-") (in-unknown-constant-p left)
+                     (member (expr-type right) '(:int2 :int4 :int8)))
+            (setf left (coerce-in-constant left (expr-type right))))
+          (when (and (string= operator "-") (in-unknown-constant-p right)
+                     (member (expr-type left) '(:int2 :int4 :int8)))
+            (setf right (coerce-in-constant right (expr-type left))))
           (when (and (in-unknown-constant-p left) (member (expr-type right) '(:float4 :float8)))
             (setf left (coerce-in-constant left (expr-type right))))
           (when (and (in-unknown-constant-p right) (member (expr-type left) '(:float4 :float8)))
@@ -3158,7 +3165,7 @@ candidate selection."
                          (member (second form)
                                  '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                    "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
-                                   "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set"
+                                   "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set" "jsonb_insert"
                                    "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid"
                                    "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                                    "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
@@ -4075,10 +4082,13 @@ Map float catalog names and dispatch integer catalog names only here, after
 expression identity has been resolved."
   (setf name (or (second (float-catalog-alias name)) name))
   (cond
-    ((string= name "jsonb_set")
+    ((member name '("jsonb_set" "jsonb_insert") :test #'string=)
      (if (member +null+ arguments) +null+
-         (sql-jsonb-set (first arguments) (second arguments) (third arguments)
-                        (if (fourth arguments) (fourth arguments) (= (length arguments) 3)))))
+         (if (string= name "jsonb_insert")
+             (sql-jsonb-set (first arguments) (second arguments) (third arguments) t
+                            :insert-p t :after-p (and (= (length arguments) 4) (fourth arguments)))
+             (sql-jsonb-set (first arguments) (second arguments) (third arguments)
+                            (if (fourth arguments) (fourth arguments) (= (length arguments) 3))))))
     ((integer-catalog-alias-p name)
      (if (member +null+ arguments) +null+
          (let ((suffix (subseq name 4)))
