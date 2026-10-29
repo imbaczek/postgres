@@ -363,7 +363,7 @@ A second read failure is a WAL critical-section failure, like other WAL I/O."
   limit (bytes 0) total (received 0) buffer spool)
 
 (defun logical-close-recovery-assembler (assembler)
-  "Release any incomplete recovery event and its temporary-file owner."
+  "Release an incomplete replay or logical-slot event and its file owner."
   (when (logical-recovery-assembler-spool assembler)
     (close-logical-spool (logical-recovery-assembler-spool assembler))
     (setf (logical-recovery-assembler-spool assembler) nil))
@@ -372,8 +372,8 @@ A second read failure is a WAL critical-section failure, like other WAL I/O."
         (logical-recovery-assembler-received assembler) 0)
   (values))
 
-(defun logical-recovery-assembler-append (assembler total offset bytes)
-  "Validate and store one recovery fragment, spilling large encoded events."
+(defun logical-recovery-assembler-append (assembler total offset bytes &key materialize)
+  "Assemble an event, spilling when large; decode it if MATERIALIZE is true."
   (let ((size (length bytes)))
     (unless (and (typep bytes '(vector (unsigned-byte 8)))
                  (integerp total) (plusp total) (integerp offset) (not (minusp offset))
@@ -393,7 +393,7 @@ A second read failure is a WAL critical-section failure, like other WAL I/O."
           (if (<= total *logical-capture-memory-bytes*)
               (setf (logical-recovery-assembler-buffer assembler)
                     (make-array total :element-type '(unsigned-byte 8)))
-              ;; Recovery must not inherit a SQL query's temporary-file quota.
+              ;; Replay and slot reads must not inherit a SQL query's temp quota.
               (sb-sys:without-interrupts
                 (let ((*query-temp-file-limit-bytes* nil))
                   (setf (logical-recovery-assembler-spool assembler) (make-logical-spool)))))))
@@ -407,17 +407,21 @@ A second read failure is a WAL critical-section failure, like other WAL I/O."
         (replace (logical-recovery-assembler-buffer assembler) bytes :start1 offset))
     (incf (logical-recovery-assembler-received assembler) size)
     (when (= (logical-recovery-assembler-received assembler) total)
-      (unwind-protect
-           (if (logical-recovery-assembler-spool assembler)
-               (let* ((spool (logical-recovery-assembler-spool assembler))
-                      (stream (logical-spool-stream spool)))
-                 (finish-output stream)
-                 (unless (file-position stream 0) (error "cannot seek logical recovery spool"))
-                 (logical-validate-change-from-cursor
-                  (make-logical-cursor :stream stream :size total)))
-               (logical-validate-change-from-cursor
-                (make-logical-cursor :bytes (logical-recovery-assembler-buffer assembler))))
-        (logical-close-recovery-assembler assembler))))
+      (return-from logical-recovery-assembler-append
+        (unwind-protect
+             (let ((cursor
+                     (if (logical-recovery-assembler-spool assembler)
+                         (let* ((spool (logical-recovery-assembler-spool assembler))
+                                (stream (logical-spool-stream spool)))
+                           (finish-output stream)
+                           (unless (file-position stream 0) (error "cannot seek logical event spool"))
+                           (make-logical-cursor :stream stream :size total))
+                         (make-logical-cursor :bytes (logical-recovery-assembler-buffer assembler)))))
+               (if materialize
+                   (let ((*logical-validation-only* nil))
+                     (logical-decode-change-from-cursor cursor))
+                   (logical-validate-change-from-cursor cursor)))
+          (logical-close-recovery-assembler assembler)))))
   (values))
 
 (defun logical-recovery-assembler-finish (assembler)

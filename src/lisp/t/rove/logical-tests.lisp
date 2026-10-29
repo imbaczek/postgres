@@ -1097,6 +1097,41 @@
              (rove:ok (null (uiop:directory-files directory))))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest test-logical-slot-spooled-fragment-lifetime
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-slot-spool-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 1)
+           (*logical-validation-only* t)
+           (original #(1 2 "slot🙂"))
+           (event (logical-encode-change (logical-test-change :insert 7 701 :new-values original)))
+           (middle (floor (length event) 2))
+           (one (make-wal-record :type +wal-record-logical-changes+ :xid 91
+                                 :payload (logical-encode-fragment 0 2
+                                                                   (make-logical-fragment :event event :start 0 :end middle))))
+           (two (make-wal-record :type +wal-record-logical-changes+ :xid 91
+                                 :payload (logical-encode-fragment 1 2
+                                                                   (make-logical-fragment :event event :start middle :end (length event)))))
+           (state (make-logical-reader-state :database-oid 7)))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (wal-logical-reader-start-batch state)
+             (wal-logical-reader-add-chunk state one)
+             (rove:ok (= 1 (length (uiop:directory-files directory))))
+             (wal-logical-reader-reset-batch state nil)
+             (rove:ok (null (uiop:directory-files directory)))
+             (wal-logical-reader-start-batch state)
+             (wal-logical-reader-add-chunk state one)
+             (wal-logical-reader-add-chunk state two)
+             (rove:ok (null (uiop:directory-files directory)))
+             (let ((change (first (logical-reader-state-changes state))))
+               (wal-logical-reader-reset-batch state nil)
+               (rove:ok (equalp (logical-change-new-values change) original))))
+        (wal-logical-reader-reset-batch state nil)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest test-logical-fragment-assembly
     (let* ((first (make-array 10 :element-type '(unsigned-byte 8)
                                  :initial-contents '(0 1 2 3 4 5 6 7 8 9)))

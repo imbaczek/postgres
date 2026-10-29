@@ -944,6 +944,9 @@ executor, so capture the same operation before transaction commit."
   (wal-recovery-reset-logical-change-batch))
 
 (defun wal-logical-reader-reset-batch (state batch-open-p)
+  (let ((batch (logical-reader-state-fragment-batch state)))
+    (when (and batch (logical-fragment-batch-assembler batch))
+      (logical-close-recovery-assembler (logical-fragment-batch-assembler batch))))
   (setf (logical-reader-state-batch-open-p state) batch-open-p
         (logical-reader-state-fragment-batch state) nil
         (logical-reader-state-xid state) nil
@@ -973,14 +976,17 @@ executor, so capture the same operation before transaction commit."
           (error "logical WAL batch mixes fragment and legacy records"))
         (let* ((batch (or (logical-reader-state-fragment-batch state)
                           (make-logical-fragment-batch +max-logical-wal-transaction-bytes+)))
-               (change (logical-fragment-batch-accept batch (wal-record-xid record)
-                                                      (wal-record-payload record))))
+               (change (progn
+                         ;; Publish ownership before acceptance can acquire a file.
+                         (setf (logical-reader-state-fragment-batch state) batch)
+                         (logical-fragment-batch-accept batch (wal-record-xid record)
+                                                        (wal-record-payload record)))))
           (setf (logical-reader-state-fragment-batch state) batch
                 (logical-reader-state-xid state) (logical-fragment-batch-xid batch)
                 (logical-reader-state-chunk-count state) (logical-fragment-batch-count batch)
                 (logical-reader-state-next-chunk state) (logical-fragment-batch-next batch)
                 (logical-reader-state-change-bytes state)
-                (logical-fragment-assembler-bytes (logical-fragment-batch-assembler batch)))
+                (logical-recovery-assembler-bytes (logical-fragment-batch-assembler batch)))
           (when change
             (setf (logical-reader-state-changes state)
                   (nconc (logical-reader-state-changes state) (list change))))))
@@ -1250,57 +1256,60 @@ slot restart point. It permits standard senders to scan ahead of feedback."
             (transaction-count 0)
             (change-bytes 0)
             (progress-lsn start-lsn))
-        ;; PostgreSQL's XLogReadRecord() consumer reads only a stable WAL
-        ;; horizon. Here *wal-lock* also excludes commit append and checkpoint
-        ;; recycling while the bounded scan is in progress.
-        (wal-scan
-         (lambda (record)
-           (wal-note-recovery-batch-record record)
-           (let ((record-type (wal-record-type record)))
-             (cond
-               ((= record-type +wal-record-batch-start+)
-                (wal-logical-reader-start-batch state))
-               ((= record-type +wal-record-logical-changes+)
-                (wal-logical-reader-add-chunk state record))
-               ((= record-type +wal-record-logical-catalog-event+)
-                (wal-logical-reader-add-catalog-event state record))
-               (t
-                (when (wal-terminal-record-type-p record-type)
-                  (let* ((has-changes
-                           (and (or (= record-type +wal-record-commit+)
-                                    (= record-type +wal-record-catalog+)
-                                    (= record-type +wal-record-catalog-commit+))
-                                (wal-logical-reader-has-database-changes-p
-                                 state)))
-                         (batch-bytes
-                           (logical-reader-state-change-bytes state)))
-                    (when (and has-changes
-                               (plusp transaction-count)
-                               (or (>= transaction-count max-transactions)
-                                   (> (+ change-bytes batch-bytes) max-bytes)))
-                      (return-from wal-logical-slot-read-transactions
-                        (wal-logical-reader-return
-                         (nreverse
-                          (logical-reader-state-transactions state))
-                         progress-lsn)))
-                    (wal-logical-reader-finish-batch state record)
-                    (setf progress-lsn (wal-record-end record))
-                    (when has-changes
-                      (incf transaction-count)
-                      (incf change-bytes batch-bytes))
-                    (when (or (>= transaction-count max-transactions)
-                              (>= change-bytes max-bytes)
-                              (>= (- progress-lsn start-lsn) max-scan-bytes))
-                      (return-from wal-logical-slot-read-transactions
-                        (wal-logical-reader-return
-                         (nreverse
-                          (logical-reader-state-transactions state))
-                         progress-lsn)))))))))
-         start-lsn :end-lsn end-lsn)
-        ;; An open batch at the durable scan horizon is an incomplete commit
-        ;; tail. Its changes stay invisible, as in DecodeCommit/reorderbuffer.
-        (wal-logical-reader-return
-         (nreverse (logical-reader-state-transactions state)) progress-lsn)))))
+        (unwind-protect
+             (progn
+               ;; PostgreSQL's XLogReadRecord() consumer reads only a stable WAL
+               ;; horizon. Here *wal-lock* also excludes commit append and checkpoint
+               ;; recycling while the bounded scan is in progress.
+               (wal-scan
+                (lambda (record)
+                  (wal-note-recovery-batch-record record)
+                  (let ((record-type (wal-record-type record)))
+                    (cond
+                      ((= record-type +wal-record-batch-start+)
+                       (wal-logical-reader-start-batch state))
+                      ((= record-type +wal-record-logical-changes+)
+                       (wal-logical-reader-add-chunk state record))
+                      ((= record-type +wal-record-logical-catalog-event+)
+                       (wal-logical-reader-add-catalog-event state record))
+                      (t
+                       (when (wal-terminal-record-type-p record-type)
+                         (let* ((has-changes
+                                  (and (or (= record-type +wal-record-commit+)
+                                           (= record-type +wal-record-catalog+)
+                                           (= record-type +wal-record-catalog-commit+))
+                                       (wal-logical-reader-has-database-changes-p
+                                        state)))
+                                (batch-bytes
+                                  (logical-reader-state-change-bytes state)))
+                           (when (and has-changes
+                                      (plusp transaction-count)
+                                      (or (>= transaction-count max-transactions)
+                                          (> (+ change-bytes batch-bytes) max-bytes)))
+                             (return-from wal-logical-slot-read-transactions
+                               (wal-logical-reader-return
+                                (nreverse
+                                 (logical-reader-state-transactions state))
+                                progress-lsn)))
+                           (wal-logical-reader-finish-batch state record)
+                           (setf progress-lsn (wal-record-end record))
+                           (when has-changes
+                             (incf transaction-count)
+                             (incf change-bytes batch-bytes))
+                           (when (or (>= transaction-count max-transactions)
+                                     (>= change-bytes max-bytes)
+                                     (>= (- progress-lsn start-lsn) max-scan-bytes))
+                             (return-from wal-logical-slot-read-transactions
+                               (wal-logical-reader-return
+                                (nreverse
+                                 (logical-reader-state-transactions state))
+                                progress-lsn)))))))))
+                start-lsn :end-lsn end-lsn)
+               ;; An open batch at the durable scan horizon is an incomplete commit
+               ;; tail. Its changes stay invisible, as in DecodeCommit/reorderbuffer.
+               (wal-logical-reader-return
+                (nreverse (logical-reader-state-transactions state)) progress-lsn))
+          (wal-logical-reader-reset-batch state nil))))))
 
 (defun wal-logical-slot-acknowledge (name acknowledged-lsn)
   "Acknowledge scanned WAL after all preceding row changes are durable."

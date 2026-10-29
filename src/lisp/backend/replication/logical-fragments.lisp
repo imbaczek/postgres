@@ -152,17 +152,12 @@ LIMIT bounds the total declared bytes across the batch before allocation."
         (unless (zerop index)
           (error "logical WAL fragments do not start at index zero")))
     (let ((assembler (or (logical-fragment-batch-assembler batch)
-                         (if validate-only
-                             (make-logical-recovery-assembler (logical-fragment-batch-limit batch))
-                             (make-logical-fragment-assembler (logical-fragment-batch-limit batch))))))
+                         (make-logical-recovery-assembler (logical-fragment-batch-limit batch)))))
       ;; Publish the assembler before it can acquire a recovery spool.
       (setf (logical-fragment-batch-assembler batch) assembler
             (logical-fragment-batch-validate-only batch) (not (null validate-only)))
-      (let ((change
-              (if validate-only
-                  (progn (logical-recovery-assembler-append assembler total offset bytes) nil)
-                  (let ((encoded (logical-assemble-event-fragment assembler total offset bytes)))
-                    (and encoded (logical-decode-change encoded))))))
+      (let ((change (logical-recovery-assembler-append assembler total offset bytes
+                                                       :materialize (not validate-only))))
         (when (and change (not (member (logical-change-kind change) '(:insert :update :delete :truncate))))
           (error "catalog event appears in a transactional row-change record"))
         (setf (logical-fragment-batch-xid batch) xid
@@ -176,7 +171,5 @@ LIMIT bounds the total declared bytes across the batch before allocation."
                (= xid (logical-fragment-batch-xid batch))
                (= (logical-fragment-batch-next batch) (logical-fragment-batch-count batch)))
     (error "logical WAL fragments do not match their commit record"))
-  (if (logical-fragment-batch-validate-only batch)
-      (logical-recovery-assembler-finish (logical-fragment-batch-assembler batch))
-      (logical-finish-fragment-assembly (logical-fragment-batch-assembler batch)))
+  (logical-recovery-assembler-finish (logical-fragment-batch-assembler batch))
   (values))

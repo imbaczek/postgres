@@ -598,12 +598,13 @@ separate from query spill quotas; its length and checksum framing also counts
 against that quota. It is cleaned up when the transaction ends. At commit the
 spool is validated in bounded blocks and its WAL records planned before
 publication. A second blockwise pass writes fragments or bounded chunks without
-materializing a whole oversized event. For fragmented events, recovery keeps
-encoded events of at most 4 MiB in memory; larger events use a temporary file
-and are validated from its stream. This recovery file does not use the SQL
-temporary-file quota. Validation avoids retaining decoded text, varchar, JSON
-text, or bytea values, but still constructs JSONB and numeric values. Logical
-slot decoding assembles whole events. The 4 MiB threshold is not a bound on the
+materializing a whole oversized event. For fragmented events, recovery and
+logical slot decoding keep encoded events of at most 4 MiB in memory; larger
+events use a temporary file and are read from its stream. These files do not
+use the SQL temporary-file quota. Recovery validation avoids retaining decoded
+text, varchar, JSON text, or bytea values, but still constructs JSONB and
+numeric values. Slot decoding materializes decoded values and retains the
+transaction's changes in memory. The 4 MiB threshold is not a bound on the
 size of an individual event. The 64 MiB capture and 65 MiB WAL limits still
 apply.
 
