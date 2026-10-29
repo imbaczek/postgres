@@ -648,10 +648,13 @@ transaction spool, spilling above 4 MiB without the SQL temporary-file quota.
 It validates the staged changes before sending and iterates them again for
 output; the spool is cleaned up when the reader scope ends. For spilled events,
 each iteration checks the event CRC in bounded blocks before decoding through a
-bounded stream cursor, without allocating the complete encoded event. Decoded
-values and protocol output may still allocate a full row message. The 4 MiB threshold is not a bound on
-the size of an individual event. The 64 MiB capture and 65 MiB WAL limits still
-apply.
+bounded stream cursor, without allocating the complete encoded event. The
+sender measures each INSERT, UPDATE, or DELETE row before writing one pgoutput
+CopyData frame through a bounded buffer. Decoded values still occupy memory,
+and the receiver still handles complete frames; other message types use their
+existing encoders. A partial row-frame write closes the connection. The 4 MiB
+threshold is not a bound on the size of an individual event. The 64 MiB capture
+and 65 MiB WAL limits and protocol frame length limit still apply.
 
 When an encoded row event exceeds one WAL record, the transaction's events
 are written as ordered fragments and reassembled by recovery and logical slot

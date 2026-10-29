@@ -195,9 +195,15 @@
 (defun standard-send-scoped-transaction (state transaction names)
   "Preflight selection, then send without retaining the selected changes."
   (let ((selected nil))
-    (standard-map-selected-changes transaction names (lambda (change)
-                                                       (declare (ignore change))
-                                                       (setf selected t)))
+    (standard-map-selected-changes
+     transaction names
+     (lambda (change)
+       (setf selected t)
+       (if (and (consp change) (eq (car change) :truncate))
+           (progn
+             (dolist (relation (cdr change)) (pgoutput-build-relation relation))
+             (pgoutput-build-truncate (mapcar #'logical-change-relation-oid (cdr change))))
+           (progn (pgoutput-build-relation change) (pgoutput-row-change-size change)))))
     (unless selected (return-from standard-send-scoped-transaction t))
     (unless (standard-xlog-data state (pgoutput-standard-begin transaction))
       (return-from standard-send-scoped-transaction nil))
@@ -218,7 +224,7 @@
            (progn
              (unless (standard-xlog-data state (pgoutput-build-relation change))
                (return-from standard-send-scoped-transaction nil))
-             (unless (standard-xlog-data state (pgoutput-build-row-change change))
+             (unless (standard-xlog-row state change)
                (return-from standard-send-scoped-transaction nil))))
        (standard-maybe-keepalive state)))
     (logical-test-failpoint :before-standard-commit (standard-stream-slot-name state)
@@ -372,6 +378,59 @@ that position cannot certify the whole transaction; retention alone is not enoug
     (replication-push-i64 data (postgres-current-timestamp))
     (payload-push data payload)
     (standard-write-frame state #\d data)))
+
+(defun standard-send-socket-chunk (socket chunk)
+  (sb-bsd-sockets:socket-send socket chunk (length chunk) :dontwait t :nosignal t))
+
+(defun standard-write-streamed-frame (state type payload-size producer)
+  "Write one frame in bounded chunks, retaining partial socket writes safely."
+  (unless (and (integerp payload-size) (<= 0 payload-size (- #x7fffffff 4)))
+    (error "invalid streamed frame length"))
+  (let ((header (make-array 5 :element-type '(unsigned-byte 8)))
+        (written 0))
+    (setf (aref header 0) (char-code type))
+    (replace header (u32-to-bytes (+ 4 payload-size)) :start1 1)
+    (unwind-protect
+         (block sending
+           (labels ((send-part (part length)
+                      (loop with offset = 0 while (< offset length)
+                            do (standard-poll-feedback state)
+                               (when (and (standard-stream-stop-reason state) (zerop written))
+                                 (return-from sending nil))
+                               (let ((chunk (subseq part offset length)))
+                                 (loop
+                                   (sb-sys:without-interrupts
+                                     (let ((count
+                                             (standard-send-socket-chunk
+                                              (standard-stream-socket state) chunk)))
+                                       (when (and count (plusp count))
+                                         (incf offset count)
+                                         (incf written count)
+                                         (setf (standard-stream-raw-partial-p state) t)
+                                         (return))))
+                                   (standard-poll-feedback state)
+                                   (when (and (standard-stream-stop-reason state) (zerop written))
+                                     (return-from sending nil))
+                                   (sb-sys:wait-until-fd-usable
+                                    (sb-bsd-sockets:socket-file-descriptor
+                                     (standard-stream-socket state)) :output 0.01 nil))))))
+             (send-part header (length header))
+             (call-with-pgoutput-buffered-sink payload-size #'send-part producer)
+             (setf (standard-stream-raw-partial-p state) nil
+                   (standard-stream-last-send-time state) (get-internal-real-time))
+             t))
+      (when (standard-stream-raw-partial-p state)
+        (ignore-errors (close (standard-stream-stream state) :abort t))))))
+
+(defun standard-xlog-row (state change &optional (end 0))
+  "Send one pgoutput row as one XLogData frame, without a row-sized buffer."
+  (let* ((size (pgoutput-row-change-size change))
+         (envelope (pgoutput-xlog-envelope end end (postgres-current-timestamp))))
+    (standard-write-streamed-frame
+     state #\d (+ (length envelope) size)
+     (lambda (sink)
+       (funcall sink envelope)
+       (pgoutput-emit-row-change change sink)))))
 
 (defun standard-keepalive (state request-reply)
   (let ((payload (make-payload)))

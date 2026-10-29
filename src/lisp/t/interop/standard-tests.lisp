@@ -189,6 +189,116 @@
                       "no ErrorResponse is appended inside the incomplete frame")))
            (setf (symbol-function 'pg::standard-poll-feedback) original))))))
 
+(deftest standard-streamed-frame-finishes-after-copydone
+    (call-with-standard-socket-pair
+     (lambda (state input)
+       (let ((original (symbol-function 'pg::standard-poll-feedback))
+             (polls 0)
+             (payload (make-array 100 :element-type '(unsigned-byte 8) :initial-element 90)))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::standard-poll-feedback)
+                      (lambda (ignored)
+                        (declare (ignore ignored))
+                        (when (= (incf polls) 2)
+                          (setf (pg::standard-stream-stop-reason state) :done))))
+                (ok (pg::standard-write-streamed-frame
+                     state #\d (length payload) (lambda (sink) (funcall sink payload))))
+                (ok (eq :done (pg::standard-stream-stop-reason state)))
+                (ok (not (pg::standard-stream-raw-partial-p state)))
+                (sb-ext:with-timeout 2
+                  (multiple-value-bind (kind bytes) (pg::pg-client-frame input)
+                    (ok (char= kind #\d))
+                    (ok (equalp bytes payload)))))
+           (setf (symbol-function 'pg::standard-poll-feedback) original))))))
+
+(deftest standard-streamed-frame-cancel-closes-partial-transport
+    (call-with-standard-socket-pair
+     (lambda (state input)
+       (let ((original (symbol-function 'pg::standard-poll-feedback)) (polls 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::standard-poll-feedback)
+                      (lambda (ignored)
+                        (declare (ignore ignored))
+                        (when (= (incf polls) 2)
+                          (pg::ereport "57014" "injected cancellation"))))
+                (ok (equal "57014"
+                           (sqlstate-of
+                            (pg::standard-write-streamed-frame
+                             state #\d 100 (lambda (sink) (funcall sink (make-array 100 :element-type '(unsigned-byte 8))))))))
+                (ok (not (open-stream-p (pg::standard-stream-stream state))))
+                (sb-ext:with-timeout 2
+                  (ok (equalp (octets '(100 0 0 0 104)) (pg::read-exact-bytes input 5)))
+                  (ok (null (read-byte input nil nil)))))
+           (setf (symbol-function 'pg::standard-poll-feedback) original))))))
+
+(deftest standard-streamed-frame-retries-short-sends
+    (call-with-standard-socket-pair
+     (lambda (state input)
+       (let ((original (symbol-function 'pg::standard-send-socket-chunk))
+             (poll (symbol-function 'pg::standard-poll-feedback))
+             (calls 0)
+             (payload (make-array 20 :element-type '(unsigned-byte 8) :initial-element 91)))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::standard-poll-feedback) (lambda (state) (declare (ignore state)))
+                      (symbol-function 'pg::standard-send-socket-chunk)
+                      (lambda (socket bytes)
+                        (incf calls)
+                        (if (= calls 1) nil
+                            (funcall original socket (subseq bytes 0 1)))))
+                (ok (pg::standard-write-streamed-frame
+                     state #\d (length payload) (lambda (sink) (funcall sink payload))))
+                (ok (> calls 20))
+                (sb-ext:with-timeout 2
+                  (multiple-value-bind (kind bytes) (pg::pg-client-frame input)
+                    (ok (char= kind #\d))
+                    (ok (equalp bytes payload)))))
+           (setf (symbol-function 'pg::standard-send-socket-chunk) original
+                 (symbol-function 'pg::standard-poll-feedback) poll))))))
+
+(deftest standard-streamed-row-matches-existing-frame
+    (call-with-standard-socket-pair
+     (lambda (state input)
+       (let* ((poll (symbol-function 'pg::standard-poll-feedback))
+              (clock (symbol-function 'pg::postgres-current-timestamp))
+              (change (pg::make-logical-change
+                       :kind :insert :database-oid 7 :relation-oid 701 :relation-name "items"
+                       :columns '((:attnum 1 :name "id" :type :int4 :typmod -1)
+                                  (:attnum 2 :name "value" :type :text :typmod -1))
+                       :new-values #(7 "hé🙂")))
+              (expected (pg::pgoutput-xlog-envelope 0 0 30)))
+         (unwind-protect
+              (progn
+                (pg::payload-push expected (pg::pgoutput-build-row-change change))
+                (setf (symbol-function 'pg::standard-poll-feedback) (lambda (state) (declare (ignore state)))
+                      (symbol-function 'pg::postgres-current-timestamp) (lambda () 30))
+                (ok (pg::standard-xlog-row state change))
+                (sb-ext:with-timeout 2
+                  (multiple-value-bind (kind bytes) (pg::pg-client-frame input)
+                    (ok (char= kind #\d))
+                    (ok (equalp bytes expected)))))
+           (setf (symbol-function 'pg::standard-poll-feedback) poll
+                 (symbol-function 'pg::postgres-current-timestamp) clock))))))
+
+(deftest standard-streamed-frame-stop-before-header
+    (call-with-standard-socket-pair
+     (lambda (state input)
+       (declare (ignore input))
+       (let ((original (symbol-function 'pg::standard-poll-feedback)) (produced nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::standard-poll-feedback)
+                      (lambda (ignored)
+                        (declare (ignore ignored))
+                        (setf (pg::standard-stream-stop-reason state) :done)))
+                (ok (not (pg::standard-write-streamed-frame
+                          state #\d 1 (lambda (sink) (setf produced t) (funcall sink 1)))))
+                (ok (not produced))
+                (ok (not (pg::standard-stream-raw-partial-p state))))
+           (setf (symbol-function 'pg::standard-poll-feedback) original))))))
+
 (deftest standard-timeout-is-a-disconnect
     (call-with-owned-standard-stream
      (lambda (state slot)

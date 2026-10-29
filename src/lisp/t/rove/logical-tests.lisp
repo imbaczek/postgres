@@ -345,6 +345,110 @@
                  (error () t))
                "logical slot command parser rejects pgoutput v1 for v2 Message support")))
 
+(rove:deftest test-pgoutput-streamed-row-matches-builder
+    (let* ((columns '((:attnum 1 :name "id" :type :int4 :typmod -1)
+                      (:attnum 2 :name "b" :type :bytea :typmod -1)
+                      (:attnum 3 :name "t" :type :text :typmod -1)
+                      (:attnum 4 :name "j" :type :jsonb :typmod -1)))
+           (bytes (make-array 33000 :element-type '(unsigned-byte 8)))
+           (text (concatenate 'string (make-string 4095 :initial-element #\a) "🙂é"))
+           (jsonb (sql-jsonb-input "{\"z\":[null,1.20],\"a\":\"🙂\"}"))
+           (new (vector 7 bytes text jsonb))
+           (old (vector 7 +null+ "old" jsonb)))
+      (dotimes (i (length bytes)) (setf (aref bytes i) (mod i 256)))
+      (dolist (change
+               (list (make-logical-change :kind :insert :database-oid 7 :relation-oid 701
+                                          :relation-name "items" :columns columns :key-attnums '(1)
+                                          :new-values new)
+                     (make-logical-change :kind :update :database-oid 7 :relation-oid 701
+                                          :relation-name "items" :columns columns :key-attnums '(1)
+                                          :old-values old :new-values (vector 7 +logical-unchanged-toast+ text jsonb))
+                     (make-logical-change :kind :update :database-oid 7 :relation-oid 701
+                                          :relation-name "items" :columns columns :old-values old :new-values new)
+                     (make-logical-change :kind :delete :database-oid 7 :relation-oid 701
+                                          :relation-name "items" :columns columns :key-attnums '(1)
+                                          :old-values old)
+                     (make-logical-change :kind :delete :database-oid 7 :relation-oid 701
+                                          :relation-name "items" :columns columns :old-values old)))
+        (let ((actual (make-payload)) (largest 0))
+          (pgoutput-emit-row-change
+           change (lambda (part)
+                    (if (integerp part)
+                        (payload-push-byte actual part)
+                        (progn (setf largest (max largest (length part)))
+                               (payload-push actual part)))))
+          (rove:ok (equalp actual (pgoutput-build-row-change change)))
+          (rove:ok (= (length actual) (pgoutput-row-change-size change)))
+          (rove:ok (<= largest 65536))))))
+
+(rove:deftest test-pgoutput-buffered-sink-boundaries
+    (dolist (length '(0 65535 65536 65537 131073))
+      (let ((source (make-array length :element-type '(unsigned-byte 8) :initial-element 97))
+            (actual (make-payload)) (largest 0))
+        (call-with-pgoutput-buffered-sink
+         length
+         (lambda (bytes count)
+           (setf largest (max largest count))
+           (loop for i below count do (payload-push-byte actual (aref bytes i))))
+         (lambda (sink) (funcall sink source)))
+        (rove:ok (equalp actual source))
+        (rove:ok (<= largest 65536))))
+  (dolist (length '(1 3))
+    (rove:ok
+     (handler-case
+         (progn
+           (call-with-pgoutput-buffered-sink length (lambda (bytes count) (declare (ignore bytes count)))
+                                             (lambda (sink) (funcall sink #(1 2))))
+           nil)
+       (error (condition) (search "measured size" (princ-to-string condition)))))))
+
+(rove:deftest test-private-streamed-row-failure-closes-frame
+    (let* ((path (merge-pathnames
+                  (format nil "pg-row-frame-~d-~d" (sb-posix:getpid) (random 1000000))
+                  (uiop:temporary-directory)))
+           (change (logical-test-change :insert 7 701 :new-values #(1 2 "value")))
+           (original (symbol-function 'call-with-pgoutput-buffered-sink))
+           (stream nil))
+      (unwind-protect
+           (progn
+             (setf stream (open path :direction :output :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede :if-does-not-exist :create)
+                   (symbol-function 'call-with-pgoutput-buffered-sink)
+                   (lambda (&rest args) (declare (ignore args)) (error "injected row write failure")))
+             (rove:ok (handler-case
+                          (progn (send-logical-row-xlog-data stream 10 20 change) nil)
+                        (error (condition) (search "injected row write failure" (princ-to-string condition)))))
+             (rove:ok (not (open-stream-p stream))))
+        (setf (symbol-function 'call-with-pgoutput-buffered-sink) original)
+        (when (and stream (open-stream-p stream)) (close stream :abort t))
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-private-streamed-row-frame-matches-builder
+    (let* ((path (merge-pathnames
+                  (format nil "pg-row-frame-ok-~d-~d" (sb-posix:getpid) (random 1000000))
+                  (uiop:temporary-directory)))
+           (change (logical-test-change :insert 7 701 :new-values #(1 2 "hé🙂")))
+           (original (symbol-function 'postgres-current-timestamp))
+           (envelope (pgoutput-xlog-envelope 10 20 30))
+           (row (pgoutput-build-row-change change))
+           (expected (make-payload)))
+      (unwind-protect
+           (progn
+             (payload-push-byte expected (char-code #\d))
+             (payload-push expected (u32-to-bytes (+ 4 (length envelope) (length row))))
+             (payload-push expected envelope)
+             (payload-push expected row)
+             (setf (symbol-function 'postgres-current-timestamp) (lambda () 30))
+             (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede :if-does-not-exist :create)
+               (send-logical-row-xlog-data stream 10 20 change))
+             (with-open-file (stream path :element-type '(unsigned-byte 8))
+               (let ((actual (make-array (file-length stream) :element-type '(unsigned-byte 8))))
+                 (rove:ok (= (length actual) (read-sequence actual stream)))
+                 (rove:ok (equalp actual expected)))))
+        (setf (symbol-function 'postgres-current-timestamp) original)
+        (when (probe-file path) (delete-file path)))))
+
 (rove:deftest test-logical-catalog-event-codec-and-parser
     (let* ((ast (list :type :alter-sequence :name "counter" :restart 19))
            (bytes (logical-encode-catalog-event 7 ast))
@@ -1657,6 +1761,32 @@
                                (pg-error (condition)
                                  (string= (pg-error-sqlstate condition) "0A000"))))
                     (rove:ok (null frames)))))))
+        (setf (symbol-function 'standard-xlog-data) original))))
+
+(rove:deftest test-standard-streaming-preflights-later-row-before-begin
+    (let* ((state (make-standard-stream :emit-floor 0))
+           (original (symbol-function 'standard-xlog-data))
+           (first (logical-test-change :insert 7 701 :new-values #(1 2 "first")))
+           (second (logical-test-change :insert 7 701 :new-values #(3 4 "second")))
+           (selection '((:relation-oid 701 :publications ((:name "p" :oid 100 :generation 1 :unsupported nil)))))
+           (sent nil))
+      (setf (logical-change-publication-selection first) selection
+            (logical-change-publication-selection second) selection
+            (logical-change-new-values second) #(3))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'standard-xlog-data)
+                   (lambda (&rest args) (declare (ignore args)) (setf sent t) t))
+             (rove:ok
+              (handler-case
+                  (progn
+                    (standard-send-scoped-transaction
+                     state (make-logical-transaction :xid 88 :commit-record-lsn 90
+                                                     :commit-lsn 100 :commit-timestamp 0
+                                                     :changes (list first second)) '("p"))
+                    nil)
+                (error (condition) (search "logical row width" (princ-to-string condition)))))
+             (rove:ok (null sent)))
         (setf (symbol-function 'standard-xlog-data) original))))
 
 (rove:deftest test-standard-scoped-corrupt-later-event-before-begin

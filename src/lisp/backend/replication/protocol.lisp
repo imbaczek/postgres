@@ -373,6 +373,169 @@ On a standby, receipt ahead of replay is reported only on the replay timeline."
         ((:float4 :float8) (sql-float-output value type))
         (otherwise (error "unsupported pgoutput value type ~a" type)))))
 
+(defun pgoutput-emit-u16 (sink value)
+  (unless (typep value '(unsigned-byte 16)) (error "pgoutput u16 is out of range"))
+  (funcall sink (ldb (byte 8 8) value))
+  (funcall sink (ldb (byte 8 0) value)))
+
+(defun pgoutput-emit-u32 (sink value)
+  (unless (typep value '(unsigned-byte 32)) (error "pgoutput u32 is out of range"))
+  (loop for shift in '(24 16 8 0) do (funcall sink (ldb (byte 8 shift) value))))
+
+(defun pgoutput-string-utf8-size (string)
+  (loop for start from 0 below (length string) by 4096
+        for end = (min (length string) (+ start 4096))
+        sum (length (sb-ext:string-to-octets string :external-format :utf-8 :start start :end end))))
+
+(defun pgoutput-emit-string (sink string)
+  (loop for start from 0 below (length string) by 4096
+        for end = (min (length string) (+ start 4096))
+        do (funcall sink (sb-ext:string-to-octets string :external-format :utf-8 :start start :end end)))
+  (values))
+
+(defun pgoutput-emit-text-value (sink value type)
+  "Write one pgoutput text field without constructing its full encoded text."
+  (case type
+    (:bytea
+     (check-type value (vector (unsigned-byte 8)))
+     (let ((length (+ 2 (* 2 (length value))))
+           (digits #(48 49 50 51 52 53 54 55 56 57 97 98 99 100 101 102))
+           (buffer (make-array 65536 :element-type '(unsigned-byte 8))))
+       (pgoutput-emit-u32 sink length)
+       (funcall sink 92) (funcall sink 120)
+       (loop for start from 0 below (length value) by 32768
+             for end = (min (length value) (+ start 32768))
+             do (loop for i from start below end for offset from 0 by 2
+                      for byte = (aref value i)
+                      do (setf (aref buffer offset) (aref digits (ash byte -4))
+                               (aref buffer (1+ offset)) (aref digits (logand byte 15))))
+                (funcall sink (subseq buffer 0 (* 2 (- end start)))))))
+    (:jsonb
+     (let ((counter (make-instance 'logical-utf8-output-stream :buffer nil)))
+       (sql-jsonb-write value counter)
+       (logical-flush-utf8-output counter)
+       (pgoutput-emit-u32 sink (logical-utf8-size counter))
+       (let ((writer (make-instance 'logical-utf8-output-stream :buffer sink)))
+         (sql-jsonb-write value writer)
+         (logical-flush-utf8-output writer))))
+    (otherwise
+     (let ((text (pgoutput-value-text value type)))
+       (unless (stringp text) (error "invalid pgoutput text value"))
+       (pgoutput-emit-u32 sink (pgoutput-string-utf8-size text))
+       (pgoutput-emit-string sink text))))
+  (values))
+
+(defun pgoutput-emit-tuple (sink columns values &optional key-attnums unchanged-allowed-p)
+  (unless (= (length values) (length columns))
+    (error "logical row image no longer matches its relation schema"))
+  (pgoutput-emit-u16 sink (length columns))
+  (dolist (column columns)
+    (let* ((attnum (getf column :attnum))
+           (value (if (or (null key-attnums) (member attnum key-attnums))
+                      (aref values (1- attnum)) +null+)))
+      (cond ((eq value +logical-unchanged-toast+)
+             (unless unchanged-allowed-p (error "invalid unchanged TOAST marker in pgoutput tuple"))
+             (funcall sink (char-code #\u)))
+            ((eq value +null+) (funcall sink (char-code #\n)))
+            (t (funcall sink (char-code #\t))
+               (pgoutput-emit-text-value sink value (getf column :type))))))
+  (values))
+
+(defun pgoutput-emit-row-change (change sink)
+  "Emit the same pgoutput row bytes as PGOUTPUT-BUILD-ROW-CHANGE."
+  (logical-validate-unchanged-toast change)
+  (let ((keys (logical-change-key-attnums change))
+        (columns (logical-change-columns change)))
+    (case (logical-change-kind change)
+      (:insert
+       (funcall sink (char-code #\I))
+       (pgoutput-emit-u32 sink (logical-change-relation-oid change))
+       (funcall sink (char-code #\N))
+       (pgoutput-emit-tuple sink columns (logical-change-new-values change)))
+      (:update
+       (funcall sink (char-code #\U))
+       (pgoutput-emit-u32 sink (logical-change-relation-oid change))
+       (when (logical-change-old-values change)
+         (funcall sink (char-code (if keys #\K #\O)))
+         (pgoutput-emit-tuple sink columns (logical-change-old-values change) keys))
+       (funcall sink (char-code #\N))
+       (pgoutput-emit-tuple sink columns (logical-change-new-values change) nil t))
+      (:delete
+       (funcall sink (char-code #\D))
+       (pgoutput-emit-u32 sink (logical-change-relation-oid change))
+       (funcall sink (char-code (if keys #\K #\O)))
+       (pgoutput-emit-tuple sink columns (logical-change-old-values change) keys))
+      (otherwise (error "unsupported logical change kind"))))
+  (values))
+
+(defun pgoutput-row-change-size (change)
+  "Validate and measure the row before its frame header is emitted."
+  (let ((size 0))
+    (pgoutput-emit-row-change
+     change (lambda (part) (incf size (if (integerp part) 1 (length part)))))
+    (unless (<= (+ 4 25 size) #x7fffffff)
+      (error "pgoutput row frame exceeds the protocol length limit"))
+    size))
+
+(defun call-with-pgoutput-buffered-sink (expected receiver producer)
+  "Run PRODUCER with a bounded octet sink and require exactly EXPECTED bytes."
+  (unless (and (integerp expected) (<= 0 expected #x7fffffff))
+    (error "invalid pgoutput output length"))
+  (let ((buffer (make-array 65536 :element-type '(unsigned-byte 8)))
+        (used 0) (total 0))
+    (labels ((flush-buffer ()
+               (when (plusp used)
+                 (funcall receiver buffer used)
+                 (setf used 0)))
+             (emit (part)
+               (let ((length (if (integerp part) 1 (length part))))
+                 (when (> (+ total length) expected)
+                   (error "pgoutput row exceeded its measured size"))
+                 (incf total length)
+                 (if (integerp part)
+                     (progn
+                       (when (= used (length buffer)) (flush-buffer))
+                       (setf (aref buffer used) part)
+                       (incf used))
+                     (loop for offset from 0 below length
+                           for take = (min (- length offset) (- (length buffer) used))
+                           do (replace buffer part :start1 used :start2 offset :end2 (+ offset take))
+                              (incf used take)
+                              (incf offset (1- take))
+                              (when (= used (length buffer)) (flush-buffer)))))))
+      (funcall producer #'emit)
+      (unless (= total expected) (error "pgoutput row differed from its measured size"))
+      (flush-buffer)))
+  (values))
+
+(defun pgoutput-xlog-envelope (wal-start wal-end timestamp)
+  (let ((data (make-payload)))
+    (payload-push-byte data (char-code #\w))
+    (replication-push-u64 data wal-start)
+    (replication-push-u64 data wal-end)
+    (replication-push-i64 data timestamp)
+    data))
+
+(defun send-logical-row-xlog-data (stream wal-start wal-end change)
+  "Send a single CopyData frame with a bounded row encoder."
+  (let* ((size (pgoutput-row-change-size change))
+         (envelope (pgoutput-xlog-envelope wal-start wal-end (postgres-current-timestamp)))
+         (started nil) (complete nil))
+    (unwind-protect
+         (progn
+           (setf started t)
+           (write-byte (char-code #\d) stream)
+           (write-sequence (u32-to-bytes (+ 4 (length envelope) size)) stream)
+           (write-sequence envelope stream)
+           (call-with-pgoutput-buffered-sink
+            size (lambda (buffer length) (write-sequence buffer stream :end length))
+            (lambda (sink) (pgoutput-emit-row-change change sink)))
+           (force-output stream)
+           (setf complete t))
+      (when (and started (not complete))
+        (ignore-errors (close stream :abort t)))))
+  (values))
+
 (defun pgoutput-build-tuple (columns values &optional key-attnums unchanged-allowed-p)
   ;; logicalrep_write_tuple() preserves relation width for old key images.
   ;; ReorderBuffer's identity tuple has NULL in non-key attributes.
@@ -486,7 +649,12 @@ keepalive's WAL-end field, which may include changes not yet applied."
 
 (defun send-logical-transaction (stream transaction wal-end)
   ;; Validate the entire staged spool before emitting a transaction frame.
-  (logical-transaction-map-changes transaction (lambda (change) (declare (ignore change))))
+  (logical-transaction-map-changes
+   transaction
+   (lambda (change)
+     (when (member (logical-change-kind change) '(:insert :update :delete))
+       (pgoutput-build-relation change)
+       (pgoutput-row-change-size change))))
   (if (zerop (logical-transaction-xid transaction))
       (let ((count 0))
         (logical-transaction-map-changes
@@ -515,9 +683,8 @@ keepalive's WAL-end field, which may include changes not yet applied."
                  (send-logical-xlog-data
                   stream (logical-transaction-commit-lsn transaction) wal-end
                   (pgoutput-build-relation change))
-                 (send-logical-xlog-data
-                  stream (logical-transaction-commit-lsn transaction) wal-end
-                  (pgoutput-build-row-change change))))))
+                 (send-logical-row-xlog-data
+                  stream (logical-transaction-commit-lsn transaction) wal-end change)))))
         (send-logical-xlog-data stream (logical-transaction-commit-lsn transaction) wal-end
                                 (pgoutput-build-commit transaction)))))
 
