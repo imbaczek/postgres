@@ -428,6 +428,7 @@
               (setf result row))))
          (ok (= 3 visits))
          (ok (= 4 parks))
+         (ok (= (length result) 3))
          (ok (equalp (subseq result 0 2) #(3 6)))
          (ok (pg::sql-array-p (aref result 2)))
          (ok (equalp (pg::sql-array-elements (aref result 2)) #(3 1 2)))
