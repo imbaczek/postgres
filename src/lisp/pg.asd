@@ -36,6 +36,7 @@
      (:file "utils/adt/pglz")
      (:file "utils/adt/json")
      (:file "utils/adt/numeric")
+     (:file "utils/adt/numeric-storage")
      (:file "utils/adt/jsonb")
      (:file "utils/adt/float")
      (:file "utils/adt/timezone")
