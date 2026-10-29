@@ -1254,13 +1254,19 @@ on an abnormal exit."
 
 (defun aggregate-input-row (environment group-keys descriptors)
   "Evaluate inputs before spilling; replay never repeats scalar side effects."
-  (concatenate 'vector
-               (map 'vector (lambda (key) (eval-expr key environment)) group-keys)
-               (map 'vector (lambda (descriptor)
-                              (if (getf descriptor :input)
-                                  (eval-expr (getf descriptor :input) environment)
-                                  +null+))
-                    descriptors)))
+  (let* ((expressions (append group-keys (mapcar (lambda (d) (getf d :input)) descriptors)))
+         (values (make-array (length expressions) :initial-element +null+))
+         (origins (and *datum-origin-capture*
+                       (make-array (length expressions) :initial-element nil))))
+    (loop for expression in expressions for i from 0
+          when expression
+            do (multiple-value-bind (value origin)
+                   (if *datum-origin-capture*
+                       (eval-expr-with-origin expression environment *query-row-origins*)
+                       (values (eval-expr expression environment) nil))
+                 (setf (aref values i) value)
+                 (when origins (setf (aref origins i) origin))))
+    (values values origins)))
 
 (defun stream-sorted-aggregates (source group-keys descriptors callback)
   "Keep one group's spillable transitions; final output allocation is unavoidable."
@@ -1268,13 +1274,17 @@ on an abnormal exit."
                          (let* ((width (length group-keys))
                                 (keys (loop for key in group-keys for position from 1
                                             collect (list :col position :type (expr-type key) :typmod (expr-typmod key))))
-                                (states nil) (current-key nil) (current-values nil))
+                                (states nil) (current-key nil) (current-values nil)
+                                (group-origins nil) (transition-origins nil))
                            (labels ((emit-current ()
                                       (when states
                                         (unwind-protect
-                                             (funcall callback
-                                                      (concatenate 'vector current-values
-                                                                   (finalize-aggregate-transition-states states)))
+                                             (let ((*query-row-origins*
+                                                     (and *datum-origin-capture*
+                                                          (concatenate 'vector group-origins transition-origins))))
+                                               (funcall callback
+                                                        (concatenate 'vector current-values
+                                                                     (finalize-aggregate-transition-states states))))
                                           (close-aggregate-transition-states states)
                                           (setf states nil))))
                                     (consume (row)
@@ -1284,18 +1294,36 @@ on an abnormal exit."
                                             (when (eq (emit-current) :stop) (return-from consume :stop)))
                                           (unless states
                                             (setf states (make-aggregate-transition-states descriptors)
-                                                  current-key key current-values (coerce values 'vector)))
+                                                  current-key key current-values (coerce values 'vector)
+                                                  group-origins (make-array width :initial-element nil)
+                                                  transition-origins (make-array (length descriptors) :initial-element nil))
+                                            (when (and *datum-origin-capture* *query-row-origins*)
+                                              (dotimes (i width)
+                                                (setf (aref group-origins i) (aref *query-row-origins* i)))))
+                                          (when *datum-origin-capture*
+                                            (loop for descriptor in descriptors for i from 0
+                                                  for value = (aref environment (+ width i))
+                                                  when (and (member (getf descriptor :kind) '(:min :max))
+                                                            (not (eq value +null+)))
+                                                    do (setf (aref transition-origins i)
+                                                             (if (eq (aref states i) +null+)
+                                                                 (and *query-row-origins*
+                                                                      (aref *query-row-origins* (+ width i)))
+                                                                 nil))))
                                           (step-aggregate-transition-states states descriptors environment width))))
                                     (finish ()
                                       (when (and (null states) (null group-keys))
                                         (setf states (make-aggregate-transition-states descriptors)
-                                              current-values #()))
+                                              current-values #() group-origins #()
+                                              transition-origins (make-array (length descriptors) :initial-element nil)))
                                       (emit-current))
                                     (input (row-callback)
                                       (funcall source
                                                (lambda (environment)
-                                                 (funcall row-callback
-                                                          (cons nil (aggregate-input-row environment group-keys descriptors)))))))
+                                                 (multiple-value-bind (values origins)
+                                                     (aggregate-input-row environment group-keys descriptors)
+                                                   (let ((*query-row-origins* origins))
+                                                     (funcall row-callback (cons nil values))))))))
                              (unwind-protect
                                   (if group-keys
                                       (stream-select-sort #'input (mapcar (lambda (key) (cons key nil)) keys)
@@ -1363,6 +1391,8 @@ on an abnormal exit."
     ((:filter :project :sort :limit)
      (simple-datum-origin-plan-p (third node) relations iterator-p worktable))
     (:top-n (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
+    (:sorted-aggregate
+     (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
     (:subquery-scan (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable))
     (:nested-loop-join
      (and (not iterator-p)

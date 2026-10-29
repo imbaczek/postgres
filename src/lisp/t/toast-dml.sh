@@ -132,6 +132,33 @@ run -c 'create table toast_scalar_mixed (id int, v text)' >/dev/null
 run -c 'alter table toast_scalar_mixed alter column v set storage plain' >/dev/null
 run -c 'insert into toast_scalar_mixed select id,(select (select v)) from toast_scalar_source' >/dev/null
 [ "$(run -c "select count(*) from toast_scalar_mixed where (id=1 and length(v)=20000 and substr(v,1,1)='a') or (id=2 and length(v)=20001 and substr(v,1,1)='b')")" = 2 ]
+run -c 'create table toast_aggregate_result (v text)' >/dev/null
+run -c 'alter table toast_aggregate_result alter column v set storage plain' >/dev/null
+run -c 'insert into toast_aggregate_result select min(v) from toast_scalar_source where id=1' >/dev/null
+run -c 'insert into toast_aggregate_result select max(v) from toast_scalar_source where id=2' >/dev/null
+run -c 'insert into toast_aggregate_result select v from toast_scalar_source group by v having min(id)>0' >/dev/null
+[ "$(run -c 'select count(*) from toast_aggregate_result where length(v)=20000')" = 2 ]
+[ "$(run -c 'select count(*) from toast_aggregate_result where length(v)=20001')" = 2 ]
+run -c 'create table toast_aggregate_source (v text)' >/dev/null
+run -c "insert into toast_aggregate_source values (null),('$index_suffix'),(null)" >/dev/null
+run -c 'insert into toast_aggregate_result select min(v) from toast_aggregate_source' >/dev/null
+run -c 'insert into toast_aggregate_result with q as materialized (select min(v) as v from toast_aggregate_source) select v from q' >/dev/null
+[ "$(run -c 'select count(*) from toast_aggregate_result where length(v)=20000')" = 4 ]
+run -c "insert into toast_aggregate_source values ('$index_suffix')" >/dev/null
+if run -v VERBOSITY=verbose -c 'insert into toast_aggregate_result select max(v) from toast_aggregate_source' >"$TMP/aggregate-equal.out" 2>&1; then
+    echo 'toast-dml: equal aggregate inputs retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/aggregate-equal.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: equal aggregate inputs did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+if run -v VERBOSITY=verbose -c 'insert into toast_aggregate_result select min(v) from toast_scalar_source' >"$TMP/aggregate-computed.out" 2>&1; then
+    echo 'toast-dml: compared aggregate datum retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/aggregate-computed.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: compared aggregate did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 run -c 'create table toast_lateral_result (id int, v text)' >/dev/null
 run -c 'alter table toast_lateral_result alter column v set storage plain' >/dev/null
 run -c 'insert into toast_lateral_result select s.id,q.v from toast_scalar_source s cross join lateral (select s.v) q' >/dev/null

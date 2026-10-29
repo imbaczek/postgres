@@ -253,8 +253,10 @@ values are detached from their original table; PLAIN targets flatten them.
 Recursive UNION retains origins through supported working-table plans while
 duplicate elimination compares logical values. Scalar subqueries with supported
 plans retain the selected datum, including correlated outer references. Supported
-LATERAL joins also retain origins from their outer rows. Other CTE producer
-shapes, aggregates, iterator-based LATERAL joins,
+LATERAL joins also retain origins from their outer rows. Sorted aggregates retain
+group representatives and the first non-NULL MIN/MAX input until another non-NULL
+input is compared. Other CTE producer shapes, hash aggregation and DISTINCT,
+iterator-based LATERAL joins,
 explicit casts, and cross-column `excluded` assignments do not yet retain this provenance.
 For an interpreted SELECT plan with a projection over one base-table sequential
 or non-parameterized index scan, optionally with filters, sorting or top-N,
