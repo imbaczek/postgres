@@ -73,9 +73,12 @@
                 (format nil "START_REPLICATION SLOT \"native_slot\" LOGICAL 0/00000000 (proto_version '~d', streaming 'off', binary 'false', two_phase 'false', origin 'any', publication_names '\"Pub One\", second')" version))))
         (ok (= version (pg::logical-replication-command-protocol-version command)))
         (ok (equal '("Pub One" "second") (pg::standard-publication-names command)))))
+  (ok (pg::parse-replication-command
+       "START_REPLICATION SLOT s LOGICAL 0/0 (proto_version '4', publication_names 'p', binary 'true')"))
+  (ok (pg::parse-replication-command
+       "START_REPLICATION SLOT s LOGICAL 0/0 (proto_version '2', binary_bytea 'true')"))
   (dolist (options '("proto_version '4', publication_names 'p', streaming 'on'"
                      "proto_version '4', publication_names 'p', streaming 'parallel'"
-                     "proto_version '4', publication_names 'p', binary 'true'"
                      "proto_version '4', publication_names 'p', messages 'true'"
                      "proto_version '4', publication_names 'p', two_phase 'true'"
                      "proto_version '4', publication_names 'p', origin 'none'"

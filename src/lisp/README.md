@@ -740,8 +740,8 @@ Extension Message contents and other allocations still materialize. INSERT, UPDA
 uses typed Bind parameters, counted and emitted in bounded blocks; the target
 still materializes parameter values. For bytea fields, canonical hex text over
 262144 characters is decoded in bounded blocks to a binary Bind parameter;
-other spellings and smaller fields use text Bind. Pgoutput and initial-copy
-source fields remain text, and this conversion does not raise the source bytea,
+other spellings and smaller fields use text Bind. Initial-copy source fields
+remain text, and this conversion does not raise the source bytea,
 event or frame limits. A malformed or incomplete
 incoming frame closes the source connection; a partial row-frame or query write
 closes its connection. Other message types use their existing encoders. The 4 MiB
@@ -801,8 +801,15 @@ handoff. Target effects and source progress commit together before feedback.
 owned source slot and durable creating/copying/ready state for crash recovery.
 Ready subscriptions resume without resetting target data.
 
-Standard mode uses explicit publication table lists and text tuples with
-streaming, binary, two-phase, and failover options disabled. DDL/sequence
+Standard mode uses explicit publication table lists and the bundled subscriber
+requests text tuples, with streaming, binary, two-phase, and failover options
+disabled. A pg-lisp publisher also accepts standard `binary 'true'` and emits
+binary tuple fields for bytea only, retaining text for other types. Extension
+mode defaults to text; `--binary-bytea` opts the bundled subscriber into binary
+bytea streaming from a supporting pg-lisp source. Older sources that do not
+recognize the option fail rather than silently switching formats. This does not
+add C binary COPY initial-copy support, request arbitrary C global binary output,
+or change admission and copy limits. DDL/sequence
 automation remains in extension mode. UPDATE messages may omit unchanged
 out-of-line values; the subscriber preserves those values on the target. Row
 filters, column lists, partitions, generated columns, and replica identity FULL

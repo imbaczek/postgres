@@ -449,6 +449,24 @@ On a standby, receipt ahead of replay is reported only on the replay timeline."
        (pgoutput-emit-string sink text))))
   (values))
 
+(defvar *pgoutput-binary-bytea* nil
+  "Emit bytea in pgoutput binary format for the negotiated stream.")
+
+(defun pgoutput-emit-binary-bytea (sink value)
+  "Emit a bytea length and raw octets from a value or scoped event slice."
+  (if (logical-event-slice-p value)
+      (progn
+        (unless (eq (logical-event-slice-type value) :bytea)
+          (error "logical event slice type mismatch"))
+        (pgoutput-emit-u32 sink (logical-event-slice-length value))
+        (logical-event-slice-visit value sink))
+      (progn
+        (check-type value (vector (unsigned-byte 8)))
+        (pgoutput-emit-u32 sink (length value))
+        (loop for start from 0 below (length value) by 65536
+              do (funcall sink (subseq value start (min (length value) (+ start 65536)))))))
+  (values))
+
 (defun pgoutput-emit-tuple (sink columns values &optional key-attnums unchanged-allowed-p)
   (unless (= (length values) (length columns))
     (error "logical row image no longer matches its relation schema"))
@@ -461,12 +479,15 @@ On a standby, receipt ahead of replay is reported only on the replay timeline."
              (unless unchanged-allowed-p (error "invalid unchanged TOAST marker in pgoutput tuple"))
              (funcall sink (char-code #\u)))
             ((eq value +null+) (funcall sink (char-code #\n)))
+            ((and *pgoutput-binary-bytea* (eq (getf column :type) :bytea))
+             (funcall sink (char-code #\b))
+             (pgoutput-emit-binary-bytea sink value))
             (t (funcall sink (char-code #\t))
                (pgoutput-emit-text-value sink value (getf column :type))))))
   (values))
 
 (defun pgoutput-emit-row-change (change sink)
-  "Emit the same pgoutput row bytes as PGOUTPUT-BUILD-ROW-CHANGE."
+  "Emit a pgoutput row in the stream's negotiated format."
   (logical-validate-unchanged-toast change)
   (let ((keys (logical-change-key-attnums change))
         (columns (logical-change-columns change)))
@@ -807,7 +828,9 @@ keepalive's WAL-end field, which may include changes not yet applied."
                                "first resumed standby status must equal the requested LSN"))
                     (wal-logical-slot-accept-resume-position
                      slot-name requested-lsn))))
-            (stream-logical-replication-loop stream slot-name requested-lsn)))
+            (let* ((option (and command (assoc "binary_bytea" (logical-replication-command-options command) :test #'equal)))
+                   (*pgoutput-binary-bytea* (and option (replication-option-boolean "binary_bytea" (cdr option)))))
+              (stream-logical-replication-loop stream slot-name requested-lsn))))
         :allow-initial-copy t)
        (when copy-mode-p (end-logical-copy-mode stream)))
      (condition

@@ -108,6 +108,8 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
 
 (defstruct logical-wire-field owner offset size crc)
 
+(defstruct logical-wire-binary-field owner offset size crc)
+
 (defparameter *logical-wire-field-spill-threshold* (* 1024 1024))
 
 (defun close-logical-wire-field-owner (owner)
@@ -156,6 +158,47 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
                          (if stream (close stream :abort t) (sb-posix:close fd))
                          (ignore-errors (sb-posix:unlink (namestring path)))))))
               finally (error "could not create logical receiver scratch file")))))
+
+(defun logical-wire-binary-field-capture (owner cursor size)
+  "Spool raw binary bytes without UTF-8 interpretation."
+  (unless (and (logical-wire-field-owner-active-p owner)
+               (<= size (logical-wire-cursor-remaining cursor))
+               (<= (+ size (logical-wire-field-owner-size owner)) +max-query-message-size+))
+    (error "invalid logical binary field length"))
+  (let* ((stream (logical-wire-field-open owner))
+         (offset (logical-wire-field-owner-size owner)))
+    (unless (file-position stream offset) (error "cannot seek logical receiver scratch file"))
+    (multiple-value-bind (sink metrics) (logical-encoding-sink size stream)
+      (loop for remaining = size then (- remaining count)
+            while (plusp remaining)
+            for count = (min remaining 65536)
+            do (funcall sink (logical-wire-octets cursor count)))
+      (multiple-value-bind (written crc) (funcall metrics)
+        (unless (= written size) (error "invalid logical binary field size"))
+        (setf (logical-wire-field-owner-size owner) (+ offset size))
+        (make-logical-wire-binary-field :owner owner :offset offset :size size :crc crc)))))
+
+(defun logical-wire-binary-field-visit (field sink)
+  "Visit a scoped binary field in bounded blocks and verify its checksum."
+  (let* ((owner (logical-wire-binary-field-owner field))
+         (stream (and (logical-wire-field-owner-active-p owner) (logical-wire-field-owner-stream owner)))
+         (size (logical-wire-binary-field-size field)))
+    (unless (and stream (<= (+ (logical-wire-binary-field-offset field) size)
+                            (logical-wire-field-owner-size owner)))
+      (error "logical binary field has expired"))
+    (finish-output stream)
+    (unless (file-position stream (logical-wire-binary-field-offset field)) (error "cannot seek logical binary field"))
+    (multiple-value-bind (counting metrics) (logical-encoding-sink size)
+      (let ((cursor (make-logical-wire-cursor :stream stream :remaining size)))
+        (loop for remaining = size then (- remaining count)
+              while (plusp remaining)
+              for count = (min remaining 65536)
+              for bytes = (logical-wire-octets cursor count)
+              do (funcall counting bytes) (when sink (funcall sink bytes))))
+      (multiple-value-bind (read-size crc) (funcall metrics)
+        (unless (and (= read-size size) (= crc (logical-wire-binary-field-crc field)))
+          (error "logical binary field checksum mismatch")))))
+  (values))
 
 (defun logical-wire-field-capture (owner cursor size)
   "Validate and spool one field in OWNER, publishing only a complete slice."

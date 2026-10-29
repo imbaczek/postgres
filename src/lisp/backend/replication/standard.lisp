@@ -97,7 +97,9 @@
           ((equal name "proto_version") (setf version (replication-protocol-version word)))
           ((equal name "publication_names")
            (unless word (ereport "22023" "publication_names requires a value")))
-          ((member name '("binary" "two_phase" "messages" "streaming") :test #'equal)
+          ((member name '("binary" "binary_bytea") :test #'equal)
+           (replication-option-boolean name word))
+          ((member name '("two_phase" "messages" "streaming") :test #'equal)
            (when (replication-option-boolean name word)
              (ereport "0A000" "~a is not supported by this pgoutput sender" name)))
           ((equal name "origin")
@@ -105,10 +107,13 @@
              (ereport "0A000" "only origin 'any' is supported")))
           (t (ereport "42601" "unrecognized pgoutput option ~a" name)))))
     (if (assoc "publication_names" options :test #'equal)
-        (unless (assoc "proto_version" options :test #'equal)
-          (ereport "22023" "proto_version option is required"))
+        (progn
+          (when (assoc "binary_bytea" options :test #'equal)
+            (ereport "42601" "binary_bytea is a private replication option"))
+          (unless (assoc "proto_version" options :test #'equal)
+            (ereport "22023" "proto_version option is required")))
         (unless (and (= version 2)
-                     (every (lambda (option) (equal (car option) "proto_version")) options))
+                     (every (lambda (option) (member (car option) '("proto_version" "binary_bytea") :test #'equal)) options))
           (ereport "0A000" "private replication requires protocol version 2")))
     (values version options)))
 
@@ -475,7 +480,9 @@ records need not decode their publication history. Keep eligibility there."
           (progn
             (unless (standard-xlog-data state (pgoutput-build-relation change))
               (return-from standard-send-transaction nil))
-            (unless (standard-xlog-data state (pgoutput-build-row-change change))
+            (unless (if *pgoutput-binary-bytea*
+                        (standard-xlog-row state change)
+                        (standard-xlog-data state (pgoutput-build-row-change change)))
               (return-from standard-send-transaction nil))))
       (standard-maybe-keepalive state))
     (logical-test-failpoint :before-standard-commit (standard-stream-slot-name state)
@@ -542,7 +549,9 @@ records need not decode their publication history. Keep eligibility there."
                    ;; Preserve input read-ahead while switching the fully drained
                    ;; output side of SBCL's dual-channel stream to raw sends.
                    (finish-output stream)
-                   (standard-stream-loop state))))
+                   (let* ((option (assoc "binary" (logical-replication-command-options command) :test #'equal))
+                          (*pgoutput-binary-bytea* (and option (replication-option-boolean "binary" (cdr option)))))
+                     (standard-stream-loop state)))))
             (standard-replication-timeout ()
               (ignore-errors (close stream :abort t))
               :disconnect))))

@@ -12,11 +12,21 @@
 
 (defstruct logical-subscription-options
   (source-host "127.0.0.1") (source-port 5433) (source-database "postgres")
-  source-identity (mode :extension) publication actual-slot
+  source-identity (mode :extension) publication actual-slot (binary-bytea-p nil)
   (target-host "127.0.0.1") (target-port 5433) (target-database "postgres")
   slot-name (tables '()))
 
 (defstruct pgoutput-column name type-oid key-p (typmod -1))
+
+(defstruct logical-binary-bytea data)
+
+(defun logical-binary-bytea-visit (value sink)
+  (let ((data (logical-binary-bytea-data value)))
+    (if (logical-wire-binary-field-p data)
+        (logical-wire-binary-field-visit data sink)
+        (loop for start from 0 below (length data) by 65536
+              do (funcall sink (subseq data start (min (length data) (+ start 65536))))))))
+
 (defstruct pgoutput-relation oid namespace name columns key-columns)
 
 (defstruct logical-subscription-runtime
@@ -54,6 +64,8 @@
                               ((string= (first remaining) "extension") :extension)
                               (t (error "--mode expects standard or extension"))))
                   (next-value arg))
+                 ((string= arg "--binary-bytea")
+                  (setf (logical-subscription-options-binary-bytea-p options) t))
                  ((string= arg "--publication")
                   (setf (logical-subscription-options-publication options) (next-value arg)))
                  ((string= arg "--source-host")
@@ -95,6 +107,9 @@
           (error "standard mode requires --publication with a simple identifier"))
         (when (logical-subscription-options-publication options)
           (error "--publication requires standard mode")))
+    (when (and (logical-subscription-options-binary-bytea-p options)
+               (not (eq (logical-subscription-options-mode options) :extension)))
+      (error "--binary-bytea requires extension mode"))
     (unless (logical-subscription-options-tables options)
       (error "at least one --table allowlist entry is required"))
     (dolist (table (logical-subscription-options-tables options))
@@ -822,6 +837,13 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
              (push (bytes->string payload :start position :end (+ position size))
                    values)
              (incf position size)))
+          (#\b
+           (when (> (+ position 4) (length payload)) (error "truncated pgoutput binary value length"))
+           (let ((size (bytes-to-u32 payload position)))
+             (incf position 4)
+             (unless (<= (+ position size) (length payload)) (error "truncated pgoutput binary value"))
+             (push (make-logical-binary-bytea :data (subseq payload position (+ position size))) values)
+             (incf position size)))
           (otherwise (error "unsupported pgoutput tuple value kind ~s" kind)))))
     (values (coerce (nreverse values) 'vector) position)))
 
@@ -834,6 +856,9 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
           do (unless (and unchanged-allowed-p
                           (member (pgoutput-column-type-oid column) '(17 25 1043 114 3802 1700)))
                (error "invalid pgoutput unchanged TOAST marker")))
+  (loop for value across tuple for column in (pgoutput-relation-columns relation)
+        when (and (logical-binary-bytea-p value) (/= (pgoutput-column-type-oid column) 17))
+          do (error "unsupported pgoutput binary column type"))
   tuple)
 
 (defun logical-row-values-for-columns (tuple columns)
@@ -958,6 +983,15 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
      (incf (car *logical-admission-bind-state*))
      (incf (cdr *logical-admission-bind-state*) (logical-admission-value-bytes value))
      (format stream "$~d" (car *logical-admission-bind-state*)))
+    ((logical-binary-bytea-p value)
+     (unless (and *logical-bind-parameters* (= type 17))
+       (error "binary bytea requires a bound bytea parameter"))
+     (let ((index (1+ (length *logical-bind-parameters*))))
+       (vector-push-extend
+        (cons type (make-pg-client-binary-parameter
+                    :writer (lambda (sink) (logical-binary-bytea-visit value sink))))
+        *logical-bind-parameters*)
+       (format stream "$~d" index)))
     ((and *logical-bind-parameters* value (not (eq value :unchanged-toast)))
      (let ((index (1+ (length *logical-bind-parameters*))))
        (vector-push-extend
@@ -1614,13 +1648,20 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
   (let ((count (logical-wire-uint cursor 2)))
     (coerce
      (loop for index below count
-           for column = (nth index columns)
+           for column = (pop columns)
            collect (case (code-char (logical-wire-byte cursor))
                      (#\n nil)
                      (#\u :unchanged-toast)
                      (#\t (let ((size (logical-wire-uint cursor 4)))
                             (logical-wire-received-field cursor size *logical-wire-field-owner*
                                                          (and column (pgoutput-column-type-oid column)))))
+                     (#\b (let* ((size (logical-wire-uint cursor 4))
+                                 (data (if (and *logical-wire-field-owner*
+                                                (or (> size *logical-wire-field-spill-threshold*)
+                                                    (not (logical-wire-reserve-field *logical-wire-field-owner* size))))
+                                           (logical-wire-binary-field-capture *logical-wire-field-owner* cursor size)
+                                           (logical-wire-octets cursor size))))
+                            (make-logical-binary-bytea :data data)))
                      (otherwise (error "unsupported pgoutput tuple value kind"))))
      'vector)))
 
@@ -1760,9 +1801,11 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
             source
             (if (eq (logical-subscription-options-mode options) :standard)
                 (logical-standard-start-command options marker)
-                (format nil "START_REPLICATION SLOT ~a LOGICAL ~a (proto_version '2')"
+                (format nil "START_REPLICATION SLOT ~a LOGICAL ~a (proto_version '2'~a)"
                         (logical-subscription-options-slot-name options)
-                        (wal-format-lsn marker))))
+                        (wal-format-lsn marker)
+                        (if (logical-subscription-options-binary-bytea-p options)
+                            ", binary_bytea 'true'" ""))))
            ;; The first feedback is the copy boundary or the target's durable
            ;; restart marker; walsender.c validates it before entering its loop.
            (pg-client-send-standby-status source marker)
@@ -1814,7 +1857,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
       (let ((options (parse-logical-subscription-args
                       (cdr sb-ext:*posix-argv*))))
         (if (eq options :help)
-            (format t "usage: pg-lisp-subscribe --slot NAME --table TABLE [--table TABLE] [--mode extension|standard] [--publication NAME] [--source-host HOST] [--source-port PORT] [--source-database DB] [--target-host HOST] [--target-port PORT] [--target-database DB]~%")
+            (format t "usage: pg-lisp-subscribe --slot NAME --table TABLE [--table TABLE] [--mode extension|standard] [--publication NAME] [--binary-bytea] [--source-host HOST] [--source-port PORT] [--source-database DB] [--target-host HOST] [--target-port PORT] [--target-database DB]~%")
             (logical-subscription-run options)))
     (error (condition)
       (format *error-output* "pg-lisp-subscribe: ~a~%" condition)

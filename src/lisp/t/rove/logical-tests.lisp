@@ -2385,6 +2385,111 @@
       (rove:ok (equal (sql-bytea-output value) (pgoutput-value-text value :bytea))
                "pgoutput uses text-format bytea output")))
 
+(rove:deftest test-pgoutput-binary-bytea-roundtrip
+    (let* ((columns '((:attnum 1 :name "i" :type :int4 :typmod -1)
+                      (:attnum 2 :name "b" :type :bytea :typmod -1)))
+           (values (vector 7 (make-array 256 :element-type '(unsigned-byte 8) :initial-contents (loop for i below 256 collect i))))
+           (*pgoutput-binary-bytea* t)
+           (payload (make-payload))
+           (owner (make-logical-wire-field-owner))
+           (*logical-wire-field-owner* owner)
+           (*logical-wire-field-spill-threshold* 1)
+           (path (merge-pathnames (format nil "pg-binary-tuple-~d-~d" (sb-posix:getpid) (random 1000000)) (uiop:temporary-directory))))
+      (unwind-protect
+           (progn
+             (pgoutput-emit-tuple (lambda (part) (if (integerp part) (payload-push-byte payload part) (payload-push payload part))) columns values)
+             (multiple-value-bind (tuple position) (logical-pgoutput-read-tuple payload 0)
+               (rove:ok (= position (length payload)))
+               (rove:ok (string= (aref tuple 0) "7"))
+               (rove:ok (equalp (logical-binary-bytea-data (aref tuple 1)) (aref values 1))))
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+               (write-sequence payload out))
+             (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+               (let* ((wire-columns (list (make-pgoutput-column :type-oid 23) (make-pgoutput-column :type-oid 17)))
+                      (tuple (logical-wire-tuple (make-logical-wire-cursor :stream in :remaining (length payload)) wire-columns))
+                      (binary (aref tuple 1))
+                      (result (make-payload)))
+                 (rove:ok (logical-wire-binary-field-p (logical-binary-bytea-data binary)))
+                 (rove:ok (handler-case
+                              (progn (logical-validate-pgoutput-tuple
+                                      (make-pgoutput-relation :columns (list (make-pgoutput-column :type-oid 23)))
+                                      (vector binary) nil) nil)
+                            (error () t)))
+                 (logical-binary-bytea-visit binary (lambda (part) (payload-push result part)))
+                 (rove:ok (equalp result (aref values 1)))
+                 (let ((query (logical-bound-query (lambda (out) (logical-write-value-literal out 17 binary)))))
+                   (let ((parameter (cdar (pg-client-bound-query-parameters query))))
+                     (rove:ok (pg-client-binary-parameter-p parameter))
+                     (let ((scratch (logical-wire-field-owner-stream owner)))
+                       (file-position scratch 0)
+                       (write-byte 42 scratch)
+                       (finish-output scratch))
+                     (rove:ok (handler-case
+                                  (progn (pg-client-bound-parameter-write parameter nil) nil)
+                                (error () t))))))))
+        (close-logical-wire-field-owner owner)
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-pgoutput-binary-bytea-mixed-markers
+    (let* ((columns '((:attnum 1 :name "key" :type :bytea :typmod -1)
+                      (:attnum 2 :name "i" :type :int4 :typmod -1)
+                      (:attnum 3 :name "v" :type :bytea :typmod -1)))
+           (key (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(0 128 255)))
+           (values (vector key 7 +logical-unchanged-toast+))
+           (default (make-payload)) (binary (make-payload)))
+      (let ((*pgoutput-binary-bytea* nil))
+        (pgoutput-emit-tuple (lambda (part) (if (integerp part) (payload-push-byte default part) (payload-push default part))) columns values nil t)
+        (rove:ok (equalp default (pgoutput-build-tuple columns values nil t))))
+      (let ((*pgoutput-binary-bytea* t))
+        (pgoutput-emit-tuple (lambda (part) (if (integerp part) (payload-push-byte binary part) (payload-push binary part))) columns values nil t))
+      (multiple-value-bind (tuple end) (logical-pgoutput-read-tuple binary 0)
+        (rove:ok (= end (length binary)))
+        (rove:ok (equalp (logical-binary-bytea-data (aref tuple 0)) key))
+        (rove:ok (string= (aref tuple 1) "7"))
+        (rove:ok (eq (aref tuple 2) :unchanged-toast)))
+      (let ((*pgoutput-binary-bytea* t) (empty (make-payload)))
+        (pgoutput-emit-tuple (lambda (part) (if (integerp part) (payload-push-byte empty part) (payload-push empty part)))
+                             columns (vector (make-array 0 :element-type '(unsigned-byte 8)) +null+ +null+))
+        (multiple-value-bind (tuple end) (logical-pgoutput-read-tuple empty 0)
+          (rove:ok (= end (length empty)))
+          (rove:ok (zerop (length (logical-binary-bytea-data (aref tuple 0)))))
+          (rove:ok (null (aref tuple 1)))))))
+
+(rove:deftest test-pgoutput-binary-other-type-selected-versus-skipped
+    (let* ((path (merge-pathnames (format nil "pg-binary-other-~d-~d" (sb-posix:getpid) (random 1000000)) (uiop:temporary-directory)))
+           (payload #(0 1 98 0 0 0 1 42))
+           (relation (make-pgoutput-relation :columns (list (make-pgoutput-column :type-oid 23))))
+           (runtime (make-logical-subscription-runtime)) (selected t) (calls 0)
+           (old-selected (symbol-function 'logical-relation-selected-p))
+           (old-query (symbol-function 'logical-target-query)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'logical-relation-selected-p) (lambda (&rest ignored) (declare (ignore ignored)) selected)
+                   (symbol-function 'logical-target-query) (lambda (&rest ignored) (declare (ignore ignored)) (incf calls)))
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+               (write-sequence payload out))
+             (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+               (let ((tuples (list (logical-pgoutput-read-tuple payload 0)
+                                   (logical-wire-tuple (make-logical-wire-cursor :stream in :remaining (length payload))
+                                                       (pgoutput-relation-columns relation)))))
+                 (dolist (tuple tuples)
+                   (setf selected t)
+                   (rove:ok (handler-case (progn (logical-apply-insert-tuple runtime relation tuple) nil)
+                              (error (condition) (search "unsupported pgoutput binary" (princ-to-string condition)))))
+                   (setf selected nil)
+                   (rove:ok (null (logical-apply-insert-tuple runtime relation tuple))))))
+             (rove:ok (zerop calls)))
+        (setf (symbol-function 'logical-relation-selected-p) old-selected
+              (symbol-function 'logical-target-query) old-query)
+        (when (probe-file path) (delete-file path)))))
+
+(rove:deftest test-pgoutput-binary-truncated-and-trailing-rejected
+    (dolist (payload (list #(78 0 1 98 0 0 0 2 42)
+                           #(78 0 1 98 255 255 255 254)
+                           #(78 0 1 98 0 0 0 1 42 0)))
+      (rove:ok (handler-case (progn (logical-pgoutput-read-insert payload 0) nil)
+                 (error () t)))))
+
 (rove:deftest test-logical-json-row-change
     (let* ((value "{ \"a\": 1, \"a\": [null, true] }")
            (event (logical-test-change :insert 7 701 :new-values (vector 10 120 value))))
@@ -2830,6 +2935,12 @@
                              (if (integerp part) (vector-push-extend part output)
                                  (loop for byte across part do (vector-push-extend byte output)))))
                   (rove:ok (equalp output (pgoutput-build-row-change change)))
+                  (let ((*pgoutput-binary-bytea* t) (binary (make-payload)))
+                    (pgoutput-emit-row-change decoded (lambda (part)
+                                                        (if (integerp part) (payload-push-byte binary part)
+                                                            (payload-push binary part))))
+                    (let ((tuple (logical-pgoutput-read-insert binary 5)))
+                      (rove:ok (equalp (logical-binary-bytea-data (aref tuple 2)) bytes))))
                   (rove:ok (handler-case
                                (progn
                                  (logical-event-slice-visit
@@ -3311,6 +3422,14 @@
                      nil)
                  (error () t))
                "CREATE SEQUENCE rejects bounds that do not contain its start")))
+
+(rove:deftest test-logical-subscription-binary-bytea-option
+    (rove:ok (logical-subscription-options-binary-bytea-p
+              (parse-logical-subscription-args '("--slot" "s" "--table" "t" "--binary-bytea"))))
+  (rove:ok (handler-case
+               (progn (parse-logical-subscription-args
+                       '("--mode" "standard" "--publication" "p" "--slot" "s" "--table" "t" "--binary-bytea")) nil)
+             (error () t))))
 
 (rove:deftest test-logical-subscription-argument-parser
     (let ((options
