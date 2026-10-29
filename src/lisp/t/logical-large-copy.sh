@@ -83,4 +83,24 @@ test_wait_owned_sql_server "$TARGET_PID" "$TARGET_PORT" psql 300
 [ "$(sql "$TARGET_PORT" "SELECT state FROM pg_lisp_subscription_progress WHERE source_slot='large_copy'")" = ready ]
 awk 'BEGIN { printf "SELECT payload = \047"; for (i=0;i<8388736;i++) printf "x"; printf "\047 FROM big_copy WHERE id=1;\n" }' >"$TMP/check.sql"
 [ "$(psql -X -qAt -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$TARGET_PORT" -U postgres -d postgres -f "$TMP/check.sql")" = t ]
+# The before/after logical image exceeds one WAL record even though the SQL
+# command is small. Refusal must leave WAL usable and the old value intact.
+if sql "$SOURCE_PORT" "BEGIN; INSERT INTO big_copy VALUES (3, 'must roll back'); UPDATE big_copy SET payload = payload || payload WHERE id=1; COMMIT" >"$TMP/oversize.out" 2>&1; then
+    echo 'logical-large-copy: oversized logical change unexpectedly committed' >&2
+    exit 1
+fi
+grep -F 'one logical row change exceeds the maximum WAL record size' "$TMP/oversize.out" >/dev/null
+[ "$(sql "$SOURCE_PORT" 'SELECT length(payload) FROM big_copy WHERE id=1')" = 8388736 ]
+[ "$(sql "$SOURCE_PORT" 'SELECT count(*) FROM big_copy WHERE id=3')" = 0 ]
+sql "$SOURCE_PORT" "INSERT INTO big_copy VALUES (2,'still writable')" >/dev/null
+kill "$SOURCE_PID"
+wait "$SOURCE_PID" 2>/dev/null || true
+SOURCE_PID=
+"$BASE/pg-lisp.sh" -p "$SOURCE_PORT" -D "$TMP/source" >>"$TMP/source.log" 2>&1 &
+SOURCE_PID=$!
+test_wait_owned_sql_server "$SOURCE_PID" "$SOURCE_PORT" psql 300
+[ "$(sql "$SOURCE_PORT" 'SELECT length(payload) FROM big_copy WHERE id=1')" = 8388736 ]
+[ "$(psql -X -qAt -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$SOURCE_PORT" -U postgres -d postgres -f "$TMP/check.sql")" = t ]
+[ "$(sql "$SOURCE_PORT" 'SELECT count(*) FROM big_copy WHERE id=3')" = 0 ]
+[ "$(sql "$SOURCE_PORT" 'SELECT payload FROM big_copy WHERE id=2')" = 'still writable' ]
 echo 'logical-large-copy: PASS'
