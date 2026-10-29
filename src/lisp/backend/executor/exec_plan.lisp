@@ -1474,7 +1474,7 @@ on an abnormal exit."
   (values))
 
 (defun simple-select-toast-demand (node relations)
-  "Find demanded columns in a simple projection and its sequential scan filters.
+  "Find demanded columns in a simple projection and its base-table scan filters.
 Unrecognized plans and expression forms require full materialization."
   (when (eq (first node) :limit) (setf node (third node)))
   (when (and (eq (first node) :project) (= (length relations) 1))
@@ -1482,7 +1482,8 @@ Unrecognized plans and expression forms require full materialization."
       (loop while (eq (first scan) :filter)
             do (push (second scan) filters)
                (setf scan (third scan)))
-      (when (eq (first scan) :seq-scan)
+      (when (and (member (first scan) '(:seq-scan :index-scan))
+                 (or (eq (first scan) :seq-scan) (null (seventh scan))))
         (let* ((relation (physical-scan-relation scan relations))
                (table (getf relation :table))
                (slots nil))
@@ -1506,7 +1507,12 @@ Unrecognized plans and expression forms require full materialization."
             (when (and table (not (getf relation :row-source))
                        (not (getf relation :join-order-base))
                        (every (lambda (target) (walk (getf target :expr))) targets)
-                       (every #'walk filters))
+                       (every #'walk filters)
+                       (or (eq (first scan) :seq-scan)
+                           (let ((path (physical-scan-path scan relation)))
+                             (and (null (select-scan-path-parameter-expr path))
+                                  (or (null (select-scan-path-qual path))
+                                      (walk (select-scan-path-qual path)))))))
               (cons table slots))))))))
 
 (defun interpret-query-plan (plan registered-relations row-callback)

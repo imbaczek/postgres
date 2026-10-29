@@ -424,6 +424,22 @@
                      (materialize-select-tuple table (make-htup :values (vector 3 pointer)) nil)
                      nil)
                  (pg-error () t)))
+      (let* ((index (make-pg-index :oid 99 :table-oid 42))
+             (path (make-select-scan-path :kind :index-scan :index index))
+             (index-relations (list (list :table table :path path)))
+             (qual '(:binop "=" (:col 1) (:const 3)))
+             (index-scan (list :index-scan 0 42 99 qual #() nil))
+             (index-node (list :project targets (list :filter qual index-scan))))
+        (rove:ok (equal '(1) (cdr (simple-select-toast-demand index-node index-relations))))
+        ;; The index qualification can require a slot absent from the filter and targets.
+        (setf (fifth index-scan) '(:binop "=" (:col 2) (:const "x")))
+        (let ((needed (cdr (simple-select-toast-demand index-node index-relations))))
+          (rove:ok (and (member 1 needed) (member 2 needed))))
+        (setf (fifth index-scan) '(:subplan opaque))
+        (rove:ok (null (simple-select-toast-demand index-node index-relations)))
+        (setf (fifth index-scan) qual
+              (seventh index-scan) '(:outer-ref 1 (:col 1)))
+        (rove:ok (null (simple-select-toast-demand index-node index-relations))))
       (rove:ok (null (simple-select-toast-demand (list :sort nil node) relations)))
       (let ((filtered (simple-select-toast-demand
                        (list :project

@@ -266,6 +266,11 @@ original_pointer=$(reuse_pointer)
 [ "$(run -c "insert into toast_reuse (id, marker) select id, marker from toast_reuse on conflict (id) do update set marker = excluded.marker + 1 returning v = '$big'")" = t ]
 [ "$(run -c "select marker, v = '$big' from toast_reuse where id = 1")" = '1|t' ]
 [ "$(reuse_pointer)" = "$original_pointer" ]
+run -c 'create table toast_index_demand (id int primary key, v text)' >/dev/null
+run -c 'alter table toast_index_demand alter column v set storage external' >/dev/null
+index_rows=$(awk 'BEGIN { for (i=2;i<=1001;i++) printf "%s(%d, NULL)", i==2 ? "" : ",", i }')
+run -c "insert into toast_index_demand values $index_rows, (1, '$big')" >/dev/null
+run -c 'analyze toast_index_demand' >/dev/null
 # Count actual TOAST fetches during live SQL execution. A query that needs only
 # id must not touch v; fetching v and using it in a filter must still work.
 printf '%s\n(quit)\n' '(let ((counter (intern "*TOAST-TEST-FETCH-COUNT*")) (original (symbol-function (quote toast-fetch-value)))) (setf (symbol-value counter) 0 (symbol-value (intern "*TOAST-TEST-FETCH-ORIGINAL*")) original) (setf (symbol-function (quote toast-fetch-value)) (lambda (&rest args) (incf (symbol-value counter)) (apply original args))))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/toast-fetch-install.out"
@@ -277,13 +282,21 @@ toast_fetch_count() {
 }
 [ "$(run -c 'select id from toast_reuse')" = 1 ]
 [ "$(toast_fetch_count)" = 0 ]
+# The primary-key equality uses a nonparameterized index scan. Its recheck
+# needs id, but should not fetch the unreferenced external value.
+run -c 'explain select id from toast_index_demand where id = 1' | grep -q 'Index Scan using'
+[ "$(run -c 'select id from toast_index_demand where id = 1')" = 1 ]
+[ "$(toast_fetch_count)" = 0 ]
 [ "$(run -c 'select id + 1 from toast_reuse where id + 0 = 1')" = 2 ]
 [ "$(toast_fetch_count)" = 0 ]
 [ "$(run -c 'select abs(id) from toast_reuse where id + 0 = 1')" = 1 ]
 [ "$(toast_fetch_count)" = 0 ]
+[ "$(run -c "select v = '$big' from toast_index_demand where id = 1")" = t ]
+fetch_after_index=$(toast_fetch_count)
+[ "$fetch_after_index" -gt 0 ]
 [ "$(run -c "select v = '$big' from toast_reuse where id = 1")" = t ]
 fetch_after_projection=$(toast_fetch_count)
-[ "$fetch_after_projection" -gt 0 ]
+[ "$fetch_after_projection" -gt "$fetch_after_index" ]
 [ "$(run -c "select id from toast_reuse where v = '$big'")" = 1 ]
 fetch_after_filter=$(toast_fetch_count)
 [ "$fetch_after_filter" -gt "$fetch_after_projection" ]
