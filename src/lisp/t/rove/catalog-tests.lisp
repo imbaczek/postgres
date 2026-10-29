@@ -171,7 +171,7 @@
                       :relfrozenxid ,+first-normal-xid+
                       :columns ((:name "value" :type :int4 :typmod -1
                                  :attnum 1 :notnull t :default-sequence nil
-                                 :default-expression nil :default-sql nil))
+                                 :default-expression nil :default-sql nil :storage nil))
                       :indexes (52) :toast nil :checks nil
                       :statistics nil))
              "class and column codecs use compatible flat plists")

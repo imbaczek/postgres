@@ -11,7 +11,12 @@
   notnull
   default-sequence-name
   default-expression
-  default-sql)
+  default-sql
+  storage)
+
+(defun pg-column-effective-storage (column)
+  "Return COLUMN's explicit storage policy or its type default."
+  (or (pg-column-storage column) (sql-type-storage-code (pg-column-type column))))
 
 ;; Optional metadata owned by one pg-class, modeling the TOAST table and its
 ;; index identities (as in catalog/toasting.c).  This scaffold does not create
@@ -198,7 +203,8 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
   (:default-sequence pg-column-default-sequence-name :default-sequence-name)
   (:default-expression pg-column-default-expression :default-expression
                        :encode #'catalog-expression-to-sexp :decode #'catalog-expression-from-sexp)
-  (:default-sql pg-column-default-sql :default-sql))
+  (:default-sql pg-column-default-sql :default-sql)
+  (:storage pg-column-storage :storage))
 
 (define-catalog-codec sequence make-pg-sequence
   (:oid pg-sequence-oid :oid)
@@ -1185,7 +1191,14 @@ from advancing the shared WAL generation between a failed save and rollback."
       (dolist (check checks)
         (unless (getf check :validated)
           (format stream "; ALTER TABLE ~a ADD CONSTRAINT ~a CHECK (~a) NOT VALID"
-                  name (catalog-sql-quote-ident (getf check :name)) (catalog-check-expression-sql check table)))))))
+                  name (catalog-sql-quote-ident (getf check :name)) (catalog-check-expression-sql check table))))
+      (loop for column across (pg-class-columns table)
+            for storage = (pg-column-effective-storage column)
+            unless (char= storage (sql-type-storage-code (pg-column-type column)))
+              do (format stream "; ALTER TABLE ~a ALTER COLUMN ~a SET STORAGE ~a"
+                         name (catalog-sql-quote-ident (pg-column-name column))
+                         (case storage (#\p "PLAIN") (#\e "EXTERNAL")
+                               (#\x "EXTENDED") (#\m "MAIN")))))))
 
 (defun catalog-standalone-index-definition-sql (index table)
   (format nil "CREATE ~aINDEX IF NOT EXISTS ~a ON ~a (~{~a~^, ~})~a"
@@ -1495,7 +1508,7 @@ ownership durable; table rollback or drop handles their eventual removal."
 (defparameter *toast-chunk-columns*
   (vector (make-pg-column :name "chunk_id" :type :oid :typmod -1 :attnum 1)
           (make-pg-column :name "chunk_seq" :type :int4 :typmod -1 :attnum 2)
-          (make-pg-column :name "chunk_data" :type :bytea :typmod -1 :attnum 3)))
+          (make-pg-column :name "chunk_data" :type :bytea :typmod -1 :attnum 3 :storage #\p)))
 
 (defun toast-chunk-key (value-id sequence)
   "Encode the unsigned 32-bit OID and signed int4 sequence as an ordered key.
@@ -1605,14 +1618,14 @@ chunks are copied. Abort the transaction after any partial write."
                                 :relation-id (pg-toast-oid toast) :id-width 4)))
 
 (defun toast-plan-tuple (values columns &key (external-p t))
-  "Plan EXTENDED and MAIN compression and externalization phases.
-Numeric uses MAIN; varchar, text, JSON, JSONB and bytea use EXTENDED. Per-column
-storage overrides are not supported. Return physical values and selected indexes;
-selected values contain placeholder pointers that the caller must replace.
+  "Plan compression and externalization phases according to column storage.
+Return physical values, selected indexes, and the subset selected compressed.
+Selected values contain placeholder pointers that the caller must replace.
 VALUES remains unchanged; EXTERNAL-P says whether the relation has a TOAST table."
   (let* ((physical (copy-seq values))
          (attempted (make-array (length columns) :initial-element nil))
          (selected nil)
+         (compressed-selected nil)
          (cached nil)
          (header (maxalign (+ +size-of-heap-tuple-header+ (ceiling (length columns) 8))))
          (max-data (- +toast-tuple-target+ header)))
@@ -1631,9 +1644,11 @@ VALUES remains unchanged; EXTERNAL-P says whether the relation has a TOAST table
                (let ((best nil) (best-size (maxalign (+ 4 +external-varlena-fixed-size+))))
                  (loop for i below (length columns)
                        for value = (aref physical i)
-                       for type = (pg-column-type (aref columns i))
+                       for column = (aref columns i)
+                       for type = (pg-column-type column)
+                       for storage = (pg-column-effective-storage column)
                        when (and (member type '(:varchar :text :json :jsonb :bytea :numeric))
-                                 (eq (eq type :numeric) main-p)
+                                 (if main-p (char= storage #\m) (find storage "xe"))
                                  (not (eq value +null+))
                                  (not (heap-external-varlena-p value))
                                  (or (not compress-p)
@@ -1646,12 +1661,15 @@ VALUES remains unchanged; EXTERNAL-P says whether the relation has a TOAST table
              (compress-value (index)
                (setf (aref attempted index) t)
                (let* ((raw (aref cached index))
-                      (compressed (toast-compressed-payload raw)))
+                      (compressed (unless (char= (pg-column-effective-storage (aref columns index)) #\e)
+                                    (toast-compressed-payload raw))))
                  (when (and compressed (< (+ 4 (length compressed)) (- (length raw) 2)))
                    (setf (aref physical index) (make-heap-compressed-varlena :payload compressed)
                          (aref cached index) nil))))
              (externalize (index)
                (push index selected)
+               (when (heap-compressed-varlena-p (aref physical index))
+                 (push index compressed-selected))
                (setf (aref physical index)
                      (make-heap-external-varlena :raw-size 5 :external-info 1
                                                  :value-id 1 :relation-id 1 :id-width 4))))
@@ -1678,7 +1696,7 @@ VALUES remains unchanged; EXTERNAL-P says whether the relation has a TOAST table
         (loop while (> (layout) +toast-tuple-target-main+)
               for best = (candidate t nil)
               while best do (externalize best)))
-      (values physical (nreverse selected)))))
+      (values physical (nreverse selected) compressed-selected))))
 
 (defun toast-externalize-tuple-unlocked (toast values columns xid cid)
   "Return a physical copy of VALUES, compressing inline or storing in TOAST.
@@ -1687,13 +1705,13 @@ lock acquired first. This function does not acquire either lock.
 Abort XID after any error once storage begins. VALUES remains suitable for SQL
 index keys, RETURNING, and replication. The planner may leave the tuple above
 its target. Selected external payloads use PGLZ when it meets the size threshold."
-  (multiple-value-bind (physical indexes) (toast-plan-tuple values columns :external-p (not (null toast)))
+  (multiple-value-bind (physical indexes compressed-indexes) (toast-plan-tuple values columns :external-p (not (null toast)))
     (when indexes
       (let ((raw-payloads (nth-value 2 (heap-tuple-layout values columns))))
         (dolist (index indexes)
           (setf (aref physical index)
                 (toast-store-value-unlocked toast (aref raw-payloads index)
-                                            nil xid cid :compress t)))))
+                                            nil xid cid :compress (member index compressed-indexes))))))
     physical))
 
 (defun toast-fetch-value (toast pointer snapshot &key (index-reader #'call-with-btree-relation-read-lock))

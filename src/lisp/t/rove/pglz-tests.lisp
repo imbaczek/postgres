@@ -114,6 +114,20 @@
         (rove:ok (heap-compressed-varlena-p (aref physical 0)))
         (rove:ok (equal plan '(1))))))
 
+(rove:deftest test-external-compression-follows-planner
+    (let ((block (make-array 2100 :element-type '(unsigned-byte 8))) (state 1))
+      (dotimes (i (length block))
+        (setf state (logand #xffffffff (+ (* state 1664525) 1013904223))
+              (aref block i) (if (< i 200) 42 (ldb (byte 8 24) state))))
+      (let ((value (concatenate '(vector (unsigned-byte 8)) block block block)))
+        (dolist (case '((#\x (0)) (#\e nil)))
+          (let ((columns (vector (make-pg-column :type :bytea :storage (first case)))))
+            (multiple-value-bind (physical selected compressed)
+                (toast-plan-tuple (vector value) columns)
+              (rove:ok (heap-external-varlena-p (aref physical 0)))
+              (rove:ok (equal selected '(0)))
+              (rove:ok (equal compressed (second case)))))))))
+
 (rove:deftest test-inline-compressed-corruption
     (let* ((column (make-pg-column :type :bytea))
            (columns (vector column))

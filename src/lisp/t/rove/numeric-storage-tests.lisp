@@ -113,6 +113,30 @@
           (rove:ok (equal indexes '(0)))
           (rove:ok (eq (aref physical 1) compressible))))))
 
+(rove:deftest test-toast-column-storage-policies
+    (let ((bytes (make-array 4000 :element-type '(unsigned-byte 8) :initial-element 42)))
+      (dolist (case '((#\p nil nil) (#\e (0) nil) (#\x nil t) (#\m nil t)))
+        (let* ((columns (vector (make-pg-column :type :bytea :storage (first case))))
+               (values (vector bytes)))
+          (multiple-value-bind (physical indexes) (toast-plan-tuple values columns)
+            (rove:ok (equal indexes (second case)))
+            (rove:ok (eq (not (null (heap-compressed-varlena-p (aref physical 0))))
+                         (third case))))))))
+
+(rove:deftest test-plain-varlena-header-and-alignment
+    (let* ((plain (vector (make-pg-column :type :int2)
+                          (make-pg-column :type :text :storage #\p)))
+           (extended (vector (make-pg-column :type :int2)
+                             (make-pg-column :type :text :storage #\x)))
+           (values (vector 1 "abc"))
+           (plain-tuple (form-heap-tuple values plain 3 0 0 0 1))
+           (extended-tuple (form-heap-tuple values extended 3 0 0 0 1)))
+      (rove:ok (= (length plain-tuple) 35))
+      (rove:ok (= (length extended-tuple) 30))
+      (rove:ok (equalp (nth-value 0 (deform-heap-tuple plain-tuple plain)) values))
+      (rove:ok (equalp (nth-value 0 (deform-heap-tuple extended-tuple extended)) values))
+      (rove:ok (equalp (nth-value 0 (deform-heap-tuple extended-tuple plain)) values))))
+
 (rove:deftest test-toast-policy-target-boundaries
     (labels ((random-byte (state)
                (let ((next (logand #xffffffff (+ (* state 1664525) 1013904223))))

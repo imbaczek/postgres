@@ -104,6 +104,27 @@ run -c "insert into toast_bytes values (2, '\\x$binary_multi')" >/dev/null
 [ "$(run -c "delete from toast_bytes where id = 2 returning v")" = "\\x$binary_multi" ]
 run -c 'create table toast_text (id int primary key, v text)' >/dev/null
 run -c "insert into toast_text values (1, '$big')" >/dev/null
+run -c 'alter table toast_text alter column v set storage external' >/dev/null
+[ "$(run -c "select a.attstorage from pg_attribute a join pg_class c on a.attrelid = c.oid where c.relname = 'toast_text' and a.attname = 'v'")" = e ]
+[ "$(run -c "select v = '$big' from toast_text where id = 1")" = t ]
+run -c "insert into toast_text values (2, '$big')" >/dev/null
+run -c 'alter table toast_text alter column v set storage plain' >/dev/null
+[ "$(run -c "select v = '$big' from toast_text where id = 2")" = t ]
+run -c 'alter table toast_text alter column v set storage default' >/dev/null
+[ "$(run -c "select a.attstorage from pg_attribute a join pg_class c on a.attrelid = c.oid where c.relname = 'toast_text' and a.attname = 'v'")" = x ]
+run -c 'delete from toast_text where id = 2' >/dev/null
+if run -c 'alter table toast_text alter column id set storage extended' >/dev/null 2>&1; then
+    echo 'toast-dml: fixed-width storage override was accepted' >&2
+    exit 1
+fi
+for query in 'alter table toast_text alter column v set storage nonsense' \
+             'alter table toast_text alter column absent set storage plain' \
+             'alter table toast_text alter column ctid set storage plain'; do
+    if run -c "$query" >/dev/null 2>&1; then
+        echo "toast-dml: invalid storage alteration was accepted: $query" >&2
+        exit 1
+    fi
+done
 [ "$(run -c 'select length(v) from toast_text where id = 1')" = 3000 ]
 [ "$(run -c "select v = '$big' from toast_text where id = 1")" = t ]
 run -c 'create index toast_text_v_idx on toast_text (v)' >/dev/null
@@ -155,6 +176,16 @@ run -c 'truncate toast_dml' >/dev/null
 run -c 'vacuum toast_dml' >/dev/null
 numeric_big=$(awk 'BEGIN { s=1; printf "7"; for (i=1;i<20000;i++) { s=(s*1664525+1013904223)%4294967296; printf "%d", int(s/16777216)%10 } }')
 numeric_repeat=$(awk 'BEGIN { for (i=0;i<20000;i++) printf "1" }')
+run -c 'create table storage_restart (v text)' >/dev/null
+run -c 'alter table storage_restart alter column v set storage external' >/dev/null
+run -c "insert into storage_restart values ('$numeric_repeat')" >/dev/null
+run -c 'alter table storage_restart alter column v set storage plain' >/dev/null
+[ "$(run -c 'select length(v) from storage_restart')" = 20000 ]
+if run -c "insert into storage_restart values ('$numeric_repeat')" >/dev/null 2>&1; then
+    echo 'toast-dml: PLAIN accepted a tuple exceeding a heap page' >&2
+    exit 1
+fi
+run -c 'alter table storage_restart alter column v set storage main' >/dev/null
 run -c 'create table vacuum_inline_text (v text)' >/dev/null
 run -c "insert into vacuum_inline_text values ('$numeric_repeat')" >/dev/null
 run -c 'vacuum full vacuum_inline_text' >/dev/null
@@ -182,6 +213,8 @@ wait "$SRV" || true
 SRV=
 test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
+[ "$(run -c "select a.attstorage from pg_attribute a join pg_class c on a.attrelid = c.oid where c.relname = 'storage_restart' and a.attname = 'v'")" = m ]
+[ "$(run -c 'select length(v) from storage_restart')" = 20000 ]
 [ "$(run -c "select reltoastrelid from pg_class where relname = 'toast_numeric'")" = "$numeric_toast_oid" ]
 [ "$(run -c "select v = '$numeric_big'::numeric from toast_numeric where id = 1")" = t ]
 [ "$(run -c 'select length(v::text) from toast_numeric where id = 2')" = 20000 ]

@@ -390,7 +390,7 @@ Reject unsupported parameters and unsupported local settings."
                do (push (sql-attribute-row
                          (pg-class-oid table) (pg-column-name column) (pg-column-type column)
                          (pg-column-attnum column) (pg-column-typmod column)
-                         (pg-column-notnull column)) rows))
+                         (pg-column-notnull column) (pg-column-effective-storage column)) rows))
          (let ((toast (pg-class-toast table)))
            (when toast
              (dolist (relation (list (cons (pg-toast-oid toast) t)
@@ -408,7 +408,7 @@ Reject unsupported parameters and unsupported local settings."
                  for column = (aref (pg-class-columns table) (1- attnum))
                  do (push (sql-attribute-row
                            (pg-index-oid index) (pg-column-name column) (pg-column-type column)
-                           number (pg-column-typmod column) nil) rows))))
+                           number (pg-column-typmod column) nil (pg-column-effective-storage column)) rows))))
        (database-indexes database))
       (maphash
        (lambda (name sequence)

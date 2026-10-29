@@ -1331,6 +1331,34 @@ before this removal horizon is captured."
           (save-catalog :logical-event
                         (logical-catalog-event-for-ast ast)))))))
 
+(defun exec-alter-column-storage (db table ast)
+  "Change a column's policy for future tuples and publish the catalog change."
+  (with-table-ddl (table :refresh-snapshot t)
+    (let* ((name (getf ast :column))
+           (column (find-column table name))
+           (requested (getf ast :storage)))
+      (unless column
+        (if (member name '("ctid" "xmin" "xmax" "cmin" "cmax" "tableoid") :test #'string=)
+            (ereport "0A000" "cannot alter system column ~s" name)
+            (ereport "42703" "column ~s does not exist" name)))
+      (let* ((default (sql-type-storage-code (pg-column-type column)))
+             (storage (cond ((string-equal requested "default") default)
+                            ((string-equal requested "plain") #\p)
+                            ((string-equal requested "external") #\e)
+                            ((string-equal requested "extended") #\x)
+                            ((string-equal requested "main") #\m)
+                            (t (ereport "22023" "invalid storage type ~s" requested)))))
+        (when (and (char= default #\p) (char/= storage #\p))
+          (ereport "0A000" "column data type ~a can only have storage PLAIN"
+                   (sql-type-catalog-name (pg-column-type column))))
+        (with-catalog-mutation-rollback (db)
+          (let ((replacement (copy-pg-column column))
+                (columns (copy-seq (pg-class-columns table))))
+            (setf (pg-column-storage replacement) storage
+                  (aref columns (1- (pg-column-attnum column))) replacement
+                  (pg-class-columns table) columns))
+          (save-catalog :logical-event (logical-catalog-event-for-ast ast)))))))
+
 (defun exec-alter-table (stream ast)
   (let* ((name (getf ast :table))
          (primary (eq (getf ast :action) :add-primary-key))
@@ -1349,6 +1377,8 @@ before this removal horizon is captured."
             (return-from exec-alter-table nil))
           (ereport "42P01" "relation \"~a\" does not exist" name)))
     (cond
+      ((eq (getf ast :action) :set-storage)
+       (exec-alter-column-storage db table ast))
       ((or (member (getf ast :action) '(:set-default :drop-default :add-check :validate-constraint))
            (and (member (getf ast :action) '(:rename-constraint :drop-constraint))
                 (find (getf ast :constraint-name) (pg-class-checks table)

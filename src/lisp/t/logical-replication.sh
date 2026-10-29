@@ -294,6 +294,7 @@ REPLICA_TWO_PID=$SERVER_PID
 seed_copy_stress_table
 sql "$SOURCE_PORT" "SET DateStyle TO 'ISO, DMY'; SET TimeZone TO 'Europe/Warsaw'; CREATE TABLE bootstrap_temporal (id integer PRIMARY KEY, d date DEFAULT '01/02/2024' CHECK(d >= '01/02/2024') CHECK(d = ANY('{01/02/2024,04/03/2024}')), z timestamptz DEFAULT '01/02/2024 12:00:00', created timestamp DEFAULT 'now')" >/dev/null
 sql "$SOURCE_PORT" "CREATE TABLE replicated_rows (id integer PRIMARY KEY, amount bigint NOT NULL, label text); CREATE TABLE bootstrap_constraint_order (a integer DEFAULT '1.5'::numeric CHECK(a > '0.25'::numeric), b integer, c integer, CONSTRAINT bootstrap_constraint_order_pkey PRIMARY KEY (a), CONSTRAINT bootstrap_constraint_order_b_key UNIQUE (b), CONSTRAINT bootstrap_constraint_order_c_key UNIQUE (c)); CREATE TABLE nullable_rows (nullable_key integer, label bytea, j json, b jsonb, n numeric); CREATE UNIQUE INDEX nullable_rows_key_idx ON nullable_rows (nullable_key) NULLS NOT DISTINCT; CREATE TABLE ignored_rows (id integer PRIMARY KEY, label varchar(64)); CREATE SEQUENCE bootstrap_counter START WITH 10 INCREMENT BY 2; ALTER SEQUENCE bootstrap_counter INCREMENT BY -2; SELECT setval('bootstrap_counter', 100, true); INSERT INTO replicated_rows VALUES (1, 10, 'initial'), (9, 90, 'remove'); INSERT INTO nullable_rows VALUES (NULL, 'initial-null'), (2, 'two'); INSERT INTO ignored_rows VALUES (1, 'before')"
+sql "$SOURCE_PORT" "ALTER TABLE nullable_rows ALTER COLUMN label SET STORAGE EXTERNAL" >/dev/null
 
 long_text=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "x" }')
 sql "$SOURCE_PORT" "UPDATE replicated_rows SET label = '$long_text' WHERE id = 1" >/dev/null
@@ -490,6 +491,12 @@ wait_for_rows "$REPLICA_TWO_PORT" "$expected_first"
 expected_nullable_first=$(nullable_rows "$SOURCE_PORT")
 wait_for_nullable_rows "$REPLICA_ONE_PORT" "$expected_nullable_first"
 wait_for_nullable_rows "$REPLICA_TWO_PORT" "$expected_nullable_first"
+for port in "$REPLICA_ONE_PORT" "$REPLICA_TWO_PORT"; do
+    [ "$(sql "$port" "SELECT a.attstorage FROM pg_attribute a JOIN pg_class c ON a.attrelid = c.oid WHERE c.relname = 'nullable_rows' AND a.attname = 'label'")" = e ] || {
+        echo "logical-replication: bootstrap lost column storage policy" >&2
+        exit 1
+    }
+done
 if [ "$(sql "$REPLICA_TWO_PORT" "SELECT count(*) FROM copy_stress")" != 12 ] \
         || [ "$(sql "$REPLICA_ONE_PORT" "SELECT count(*) FROM copy_stress")" != 0 ]; then
     echo "logical-replication: initial copy chunking ignored the selected-table boundary" >&2
@@ -533,6 +540,7 @@ sql "$SOURCE_PORT" "BEGIN; INSERT INTO replicated_rows VALUES (77, 770, 'aborted
 
 # Commit additional work while replica two is disconnected. It must restart from
 # its target's durable marker without duplicating the transaction applied above.
+sql "$SOURCE_PORT" "ALTER TABLE nullable_rows ALTER COLUMN label SET STORAGE MAIN" >/dev/null
 sql "$SOURCE_PORT" "BEGIN; UPDATE replicated_rows SET amount = 22, label = 'resumed' WHERE id = 2; INSERT INTO replicated_rows VALUES (4, 40, 'later'); DELETE FROM nullable_rows WHERE nullable_key IS NULL; COMMIT"
 sql "$SOURCE_PORT" "ALTER TABLE replicated_rows ADD CONSTRAINT replicated_rows_amount_key UNIQUE (amount); CREATE INDEX replicated_rows_id_amount_idx ON replicated_rows (id, amount); CREATE INDEX ignored_rows_label_idx ON ignored_rows (label); CREATE SEQUENCE streaming_counter START WITH 10 INCREMENT BY 5; SELECT nextval('streaming_counter'); ALTER SEQUENCE streaming_counter INCREMENT BY -3; SELECT nextval('streaming_counter')"
 long_text_stream=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "y" }')
@@ -553,6 +561,12 @@ wait_for_rows "$REPLICA_ONE_PORT" "$expected_final"
 wait_for_rows "$REPLICA_TWO_PORT" "$expected_final"
 wait_for_lsn_barrier "$REPLICA_ONE_PORT" logical_replica_one "$disconnected_barrier"
 wait_for_lsn_barrier "$REPLICA_TWO_PORT" logical_replica_two "$disconnected_barrier"
+for port in "$REPLICA_ONE_PORT" "$REPLICA_TWO_PORT"; do
+    [ "$(sql "$port" "SELECT a.attstorage FROM pg_attribute a JOIN pg_class c ON a.attrelid = c.oid WHERE c.relname = 'nullable_rows' AND a.attname = 'label'")" = m ] || {
+        echo "logical-replication: streamed ALTER lost column storage policy" >&2
+        exit 1
+    }
+done
 if [ "$(sql "$REPLICA_ONE_PORT" "SELECT count(*) FROM concurrent_schema_one")" != 0 ] \
         || [ "$(sql "$REPLICA_TWO_PORT" "SELECT count(*) FROM concurrent_schema_one")" != 0 ] \
         || [ "$(sql "$REPLICA_ONE_PORT" "SELECT count(*) FROM concurrent_schema_two")" != 0 ] \
