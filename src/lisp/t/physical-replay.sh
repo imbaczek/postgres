@@ -46,6 +46,11 @@ compare() {
     sql "$PORT" 'SELECT id,body,document FROM toast_replay ORDER BY id' >"$TMP/source.toast"
     sql "$TARGET_PORT" 'SELECT id,body,document FROM toast_replay ORDER BY id' >"$TMP/target.toast"
     cmp "$TMP/source.toast" "$TMP/target.toast"
+    for port in "$PORT" "$TARGET_PORT"; do
+        PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$port" -U postgres -d postgres \
+            -qAt -v ON_ERROR_STOP=1 -f "$TMP/compressed-index-query.sql" >"$TMP/index-$port.rows"
+    done
+    cmp "$TMP/index-$PORT.rows" "$TMP/index-$TARGET_PORT.rows"
     test "$(sql "$TARGET_PORT" 'SELECT pg_is_in_recovery()')" = t
 }
 export_wal() {
@@ -62,6 +67,17 @@ SOURCE=$!
 test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 sql "$PORT" "CREATE TABLE data (id integer PRIMARY KEY,label varchar(32)); INSERT INTO data VALUES (1,'base'); CREATE SEQUENCE replay_seq START WITH 7; CREATE TABLE base_empty (id integer); CREATE TABLE base_drop (id integer); INSERT INTO base_drop VALUES (10)"
 sql "$PORT" 'CREATE TABLE toast_replay (id integer PRIMARY KEY, body text, document jsonb); ALTER TABLE toast_replay ALTER COLUMN body SET STORAGE EXTERNAL; ALTER TABLE toast_replay ALTER COLUMN document SET STORAGE EXTERNAL'
+sql "$PORT" 'CREATE TABLE compressed_index_replay (id integer, value text UNIQUE)'
+python3 - "$TMP" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+value = 'x' * 20000
+(root / 'compressed-index-insert.sql').write_text(
+    f"INSERT INTO compressed_index_replay VALUES (1, '{value}');\n", encoding='utf-8')
+(root / 'compressed-index-query.sql').write_text(
+    f"SELECT id FROM compressed_index_replay WHERE value = '{value}';\n", encoding='utf-8')
+PY
 awk 'BEGIN { for (row=1;row<=2;row++) { printf "INSERT INTO toast_replay VALUES (%d, \047", row; for (i=0;i<10000;i++) printf "%c", 97+(i%23); printf "\047, \047{\"value\":\""; for (i=0;i<10000;i++) printf "%c", 65+(i%23); print "\"}\047::jsonb);" } }' >"$TMP/toast-seed.sql"
 PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -f "$TMP/toast-seed.sql" >/dev/null
 # Multiple base heap pages ensure that later updates do not carry every base
@@ -139,6 +155,7 @@ attempt=0
 while ! grep -Fxq "$old_toast" "$TMP/tx.log"; do
     attempt=$((attempt + 1)); test "$attempt" -lt 100; sleep 0.1
 done
+PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -f "$TMP/compressed-index-insert.sql" >/dev/null
 sql "$PORT" "UPDATE data SET label='updated' WHERE id=1; INSERT INTO data VALUES (3,'next'); UPDATE toast_replay SET body=body || body WHERE id=1; DELETE FROM toast_replay WHERE id=2; SELECT nextval('replay_seq'); CREATE TABLE extra (id integer); INSERT INTO extra VALUES (42); CREATE TABLE empty_after_base (id integer); DROP TABLE base_drop"
 export_wal
 receive_all
@@ -167,6 +184,8 @@ wait "$TX"
 TX=
 checked target '(physical-recovery-replay)' catchup
 compare
+test "$(cat "$TMP/index-$TARGET_PORT.rows")" = 1
+checked target '(let* ((db (gethash "postgres" (catalog-databases *catalog*))) (idx (gethash "compressed_index_replay_value_key" (database-indexes db))) (key (encode-index-key (list (make-string 20000 :initial-element #\x)) (list :text)))) (assert (= 1 (length (btree-search (pg-index-relfilenode idx) key)))))' compressed-index-replay
 test "$(sql "$TARGET_PORT" 'SELECT id FROM extra')" = 42
 test "$(sql "$TARGET_PORT" "SELECT pg_lisp_sequence_state('replay_seq')")" = "$(sql "$PORT" "SELECT pg_lisp_sequence_state('replay_seq')")"
 # Kill after the authoritative pointer is durable, before receive-floor publication.
@@ -199,6 +218,7 @@ TARGET=
 start_target
 compare
 test "$(sql "$TARGET_PORT" 'SELECT length(body) FROM toast_replay WHERE id=1')" = 40000
+checked target '(let* ((db (gethash "postgres" (catalog-databases *catalog*))) (idx (gethash "compressed_index_replay_value_key" (database-indexes db))) (key (encode-index-key (list (make-string 20000 :initial-element #\x)) (list :text)))) (assert (= 1 (length (btree-search (pg-index-relfilenode idx) key)))))' compressed-index-after-crash
 checked target '(physical-test-verify-source-xids)' redo-crash-membership
 test "$(sql "$TARGET_PORT" 'SELECT id FROM extra')" = 42
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM base_empty')" = 0
