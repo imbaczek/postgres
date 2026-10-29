@@ -26,6 +26,98 @@ run() {
 }
 test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-socket "$TMP/control.sock"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
+# Each 600-byte datum is above PostgreSQL's index compression target, even
+# though no individual logical key segment reaches 1024 bytes.
+"${PYTHON:-python3}" - >"$TMP/index-medium.sql" <<'PY'
+columns = ','.join(f'c{i} text' for i in range(14))
+names = ','.join(f'c{i}' for i in range(14))
+values = ','.join("'" + chr(97 + i) * 600 + "'" for i in range(14))
+print(f'CREATE TABLE medium_index ({columns});')
+print(f'CREATE UNIQUE INDEX medium_index_key ON medium_index ({names});')
+print(f'INSERT INTO medium_index VALUES ({values});')
+print(f'CREATE TABLE medium_build ({columns});')
+print('INSERT INTO medium_build SELECT * FROM medium_index;')
+print(f'CREATE UNIQUE INDEX medium_build_key ON medium_build ({names});')
+PY
+run -f "$TMP/index-medium.sql" >/dev/null
+[ "$(run -c 'select count(*) from medium_index')" = 1 ]
+[ "$(run -c 'select count(*) from medium_build')" = 1 ]
+# Build from originally uncompressed external values so the index threshold,
+# rather than inherited heap compression, decides admission.
+"${PYTHON:-python3}" - >"$TMP/index-threshold.sql" <<'PY'
+for name, length, typ in [('below', 506, 'text'), ('above', 507, 'text'),
+                          ('escaped', 300, 'bytea')]:
+    columns = ','.join(f'c{i} {typ}' for i in range(17))
+    names = ','.join(f'c{i}' for i in range(17))
+    value = "'" + ('a' * length if typ == 'text' else r'\x' + '00' * length) + "'"
+    print(f'CREATE TABLE threshold_{name} ({columns});')
+    for i in range(17):
+        print(f'ALTER TABLE threshold_{name} ALTER c{i} SET STORAGE EXTERNAL;')
+    print(f"INSERT INTO threshold_{name} VALUES ({','.join([value] * 17)});")
+    for i in range(17):
+        print(f'ALTER TABLE threshold_{name} ALTER c{i} SET STORAGE EXTENDED;')
+    if name == 'above':
+        print(f'CREATE INDEX threshold_above_idx ON threshold_above ({names});')
+PY
+run -f "$TMP/index-threshold.sql" >/dev/null
+index_columns=$("${PYTHON:-python3}" -c "print(','.join('c%d' % i for i in range(17)))")
+for name in below escaped; do
+    if run -v VERBOSITY=verbose -c "CREATE INDEX threshold_${name}_idx ON threshold_${name} ($index_columns)" >"$TMP/threshold-$name.out" 2>&1; then
+        echo "toast-dml: $name datum below index compression threshold was accepted" >&2; exit 1
+    fi
+    case $(cat "$TMP/threshold-$name.out") in
+        *54000*) ;;
+        *) echo "toast-dml: $name threshold failure did not report SQLSTATE 54000" >&2; exit 1 ;;
+    esac
+done
+"${PYTHON:-python3}" - "$TMP" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+names = ','.join(f'c{i}' for i in range(14))
+columns = ','.join(f'c{i} text' for i in range(14))
+values = ','.join("'" + chr(97 + i) * 600 + "'" for i in range(14))
+for mode in ('mixed', 'external', 'plain', 'inherited_external', 'inherited_plain'):
+    inherited = mode.startswith('inherited_')
+    initial = 'EXTENDED' if inherited else 'EXTERNAL'
+    lines = [f'CREATE TABLE policy_{mode} ({columns});']
+    lines += [f'ALTER TABLE policy_{mode} ALTER c{i} SET STORAGE {initial};' for i in range(14)]
+    lines += [f'INSERT INTO policy_{mode} VALUES ({values});']
+    for i in range(14):
+        target = ('EXTENDED' if i < 13 else 'EXTERNAL') if mode == 'mixed' else (
+            'PLAIN' if mode.endswith('plain') else 'EXTERNAL')
+        lines.append(f'ALTER TABLE policy_{mode} ALTER c{i} SET STORAGE {target};')
+    (root / f'policy-{mode}.sql').write_text('\n'.join(lines) + '\n')
+PY
+policy_columns=$("${PYTHON:-python3}" -c "print(','.join('c%d' % i for i in range(14)))")
+for mode in mixed external plain inherited_external inherited_plain; do
+    run -f "$TMP/policy-$mode.sql" >/dev/null
+    if [ "$mode" = external ] || [ "$mode" = plain ]; then
+        if run -v VERBOSITY=verbose -c "CREATE INDEX policy_${mode}_idx ON policy_${mode} ($policy_columns)" >"$TMP/policy-$mode.out" 2>&1; then
+            echo "toast-dml: $mode policy incorrectly allowed index compression" >&2; exit 1
+        fi
+        case $(cat "$TMP/policy-$mode.out") in
+            *54000*) ;;
+            *) echo "toast-dml: $mode index failure did not report SQLSTATE 54000" >&2; exit 1 ;;
+        esac
+    else
+        run -c "CREATE INDEX policy_${mode}_idx ON policy_${mode} ($policy_columns)" >/dev/null
+    fi
+done
+# A modest saving in one segment must not make the complete key larger due
+# to per-segment headers; the same raw logical key already fits on a page.
+"${PYTHON:-python3}" - >"$TMP/index-overhead.sql" <<'PY'
+prefix = ('8weqi6l506f2b6apyhr1oabz6o16424gwkcjmhz4vw2jwsiyyb4kiwhd3tm0jy9qdssfphldjfln3oyzw8mi0pokvjol1f74rhf9iw2cdef57uxeegui4u9enly24vnahigv5lrt6z6eqix64mhe1jqkvrkbcpk7dwlve3mbf9qpydznu1a2it8n0l8wpsa903gv8tfp16qu8jc4rumouvfhubz9d4uwr1nmct3oxy7jgrx3q8mwrik52b68f0urjxipfjtqitwogveei6c014wuegypmgbv1ywz7cw8ykdo5w3j1gvmew2olwes0byggkossr1v1ajpd25nh20v292ut8pi0el9wts2ngse9edqje8dysk3yfm3zdxk8tzx')
+names = ','.join(f'c{i}' for i in range(32))
+print(f"CREATE TABLE index_overhead ({','.join(f'c{i} text' for i in range(32))});")
+for i in range(1, 32):
+    print(f'ALTER TABLE index_overhead ALTER c{i} SET STORAGE PLAIN;')
+values = [prefix + 'A' * (600 - len(prefix))] + ['x' * 240] * 31
+print('INSERT INTO index_overhead VALUES (' + ','.join("'" + v + "'" for v in values) + ');')
+print('ALTER TABLE index_overhead ALTER c0 SET STORAGE PLAIN;')
+print(f'CREATE INDEX index_overhead_idx ON index_overhead ({names});')
+PY
+run -f "$TMP/index-overhead.sql" >/dev/null
+[ "$(run -c 'select count(*) from index_overhead')" = 1 ]
 # A non-NULL nine-column row has no bitmap and fits where an otherwise similar
 # row with a NULL needs the larger header and no longer fits.
 wide_payload=$(awk 'BEGIN { for (i=0;i<8100;i++) printf "x" }')

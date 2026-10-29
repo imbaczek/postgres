@@ -1375,6 +1375,10 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
   (loop for attnum in (pg-index-columns idx)
         collect (aref values (1- attnum))))
 
+(defconstant +toast-index-target+
+  (floor (- +blcksz+ (maxalign (+ +size-of-page-header+ +size-of-item-id+))) 16)
+  "C heaptoast.h TOAST_INDEX_TARGET: one sixteenth of MaxHeapTupleSize.")
+
 (defun index-storage-key (index table values &optional physical-values)
   "Encode VALUES, retaining independently compressed eligible column segments.
 The segments preserve their storage representation across B-tree page rewrites."
@@ -1383,13 +1387,19 @@ The segments preserve their storage representation across B-tree page rewrites."
           for attnum in (pg-index-columns index)
           for column = (aref (pg-class-columns table) (1- attnum))
           for raw = (encode-index-key (list value) (list (pg-column-type column)))
-          for compressed = (and (> (length raw) 1024)
-                                (or (find (pg-column-effective-storage column) "xm")
-                                    (let ((physical (and physical-values (aref physical-values (1- attnum)))))
-                                      (or (heap-compressed-varlena-p physical)
-                                          (and (heap-external-varlena-p physical)
-                                               (< (logand (heap-external-varlena-external-info physical) #x3fffffff)
-                                                  (- (heap-external-varlena-raw-size physical) 4))))))
+          for physical = (and physical-values (aref physical-values (1- attnum)))
+          for inherited-compression-p = (or (heap-compressed-varlena-p physical)
+                                            (and (heap-external-varlena-p physical)
+                                                 (< (logand (heap-external-varlena-external-info physical) #x3fffffff)
+                                                    (- (heap-external-varlena-raw-size physical) 4))))
+          for compressed = (and (or inherited-compression-p
+                                    (and (find (pg-column-effective-storage column) "xm")
+                                         (not (eq value +null+))
+                                         (multiple-value-bind (size offsets payloads mask)
+                                             (heap-tuple-layout (vector value) (vector column))
+                                           (declare (ignore size offsets mask))
+                                           (let ((payload (aref payloads 0)))
+                                             (and payload (> (+ (length payload) 4) +toast-index-target+))))))
                                 (pglz-compress raw))
           do (when compressed (setf compressed-p t))
              (push (list raw compressed) parts))
@@ -1400,6 +1410,9 @@ The segments preserve their storage representation across B-tree page rewrites."
           (let* ((size (loop for (raw compressed) in parts sum (+ 9 (length (or compressed raw)))))
                  (payload (make-array size :element-type '(unsigned-byte 8)))
                  (position 0))
+            ;; Segment headers can outweigh a modest compression saving.
+            (when (>= size (length logical))
+              (return-from index-storage-key logical))
             (loop for (raw compressed) in parts
                   for bytes = (or compressed raw)
                   do (setf (aref payload position) (if compressed 1 0))
