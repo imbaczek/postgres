@@ -421,17 +421,35 @@ result is text for typeof and int4 for array_length."
 
 (defvar *toast-slice-current* nil)
 
-(defun eval-toast-bytea-substring (arguments context)
-  "Evaluate a selected external bytea substring at its projection position."
+(defun eval-toast-substring (arguments context type)
+  "Evaluate a selected external bytea or text substring at its projection position."
   (let ((bounds (mapcar (lambda (argument) (eval-expr argument nil)) (rest arguments))))
-    (when (member +null+ bounds) (return-from eval-toast-bytea-substring +null+))
+    (when (member +null+ bounds)
+      ;; Full text materialization validated UTF-8 even when a bound was NULL.
+      (when (eq type :text)
+        (destructuring-bind (toast pointer snapshot environment) context
+          (declare (ignore environment))
+          (unless toast (ereport "XX001" "external value has no owning TOAST relation"))
+          (toast-fetch-text-slice toast pointer snapshot 0 0
+                                  :index-reader #'select-toast-index-reader)))
+      (return-from eval-toast-substring +null+))
+    (when (and (eq type :text) (rest bounds) (minusp (second bounds)))
+      ;; Preserve full-materialization error ordering for corrupt text.
+      (destructuring-bind (toast pointer snapshot environment) context
+        (declare (ignore environment))
+        (unless toast (ereport "XX001" "external value has no owning TOAST relation"))
+        (toast-fetch-text-slice toast pointer snapshot 0 0
+                                :index-reader #'select-toast-index-reader)))
     (multiple-value-bind (offset count)
         (sql-substring-range (first bounds) (second bounds) (not (null (rest bounds))))
       (destructuring-bind (toast pointer snapshot environment) context
         (declare (ignore environment))
         (unless toast (ereport "XX001" "external value has no owning TOAST relation"))
-        (toast-fetch-value-slice toast pointer snapshot offset (or count #x40000000)
-                                 :index-reader #'select-toast-index-reader)))))
+        (if (eq type :bytea)
+            (toast-fetch-value-slice toast pointer snapshot offset (or count #x40000000)
+                                     :index-reader #'select-toast-index-reader)
+            (toast-fetch-text-slice toast pointer snapshot offset count
+                                    :index-reader #'select-toast-index-reader))))))
 
 (defun analyze-wal-receiver-function (name arguments)
   (when arguments
@@ -4201,7 +4219,7 @@ truncate and interpret the result at TYPE's signed width."
     (:func
      (let ((slice (assoc expr *toast-slice-current* :test #'eq)))
        (when (and slice (eq env (fourth (cdr slice))))
-         (return-from eval-expr (eval-toast-bytea-substring (third expr) (cdr slice)))))
+         (return-from eval-expr (eval-toast-substring (third expr) (cdr slice) (expr-type expr)))))
      (let* ((name (second expr))
             (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr)))
             (type (expr-type expr)))

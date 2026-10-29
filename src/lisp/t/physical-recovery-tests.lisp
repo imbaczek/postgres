@@ -552,6 +552,112 @@
           (when pg::*clog-stream* (close pg::*clog-stream*))
           (pg::smgr-close-all)))))
 
+(deftest toast-text-slices-stream-utf8-and-validate-suffix
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (pg::*relation-streams* (make-hash-table :test #'equal))
+             (pg::*wal-page-cache* (make-hash-table :test #'equal))
+             (pg::*wal-ready* nil) (pg::*clog-stream* nil) (pg::*active-xids* nil)
+             (pg::*catalog* (pg::make-catalog)) (pg::*backend* (pg::make-backend))
+             (database (pg::make-database :name "postgres"))
+             (snapshot (pg::make-snapshot-struct :xmin 3 :xmax 50 :xip nil :curcid 0))
+             (registration (pg::make-snapshot-registration))
+             (text (concatenate 'string (make-string 1995 :initial-element #\a)
+                                "é🙂é€" (make-string 5000 :initial-element #\z)))
+             (raw (pg::string->bytes text)))
+        (setf (gethash "postgres" (pg::catalog-databases pg::*catalog*)) database)
+        (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
+        (unwind-protect
+             (let* ((table (pg::create-table* database "text_slice"
+                                              (list (list :name "v" :type :text :typmod -1))))
+                    (toast (pg::pg-class-toast table))
+                    (plain nil) (compressed nil) (bad nil))
+               (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                 (pg::with-write-lock
+                   (setf plain (pg::toast-store-value-unlocked toast raw nil 42 0)
+                         compressed (pg::toast-store-value-unlocked toast raw nil 42 0 :compress t)
+                         bad (pg::toast-store-value-unlocked
+                              toast (concatenate '(vector (unsigned-byte 8)) raw
+                                                 (make-array 1 :element-type '(unsigned-byte 8) :initial-element #xff))
+                              nil 42 0))))
+               (pg::register-active-snapshot snapshot registration)
+               (ok (nth-value 2 (pg::toast-pointer-storage-size toast compressed)))
+               ;; A full-value projection of the same column must retain the
+               ;; ordinary fetch path while its substring still returns SQL text.
+               (pg::clog-set 42 pg::+clog-committed+)
+               (pg::with-write-lock
+                 (pg::heapam-insert (pg::pg-class-relfilenode table)
+                                    (pg::pg-class-columns table) (vector plain) 42 0))
+               (let ((old (symbol-function 'pg::toast-fetch-value)) (calls 0) (rows nil)
+                                                                    (pg::*current-snapshot* snapshot))
+                 (unwind-protect
+                      (progn
+                        (setf (symbol-function 'pg::toast-fetch-value)
+                              (lambda (&rest args) (incf calls) (apply old args)))
+                        (let* ((ast (first (pg::parse-statements
+                                            "SELECT substring(v,1996,3), v FROM text_slice")))
+                               (plan (pg::plan-select-query ast)))
+                          (pg::interpret-query-plan
+                           plan (getf (pg::query-plan-prepared plan) :relations)
+                           (lambda (row) (push (car row) rows))))
+                        (ok (= calls 1))
+                        (ok (and (= (length rows) 1)
+                                 (string= (aref (first rows) 0) (subseq text 1995 1998))
+                                 (string= (aref (first rows) 1) text))))
+                   (setf (symbol-function 'pg::toast-fetch-value) old)))
+               (let ((old (symbol-function 'pg::toast-fetch-value)))
+                 (unwind-protect
+                      (progn
+                        (setf (symbol-function 'pg::toast-fetch-value)
+                              (lambda (&rest args) (declare (ignore args))
+                                (error "text slice must not fetch full value")))
+                        (let* ((pg::*current-snapshot* snapshot)
+                               (ast (first (pg::parse-statements "SELECT substring(v,1996,3) FROM text_slice")))
+                               (plan (pg::plan-select-query ast))
+                               (rows nil))
+                          (pg::interpret-query-plan
+                           plan (getf (pg::query-plan-prepared plan) :relations)
+                           (lambda (row) (push (car row) rows)))
+                          (ok (and (= (length rows) 1)
+                                   (string= (aref (first rows) 0) (subseq text 1995 1998)))))
+                        (dolist (pointer (list plain compressed))
+                          (dolist (bounds '((0 0) (1994 6) (1995 1) (1996 1) (1997 2) (7000 100) (0 nil)))
+                            (let* ((start (min (first bounds) (length text)))
+                                   (count (second bounds))
+                                   (end (if count (min (length text) (+ start count)) (length text))))
+                              (ok (string= (subseq text start end)
+                                           (pg::toast-fetch-text-slice toast pointer snapshot
+                                                                       (first bounds) count))))))
+                        (let* ((expression '(:func "substr" ((:col 1 :type :text)
+                                                             (:const 1996 :type :int4)
+                                                             (:const 3 :type :int4)) :type :text))
+                               (environment (vector pg::+null+))
+                               (pg::*toast-slice-current*
+                                 (list (cons expression (list toast plain snapshot environment)))))
+                          (ok (string= (subseq text 1995 1998)
+                                       (pg::eval-expr expression environment))))
+                        (ok (intake-fails-p (lambda () (pg::toast-fetch-text-slice toast bad snapshot 0 1))))
+                        (ok (intake-fails-p (lambda () (pg::toast-fetch-text-slice toast bad snapshot 0 0))))
+                        (dolist (suffix '((#x80) (#xc0 #x80) (#xe0 #x80 #x80)
+                                          (#xed #xa0 #x80) (#xf4 #x90 #x80 #x80) (#xe2 #x82)))
+                          (let ((invalid (concatenate '(vector (unsigned-byte 8)) raw
+                                                      (coerce suffix '(vector (unsigned-byte 8))))))
+                            (dolist (compression '(nil t))
+                              (let ((pointer
+                                      (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                                        (pg::with-write-lock
+                                          (pg::toast-store-value-unlocked toast invalid nil 42 0 :compress compression)))))
+                                (when compression
+                                  (ok (nth-value 2 (pg::toast-pointer-storage-size toast pointer))))
+                                (ok (intake-fails-p
+                                     (lambda () (pg::toast-fetch-text-slice toast pointer snapshot 0 1))))))))
+                        (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
+                          (ok t)))
+                   (setf (symbol-function 'pg::toast-fetch-value) old))))
+          (pg::release-snapshot-registration registration)
+          (when pg::*clog-stream* (close pg::*clog-stream*))
+          (pg::smgr-close-all)))))
+
 (deftest toast-stores-and-fetches-binary-chunks
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)

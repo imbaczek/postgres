@@ -597,6 +597,29 @@
                          (make-array 3 :element-type '(unsigned-byte 8)
                                        :initial-contents '(2 3 4)))))))
 
+(rove:deftest test-simple-select-toast-text-slice-plan
+    (let* ((columns (vector (make-pg-column :name "v" :type :varchar :attnum 1)
+                            (make-pg-column :name "t" :type :text :attnum 2)))
+           (table (make-pg-class :oid 42 :columns columns))
+           (relations (list (list :table table)))
+           (scan '(:seq-scan 0 42))
+           (varchar '(:func "substring" ((:cast (:col 1 :type :varchar) :type :text)
+                                         (:const 2 :type :int4)) :type :text))
+           (text '(:func "substr" ((:col 2 :type :text) (:const 1 :type :int4)
+                                   (:const 3 :type :int4)) :type :text))
+           (plan (simple-select-toast-slice
+                  (list :project (list (list :expr varchar) (list :expr text)) scan) relations)))
+      (rove:ok (and plan (equal (mapcar #'cdr (cdr plan)) '(1 2))))
+      (rove:ok (null (simple-select-toast-slice
+                      (list :project (list (list :expr varchar)
+                                           (list :expr '(:col 1 :type :varchar))) scan)
+                      relations)))
+      (rove:ok (null (simple-select-toast-slice
+                      (list :project (list (list :expr
+                                                 '(:func "substr" ((:col 2 :type :text)
+                                                                   (:col 1 :type :int4)) :type :text))) scan)
+                      relations)))))
+
 (rove:deftest test-tuple-roundtrip
     (let* ((cols (coerce
                   (list (make-pg-column :name "a" :type :int4 :typmod -1

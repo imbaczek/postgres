@@ -45,7 +45,7 @@ trailing bytes within that range with corruption error XX001."
 
 (declaim (ftype (function () t) check-for-interrupts))
 
-(defun pglz-decompress-slice (raw-size start length compressed-size producer)
+(defun pglz-decompress-slice (raw-size start length compressed-size producer &key octet-consumer)
   "Decode and validate an entire PGLZ stream, retaining only a requested slice.
 PRODUCER calls its argument with each unsigned byte of the compressed stream."
   (check-type raw-size (integer 0 1073741819))
@@ -65,6 +65,7 @@ PRODUCER calls its argument with each unsigned byte of the compressed stream."
                  (check-for-interrupts))
                (when (>= out raw-size) (corrupt))
                (setf (aref history (logand out 4095)) byte)
+               (when octet-consumer (funcall octet-consumer byte))
                (when (and (>= out start) (< out (+ start length)))
                  (setf (aref result (- out start)) byte))
                (incf out))

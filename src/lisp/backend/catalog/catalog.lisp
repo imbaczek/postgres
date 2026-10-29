@@ -1781,6 +1781,72 @@ misordered, extra or malformed chunks signal corruption."
                      (toast-decompress-payload payload raw-size)
                      payload))))))
 
+(defun toast-map-value-octets (toast pointer snapshot function
+                               &key (index-reader #'call-with-btree-relation-read-lock))
+  "Visit every validated raw octet under the parent snapshot and index lease."
+  (unless (and snapshot
+               (sb-thread:with-mutex (*snapshot-count-lock*)
+                 (gethash snapshot *active-snapshot-set*)))
+    (error "TOAST fetch requires an active snapshot"))
+  (multiple-value-bind (size raw-size compressed-p) (toast-pointer-storage-size toast pointer)
+    (let ((index-node (pg-toast-index-relfilenode toast)))
+      (when (< (buf-nblocks index-node) 2)
+        (ereport "XX001" "TOAST index is missing"))
+      (funcall index-reader index-node
+               (lambda ()
+                 (if compressed-p
+                     (pglz-decompress-slice
+                      raw-size 0 0 (- size 4)
+                      (lambda (consume)
+                        (toast-map-value-chunks-unlocked
+                         toast pointer size
+                         (lambda (data sequence)
+                           (when (zerop sequence)
+                             (unless (and (> (length data) 4) (= (page-u32 data 0) raw-size))
+                               (ereport "XX001" "invalid compressed TOAST header")))
+                           (loop for i from (if (zerop sequence) 4 0) below (length data)
+                                 do (funcall consume (aref data i))))))
+                      :octet-consumer function)
+                     (toast-map-value-chunks-unlocked
+                      toast pointer size
+                      (lambda (data sequence)
+                        (declare (ignore sequence))
+                        (check-for-interrupts)
+                        (loop for byte across data do (funcall function byte)))))))))
+  (values))
+
+(defun toast-fetch-text-slice (toast pointer snapshot start count
+                               &key (index-reader #'call-with-btree-relation-read-lock))
+  "Return selected Unicode characters while validating the complete UTF-8 value."
+  (unless (and (integerp start) (>= start 0)
+               (or (null count) (and (integerp count) (>= count 0))))
+    (error "invalid TOAST text slice bounds"))
+  (let ((needed 0) (code 0) (minimum 0) (position 0))
+    (with-output-to-string (output)
+      (labels ((emit (value)
+                 (when (and (>= position start)
+                            (or (null count) (< (- position start) count)))
+                   (write-char (code-char value) output))
+                 (incf position))
+               (consume (byte)
+                 (if (zerop needed)
+                     (cond ((< byte #x80) (emit byte))
+                           ((<= #xc2 byte #xdf) (setf needed 1 code (logand byte #x1f) minimum #x80))
+                           ((<= #xe0 byte #xef) (setf needed 2 code (logand byte #x0f) minimum #x800))
+                           ((<= #xf0 byte #xf4) (setf needed 3 code (logand byte #x07) minimum #x10000))
+                           (t (error "invalid UTF-8 in TOAST text")))
+                     (progn
+                       (unless (<= #x80 byte #xbf) (error "invalid UTF-8 in TOAST text"))
+                       (setf code (logior (ash code 6) (logand byte #x3f)))
+                       (decf needed)
+                       (when (zerop needed)
+                         (unless (and (<= minimum code #x10ffff)
+                                      (not (<= #xd800 code #xdfff)))
+                           (error "invalid UTF-8 in TOAST text"))
+                         (emit code))))))
+        (toast-map-value-octets toast pointer snapshot #'consume :index-reader index-reader)
+        (unless (zerop needed) (error "truncated UTF-8 in TOAST text"))))))
+
 (defun toast-fetch-value-slice (toast pointer snapshot start length
                                 &key (index-reader #'call-with-btree-relation-read-lock))
   "Fetch up to LENGTH bytes from START, clamped to the logical value.

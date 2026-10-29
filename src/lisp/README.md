@@ -972,7 +972,13 @@ on process restart. These functions reject a primary with SQLSTATE `55000`.
 outside signed int64; `::bigint` checks overflow.
 Text `||` and `substr(text, start [, length])` support the string operations used
 by Patroni's status expression. Substring positions count Unicode characters,
-including SQL's adjusted zero/negative starts. The `substr` and `substring`
+including SQL's adjusted zero/negative starts. Direct text or varchar substring
+projections with constant bounds can use the same narrow interpreted single-table
+sequential-scan optimization described below when the column is not otherwise
+needed in full. For external values it streams all chunks, validates the full
+UTF-8 value (including for an empty result), and retains only selected
+characters; compressed values also decode the full PGLZ stream. Other plan or
+expression shapes use ordinary materialization. The `substr` and `substring`
 function forms also accept `bytea`, where positions count bytes. Bytea `||`
 concatenates octets; when one operand is bytea, an unknown literal on the
 other side is read as bytea. The result allocation, including its four-byte
