@@ -568,11 +568,11 @@ Match varchar_support and numeric_support's typmod relabel conditions."
       (when (< (length slots) width) (cons table slots)))))
 
 (defun dml-target-row-origins (tuple environment)
-  "Map detached target origins into the DML environment, leaving source slots empty."
-  (let* ((origins (htup-origins tuple))
-         (result (make-array (length environment) :initial-element nil)))
-    (when origins (replace result origins :end1 (min (length result) (length origins))))
-    result))
+  "Replace target origins while retaining the matched source row's origins."
+  (let* ((target-width (length (htup-values tuple)))
+         (source-origins (and *query-row-origins*
+                              (subseq *query-row-origins* target-width))))
+    (dml-row-origins tuple source-origins environment)))
 
 (defun exec-update-subqueries (stream ast)
   (let* ((*datum-origin-capture* t)

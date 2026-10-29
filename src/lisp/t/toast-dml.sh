@@ -179,6 +179,49 @@ exec 3>&-
 wait "$READER"; READER=
 wait "$WRITER"; WRITER=
 [ "$(run -c 'select id,length(v),substr(v,1,1) from toast_scalar_epq')" = '2|20001|b' ]
+run -c 'create table toast_update_from (id int primary key, v text)' >/dev/null
+run -c 'alter table toast_update_from alter column v set storage plain' >/dev/null
+run -c "insert into toast_update_from values (1,'small'),(2,'small')" >/dev/null
+run -c 'update toast_update_from t set v=s.v from toast_scalar_source s where t.id=s.id' >/dev/null
+[ "$(run -c "select count(*) from toast_update_from where (id=1 and length(v)=20000 and substr(v,1,1)='a') or (id=2 and length(v)=20001 and substr(v,1,1)='b')")" = 2 ]
+run -c 'update toast_update_from t set v=s.v from (select s.id,s.v from toast_scalar_source s join toast_join_keys k using(id)) s where t.id=s.id' >/dev/null
+run -c 'update toast_update_from t set v=s.v from toast_scalar_source s join toast_join_keys k using(id) where t.id=s.id' >/dev/null
+[ "$(run -c "select count(*) from toast_update_from where (id=1 and length(v)=20000 and substr(v,1,1)='a') or (id=2 and length(v)=20001 and substr(v,1,1)='b')")" = 2 ]
+if run -v VERBOSITY=verbose -c "update toast_update_from t set v=s.v || '' from toast_scalar_source s where t.id=s.id" >"$TMP/update-from-computed.out" 2>&1; then
+    echo 'toast-dml: computed UPDATE FROM retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/update-from-computed.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: computed UPDATE FROM did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+run -c 'create table toast_from_epq (id int primary key, v text)' >/dev/null
+run -c 'alter table toast_from_epq alter column v set storage plain' >/dev/null
+run -c "insert into toast_from_epq values (1,'short')" >/dev/null
+run -c 'create table toast_from_pair (a text, b text)' >/dev/null
+run -c "insert into toast_from_pair values ('$index_suffix','b$index_suffix')" >/dev/null
+mkfifo "$TMP/from-epq.sql"
+run < "$TMP/from-epq.sql" > "$TMP/from-epq.out" 2>&1 &
+READER=$!
+exec 3> "$TMP/from-epq.sql"
+printf '%s\n' 'begin; update toast_from_epq set id=2 where id=1;' '\echo ready' >&3
+i=0
+until grep -Fxq ready "$TMP/from-epq.out"; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || { cat "$TMP/from-epq.out" >&2; exit 1; }; sleep 0.1
+done
+run -c 'select pg_backend_pid()' -c 'update toast_from_epq t set v=case when t.id=1 then s.a else s.b end from toast_from_pair s where t.id<=2' >"$TMP/from-epq-waiter.out" 2>&1 &
+WRITER=$!
+i=0
+until waiter_pid=$(awk '/^[0-9]+$/{print; exit}' "$TMP/from-epq-waiter.out") && [ -n "$waiter_pid" ]; do
+    kill -0 "$WRITER" 2>/dev/null || { cat "$TMP/from-epq-waiter.out" >&2; exit 1; }
+    i=$((i + 1)); [ "$i" -lt 100 ] || exit 1; sleep 0.1
+done
+printf '%s\n(quit)\n' "(loop repeat 100 for backend = (lookup-backend $waiter_pid) when (and backend (backend-waiting-xid backend)) return :waiting do (sleep 0.05) finally (return :timeout))" | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/from-epq-wait.out"
+grep -Fq ':WAITING' "$TMP/from-epq-wait.out" || { cat "$TMP/from-epq-wait.out" >&2; exit 1; }
+printf '%s\n' 'commit;' '\q' >&3
+exec 3>&-
+wait "$READER"; READER=
+wait "$WRITER"; WRITER=
+[ "$(run -c 'select id,length(v),substr(v,1,1) from toast_from_epq')" = '2|20001|b' ]
 run -c 'create table toast_scalar_mixed (id int, v text)' >/dev/null
 run -c 'alter table toast_scalar_mixed alter column v set storage plain' >/dev/null
 run -c 'insert into toast_scalar_mixed select id,(select (select v)) from toast_scalar_source' >/dev/null

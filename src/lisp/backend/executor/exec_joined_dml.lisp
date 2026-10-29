@@ -33,26 +33,26 @@
         result)))
 
 (defun make-dml-source-replay (plan)
-  ;; The replay store lazily owns copied source environments, spilling as needed.
-  ;; Its iterator retains the source plan's CTE and outer-frame context; closing
-  ;; the store also closes the input, including on errors or cancellation.
+  ;; The synthetic SELECT * projection is not the DML source environment:
+  ;; JOIN USING can project fewer columns than the raw source slot layout.
   (let* ((relations (subquery-registered-relations plan))
          (frames *subquery-outer-frames*)
          (context *cte-execution-context*)
-         (input (let ((*cte-active-plan* plan))
-                  ;; Admission may have waited while a planned index was dropped. Reconcile
-                  ;; with registered paths before constructing the iterator, preserving
-                  ;; a valid planned index and otherwise using the sequential fallback.
+         (tree (query-plan-physical plan))
+         (capture-p (and *datum-origin-capture* (eq (first tree) :project)
+                         (simple-datum-origin-plan-p (third tree) relations t)))
+         (input (let ((*cte-active-plan* plan) (*datum-origin-capture* capture-p))
                   (reconcile-query-plan-access-paths plan relations)
-                  (make-physical-plan-iterator (query-plan-physical plan) relations))))
-    (make-query-replay-store
-     (make-sql-iterator
-      (lambda ()
-        (let ((*cte-active-plan* plan) (*subquery-outer-frames* frames)
-                                       (*cte-execution-context* context))
-          (multiple-value-bind (row present) (sql-iterator-next input)
-            (values (when present (cdr row)) present))))
-      (lambda () (close-sql-iterator input))))))
+                  (make-physical-plan-iterator (if capture-p (third tree) tree) relations))))
+    (let ((*datum-origin-capture* capture-p))
+      (make-query-replay-store
+       (make-sql-iterator
+        (lambda ()
+          (let ((*cte-active-plan* plan) (*subquery-outer-frames* frames)
+                                         (*cte-execution-context* context) (*datum-origin-capture* capture-p))
+            (multiple-value-bind (row present origins) (sql-iterator-next input)
+              (values (when present (if capture-p row (cdr row))) present origins))))
+        (lambda () (close-sql-iterator input)))))))
 
 (defun dml-one-time-qualification-p (expression)
   ;; Like is_pseudo_constant_clause, a gate must be row-independent and free of
@@ -87,6 +87,18 @@
                     (nreverse rows) :initial-value '(:bool t)))))
   prepared)
 
+(defun dml-row-origins (tuple source-origins environment)
+  "Combine target and source metadata in the same slots as ENVIRONMENT."
+  (let* ((target-origins (htup-origins tuple))
+         (target-width (length (htup-values tuple)))
+         (result (make-array (length environment) :initial-element nil)))
+    (when target-origins
+      (replace result target-origins :end1 (min target-width (length target-origins))))
+    (when source-origins
+      (replace result source-origins :start1 target-width
+                                     :end1 (min (length result) (+ target-width (length source-origins)))))
+    result))
+
 (defun stream-joined-dml-candidates (prepared table function &optional toast-demand)
   ;; Target tuples carry physical identity; replayed source values are independent
   ;; of that identity and remain from the original statement snapshot. The success
@@ -109,7 +121,10 @@
                                      :demand toast-demand :retain-external-p (not (null toast-demand)))
            (let ((modified-p nil))
              (flet ((offer (source)
-                      (let ((environment (concatenate 'vector (htup-values tuple) source)))
+                      (let* ((environment (concatenate 'vector (htup-values tuple) source))
+                             (*query-row-origins*
+                               (and *datum-origin-capture*
+                                    (dml-row-origins tuple *query-row-origins* environment))))
                         (when (or (null where)
                                   (call-with-dml-expression-evaluation
                                    (lambda () (true-p (eval-expr where environment)))))
