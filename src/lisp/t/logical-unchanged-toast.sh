@@ -63,6 +63,12 @@ until [ "$(sql "$TARGET_PORT" "SELECT state FROM pg_lisp_subscription_progress W
     sleep 0.25
 done
 stop_worker
+i=0
+until [ "$(sql "$SOURCE_PORT" "SELECT active FROM pg_replication_slots WHERE slot_name='unchanged_toast'")" = f ]; do
+    i=$((i + 1)); [ "$i" -lt 1200 ] || { echo 'logical-unchanged-toast: slot release timed out' >&2; exit 1; }
+    sleep 0.25
+done
+slot_floor=$(sql "$SOURCE_PORT" "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='unchanged_toast'")
 sql "$TARGET_PORT" 'ALTER TABLE unchanged_toast ALTER COLUMN v SET STORAGE EXTERNAL' >/dev/null
 awk 'BEGIN { printf "INSERT INTO unchanged_toast VALUES (1, 0, \047"; for (i=0;i<41943040;i++) printf "x"; printf "\047);\n" }' >"$TMP/insert.sql"
 psql -X -q -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$SOURCE_PORT" -U postgres -d postgres -f "$TMP/insert.sql" >/dev/null
@@ -74,8 +80,12 @@ sql "$SOURCE_PORT" 'INSERT INTO unchanged_toast VALUES (1,2,NULL) ON CONFLICT (i
 sql "$SOURCE_PORT" 'UPDATE unchanged_toast SET id=4 WHERE id=1' >/dev/null
 sql "$SOURCE_PORT" 'INSERT INTO unchanged_toast VALUES (2, 2, NULL)' >/dev/null
 sql "$SOURCE_PORT" "BEGIN; INSERT INTO unchanged_toast VALUES (3,0,'same transaction'); UPDATE unchanged_toast SET marker=3 WHERE id=3; COMMIT" >/dev/null
-kill "$SOURCE_PID"; wait "$SOURCE_PID" 2>/dev/null || true; SOURCE_PID=
+[ "$(sql "$SOURCE_PORT" "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='unchanged_toast'")" = "$slot_floor" ]
+# The subscriber is stopped: recovery must reconstruct the retained marker
+# before the slot is reopened, without relying on a clean shutdown.
+kill -KILL "$SOURCE_PID"; wait "$SOURCE_PID" 2>/dev/null || true; SOURCE_PID=
 start_source
+[ "$(sql "$SOURCE_PORT" "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='unchanged_toast'")" = "$slot_floor" ]
 [ "$(sql "$SOURCE_PORT" 'SELECT marker, length(v) FROM unchanged_toast WHERE id=4')" = '2|41943040' ]
 start_worker
 i=0
@@ -85,12 +95,30 @@ until [ "$(sql "$TARGET_PORT" 'SELECT count(*) FROM unchanged_toast' 2>/dev/null
     i=$((i + 1)); [ "$i" -lt 1200 ] || { echo 'logical-unchanged-toast: apply timed out' >&2; exit 1; }
     sleep 0.25
 done
+applied_lsn=$(sql "$TARGET_PORT" "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot='unchanged_toast' AND state='ready'")
+i=0
+until [ "$(sql "$SOURCE_PORT" "SELECT confirmed_flush_lsn >= '$applied_lsn'::pg_lsn FROM pg_replication_slots WHERE slot_name='unchanged_toast'" 2>/dev/null || true)" = t ]; do
+    kill -0 "$WORKER_PID" 2>/dev/null || { cat "$TMP/worker.log" >&2; exit 1; }
+    i=$((i + 1)); [ "$i" -lt 1200 ] || { echo 'logical-unchanged-toast: acknowledgment timed out' >&2; exit 1; }
+    sleep 0.25
+done
 stop_worker
 kill "$TARGET_PID"; wait "$TARGET_PID" 2>/dev/null || true; TARGET_PID=
 start_target
 [ "$(sql "$TARGET_PORT" 'SELECT marker, length(v) FROM unchanged_toast WHERE id=4')" = '2|41943040' ]
 [ "$(sql "$TARGET_PORT" 'SELECT v IS NULL FROM unchanged_toast WHERE id=2')" = t ]
 [ "$(sql "$TARGET_PORT" 'SELECT marker, v FROM unchanged_toast WHERE id=3')" = '3|same transaction' ]
+start_worker
+sql "$SOURCE_PORT" "INSERT INTO unchanged_toast VALUES (5,5,'resume barrier')" >/dev/null
+i=0
+until [ "$(sql "$TARGET_PORT" 'SELECT count(*) FROM unchanged_toast' 2>/dev/null || true)" = 4 ]; do
+    kill -0 "$WORKER_PID" 2>/dev/null || { cat "$TMP/worker.log" >&2; exit 1; }
+    i=$((i + 1)); [ "$i" -lt 1200 ] || { echo 'logical-unchanged-toast: resume timed out' >&2; exit 1; }
+    sleep 0.25
+done
+[ "$(sql "$TARGET_PORT" 'SELECT marker, v FROM unchanged_toast WHERE id=5')" = '5|resume barrier' ]
+[ "$(sql "$TARGET_PORT" 'SELECT count(*) FROM unchanged_toast WHERE id=4 AND marker=2')" = 1 ]
+stop_worker
 awk 'BEGIN { for (i=0;i<41943040;i++) printf "x"; printf "\n" }' >"$TMP/expected"
 sql "$TARGET_PORT" 'SELECT v FROM unchanged_toast WHERE id=4' >"$TMP/actual"
 cmp "$TMP/expected" "$TMP/actual"
