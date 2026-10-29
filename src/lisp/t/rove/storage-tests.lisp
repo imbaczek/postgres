@@ -300,6 +300,20 @@
       (rove:ok (string= "\"t\" text" (catalog-column-definition-sql column))
                "bootstrap schema retains the text type")))
 
+(rove:deftest test-json-input-validation
+    (dolist (text '("null" " true " "1" "-0.5e+10" "[]" "{}"
+                    "{\"a\": [1, null, {\"b\": true}], \"a\": 2}"
+                    "\"\\uD800\\u0000\""))
+      (rove:ok (string= text (sql-json-input text))
+               "valid JSON retains its exact source text"))
+  (dolist (text '("" "NULL" "01" "1." "1e" "[1,]" "{\"a\":}" "{\"a\":1,}"
+                  "{a:1}" "\"\\q\"" "\"\\u12x4\"" "true false" "\"\\u１234\""))
+    (rove:ok (handler-case (progn (sql-json-input text) nil) (error () t))
+             "invalid JSON signals an error"))
+  (let ((deep (concatenate 'string (make-string 20000 :initial-element #\[)
+                           "0" (make-string 20000 :initial-element #\]))))
+    (rove:ok (string= deep (sql-json-input deep)) "deep JSON uses an explicit stack")))
+
 (rove:deftest test-tuple-roundtrip
     (let* ((cols (coerce
                   (list (make-pg-column :name "a" :type :int4 :typmod -1

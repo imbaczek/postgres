@@ -166,7 +166,7 @@
          (progn ,@body))))
 
 (defparameter +sql-expression-types+
-  '((:bytea 17 -1) (:bool 16 1) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
+  '((:json 114 -1) (:bytea 17 -1) (:bool 16 1) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
     (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1)
     (:text-array 1009 -1) (:int2-array 1005 -1) (:int2vector-array 1006 -1) (:int4-array 1007 -1) (:int8-array 1016 -1)
     (:numeric-array 1231 -1) (:float4-array 1021 -1) (:float8-array 1022 -1)
@@ -1268,7 +1268,8 @@ so a nested argument error keeps its own diagnostics."
             expressions)))
 
 (defun analyze-comparison-operands (left right)
-  "Coerce unknown constants, and resolve new catalog types before value comparison."
+  "Coerce unknown constants, and resolve new catalog types before value comparison.
+JSON has no comparison operators, even though its stored value is text."
   (cond
     ((and (in-unknown-constant-p left) (not (in-unknown-constant-p right)))
      (setf left (coerce-in-constant left (expr-type right))))
@@ -1305,6 +1306,8 @@ so a nested argument error keeps its own diagnostics."
       (unless (eq (expr-type left) type) (setf left (list :cast left :type type :typmod -1)))
       (unless (eq (expr-type right) type) (setf right (list :cast right :type type :typmod -1)))))
   (let ((left-type (expr-type left)) (right-type (expr-type right)))
+    (when (or (eq left-type :json) (eq right-type :json))
+      (ereport "42883" "operator does not exist for json"))
     (unless (or (eq left-type right-type)
                 (and (member left-type '(:int2 :int4 :int8 :numeric)) (member right-type '(:int2 :int4 :int8 :numeric)))
                 (and (member left-type '(:text :varchar :name))
@@ -1734,6 +1737,9 @@ are supported."
 
 (defun sql-cast-value (value source target typmod &optional interval-literal-p)
   (when (eq value +null+) (return-from sql-cast-value +null+))
+  (when (eq target :json)
+    (return-from sql-cast-value
+      (if (eq source :json) value (sql-json-input (value->text value source)))))
   (when (eq target :bytea)
     (return-from sql-cast-value
       (cond ((eq source :bytea) value)
@@ -2689,6 +2695,8 @@ candidate selection."
   (let ((keys '()))
     (dolist (ast group-asts)
       (let ((expr (analyze-expr ast scope)))
+        (when (eq (expr-type expr) :json)
+          (ereport "42883" "could not identify an equality operator for type json"))
         (unless (or (eq (first expr) :col)
                     (and (eq (first expr) :outer-ref) (eq (first ast) :column)))
           (ereport "0A000" "GROUP BY currently supports column references only"))
@@ -3072,6 +3080,8 @@ candidate selection."
                  (ereport "42P01" "missing FROM-clause entry for table ~a" (second raw))
                  (ereport "42703" "column ~a does not exist" (second raw))))
            (ereport "0A000" "only result column names can be used in UNION ORDER BY")))
+       (when (eq (getf (nth position targets) :type) :json)
+         (ereport "42883" "could not identify an ordering operator for type json"))
        (cons (getf (nth position targets) :expr) (getf item :desc))))
    order))
 

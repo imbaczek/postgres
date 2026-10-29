@@ -997,7 +997,7 @@ from advancing the shared WAL generation between a failed save and rollback."
                             (- (logxor (logand packed #x7ff) #x400) #x400)))))
     (:varchar (if (< typmod 4) "varchar" (format nil "varchar(~d)" (- typmod 4))))
     (:int2 "smallint") (:int4 "integer") (:int8 "bigint") (:float4 "real")
-    (:float8 "double precision") (:bool "boolean") (:text "text") (:bytea "bytea") (:name "name")
+    (:float8 "double precision") (:bool "boolean") (:text "text") (:json "json") (:bytea "bytea") (:name "name")
     (:oid "oid") (:pg-lsn "pg_lsn") (:bit (if (minusp typmod) "\"bit\"" (format nil "bit(~d)" typmod)))
     (:char "\"char\"") (:int2vector "int2vector") (:text-array "text[]")
     (otherwise (ereport "0A000" "cannot serialize stored expression type ~a" type))))
@@ -1127,7 +1127,7 @@ from advancing the shared WAL generation between a failed save and rollback."
                                      (precision (ldb (byte 16 16) packed))
                                      (scale (- (logxor (logand packed #x7ff) #x400) #x400)))
                                 (format nil "numeric(~d,~d)" precision scale)))))
-              (:text "text") (:bytea "bytea")
+              (:text "text") (:json "json") (:bytea "bytea")
               (:varchar (if (< (pg-column-typmod column) 4) "varchar"
                             (format nil "varchar(~a)" (- (pg-column-typmod column) 4))))
               (otherwise (error "cannot publish unsupported type ~a" (pg-column-type column)))))
@@ -1363,6 +1363,10 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
 (defun make-index-object (oid name table cols
                           &key unique primary constraint nulls-not-distinct)
   "Create detached INDEX metadata with a previously reserved object ID."
+  (when (some (lambda (attnum)
+                (eq (pg-column-type (aref (pg-class-columns table) (1- attnum))) :json))
+              cols)
+    (ereport "42704" "data type json has no default operator class for access method btree"))
   (make-pg-index :oid oid
                  :name name
                  :relfilenode oid
@@ -1506,7 +1510,7 @@ The OID encoding alone is a byte prefix of every key for that value."
   "Default target heap tuple size, based on four tuples per page.")
 
 (defun toast-externalization-plan (values columns &optional (target +toast-tuple-target+))
-  "Select inline varchar, text and bytea attributes to externalize without compression.
+  "Select inline varchar, text, json and bytea attributes to externalize without compression.
 Return (index . payload) pairs in largest-first order; VALUES and COLUMNS are
 unchanged. Payloads may alias inline bytea values and must remain stable until
 used. The target is a goal, not a guarantee: selection stops when the tuple fits
@@ -1527,7 +1531,7 @@ and externalization of other variable-width types are not implemented."
           (loop for i below (length columns)
                 for value = (aref physical i)
                 for type = (pg-column-type (aref columns i))
-                when (and (member type '(:varchar :text :bytea))
+                when (and (member type '(:varchar :text :json :bytea))
                           (not (eq value +null+))
                           (not (heap-external-varlena-p value)))
                   do (let* ((payload (aref encoded i))

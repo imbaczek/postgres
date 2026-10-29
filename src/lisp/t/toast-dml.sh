@@ -24,6 +24,32 @@ test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data"
 test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
 big=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "a" }')
 other=$(awk 'BEGIN { for (i=0;i<3000;i++) printf "b" }')
+json_value=" { \"key\": \"$big\", \"key\": 2 } "
+run -c 'create table toast_json (id int primary key, v json)' >/dev/null
+run -c "insert into toast_json values (1, '$json_value')" >/dev/null
+[ "$(run -c 'select v from toast_json where id = 1')" = "$json_value" ]
+if run -c 'select v = v from toast_json' >/dev/null 2>&1; then
+    echo 'toast-dml: JSON equality was accepted' >&2
+    exit 1
+fi
+for query in 'select distinct v from toast_json' 'select v from toast_json order by v' \
+             'select v, count(*) from toast_json group by v' \
+             'select v from toast_json union select v from toast_json' \
+             'select row_number() over (partition by v) from toast_json' \
+             'select row_number() over (order by v) from toast_json' \
+             'create index invalid_json_idx on toast_json(v)' \
+             'create table invalid_json_pk (v json primary key)'; do
+    if run -c "$query" >/dev/null 2>&1; then
+        echo "toast-dml: unsupported JSON operation was accepted: $query" >&2
+        exit 1
+    fi
+done
+run -c "update toast_json set v = '{\"updated\":true}' where id = 1" >/dev/null
+[ "$(run -c 'delete from toast_json where id = 1 returning v')" = '{"updated":true}' ]
+if run -c "insert into toast_json values (2, '{invalid}')" >/dev/null 2>&1; then
+    echo 'toast-dml: invalid JSON was accepted' >&2
+    exit 1
+fi
 binary_hex=$(awk 'BEGIN { for (i=0;i<1500;i++) printf "00ff" }')
 run -c 'create table toast_bytes (id int primary key, v bytea)' >/dev/null
 run -c "insert into toast_bytes values (1, '\\x$binary_hex')" >/dev/null

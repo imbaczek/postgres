@@ -323,7 +323,7 @@
         (/ value 1000.0)))))
 
 (defun logical-type-supported-p (type-oid)
-  (member type-oid '(17 20 21 23 25 700 701 1043 1082 1083 1114 1184 1186 1266 1700)))
+  (member type-oid '(17 20 21 23 25 114 700 701 1043 1082 1083 1114 1184 1186 1266 1700)))
 
 (defun logical-validate-client-schema (table source-columns target-columns)
   (unless (= (length source-columns) (length target-columns))
@@ -509,7 +509,7 @@ including appended NOT VALID ALTERs, rather than reinstalling constraints."
            (error "source returned a malformed integer value")
            (error "pgoutput integer value is malformed")))
      value)
-    ((member type-oid '(17 25 700 701 1043 1082 1083 1114 1184 1186 1266 1700)) (logical-sql-literal value))
+    ((member type-oid '(17 25 114 700 701 1043 1082 1083 1114 1184 1186 1266 1700)) (logical-sql-literal value))
     (t (error "unsupported ~a type OID ~a"
               (if (eq context :copy) "logical copy" "pgoutput") type-oid))))
 

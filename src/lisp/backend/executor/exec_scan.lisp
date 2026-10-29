@@ -805,6 +805,9 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
     (when definition (validate-recursive-term-aggregates right))
     (multiple-value-bind (targets coercions)
         (analyze-union-targets (or frozen (getf left :targets)) (getf right :targets))
+      (when (and (not (eq (getf ast :set-operation) :union-all))
+                 (some (lambda (target) (eq (getf target :type) :json)) targets))
+        (ereport "42883" "could not identify an equality operator for type json"))
       (when definition
         (loop for seed in frozen for target in targets for position from 1
               unless (and (eq (getf seed :type) (getf target :type))
@@ -1085,6 +1088,12 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                targets order
                (+ width (length *select-window-functions*))
                (getf ast :distinct)))))
+      (when (and (getf ast :distinct)
+                 (some (lambda (target) (eq (getf target :type) :json)) targets))
+        (ereport "42883" "could not identify an equality operator for type json"))
+      (when (some (lambda (item) (eq (expr-type (car item)) :json))
+                  (second set-analysis))
+        (ereport "42883" "could not identify an ordering operator for type json"))
       (list :window-validation-keys
             (when *cte-definition-analysis-p*
               (mapcar (lambda (target) (getf target :expr)) *window-key-targets*))
@@ -1445,7 +1454,7 @@ TOAST chunk visibility follows the parent and is not independently filtered."
                                                  :index-reader index-reader)))
                    (setf (aref values i)
                          (case type
-                           ((:varchar :text) (bytes->string bytes))
+                           ((:varchar :text :json) (bytes->string bytes))
                            (:bytea bytes)
                            (otherwise (ereport "XX001" "external value has unsupported type")))))))
     tuple))

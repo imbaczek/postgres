@@ -30,7 +30,7 @@
   (change-bytes 0) (changes '()) (transactions '()))
 
 (defun logical-type-code (type)
-  "Map a column type to its logical schema code; text and varchar are distinct."
+  "Map a column type to its logical schema code; text, varchar and json are distinct."
   (case type
     (:int4 1)
     (:int8 2)
@@ -47,6 +47,7 @@
     (:timetz 13)
     (:text 14)
     (:bytea 15)
+    (:json 16)
     (otherwise (error "logical replication does not support type ~a" type))))
 
 (defun logical-type-from-code (code)
@@ -66,6 +67,7 @@
     (13 :timetz)
     (14 :text)
     (15 :bytea)
+    (16 :json)
     (otherwise (error "invalid logical column type code ~a" code))))
 
 (defun logical-kind-code (kind)
@@ -121,7 +123,8 @@
     (logical-write-octets buffer octets)))
 
 (defun logical-write-value (buffer type value)
-  "Encode a value; text and varchar share UTF-8 tag 3, while bytea uses tag 15 followed by a u32 length and raw octets."
+  "Encode a value; text, varchar and json share UTF-8 tag 3. Their schema codes
+remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
   (cond
     ((eq value +null+)
      (logical-write-u8 buffer 0))
@@ -173,7 +176,7 @@
      (logical-write-u8 buffer 15)
      (logical-write-u32 buffer (length value))
      (logical-write-octets buffer value))
-    ((member type '(:varchar :text))
+    ((member type '(:varchar :text :json))
      (unless (stringp value)
        (error "invalid varchar logical row value ~s" value))
      (let ((octets (sb-ext:string-to-octets value :external-format :utf-8)))
@@ -375,7 +378,9 @@
   (if (logbitp 63 value) (- value #x10000000000000000) value))
 
 (defun logical-read-value (cursor type)
-  "Decode a value, accepting tag 3 for text or varchar and tag 15 for length-prefixed bytea octets; reject mismatched column types."
+  "Decode a value, accepting tag 3 for text, varchar or json and tag 15 for
+length-prefixed bytea octets; reject mismatched column types. JSON text is not
+revalidated by this codec."
   (let ((tag (logical-read-u8 cursor)))
     (case tag
       (0 +null+)
@@ -385,7 +390,7 @@
       (2 (unless (eq type :int8)
            (error "logical value tag does not match its column type"))
        (logical-u64-signed (logical-read-u64 cursor)))
-      (3 (unless (member type '(:varchar :text))
+      (3 (unless (member type '(:varchar :text :json))
            (error "logical value tag does not match its column type"))
        (sb-ext:octets-to-string
         (logical-read-octets cursor (logical-read-u32 cursor))

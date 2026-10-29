@@ -128,7 +128,7 @@
   (case (pg-column-type col)
     ((:int8 :float8 :time :timestamp :timestamptz :interval :timetz) 8)
     (:int2 2)
-    ((:int4 :oid :numeric :varchar :text :bytea :float4 :date) 4)
+    ((:int4 :oid :numeric :varchar :text :json :bytea :float4 :date) 4)
     (t 1)))
 
 (defun column-fixed-size (col)
@@ -182,7 +182,7 @@ must remain stable while the layout is used."
                ((eq v +null+) (setf has-null t))
                (t
                 (let ((al (column-align col)))
-                  (when (member (pg-column-type col) '(:varchar :text :bytea))
+                  (when (member (pg-column-type col) '(:varchar :text :json :bytea))
                     (setf (aref varlena-data i)
                           (if (heap-external-varlena-p v)
                               (heap-encode-external-varlena v)
@@ -190,14 +190,14 @@ must remain stable while the layout is used."
                                   (if (eq (pg-column-type col) :bytea)
                                       (progn (check-type v (vector (unsigned-byte 8))) v)
                                       (string->bytes v))))))
-                  (unless (and (member (pg-column-type col) '(:varchar :text :bytea))
+                  (unless (and (member (pg-column-type col) '(:varchar :text :json :bytea))
                                (or (heap-external-varlena-p v)
                                    (<= (length (aref varlena-data i)) 126)))
                     (setf cursor (align-up cursor al)))
                   (setf (aref offsets i) cursor)
                   (incf cursor
                         (case (pg-column-type col)
-                          ((:varchar :text :bytea)
+                          ((:varchar :text :json :bytea)
                            (let ((size (length (aref varlena-data i))))
                              (if (heap-external-varlena-p v) size
                                  (+ size (if (<= size 126) 1 4)))))
@@ -206,14 +206,14 @@ must remain stable while the layout is used."
     (when has-null (setf infomask (logior infomask +heap-hasnull+)))
     (when (some #'heap-external-varlena-p values)
       (setf infomask (logior infomask +heap-hasexternal+)))
-    (when (some (lambda (c) (member (pg-column-type c) '(:varchar :text :bytea :numeric))) columns)
+    (when (some (lambda (c) (member (pg-column-type c) '(:varchar :text :json :bytea :numeric))) columns)
       (setf infomask (logior infomask +heap-hasvarwidth+)))
     (values cursor offsets varlena-data infomask)))
 
 (defun form-heap-tuple (values columns xmin xmax cid block off)
   "Build a HeapTupleHeaderData + null bitmap + attribute data byte vector.
 Inline :bytea values are octet vectors copied into the returned tuple; callers
-must keep them stable during this call. :varchar, :text and :bytea may instead be
+must keep them stable during this call. :varchar, :text, :json and :bytea may instead be
 physical external descriptors, written unaligned with HEAP_HASEXTERNAL set.
 This codec does not create or fetch TOAST data."
   (let* ((natts (length columns))
@@ -273,7 +273,7 @@ This codec does not create or fetch TOAST data."
                            (size (+ 4 (length data))))
                       (page-set-u32 bytes off size)
                       (replace bytes data :start1 (+ off 4))))
-                   ((:varchar :text :bytea)
+                   ((:varchar :text :json :bytea)
                     (let ((data (aref varlena-data i)))
                       (if (heap-external-varlena-p v)
                           (replace bytes data :start1 off)
@@ -407,7 +407,7 @@ reject external and compressed datums and lengths outside BYTES."
 (defun deform-heap-tuple (bytes columns)
   "Return values, XIDs, command ID, infomask, and successor TID.
 Inline :bytea attributes are fresh octet vectors independent of BYTES.
-External :varchar, :text and :bytea attributes become physical descriptors; TOAST
+External :varchar, :text, :json and :bytea attributes become physical descriptors; TOAST
 fetching, decompression, and SQL-level materialization are not done here."
   (let* ((natts (length columns))
          (xmin (page-u32 bytes +heap-tuple-xmin-off+))
@@ -428,7 +428,7 @@ fetching, decompression, and SQL-level materialization are not done here."
                                                   (floor i 8)))))))
                (unless is-null
                  (let ((al (column-align col)))
-                   (unless (and (member (pg-column-type col) '(:varchar :text :bytea))
+                   (unless (and (member (pg-column-type col) '(:varchar :text :json :bytea))
                                 (not (zerop (aref bytes cursor))))
                      (setf cursor (align-up cursor al)))
                    (case (pg-column-type col)
@@ -478,7 +478,7 @@ fetching, decompression, and SQL-level materialization are not done here."
                               (sql-numeric-input (bytes->string bytes :start (+ cursor 4)
                                                                       :end (+ cursor size))))
                         (incf cursor size)))
-                     ((:varchar :text :bytea)
+                     ((:varchar :text :json :bytea)
                       (if (= (aref bytes cursor) 1)
                           (multiple-value-bind (pointer end)
                               (heap-decode-external-varlena bytes cursor)

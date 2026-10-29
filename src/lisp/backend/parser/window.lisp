@@ -121,6 +121,12 @@
                                                                 (getf item :desc)))
                                            (getf raw :order))
                             :frame (or (getf raw :frame) '(:range :current)))))
+            (when (some (lambda (expression) (eq (expr-type expression) :json))
+                        (getf spec :partition))
+              (ereport "42883" "could not identify an equality operator for type json"))
+            (when (some (lambda (item) (eq (expr-type (car item)) :json))
+                        (getf spec :order))
+              (ereport "42883" "could not identify an ordering operator for type json"))
             (vector-push-extend spec *select-window-specifications*)
             spec)))))
 

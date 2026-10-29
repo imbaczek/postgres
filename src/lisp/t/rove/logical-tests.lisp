@@ -72,6 +72,19 @@
       (rove:ok (equal (sql-bytea-output value) (pgoutput-value-text value :bytea))
                "pgoutput uses text-format bytea output")))
 
+(rove:deftest test-logical-json-row-change
+    (let* ((value "{ \"a\": 1, \"a\": [null, true] }")
+           (event (logical-test-change :insert 7 701 :new-values (vector 10 120 value))))
+      (setf (getf (third (logical-change-columns event)) :type) :json
+            (getf (third (logical-change-columns event)) :typmod) -1)
+      (let ((decoded (logical-decode-change (logical-encode-change event))))
+        (rove:ok (eq :json (getf (third (logical-change-columns decoded)) :type))
+                 "logical WAL preserves JSON type")
+        (rove:ok (string= value (aref (logical-change-new-values decoded) 2))
+                 "logical WAL preserves JSON source text"))
+      (rove:ok (= 114 (pgoutput-type-oid :json)) "pgoutput advertises JSON OID 114")
+      (rove:ok (logical-type-supported-p 114) "subscriber accepts JSON OID 114")))
+
 (rove:deftest test-logical-pgoutput-v2-codec
     ;; Compare the v2 message shapes with pgoutput.c's Relation/Begin/Commit and
     ;; logicalrep_write_insert/update/delete in src/backend/replication/.

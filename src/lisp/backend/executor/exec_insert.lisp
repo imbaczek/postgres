@@ -5,6 +5,7 @@
 (defun coerce-value (value type typmod)
   (cond
     ((eq value +null+) +null+)
+    ((eq type :json) (sql-json-input value))
     ((eq type :timetz) (sql-cast-value value (if (stringp value) :text :timetz) :timetz typmod t))
     ((eq type :interval) (sql-cast-value value (if (stringp value) :text :interval) :interval typmod t))
     ((eq type :date) (if (stringp value) (sql-cast-value value :text :date -1 t) value))

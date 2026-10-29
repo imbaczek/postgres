@@ -33,6 +33,7 @@
                    (:file "wal-eor")
                    (:file "wal-checkpoint")
                    (:file "bufmgr")))
+     (:file "utils/adt/json")
      (:file "utils/adt/numeric")
      (:file "utils/adt/float")
      (:file "utils/adt/timezone")
