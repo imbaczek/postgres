@@ -469,6 +469,8 @@ Unresolved owners remain reachable for retry by their original thread."
               (setf *query-temp-scope-directory* scope
                     (query-temp-cleanup-owner-directory *query-temp-cleanup-owner*) scope))))))
 
+(declaim (notinline unlink-query-temp-file))
+
 (defun unlink-query-temp-file (pathname)
   (delete-file pathname))
 

@@ -25,6 +25,7 @@
   (first-snapshot-set nil)
   (dirty-relations '())
   (logical-changes '())
+  (logical-spool nil)
   (logical-change-bytes 0)
   (sequence-currvals (make-hash-table :test #'eql))
   (settings (make-hash-table :test #'equal))
@@ -1745,6 +1746,9 @@ READ WRITE outside recovery."
 Mask interrupts until cleanup and the idle transition finish, so no interrupt
 can discard the owner of a virtual ID or its remaining relation locks."
   (sb-sys:without-interrupts
+    (when (backend-logical-spool b)
+      (close-logical-spool (backend-logical-spool b))
+      (setf (backend-logical-spool b) nil))
     (release-backend-transaction-snapshot b)
     (when (backend-virtual-reader-xid b)
       (release-xid (backend-virtual-reader-xid b) b))
@@ -1777,15 +1781,16 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
   (ensure-exported-snapshot-scope-can-end *backend*)
   (let ((b *backend*))
     (if (backend-xid b)
-        (progn
-          ;; Validate record sizes before entering the WAL critical section: a
-          ;; rejected row must not leave a partially published commit batch.
-          (when (and *wal-ready* (backend-logical-changes b))
-            (logical-preflight-event-fragments (backend-logical-changes b)))
-          ;; WAL page images and the commit record reach stable storage
-          ;; before CLOG can make the transaction visible. The callback and
-          ;; transaction reset are kept in the same interrupt-free section
-          ;; so a FATAL interrupt cannot abort a durable commit.
+        (let ((changes
+                (when *wal-ready*
+                  (append (reverse (backend-logical-changes b))
+                          (when (backend-logical-spool b)
+                            (logical-spool-seal (backend-logical-spool b))
+                            (logical-spool-events-in-order (backend-logical-spool b)))))))
+          ;; Restore, validate and preflight before publishing any WAL batch.
+          (when changes (logical-preflight-event-fragments changes))
+          ;; WAL reaches stable storage before CLOG makes the commit visible.
+          ;; Reset remains interrupt-free so a durable commit cannot be aborted.
           (sb-sys:without-interrupts
             (wal-commit-transaction
              (backend-xid b)
@@ -1794,7 +1799,7 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
                          :fsync (not *wal-ready*))
                (release-xid (backend-xid b))
                (finish-backend-transaction b t))
-             (reverse (backend-logical-changes b)))))
+             changes)))
         (finish-backend-transaction b t)))
   (values))
 

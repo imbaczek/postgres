@@ -618,6 +618,15 @@ revalidated by this codec."
               :last (pg-sequence-last-value sequence)
               :called (pg-sequence-called-p sequence))))))))
 
+(defun logical-capture-encoded-event (backend encoded total)
+  "Own one freshly encoded event through BACKEND's transaction lifetime."
+  (let ((spool (sb-sys:without-interrupts
+                 (or (backend-logical-spool backend)
+                     (setf (backend-logical-spool backend) (make-logical-spool))))))
+    (logical-spool-append spool encoded)
+    (setf (backend-logical-change-bytes backend) total))
+  (values))
+
 (defun logical-note-transaction-event (kind payload &key (publication-selection :unknown))
   "Capture a transactional utility event such as TRUNCATE before XID commit."
   (when (and *backend* (backend-xid *backend*))
@@ -636,8 +645,7 @@ revalidated by this codec."
                      (length encoded))))
       (when (> total +max-logical-transaction-bytes+)
         (ereport "54000" "logical transaction exceeds the 64 MiB change limit"))
-      (push encoded (backend-logical-changes *backend*))
-      (setf (backend-logical-change-bytes *backend*) total)
+      (logical-capture-encoded-event *backend* encoded total)
       change)))
 
 (defun logical-relation-columns (table)
@@ -686,9 +694,7 @@ executor, so capture the same operation before transaction commit."
       (when (> total limit)
         (ereport "54000"
                  "logical change stream transaction exceeds the 64 MiB limit"))
-      (setf (backend-logical-changes *backend*)
-            (cons encoded (backend-logical-changes *backend*))
-            (backend-logical-change-bytes *backend*) total)))
+      (logical-capture-encoded-event *backend* encoded total)))
   (values))
 
 (defun logical-encode-chunk (index count events)

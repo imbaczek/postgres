@@ -33,7 +33,8 @@ Options: `-p PORT` (default 5433), `-h HOST` (default 127.0.0.1), `-D PGDATA`
 (default `./pgdata`). PGDATA is created on first boot with `PG_VERSION`,
 `global/`, `base/`, `pg_xact`, and `pg_catalog.dat`. Ports are validated at
 startup (1..65535) and a missing option value is a clean error, not a crash.
-`--temp-file-limit-bytes BYTES` caps the live spill files used by one query;
+`--temp-file-limit-bytes BYTES` caps the live spill files used by one query and,
+separately, each transaction's logical capture spool;
 `-1` (the default) means unlimited. `PG_QUERY_TEMP_FILE_LIMIT_BYTES` sets the
 same value when the command-line option is omitted. Spill files live in private
 `PGDATA/pgsql_tmp` namespaces keyed by process identity and session/query; startup
@@ -585,6 +586,15 @@ overhead. Row changes made by the `pg-lisp-subscribe-apply` application have
 an extra 1 MiB of headroom; transactional utility events still check the
 64 MiB limit. The WAL transaction and fragment reader limit is 65 MiB. These
 are encoded-change limits, not guarantees that a value of that size will fit.
+
+Logical capture keeps encoded events in memory until their cumulative size
+exceeds 4 MiB, then spills all events to a transaction-owned temporary file.
+The spool has its own quota using the `--temp-file-limit-bytes` setting,
+separate from query spill quotas; its length and checksum framing also counts
+against that quota. It is cleaned up when the transaction ends. At commit the
+spool is read and validated in full and all encoded events are materialized in
+memory before WAL publication, so the spill threshold is not a commit-time
+memory bound. The 64 MiB capture and 65 MiB WAL limits still apply.
 
 When an encoded row event exceeds one WAL record, the transaction's events
 are written as ordered fragments and reassembled by recovery and logical slot

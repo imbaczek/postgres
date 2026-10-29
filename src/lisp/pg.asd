@@ -97,6 +97,7 @@
       :serial t
       :components ((:file "exec_arena")
                    (:file "exec_spill")
+                   (:file "../replication/logical-spool")
                    (:file "exec_scan")
                    (:file "exec_plan")
                    (:file "exec_window")

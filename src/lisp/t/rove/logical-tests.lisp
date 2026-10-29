@@ -611,6 +611,121 @@
                  (error () t))
                "a replacement publisher incarnation cannot reuse the old event marker")))
 
+(rove:deftest test-logical-spool-spills-and-cleans-up
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-logical-spool-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 3)
+           (first (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(1 2)))
+           (second (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(3 4 5)))
+           (spool (make-logical-spool)))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (logical-spool-append spool first)
+             (rove:ok (null (logical-spool-path spool)))
+             (logical-spool-append spool second)
+             (rove:ok (probe-file (logical-spool-path spool)))
+             (rove:ok (null (logical-spool-events spool)))
+             (logical-spool-seal spool)
+             (rove:ok (equalp (logical-spool-events-in-order spool) (list first second)))
+             (close-logical-spool spool)
+             (close-logical-spool spool)
+             (rove:ok (null (uiop:directory-files directory))))
+        (close-logical-spool spool)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-logical-spool-rejects-quota-and-corruption
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-logical-spool-fault-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (event (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(1 2))))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (let* ((*query-temp-file-limit-bytes* 9)
+                    (spool (make-logical-spool)))
+               (unwind-protect
+                    (progn
+                      (rove:ok (handler-case (progn (logical-spool-append spool event) nil)
+                                 (pg-error (condition) (string= (pg-error-sqlstate condition) "53400"))))
+                      (rove:ok (logical-spool-failed-p spool))
+                      (rove:ok (handler-case (progn (logical-spool-seal spool) nil)
+                                 (error () t))))
+                 (close-logical-spool spool)))
+             (let ((*query-temp-file-limit-bytes* nil)
+                   (spool (make-logical-spool)))
+               (unwind-protect
+                    (progn
+                      (logical-spool-append spool event)
+                      (logical-spool-seal spool)
+                      (file-position (logical-spool-stream spool) 8)
+                      (write-byte 99 (logical-spool-stream spool))
+                      (finish-output (logical-spool-stream spool))
+                      (rove:ok (handler-case (progn (logical-spool-events-in-order spool) nil)
+                                 (error () t))))
+                 (close-logical-spool spool)))
+             (rove:ok (null (uiop:directory-files directory))))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-logical-spool-outlives-query-and-ends-with-transaction
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-logical-xact-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (*backend* (make-backend))
+           (event (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3))))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (with-query-temp-files
+               (logical-capture-encoded-event *backend* event 3))
+             (let ((spool (backend-logical-spool *backend*)))
+               (rove:ok (probe-file (logical-spool-path spool)))
+               (logical-spool-seal spool)
+               (rove:ok (equalp (logical-spool-events-in-order spool) (list event)))
+               (reset-backend-transaction *backend*)
+               (rove:ok (null (backend-logical-spool *backend*)))
+               (rove:ok (null (probe-file (logical-spool-path spool))))))
+        (when (backend-logical-spool *backend*) (reset-backend-transaction *backend*))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-logical-spool-cleanup-failure-retains-owner
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-logical-cleanup-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (*query-temp-pending-cleanups* nil)
+           (*backend* (make-backend))
+           (event (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3)))
+           (original (symbol-function 'unlink-query-temp-file)))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (logical-capture-encoded-event *backend* event 3)
+             (let ((spool (backend-logical-spool *backend*)))
+               (logical-spool-seal spool)
+               (call-with-logical-spool-owner
+                spool (lambda () (finish-query-temp-stream (logical-spool-stream spool) t))))
+             (setf (symbol-function 'unlink-query-temp-file)
+                   (lambda (path) (declare (ignore path)) (error "injected unlink failure")))
+             (reset-backend-transaction *backend*)
+             (rove:ok (null (backend-logical-spool *backend*)))
+             (rove:ok (= 1 (getf (query-temp-pending-cleanup-status) :records)))
+             (rove:ok (= 1 (length (uiop:directory-files directory))))
+             (setf (symbol-function 'unlink-query-temp-file) original)
+             (retry-pending-query-temp-cleanup)
+             (rove:ok (zerop (getf (query-temp-pending-cleanup-status) :records)))
+             (rove:ok (null (uiop:directory-files directory))))
+        (setf (symbol-function 'unlink-query-temp-file) original)
+        (retry-pending-query-temp-cleanup)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest test-logical-fragment-assembly
     (let* ((first (make-array 10 :element-type '(unsigned-byte 8)
                                  :initial-contents '(0 1 2 3 4 5 6 7 8 9)))

@@ -1,0 +1,138 @@
+;;;; Transaction-owned storage for encoded logical events.
+(in-package #:pg)
+
+(defparameter *logical-capture-memory-bytes* (* 4 1024 1024))
+
+(defstruct (logical-spool (:constructor %make-logical-spool))
+  owner (events '()) (bytes 0) (count 0) path stream sealed-p closed-p failed-p)
+
+(defun make-logical-spool ()
+  "Create an owner whose lifetime is the transaction, not a query scope."
+  (let* ((quota (make-query-temp-quota *query-temp-file-limit-bytes*))
+         (owner (make-query-temp-scope-owner quota)))
+    (setf (query-temp-cleanup-owner-temporary-directory owner) *query-temp-directory*)
+    (%make-logical-spool :owner owner)))
+
+(defun call-with-logical-spool-owner (spool function)
+  "Rebind the temporary-file machinery to SPOOL's persistent cleanup owner."
+  (let* ((owner (logical-spool-owner spool))
+         (*query-temp-cleanup-owner* owner)
+         (*query-temp-file-scope-active-p* t)
+         (*query-temp-quota* (query-temp-cleanup-owner-quota owner))
+         (*query-temp-directory* (query-temp-cleanup-owner-temporary-directory owner))
+         (*query-temp-scope-directory* (query-temp-cleanup-owner-directory owner))
+         (*query-temp-files* nil))
+    (unwind-protect (funcall function)
+      (setf (query-temp-cleanup-owner-directory owner) *query-temp-scope-directory*))))
+
+(defun logical-spool-write-event (spool event)
+  "Write one length- and CRC-framed event, reserving quota before file I/O."
+  (let ((length (length event)) (path (logical-spool-path spool))
+                                (stream (logical-spool-stream spool)))
+    (unless (<= 1 length #xffffffff) (error "invalid logical spool event length"))
+    (query-temp-check-space path (+ 8 length))
+    ;; Reserve before I/O so partial writes stay charged until cleanup.
+    (query-temp-account-space path (+ 8 length))
+    (dolist (word (list length (wal-crc32 event)))
+      (dotimes (shift 4)
+        (write-byte (logand (ash word (* -8 shift)) #xff) stream)))
+    (write-sequence event stream)))
+
+(defun logical-spool-append (spool event)
+  "Take ownership of a fresh EVENT, spilling once the memory limit is reached.
+The caller must not mutate EVENT after passing it to this function."
+  (when (or (logical-spool-sealed-p spool) (logical-spool-closed-p spool)
+            (logical-spool-failed-p spool))
+    (error "logical spool is not writable"))
+  (unless (and (typep event '(vector (unsigned-byte 8))) (plusp (length event)))
+    (error "invalid logical spool event"))
+  (let ((complete nil))
+    (unwind-protect
+         (progn
+           (call-with-logical-spool-owner
+            spool
+            (lambda ()
+              (when (and (null (logical-spool-stream spool))
+                         (> (+ (logical-spool-bytes spool) (length event))
+                            *logical-capture-memory-bytes*))
+                (sb-sys:without-interrupts
+                  (multiple-value-bind (path stream) (open-query-temp-io)
+                    (setf (logical-spool-path spool) path
+                          (logical-spool-stream spool) stream)))
+                (dolist (prior (reverse (logical-spool-events spool)))
+                  (logical-spool-write-event spool prior))
+                (setf (logical-spool-events spool) nil))
+              (if (logical-spool-stream spool)
+                  (logical-spool-write-event spool event)
+                  (push event (logical-spool-events spool)))
+              (incf (logical-spool-bytes spool) (length event))
+              (incf (logical-spool-count spool))))
+           (setf complete t))
+      (unless complete (setf (logical-spool-failed-p spool) t))))
+  (values))
+
+(defun logical-spool-seal (spool)
+  "Flush completed events before a caller enters the WAL critical section."
+  (when (or (logical-spool-closed-p spool) (logical-spool-failed-p spool))
+    (error "logical spool cannot be sealed"))
+  (unless (logical-spool-sealed-p spool)
+    (let ((complete nil))
+      (unwind-protect
+           (progn
+             (when (logical-spool-stream spool)
+               (finish-output (logical-spool-stream spool)))
+             (setf (logical-spool-sealed-p spool) t
+                   complete t))
+        (unless complete (setf (logical-spool-failed-p spool) t)))))
+  (values))
+
+(defun logical-spool-read-u32 (stream)
+  (loop for shift below 4
+        for byte = (read-byte stream nil nil)
+        do (unless byte (error "truncated logical spool header"))
+        sum (ash byte (* 8 shift))))
+
+(defun %logical-spool-events-in-order (spool)
+  "Restore and validate all events before WAL publication begins."
+  (unless (and (logical-spool-sealed-p spool) (not (logical-spool-closed-p spool)))
+    (error "logical spool is not readable"))
+  (if (null (logical-spool-stream spool))
+      (reverse (logical-spool-events spool))
+      (let ((stream (logical-spool-stream spool)) (events '()) (total 0))
+        (unless (file-position stream 0) (error "cannot seek logical spool"))
+        (dotimes (index (logical-spool-count spool))
+          (let ((length (logical-spool-read-u32 stream))
+                (checksum (logical-spool-read-u32 stream)))
+            (unless (and (plusp length) (<= (+ total length) (logical-spool-bytes spool)))
+              (error "invalid logical spool event length"))
+            (let ((event (make-array length :element-type '(unsigned-byte 8))))
+              (unless (= (read-sequence event stream) length)
+                (error "truncated logical spool event"))
+              (unless (= (wal-crc32 event) checksum)
+                (error "logical spool checksum mismatch"))
+              (incf total length)
+              (push event events))))
+        (unless (and (= total (logical-spool-bytes spool))
+                     (null (read-byte stream nil nil)))
+          (error "invalid logical spool contents"))
+        (nreverse events))))
+
+(defun logical-spool-events-in-order (spool)
+  "Materialize verified events, permanently rejecting this spool after an error."
+  (when (logical-spool-failed-p spool) (error "logical spool has failed"))
+  (let ((complete nil))
+    (unwind-protect
+         (multiple-value-prog1 (%logical-spool-events-in-order spool)
+           (setf complete t))
+      (unless complete (setf (logical-spool-failed-p spool) t)))))
+
+(defun close-logical-spool (spool)
+  "Transfer cleanup ownership before forgetting any transaction resources."
+  (sb-sys:without-interrupts
+    (unless (logical-spool-closed-p spool)
+      (call-with-logical-spool-owner
+       spool (lambda () (finish-query-temp-scope)))
+      (setf (logical-spool-closed-p spool) t
+            (logical-spool-events spool) nil
+            (logical-spool-stream spool) nil)))
+  (values))
