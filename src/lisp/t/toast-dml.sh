@@ -104,11 +104,56 @@ if run -c 'set bytea_output = invalid' >/dev/null 2>&1; then
     exit 1
 fi
 run -c 'create table toast_bytes (id int primary key, v bytea)' >/dev/null
+run -c 'alter table toast_bytes alter column v set storage external' >/dev/null
 run -c "insert into toast_bytes values (1, '\\x$binary_hex')" >/dev/null
 [ "$(run -c 'select length(v) from toast_bytes where id = 1')" = 3000 ]
 [ "$(run -c "select v = '\\x$binary_hex' from toast_bytes where id = 1")" = t ]
+# Count exact chunk lookups to distinguish a partial fetch from full detoasting.
+printf '%s\n(quit)\n' '(let ((original (symbol-function (quote btree-search-unlocked))) (counter (intern "*SLICE-LOOKUPS*"))) (setf (symbol-value counter) 0 (symbol-value (intern "*SLICE-LOOKUP-ORIGINAL*")) original) (setf (symbol-function (quote btree-search-unlocked)) (lambda (&rest args) (incf (symbol-value counter)) (apply original args))))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/slice-install.out"
+! grep -q ';; error:' "$TMP/slice-install.out"
+[ "$(run -c 'select substr(v,100,20) from toast_bytes where id + 0 = 1')" = "\\x$(printf '%s' "$binary_hex" | cut -c 199-238)" ]
+[ "$(run -c 'select substring(v,1995,20) from toast_bytes where id + 0 = 1')" = "\\x$(printf '%s' "$binary_hex" | cut -c 3989-4028)" ]
+[ "$(run -c 'select substr(v,NULL) from toast_bytes where id + 0 = 1')" = '' ]
+[ "$(run -c 'select substr(v,1,NULL) from toast_bytes where id + 0 = 1')" = '' ]
+[ "$(run -c 'select substr(v,1,-1) from toast_bytes where id + 0 = 0')" = '' ]
+[ "$(run -c 'select substr(v,1,-1) from toast_bytes limit 0')" = '' ]
+printf '%s\n(quit)\n' '(format t "LOOKUPS=~d~%" (symbol-value (intern "*SLICE-LOOKUPS*"))) (setf (symbol-function (quote btree-search-unlocked)) (symbol-value (intern "*SLICE-LOOKUP-ORIGINAL*")))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/slice-restore.out"
+! grep -q ';; error:' "$TMP/slice-restore.out"
+[ "$(awk -F= '/LOOKUPS=/{print $2}' "$TMP/slice-restore.out")" = 3 ]
+if run -c 'select substr(v,1,-1) from toast_bytes where id + 0 = 1' >"$TMP/slice-negative.out" 2>&1; then
+    echo 'toast-dml: negative substring length was accepted' >&2
+    exit 1
+fi
+grep -q 'negative substring length not allowed' "$TMP/slice-negative.out"
+run -c "insert into toast_bytes values (3, '\\x010203'), (4, NULL)" >/dev/null
+[ "$(run -c 'select substr(v,2,2) from toast_bytes where id + 0 = 3')" = '\x0203' ]
+[ "$(run -c 'select substr(v,2,2) from toast_bytes where id + 0 = 4')" = '' ]
+[ "$(run -c 'select substr(v,1,-1) from toast_bytes where id + 0 = 4')" = '' ]
+[ "$(run -c 'select substr(v,1,2) from toast_bytes where v is null')" = '' ]
+run -c 'delete from toast_bytes where id > 2' >/dev/null
 [ "$(run -c 'select substr(v,1995,20) from toast_bytes where id = 1')" = "\\x$(printf '%s' "$binary_hex" | cut -c 3989-4028)" ]
+[ "$(run -c "select substr(v,2,2), v = '\\x$binary_hex' from toast_bytes where id + 0 = 1")" = "\\x$(printf '%s' "$binary_hex" | cut -c 3-6)|t" ]
 [ "$(run -c 'select substring(v,0,3) from toast_bytes where id = 1')" = "\\x$(printf '%s' "$binary_hex" | cut -c 1-4)" ]
+mkfifo "$TMP/slice-reader.sql"
+run < "$TMP/slice-reader.sql" > "$TMP/slice-reader.out" 2>&1 &
+READER=$!
+exec 3> "$TMP/slice-reader.sql"
+printf '%s\n' 'begin isolation level repeatable read; select substr(v,100,20) from toast_bytes where id + 0 = 1;' '\echo slice-ready' >&3
+slice_wait=0
+while ! grep -q '^slice-ready$' "$TMP/slice-reader.out"; do
+    kill -0 "$READER" 2>/dev/null || { cat "$TMP/slice-reader.out" >&2; exit 1; }
+    slice_wait=$((slice_wait + 1))
+    [ "$slice_wait" -lt 300 ] || { echo 'toast-dml: slice reader timed out' >&2; exit 1; }
+    sleep 0.1
+done
+run -c "update toast_bytes set v = '\\x00' where id = 1" >/dev/null
+run -c 'vacuum toast_bytes' >/dev/null
+printf '%s\n' 'select substr(v,100,20) from toast_bytes where id + 0 = 1; commit;' '\q' >&3
+exec 3>&-
+wait "$READER"
+READER=
+[ "$(grep -c "^\\\\x$(printf '%s' "$binary_hex" | cut -c 199-238)$" "$TMP/slice-reader.out")" = 2 ]
+run -c "update toast_bytes set v = '\\x$binary_hex' where id = 1" >/dev/null
 run -c 'create index toast_bytes_v_idx on toast_bytes (v)' >/dev/null
 [ "$(run -c "select id from toast_bytes where v = '\\x$binary_hex'")" = 1 ]
 [ "$(run -c "delete from toast_bytes where id = 1 returning v")" = "\\x$binary_hex" ]
@@ -116,6 +161,7 @@ run -c 'create index toast_bytes_v_idx on toast_bytes (v)' >/dev/null
 # compressed result span multiple TOAST chunks.
 binary_block=$(awk 'BEGIN { s=1; for (i=0;i<2100;i++) { s=(s*1664525+1013904223)%4294967296; printf "%02x", (i<200 ? 42 : int(s/16777216)) } }')
 binary_multi="$binary_block$binary_block$binary_block"
+run -c 'alter table toast_bytes alter column v set storage extended' >/dev/null
 run -c "insert into toast_bytes values (2, '\\x$binary_multi')" >/dev/null
 [ "$(run -c 'select length(v) from toast_bytes where id = 2')" = 6300 ]
 [ "$(run -c 'select substr(v,200,30) from toast_bytes where id = 2')" = "\\x$(printf '%s' "$binary_multi" | cut -c 399-458)" ]

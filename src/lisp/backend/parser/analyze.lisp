@@ -400,16 +400,40 @@ result is text for typeof and int4 for array_length."
                         (rest arguments)))
           :type type :typmod -1)))
 
+(defun sql-substring-range (start length length-p)
+  "Return a zero-based offset and a count, or NIL count for the tail."
+  (when (and length-p (minusp length))
+    (ereport "22011" "negative substring length not allowed"))
+  (let ((adjusted (max 1 start)))
+    (values (1- adjusted)
+            (unless (or (not length-p) (> (+ start length) +int4-max+))
+              (max 0 (- (+ start length) adjusted))))))
+
 (defun eval-substr-function (arguments)
-  "Match text_substring's character positions, negative starts and overflow-to-tail."
+  "Match text and bytea substring position and length rules."
   (when (member +null+ arguments) (return-from eval-substr-function +null+))
-  (destructuring-bind (text start &optional (length nil length-p)) arguments
-    (when (and length-p (minusp length))
-      (ereport "22011" "negative substring length not allowed"))
-    (let* ((size (length text))
-           (begin (min size (1- (max 1 start))))
-           (end (if length-p (min size (max 0 (1- (+ start length)))) size)))
-      (subseq text begin (max begin end)))))
+  (destructuring-bind (value start &optional (length nil length-p)) arguments
+    (multiple-value-bind (offset count) (sql-substring-range start length length-p)
+      (let* ((size (length value))
+             (begin (min size offset))
+             (end (if count (min size (+ begin count)) size)))
+        (subseq value begin end)))))
+
+(defvar *toast-slice-expression* nil)
+
+(defvar *toast-slice-current* nil)
+
+(defun eval-toast-bytea-substring (arguments)
+  "Evaluate a selected external bytea substring at its projection position."
+  (let ((bounds (mapcar (lambda (argument) (eval-expr argument nil)) (rest arguments))))
+    (when (member +null+ bounds) (return-from eval-toast-bytea-substring +null+))
+    (multiple-value-bind (offset count)
+        (sql-substring-range (first bounds) (second bounds) (not (null (rest bounds))))
+      (destructuring-bind (toast pointer snapshot environment) *toast-slice-current*
+        (declare (ignore environment))
+        (unless toast (ereport "XX001" "external value has no owning TOAST relation"))
+        (toast-fetch-value-slice toast pointer snapshot offset (or count #x40000000)
+                                 :index-reader #'select-toast-index-reader)))))
 
 (defun analyze-wal-receiver-function (name arguments)
   (when arguments
@@ -4009,6 +4033,9 @@ truncate and interpret the result at TYPE's signed width."
                            (t (eq want nil)))))
          (if neg (not result) result))))
     (:func
+     (when (and *toast-slice-current* (eq expr *toast-slice-expression*)
+                (eq env (fourth *toast-slice-current*)))
+       (return-from eval-expr (eval-toast-bytea-substring (third expr))))
      (let* ((name (second expr))
             (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr)))
             (type (expr-type expr)))

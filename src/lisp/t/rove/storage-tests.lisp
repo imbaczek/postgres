@@ -473,6 +473,39 @@
                        (materialize-select-tuple table selected nil :demand *select-toast-demand*) nil)
                    (pg-error () t))))))
 
+(rove:deftest test-simple-select-toast-slice-plan
+    (let* ((columns (vector (make-pg-column :name "id" :type :int4 :attnum 1)
+                            (make-pg-column :name "data" :type :bytea :attnum 2)))
+           (table (make-pg-class :oid 42 :columns columns))
+           (relations (list (list :table table)))
+           (scan '(:seq-scan 0 42))
+           (expr '(:func "substr" ((:col 2 :type :bytea) (:const 2 :type :int4)
+                                   (:const 3 :type :int4)) :type :bytea))
+           (target (list :expr expr))
+           (filter (list :filter '(:binop "=" (:col 1) (:const 1)) scan))
+           (node (list :project (list target) filter))
+           (result (simple-select-toast-slice node relations)))
+      (rove:ok (and (eq (first result) expr) (eq (second result) table) (= (third result) 2)))
+      (rove:ok (null (simple-select-toast-slice
+                      (list :project (list target) (list :filter '(:is-null (:col 2) nil) scan))
+                      relations)))
+      (rove:ok (null (simple-select-toast-slice (list :sort nil node) relations)))
+      (rove:ok (null (simple-select-toast-slice (list :project (list target target) scan) relations)))
+      (rove:ok (null (simple-select-toast-slice
+                      (list :project (list (list :expr '(:func "substr" ((:col 2 :type :bytea)
+                                                                         (:func "random" nil)) :type :bytea)))
+                            scan)
+                      relations)))
+      ;; An expression evaluated against another row must never use the saved pointer.
+      (let* ((saved-row (vector 1 +null+))
+             (other-row (vector 1 (make-array 4 :element-type '(unsigned-byte 8)
+                                                :initial-contents '(1 2 3 4))))
+             (*toast-slice-expression* expr)
+             (*toast-slice-current* (list nil nil nil saved-row)))
+        (rove:ok (equalp (eval-expr expr other-row)
+                         (make-array 3 :element-type '(unsigned-byte 8)
+                                       :initial-contents '(2 3 4)))))))
+
 (rove:deftest test-tuple-roundtrip
     (let* ((cols (coerce
                   (list (make-pg-column :name "a" :type :int4 :typmod -1

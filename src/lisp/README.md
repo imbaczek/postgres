@@ -211,8 +211,8 @@ or expression shapes fall back to full tuple materialization.
 An internal TOAST byte-slice API reads only intersecting chunks of an
 uncompressed external value under an active snapshot protecting its parent.
 It validates the pointer and requested chunks, but does not check unrequested
-chunks; compressed values use a full validated fetch. SQL expressions do not
-yet use this slice API.
+chunks; compressed values use a full validated fetch. The limited SQL bytea
+substring optimization described below uses this API.
 Fixed-width types accept only `PLAIN` or `DEFAULT`. `VACUUM FULL` rewrites
 existing values using the current policy; it fails if a `PLAIN` value cannot
 fit on a heap page, leaving the original table intact.
@@ -799,8 +799,12 @@ outside signed int64; `::bigint` checks overflow.
 Text `||` and `substr(text, start [, length])` support the string operations used
 by Patroni's status expression. Substring positions count Unicode characters,
 including SQL's adjusted zero/negative starts. The `substr` and `substring`
-function forms also accept `bytea`, where positions count bytes; they currently
-materialize an external value before slicing it. Array concatenation remains unsupported.
+function forms also accept `bytea`, where positions count bytes. An interpreted
+single-column substring projection with constant bounds over one base-table
+sequential scan can read only the needed uncompressed TOAST chunks. Optional
+filters must not reference that bytea column; LIMIT is supported. Other plan
+shapes materialize the value, as do compressed external values.
+Array concatenation remains unsupported.
 Fixed `bit(N)` expression casts and `B'...'`/`X'...'` literals support binary/hex
 input, explicit padding/truncation, and C-compatible integer/bigint conversion.
 Varying-bit types, bitwise operations, bit concatenation and bit table storage

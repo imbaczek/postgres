@@ -1439,6 +1439,9 @@ scopes to clean up."
 (defvar *select-toast-demand* nil
   "NIL means full materialization; otherwise a cons of table and needed slots.")
 
+(defvar *select-toast-slice-plan* nil
+  "A recognized expression, owning table, and bytea slot for this scan.")
+
 (defun materialize-select-tuple (table tuple snapshot &key (index-reader #'select-toast-index-reader) demand)
   "Replace external attributes with SQL values, omitting proven unused slots.
 The parent is visible and SNAPSHOT remains active throughout the fetch. TOAST
@@ -1531,8 +1534,15 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
     (:seq-scan
      (heapam-scan relfilenode (pg-class-columns table) snapshot
                   (lambda (tuple)
-                    (let ((row (materialize-select-tuple table tuple snapshot :demand *select-toast-demand*)))
-                      (let ((*select-toast-demand* nil))
+                    (let* ((slot (and *select-toast-slice-plan*
+                                      (eq table (second *select-toast-slice-plan*))
+                                      (third *select-toast-slice-plan*)))
+                           (value (and slot (aref (htup-values tuple) (1- slot))))
+                           (*toast-slice-current* (when (heap-external-varlena-p value)
+                                                    (list (pg-class-toast table) value snapshot (htup-values tuple))))
+                           (row (materialize-select-tuple table tuple snapshot :demand *select-toast-demand*)))
+                      (let ((*select-toast-demand* nil)
+                            (*select-toast-slice-plan* nil))
                         (funcall callback row))))))
     (:index-scan
      (scan-select-index table path snapshot callback environment))))
