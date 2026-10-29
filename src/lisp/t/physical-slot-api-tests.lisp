@@ -11,6 +11,7 @@
           (pg::*wal-slot-recycling-termination-requests* (make-hash-table :test #'eq))
           (pg::*max-replication-slots* 10)
           (pg::*wal-slot-retention-policy* nil)
+          (pg::*wal-keep-size-mb* 0)
           (pg::*logical-capture-live-slots* 0)
           (pg::*logical-slot-owner-termination-requests* (make-hash-table :test #'eq))
           (pg::*exported-logical-snapshots* (make-hash-table :test #'equal))
@@ -44,6 +45,101 @@
                  (cl-spec:run-property
                   'checkpoint-recycling-keeps-the-segment-containing-the-last-byte :seed 42))))
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(declaim (special pg::*wal-keep-size-mb*))
+
+(cl-spec:defproperty wal-keep-floor-obeys-whole-segment-retention
+    ((segment (range integer 0 10000))
+     (megabytes (range integer 0 100000))
+     (offset (range integer 0 16777215)))
+  (:about pg::wal-keep-retention-segment)
+  (:trials (:normal 200))
+  (let* ((pg::*wal-keep-size-mb* megabytes)
+         (current (+ (* segment pg::+wal-segment-size+) offset))
+         (result (pg::wal-keep-retention-segment current)))
+    (and (= result (max 0 (- segment (truncate megabytes 16))))
+         (<= 0 result segment))))
+
+(deftest generated-wal-keep-segment-boundaries
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'wal-keep-floor-obeys-whole-segment-retention :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (ok (= 200 (getf data :trials)))))
+
+(deftest wal-keep-recycling-preserves-the-requested-prefix-and-slot
+    (dolist (megabytes '(0 1 15 16 17 31 32 64 80))
+      (call-with-physical-slot-api-fixture
+       (lambda (root)
+         (declare (ignore root))
+         (let* ((size pg::+wal-segment-size+)
+                (pg::*wal-keep-size-mb* megabytes)
+                (pg::*wal-durable-lsn* (+ (* 4 size) 32))
+                (pg::*wal-slot-retention-policy*
+                  (pg::make-wal-slot-retention-policy :mode :segments :limit 0))
+                (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+                (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+                (pg::*wal-output-stream* nil) (pg::*wal-output-segment* nil)
+                (expected (max 0 (- 4 (floor megabytes 16))))
+                (slot (physical-slot-test-object :restart 1)))
+           (pg::wal-ensure-directory-durable (pg::wal-directory))
+           (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
+           (dotimes (segment 5)
+             (pg::wal-atomic-write-bytes (pg::wal-segment-path segment) #(0)))
+           (setf (gethash "public_physical" pg::*wal-replication-slots*) slot)
+           (pg::wal-save-replication-slot slot)
+           (sb-thread:with-mutex (pg::*wal-lock*)
+             (pg::wal-remove-checkpointed-segments-under-wal-lock (+ (* 4 size) 32)))
+           (dotimes (segment 5)
+             (ok (eql (>= segment expected)
+                      (not (null (probe-file (pg::wal-segment-path segment)))))))
+           (ok (eq (if (zerop expected) :reserved :lost)
+                   (pg::wal-replication-slot-wal-status slot)))
+           (ok (eq (pg::wal-replication-slot-wal-status slot)
+                   (pg::wal-replication-slot-wal-status
+                    (pg::wal-read-replication-slot
+                     (pg::wal-replication-slot-path "public_physical"))))))))))
+
+(deftest wal-keep-independent-floor-still-honors-xids-and-snapshots
+    (let* ((size pg::+wal-segment-size+)
+           (pg::*wal-keep-size-mb* 16)
+           (pg::*wal-durable-lsn* (* 10 size))
+           (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+           (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq)))
+      (sb-thread:with-mutex (pg::*wal-lock*)
+        (ok (= 2 (pg::wal-independent-retention-segment 8 (* 3 size))))
+        (setf (gethash 'snapshot pg::*wal-snapshot-retention-pins*) (+ size 1))
+        (ok (= 1 (pg::wal-independent-retention-segment 8 (* 3 size))))
+        (setf (gethash 42 pg::*wal-xid-first-lsn*) 1)
+        (ok (= 0 (pg::wal-independent-retention-segment 8 (* 3 size)))))))
+
+(deftest wal-keep-controls-standard-slot-status-and-safe-size
+    (call-with-physical-slot-api-fixture
+     (lambda (root)
+       (declare (ignore root))
+       (let* ((size pg::+wal-segment-size+)
+              (pg::*wal-end-lsn* (+ (* 4 size) 32))
+              (pg::*wal-slot-retention-policy*
+                (pg::make-wal-slot-retention-policy :mode :segments :limit 0 :max-wal-bytes size))
+              (slot (physical-slot-test-object :restart 1)))
+         (setf (gethash "public_physical" pg::*wal-replication-slots*) slot)
+         (dolist (megabytes '(0 15 16 64))
+           (let ((pg::*wal-keep-size-mb* megabytes))
+             (ok (equal (if (= megabytes 64) "extended" "unreserved")
+                        (pg::wal-slot-catalog-status slot)))
+             (ok (= (- (* (1+ (floor megabytes 16)) size) pg::*wal-end-lsn*)
+                    (pg::wal-slot-safe-wal-bytes slot)))))
+         (let ((pg::*wal-keep-size-mb* 64)
+               (pg::*wal-slot-retention-policy*
+                 (pg::make-wal-slot-retention-policy :mode :bytes :limit 0))
+               (pg::*max-slot-wal-keep-bytes* 0))
+           (ok (equal "unreserved" (pg::wal-slot-catalog-status slot)))
+           (ok (= (- 2 pg::*wal-end-lsn*) (pg::wal-slot-safe-wal-bytes slot))))))))
+
+(deftest wal-keep-setting-parses-units-and-rejects-invalid-values
+    (ok (= 0 (pg::startup-normalize-setting "wal_keep_size" "0")))
+  (ok (= 1024 (pg::startup-normalize-setting "wal_keep_size" "1GB")))
+  (dolist (value '("-1" "2147483648" "1s"))
+    (ok (intake-fails-p (lambda () (pg::startup-normalize-setting "wal_keep_size" value))))))
 
 (deftest slot-retention-policy-follows-standard-and-native-configuration-provenance
     (with-physical-store-directory (root)
@@ -172,6 +268,75 @@
              (gethash "public_physical" pg::*wal-replication-slots*) slot)
        (pg::wal-save-replication-slot slot)
        (funcall function slot owner backend checkpoint)))))
+
+(deftest wal-keep-reload-rechecks-the-frozen-owner-endpoint
+    (call-with-active-slot-recycling-fixture
+     (lambda (slot owner backend checkpoint)
+       (declare (ignore owner))
+       (let* ((signals 0)
+              (pg::*backend* nil)
+              (pg::*logical-test-invalidated-backend-hook*
+                (lambda (target) (declare (ignore target)) (incf signals)))
+              (pg::*logical-test-failpoint-hook*
+                (lambda (point &rest arguments)
+                  (declare (ignore arguments))
+                  (when (eq point :before-recycling-owner-termination-claim)
+                    (setf pg::*wal-keep-size-mb* 64
+                          pg::*wal-durable-lsn* (* 20 pg::+wal-segment-size+))))))
+         (pg::wal-remove-checkpointed-segments checkpoint)
+         (ok (= 0 signals))
+         (ok (eq :reserved (pg::wal-replication-slot-wal-status slot)))
+         (ok (eq backend (pg::wal-replication-slot-active-owner-backend slot)))
+         (ok (null pg::*wal-slot-recycling-pending*))
+         (ok (probe-file (pg::wal-segment-path 0)))))))
+
+(deftest wal-keep-does-not-revive-lost-slots-or-removed-files
+    (call-with-physical-slot-api-fixture
+     (lambda (root)
+       (declare (ignore root))
+       (let* ((size pg::+wal-segment-size+)
+              (pg::*wal-durable-lsn* (* 4 size))
+              (pg::*wal-slot-retention-policy*
+                (pg::make-wal-slot-retention-policy :mode :segments :limit 0))
+              (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+              (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+              (pg::*wal-output-stream* nil) (pg::*wal-output-segment* nil)
+              (slot (physical-slot-test-object :restart 1)))
+         (pg::wal-ensure-directory-durable (pg::wal-directory))
+         (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
+         (pg::wal-atomic-write-bytes (pg::wal-segment-path 0) #(0))
+         (setf (gethash "public_physical" pg::*wal-replication-slots*) slot)
+         (sb-thread:with-mutex (pg::*wal-lock*)
+           (pg::wal-remove-checkpointed-segments-under-wal-lock (+ (* 3 size) 32))
+           (setf pg::*wal-keep-size-mb* 64)
+           (pg::wal-remove-checkpointed-segments-under-wal-lock (+ (* 3 size) 32)))
+         (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))
+         (ok (equal "lost" (pg::wal-slot-catalog-status slot)))
+         (ok (eq pg::+null+ (pg::wal-slot-safe-wal-bytes slot)))
+         (ok (not (probe-file (pg::wal-segment-path 0))))))))
+
+(deftest wal-keep-preserves-files-without-weakening-the-native-byte-cap
+    (call-with-physical-slot-api-fixture
+     (lambda (root)
+       (declare (ignore root))
+       (let* ((size pg::+wal-segment-size+)
+              (pg::*wal-keep-size-mb* 64)
+              (pg::*wal-durable-lsn* (* 4 size))
+              (pg::*max-slot-wal-keep-bytes* 0)
+              (pg::*wal-slot-retention-policy*
+                (pg::make-wal-slot-retention-policy :mode :bytes :limit 0))
+              (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
+              (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+              (pg::*wal-output-stream* nil) (pg::*wal-output-segment* nil)
+              (slot (physical-slot-test-object :restart 1)))
+         (pg::wal-ensure-directory-durable (pg::wal-directory))
+         (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
+         (pg::wal-atomic-write-bytes (pg::wal-segment-path 0) #(0))
+         (setf (gethash "public_physical" pg::*wal-replication-slots*) slot)
+         (sb-thread:with-mutex (pg::*wal-lock*)
+           (pg::wal-remove-checkpointed-segments-under-wal-lock (+ (* 3 size) 32)))
+         (ok (eq :lost (pg::wal-replication-slot-wal-status slot)))
+         (ok (probe-file (pg::wal-segment-path 0)))))))
 
 (deftest standard-slot-recycling-preserves-pending-work-until-owner-release
     (call-with-active-slot-recycling-fixture

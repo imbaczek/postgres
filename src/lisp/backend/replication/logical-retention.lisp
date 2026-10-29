@@ -67,7 +67,7 @@ checks outside WAL are advisory."
        (eq owner (wal-replication-slot-active-owner slot))
        (eq backend (wal-replication-slot-active-owner-backend slot))
        (let* ((redo (wal-checkpoint-recycling-segment (wal-slot-recycling-work-checkpoint-lsn work)))
-              (independent (wal-independent-retention-segment redo))
+              (independent (wal-independent-retention-segment redo (wal-slot-recycling-work-durable-lsn work)))
               (keep (wal-slot-removal-segment
                      redo independent (wal-slot-recycling-work-durable-lsn work))))
          (< (wal-replication-slot-restart-lsn slot) (* keep +wal-segment-size+)))))
@@ -180,7 +180,7 @@ The saved restart floor remains internal; consumer cleanup runs after locks drai
 (defun wal-prepare-standard-slot-recycling-under-lock (redo-segment current)
   "Save loss for inactive slots and collect active owner triples under WAL.
 Active slots retain WAL until their owners release and the predicate is rechecked."
-  (let* ((independent (wal-independent-retention-segment redo-segment))
+  (let* ((independent (wal-independent-retention-segment redo-segment current))
          (keep (wal-slot-removal-segment redo-segment independent current))
          (requests nil))
     (wal-invalidate-replication-slots-matching-under-lock
@@ -202,7 +202,7 @@ Standard segments stop active owners first; native bytes keep their existing pat
     (:bytes
      (wal-invalidate-lagging-replication-slots-under-wal-lock)
      (wal-slot-removal-segment
-      redo-segment (wal-independent-retention-segment redo-segment)))
+      redo-segment (wal-independent-retention-segment redo-segment current) current))
     (:segments
      (physical-source-invalidate-lagging-pins-under-wal-lock)
      (wal-prepare-standard-slot-recycling-under-lock redo-segment current))))

@@ -25,6 +25,7 @@
     ("max_replication_slots" :postmaster :integer "10" 0 262143 nil)
     ("checkpoint_timeout" :sighup :integer "300" 30 86400 :seconds)
     ("max_wal_size" :sighup :integer "1024" 2 2147483647 :megabytes)
+    ("wal_keep_size" :sighup :integer "0" 0 2147483647 :megabytes)
     ("max_slot_wal_keep_size" :sighup :integer "-1" -1 2147483647 :megabytes)))
 
 (sb-alien:define-alien-routine ("strtol" startup-strtol) sb-alien:long
@@ -439,6 +440,7 @@ The other worker pools use their C defaults in the process-budget calculation."
         (slot-policy (startup-effective-slot-policy settings native)))
     (setf *startup-server-settings* settings
           *startup-native-inputs* native *startup-command-overrides* overrides
+          *wal-keep-size-mb* (startup-setting-value settings "wal_keep_size")
           *physical-restartpoint-timeout* timeout
           *physical-restartpoint-wal-bytes* wal-bytes
           *max-slot-wal-keep-bytes* (wal-slot-retention-policy-limit slot-policy)
@@ -529,7 +531,8 @@ The other worker pools use their C defaults in the process-budget calculation."
         (let ((value (getf entry :value)))
           (values (case (intern (string-upcase name) :keyword)
                     (:checkpoint_timeout (startup-format-unit value :seconds))
-                    (:max_wal_size (startup-format-unit (* value 1024 1024) :bytes))
+                    ((:max_wal_size :wal_keep_size)
+                     (startup-format-unit (* value 1024 1024) :bytes))
                     (:max_slot_wal_keep_size
                      (if *max-slot-wal-keep-bytes* (startup-format-unit *max-slot-wal-keep-bytes* :bytes) "-1"))
                     (t (princ-to-string value)))

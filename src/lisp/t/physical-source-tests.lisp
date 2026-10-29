@@ -113,6 +113,24 @@
          (ok (pg::physical-source-pin-lost-p (gethash "lagged" pg::*physical-source-pins*)))
          (ok (zerop (hash-table-count pg::*wal-snapshot-retention-pins*)))))))
 
+(deftest wal-keep-retains-files-after-private-proof-cap-loss
+    (call-with-physical-source-fixture
+     (lambda ()
+       (let* ((pg::*max-slot-wal-keep-bytes* 64)
+              (pg::*wal-keep-size-mb* 64)
+              (pg::*wal-slot-retention-policy*
+                (pg::make-wal-slot-retention-policy :mode :segments :limit 64))
+              (pin (pg::physical-source-pin-create "wal_keep")))
+         (pg::wal-remove-checkpointed-segments pg::*wal-durable-lsn*)
+         (ok (pg::physical-source-pin-lost-p pin))
+         (ok (not (gethash pin pg::*wal-snapshot-retention-pins*)))
+         (ok (equal '(0 1 2 3) (pg::wal-discover-segments)))
+         (pg::physical-source-pin-load)
+         (ok (pg::physical-source-pin-lost-p (gethash "wal_keep" pg::*physical-source-pins*)))
+         (setf pg::*wal-keep-size-mb* 0)
+         (pg::wal-remove-checkpointed-segments pg::*wal-durable-lsn*)
+         (ok (equal '(3) (pg::wal-discover-segments)))))))
+
 (deftest private-proof-startup-stabilizes-before-replacing-retention
     (dolist (failure '(nil :file :directory))
       (call-with-physical-source-fixture

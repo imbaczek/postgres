@@ -39,6 +39,8 @@
 
 (defconstant +wal-version+ 7)
 
+(defvar *wal-keep-size-mb* 0)
+
 (defparameter *max-slot-wal-keep-bytes* (* 1024 1024 1024)
   "Native exact-byte slot cap; NIL disables it. Installed settings select the policy.
 The initial 1 GiB value is also the fallback before a policy is installed.")
@@ -2154,7 +2156,11 @@ This is distinct from the advisory public reserved, extended or unreserved statu
   (and (eq :reserved (wal-replication-slot-wal-status slot))
        (wal-replication-slot-restart-lsn slot)))
 
-(defun wal-independent-retention-segment (redo-segment)
+(defun wal-keep-retention-segment (current)
+  (max 0 (- (floor current +wal-segment-size+)
+            (floor (* *wal-keep-size-mb* 1024 1024) +wal-segment-size+))))
+
+(defun wal-independent-retention-segment (redo-segment &optional (current *wal-durable-lsn*))
   "Combine redo, active XID and snapshot floors independent of slots.
 The caller holds WAL; take the XID lock to copy active positions."
   (let ((positions
@@ -2162,8 +2168,9 @@ The caller holds WAL; take the XID lock to copy active positions."
            (sb-thread:with-mutex (*xid-lock*)
              (loop for lsn being the hash-values of *wal-xid-first-lsn* collect lsn))
            (loop for lsn being the hash-values of *wal-snapshot-retention-pins* collect lsn))))
-    (if positions (min redo-segment (floor (reduce #'min positions) +wal-segment-size+))
-        redo-segment)))
+    (min redo-segment
+         (if (plusp *wal-keep-size-mb*) (wal-keep-retention-segment current) redo-segment)
+         (if positions (floor (reduce #'min positions) +wal-segment-size+) redo-segment))))
 
 (defun wal-slot-removal-segment (redo-segment independent-segment &optional (current *wal-durable-lsn*))
   "Combine independent retention with reserved slot floors under the WAL lock.
@@ -2194,7 +2201,8 @@ The standard policy rounds its limit down to whole WAL segments."
         +null+
         (- (ecase mode
              (:segments (* (+ (floor (or restart 0) +wal-segment-size+)
-                              (floor limit +wal-segment-size+) 1)
+                              (max (floor limit +wal-segment-size+)
+                                   (floor (* *wal-keep-size-mb* 1024 1024) +wal-segment-size+)) 1)
                            +wal-segment-size+))
              (:bytes (+ restart limit 1)))
            write))))
@@ -2226,7 +2234,7 @@ Use 1 GiB when no policy is installed."
              (ecase (wal-slot-retention-mode)
                (:bytes (wal-slot-byte-limit-exceeded-p slot write))
                (:segments (< (floor restart +wal-segment-size+)
-                             (wal-slot-removal-segment current current write))))))
+                             (wal-slot-removal-segment current (wal-keep-retention-segment write) write))))))
       (cond (unreserved "unreserved")
             ((wal-slot-within-normal-window-p restart write) "reserved")
             (t "extended")))))
