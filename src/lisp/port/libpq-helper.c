@@ -1,3 +1,12 @@
+/*
+ * libpq-helper.c
+ *
+ * Run libpq in a child process for the Lisp physical replication transport.
+ * The child owns the PGconn and translates bounded requests and replies over
+ * stdin and stdout. It does not interpret WAL, decide durable progress, or
+ * choose feedback; those decisions belong to Lisp. This API is not yet wired
+ * into the physical receiver.
+ */
 #define _GNU_SOURCE
 #include <libpq-fe.h>
 #include <errno.h>
@@ -24,12 +33,19 @@
 #define COPY_SEND_MAX (65536U - 4U)
 #define OPERATION_MS 10000
 
+/*
+ * Each frame has a 25-byte header: magic, session, request, kind, and body
+ * length, with integers in network byte order. The hello uses request zero;
+ * later requests increase by one and replies carry the same identities. Only
+ * one request may be in flight. Errors are bounded replies followed by exit.
+ */
 static uint64_t session_id;
 static uint64_t request_id;
 static PGconn *connection;
 static PGresult *result;
 static unsigned char *request_body;
 static char *copy_data;
+/* COPY IN follows the server's CopyDone and still permits final feedback. */
 static enum { COMMAND_MODE, COPY_BOTH_MODE, COPY_IN_MODE } phase;
 
 static void
@@ -237,6 +253,8 @@ open_connection(const unsigned char *body, uint32_t size)
 	char *fallback = read_string(&next, body + size);
 	if (next != body + size)
 		fail("08P01", "helper open request has trailing bytes");
+	/* Expand conninfo using libpq, then force replication and UTF-8. The
+	 * application name is only a fallback; effective multihost is rejected. */
 	const char *keys[] = {"dbname", "replication", "client_encoding", "fallback_application_name", NULL};
 	const char *values[] = {conninfo, "database", "UTF8", fallback, NULL};
 	int64_t deadline = milliseconds() + OPERATION_MS;
@@ -307,6 +325,7 @@ append_string(unsigned char *next, const char *value, uint32_t size)
 static void
 emit_result(uint32_t maximum, unsigned char kind)
 {
+	/* Bound the serialized result and preserve metadata for Lisp to validate. */
 	int fields = PQnfields(result);
 	int rows = PQntuples(result);
 	const char *tag = PQcmdStatus(result);
@@ -428,6 +447,8 @@ receive_copy(const unsigned char *body, uint32_t size)
 	uint32_t timeout = get32(body + 4);
 	if (!maximum || maximum > COPY_RECEIVE_MAX || timeout > OPERATION_MS)
 		fail("08P01", "helper receive has invalid bounds");
+	/* The reply limit is 131097 bytes: stock 128 KiB WAL plus 25 bytes.
+	 * libpq may allocate input before this payload limit can be checked. */
 	int64_t deadline = milliseconds() + timeout;
 	for (;;)
 	{
@@ -486,6 +507,7 @@ send_copy(const unsigned char *body, uint32_t size)
 static void
 end_copy(const unsigned char *body, uint32_t size)
 {
+	/* Lisp sends this request only after it has decided that ending is safe. */
 	if (!connection || phase != COPY_IN_MODE || size != 4)
 		fail("08P01", "helper CopyDone requires the server completion phase");
 	uint32_t maximum = result_bound(body, size);
@@ -525,6 +547,7 @@ initialize(int argc, char **argv)
 	if (quiet < 0 || dup2(quiet, STDERR_FILENO) < 0)
 		_exit(2);
 	close(quiet);
+	/* Bound the whole child address space, not individual wire allocations. */
 	struct rlimit memory = {MEMORY_LIMIT, MEMORY_LIMIT};
 	if (setrlimit(RLIMIT_AS, &memory) != 0)
 		_exit(2);

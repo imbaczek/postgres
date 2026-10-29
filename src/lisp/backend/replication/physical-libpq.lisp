@@ -1,5 +1,10 @@
 (in-package #:pg)
 
+;; The helper owns libpq in an isolated child. This transport is not yet wired
+;; into the physical receiver; Lisp remains responsible for WAL validation,
+;; durability, and deciding when feedback and frontend CopyDone may be sent.
+;; The largest COPY payload admits stock 128 KiB WAL data plus its 25-byte
+;; header (and the smaller 65561-byte native payload).
 (defconstant +physical-libpq-copy-maximum+ (+ (* 128 1024) 25))
 
 (defun physical-libpq-header (session request kind size)
@@ -29,6 +34,10 @@
             (:constructor %make-physical-libpq-profile (conninfo fallback))
             (:conc-name %physical-libpq-profile-)
             (:print-function physical-libpq-print-profile))
+  "Copied connection settings; printing the profile does not expose secrets.
+FALLBACK supplies libpq's fallback application name. Libpq resolves service and
+environment settings for each connection attempt. Effective multihost connections
+are unsupported by the helper."
   (conninfo "" :type string :read-only t)
   (fallback "" :type string :read-only t))
 
@@ -56,7 +65,9 @@
 (defun physical-libpq-profile-fallback (profile)
   (copy-seq (%physical-libpq-profile-fallback profile)))
 
-(defstruct physical-libpq-result kind status tag columns rows)
+(defstruct physical-libpq-result
+  "A bounded helper result, including metadata to check against the expected schema."
+  kind status tag columns rows)
 
 (defun physical-libpq-decode-result (kind body)
   (unless (member kind '(#\T #\C))
@@ -115,6 +126,9 @@
     row))
 
 (defstruct (physical-libpq-channel (:constructor %make-physical-libpq-channel))
+  "One child and its request stream. The owning transport API performs I/O and
+close; a controller may stop it using PIDFD. Session and request identities bind each
+reply to its exchange. A stopped channel cannot be reused; failed exchanges close it."
   process
   pidfd
   owner
@@ -195,6 +209,7 @@
     (error "libpq helper operation requires its owning thread")))
 
 (defun physical-libpq-stop (channel)
+  "Mark CHANNEL stopped and signal its child through the stable process handle."
   (sb-thread:with-mutex ((physical-libpq-channel-lock channel))
     (setf (physical-libpq-channel-stopped channel) t)
     (when (physical-libpq-channel-pidfd channel)
@@ -205,6 +220,9 @@
   (values))
 
 (defun physical-libpq-close (channel)
+  "Stop and reap CHANNEL from its owner. Repeated close is harmless.
+Cleanup runs without interrupts. The capacity slot is retained if child death
+cannot be established, so another child cannot silently exceed the limit."
   (physical-libpq-require-owner channel)
   (sb-sys:without-interrupts
     (unless (physical-libpq-channel-closed channel)
@@ -247,6 +265,8 @@
          (unless ,complete (physical-libpq-close ,owned))))))
 
 (defun physical-libpq-exchange (channel kind body kinds maximum &key (timeout 12))
+  "Send one bounded request and validate its matching typed reply.
+On failure or timeout, close the channel instead of reusing a partial exchange."
   (with-physical-libpq-operation (channel)
     (sb-ext:with-timeout timeout
       (let ((request (physical-libpq-write-request channel kind body)))
@@ -269,6 +289,7 @@
       (bytes->string bytes))))
 
 (defun physical-libpq-acquire-process-handle (channel)
+  "Acquire a pidfd while SBCL's process reaper lock protects the child identity."
   (let ((process (physical-libpq-channel-process channel))
         (failure nil))
     (sb-int:with-system-mutex (sb-impl::*active-processes-lock*)
@@ -285,6 +306,10 @@
     (when failure (error failure))))
 
 (defun physical-libpq-open-channel (helper &key on-spawn)
+  "Reserve one of two slots, spawn HELPER, and verify its identity and hello.
+Ownership assumes RUN-PROGRAM returns normally. This project installs no process
+status hooks; an unrelated hook that throws before RUN-PROGRAM returns is not
+supported. A failed open attempts to close the reserved channel."
   (let* ((path (namestring (truename helper)))
          (parent (format nil "~d" (sb-posix:getpid)))
          (session (loop for value = (logior (ash (random-cancel-key) 32)
@@ -341,6 +366,7 @@
         channel))))
 
 (defun physical-libpq-query (channel query schema tag &key (maximum 4096) command-only)
+  "Run a command and require its bounded result to match SCHEMA and TAG."
   (with-physical-libpq-operation (channel)
     (let ((body (make-payload)))
       (payload-push-u32 body maximum)
@@ -361,6 +387,7 @@
     (list :switch next fork)))
 
 (defun physical-libpq-start (channel query)
+  "Start streaming, returning :COPY-BOTH or the validated timeline switch."
   (with-physical-libpq-operation (channel)
     (let ((body (make-payload)))
       (payload-push-u32 body 4096)
@@ -371,6 +398,7 @@
             (physical-libpq-switch-result kind bytes))))))
 
 (defun physical-libpq-receive (channel &key (wait-ms 1000) (maximum +physical-libpq-copy-maximum+))
+  "Receive COPY data, server completion, or an idle indication within the bounds."
   (unless (and (typep wait-ms '(integer 0 10000))
                (typep maximum '(integer 1 131097)))
     (error "invalid libpq copy receive bound"))
@@ -381,12 +409,15 @@
                              :timeout (+ 12 (/ wait-ms 1000)))))
 
 (defun physical-libpq-feedback (channel body)
+  "Send feedback chosen by the caller from its own WAL and durability state."
   (unless (<= 1 (length body) 65532)
     (error "invalid libpq feedback length"))
   (physical-libpq-exchange channel #\S body '(#\A) 0)
   (values))
 
 (defun physical-libpq-finish (channel next fork)
+  "Send frontend CopyDone and verify the resulting switch against NEXT and FORK.
+The caller must first flush local receipt and send truthful durability feedback."
   (with-physical-libpq-operation (channel)
     (let ((body (make-payload)))
       (payload-push-u32 body 4096)
