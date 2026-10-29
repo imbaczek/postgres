@@ -43,6 +43,9 @@ compare() {
     sql "$PORT" 'SELECT id,label FROM data ORDER BY id' >"$TMP/source.rows"
     sql "$TARGET_PORT" 'SELECT id,label FROM data ORDER BY id' >"$TMP/target.rows"
     diff -u "$TMP/source.rows" "$TMP/target.rows"
+    sql "$PORT" 'SELECT id,body,document FROM toast_replay ORDER BY id' >"$TMP/source.toast"
+    sql "$TARGET_PORT" 'SELECT id,body,document FROM toast_replay ORDER BY id' >"$TMP/target.toast"
+    cmp "$TMP/source.toast" "$TMP/target.toast"
     test "$(sql "$TARGET_PORT" 'SELECT pg_is_in_recovery()')" = t
 }
 export_wal() {
@@ -58,6 +61,9 @@ mkdir -m 700 "$TMP/copy"
 SOURCE=$!
 test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 sql "$PORT" "CREATE TABLE data (id integer PRIMARY KEY,label varchar(32)); INSERT INTO data VALUES (1,'base'); CREATE SEQUENCE replay_seq START WITH 7; CREATE TABLE base_empty (id integer); CREATE TABLE base_drop (id integer); INSERT INTO base_drop VALUES (10)"
+sql "$PORT" 'CREATE TABLE toast_replay (id integer PRIMARY KEY, body text, document jsonb); ALTER TABLE toast_replay ALTER COLUMN body SET STORAGE EXTERNAL; ALTER TABLE toast_replay ALTER COLUMN document SET STORAGE EXTERNAL'
+awk 'BEGIN { for (row=1;row<=2;row++) { printf "INSERT INTO toast_replay VALUES (%d, \047", row; for (i=0;i<10000;i++) printf "%c", 97+(i%23); printf "\047, \047{\"value\":\""; for (i=0;i<10000;i++) printf "%c", 65+(i%23); print "\"}\047::jsonb);" } }' >"$TMP/toast-seed.sql"
+PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -f "$TMP/toast-seed.sql" >/dev/null
 # Multiple base heap pages ensure that later updates do not carry every base
 # page in post-base WAL. Recreating a lost heap from those records would lose rows.
 base_rows=$(python3 - <<'PY'
@@ -118,26 +124,43 @@ checked target '(reload)' live-reload
 grep -q 'reload complete' "$TMP/live-reload.log"
 # A safe row prefix advances; retained transactions still delay catalog replay.
 mkfifo "$TMP/tx.fifo"
+old_toast=$(sql "$PORT" 'SELECT count(*), sum(length(body)), sum(length(document::text)) FROM toast_replay')
+sql "$PORT" 'SELECT id,body,document FROM toast_replay ORDER BY id' >"$TMP/old-toast.rows"
 PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$TARGET_PORT" -U postgres -d postgres \
     -qAt -v ON_ERROR_STOP=1 <"$TMP/tx.fifo" >"$TMP/tx.log" 2>&1 &
 TX=$!
 exec 7>"$TMP/tx.fifo"
-printf 'BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT count(*) FROM data;\n' >&7
+printf 'BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT count(*) FROM data;\nSELECT count(*), sum(length(body)), sum(length(document::text)) FROM toast_replay;\nSELECT id,body,document FROM toast_replay ORDER BY id;\n' >&7
 attempt=0
 while ! grep -q "^$((base_count + 1))$" "$TMP/tx.log"; do
     attempt=$((attempt + 1)); test "$attempt" -lt 100; sleep 0.1
 done
-sql "$PORT" "UPDATE data SET label='updated' WHERE id=1; INSERT INTO data VALUES (3,'next'); SELECT nextval('replay_seq'); CREATE TABLE extra (id integer); INSERT INTO extra VALUES (42); CREATE TABLE empty_after_base (id integer); DROP TABLE base_drop"
+attempt=0
+while ! grep -Fxq "$old_toast" "$TMP/tx.log"; do
+    attempt=$((attempt + 1)); test "$attempt" -lt 100; sleep 0.1
+done
+sql "$PORT" "UPDATE data SET label='updated' WHERE id=1; INSERT INTO data VALUES (3,'next'); UPDATE toast_replay SET body=body || body WHERE id=1; DELETE FROM toast_replay WHERE id=2; SELECT nextval('replay_seq'); CREATE TABLE extra (id integer); INSERT INTO extra VALUES (42); CREATE TABLE empty_after_base (id integer); DROP TABLE base_drop"
 export_wal
 receive_all
 checked target '(physical-recovery-replay)' deferred
 grep -q ':DEFERRED' "$TMP/deferred.log"
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = "$((base_count + 2))"
-printf 'SELECT count(*) FROM data;\n' >&7
+test "$(sql "$TARGET_PORT" 'SELECT count(*), sum(length(body)) FROM toast_replay')" = '1|20000'
+printf 'SELECT count(*) FROM data;\nSELECT count(*), sum(length(body)), sum(length(document::text)) FROM toast_replay;\nSELECT id,body,document FROM toast_replay ORDER BY id;\n' >&7
 attempt=0
 while [ "$(grep -c "^$((base_count + 1))$" "$TMP/tx.log")" -lt 2 ]; do
     attempt=$((attempt + 1)); test "$attempt" -lt 100; sleep 0.05
 done
+attempt=0
+while [ "$(grep -Fxc "$old_toast" "$TMP/tx.log")" -lt 2 ]; do
+    attempt=$((attempt + 1)); test "$attempt" -lt 100; sleep 0.05
+done
+while IFS= read -r old_row; do
+    attempt=0
+    while [ "$(grep -Fxc "$old_row" "$TMP/tx.log")" -lt 2 ]; do
+        attempt=$((attempt + 1)); test "$attempt" -lt 100; sleep 0.05
+    done
+done <"$TMP/old-toast.rows"
 printf 'COMMIT;\n\\q\n' >&7
 exec 7>&-
 wait "$TX"
