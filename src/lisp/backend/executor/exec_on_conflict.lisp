@@ -172,40 +172,12 @@
     (ereport "40001" "could not serialize access due to concurrent update")))
 
 (defun on-conflict-update-values (table conflict old excluded)
-  (let ((environment (concatenate 'vector old excluded))
-        (new (copy-seq old)))
-    (dolist (assignment (getf conflict :sets))
-      (let* ((column (car assignment))
-             (expression (getf (cdr assignment) :expr))
-             (value (if (eq expression :default) (coerce-dml-column-default column)
-                        (eval-expr expression environment))))
-        (setf (aref new (1- (pg-column-attnum column)))
-              (coerce-value value (pg-column-type column) (pg-column-typmod column)))))
-    (check-not-null new (pg-class-columns table))
-    (check-table-constraints table new)
-    new))
-
-(defun on-conflict-compressed-values (table conflict actual new excluded excluded-reuse)
-  "Preserve claimed-row or direct EXCLUDED compressed values for an update."
-  (let* ((columns (pg-class-columns table))
-         (result (or (unchanged-tuple-compressed-values actual (getf conflict :sets) new)
-                     (make-array (length columns) :initial-element nil)))
-         (width (length columns)))
-    (when excluded-reuse
-      (dolist (assignment (getf conflict :sets))
-        (let* ((column (car assignment))
-               (target (cdr assignment))
-               (expr (getf target :expr))
-               (input (and (consp expr) (eq (first expr) :assignment) (second expr)))
-               (slot (and (consp input) (eq (first input) :col) (- (second input) width)))
-               (i (1- (pg-column-attnum column))))
-          (when (and slot (= slot (1+ i)) (<= 1 slot width)
-                     (aref excluded-reuse (1- slot))
-                     (datum-origin-assignment-compatible-p input column)
-                     (equalp (aref (nth-value 2 (heap-tuple-layout (vector (aref new i)) (vector column))) 0)
-                             (aref (nth-value 2 (heap-tuple-layout (vector (aref excluded (1- slot))) (vector column))) 0)))
-            (setf (aref result i) (aref excluded-reuse (1- slot)))))))
-    result))
+  (subquery-update-values
+   table
+   (mapcar (lambda (assignment)
+             (cons (car assignment) (getf (cdr assignment) :expr)))
+           (getf conflict :sets))
+   old (concatenate 'vector old excluded)))
 
 (defun claim-on-conflict-candidate (table values conflict indexes)
   ;; Claim before WHERE, retaining ownership to transaction end even when WHERE
@@ -224,56 +196,66 @@
           (when owner (return-from claim-on-conflict-candidate (values :wait owner))))))
     (values status candidate)))
 
-(defun insert-tuple-on-conflict (table values conflict state &key compressed-reuse)
+(defun insert-tuple-on-conflict (table values conflict state &key compressed-reuse datum-origins)
   (declare (ignore state))
-  (loop
-    (multiple-value-bind (block off publications action tuple)
-        (insert-tuple-with-unique
-         table values :publication-kind :insert :compressed-reuse compressed-reuse
-         :before-check
-         (when conflict
-           (lambda (indexes) (claim-on-conflict-candidate table values conflict indexes))))
-      (declare (ignore block off))
-      (unless (eq action :conflict)
-        (logical-note-row-change :insert table :new-values values :publication-selection publications)
-        (return (values :insert values nil)))
-      (when (eq (getf conflict :action) :nothing)
-        (return (values :nothing nil nil)))
-      ;; The row is claimed, but B-tree and writer locks have been released;
-      ;; SQL evaluation and any subsequent waits must remain outside those locks.
-      (materialize-select-tuple table tuple *current-snapshot*)
-      (let* ((old (htup-values tuple))
-             (environment (concatenate 'vector old values))
-             (where (getf (getf conflict :where-target) :expr))
-             (accepted (call-with-dml-expression-evaluation
-                        (lambda () (or (null where) (true-p (eval-expr where environment)))))))
-        (unless accepted (return (values :nothing nil nil)))
-        (let ((new (call-with-dml-expression-evaluation
-                    (lambda () (on-conflict-update-values table conflict old values))))
-              (rel (pg-class-relfilenode table))
-              (xid (backend-xid *backend*))
-              (protected-snapshot *current-snapshot*))
-          ;; READ COMMITTED refreshes only the heap claim snapshot. WHERE and SET
-          ;; subqueries above retain the original statement snapshot.
-          (let ((*current-snapshot* (if (eq (backend-isolation-level *backend*) :read-committed)
-                                        (fresh-delete-snapshot *current-snapshot*) *current-snapshot*)))
-            (multiple-value-bind (deleted actual old-block old-offnum write-status)
-                (heapam-delete-tid rel (pg-class-columns table) (htup-block tuple) (htup-offnum tuple)
-                                   xid (backend-command-id *backend*))
-              (check-heapam-write-status write-status)
-              (when deleted
-                (let ((reuse (unchanged-tuple-toast-pointers actual (getf conflict :sets) table new protected-snapshot)))
-                  (delete-tuple-toast-values table actual xid (backend-command-id *backend*) reuse)
-                  (materialize-select-tuple table actual protected-snapshot)
-                  (multiple-value-bind (new-block new-offnum selection)
-                      (insert-tuple-with-unique
-                       table new :exclude-tid (cons old-block old-offnum) :publication-kind :update
-                       :toast-reuse reuse :compressed-reuse (on-conflict-compressed-values table conflict actual new values compressed-reuse)
-                       :on-success
-                       (lambda (next-block next-offnum)
-                         (unless (heapam-set-ctid-unlocked rel old-block old-offnum next-block next-offnum)
-                           (ereport "XX000" "could not link updated heap tuple"))))
-                    (declare (ignore new-block new-offnum))
-                    (logical-note-row-change :update table :old-values (htup-values actual)
-                                             :new-values new :toast-reuse reuse :publication-selection selection))
-                  (return-from insert-tuple-on-conflict (values :update new (htup-values actual))))))))))))
+  (let ((*datum-origin-capture* t) (*query-row-origins* nil))
+    (loop
+      (multiple-value-bind (block off publications action tuple)
+          (insert-tuple-with-unique
+           table values :publication-kind :insert :compressed-reuse compressed-reuse
+           :before-check
+           (when conflict
+             (lambda (indexes) (claim-on-conflict-candidate table values conflict indexes))))
+        (declare (ignore block off))
+        (unless (eq action :conflict)
+          (logical-note-row-change :insert table :new-values values :publication-selection publications)
+          (return (values :insert values nil)))
+        (when (eq (getf conflict :action) :nothing)
+          (return (values :nothing nil nil)))
+        ;; The claimed row cannot change while WHERE and SET are evaluated.
+        (materialize-select-tuple table tuple *current-snapshot*)
+        (let* ((old (htup-values tuple))
+               (environment (concatenate 'vector old values))
+               (*query-row-origins*
+                 (concatenate 'vector
+                              (or (htup-origins tuple) (make-array (length old) :initial-element nil))
+                              (or datum-origins (make-array (length values) :initial-element nil))))
+               (where (getf (getf conflict :where-target) :expr))
+               (accepted (call-with-dml-expression-evaluation
+                          (lambda () (or (null where) (true-p (eval-expr where environment)))))))
+          (unless accepted (return (values :nothing nil nil)))
+          (multiple-value-bind (new computed-compressed descriptors)
+              (call-with-dml-expression-evaluation
+               (lambda () (on-conflict-update-values table conflict old values)))
+            (let ((rel (pg-class-relfilenode table))
+                  (xid (backend-xid *backend*))
+                  (protected-snapshot *current-snapshot*))
+              ;; Refresh the claim snapshot while preserving the statement snapshot for subqueries.
+              (let ((*current-snapshot* (if (eq (backend-isolation-level *backend*) :read-committed)
+                                            (fresh-delete-snapshot *current-snapshot*) *current-snapshot*)))
+                (multiple-value-bind (deleted actual old-block old-offnum write-status)
+                    (heapam-delete-tid rel (pg-class-columns table) (htup-block tuple) (htup-offnum tuple)
+                                       xid (backend-command-id *backend*))
+                  (check-heapam-write-status write-status)
+                  (when deleted
+                    (let ((reuse (unchanged-tuple-toast-pointers actual (getf conflict :sets) table new protected-snapshot)))
+                      (dml-reuse-matching-external-descriptors table actual new descriptors reuse protected-snapshot)
+                      (delete-tuple-toast-values table actual xid (backend-command-id *backend*) reuse)
+                      (materialize-select-tuple table actual protected-snapshot)
+                      (let ((old-compressed (unchanged-tuple-compressed-values actual (getf conflict :sets) new)))
+                        (dotimes (i (length computed-compressed))
+                          (cond ((aref reuse i) (setf (aref computed-compressed i) nil))
+                                ((and old-compressed (null (aref computed-compressed i)))
+                                 (setf (aref computed-compressed i) (aref old-compressed i))))))
+                      (multiple-value-bind (new-block new-offnum selection)
+                          (insert-tuple-with-unique
+                           table new :exclude-tid (cons old-block old-offnum) :publication-kind :update
+                           :toast-reuse reuse :compressed-reuse computed-compressed
+                           :on-success
+                           (lambda (next-block next-offnum)
+                             (unless (heapam-set-ctid-unlocked rel old-block old-offnum next-block next-offnum)
+                               (ereport "XX000" "could not link updated heap tuple"))))
+                        (declare (ignore new-block new-offnum))
+                        (logical-note-row-change :update table :old-values (htup-values actual)
+                                                 :new-values new :toast-reuse reuse :publication-selection selection))
+                      (return-from insert-tuple-on-conflict (values :update new (htup-values actual))))))))))))))

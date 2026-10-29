@@ -248,7 +248,7 @@ and CTEs with supported scan and join producers, UNION arms, and optional filter
 sorting, top-N or LIMIT, direct projected columns
 and the selected CASE or COALESCE
 branch can retain compressed values through compatible assignments. This includes
-same-column `excluded` assignments in `ON CONFLICT DO UPDATE`. External source
+compatible `excluded` and existing-row expressions in `ON CONFLICT DO UPDATE`. External source
 values are detached from their original table; PLAIN targets flatten them.
 Recursive UNION retains origins through supported working-table plans while
 duplicate elimination compares logical values. Scalar subqueries with supported
@@ -260,8 +260,8 @@ may be reused only when it matches the corresponding attribute of the claimed
 old row and the assigned value remains unchanged.
 LATERAL joins also retain origins from their outer rows. Grouping and DISTINCT retain
 the first representative; MIN/MAX retain the first non-NULL input until another
-non-NULL input is compared. Other CTE producer shapes,
-explicit casts, and cross-column `excluded` assignments do not yet retain this provenance.
+non-NULL input is compared. Other CTE producer shapes and explicit casts do not yet
+retain this provenance.
 For an interpreted SELECT plan with a projection over one base-table sequential
 or non-parameterized index scan, optionally with filters, sorting or top-N,
 and LIMIT, external values unused by the projection, filters, ordering, and

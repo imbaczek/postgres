@@ -128,6 +128,55 @@ run -c 'insert into toast_scalar_result select (select (select v)) from toast_in
 [ "$(run -c "select count(*) from toast_scalar_result where v='short'")" = 2 ]
 run -c 'create table toast_scalar_source (id int, v text)' >/dev/null
 run -c "insert into toast_scalar_source values (1,'$index_suffix'),(2,'b$index_suffix')" >/dev/null
+run -c 'create table toast_conflict_origins (id int primary key, a text, b text)' >/dev/null
+run -c 'alter table toast_conflict_origins alter column a set storage external' >/dev/null
+run -c 'alter table toast_conflict_origins alter column b set storage plain' >/dev/null
+run -c "insert into toast_conflict_origins values (1,'old','small')" >/dev/null
+run -c "insert into toast_conflict_origins select 1,v,'ignored' from toast_scalar_source where id=1 on conflict (id) do update set b=excluded.a" >/dev/null
+run -c "insert into toast_conflict_origins values (1,'ignored','ignored') on conflict (id) do update set b=case when true then toast_conflict_origins.b else '' end" >/dev/null
+run -c "insert into toast_conflict_origins values (1,'ignored','ignored') on conflict (id) do update set b=(select toast_conflict_origins.b)" >/dev/null
+[ "$(run -c 'select length(b) from toast_conflict_origins where id=1')" = 20000 ]
+run -c 'create table toast_conflict_narrow (id int primary key, a varchar(30000), b text)' >/dev/null
+run -c 'alter table toast_conflict_narrow alter column a set storage external' >/dev/null
+run -c 'alter table toast_conflict_narrow alter column b set storage plain' >/dev/null
+run -c "insert into toast_conflict_narrow values (1,'old','small')" >/dev/null
+if run -v VERBOSITY=verbose -c "insert into toast_conflict_narrow select 1,v,'ignored' from toast_scalar_source where id=1 on conflict (id) do update set b=excluded.a" >"$TMP/conflict-narrow.out" 2>&1; then
+    echo 'toast-dml: narrowed proposed datum retained origin' >&2; exit 1
+fi
+case $(cat "$TMP/conflict-narrow.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: narrowed proposed datum did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+if run -v VERBOSITY=verbose -c "insert into toast_conflict_origins select 1,v || '', 'ignored' from toast_scalar_source where id=1 on conflict (id) do update set b=excluded.a" >"$TMP/conflict-computed.out" 2>&1; then
+    echo 'toast-dml: computed EXCLUDED datum retained compression' >&2; exit 1
+fi
+case $(cat "$TMP/conflict-computed.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: computed EXCLUDED datum did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+mkfifo "$TMP/conflict-origin-epq.sql"
+run < "$TMP/conflict-origin-epq.sql" > "$TMP/conflict-origin-epq.out" 2>&1 &
+READER=$!
+exec 3> "$TMP/conflict-origin-epq.sql"
+printf '%s\n' "begin; update toast_conflict_origins set b='after' where id=1;" '\echo ready' >&3
+i=0
+until grep -Fxq ready "$TMP/conflict-origin-epq.out"; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || { cat "$TMP/conflict-origin-epq.out" >&2; exit 1; }; sleep 0.1
+done
+run -c 'select pg_backend_pid()' -c "insert into toast_conflict_origins select 1,v,'ignored' from toast_scalar_source where id=2 on conflict (id) do update set b=case when toast_conflict_origins.b='after' then excluded.a else 'bad' end" >"$TMP/conflict-origin-waiter.out" 2>&1 &
+WRITER=$!
+i=0
+until waiter_pid=$(awk '/^[0-9]+$/{print; exit}' "$TMP/conflict-origin-waiter.out") && [ -n "$waiter_pid" ]; do
+    kill -0 "$WRITER" 2>/dev/null || { cat "$TMP/conflict-origin-waiter.out" >&2; exit 1; }
+    i=$((i + 1)); [ "$i" -lt 100 ] || exit 1; sleep 0.1
+done
+printf '%s\n(quit)\n' "(loop repeat 100 for backend = (lookup-backend $waiter_pid) when (and backend (backend-waiting-xid backend)) return :waiting do (sleep 0.05) finally (return :timeout))" | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/conflict-origin-wait.out"
+grep -Fq ':WAITING' "$TMP/conflict-origin-wait.out" || { cat "$TMP/conflict-origin-wait.out" >&2; exit 1; }
+printf '%s\n' 'commit;' '\q' >&3
+exec 3>&-
+wait "$READER"; READER=
+wait "$WRITER"; WRITER=
+[ "$(run -c 'select length(b),substr(b,1,1) from toast_conflict_origins where id=1')" = '20001|b' ]
 run -c 'create table toast_scalar_dml (id int primary key, v text)' >/dev/null
 run -c 'alter table toast_scalar_dml alter column v set storage plain' >/dev/null
 run -c 'insert into toast_scalar_dml values (1,(select v from toast_scalar_source where id=1)),(2,(select v from toast_scalar_source where id=2))' >/dev/null
@@ -407,6 +456,55 @@ run -c 'update toast_external_self set v=(select v) where id=1' >/dev/null
 run -c "update toast_external_self set v=coalesce(v,'') where id=1" >/dev/null
 run -c 'update toast_external_self t set v=s.v from toast_external_self s where t.id=1 and s.id=1' >/dev/null
 [ "$(run -c 'select length(v) from toast_external_self where id=1')" = 200000 ]
+run -c 'create table toast_conflict_external (id int primary key, a text, b text)' >/dev/null
+awk 'BEGIN { printf "insert into toast_conflict_external values (1,\047small\047,\047"; for (i=0;i<200000;i++) printf "a"; print "\047);" }' | run >/dev/null
+run -c 'alter table toast_conflict_external alter column a set storage plain' >/dev/null
+run -c 'alter table toast_conflict_external alter column b set storage plain' >/dev/null
+run -c "insert into toast_conflict_external select 1,b,'ignored' from toast_conflict_external where id=1 on conflict (id) do update set b=excluded.a" >/dev/null
+[ "$(run -c 'select length(b) from toast_conflict_external where id=1')" = 200000 ]
+run -c 'create table toast_conflict_cross (id int primary key, a text, b text unique)' >/dev/null
+run -c 'alter table toast_conflict_cross alter column a set storage plain' >/dev/null
+run -c 'alter table toast_conflict_cross alter column b set storage external' >/dev/null
+run -c "insert into toast_conflict_cross values (1,'old','small')" >/dev/null
+run -c "insert into toast_conflict_cross select 1,v,'ignored' from toast_external_self where id=1 on conflict (id) do update set b=excluded.a" >/dev/null
+[ "$(run -c 'select length(b) from toast_conflict_cross where id=1')" = 200000 ]
+if run -v VERBOSITY=verbose -c "insert into toast_conflict_external select 1,v,'ignored' from toast_external_self where id=1 on conflict (id) do update set b=excluded.a" >"$TMP/conflict-external-foreign.out" 2>&1; then
+    echo 'toast-dml: foreign EXCLUDED descriptor reused under PLAIN' >&2; exit 1
+fi
+case $(cat "$TMP/conflict-external-foreign.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: foreign EXCLUDED descriptor did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+# EXCLUDED retains its statement-snapshot datum across a conflict wait, but
+# must match the newly claimed old tuple before any descriptor is reused.
+mkfifo "$TMP/conflict-descriptor.sql"
+run < "$TMP/conflict-descriptor.sql" > "$TMP/conflict-descriptor.out" 2>&1 &
+READER=$!
+exec 3> "$TMP/conflict-descriptor.sql"
+printf '%s\n' "begin; update toast_conflict_external set b='short' where id=1;" '\echo ready' >&3
+i=0
+until grep -Fxq ready "$TMP/conflict-descriptor.out"; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || { cat "$TMP/conflict-descriptor.out" >&2; exit 1; }; sleep 0.1
+done
+run -v VERBOSITY=verbose -c 'select pg_backend_pid()' -c "insert into toast_conflict_external select 1,b,'ignored' from toast_conflict_external where id=1 on conflict (id) do update set b=excluded.a" >"$TMP/conflict-descriptor-waiter.out" 2>&1 &
+WRITER=$!
+i=0
+until waiter_pid=$(awk '/^[0-9]+$/{print; exit}' "$TMP/conflict-descriptor-waiter.out") && [ -n "$waiter_pid" ]; do
+    kill -0 "$WRITER" 2>/dev/null || { cat "$TMP/conflict-descriptor-waiter.out" >&2; exit 1; }
+    i=$((i + 1)); [ "$i" -lt 100 ] || exit 1; sleep 0.1
+done
+printf '%s\n(quit)\n' "(loop repeat 100 for backend = (lookup-backend $waiter_pid) when (and backend (backend-waiting-xid backend)) return :waiting do (sleep 0.05) finally (return :timeout))" | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/conflict-descriptor-wait.out"
+grep -Fq ':WAITING' "$TMP/conflict-descriptor-wait.out" || { cat "$TMP/conflict-descriptor-wait.out" >&2; exit 1; }
+printf '%s\n' 'commit;' '\q' >&3
+exec 3>&-
+wait "$READER"; READER=
+if wait "$WRITER"; then echo 'toast-dml: stale EXCLUDED descriptor reused after conflict wait' >&2; exit 1; fi
+WRITER=
+case $(cat "$TMP/conflict-descriptor-waiter.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: stale EXCLUDED descriptor did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
+[ "$(run -c 'select b from toast_conflict_external where id=1')" = short ]
 if run -v VERBOSITY=verbose -c 'update toast_external_self t set v=s.v from toast_external_self s where t.id=1 and s.id=2' >"$TMP/external-other-row.out" 2>&1; then
     echo 'toast-dml: equal external value from another row reused a descriptor' >&2; exit 1
 fi

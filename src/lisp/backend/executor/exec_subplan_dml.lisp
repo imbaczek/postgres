@@ -389,7 +389,8 @@ Match varchar_support and numeric_support's typmod relabel conditions."
                          (or (not (datum-origin-external-p origin))
                              (not (char= (pg-column-effective-storage column) #\p)))
                          (datum-origin-compressed origin))
-                    (and compatible (datum-origin-descriptor origin))))))
+                    (and compatible (datum-origin-descriptor origin))
+                    (and compatible origin)))))
       (values (eval-expr expression environment) nil nil)))
 
 (defun exec-insert-subqueries (stream ast)
@@ -406,11 +407,14 @@ Match varchar_support and numeric_support's typmod relabel conditions."
          (labels
              ((insert-row (expressions environment)
                 (check-for-interrupts)
-                (let ((compressed (make-array (length columns) :initial-element nil)))
+                (let ((compressed (make-array (length columns) :initial-element nil))
+                      (datum-origins (make-array (length columns) :initial-element nil)))
                   (flet ((eval-assignment (expression column)
-                           (multiple-value-bind (value origin)
+                           (multiple-value-bind (value origin descriptor datum-origin)
                                (eval-dml-assignment-with-origin expression environment column)
-                             (setf (aref compressed (1- (pg-column-attnum column))) origin)
+                             (declare (ignore descriptor))
+                             (setf (aref compressed (1- (pg-column-attnum column))) origin
+                                   (aref datum-origins (1- (pg-column-attnum column))) datum-origin)
                              value)))
                     (let ((values
                             (call-with-dml-expression-evaluation
@@ -445,7 +449,7 @@ Match varchar_support and numeric_support's typmod relabel conditions."
                       (multiple-value-bind (action actual old)
                           (if (getf prepared :conflict)
                               (insert-tuple-on-conflict table values (getf prepared :conflict) state
-                                                        :compressed-reuse compressed)
+                                                        :compressed-reuse compressed :datum-origins datum-origins)
                               (multiple-value-bind (block off publications)
                                   (insert-tuple-with-unique table values :publication-kind :insert
                                                                          :compressed-reuse compressed)
