@@ -125,8 +125,8 @@ depth greater than 512 are rejected with SQLSTATE 54001; the root has depth zero
                  (t (write-char c out))))
   (write-char #\" out))
 
-(defun sql-jsonb-output (jsonb)
-  "Render normalized JSONB in PostgreSQL's spaced, canonical text form."
+(defun sql-jsonb-write (jsonb out)
+  "Write normalized JSONB in PostgreSQL's spaced, canonical text form."
   (labels ((emit (value out)
              (cond
                ((eq value :json-null) (write-string "null" out))
@@ -147,7 +147,11 @@ depth greater than 512 are rejected with SQLSTATE 54001; the root has depth zero
                       do (unless first (write-string ", " out)) (emit item out))
                 (write-char #\] out))
                (t (write-string (sql-numeric-output value) out)))))
-    (with-output-to-string (out) (emit (sql-jsonb-value jsonb) out))))
+    (emit (sql-jsonb-value jsonb) out)))
+
+(defun sql-jsonb-output (jsonb)
+  "Render normalized JSONB in PostgreSQL's spaced, canonical text form."
+  (with-output-to-string (out) (sql-jsonb-write jsonb out)))
 
 (defun sql-jsonb-extract (jsonb key text-p)
   "Extract a JSONB object field or array element; return SQL NULL when absent.

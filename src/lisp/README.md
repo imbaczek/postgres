@@ -591,8 +591,9 @@ Logical capture keeps encoded events in memory until their cumulative size
 exceeds 4 MiB, then spills all events to a transaction-owned temporary file.
 For each change, capture first counts encoded bytes and computes a checksum;
 when the threshold would be exceeded, a second encoding pass writes directly
-to the file. String encoding uses bounded UTF-8 blocks, though JSONB output
-still constructs a complete text representation.
+to the file. String encoding uses bounded UTF-8 blocks. JSONB capture counts
+and emits its canonical text in bounded UTF-8 blocks without constructing a
+complete output string; the normalized JSONB value itself remains in memory.
 The spool has its own quota using the `--temp-file-limit-bytes` setting,
 separate from query spill quotas; its length and checksum framing also counts
 against that quota. It is cleaned up when the transaction ends. At commit the

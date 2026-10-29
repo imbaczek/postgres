@@ -829,6 +829,30 @@
                                        (loop for byte across part do (vector-push-extend byte actual)))))
           (rove:ok (equalp expected actual))))))
 
+(rove:deftest test-logical-jsonb-bounded-utf8-output
+    (let* ((large (concatenate 'string (make-string 4095 :initial-element #\a)
+                               "🙂" (make-string 5000 :initial-element #\Newline)))
+           (value (sql-jsonb-input
+                   (with-output-to-string (out)
+                     (write-string "{\"nested\":[1.00," out)
+                     (sql-jsonb-write-string large out)
+                     (write-string "]}" out))))
+           (expected (sb-ext:string-to-octets (sql-jsonb-output value) :external-format :utf-8))
+           (actual (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+           (largest 0))
+      (logical-write-jsonb-u32
+       (lambda (part)
+         (if (integerp part)
+             (vector-push-extend part actual)
+             (progn (setf largest (max largest (length part)))
+                    (loop for byte across part do (vector-push-extend byte actual)))))
+       value)
+      (rove:ok (= (length expected)
+                  (loop for i below 4 sum (ash (aref actual i) (* 8 i)))))
+      (rove:ok (equalp expected (subseq actual 4)))
+      (rove:ok (<= largest (* 4096 4)))
+      (rove:ok (> (length expected) largest))))
+
 (rove:deftest test-logical-spool-detects-change-between-passes
     (let* ((directory (merge-pathnames
                        (format nil "pg-logical-mutation-~d-~d/" (sb-posix:getpid) (random 1000000))

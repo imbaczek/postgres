@@ -146,6 +146,38 @@ Discard the cursor after a read error; the stream may have advanced."
                                    (sb-ext:string-to-octets string :external-format :utf-8
                                                                    :start start :end end)))))
 
+(defclass logical-utf8-output-stream (sb-gray:fundamental-character-output-stream)
+  ((buffer :initarg :buffer :reader logical-utf8-buffer)
+   (characters :initform (make-array 4096 :element-type 'character :fill-pointer 0)
+               :reader logical-utf8-characters)
+   (size :initform 0 :accessor logical-utf8-size)))
+
+(defun logical-flush-utf8-output (stream)
+  (let ((characters (logical-utf8-characters stream)))
+    (unless (zerop (length characters))
+      (let ((octets (sb-ext:string-to-octets characters :external-format :utf-8)))
+        (incf (logical-utf8-size stream) (length octets))
+        (when (logical-utf8-buffer stream)
+          (logical-write-octets (logical-utf8-buffer stream) octets)))
+      (setf (fill-pointer characters) 0))))
+
+(defmethod sb-gray:stream-write-char ((stream logical-utf8-output-stream) character)
+  (let ((characters (logical-utf8-characters stream)))
+    (vector-push character characters)
+    (when (= (length characters) (array-total-size characters))
+      (logical-flush-utf8-output stream)))
+  character)
+
+(defun logical-write-jsonb-u32 (buffer value)
+  "Count canonical UTF-8 bytes, then emit them in bounded blocks."
+  (let ((counter (make-instance 'logical-utf8-output-stream :buffer nil)))
+    (sql-jsonb-write value counter)
+    (logical-flush-utf8-output counter)
+    (logical-write-u32 buffer (logical-utf8-size counter))
+    (let ((writer (make-instance 'logical-utf8-output-stream :buffer buffer)))
+      (sql-jsonb-write value writer)
+      (logical-flush-utf8-output writer))))
+
 (defun logical-write-value (buffer type value)
   "Encode a value; text, varchar and json share UTF-8 tag 3. Their schema codes
 remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
@@ -198,7 +230,7 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
     ((eq type :jsonb)
      (unless (sql-jsonb-p value) (error "invalid jsonb logical row value"))
      (logical-write-u8 buffer 17)
-     (logical-write-string-u32 buffer (sql-jsonb-output value)))
+     (logical-write-jsonb-u32 buffer value))
     ((eq type :bytea)
      (check-type value (vector (unsigned-byte 8)))
      (logical-write-u8 buffer 15)
