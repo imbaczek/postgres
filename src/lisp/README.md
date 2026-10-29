@@ -78,6 +78,14 @@ Native streaming uses the experimental `pg_lisp_wal_7` format. End-of-recovery
 syntax and read-only timeline checks use that same format; operational promotion
 remains unfinished.
 This does not provide C WAL or control-file disk compatibility.
+During startup WAL recovery, page records for a batch are validated and staged
+in a spool that spills above 4 MiB. After the terminal record is validated,
+recovery validates the spool before applying its page records in WAL order.
+The temporary file is cleaned up at batch completion or recovery unwind and
+does not use the SQL temporary-file quota. Each page record is still decoded
+in memory, as are catalog chunks. This spool is specific to startup recovery;
+physical standby replay still stages page images in a list, and the primary's
+dirty page cache is not bounded by it.
 `./t/checkpoint-snapshot.sh` covers legacy upgrade, both publication crash
 boundaries, control-copy mismatch rejection and standby restartpoint preservation.
 Version 7 additionally logs native XID reservations before allocation. Standby

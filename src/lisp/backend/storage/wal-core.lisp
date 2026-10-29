@@ -135,6 +135,17 @@
 (defvar *wal-recovery-reservation-batch-clean-p* nil)
 
 (defvar *wal-recovery-page-images* '())
+
+(defvar *wal-recovery-page-spool-enabled* nil)
+
+(defvar *wal-recovery-page-spool* nil)
+
+(declaim (notinline query-temp-cleanup-owner-state))
+
+(declaim (notinline logical-spool-owner))
+
+(declaim (special *query-temp-file-limit-bytes*))
+
 (defvar *wal-recovery-catalog-chunks* '())
 (defvar *wal-recovery-catalog-chunk-count* nil)
 (defvar *wal-recovery-catalog-next-chunk* 0)
@@ -1475,6 +1486,46 @@ src/backend/access/transam/xlogreader.c."
       (wal-decode-catalog-payload payload)
     (lambda () (wal-apply-catalog-image deletes catalog-bytes))))
 
+(defun wal-recovery-close-page-spool ()
+  (when *wal-recovery-page-spool*
+    (close-logical-spool *wal-recovery-page-spool*)
+    (unless (eq :resolved (query-temp-cleanup-owner-state
+                           (logical-spool-owner *wal-recovery-page-spool*)))
+      (error "recovery page spool cleanup failed"))
+    (setf *wal-recovery-page-spool* nil))
+  (values))
+
+(defun wal-recovery-stage-page-record (record)
+  "Validate one page record before retaining its bounded raw payload."
+  (let* ((payload (wal-record-payload record))
+         (size (length payload))
+         (event (make-array (+ 12 size) :element-type '(unsigned-byte 8))))
+    (wal-decode-page-images payload (wal-record-end record) (wal-record-version record))
+    (wal-set-u32 event 0 (wal-record-version record))
+    (wal-set-u64 event 4 (wal-record-end record))
+    (replace event payload :start1 12)
+    (unless *wal-recovery-page-spool*
+      ;; Publish ownership before the first append can acquire a file.
+      (sb-sys:without-interrupts
+        (let ((*query-temp-file-limit-bytes* nil))
+          (setf *wal-recovery-page-spool* (make-logical-spool)))))
+    (logical-spool-append *wal-recovery-page-spool* event))
+  (values))
+
+(defun wal-recovery-map-page-spool (function)
+  "Visit validated records, one at a time, in original WAL order."
+  (when *wal-recovery-page-spool*
+    (logical-spool-map-events
+     *wal-recovery-page-spool*
+     (lambda (event)
+       (unless (>= (length event) 12) (error "invalid recovery page spool record"))
+       (let ((version (wal-u32 event 0))
+             (lsn (wal-u64 event 4)))
+         (unless (<= +wal-version-v2+ version +wal-version+)
+           (error "invalid recovery page spool version"))
+         (funcall function (wal-decode-page-images (subseq event 12) lsn version))))))
+  (values))
+
 (defun wal-replay-finish-batch (terminal-preparer &optional catalog-chunks-p)
   (unless *wal-recovery-group-active*
     (error "WAL terminal record appears outside a batch"))
@@ -1488,8 +1539,14 @@ src/backend/access/transam/xlogreader.c."
   (let ((terminal-function (funcall terminal-preparer)))
     (unless (functionp terminal-function)
       (error "WAL terminal validation did not produce an apply operation"))
-    (wal-apply-page-images (nreverse *wal-recovery-page-images*))
+    (when *wal-recovery-page-spool*
+      (logical-spool-seal *wal-recovery-page-spool*)
+      (wal-recovery-map-page-spool (lambda (images) (declare (ignore images)))))
+    (if *wal-recovery-page-spool-enabled*
+        (wal-recovery-map-page-spool #'wal-apply-page-images)
+        (wal-apply-page-images (nreverse *wal-recovery-page-images*)))
     (funcall terminal-function))
+  (wal-recovery-close-page-spool)
   (setf *wal-recovery-reservation-batch-clean-p* nil
         *wal-recovery-group-active* nil
         *wal-recovery-page-images* '()
@@ -1534,6 +1591,7 @@ src/backend/access/transam/xlogreader.c."
       ((= (wal-record-type record) +wal-record-batch-start+)
        ;; A prior group without a terminal record is a crash tail. Ignore its
        ;; accumulated images and begin staging the next post-restart batch.
+       (wal-recovery-close-page-spool)
        (setf *wal-recovery-group-active* t
              *wal-recovery-page-images* '()
              *wal-recovery-catalog-chunks* '()
@@ -1546,12 +1604,14 @@ src/backend/access/transam/xlogreader.c."
          (error "WAL page images appear outside a batch"))
        (when *wal-recovery-catalog-chunk-count*
          (error "WAL page images follow catalog chunks in a batch"))
-       (setf *wal-recovery-page-images*
-             (nconc (reverse
-                     (wal-decode-page-images (wal-record-payload record)
-                                             (wal-record-end record)
-                                             (wal-record-version record)))
-                    *wal-recovery-page-images*)))
+       (if *wal-recovery-page-spool-enabled*
+           (wal-recovery-stage-page-record record)
+           (setf *wal-recovery-page-images*
+                 (nconc (reverse
+                         (wal-decode-page-images (wal-record-payload record)
+                                                 (wal-record-end record)
+                                                 (wal-record-version record)))
+                        *wal-recovery-page-images*))))
       ((= (wal-record-type record) +wal-record-logical-changes+)
        (when *wal-recovery-logical-catalog-event-p*
          (error "logical row changes follow a catalog event in the same batch"))
@@ -1648,6 +1708,7 @@ src/backend/access/transam/xlogreader.c."
   `(let ((*wal-recovery-reservation-batch-clean-p* nil)
          (*wal-recovery-group-active* nil)
          (*wal-recovery-page-images* '())
+         (*wal-recovery-page-spool* nil)
          (*wal-recovery-catalog-chunks* '())
          (*wal-recovery-catalog-chunk-count* nil)
          (*wal-recovery-catalog-next-chunk* 0)
@@ -1658,11 +1719,13 @@ src/backend/access/transam/xlogreader.c."
          (*wal-recovery-logical-catalog-event-p* nil))
      (unwind-protect
           (progn ,@body)
-       (wal-recovery-reset-logical-change-batch))))
+       (unwind-protect (wal-recovery-close-page-spool)
+         (wal-recovery-reset-logical-change-batch)))))
 
 (defun wal-recover ()
   "Redo durable complete batches before loading the catalog."
-  (with-wal-replay-staging () (wal-scan #'wal-replay-record))
+  (let ((*wal-recovery-page-spool-enabled* t))
+    (with-wal-replay-staging () (wal-scan #'wal-replay-record)))
   (clog-fsync)
   (values))
 
