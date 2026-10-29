@@ -170,6 +170,55 @@ def reject_bootstrap_for_anchor(system_id, fork, manifest, seed):
         connection.close()
 
 
+def exercise_named_streams(promoted, port, system_id, base, fork, manifest, seed,
+                           source_prefix, history, eor):
+    public = "wire_public_slot"
+
+    def state():
+        active, restart = query(promoted, "SELECT active,restart_lsn FROM pg_replication_slots "
+                                "WHERE slot_name='wire_public_slot'")[0]
+        number = None if restart is None else sum(
+            int(part, 16) << shift for part, shift in zip(restart.split("/"), (32, 0)))
+        return active, number
+
+    query(promoted, "SELECT * FROM pg_create_physical_replication_slot('wire_public_slot')")
+    assert state() == (False, None)
+    follow_stream_wire.at_fork(port, system_id, base, fork, manifest, seed,
+                               slot="wire_follow", public_slot=public)
+    assert state() == (False, None), "exact-fork completion reserved a public slot without feedback"
+    follow_stream_wire.early_done(port, system_id, base, fork, fork, manifest, seed,
+                                  2, "wire_follow", public_slot=public)
+    assert state() == (False, None), "CopyDone before proof feedback reserved the public slot"
+    follow_stream_wire.prepare(port, "named_behind", system_id, base, base, fork,
+                               manifest, 14695981039346656037, source_prefix, history, eor)
+    digest = follow_stream_wire.parent_suffix(port, system_id, base, fork, manifest,
+                                               source_prefix, proof_pin="named_behind", public_slot=public)
+    assert state() == (False, fork)
+    query(promoted, "SELECT * FROM pg_replication_slot_advance('wire_public_slot','"
+          + follow_stream_wire.lsn(fork + len(eor)) + "')")
+    assert state() == (False, fork + len(eor))
+
+    def observe(client):
+        wait(lambda: state() == (True, fork))
+        assert state() == (True, fork), "public retention followed write/apply instead of flush"
+        follow_stream_wire.rejects_public_slot(port, system_id, base, fork, manifest, seed, public, "55006")
+        follow_stream_wire.rejects_public_slot(port, system_id, base, fork, manifest, seed,
+                                                "missing_public_slot", "42704")
+        assert state() == (True, fork)
+        control("target.sock", '(assert (and (not (gethash "wire_follow" *physical-source-senders*)) '
+                '(= 1 (wal-replication-slot-restart-timeline (gethash "wire_public_slot" *wal-replication-slots*)))))')
+
+    live_sender = follow_stream_wire.child_eor(port, system_id, base, fork, manifest, digest, eor,
+                                               proof_pin="named_behind", public_slot=public,
+                                               observe=observe, hold=True)
+    try:
+        print("named-stream: exact claims, feedback-only flush, backward reconnect, fork timeline and CopyDone cleanup PASS", flush=True)
+        return public, live_sender
+    except BaseException:
+        live_sender.close()
+        raise
+
+
 def exercise_controller(promoted, sibling):
     control("sibling.sock", '(defparameter *controller-original-runtime* *physical-follow-runtime*)')
     control("sibling.sock", '(physical-follow-retarget "127.0.0.1" 1 "unreachable")', expect_error=True)
@@ -342,11 +391,24 @@ try:
         behind_digest = follow_stream_wire.parent_suffix(
             promoted_port, system_id, original_end, fork, manifest,
             (bundle / "source-prefix.bin").read_bytes())
+        named_public, named_sender = exercise_named_streams(
+            promoted, promoted_port, system_id, original_end,
+            fork, manifest, seed, source_prefix, source_history, source_eor)
+        connections.append(named_sender)
         follow_stream_wire.child_eor(promoted_port, system_id, original_end, fork, manifest, seed,
                                      (bundle / "eor.bin").read_bytes())
         wait(lambda: ":DONE" in control("target.sock", '(if (gethash "selected_follow" *physical-source-senders*) :waiting :done)'))
+        assert query(promoted, "SELECT active FROM pg_replication_slots "
+                     "WHERE slot_name='wire_public_slot'") == [(True,)]
         source_peer, source_socket_identity, promoted = restart_promoted_source(promoted, source_peer.pid)
+        named_sender.close()
         connections.append(promoted)
+        assert query(promoted, "SELECT active,restart_lsn='" + follow_stream_wire.lsn(fork)
+                     + "'::pg_lsn FROM pg_replication_slots WHERE slot_name='wire_public_slot'") == [(False, True)]
+        control("target.sock", '(assert (= 1 (wal-replication-slot-restart-timeline '
+                '(gethash "wire_public_slot" *wal-replication-slots*))))')
+        query(promoted, "SELECT pg_drop_replication_slot('" + named_public + "')")
+        print("named-stream: SIGKILL with an active sender preserves the public slot and clears runtime ownership PASS", flush=True)
         assert follow_stream_wire.prepare(
             promoted_port, "wire_follow", system_id, original_end, fork, fork,
             manifest, seed, source_prefix, source_history, source_eor) == wire_anchor

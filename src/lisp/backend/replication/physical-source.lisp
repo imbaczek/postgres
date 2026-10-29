@@ -12,6 +12,45 @@ checks received WAL progress. These digests detect corruption or divergence."
 
 (defvar *physical-source-senders* (make-hash-table :test #'equal))
 
+(defstruct physical-sender
+  name pin public-name public-slot backend system-id timeline namespace)
+
+(defun physical-source-check-sender-under-lock (name owner)
+  (let ((pin (gethash name *physical-source-pins*)))
+    (unless (and pin (physical-source-pin-stream-ready-p pin)
+                 (not (physical-source-pin-lost-p pin))
+                 (= (physical-source-pin-timeline pin) *wal-insert-timeline*)
+                 (eq owner (gethash name *physical-source-senders*))
+                 (or (not (physical-sender-p owner))
+                     (and (equal name (physical-sender-name owner))
+                          (eq pin (physical-sender-pin owner))
+                          (eq *backend* (physical-sender-backend owner))
+                          (not (recovery-in-progress-p))
+                          (= (physical-sender-system-id owner) (catalog-system-identifier))
+                          (= (physical-sender-timeline owner) *wal-insert-timeline*)
+                          (eq (physical-sender-namespace owner) *wal-segment-namespace*)
+                          (let ((slot (physical-sender-public-slot owner)))
+                            (or (null slot)
+                                (and (eq slot (gethash (physical-sender-public-name owner)
+                                                       *wal-replication-slots*))
+                                     (wal-physical-slot-p slot)
+                                     (not (eq :lost (wal-replication-slot-wal-status slot)))
+                                     (eq owner (wal-replication-slot-active-owner slot))
+                                     (eq (physical-sender-backend owner)
+                                         (wal-replication-slot-active-owner-backend slot))))))))
+      (wal-invalid-input "physical sender no longer owns its retained source context"))
+    pin))
+
+(defun physical-source-validate-receipt-under-lock (name owner lsn digest)
+  (let* ((pin (physical-source-check-sender-under-lock name owner))
+         (old (physical-source-pin-confirmed-lsn pin)))
+    (unless (and (typep digest '(unsigned-byte 64))
+                 (<= (or old (physical-source-pin-consistent-lsn pin)) lsn *wal-durable-lsn*))
+      (wal-invalid-input "physical receipt no longer belongs to a valid retained sender"))
+    (when (and (eql old lsn) (/= digest (physical-source-pin-prefix-digest pin)))
+      (wal-invalid-input "physical receipt digest changed at the same boundary"))
+    pin))
+
 (defvar *physical-source-test-hook* nil)
 
 (defun physical-source-pin-test-point (point pin)
@@ -298,34 +337,26 @@ leave that registry intact."
         (setf *physical-source-pins* candidates))))
   (values))
 
+(defun physical-source-confirm-receipt-under-lock (name owner lsn digest)
+  (let* ((pin (physical-source-validate-receipt-under-lock name owner lsn digest))
+         (old (physical-source-pin-confirmed-lsn pin)))
+    (when (eql old lsn) (return-from physical-source-confirm-receipt-under-lock pin))
+    (let ((candidate (copy-physical-source-pin pin)))
+      (setf (physical-source-pin-confirmed-lsn candidate) lsn
+            (physical-source-pin-restart-lsn candidate) lsn
+            (physical-source-pin-prefix-digest candidate) digest)
+      (physical-source-pin-save candidate)
+      (setf (physical-source-pin-confirmed-lsn pin) lsn
+            (physical-source-pin-restart-lsn pin) lsn
+            (physical-source-pin-prefix-digest pin) digest
+            (gethash pin *wal-snapshot-retention-pins*) lsn)
+      (physical-source-pin-test-point :after-publish pin)
+      pin)))
+
 (defun physical-source-confirm-receipt (name owner lsn digest)
   "Publish only a verified complete-record flush, durably before releasing WAL."
   (with-wal-critical
-    (let* ((pin (gethash name *physical-source-pins*))
-           (old (and pin (physical-source-pin-confirmed-lsn pin))))
-      (unless (and pin (physical-source-pin-stream-ready-p pin)
-                   (not (physical-source-pin-lost-p pin))
-                   (= (physical-source-pin-timeline pin) *wal-insert-timeline*)
-                   (eq owner (gethash name *physical-source-senders*))
-                   (typep digest '(unsigned-byte 64))
-                   (<= (or old (physical-source-pin-consistent-lsn pin)) lsn *wal-durable-lsn*))
-        (wal-invalid-input "physical receipt no longer belongs to a valid retained sender"))
-      (when (eql old lsn)
-        (unless (= digest (physical-source-pin-prefix-digest pin))
-          (wal-invalid-input "physical receipt digest changed at the same boundary"))
-        (return-from physical-source-confirm-receipt pin))
-      (let ((candidate (copy-physical-source-pin pin)))
-        (setf (physical-source-pin-confirmed-lsn candidate) lsn
-              (physical-source-pin-restart-lsn candidate) lsn
-              (physical-source-pin-prefix-digest candidate) digest)
-        (physical-source-pin-save candidate)
-        ;; Keep the object used by the recycler stable across acknowledgment.
-        (setf (physical-source-pin-confirmed-lsn pin) lsn
-              (physical-source-pin-restart-lsn pin) lsn
-              (physical-source-pin-prefix-digest pin) digest
-              (gethash pin *wal-snapshot-retention-pins*) lsn)
-        (physical-source-pin-test-point :after-publish pin)
-        pin))))
+    (physical-source-confirm-receipt-under-lock name owner lsn digest)))
 
 (defun physical-source-invalidate-lagging-pins-under-wal-lock ()
   "Persist lost retention before checkpoint may remove its required WAL."

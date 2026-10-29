@@ -8,8 +8,9 @@ def lsn(value):
     return f"{value >> 32:X}/{value & 0xffffffff:08X}"
 
 
-def start_query(proof_pin, system_id, base, cursor, timeline, manifest, seed):
-    return (f"START_REPLICATION PHYSICAL {lsn(cursor)} "
+def start_query(proof_pin, system_id, base, cursor, timeline, manifest, seed, public_slot=None):
+    public = f"SLOT {public_slot} " if public_slot is not None else ""
+    return (f"START_REPLICATION {public}PHYSICAL {lsn(cursor)} "
             f"(native_format 'pg_lisp_wal_7', proof_pin '{proof_pin}', mode 'follow', system_id '{system_id}', "
             f"timeline '{timeline}', base_lsn '{lsn(base)}', prefix_digest '{seed}', "
             f"manifest_digest '{manifest}')")
@@ -147,11 +148,11 @@ def switch_result(client, fork):
     assert rows == [["2", lsn(fork)]], rows
 
 
-def at_fork(port, system_id, base, fork, manifest, seed, slot="selected_follow"):
+def at_fork(port, system_id, base, fork, manifest, seed, slot="selected_follow", public_slot=None):
     client = RawConnection(port, "follow-at-fork", replication=True)
     client.socket.settimeout(15)
     try:
-        send_query(client, start_query(slot, system_id, base, fork, 1, manifest, seed))
+        send_query(client, start_query(slot, system_id, base, fork, 1, manifest, seed, public_slot))
         switch_result(client, fork)  # In particular, there must be no CopyBoth.
         assert client.query("IDENTIFY_SYSTEM")[0][:2] == [str(system_id), "2"]
     finally:
@@ -177,13 +178,27 @@ def rejects_unbound_requests(port, system_id, base, fork, manifest, seed):
             client.close()
 
 
+def rejects_public_slot(port, system_id, base, fork, manifest, seed, public_slot, state):
+    client = RawConnection(port, "follow-public-slot-rejection", replication=True)
+    client.socket.settimeout(15)
+    try:
+        send_query(client, start_query("wire_follow", system_id, base, fork, 2,
+                                       manifest, seed, public_slot))
+        kind, body = client.receive()
+        assert kind == b"E", (kind, body[:40])
+        assert client.error_fields(body)["C"] == state
+        assert client.receive() == (b"Z", b"I")
+    finally:
+        client.close()
+
+
 def early_done(port, system_id, base, cursor, fork, manifest, seed, timeline,
-               slot, after_data=False):
+               slot, after_data=False, public_slot=None):
     client = RawConnection(port, "follow-early-copy-done", replication=True)
     client.socket.settimeout(15)
     sent_done = False
     try:
-        send_query(client, start_query(slot, system_id, base, cursor, timeline, manifest, seed))
+        send_query(client, start_query(slot, system_id, base, cursor, timeline, manifest, seed, public_slot))
         assert client.receive() == (b"W", b"\0\0\0")
         if not after_data:
             client.socket.sendall(b"c" + struct.pack("!I", 4))
@@ -230,15 +245,16 @@ def malformed_copy_done(port, system_id, base, fork, manifest, seed):
         client.close()
 
 
-def parent_suffix(port, system_id, base, fork, manifest, prefix):
+def parent_suffix(port, system_id, base, fork, manifest, prefix,
+                  proof_pin="selected_behind", public_slot=None):
     client = RawConnection(port, "follow-parent-prefix", replication=True)
     client.socket.settimeout(15)
     written = flushed = base
     pending = bytearray()
     digest = 14695981039346656037
     try:
-        send_query(client, start_query("selected_behind", system_id, base, base, 1,
-                                       manifest, digest))
+        send_query(client, start_query(proof_pin, system_id, base, base, 1,
+                                       manifest, digest, public_slot))
         assert client.receive() == (b"W", b"\0\0\0")
         while True:
             kind, body = client.receive()
@@ -276,11 +292,13 @@ def parent_suffix(port, system_id, base, fork, manifest, prefix):
         client.close()
 
 
-def child_eor(port, system_id, base, fork, manifest, seed, expected):
+def child_eor(port, system_id, base, fork, manifest, seed, expected,
+              proof_pin="selected_follow", public_slot=None, observe=None, hold=False):
     client = RawConnection(port, "follow-child-eor", replication=True)
     client.socket.settimeout(15)
+    retained = False
     try:
-        send_query(client, start_query("selected_follow", system_id, base, fork, 2, manifest, seed))
+        send_query(client, start_query(proof_pin, system_id, base, fork, 2, manifest, seed, public_slot))
         assert client.receive() == (b"W", b"\0\0\0")
         while True:
             kind, body = client.receive()
@@ -296,6 +314,10 @@ def child_eor(port, system_id, base, fork, manifest, seed, expected):
             assert body[25:] == expected
             # Read the frame without claiming its durability or applying it.
             status(client, fork + len(expected), fork, base)
-            return
+            if observe is not None:
+                observe(client)
+            retained = hold
+            return client if retained else None
     finally:
-        client.close()
+        if not retained:
+            client.close()

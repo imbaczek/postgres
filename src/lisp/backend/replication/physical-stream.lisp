@@ -270,17 +270,43 @@ end-of-recovery bytes use text."
       (send-command-complete stream "PREPARE_FOLLOW")
       (send-ready-for-query stream (transaction-status-char)))))
 
-(defun physical-source-acquire-sender (command)
+(defun physical-source-public-slot-under-lock (command)
+  (let ((name (logical-replication-command-slot-name command)))
+    (when name
+      (let ((slot (gethash name *wal-replication-slots*)))
+        (unless slot (ereport "42704" "replication slot ~s does not exist" name))
+        (unless (wal-physical-slot-p slot)
+          (ereport "55000" "cannot use a logical slot for physical replication"))
+        (when (eq :lost (wal-replication-slot-wal-status slot))
+          (ereport "55000" "physical replication slot has lost its WAL"))
+        (when (and (wal-replication-slot-active-owner slot)
+                   (not (and (physical-slot-owned-by-backend-p slot *backend*)
+                             (eq *backend* (wal-replication-slot-active-owner slot))
+                             (eq *backend* (wal-replication-slot-active-owner-backend slot)))))
+          (ereport "55006" "replication slot ~s is active" name))
+        (unless *backend* (ereport "55000" "named physical streaming requires a backend owner"))
+        slot))))
+
+(defun call-with-native-physical-sender (command function)
+  (let* ((name (physical-stream-proof-pin command))
+         (owner (make-physical-sender :name name :backend *backend*)))
+    (unwind-protect
+         (multiple-value-bind (claimed limit next)
+             (with-live-operation (physical-source-acquire-sender command owner))
+           (funcall function claimed limit next))
+      (with-live-operation-captured-backend-cleanup
+        (physical-source-release-sender name owner)))))
+
+(defun physical-source-acquire-sender (command &optional context)
   "Validate the requested mode and claim its pin under WAL exclusion.
 A follow pin must be ready and bound to the current writer timeline; START may
 request an eligible ancestor. In follow mode base_lsn is the receiver's immutable
 base and bounds apply feedback, not the anchor cursor."
   (prevent-recovery-primary-operation "native physical walsender")
-  (when (logical-replication-command-slot-name command)
-    (ereport "0A000" "named native physical streams require public slot ownership support"))
   (sb-thread:with-mutex (*wal-lock*)
     (let* ((name (physical-stream-proof-pin command))
            (pin (gethash name *physical-source-pins*))
+           (public (physical-source-public-slot-under-lock command))
            (follow (equal "follow" (physical-stream-mode command)))
            (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
            (cursor (logical-replication-command-requested-lsn command)))
@@ -312,23 +338,39 @@ base and bounds apply feedback, not the anchor cursor."
       (if follow (physical-follow-pin-check-live pin) (physical-source-pin-check-wal pin))
       (multiple-value-bind (limit next)
           (if follow (physical-follow-stream-boundary command pin) (values))
-        (let ((owner (gensym "PHYSICAL-SENDER-")))
-          (setf (gethash name *physical-source-senders*) owner)
+        (let ((owner (or context (make-physical-sender :name name :backend *backend*))))
+          (sb-sys:without-interrupts
+            (setf (physical-sender-pin owner) pin
+                  (physical-sender-public-name owner) (logical-replication-command-slot-name command)
+                  (physical-sender-public-slot owner) public
+                  (physical-sender-system-id owner) (catalog-system-identifier)
+                  (physical-sender-timeline owner) *wal-insert-timeline*
+                  (physical-sender-namespace owner) *wal-segment-namespace*
+                  (gethash name *physical-source-senders*) owner)
+            (logical-test-failpoint :after-native-private-sender-claim owner)
+            (when public
+              (setf (wal-replication-slot-active-owner public) owner
+                    (wal-replication-slot-active-owner-backend public) *backend*
+                    (wal-replication-slot-inactive-since public) 0)
+              (logical-test-failpoint :after-native-public-sender-claim owner)))
           (values owner limit next))))))
 
 (defun physical-source-release-sender (name owner)
-  (sb-thread:with-mutex (*wal-lock*)
-    (when (eq owner (gethash name *physical-source-senders*))
-      (remhash name *physical-source-senders*))))
+  (sb-sys:without-interrupts
+    (sb-thread:with-mutex (*wal-lock*)
+      (when (eq owner (gethash name *physical-source-senders*))
+        (remhash name *physical-source-senders*)))
+    (when (and (physical-sender-p owner) (physical-sender-public-slot owner))
+      (wal-release-replication-slot-owner
+       (physical-sender-public-name owner) owner (physical-sender-public-slot owner)))))
+
+(defun physical-source-retained-sender-pin (name owner)
+  (handler-case (physical-source-check-sender-under-lock name owner)
+    (wal-input-validation-error (condition) (ereport "55000" "~a" condition))))
 
 (defun physical-source-sender-floor (name owner)
   (sb-thread:with-mutex (*wal-lock*)
-    (let ((pin (gethash name *physical-source-pins*)))
-      (unless (and pin (physical-source-pin-stream-ready-p pin)
-                   (not (physical-source-pin-lost-p pin))
-                   (= (physical-source-pin-timeline pin) *wal-insert-timeline*)
-                   (eq owner (gethash name *physical-source-senders*)))
-        (ereport "55000" "native physical source retention is lost; reseed is required"))
+    (let ((pin (physical-source-retained-sender-pin name owner)))
       (values (or (physical-source-pin-confirmed-lsn pin) (physical-source-pin-consistent-lsn pin))
               (physical-source-pin-prefix-digest pin)))))
 
@@ -338,46 +380,41 @@ A follow pin dispatches to the historical source reader after ownership checks.
 Explicit follow START admission acquires a ready follow pin."
   (sb-thread:with-mutex (*wal-lock*)
     (wal-check-healthy)
-    (unless (and (eq owner (gethash name *physical-source-senders*))
-                 (let ((pin (gethash name *physical-source-pins*)))
-                   (and pin (not (physical-source-pin-lost-p pin))
-                        (= (physical-source-pin-timeline pin) *wal-insert-timeline*))))
-      (ereport "55000" "physical sender lost its local source pin ownership"))
-    (let ((pin (gethash name *physical-source-pins*)))
+    (let ((pin (physical-source-retained-sender-pin name owner)))
       (when (physical-follow-pin-p pin)
-        (return-from physical-source-read-next (physical-follow-source-read-next pin cursor))))
-    (let* ((*wal-insert-timeline* (physical-source-pin-timeline (gethash name *physical-source-pins*)))
-           (durable *wal-durable-lsn*)
-           (segment (floor cursor +wal-segment-size+))
-           (offset (mod cursor +wal-segment-size+))
-           (start cursor))
-      (when (= cursor durable) (return-from physical-source-read-next (values nil nil durable)))
-      (unless (< cursor durable) (ereport "55000" "physical source cursor is beyond durable WAL"))
-      (with-open-file (input (wal-segment-path segment) :element-type '(unsigned-byte 8))
-        (when (= offset (file-length input))
-          (unless (plusp offset) (error "empty physical source segment"))
-          (incf segment)
-          (setf offset 0 start (* segment +wal-segment-size+))))
-      (with-open-file (input (wal-segment-path segment) :element-type '(unsigned-byte 8))
-        (file-position input offset)
-        (let ((header (make-array +wal-header-size+ :element-type '(unsigned-byte 8))))
-          (unless (= +wal-header-size+ (read-sequence header input))
-            (error "truncated retained physical source header"))
-          (let* ((length (wal-u32 header 8))
-                 (end (+ start length)))
-            (unless (and (<= +wal-header-size+ length +wal-segment-size+)
-                         (<= (+ offset length) +wal-segment-size+)
-                         (<= end durable)
-                         (or (= start cursor)
-                             (> (+ (mod cursor +wal-segment-size+) length) +wal-segment-size+)))
-              (error "invalid retained physical record length or segment gap"))
-            (let ((raw (make-array length :element-type '(unsigned-byte 8))))
-              (replace raw header)
-              (unless (= length (read-sequence raw input :start +wal-header-size+))
-                (error "truncated retained physical source record"))
-              (let ((record (wal-decode-record raw start)))
-                (wal-require-ordinary-record-type (wal-record-type record))
-                (values record raw durable)))))))))
+        (return-from physical-source-read-next (physical-follow-source-read-next pin cursor)))
+      (let* ((*wal-insert-timeline* (physical-source-pin-timeline pin))
+             (durable *wal-durable-lsn*)
+             (segment (floor cursor +wal-segment-size+))
+             (offset (mod cursor +wal-segment-size+))
+             (start cursor))
+        (when (= cursor durable) (return-from physical-source-read-next (values nil nil durable)))
+        (unless (< cursor durable) (ereport "55000" "physical source cursor is beyond durable WAL"))
+        (with-open-file (input (wal-segment-path segment) :element-type '(unsigned-byte 8))
+          (when (= offset (file-length input))
+            (unless (plusp offset) (error "empty physical source segment"))
+            (incf segment)
+            (setf offset 0 start (* segment +wal-segment-size+))))
+        (with-open-file (input (wal-segment-path segment) :element-type '(unsigned-byte 8))
+          (file-position input offset)
+          (let ((header (make-array +wal-header-size+ :element-type '(unsigned-byte 8))))
+            (unless (= +wal-header-size+ (read-sequence header input))
+              (error "truncated retained physical source header"))
+            (let* ((length (wal-u32 header 8))
+                   (end (+ start length)))
+              (unless (and (<= +wal-header-size+ length +wal-segment-size+)
+                           (<= (+ offset length) +wal-segment-size+)
+                           (<= end durable)
+                           (or (= start cursor)
+                               (> (+ (mod cursor +wal-segment-size+) length) +wal-segment-size+)))
+                (error "invalid retained physical record length or segment gap"))
+              (let ((raw (make-array length :element-type '(unsigned-byte 8))))
+                (replace raw header)
+                (unless (= length (read-sequence raw input :start +wal-header-size+))
+                  (error "truncated retained physical source record"))
+                (let ((record (wal-decode-record raw start)))
+                  (wal-require-ordinary-record-type (wal-record-type record))
+                  (values record raw durable))))))))))
 
 (defun physical-source-prove-range (name owner cursor requested digest &optional progress)
   "Hash only a newly acknowledged suffix, rejecting an interior record cursor."
@@ -400,6 +437,44 @@ Explicit follow START admission acquires a ready follow pin."
                (setf cursor (wal-record-end record)))))
   digest)
 
+(defun physical-source-publish-public-flush-under-lock (owner lsn timeline)
+  (let ((slot (when (physical-sender-p owner) (physical-sender-public-slot owner))))
+    (when (and slot (plusp lsn)
+               (or (not (eql lsn (wal-replication-slot-restart-lsn slot)))
+                   (not (eql timeline (wal-replication-slot-restart-timeline slot)))))
+      (let ((old (wal-replication-slot-restart-lsn slot))
+            (candidate (wal-copy-replication-slot-with-profile slot)))
+        (setf (wal-replication-slot-restart-lsn candidate) lsn
+              (wal-replication-slot-restart-timeline candidate) timeline)
+        (when (or (null old) (< lsn old))
+          (setf (wal-replication-slot-restart-lsn slot) lsn
+                (wal-replication-slot-restart-timeline slot) timeline))
+        (wal-save-replication-slot candidate)
+        (setf (wal-replication-slot-restart-lsn slot) lsn
+              (wal-replication-slot-restart-timeline slot) timeline)))))
+
+(defun physical-source-confirm-feedback (command owner received digest)
+  (let ((name (physical-stream-proof-pin command))
+        (started nil) (finished nil) (interrupted nil))
+    (unwind-protect
+         (with-wal-critical
+           (let* ((pin (physical-source-validate-receipt-under-lock name owner received digest))
+                  (public (when (physical-sender-p owner) (physical-sender-public-slot owner)))
+                  (timeline (when (and public (plusp received))
+                              (physical-slot-current-prefix-timeline received))))
+             (unless (<= (physical-source-pin-restart-lsn pin) received)
+               (wal-invalid-input "private source retention does not protect physical feedback"))
+             (unwind-protect
+                  (progn
+                    (when (and public (plusp received))
+                      (setf started t)
+                      (physical-source-publish-public-flush-under-lock owner received timeline))
+                    (prog1 (physical-source-confirm-receipt-under-lock name owner received digest)
+                      (setf finished t)))
+               (when (and started (not finished))
+                 (setf *wal-poisoned* t interrupted t)))))
+      (when interrupted (request-fast-shutdown)))))
+
 (defun physical-source-confirm-status (command owner status)
   "Advance retention from validated flush, independently of write and apply."
   (let ((name (physical-stream-proof-pin command))
@@ -409,7 +484,7 @@ Explicit follow START admission acquires a ready follow pin."
       (when (> received floor)
         (setf digest (physical-source-prove-range name owner floor received digest)))
       (with-live-operation
-        (physical-source-confirm-receipt name owner received digest))))
+        (physical-source-confirm-feedback command owner received digest))))
   status)
 
 (defun physical-source-validate-resume (command owner &optional progress)
@@ -525,57 +600,57 @@ A historic stream stops at its fork before sending child end-of-recovery WAL."
 
 (defun start-native-physical-replication (stream command)
   "Serve a negotiated native physical stream with bounded timeline completion.
-Prove the resume prefix before WalData, outside the writer critical section.
-If the request starts at a historic fork, complete without CopyBoth; otherwise
-finish CopyBoth before the switch result. Early exact CopyDone ends normally
-without confirming an unproved receipt. Always release the sender on exit."
-  (multiple-value-bind (owner limit next)
-      (with-live-operation (physical-source-acquire-sender command))
-    (let ((name (physical-stream-proof-pin command))
-          (cursor (logical-replication-command-requested-lsn command))
-          (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
-          (copy-mode nil))
-      (unwind-protect
-           (handler-case
-               (if (and limit (= cursor limit))
-                   (progn
-                     (physical-source-validate-resume command owner)
-                     (with-live-operation
-                       (physical-source-confirm-receipt
-                        name owner cursor (physical-stream-u64 (physical-stream-option command "prefix_digest"))))
-                     (physical-stream-complete stream command owner next limit))
-                   (progn
-                     ;; CopyBoth permits heartbeats during proof, but no WAL bytes.
-                     (sb-ext:with-timeout 10 (send-copy-both-response stream))
-                     (setf copy-mode t)
-                     (let ((status (list :write cursor :flush cursor :apply base)))
-                       (physical-source-validate-resume
-                        command owner
-                        (lambda (durable)
-                          (physical-stream-send-keepalive stream (if limit (min durable limit) durable))
-                          (setf status (physical-stream-read-status stream status cursor base))
-                          (unless status (error 'end-of-file :stream stream)))))
-                     (with-live-operation
-                       (physical-source-confirm-receipt
-                        name owner cursor (physical-stream-u64 (physical-stream-option command "prefix_digest"))))
-                     (multiple-value-bind (result status)
-                         (physical-stream-send-loop stream command owner limit)
-                       (when (and (eq result :switch)
-                                  (physical-stream-finish-historic stream command owner limit status))
-                         (physical-stream-complete stream command owner next limit)))))
-             (physical-stream-copy-done ()
-               (write-message stream #\c (make-payload))
-               (physical-stream-complete stream command owner next limit))
-             (sb-ext:timeout () (ignore-errors (close stream :abort t)))
-             (stream-error () (ignore-errors (close stream :abort t)))
-             (sb-bsd-sockets:socket-error () (ignore-errors (close stream :abort t)))
-             (error (condition)
-               (unless copy-mode (error condition))
-               (ignore-errors
-                (send-error-response stream
-                                     (if (typep condition 'pg-error) condition
-                                         (make-condition 'pg-error :sqlstate "XX000"
-                                                                   :message (princ-to-string condition)))))
-               (ignore-errors (close stream :abort t))))
-        (with-live-operation-captured-backend-cleanup
-          (physical-source-release-sender name owner))))))
+Prove the resume prefix before WalData. Always release both sender claims."
+  (call-with-native-physical-sender
+   command
+   (lambda (owner limit next)
+     (let ((name (physical-stream-proof-pin command))
+           (cursor (logical-replication-command-requested-lsn command))
+           (base (parse-replication-lsn (physical-stream-option command "base_lsn")))
+           (copy-mode nil))
+       (handler-case
+           (if (and limit (= cursor limit))
+               (progn
+                 (physical-source-validate-resume command owner)
+                 (with-live-operation
+                   (physical-source-confirm-receipt
+                    name owner cursor (physical-stream-u64 (physical-stream-option command "prefix_digest"))))
+                 (physical-stream-complete stream command owner next limit))
+               (progn
+                 (sb-ext:with-timeout 10 (send-copy-both-response stream))
+                 (setf copy-mode t)
+                 (let ((status (list :write cursor :flush cursor :apply base))
+                       (feedback nil))
+                   (physical-source-validate-resume
+                    command owner
+                    (lambda (durable)
+                      (physical-stream-send-keepalive stream (if limit (min durable limit) durable))
+                      (setf status (physical-stream-read-status stream status cursor base))
+                      (unless status (error 'end-of-file :stream stream))
+                      (setf feedback status)))
+                   (with-live-operation
+                     (if feedback
+                         (physical-source-confirm-feedback
+                          command owner (getf feedback :flush)
+                          (physical-stream-u64 (physical-stream-option command "prefix_digest")))
+                         (physical-source-confirm-receipt
+                          name owner cursor (physical-stream-u64 (physical-stream-option command "prefix_digest"))))))
+                 (multiple-value-bind (result status)
+                     (physical-stream-send-loop stream command owner limit)
+                   (when (and (eq result :switch)
+                              (physical-stream-finish-historic stream command owner limit status))
+                     (physical-stream-complete stream command owner next limit)))))
+         (physical-stream-copy-done ()
+           (write-message stream #\c (make-payload))
+           (physical-stream-complete stream command owner next limit))
+         (sb-ext:timeout () (ignore-errors (close stream :abort t)))
+         (stream-error () (ignore-errors (close stream :abort t)))
+         (sb-bsd-sockets:socket-error () (ignore-errors (close stream :abort t)))
+         (error (condition)
+           (unless copy-mode (error condition))
+           (ignore-errors
+            (send-error-response stream
+                                 (if (typep condition 'pg-error) condition
+                                     (make-condition 'pg-error :sqlstate "XX000"
+                                                               :message (princ-to-string condition)))))
+           (ignore-errors (close stream :abort t))))))))

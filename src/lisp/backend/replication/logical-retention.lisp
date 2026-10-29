@@ -310,12 +310,13 @@ Preserve FUNCTION's values; callers may choose a nonwaiting retry."
 (defvar *logical-slot-owner-termination-requests*
   (make-hash-table :test #'eq))
 
-(defun wal-release-replication-slot-owner (name owner)
+(defun wal-release-replication-slot-owner (name owner &optional expected-slot)
   "Release OWNER's runtime claim and backend association."
   (sb-sys:without-interrupts
     (sb-thread:with-mutex (*wal-lock*)
       (let ((slot (gethash name *wal-replication-slots*)))
-        (when (and slot (eq owner (wal-replication-slot-active-owner slot)))
+        (when (and slot (or (null expected-slot) (eq expected-slot slot))
+                   (eq owner (wal-replication-slot-active-owner slot)))
           (let ((creator (when (wal-physical-slot-p slot)
                            (wal-replication-slot-temporary-owner slot))))
             (setf (wal-replication-slot-active-owner slot) creator

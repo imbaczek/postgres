@@ -38,15 +38,308 @@
                          pg::+physical-native-format+ options)))
       (ok (intake-fails-p (lambda () (pg::parse-replication-command query)))))))
 
-(deftest named-native-streams-fail-explicitly-until-public-ownership-is-wired
-    (let ((pg::*physical-recovery-state* nil)
-          (pg::*physical-recovery-failed-p* nil)
-          (pg::*physical-source-pins* (make-hash-table :test #'equal))
-          (pg::*physical-source-senders* (make-hash-table :test #'equal))
-          (command (pg::make-logical-replication-command :type :physical-start :slot-name "public_slot"
-                                                         :options '(("proof_pin" . "'private_proof'")))))
-      (ok (equal "0A000" (recovery-state-of (lambda () (pg::physical-source-acquire-sender command)))))
-      (ok (zerop (hash-table-count pg::*physical-source-senders*)))))
+(defun call-with-public-stream-fixture (function &key (public-name "public_slot") (proof-name "private_proof") temporary)
+  (call-with-physical-source-fixture
+   (lambda ()
+     (let* ((pg::*physical-recovery-state* nil)
+            (pg::*physical-recovery-failed-p* nil)
+            (pg::*wal-ready* t)
+            (pg::*wal-insert-timeline* 1) (pg::*wal-segment-namespace* :legacy)
+            (pg::*physical-source-senders* (make-hash-table :test #'equal))
+            (pg::*backend* (pg::make-backend :pid 3456))
+            (base pg::*wal-checkpoint-lsn*)
+            (pg::*wal-durable-lsn* (+ base 64))
+            (pg::*wal-end-lsn* pg::*wal-durable-lsn*)
+            (public (pg::wal-create-physical-replication-slot public-name :temporary temporary))
+            (pin (pg::physical-source-pin-create proof-name)))
+       (pg::wal-atomic-write-bytes
+        (pg::wal-segment-path (floor base pg::+wal-segment-size+))
+        (concatenate '(vector (unsigned-byte 8))
+                     (pg::wal-encode-record pg::+wal-record-maintenance+ 0 base #())
+                     (pg::wal-encode-record pg::+wal-record-maintenance+ 0 (+ base 32) #())))
+       (flet ((command (&optional (cursor (or (pg::physical-source-pin-confirmed-lsn pin) base)))
+                (pg::parse-replication-command
+                 (format nil
+                         "START_REPLICATION SLOT ~a PHYSICAL ~a (native_format '~a', proof_pin '~a', system_id '~d', timeline '1', base_lsn '~a', prefix_digest '~d')"
+                         public-name (pg::wal-format-lsn cursor) pg::+physical-native-format+ proof-name
+                         (pg::catalog-system-identifier) (pg::wal-format-lsn base)
+                         (pg::physical-source-pin-prefix-digest pin)))))
+         (funcall function #'command public pin base))))))
+
+(deftest named-native-stream-claims-both-identities-and-keeps-durable-state
+    (dolist (shared '(nil t))
+      (call-with-public-stream-fixture
+       (lambda (command public pin base)
+         (declare (ignore base))
+         (let ((owner nil))
+           (pg::call-with-native-physical-sender
+            (funcall command)
+            (lambda (context limit next)
+              (declare (ignore limit next))
+              (setf owner context)
+              (ok (eq context (pg::wal-replication-slot-active-owner public)))
+              (ok (eq pg::*backend* (pg::wal-replication-slot-active-owner-backend public)))
+              (ok (eq context (gethash (pg::physical-source-pin-name pin) pg::*physical-source-senders*)))
+              (ok (null (pg::wal-replication-slot-restart-lsn public)))))
+           (ok (null (pg::wal-replication-slot-active-owner public)))
+           (ok (null (gethash (pg::physical-source-pin-name pin) pg::*physical-source-senders*)))
+           (ok (eq public (gethash "public_slot" pg::*wal-replication-slots*)))
+           (ok (eq pin (gethash (pg::physical-source-pin-name pin) pg::*physical-source-pins*)))
+           (ok (probe-file (pg::wal-replication-slot-path "public_slot")))
+           (ok (probe-file (pg::physical-source-pin-path (pg::physical-source-pin-name pin))))
+           (ok owner)))
+       :proof-name (if shared "public_slot" "private_proof"))))
+
+(deftest named-native-stream-rejects-public-slot-errors-without-claiming-proof
+    (dolist (kind '(:missing :logical :lost :busy))
+      (call-with-public-stream-fixture
+       (lambda (command public pin base)
+         (declare (ignore base))
+         (ecase kind
+           (:missing (remhash "public_slot" pg::*wal-replication-slots*))
+           (:logical (setf (pg::wal-replication-slot-kind public) :logical))
+           (:lost (setf (pg::wal-replication-slot-wal-status public) :lost))
+           (:busy (setf (pg::wal-replication-slot-active-owner public) :another-owner)))
+         (ok (equal (ecase kind (:missing "42704") ((:logical :lost) "55000") (:busy "55006"))
+                    (recovery-state-of
+                     (lambda ()
+                       (pg::call-with-native-physical-sender
+                        (funcall command) (lambda (&rest values) (declare (ignore values))))))))
+         (ok (null (gethash (pg::physical-source-pin-name pin) pg::*physical-source-senders*)))
+         (ok (eq (if (eq kind :busy) :another-owner nil)
+                 (pg::wal-replication-slot-active-owner public)))))))
+
+(deftest named-native-stream-installs-cleanup-before-either-claim
+    (dolist (cut '(:after-native-private-sender-claim :after-native-public-sender-claim))
+      (call-with-public-stream-fixture
+       (lambda (command public pin base)
+         (declare (ignore base))
+         (let ((pg::*logical-test-failpoint-hook*
+                 (lambda (point &rest details)
+                   (declare (ignore details))
+                   (when (eq point cut) (throw 'abort-claim :aborted)))))
+           (ok (eq :aborted
+                   (catch 'abort-claim
+                     (pg::call-with-native-physical-sender
+                      (funcall command) (lambda (&rest values) (declare (ignore values))))))))
+         (ok (null (pg::wal-replication-slot-active-owner public)))
+         (ok (null (gethash (pg::physical-source-pin-name pin) pg::*physical-source-senders*)))
+         (ok (not pg::*wal-poisoned*))))))
+
+(deftest named-native-stream-first-real-feedback-reserves-only-flush
+    (call-with-public-stream-fixture
+     (lambda (command public pin base)
+       (let ((query (funcall command)))
+         (pg::call-with-native-physical-sender
+          query
+          (lambda (owner limit next)
+            (declare (ignore limit next))
+            (pg::physical-source-validate-resume query owner)
+            (pg::physical-source-confirm-receipt
+             (pg::physical-source-pin-name pin) owner base (pg::physical-source-pin-prefix-digest pin))
+            (ok (null (pg::wal-replication-slot-restart-lsn public)))
+            (pg::physical-source-confirm-status
+             query owner (list :write (+ base 64) :flush (+ base 32) :apply base))
+            (ok (= (+ base 32) (pg::wal-replication-slot-restart-lsn public)))
+            (ok (= (+ base 32) (pg::physical-source-pin-confirmed-lsn pin)))))
+         (ok (= (+ base 32)
+                (pg::wal-replication-slot-restart-lsn
+                 (pg::wal-read-replication-slot (pg::wal-replication-slot-path "public_slot")))))))))
+
+(deftest named-native-stream-can-start-before-and-feedback-backward-from-public-floor
+    (call-with-public-stream-fixture
+     (lambda (command public pin base)
+       (let ((first (funcall command)))
+         (pg::call-with-native-physical-sender
+          first
+          (lambda (owner limit next)
+            (declare (ignore limit next))
+            (pg::physical-source-confirm-status
+             first owner (list :write (+ base 64) :flush (+ base 32) :apply base)))))
+       (pg::wal-advance-physical-replication-slot "public_slot" (+ base 64))
+       (let ((second (funcall command)))
+         (pg::call-with-native-physical-sender
+          second
+          (lambda (owner limit next)
+            (declare (ignore limit next))
+            (pg::physical-source-validate-resume second owner)
+            (ok (= (+ base 64) (pg::wal-replication-slot-restart-lsn public)))
+            (pg::physical-source-confirm-status
+             second owner (list :write (+ base 64) :flush (+ base 32) :apply base))
+            (ok (= (+ base 32) (pg::physical-source-pin-confirmed-lsn pin)))
+            (ok (= (+ base 32) (pg::wal-replication-slot-restart-lsn public))))))
+       (ok (= (+ base 32)
+              (pg::wal-replication-slot-restart-lsn
+               (pg::wal-read-replication-slot (pg::wal-replication-slot-path "public_slot"))))))))
+
+(deftest named-native-temporary-stream-restores-the-creator-claim-on-release
+    (call-with-public-stream-fixture
+     (lambda (command public pin base)
+       (declare (ignore pin base))
+       (let ((creator pg::*backend*))
+         (ok (eq creator (pg::wal-replication-slot-active-owner public)))
+         (pg::call-with-native-physical-sender
+          (funcall command)
+          (lambda (owner limit next)
+            (declare (ignore limit next))
+            (ok (eq owner (pg::wal-replication-slot-active-owner public)))
+            (ok (not (eq creator owner)))))
+         (ok (eq creator (pg::wal-replication-slot-active-owner public)))
+         (ok (eq creator (pg::wal-replication-slot-active-owner-backend public)))
+         (ok (plusp (pg::wal-replication-slot-inactive-since public)))
+         (ok (not (eq pg::+null+ (aref (pg::sql-public-replication-slot-row public) 16))))
+         (ok (eq public (gethash "public_slot" pg::*wal-replication-slots*)))
+         (ok (probe-file (pg::wal-replication-slot-path "public_slot")))))
+     :temporary t))
+
+(deftest named-native-stream-revalidates-both-generations-before-read-and-feedback
+    (dolist (change '(:public :private :owner :backend :caller :lost :timeline :namespace))
+      (call-with-public-stream-fixture
+       (lambda (command public pin base)
+         (let ((query (funcall command)))
+           (pg::call-with-native-physical-sender
+            query
+            (lambda (owner limit next)
+              (declare (ignore limit next))
+              (ecase change
+                (:public (setf (gethash "public_slot" pg::*wal-replication-slots*)
+                               (pg::copy-wal-replication-slot public)))
+                (:private (setf (gethash (pg::physical-source-pin-name pin) pg::*physical-source-pins*)
+                                (pg::copy-physical-source-pin pin)))
+                (:owner (setf (pg::wal-replication-slot-active-owner public) :replacement))
+                (:backend (setf (pg::wal-replication-slot-active-owner-backend public)
+                                (pg::make-backend :pid 9999)))
+                (:caller (setf pg::*backend* (pg::make-backend :pid 9999)))
+                (:lost (setf (pg::wal-replication-slot-wal-status public) :lost))
+                (:timeline (incf pg::*wal-insert-timeline*))
+                (:namespace (setf pg::*wal-segment-namespace* :timeline)))
+              (ok (equal "55000"
+                         (recovery-state-of (lambda () (pg::physical-source-read-next
+                                                        (pg::physical-source-pin-name pin) owner base)))))
+              (ok (intake-fails-p
+                   (lambda () (pg::physical-source-confirm-status
+                               query owner (list :write base :flush base :apply base)))))
+              (ok (not pg::*wal-poisoned*))
+              (when (eq change :caller)
+                (setf pg::*backend* (pg::physical-sender-backend owner)))))
+           (when (eq change :public)
+             (let ((replacement (gethash "public_slot" pg::*wal-replication-slots*)))
+               (ok (pg::wal-replication-slot-active-owner replacement)))))))))
+
+(deftest named-native-public-flush-publication-fences-all-interrupted-cuts
+    (dolist (backward '(nil t))
+      (dolist (cut '(:before-save :after-save))
+        (dolist (exit '(:error :throw :timeout))
+          (call-with-public-stream-fixture
+           (lambda (command public pin base)
+             (let* ((save (symbol-function 'pg::wal-save-replication-slot))
+                    (old (if backward (+ base 64) base))
+                    (new (+ base 32))
+                    (pg::*pm-requested-mode* pg::+no-shutdown+)
+                    (query (funcall command))
+                    (interrupted nil))
+               (setf (pg::wal-replication-slot-restart-lsn public) old
+                     (pg::wal-replication-slot-restart-timeline public) 1)
+               (funcall save public)
+               (unwind-protect
+                    (progn
+                      (setf (symbol-function 'pg::wal-save-replication-slot)
+                            (lambda (candidate)
+                              (ok (<= (pg::wal-replication-slot-restart-lsn public) (min old new)))
+                              (when (eq cut :after-save) (funcall save candidate))
+                              (ecase exit
+                                (:error (error "injected public feedback save failure"))
+                                (:throw (throw 'abort-public-save :aborted))
+                                (:timeout (error 'sb-ext:timeout :seconds 1)))))
+                      (handler-case
+                          (setf interrupted
+                                (catch 'abort-public-save
+                                  (pg::call-with-native-physical-sender
+                                   query
+                                   (lambda (owner limit next)
+                                     (declare (ignore limit next))
+                                     (pg::physical-source-confirm-status
+                                      query owner (list :write (+ base 64) :flush new :apply base))))))
+                        (error () (setf interrupted :error))
+                        (sb-ext:timeout () (setf interrupted :timeout)))
+                      (ok interrupted)
+                      (ok pg::*wal-poisoned*)
+                      (ok (= pg::+fast-shutdown+ pg::*pm-requested-mode*))
+                      (ok (= (min old new) (pg::wal-replication-slot-restart-lsn public)))
+                      (ok (null (pg::wal-replication-slot-active-owner public)))
+                      (ok (null (gethash (pg::physical-source-pin-name pin) pg::*physical-source-senders*)))
+                      (ok (probe-file (pg::physical-source-pin-path (pg::physical-source-pin-name pin))))
+                      (ok (null (pg::physical-source-pin-confirmed-lsn pin)))
+                      (ok (= (if (eq cut :after-save) new old)
+                             (pg::wal-replication-slot-restart-lsn
+                              (pg::wal-read-replication-slot (pg::wal-replication-slot-path "public_slot")))))
+                      (ok (intake-fails-p
+                           (lambda () (pg::physical-source-pin-release (pg::physical-source-pin-name pin))))))
+                 (setf (symbol-function 'pg::wal-save-replication-slot) save)))))))))
+
+(deftest named-native-public-feedback-fences-real-atomic-file-publication-cuts
+    (dolist (backward '(nil t))
+      (dolist (cut '(:slot-file-before-fsync :slot-file-after-fsync :slot-file-before-rename
+                     :slot-file-after-rename :slot-file-before-directory-fsync
+                     :slot-file-after-directory-fsync-before-memory-publication))
+        (dolist (exit '(:error :throw :timeout))
+          (call-with-public-stream-fixture
+           (lambda (command public pin base)
+             (let* ((old (if backward (+ base 64) base))
+                    (new (+ base 32))
+                    (query (funcall command))
+                    (original-shutdown (symbol-function 'pg::request-fast-shutdown))
+                    (requests nil)
+                    (pg::*pm-requested-mode* pg::+no-shutdown+))
+               (setf (pg::wal-replication-slot-restart-lsn public) old
+                     (pg::wal-replication-slot-restart-timeline public) 1)
+               (pg::wal-save-replication-slot public)
+               (unwind-protect
+                    (progn
+                      (setf (symbol-function 'pg::request-fast-shutdown)
+                            (lambda (&rest args)
+                              (push (and pg::*wal-poisoned*
+                                         (not (sb-thread:holding-mutex-p pg::*wal-lock*))
+                                         (not (sb-thread:holding-mutex-p pg::*write-lock*))) requests)
+                              (apply original-shutdown args)))
+                      (let ((pg::*logical-test-failpoint-hook*
+                              (lambda (point &rest details)
+                                (declare (ignore details))
+                                (when (eq point cut)
+                                  (ok (sb-thread:holding-mutex-p pg::*wal-lock*))
+                                  (ok (= (min old new) (pg::wal-replication-slot-restart-lsn public)))
+                                  (ecase exit
+                                    (:error (error "public feedback atomic cut"))
+                                    (:throw (throw 'atomic-feedback-cut :aborted))
+                                    (:timeout (error 'sb-ext:timeout :seconds 1)))))))
+                        (handler-case
+                            (catch 'atomic-feedback-cut
+                              (pg::call-with-native-physical-sender
+                               query
+                               (lambda (owner limit next)
+                                 (declare (ignore limit next))
+                                 (pg::physical-source-confirm-status
+                                  query owner (list :write (+ base 64) :flush new :apply base)))))
+                          (sb-ext:timeout () nil)
+                          (error () nil)))
+                      (ok pg::*wal-poisoned*)
+                      (ok requests)
+                      (ok (every #'identity requests))
+                      (ok (= pg::+fast-shutdown+ pg::*pm-requested-mode*))
+                      (ok (= (min old new) (pg::wal-replication-slot-restart-lsn public)))
+                      (ok (null (pg::physical-source-pin-confirmed-lsn pin)))
+                      (ok (null (pg::wal-replication-slot-active-owner public)))
+                      (ok (null (gethash (pg::physical-source-pin-name pin) pg::*physical-source-senders*)))
+                      (ok (= (if (member cut '(:slot-file-after-rename
+                                               :slot-file-before-directory-fsync
+                                               :slot-file-after-directory-fsync-before-memory-publication))
+                                 new old)
+                             (pg::wal-replication-slot-restart-lsn
+                              (pg::wal-read-replication-slot (pg::wal-replication-slot-path "public_slot")))))
+                      (ok (intake-fails-p
+                           (lambda () (pg::wal-remove-checkpointed-segments pg::*wal-durable-lsn*))))
+                      (ok (probe-file (pg::wal-segment-path (1- (floor base pg::+wal-segment-size+))))))
+                 (setf (symbol-function 'pg::request-fast-shutdown) original-shutdown)))))))))
 
 (deftest native-default-receiver-start-uses-private-proof-only
     (with-physical-store-directory (root)

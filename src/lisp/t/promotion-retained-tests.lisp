@@ -234,6 +234,36 @@
         :history-text (pg::bytes->string (pg::timeline-history-bytes 2))
         :eor-octets (coerce eor 'list)))
 
+(deftest named-child-stream-feedback-at-the-fork-retains-the-parent-prefix-timeline
+    (call-with-historical-follow-source
+     (lambda (root reference prefix eor)
+       (declare (ignore root))
+       (let* ((pg::*backend* (pg::make-backend :pid 3456))
+              (pg::*wal-replication-slots* (make-hash-table :test #'equal))
+              (fork (getf reference :end))
+              (pin (pg::physical-source-follow-ready
+                    "named_fork" (historical-follow-request reference prefix eor fork)))
+              (public (pg::wal-create-physical-replication-slot "public_fork"))
+              (query
+                (pg::parse-replication-command
+                 (format nil
+                         "START_REPLICATION SLOT public_fork PHYSICAL ~a (native_format '~a', proof_pin 'named_fork', mode 'follow', system_id '~d', timeline '2', base_lsn '~a', prefix_digest '~d', manifest_digest '~d')"
+                         (pg::wal-format-lsn fork) pg::+physical-native-format+
+                         (pg::catalog-system-identifier)
+                         (pg::wal-format-lsn (getf (pg::physical-follow-pin-anchor pin) :base))
+                         (pg::physical-source-pin-prefix-digest pin)
+                         (pg::physical-source-pin-manifest-digest pin)))))
+         (pg::call-with-native-physical-sender
+          query
+          (lambda (owner limit next)
+            (declare (ignore limit next))
+            (pg::physical-source-confirm-status
+             query owner (list :write fork :flush fork :apply 152))
+            (ok (= fork (pg::wal-replication-slot-restart-lsn public)))
+            (ok (= 1 (pg::wal-replication-slot-restart-timeline public)))))
+         (ok (= 1 (pg::wal-replication-slot-restart-timeline
+                   (pg::wal-read-replication-slot (pg::wal-replication-slot-path "public_fork")))))))))
+
 (deftest physical-slot-primary-validation-uses-committed-archive
     (call-with-historical-follow-source
      (lambda (root reference prefix eor)
