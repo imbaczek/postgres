@@ -485,37 +485,41 @@ keepalive's WAL-end field, which may include changes not yet applied."
    stream lsn lsn (pgoutput-build-safe-progress-message lsn)))
 
 (defun send-logical-transaction (stream transaction wal-end)
-  ;; Use one XLogData frame per pgoutput message like the C logical output
-  ;; plugin's prepare/write callback path.
-  (let ((changes (logical-transaction-changes transaction)))
-    (if (zerop (logical-transaction-xid transaction))
-        (progn
-          (unless (and (= (length changes) 1)
-                       (member (logical-change-kind (first changes))
-                               '(:ddl :sequence-state)))
-            (error "catalog logical transaction must contain one standalone event"))
-          (send-logical-xlog-data
-           stream (logical-transaction-commit-lsn transaction) wal-end
-           (pgoutput-build-message (first changes) transaction)))
-        (progn
-          (send-logical-xlog-data
-           stream (logical-transaction-commit-lsn transaction) wal-end
-           (pgoutput-build-begin transaction))
-          (dolist (change changes)
-            (if (eq (logical-change-kind change) :truncate)
-                (send-logical-xlog-data
-                 stream (logical-transaction-commit-lsn transaction) wal-end
-                 (pgoutput-build-message change transaction))
-                (progn
-                  (send-logical-xlog-data
-                   stream (logical-transaction-commit-lsn transaction) wal-end
-                   (pgoutput-build-relation change))
-                  (send-logical-xlog-data
-                   stream (logical-transaction-commit-lsn transaction) wal-end
-                   (pgoutput-build-row-change change)))))
-          (send-logical-xlog-data
-           stream (logical-transaction-commit-lsn transaction) wal-end
-           (pgoutput-build-commit transaction))))))
+  ;; Validate the entire staged spool before emitting a transaction frame.
+  (logical-transaction-map-changes transaction (lambda (change) (declare (ignore change))))
+  (if (zerop (logical-transaction-xid transaction))
+      (let ((count 0))
+        (logical-transaction-map-changes
+         transaction
+         (lambda (change)
+           (incf count)
+           (unless (and (= count 1)
+                        (member (logical-change-kind change) '(:ddl :sequence-state)))
+             (error "catalog logical transaction must contain one standalone event"))
+           (send-logical-xlog-data
+            stream (logical-transaction-commit-lsn transaction) wal-end
+            (pgoutput-build-message change transaction))))
+        (unless (= count 1)
+          (error "catalog logical transaction must contain one standalone event")))
+      (progn
+        (send-logical-xlog-data stream (logical-transaction-commit-lsn transaction) wal-end
+                                (pgoutput-build-begin transaction))
+        (logical-transaction-map-changes
+         transaction
+         (lambda (change)
+           (if (eq (logical-change-kind change) :truncate)
+               (send-logical-xlog-data
+                stream (logical-transaction-commit-lsn transaction) wal-end
+                (pgoutput-build-message change transaction))
+               (progn
+                 (send-logical-xlog-data
+                  stream (logical-transaction-commit-lsn transaction) wal-end
+                  (pgoutput-build-relation change))
+                 (send-logical-xlog-data
+                  stream (logical-transaction-commit-lsn transaction) wal-end
+                  (pgoutput-build-row-change change))))))
+        (send-logical-xlog-data stream (logical-transaction-commit-lsn transaction) wal-end
+                                (pgoutput-build-commit transaction)))))
 
 (defun replication-status-position (status)
   (let ((write-lsn (getf status :write))
@@ -649,36 +653,38 @@ keepalive's WAL-end field, which may include changes not yet applied."
 (defun stream-logical-replication-loop (stream slot-name initial-lsn)
   (let ((sent-lsn initial-lsn))
     (loop
-      (multiple-value-bind (transactions progress-lsn)
-          (wal-logical-slot-read-transactions
-           slot-name
-           :max-transactions 1
-           :max-scan-bytes (logical-stream-scan-budget-bytes))
-        (if transactions
-            (let* ((transaction (first transactions))
-                   (commit-lsn (logical-transaction-commit-lsn transaction)))
-              (send-logical-transaction stream transaction progress-lsn)
-              (setf sent-lsn commit-lsn)
-              (let ((status (replication-standby-status stream)))
-                (unless status (return))
-                (setf sent-lsn
-                      (validate-stream-status slot-name sent-lsn status))))
-            (if (> progress-lsn sent-lsn)
-                (progn
-                  ;; Advance only through a bounded scan that found no
-                  ;; subscriber-visible event, never through keepalive WAL-END.
-                  (send-logical-progress stream progress-lsn)
-                  (setf sent-lsn progress-lsn)
-                  (let ((status (replication-standby-status stream)))
-                    (unless status (return))
-                    (setf sent-lsn
-                          (validate-stream-status slot-name sent-lsn status))))
-                (progn
-                  (send-logical-keepalive stream sent-lsn)
-                  (let ((status (replication-standby-status stream)))
-                    (unless status (return))
-                    (validate-stream-status slot-name sent-lsn status)
-                    (sleep 0.05)))))))))
+      (unless
+          (call-with-logical-reader-spools
+           (lambda ()
+             (multiple-value-bind (transactions progress-lsn)
+                 (wal-logical-slot-read-transactions
+                  slot-name :max-transactions 1
+                  :max-scan-bytes (logical-stream-scan-budget-bytes))
+               (if transactions
+                   (let* ((transaction (first transactions))
+                          (commit-lsn (logical-transaction-commit-lsn transaction)))
+                     (send-logical-transaction stream transaction progress-lsn)
+                     (setf sent-lsn commit-lsn)
+                     (let ((status (replication-standby-status stream)))
+                       (when status
+                         (setf sent-lsn (validate-stream-status slot-name sent-lsn status))
+                         t)))
+                   (if (> progress-lsn sent-lsn)
+                       (progn
+                         (send-logical-progress stream progress-lsn)
+                         (setf sent-lsn progress-lsn)
+                         (let ((status (replication-standby-status stream)))
+                           (when status
+                             (setf sent-lsn (validate-stream-status slot-name sent-lsn status))
+                             t)))
+                       (progn
+                         (send-logical-keepalive stream sent-lsn)
+                         (let ((status (replication-standby-status stream)))
+                           (when status
+                             (validate-stream-status slot-name sent-lsn status)
+                             (sleep 0.05)
+                             t))))))))
+        (return)))))
 
 (defun create-replication-slot-command (stream command)
   (let ((name (logical-replication-command-slot-name command))

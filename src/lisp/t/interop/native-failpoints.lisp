@@ -66,19 +66,21 @@
   (setf *logical-test-failpoint-hook*
         (lambda (point &rest details)
           (when (and (eq point :before-standard-commit) (equal "interop_sub" (first details)))
-            (dolist (change (logical-transaction-changes (third details)))
-              (when (and (eq :insert (logical-change-kind change))
-                         (equal "interop_rows" (logical-change-relation-name change))
-                         (member (aref (logical-change-new-values change) 0) ids))
-                (let* ((id (aref (logical-change-new-values change) 0))
-                       (base (format nil "~a/native-transaction-~d" directory id)))
-                  (unless (probe-file (concatenate 'string base ".ready"))
-                    (with-open-file (output (concatenate 'string base ".end")
-                                            :direction :output :if-exists :supersede
-                                            :if-does-not-exist :create)
-                      (write-line (wal-format-lsn (second details)) output)
-                      (finish-output output)
-                      (fsync-stream output))
-                    (logical-test-failpoint-mark-once
-                     (concatenate 'string base ".ready") point))))))))
+            (logical-transaction-map-changes
+             (third details)
+             (lambda (change)
+               (when (and (eq :insert (logical-change-kind change))
+                          (equal "interop_rows" (logical-change-relation-name change))
+                          (member (aref (logical-change-new-values change) 0) ids))
+                 (let* ((id (aref (logical-change-new-values change) 0))
+                        (base (format nil "~a/native-transaction-~d" directory id)))
+                   (unless (probe-file (concatenate 'string base ".ready"))
+                     (with-open-file (output (concatenate 'string base ".end")
+                                             :direction :output :if-exists :supersede
+                                             :if-does-not-exist :create)
+                       (write-line (wal-format-lsn (second details)) output)
+                       (finish-output output)
+                       (fsync-stream output))
+                     (logical-test-failpoint-mark-once
+                      (concatenate 'string base ".ready") point)))))))))
   :native-transaction-hook-installed)

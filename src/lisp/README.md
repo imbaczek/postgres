@@ -623,9 +623,13 @@ logical slot decoding keep encoded events of at most 4 MiB in memory; larger
 events use a temporary file and are read from its stream. These files do not
 use the SQL temporary-file quota. Recovery validation avoids retaining decoded
 text, varchar, JSON text, or bytea values, but still constructs JSONB and
-numeric values. Slot decoding materializes decoded values and retains the
-transaction's changes in memory. The 4 MiB threshold is not a bound on the
-size of an individual event. The 64 MiB capture and 65 MiB WAL limits still
+numeric values. The scoped slot sender stages committed changes in a
+transaction spool, spilling above 4 MiB without the SQL temporary-file quota.
+It validates the staged changes before sending and iterates them again for
+output; the spool is cleaned up when the reader scope ends. Each iteration
+still materializes a whole encoded event and its decoded values, and protocol
+output may allocate a full row message. The 4 MiB threshold is not a bound on
+the size of an individual event. The 64 MiB capture and 65 MiB WAL limits still
 apply.
 
 When an encoded row event exceeds one WAL record, the transaction's events

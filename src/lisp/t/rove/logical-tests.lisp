@@ -1255,6 +1255,206 @@
         (wal-logical-reader-reset-batch state nil)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest test-logical-scoped-committed-transaction-spool
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-slot-iterator-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 1)
+           (*query-temp-file-limit-bytes* 0)
+           (*logical-validation-only* t)
+           (state (make-logical-reader-state :database-oid 7))
+           (first (logical-encode-change
+                   (logical-test-change :insert 7 701 :new-values #(1 2 "first"))))
+           (second (logical-encode-change
+                    (logical-test-change :insert 7 701 :new-values #(3 4 "second"))))
+           (chunk (make-wal-record :type +wal-record-logical-changes+ :xid 88
+                                   :payload (logical-encode-chunk 0 1 (list first second))))
+           (commit (make-wal-record :type +wal-record-commit+ :xid 88 :start 90 :end 100
+                                    :payload (wal-encode-commit-timestamp 0)))
+           (transaction nil))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (call-with-logical-reader-spools
+              (lambda ()
+                (wal-logical-reader-start-batch state)
+                (wal-logical-reader-add-chunk state chunk)
+                (rove:ok (null (logical-reader-state-changes state)))
+                (rove:ok (null (logical-reader-state-transactions state)))
+                (rove:ok (= 1 (length (uiop:directory-files directory))))
+                (wal-logical-reader-finish-batch state commit)
+                (setf transaction (first (logical-reader-state-transactions state)))
+                (let ((values nil))
+                  (logical-transaction-map-changes
+                   transaction (lambda (change) (push (logical-change-new-values change) values)))
+                  (rove:ok (equalp (nreverse values) (list #(1 2 "first") #(3 4 "second")))))))
+             (rove:ok (null (uiop:directory-files directory)))
+             (rove:ok (handler-case
+                          (progn (logical-transaction-map-changes transaction #'identity) nil)
+                        (error () t))))
+        (wal-logical-reader-reset-batch state nil)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-logical-scoped-spool-abort-and-invalid-terminal-cleanup
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-slot-abort-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 1)
+           (state (make-logical-reader-state :database-oid 7))
+           (event (logical-encode-change
+                   (logical-test-change :insert 7 701 :new-values #(1 2 "value"))))
+           (chunk (make-wal-record :type +wal-record-logical-changes+ :xid 88
+                                   :payload (logical-encode-chunk 0 1 (list event))))
+           (bad-commit (make-wal-record :type +wal-record-commit+ :xid 89 :end 100)))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (rove:ok
+              (handler-case
+                  (call-with-logical-reader-spools
+                   (lambda ()
+                     (wal-logical-reader-start-batch state)
+                     (wal-logical-reader-add-chunk state chunk)
+                     (wal-logical-reader-finish-batch state bad-commit)
+                     nil))
+                (error () t)))
+             (rove:ok (null (logical-reader-state-transactions state)))
+             (rove:ok (null (uiop:directory-files directory)))
+             (wal-logical-reader-reset-batch state nil)
+             (rove:ok
+              (handler-case
+                  (call-with-logical-reader-spools
+                   (lambda ()
+                     (wal-logical-reader-start-batch state)
+                     (wal-logical-reader-add-chunk state chunk)
+                     (error "injected callback failure")))
+                (error () t)))
+             (rove:ok (null (uiop:directory-files directory))))
+        (wal-logical-reader-reset-batch state nil)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-standard-scoped-spool-preflight-and-interruption
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-slot-send-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 1)
+           (state (make-logical-reader-state :database-oid 7))
+           (stream (make-standard-stream :emit-floor 0 :last-send-time (get-internal-real-time)))
+           (original (symbol-function 'standard-xlog-data))
+           (change (logical-test-change :insert 7 701 :new-values #(1 2 "value")))
+           (frames nil) (fail-relation nil))
+      (setf (logical-change-publication-selection change)
+            '((:relation-oid 701 :publications ((:name "p" :oid 100 :generation 1 :unsupported nil)))))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'standard-xlog-data)
+                   (lambda (ignored payload &optional (end 0))
+                     (declare (ignore ignored))
+                     (push (list (code-char (aref payload 0)) end) frames)
+                     (not (and fail-relation (= (aref payload 0) (char-code #\R))))))
+             (call-with-logical-reader-spools
+              (lambda ()
+                (logical-reader-store-change state change)
+                (let* ((spool (logical-reader-state-spool state))
+                       (transaction (make-logical-transaction :xid 88 :commit-record-lsn 90
+                                                              :commit-lsn 100 :commit-timestamp 0
+                                                              :spool spool)))
+                  (logical-spool-seal spool)
+                  (rove:ok (standard-send-scoped-transaction stream transaction '("other")))
+                  (rove:ok (null frames))
+                  (setf fail-relation t)
+                  (rove:ok (null (standard-send-scoped-transaction stream transaction '("p"))))
+                  (rove:ok (equal (nreverse frames) (list (list #\B 0) (list #\R 0))))
+                  (rove:ok (zerop (standard-stream-pending-count stream))))))
+             (rove:ok (null (uiop:directory-files directory))))
+        (setf (symbol-function 'standard-xlog-data) original)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-standard-scoped-preflight-checks-later-events
+    (let* ((state (make-standard-stream :emit-floor 0))
+           (original (symbol-function 'standard-xlog-data))
+           (first (logical-test-change :insert 7 701 :new-values #(1 2 "first")))
+           (second (logical-test-change :insert 7 701 :new-values #(3 4 "second")))
+           (frames nil))
+      (setf (logical-change-publication-selection first)
+            '((:relation-oid 701 :publications ((:name "p" :oid 100 :generation 1 :unsupported nil)))))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'standard-xlog-data)
+                   (lambda (ignored payload &optional (end 0))
+                     (declare (ignore ignored payload end))
+                     (setf frames t) t))
+             (call-with-logical-reader-spools
+              (lambda ()
+                (let ((reader (make-logical-reader-state :database-oid 7)))
+                  (logical-reader-store-change reader first)
+                  (logical-reader-store-change reader second)
+                  (let ((spool (logical-reader-state-spool reader)))
+                    (logical-spool-seal spool)
+                    (rove:ok (handler-case
+                                 (progn
+                                   (standard-send-scoped-transaction
+                                    state (make-logical-transaction :xid 88 :spool spool
+                                                                    :commit-record-lsn 90
+                                                                    :commit-lsn 100 :commit-timestamp 0)
+                                    '("p"))
+                                   nil)
+                               (pg-error (condition)
+                                 (string= (pg-error-sqlstate condition) "0A000"))))
+                    (rove:ok (null frames)))))))
+        (setf (symbol-function 'standard-xlog-data) original))))
+
+(rove:deftest test-standard-scoped-corrupt-later-event-before-begin
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-slot-corrupt-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (state (make-standard-stream :emit-floor 0))
+           (original (symbol-function 'standard-xlog-data))
+           (change (logical-test-change :insert 7 701 :new-values #(1 2 "value")))
+           (frames nil))
+      (setf (logical-change-publication-selection change)
+            '((:relation-oid 701 :publications ((:name "p" :oid 100 :generation 1 :unsupported nil)))))
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'standard-xlog-data)
+                   (lambda (ignored payload &optional (end 0))
+                     (declare (ignore ignored payload end))
+                     (setf frames t) t))
+             (call-with-logical-reader-spools
+              (lambda ()
+                (let ((reader (make-logical-reader-state :database-oid 7)))
+                  (logical-reader-store-change reader change)
+                  (logical-reader-store-change reader change)
+                  (let* ((spool (logical-reader-state-spool reader))
+                         (file (logical-spool-stream spool))
+                         (second-start (+ 16 (length (logical-encode-change change)))))
+                    (logical-spool-seal spool)
+                    ;; Change a text byte, leaving the encoded event structurally valid.
+                    (file-position file (+ second-start (1- (length (logical-encode-change change)))))
+                    (write-byte 99 file)
+                    (finish-output file)
+                    (rove:ok (handler-case
+                                 (progn
+                                   (standard-send-scoped-transaction
+                                    state (make-logical-transaction :xid 88 :spool spool
+                                                                    :commit-record-lsn 90
+                                                                    :commit-lsn 100 :commit-timestamp 0)
+                                    '("p"))
+                                   nil)
+                               (error (condition)
+                                 (search "checksum mismatch" (princ-to-string condition)))))
+                    (rove:ok (null frames))))))
+             (rove:ok (null (uiop:directory-files directory))))
+        (setf (symbol-function 'standard-xlog-data) original)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest test-logical-slot-scan-spool-cleanup
     (let* ((directory (merge-pathnames
                        (format nil "pg-slot-scan-~d-~d/" (sb-posix:getpid) (random 1000000))

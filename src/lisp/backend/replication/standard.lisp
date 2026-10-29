@@ -168,21 +168,65 @@
      oids)))
 
 (defun standard-transaction-changes (transaction names)
-  "Use per-change historic publication state; never reinterpret a retained row."
-  (loop for change in (logical-transaction-changes transaction)
-        for kind = (logical-change-kind change)
-        append
-        (case kind
-          ((:ddl :sequence-state) nil)
-          (:truncate
-           (let ((relations (standard-truncate-relations
-                             change (standard-selected-actions names change))))
-             (when relations (list (cons :truncate relations)))))
-          ((:insert :update :delete)
-           (when (member kind (gethash (logical-change-relation-oid change)
-                                       (standard-selected-actions names change)))
-             (list change)))
-          (otherwise (ereport "0A000" "unsupported logical row operation")))))
+  "Materialize selected changes for callers that require a list."
+  (let ((changes nil))
+    (standard-map-selected-changes transaction names
+                                   (lambda (change) (push change changes)))
+    (nreverse changes)))
+
+(defun standard-map-selected-changes (transaction names function)
+  "Apply historic publication selection one change at a time."
+  (logical-transaction-map-changes
+   transaction
+   (lambda (change)
+     (let ((kind (logical-change-kind change)))
+       (case kind
+         ((:ddl :sequence-state) nil)
+         (:truncate
+          (let ((relations (standard-truncate-relations
+                            change (standard-selected-actions names change))))
+            (when relations (funcall function (cons :truncate relations)))))
+         ((:insert :update :delete)
+          (when (member kind (gethash (logical-change-relation-oid change)
+                                      (standard-selected-actions names change)))
+            (funcall function change)))
+         (otherwise (ereport "0A000" "unsupported logical row operation")))))))
+
+(defun standard-send-scoped-transaction (state transaction names)
+  "Preflight selection, then send without retaining the selected changes."
+  (let ((selected nil))
+    (standard-map-selected-changes transaction names (lambda (change)
+                                                       (declare (ignore change))
+                                                       (setf selected t)))
+    (unless selected (return-from standard-send-scoped-transaction t))
+    (unless (standard-xlog-data state (pgoutput-standard-begin transaction))
+      (return-from standard-send-scoped-transaction nil))
+    (standard-map-selected-changes
+     transaction names
+     (lambda (change)
+       (when (standard-stream-stop-reason state)
+         (return-from standard-send-scoped-transaction nil))
+       (if (and (consp change) (eq (car change) :truncate))
+           (progn
+             (dolist (relation (cdr change))
+               (unless (standard-xlog-data state (pgoutput-build-relation relation))
+                 (return-from standard-send-scoped-transaction nil)))
+             (unless (standard-xlog-data
+                      state (pgoutput-build-truncate
+                             (mapcar #'logical-change-relation-oid (cdr change))))
+               (return-from standard-send-scoped-transaction nil)))
+           (progn
+             (unless (standard-xlog-data state (pgoutput-build-relation change))
+               (return-from standard-send-scoped-transaction nil))
+             (unless (standard-xlog-data state (pgoutput-build-row-change change))
+               (return-from standard-send-scoped-transaction nil))))
+       (standard-maybe-keepalive state)))
+    (logical-test-failpoint :before-standard-commit (standard-stream-slot-name state)
+                            (logical-transaction-commit-lsn transaction) transaction)
+    (unless (standard-xlog-data state (pgoutput-standard-commit transaction)
+                                (logical-transaction-commit-lsn transaction))
+      (return-from standard-send-scoped-transaction nil))
+    (not (standard-stream-stop-reason state))))
 
 (defun standard-transaction-visible-p (transaction floor)
   "Replay a transaction until its complete commit end is acknowledged.
@@ -386,21 +430,22 @@ records need not decode their publication history. Keep eligibility there."
       (when (standard-stream-stop-reason state) (return))
       (let ((advanced nil))
         (when (< (standard-stream-pending-count state) +standard-stream-boundary-limit+)
-          (multiple-value-bind (transactions progress)
-              (with-live-operation
-                (wal-logical-slot-read-transactions
-                 (standard-stream-slot-name state)
-                 :from-lsn (standard-stream-scan-cursor state) :max-transactions 1))
-            (dolist (transaction transactions)
-              (when (standard-transaction-visible-p transaction (standard-stream-emit-floor state))
-                (unless (standard-send-transaction
-                         state transaction
-                         (standard-transaction-changes transaction (standard-stream-publication-names state)))
-                  (return-from streaming nil))))
-            (when (> progress (standard-stream-scan-cursor state))
-              (setf advanced t (standard-stream-scan-cursor state) progress)
-              (standard-note-frontier state progress)
-              (with-live-operation (standard-acknowledge-flush state)))))
+          (call-with-logical-reader-spools
+           (lambda ()
+             (multiple-value-bind (transactions progress)
+                 (with-live-operation
+                   (wal-logical-slot-read-transactions
+                    (standard-stream-slot-name state)
+                    :from-lsn (standard-stream-scan-cursor state) :max-transactions 1))
+               (dolist (transaction transactions)
+                 (when (standard-transaction-visible-p transaction (standard-stream-emit-floor state))
+                   (unless (standard-send-scoped-transaction
+                            state transaction (standard-stream-publication-names state))
+                     (return-from streaming nil))))
+               (when (> progress (standard-stream-scan-cursor state))
+                 (setf advanced t (standard-stream-scan-cursor state) progress)
+                 (standard-note-frontier state progress)
+                 (with-live-operation (standard-acknowledge-flush state)))))))
         (standard-maybe-keepalive state)
         (unless advanced
           (sb-sys:wait-until-fd-usable
