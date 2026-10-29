@@ -2089,6 +2089,23 @@ candidate selection."
   (list :binop operator left right :type (if (string= operator "->") (expr-type left) :text)
         :typmod -1))
 
+(defun analyze-json-path-extraction (operator left right)
+  "Resolve JSON and JSONB path extraction against text arrays."
+  (unless (member (expr-type left) '(:json :jsonb))
+    (report-operator-resolution-error
+     operator (list left right)
+     (and (in-unknown-constant-p left)
+          (or (in-unknown-constant-p right)
+              (sql-implicit-coercion-p (expr-type right) :text-array)))))
+  (when (in-unknown-constant-p right)
+    (setf right (coerce-in-constant right :text-array)))
+  (unless (eq (expr-type right) :text-array)
+    (if (sql-implicit-coercion-p (expr-type right) :text-array)
+        (setf right (list :cast right :type :text-array :typmod -1))
+        (report-operator-resolution-error operator (list left right))))
+  (list :binop operator left right :type (if (string= operator "#>") (expr-type left) :text)
+        :typmod -1))
+
 (defun analyze-binop-expression (expression scope)
   (let* ((operator (second expression))
          (left (analyze-expr (third expression) scope))
@@ -2096,6 +2113,8 @@ candidate selection."
     (when (and (> (length operator) 1) (char= (char operator 0) #\^))
       (ereport "42883" "operator does not exist: ~a ~a ~a"
                (typed-arg-name left) operator (typed-arg-name right)))
+    (when (member operator '("#>" "#>>") :test #'string=)
+      (return-from analyze-binop-expression (analyze-json-path-extraction operator left right)))
     (when (member operator '("->" "->>") :test #'string=)
       (return-from analyze-binop-expression (analyze-json-extraction operator left right)))
     (when (string= operator "^")
@@ -3830,6 +3849,11 @@ truncate and interpret the result at TYPE's signed width."
        (if (member op '("=" "<>" "<" "<=" ">" ">=") :test #'string=)
            (sql-compare op l r)
            (let ((value (cond ((or (eq l +null+) (eq r +null+)) +null+)
+                              ((member op '("#>" "#>>") :test #'string=)
+                               (sql-json-path-extract
+                                l (if (sql-array-p r) (sql-array-elements r) r)
+                                (eq (expr-type (third expr)) :jsonb)
+                                (string= op "#>>")))
                               ((member op '("->" "->>") :test #'string=)
                                (if (eq (expr-type (third expr)) :json)
                                    (sql-json-extract l r (string= op "->>"))

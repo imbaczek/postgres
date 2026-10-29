@@ -30,6 +30,7 @@ run -c 'create table toast_jsonb (id int primary key, v jsonb)' >/dev/null
 run -c "insert into toast_jsonb values (1, '$jsonb_value')" >/dev/null
 [ "$(run -c 'select v from toast_jsonb where id = 1')" = "{\"key\": 3, \"long\": \"$big\"}" ]
 [ "$(run -c "select v ->> 'long' from toast_jsonb where id = 1")" = "$big" ]
+[ "$(run -c "select v #>> '{long}' from toast_jsonb where id = 1")" = "$big" ]
 [ "$(run -c "select v -> 'key' from toast_jsonb where id = 1")" = 3 ]
 [ "$(run -c "select v = '{\"long\":\"$big\",\"key\":3}'::jsonb from toast_jsonb where id = 1")" = t ]
 run -c 'create index toast_jsonb_v_idx on toast_jsonb(v)' >/dev/null
@@ -55,6 +56,7 @@ run -c "insert into toast_json values (1, '$json_value')" >/dev/null
 [ "$(run -c 'select v from toast_json where id = 1')" = "$json_value" ]
 [ "$(run -c "select v -> 'key' from toast_json where id = 1")" = 2 ]
 [ "$(run -c "select v ->> 'key' from toast_json where id = 1")" = 2 ]
+[ "$(run -c "select v #>> '{key}' from toast_json where id = 1")" = 2 ]
 run -c 'insert into toast_jsonb select 4, v from toast_json where id = 1' >/dev/null
 [ "$(run -c 'select v from toast_jsonb where id = 4')" = '{"key": 2}' ]
 run -c 'insert into toast_json select 2, v from toast_jsonb where id = 4' >/dev/null

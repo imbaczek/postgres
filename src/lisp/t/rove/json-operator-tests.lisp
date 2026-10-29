@@ -87,3 +87,54 @@
                         (string= (pg-error-sqlstate condition) (second case))
                         (string= (pg-error-message condition) (third case))
                         (string= (pg-error-detail condition) (fourth case))))))))
+
+(rove:deftest test-json-path-extraction
+    (flet ((check (sql expected type)
+             (multiple-value-bind (value actual-type) (json-test-evaluate sql)
+               (rove:ok (eq actual-type type))
+               (rove:ok (equal (if (sql-jsonb-p value) (sql-jsonb-output value) value)
+                               expected)))))
+      (dolist (kind '("json" "jsonb"))
+        (check (format nil "select '{\"a\":[1, {\"b\":2}]}'::~a #>> '{a,-1,b}'" kind) "2" :text)
+        (check (format nil "select '[10,20]'::~a #>> array['  +01']" kind) "20" :text)
+        (check (format nil "select '[10,20]'::~a #>> array['1 ']" kind) +null+ :text)
+        (check (format nil "select '1'::~a #> '{0}'" kind) +null+ (if (string= kind "json") :json :jsonb))
+        (check (format nil "select 'null'::~a #>> '{}'" kind) +null+ :text)
+        (check (format nil "select '\"abc\"'::~a #>> '{}'" kind) "abc" :text)
+        (check (format nil "select '{\"a\":1}'::~a #> array['a',null]" kind) +null+
+               (if (string= kind "json") :json :jsonb))
+        (check (format nil "select '{\"a\":{\"b\":3}}'::~a #>> array[['a','b']]" kind) "3" :text))
+      (check "select ' { \"a\" : [1, 2] } '::json #> '{a}'" "[1, 2]" :json)
+      (check "select '[1,2]'::jsonb #> '{}'" "[1, 2]" :jsonb)
+      (check "select '  1.00e+2  '::json #>> '{}'" "  1.00e+2" :text)
+      (check "select '  null  '::json #>> '{}'" +null+ :text)
+      (check "select '  null  '::json #> '{}'" "  null" :json)
+      (check "select '{\"a\":1}'::json #>> array['a'::varchar]" "1" :text)
+      (check "select '{\"a\":1}'::jsonb #>> array['a'::name]" "1" :text)))
+
+(rove:deftest test-json-path-operator-resolution
+    (dolist (case '(("select '{}' #> '{a}'" "42725")
+                    ("select '{}'::jsonb #> array[1]" "42883")
+                    ("select '{}'::json #> 'not an array'" "22P02")))
+      (let ((condition (handler-case (progn (json-test-evaluate (first case)) nil)
+                         (pg-error (error) error))))
+        (rove:ok (and condition (string= (pg-error-sqlstate condition) (second case)))))))
+
+(rove:deftest test-json-path-duplicate-prefixes
+    (rove:ok (equal (json-test-evaluate
+                     "select '{\"a\":{\"b\":1},\"a\":{}}'::json #> '{a,b}'")
+                    "1"))
+  (rove:ok (equal (json-test-evaluate
+                   "select '{\"a\":[1,2],\"a\":[3,4,5]}'::json #>> '{a,-1}'")
+                  "4"))
+  (rove:ok (eq +null+ (json-test-evaluate
+                       "select '{\"x\":[1,2,3],\"a\":[4,5]}'::json #>> '{a,-1}'")))
+  (rove:ok (equal "5" (json-test-evaluate
+                       "select '{\"x\":[1,2],\"a\":[4,5,6]}'::json #>> '{a,-1}'"))))
+
+(rove:deftest test-json-path-deep-document
+    (let* ((depth 10000)
+           (json (concatenate 'string (make-string depth :initial-element #\[)
+                              "1" (make-string depth :initial-element #\])))
+           (path (make-array depth :initial-element "0")))
+      (rove:ok (equal (sql-json-path-extract json path nil t) "1"))))
