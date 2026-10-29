@@ -261,6 +261,29 @@ reuse_pointer() {
 }
 original_pointer=$(reuse_pointer)
 [ -n "$original_pointer" ]
+# An optimized INSERT SELECT omits v from the source projection; conflict
+# handling must still materialize v from the existing target row.
+[ "$(run -c "insert into toast_reuse (id, marker) select id, marker from toast_reuse on conflict (id) do update set marker = excluded.marker + 1 returning v = '$big'")" = t ]
+[ "$(run -c "select marker, v = '$big' from toast_reuse where id = 1")" = '1|t' ]
+[ "$(reuse_pointer)" = "$original_pointer" ]
+# Count actual TOAST fetches during live SQL execution. A query that needs only
+# id must not touch v; fetching v and using it in a filter must still work.
+printf '%s\n(quit)\n' '(let ((counter (intern "*TOAST-TEST-FETCH-COUNT*")) (original (symbol-function (quote toast-fetch-value)))) (setf (symbol-value counter) 0 (symbol-value (intern "*TOAST-TEST-FETCH-ORIGINAL*")) original) (setf (symbol-function (quote toast-fetch-value)) (lambda (&rest args) (incf (symbol-value counter)) (apply original args))))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/toast-fetch-install.out"
+! grep -q ';; error:' "$TMP/toast-fetch-install.out"
+toast_fetch_count() {
+    printf '%s\n(quit)\n' '(format t "FETCH-COUNT=~d~%" (symbol-value (intern "*TOAST-TEST-FETCH-COUNT*")))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/toast-fetch-count.out"
+    if grep -q ';; error:' "$TMP/toast-fetch-count.out"; then cat "$TMP/toast-fetch-count.out" >&2; exit 1; fi
+    awk -F= '/FETCH-COUNT=/{print $2}' "$TMP/toast-fetch-count.out"
+}
+[ "$(run -c 'select id from toast_reuse')" = 1 ]
+[ "$(toast_fetch_count)" = 0 ]
+[ "$(run -c "select v = '$big' from toast_reuse where id = 1")" = t ]
+fetch_after_projection=$(toast_fetch_count)
+[ "$fetch_after_projection" -gt 0 ]
+[ "$(run -c "select id from toast_reuse where v = '$big'")" = 1 ]
+[ "$(toast_fetch_count)" -gt "$fetch_after_projection" ]
+printf '%s\n(quit)\n' '(setf (symbol-function (quote toast-fetch-value)) (symbol-value (intern "*TOAST-TEST-FETCH-ORIGINAL*")))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/toast-fetch-restore.out"
+! grep -q ';; error:' "$TMP/toast-fetch-restore.out"
 mkfifo "$TMP/reuse-reader.sql"
 run < "$TMP/reuse-reader.sql" > "$TMP/reuse-reader.out" 2>&1 &
 READER=$!
@@ -360,6 +383,32 @@ test_wait_owned_sql_server "$SRV" "$PORT" || { cat "$LOG" >&2; exit 1; }
 [ "$(run -c 'select length(v) from storage_restart')" = 20000 ]
 [ "$(run -c "select marker, v = '$big' from toast_reuse where id = 1")" = '6|t' ]
 [ "$(reuse_pointer)" = "$latest_pointer" ]
+# Multiple updates in one transaction must keep the new pointer after the
+# replacement, and an aborted insert/reuse/replacement must leave no row.
+transaction_next_id=$(toast_next_id)
+run -c "begin; update toast_reuse set marker = 7 where id = 1; update toast_reuse set v = '$other', marker = 8 where id = 1; update toast_reuse set marker = 9 where id = 1; commit" >/dev/null
+transaction_pointer=$(reuse_pointer)
+[ "$transaction_pointer" != "$latest_pointer" ]
+[ "$(toast_next_id)" -eq "$((transaction_next_id + 1))" ]
+[ "$(run -c "select marker, v = '$other' from toast_reuse where id = 1")" = '9|t' ]
+run -c "begin; insert into toast_reuse values (2, 0, '$big'); update toast_reuse set marker = 1 where id = 2; update toast_reuse set v = '$other' where id = 2; rollback" >/dev/null
+[ "$(run -c 'select count(*) from toast_reuse where id = 2')" = 0 ]
+[ "$(reuse_pointer)" = "$transaction_pointer" ]
+run -c 'vacuum toast_reuse' >/dev/null
+[ "$(run -c "select marker, v = '$other' from toast_reuse where id = 1")" = '9|t' ]
+[ "$(reuse_pointer)" = "$transaction_pointer" ]
+# PLAIN affects newly assigned values, while an omitted column keeps the
+# already external datum even after its storage policy changes.
+run -c 'alter table toast_reuse alter column v set storage plain' >/dev/null
+run -c 'update toast_reuse set marker = 10 where id = 1' >/dev/null
+[ "$(reuse_pointer)" = "$transaction_pointer" ]
+run -c "update toast_reuse set v = '$other', marker = 11 where id = 1" >/dev/null
+[ "$(run -c "select marker, v = '$other' from toast_reuse where id = 1")" = '11|t' ]
+printf '%s\n(quit)\n' '(let* ((db (gethash "postgres" (catalog-databases *catalog*))) (table (gethash "toast_reuse" (database-tables db))) (snapshot (make-snapshot 0)) (count 0)) (heapam-scan (pg-class-relfilenode table) (pg-class-columns table) snapshot (lambda (tuple) (incf count) (when (heap-external-varlena-p (aref (htup-values tuple) 2)) (error "assigned PLAIN value is external")))) (unless (= count 1) (error "unexpected visible row count")) (format t "PLAIN-OK~%"))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/reuse-plain.out"
+grep -Fq 'PLAIN-OK' "$TMP/reuse-plain.out"
+! grep -q ';; error:' "$TMP/reuse-plain.out"
+run -c 'vacuum toast_reuse' >/dev/null
+[ "$(run -c "select marker, v = '$other' from toast_reuse where id = 1")" = '11|t' ]
 [ "$(run -c "select reltoastrelid from pg_class where relname = 'toast_numeric'")" = "$numeric_toast_oid" ]
 [ "$(run -c "select v = '$numeric_big'::numeric from toast_numeric where id = 1")" = t ]
 [ "$(run -c 'select length(v::text) from toast_numeric where id = 2')" = 20000 ]

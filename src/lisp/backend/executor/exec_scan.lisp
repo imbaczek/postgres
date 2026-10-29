@@ -1436,32 +1436,34 @@ scopes to clean up."
               return (snapshot-registration-snapshot registration))
       fallback))
 
-(defun materialize-select-tuple (table tuple snapshot &key (index-reader #'select-toast-index-reader))
-  "Replace external attributes of parent TUPLE with SQL values in place.
-Textual payloads become strings; bytea remains octets, and JSONB and numeric
-payloads are decoded into their SQL values.
-For a normal scan the caller checks parent visibility and keeps SNAPSHOT active
-through the fetch. An index build may also fetch retained dead versions; its
-removal horizon and the active protection snapshot keep their chunks available.
-TOAST chunk visibility follows the parent and is not independently filtered."
+(defvar *select-toast-demand* nil
+  "NIL means full materialization; otherwise a cons of table and needed slots.")
+
+(defun materialize-select-tuple (table tuple snapshot &key (index-reader #'select-toast-index-reader) demand)
+  "Replace external attributes with SQL values, omitting proven unused slots.
+The parent is visible and SNAPSHOT remains active throughout the fetch. TOAST
+chunk visibility follows the parent and is not independently filtered."
   (let ((values (htup-values tuple))
         (columns (pg-class-columns table)))
     (loop for i below (length values)
           for value = (aref values i)
           when (heap-external-varlena-p value)
-            do (let* ((toast (pg-class-toast table))
-                      (type (pg-column-type (aref columns i))))
-                 (unless toast
-                   (ereport "XX001" "external value has no owning TOAST relation"))
-                 (let ((bytes (toast-fetch-value toast value snapshot
-                                                 :index-reader index-reader)))
-                   (setf (aref values i)
-                         (case type
-                           ((:varchar :text :json) (bytes->string bytes))
-                           (:bytea bytes)
-                           (:jsonb (sql-jsonb-from-octets bytes))
-                           (:numeric (sql-numeric-from-varlena-payload bytes))
-                           (otherwise (ereport "XX001" "external value has unsupported type")))))))
+            do (if (and demand
+                        (eq table (car demand))
+                        (not (member (1+ i) (cdr demand))))
+                   (setf (aref values i) +null+)
+                   (let* ((toast (pg-class-toast table))
+                          (type (pg-column-type (aref columns i))))
+                     (unless toast
+                       (ereport "XX001" "external value has no owning TOAST relation"))
+                     (let ((bytes (toast-fetch-value toast value snapshot :index-reader index-reader)))
+                       (setf (aref values i)
+                             (case type
+                               ((:varchar :text :json) (bytes->string bytes))
+                               (:bytea bytes)
+                               (:jsonb (sql-jsonb-from-octets bytes))
+                               (:numeric (sql-numeric-from-varlena-payload bytes))
+                               (otherwise (ereport "XX001" "external value has unsupported type"))))))))
     tuple))
 
 (defun unchanged-tuple-toast-pointers (tuple assignments)
@@ -1519,7 +1521,9 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
                (let ((tuple (heapam-get-tuple relfilenode (car tid) (cdr tid)
                                               (pg-class-columns table))))
                  (when (and tuple (htup-visible-p tuple snapshot))
-                   (funcall callback (materialize-select-tuple table tuple snapshot)))))))))))))
+                   (let ((row (materialize-select-tuple table tuple snapshot :demand *select-toast-demand*)))
+                     (let ((*select-toast-demand* nil))
+                       (funcall callback row))))))))))))))
 
 (defun scan-select-path (table relfilenode path snapshot callback
                          &optional environment)
@@ -1527,7 +1531,9 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
     (:seq-scan
      (heapam-scan relfilenode (pg-class-columns table) snapshot
                   (lambda (tuple)
-                    (funcall callback (materialize-select-tuple table tuple snapshot)))))
+                    (let ((row (materialize-select-tuple table tuple snapshot :demand *select-toast-demand*)))
+                      (let ((*select-toast-demand* nil))
+                        (funcall callback row))))))
     (:index-scan
      (scan-select-index table path snapshot callback environment))))
 

@@ -401,6 +401,41 @@
         (rove:ok (eq pointer (aref physical 0)))
         (rove:ok (stringp (aref logical 0))))))
 
+(rove:deftest test-simple-select-toast-demand
+    (let* ((columns (vector (make-pg-column :name "id" :type :int4 :attnum 1)
+                            (make-pg-column :name "payload" :type :text :attnum 2)))
+           (table (make-pg-class :oid 42 :columns columns))
+           (relations (list (list :table table)))
+           (scan '(:seq-scan 0 42))
+           (targets (list (list :expr (list :col 1 :type :int4 :typmod -1))))
+           (node (list :project targets scan))
+           (demand (simple-select-toast-demand node relations))
+           (pointer (make-heap-external-varlena :raw-size 5004 :external-info 5000
+                                                :value-id 42 :relation-id 7 :id-width 4))
+           (tuple (make-htup :values (vector 3 pointer))))
+      (rove:ok (equal (cdr demand) '(1)))
+      (let ((*select-toast-demand* demand))
+        ;; No TOAST relation exists: this succeeds only if the unused pointer is skipped.
+        (materialize-select-tuple table tuple nil :demand *select-toast-demand*)
+        (rove:ok (equalp (htup-values tuple) (vector 3 +null+))))
+      ;; An unrelated caller must fetch even while an outer scan has a demand hint.
+      (rove:ok (handler-case
+                   (let ((*select-toast-demand* demand))
+                     (materialize-select-tuple table (make-htup :values (vector 3 pointer)) nil)
+                     nil)
+                 (pg-error () t)))
+      (rove:ok (null (simple-select-toast-demand (list :sort nil node) relations)))
+      (rove:ok (null (simple-select-toast-demand
+                      (list :project targets (list :filter '(:const t) scan)) relations)))
+      (rove:ok (null (simple-select-toast-demand
+                      (list :project (list (list :expr '(:func "length" nil))) scan)
+                      relations)))
+      (let ((selected (make-htup :values (vector 3 pointer))))
+        (rove:ok (handler-case
+                     (let ((*select-toast-demand* (cons table '(2))))
+                       (materialize-select-tuple table selected nil :demand *select-toast-demand*) nil)
+                   (pg-error () t))))))
+
 (rove:deftest test-tuple-roundtrip
     (let* ((cols (coerce
                   (list (make-pg-column :name "a" :type :int4 :typmod -1
