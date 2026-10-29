@@ -1817,9 +1817,9 @@
     (dolist (entry '(("\"\"" t) ("\"a🙂\\n\\u0001\"" t)
                      ("\"a\\/\"" nil) ("\"\\u0000\"" nil)
                      ("\"\\u0061\"" nil) ("\"\\u000A\"" nil)
-                     ("\"\\u000a\"" nil) ("[1]" nil) ("\"x\" " nil)
+                     ("\"\\u000a\"" nil) ("[1]" t) ("\"x\" " nil)
                      ("[\"x\", [true, null], false]" t) ("[\"x\",true]" nil)
-                     ("[\"x\", 1]" nil) ("[\"x\", {\"a\": true}]" nil)))
+                     ("[\"x\", 1]" t) ("[\"x\", {\"a\": true}]" t)))
       (let* ((bytes (string->bytes (first entry)))
              (cursor (make-logical-cursor :bytes bytes)))
         (rove:ok (eq (not (null (logical-jsonb-canonical-simple-p cursor (length bytes))))
@@ -1863,8 +1863,8 @@
                                         "\"x\"" (make-string 512 :initial-element #\]))))
       (rove:ok (not (recognized (concatenate 'string (make-string 513 :initial-element #\[)
                                              "\"x\"" (make-string 513 :initial-element #\])))))
-      (rove:ok (not (recognized "[1.00, \"x\"]")))
-      (rove:ok (not (recognized "{\"x\": true}"))))
+      (rove:ok (recognized "[1.00, \"x\"]"))
+      (rove:ok (recognized "{\"x\": true}")))
   (let* ((bytes (make-array 65540 :element-type '(unsigned-byte 8) :initial-element 120))
          (cursor (make-logical-cursor :bytes bytes)))
     (setf (aref bytes 0) 34 (aref bytes 65535) #xc2 (aref bytes 65536) #x20
@@ -1872,6 +1872,76 @@
     (rove:ok (handler-case (progn (logical-jsonb-canonical-simple-p cursor (length bytes)) nil)
                (error () t)))
     (rove:ok (zerop (logical-cursor-offset cursor)))))
+
+(rove:deftest test-jsonb-canonical-objects-and-numbers
+    (flet ((recognized (text)
+             (let ((bytes (string->bytes text)))
+               (logical-jsonb-canonical-simple-p (make-logical-cursor :bytes bytes) (length bytes)))))
+      (dolist (text '("0" "0.00" "-0.01" "1.2300" "{}"
+                      "{\"\\n\": 1, \"A\": 2}" "{\"a\": {\"é\": [0.00, true]}}"))
+        (rove:ok (recognized text)))
+      (dolist (text '("-0" "-0.00" "01" "1e2" "1." "{\"A\": 1, \"\\n\": 2}"
+                      "{\"a\": 1, \"a\": 2}" "{\"aa\": 1, \"b\": 2}"
+                      "{\"a\":1}"))
+        (rove:ok (not (recognized text))))
+      (rove:ok (recognized (make-string 131072 :initial-element #\1)))
+      (rove:ok (not (recognized (make-string 131073 :initial-element #\1))))
+      (rove:ok (recognized (concatenate 'string "0." (make-string 16383 :initial-element #\0))))
+      (rove:ok (not (recognized (concatenate 'string "0." (make-string 16384 :initial-element #\0)))))
+      (rove:ok (not (recognized (concatenate 'string "{\"" (make-string 4097 :initial-element #\x)
+                                             "\": 1}"))))))
+
+(rove:deftest test-jsonb-canonical-object-differential
+    (dolist (text '("{\"\": 0, \"a\": 1, \"zz\": 2, \"é\": 3, \"aaa\": 4}"
+                    "{\"\\u0001\": 1, \"\\n\": 2, \"\\\"\": 3, \"A\": 4}"
+                    "{\"a\": {\"z\": 1}, \"b\": 2}"
+                    "{\"b\": {\"z\": 1}, \"a\": 2}"
+                    "{\"a\": 1, \"a\": 2}"
+                    "[0.00, -0.0001, 1.2300]"))
+      (let* ((bytes (string->bytes text))
+             (cursor (make-logical-cursor :bytes bytes))
+             (accepted (logical-jsonb-canonical-simple-p cursor (length bytes))))
+        (rove:ok (zerop (logical-cursor-offset cursor)))
+        (when accepted
+          (rove:ok (string= text (sql-jsonb-output (sql-jsonb-input text)))))
+        (when (or (search "\"b\": {\"z\": 1}, \"a\"" text)
+                  (search "\"a\": 1, \"a\": 2" text))
+          (rove:ok (not accepted))))))
+
+(rove:deftest test-publisher-jsonb-object-slice-and-unsorted-fallback
+    (let* ((*query-temp-directory* (uiop:temporary-directory))
+           (*logical-capture-memory-bytes* 1)
+           (value (make-sql-jsonb
+                   (cons :object (list (cons "a" (make-string 70000 :initial-element #\x))
+                                       (cons "b" (sql-numeric-input "1.2300"))))))
+           (change (logical-test-change :insert 7 701 :new-values (vector 1 2 value))))
+      (setf (getf (third (logical-change-columns change)) :type) :jsonb)
+      (dolist (unsorted '(nil t))
+        (let* ((event (logical-encode-change change))
+               (spool (make-logical-spool)))
+          (when unsorted
+            (let ((a (search (string->bytes "\"a\"") event))
+                  (b (search (string->bytes "\"b\"") event)))
+              (setf (aref event (1+ a)) (char-code #\b)
+                    (aref event (1+ b)) (char-code #\a))))
+          (unwind-protect
+               (progn
+                 (logical-spool-append spool event)
+                 (logical-spool-seal spool)
+                 (logical-transaction-map-send-changes
+                  (make-logical-transaction :spool spool)
+                  (lambda (decoded)
+                    (let ((actual (aref (logical-change-new-values decoded) 2))
+                          (expected (logical-decode-change event))
+                          (output (make-array 0 :element-type '(unsigned-byte 8)
+                                                :adjustable t :fill-pointer 0)))
+                      (rove:ok (eq (not (null (logical-event-slice-p actual))) (not unsorted)))
+                      (pgoutput-emit-row-change
+                       decoded (lambda (part)
+                                 (if (integerp part) (vector-push-extend part output)
+                                     (loop for byte across part do (vector-push-extend byte output)))))
+                      (rove:ok (equalp output (pgoutput-build-row-change expected)))))))
+            (close-logical-spool spool))))))
 
 (rove:deftest test-jsonb-recognizer-propagates-cancel
     (let* ((bytes (string->bytes "\"test\""))
@@ -1892,7 +1962,7 @@
            (*logical-capture-memory-bytes* 1)
            (large (make-string 70000 :initial-element #\x)))
       (dolist (entry (list (list (make-sql-jsonb (vector large (vector :json-true :json-null))) t)
-                           (list (make-sql-jsonb (vector large (sql-numeric-input "1.2300"))) nil)))
+                           (list (make-sql-jsonb (vector large (sql-numeric-input "1.2300"))) t)))
         (let* ((value (first entry))
                (change (logical-test-change :insert 7 701 :new-values (vector 1 2 value)))
                (spool (make-logical-spool)))

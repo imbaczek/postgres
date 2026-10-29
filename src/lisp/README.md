@@ -695,10 +695,13 @@ standard and private senders use event-lifetime slices for text, varchar, JSON
 and bytea, checking slice CRCs and emitting bytes or bytea hex in bounded blocks.
 Slices expire when the event callback returns. Recovery validation and scoped
 senders also scan canonical JSONB values of at least 64 KiB without constructing
-the value when they consist of strings, booleans, nulls, or nested arrays of
-those values. Objects, numbers, smaller values, and valid noncanonical forms
-fall back to materialization for normalization. Numeric and ordinary list-based
-reader values still materialize; complete transaction validation precedes
+the value, including nested arrays and objects, strings, literals and decimal
+numbers. Object keys must be in canonical order and at most 4096 decoded UTF-8
+bytes; nesting and decimal digit bounds also apply to this fast path. Smaller
+values, noncanonical forms and values outside those bounds fall back to the
+materializing parser for validation and normalization; malformed values are
+rejected. SQL numeric values and ordinary list-based reader values still
+materialize; complete transaction validation precedes
 output. The sender measures each INSERT, UPDATE, or DELETE row before writing one pgoutput
 CopyData frame through a bounded buffer. The subscriber reads replication frames
 directly through a length-bounded stream cursor and completes decoding before
