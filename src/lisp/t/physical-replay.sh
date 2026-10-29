@@ -182,8 +182,12 @@ checked target '(assert (< (physical-store-floor-lsn *physical-receive-store*) *
 checked target '(physical-test-verify-source-xids :generation t)' restored-pointer-membership
 checked target '(physical-recovery-restartpoint)' first-restartpoint
 checked target '(physical-test-verify-source-xids :generation t)' first-generation-membership
-# Redo failure after mutating pages must recover from the full retained prefix.
-sql "$PORT" "DELETE FROM data WHERE id=2; INSERT INTO data VALUES (4,'crash')"
+# Drain read-only source transactions so the next page-bearing batch is the
+# TOAST update. Both old and new bodies span multiple external chunks.
+export_wal
+receive_all
+checked target '(physical-recovery-replay)' drain-before-toast-crash
+sql "$PORT" "UPDATE toast_replay SET body=body || body WHERE id=1"
 export_wal
 receive_all
 checked target '(physical-test-crash-after-redo)' crash-hook
@@ -194,6 +198,7 @@ test "$crash_status" -eq 137
 TARGET=
 start_target
 compare
+test "$(sql "$TARGET_PORT" 'SELECT length(body) FROM toast_replay WHERE id=1')" = 40000
 checked target '(physical-test-verify-source-xids)' redo-crash-membership
 test "$(sql "$TARGET_PORT" 'SELECT id FROM extra')" = 42
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM base_empty')" = 0
