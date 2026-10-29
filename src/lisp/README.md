@@ -243,12 +243,13 @@ actually claimed. Logical admission conservatively includes reused external
 values in its full-row size bound even when an unchanged marker makes the event
 small; a sufficiently large bound triggers full-row materialization and transport
 validation.
-For `INSERT ... SELECT` from a single-table scan with optional filters, sorting,
-top-N or LIMIT, direct projected columns and the selected CASE or COALESCE
+For `INSERT ... SELECT` from supported scans, nested-loop joins and derived
+tables with optional filters, sorting, top-N or LIMIT, direct projected columns
+and the selected CASE or COALESCE
 branch can retain compressed values through compatible assignments. This includes
 same-column `excluded` assignments in `ON CONFLICT DO UPDATE`. External source
 values are detached from their original table; PLAIN targets flatten them.
-Joins, CTEs, aggregates, scalar subqueries, explicit casts, and
+CTEs, aggregates, scalar subqueries, lateral outer references, explicit casts, and
 cross-column `excluded` assignments do not yet retain this provenance.
 For an interpreted SELECT plan with a projection over one base-table sequential
 or non-parameterized index scan, optionally with filters, sorting or top-N,

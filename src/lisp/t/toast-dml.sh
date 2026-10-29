@@ -84,6 +84,29 @@ printf '%s\n' '(setf pg::*query-work-memory-bytes* 1024)' '(quit)' | \
 run -c 'insert into toast_select_plain select v from toast_inline_build order by v' >/dev/null
 run -c 'insert into toast_select_plain select v from toast_inline_build order by v limit 1' >/dev/null
 [ "$(run -c 'select count(*) from toast_select_plain where length(v)=20000')" = 5 ]
+run -c 'create table toast_join_keys (id int)' >/dev/null
+run -c 'insert into toast_join_keys values (1),(2),(3)' >/dev/null
+run -c 'create table toast_join_result (v text)' >/dev/null
+run -c 'alter table toast_join_result alter column v set storage plain' >/dev/null
+run -c 'insert into toast_join_result select s.v from toast_join_keys k left join toast_inline_build s on k.id <> 2' >/dev/null
+[ "$(run -c 'select count(*) from toast_join_result where length(v)=20000')" = 2 ]
+[ "$(run -c "select count(*) from toast_join_result where v='short'")" = 2 ]
+[ "$(run -c 'select count(*) from toast_join_result where v is null')" = 1 ]
+run -c 'insert into toast_join_result select s.v from toast_inline_build s right join toast_join_keys k on k.id=1' >/dev/null
+[ "$(run -c 'select count(*) from toast_join_result where length(v)=20000')" = 3 ]
+[ "$(run -c 'select count(*) from toast_join_result where v is null')" = 3 ]
+run -c 'insert into toast_join_result select s.v from toast_inline_build s full join toast_join_keys k on k.id=1' >/dev/null
+[ "$(run -c 'select count(*) from toast_join_result where length(v)=20000')" = 4 ]
+[ "$(run -c 'select count(*) from toast_join_result where v is null')" = 5 ]
+run -c 'create table toast_join_empty (v text)' >/dev/null
+run -c 'insert into toast_join_result select s.v from toast_join_empty s full join toast_join_keys k on k.id=1' >/dev/null
+[ "$(run -c 'select count(*) from toast_join_result where v is null')" = 8 ]
+run -c 'insert into toast_join_result select s.v from toast_join_empty e full join toast_inline_build s on false' >/dev/null
+[ "$(run -c 'select count(*) from toast_join_result where length(v)=20000')" = 5 ]
+run -c 'create table toast_derived_result (v text)' >/dev/null
+run -c 'alter table toast_derived_result alter column v set storage plain' >/dev/null
+run -c 'insert into toast_derived_result select q.v from (select v from toast_inline_build) q' >/dev/null
+[ "$(run -c 'select count(*) from toast_derived_result where length(v)=20000')" = 1 ]
 printf '%s\n' '(setf pg::*query-work-memory-bytes* (* 4 1024 1024))' '(quit)' | \
     "${SBCL:-sbcl}" --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/sort-work-mem-reset.out"
 run -c 'create table toast_select_conflict (id int primary key, v text)' >/dev/null
@@ -120,6 +143,13 @@ run -c 'alter table toast_select_wider alter column v set storage plain' >/dev/n
 run -c 'insert into toast_select_wider select v from toast_inline_varchar' >/dev/null
 run -c 'insert into toast_select_wider select v from toast_inline_varchar where id=2' >/dev/null
 [ "$(run -c 'select count(*) from toast_select_wider where length(v)=20000')" = 2 ]
+run -c 'create table toast_join_wider (v varchar(40000))' >/dev/null
+run -c "insert into toast_join_wider values ('$index_suffix')" >/dev/null
+run -c 'insert into toast_select_plain select v from toast_inline_varchar join toast_join_wider using(v)' >/dev/null
+[ "$(run -c 'select count(*) from toast_select_plain where length(v)=20000')" = 6 ]
+run -c 'create index toast_join_keys_id on toast_join_keys(id)' >/dev/null
+run -c 'insert into toast_join_result select s.v from toast_inline_varchar s join toast_join_keys k on s.id=k.id' >/dev/null
+[ "$(run -c 'select count(*) from toast_join_result where length(v)=20000')" = 6 ]
 run -c 'create table toast_external_compressed (v text unique)' >/dev/null
 awk 'BEGIN { printf "insert into toast_external_compressed values (\047"; for (i=0;i<200000;i++) printf "a"; print "\047);" }' | run >/dev/null
 run -c 'alter table toast_external_compressed alter column v set storage external' >/dev/null

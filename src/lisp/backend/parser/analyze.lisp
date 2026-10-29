@@ -4247,6 +4247,13 @@ origin. Computed expressions return no origin."
            (slot (1- (second expression))))
        (values value (and origins (< -1 slot (length origins))
                           (not (eq value +null+)) (aref origins slot)))))
+    (:join-coalesce
+     (multiple-value-bind (value origin) (eval-expr-with-origin (second expression) environment origins)
+       (if (eq value +null+)
+           (eval-expr-with-origin (third expression) environment origins)
+           (values value origin))))
+    (:join-relabel
+     (eval-expr-with-origin (second expression) environment origins))
     (:coalesce
      (dolist (argument (second expression) (values +null+ nil))
        (multiple-value-bind (value origin) (eval-expr-with-origin argument environment origins)

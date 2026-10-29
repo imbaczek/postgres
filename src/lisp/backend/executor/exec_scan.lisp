@@ -1647,6 +1647,15 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
     (replace environment row :start1 (getf relation :offset))
     environment))
 
+(defun make-select-relation-origins (relations relation origins)
+  "Place ORIGINS in the same source-order slots as a reordered scan row."
+  (when origins
+    (let* ((width (or (getf relation :environment-width)
+                      (reduce #'+ relations :key (lambda (spec) (getf spec :width)) :initial-value 0)))
+           (result (make-array width :initial-element nil)))
+      (replace result origins :start1 (getf relation :offset))
+      result)))
+
 (defun make-select-result-row (environment where targets)
   "Apply WHERE before projecting ENVIRONMENT, retaining it for ORDER BY."
   (when (or (null where) (true-p (eval-expr where environment)))
@@ -1680,12 +1689,17 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
         environment)
       (concatenate 'vector left right)))
 
+(defun combine-select-join-origins (left left-origins right right-origins join)
+  "Combine origin slots using the same layout as the corresponding join values."
+  (when (or left-origins right-origins)
+    (combine-select-join-environment
+     (or left-origins (make-array (length left) :initial-element nil))
+     (or right-origins (make-array (length right) :initial-element nil))
+     join)))
+
 (defun stream-select-join-environments (left-stream right-stream join callback)
   "Run a lazy nested-loop join with a spillable, replayable inner stream.
-
-The inner stream is opened only after the first outer row arrives. Its rows are
-cached as they are consumed, so the first joined row can be returned before the
-inner input is exhausted and later outer rows can replay the same input."
+Keep detached per-row origins alongside spooled values when capture is active."
   (let* ((join-type (getf join :type))
          (qual (getf join :qual))
          (left-width (getf join :left-width))
@@ -1693,70 +1707,67 @@ inner input is exhausted and later outer rows can replay the same input."
          (null-left (make-array left-width :initial-element +null+))
          (null-right (make-array right-width :initial-element +null+))
          (right/full-p (member join-type '(:right :full)))
+         (capture-p *datum-origin-capture*)
          (work-memory (max 1 *query-work-memory-bytes*))
-         (spool-memory (if right/full-p
-                           (max 1 (floor work-memory 2))
-                           work-memory))
+         (spool-memory (if right/full-p (max 1 (floor work-memory 2)) work-memory))
          (match-memory (max 1 (- work-memory spool-memory))))
     (with-query-temp-files ()
                            (with-query-row-spool (right-spool spool-memory)
                              (labels ((run-join (matched-right)
-                                        (let ((right-loaded nil)
-                                              (outer-seen nil)
-                                              (stopped nil))
-                                          (labels ((emit (environment)
-                                                     (when (eq (funcall callback environment) :stop)
-                                                       (setf stopped t)
-                                                       :stop))
-                                                   (process-right (left right right-index matched-left)
+                                        (let ((right-loaded nil) (outer-seen nil) (stopped nil))
+                                          (labels ((emit (environment origins)
+                                                     (let ((*query-row-origins* origins))
+                                                       (when (eq (funcall callback environment) :stop)
+                                                         (setf stopped t)
+                                                         :stop)))
+                                                   (stored-row (right)
+                                                     (if capture-p
+                                                         (list right (datum-origins-for-spill *query-row-origins*))
+                                                         right))
+                                                   (stored-values (stored)
+                                                     (if capture-p (first stored) stored))
+                                                   (stored-origins (stored)
+                                                     (when capture-p
+                                                       (datum-origins-from-spill (second stored))))
+                                                   (process-right (left left-origins right right-origins right-index matched-left)
                                                      (check-for-interrupts)
-                                                     (let ((joined
-                                                             (combine-select-join-environment
-                                                              left right join)))
-                                                       (when (true-p (eval-expr qual joined))
-                                                         ;; Outer-join match state comes from ON
-                                                         ;; alone; WHERE remains above this node.
-                                                         (setf (car matched-left) t)
-                                                         (when matched-right
-                                                           (query-match-map-mark
-                                                            matched-right right-index))
-                                                         (emit joined))))
-                                                   (load-right-for-left (left matched-left)
+                                                     (let ((joined (combine-select-join-environment left right join))
+                                                           (origins (combine-select-join-origins left left-origins right right-origins join)))
+                                                       (let ((*query-row-origins* origins))
+                                                         (when (true-p (eval-expr qual joined))
+                                                           (setf (car matched-left) t)
+                                                           (when matched-right (query-match-map-mark matched-right right-index))
+                                                           (emit joined origins)))))
+                                                   (load-right-for-left (left left-origins matched-left)
                                                      (setf right-loaded t)
-                                                     (funcall
-                                                      right-stream
-                                                      (lambda (right)
-                                                        (let ((right-index
-                                                                (query-row-spool-append
-                                                                 right-spool right)))
-                                                          (when matched-right
-                                                            (let ((map-index
-                                                                    (query-match-map-append
-                                                                     matched-right)))
-                                                              (unless (= right-index map-index)
-                                                                (error "Join spool and match map lost row alignment"))))
-                                                          (process-right left right right-index
-                                                                         matched-left))))
-                                                     (unless stopped
-                                                       (query-row-spool-seal right-spool)))
+                                                     (funcall right-stream
+                                                              (lambda (right)
+                                                                (let* ((right-origins *query-row-origins*)
+                                                                       (right-index (query-row-spool-append right-spool (stored-row right))))
+                                                                  (when matched-right
+                                                                    (let ((map-index (query-match-map-append matched-right)))
+                                                                      (unless (= right-index map-index)
+                                                                        (error "Join spool and match map lost row alignment"))))
+                                                                  (process-right left left-origins right right-origins right-index matched-left))))
+                                                     (unless stopped (query-row-spool-seal right-spool)))
                                                    (visit-left (left)
                                                      (unless stopped
                                                        (check-for-interrupts)
                                                        (setf outer-seen t)
-                                                       (let ((matched-left (list nil)))
+                                                       (let ((matched-left (list nil)) (left-origins *query-row-origins*))
                                                          (if right-loaded
-                                                             (map-query-row-spool
-                                                              right-spool
-                                                              (lambda (right right-index)
-                                                                (process-right
-                                                                 left right right-index
-                                                                 matched-left)))
-                                                             (load-right-for-left left matched-left))
-                                                         (when (and (not stopped)
-                                                                    (not (car matched-left))
+                                                             (map-query-row-spool right-spool
+                                                                                  (lambda (stored right-index)
+                                                                                    (process-right left left-origins
+                                                                                                   (stored-values stored) (stored-origins stored)
+                                                                                                   right-index matched-left)))
+                                                             (load-right-for-left left left-origins matched-left))
+                                                         (when (and (not stopped) (not (car matched-left))
                                                                     (member join-type '(:left :full)))
-                                                           (emit (concatenate 'vector
-                                                                              left null-right))))
+                                                           (emit (concatenate 'vector left null-right)
+                                                                 (and left-origins
+                                                                      (concatenate 'vector left-origins
+                                                                                   (make-array right-width :initial-element nil))))))
                                                        (when stopped :stop)))
                                                    (emit-unmatched-rights ()
                                                      (if outer-seen
@@ -1764,34 +1775,32 @@ inner input is exhausted and later outer rows can replay the same input."
                                                            (query-match-map-finish matched-right)
                                                            (map-query-row-spool
                                                             right-spool
-                                                            (lambda (right right-index)
-                                                              (unless
-                                                                  (query-match-map-matched-p
-                                                                   matched-right right-index)
-                                                                (emit (concatenate 'vector
-                                                                                   null-left right))))))
-                                                         ;; RIGHT/FULL JOIN with an empty outer
-                                                         ;; input can stream the inner rows directly.
-                                                         (funcall
-                                                          right-stream
-                                                          (lambda (right)
-                                                            (emit (concatenate 'vector
-                                                                               null-left right)))))))
+                                                            (lambda (stored right-index)
+                                                              (unless (query-match-map-matched-p matched-right right-index)
+                                                                (let ((right (stored-values stored))
+                                                                      (origins (stored-origins stored)))
+                                                                  (emit (concatenate 'vector null-left right)
+                                                                        (and origins
+                                                                             (concatenate 'vector
+                                                                                          (make-array left-width :initial-element nil)
+                                                                                          origins))))))))
+                                                         (funcall right-stream
+                                                                  (lambda (right)
+                                                                    (emit (concatenate 'vector null-left right)
+                                                                          (and *query-row-origins*
+                                                                               (concatenate 'vector
+                                                                                            (make-array left-width :initial-element nil)
+                                                                                            *query-row-origins*))))))))
                                             (funcall left-stream #'visit-left)
-                                            (unless stopped
-                                              (when right/full-p
-                                                (emit-unmatched-rights)))
+                                            (unless stopped (when right/full-p (emit-unmatched-rights)))
                                             (when stopped :stop)))))
                                (if right/full-p
-                                   (with-query-match-map (matched-right match-memory)
-                                     (run-join matched-right))
+                                   (with-query-match-map (matched-right match-memory) (run-join matched-right))
                                    (run-join nil)))))))
 
 (defun stream-select-indexed-join-environments
     (left-stream parameterized-right-stream join callback)
-  "Rescan a parameterized index or LATERAL input for each left row.
-The right input belongs to one left-row parameter epoch and cannot be replayed
-for another left row.  LEFT joins null-extend only after that input is exhausted."
+  "Rescan a parameterized inner input for each left row, retaining origins."
   (let* ((join-type (getf join :type))
          (qual (getf join :qual))
          (right-width (getf join :right-width))
@@ -1799,25 +1808,28 @@ for another left row.  LEFT joins null-extend only after that input is exhausted
          (stopped nil))
     (unless (member join-type '(:inner :cross :left))
       (error "Parameterized join does not support ~a joins" join-type))
-    (labels ((emit (environment)
-               (when (eq (funcall callback environment) :stop)
-                 (setf stopped t)
-                 :stop))
+    (labels ((emit (environment origins)
+               (let ((*query-row-origins* origins))
+                 (when (eq (funcall callback environment) :stop)
+                   (setf stopped t)
+                   :stop)))
              (visit-left (left)
                (unless stopped
                  (check-for-interrupts)
-                 (let ((matched nil))
-                   (funcall
-                    parameterized-right-stream left
-                    (lambda (right)
-                      (let ((joined
-                              (combine-select-join-environment left right join)))
-                        (when (true-p (eval-expr qual joined))
-                          (setf matched t)
-                          (emit joined)))))
-                   (when (and (not stopped) (not matched)
-                              (eq join-type :left))
-                     (emit (concatenate 'vector left null-right))))
+                 (let ((matched nil) (left-origins *query-row-origins*))
+                   (funcall parameterized-right-stream left
+                            (lambda (right)
+                              (let ((joined (combine-select-join-environment left right join))
+                                    (origins (combine-select-join-origins left left-origins right *query-row-origins* join)))
+                                (let ((*query-row-origins* origins))
+                                  (when (true-p (eval-expr qual joined))
+                                    (setf matched t)
+                                    (emit joined origins))))))
+                   (when (and (not stopped) (not matched) (eq join-type :left))
+                     (emit (concatenate 'vector left null-right)
+                           (and left-origins
+                                (concatenate 'vector left-origins
+                                             (make-array right-width :initial-element nil))))))
                  (when stopped :stop))))
       (funcall left-stream #'visit-left)
       (if stopped :stop (values)))))

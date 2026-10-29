@@ -1363,6 +1363,10 @@ on an abnormal exit."
     ((:filter :project :sort) (simple-datum-origin-plan-p (third node)))
     (:limit (simple-datum-origin-plan-p (third node)))
     (:top-n (simple-datum-origin-plan-p (fourth node)))
+    (:subquery-scan (simple-datum-origin-plan-p (fourth node)))
+    (:nested-loop-join
+     (and (simple-datum-origin-plan-p (third node))
+          (simple-datum-origin-plan-p (fourth node))))
     (otherwise nil)))
 
 (defun execute-physical-plan-node (node registered-relations outer-environment
@@ -1395,7 +1399,9 @@ on an abnormal exit."
                                   (htup-values row)))
                  (*query-row-origins*
                    (and *datum-origin-capture* (not (getf relation :row-source))
-                        (not (getf relation :join-order-base)) (htup-origins row))))
+                        (if (getf relation :join-order-base)
+                            (make-select-relation-origins registered-relations relation (htup-origins row))
+                            (htup-origins row)))))
             (funcall emit
                      (if (getf relation :join-order-base)
                          (make-select-relation-environment
