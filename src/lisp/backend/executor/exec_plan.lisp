@@ -1445,11 +1445,18 @@ on an abnormal exit."
   "Recognize plans whose execution retains detached row origins."
   (case (first node)
     ((:result :seq-scan :index-scan) t)
-    ((:filter :project :project-set :sort :limit :window-input)
+    ((:filter :project :project-set :limit :window-input)
      (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
+    ((:sort :top-n)
+     (let ((child (if (eq (first node) :top-n) (fourth node) (third node)))
+           (*datum-origin-capture* nil))
+       ;; These paths do not carry origins through the sort. Disable origin
+       ;; capture rather than change when targets or set-returning functions run.
+       (and (not (sort-projection-deferred-slots node child))
+            (not (sort-project-set-info node child))
+            (simple-datum-origin-plan-p child relations iterator-p worktable seen))))
     (:window
      (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
-    (:top-n (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable seen))
     (:hash-distinct (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
     (:append
      (every (lambda (arm)
