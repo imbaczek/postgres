@@ -218,6 +218,54 @@
           :owner (pg::physical-libpq-frozen-profile-datum
                   (pg::make-physical-libpq-frozen-profile info)))))
 
+(deftest physical-follow-first-attachment-keeps-frozen-owner-separate-from-unowned-backup
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (ok (= 42 (pg::physical-store-system-id store)))
+       (ok (= 152 pg::*last-replay-lsn*))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((view (list :source 1 :parent 1 :history-text ""
+                          :history (pg::timeline-parse-history 1 "")))
+              (source (libpq-test-source "first-private-marker" 5433))
+              (operation (pg::make-physical-follow-operation
+                          :host "127.0.0.1" :port 5433 :prefix "same"
+                          :context (list :accepted-source source)))
+              (pg::*physical-follow-operation* operation)
+              (pg::*physical-follow-controller-blocked-p* nil)
+              (pg::*physical-follow-controller-stopping-p* nil)
+              (before (pg::physical-store-control-tuple store)))
+         (pg::physical-follow-save-config
+          (pg::physical-follow-unattached-config-for-base
+           (pg::physical-recovery-verify-base-state)))
+         (pg::physical-follow-operation-initial-config operation)
+         (multiple-value-bind (entry snapshot) (pg::physical-follow-operation-intent operation view)
+           (declare (ignore snapshot))
+           (ok (null (getf (sixth (pg::physical-follow-read-config)) :source)))
+           (ok (equal (getf source :owner) (getf entry :connection)))
+           (let* ((anchor (append (copy-list (getf entry :request))
+                                  (list :kind :same-timeline :history-text "")))
+                  (active (pg::physical-follow-operation-publish operation view entry anchor))
+                  (binding (fifth active))
+                  (state (sixth active)))
+             (ok (equal source (getf state :source)))
+             (ok (null (getf state :mode)))
+             (ok (null (getf state :cleanup)))
+             (ok (equal (getf state :unowned-bootstrap)
+                        (pg::physical-follow-unowned-bootstrap-from-base
+                         (pg::physical-recovery-verify-base-state))))
+             (ok (equal before (getf binding :before)))
+             (ok (equal before (getf binding :after)))
+             (ok (equal before (pg::physical-store-control-tuple store)))
+             (ok (null (pg::physical-store-selection store)))
+             (ok (eq :active (getf binding :phase)))
+             (ok (pg::physical-follow-check-active-state
+                  store (pg::physical-recovery-verify-base-state) active))
+             (follow-controller-test-advance store)
+             (ok (pg::physical-follow-check-active-state
+                  store (pg::physical-recovery-verify-base-state) active))))))
+     :applied 152 :system-id 42))
+
 (deftest physical-follow-intent-keeps-candidate-owner-separate-from-current-source
     (let ((old-source (libpq-test-source "old-private-marker" 5432))
           (new-source (libpq-test-source "new-private-marker" 5433)))

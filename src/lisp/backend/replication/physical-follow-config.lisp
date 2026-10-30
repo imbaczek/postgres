@@ -55,13 +55,30 @@ The tuple identifies a pin; it does not authenticate the remote endpoint."
            (when source
              (list :connection (getf (physical-follow-source-copy source) :owner))))))
 
+(defun physical-follow-unowned-bootstrap-copy (record)
+  (physical-follow-check-plist record '(:pin :request))
+  (unless (and (stringp (getf record :pin))
+               (wal-valid-replication-slot-name-p (getf record :pin)))
+    (error "invalid unowned bootstrap pin"))
+  (list :pin (copy-seq (getf record :pin))
+        :request (physical-follow-bootstrap-request-copy (getf record :request))))
+
+(defun physical-follow-unowned-bootstrap-from-base (base)
+  (physical-follow-unowned-bootstrap-copy
+   (list :pin (getf base :source-pin)
+         :request (list :version 1 :system-id (getf base :system-id)
+                        :source-timeline (getf base :timeline) :base (getf base :end)
+                        :manifest-digest (getf base :manifest-digest)))))
+
 (defun physical-follow-controller-copy (state)
   "Check and copy durable controller state. A preparation reserves one queue slot."
-  (physical-follow-check-plist
-   state (if (getf state :source) '(:version :enabled :preparing :cleanup :source)
-             '(:version :enabled :preparing :cleanup)))
+  (let ((keys '(:version :enabled :preparing :cleanup)))
+    (dolist (key '(:source :mode :unowned-bootstrap))
+      (when (getf state key) (setf keys (append keys (list key)))))
+    (physical-follow-check-plist state keys))
   (unless (and (eql 1 (getf state :version)) (member (getf state :enabled) '(nil t))
-               (listp (getf state :cleanup)))
+               (listp (getf state :cleanup))
+               (member (getf state :mode) '(nil :standby-unattached)))
     (error "invalid native follow controller state"))
   (let* ((preparing (when (getf state :preparing)
                       (physical-follow-cleanup-copy (getf state :preparing))))
@@ -72,14 +89,30 @@ The tuple identifies a pin; it does not authenticate the remote endpoint."
       (error "native follow cleanup capacity, preparation or duplicate entry is invalid"))
     (append (list :version 1 :enabled (getf state :enabled) :preparing preparing :cleanup queue)
             (when (getf state :source)
-              (list :source (physical-follow-source-copy (getf state :source)))))))
+              (list :source (physical-follow-source-copy (getf state :source))))
+            (when (getf state :mode) (list :mode (getf state :mode)))
+            (when (getf state :unowned-bootstrap)
+              (list :unowned-bootstrap
+                    (physical-follow-unowned-bootstrap-copy (getf state :unowned-bootstrap)))))))
 
-(defun physical-follow-cleanup-only-p (config)
+(defun physical-follow-no-source-p (config)
   (and (listp config) (= 6 (length config)) (eql 1 (first config))
        (every #'null (subseq config 1 5))))
 
+(defun physical-follow-unattached-p (config)
+  (and (physical-follow-no-source-p config)
+       (eq :standby-unattached (getf (sixth config) :mode))))
+
+(defun physical-follow-cleanup-only-p (config)
+  (and (physical-follow-no-source-p config)
+       (not (getf (sixth config) :mode))))
+
 (defun physical-follow-effective-config (config)
-  (unless (physical-follow-cleanup-only-p config)
+  (when (physical-follow-unattached-p config)
+    (return-from physical-follow-effective-config
+      (list :standby-unattached
+            (physical-follow-unowned-bootstrap-copy (getf (sixth config) :unowned-bootstrap)))))
+  (unless (physical-follow-no-source-p config)
     (let ((core (subseq config 0 (if (fifth config) 5 4)))
           (source (when (= 6 (length config)) (getf (sixth config) :source))))
       (if source
@@ -91,17 +124,33 @@ The tuple identifies a pin; it does not authenticate the remote endpoint."
       (physical-follow-controller-copy (sixth config))
       (list :version 1 :enabled t :preparing nil :cleanup nil)))
 
+(defun physical-follow-check-unowned-bootstrap-base (config base)
+  (let* ((state (physical-follow-controller-state config))
+         (record (getf state :unowned-bootstrap))
+         (preparing (getf state :preparing)))
+    (when record
+      (unless (equal record (physical-follow-unowned-bootstrap-from-base base))
+        (error "unowned bootstrap reference differs from the verified base"))
+      (when preparing
+        (let ((request (getf preparing :request)))
+          (unless (and (= (getf request :system-id) (getf base :system-id))
+                       (= (getf request :base-timeline) (getf base :timeline))
+                       (= (getf request :base) (getf base :end))
+                       (= (getf request :manifest-digest) (getf base :manifest-digest)))
+            (error "unattached preparation differs from the verified base"))))))
+  config)
+
 (defun physical-follow-config-source (config)
   (when (= 6 (length config))
     (let ((source (getf (sixth config) :source)))
       (when source (physical-follow-source-copy source)))))
 
 (defun physical-follow-controller-enabled-p (config)
-  (and (not (physical-follow-cleanup-only-p config))
+  (and (not (physical-follow-no-source-p config))
        (getf (physical-follow-controller-state config) :enabled)))
 
 (defun physical-follow-with-controller (config state)
-  (append (if (physical-follow-cleanup-only-p config) '(1 nil nil nil nil)
+  (append (if (physical-follow-no-source-p config) '(1 nil nil nil nil)
               (list 1 (second config) (third config) (fourth config) (copy-tree (fifth config))))
           (list (physical-follow-controller-copy state))))
 

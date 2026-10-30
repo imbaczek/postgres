@@ -94,6 +94,49 @@
                   store (pg::physical-recovery-verify-base-state) active))))))
      :applied 152 :system-id 42))
 
+(deftest follow-unattached-first-publication-preserves-unowned-backup
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (ok (= 42 (pg::physical-store-system-id store)))
+       (ok (= 152 pg::*last-replay-lsn*))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((view (list :source 1 :parent 1 :history-text ""
+                          :history (pg::timeline-parse-history 1 "")))
+              (operation (pg::make-physical-follow-operation
+                          :host "127.0.0.1" :port 5433 :prefix "same"))
+              (pg::*physical-follow-operation* operation)
+              (pg::*physical-follow-controller-blocked-p* nil)
+              (pg::*physical-follow-controller-stopping-p* nil)
+              (before (pg::physical-store-control-tuple store)))
+         (pg::physical-follow-save-config
+          (pg::physical-follow-unattached-config-for-base
+           (pg::physical-recovery-verify-base-state)))
+         (pg::physical-follow-operation-initial-config operation)
+         (multiple-value-bind (entry snapshot) (pg::physical-follow-operation-intent operation view)
+           (declare (ignore snapshot))
+           (let* ((anchor (append (copy-list (getf entry :request))
+                                  (list :kind :same-timeline :history-text "")))
+                  (active (pg::physical-follow-operation-publish operation view entry anchor))
+                  (binding (fifth active))
+                  (state (sixth active)))
+             (ok (null (getf state :mode)))
+             (ok (null (getf state :cleanup)))
+             (ok (equal (getf state :unowned-bootstrap)
+                        (pg::physical-follow-unowned-bootstrap-from-base
+                         (pg::physical-recovery-verify-base-state))))
+             (ok (equal before (getf binding :before)))
+             (ok (equal before (getf binding :after)))
+             (ok (equal before (pg::physical-store-control-tuple store)))
+             (ok (null (pg::physical-store-selection store)))
+             (ok (eq :active (getf binding :phase)))
+             (ok (pg::physical-follow-check-active-state
+                  store (pg::physical-recovery-verify-base-state) active))
+             (follow-controller-test-advance store)
+             (ok (pg::physical-follow-check-active-state
+                  store (pg::physical-recovery-verify-base-state) active))))))
+     :applied 152 :system-id 42))
+
 (deftest follow-controller-promotion-preserves-bootstrap-retirement-before-manifest-deletion
     (call-with-promotion-fixture
      (lambda (root store)
@@ -108,6 +151,42 @@
          (pg::physical-follow-save-config config)
          (delete-file (merge-pathnames "physical-backup.manifest" pg::*pgdata*))
          (ok (equal config (pg::physical-follow-promotion-cleanup-config)))))
+     :system-id 42))
+
+(deftest follow-unattached-promotion-preserves-unowned-backup-without-routing-cleanup
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((base (pg::physical-recovery-verify-base-state))
+              (unattached (pg::physical-follow-unattached-config-for-base base)))
+         (pg::physical-follow-save-config unattached)
+         (let ((config (pg::physical-follow-promotion-cleanup-config)))
+           (ok (pg::physical-follow-cleanup-only-p config))
+           (ok (null (getf (sixth config) :cleanup)))
+           (ok (equal (getf (sixth config) :unowned-bootstrap)
+                      (getf (sixth unattached) :unowned-bootstrap)))
+           (pg::physical-follow-save-config config)
+           (delete-file (merge-pathnames "physical-backup.manifest" pg::*pgdata*))
+           (ok (equal config (pg::physical-follow-promotion-cleanup-config))))))
+     :system-id 42))
+
+(deftest follow-never-attached-promotion-preserves-unowned-backup
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((base (pg::physical-recovery-verify-base-state))
+              (expected (pg::physical-follow-unowned-bootstrap-from-base base))
+              (config (pg::physical-follow-promotion-cleanup-config)))
+         (ok config)
+         (when config
+           (ok (pg::physical-follow-cleanup-only-p config))
+           (ok (null (getf (sixth config) :cleanup)))
+           (ok (equal expected (getf (sixth config) :unowned-bootstrap)))
+           (pg::physical-follow-save-config config)
+           (delete-file (merge-pathnames "physical-backup.manifest" pg::*pgdata*))
+           (ok (equal config (pg::physical-follow-promotion-cleanup-config))))))
      :system-id 42))
 
 (deftest follow-controller-stop-disables-active-binding-without-losing-cleanup
@@ -259,6 +338,328 @@
 
 (defun follow-controller-test-state (&key preparing queue (enabled t))
   (list :version 1 :enabled enabled :preparing preparing :cleanup queue))
+
+(defun follow-unattached-test-config ()
+  (list 1 nil nil nil nil
+        (list :version 1 :enabled nil :preparing nil :cleanup nil
+              :mode :standby-unattached
+              :unowned-bootstrap
+              (list :pin "unowned_seed"
+                    :request (list :version 1 :system-id 42 :source-timeline 1
+                                   :base 64 :manifest-digest 77)))))
+
+(deftest follow-first-attachment-apis-propagate-deferred-before-starting-workers
+    (let ((ensure (symbol-function 'pg::physical-follow-ensure-attachment-state))
+          (start (symbol-function 'pg::physical-follow-controller-start-worker))
+          (calls 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-follow-ensure-attachment-state)
+                   (lambda () (incf calls) :deferred)
+                   (symbol-function 'pg::physical-follow-controller-start-worker)
+                   (lambda (&key force) (declare (ignore force))
+                     (error "deferred attachment must not start workers")))
+             (ok (eq :deferred (pg::physical-follow-retarget "127.0.0.1" 5432)))
+             (ok (eq :deferred (pg::physical-follow-retarget-conninfo "host=localhost")))
+             (ok (= 2 calls))
+             (ok (intake-fails-p
+                  (lambda () (pg::physical-follow-retarget "127.0.0.1" 5432 "INVALID"))))
+             (ok (intake-fails-p
+                  (lambda () (pg::physical-follow-retarget-conninfo
+                              "host=localhost" :prefix "INVALID"))))
+             (ok (= 2 calls)))
+        (setf (symbol-function 'pg::physical-follow-ensure-attachment-state) ensure
+              (symbol-function 'pg::physical-follow-controller-start-worker) start))))
+
+(deftest follow-unattached-deferred-promotion-restores-only-replay
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((config (pg::physical-follow-unattached-config-for-base
+                       (pg::physical-recovery-verify-base-state)))
+              (receiver (symbol-function 'pg::physical-follow-launch))
+              (replay (symbol-function 'pg::physical-follow-launch-replay-only))
+              (pg::*physical-promotion-stopping-p* t)
+              (pg::*physical-replay-paused-p* nil)
+              (seen nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-launch)
+                      (lambda (config) (declare (ignore config)) (error "unexpected receiver"))
+                      (symbol-function 'pg::physical-follow-launch-replay-only)
+                      (lambda (saved)
+                        (setf seen saved)
+                        (ok pg::*physical-replay-paused-p*)
+                        (ok (not pg::*physical-promotion-stopping-p*))
+                        :started))
+                (call-with-current-promotion-owner
+                 (lambda ()
+                   (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                     (ok (eq :awaiting-child-initialization
+                             (pg::physical-promotion-resume-recovery-workers config t nil))))))
+                (ok (equal config seen)))
+           (setf (symbol-function 'pg::physical-follow-launch) receiver
+                 (symbol-function 'pg::physical-follow-launch-replay-only) replay))))
+     :system-id 42))
+
+(deftest follow-unattached-stop-rejects-before-quiescing-or-rewriting-state
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((config (pg::physical-follow-unattached-config-for-base
+                       (pg::physical-recovery-verify-base-state)))
+              (runtime (pg::make-physical-follow-runtime :config config))
+              (pg::*physical-follow-runtime* runtime)
+              (pg::*physical-follow-controller-blocked-p* nil)
+              (pg::*physical-follow-controller-stopping-p* nil)
+              (quiesce (symbol-function 'pg::physical-follow-quiesce-runtime))
+              (calls 0))
+         (pg::physical-follow-save-config config)
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-quiesce-runtime)
+                      (lambda () (incf calls)))
+                (ok (intake-fails-p #'pg::physical-follow-stop))
+                (ok (zerop calls))
+                (ok (eq runtime pg::*physical-follow-runtime*))
+                (ok (equal config (pg::physical-follow-read-config))))
+           (setf (symbol-function 'pg::physical-follow-quiesce-runtime) quiesce))))
+     :system-id 42))
+
+(deftest follow-first-attachment-initializes-durable-unattached-state-before-network
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let ((launch (symbol-function 'pg::physical-follow-launch-replay-only))
+             (launched nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-launch-replay-only)
+                      (lambda (config)
+                        (ok (equal config (pg::physical-follow-read-config)))
+                        (push config launched)
+                        :started))
+                (let ((config (pg::physical-follow-ensure-attachment-state)))
+                  (ok (pg::physical-follow-unattached-p config))
+                  (ok (null (getf (sixth config) :source)))
+                  (ok (null (getf (sixth config) :cleanup)))
+                  (ok (equal (pg::physical-follow-unowned-bootstrap-from-base
+                              (pg::physical-recovery-verify-base-state))
+                             (getf (sixth config) :unowned-bootstrap)))
+                  (ok (equal (list config) launched))
+                  (ok (equal config (pg::physical-follow-ensure-attachment-state)))
+                  (ok (equal config (pg::physical-follow-read-config)))))
+           (setf (symbol-function 'pg::physical-follow-launch-replay-only) launch))))
+     :system-id 42))
+
+(deftest follow-unattached-state-is-distinct-from-primary-cleanup
+    (let ((config (follow-unattached-test-config)))
+      (ok (eq config (pg::physical-follow-check-config config)))
+      (ok (equal config (pg::physical-follow-decode-config (pg::physical-follow-config-image config))))
+      (ok (pg::physical-follow-no-source-p config))
+      (ok (pg::physical-follow-unattached-p config))
+      (ok (not (pg::physical-follow-cleanup-only-p config)))
+      (ok (not (pg::physical-follow-controller-enabled-p config)))
+      (ok (equal (list :standby-unattached (getf (sixth config) :unowned-bootstrap))
+                 (pg::physical-follow-effective-config config)))
+      (remf (sixth config) :mode)
+      (ok (pg::physical-follow-cleanup-only-p config))
+      (ok (not (pg::physical-follow-unattached-p config)))
+      (ok (null (pg::physical-follow-effective-config config)))
+      (ok (equal config (pg::physical-follow-decode-config (pg::physical-follow-config-image config))))))
+
+(deftest follow-unattached-preparation-preserves-unowned-pin-outside-cleanup
+    (let* ((config (follow-unattached-test-config))
+           (reference (copy-tree (getf (sixth config) :unowned-bootstrap)))
+           (entry (follow-controller-test-entry "first_attempt")))
+      (setf (getf (sixth config) :preparing) entry)
+      (pg::physical-follow-check-config config)
+      (let ((aborted (pg::physical-follow-abandon-preparation-config config)))
+        (ok (pg::physical-follow-unattached-p aborted))
+        (ok (equal reference (getf (sixth aborted) :unowned-bootstrap)))
+        (ok (equal (list entry) (getf (sixth aborted) :cleanup)))
+        (ok (null (getf (sixth aborted) :preparing)))
+        (ok (equal aborted (pg::physical-follow-decode-config (pg::physical-follow-config-image aborted))))
+        (ok (not (find "unowned_seed" (getf (sixth aborted) :cleanup)
+                       :key (lambda (item) (getf item :pin)) :test #'equal))))))
+
+(deftest follow-unattached-reference-must-match-the-verified-base
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((base (pg::physical-recovery-verify-base-state))
+              (config (pg::physical-follow-unattached-config-for-base base))
+              (reference (getf (sixth config) :unowned-bootstrap)))
+         (ok (equal (getf base :source-pin) (getf reference :pin)))
+         (ok (eq config (pg::physical-follow-check-unowned-bootstrap-base config base)))
+         (ok (null (pg::physical-follow-current-retirement config base)))
+         (dolist (key '(:system-id :source-timeline :base :manifest-digest))
+           (let ((bad (copy-tree config)))
+             (incf (getf (getf (getf (sixth bad) :unowned-bootstrap) :request) key))
+             (ok (signals (pg::physical-follow-check-unowned-bootstrap-base bad base) 'error)
+                 (symbol-name key))))
+         (let ((bad (copy-tree config)))
+           (setf (getf (getf (sixth bad) :unowned-bootstrap) :pin) "another_seed")
+           (ok (signals (pg::physical-follow-check-unowned-bootstrap-base bad base) 'error)))))
+     :system-id 42))
+
+(deftest follow-unattached-launches-only-replay-and-preserves-pause
+    (dolist (paused '(nil t))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+         (let* ((config (pg::physical-follow-unattached-config-for-base
+                         (pg::physical-recovery-verify-base-state)))
+                (pg::*physical-replay-paused-p* paused)
+                (original (symbol-function 'pg::physical-follow-replay-loop)))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-replay-loop)
+                        (lambda (runtime)
+                          (loop until (pg::physical-follow-runtime-stopped-p runtime)
+                                do (sleep 0.005))))
+                  (pg::physical-follow-controller-save-config config)
+                  (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+                    (ok (eq :started (pg::physical-follow-launch-replay-only config)))
+                    (let ((runtime pg::*physical-follow-runtime*))
+                      (ok runtime)
+                      (ok (null (pg::physical-follow-runtime-receiver-thread runtime)))
+                      (ok (null (pg::physical-follow-runtime-client runtime)))
+                      (ok (pg::physical-follow-runtime-receiver-stopped-p runtime))
+                      (ok (not (pg::physical-follow-runtime-stopped-p runtime)))
+                      (ok (sb-thread:thread-alive-p (pg::physical-follow-runtime-replay-thread runtime)))
+                      (ok (eql paused pg::*physical-replay-paused-p*)))
+                    (ok (intake-fails-p
+                         (lambda () (pg::physical-follow-launch-replay-only config))))))
+             (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+               (pg::physical-follow-quiesce-runtime))
+             (setf (symbol-function 'pg::physical-follow-replay-loop) original))))
+       :system-id 42)))
+
+(deftest follow-unattached-autostart-resumes-replay-without-a-receiver
+    (dolist (paused '(nil t))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+         (let* ((config (pg::physical-follow-unattached-config-for-base
+                         (pg::physical-recovery-verify-base-state)))
+                (pg::*physical-replay-paused-p* paused)
+                (original (symbol-function 'pg::physical-follow-replay-loop)))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-replay-loop)
+                        (lambda (runtime)
+                          (loop until (pg::physical-follow-runtime-stopped-p runtime)
+                                do (sleep 0.005))))
+                  (pg::physical-follow-controller-save-config config)
+                  (progn
+                    (ok (eq :started (pg::physical-follow-autostart)))
+                    (let ((runtime pg::*physical-follow-runtime*))
+                      (ok runtime)
+                      (ok (null (pg::physical-follow-runtime-receiver-thread runtime)))
+                      (ok (null (pg::physical-follow-runtime-client runtime)))
+                      (ok (pg::physical-follow-runtime-receiver-stopped-p runtime))
+                      (ok (not (pg::physical-follow-runtime-stopped-p runtime)))
+                      (ok (sb-thread:thread-alive-p (pg::physical-follow-runtime-replay-thread runtime)))
+                      (ok (eql paused pg::*physical-replay-paused-p*)))
+                    (let ((before pg::*physical-follow-runtime*))
+                      (pg::physical-follow-autostart)
+                      (ok (eq before pg::*physical-follow-runtime*)))))
+             (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+               (pg::physical-follow-quiesce-runtime))
+             (setf (symbol-function 'pg::physical-follow-replay-loop) original))))
+       :system-id 42)))
+
+(deftest follow-unattached-failed-preparation-restores-replay-and-queues-only-attempt
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((config (pg::physical-follow-unattached-config-for-base
+                       (pg::physical-recovery-verify-base-state)))
+              (operation (pg::make-physical-follow-operation
+                          :host "127.0.0.1" :port 5433 :prefix "first"))
+              (pg::*physical-follow-operation* operation)
+              (pg::*physical-follow-controller-blocked-p* nil)
+              (pg::*physical-follow-controller-stopping-p* nil)
+              (original (symbol-function 'pg::physical-follow-replay-loop)))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-replay-loop)
+                      (lambda (runtime)
+                        (loop until (pg::physical-follow-runtime-stopped-p runtime)
+                              do (sleep 0.005))))
+                (pg::physical-follow-controller-save-config config)
+                (pg::physical-follow-operation-initial-config operation)
+                (multiple-value-bind (entry snapshot)
+                    (pg::physical-follow-operation-intent
+                     operation (list :source 1 :parent 1 :history-text ""
+                                     :history (pg::timeline-parse-history 1 "")))
+                  (declare (ignore snapshot))
+                  (pg::physical-follow-operation-recover operation)
+                  (let ((saved (pg::physical-follow-read-config))
+                        (runtime pg::*physical-follow-runtime*))
+                    (ok (pg::physical-follow-unattached-p saved))
+                    (ok (null (getf (sixth saved) :preparing)))
+                    (ok (equal (list entry) (getf (sixth saved) :cleanup)))
+                    (ok (equal (getf (sixth config) :unowned-bootstrap)
+                               (getf (sixth saved) :unowned-bootstrap)))
+                    (ok runtime)
+                    (when runtime
+                      (ok (null (pg::physical-follow-runtime-receiver-thread runtime)))
+                      (ok (sb-thread:thread-alive-p
+                           (pg::physical-follow-runtime-replay-thread runtime)))))
+                  (ok (not pg::*physical-recovery-failed-p*))))
+           (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+             (pg::physical-follow-quiesce-runtime))
+           (setf (symbol-function 'pg::physical-follow-replay-loop) original))))
+     :system-id 42))
+
+(deftest follow-unattached-state-rejects-receipt-authority-and-pin-aliases
+    (dolist (change '((:mode :invalid) (:enabled t) (:unowned-bootstrap nil) (:source :invalid)))
+      (let ((config (follow-unattached-test-config)))
+        (setf (getf (sixth config) (first change)) (second change))
+        (ok (signals (pg::physical-follow-check-config config) 'error))))
+  (dolist (kind '(:current :preparing :queued :route))
+    (let* ((config (follow-unattached-test-config))
+           (state (sixth config)))
+      (ecase kind
+        (:current
+         (setf (second config) "127.0.0.1" (third config) 5432 (fourth config) "unowned_seed")
+         (remf state :mode))
+        (:preparing (setf (getf state :preparing) (follow-controller-test-entry "unowned_seed")))
+        (:queued (setf (getf state :cleanup) (list (follow-controller-test-entry "unowned_seed"))))
+        (:route (setf (getf (getf state :unowned-bootstrap) :host) "127.0.0.1")))
+      (ok (signals (pg::physical-follow-check-config config) 'error) (symbol-name kind)))))
+
+(cl-spec:defproperty follow-unattached-envelope-preserves-full-width-bootstrap-reference
+    ((system-id (range integer 0 18446744073709551615))
+     (base (range integer 0 18446744073709551615))
+     (digest (range integer 0 18446744073709551615))
+     (primary boolean))
+  (:about pg::physical-follow-decode-config)
+  (:trials (:normal 200))
+  (let* ((config (follow-unattached-test-config))
+         (state (sixth config))
+         (request (getf (getf state :unowned-bootstrap) :request)))
+    (setf (getf request :system-id) system-id
+          (getf request :base) base
+          (getf request :manifest-digest) digest)
+    (when primary (remf state :mode))
+    (equal config (pg::physical-follow-decode-config (pg::physical-follow-config-image config)))))
+
+(deftest generated-follow-unattached-bootstrap-reference-roundtrip
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'follow-unattached-envelope-preserves-full-width-bootstrap-reference
+                                       :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (ok (= 200 (getf data :trials)))))
 
 (deftest follow-controller-envelope-preserves-effective-binding-and-preparation
     (dolist (bound '(nil t))
@@ -439,3 +840,77 @@
       (call-with-promotion-fixture
        (lambda (root store) (follow-controller-test-cold-phase phase root store))
        :system-id 42)))
+
+(deftest follow-unattached-cold-start-preserves-base-and-abandons-preparation
+    (dolist (preparing '(nil t))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root))
+         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+         (let* ((base (pg::physical-recovery-verify-base-state))
+                (config (pg::physical-follow-unattached-config-for-base base))
+                (entry nil))
+           (pg::physical-follow-save-config config)
+           (when preparing
+             (let* ((operation (pg::make-physical-follow-operation
+                                :host "127.0.0.1" :port 5433 :prefix "cold"))
+                    (pg::*physical-follow-operation* operation)
+                    (pg::*physical-follow-controller-blocked-p* nil)
+                    (pg::*physical-follow-controller-stopping-p* nil))
+               (pg::physical-follow-operation-initial-config operation)
+               (setf entry
+                     (pg::physical-follow-operation-intent
+                      operation (list :source 1 :parent 1 :history-text ""
+                                      :history (pg::timeline-parse-history 1 ""))))))
+           (pg::physical-store-close store)
+           (sb-posix:rename (namestring (pg::physical-store-directory store))
+                            (namestring (pg::physical-recovery-spool-directory)))
+           (call-with-current-promotion-owner
+            (lambda ()
+              (let ((pg::*wal-ready* nil)
+                    (pg::*physical-receive-store* nil)
+                    (pg::*physical-recovery-state* nil)
+                    (pg::*physical-follow-runtime* nil)
+                    (pg::*physical-restartpoint-worker* nil))
+                (pg::physical-recovery-prepare)
+                (let* ((saved (pg::physical-follow-read-config))
+                       (state (sixth saved)))
+                  (ok (pg::physical-follow-unattached-p saved))
+                  (ok (null (getf state :preparing)))
+                  (ok (equal (if entry (list entry) nil) (getf state :cleanup)))
+                  (ok (equal (getf (sixth config) :unowned-bootstrap)
+                             (getf state :unowned-bootstrap)))
+                  (ok (equal saved (getf pg::*physical-recovery-state* :follow-startup-config)))
+                  (ok (pg::physical-follow-check-startup-admission pg::*physical-recovery-state*))
+                  (ok (null pg::*physical-follow-runtime*))
+                  (ok (null pg::*physical-receive-store*))))))))
+       :system-id 42)))
+
+(deftest follow-unattached-cold-start-rejects-required-progress-beyond-durable-spool
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((base (pg::physical-recovery-verify-base-state))
+              (config (pg::physical-follow-unattached-config-for-base base)))
+         (pg::physical-follow-save-config config)
+         (pg::physical-recovery-write-control
+          base 2 (+ 8 (pg::physical-store-flushed-lsn store)) pg::*next-xid*)
+         (let ((before (lineage-test-bytes (pg::physical-recovery-control-path))))
+           (pg::physical-store-close store)
+           (sb-posix:rename (namestring (pg::physical-store-directory store))
+                            (namestring (pg::physical-recovery-spool-directory)))
+           (call-with-current-promotion-owner
+            (lambda ()
+              (let ((pg::*wal-ready* nil)
+                    (pg::*physical-receive-store* nil)
+                    (pg::*physical-recovery-state* nil)
+                    (pg::*physical-follow-runtime* nil)
+                    (pg::*physical-restartpoint-worker* nil))
+                (ok (intake-fails-p #'pg::physical-recovery-prepare))
+                (ok (null pg::*physical-recovery-state*))
+                (ok (null pg::*physical-receive-store*))
+                (ok (equalp before (lineage-test-bytes
+                                    (pg::physical-recovery-control-path))))))))
+         (ok (equal config (pg::physical-follow-read-config)))
+         (ok (probe-file root))))
+     :system-id 42))

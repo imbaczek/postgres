@@ -71,29 +71,50 @@ reload exclusion and live-operation quiescence."
   (physical-follow-call-with-receive-root
    *physical-receive-store* (lambda () (physical-follow-controller-snapshot-under-lease view))))
 
+(defun physical-follow-check-unbound-state (store base applied)
+  (physical-follow-call-with-receive-root
+   store
+   (lambda ()
+     (let* ((candidate (physical-follow-copy-checked-store store))
+            (tuple (physical-store-control-tuple candidate))
+            (control (physical-recovery-read-control *pgdata*))
+            (required (list (getf control :applied)
+                            (getf control :applied-timeline (getf control :timeline)))))
+       (unless (and (= (first tuple) (getf base :system-id))
+                    (= (second tuple) (getf base :timeline))
+                    (= (third tuple) (getf base :end))
+                    (= (nth 9 tuple) (getf base :manifest-digest)))
+         (error "current receiver differs from its immutable base"))
+       (physical-store-validate-prefix candidate)
+       (physical-follow-scan-current-state
+        candidate base applied required control (physical-follow-controller-index candidate) nil)))))
+
 (defun physical-follow-controller-check-current (config)
   "Validate the current recovery and receive state before restoring its receiver.
 The caller excludes concurrent mutation and protects the selected store."
   (let ((base (physical-recovery-verify-base-state)))
     (if (fifth config)
         (physical-follow-check-active-state *physical-receive-store* base config)
-        (physical-follow-call-with-receive-root
-         *physical-receive-store*
-         (lambda ()
-           (let* ((candidate (physical-follow-copy-checked-store *physical-receive-store*))
-                  (tuple (physical-store-control-tuple candidate))
-                  (control (physical-recovery-read-control *pgdata*))
-                  (required (list (getf control :applied)
-                                  (getf control :applied-timeline (getf control :timeline)))))
-             (unless (and (= (first tuple) (getf base :system-id))
-                          (= (second tuple) (getf base :timeline))
-                          (= (third tuple) (getf base :end))
-                          (= (nth 9 tuple) (getf base :manifest-digest)))
-               (error "current receiver differs from its immutable base"))
-             (physical-store-validate-prefix candidate)
-             (physical-follow-scan-current-state
-              candidate base (list *last-replay-lsn* (physical-recovery-replay-timeline))
-              required control (physical-follow-controller-index candidate) nil)))))))
+        (physical-follow-check-unbound-state
+         *physical-receive-store* base
+         (list *last-replay-lsn* (physical-recovery-replay-timeline))))))
+
+(defun physical-follow-launch-replay-only (config)
+  (check-physical-recovery-worker-start)
+  (physical-follow-check-config config)
+  (unless (and (physical-follow-unattached-p config)
+               (recovery-in-progress-p) *physical-receive-store*
+               (eql 2 (getf *physical-recovery-state* :phase))
+               (zerop *live-operation-depth*)
+               (sb-thread:holding-mutex-p *physical-follow-command-lock*))
+    (error "replay-only launch requires an unattached streaming standby"))
+  (sb-thread:with-mutex (*reload-run-lock*)
+    (with-live-operation-quiescence
+      (unless (equal config (physical-follow-read-config))
+        (error "unattached configuration changed before replay launch"))
+      (physical-follow-check-unowned-bootstrap-base config (physical-recovery-verify-base-state))
+      (physical-follow-controller-check-current config)))
+  (physical-follow-launch-workers config nil))
 
 (defun physical-follow-controller-snapshot-under-lease (view)
   "Capture the receive, replay and durable recovery witnesses under root protection.
@@ -191,6 +212,8 @@ to identify the same PGDATA."
 
 (defun physical-follow-current-retirement (config base)
   "Copy the current source identity for later asynchronous retirement."
+  (when (physical-follow-no-source-p config)
+    (return-from physical-follow-current-retirement nil))
   (let* ((binding (fifth config))
          (request
            (if binding
@@ -204,33 +227,50 @@ to identify the same PGDATA."
            :pin (fourth config) :request request)
      (getf (physical-follow-controller-state config) :source))))
 
+(defun physical-follow-unattached-config-for-base (base)
+  (physical-follow-check-config
+   (list 1 nil nil nil nil
+         (list :version 1 :enabled nil :preparing nil :cleanup nil
+               :mode :standby-unattached
+               :unowned-bootstrap (physical-follow-unowned-bootstrap-from-base base)))))
+
+(defun physical-follow-promotion-base ()
+  (multiple-value-bind (manifest digest) (recovery-read-manifest *pgdata*)
+    (recovery-check-manifest-schema manifest)
+    (let ((control (physical-recovery-read-control *pgdata*)))
+      (unless (and (= (getf manifest :system-id) (getf control :system-id))
+                   (= (getf manifest :timeline) (getf control :timeline))
+                   (= digest (getf control :manifest-digest))
+                   (= (getf manifest :checkpoint) (getf control :checkpoint)))
+        (error "promotion cleanup base identity does not match recovery control")))
+    (let ((base (copy-list manifest)))
+      (setf (getf base :manifest-digest) digest)
+      base)))
+
 (defun physical-follow-promotion-cleanup-config ()
   "Build the post-promotion cleanup image before retiring base provenance.
 The caller must save it durably before removing recovery artifacts. Remote
 retirement may finish later."
-  (when (probe-file (physical-follow-config-path))
-    (let* ((config (physical-follow-read-config))
-           (state (physical-follow-controller-state config)))
-      (when (physical-follow-cleanup-only-p config)
-        (return-from physical-follow-promotion-cleanup-config config))
-      (when (or (getf state :preparing) (eq :pending (getf (fifth config) :phase)))
-        (error "promotion requires a reconciled follow configuration"))
-      (let ((base nil))
-        (unless (fifth config)
-          (multiple-value-bind (manifest digest) (recovery-read-manifest *pgdata*)
-            (recovery-check-manifest-schema manifest)
-            (let ((control (physical-recovery-read-control *pgdata*)))
-              (unless (and (= (getf manifest :system-id) (getf control :system-id))
-                           (= (getf manifest :timeline) (getf control :timeline))
-                           (= digest (getf control :manifest-digest))
-                           (= (getf manifest :checkpoint) (getf control :checkpoint)))
-                (error "promotion cleanup base identity does not match recovery control")))
-            (setf base (copy-list manifest) (getf base :manifest-digest) digest)))
-        (setf (getf state :enabled) nil
-              state (physical-follow-enqueue-cleanup
-                     state (physical-follow-current-retirement config base)))
-        (remf state :source)
-        (physical-follow-check-config (list 1 nil nil nil nil state))))))
+  (let* ((base (unless (probe-file (physical-follow-config-path))
+                 (physical-follow-promotion-base)))
+         (config (if base (physical-follow-unattached-config-for-base base)
+                     (physical-follow-read-config)))
+         (state (physical-follow-controller-state config)))
+    (when (physical-follow-cleanup-only-p config)
+      (return-from physical-follow-promotion-cleanup-config config))
+    (when (or (getf state :preparing) (eq :pending (getf (fifth config) :phase)))
+      (error "promotion requires a reconciled follow configuration"))
+    (when (and (not base)
+               (or (not (fifth config)) (getf state :unowned-bootstrap)))
+      (setf base (physical-follow-promotion-base)))
+    (physical-follow-check-unowned-bootstrap-base config base)
+    (let ((retired (physical-follow-current-retirement config base)))
+      (setf (getf state :enabled) nil)
+      (when retired
+        (setf state (physical-follow-enqueue-cleanup state retired))))
+    (remf state :mode)
+    (remf state :source)
+    (physical-follow-check-config (list 1 nil nil nil nil state))))
 
 (defun physical-follow-startup-owner-check ()
   (when (probe-file (physical-follow-config-path))
@@ -259,12 +299,17 @@ state before validating an active binding. Protect the store and retained root."
   (when (probe-file (physical-follow-config-path))
     (let ((config (physical-follow-read-config)))
       (when (= 4 (length config)) (return-from physical-follow-prepare-startup config))
+      (physical-follow-check-unowned-bootstrap-base config base)
       (sb-thread:with-mutex (*physical-follow-command-lock*)
         (sb-thread:with-mutex (*reload-run-lock*)
           (with-live-operation-quiescence
             (physical-follow-call-with-offline-store
              base
              (lambda (store)
+               (when (physical-follow-unattached-p config)
+                 (physical-follow-check-unbound-state
+                  store base (list (getf base :required-applied)
+                                   (getf base :required-timeline))))
                (when (getf (physical-follow-controller-state config) :preparing)
                  (when (fifth config)
                    (physical-follow-check-active-state store base config))
@@ -331,6 +376,8 @@ state before validating an active binding. Protect the store and retained root."
         (when (or (physical-follow-cleanup-only-p config) (getf state :preparing)
                   (and (fifth config) (not (eq :active (getf (fifth config) :phase)))))
           (error "native follow transition is already pending or has no current source"))
+        (physical-follow-check-unowned-bootstrap-base
+         config (physical-recovery-verify-base-state))
         (unless (< (length (getf state :cleanup)) +physical-follow-cleanup-capacity+)
           (error "native follow cleanup queue is full"))
         (when (and (physical-follow-operation-runtime operation)
@@ -394,14 +441,17 @@ state before validating an active binding. Protect the store and retained root."
             (setf (physical-follow-operation-client operation) nil)))))))
 
 (defun physical-follow-fresh-attempt-name (prefix config)
-  "Generate an attempt-specific pin name distinct from current and queued names."
+  "Generate an attempt pin distinct from every retained pin name."
   (unless (and (wal-valid-replication-slot-name-p prefix) (<= (length prefix) 30))
     (error "follow pin prefix must be a valid name of at most 30 characters"))
-  (loop for name = (format nil "~a_~(~32,'0x~)" prefix (random (ash 1 128) (make-random-state t)))
-        unless (or (equal name (fourth config))
-                   (find name (getf (physical-follow-controller-state config) :cleanup)
-                         :key (lambda (entry) (getf entry :pin)) :test #'equal))
-          return name))
+  (let ((state (physical-follow-controller-state config)))
+    (loop for name = (format nil "~a_~(~32,'0x~)" prefix (random (ash 1 128) (make-random-state t)))
+          unless (or (equal name (fourth config))
+                     (equal name (getf (getf state :preparing) :pin))
+                     (equal name (getf (getf state :unowned-bootstrap) :pin))
+                     (find name (getf state :cleanup)
+                           :key (lambda (entry) (getf entry :pin)) :test #'equal))
+            return name)))
 
 (defun physical-follow-preparation-entry (operation slot coordinates)
   (physical-follow-cleanup-with-owner
@@ -445,9 +495,17 @@ that owner stays with the pin until a new publication, not a later reconnect."
             (setf (getf state :preparing) entry
                   intent (physical-follow-with-controller current state))
             (physical-follow-config-image (physical-follow-abandon-preparation-config intent))
-            (physical-follow-config-image
-             (physical-follow-with-controller
-              intent (physical-follow-operation-source-state operation state)))
+            (let ((preview (physical-follow-operation-source-state operation state)))
+              (if (physical-follow-unattached-p intent)
+                  (progn
+                    (remf preview :mode)
+                    (setf (getf preview :preparing) nil)
+                    (physical-follow-config-image
+                     (physical-follow-with-controller
+                      (list 1 (getf entry :host) (getf entry :port) (getf entry :pin) nil)
+                      preview)))
+                  (physical-follow-config-image
+                   (physical-follow-with-controller intent preview))))
             (setf (getf (physical-follow-operation-context operation) :intent-write) t)
             (physical-follow-controller-save-config intent)
             (setf (physical-follow-operation-config operation) intent
@@ -475,10 +533,11 @@ the old source before publication; its remote acknowledgment is not required."
           (unless (and (equal request (getf entry :request))
                        (equal (getf anchor :history-text) (getf view :history-text)))
             (error "native follow prefix or source history changed during preparation"))
+          (remf state :mode)
           (setf state (physical-follow-operation-source-state operation state))
           (setf (getf state :preparing) nil
                 (getf state :enabled) t
-                state (physical-follow-enqueue-cleanup state retired)
+                state (if retired (physical-follow-enqueue-cleanup state retired) state)
                 pending (physical-follow-with-controller
                          (list 1 (getf entry :host) (getf entry :port) (getf entry :pin) binding) state))
           (let ((candidate
@@ -532,8 +591,11 @@ publication failures fence recovery for restart reconciliation."
                        (physical-follow-operation-cancelled-p operation)
                        *physical-shutdown-state* *physical-promotion-stopping-p*
                        (shutdown-in-progress-p))
-             (when (physical-follow-controller-enabled-p config)
-               (physical-follow-launch config)))))))))
+             (cond
+               ((physical-follow-unattached-p config)
+                (physical-follow-launch-replay-only config))
+               ((physical-follow-controller-enabled-p config)
+                (physical-follow-launch config))))))))))
 
 (declaim (special *physical-follow-prepare-timeout*))
 
@@ -656,9 +718,51 @@ The caller must not hold command, reload or live-operation admission locks."
               (setf *physical-follow-controller-blocked-p* nil
                     *physical-follow-controller-block-owner* nil)))))))
 
+(defun physical-follow-ensure-attachment-state ()
+  (when (plusp *live-operation-depth*)
+    (error "follow initialization requires its own operation admission"))
+  (sb-thread:with-mutex (*physical-follow-command-lock*)
+    (let ((config (when (probe-file (physical-follow-config-path))
+                    (physical-follow-read-config))))
+      (when (and config (not (physical-follow-unattached-p config)))
+        (return-from physical-follow-ensure-attachment-state config))
+      (check-physical-recovery-worker-start)
+      (unless (recovery-in-progress-p)
+        (error "follow initialization requires a verified recovery base"))
+      (sb-thread:with-mutex (*physical-follow-lock*)
+        (when (or *physical-follow-operation* *physical-follow-controller-blocked-p*
+                  *physical-follow-controller-stopping-p*)
+          (error "native follow controller is busy or stopping")))
+      (when (and config (getf (sixth config) :preparing))
+        (error "follow initialization requires reconciled preparation"))
+      (unless *physical-receive-store*
+        (when (eq :deferred (physical-recovery-enable-streaming))
+          (return-from physical-follow-ensure-attachment-state :deferred)))
+      (sb-thread:with-mutex (*reload-run-lock*)
+        (with-live-operation-quiescence
+          (check-physical-recovery-worker-start)
+          (unless (and (recovery-in-progress-p) *physical-receive-store*
+                       (eql 2 (getf *physical-recovery-state* :phase)))
+            (error "follow initialization requires streaming recovery"))
+          (unless (equal config (when (probe-file (physical-follow-config-path))
+                                  (physical-follow-read-config)))
+            (error "follow configuration changed before initialization"))
+          (let ((base (physical-recovery-verify-base-state)))
+            (setf config (or config (physical-follow-unattached-config-for-base base)))
+            (physical-follow-check-unowned-bootstrap-base config base)
+            (physical-follow-controller-check-current config)
+            (physical-follow-controller-save-config config))))
+      (unless *physical-follow-runtime*
+        (physical-follow-launch-replay-only config))
+      config)))
+
 (defun physical-follow-retarget (host port &optional (prefix "follow"))
   "Synchronously request a transition to the direct endpoint on a fresh pin."
   (when (plusp *live-operation-depth*) (error "follow retarget requires its own operation admission"))
+  (physical-follow-endpoint-check host port prefix)
+  (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))
+  (when (eq :deferred (physical-follow-ensure-attachment-state))
+    (return-from physical-follow-retarget :deferred))
   (physical-follow-controller-start-worker :force t)
   (let ((operation (physical-follow-start-operation host port prefix)))
     (sb-thread:join-thread (physical-follow-operation-thread operation))
@@ -671,6 +775,10 @@ The caller must not hold command, reload or live-operation admission locks."
   (when (plusp *live-operation-depth*)
     (error "native follow retarget requires its own operation admission"))
   (let ((profile (make-physical-libpq-profile conninfo :fallback fallback)))
+    (physical-follow-endpoint-check "libpq" 5432 prefix)
+    (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))
+    (when (eq :deferred (physical-follow-ensure-attachment-state))
+      (return-from physical-follow-retarget-conninfo :deferred))
     (physical-follow-controller-start-worker :force t)
     (let ((operation (physical-follow-start-operation "libpq" 5432 prefix nil profile)))
       (sb-thread:join-thread (physical-follow-operation-thread operation))

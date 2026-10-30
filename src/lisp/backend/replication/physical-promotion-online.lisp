@@ -113,7 +113,10 @@ pause lock. Acknowledged pause commands cannot be overwritten by this restore."
       (sb-thread:with-mutex (*physical-replay-pause-lock*)
         (setf *physical-replay-paused-p* paused
               *physical-promotion-stopping-p* nil))))
-  (when config (physical-follow-launch config))
+  (when config
+    (if (physical-follow-unattached-p config)
+        (physical-follow-launch-replay-only config)
+        (physical-follow-launch config)))
   (when restartpoint (physical-restartpoint-start-worker))
   :awaiting-child-initialization)
 

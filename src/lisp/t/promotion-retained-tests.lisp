@@ -818,12 +818,14 @@
 
 (deftest committed-archive-ownership-precedes-cleanup-and-survives-interruptions
     (dolist (cut '(:after-primary-retained-registration :after-retire-required
-                   :after-retire-manifest :after-retire-follow :after-retire-pointer
+                   :after-retire-manifest :after-retire-follow-transfer :after-retire-pointer
                    :after-retire-pending :after-pending-retained-retirement))
       (handoff-test-committed
        (lambda (root store reference)
          (declare (ignore store))
-         (let* ((id (getf reference :root-id))
+         (let* ((unowned (pg::physical-follow-unowned-bootstrap-from-base
+                          (pg::physical-follow-promotion-base)))
+                (id (getf reference :root-id))
                 (pending (pg::physical-promotion-retained-owner :pending))
                 (primary (pg::physical-promotion-retained-owner :primary))
                 (events nil))
@@ -857,8 +859,14 @@
               (ok (null (pg::physical-retained-root-current pending)))
               (ok (pg::physical-retained-root-protected-p
                    (pg::physical-recovery-retained-directory) :inventory id))
+              (let* ((config (pg::physical-follow-read-config))
+                     (state (sixth config)))
+                (ok (pg::physical-follow-cleanup-only-p config))
+                (ok (equal unowned (getf state :unowned-bootstrap)))
+                (ok (null (getf state :cleanup)))
+                (ok (null (getf state :source))))
               (dolist (name '("recovery.required" "physical-backup.manifest"
-                              "physical-follow.control" "physical-restartpoint.control"
+                              "physical-restartpoint.control"
                               "physical-recovery.control"))
                 (ok (null (probe-file (merge-pathnames name root))))))))))))
 
