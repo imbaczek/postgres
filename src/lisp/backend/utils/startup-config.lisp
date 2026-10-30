@@ -175,7 +175,8 @@ rounding do not apply."
 (defun startup-normalize-setting (name input)
   "Normalize a startup setting from text or literal octets.
 For cluster_name, postmaster SQL_ASCII clips 63 raw bytes before ASCII cleaning,
-even with a UTF-8 database. Other settings decode their input as UTF-8.
+even with a UTF-8 database. Conninfo retains its input octets; other settings
+decode their input as UTF-8.
 Timeline input is validated but its original spelling is retained."
   (let ((spec (assoc name *startup-setting-specs* :test #'string=))
         (octets (startup-input-octets input)))
@@ -551,7 +552,8 @@ The other worker pools use their C defaults in the process-budget calculation."
 (defun startup-install-settings (settings native overrides)
   "Validate and install settings, including session quotas before listen.
 Install wal_keep_size in MB on successful reload; postmaster settings such as
-hot_standby retain their active values until restart."
+hot_standby retain their active values until restart. Settings and the desired
+follow generation are published together under live-operation quiescence."
   (startup-check-connection-limits settings)
   (let ((timeout (startup-setting-value settings "checkpoint_timeout"))
         (wal-bytes (* 1024 1024 (startup-setting-value settings "max_wal_size")))

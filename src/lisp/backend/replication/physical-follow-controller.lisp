@@ -655,7 +655,8 @@ that owner stays with the pin until a new publication, not a later reconnect."
 A restartpoint can advance during the RPC; use the final durable witness. Queue
 the old source before publication; its remote acknowledgment is not required.
 With workers quiesced, strictly validate the candidate before writing pending
-state. Receipt resumes only after activation."
+state. Receipt resumes only after activation. The generation is checked again
+under command and reload exclusion before durable publication."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (sb-thread:with-mutex (*reload-run-lock*)
       (with-live-operation-quiescence
@@ -868,7 +869,8 @@ result; restore stopped workers when needed."
 (defun physical-follow-start-operation (host port prefix &optional runtime profile (slot :inherit) generation configured-p)
   "Start a transition with a snapshot of the requested public slot.
 :INHERIT copies the runtime's accepted slot for automatic handoff; explicit NIL
-requests no slot. Capture the choice before the worker starts."
+requests no slot. Capture the choice and generation before the worker starts.
+Configured operations must still own the active desired generation."
   (physical-follow-endpoint-check host port prefix)
   (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))
   (let* ((source (when runtime (physical-follow-config-source (physical-follow-runtime-config runtime))))

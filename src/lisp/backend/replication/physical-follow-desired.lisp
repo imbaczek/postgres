@@ -2,6 +2,11 @@
 
 (declaim (special *physical-follow-lock*))
 
+;;; Desired source settings and the durable claim to manage native follow.
+;;; Snapshots own their setting bytes; opaque tokens fence old asynchronous work.
+;;; Live claims are durable before publication. Cold startup establishes the
+;;; verified base and claim before receipt is admitted.
+
 (define-condition physical-follow-generation-changed (error) ()
   (:report (lambda (condition stream)
              (declare (ignore condition))
@@ -15,6 +20,9 @@
             (:constructor %make-physical-follow-desired (conninfo slot fallback policy policy-token claimed-p predecessor))
             (:conc-name %physical-follow-desired-)
             (:print-function physical-follow-print-desired))
+  "One private desired generation with owned copies of its settings.
+IDENTITY and PREDECESSOR are opaque tokens used to reject stale installs.
+The complete conninfo bytes distinguish generations; printing hides credentials."
   (identity (list nil) :read-only t)
   (predecessor nil :read-only t)
   (conninfo #() :read-only t)
@@ -34,6 +42,7 @@
   (copy-seq (%physical-follow-desired-conninfo desired)))
 
 (defun physical-follow-desired-receiver-conninfo (desired)
+  "Copy the first 1023 bytes for receiver transport, retaining full input in DESIRED."
   (let ((bytes (%physical-follow-desired-conninfo desired)))
     (subseq bytes 0 (min 1023 (length bytes)))))
 
@@ -65,6 +74,7 @@
   (when (plusp (length slot)) (copy-seq slot)))
 
 (defun physical-follow-next-desired (previous conninfo slot fallback policy claimed-p)
+  "Return the existing generation if unchanged, or an owned successor snapshot."
   (let* ((bytes (etypecase conninfo
                   (string (string->bytes conninfo))
                   ((vector (unsigned-byte 8)) (copy-seq conninfo))))
@@ -104,6 +114,9 @@
       t)))
 
 (defun physical-follow-persist-management (base)
+  "Durably claim management for the verified base identity before publication.
+A mismatch or write failure fails recovery closed; atomic publication includes
+file and directory synchronization."
   (let ((bytes (physical-follow-managed-marker-bytes base)))
     (handler-case
         (progn
@@ -132,6 +145,9 @@
     (error 'physical-follow-generation-changed)))
 
 (defun physical-follow-call-with-desired-install (desired function)
+  "Install settings and their generation together under quiescence.
+Check the predecessor under the follow lock before and after the durable claim;
+FUNCTION publishes the settings while that lock is held."
   (check-type desired physical-follow-desired)
   (flet ((install ()
            (sb-thread:with-mutex (*physical-follow-lock*)

@@ -1,5 +1,10 @@
 (in-package #:pg)
 
+;;; Reconcile configured source settings without choosing a writer.
+;;; Stop old receipt before replacement; retain replay, proof and cleanup debt.
+;;; Join workers outside admission and lifecycle locks. Final publication checks
+;;; decide whether an asynchronous attempt still owns receipt authority.
+
 (defvar *physical-follow-desired-applied* nil)
 (defvar *physical-follow-manual-generation* nil)
 (defvar *physical-follow-desired-worker* nil)
@@ -15,6 +20,9 @@
   (physical-follow-require-generation desired))
 
 (defun physical-follow-disable-desired-receipt (desired)
+  "Disable old receipt before a configured replacement or an empty conninfo.
+Keep replay and its pause state, and queue unfinished preparation for cleanup.
+Persist the disabled state under reload exclusion and live-operation quiescence."
   (physical-follow-call-with-controller-blocked
    (lambda ()
      (sb-thread:with-mutex (*physical-follow-command-lock*)
@@ -54,6 +62,12 @@
   :applied)
 
 (defun physical-follow-reconcile-desired-step ()
+  "Reconcile one claimed generation, retrying failures without restoring old receipt.
+An empty conninfo leaves replay running without a receiver. A superseded
+attempt cannot publish local follow state or mark the newer generation
+applied. The native source
+must support this controller's preparation and cleanup protocol; this worker
+does not provide an external failover coordinator."
   (let ((desired (sb-thread:with-mutex (*physical-follow-lock*) *physical-follow-desired*)))
     (cond
       ((not (physical-follow-desired-claimed-p desired)) :unmanaged)
@@ -127,6 +141,8 @@
   :started)
 
 (defun physical-follow-desired-stop-worker ()
+  "Stop the configured worker and cancel its operation before joining it.
+Join outside the follow lock; failure to stop marks recovery failed."
   (let ((worker nil) (client nil))
     (sb-thread:with-mutex (*physical-follow-lock*)
       (setf *physical-follow-desired-stopping-p* t
@@ -150,6 +166,7 @@
     (not (null worker))))
 
 (defun physical-follow-plan-settings (settings &optional force-claim)
+  "Snapshot configured settings and retain an existing management claim."
   (let* ((entry (and settings (gethash "primary_conninfo" settings)))
          (slot (and settings (gethash "primary_slot_name" settings)))
          (cluster (and settings (gethash "cluster_name" settings)))
@@ -179,6 +196,8 @@
        (not *physical-promotion-stopping-p*) (not (shutdown-in-progress-p))))
 
 (defun physical-follow-call-with-desired-paused (function)
+  "Temporarily stop the configured worker for a lifecycle operation.
+Restart it when recovery still permits work; join outside live admission."
   (when (plusp *live-operation-depth*)
     (error "configured follow must be joined outside operation admission"))
   (let ((paused (when (and *physical-follow-desired-worker*
@@ -189,6 +208,9 @@
         (physical-follow-desired-start-worker)))))
 
 (defun physical-follow-call-with-manual-source (function)
+  "Reserve a manual source operation and suspend its successful generation.
+Take command then follow lock for reservation, releasing both before joining.
+A later desired generation can resume configured reconciliation."
   (when (plusp *live-operation-depth*)
     (error "manual follow requires its own operation admission"))
   (when (sb-thread:holding-mutex-p *physical-follow-command-lock*)

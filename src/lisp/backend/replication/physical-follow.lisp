@@ -24,6 +24,7 @@ STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
   (physical-follow-require-generation (physical-follow-runtime-generation runtime)))
 
 (defun physical-follow-authorize-receiver (runtime)
+  "Fence receiver work against a superseded claimed generation under admission."
   (with-live-operation
     (physical-follow-require-runtime-generation runtime)
     (check-recovery-available))
@@ -1300,6 +1301,7 @@ Receipt ends there; replay remains free to reach its own policy fence."
              (physical-follow-runtime-last-error runtime)))
 
 (defun physical-follow-publish-transition (runtime transition)
+  "Publish a transition only for the current runtime and generation."
   (sb-thread:with-mutex (*physical-follow-lock*)
     (when (and (physical-follow-generation-current-p (physical-follow-runtime-generation runtime))
                (eq runtime *physical-follow-runtime*)
@@ -1367,7 +1369,9 @@ reload exclusion and quiescence before workers can read it."
 
 (defun physical-follow-launch-workers (config receive-p &optional transition generation configured-p)
   "Publish replay and, when RECEIVE-P, receipt workers together.
-The caller holds the command mutex outside admission and has validated CONFIG."
+The caller holds the command mutex outside admission and has validated CONFIG.
+Configured receipt also requires an active desired generation at publication;
+the accepted binding alone does not authorize a stale configured launch."
   (unless (and (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*))
     (error "follow worker launch requires command exclusion outside admission"))
@@ -1520,7 +1524,8 @@ owns its transition."
 
 (defun physical-follow-stop ()
   "Stop receipt and replay while preserving accepted bindings and cleanup work.
-An unattached standby rejects this operation; use replay pause instead."
+An unattached standby rejects this operation; use replay pause instead.
+A successful manual stop suspends configured reconciliation for this generation."
   (physical-follow-call-with-manual-source
    (lambda (generation)
      (declare (ignore generation))

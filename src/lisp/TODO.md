@@ -1,11 +1,23 @@
 # Development TODO
 
-- [ ] Implement desired-generation reconciliation for `primary_conninfo` and
-  `primary_slot_name` for standard follow. `recovery_target_timeline` is active
-  at cold startup and changes require restart.
-  Signal-managed startup currently prepares a verified native standby for replay
-  only. Archive-only recovery remains unsupported future work; coordination is
-  outside this scope. This does not provide full Patroni follow support.
+- [x] Implement desired-generation reconciliation for `primary_conninfo` and
+  `primary_slot_name` for native standard follow, including reload, durable
+  management ownership, cold restart and promotion. `recovery_target_timeline`
+  is active at cold startup and changes require restart. Archive-only recovery
+  remains unsupported; coordination is outside this scope.
+
+- [ ] Complete the pinned Patroni writer and real `Postgresql.follow` acceptance.
+  Its current complete writer snapshots contain 13 unsupported settings:
+  `max_locks_per_transaction`, `max_prepared_transactions`,
+  `max_worker_processes`, `track_commit_timestamp`, `wal_level`, `wal_log_hints`,
+  `hba_file`, `ident_file`, `recovery_target`, `recovery_target_lsn`,
+  `recovery_target_name`, `recovery_target_time` and `recovery_target_xid`.
+  Keep the complete writer oracle unchanged. Next establish shared lock-object
+  and owner accounting before exposing `max_locks_per_transaction`; C sizes a
+  shared pool, not a per-transaction limit. Cover atomic multi-relation admission,
+  repeated acquisition, abort/cancellation/disconnect and virtual-reader cleanup.
+  Include persisted source resource requirements and standby validation, following
+  C's `XLogReportParameters` and `CheckRequiredParameterValues`.
 
 - [ ] Fix signed integer GUC parsing for C23 binary prefixes independently of
   the unsigned recovery timeline parser. C reports `100` for
@@ -25,8 +37,9 @@
   supported implicit query blocks, SQL promotion, fresh child backup/follow and
   durable receive-history selection, source-side follow anchors, the read-only
   extent layer, immutable inventory publication, local retained-root ownership and
-  receive-control inventory validation and receive-compaction sealing have completed
-  this pass and its review. Keep the same order for the remaining HA work.
+  receive-control inventory validation, receive-compaction sealing and configured
+  native follow have completed this pass and its review. Keep the same order for
+  the remaining HA work.
 
 - [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker
   retained `*active-xids* = (3)` after 1,598 passing checks, causing later physical

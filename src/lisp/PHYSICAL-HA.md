@@ -3,19 +3,91 @@
 Open development audits, including cold-image/load-order correctness, are tracked
 in [TODO.md](TODO.md).
 
-Status, 2026-10-27: native intake/bootstrap/recovery, continuous receipt/reconnect,
+Status, 2026-10-30: native intake/bootstrap/recovery, continuous receipt/reconnect,
 advancing source retention, explicit/automatic local restartpoints, PGDATA/PID
 ownership, a startup/reload configuration subset, client application-name settings
 and online promotion are implemented. Fresh backups from a promoted child can follow
 that same timeline. Pinned Patroni's full promotion method passes through native
 pg_ctl and pg_controldata, including its production-state wait. Locally selected
 ancestor-spool fork replay and later promotion now pass manual crash tests.
-Standard follow configuration, rewind/rejoin, synchronous
+Configured native follow now reconciles source settings through reload and cold
+restart. Complete Patroni writer/follow acceptance, rewind/rejoin, synchronous
 durability and remaining Patroni interfaces are unfinished. C physical WAL/disk
 compatibility remains future work. Coordination is excluded. The repository's
 original C source is the behavior oracle.
 
 ## Verified starting points
+
+### Configured native follow
+
+`primary_conninfo` and `primary_slot_name` are SIGHUP settings. Reload installs
+their complete values together and wakes a local reconciliation worker. An
+unchanged value keeps the same generation and receiver. Source, slot, fallback
+application name or effective timeline-policy changes create a fresh generation;
+changing A to B and back to A does not revive A's earlier workers. Slot names are
+validated before installation. Conninfo syntax and connection failures are handled
+by the asynchronous attempt, so an unavailable source does not reject reload.
+
+The worker disables old receipt before trying the replacement. Empty conninfo
+leaves replay running without a receiver. Connection, route and other failures
+before binding publication retry the current settings while retaining replay
+pause state, accepted proof, source ownership and retirement debt. Later
+publication failures follow durable reconciliation or fence recovery.
+Generation checks protect receiver results, WAL admission,
+operation publication and worker launch. Work authorized before a reload may
+still be in flight; it cannot publish a stale result afterward. Previously accepted
+complete WAL writes can still be flushed when their old receiver exits.
+
+The full raw conninfo value is retained for comparison and metadata output. The
+physical libpq attempt uses its first 1023 bytes, following C's `MAXCONNINFO`
+copy in `walreceiverfuncs.c`. Valid UTF-8 metadata remains ordinary text; other
+octets are preserved by SHOW, current_setting, pg_settings, DataRow text/binary
+formats and `postgres -C`. Physical connection profiles retain libpq's physical
+replication and passfile behavior rather than forcing the database-scoped mode.
+
+During live recovery, the first standard-management claim writes
+`physical-follow-managed.control` before publishing the claimed settings. Cold
+startup first reads settings, then verifies native base provenance and writes or
+checks the marker before admitting receipt. The marker binds the claim to the
+verified immutable base system ID and manifest digest. Removing the setting or
+signal file later does not revive an old manually saved source after restart.
+Cold startup validates
+native base provenance and the marker before exposing recovery; ambiguous marker
+publication fences recovery. On an unclaimed standby, slot-only configuration
+does not claim a manual route. Promotion retires the marker with recovery
+provenance.
+
+Manual follow commands reserve under command and follow locks before stopping
+the reconciler, then release those locks before joins. Successful commands suspend
+reconciliation for that generation; failed commands can resume the existing
+accepted receiver. A new settings generation releases the suspension. Automatic
+handoff defers during the reservation; the reservation itself leaves private
+retirement cleanup eligible. An active or blocked transition can still defer it.
+Promotion and shutdown stop the reconciler, and a final locked check prevents a
+configured operation from publishing receipt after that stop.
+
+`t/configured-follow.sh` writes configuration and calls `pg_reload_conf`; it does
+not use private retarget commands. It verifies first attachment, unchanged reload,
+slot replacement, raw metadata against native and C executables, paused replay
+after clearing conninfo, failed replacement and retry, SIGKILL restart, removal
+of all source settings, descendant-source follow, promotion and primary restart.
+The final run passed at `/tmp/pg-operation-parking.gSyZhs`, recorded in
+`/tmp/pg-configured-follow-owned-v5.log`. Final validation passed 1,200 physical,
+185 logical wire and 641 unit Rove tests, plus 245 targeted tests and a fresh-cache
+strict compile (`/tmp/pg-configured-follow-final2-compile.log`). Process-kill tests
+do not establish power-loss behavior.
+
+This completes the native configured-source path, not the complete pinned
+Patroni interface. The unchanged full writer oracle still identifies 13 missing
+settings, listed in TODO.md. Its next resource milestone must implement shared
+lock-object and owner admission before accepting `max_locks_per_transaction`.
+C sizes shared capacity from that value and backend/prepared-transaction counts;
+it does not cap each transaction at that number. Native resource requirements
+also need durable source reporting and standby checks, following C's
+`XLogReportParameters` and `CheckRequiredParameterValues`. Real
+`Postgresql.follow` acceptance remains separate from the writer metadata oracle.
+Archive recovery, rejoin/reseed, synchronous durability and coordination remain
+outside this checkpoint; no coordinator or election mechanism was added.
 
 ### Child follow and rejoin intake
 
