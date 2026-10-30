@@ -31,12 +31,13 @@ ownership must be checked by the live promotion path."
     (error "pending promotion requires stopped workers and no open reader transactions")))
 
 (defun physical-promotion-check-reader-snapshots (backends parked)
-  "Check the exact active snapshot census against transaction and parked owners.
+  "Check the exact active snapshot census against transaction, query and parked owners.
 
 Under the snapshot lock, validate identities and parked generations.  Reject
 missing or conflicting owners instead of discarding their registrations."
   (let ((owners (make-hash-table :test #'eq))
-        (parked-registrations (make-hash-table :test #'eq)))
+        (parked-registrations (make-hash-table :test #'eq))
+        (queries (query-execution-owner-reload-state)))
     (sb-thread:with-mutex (*snapshot-count-lock*)
       (labels ((note (snapshot registration owner &optional generation)
                  (unless (and snapshot registration
@@ -57,6 +58,16 @@ missing or conflicting owners instead of discarding their registrations."
           (let ((snapshot (backend-transaction-snapshot backend))
                 (registration (backend-transaction-snapshot-registration backend)))
             (when (or snapshot registration) (note snapshot registration backend))))
+        (dolist (query queries)
+          (let ((registration (query-execution-owner-snapshot-registration query))
+                (backend (query-execution-owner-backend query)))
+            (when (snapshot-registration-active-p registration)
+              (unless (and backend (member backend backends :test #'eq)
+                           (sb-thread:thread-alive-p (query-execution-owner-thread query))
+                           (or (null (backend-thread backend))
+                               (eq (backend-thread backend) (query-execution-owner-thread query))))
+                (error "promotion query snapshot has no live backend owner"))
+              (note (snapshot-registration-snapshot registration) registration backend))))
         (dolist (entry parked)
           (destructuring-bind (token backend thread registrations) entry
             (unless (and (eq :parked (live-operation-token-state token))

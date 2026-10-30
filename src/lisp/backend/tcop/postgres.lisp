@@ -323,6 +323,7 @@ The admitted decoder repeats these checks authoritatively."
                        (decode-frontend-message
                         type-byte length-bytes payload)))
                 (when *extended-query-state*
+                  (extended-drop-portal *extended-query-state* "")
                   (remhash "" (extended-query-state-statements *extended-query-state*)))
                 (if (eq *live-operation-current-lane* :drain)
                     (multiple-value-bind (statements parsed-p)
@@ -435,7 +436,9 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
   (send-ready-for-query stream (transaction-status-char)))
 
 (defun handle-extended-query-frame (stream type-byte length-bytes payload)
-  (let ((state *extended-query-state*))
+  ;; Keep the cycle deadline across a suspended Execute; Sync or a completed
+  ;; Execute ends it. Errors discard execution state before waiting for Sync.
+  (let ((state *extended-query-state*) (*extended-execute-suspended-p* nil))
     (with-backend-query-execution (:cleanup :query-state)
       (with-live-operation-query-dispatch t
         (handler-case
@@ -465,7 +468,9 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                                               (extended-parse-frame (code-char type-byte) payload))
                                           payload))
               (setf (extended-query-state-statement-deadline state)
-                    (unless (member (code-char type-byte) '(#\E #\S))
+                    (unless (or (= type-byte (char-code #\S))
+                                (and (= type-byte (char-code #\E))
+                                     (not *extended-execute-suspended-p*)))
                       (backend-statement-deadline *backend*))))
           (pg-error (condition)
             (when (fatal-error-p condition) (error condition))
@@ -473,7 +478,8 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
               (note-query-error)
               (setf (extended-query-state-statement-deadline state) nil
                     (extended-query-state-executed-in-cycle-p state) nil)
-              (extended-clear-portals state)
+              (let ((*preserve-failed-extended-portals* (eq (backend-state *backend*) :aborted)))
+                (extended-clear-portals-for-backend *backend*))
               (when implicit
                 (unless (eq (backend-state *backend*) :idle) (abort-transaction))
                 (restore-session-settings stream))
@@ -489,7 +495,8 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
               (note-query-error)
               (setf (extended-query-state-statement-deadline state) nil
                     (extended-query-state-executed-in-cycle-p state) nil)
-              (extended-clear-portals state)
+              (let ((*preserve-failed-extended-portals* (eq (backend-state *backend*) :aborted)))
+                (extended-clear-portals-for-backend *backend*))
               (when implicit
                 (unless (eq (backend-state *backend*) :idle) (abort-transaction))
                 (restore-session-settings stream))
@@ -510,6 +517,7 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
       (with-live-operation-query-dispatch t
         (let* ((message (decode-frontend-message type-byte length-bytes payload))
                (query (query-string message)))
+          (extended-drop-portal state "")
           (remhash "" (extended-query-state-statements state))
           (setf (extended-query-state-statement-deadline state) nil)
           (multiple-value-bind (statements parsed-p)
@@ -555,7 +563,8 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                       (unless (backend-explicit backend)
                         (unless (eq (backend-state backend) :idle) (abort-transaction))
                         (restore-session-settings stream))
-                      (clrhash (extended-query-state-portals state))
+                      (let ((*preserve-failed-extended-portals* (eq (backend-state *backend*) :aborted)))
+                        (extended-clear-portals-for-backend *backend*))
                       (setf (extended-query-state-implicit-p state) nil cleaned t)
                       (send-error-response stream
                                            (if (typep condition 'pg-error) condition
@@ -570,7 +579,8 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
               (setf (extended-query-state-implicit-p state) nil
                     (extended-query-state-executed-in-cycle-p state) nil)
               (when (or (not completed) (eq (backend-state backend) :idle))
-                (clrhash (extended-query-state-portals state))))
+                (let ((*preserve-failed-extended-portals* (eq (backend-state *backend*) :aborted)))
+                  (extended-clear-portals-for-backend *backend*))))
             (send-ready-for-query stream (transaction-status-char)))))))
   :continue)
 
@@ -600,7 +610,8 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
          (when (eq (backend-state *backend*) :in-progress) (commit-transaction))
          (setf (extended-query-state-implicit-p *extended-query-state*) nil
                (extended-query-state-executed-in-cycle-p *extended-query-state*) nil)
-         (clrhash (extended-query-state-portals *extended-query-state*))))
+         (let ((*preserve-failed-extended-portals* (eq (backend-state *backend*) :aborted)))
+           (extended-clear-portals-for-backend *backend*))))
      (if (and *extended-query-state* (extended-query-state-implicit-p *extended-query-state*))
          (handle-extended-implicit-simple-query stream type-byte length-bytes payload)
          (prog1 (handle-simple-query-frame stream type-byte length-bytes payload)
@@ -610,7 +621,8 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                       (member (backend-state *backend*) '(:idle :aborted)))
              (when (eq (backend-state *backend*) :idle)
                (setf (extended-query-state-implicit-p *extended-query-state*) nil))
-             (clrhash (extended-query-state-portals *extended-query-state*))))))
+             (let ((*preserve-failed-extended-portals* (eq (backend-state *backend*) :aborted)))
+               (extended-clear-portals-for-backend *backend*))))))
     ((find (code-char type-byte) "PBESCHD")
      (handle-extended-query-frame stream type-byte length-bytes payload))
     ;; A captured active session may terminate during drain so its transaction

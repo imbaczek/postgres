@@ -492,7 +492,8 @@
          (setf *current-snapshot* snapshot))))))
 
 (defun query-execution-owner-pin-snapshot (owner snapshot)
-  "Copy an already protected snapshot before the enclosing registration releases."
+  "Copy an already protected snapshot before the enclosing registration releases.
+The owner retains its own registration until its executable state is retired."
   (query-execution-owner-acquire-snapshot
    owner
    (lambda (registration)
@@ -591,6 +592,75 @@ Retain the snapshot and census entry while any closer needs a retry."
             (sb-ext:timeout () nil)))))
     (when fatal-condition (error fatal-condition))
     (remove-if #'query-execution-owner-closed-p owners)))
+
+(defun retire-query-execution-owners-for-backend (backend)
+  "Discard executable state only after its backend's frontend stack has unwound."
+  (let* ((owners
+           (remove-if-not (lambda (owner) (eq backend (query-execution-owner-backend owner)))
+                          (query-execution-owner-reload-state)))
+         (failures nil))
+    (labels ((attempt (function)
+               (handler-case (funcall function)
+                 (error (condition) (push condition failures) nil)
+                 (sb-ext:timeout (condition) (push condition failures) nil))))
+      (dolist (owner owners)
+        (unless (eq (query-execution-owner-thread owner) sb-thread:*current-thread*)
+          (error "terminal query cleanup requires the owning backend thread"))
+        (dotimes (retry 2)
+          (unless (query-execution-owner-closed-p owner)
+            (attempt (lambda ()
+                       (multiple-value-bind (closed errors) (close-query-execution-owner owner)
+                         (setf failures (append errors failures))
+                         closed))))))
+      (dolist (owner owners)
+        (unless (query-execution-owner-closed-p owner)
+          (setf (query-execution-owner-state owner) :closing
+                (query-execution-owner-cleanup-functions owner) nil)
+          (call-with-query-execution-owner-context
+           owner
+           (lambda ()
+             (dolist (iterator (loop for iterator being the hash-keys of *sql-open-iterators*
+                                     collect iterator))
+               (attempt (lambda () (close-sql-iterator iterator))))
+             (dolist (state (loop for state being the hash-keys of *cte-open-states* collect state))
+               (attempt (lambda () (close-cte-execution-state state))))
+             ;; Exit discards unread TIDs. Parking's detachment could allocate a
+             ;; spool and deliberately retain a lease after an I/O or quota error.
+             (let ((leases
+                     (remove-duplicates
+                      (append *btree-read-leases*
+                              (mapcar #'select-index-scan-lease *select-index-scans*)
+                              (mapcan (lambda (group)
+                                        (mapcar #'cdr (select-index-lease-group-leases group)))
+                                      *select-index-lease-groups*))
+                      :test #'eq)))
+               (dolist (lease leases)
+                 (when lease (attempt (lambda () (release-btree-read-lease lease)))))
+               (when (some (lambda (lease) (and lease (btree-read-lease-active-p lease))) leases)
+                 (error "terminal query cleanup left an owned B-tree lease")))
+             (setf *select-index-scans* nil *select-index-lease-groups* nil)
+             (close-query-temp-owner (query-execution-owner-temp-owner owner))
+             ;; SQL owner registrations have no independent WAL-retention pin.
+             ;; Release is idempotent and may finish an interrupted generation.
+             (let ((registration (query-execution-owner-snapshot-registration owner)))
+               (attempt (lambda () (release-snapshot-registration registration)))
+               (when (snapshot-registration-releasing-p registration)
+                 (finish-snapshot-registration-release
+                  registration (snapshot-registration-lifecycle-generation registration)
+                  (snapshot-registration-wal-retention-lsn registration)))
+               (when (or (snapshot-registration-active-p registration)
+                         (snapshot-registration-releasing-p registration))
+                 (error "terminal query cleanup left an active snapshot")))))
+          (setf (query-execution-owner-state owner) :closed
+                (query-execution-owner-bindings owner) nil
+                (query-execution-owner-backend owner) nil)
+          (sb-thread:with-mutex (*query-execution-owner-lock*)
+            (remhash owner *query-execution-owners*)
+            (incf *query-execution-owner-generation*)
+            (sb-thread:condition-broadcast *query-execution-owner-cv*))))
+      (dolist (condition failures)
+        (format *error-output* "~&pg-lisp: backend query cleanup: ~a~%" condition))
+      (nreverse failures))))
 
 (defun call-with-query-cte-execution (root-p function)
   (if (not root-p) (funcall function)

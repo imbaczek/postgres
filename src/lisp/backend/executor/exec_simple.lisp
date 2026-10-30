@@ -553,6 +553,7 @@ Do not perform wire I/O while restoring transaction state."
     (return-from command-begin))
   (if (eq (backend-state *backend*) :idle)
       (progn
+        (clear-backend-command-id-used *backend*)
         (setf (backend-explicit *backend*) t
               (backend-isolation-level *backend*)
               (or (getf ast :isolation-level) :read-committed)
@@ -1539,9 +1540,12 @@ before this removal horizon is captured."
                      (:copy-to (setf copy-row-count (exec-copy-to stream ast)))
                      (:explain (exec-explain stream ast))
                      (:analyze (exec-analyze stream ast))
-                     (:insert (let ((*wal-row-page-write-p* t)) (exec-insert stream ast)))
-                     (:update (let ((*wal-row-page-write-p* t)) (exec-update stream ast)))
-                     (:delete (let ((*wal-row-page-write-p* t)) (exec-delete stream ast)))
+                     (:insert (note-backend-command-id-used)
+                      (let ((*wal-row-page-write-p* t)) (exec-insert stream ast)))
+                     (:update (note-backend-command-id-used)
+                      (let ((*wal-row-page-write-p* t)) (exec-update stream ast)))
+                     (:delete (note-backend-command-id-used)
+                      (let ((*wal-row-page-write-p* t)) (exec-delete stream ast)))
                      (:truncate (exec-truncate stream ast))
                      (:create-table (exec-create-table stream ast))
                      (:drop-table (exec-drop-table stream ast))
@@ -1644,6 +1648,7 @@ Transaction options and session characteristics are excluded."
 
 (defun begin-extended-implicit-query-block ()
   (sb-sys:without-interrupts
+    (clear-backend-command-id-used *backend*)
     (setf (backend-read-only *backend*) (backend-transaction-read-only-p *backend*)
           (backend-settings-transaction-start *backend*) (copy-session-settings (backend-settings *backend*))
           (backend-implicit-query-block *backend*) t
@@ -1665,7 +1670,8 @@ Transaction options and session characteristics are excluded."
           (apply #'send-command-complete response)))))
 
 (defun execute-query-statements (stream statements implicit-block-p)
-  "Execute statements in order, deferring the last command tag in an implicit block."
+  "Execute statements in order, deferring the last command tag in an implicit block.
+Advance the command ID after each successful non-transaction statement."
   (loop for tail on statements
         for ast = (first tail)
         do (when (and *extended-simple-multi-p*
@@ -1675,8 +1681,13 @@ Transaction options and session characteristics are excluded."
            (arm-statement-timeout)
            (let ((*defer-command-complete-p* (and implicit-block-p (null (rest tail)))))
              (unwind-protect
-                  (progn (check-for-interrupts)
-                         (execute-simple-query-statement stream ast))
+                  (progn
+                    (check-for-interrupts)
+                    (let ((*statement-command-start-advance-p* nil))
+                      (execute-simple-query-statement stream ast))
+                    (when (and (eq (backend-state *backend*) :in-progress)
+                               (not (member (getf ast :type) '(:begin :commit :rollback))))
+                      (incf (backend-command-id *backend*))))
                (clear-statement-timeout)))))
 
 (defun execute-simple-query-statements (stream statements)
@@ -1694,6 +1705,7 @@ is sent only after commit."
         (sb-sys:without-interrupts
           (unwind-protect
                (progn
+                 (clear-backend-command-id-used *backend*)
                  (setf (backend-settings-transaction-start *backend*)
                        (copy-session-settings (backend-settings *backend*))
                        (backend-implicit-query-block *backend*) t
