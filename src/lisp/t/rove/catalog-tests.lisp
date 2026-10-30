@@ -341,6 +341,33 @@
                   3)
                "column distinct count persists through the class catalog codec")))
 
+(rove:deftest aggregate-toast-demand-proofs
+    (let* ((table (make-pg-class :oid 9001 :columns (vector (make-pg-column :name "id" :type :int4)
+                                                            (make-pg-column :name "v" :type :text))))
+           (relations (list (list :table table)))
+           (scan '(:seq-scan 0 9001))
+           (project (lambda (child) (list :project (list (list :expr (list :col 1))) child))))
+      (rove:ok (equal (aggregate-toast-demand
+                       (funcall project (list :hash-aggregate nil 1 scan)) relations)
+                      (cons table nil)))
+      (rove:ok (equal (aggregate-toast-demand
+                       (funcall project (list :hash-aggregate nil 1
+                                              (list :filter '(:binop := (:col 1) (:const 7)) scan)))
+                       relations)
+                      (cons table '(1))))
+      (rove:ok (equal (aggregate-toast-demand
+                       (funcall project (list :sorted-aggregate nil (list '(:kind :count-expr :input (:col 2))) scan)) relations)
+                      (cons table '(2))))
+      (rove:ok (equal (aggregate-toast-demand
+                       (funcall project (list :hash-aggregate (list '(:col 2)) 1 scan)) relations)
+                      (cons table '(2))))
+      (rove:ok (null (aggregate-toast-demand
+                      (funcall project (list :hash-aggregate nil 1
+                                             (list :filter '(:subplan x) scan))) relations)))
+      (rove:ok (null (aggregate-toast-demand
+                      (funcall project (list :sorted-aggregate nil (list '(:kind :sum :input (:subplan x))) scan))
+                      relations)))))
+
 (rove:deftest test-analyze-physical-column-width-and-distinct
     (let* ((column (make-pg-column :name "v" :type :text))
            (columns (vector column))

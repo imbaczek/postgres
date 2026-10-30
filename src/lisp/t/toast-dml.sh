@@ -1191,6 +1191,22 @@ toast_fetch_count() {
     if grep -q ';; error:' "$TMP/toast-fetch-count.out"; then cat "$TMP/toast-fetch-count.out" >&2; exit 1; fi
     awk -F= '/FETCH-COUNT=/{print $2}' "$TMP/toast-fetch-count.out"
 }
+# Aggregate inputs, grouping and filters demand only their referenced source
+# columns; COUNT(*) itself never needs an external value.
+[ "$(run -c 'select count(*) from toast_sort_demand')" = 3 ]
+[ "$(run -c 'select count(*),sum(id) from toast_sort_demand where id + 0 > 0')" = '3|6' ]
+[ "$(run -c 'select id,count(*) from toast_sort_demand group by id order by id limit 2')" = "$(printf '1|1\n2|1')" ]
+[ "$(run -c 'select count(*) + 1 from toast_sort_demand group by id order by id desc')" = "$(printf '2\n2\n2')" ]
+[ "$(run -c 'select sum(id) + 1 from toast_sort_demand')" = 7 ]
+[ "$(toast_fetch_count)" = 0 ]
+[ "$(run -c 'select count(v) from toast_sort_demand')" = 3 ]
+[ "$(toast_fetch_count)" = 3 ]
+[ "$(run -c 'select count(*) from toast_sort_demand where v is not null')" = 3 ]
+[ "$(run -c 'select count(*) from toast_sort_demand group by v')" = "$(printf '1\n1\n1')" ]
+[ "$(run -c 'select count(*) from toast_sort_demand group by id order by min(length(v))')" = "$(printf '1\n1\n1')" ]
+[ "$(toast_fetch_count)" = 12 ]
+printf '%s\n(quit)\n' '(setf (symbol-value (intern "*TOAST-TEST-FETCH-COUNT*")) 0)' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/toast-fetch-reset.out"
+! grep -q ';; error:' "$TMP/toast-fetch-reset.out"
 [ "$(run -c 'select id from toast_reuse')" = 1 ]
 [ "$(toast_fetch_count)" = 0 ]
 # The primary-key equality uses a nonparameterized index scan. Its recheck

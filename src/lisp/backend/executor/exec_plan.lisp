@@ -1663,6 +1663,34 @@ on an abnormal exit."
             (+ self-time child-total-time))))
   (values))
 
+(defun aggregate-toast-demand (node relations)
+  "Prove source demand for supported single-table aggregate plans.
+All group keys, aggregate inputs, filters, and index recheck expressions are
+walked; unsupported expressions and plan shapes require full materialization."
+  (when (eq (first node) :limit) (setf node (third node)))
+  (case (first node)
+    (:sort (setf node (third node)))
+    (:top-n (setf node (fourth node))))
+  (when (and (eq (first node) :project) (= (length relations) 1))
+    (let* ((aggregate (third node))
+           (groups (second aggregate))
+           (specification (third aggregate)))
+      (when (and (member (first aggregate) '(:hash-aggregate :sorted-aggregate))
+                 (listp groups)
+                 (or (and (eq (first aggregate) :hash-aggregate)
+                          (integerp specification) (plusp specification))
+                     (and (eq (first aggregate) :sorted-aggregate)
+                          (listp specification)
+                          (every (lambda (descriptor)
+                                   (let ((kind (getf descriptor :kind)))
+                                     (and (member kind '(:count :count-expr :sum :avg :min :max :array-agg))
+                                          (or (eq kind :count) (getf descriptor :input)))))
+                                 specification))))
+        (let* ((inputs (if (integerp specification) nil
+                           (remove nil (mapcar (lambda (descriptor) (getf descriptor :input)) specification))))
+               (targets (mapcar (lambda (expr) (list :expr expr)) (append groups inputs))))
+          (simple-select-toast-demand (list :project targets (fourth aggregate)) relations))))))
+
 (defun simple-select-toast-demand (node relations)
   "Find demanded source columns for a simple projection, filters and ordering.
 Unrecognized plans and expression forms require full materialization."
@@ -1773,7 +1801,8 @@ projection or filter forms fall back to ordinary full materialization."
   (let* ((metadata-map (query-plan-metadata plan))
          (*select-toast-slice-plan* (simple-select-toast-slice (query-plan-physical plan) registered-relations))
          (*toast-slice-current* nil)
-         (*select-toast-demand* (simple-select-toast-demand (query-plan-physical plan) registered-relations))
+         (*select-toast-demand* (or (simple-select-toast-demand (query-plan-physical plan) registered-relations)
+                                    (aggregate-toast-demand (query-plan-physical plan) registered-relations)))
          (*subquery-instrumentation-depth* (1+ *subquery-instrumentation-depth*)))
     (when (and *select-toast-slice-plan* *select-toast-demand*)
       (setf *select-toast-demand*

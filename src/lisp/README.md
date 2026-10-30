@@ -271,6 +271,10 @@ and LIMIT, external values unused by the projection, filters, ordering, and
 index qualification are not fetched. Demand analysis recognizes columns, constants, casts, Boolean and
 arithmetic operators, and function calls with recognized arguments. Other plan
 or expression shapes fall back to full tuple materialization.
+Supported single-table aggregate plans also identify the source columns needed
+by grouping, aggregate arguments, filters, and index qualification. For example,
+`COUNT(*)` does not fetch an unrelated external value. Aggregate shapes or
+expressions that demand analysis cannot prove fall back to full materialization.
 An internal TOAST byte-slice API reads only intersecting chunks of an
 uncompressed external value under an active snapshot protecting its parent.
 It validates the pointer and requested chunks, but does not check unrequested
