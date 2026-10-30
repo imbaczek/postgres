@@ -109,7 +109,9 @@
 (defvar *dml-returning-spool* nil)
 
 (defun send-dml-returning-description (stream targets)
-  (when (and targets (not *dml-returning-spool*))
+  ;; Extended Execute sends rows without a RowDescription; clients may Describe
+  ;; the bound portal separately.
+  (when (and targets (not *dml-returning-spool*) (not *select-suppress-description*))
     (send-row-description stream (mapcar #'target->result-column targets))))
 
 (defun emit-dml-returning (stream targets values &key old-values (new-values values) (source-values #()))
@@ -131,7 +133,8 @@
   (check-for-interrupts)
   (when (and targets *dml-returning-spool*)
     (query-row-spool-seal *dml-returning-spool*)
-    (send-row-description stream (mapcar #'target->result-column targets))
+    (unless *select-suppress-description*
+      (send-row-description stream (mapcar #'target->result-column targets)))
     (map-query-row-spool *dml-returning-spool*
                          (lambda (values index)
                            (declare (ignore index))
@@ -260,6 +263,11 @@
   ;; Admit the target write and every source read together. Registering the target
   ;; first can deadlock with an index builder waiting on that writer while blocking
   ;; a source reader. Admission also excludes target index DDL during revalidation.
+  ;; Check the portal's advertised shape before admission or any target write.
+  (when *select-suppress-description*
+    (check-result-column-shape
+     (mapcar #'target->result-column (getf prepared :returning))
+     *select-expected-result-columns*))
   (let* ((table (getf prepared :table))
          (relfilenode (pg-class-relfilenode table))
          (target-toast (pg-class-toast table))

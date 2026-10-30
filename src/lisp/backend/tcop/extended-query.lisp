@@ -16,7 +16,11 @@
   (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
     (gethash portal *extended-select-portal-metadata*)))
 
-(defun extended-portal-select-p (portal) (not (null (extended-select-portal-info portal))))
+(defun extended-portal-select-p (portal)
+  (eq (getf (extended-statement-ast (extended-portal-statement portal)) :type) :select))
+
+(defun extended-portal-returns-rows-p (portal)
+  (not (null (extended-select-portal-info portal))))
 
 (defun extended-portal-result-columns (portal)
   (let ((info (extended-select-portal-info portal))) (and info (extended-select-portal-metadata-columns info))))
@@ -24,9 +28,11 @@
 (defun extended-portal-result-formats (portal)
   (let ((info (extended-select-portal-info portal))) (and info (extended-select-portal-metadata-formats info))))
 
-(defun make-extended-query-portal (statement values select-p columns formats)
+(defun make-extended-query-portal (statement values returns-rows-p columns formats)
+  ;; Keep row metadata outside the portal structure so a reload can use portals
+  ;; created by an older image. The weak table does not extend portal lifetime.
   (let ((portal (make-extended-portal :statement statement :values values)))
-    (when select-p
+    (when returns-rows-p
       (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
         (setf (gethash portal *extended-select-portal-metadata*)
               (make-extended-select-portal-metadata :columns columns :formats formats))))
@@ -297,6 +303,17 @@ it if installation fails; replacing a portal releases the old registration."
         (declare (ignore registered))))
     columns))
 
+(defun extended-statement-returns-rows-p (statement)
+  (let ((ast (extended-statement-ast statement)))
+    (or (eq (getf ast :type) :select) (not (null (getf ast :returning))))))
+
+(defun extended-statement-result-columns (ast &optional register-p)
+  ;; Prepare DML even without RETURNING so Parse validates the statement. For
+  ;; RETURNING, derive result columns through the same analysis used by execution.
+  (if (eq (getf ast :type) :select)
+      (extended-select-result-columns ast register-p)
+      (mapcar #'target->result-column (getf (prepare-dml-subqueries ast) :returning))))
+
 (defvar *extended-statement-signatures* (make-hash-table :test #'eq :weakness :key))
 
 (defvar *extended-statement-signatures-lock* (sb-thread:make-mutex :name "extended statement signatures"))
@@ -428,9 +445,7 @@ it if installation fails; replacing a portal releases the old registration."
          (let* ((statements (parse-statements sql))
                 (types (map 'vector #'extended-type-from-oid oids)))
            (unless (and (= (length statements) 1)
-                        (or (and (member (getf (first statements) :type) '(:insert :update :delete))
-                                 (null (getf (first statements) :returning)))
-                            (eq (getf (first statements) :type) :select)))
+                        (member (getf (first statements) :type) '(:insert :update :delete :select)))
              (ereport "0A000" "extended query supports DML or SELECT"))
            (when (extended-context-sensitive-literal-p (first statements))
              (ereport "0A000" "string literals in extended statements are not supported; use parameters"))
@@ -440,9 +455,7 @@ it if installation fails; replacing a portal releases the old registration."
            ;; readers remain registered until transaction end.
            (with-statement-snapshot (snapshot #'statement-start)
              (let* ((*query-parameter-types* types)
-                    (signature (if (eq (getf (first statements) :type) :select)
-                                   (extended-result-signature (extended-select-result-columns (first statements) t))
-                                   (progn (prepare-dml-subqueries (first statements)) nil))))
+                    (signature (extended-result-signature (extended-statement-result-columns (first statements) t))))
                (let ((statement (make-extended-statement :ast (first statements) :types types)))
                  (sb-thread:with-mutex (*extended-statement-signatures-lock*)
                    (setf (gethash statement *extended-statement-signatures*) signature))
@@ -466,16 +479,16 @@ it if installation fails; replacing a portal releases the old registration."
            (unless (and (member (length formats) (list 0 1 (length ranges)))
                         (every (lambda (format) (member format '(0 1))) formats))
              (ereport "08P01" "invalid parameter formats"))
-           (let* ((select-p (eq (getf (extended-statement-ast statement) :type) :select))
-                  (columns (when select-p
+           (let* ((returns-rows-p (extended-statement-returns-rows-p statement))
+                  (columns (when returns-rows-p
                              (let ((*query-parameter-types* (extended-statement-types statement)))
                                (extended-check-result-signature
-                                statement (extended-select-result-columns (extended-statement-ast statement) t)))))
-                  (result-formats (when select-p (extended-select-result-formats results columns)))
+                                statement (extended-statement-result-columns (extended-statement-ast statement) t)))))
+                  (result-formats (when returns-rows-p (extended-select-result-formats results columns)))
                   (types (extended-statement-types statement))
                   (format-vector (coerce formats 'vector))
                   (values (make-array (length ranges))))
-             (unless (or select-p (null results) (and (= (length results) 1) (= (first results) 0)))
+             (unless (or returns-rows-p (null results) (and (= (length results) 1) (= (first results) 0)))
                (ereport "0A000" "binary result format is not supported"))
              (loop for range in ranges for index from 0
                    for type = (aref types index)
@@ -500,7 +513,7 @@ it if installation fails; replacing a portal releases the old registration."
              (when (extended-bind-spool-p payload) (extended-verify-bind-spool payload))
              (extended-install-portal
               state portal
-              (make-extended-query-portal statement values select-p columns result-formats))
+              (make-extended-query-portal statement values returns-rows-p columns result-formats))
              (write-message stream #\2 #())))))
       (:execute
        (destructuring-bind (kind name limit) operation
@@ -516,7 +529,7 @@ it if installation fails; replacing a portal releases the old registration."
                  (*query-parameter-values* (extended-portal-values portal))
                  (*select-result-formats* (extended-portal-result-formats portal))
                  (*select-expected-result-columns* (extended-portal-result-columns portal))
-                 (*select-suppress-description* (extended-portal-select-p portal))
+                 (*select-suppress-description* (extended-portal-returns-rows-p portal))
                  (*statement-snapshot-override*
                    (let ((info (extended-select-portal-info portal)))
                      (and info (extended-select-portal-metadata-snapshot info)))))
@@ -526,29 +539,29 @@ it if installation fails; replacing a portal releases the old registration."
       (:describe
        (destructuring-bind (kind target name) operation
          (declare (ignore kind))
-         (multiple-value-bind (columns select-p)
+         (multiple-value-bind (columns returns-rows-p)
              (case target
                (#\S (let ((statement (gethash name (extended-query-state-statements state))))
                       (unless statement (ereport "26000" "prepared statement does not exist"))
                       (when (and (eq (backend-state *backend*) :aborted)
-                                 (eq (getf (extended-statement-ast statement) :type) :select))
+                                 (extended-statement-returns-rows-p statement))
                         (ereport "25P02" "current transaction is aborted, commands ignored until end of transaction block"))
                       (let ((response (make-payload)))
                         (payload-push-u16 response (length (extended-statement-types statement)))
                         (loop for type across (extended-statement-types statement)
                               do (payload-push-u32 response (type-oid type)))
                         (write-message stream #\t response))
-                      (when (eq (getf (extended-statement-ast statement) :type) :select)
+                      (when (extended-statement-returns-rows-p statement)
                         (let ((*query-parameter-types* (extended-statement-types statement)))
                           (values (extended-check-result-signature
-                                   statement (extended-select-result-columns (extended-statement-ast statement))) t)))))
+                                   statement (extended-statement-result-columns (extended-statement-ast statement))) t)))))
                (#\P (let ((portal (gethash name (extended-query-state-portals state))))
                       (unless portal (ereport "34000" "portal does not exist"))
-                      (when (and (eq (backend-state *backend*) :aborted) (extended-portal-select-p portal))
+                      (when (and (eq (backend-state *backend*) :aborted) (extended-portal-returns-rows-p portal))
                         (ereport "25P02" "current transaction is aborted, commands ignored until end of transaction block"))
-                      (values (extended-portal-result-columns portal) (extended-portal-select-p portal))))
+                      (values (extended-portal-result-columns portal) (extended-portal-returns-rows-p portal))))
                (otherwise (ereport "08P01" "invalid describe target")))
-           (if select-p (send-row-description stream columns) (write-message stream #\n #())))))
+           (if returns-rows-p (send-row-description stream columns) (write-message stream #\n #())))))
       (:close
        (destructuring-bind (kind target name) operation
          (declare (ignore kind))
