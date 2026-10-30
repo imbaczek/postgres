@@ -88,6 +88,243 @@
                         (lambda (tuple) (push (aref (htup-values tuple) 0) seen)))
       (rove:ok (equal seen '("visible")) "invisible tuple attributes are not read")))
 
+(rove:deftest test-visible-heap-page-iterator-decodes-only-when-pulled
+    (let* ((columns (vector (make-pg-column :name "s" :type :varchar :typmod -1 :attnum 1)))
+           (hidden (form-heap-tuple (vector "hidden") columns 100 0 0 0 0))
+           (first (form-heap-tuple (vector "first") columns +frozen-xid+ 0 0 0 0))
+           (broken (form-heap-tuple (vector "bad") columns +frozen-xid+ 0 0 0 0))
+           (page (page-init (make-page)))
+           (snapshot (make-snapshot-struct :xmin 3 :xmax 10 :xip nil :curcid 1)))
+      ;; A malformed hidden row is skipped; a malformed later visible row is not
+      ;; touched until the second pull.
+      (setf (aref hidden (aref hidden +heap-tuple-hoff-off+)) 1
+            (aref broken (aref broken +heap-tuple-hoff-off+)) 1)
+      (page-add-item page hidden)
+      (page-add-item page first)
+      (page-add-item page broken)
+      (let ((iterator (make-visible-heap-page-iterator page 7 columns snapshot)))
+        (unwind-protect
+             (progn
+               (multiple-value-bind (tuple present) (sql-iterator-next iterator)
+                 (rove:ok present)
+                 (rove:ok (= 7 (htup-block tuple)))
+                 (rove:ok (= 2 (htup-offnum tuple)))
+                 (rove:ok (equal "first" (aref (htup-values tuple) 0))))
+               (rove:ok (handler-case (progn (sql-iterator-next iterator) nil)
+                          (error () t))
+                        "the later malformed tuple is decoded on its own pull"))
+          (close-sql-iterator iterator))))
+  (let* ((columns (vector (make-pg-column :name "s" :type :varchar :typmod -1 :attnum 1)))
+         (page (page-init (make-page)))
+         (snapshot (make-snapshot-struct :xmin 3 :xmax 10 :xip nil :curcid 1)))
+    (page-add-item page (form-heap-tuple (vector "one") columns +frozen-xid+ 0 0 0 0))
+    (page-add-item page (form-heap-tuple (vector "two") columns +frozen-xid+ 0 0 0 0))
+    (let ((iterator (make-visible-heap-page-iterator page 0 columns snapshot)))
+      (unwind-protect
+           (progn
+             (rove:ok (equal "one" (aref (htup-values (sql-iterator-next iterator)) 0)))
+             (rove:ok (equal "two" (aref (htup-values (sql-iterator-next iterator)) 0)))
+             (rove:ok (not (nth-value 1 (sql-iterator-next iterator))))
+             (rove:ok (not (nth-value 1 (sql-iterator-next iterator)))))
+        (close-sql-iterator iterator)))))
+
+(rove:deftest test-select-scan-iterator-defers-visible-tuple-decoding
+    (let* ((columns (vector (make-pg-column :name "s" :type :varchar :typmod -1 :attnum 1)))
+           (table (make-pg-class :oid 42 :name "lazy-test" :relfilenode 100 :columns columns))
+           (relation (list :table table))
+           (node '(:seq-scan 0 42))
+           (page (page-init (make-page)))
+           (broken (form-heap-tuple (vector "bad") columns +frozen-xid+ 0 0 0 0))
+           (*current-snapshot* (make-snapshot-struct :xmin 3 :xmax 10 :xip nil :curcid 1))
+           (old-read (symbol-function 'buf-read))
+           (old-count (symbol-function 'buf-nblocks)))
+      (setf (aref broken (aref broken +heap-tuple-hoff-off+)) 1)
+      (page-add-item page (form-heap-tuple (vector "first") columns +frozen-xid+ 0 0 0 0))
+      (page-add-item page broken)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'buf-read)
+                   (lambda (relfilenode block &optional (fork :main))
+                     (declare (ignore relfilenode block fork))
+                     (copy-seq page))
+                   (symbol-function 'buf-nblocks)
+                   (lambda (relfilenode &optional (fork :main))
+                     (declare (ignore relfilenode fork))
+                     1))
+             (let ((iterator (make-select-scan-iterator node (list relation))))
+               (unwind-protect
+                    (progn
+                      (multiple-value-bind (row present) (sql-iterator-next iterator)
+                        (rove:ok present)
+                        (rove:ok (equal "first" (aref row 0))))
+                      (rove:ok (handler-case (progn (sql-iterator-next iterator) nil)
+                                 (error () t))
+                               "the second tuple is not decoded during the first pull"))
+                 (close-sql-iterator iterator)))
+             (let ((iterator (make-select-scan-iterator node (list relation))))
+               (unwind-protect
+                    (rove:ok (nth-value 1 (sql-iterator-next iterator)))
+                 (close-sql-iterator iterator))))
+        (setf (symbol-function 'buf-read) old-read
+              (symbol-function 'buf-nblocks) old-count))))
+
+(rove:deftest test-select-index-iterator-defers-heap-fetch
+    (let* ((columns (vector (make-pg-column :name "s" :type :text :attnum 1)
+                            (make-pg-column :name "unused" :type :bytea :attnum 2)))
+           (table (make-pg-class :oid 42 :name "index-lazy-test"
+                                 :relfilenode 100 :columns columns))
+           (relation (list :table table))
+           (pointer (make-heap-external-varlena :raw-size 5004 :external-info 5000
+                                                :value-id 42 :relation-id 7 :id-width 4))
+           (old-tids (symbol-function 'make-select-index-tid-iterator))
+           (old-fetch (symbol-function 'heapam-get-tuple))
+           (old-visible (symbol-function 'htup-visible-p))
+           (fetches 0)
+           (closed nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'make-select-index-tid-iterator)
+                   (lambda (ignored-table ignored-path ignored-environment)
+                     (declare (ignore ignored-table ignored-path ignored-environment))
+                     (let ((rows (list #(1 1) #(1 2))))
+                       (make-sql-iterator
+                        (lambda () (when rows (values (pop rows) t)))
+                        (lambda () (setf closed t)))))
+                   (symbol-function 'heapam-get-tuple)
+                   (lambda (relfilenode block offnum ignored-columns &optional ignored-toast)
+                     (declare (ignore relfilenode block ignored-columns ignored-toast))
+                     (incf fetches)
+                     (if (= offnum 2)
+                         (error "later tuple is malformed")
+                         (make-htup :values (vector "first" pointer))))
+                   (symbol-function 'htup-visible-p)
+                   (lambda (tuple snapshot)
+                     (declare (ignore tuple snapshot))
+                     t))
+             (let ((iterator (make-select-index-scan-iterator
+                              table nil nil relation (list relation) nil nil (cons table '(1)))))
+               (unwind-protect
+                    (progn
+                      (multiple-value-bind (row present) (sql-iterator-next iterator)
+                        (rove:ok present)
+                        (rove:ok (equal "first" (aref row 0)))
+                        (rove:ok (eq (aref row 1) +null+))
+                        (rove:ok (= 1 fetches)))
+                      (rove:ok (handler-case (progn (sql-iterator-next iterator) nil)
+                                 (error () t)))
+                      (rove:ok (= 2 fetches)))
+                 (close-sql-iterator iterator)))
+             (rove:ok closed))
+        (setf (symbol-function 'make-select-index-tid-iterator) old-tids
+              (symbol-function 'heapam-get-tuple) old-fetch
+              (symbol-function 'htup-visible-p) old-visible))))
+
+(rove:deftest test-resumable-select-toast-slice-context
+    (let* ((columns (vector (make-pg-column :name "id" :type :int4 :attnum 1)
+                            (make-pg-column :name "data" :type :bytea :attnum 2)))
+           (table (make-pg-class :oid 42 :name "slice-test" :relfilenode 100
+                                 :columns columns :toast :test-toast))
+           (relations (list (list :table table)))
+           (page (page-init (make-page)))
+           (slice '(:func "substr" ((:col 2 :type :bytea) (:const 2 :type :int4)
+                                    (:const 2 :type :int4)) :type :bytea))
+           (id '(:col 1 :type :int4))
+           (scan '(:seq-scan 0 42))
+           (filter (list :filter '(:binop ">" (:col 1 :type :int4) (:const 1 :type :int4)) scan))
+           (projection (list :project (list (list :expr slice) (list :expr id)) filter))
+           (plan (%make-query-plan :physical (list :limit 2 projection)))
+           (*current-snapshot* (make-snapshot-struct :xmin 3 :xmax 10 :xip nil :curcid 1))
+           (old-read (symbol-function 'buf-read))
+           (old-count (symbol-function 'buf-nblocks))
+           (old-slice (symbol-function 'toast-fetch-value-slice))
+           (old-fetch (symbol-function 'toast-fetch-value))
+           (slice-ids nil)
+           (full-fetches 0))
+      (loop for id from 1 to 2
+            for pointer = (make-heap-external-varlena
+                           :raw-size 5004 :external-info 5000
+                           :value-id (+ 100 id) :relation-id 7 :id-width 4)
+            do (page-add-item page (form-heap-tuple (vector id pointer) columns
+                                                    +frozen-xid+ 0 0 0 0)))
+      (page-add-item page (form-heap-tuple (vector 3 +null+) columns +frozen-xid+ 0 0 0 0))
+      ;; Instrumentation wraps each node and must carry the row's slice context.
+      (dolist (node (list scan filter projection (query-plan-physical plan)))
+        (setf (gethash node (query-plan-metadata plan)) (make-plan-node-metadata)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'buf-read)
+                   (lambda (relfilenode block &optional (fork :main))
+                     (declare (ignore relfilenode block fork)) (copy-seq page))
+                   (symbol-function 'buf-nblocks)
+                   (lambda (relfilenode &optional (fork :main))
+                     (declare (ignore relfilenode fork)) 1)
+                   (symbol-function 'toast-fetch-value-slice)
+                   (lambda (toast pointer snapshot start length &key index-reader)
+                     (declare (ignore toast snapshot index-reader))
+                     (push (heap-external-varlena-value-id pointer) slice-ids)
+                     (rove:ok (and (= start 1) (= length 2)))
+                     (make-array 2 :element-type '(unsigned-byte 8)
+                                   :initial-contents (list (heap-external-varlena-value-id pointer) 7)))
+                   (symbol-function 'toast-fetch-value)
+                   (lambda (toast pointer snapshot &key index-reader)
+                     (declare (ignore toast pointer snapshot index-reader))
+                     (incf full-fetches)
+                     (make-array 4 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(1 2 3 4))))
+             (let ((iterator (make-resumable-query-plan-iterator plan relations))
+                   (other (make-resumable-query-plan-iterator plan relations)))
+               (unwind-protect
+                    (progn
+                      (multiple-value-bind (row present) (sql-iterator-next iterator)
+                        (rove:ok present)
+                        (rove:ok (equalp (car row) (vector #(102 7) 2)))
+                        (rove:ok (equal slice-ids '(102)))
+                        (rove:ok (zerop full-fetches)))
+                      (multiple-value-bind (row present) (sql-iterator-next other)
+                        (rove:ok present)
+                        (rove:ok (equalp (car row) (vector #(102 7) 2))))
+                      (multiple-value-bind (row present) (sql-iterator-next iterator)
+                        (rove:ok present)
+                        (rove:ok (eq (aref (car row) 0) +null+))
+                        (rove:ok (= (aref (car row) 1) 3)))
+                      (rove:ok (not (nth-value 1 (sql-iterator-next iterator)))))
+                 (close-sql-iterator iterator)
+                 (close-sql-iterator other)))
+             ;; A second target needs the whole column, so the slice hint cannot
+             ;; suppress its full materialization.
+             (let* ((full-projection (list :project
+                                           (list (list :expr slice)
+                                                 (list :expr '(:col 2 :type :bytea)))
+                                           scan))
+                    (full-plan (%make-query-plan :physical full-projection))
+                    (iterator (make-resumable-query-plan-iterator full-plan relations)))
+               (unwind-protect
+                    (multiple-value-bind (row present) (sql-iterator-next iterator)
+                      (rove:ok present)
+                      (rove:ok (equalp (car row) (vector #(2 3) #(1 2 3 4))))
+                      (rove:ok (= full-fetches 1))
+                      (rove:ok (equal slice-ids '(102 102))))
+                 (close-sql-iterator iterator)))
+             ;; A blocking sort cannot retain the row-scoped context. Its input
+             ;; must fetch full values before it spills and evaluates projection.
+             (let* ((*query-work-memory-bytes* 1)
+                    (*query-temp-directory* (uiop:temporary-directory))
+                    (sort-plan (%make-query-plan :physical (list :sort nil projection)))
+                    (before full-fetches))
+               (with-query-temp-files
+                 (let ((iterator (make-resumable-query-plan-iterator sort-plan relations)))
+                   (unwind-protect
+                        (multiple-value-bind (row present) (sql-iterator-next iterator)
+                          (rove:ok present)
+                          (rove:ok (equalp (car row) (vector #(2 3) 2)))
+                          (rove:ok (= full-fetches (+ before 2)))
+                          (rove:ok (equal slice-ids '(102 102))))
+                     (close-sql-iterator iterator))))))
+        (setf (symbol-function 'buf-read) old-read
+              (symbol-function 'buf-nblocks) old-count
+              (symbol-function 'toast-fetch-value-slice) old-slice
+              (symbol-function 'toast-fetch-value) old-fetch))))
+
 (rove:deftest test-toast-chunk-assembly
     (let ((chunks (list (cons 0 (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(0 1 2 3)))
                         (cons 1 #(4 5 6 7))

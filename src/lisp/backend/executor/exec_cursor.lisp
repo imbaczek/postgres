@@ -1,15 +1,24 @@
 ;;;; exec_cursor.lisp -- resumable physical plans for demand-driven producers.
 (in-package #:pg)
 
-(defun make-mapping-sql-iterator (input function)
+(defun make-mapping-sql-iterator (input function &key preserve-toast-context)
+  ;; The fourth iterator value is a TOAST slice context for the current row.
+  ;; Bind it only while evaluating that row; pass it on only when requested.
   (make-sql-iterator
    (lambda ()
      (loop
-       (multiple-value-bind (row present origins) (sql-iterator-next input)
-         (unless present (return (values nil nil nil)))
-         (let ((*query-row-origins* (and *datum-origin-capture* origins)))
+       (multiple-value-bind (row present origins toast-context) (sql-iterator-next input)
+         (unless present (return (values nil nil nil nil)))
+         ;; A scan's saved pointer belongs only to this input row. Nested
+         ;; subqueries must compute their own demand and slice plans.
+         (let ((*query-row-origins* (and *datum-origin-capture* origins))
+               (*toast-slice-current* toast-context)
+               (*select-toast-demand* nil)
+               (*select-toast-slice-plan* nil))
            (multiple-value-bind (result keep result-origins) (funcall function row)
-             (when keep (return (values result t result-origins))))))))
+             (when keep
+               (return (values result t result-origins
+                               (and preserve-toast-context toast-context)))))))))
    (lambda () (close-sql-iterator input))))
 
 (defun make-buffered-sql-iterator (producer &optional input)
@@ -31,6 +40,86 @@
 
 (defvar *lateral-outer-environment* nil)
 
+(defun make-visible-heap-page-iterator (page block columns snapshot)
+  "Visit visible heap tuples from an owned PAGE one at a time.
+
+Check tuple visibility before deforming it, and leave later tuples untouched
+until their next pull.  SNAPSHOT must remain registered for this iterator."
+  (let ((offnum 0) (count (page-lp-count page)))
+    (make-sql-iterator
+     (lambda ()
+       (loop while (< offnum count)
+             do (check-for-interrupts)
+                (incf offnum)
+                (with-live-page-item (page offnum offset length)
+                  (let ((xmin (full-xid-from-32
+                               (page-u32 page (+ offset +heap-tuple-xmin-off+))))
+                        (xmax (full-xid-from-32
+                               (page-u32 page (+ offset +heap-tuple-xmax-off+))))
+                        (cid (page-u32 page (+ offset +heap-tuple-cid-off+)))
+                        (infomask (page-u16 page (+ offset +heap-tuple-infomask-off+))))
+                    (when (heap-tuple-visible-p xmin xmax cid snapshot
+                                                (and *backend* (backend-xid *backend*)) infomask)
+                      (multiple-value-bind (values raw-xmin raw-xmax raw-cid raw-infomask
+                                            ctid-block ctid-offnum physical-compressed)
+                          (deform-heap-tuple (subseq page offset (+ offset length)) columns)
+                        (declare (ignore raw-xmin raw-xmax raw-cid raw-infomask))
+                        (return
+                          (values (make-htup :block block :offnum offnum
+                                             :ctid-block ctid-block :ctid-offnum ctid-offnum
+                                             :xmin xmin :xmax xmax :cid cid :infomask infomask
+                                             :values values :physical-compressed physical-compressed)
+                                  t))))))))
+     (lambda () (setf page nil)))))
+
+(defun make-select-index-tid-iterator (table path environment)
+  ;; Buffer matching TIDs under the index lease, then release the lease before
+  ;; fetching heap tuples. The buffer may spill and is owned by the iterator.
+  (let ((*datum-origin-capture* nil))
+    (make-buffered-sql-iterator
+     (lambda (emit)
+       (let* ((index (select-scan-path-index path))
+              (key (select-scan-index-key table path environment)))
+         (when key
+           (call-with-current-select-index-domain
+            (pg-index-relfilenode index)
+            (lambda ()
+              (call-with-btree-equal-cursor
+               (pg-index-relfilenode index) key
+               (lambda (cursor lease)
+                 (call-with-select-index-cursor
+                  cursor lease
+                  (lambda (tid)
+                    (check-for-interrupts)
+                    (funcall emit (vector (car tid) (cdr tid)))))))))))
+       (detach-select-index-scans)))))
+
+(defun make-select-index-scan-iterator (table path snapshot relation relations environment capture-p demand)
+  ;; Fetch and check one buffered TID at a time against the scan snapshot.
+  ;; Closing this iterator also closes the TID buffer.
+  (let ((tids (make-select-index-tid-iterator table path environment)))
+    (make-sql-iterator
+     (lambda ()
+       (loop
+         (multiple-value-bind (tid present) (sql-iterator-next tids)
+           (unless present (return (values nil nil nil)))
+           (let* ((*datum-origin-capture* capture-p)
+                  (tuple (heapam-get-tuple (pg-class-relfilenode table)
+                                           (aref tid 0) (aref tid 1)
+                                           (pg-class-columns table))))
+             (when (and tuple (htup-visible-p tuple snapshot))
+               (let ((row (htup-values (materialize-select-tuple table tuple snapshot :demand demand)))
+                     (origins (and capture-p (htup-origins tuple))))
+                 (return
+                   (values (if (getf relation :join-order-base)
+                               (make-select-relation-environment relations relation row)
+                               row)
+                           t
+                           (if (getf relation :join-order-base)
+                               (make-select-relation-origins relations relation origins)
+                               origins)))))))))
+     (lambda () (close-sql-iterator tids)))))
+
 (defun make-select-scan-iterator (node relations)
   ;; Capture the parameter environment and statement snapshot for this scan's
   ;; lifetime; later outer rows must not change its index key or visibility.
@@ -39,32 +128,15 @@
          (path (physical-scan-path node relation))
          (environment (copy-query-sort-value *lateral-outer-environment*))
          (source (getf relation :row-source))
-         (block 0) (nblocks nil) (rows nil) (initialized nil)
+         (block 0) (nblocks nil) (rows nil) (page-reader nil) (initialized nil)
          (snapshot *current-snapshot*)
-         (capture-p *datum-origin-capture*))
-    ;; Buffer base heap values for the complete key before yielding. The bounded
-    ;; store can spill even under a small upper LIMIT; filters and projections
-    ;; remain above it and evaluate lazily as rows are consumed.
+         (capture-p *datum-origin-capture*)
+         (demand *select-toast-demand*)
+         (slice-plan *select-toast-slice-plan*))
     (when (eq (select-scan-path-kind path) :index-scan)
       (return-from make-select-scan-iterator
-        (make-buffered-sql-iterator
-         (lambda (emit)
-           (scan-select-index
-            table path snapshot
-            (lambda (tuple)
-              (let ((row (htup-values tuple))
-                    (*query-row-origins* (and capture-p
-                                              (if (getf relation :join-order-base)
-                                                  (make-select-relation-origins relations relation (htup-origins tuple))
-                                                  (htup-origins tuple)))))
-                ;; Reordered joins still require values in source-order slots.
-                (funcall emit (if (getf relation :join-order-base)
-                                  (make-select-relation-environment relations relation row)
-                                  row))))
-            environment)
-           ;; A scan can reuse leases held by an outer domain. Detach those too
-           ;; before yielding to SQL filters, projections, or mutation.
-           (detach-select-index-scans)))))
+        (make-select-index-scan-iterator table path snapshot relation relations
+                                         environment capture-p demand)))
     (unless (eq (select-scan-path-kind path) :seq-scan)
       (error "A resumable producer requires a SeqScan plan"))
     (make-sql-iterator
@@ -74,30 +146,49 @@
          (if source (setf rows (funcall source))
              (setf nblocks (buf-nblocks (pg-class-relfilenode table)))))
        (loop
+         (check-for-interrupts)
          (when rows
-           (let* ((item (pop rows))
-                  (row (if (and capture-p (not source)) (car item) item))
-                  (origins (and capture-p (not source) (cdr item))))
+           (let ((row (pop rows)))
              (return
                (values (if (getf relation :join-order-base)
                            (make-select-relation-environment relations relation row)
-                           row) t
-                       (if (getf relation :join-order-base)
-                           (make-select-relation-origins relations relation origins)
-                           origins)))))
+                           row)
+                       t nil))))
+         (when page-reader
+           (multiple-value-bind (tuple present) (sql-iterator-next page-reader)
+             (when present
+               (let* ((*datum-origin-capture* capture-p)
+                      (values (htup-values tuple))
+                      (toast-context
+                        (when (and slice-plan (eq table (car slice-plan)))
+                          (loop for (expression . slot) in (cdr slice-plan)
+                                for value = (aref values (1- slot))
+                                when (heap-external-varlena-p value)
+                                  collect (cons expression
+                                                (list (pg-class-toast table) value snapshot values)))))
+                      (row (htup-values (materialize-select-tuple table tuple snapshot :demand demand)))
+                      (origins (and capture-p (htup-origins tuple))))
+                 (return
+                   (values (if (getf relation :join-order-base)
+                               (make-select-relation-environment relations relation row)
+                               row)
+                           t
+                           (if (getf relation :join-order-base)
+                               (make-select-relation-origins relations relation origins)
+                               origins)
+                           toast-context))))
+             (close-sql-iterator page-reader)
+             (setf page-reader nil)))
          (when (or source (>= block nblocks)) (return (values nil nil)))
-         (let ((page (buf-read (pg-class-relfilenode table) block)))
+         (let* ((current block)
+                (page (buf-read (pg-class-relfilenode table) current)))
+           (incf block)
            (when page
-             (heapam-scan-page page block (pg-class-columns table) snapshot
-                               (lambda (tuple)
-                                 (materialize-select-tuple table tuple snapshot)
-                                 (push (if capture-p
-                                           (cons (htup-values tuple) (htup-origins tuple))
-                                           (htup-values tuple))
-                                       rows)))))
-         (incf block)
-         (setf rows (nreverse rows))))
-     (lambda () (setf rows nil)))))
+             (setf page-reader (make-visible-heap-page-iterator
+                                page current (pg-class-columns table) snapshot))))))
+     (lambda ()
+       (unwind-protect (close-sql-iterator page-reader)
+         (setf rows nil page-reader nil))))))
 
 (defun make-append-sql-iterator (arms relations)
   (let ((remaining arms) (input nil) (coercions nil))
@@ -264,19 +355,45 @@
                  (incf (plan-node-metadata-actual-loops metadata))
                  (setf started-p t)))
              (unwind-protect
-                  (multiple-value-bind (row present origins) (sql-iterator-next input)
+                  (multiple-value-bind (row present origins toast-context) (sql-iterator-next input)
                     (when (and started present)
                       (incf (plan-node-metadata-actual-row-count metadata))
                       (setf (plan-node-metadata-actual-rows metadata)
                             (/ (plan-node-metadata-actual-row-count metadata)
                                (plan-node-metadata-actual-loops metadata))))
-                    (values row present origins))
+                    (values row present origins toast-context))
                (when started
                  (let ((elapsed (- (get-internal-real-time) started)))
                    (incf (plan-node-metadata-actual-total-time-ticks metadata) elapsed)
                    (when first-p
                      (incf (plan-node-metadata-actual-startup-time-ticks metadata) elapsed)))))))
          (lambda () (close-sql-iterator input))))))
+
+(defun make-resumable-query-plan-iterator (plan relations)
+  ;; Restore the plan's TOAST demand and instrumentation context for each pull;
+  ;; the caller owns the returned iterator and closes it when the plan ends.
+  (let* ((physical (query-plan-physical plan))
+         (slice-plan (simple-select-toast-slice physical relations))
+         (demand (or (simple-select-toast-demand physical relations)
+                     (aggregate-toast-demand physical relations))))
+    (when (and slice-plan demand)
+      (setf demand (cons (car demand)
+                         (set-difference (cdr demand)
+                                         (mapcar #'cdr (cdr slice-plan))))))
+    (let* ((*select-toast-demand* demand)
+           (*select-toast-slice-plan* slice-plan)
+           (*toast-slice-current* nil)
+           (*cte-active-plan* plan)
+           (input (make-physical-plan-iterator physical relations)))
+      (make-sql-iterator
+       (lambda ()
+         (let ((*select-toast-demand* demand)
+               (*select-toast-slice-plan* slice-plan)
+               (*toast-slice-current* nil)
+               (*cte-active-plan* plan))
+           (multiple-value-bind (row present origins) (sql-iterator-next input)
+             (values row present origins))))
+       (lambda () (close-sql-iterator input))))))
 
 (defun %make-physical-plan-iterator (node relations)
   (case (first node)
@@ -311,7 +428,8 @@
     (:filter
      (make-mapping-sql-iterator
       (make-physical-plan-iterator (third node) relations)
-      (lambda (row) (values row (true-p (eval-expr (second node) row)) *query-row-origins*))))
+      (lambda (row) (values row (true-p (eval-expr (second node) row)) *query-row-origins*))
+      :preserve-toast-context t))
     (:project
      (make-mapping-sql-iterator
       (make-physical-plan-iterator (third node) relations)
