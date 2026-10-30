@@ -425,9 +425,12 @@ unsolicited EOF, which is a protocol violation."
 (defvar *physical-libpq-channels-lock*
   (sb-thread:make-mutex :name "libpq helper capacity"))
 
+(defconstant +physical-libpq-channel-limit+ 3
+  "One receiver, one transition and one asynchronous retirement may overlap.")
+
 (defun physical-libpq-reserve-channel ()
   (sb-thread:with-mutex (*physical-libpq-channels-lock*)
-    (when (>= (hash-table-count *physical-libpq-channels*) 2)
+    (when (>= (hash-table-count *physical-libpq-channels*) +physical-libpq-channel-limit+)
       (error "libpq helper capacity exhausted"))
     (let ((channel (%make-physical-libpq-channel :owner sb-thread:*current-thread*)))
       (setf (gethash channel *physical-libpq-channels*) t)
@@ -574,7 +577,7 @@ On failure or timeout, close the channel instead of reusing a partial exchange."
                                 (value "dbname") (value "user")))))
 
 (defun physical-libpq-open-channel (helper &key on-spawn)
-  "Reserve one of two slots, spawn HELPER, and verify its identity and hello.
+  "Reserve a bounded slot, spawn HELPER, and verify its identity and hello.
 Ownership assumes RUN-PROGRAM returns normally. This project installs no process
 status hooks; an unrelated hook that throws before RUN-PROGRAM returns is not
 supported. A failed open attempts to close the reserved channel."

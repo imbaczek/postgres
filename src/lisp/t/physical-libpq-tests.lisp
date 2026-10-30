@@ -632,16 +632,53 @@
 
 (deftest physical-libpq-capacity-is-returned-only-after-close
     (let ((first (pg::physical-libpq-reserve-channel))
-          (second nil))
+          (second nil) (third nil))
       (unwind-protect
            (progn
-             (setf second (pg::physical-libpq-reserve-channel))
+             (setf second (pg::physical-libpq-reserve-channel)
+                   third (pg::physical-libpq-reserve-channel))
+             (pg::physical-libpq-stop third)
              (ok (intake-fails-p #'pg::physical-libpq-reserve-channel))
              (pg::physical-libpq-close second)
              (setf second (pg::physical-libpq-reserve-channel))
              (ok second))
+        (when third (pg::physical-libpq-close third))
         (when second (pg::physical-libpq-close second))
         (pg::physical-libpq-close first))))
+
+(deftest physical-libpq-admits-receiver-cleanup-and-transition-concurrently
+    (let ((ready (sb-thread:make-semaphore :count 0))
+          (release (sb-thread:make-semaphore :count 0))
+          (channels (make-array 3 :initial-element nil))
+          (errors (make-array 3 :initial-element nil))
+          (threads nil))
+      (unwind-protect
+           (progn
+             (dotimes (index 3)
+               (let ((slot index))
+                 (push (sb-thread:make-thread
+                        (lambda ()
+                          (let ((channel nil))
+                            (unwind-protect
+                                 (handler-case
+                                     (progn
+                                       (setf channel (pg::physical-libpq-reserve-channel)
+                                             (aref channels slot) channel)
+                                       (sb-thread:signal-semaphore ready)
+                                       (sb-thread:wait-on-semaphore release))
+                                   (error (condition)
+                                     (setf (aref errors slot) condition)
+                                     (sb-thread:signal-semaphore ready)))
+                              (when channel (pg::physical-libpq-close channel)))))
+                        :name (nth slot '("test receiver" "test cleanup" "test transition")))
+                       threads)))
+             (dotimes (index 3)
+               (ok (sb-thread:wait-on-semaphore ready :timeout 5)))
+             (ok (every #'null errors))
+             (ok (every #'identity channels))
+             (ok (intake-fails-p #'pg::physical-libpq-reserve-channel)))
+        (sb-thread:signal-semaphore release 3)
+        (dolist (thread threads) (sb-thread:join-thread thread)))))
 
 (deftest physical-libpq-deadline-kills-and-reaps-owned-helper
     (call-with-owned-libpq-test-process
