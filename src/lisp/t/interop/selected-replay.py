@@ -295,6 +295,39 @@ def exercise_managed_restart(peer, socket_identity, sibling):
     return peer, socket_identity, sibling
 
 
+def exercise_public_slot(peer, socket_identity, sibling, source):
+    assert os.environ.get("FOLLOW_LIBPQ") == "1"
+
+    def attach(slot):
+        form = retarget_form(source_port, "public_trial")
+        value = "nil" if slot is None else lisp_string(slot)
+        control("sibling.sock", form[:-1] + f" :slot {value})")
+        wait(lambda: query(sibling, "SELECT status,slot_name FROM pg_stat_get_wal_receiver()")
+             == [("streaming", slot)])
+
+    for slot in ("public_trial_a", "public_trial_b"):
+        query(source, f"SELECT pg_create_physical_replication_slot('{slot}',true)")
+    attach("public_trial_a")
+    wait(lambda: query(source, "SELECT active FROM pg_replication_slots WHERE slot_name='public_trial_a'") == [(True,)])
+    control("sibling.sock", '(assert (not (equal (fourth (physical-follow-read-config)) (physical-follow-config-public-slot (physical-follow-read-config)))))')
+    accepted = control("sibling.sock", '(physical-follow-effective-config (physical-follow-read-config))')
+    sibling.close()
+    assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
+    peer, socket_identity = start_peer()
+    sibling = connect(replica_port)
+    wait(lambda: query(sibling, "SELECT status,slot_name FROM pg_stat_get_wal_receiver()")
+         == [("streaming", "public_trial_a")])
+    assert accepted == control("sibling.sock", '(physical-follow-effective-config (physical-follow-read-config))')
+    attach("public_trial_b")
+    wait(lambda: query(source, "SELECT slot_name,active FROM pg_replication_slots WHERE slot_name IN ('public_trial_a','public_trial_b') ORDER BY slot_name")
+         == [("public_trial_a", False), ("public_trial_b", True)])
+    attach(None)
+    wait(lambda: query(source, "SELECT slot_name,active FROM pg_replication_slots WHERE slot_name IN ('public_trial_a','public_trial_b') ORDER BY slot_name")
+         == [("public_trial_a", False), ("public_trial_b", False)])
+    print("follow-controller: public slot START, SQL telemetry, cold reconnect, replacement and explicit clear PASS", flush=True)
+    return peer, socket_identity, sibling
+
+
 def observed_application(endpoint, expected):
     form = (f'(if (= 1 (count {lisp_string(expected)} (list-backends) '
             ":key #'backend-application-name :test #'equal)) :observed :waiting)")
@@ -440,6 +473,9 @@ try:
         connections.append(sibling)
         if os.environ.get("FOLLOW_MANAGED_STARTUP") == "1":
             peer, socket_identity, sibling = exercise_managed_restart(peer, socket_identity, sibling)
+            connections.append(sibling)
+        if os.environ.get("FOLLOW_PUBLIC_SLOT") == "1":
+            peer, socket_identity, sibling = exercise_public_slot(peer, socket_identity, sibling, source)
             connections.append(sibling)
     else:
         control("sibling.sock", f'(physical-follow-start "127.0.0.1" {source_port} "sibling_seed")')
