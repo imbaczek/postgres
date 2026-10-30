@@ -91,6 +91,165 @@
         (when pg::*wal-output-stream* (close pg::*wal-output-stream*))
         (when pg::*clog-stream* (close pg::*clog-stream*))))))
 
+(defun call-with-resource-wal-fixture (function)
+  (let ((pg::*wal-control-metadata* nil) (pg::*wal-insert-timeline* 1)
+                                         (pg::*wal-checkpoint-timeline* 1) (pg::*wal-segment-namespace* :legacy)
+                                         (pg::*wal-resource-parameters-test-hook* nil))
+    (call-with-wal-allocation-fixture
+     (lambda ()
+       (setf pg::*wal-control-metadata* (pg::make-wal-control-metadata 42 4 0))
+       (pg::wal-save-control-fields 0 0)
+       (funcall function)))))
+
+(deftest primary-resource-report-flushes-before-publication-and-skips-unchanged-values
+    (call-with-resource-wal-fixture
+     (lambda ()
+       (let* ((parameters (pg::make-resource-parameters 100 8 10 0 128))
+              (events nil)
+              (pg::*wal-resource-parameters-test-hook*
+                (lambda (point end)
+                  (let ((metadata (nth-value 6 (pg::wal-read-control-fields))))
+                    (push point events)
+                    (ok (= 96 end pg::*wal-durable-lsn*))
+                    (if (eq point :after-wal-flush)
+                        (ok (null (getf metadata :resource-parameters)))
+                        (ok (equal '(100 8 10 0 128) (getf metadata :resource-parameters))))))))
+         (ok (= 96 (pg::wal-report-resource-parameters parameters)))
+         (ok (equal '(:after-control-save :after-wal-flush) events))
+         (ok (= 96 (pg::wal-report-resource-parameters parameters)))
+         (ok (= 2 (length events)))
+         (let ((records nil))
+           (pg::wal-scan (lambda (record) (push record records)))
+           (ok (equal '(6 16) (mapcar #'pg::wal-record-type (nreverse records)))))
+         (ok (= 96 (getf pg::*wal-control-metadata* :resource-lsn)))
+         (ok (= 1 (getf pg::*wal-control-metadata* :resource-timeline)))))))
+
+(deftest primary-resource-report-crash-gap-is-repaired-from-flushed-wal
+    (dolist (point '(:after-wal-flush :after-control-save))
+      (call-with-resource-wal-fixture
+       (lambda ()
+         (let ((pg::*wal-resource-parameters-test-hook*
+                 (lambda (stage end)
+                   (declare (ignore end))
+                   (when (eq stage point) (error "injected resource publication failure")))))
+           (ok (intake-fails-p
+                (lambda () (pg::wal-report-resource-parameters
+                            (pg::make-resource-parameters 100 8 10 0 128))))))
+         (ok pg::*wal-poisoned*)
+         (ok (= 96 pg::*wal-durable-lsn*))
+         (close pg::*wal-output-stream*) (setf pg::*wal-output-stream* nil)
+         (close pg::*clog-stream*) (setf pg::*clog-stream* nil)
+         (pg::wal-init) (pg::xact-init) (pg::wal-recover)
+         (ok (not pg::*wal-poisoned*))
+         (ok (equal '(100 8 10 0 128) (getf pg::*wal-control-metadata* :resource-parameters)))
+         (ok (= 96 (getf (nth-value 6 (pg::wal-read-control-fields)) :resource-lsn)))))))
+
+(deftest primary-resource-report-nonlocal-exit-fences-further-writes
+    (call-with-resource-wal-fixture
+     (lambda ()
+       (let ((pg::*wal-resource-parameters-test-hook*
+               (lambda (point end)
+                 (declare (ignore end))
+                 (when (eq point :after-wal-flush) (throw 'abandoned :abandoned)))))
+         (ok (eq :abandoned
+                 (catch 'abandoned
+                   (pg::wal-report-resource-parameters (pg::make-resource-parameters 100 8 10 0 128))))))
+       (ok pg::*wal-poisoned*)
+       (ok (null (getf pg::*wal-control-metadata* :resource-parameters)))
+       (ok (intake-fails-p
+            (lambda () (pg::wal-report-resource-parameters (pg::make-resource-parameters 100 8 10 0 128))))))))
+
+(deftest primary-resource-recovery-restores-the-latest-tuple-including-decreases
+    (call-with-resource-wal-fixture
+     (lambda ()
+       (dolist (values '((100 8 10 0 128) (200 16 20 4 256) (50 4 5 0 64)))
+         (pg::wal-report-resource-parameters (apply #'pg::make-resource-parameters values)))
+       (ok (zerop pg::*wal-checkpoint-lsn*))
+       (ok (= 288 (getf pg::*wal-control-metadata* :resource-lsn)))
+       (close pg::*wal-output-stream*) (setf pg::*wal-output-stream* nil)
+       (close pg::*clog-stream*) (setf pg::*clog-stream* nil)
+       (pg::wal-init) (pg::xact-init) (pg::wal-recover)
+       (ok (equal '(50 4 5 0 64) (getf pg::*wal-control-metadata* :resource-parameters)))
+       (ok (= 288 (pg::wal-report-resource-parameters (pg::make-resource-parameters 50 4 5 0 64))))
+       (ok (= 288 pg::*wal-end-lsn*)))))
+
+(deftest primary-resource-publication-readback-failure-keeps-old-memory-and-fences-writes
+    (call-with-resource-wal-fixture
+     (lambda ()
+       (let ((read-control (symbol-function 'pg::wal-read-control-fields))
+             (prior (copy-list pg::*wal-control-metadata*)))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::wal-read-control-fields)
+                      (lambda () (values 0 0 nil 1 1 :legacy prior)))
+                (ok (intake-fails-p
+                     (lambda () (pg::wal-report-resource-parameters
+                                 (pg::make-resource-parameters 100 8 10 0 128)))))
+                (ok pg::*wal-poisoned*)
+                (ok (equal prior pg::*wal-control-metadata*)))
+           (setf (symbol-function 'pg::wal-read-control-fields) read-control)))
+       (ok (equal '(100 8 10 0 128)
+                  (getf (nth-value 6 (pg::wal-read-control-fields)) :resource-parameters))))))
+
+(deftest primary-resource-report-ordinary-refusals-do-not-start-a-wal-batch
+    (call-with-resource-wal-fixture
+     (lambda ()
+       (ok (intake-fails-p (lambda () (pg::wal-report-resource-parameters nil))))
+       (let ((pg::*wal-ready* nil))
+         (ok (intake-fails-p
+              (lambda () (pg::wal-report-resource-parameters (pg::make-resource-parameters 100 8 10 0 128))))))
+       (ok (not pg::*wal-poisoned*))
+       (ok (= 0 pg::*wal-end-lsn* pg::*wal-durable-lsn*)))))
+
+(deftest logical-reader-validates-resource-records-without-publishing-applied-facts
+    (dolist (mixed '(nil t))
+      (call-with-resource-wal-fixture
+       (lambda ()
+         (let* ((owner (gensym "RESOURCE-READER"))
+                (pg::*wal-logical-slot-owner* owner)
+                (pg::*wal-logical-slot-read-progress* nil)
+                (slot (pg::make-wal-replication-slot
+                       :name "resource" :database-oid 1 :restart-lsn 0
+                       :consistent-lsn 0 :confirmed-flush-lsn 0 :active-owner owner)))
+           (setf (gethash "resource" pg::*wal-replication-slots*) slot)
+           (pg::wal-append-batch-start)
+           (when mixed
+             (pg::wal-append-record pg::+wal-record-pages+ 0 (pg::wal-encode-page-images nil 0)))
+           (pg::wal-append-record pg::+wal-record-parameter-change+ 0
+                                  (pg::wal-encode-resource-parameters
+                                   (pg::make-resource-parameters 100 8 10 0 128)))
+           (pg::wal-flush)
+           (if mixed
+               (ok (intake-fails-p (lambda () (pg::wal-logical-slot-read-transactions "resource"))))
+               (multiple-value-bind (transactions progress)
+                   (pg::wal-logical-slot-read-transactions "resource")
+                 (ok (null transactions))
+                 (ok (= progress pg::*wal-durable-lsn*))))
+           (ok (null (getf pg::*wal-control-metadata* :resource-parameters))))))))
+
+(deftest resource-resume-boundary-rejects-mixed-malformed-and-unstarted-metadata
+    (dolist (mode '(:valid :mixed :malformed :unstarted :invalid-marker))
+      (call-with-resource-wal-fixture
+       (lambda ()
+         (let ((slot (pg::make-wal-replication-slot :name "resource" :database-oid 1 :restart-lsn 0
+                                                    :consistent-lsn 0 :confirmed-flush-lsn 0))
+               (payload (pg::wal-encode-resource-parameters (pg::make-resource-parameters 100 8 10 0 128))))
+           (unless (eq mode :unstarted)
+             (if (eq mode :invalid-marker)
+                 (pg::wal-append-record pg::+wal-record-batch-start+ 3
+                                        (make-array 0 :element-type '(unsigned-byte 8)))
+                 (pg::wal-append-batch-start)))
+           (when (eq mode :mixed)
+             (pg::wal-append-record pg::+wal-record-pages+ 0 (pg::wal-encode-page-images nil 0)))
+           (when (eq mode :malformed) (setf (aref payload 28) 1))
+           (pg::wal-append-record pg::+wal-record-parameter-change+ 0 payload)
+           (pg::wal-flush)
+           (if (eq mode :valid)
+               (ok (pg::wal-slot-terminal-ack-p slot pg::*wal-durable-lsn*))
+               (ok (intake-fails-p
+                    (lambda () (pg::wal-slot-terminal-ack-p slot pg::*wal-durable-lsn*)))))
+           (ok (null (getf pg::*wal-control-metadata* :resource-parameters))))))))
+
 (deftest xid-allocation-flushes-reservation-once-before-using-capacity
     (call-with-wal-allocation-fixture
      (lambda ()

@@ -120,3 +120,102 @@ capacity is twice N. The default autovacuum slot count is 16."
           do (setf (aref bytes index)
                    (parse-integer text :start (* index 2) :end (+ (* index 2) 2) :radix 16)))
     (wal-decode-resource-parameters bytes)))
+
+(defun wal-parameter-change-record-info (record)
+  (unless (and (= (wal-record-type record) +wal-record-parameter-change+)
+               (>= (wal-record-version record) 8)
+               (zerop (wal-record-xid record))
+               (typep (wal-record-start record) '(unsigned-byte 64))
+               (typep (wal-record-end record) '(unsigned-byte 64))
+               (= (wal-record-end record)
+                  (+ (wal-record-start record) +wal-header-size+
+                     (length (wal-record-payload record))))
+               (> (wal-record-end record) (wal-record-start record))
+               (= (floor (wal-record-start record) +wal-segment-size+)
+                  (floor (1- (wal-record-end record)) +wal-segment-size+)))
+    (error "invalid native parameter change record"))
+  (wal-decode-resource-parameters (wal-record-payload record)))
+
+(declaim (ftype function wal-save-control-fields wal-read-control-fields
+                wal-control-metadata-valid-p wal-control-resource-parameters))
+
+(defvar *wal-resource-parameters-test-hook* nil)
+
+(defun wal-resource-parameters-test-point (point end)
+  (when *wal-resource-parameters-test-hook*
+    (funcall *wal-resource-parameters-test-hook* point end)))
+
+(defun wal-publish-resource-parameters-under-lock (parameters end timeline)
+  (unless (and (wal-control-metadata-valid-p *wal-control-metadata*)
+               (resource-parameters-valid-p parameters)
+               (typep end '(integer 1 18446744073709551615))
+               (<= end *wal-durable-lsn*)
+               (eql timeline *wal-insert-timeline*))
+    (error "invalid primary resource publication"))
+  (let ((published
+          (let ((*wal-control-metadata*
+                  (append
+                   (loop for (key value) on *wal-control-metadata* by #'cddr
+                         unless (member key '(:resource-parameters :resource-lsn :resource-timeline))
+                           append (list key value))
+                   (list :resource-parameters (resource-parameters-values parameters)
+                         :resource-lsn end :resource-timeline timeline))))
+            (wal-save-control-fields *wal-checkpoint-lsn* *wal-durable-lsn*)
+            (let ((actual (multiple-value-list (wal-read-control-fields))))
+              (unless (equal actual
+                             (list *wal-checkpoint-lsn* *wal-durable-lsn*
+                                   *wal-checkpoint-snapshot* *wal-insert-timeline*
+                                   *wal-checkpoint-timeline* *wal-segment-namespace*
+                                   *wal-control-metadata*))
+                (error "resource control readback differs from published image"))
+              (seventh actual)))))
+    (setf *wal-control-metadata* published))
+  (values))
+
+(defun wal-report-resource-parameters (parameters)
+  (prevent-recovery-primary-operation "primary resource reporting")
+  (unless (resource-parameters-valid-p parameters) (error "invalid resource parameters"))
+  (let ((started nil) (completed nil) (failure nil) (result nil))
+    (unwind-protect
+         (sb-thread:with-mutex (*wal-lock*)
+           (wal-check-healthy)
+           (unless (and *wal-ready* (wal-control-metadata-valid-p *wal-control-metadata*))
+             (error "primary control identity is not initialized"))
+           (if (equal (resource-parameters-values parameters)
+                      (getf *wal-control-metadata* :resource-parameters))
+               (setf result (getf *wal-control-metadata* :resource-lsn))
+               (progn
+                 (unwind-protect
+                      (handler-case
+                          (progn
+                            (setf started t)
+                            (wal-append-batch-start)
+                            (wal-append-record +wal-record-parameter-change+ 0
+                                               (wal-encode-resource-parameters parameters))
+                            (wal-flush)
+                            (wal-resource-parameters-test-point :after-wal-flush *wal-end-lsn*)
+                            (wal-publish-resource-parameters-under-lock
+                             parameters *wal-end-lsn* *wal-insert-timeline*)
+                            (wal-resource-parameters-test-point :after-control-save *wal-end-lsn*)
+                            (setf result *wal-end-lsn* completed t))
+                        (error (condition) (setf failure condition)))
+                   (unless completed (setf *wal-poisoned* t))))))
+      (when (and started (not completed) (not failure))
+        (when (fboundp 'request-fast-shutdown)
+          (ignore-errors (funcall (symbol-function 'request-fast-shutdown))))))
+    (when failure (wal-fail-stop failure))
+    result))
+
+(defun wal-recover-resource-parameters (record)
+  (let* ((parameters (wal-parameter-change-record-info record))
+         (end (wal-record-end record))
+         (prior (getf *wal-control-metadata* :resource-lsn)))
+    (cond
+      ((or (null prior) (> end prior))
+       (wal-publish-resource-parameters-under-lock parameters end *wal-insert-timeline*))
+      ((= end prior)
+       (unless (and (eql *wal-insert-timeline* (getf *wal-control-metadata* :resource-timeline))
+                    (equal (resource-parameters-values parameters)
+                           (getf *wal-control-metadata* :resource-parameters)))
+         (error "resource WAL differs from control at its published position")))))
+  (values))

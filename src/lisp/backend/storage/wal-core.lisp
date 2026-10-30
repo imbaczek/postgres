@@ -25,6 +25,10 @@
 
 (defconstant +wal-record-running-xacts+ 14)
 
+(defconstant +wal-record-parameter-change+ 16)
+
+(declaim (ftype function wal-parameter-change-record-info wal-recover-resource-parameters))
+
 (declaim (ftype function wal-running-xacts-record-info
                 wal-append-running-xacts-under-lock))
 
@@ -1719,6 +1723,7 @@ Follow a symlink at the WAL directory itself. Enumeration errors are reported."
                               +wal-record-catalog-commit+
                               +wal-record-maintenance+))
            (and (= type +wal-record-relation-reset+) (>= version 8))
+           (and (= type +wal-record-parameter-change+) (>= version 8))
            (and (= type +wal-record-xid-reservation+) (>= version +wal-version-v7+))
            (and (= type +wal-record-running-xacts+) (>= version 7))
            (and (= type +wal-record-end-of-recovery+) (>= version 7))
@@ -2059,6 +2064,10 @@ src/backend/access/transam/xlogreader.c."
        (error "logical changes are attached to an unsupported WAL terminal"))))
   (values))
 
+(defun wal-empty-metadata-terminal-type-p (type)
+  (member type (list +wal-record-running-xacts+ +wal-record-xid-reservation+
+                     +wal-record-parameter-change+) :test #'=))
+
 (defun wal-note-recovery-batch-record (record)
   "Allocation and running-transaction terminals require an empty batch marker."
   (wal-require-ordinary-record-type (wal-record-type record))
@@ -2068,8 +2077,29 @@ src/backend/access/transam/xlogreader.c."
        (unless (and (zerop (wal-record-xid record)) (zerop (length (wal-record-payload record))))
          (error "invalid WAL batch-start marker"))
        (setf *wal-recovery-reservation-batch-clean-p* t))
-      ((not (member type (list +wal-record-xid-reservation+ +wal-record-running-xacts+)))
+      ((not (wal-empty-metadata-terminal-type-p type))
        (setf *wal-recovery-reservation-batch-clean-p* nil)))))
+
+(defun wal-validate-empty-metadata-terminal (record clean-p)
+  (unless clean-p
+    (error "metadata terminal must be the sole record after its batch marker"))
+  (let ((type (wal-record-type record)))
+    (cond
+      ((= type +wal-record-running-xacts+) (wal-running-xacts-record-info record))
+      ((= type +wal-record-parameter-change+) (wal-parameter-change-record-info record))
+      ((= type +wal-record-xid-reservation+) (wal-xid-reservation-record-bound record))
+      (t (error "unsupported empty metadata terminal")))))
+
+(defun wal-replay-empty-metadata-terminal (record)
+  (wal-recovery-validate-logical-terminal :other)
+  (let* ((decoded (wal-validate-empty-metadata-terminal
+                   record *wal-recovery-reservation-batch-clean-p*))
+         (apply-function
+           (if (= (wal-record-type record) +wal-record-xid-reservation+)
+               (lambda ()
+                 (unless (recovery-in-progress-p) (xid-restore-reservation-floor decoded)))
+               #'values)))
+    (wal-replay-finish-batch (lambda () apply-function))))
 
 (defun wal-replay-record (record)
   (when (> (wal-record-end record) *wal-checkpoint-lsn*)
@@ -2167,21 +2197,8 @@ src/backend/access/transam/xlogreader.c."
        (wal-recovery-validate-logical-terminal :other)
        (wal-checkpoint-record-snapshot record)
        (wal-replay-finish-batch (lambda () #'values)))
-      ((= (wal-record-type record) +wal-record-running-xacts+)
-       (wal-recovery-validate-logical-terminal :other)
-       (unless *wal-recovery-reservation-batch-clean-p*
-         (error "running transaction snapshot requires an empty metadata batch"))
-       (wal-running-xacts-record-info record)
-       (wal-replay-finish-batch (lambda () #'values)))
-      ((= (wal-record-type record) +wal-record-xid-reservation+)
-       (wal-recovery-validate-logical-terminal :other)
-       (unless *wal-recovery-reservation-batch-clean-p*
-         (error "XID reservation must be the sole record after its batch marker"))
-       (let ((bound (wal-xid-reservation-record-bound record)))
-         (wal-replay-finish-batch
-          (lambda ()
-            (lambda ()
-              (unless (recovery-in-progress-p) (xid-restore-reservation-floor bound)))))))
+      ((wal-empty-metadata-terminal-type-p (wal-record-type record))
+       (wal-replay-empty-metadata-terminal record))
       ((= (wal-record-type record) +wal-record-maintenance+)
        (wal-recovery-validate-logical-terminal :other)
        (unless (zerop (wal-record-xid record))
@@ -2218,8 +2235,16 @@ src/backend/access/transam/xlogreader.c."
 
 (defun wal-recover ()
   "Redo durable complete batches before loading the catalog."
-  (let ((*wal-recovery-page-spool-enabled* t))
-    (with-wal-replay-staging () (wal-scan #'wal-replay-record)))
+  (let ((*wal-recovery-page-spool-enabled* t)
+        (resource-record nil))
+    (with-wal-replay-staging ()
+      (wal-scan (lambda (record)
+                  (wal-replay-record record)
+                  (when (and (> (wal-record-end record) *wal-checkpoint-lsn*)
+                             (= (wal-record-type record) +wal-record-parameter-change+))
+                    (setf resource-record record)))))
+    (when resource-record
+      (with-wal-critical (wal-recover-resource-parameters resource-record))))
   (clog-fsync)
   (values))
 
@@ -2499,17 +2524,22 @@ as in C's metadata calculation. Lost slots remain lost."
   (member type (list +wal-record-commit+ +wal-record-catalog+
                      +wal-record-catalog-commit+ +wal-record-checkpoint+
                      +wal-record-maintenance+ +wal-record-clog-reset+ +wal-record-xid-reservation+
-                     +wal-record-running-xacts+)
+                     +wal-record-running-xacts+ +wal-record-parameter-change+)
           :test #'=))
 
 (defun wal-slot-terminal-ack-p (slot target-lsn)
-  (let ((batch-open nil)
+  (let ((*wal-recovery-reservation-batch-clean-p* nil)
+        (batch-open nil)
         (found nil)
         (scan-from-lsn (or (wal-replication-slot-confirmed-flush-lsn slot)
                            (wal-replication-slot-consistent-lsn slot)
                            (wal-replication-slot-restart-lsn slot))))
     (wal-scan
      (lambda (record)
+       (wal-note-recovery-batch-record record)
+       (when (wal-empty-metadata-terminal-type-p (wal-record-type record))
+         (wal-validate-empty-metadata-terminal
+          record (and batch-open *wal-recovery-reservation-batch-clean-p*)))
        (cond
          ((= (wal-record-type record) +wal-record-batch-start+)
           (setf batch-open t))
@@ -2518,7 +2548,7 @@ as in C's metadata calculation. Lost slots remain lost."
                      (wal-terminal-record-type-p (wal-record-type record)))
             (when (= (wal-record-end record) target-lsn)
               (setf found t))
-            (setf batch-open nil))))
+            (setf batch-open nil *wal-recovery-reservation-batch-clean-p* nil))))
        (when (or found (>= (wal-record-end record) target-lsn))
          :stop))
      ;; LogicalConfirmReceivedLocation() in src/backend/replication/logical/logical.c

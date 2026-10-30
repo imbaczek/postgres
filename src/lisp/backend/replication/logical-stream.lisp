@@ -1594,14 +1594,8 @@ executor, so capture the same operation before transaction commit."
          (row-change-p (or (logical-reader-state-row-p state)
                            (some (lambda (change) (member (logical-change-kind change)
                                                           '(:insert :update :delete :truncate))) changes))))
-    (when (= record-type +wal-record-running-xacts+)
-      (unless *wal-recovery-reservation-batch-clean-p*
-        (error "logical reader running snapshot requires an empty metadata batch"))
-      (wal-running-xacts-record-info record))
-    (when (= record-type +wal-record-xid-reservation+)
-      (unless *wal-recovery-reservation-batch-clean-p*
-        (error "logical reader reservation is not the sole record after its batch marker"))
-      (wal-xid-reservation-record-bound record))
+    (when (wal-empty-metadata-terminal-type-p record-type)
+      (wal-validate-empty-metadata-terminal record *wal-recovery-reservation-batch-clean-p*))
     (cond
       ((= record-type +wal-record-commit+)
        (when (logical-reader-state-fragment-batch state)

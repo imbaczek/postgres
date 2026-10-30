@@ -140,14 +140,8 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
         identity removed))
       (t
        (wal-recovery-validate-logical-terminal :other)
-       (cond ((= type +wal-record-running-xacts+)
-              (unless *wal-recovery-reservation-batch-clean-p*
-                (error "running transaction snapshot cannot finish a nonempty batch"))
-              (wal-running-xacts-record-info record))
-             ((= type +wal-record-xid-reservation+)
-              (unless *wal-recovery-reservation-batch-clean-p*
-                (error "reservation cannot finish a nonempty batch in history"))
-              (wal-xid-reservation-record-bound record))
+       (cond ((wal-empty-metadata-terminal-type-p type)
+              (wal-validate-empty-metadata-terminal record *wal-recovery-reservation-batch-clean-p*))
              ((= type +wal-record-clog-reset+) (wal-read-u64-payload payload))
              ((= type +wal-record-checkpoint+) (wal-checkpoint-record-snapshot record))
              ((not (and (zerop (length payload)) (zerop (wal-record-xid record))))

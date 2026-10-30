@@ -210,3 +210,55 @@
                  (rove:ok (= 100 (first (getf metadata :resource-parameters))))
                  (rove:ok (= 100 (first (getf (nth-value 6 (wal-read-control-fields)) :resource-parameters))))))
           (setf (symbol-function 'wal-control-path) control-path)))))
+
+(defun resource-parameter-test-record (&key (start 32) (version 8) (xid 0)
+                                         (type 16) (values '(100 8 10 0 128)))
+  (let ((payload (wal-encode-resource-parameters (resource-parameters-from-values values))))
+    (make-wal-record :version version :type type :xid xid :start start
+                     :end (+ start +wal-header-size+ (length payload)) :payload payload)))
+
+(rove:deftest parameter-change-record-has-a-strict-empty-metadata-shape
+    (let ((record (resource-parameter-test-record)))
+      (rove:ok (wal-valid-type-p 16 8))
+      (rove:ok (not (wal-valid-type-p 16 7)))
+      (rove:ok (wal-terminal-record-type-p 16))
+      (rove:ok (equal '(100 8 10 0 128)
+                      (resource-parameters-values (wal-parameter-change-record-info record))))
+      (dolist (bad (list (resource-parameter-test-record :version 7)
+                         (resource-parameter-test-record :type 14)
+                         (resource-parameter-test-record :xid 3)
+                         (resource-parameter-test-record :start (- +wal-segment-size+ 48))))
+        (rove:ok (resource-parameters-test-error-p
+                  (lambda () (wal-parameter-change-record-info bad)))))
+      (incf (wal-record-end record))
+      (rove:ok (resource-parameters-test-error-p
+                (lambda () (wal-parameter-change-record-info record))))))
+
+(rove:deftest parameter-change-redo-requires-a-separate-complete-batch
+    (let ((*wal-checkpoint-lsn* 0)
+          (*wal-control-metadata* (make-wal-control-metadata 42 4 0))
+          (record (resource-parameter-test-record)))
+      (with-wal-replay-staging ()
+        (rove:ok (resource-parameters-test-error-p (lambda () (wal-replay-record record)))))
+      (with-wal-replay-staging ()
+        (wal-replay-record (make-wal-record :version 8 :type +wal-record-batch-start+
+                                            :xid 0 :start 0 :end 32
+                                            :payload (make-array 0 :element-type '(unsigned-byte 8))))
+        (wal-replay-record record)
+        (rove:ok (not *wal-recovery-group-active*))
+        (rove:ok (null (getf *wal-control-metadata* :resource-parameters))))
+      (with-wal-replay-staging ()
+        (setf *wal-recovery-group-active* t *wal-recovery-reservation-batch-clean-p* nil)
+        (rove:ok (resource-parameters-test-error-p (lambda () (wal-replay-record record)))))))
+
+(rove:deftest parameter-change-history-validation-does-not-publish-resource-facts
+    (let ((*wal-control-metadata* (make-wal-control-metadata 42 4 0))
+          (record (resource-parameter-test-record)))
+      (with-wal-replay-staging ()
+        (physical-history-accept-record
+         (make-wal-record :version 8 :type +wal-record-batch-start+ :xid 0
+                          :start 0 :end 32 :payload (make-array 0 :element-type '(unsigned-byte 8)))
+         nil nil)
+        (physical-history-accept-record record nil nil)
+        (rove:ok (not *wal-recovery-group-active*))
+        (rove:ok (null (getf *wal-control-metadata* :resource-parameters))))))
