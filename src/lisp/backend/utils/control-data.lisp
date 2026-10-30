@@ -216,7 +216,10 @@ control stores ends."
            (time (getf metadata :state-time))
            (recovery-lsn 0) (recovery-timeline 0))
       (when (and (null control)
-                 (or (third capture) (fourth capture) (fifth capture) (seventh capture)))
+                 (or (third capture) (fourth capture) (fifth capture)
+                     (and (seventh capture)
+                          (not (physical-follow-cleanup-only-p
+                                (physical-follow-decode-config (seventh capture)))))))
         (error "native recovery metadata is incomplete: recovery control is missing"))
       (cond
         ((and (or (> insertion 1) (getf metadata :retained-reference))

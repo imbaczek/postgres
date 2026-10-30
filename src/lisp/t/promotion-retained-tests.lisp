@@ -1416,6 +1416,31 @@
                           (hash-table-count pg::*physical-retained-root-updates*)))))
        (ok (null (probe-file (merge-pathnames "postmaster.pid" target)))))))
 
+(deftest native-control-allows-only-checked-post-promotion-cleanup-follow
+    (handoff-test-committed
+     (lambda (root store reference)
+       (declare (ignore store reference))
+       (dolist (name '("recovery.required" "physical-backup.manifest"
+                       "physical-restartpoint.control" "physical-recovery.control"))
+         (let ((path (merge-pathnames name root)))
+           (when (probe-file path) (delete-file path))))
+       (let ((cleanup (list 1 nil nil nil nil
+                            (list :version 1 :enabled nil :preparing nil :cleanup nil))))
+         (pg::wal-atomic-write-bytes (pg::physical-follow-config-path)
+                                     (pg::physical-follow-config-image cleanup))
+         (let* ((before (pg::native-control-capture))
+                (facts (pg::native-control-read root)))
+           (ok (= 2 (getf facts :checkpoint-timeline)))
+           (ok (zerop (getf facts :recovery-timeline)))
+           (ok (equalp before (pg::native-control-capture)))))
+       (dolist (bytes (list (pg::physical-follow-config-image '(1 "127.0.0.1" 5433 "active"))
+                            (make-array 3 :element-type '(unsigned-byte 8)
+                                          :initial-contents '(1 2 3))))
+         (pg::wal-atomic-write-bytes (pg::physical-follow-config-path) bytes)
+         (let ((before (pg::native-control-capture)))
+           (ok (signals (pg::native-control-read root) 'error))
+           (ok (equalp before (pg::native-control-capture))))))))
+
 (deftest missing-child-recovery-control-cannot-select-primary
     (call-with-child-inspection-fixture
      (lambda (target manifest digest)
