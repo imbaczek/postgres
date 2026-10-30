@@ -19,6 +19,7 @@
     ("data_directory" :postmaster :string nil)
     ("cluster_name" :postmaster :string "")
     ("restore_command" :sighup :string "")
+    ("recovery_target_timeline" :postmaster :timeline "latest")
     ("hot_standby" :postmaster :boolean "on")
     ("max_connections" :postmaster :integer "100" 1 262143 nil)
     ("max_wal_senders" :postmaster :integer "10" 0 262143 nil)
@@ -37,6 +38,40 @@
   (text (* sb-alien:char)) (end (* (* sb-alien:char))))
 
 (sb-alien:define-alien-routine ("__errno_location" startup-errno-location) (* sb-alien:int))
+
+(sb-alien:define-alien-routine ("strtoull" startup-strtoull) sb-alien:unsigned-long-long
+  (text (* sb-alien:char)) (end (* (* sb-alien:char))) (base sb-alien:int))
+
+(defun startup-recovery-timeline-number (begin end)
+  (let ((address (sb-sys:find-foreign-symbol-address "__isoc23_strtoull")))
+    (setf (sb-alien:deref (startup-errno-location)) 0)
+    (if address
+        (sb-alien:alien-funcall
+         (sb-alien:sap-alien
+          (sb-sys:int-sap address)
+          (function sb-alien:unsigned-long-long
+                    (* sb-alien:char) (* (* sb-alien:char)) sb-alien:int))
+         begin end 0)
+        (startup-strtoull begin end 0))))
+
+(defun startup-parse-recovery-timeline (text)
+  (when (find (code-char 0) text) (error "NUL in recovery_target_timeline"))
+  (cond ((string= text "current") :current)
+        ((string= text "latest") :latest)
+        (t
+         (let ((bytes (concatenate '(vector (unsigned-byte 8)) (string->bytes text) #(0))))
+           (sb-sys:with-pinned-objects (bytes)
+             (sb-alien:with-alien ((end (* sb-alien:char)))
+               (let* ((begin (sb-alien:sap-alien (sb-sys:vector-sap bytes) (* sb-alien:char)))
+                      (errno (startup-errno-location)))
+                 (let* ((timeline (startup-recovery-timeline-number begin (sb-alien:addr end)))
+                        (offset (- (sb-sys:sap-int (sb-alien:alien-sap end))
+                                   (sb-sys:sap-int (sb-sys:vector-sap bytes)))))
+                   (unless (and (zerop (sb-alien:deref errno))
+                                (zerop (aref bytes offset))
+                                (<= 1 timeline 4294967295))
+                     (error "invalid recovery_target_timeline ~s" text))
+                   timeline))))))))
 
 (defun startup-numeric-prefix (text)
   "Use the same C numeric conversions as guc.c:parse_int, without Lisp READ."
@@ -137,6 +172,7 @@ even with a UTF-8 database. Other settings decode their input as UTF-8."
       (ecase (third spec)
         (:integer (startup-parse-integer-setting spec text))
         (:boolean (startup-parse-boolean-setting text))
+        (:timeline (startup-parse-recovery-timeline text) text)
         (:string
          (when (and (string= name "restore_command") (not (equal text "")))
            (error "nonempty restore_command requires unimplemented archive recovery"))
@@ -383,6 +419,12 @@ other values request configuration output. The last -C selects between these use
 (defun startup-setting-value (settings name)
   (getf (gethash name settings) :value))
 
+(defun startup-recovery-timeline-goal ()
+  (startup-parse-recovery-timeline
+   (or (when *startup-server-settings*
+         (startup-setting-value *startup-server-settings* "recovery_target_timeline"))
+       "latest")))
+
 (defun startup-default-settings (directory)
   (let ((settings (make-hash-table :test #'equal)))
     (dolist (spec *startup-setting-specs*)
@@ -505,9 +547,10 @@ hot_standby retain their active values until restart."
 (defun startup-reload-settings ()
   "Validate a fresh input tree before replacing active values under quiescence."
   (when *startup-server-settings*
-    (let ((candidate (startup-load-settings *startup-native-inputs* *startup-command-overrides* *pgdata*)))
+    (let ((candidate (startup-load-settings *startup-native-inputs* *startup-command-overrides* *pgdata*))
+          (defaults (startup-default-settings (namestring *pgdata*))))
       (dolist (spec *startup-setting-specs*)
-        (let* ((name (first spec)) (old (gethash name *startup-server-settings*))
+        (let* ((name (first spec)) (old (or (gethash name *startup-server-settings*) (gethash name defaults)))
                                    (new (gethash name candidate)))
           ;; SelectConfigFiles locks the resolved data path above file priority.
           (when (string= name "data_directory")

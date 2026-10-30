@@ -63,7 +63,8 @@ retired last, so their presence cannot safely select primary startup. Nonpending
 standby control requires recovery validation. A pending request is reconciled
 against parent or committed child control. Return :PRIMARY-READY when pending
 completion already initialized storage. Invalid proof is an error."
-  (let ((signal-mode (physical-recovery-read-signal-mode)))
+  (let ((signal-mode (physical-recovery-read-signal-mode))
+        (timeline-goal (startup-recovery-timeline-goal)))
     (when (and (not (wal-namespace-file-stat (physical-recovery-control-path) t))
                (or signal-mode
                    (wal-namespace-file-stat (merge-pathnames "recovery.required" *pgdata*) t)
@@ -73,14 +74,14 @@ completion already initialized storage. Invalid proof is an error."
                    (wal-namespace-file-stat (merge-pathnames "physical-restartpoint.control" *pgdata*) t)))
       (error "recovery metadata is incomplete: recovery control is missing"))
     (cond
-      ((physical-bootstrap-standby-control-p) (physical-recovery-prepare :signal-mode signal-mode) (values))
+      ((physical-bootstrap-standby-control-p) (physical-recovery-prepare :signal-mode signal-mode :timeline-goal timeline-goal) (values))
       ((physical-promotion-startup-primary-p) (values))
       ((physical-promotion-startup-pending-p) :primary-ready)
       (t
        (if (or (probe-file (merge-pathnames "recovery.required" *pgdata*))
                (probe-file (merge-pathnames "physical-backup.manifest" *pgdata*))
                (probe-file (merge-pathnames "physical-recovery.control" *pgdata*)))
-           (physical-recovery-prepare :signal-mode signal-mode)
+           (physical-recovery-prepare :signal-mode signal-mode :timeline-goal timeline-goal)
            (when (recovery-in-progress-p)
              (error "cannot clear recovery role by removing its metadata")))
        (values)))))
