@@ -7,6 +7,8 @@ PSQL=${PSQL:-psql}
 PATRONI_PYTHON=${PATRONI_PYTHON:-/tmp/pg-patroni-4.1.5-venv/bin/python3}
 PORT=${PORT:-6530}
 WORKER_PROCESSES=${WORKER_PROCESSES:-8}
+WAL_LEVEL=${WAL_LEVEL:-replica}
+WAL_LOG_HINTS=${WAL_LOG_HINTS:-off}
 TARGET_PORT=$((PORT + 1))
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-promotion-online.XXXXXX")
 SOURCE= TARGET= READER= UTILITY=
@@ -31,10 +33,12 @@ checked() {
 }
 start_target() {
     rm -f "$TMP/target.sock"
-    "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" -c "max_worker_processes=$WORKER_PROCESSES" --control-socket "$TMP/target.sock" >>"$TMP/target.log" 2>&1 &
+    "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" -c "max_worker_processes=$WORKER_PROCESSES" -c "wal_level=$WAL_LEVEL" -c "wal_log_hints=$WAL_LOG_HINTS" --control-socket "$TMP/target.sock" >>"$TMP/target.log" 2>&1 &
     TARGET=$!
     test_wait_owned_sql_server "$TARGET" "$TARGET_PORT" "$PSQL"
     test "$(sql "$TARGET_PORT" 'SHOW max_worker_processes')" = "$WORKER_PROCESSES"
+    test "$(sql "$TARGET_PORT" 'SHOW wal_level')" = "$WAL_LEVEL"
+    test "$(sql "$TARGET_PORT" 'SHOW wal_log_hints')" = "$WAL_LOG_HINTS"
     test "$(sql "$TARGET_PORT" "SELECT setting, context, vartype, pending_restart FROM pg_settings WHERE name = 'max_worker_processes'")" = "$WORKER_PROCESSES|postmaster|integer|f"
 }
 wait_value() {
@@ -46,7 +50,7 @@ wait_value() {
     done
 }
 mkdir -m 700 "$TMP/copy"
-"$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" -c "max_worker_processes=$WORKER_PROCESSES" --control-socket "$TMP/source.sock" >"$TMP/source.log" 2>&1 &
+"$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" -c "max_worker_processes=$WORKER_PROCESSES" -c "wal_level=$WAL_LEVEL" -c "wal_log_hints=$WAL_LOG_HINTS" --control-socket "$TMP/source.sock" >"$TMP/source.log" 2>&1 &
 SOURCE=$!
 test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 test "$(sql "$PORT" 'SHOW max_worker_processes')" = "$WORKER_PROCESSES"

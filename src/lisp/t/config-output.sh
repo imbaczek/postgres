@@ -34,6 +34,11 @@ test "$(native -c max_worker_processes=0 -C max_worker_processes)" = 0
 test "$(native -c max_worker_processes=17 -C max_worker_processes)" = 17
 test "$(native -C max_prepared_transactions)" = 0
 test "$(native -C track_commit_timestamp)" = off
+test "$(native -C wal_level)" = replica
+test "$(native -c wal_level=logical -C wal_level)" = logical
+test "$(native -c wal_level=archive -C wal_level)" = replica
+test "$(native -C wal_log_hints)" = off
+test "$(native -c wal_log_hints=on -C wal_log_hints)" = on
 for name in recovery_target recovery_target_lsn recovery_target_name recovery_target_time recovery_target_xid; do
     test "$(native -C "$name")" = ''
 done
@@ -46,7 +51,7 @@ if native -C missing_setting >"$TMP/unknown.out" 2>"$TMP/unknown.err"; then
     exit 1
 fi
 if [ -x "$REFERENCE_POSTGRES" ]; then
-    for name in port checkpoint_timeout max_wal_size max_locks_per_transaction max_worker_processes max_prepared_transactions track_commit_timestamp wal_keep_size hot_standby recovery_target_timeline recovery_target recovery_target_lsn recovery_target_name recovery_target_time recovery_target_xid restore_command data_directory; do
+    for name in port checkpoint_timeout max_wal_size max_locks_per_transaction max_worker_processes max_prepared_transactions track_commit_timestamp wal_level wal_log_hints wal_keep_size hot_standby recovery_target_timeline recovery_target recovery_target_lsn recovery_target_name recovery_target_time recovery_target_xid restore_command data_directory; do
         expected=$("$REFERENCE_POSTGRES" -D "$TMP/empty-data" -c "config_file=$TMP/server.conf" -C "$name")
         actual=$(native -C "$name")
         if [ "$actual" != "$expected" ]; then
@@ -54,7 +59,7 @@ if [ -x "$REFERENCE_POSTGRES" ]; then
             exit 1
         fi
     done
-    for option in max_connections=0b1100100 max_worker_processes=0b10 max_locks_per_transaction=+0B1010 checkpoint_timeout=0b11110s max_slot_wal_keep_size=-0b1; do
+    for option in wal_level=archive wal_level=hot_standby wal_level=logical wal_log_hints=on max_connections=0b1100100 max_worker_processes=0b10 max_locks_per_transaction=+0B1010 checkpoint_timeout=0b11110s max_slot_wal_keep_size=-0b1; do
         name=${option%%=*}
         expected=$("$REFERENCE_POSTGRES" -D "$TMP/empty-data" -c "config_file=$TMP/server.conf" -c "$option" -C "$name")
         actual=$(native -c "$option" -C "$name")
