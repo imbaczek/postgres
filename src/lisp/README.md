@@ -767,8 +767,13 @@ as do these modifiers on window calls.
 
 Sequence expressions support `nextval('sequence')`, `currval('sequence')`, and
 `setval('sequence', value [, is_called])`. Supported scalar expressions can be
-stored as column defaults and CHECK constraints. Sequence names in stored
-expressions must be literal strings or NULL. Sequence values use the signed `int8`
+stored as column defaults and CHECK constraints. An unknown name literal is
+resolved to an existing relation during analysis; numeric OID literals and `'-'`
+do not require a catalog lookup then. The relation's sequence kind is checked
+when the function runs. An explicit `::text` argument is resolved when the
+function runs. Stored expressions retain sequence names,
+not full `regclass` OID identity. Sequence names in stored expressions must be
+literal strings or NULL. Sequence values use the signed `int8`
 range and are persisted separately from transaction rollback, as in PostgreSQL.
 See [defaults, checks and aggregates](t/DEFAULTS-CHECKS-AGGREGATES.md) for scope,
 validation and replication limits.
@@ -1248,6 +1253,9 @@ cd src/lisp
 ./t/wal-crash-recovery.sh  # SIGKILL recovery at commit, page, update, split, and checkpoint boundaries
 python3 ./t/command-complete.py # autocommit reply ordering, commit errors, recovery and protocol boundaries
 python3 ./t/settings-rollback.py # transactional set_config undo, reset and successful persistence
+python3 ./t/settings-numeric.py # numeric SET literals and session values
+python3 ./t/limit-numeric.py # numeric LIMIT literal coercion and errors
+python3 ./t/sequence-name-binding.py # sequence name resolution and error timing
 python3 ./t/portal-snapshot.py # Parse/Bind visibility, VACUUM protection and portal snapshot cleanup
 python3 ./t/truncate.py # whole-relation truncation, rollback, exclusion, indexes/TOAST and crash recovery
 python3 ./t/truncate-replay.py # native replay, restart, promotion and backup after truncation

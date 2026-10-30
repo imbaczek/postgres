@@ -7,7 +7,9 @@
 
 (defun vacuum-compute-freeze-cutoff
     (old-relfrozenxid oldest-xmin next-xid &key forced-freeze-cutoff)
-  "Choose the freeze cutoff from the caller's horizon and age policy."
+  "Choose the freeze cutoff from the caller's horizon and age policy.
+An aggressive scan does not change the minimum age.  A forced cutoff is also
+bounded by the oldest active snapshot horizon."
   (declare (ignore old-relfrozenxid))
   (let ((freeze-target
           (or forced-freeze-cutoff
