@@ -211,9 +211,10 @@ base. In the base segment, compare the extent prefix with the immutable overlap.
                         (getf identity :base-timeline))))))
 
 (defun physical-source-lineage-live-segment (source-timeline segment history &optional (namespace :timeline) allow-ancestor (end *wal-durable-lsn*))
-  "Copy a selected lineage segment, bounded by durable WAL.
-ALLOW-ANCESTOR permits an eligible older timeline for public slot coverage;
-private follow requires the current-source timeline."
+  "Copy a selected lineage segment, bounded by durable WAL and END.
+ALLOW-ANCESTOR permits an eligible older timeline for public slot coverage and
+bounded retained-timeline follow.  Ordinary follow requires the current source.
+A present but invalid newer carrier is an error, not a reason to fall back."
   (multiple-value-bind (stream timeline size)
       (wal-lineage-open-segment segment history 0 namespace)
     (unwind-protect
@@ -233,6 +234,10 @@ private follow requires the current-source timeline."
   (physical-source-lineage-live-segment (physical-source-pin-timeline pin) segment history))
 
 (defun physical-source-call-with-retained-segment (fields system-id source history segment function)
+  "Read a segment under WAL exclusion from the committed primary root.
+Check the writer and control against the actual promotion parent and fork, then
+hold a root reader lease while rechecking control, reading immutable objects and
+calling FUNCTION with the bytes, carrier timeline and actual promotion fork."
   (unless (sb-thread:holding-mutex-p *wal-lock*)
     (error "source root reader requires WAL exclusion"))
   (when (recovery-in-progress-p)
@@ -294,6 +299,10 @@ private follow caller leaves it false."
                (values bytes timeline)))))))
 
 (defun physical-follow-source-bounded-segment (pin segment logical-start history)
+  "Read ancestry through the requested fork, which may precede the root fork.
+Clip the root at that bound without requiring the latest child EOR.  If the
+requested logical read starts before the root base, compare the live prefix through
+the bound before using it.  An invalid present carrier is an error."
   (unless (sb-thread:holding-mutex-p *wal-lock*)
     (error "bounded source segment requires WAL exclusion"))
   (when (recovery-in-progress-p)
@@ -326,8 +335,9 @@ private follow caller leaves it false."
                  (values (clip bytes) timeline))))))))
 
 (defun physical-follow-source-segment (pin segment &optional logical-start)
-  "Read the selected lineage for a private follow pin, retaining its stricter
-current-source requirement when live WAL is needed."
+  "Read the selected lineage for a private follow pin.
+Ordinary same-timeline and descendant pins require the current source when
+live WAL is needed; a retained-timeline pin permits bounded ancestral WAL."
   (physical-follow-pin-check-source pin)
   (if (eq :retained-timeline (physical-follow-anchor-kind (physical-follow-pin-anchor pin)))
       (physical-follow-source-bounded-segment pin segment logical-start (physical-follow-pin-history pin))
@@ -359,9 +369,9 @@ WAL advanced; crossing the base changes the key."
           (values bytes timeline)))))
 
 (defun physical-follow-source-read-next (pin cursor)
-  "Read the next complete record within PIN's confirmed-to-durable range.
+  "Read the next complete record from PIN's confirmed position through its endpoint.
 Recheck source identity and ready state, lineage, rotation gaps and durability;
-return the record, its bytes and the durable endpoint under WAL exclusion."
+return the record, its bytes and the pin endpoint under WAL exclusion."
   (let ((end (physical-follow-pin-end-lsn pin)))
     (when (recovery-in-progress-p)
       (wal-invalid-input "historical sender cannot continue during recovery"))

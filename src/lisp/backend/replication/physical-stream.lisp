@@ -37,7 +37,8 @@
   "Return the requested timeline's fork limit and next timeline from PIN.
 Allow the segment containing the timeline's beginning, as C does, but reject
 starts before that segment or beyond its fork. The pin names the current writer;
-the requested timeline may be an ancestor."
+the requested timeline may be an ancestor.  A retained-timeline pin permits
+START only on its requested receive timeline."
   (let* ((history (physical-follow-pin-history pin))
          (timeline (physical-stream-u64 (physical-stream-option command "timeline")))
          (position (position timeline history :key #'timeline-history-entry-timeline))
@@ -104,7 +105,8 @@ Missing, duplicate or unknown options fail before a sender is acquired."
 The same order defines the receiver fields in the result row.")
 
 (defun physical-follow-prepare-request (command)
-  "Decode receiver coordinates and check their wire types."
+  "Decode receiver coordinates and check their wire types.
+Only explicit proof_kind retained_timeline selects the retained proof."
   (let ((proof (physical-stream-option command "proof_kind")))
     (when (and proof (not (equal proof "retained_timeline")))
       (ereport "22023" "invalid native physical proof kind"))
@@ -229,7 +231,8 @@ and report unexpected failures as XX000."
 
 (defun physical-follow-prepare-result-tail (anchor)
   "Return history and the descendant fields for a PREPARE result.
-Same-timeline anchors return SQL NULL for next timeline, fork and EOR."
+Same-timeline anchors return SQL NULL for next timeline, fork and EOR.
+Retained anchors return next timeline and fork, but no child EOR."
   (cons (copy-seq (getf anchor :history-text))
         (if (eq :same-timeline (physical-follow-anchor-kind anchor))
             (list nil nil nil)
@@ -438,7 +441,8 @@ Explicit follow START admission acquires a ready follow pin."
                   (values record raw durable))))))))))
 
 (defun physical-source-prove-range (name owner cursor requested digest &optional progress)
-  "Hash only a newly acknowledged suffix, rejecting an interior record cursor."
+  "Hash only a newly acknowledged suffix, rejecting an interior record cursor.
+The source reader bounds retained-timeline proof at the requested fork."
   (with-live-operation
     (sb-thread:with-mutex (*wal-lock*)
       (let ((pin (physical-source-retained-sender-pin name owner)))
@@ -636,7 +640,8 @@ A historic stream stops at its fork before sending child end-of-recovery WAL."
   "Serve a negotiated native physical stream with bounded timeline completion.
 Prove the resume prefix before WalData. Resume proof alone confirms the private
 pin; only actual validated positive flush feedback updates the public slot.
-Always release both sender claims."
+At the fork, complete without entering Copy mode.  Always release both sender
+claims."
   (call-with-native-physical-sender
    command
    (lambda (owner limit next)

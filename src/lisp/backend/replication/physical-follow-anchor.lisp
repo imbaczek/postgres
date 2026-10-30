@@ -125,9 +125,10 @@ the receiver's digest or the independently compared overlap."
        #xCBF29CE484222325 (subseq bytes 0 (- end start))))))
 
 (defun physical-follow-pin-check-suffix (pin)
-  "Validate selected ancestry and WAL through a captured durable endpoint.
+  "Validate selected ancestry and WAL through a captured endpoint.
 Use the source root and live segments independently of the receiver's base;
-require complete records and check any end-of-recovery transition at its fork."
+require complete records and check any end-of-recovery transition at its fork.
+For a retained-timeline pin the endpoint is its requested fork, not writer flush."
   (let* ((history (physical-follow-pin-history pin))
          (cursor (physical-source-pin-consistent-lsn pin))
          (end (with-live-operation

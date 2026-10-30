@@ -778,6 +778,17 @@ alone would not provide that behavior. The implementation must cover first
 attachment, same-timeline changes, descendant transitions, clearing conninfo,
 failed replacement, cold restart and shutdown/promotion races.
 
+The internal timeline policy foundation (`19102902196`, `a1b6456b069`)
+resolves startup goals and fences replay against selected ancestry. Its owned
+raw and libpq experiments passed. It does not yet expose a recovery target GUC
+or integrate receiver target selection and completion with the controller.
+
+The retained-timeline source capability (`1f72a21c8cd`) provides an explicit
+fork-bounded proof and streaming path for ancestral WAL. Focused source and raw
+protocol tests, all 1,109 physical tests and strict compilation passed. Integrated
+raw and libpq tests of this new path belong to the next controller milestone;
+GUC generation reconciliation and controller integration remain open.
+
 The native `-C` metadata path now prints supported static settings using
 configuration precedence and base units before storage ownership or listener
 startup, provided the data directory exists. The CLI oracle passes five C
@@ -892,7 +903,8 @@ now accepts an unreserved NULL floor, checks the durable catalog identity and
 selected history, removes temporary slots after a crash, and resets inactivity
 time as C does. Reserved positions use checked retained ancestry and eligible
 live timeline files. Physical slot validation permits parent files before the
-fork; private follow pins retain their stricter source-file requirement. Native
+fork; ordinary private follow pins retain their stricter source-file requirement,
+while explicit retained-timeline pins permit bounded ancestral files. Native
 rotation gaps need a complete predecessor record and a following record that
 could not fit. Standby loading and subsequent promotion carryover are described
 below. A decoder's

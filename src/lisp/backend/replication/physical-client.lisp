@@ -272,7 +272,8 @@ must compare the history with the source anchor."
 
 (defun pg-client-native-request-query (verb slot coordinates)
   "Build PREPARE_FOLLOW or exact RELEASE_FOLLOW from the same receiver request.
-The copied fields are shape-checked, not proof of source identity or history."
+The copied fields are shape-checked, not proof of source identity or history.
+Both commands carry proof_kind retained_timeline for the explicit retained kind."
   (unless (member verb '("PREPARE_FOLLOW" "RELEASE_FOLLOW") :test #'equal)
     (error "invalid native follow request command"))
   (unless (wal-valid-replication-slot-name-p slot) (error "invalid native follow pin name"))
@@ -303,6 +304,7 @@ The copied fields are shape-checked, not proof of source identity or history."
   "Prepare and return a checked source anchor for the supplied coordinates.
 Same-timeline replies require SQL NULL in the three descendant-only fields;
 descendant replies validate the next timeline, fork and end-of-recovery record.
+Explicit retained replies require next timeline and fork, with SQL NULL for EOR.
 The caller must independently verify source identity and local durable witnesses.
 This helper does not install history, redo WAL, update recovery state or admit a receiver.
 The caller owns network deadlines, cancellation and client cleanup; it must not

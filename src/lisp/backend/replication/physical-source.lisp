@@ -48,7 +48,8 @@ For a sender context also check the calling backend and source incarnation."
 (declaim (ftype function physical-follow-pin-end-lsn))
 
 (defun physical-source-validate-receipt-under-lock (name owner lsn digest)
-  "Validate private receipt against the current sender and durable WAL under WAL."
+  "Validate private receipt against the sender and its retained endpoint under WAL.
+For a retained-timeline pin that endpoint is the requested fork."
   (let* ((pin (physical-source-check-sender-under-lock name owner))
          (old (physical-source-pin-confirmed-lsn pin)))
     (unless (and (typep digest '(unsigned-byte 64))
@@ -254,7 +255,9 @@ A standby may have only the durable pin; a primary requires registry agreement."
          (values (or pin disk) disk))))))
 
 (defun physical-source-pin-read (path &key stabilize)
-  "Read and validate a private source pin; startup may stabilize it first."
+  "Read and validate a private source pin; startup may stabilize it first.
+Reopened follow pins not marked lost check retained source coverage through
+their endpoint; lost pins need no WAL."
   (let ((bytes (read-bounded-regular-file path (physical-follow-pin-image-limit) :stabilize stabilize)))
     (if (physical-follow-pin-image-p bytes)
         (let ((pin (physical-follow-pin-decode bytes)))

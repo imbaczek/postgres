@@ -38,7 +38,8 @@ eligibility for a future follow path; bootstrap START does not accept this pin."
 (defun physical-follow-request-copy (request)
   "Check and copy the shape and bounds of receiver coordinates.
 This does not prove their contents or authenticate the source; it needs no
-source history or WAL."
+source history or WAL.  An explicit retained-timeline kind selects the bounded
+ancestral proof; an omitted kind keeps the legacy request shape."
   (let* ((kind (getf request :kind :absent))
          (keys (remove-if (lambda (key) (member key '(:history-text :eor-octets)))
                           *physical-follow-anchor-keys*)))
@@ -86,6 +87,8 @@ source history or WAL."
     (:retained-timeline :retained-timeline)))
 
 (defun physical-follow-anchor-request (anchor)
+  "Extract canonical receiver coordinates without reading WAL.
+Preserve the explicit retained kind and the legacy request shapes."
   (physical-follow-request-copy
    (append (when (eq :retained-timeline (physical-follow-anchor-kind anchor))
              (list :kind :retained-timeline))
@@ -94,10 +97,14 @@ source history or WAL."
                    append (list key (getf anchor key))))))
 
 (defun physical-follow-request-matches-anchor-p (request anchor)
+  "Compare canonical request coordinates, including an explicit retained kind.
+This comparison is pure and preserves legacy request shapes."
   (equal (physical-follow-request-copy request)
          (physical-follow-anchor-request anchor)))
 
 (defun physical-follow-retained-timeline-anchor-check (anchor)
+  "Check the requested receive timeline and its fork in source history.
+The cursor must be at or before that fork; this anchor carries no child EOR."
   (physical-follow-check-plist anchor *physical-follow-same-timeline-anchor-keys*)
   (let* ((request (physical-follow-anchor-request anchor))
          (source (getf anchor :source-timeline))
@@ -190,7 +197,8 @@ which may differ from the source's retained archive base and manifest."
 
 (defun physical-follow-anchor-check (anchor)
   "Validate the anchor's kind and fields; return history, fork and EOR.
-Same-timeline anchors return NIL for fork and EOR. WAL bytes are checked separately."
+Same-timeline anchors return NIL for fork and EOR; retained anchors return the
+fork and NIL for EOR. WAL bytes are checked separately."
   (ecase (physical-follow-anchor-kind anchor)
     (:descendant (physical-follow-descendant-anchor-check anchor))
     (:same-timeline (physical-follow-same-timeline-anchor-check anchor))
@@ -210,6 +218,7 @@ Same-timeline anchors return NIL for fork and EOR. WAL bytes are checked separat
                            (t value)))))
 
 (defun physical-follow-pin-end-lsn (pin)
+  "Return the receive timeline's fork for a retained pin, otherwise writer durability."
   (if (and (physical-follow-pin-p pin)
            (eq :retained-timeline (physical-follow-anchor-kind (physical-follow-pin-anchor pin))))
       (nth-value 1 (physical-follow-anchor-check (physical-follow-pin-anchor pin)))
@@ -220,7 +229,8 @@ Same-timeline anchors return NIL for fork and EOR. WAL bytes are checked separat
 Apply FNV-1a 64 with seed #xCBF29CE484222325 to the UTF-8 bytes of
 physical-bootstrap-manifest-text of physical-follow-anchor-copy of ANCHOR.
 The full history and, for descendant anchors, EOR are included; mutable stage,
-progress and lost state are not. This checksum identifies an anchor; it is not authentication."
+progress and lost state are not.  It needs no WAL and distinguishes exact
+retries and cleanup requests; it is not authentication."
   (physical-store-update-digest
    #xCBF29CE484222325
    (string->bytes (physical-bootstrap-manifest-text (physical-follow-anchor-copy anchor)))))
