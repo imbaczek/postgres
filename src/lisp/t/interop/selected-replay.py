@@ -79,17 +79,25 @@ def lisp_string(value):
     return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
-def start_peer(directory=None, port=None, socket_name="sibling.sock", log_name="sibling.log"):
+def start_peer(directory=None, port=None, socket_name="sibling.sock", log_name="sibling.log", timeline_goal=None):
     directory = directory or data
     port = replica_port if port is None else port
     registry = root / "extra-peers"
     registry.mkdir(mode=0o700, exist_ok=True)
+    launcher = [str(base / "pg-lisp.sh")]
+    environment = None
+    if timeline_goal is not None:
+        environment = os.environ.copy()
+        environment["PG_TEST_TIMELINE_GOAL"] = timeline_goal
+        interpreter = shutil.which(environment.get("SBCL", "sbcl"))
+        assert interpreter is not None, "SBCL executable is unavailable"
+        launcher = [str(Path(interpreter).resolve()), "--script", str(base / "t/timeline-policy-boot.lisp")]
     with (root / log_name).open("a") as output:
         process = subprocess.Popen([sys.executable, str(base / "t/interop/owned-peer.py"),
-                                    "start", str(registry), str(directory), str(base / "pg-lisp.sh"),
+                                    "start", str(registry), str(directory), *launcher,
                                     "-p", str(port), "-D", str(directory),
                                     "--control-socket", str(root / socket_name)],
-                                   stdout=output, stderr=subprocess.STDOUT)
+                                   stdout=output, stderr=subprocess.STDOUT, env=environment)
     peer_parameters[process] = (directory, socket_name)
     def ready():
         assert process.poll() is None, (root / log_name).read_text()
@@ -338,6 +346,49 @@ def exercise_public_slot(peer, socket_identity, sibling, source):
     return peer, socket_identity, sibling
 
 
+def exercise_timeline_policy(peer, socket_identity, sibling, promoted):
+    query(sibling, "SELECT pg_wal_replay_pause()")
+    assert query(promoted, "SELECT pg_promote(true,30)") == [(True,)]
+    query(promoted, "INSERT INTO promotion_sql_items VALUES (3,'excluded-child')")
+    child_end = query(promoted, "SELECT pg_current_wal_flush_lsn()::text")[0][0]
+    control("sibling.sock", retarget_form(promoted_port, "policy_child"))
+    wait(lambda: query(sibling, f"SELECT pg_last_wal_receive_lsn()>='{child_end}'::pg_lsn") == [(True,)])
+    assert query(sibling, "SELECT count(*) FROM promotion_sql_items") == [(2,)]
+    control("sibling.sock", '(assert (and (= 1 (physical-recovery-replay-timeline)) (= 2 (physical-store-selected-timeline *physical-receive-store*))))')
+    received = control("sibling.sock", '(physical-store-control-tuple *physical-receive-store*)')
+    sibling.close()
+    assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
+    (data / "standby.signal").write_text("")
+    peer, socket_identity = start_peer(timeline_goal="current")
+    sibling = connect(replica_port)
+    assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(True, 2)]
+    assert received == control("sibling.sock", '(physical-store-control-tuple *physical-receive-store*)')
+    control("sibling.sock", '(assert (and (= 1 (getf (getf *physical-recovery-state* :timeline-policy) :target)) (= 1 (physical-recovery-replay-timeline)) (not (physical-recovery-replay-pending-p)) (not *physical-recovery-failed-p*) (null (physical-follow-runtime-receiver-thread *physical-follow-runtime*))))')
+    control("sibling.sock", '(defparameter *policy-live-snapshot* (getf *physical-recovery-state* :timeline-policy))')
+    control("sibling.sock", '(reload)')
+    control("sibling.sock", '(assert (and (eq *policy-live-snapshot* (getf *physical-recovery-state* :timeline-policy)) (not (physical-recovery-replay-pending-p))))')
+    control("sibling.sock", f'(load {lisp_string(base / "t/child-bootstrap-native.lisp")})')
+    control("sibling.sock", f'(child-bootstrap-install-promotion-crash #p{lisp_string(str(root) + "/")} :after-online-intent)')
+    assert query(sibling, "SELECT pg_promote(false,30)") == [(True,)]
+    marker = root / "promotion-crash-held"
+    wait(lambda: marker.exists() and int(marker.read_text()) == peer.pid)
+    sibling.close()
+    assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
+    peer, socket_identity = start_peer()
+    sibling = connect(replica_port)
+    assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(False, 2)]
+    control("sibling.sock", '(assert (and (= 3 *wal-insert-timeline*) (= 1 (timeline-history-entry-timeline (second (timeline-read-history 3))))))')
+    assert not (data / "standby.signal").exists()
+    query(sibling, "INSERT INTO promotion_sql_items VALUES (4,'policy-primary')")
+    sibling.close()
+    assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
+    peer, socket_identity = start_peer()
+    sibling = connect(replica_port)
+    assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(False, 3)]
+    print("timeline-policy: cached child excluded on cold current startup and live reload, parent intent SIGKILL, cold primary resume/restart/write PASS", flush=True)
+    return peer, socket_identity, sibling
+
+
 def observed_application(endpoint, expected):
     form = (f'(if (= 1 (count {lisp_string(expected)} (list-backends) '
             ":key #'backend-application-name :test #'equal)) :observed :waiting)")
@@ -495,6 +546,10 @@ try:
     parent_end = query(source, "SELECT pg_current_wal_flush_lsn()")[0][0]
     for connection in (promoted, sibling):
         wait(lambda: query(connection, f"SELECT pg_last_wal_replay_lsn() >= '{parent_end}'::pg_lsn") == [(True,)])
+    if os.environ.get("FOLLOW_TIMELINE_POLICY") == "1":
+        peer, socket_identity, sibling = exercise_timeline_policy(peer, socket_identity, sibling, promoted)
+        connections.append(sibling)
+        raise SystemExit(0)
     if os.environ.get("SELECTED_REPLAY_CONTROLLER") == "1":
         exercise_same_timeline(source, sibling, source_port, 1, 2, promoted)
     if os.environ.get("SELECTED_REPLAY_CONTROLLER") != "1":
