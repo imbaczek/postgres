@@ -35,6 +35,15 @@
                         (min frontier (or (timeline-history-entry-end entry) frontier)))))
 
 (defun physical-recovery-resolve-timeline-policy (state store metadata goal)
+  "Resolve the internal recovery goal against the checked startup positions.
+CURRENT uses the greater timeline ID of the required position and restartpoint
+seed, as C uses minRecoveryPointTLI and checkpoint.ThisTimeLineID.  A numeric
+goal must contain each required position exactly and preserve the original
+ancestry through the furthest protected position.  Reject a target that would
+rewrite durable history.  LATEST leaves replay unrestricted.
+The caller stores the resolved policy in recovery state for this startup;
+selecting a newer receive timeline does not change it.  This policy is internal,
+not a public GUC."
   (unless (or (member goal '(:latest :current))
               (typep goal '(integer 1 4294967295)))
     (error "invalid recovery timeline goal"))
@@ -99,6 +108,9 @@
                  (<= (wal-record-end record) (timeline-history-entry-end entry)))))))
 
 (defun physical-recovery-policy-record-disposition (store record policy)
+  "Classify the first record outside the selected policy.
+A known end of the target is exhaustion; a different received branch means
+the target's history is unavailable and recovery must wait."
   (if (physical-recovery-policy-record-permitted-p store record policy)
       :permitted
       (let* ((history (getf (physical-store-selection store) :history))
@@ -109,6 +121,9 @@
             :timeline-history-unavailable))))
 
 (defun physical-recovery-policy-fence-current-p (fence store policy)
+  "Recognize exhaustion only for the exact replay witness that found it.
+A changed policy, store, selection or applied LSN invalidates the witness and
+allows replay to examine the durable prefix again."
   (and fence
        (eq policy (getf fence :policy))
        (eq store (getf fence :store))
@@ -116,6 +131,8 @@
        (eql *last-replay-lsn* (getf fence :applied))))
 
 (defun physical-recovery-note-policy-exhaustion (result store)
+  "Record replay exhaustion or clear the old witness after another result.
+Semantic scans do not call this: only the replay consumer owns this cache."
   (let ((policy (getf *physical-recovery-state* :timeline-policy))
         (old (getf *physical-recovery-state* :timeline-replay-fence)))
     (if (member result '(:timeline-target-reached :timeline-history-unavailable))
@@ -142,6 +159,11 @@
 (defun physical-recovery-map-permitted-records (store function &key
                                                                  (start-lsn (physical-store-floor-lsn store))
                                                                  (policy (getf *physical-recovery-state* :timeline-policy)))
+  "Visit the durable records allowed by POLICY, stopping at the first fence.
+The store validates the whole durable prefix and resume boundary before any
+callback, even when this traversal stops early.  Return the fence reason or
+the store's normal result.  This scan does not update replay exhaustion;
+callers that apply redo own that state."
   (block traversal
     (physical-store-map-durable-records
      store (lambda (record raw)

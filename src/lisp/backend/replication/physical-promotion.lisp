@@ -214,6 +214,9 @@ phase-2 recovery can yield to shutdown."
     namespace))
 
 (defun physical-promotion-pending-timeline-policy (state metadata store)
+  "Resolve policy for a pending promotion after the caller validates its owner.
+The caller must already have checked durable pending control, generation and
+parent.  The phase check here alone does not establish that ownership."
   (unless (eql 3 (getf state :phase))
     (error "pending timeline policy requires durable promotion intent"))
   (physical-recovery-resolve-timeline-policy
