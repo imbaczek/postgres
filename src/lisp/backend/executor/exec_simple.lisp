@@ -36,36 +36,85 @@
   "Return whether AST changes durable catalog state, including ANALYZE."
   (or (ddl-p ast) (eq (getf ast :type) :analyze)))
 
+(defun truncate-table-storage-state (table)
+  "Capture every storage identity that TRUNCATE must replace under catalog locks."
+  (let ((toast (pg-class-toast table)))
+    (list (pg-class-relfilenode table)
+          (mapcar (lambda (index) (cons index (pg-index-relfilenode index)))
+                  (table-indexes table))
+          toast
+          (when toast (pg-toast-relfilenode toast))
+          (when toast (pg-toast-index-relfilenode toast)))))
+
 (defun exec-truncate (stream ast)
-  ;; Capture one transactional event, including immutable source relation OIDs,
-  ;; even for empty tables. Tuple deletion preserves rollback/MVCC semantics.
+  "Replace table, index and TOAST storage while retaining gates through transaction end.
+Recheck identities after waiting and under catalog locks before changing storage."
   (get-current-xid)
   (let ((names nil) (oids nil) (relations nil) (tables nil))
-    (dolist (name (remove-duplicates (getf ast :tables) :test #'equal :from-end t))
-      (let ((table (resolve-table-or-error name)))
-        (with-registered-table (table rel xid :write)
-          (push (copy-seq (pg-class-name table)) names)
-          (push (pg-class-oid table) oids)
-          (push table tables)
-          (push (logical-relation-description table) relations)
-          (let ((columns (pg-class-columns table)))
-            (dolist (tid (collect-matching-tids table nil))
-              (check-for-interrupts)
-              (multiple-value-bind (deleted tuple block offnum status)
-                  (heapam-delete-tid
-                   rel columns (car tid) (cdr tid) xid
-                   (backend-command-id *backend*))
-                (declare (ignore block offnum))
-                (check-heapam-write-status status)
-                (when deleted
-                  (delete-tuple-toast-values table tuple xid (backend-command-id *backend*)))
-                (unless deleted
-                  (ereport "40001"
-                           "could not truncate relation after concurrent update"))))))))
+    (with-schema-write-lock
+      (let* ((captured
+               (with-write-lock
+                 (mapcar
+                  (lambda (name)
+                    (let ((table (resolve-table-or-error name)))
+                      (cons table (truncate-table-storage-state table))))
+                  (remove-duplicates (getf ast :tables) :test #'equal :from-end t))))
+             (targets (mapcar #'car captured))
+             (index-nodes
+               (loop for entry in captured
+                     for state = (cdr entry)
+                     append (append (mapcar #'cdr (second state))
+                                    (when (fifth state) (list (fifth state))))))
+             (nodes
+               (append index-nodes
+                       (loop for entry in captured
+                             for state = (cdr entry)
+                             append (cons (first state)
+                                          (when (fourth state) (list (fourth state))))))))
+        (loop
+          (acquire-transaction-relation-locks nodes)
+          (let ((current
+                  (with-write-lock
+                    (mapcar (lambda (table)
+                              (ensure-current-table table)
+                              (cons table (truncate-table-storage-state table)))
+                            targets))))
+            (when (equal captured current) (return))
+            (setf captured current
+                  index-nodes
+                  (loop for entry in captured
+                        for state = (cdr entry)
+                        append (append (mapcar #'cdr (second state))
+                                       (when (fifth state) (list (fifth state)))))
+                  nodes
+                  (append index-nodes
+                          (loop for entry in captured
+                                for state = (cdr entry)
+                                append (cons (first state)
+                                             (when (fourth state) (list (fourth state)))))))))
+        (with-btree-relation-locks (index-nodes)
+          (with-write-catalog-locks
+            (dolist (entry captured)
+              (ensure-current-table (car entry))
+              (unless (equal (cdr entry) (truncate-table-storage-state (car entry)))
+                (ereport "55000" "relation \"~a\" changed while waiting for truncate lock"
+                         (pg-class-name (car entry)))))
+            (dolist (node nodes)
+              (transaction-replace-relation node))
+            (dolist (table targets)
+              (dolist (index (table-indexes table))
+                (btree-init (pg-index-relfilenode index)))
+              (when (pg-class-toast table)
+                (btree-init (pg-toast-index-relfilenode (pg-class-toast table))))
+              (push (copy-seq (pg-class-name table)) names)
+              (push (pg-class-oid table) oids)
+              (push table tables)
+              (push (logical-relation-description table) relations))))))
     (logical-note-transaction-event
      :truncate (list :tables (nreverse names) :relation-oids (nreverse oids)
                      :relations (nreverse relations))
-     :publication-selection (with-write-lock (logical-capture-publications (nreverse tables) :truncate))))
+     :publication-selection
+     (with-write-lock (logical-capture-publications (nreverse tables) :truncate))))
   (send-command-complete stream "TRUNCATE TABLE"))
 
 (defun exec-apply-sequence-state (stream ast)

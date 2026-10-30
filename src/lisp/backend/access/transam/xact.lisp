@@ -870,14 +870,49 @@ and BODY remain interruptible; RELEASE-FUNCTION runs after every exit."
            (when ,owned
              (funcall ,release ,relations ,token)))))))
 
+(defvar *transaction-exclusive-relation-locks*
+  (make-hash-table :test #'eq :synchronized t))
+
+(defun transaction-held-relation-lock-p (node backend)
+  (some (lambda (entry) (member node (car entry) :test #'=))
+        (gethash backend *transaction-exclusive-relation-locks*)))
+
+(defun acquire-transaction-relation-locks (nodes)
+  "Keep exclusive relation admission gates until this transaction finishes."
+  (let* ((backend *backend*)
+         (xid (get-current-xid))
+         (requested (remove-if (lambda (node)
+                                 (transaction-held-relation-lock-p node backend))
+                               nodes)))
+    (when requested
+      (register-relation-accesses requested nil xid)
+      (acquire-relation-build-locks
+       requested xid t
+       (lambda (relations token)
+         (push (cons relations token)
+               (gethash backend *transaction-exclusive-relation-locks*))))))
+  (values))
+
+(defun release-transaction-relation-locks (backend)
+  (let ((entries (gethash backend *transaction-exclusive-relation-locks*)))
+    (dolist (entry entries)
+      (release-relation-build-locks (car entry) (cdr entry)))
+    (remhash backend *transaction-exclusive-relation-locks*))
+  (values))
+
 (defun acquire-relation-build-locks
     (relfilenodes &optional own-xid wait-readers-p on-acquired)
   "Block new users as one group, then wait for all active users to finish.
+Gates already held by this transaction are omitted to avoid waiting on itself.
 ON-ACQUIRED publishes cleanup ownership as gates become visible. It is
 called under the relation mutex with interrupts disabled. Raw callers retain
 responsibility for release after successful return. Without ON-ACQUIRED they
 must protect the return-to-owner handoff from interrupts; prefer the scoped macros."
-  (let ((relfilenodes (sort (remove-duplicates (copy-list relfilenodes) :test #'=)
+  (let ((relfilenodes (sort (remove-duplicates (remove-if
+                                                (lambda (node)
+                                                  (and *backend*
+                                                       (transaction-held-relation-lock-p node *backend*)))
+                                                (copy-list relfilenodes)) :test #'=)
                             #'<))
         (token (gensym "RELATION-BUILD-"))
         (published nil)
@@ -2019,6 +2054,8 @@ can discard the owner of a virtual ID or its remaining relation locks."
     (when (backend-logical-spool b)
       (close-logical-spool (backend-logical-spool b))
       (setf (backend-logical-spool b) nil))
+    (discard-transaction-replacements b)
+    (release-transaction-relation-locks b)
     (expire-transaction-exported-snapshots b)
     (release-backend-transaction-snapshot b)
     (when (backend-virtual-reader-xid b)
