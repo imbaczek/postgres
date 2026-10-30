@@ -159,7 +159,7 @@
   (test-catalog-mutation-rollback-macro)
   (test-analyze-column-statistics-and-costing)
   (test-analyze-byte-vector-sample-retention)
-  (test-analyze-byte-vector-reservoir-shrink-and-oversize)
+  (test-analyze-byte-vector-reservoir-width-and-oversize)
   (test-analyze-reservoir-sample-is-bounded)
   (test-analyze-publish-restores-on-save-failure)
   (test-analyze-publish-keeps-durable-stats-on-late-failure)

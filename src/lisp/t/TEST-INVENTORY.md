@@ -505,7 +505,7 @@ limitation of Rove: concurrent and stateful tests can use Rove once isolated.
 | `test-analyze-byte-vector-hash-collisions-and-text-equality` | [Rove](rove/catalog-tests.lisp) | Fixed examples; retain specific results/errors/evaluation order |
 | `test-analyze-value-estimate-counts-backing-storage` | [Rove](rove/catalog-tests.lisp) | Fixed examples; retain specific results/errors/evaluation order |
 | `test-analyze-byte-vector-sample-retention` | [Legacy](unit-tests/catalog-tests.lisp) | H: global scan/executor/compiler hook or publication-failure injection |
-| `test-analyze-byte-vector-reservoir-shrink-and-oversize` | [Legacy](unit-tests/catalog-tests.lisp) | H: global scan/executor/compiler hook or publication-failure injection |
+| `test-analyze-byte-vector-reservoir-width-and-oversize` | [Legacy](unit-tests/catalog-tests.lisp) | H: global scan/executor/compiler hook or publication-failure injection |
 | `test-analyze-reservoir-shrink-clears-evicted-values` | [Rove](rove/catalog-tests.lisp) | Fixed examples; retain specific results/errors/evaluation order |
 | `test-analyze-reservoir-sample-is-bounded` | [Legacy](unit-tests/catalog-tests.lisp) | H: global scan/executor/compiler hook or publication-failure injection |
 | `test-analyze-publish-restores-on-save-failure` | [Legacy](unit-tests/catalog-tests.lisp) | H: global scan/executor/compiler hook or publication-failure injection |
@@ -748,6 +748,7 @@ the inline wait assertion remain in [unit-tests.lisp](unit-tests.lisp).
 | Helper | Location after migration |
 | --- | --- |
 | `call-test-relation-scope` | [Legacy](unit-tests/ownership-tests.lisp) |
+| `call-with-test-analyze-pages` | [Legacy](unit-tests/catalog-tests.lisp) |
 | `call-with-vacuum-full-publish-test-fixture` | [Legacy](unit-tests/vacuum-tests.lisp) |
 | `call-with-wal-snapshot-release-race-state` | [Legacy](unit-tests/wal-tests.lisp) |
 | `check-vacuum-full-publish-durable-state` | [Legacy](unit-tests/vacuum-tests.lisp) |
@@ -775,7 +776,6 @@ the inline wait assertion remain in [unit-tests.lisp](unit-tests.lisp).
 | `sort-arena-test-stream` | [Legacy](unit-tests/arena-tests.lisp) |
 | `sort-arena-test-supported-p` | [Legacy](unit-tests/arena-tests.lisp) |
 | `test-analyze-catalog-class-image-roundtrip` | [Shared](rove/support.lisp) |
-| `test-analyze-retained-byte-vector-payload` | [Legacy](unit-tests/catalog-tests.lisp) |
 | `test-concat-octets` | [Legacy](unit-tests/protocol-tests.lisp) |
 | `test-data-row-first-column` | [Legacy](unit-tests/transaction-tests.lisp) |
 | `test-dispatch-query-frame` | [Legacy](unit-tests/support.lisp) |

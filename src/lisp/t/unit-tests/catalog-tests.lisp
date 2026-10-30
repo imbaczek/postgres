@@ -173,202 +173,173 @@
                   "cost model chooses a selective index scan over SeqScan"))
       (setf (symbol-function 'buf-nblocks) original-buf-nblocks))))
 
-(defun test-analyze-retained-byte-vector-payload (sample)
-  "Count payload bytes in the simple byte vectors reachable from SAMPLE."
-  (loop for row across sample
-        for value = (aref row 0)
-        when (analyze-byte-vector-p value)
-          sum (array-total-size value)))
+(defun call-with-test-analyze-pages (table rows function)
+  "Run FUNCTION with an isolated snapshot and heap pages containing ROWS.
+Install buffer reads for these physical tuples for the duration of the call."
+  (let ((pages (make-array 0 :adjustable t :fill-pointer 0))
+        (columns (pg-class-columns table))
+        (relfilenode (pg-class-relfilenode table))
+        (original-nblocks (symbol-function 'buf-nblocks))
+        (original-read (symbol-function 'buf-read))
+        (*backend* nil)
+        (*next-xid* 3))
+    (dolist (row rows)
+      (let ((bytes (form-heap-tuple row columns 1 0 0 0 1)))
+        (unless (and (plusp (length pages))
+                     (page-add-item (aref pages (1- (length pages))) bytes))
+          (let ((page (page-init (make-page))))
+            (assert (page-add-item page bytes))
+            (vector-push-extend page pages)))))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'buf-nblocks)
+                 (lambda (rel)
+                   (assert (= rel relfilenode))
+                   (length pages))
+                 (symbol-function 'buf-read)
+                 (lambda (rel block)
+                   (assert (= rel relfilenode))
+                   (aref pages block)))
+           (funcall function (make-snapshot-struct :xmin 2 :xmax 3 :curcid 1) pages))
+      (setf (symbol-function 'buf-nblocks) original-nblocks
+            (symbol-function 'buf-read) original-read))))
 
 (defun test-analyze-byte-vector-sample-retention ()
-  (let* ((table (make-pg-class :oid 5902 :name "byte_sample"
-                               :relfilenode 5902 :columns #()))
-         (original-heapam-scan (symbol-function 'heapam-scan))
-         (payload-size (* 128 1024)))
-    (unwind-protect
-         (progn
-           (setf (symbol-function 'heapam-scan)
-                 (lambda (relfilenode columns snapshot callback)
-                   (declare (ignore relfilenode columns snapshot))
-                   (dotimes (index 300)
-                     (funcall callback
-                              (make-htup
-                               :values
-                               (vector (make-array
-                                        payload-size
-                                        :element-type '(unsigned-byte 8)
-                                        :initial-element (mod index 256))))))))
-           (let ((*analyze-random-function*
-                   (lambda (limit) (declare (ignore limit)) 0)))
-             (multiple-value-bind (row-count sample)
-                 (analyze-sample-visible-rows table 5902 nil)
-               (let ((retained-bytes
-                       (test-analyze-retained-byte-vector-payload sample)))
-                 (check (= row-count 300)
-                        "ANALYZE counts all rows containing large byte vectors")
-                 (check (< (length sample) 300)
-                        "ANALYZE reduces the sample for large byte-vector rows")
-                 (check (= retained-bytes (* (length sample) payload-size))
-                        "sample payload measurement reads retained vector storage")
-                 (check (<= retained-bytes +analyze-sample-memory-bytes+)
-                        "retained byte-vector payload stays within the 4 MiB budget")))))
-      (setf (symbol-function 'heapam-scan) original-heapam-scan))))
+  (let* ((columns (vector (make-pg-column :name "id" :type :int4)
+                          (make-pg-column :name "payload" :type :bytea)))
+         (table (make-pg-class :oid 5902 :name "byte_sample"
+                               :relfilenode 5902 :columns columns))
+         (pointer (make-heap-external-varlena :raw-size (+ 4 (* 128 1024))
+                                              :external-info (* 128 1024)
+                                              :value-id 1 :relation-id 1 :id-width 4)))
+    ;; The external value is wide logically, but its heap tuple holds a pointer.
+    (call-with-test-analyze-pages
+     table (loop for i below 1000 collect (vector i pointer))
+     (lambda (snapshot pages)
+       (declare (ignore pages))
+       (multiple-value-bind (row-count sample)
+           (analyze-sample-visible-rows table 5902 snapshot)
+         (check (= row-count 1000) "ANALYZE counts rows with large external byte vectors")
+         (check (= (length sample) +analyze-sample-size+)
+                "external logical width does not reduce the physical tuple reservoir")
+         (check (<= (loop for bytes across sample sum (length bytes))
+                    +analyze-sample-memory-bytes+)
+                "physical tuple copies stay within the sample memory budget")
+         (check (every (lambda (bytes)
+                         (eq (analyze-physical-column-value table bytes 1 snapshot)
+                             +analyze-wide-value+))
+                       sample)
+                "wide external byte vectors are recognized without fetching TOAST")
+         (check (every (lambda (bytes)
+                         (integerp (analyze-physical-column-value table bytes 0 snapshot)))
+                       sample)
+                "narrow columns remain available beside wide external values"))))))
 
-(defun test-analyze-byte-vector-reservoir-shrink-and-oversize ()
-  (let* ((table (make-pg-class :oid 5903 :name "byte_sample_edges"
-                               :relfilenode 5903 :columns #()))
-         (original-heapam-scan (symbol-function 'heapam-scan))
-         (small-size 16)
-         (large-size (* 64 1024)))
-    (unwind-protect
-         (progn
-           (setf (symbol-function 'heapam-scan)
-                 (lambda (relfilenode columns snapshot callback)
-                   (declare (ignore relfilenode columns snapshot))
-                   (dotimes (index 600)
-                     (funcall callback
-                              (make-htup
-                               :values
-                               (vector
-                                (make-array
-                                 (if (< index 300) small-size large-size)
-                                 :element-type '(unsigned-byte 8)
-                                 :initial-element (mod index 256))))))))
-           (let ((*analyze-random-function*
-                   (lambda (limit) (declare (ignore limit)) 0)))
-             (multiple-value-bind (row-count sample)
-                 (analyze-sample-visible-rows table 5903 nil)
-               (check (= row-count 600)
-                      "ANALYZE continues sampling after a large byte value shrinks capacity")
-               (check (and (< (length sample) 300)
-                           (some (lambda (row)
-                                   (> (array-total-size (aref row 0)) small-size))
-                                 sample))
-                      "shrunk byte-vector reservoir considers later large values")
-               (check (<= (test-analyze-retained-byte-vector-payload sample)
-                          +analyze-sample-memory-bytes+)
-                      "mixed-size retained byte payload stays within budget")))
-           (setf (symbol-function 'heapam-scan)
-                 (lambda (relfilenode columns snapshot callback)
-                   (declare (ignore relfilenode columns snapshot))
-                   (funcall callback
-                            (make-htup
-                             :values
-                             (vector (make-array
-                                      (1+ +analyze-sample-memory-bytes+)
-                                      :element-type '(unsigned-byte 8)
-                                      :initial-element 1))))
-                   (funcall callback
-                            (make-htup :values (vector (make-array
-                                                        3
-                                                        :element-type
-                                                        '(unsigned-byte 8)
-                                                        :initial-contents '(4 5 6)))))))
-           (multiple-value-bind (row-count sample)
-               (analyze-sample-visible-rows table 5903 nil)
-             (check (= row-count 2)
-                    "ANALYZE counts an oversized byte row before a small row")
-             (check (and (= (length sample) 1)
-                         (= (test-analyze-retained-byte-vector-payload sample) 3))
-                    "ANALYZE skips an individually oversized byte row"))
-           (setf (symbol-function 'heapam-scan)
-                 (lambda (relfilenode columns snapshot callback)
-                   (declare (ignore relfilenode columns snapshot))
-                   (dotimes (index 2)
-                     (funcall callback
-                              (make-htup
-                               :values
-                               (vector (make-array
-                                        (1+ +analyze-sample-memory-bytes+)
-                                        :element-type '(unsigned-byte 8)
-                                        :initial-element index)))))))
-           (multiple-value-bind (row-count sample)
-               (analyze-sample-visible-rows table 5903 nil)
-             (check (and (= row-count 2) (zerop (length sample)))
-                    "ANALYZE returns an empty sample when every byte row is oversized"))
-           (setf (symbol-function 'heapam-scan)
-                 (lambda (relfilenode columns snapshot callback)
-                   (declare (ignore relfilenode columns snapshot callback))))
-           (multiple-value-bind (row-count sample)
-               (analyze-sample-visible-rows table 5903 nil)
-             (check (and (zerop row-count) (zerop (length sample)))
-                    "ANALYZE handles a relation with no visible rows")))
-      (setf (symbol-function 'heapam-scan) original-heapam-scan))))
+(defun test-analyze-byte-vector-reservoir-width-and-oversize ()
+  (let* ((columns (vector (make-pg-column :name "v" :type :bytea)))
+         (table (make-pg-class :oid 5903 :name "byte_sample_edges"
+                               :relfilenode 5903 :columns columns))
+         (*analyze-random-function* (constantly 0)))
+    (call-with-test-analyze-pages
+     table (loop for index below 600
+                 collect (vector (make-array (if (< index 300) 16 4096)
+                                             :element-type '(unsigned-byte 8)
+                                             :initial-element (mod index 256))))
+     (lambda (snapshot pages)
+       (declare (ignore pages))
+       (multiple-value-bind (row-count sample)
+           (analyze-sample-visible-rows table 5903 snapshot)
+         (check (= row-count 600) "ANALYZE counts rows after tuple width grows")
+         (check (= (length sample) +analyze-sample-size+)
+                "larger physical tuples retain the configured reservoir count")
+         (check (eq (analyze-physical-column-value table (aref sample 0) 0 snapshot)
+                    +analyze-wide-value+)
+                "later wide byte values can replace earlier narrow values")
+         (check (<= (loop for bytes across sample sum (length bytes))
+                    +analyze-sample-memory-bytes+)
+                "mixed-width physical samples stay within the memory budget"))))
+    ;; An oversized logical value still fits in the physical sample as a pointer.
+    (let* ((pointer (make-heap-external-varlena
+                     :raw-size (+ 5 +analyze-sample-memory-bytes+)
+                     :external-info (1+ +analyze-sample-memory-bytes+)
+                     :value-id 1 :relation-id 1 :id-width 4))
+           (small (make-array 3 :element-type '(unsigned-byte 8)
+                                :initial-contents '(4 5 6))))
+      (call-with-test-analyze-pages
+       table (list (vector pointer) (vector small))
+       (lambda (snapshot pages)
+         (declare (ignore pages))
+         (multiple-value-bind (row-count sample)
+             (analyze-sample-visible-rows table 5903 snapshot)
+           (check (and (= row-count 2) (= (length sample) 2))
+                  "ANALYZE retains physical tuples even when logical values exceed its budget")
+           (check (eq (analyze-physical-column-value table (aref sample 0) 0 snapshot)
+                      +analyze-wide-value+)
+                  "oversized external values use the wide-value marker")
+           (check (equalp (analyze-physical-column-value table (aref sample 1) 0 snapshot)
+                          small)
+                  "a narrow byte value after an oversized value is still decoded"))))
+      (call-with-test-analyze-pages
+       table (list (vector pointer) (vector pointer))
+       (lambda (snapshot pages)
+         (declare (ignore pages))
+         (let ((stats (analyze-table-statistics table 5903 snapshot)))
+           (check (and (= (pg-table-statistics-row-count stats) 2)
+                       (= (pg-table-statistics-sample-count stats) 2))
+                  "all-wide rows still contribute to ANALYZE row and sample counts")
+           (check (null (pg-column-statistics-most-common-values
+                         (aref (pg-table-statistics-columns stats) 0)))
+                  "wide values are excluded from the decoded MCV list")))))
+    (call-with-test-analyze-pages
+     table nil
+     (lambda (snapshot pages)
+       (check (zerop (length pages)) "the empty fixture has no heap blocks")
+       (multiple-value-bind (row-count sample)
+           (analyze-sample-visible-rows table 5903 snapshot)
+         (check (and (zerop row-count) (zerop (length sample)))
+                "ANALYZE handles a relation with no visible rows"))))))
 
 (defun test-analyze-reservoir-sample-is-bounded ()
-  (let* ((table (make-pg-class
-                 :oid 59 :name "sampled" :relfilenode 5901
-                 :columns (vector (make-pg-column :name "id" :type :int4
-                                                  :typmod -1 :attnum 1))))
-         (original-heapam-scan (symbol-function 'heapam-scan)))
-    (unwind-protect
-         (progn
-           (setf (symbol-function 'heapam-scan)
-                 (lambda (relfilenode columns snapshot callback)
-                   (declare (ignore relfilenode columns snapshot))
-                   (dotimes (value 1000)
-                     (funcall callback (make-htup :values (vector value))))))
-           (multiple-value-bind (row-count sample)
-               (analyze-sample-visible-rows table 5901 nil)
-             (check (= row-count 1000)
-                    "ANALYZE counts visible rows while sampling")
-             (check (= (length sample) +analyze-sample-size+)
-                    "ANALYZE reservoir remains at its configured sample bound")
-             (check (every (lambda (row)
-                             (and (integerp (aref row 0))
-                                  (<= 0 (aref row 0) 999)))
-                           sample)
-                    "ANALYZE sample contains copied visible row values"))
-           (let ((*analyze-random-function*
-                   (lambda (limit) (declare (ignore limit)) 0))
-                 (row (make-array 30000 :initial-element +null+)))
-             (setf (symbol-function 'heapam-scan)
-                   (lambda (relfilenode columns snapshot callback)
-                     (declare (ignore relfilenode columns snapshot))
-                     (dotimes (value 100)
-                       (setf (aref row 0) value)
-                       (funcall callback (make-htup :values row)))))
-             (multiple-value-bind (row-count sample)
-                 (analyze-sample-visible-rows table 5901 nil)
-               (check (= row-count 100)
-                      "ANALYZE counts rows after its byte-limited sample fills")
-               (check (and (< (length sample) +analyze-sample-size+)
-                           (= (aref (aref sample 0) 0) 99))
-                      "byte-limited reservoir shrinks and still considers later rows")))
-           (let ((*analyze-random-function*
-                   (lambda (limit) (declare (ignore limit)) 0))
-                 (wide-row (make-array 100000 :initial-element +null+)))
-             (setf (aref wide-row 0) 999
-                   (symbol-function 'heapam-scan)
-                   (lambda (relfilenode columns snapshot callback)
-                     (declare (ignore relfilenode columns snapshot))
-                     (dotimes (value +analyze-sample-size+)
-                       (funcall callback (make-htup :values (vector value))))
-                     (funcall callback (make-htup :values wide-row))))
-             (multiple-value-bind (row-count sample)
-                 (analyze-sample-visible-rows table 5901 nil)
-               (check (= row-count (1+ +analyze-sample-size+))
-                      "ANALYZE counts rows when a wider row reduces reservoir capacity")
-               (check (and (= (length sample) 5)
-                           (= (length (aref sample 0)) 100000)
-                           (= (aref (aref sample 0) 0) 999))
-                      "ANALYZE shrinks an existing reservoir when wider rows arrive")))
-           (setf (symbol-function 'heapam-scan)
-                 (lambda (relfilenode columns snapshot callback)
-                   (declare (ignore relfilenode columns snapshot))
-                   (funcall callback
-                            (make-htup
-                             :values (make-array 600000
-                                                 :initial-element +null+)))
-                   (funcall callback (make-htup :values #(7)))))
-           (multiple-value-bind (row-count sample)
-               (analyze-sample-visible-rows table 5901 nil)
-             (check (= row-count 2)
-                    "ANALYZE counts rows even when one row exceeds sample bytes")
-             (check (and (= (length sample) 1)
-                         (= (aref (aref sample 0) 0) 7))
-                    "ANALYZE skips oversized sample copies under its byte budget")))
-      (setf (symbol-function 'heapam-scan) original-heapam-scan))))
+  (let* ((columns (vector (make-pg-column :name "id" :type :int4 :attnum 1)))
+         (table (make-pg-class :oid 59 :name "sampled" :relfilenode 5901 :columns columns))
+         (*analyze-random-function* (constantly 0)))
+    (call-with-test-analyze-pages
+     table (loop for value below 1000 collect (vector value))
+     (lambda (snapshot pages)
+       (check (> (length pages) 1) "the reservoir fixture spans multiple heap pages")
+       (multiple-value-bind (row-count sample)
+           (analyze-sample-visible-rows table 5901 snapshot)
+         (check (= row-count 1000) "ANALYZE counts visible rows while sampling")
+         (check (= (length sample) +analyze-sample-size+)
+                "ANALYZE reservoir remains at its configured sample bound")
+         (check (every (lambda (bytes)
+                         (let ((value (analyze-physical-column-value table bytes 0 snapshot)))
+                           (and (integerp value) (<= 0 value 999))))
+                       sample)
+                "ANALYZE sample contains valid physical tuple copies")
+         (check (= (analyze-physical-column-value table (aref sample 0) 0 snapshot) 999)
+                "the full reservoir still considers later rows")
+         ;; Samples must own their tuple bytes after the source pages change.
+         (loop for page across pages do (fill page 0))
+         (check (= (analyze-physical-column-value table (aref sample 0) 0 snapshot) 999)
+                "sampled tuples remain owned after source pages change"))))
+    (call-with-test-analyze-pages
+     table (loop for value below 10 collect (vector value))
+     (lambda (snapshot pages)
+       (let ((page (aref pages 0)))
+         (multiple-value-bind (offset flags length) (page-get-lp page 1)
+           (declare (ignore flags length))
+           (page-set-u32 page (+ offset +heap-tuple-xmax-off+) 1))
+         (page-mark-dead page 2)
+         (page-mark-unused page 3))
+       (multiple-value-bind (row-count sample)
+           (analyze-sample-visible-rows table 5901 snapshot)
+         (check (and (= row-count 7) (= (length sample) 7))
+                "ANALYZE excludes deleted tuples and dead or unused line pointers")
+         (check (equal (loop for bytes across sample
+                             collect (analyze-physical-column-value table bytes 0 snapshot))
+                       '(3 4 5 6 7 8 9))
+                "physical sampling applies snapshot visibility before admission"))))))
 
 (defun test-analyze-publish-restores-on-save-failure ()
   (let* ((table (make-pg-class :oid 60 :name "stats_failure"
