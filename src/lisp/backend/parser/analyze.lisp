@@ -5017,6 +5017,7 @@ truncate and interpret the result at TYPE's signed width."
      (format nil "~{~d~^ ~}" (coerce (if (sql-array-p v) (sql-array-elements v) v) 'list)))
     ((or (sql-decimal-p v) (and (eq type :numeric) (sql-numeric-special-p v)))
      (sql-numeric-output v))
+    ((and (eq type :text) (typep v '(vector (unsigned-byte 8)))) v)
     ((stringp v) v)
     (t (princ-to-string v))))
 

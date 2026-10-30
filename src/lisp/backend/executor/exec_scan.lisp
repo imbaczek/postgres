@@ -1917,6 +1917,7 @@ Keep detached per-row origins alongside spooled values when capture is active."
 (defun select-row-field-writer (value type)
   "Return a repeatable character writer, or NIL for SQL NULL."
   (cond ((eq value +null+) nil)
+        ((and (eq type :text) (typep value '(vector (unsigned-byte 8)))) value)
         ((eq type :bytea)
          (let ((format (or (session-extra-setting-value "bytea_output") "hex")))
            (lambda (out) (select-write-bytea-text out value format))))
@@ -1955,6 +1956,11 @@ Keep detached per-row origins alongside spooled values when capture is active."
           do (funcall counting part) (when sink (funcall sink part)))
     (funcall metrics)))
 
+(defun select-row-text-write (writer sink &optional (limit #x7fffffff))
+  (if (typep writer '(vector (unsigned-byte 8)))
+      (select-row-binary-bytea-write writer sink limit)
+      (select-row-utf8-write writer sink limit)))
+
 (defun select-row-binary-write (value type sink &optional (limit #x7fffffff))
   "Count, checksum and optionally emit a supported binary field."
   (multiple-value-bind (counting metrics) (logical-encoding-sink limit)
@@ -1964,7 +1970,7 @@ Keep detached per-row origins alongside spooled values when capture is active."
         (:numeric (emit (extended-binary-numeric-output value)))
         ((:text :varchar :json :jsonb)
          (when (eq type :jsonb) (emit (vector 1)))
-         (select-row-utf8-write (select-row-field-writer value type) #'emit limit))
+         (select-row-text-write (select-row-field-writer value type) #'emit limit))
         (otherwise (error "unsupported binary DataRow type"))))
     (funcall metrics)))
 
@@ -1986,7 +1992,7 @@ Keep detached per-row origins alongside spooled values when capture is active."
              (multiple-value-bind (length checksum)
                  (cond ((null writer) (values nil nil))
                        (binary (select-row-binary-write (car writer) (cdr writer) nil))
-                       (t (select-row-utf8-write writer nil)))
+                       (t (select-row-text-write writer nil)))
                (when (and length (> length #x7fffffff)) (error "DataRow field too large"))
                (when length (incf size length))
                (push (list writer length checksum binary) fields)))
@@ -2010,7 +2016,7 @@ Keep detached per-row origins alongside spooled values when capture is active."
                      (when writer
                        (multiple-value-bind (actual actual-checksum)
                            (if binary (select-row-binary-write (car writer) (cdr writer) #'emit length)
-                               (select-row-utf8-write writer #'emit length))
+                               (select-row-text-write writer #'emit length))
                          (unless (and (= length actual) (= checksum actual-checksum))
                            (error "DataRow field changed during output"))))))
                  (unless last-byte (error "empty DataRow frame"))
