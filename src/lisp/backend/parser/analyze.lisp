@@ -1436,6 +1436,55 @@ so a nested argument error keeps its own diagnostics."
       (report-qualified-numeric-call-error name schema (third expr) table
                                            (getf (cdddr expr) :call-order)))))
 
+(defun analyze-sequence-function (name arguments)
+  "Resolve sequence calls before execution can discard a strict or unused call.
+
+C coerces an unknown name literal through regclassin during analysis.  Resolve
+names here, but accept numeric OIDs and the dash without a catalog lookup.
+Defer this check when call decorations must be rejected first.  Explicit text
+arguments are resolved at runtime; stored sequence references still use names."
+  (let* ((setval-p (string= name "setval"))
+         (types (if setval-p '(:text :int8 :bool) '(:text))))
+    (unless (and (if setval-p (member (length arguments) '(2 3))
+                     (= (length arguments) 1))
+                 (eq (expr-type (first arguments)) :text)
+                 (loop for argument in (rest arguments) for type in (rest types)
+                       always (or (in-unknown-constant-p argument)
+                                  (sql-implicit-coercion-p (expr-type argument) type))))
+      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+    (let ((argument (first arguments)))
+      (when (and (not *defer-function-constant-coercion-p*)
+                 (in-unknown-constant-p argument) (stringp (second argument)))
+        (let ((literal (second argument)))
+          ;; parseDashOrOid accepts these without consulting pg_class.
+          (cond ((string= literal "-"))
+                ((and (plusp (length literal))
+                      (every (lambda (character) (char<= #\0 character #\9)) literal))
+                 (sql-oid-input literal))
+                (t (check-sequence-function-relation literal))))))
+    (list :func name
+          (cons (first arguments)
+                (loop for argument in (rest arguments) for type in (rest types)
+                      collect (coerce-common-expression argument type)))
+          :type :int8 :typmod -1)))
+
+(defun check-sequence-function-relation (name &optional require-sequence-p)
+  "Resolve a sequence call's relation without relocking an analysis caller.
+
+Unknown literals name any relation, like regclassin.  Check the sequence kind
+only when a non-NULL call executes; explicit text arguments arrive here then."
+  (flet ((check-relation ()
+           (let ((sequence (lookup-sequence name))
+                 (relation (or (lookup-table name) (lookup-index name))))
+             (unless (or sequence relation)
+               (ereport "42P01" "relation \"~a\" does not exist" name))
+             (when (and require-sequence-p (not sequence))
+               (ereport "42809" "\"~a\" is not a sequence" name)))))
+    (if (sb-thread:holding-mutex-p *write-lock*)
+        (check-relation)
+        (with-write-lock (check-relation))))
+  name)
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (check-qualified-numeric-function-call expr table)
@@ -1532,12 +1581,11 @@ so a nested argument error keeps its own diagnostics."
                :test #'string=)
        (analyze-nullary-function name args))
       ((logical-helper-function-p name) (analyze-logical-helper-function name args))
-      ((member name '("nextval" "currval") :test #'string=)
-       (unless (and (= (length args) 1)
-                    (eq (expr-type (first args)) :text))
-         (ereport "42883" "function ~a(~a) does not exist"
-                  name (call-signature args)))
-       (list :func name args :type :int8 :typmod -1))
+      ((member name '("nextval" "currval" "setval") :test #'string=)
+       (let ((*defer-function-constant-coercion-p*
+               (or (getf (cdddr expr) :call-distinct)
+                   (getf (cdddr expr) :call-order))))
+         (analyze-sequence-function name args)))
       ((string= name "set_config")
        (unless (and (= (length args) 3)
                     (eq (expr-type (first args)) :text)
@@ -1546,15 +1594,6 @@ so a nested argument error keeps its own diagnostics."
                         (equal (third args) (list :const +null+ :type :text :typmod -1))))
          (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
        (list :func name args :type :text :typmod -1))
-      ((string= name "setval")
-       (unless (and (member (length args) '(2 3))
-                    (eq (expr-type (first args)) :text)
-                    (member (expr-type (second args)) '(:int4 :int8))
-                    (or (= (length args) 2)
-                        (eq (expr-type (third args)) :bool)))
-         (ereport "42883" "function ~a(~a) does not exist"
-                  name (call-signature args)))
-       (list :func name args :type :int8 :typmod -1))
       ((member name '("length" "char_length" "character_length" "octet_length") :test #'string=)
        (unless (and (= (length args) 1)
                     (or (member (expr-type (first args)) '(:text :varchar :name :char))
@@ -4338,11 +4377,11 @@ aliases share the corresponding numeric operator implementation."
     ((string= name "nextval")
      (unless (and (= (length args) 1) (stringp (first args)))
        (ereport "42883" "nextval expects one sequence name string"))
-     (sequence-nextval (first args)))
+     (sequence-nextval (check-sequence-function-relation (first args) t)))
     ((string= name "currval")
      (unless (and (= (length args) 1) (stringp (first args)))
        (ereport "42883" "currval expects one sequence name string"))
-     (sequence-currval (first args)))
+     (sequence-currval (check-sequence-function-relation (first args) t)))
     ((string= name "set_config")
      (set-config-value (first args) (second args) (third args)))
     ((string= name "setval")
@@ -4353,7 +4392,7 @@ aliases share the corresponding numeric operator implementation."
                       (member (third args) '(t nil))))
        (ereport "42883"
                 "setval expects a sequence name, int8 value, and optional boolean"))
-     (sequence-setval (first args) (second args)
+     (sequence-setval (check-sequence-function-relation (first args) t) (second args)
                       (if (= (length args) 3) (third args) t)))
     ((logical-helper-function-p name)
      (eval-logical-helper-function name args))

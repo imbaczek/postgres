@@ -113,10 +113,10 @@
 
 (rove:deftest window-key-sharing-and-probe-cleanup
     (let* ((prepared (prepare-select (first (parse-statements
-                                             "SELECT sum(nextval('unused')::int4),rank() OVER(ORDER BY sum(nextval('unused')::int4))")))))
+                                             "SELECT sum(nextval('unused'::text)::int4),rank() OVER(ORDER BY sum(nextval('unused'::text)::int4))")))))
       (rove:ok (= 1 (getf prepared :aggregate-count))))
   (let* ((prepared (prepare-select (first (parse-statements
-                                           "SELECT DISTINCT sum(nextval('unused')) OVER(ORDER BY 1) ORDER BY sum(nextval('unused')) OVER(ORDER BY 1)")))))
+                                           "SELECT DISTINCT sum(nextval('unused'::text)) OVER(ORDER BY 1) ORDER BY sum(nextval('unused'::text)) OVER(ORDER BY 1)")))))
     (rove:ok (= 1 (length (getf prepared :windows)))))
   (let ((plan (plan-select-query (first (parse-statements "SELECT rank() OVER(ORDER BY 1)")))))
     (rove:ok (search "WindowAgg" (format-query-plan plan)))))

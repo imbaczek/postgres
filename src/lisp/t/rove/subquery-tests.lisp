@@ -241,7 +241,7 @@
                    "SELECT DISTINCT (SELECT d.x) FROM (SELECT 1 AS x) d ORDER BY (SELECT x)")))
   (let* ((plan (plan-select-query
                 (first (parse-statements
-                        "SELECT DISTINCT (SELECT sum(o.x+nextval('unused'))) FROM (SELECT 1 AS x) o ORDER BY (SELECT sum(o.x+nextval('unused')))")))))
+                        "SELECT DISTINCT (SELECT sum(o.x+nextval('unused'::text))) FROM (SELECT 1 AS x) o ORDER BY (SELECT sum(o.x+nextval('unused'::text)))")))))
     (rove:ok (= 1 (getf (query-plan-prepared plan) :aggregate-count))
              "ORDER reuses the selected outer-owned volatile transition")))
 
@@ -251,7 +251,7 @@
                      "SELECT (SELECT sum(i.x + sum(o.x)) FROM (SELECT 10 AS x) i) FROM (SELECT 1 AS x UNION ALL SELECT 2) o")))
   (let* ((plan (plan-select-query
                 (first (parse-statements
-                        "SELECT (SELECT nextval('unused') + CASE WHEN EXISTS(SELECT o.x) THEN 0 ELSE 0 END) FROM (SELECT 1 AS x) o"))))
+                        "SELECT (SELECT nextval('unused'::text) + CASE WHEN EXISTS(SELECT o.x) THEN 0 ELSE 0 END) FROM (SELECT 1 AS x) o"))))
          (descriptor (first (getf (query-plan-prepared plan) :sublinks))))
     (rove:ok (null (sql-subplan-depths descriptor))
              "EXISTS target removal precedes dependency classification")))

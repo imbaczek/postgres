@@ -39,19 +39,25 @@
                (first case)))))
 
 (rove:deftest values-ordering-evaluates-seed-once
-    (let ((original (symbol-function 'sequence-nextval))
-          (calls 0))
-      (unwind-protect
-           (progn
-             (setf (symbol-function 'sequence-nextval)
-                   (lambda (name)
-                     (assert (string= name "values_seed_once"))
-                     (incf calls)))
-             (rove:ok (equal '((1))
-                             (subquery-test-rows
-                              "VALUES(nextval('values_seed_once')) ORDER BY column1+1")))
-             (rove:ok (= calls 1) "ORDER BY reads the projected VALUES column"))
-        (setf (symbol-function 'sequence-nextval) original))))
+    (let* ((*catalog* (make-catalog))
+           (*backend* (make-backend :database "postgres"))
+           (database (make-database :name "postgres" :oid 1)))
+      (setf (gethash "postgres" (catalog-databases *catalog*)) database)
+      (setf (gethash "values_seed_once" (database-sequences database))
+            (make-pg-sequence :name "values_seed_once" :oid 9904))
+      (let ((original (symbol-function 'sequence-nextval))
+            (calls 0))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'sequence-nextval)
+                     (lambda (name)
+                       (assert (string= name "values_seed_once"))
+                       (incf calls)))
+               (rove:ok (equal '((1))
+                               (subquery-test-rows
+                                "VALUES(nextval('values_seed_once')) ORDER BY column1+1")))
+               (rove:ok (= calls 1) "ORDER BY reads the projected VALUES column"))
+          (setf (symbol-function 'sequence-nextval) original)))))
 
 (rove:deftest greatest-rejects-call-modifiers
     (let ((caught nil))

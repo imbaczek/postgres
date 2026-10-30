@@ -547,7 +547,8 @@
 (deftest publication-srf-order-reuses-expanded-field
     (call-with-publication-srf-fixture
      (lambda (database)
-       (declare (ignore database))
+       (setf (gethash "field_calls" (pg::database-sequences database))
+             (pg::make-pg-sequence :name "field_calls" :oid 9905))
        (let* ((sql "SELECT (pg_get_publication_tables(nextval('field_calls')::text)).* ORDER BY relid")
               (prepared (pg::query-plan-prepared
                          (pg::plan-select-query (first (pg::parse-statements sql))))))
@@ -605,7 +606,7 @@
          (ok (= 2 (length (derived-query-rows sql))))))))
 
 (deftest publication-srf-keeps-volatile-aggregate-identities
-    (let* ((sql "SELECT (pg_get_publication_tables(VARIADIC array_agg(nextval('srf_calls')::text))).* FROM (SELECT 1) AS input")
+    (let* ((sql "SELECT (pg_get_publication_tables(VARIADIC array_agg(nextval('srf_calls'::text)::text))).* FROM (SELECT 1) AS input")
            (ast (first (pg::parse-statements sql)))
            (prepared (pg::query-plan-prepared (pg::plan-select-query ast))))
       (ok (= 4 (length (getf prepared :aggregates))))
