@@ -366,6 +366,12 @@ def exercise_retained_policy(peer, socket_identity, sibling, source, promoted):
     if os.environ.get("FOLLOW_LIBPQ") == "1":
         query(promoted, "SELECT pg_create_physical_replication_slot('retained_public',true)")
         form = form[:-1] + ' :slot "retained_public")'
+    control("sibling.sock", '(defparameter *observation-before* (list *physical-follow-runtime* (physical-follow-read-config) (physical-store-control-tuple *physical-receive-store*) (physical-follow-runtime-replay-thread *physical-follow-runtime*)))')
+    control("sibling.sock", '(setf *physical-follow-test-hook* (lambda (point) (when (eq point :before-follow-config-rename) (setf *physical-follow-test-hook* nil) (error "observed namespace save cut"))))')
+    failed_observation = control("sibling.sock", form, expect_error=True)
+    assert 'could not save observed follow timeline' in failed_observation
+    control("sibling.sock", '(assert (and (null *physical-follow-test-hook*) (eq (first *observation-before*) *physical-follow-runtime*) (equal (second *observation-before*) (physical-follow-read-config)) (equal (third *observation-before*) (physical-store-control-tuple *physical-receive-store*)) (eq (fourth *observation-before*) (physical-follow-runtime-replay-thread *physical-follow-runtime*)) (sb-thread:thread-alive-p (fourth *observation-before*)) (= 2 (physical-follow-observed-timeline (getf *physical-recovery-state* :system-id))) (not *physical-recovery-failed-p*) (null *physical-follow-auto-error*)))')
+    assert query(sibling, "SELECT pg_is_wal_replay_paused(),count(*) FROM promotion_sql_items") == [(True, 1)]
     control("sibling.sock", form)
     wait(lambda: query(sibling, f"SELECT pg_last_wal_receive_lsn()='{fork}'::pg_lsn") == [(True,)])
     wait(lambda: ':RECEIVER-STOPPED T' in control("sibling.sock", '(list :receiver-stopped (physical-follow-runtime-receiver-stopped-p *physical-follow-runtime*))'))
@@ -420,6 +426,7 @@ def exercise_retained_policy(peer, socket_identity, sibling, source, promoted):
     sibling = connect(replica_port)
     assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(False, 3)]
     print("retained-policy: parent-only receipt completion, paused replay/resume, source-offline cold startup and live reload PASS", flush=True)
+    print("retained-policy: observed namespace save failure preserves replay and accepted route, manual retry PASS", flush=True)
     print("retained-policy: parent promotion skips known source timeline, intent SIGKILL and cold primary restart PASS", flush=True)
     return peer, socket_identity, sibling
 
