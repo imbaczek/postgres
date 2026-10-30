@@ -11,6 +11,149 @@
 (defun sample-resource-fact (&optional (connections 100) (lsn 64))
   (list :resource-parameters (list connections 8 10 0 128) :resource-lsn lsn :resource-timeline 1))
 
+(deftest managed-worker-real-thread-holds-its-slot-through-completion
+    (let ((pg::*managed-worker-registration-closed-p* nil)
+          (pg::*managed-worker-slots* (make-array 1 :initial-element nil))
+          (pg::*installed-resource-parameters* (pg::make-resource-parameters 100 1 10 0 128))
+          (entered (sb-thread:make-semaphore)) (release (sb-thread:make-semaphore)))
+      (let ((handle (pg::managed-worker-register
+                     (lambda () (sb-thread:signal-semaphore entered)
+                       (sb-thread:wait-on-semaphore release)))))
+        (unwind-protect
+             (progn
+               (ok (eq handle (pg::managed-worker-start handle)))
+               (ok (sb-thread:wait-on-semaphore entered :timeout 5))
+               (ok (eq :running (pg::managed-worker-status handle)))
+               (ok (null (pg::managed-worker-register (lambda () :overflow)))))
+          (sb-thread:signal-semaphore release)
+          (ok (pg::managed-worker-wait handle :timeout 5)))
+        (ok (eq :stopped (pg::managed-worker-status handle)))
+        (ok (every #'null pg::*managed-worker-slots*)))))
+
+(deftest managed-worker-launch-failures-do-not-run-or-release-a-live-job-early
+    (dolist (point '(:before-gate-create :before-thread-create :after-thread-create))
+      (let ((pg::*managed-worker-registration-closed-p* nil)
+            (pg::*managed-worker-slots* (make-array 1 :initial-element nil))
+            (pg::*installed-resource-parameters* (pg::make-resource-parameters 100 1 10 0 128))
+            (ran nil))
+        (let ((handle (pg::managed-worker-register (lambda () (setf ran t)))))
+          (let ((pg::*managed-worker-test-hook*
+                  (lambda (at) (when (eq point at) (error "owned worker launch failure")))))
+            (ok (intake-fails-p (lambda () (pg::managed-worker-start handle)))))
+          (ok (pg::managed-worker-wait handle :timeout 5))
+          (ok (not ran))
+          (ok (every #'null pg::*managed-worker-slots*))))))
+
+(deftest managed-worker-error-and-cooperative-stop-release-capacity
+    (let ((pg::*managed-worker-registration-closed-p* nil)
+          (pg::*managed-worker-slots* (make-array 1 :initial-element nil))
+          (pg::*installed-resource-parameters* (pg::make-resource-parameters 100 1 10 0 128)))
+      (let ((handle (pg::managed-worker-register (lambda () (error "owned job error")))))
+        (pg::managed-worker-start handle)
+        (ok (pg::managed-worker-wait handle :timeout 5)))
+      (let* ((entered (sb-thread:make-semaphore))
+             (handle (pg::managed-worker-register
+                      (lambda ()
+                        (sb-thread:signal-semaphore entered)
+                        (loop until (pg::managed-worker-stop-requested-p) do (sleep 0.001))))))
+        (unwind-protect
+             (progn
+               (pg::managed-worker-start handle)
+               (ok (sb-thread:wait-on-semaphore entered :timeout 5)))
+          (pg::managed-worker-request-stop handle)
+          (ok (pg::managed-worker-wait handle :timeout 5)))
+        (ok (every #'null pg::*managed-worker-slots*)))))
+
+(deftest managed-worker-reservations-count-before-start-and-reject-stale-handles
+    (let ((pg::*managed-worker-registration-closed-p* nil)
+          (pg::*managed-worker-slots* (make-array 1 :initial-element nil))
+          (pg::*managed-worker-generation* 0)
+          (pg::*installed-resource-parameters* (pg::make-resource-parameters 100 1 10 0 128)))
+      (let ((first (pg::managed-worker-register (lambda () :done))))
+        (ok (eq :registered (pg::managed-worker-status first)))
+        (ok (null (pg::managed-worker-register (lambda () :overflow))))
+        (ok (pg::managed-worker-request-stop first))
+        (let ((second (pg::managed-worker-register (lambda () :new))))
+          (ok (= (pg::managed-worker-handle-slot first) (pg::managed-worker-handle-slot second)))
+          (ok (/= (pg::managed-worker-handle-generation first)
+                  (pg::managed-worker-handle-generation second)))
+          (ok (eq :stopped (pg::managed-worker-status first)))
+          (ok (not (pg::managed-worker-request-stop first)))
+          (ok (eq :registered (pg::managed-worker-status second)))
+          (ok (pg::managed-worker-request-stop second))
+          (ok (every #'null pg::*managed-worker-slots*))))))
+
+(deftest managed-worker-zero-capacity-and-unsupported-options-do-not-reserve
+    (let ((pg::*managed-worker-registration-closed-p* nil)
+          (pg::*managed-worker-slots* (make-array 0))
+          (pg::*managed-worker-generation* 0)
+          (pg::*installed-resource-parameters* (pg::make-resource-parameters 100 0 10 0 128)))
+      (ok (null (pg::managed-worker-register (lambda () :disabled))))
+      (dolist (options '((:parallel t) (:database "postgres") (:restart :always)))
+        (ok (intake-fails-p
+             (lambda () (apply #'pg::managed-worker-register (lambda () :unsupported) options)))))
+      (ok (zerop pg::*managed-worker-generation*))))
+
+(deftest managed-worker-cancelled-registration-releases-reservation
+    (let ((pg::*managed-worker-slots* (make-array 1 :initial-element nil))
+          (pg::*managed-worker-registration-closed-p* nil)
+          (pg::*installed-resource-parameters* (pg::make-resource-parameters 100 1 10 0 128))
+          (pg::*managed-worker-test-hook*
+            (lambda (stage)
+              (when (eq stage :after-registration) (error "cancel registration"))))
+          (ran nil))
+      (ok (intake-fails-p
+           (lambda () (pg::start-managed-background-worker (lambda () (setf ran t))))))
+      (ok (not ran))
+      (ok (every #'null pg::*managed-worker-slots*))))
+
+(deftest managed-worker-shutdown-closes-registration-and-releases-reservations
+    (let ((pg::*managed-worker-slots* (make-array 1 :initial-element nil))
+          (pg::*managed-worker-registration-closed-p* nil)
+          (pg::*installed-resource-parameters* (pg::make-resource-parameters 100 1 10 0 128)))
+      (let ((handle (pg::managed-worker-register (lambda () :unused))))
+        (ok handle)
+        (ok (equal (list handle) (pg::managed-worker-request-shutdown)))
+        (ok (eq :stopped (pg::managed-worker-status handle)))
+        (ok (pg::managed-worker-wait handle :timeout 0))
+        (ok (null (pg::managed-worker-register (lambda () :closed))))
+        (ok (every #'null pg::*managed-worker-slots*)))))
+
+(deftest managed-worker-shutdown-waits-for-cooperative-user-code
+    (let ((pg::*managed-worker-slots* (make-array 1 :initial-element nil))
+          (pg::*managed-worker-registration-closed-p* nil)
+          (pg::*installed-resource-parameters* (pg::make-resource-parameters 100 1 10 0 128))
+          (entered (sb-thread:make-semaphore))
+          (finished (sb-thread:make-semaphore)))
+      (let ((handle
+              (pg::start-managed-background-worker
+               (lambda ()
+                 (unwind-protect
+                      (progn
+                        (sb-thread:signal-semaphore entered)
+                        (loop until (pg::managed-worker-stop-requested-p) do (sleep 0.001)))
+                   (sb-thread:signal-semaphore finished))))))
+        (unwind-protect
+             (progn
+               (ok (sb-thread:wait-on-semaphore entered :timeout 5))
+               (pg::managed-worker-shutdown)
+               (ok (sb-thread:wait-on-semaphore finished :timeout 0.001))
+               (ok (eq :stopped (pg::managed-worker-status handle)))
+               (ok (null (pg::start-managed-background-worker (lambda () :closed)))))
+          (pg::managed-worker-request-stop handle)
+          (ok (pg::managed-worker-wait handle :timeout 5))))))
+
+(deftest managed-worker-timeout-releases-capacity
+    (let ((pg::*managed-worker-slots* (make-array 1 :initial-element nil))
+          (pg::*managed-worker-registration-closed-p* nil)
+          (pg::*installed-resource-parameters* (pg::make-resource-parameters 100 1 10 0 128)))
+      (let ((handle (pg::start-managed-background-worker
+                     (lambda () (error 'sb-ext:timeout)))))
+        (ok handle)
+        (ok (pg::managed-worker-wait handle :timeout 5))
+        (ok (eq :stopped (pg::managed-worker-status handle)))
+        (ok (every #'null pg::*managed-worker-slots*)))))
+
 (deftest cold-resource-readiness-requires-proof-after-reconstruction
     (let* ((fact (list :resource-parameters (list 100 8 10 0 64)
                        :resource-lsn 192 :resource-timeline 1))
@@ -52,10 +195,16 @@
 (deftest startup-resource-capacity-installs-one-consistent-tuple-and-lock-pool
     (let ((settings (pg::startup-default-settings "/tmp/resource-capacity-test/"))
           (pg::*installed-resource-parameters* nil)
+          (pg::*managed-worker-slots* nil)
+          (pg::*managed-worker-registration-closed-p* nil)
           (pg::*relation-lock-object-limit* nil)
           (pg::*relation-lock-owner-limit* nil))
       (let ((installed (pg::startup-install-resource-capacity settings)))
         (ok (equal '(100 8 10 0 128) (pg::resource-parameters-values installed)))
+        (progn
+          (ok (= 8 (length pg::*managed-worker-slots*)))
+          (ok (every #'null pg::*managed-worker-slots*))
+          (ok (not pg::*managed-worker-registration-closed-p*)))
         (ok (= 17408 pg::*relation-lock-object-limit*))
         (ok (= 34816 pg::*relation-lock-owner-limit*))
         (ok (intake-fails-p (lambda () (pg::startup-install-resource-capacity settings))))

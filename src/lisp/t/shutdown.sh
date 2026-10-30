@@ -303,6 +303,28 @@ grep -q 'received smart shutdown request' "$LOG" \
 # ---- SIGTERM: smart shutdown ---------------------------------------------
 
 start_server
+worker_state=$(printf '%s\n(quit)\n' \
+    "(let ((started (sb-thread:make-semaphore)))
+       (unless (start-managed-background-worker
+                (lambda ()
+                  (unwind-protect
+                       (progn
+                         (sb-thread:signal-semaphore started)
+                         (loop until (managed-worker-stop-requested-p) do (sleep 0.01)))
+                    (with-open-file (out \"$TMP/managed-worker-stopped\" :direction :output :if-exists :supersede)
+                      (write-line \"stopped\" out))))
+                :name \"shutdown test worker\")
+         (error \"managed worker was refused\"))
+       (unless (sb-thread:wait-on-semaphore started :timeout 5)
+         (error \"managed worker did not start\"))
+       :ready)" \
+    | timeout 20 "$SBCL" --script "$BASE/t/control-client.lisp" \
+        tcp "127.0.0.1:$CONTROL_PORT" 2>&1) \
+    || fail "could not start managed shutdown worker"
+printf '%s\n' "$worker_state" | grep -q ':READY' \
+    || fail "managed shutdown worker did not become ready: $worker_state"
+[ ! -f "$TMP/managed-worker-stopped" ] \
+    || fail "managed worker stopped when the registering control client disconnected"
 q 'create table t (a int primary key)' >/dev/null
 rm -f "$TMP/smart-a-in" "$TMP/smart-b-in"
 mkfifo "$TMP/smart-a-in" "$TMP/smart-b-in"
@@ -351,6 +373,8 @@ status=$?
 set -e
 SRV=
 [ "$status" -eq 0 ] || fail "smart shutdown exited with status $status"
+[ -f "$TMP/managed-worker-stopped" ] \
+    || fail "smart shutdown did not let managed worker cleanup finish"
 wait "$TX_SESSION" 2>/dev/null || true
 wait "$QUERY_SESSION" 2>/dev/null || true
 TX_SESSION=

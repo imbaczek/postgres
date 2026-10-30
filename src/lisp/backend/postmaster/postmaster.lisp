@@ -311,6 +311,8 @@ command (idle) is ignored; the connection and its transaction state survive."
 
 (declaim (ftype function prepare-primary-shutdown call-with-live-operation))
 
+(declaim (ftype function managed-worker-request-shutdown managed-worker-shutdown))
+
 (defun prepare-postmaster-shutdown ()
   "Stop controller work and finalize storage from MAIN outside live admission."
   (when (plusp *live-operation-depth*)
@@ -320,6 +322,7 @@ command (idle) is ignored; the connection and its transaction state survive."
   (unless (sb-thread:with-mutex (*shutdown-lock*) *shutdown-finished*)
     ;; Like C ShutdownXLOG, recovery shutdown publishes an applied restartpoint.
     ;; The signal worker remains free to process SIGQUIT while this waits.
+    (managed-worker-shutdown)
     (physical-follow-controller-stop-worker)
     (if (recovery-in-progress-p)
         (progn
@@ -361,6 +364,8 @@ are killed abruptly."
   (sb-ext:exit :code 0))
 
 (defun act-on-shutdown (mode)
+  (when (or (= mode +smart-shutdown+) (= mode +fast-shutdown+))
+    (managed-worker-request-shutdown))
   (case mode
     (#.+smart-shutdown+
      (admin-log "received smart shutdown request")

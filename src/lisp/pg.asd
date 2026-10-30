@@ -66,7 +66,7 @@
         :components ((:file "vacuumlazy")))))
      (:module "postmaster"
       :serial t
-      :components ((:file "postmaster")))
+      :components ((:file "postmaster") (:file "bgworker")))
      (:module "catalog"
       :serial t
       :components ((:file "catalog")

@@ -7,6 +7,9 @@
 
 (defvar *startup-command-overrides* nil)
 
+(declaim (special *managed-worker-slots* *managed-worker-lock*
+                  *managed-worker-registration-closed-p*))
+
 (declaim (special *physical-restartpoint-timeout* *physical-restartpoint-wal-bytes*))
 
 (declaim (ftype function directory-pathname parse-port-arg parse-query-temp-file-limit-bytes
@@ -577,15 +580,22 @@ has default 128 and range 10 through INT_MAX, and requires a restart to change."
   "Install the tuple and relation limits once under the relation lock.
 Check existing registrations fit before publishing either limit."
   (multiple-value-bind (parameters objects owners) (startup-resource-capacity-plan settings)
-    (sb-thread:with-mutex (*relation-lock-mutex*)
-      (when *installed-resource-parameters*
-        (error "resource capacity is already installed; restart is required"))
-      (multiple-value-bind (used-objects used-owners) (relation-resource-footprint-under-lock)
-        (unless (and (<= used-objects objects) (<= used-owners owners))
-          (error "installed resource capacity cannot cover existing relation registrations")))
-      (setf *relation-lock-object-limit* objects
-            *relation-lock-owner-limit* owners
-            *installed-resource-parameters* parameters))
+    (let ((slots (make-array (resource-parameters-workers parameters) :initial-element nil)))
+      (sb-thread:with-mutex (*relation-lock-mutex*)
+        (sb-thread:with-mutex (*managed-worker-lock*)
+          (when (or *installed-resource-parameters* *managed-worker-slots*)
+            (error "resource capacity is already installed; restart is required"))
+          (when (shutdown-in-progress-p)
+            (error "cannot install resource capacity during shutdown"))
+          (multiple-value-bind (used-objects used-owners) (relation-resource-footprint-under-lock)
+            (unless (and (<= used-objects objects) (<= used-owners owners))
+              (error "installed resource capacity cannot cover existing relation registrations")))
+          (sb-sys:without-interrupts
+            (setf *relation-lock-object-limit* objects
+                  *relation-lock-owner-limit* owners
+                  *managed-worker-slots* slots
+                  *managed-worker-registration-closed-p* nil
+                  *installed-resource-parameters* parameters)))))
     parameters))
 
 (defun startup-install-settings (settings native overrides)

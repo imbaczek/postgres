@@ -321,6 +321,8 @@
              (pg::*startup-server-settings* nil)
              (pg::*startup-native-inputs* nil) (pg::*startup-command-overrides* nil)
              (pg::*installed-resource-parameters* nil)
+             (pg::*managed-worker-slots* nil)
+             (pg::*managed-worker-registration-closed-p* nil)
              (pg::*relation-lock-object-limit* nil) (pg::*relation-lock-owner-limit* nil))
         (write-startup-config configuration (format nil "max_locks_per_transaction=137~%"))
         (multiple-value-bind (native overrides) (pg::startup-cli-inputs (list "-D" (namestring root)))
