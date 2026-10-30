@@ -7,6 +7,9 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import psycopg2
+from binary_values import parse
+from returning_portals import bind, close_portal, cycle, execute, expect_kinds
+from subqueries import QueryConnection
 
 
 def connect(port):
@@ -93,6 +96,43 @@ def only_snapshot():
         pool.shutdown(wait=True)
 
 
+def suspended_portal():
+    # Use READ COMMITTED so the suspended portal's registered statement
+    # snapshot, rather than a retained RR transaction snapshot, protects rows.
+    reader = QueryConnection(target_port, 'promotion-suspended-portal')
+    try:
+        reader.query('BEGIN')
+        sql = 'SELECT id,label FROM promotion_sql_items'
+        result = cycle(reader, [parse(sql, name=b'old'), bind((), portal=b'old', statement=b'old'),
+                                execute(1, b'old')])
+        expect_kinds(result, [b'1', b'2', b'D', b's', b'Z'])
+        first = reader.data_row(result[2][1])
+        assert first == ['1', 'before'], first
+        query(source, "UPDATE promotion_sql_items SET label='changed' WHERE id=402")
+        query(source, "INSERT INTO promotion_sql_items VALUES (403,'new')")
+        position = scalar(source, 'SELECT pg_current_wal_flush_lsn()')
+        wait_until(lambda: scalar(target, f"SELECT pg_last_wal_receive_lsn() >= '{position}'::pg_lsn"))
+        result = subprocess.run(
+            [str(base / 'bin/pg_ctl'), 'promote', '-D', str(root / 'copy'), '-w', '-t', '30'],
+            text=True, capture_output=True, timeout=40)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert scalar(target, 'SELECT pg_is_in_recovery()') is False
+        assert scalar(target, 'SELECT count(*) FROM promotion_sql_items') == 403
+        assert scalar(target, 'SELECT label FROM promotion_sql_items WHERE id=402') == 'changed'
+        # Resume the same cursor after replay and promotion; it must not see
+        # either the updated version or the newly inserted row.
+        result = cycle(reader, [execute(0, b'old')])
+        expect_kinds(result, [b'D'] * 401 + [b'C', b'Z'])
+        rows = [reader.data_row(body) for kind, body in result if kind == b'D']
+        assert [int(row[0]) for row in rows] == list(range(2, 403))
+        assert rows[-1] == ['402', 'old-402-' + 'x' * 192], rows[-1]
+        expect_kinds(cycle(reader, [close_portal(b'old')]), [b'3', b'Z'])
+        reader.query('COMMIT')
+        print('promotion-readers: suspended portal retains statement snapshot across promotion PASS', flush=True)
+    finally:
+        reader.close()
+
+
 base, root = Path(sys.argv[1]), Path(sys.argv[2])
 source_port, target_port, target_pid = map(int, sys.argv[3:])
 source, target = connect(source_port), connect(target_port)
@@ -101,7 +141,17 @@ utility = None
 try:
     query(source, "INSERT INTO promotion_sql_items VALUES (2,'warm')")
     wait_until(lambda: scalar(target, "SELECT count(*) FROM promotion_sql_items") == 2)
+    if os.environ.get("PROMOTION_SUSPENDED_PORTAL"):
+        # Hundreds of inline tuples span several heap pages, so the late row
+        # has not been copied by the first pull of the unqualified scan.
+        padding = 'x' * 192
+        query(source, 'INSERT INTO promotion_sql_items VALUES ' + ','.join(
+            f"({i},'old-{i}-{padding}')" for i in range(3, 403)))
+        wait_until(lambda: scalar(target, 'SELECT count(*) FROM promotion_sql_items') == 402)
     query(target, "SELECT pg_wal_replay_pause()")
+    if os.environ.get("PROMOTION_SUSPENDED_PORTAL"):
+        suspended_portal()
+        sys.exit(0)
     if os.environ.get("PROMOTION_ONLY_SNAPSHOT"):
         only_snapshot()
         sys.exit(0)
