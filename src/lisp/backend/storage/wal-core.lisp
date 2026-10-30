@@ -1316,12 +1316,20 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
 (declaim (ftype function wal-validate-logical-binary-capability-under-lock))
 
 (defun wal-commit-transaction (xid after-durable-function &optional logical-changes)
-  "Flush page images, LOGICAL-CHANGES, and XID's commit as one WAL boundary."
+  "Flush page images, LOGICAL-CHANGES, and XID's commit as one WAL boundary.
+Replacement publication runs inside the same fail-stop WAL critical section."
   (unless *wal-ready*
+    (when (fboundp 'publish-transaction-replacements-under-wal-lock)
+      (with-wal-critical
+        (funcall 'publish-transaction-replacements-under-wal-lock
+                 (when (boundp '*backend*) (symbol-value '*backend*)) t)))
     (funcall after-durable-function)
     (return-from wal-commit-transaction (values)))
   (with-wal-critical
     (wal-validate-logical-binary-capability-under-lock xid)
+    (when (fboundp 'publish-transaction-replacements-under-wal-lock)
+      (funcall 'publish-transaction-replacements-under-wal-lock
+               (when (boundp '*backend*) (symbol-value '*backend*))))
     (let ((keys (wal-primary-page-keys)) (split-p *wal-pending-btree-split*))
       (wal-primary-preflight-page-keys keys)
       (with-wal-primary-page-spool (spool)

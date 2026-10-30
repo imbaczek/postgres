@@ -1519,9 +1519,21 @@
   (rove:ok (handler-case (progn (analyze-expr '(:parameter 0) nil) nil)
              (pg-error (condition) (string= (pg-error-sqlstate condition) "42P02")))))
 
+(defun logical-test-extended-statement-start (registration)
+  "Supply an owned snapshot without starting storage or XID wraparound machinery."
+  (let ((snapshot (make-snapshot-struct
+                   :xmin 10 :xmax 10 :xip nil
+                   :curcid (incf (backend-command-id *backend*)))))
+    (sb-thread:with-mutex (*xid-lock*)
+      (register-active-snapshot snapshot registration))
+    snapshot))
+
 (rove:deftest test-extended-dml-bind-and-sync
     (let* ((*extended-query-state* (make-extended-query-state))
            (*backend* (make-backend))
+           (*active-snapshots* 0)
+           (*active-snapshot-set* (make-hash-table :test #'eq))
+           (original-start (symbol-function 'statement-start))
            (path (merge-pathnames (format nil "pg-extended-~d-~d" (sb-posix:getpid) (random 1000000))
                                   (uiop:temporary-directory)))
            (original-execute (symbol-function 'execute-statement))
@@ -1531,13 +1543,16 @@
       (unwind-protect
            (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
                                      :if-exists :supersede)
-             (setf (symbol-function 'prepare-dml-subqueries) (lambda (ast) (declare (ignore ast)) nil)
+             (setf (symbol-function 'statement-start) #'logical-test-extended-statement-start
+                   (symbol-function 'prepare-dml-subqueries) (lambda (ast) (declare (ignore ast)) nil)
                    (symbol-function 'execute-statement)
                    (lambda (stream ast) (declare (ignore stream ast))
                      (setf observed (list *query-parameter-types* *query-parameter-values*)))
                    (symbol-function 'commit-transaction)
                    (lambda () (setf committed t) (set-backend-state *backend* :idle)))
              (extended-apply-operation out '(:parse "" "insert into t values ($1, $2)" (23 25)) #())
+             (rove:ok (= 1 (backend-command-id *backend*)))
+             (rove:ok (zerop *active-snapshots*))
              (extended-apply-operation out '(:bind "" "" (0) ((0 . 2) (2 . 5)) ())
                                        (string->bytes "42hello"))
              (extended-apply-operation out '(:execute "" 0) #())
@@ -1546,7 +1561,9 @@
              (extended-apply-operation out '(:sync) #())
              (rove:ok committed)
              (rove:ok (eq :idle (backend-state *backend*))))
-        (setf (symbol-function 'prepare-dml-subqueries) original-prepare
+        (extended-clear-portals *extended-query-state*)
+        (setf (symbol-function 'statement-start) original-start
+              (symbol-function 'prepare-dml-subqueries) original-prepare
               (symbol-function 'execute-statement) original-execute
               (symbol-function 'commit-transaction) original-commit)
         (when (probe-file path) (delete-file path)))))
@@ -1946,14 +1963,18 @@
 
 (rove:deftest test-extended-select-portal-formats-and-description
     (let* ((*backend* (make-backend)) (*extended-query-state* (make-extended-query-state))
+                                      (*active-snapshots* 0)
+                                      (*active-snapshot-set* (make-hash-table :test #'eq))
+                                      (old-start (symbol-function 'statement-start))
                                       (path (merge-pathnames (format nil "pg-select-portal-~d-~d" (sb-posix:getpid) (random 1000000)) (uiop:temporary-directory)))
                                       (old-columns (symbol-function 'extended-select-result-columns))
                                       (old-execute (symbol-function 'execute-statement))
                                       (observed nil))
       (unwind-protect
            (progn
-             (setf (symbol-function 'extended-select-result-columns)
-                   (lambda (ast) (declare (ignore ast))
+             (setf (symbol-function 'statement-start) #'logical-test-extended-statement-start
+                   (symbol-function 'extended-select-result-columns)
+                   (lambda (ast &optional register-p) (declare (ignore ast register-p))
                      (list (make-result-column :name "i" :type-oid 23)
                            (make-result-column :name "b" :type-oid 17)))
                    (symbol-function 'execute-statement)
@@ -1962,6 +1983,8 @@
              (with-open-file (out path :direction :io :element-type '(unsigned-byte 8) :if-exists :supersede :if-does-not-exist :create)
                (extended-apply-operation out '(:parse "s" "SELECT * FROM t" ()) #())
                (extended-apply-operation out '(:bind "p" "s" () () (0 1)) #())
+               (rove:ok (= 2 (backend-command-id *backend*)))
+               (rove:ok (= 1 *active-snapshots*))
                (extended-apply-operation out '(:describe #\P "p") #())
                (extended-apply-operation out '(:execute "p" 0) #())
                (rove:ok (and (first observed) (equalp (second observed) #(0 1))))
@@ -1973,7 +1996,10 @@
                  (rove:ok (= type (char-code #\T)))
                  (let ((columns (pg-client-read-column-description payload)))
                    (rove:ok (equal (mapcar #'pg-client-column-format columns) '(0 1)))))))
-        (setf (symbol-function 'extended-select-result-columns) old-columns
+        (extended-clear-portals *extended-query-state*)
+        (rove:ok (zerop *active-snapshots*))
+        (setf (symbol-function 'statement-start) old-start
+              (symbol-function 'extended-select-result-columns) old-columns
               (symbol-function 'execute-statement) old-execute)
         (when (probe-file path) (delete-file path)))))
 
