@@ -346,6 +346,62 @@ def exercise_public_slot(peer, socket_identity, sibling, source):
     return peer, socket_identity, sibling
 
 
+def exercise_retained_policy(peer, socket_identity, sibling, source, promoted):
+    assert query(sibling, "SELECT count(*) FROM promotion_sql_items") == [(1,)]
+    control("sibling.sock", '(physical-follow-stop)')
+    sibling.close()
+    assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
+    (data / "standby.signal").write_text("")
+    peer, socket_identity = start_peer(timeline_goal="current")
+    sibling = connect(replica_port)
+    query(sibling, "SELECT pg_wal_replay_pause()")
+    query(source, "INSERT INTO promotion_sql_items VALUES (2,'retained-parent')")
+    parent_end = query(source, "SELECT pg_current_wal_flush_lsn()::text")[0][0]
+    wait(lambda: query(promoted, f"SELECT pg_last_wal_replay_lsn()>='{parent_end}'::pg_lsn") == [(True,)])
+    assert query(promoted, "SELECT pg_promote(true,30)") == [(True,)]
+    query(promoted, "INSERT INTO promotion_sql_items VALUES (3,'excluded-retained-child')")
+    fork_output = control("target.sock", '(format t "RETAINED-FORK ~a~%" (wal-format-lsn (timeline-history-entry-end (second (timeline-read-history *wal-insert-timeline*)))) )')
+    fork = fork_output.partition("RETAINED-FORK ")[2].split()[0]
+    form = retarget_form(promoted_port, "retained_parent")
+    if os.environ.get("FOLLOW_LIBPQ") == "1":
+        query(promoted, "SELECT pg_create_physical_replication_slot('retained_public',true)")
+        form = form[:-1] + ' :slot "retained_public")'
+    control("sibling.sock", form)
+    wait(lambda: query(sibling, f"SELECT pg_last_wal_receive_lsn()='{fork}'::pg_lsn") == [(True,)])
+    wait(lambda: ':RECEIVER-STOPPED T' in control("sibling.sock", '(list :receiver-stopped (physical-follow-runtime-receiver-stopped-p *physical-follow-runtime*))'))
+    assert query(sibling, "SELECT pg_is_wal_replay_paused(),count(*) FROM promotion_sql_items") == [(True, 1)]
+    control("sibling.sock", '(let* ((runtime *physical-follow-runtime*) (binding (fifth (physical-follow-read-config)))) (assert (eq :retained-timeline (getf (getf binding :anchor) :kind))) (assert (null (getf binding :child-history))) (assert (equal (getf binding :before) (getf binding :after))) (assert (= 1 (physical-store-selected-timeline *physical-receive-store*))) (assert (not (physical-follow-runtime-stopped-p runtime))) (assert (sb-thread:thread-alive-p (physical-follow-runtime-replay-thread runtime))) (assert (not *physical-recovery-failed-p*)))')
+    query(sibling, "SELECT pg_wal_replay_resume()")
+    wait(lambda: query(sibling, "SELECT count(*) FROM promotion_sql_items") == [(2,)])
+    assert query(sibling, "SELECT count(*) FROM promotion_sql_items WHERE id=3") == [(0,)]
+    wait(lambda: ':CLEANUP-COUNT 0' in control("sibling.sock", '(physical-follow-controller-status)'))
+    if os.environ.get("FOLLOW_LIBPQ") == "1":
+        control("target.sock", f'(let ((slot (gethash "retained_public" *wal-replication-slots*))) (assert (= 1 (wal-replication-slot-restart-timeline slot))) (assert (= (parse-replication-lsn "{fork}") (wal-replication-slot-restart-lsn slot))) (assert (null (wal-replication-slot-active-owner slot))))')
+    saved = (data / "physical-follow.control").read_bytes()
+    # Remove signal management so the cold policy-aware launch is the receipt fence.
+    (data / "standby.signal").unlink()
+    signaler = [sys.executable, str(base / "t/interop/signal-owned-server.py"),
+                str(promoted_pid), str(root / "copy")]
+    assert int((root / "copy/postmaster.pid").read_text().splitlines()[0]) == promoted_pid
+    subprocess.run([*signaler, "STOP"], check=True)
+    try:
+        wait(lambda: psutil.Process(promoted_pid).status() == psutil.STATUS_STOPPED)
+        sibling.close()
+        assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
+        peer, socket_identity = start_peer(timeline_goal="current")
+        sibling = connect(replica_port)
+        assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(True, 2)]
+        assert saved == (data / "physical-follow.control").read_bytes()
+        control("sibling.sock", '(assert (and (physical-follow-controller-enabled-p (physical-follow-read-config)) (null (physical-follow-runtime-receiver-thread *physical-follow-runtime*)) (physical-follow-runtime-receiver-stopped-p *physical-follow-runtime*) (not *physical-recovery-failed-p*)))')
+        control("sibling.sock", '(defparameter *retained-policy-live-state* (list (getf *physical-recovery-state* :timeline-policy) (physical-follow-runtime-replay-thread *physical-follow-runtime*)))')
+        control("sibling.sock", '(reload)')
+        control("sibling.sock", '(assert (and (eq (first *retained-policy-live-state*) (getf *physical-recovery-state* :timeline-policy)) (eq (second *retained-policy-live-state*) (physical-follow-runtime-replay-thread *physical-follow-runtime*)) (sb-thread:thread-alive-p (second *retained-policy-live-state*)) (null (physical-follow-runtime-receiver-thread *physical-follow-runtime*))))')
+    finally:
+        subprocess.run([*signaler, "CONT"], check=True)
+    print("retained-policy: parent-only receipt completion, paused replay/resume, source-offline cold startup and live reload PASS", flush=True)
+    return peer, socket_identity, sibling
+
+
 def exercise_timeline_policy(peer, socket_identity, sibling, promoted):
     query(sibling, "SELECT pg_wal_replay_pause()")
     assert query(promoted, "SELECT pg_promote(true,30)") == [(True,)]
@@ -542,6 +598,10 @@ try:
         control("sibling.sock", f'(physical-follow-start "127.0.0.1" {source_port} "sibling_seed")')
     if os.environ.get("FOLLOW_CLUSTER_NAME") == "1":
         exercise_cluster_name(sibling)
+    if os.environ.get("FOLLOW_RETAINED_POLICY") == "1":
+        peer, socket_identity, sibling = exercise_retained_policy(peer, socket_identity, sibling, source, promoted)
+        connections.append(sibling)
+        raise SystemExit(0)
     query(source, "INSERT INTO promotion_sql_items VALUES (2,'shared-parent')")
     parent_end = query(source, "SELECT pg_current_wal_flush_lsn()")[0][0]
     for connection in (promoted, sibling):
