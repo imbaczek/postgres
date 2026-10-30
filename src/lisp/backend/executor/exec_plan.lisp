@@ -1484,6 +1484,30 @@ on an abnormal exit."
 
 (defvar *query-sort-project* nil)
 
+(defvar *query-project-set* nil)
+
+(defun project-set-projection-targets-p (targets width count)
+  "Return true when set-dependent targets are bare ProjectSet output slots.
+
+Expressions wrapping a set result must remain in a separate projection."
+  (every (lambda (target)
+           (let ((expression (getf target :expr)))
+             (or (not (project-set-expression-dependent-p expression width count targets))
+                 (and (eq (first expression) :col)
+                      (< width (second expression))
+                      (<= (second expression) (+ width count))))))
+         targets))
+
+(defun project-set-projection-node (project)
+  "Return PROJECT's child when its targets can be evaluated during expansion."
+  (let ((child (third project)))
+    (when (and (eq (first child) :project-set)
+               (integerp (fourth child))
+               (not (minusp (fourth child)))
+               (project-set-projection-targets-p
+                (second project) (fourth child) (length (second child))))
+      child)))
+
 (defun sort-projection-volatile-p (expression)
   ;; Like the C volatility walk, inspect a SubPlan's test expression, not its
   ;; separately planned query. Only functions in this executor's set defer.
@@ -1581,6 +1605,21 @@ The sort owns this row and its environment until it delivers or discards it."
 (defun execute-physical-plan-node (node registered-relations outer-environment
                                    emit run-child run-node)
   "Execute one physical node using the instrumented callbacks from RUN-NODE."
+  (when (member (first node) '(:sort :top-n))
+    (let ((child (if (eq (first node) :top-n) (fourth node) (third node))))
+      (multiple-value-bind (set-node width calls targets) (sort-project-set-info node child)
+        (when (and set-node
+                   (notany (lambda (entry)
+                             (project-set-expression-dependent-p
+                              (car entry) width (length calls) targets))
+                           (second node)))
+          (let ((input (make-sorted-project-set-iterator
+                        node child set-node width calls registered-relations
+                        :source-streamer
+                        (lambda (callback) (funcall run-child (third set-node) callback)))))
+            (return-from execute-physical-plan-node
+              (unwind-protect (map-sql-iterator input emit)
+                (close-sql-iterator input))))))))
   (case (first node)
     (:result
      (let ((*query-row-origins* nil)) (funcall emit #())))
@@ -1676,17 +1715,37 @@ The sort owns this row and its environment until it delivers or discards it."
      (stream-window-stage (lambda (callback) (funcall run-child (third node) callback))
                           (second node) emit))
     (:project-set
-     (funcall run-child (third node)
-              (lambda (environment) (stream-project-set environment (second node) emit))))
+     (let ((targets (and *query-project-set*
+                         (eq node (car *query-project-set*))
+                         (cdr *query-project-set*))))
+       (funcall run-child (third node)
+                (lambda (environment)
+                  (if targets
+                      (let* ((pending t)
+                             (origins *query-row-origins*)
+                             (input (make-sql-iterator
+                                     (lambda ()
+                                       (when pending
+                                         (setf pending nil)
+                                         (values environment t origins)))))
+                             (projected
+                               (make-project-set-projection-iterator
+                                input (second node) targets (fourth node))))
+                        (unwind-protect (map-sql-iterator projected emit)
+                          (close-sql-iterator projected)))
+                      (stream-project-set environment (second node) emit))))))
     (:project
-     (let ((targets (second node))
-           (deferred (and *query-sort-project*
-                          (eq node (car *query-sort-project*))
-                          (cdr *query-sort-project*))))
+     (let* ((targets (second node))
+            (deferred (and *query-sort-project*
+                           (eq node (car *query-sort-project*))
+                           (cdr *query-sort-project*)))
+            (set-node (and (null deferred) (project-set-projection-node node)))
+            (*query-project-set* (and set-node (cons set-node targets))))
        (funcall run-child
                 (third node)
                 (lambda (environment)
                   (cond
+                    (set-node (funcall emit environment))
                     (deferred
                         (funcall emit (make-sort-project-input-row environment targets deferred)))
                     (*datum-origin-capture*
@@ -1917,7 +1976,8 @@ projection or filter forms fall back to ordinary full materialization."
 
 (defun interpret-query-plan (plan registered-relations row-callback)
   "Reference interpreter for physical S-expression plans."
-  (let* ((metadata-map (query-plan-metadata plan))
+  (let* ((*cte-active-plan* plan)
+         (metadata-map (query-plan-metadata plan))
          (*select-toast-slice-plan* (simple-select-toast-slice (query-plan-physical plan) registered-relations))
          (*toast-slice-current* nil)
          (*select-toast-demand* (or (simple-select-toast-demand (query-plan-physical plan) registered-relations)

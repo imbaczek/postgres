@@ -267,11 +267,51 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
        (setf sets nil ended nil environment nil input-origins nil)
        (close-sql-iterator input)))))
 
-(defun make-sorted-project-set-iterator (node project set-node width calls relations)
-  ;; Sort source rows before expansion when no sort key depends on an SRF.
-  ;; Cache ordinary targets and raw sort keys once per source row; evaluate
-  ;; deferred targets as expanded rows are pulled, preserving bare SRF attempt
-  ;; order. The buffered sort owns its source and closes it on iterator close.
+(defun make-project-set-projection-iterator (input calls targets width)
+  "Project targets in order on each attempt to expand an input row.
+
+Step each bare set target when reached, creating its iterator and evaluating
+its arguments lazily.  Scalar targets also run on the final attempt, even when
+all sets are empty and no row is emitted.  Closing the result closes INPUT."
+  (let ((attempt-values nil) (attempt-origins nil)
+                             (capture-p *datum-origin-capture*))
+    (let ((expanded
+            (make-project-set-iterator
+             input calls
+             :attempt-function
+             (lambda (environment set-values step-set)
+               (setf attempt-values (make-array (length targets))
+                     attempt-origins
+                     (and capture-p (make-array (length targets) :initial-element nil)))
+               (loop for target in targets for index from 0
+                     for expression = (getf target :expr)
+                     do (if (and (eq (first expression) :col)
+                                 (< width (second expression))
+                                 (<= (second expression) (+ width (length calls))))
+                            (let ((slot (- (second expression) width 1)))
+                              (funcall step-set slot)
+                              (setf (aref attempt-values index) (aref set-values slot)))
+                            (multiple-value-bind (value origin)
+                                (if capture-p
+                                    (eval-expr-with-origin expression environment *query-row-origins*)
+                                    (values (eval-expr expression environment) nil))
+                              (setf (aref attempt-values index) value)
+                              (when capture-p
+                                (setf (aref attempt-origins index) origin)))))))))
+      (make-mapping-sql-iterator
+       expanded
+       (lambda (environment)
+         (values (cons attempt-values environment) t attempt-origins))))))
+
+(defun make-sorted-project-set-iterator (node project set-node width calls relations &key source-streamer)
+  "Sort source rows before expansion when no sort key depends on a set result.
+
+Cache ordinary targets and sort keys per source row.  Evaluate deferred targets
+as expanded rows are pulled; bare set targets use target-list attempt order,
+while expressions wrapping set results remain a separate projection.
+SOURCE-STREAMER, when supplied, streams the source through the caller's
+instrumented push execution; otherwise the sort owns and closes a pull iterator.
+Closing the returned iterator releases the buffered sort and its source."
   (let* ((targets (second project))
          (target-count (length targets))
          (deferred
@@ -280,14 +320,7 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
                   (or (project-set-expression-dependent-p (getf target :expr) width (length calls) targets)
                       (sort-projection-volatile-p (getf target :expr))))
                 targets))
-         (bare-p
-           (every (lambda (target)
-                    (let ((expression (getf target :expr)))
-                      (or (not (project-set-expression-dependent-p expression width (length calls) targets))
-                          (and (eq (first expression) :col)
-                               (< width (second expression))
-                               (<= (second expression) (+ width (length calls)))))))
-                  targets))
+         (bare-p (project-set-projection-targets-p targets width (length calls)))
          (extra nil)
          (order
            (loop for entry in (second node)
@@ -304,20 +337,27 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
                              (cdr entry))))))
          (cache nil)
          (attempt-values nil)
+         (transform
+           (lambda (environment)
+             (let* ((row (make-sort-project-input-row environment targets deferred))
+                    (keys (map 'vector (lambda (expression) (eval-expr expression environment))
+                               (reverse extra))))
+               (setf (car row) (concatenate 'vector (car row) keys))
+               (values row t nil))))
          (source
-           (make-mapping-sql-iterator
-            (make-physical-plan-iterator (third set-node) relations)
-            (lambda (environment)
-              (let* ((row (make-sort-project-input-row environment targets deferred))
-                     (keys (map 'vector (lambda (expression) (eval-expr expression environment))
-                                (reverse extra))))
-                (setf (car row) (concatenate 'vector (car row) keys))
-                (values row t nil)))))
+           (unless source-streamer
+             (make-mapping-sql-iterator
+              (make-physical-plan-iterator (third set-node) relations) transform)))
          (sorted
            (make-buffered-sql-iterator
             (lambda (emit)
               (stream-select-sort
-               (lambda (callback) (map-sql-iterator source callback)) order emit))
+               (lambda (callback)
+                 (if source-streamer
+                     (funcall source-streamer
+                              (lambda (environment) (funcall callback (funcall transform environment))))
+                     (map-sql-iterator source callback)))
+               order emit))
             source))
          (input
            (make-mapping-sql-iterator
@@ -328,31 +368,33 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
               (setf cache (subseq (car row) 0 target-count))
               (values (cdr row) t nil))))
          (expanded
-           (make-project-set-iterator
-            input calls
-            :attempt-function
-            (when bare-p
-              (lambda (environment set-values step-set)
-                (setf attempt-values (copy-seq cache))
-                (loop for target in targets for index from 0
-                      for expression = (getf target :expr)
-                      do (cond
-                           ((and (eq (first expression) :col)
-                                 (< width (second expression))
-                                 (<= (second expression) (+ width (length calls))))
-                            (let ((slot (- (second expression) width 1)))
-                              (funcall step-set slot)
-                              (setf (aref attempt-values index) (aref set-values slot))))
-                           ((aref deferred index)
-                            (setf (aref attempt-values index) (eval-expr expression environment)))))))))
+           (instrument-physical-plan-iterator set-node
+                                              (make-project-set-iterator
+                                               input calls
+                                               :attempt-function
+                                               (when bare-p
+                                                 (lambda (environment set-values step-set)
+                                                   (setf attempt-values (copy-seq cache))
+                                                   (loop for target in targets for index from 0
+                                                         for expression = (getf target :expr)
+                                                         do (cond
+                                                              ((and (eq (first expression) :col)
+                                                                    (< width (second expression))
+                                                                    (<= (second expression) (+ width (length calls))))
+                                                               (let ((slot (- (second expression) width 1)))
+                                                                 (funcall step-set slot)
+                                                                 (setf (aref attempt-values index) (aref set-values slot))))
+                                                              ((aref deferred index)
+                                                               (setf (aref attempt-values index) (eval-expr expression environment))))))))))
          (output
-           (make-mapping-sql-iterator
-            expanded
-            (lambda (environment)
-              (values (if bare-p
-                          (cons attempt-values environment)
-                          (finish-sort-project-row (cons cache environment) targets deferred))
-                      t nil)))))
+           (instrument-physical-plan-iterator project
+                                              (make-mapping-sql-iterator
+                                               expanded
+                                               (lambda (environment)
+                                                 (values (if bare-p
+                                                             (cons attempt-values environment)
+                                                             (finish-sort-project-row (cons cache environment) targets deferred))
+                                                         t nil))))))
     (if (eq (first node) :top-n)
         (let ((remaining (third node)))
           (make-sql-iterator
@@ -466,9 +508,9 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
            (delete-query-temp-file (query-match-map-pathname matches))))
        (setf current-left nil left-origins nil)))))
 
-(defun make-physical-plan-iterator (node relations)
-  (let* ((input (%make-physical-plan-iterator node relations))
-         (metadata (and *cte-active-plan* (gethash node (query-plan-metadata *cte-active-plan*))))
+(defun instrument-physical-plan-iterator (node input)
+  "Count and time pulls from INPUT for NODE; closing the wrapper closes INPUT."
+  (let* ((metadata (and *cte-active-plan* (gethash node (query-plan-metadata *cte-active-plan*))))
          (started-p nil))
     (if (null metadata) input
         (make-sql-iterator
@@ -493,6 +535,9 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
                    (when first-p
                      (incf (plan-node-metadata-actual-startup-time-ticks metadata) elapsed)))))))
          (lambda () (close-sql-iterator input))))))
+
+(defun make-physical-plan-iterator (node relations)
+  (instrument-physical-plan-iterator node (%make-physical-plan-iterator node relations)))
 
 (defun make-resumable-query-plan-iterator (plan relations)
   ;; Restore the plan's TOAST demand and instrumentation context for each pull;
@@ -556,13 +601,16 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
       (lambda (row) (values row (true-p (eval-expr (second node) row)) *query-row-origins*))
       :preserve-toast-context t))
     (:project
-     (let ((deferred (and *query-sort-project*
-                          (eq node (car *query-sort-project*))
-                          (cdr *query-sort-project*))))
+     (let* ((deferred (and *query-sort-project*
+                           (eq node (car *query-sort-project*))
+                           (cdr *query-sort-project*)))
+            (set-node (and (null deferred) (project-set-projection-node node)))
+            (*query-project-set* (and set-node (cons set-node (second node)))))
        (make-mapping-sql-iterator
         (make-physical-plan-iterator (third node) relations)
         (lambda (row)
           (cond
+            (set-node (values row t *query-row-origins*))
             (deferred (values (make-sort-project-input-row row (second node) deferred) t nil))
             (*datum-origin-capture*
              (let ((values (make-array (length (second node))))
@@ -583,7 +631,11 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
     (:window
      (make-window-plan-iterator (make-physical-plan-iterator (third node) relations) (second node)))
     (:project-set
-     (make-project-set-iterator (make-physical-plan-iterator (third node) relations) (second node)))
+     (let ((input (make-physical-plan-iterator (third node) relations)))
+       (if (and *query-project-set* (eq node (car *query-project-set*)))
+           (make-project-set-projection-iterator
+            input (second node) (cdr *query-project-set*) (fourth node))
+           (make-project-set-iterator input (second node)))))
     (:limit
      (let ((remaining (second node)) (input nil))
        (make-sql-iterator
