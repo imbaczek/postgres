@@ -40,54 +40,6 @@
 
 (defvar *lateral-outer-environment* nil)
 
-(defvar *query-sort-project* nil)
-
-(defun sort-projection-volatile-p (expression)
-  ;; Like the C volatility walk, inspect a SubPlan's test expression, not its
-  ;; separately planned query. Only functions in this executor's set defer.
-  (labels ((walk (form)
-             (and (consp form)
-                  (cond
-                    ((eq (first form) :subplan)
-                     (let ((subplan (second form)))
-                       (when (sql-subplan-p subplan)
-                         (walk (sql-subplan-test subplan)))))
-                    ((eq (first form) :func)
-                     (or (member (second form)
-                                 '("nextval" "currval" "setval" "random" "setseed"
-                                   "set_config" "pg_cancel_backend" "pg_terminate_backend"
-                                   "pg_promote" "pg_current_wal_lsn" "pg_current_wal_flush_lsn"
-                                   "pg_export_snapshot" "pg_is_in_recovery"
-                                   "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn"
-                                   "pg_wal_replay_pause" "pg_wal_replay_resume"
-                                   "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state"
-                                   "pg_reload_conf" "pg_reload_code"
-                                   "pg_create_physical_replication_slot" "pg_replication_slot_advance"
-                                   "pg_drop_replication_slot" "pg_lisp_acquire_subscription")
-                                 :test #'string=)
-                         (walk (third form))))
-                    (t (or (walk (car form)) (walk (cdr form))))))))
-    (not (null (walk expression)))))
-
-(defun project-set-expression-dependent-p (expression width count targets)
-  ;; Generated slots follow WIDTH source slots. Resolve projected sort-output
-  ;; references too; an invalid reference conservatively requires expansion.
-  (labels ((walk (form)
-             (and (consp form)
-                  (case (first form)
-                    (:col (let ((slot (second form)))
-                            (and (integerp slot) (< width slot) (<= slot (+ width count)))))
-                    (:sort-output
-                     (let ((slot (second form)))
-                       (if (and (integerp slot) (<= 1 slot (length targets)))
-                           (walk (getf (nth (1- slot) targets) :expr))
-                           t)))
-                    (:subplan
-                     (let ((subplan (second form)))
-                       (and (sql-subplan-p subplan) (walk (sql-subplan-test subplan)))))
-                    (otherwise (or (walk (car form)) (walk (cdr form))))))))
-    (not (null (walk expression)))))
-
 (defun sort-project-set-info (node child)
   ;; Only this shape can sort source rows before expanding the set results.
   ;; Origin capture keeps the ordinary path, which preserves datum origins.
@@ -97,47 +49,6 @@
                                     (calls (second set-node)) (targets (second child)))
       (when (and (integerp width) (not (minusp width)) calls)
         (values set-node width calls targets)))))
-
-(defun sort-projection-deferred-slots (node child)
-  (when (and (not *datum-origin-capture*) (member (first node) '(:sort :top-n))
-             (eq (first child) :project))
-    (let* ((targets (second child))
-           (set-node (and (eq (first (third child)) :project-set) (third child)))
-           (width (and set-node (fourth set-node)))
-           (count (and set-node (length (second set-node))))
-           (slots (map 'vector
-                       (lambda (target)
-                         (and (sort-projection-volatile-p (getf target :expr))
-                              (or (null set-node)
-                                  (and (integerp width)
-                                       (not (project-set-expression-dependent-p
-                                             (getf target :expr) width count targets))))))
-                       targets)))
-      (dolist (entry (second node))
-        (let ((expression (car entry)))
-          (when (eq (first expression) :sort-output)
-            (let ((slot (second expression)))
-              (unless (and (integerp slot) (<= 1 slot (length slots)))
-                (return-from sort-projection-deferred-slots nil))
-              (setf (aref slots (1- slot)) nil)))))
-      (when (find t slots) slots))))
-
-(defun make-sort-project-input-row (environment targets deferred)
-  ;; Keep the source environment with precomputed targets for the later pull.
-  (let ((values (make-array (length targets) :initial-element +null+)))
-    (loop for target in targets for i from 0
-          unless (aref deferred i)
-            do (setf (aref values i) (eval-expr (getf target :expr) environment)))
-    (cons values environment)))
-
-(defun finish-sort-project-row (row targets deferred)
-  ;; Evaluate deferred targets once, in target order, as each sorted row leaves.
-  (let ((values (copy-seq (car row)))
-        (environment (cdr row)))
-    (loop for target in targets for i from 0
-          when (aref deferred i)
-            do (setf (aref values i) (eval-expr (getf target :expr) environment)))
-    (cons values environment)))
 
 (defun make-visible-heap-page-iterator (page block columns snapshot)
   "Visit visible heap tuples from an owned PAGE one at a time.

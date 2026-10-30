@@ -1482,6 +1482,102 @@ on an abnormal exit."
           (eq (getf (physical-scan-relation node relations) :cte) worktable)))
     (otherwise nil)))
 
+(defvar *query-sort-project* nil)
+
+(defun sort-projection-volatile-p (expression)
+  ;; Like the C volatility walk, inspect a SubPlan's test expression, not its
+  ;; separately planned query. Only functions in this executor's set defer.
+  (labels ((walk (form)
+             (and (consp form)
+                  (cond
+                    ((eq (first form) :subplan)
+                     (let ((subplan (second form)))
+                       (when (sql-subplan-p subplan)
+                         (walk (sql-subplan-test subplan)))))
+                    ((eq (first form) :func)
+                     (or (member (second form)
+                                 '("nextval" "currval" "setval" "random" "setseed"
+                                   "set_config" "pg_cancel_backend" "pg_terminate_backend"
+                                   "pg_promote" "pg_current_wal_lsn" "pg_current_wal_flush_lsn"
+                                   "pg_export_snapshot" "pg_is_in_recovery"
+                                   "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn"
+                                   "pg_wal_replay_pause" "pg_wal_replay_resume"
+                                   "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state"
+                                   "pg_reload_conf" "pg_reload_code"
+                                   "pg_create_physical_replication_slot" "pg_replication_slot_advance"
+                                   "pg_drop_replication_slot" "pg_lisp_acquire_subscription")
+                                 :test #'string=)
+                         (walk (third form))))
+                    (t (or (walk (car form)) (walk (cdr form))))))))
+    (not (null (walk expression)))))
+
+(defun project-set-expression-dependent-p (expression width count targets)
+  ;; Generated slots follow WIDTH source slots. Resolve projected sort-output
+  ;; references too; an invalid reference conservatively requires expansion.
+  (labels ((walk (form)
+             (and (consp form)
+                  (case (first form)
+                    (:col (let ((slot (second form)))
+                            (and (integerp slot) (< width slot) (<= slot (+ width count)))))
+                    (:sort-output
+                     (let ((slot (second form)))
+                       (if (and (integerp slot) (<= 1 slot (length targets)))
+                           (walk (getf (nth (1- slot) targets) :expr))
+                           t)))
+                    (:subplan
+                     (let ((subplan (second form)))
+                       (and (sql-subplan-p subplan) (walk (sql-subplan-test subplan)))))
+                    (otherwise (or (walk (car form)) (walk (cdr form))))))))
+    (not (null (walk expression)))))
+
+(defun sort-projection-deferred-slots (node child)
+  "Choose volatile targets to evaluate after sorting in either executor.
+
+Sort keys must be computed before sorting.  Keep targets that depend on
+ProjectSet output there too, and use the ordinary path when datum origins are
+needed.  Deferred targets run only for rows delivered by the sort or top-N."
+  (when (and (not *datum-origin-capture*) (member (first node) '(:sort :top-n))
+             (eq (first child) :project))
+    (let* ((targets (second child))
+           (set-node (and (eq (first (third child)) :project-set) (third child)))
+           (width (and set-node (fourth set-node)))
+           (count (and set-node (length (second set-node))))
+           (slots (map 'vector
+                       (lambda (target)
+                         (and (sort-projection-volatile-p (getf target :expr))
+                              (or (null set-node)
+                                  (and (integerp width)
+                                       (not (project-set-expression-dependent-p
+                                             (getf target :expr) width count targets))))))
+                       targets)))
+      (dolist (entry (second node))
+        (let ((expression (car entry)))
+          (when (eq (first expression) :sort-output)
+            (let ((slot (second expression)))
+              (unless (and (integerp slot) (<= 1 slot (length slots)))
+                (return-from sort-projection-deferred-slots nil))
+              (setf (aref slots (1- slot)) nil)))))
+      (when (find t slots) slots))))
+
+(defun make-sort-project-input-row (environment targets deferred)
+  "Compute sort input targets and retain ENVIRONMENT for deferred targets.
+
+The sort owns this row and its environment until it delivers or discards it."
+  (let ((values (make-array (length targets) :initial-element +null+)))
+    (loop for target in targets for i from 0
+          unless (aref deferred i)
+            do (setf (aref values i) (eval-expr (getf target :expr) environment)))
+    (cons values environment)))
+
+(defun finish-sort-project-row (row targets deferred)
+  "Evaluate deferred targets once, in target order, when a sorted row is delivered."
+  (let ((values (copy-seq (car row)))
+        (environment (cdr row)))
+    (loop for target in targets for i from 0
+          when (aref deferred i)
+            do (setf (aref values i) (eval-expr (getf target :expr) environment)))
+    (cons values environment)))
+
 (defun execute-physical-plan-node (node registered-relations outer-environment
                                    emit run-child run-node)
   "Execute one physical node using the instrumented callbacks from RUN-NODE."
@@ -1583,21 +1679,28 @@ on an abnormal exit."
      (funcall run-child (third node)
               (lambda (environment) (stream-project-set environment (second node) emit))))
     (:project
-     (let ((targets (second node)))
+     (let ((targets (second node))
+           (deferred (and *query-sort-project*
+                          (eq node (car *query-sort-project*))
+                          (cdr *query-sort-project*))))
        (funcall run-child
                 (third node)
                 (lambda (environment)
-                  (if *datum-origin-capture*
-                      (let ((values (make-array (length targets)))
-                            (origins (make-array (length targets) :initial-element nil)))
-                        (loop for target in targets for i from 0
-                              do (multiple-value-bind (value origin)
-                                     (eval-expr-with-origin (getf target :expr) environment *query-row-origins*)
-                                   (setf (aref values i) value (aref origins i) origin)))
-                        (let ((*query-row-origins* origins))
-                          (funcall emit (cons values environment))))
-                      (let ((row (make-select-result-row environment nil targets)))
-                        (when row (funcall emit row))))))))
+                  (cond
+                    (deferred
+                        (funcall emit (make-sort-project-input-row environment targets deferred)))
+                    (*datum-origin-capture*
+                     (let ((values (make-array (length targets)))
+                           (origins (make-array (length targets) :initial-element nil)))
+                       (loop for target in targets for i from 0
+                             do (multiple-value-bind (value origin)
+                                    (eval-expr-with-origin (getf target :expr) environment *query-row-origins*)
+                                  (setf (aref values i) value (aref origins i) origin)))
+                       (let ((*query-row-origins* origins))
+                         (funcall emit (cons values environment)))))
+                    (t
+                     (let ((row (make-select-result-row environment nil targets)))
+                       (when row (funcall emit row)))))))))
     (:hash-distinct
      (stream-hash-aggregate
       (lambda (callback)
@@ -1606,21 +1709,32 @@ on an abnormal exit."
       (second node) 0
       (lambda (values) (funcall emit (cons values values)))))
     (:sort
-     (stream-select-sort
-      (lambda (sort-callback)
-        (funcall run-child (third node) sort-callback))
-      (second node) emit))
+     (let* ((child (third node))
+            (deferred (sort-projection-deferred-slots node child))
+            (*query-sort-project* (and deferred (cons child deferred))))
+       (stream-select-sort
+        (lambda (sort-callback)
+          (funcall run-child child sort-callback))
+        (second node)
+        (lambda (row)
+          (funcall emit (if deferred
+                            (finish-sort-project-row row (second child) deferred)
+                            row))))))
     (:top-n
      (let* ((order (second node))
             (limit (third node))
             (input (fourth node))
+            (deferred (sort-projection-deferred-slots node input))
+            (*query-sort-project* (and deferred (cons input deferred)))
             (rows (collect-select-top-n
                    (lambda (callback)
                      (funcall run-child input callback))
                    order limit *datum-origin-capture*)))
        (loop for row in rows
              do (let ((*query-row-origins* (and *datum-origin-capture* (cdr row))))
-                  (when (eq (funcall emit (if *datum-origin-capture* (car row) row)) :stop)
+                  (when (eq (funcall emit (cond (deferred (finish-sort-project-row row (second input) deferred))
+                                                (*datum-origin-capture* (car row))
+                                                (t row))) :stop)
                     (return :stop))))))
     (:limit
      (let ((limit (second node))
