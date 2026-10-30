@@ -92,11 +92,7 @@ Return the escaped value, whether clipping occurred, and the clipped input text.
   (let* ((text (princ-to-string value))
          (clipped (sql-name-input text)))
     (values
-     (with-output-to-string (output)
-       (loop for byte across (string->bytes clipped)
-             do (if (<= 32 byte 126)
-                    (write-char (code-char byte) output)
-                    (format output "\\x~(~2,'0x~)" byte))))
+     (guc-clean-ascii-octets (string->bytes clipped))
      (not (equal text clipped)) clipped)))
 
 (defun session-publish-application-name ()

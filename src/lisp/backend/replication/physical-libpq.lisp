@@ -45,7 +45,11 @@ are unsupported by the helper."
   (conninfo "" :type string :read-only t)
   (fallback "" :type string :read-only t))
 
-(defun make-physical-libpq-profile (conninfo &key (fallback "walreceiver"))
+(defun physical-libpq-default-fallback ()
+  (let ((name (startup-setting-show-value "cluster_name")))
+    (if (and name (plusp (length name))) name "walreceiver")))
+
+(defun make-physical-libpq-profile (conninfo &key (fallback (physical-libpq-default-fallback)))
   (unless (and (stringp conninfo) (stringp fallback))
     (error "invalid libpq connection profile"))
   (let ((saved-conninfo (copy-seq conninfo))

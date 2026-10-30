@@ -786,7 +786,7 @@ recovery cannot yet be enabled. A failed first connection leaves replay running.
       (error "native follow transition failed: ~a" (physical-follow-operation-error operation)))
     (physical-follow-operation-result operation)))
 
-(defun physical-follow-retarget-conninfo (conninfo &key (prefix "follow") (fallback "walreceiver"))
+(defun physical-follow-retarget-conninfo (conninfo &key (prefix "follow") (fallback (physical-libpq-default-fallback)))
   "Attach or retarget native follow using a libpq profile."
   (when (plusp *live-operation-depth*)
     (error "native follow retarget requires its own operation admission"))

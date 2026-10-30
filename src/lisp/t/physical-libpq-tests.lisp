@@ -49,6 +49,28 @@
       (ok (intake-fails-p
            (lambda () (pg::make-physical-libpq-profile (format nil "host=x~c" (code-char 0))))))))
 
+(deftest physical-libpq-new-profiles-use-installed-cluster-name-with-explicit-fallback-precedence
+    (let* ((pg::*startup-server-settings* (make-hash-table :test #'equal))
+           (entry (list :value "research")))
+      (setf (gethash "cluster_name" pg::*startup-server-settings*) entry)
+      (let ((saved (pg::make-physical-libpq-profile "host=localhost")))
+        (ok (equal "research" (pg::physical-libpq-profile-fallback saved)))
+        (ok (equal "explicit"
+                   (pg::physical-libpq-profile-fallback
+                    (pg::make-physical-libpq-profile "host=localhost" :fallback "explicit"))))
+        (ok (equal ""
+                   (pg::physical-libpq-profile-fallback
+                    (pg::make-physical-libpq-profile "host=localhost" :fallback ""))))
+        (setf (getf entry :value) "replacement")
+        (ok (equal "research" (pg::physical-libpq-profile-fallback saved)))
+        (ok (equal "replacement"
+                   (pg::physical-libpq-profile-fallback
+                    (pg::make-physical-libpq-profile "host=localhost"))))
+        (setf (getf entry :value) "")
+        (ok (equal "walreceiver"
+                   (pg::physical-libpq-profile-fallback
+                    (pg::make-physical-libpq-profile "host=localhost")))))))
+
 (defun libpq-test-string (payload text)
   (let ((bytes (pg::string->bytes text)))
     (pg::payload-push-u32 payload (length bytes))

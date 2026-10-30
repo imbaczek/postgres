@@ -438,22 +438,85 @@
     (destructuring-bind (name text) case
       (ok (intake-fails-p (lambda () (pg::startup-normalize-setting name text)))))))
 
+(deftest cluster-name-clips-startup-bytes-before-escaping-nonprintable-bytes
+    (dolist (case (list (list "" "") (list "research" "research")
+                        (list (make-string 70 :initial-element #\a)
+                              (make-string 63 :initial-element #\a))
+                        (list (concatenate 'string (make-string 62 :initial-element #\a) "é")
+                              (concatenate 'string (make-string 62 :initial-element #\a) "\\xc3"))
+                        (list (concatenate 'string (make-string 61 :initial-element #\a) "é")
+                              (concatenate 'string (make-string 61 :initial-element #\a) "\\xc3\\xa9"))
+                        (list (string #\Newline) "\\x0a")))
+      (destructuring-bind (input expected) case
+        (ok (equal expected (pg::startup-normalize-setting "cluster_name" input)))))
+  (ok (eq :postmaster (second (assoc "cluster_name" pg::*startup-setting-specs* :test #'equal)))) )
+
+(cl-spec:defproperty cluster-name-preserves-printable-ascii-within-name-bound
+    ((size (range integer 0 100)) (byte (range integer 32 126)))
+  (:about pg::startup-normalize-setting)
+  (:trials (:normal 200))
+  (let ((input (make-string size :initial-element (code-char byte))))
+    (equal (subseq input 0 (min size 63))
+           (pg::startup-normalize-setting "cluster_name" input))))
+
+(deftest generated-cluster-name-ascii-normalization
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'cluster-name-preserves-printable-ascii-within-name-bound
+                                       :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
 (deftest startup-config-literals-and-escapes-do-not-use-the-lisp-reader
     (multiple-value-bind (name value)
         (pg::startup-config-line "listen_addresses = '\\06127.0.0.1' # comment")
       (ok (equal "listen_addresses" name))
-      (ok (equal "127.0.0.1" value)))
+      (ok (equal "127.0.0.1" (pg::startup-input-text value))))
   (multiple-value-bind (name value)
       (pg::startup-config-line "data_directory 'a''b\\\\c#literal'")
     (declare (ignore name))
-    (ok (equal "a'b\\c#literal" value)))
+    (ok (equal "a'b\\c#literal" (pg::startup-input-text value))))
   (multiple-value-bind (name value)
       (pg::startup-config-line "data_directory = '#.(error \"not Lisp\")'")
     (declare (ignore name))
-    (ok (equal "#.(error \"not Lisp\")" value)))
+    (ok (equal "#.(error \"not Lisp\")" (pg::startup-input-text value))))
   (dolist (line '("port =" "port = 1 2" "port = 'unterminated"
                   "listen_addresses = *" "listen_addresses = 127.0.0.1"))
     (ok (intake-fails-p (lambda () (pg::startup-config-line line))))))
+
+(deftest startup-config-octal-escapes-preserve-utf8-octets
+    (multiple-value-bind (name value)
+        (pg::startup-config-line "cluster_name='\\303\\251'")
+      (ok (equal "cluster_name" name))
+      (ok (equal "é" (pg::startup-input-text value))))
+  (with-physical-store-directory (root)
+    (let ((configuration (merge-pathnames "postgresql.conf" root))
+          (table (make-hash-table :test #'equal)))
+      (write-startup-config configuration "cluster_name='\\303\\251'")
+      (pg::startup-read-config configuration table)
+      (ok (equal "\\xc3\\xa9" (pg::startup-setting-value table "cluster_name"))))))
+
+(deftest startup-config-octal-consumption-wraps-bytes-and-uses-c-string-nul-boundary
+    (multiple-value-bind (name value) (pg::startup-config-line "cluster_name='\\7779'")
+      (declare (ignore name))
+      (ok (typep value '(vector (unsigned-byte 8))))
+      (ok (equalp #(255 57) value))
+      (ok (equal "\\xff9" (pg::startup-normalize-setting "cluster_name" value))))
+  (multiple-value-bind (name value) (pg::startup-config-line "cluster_name='\\000'")
+    (declare (ignore name))
+    (ok (zerop (length value)))
+    (ok (equal "" (pg::startup-normalize-setting "cluster_name" value)))))
+
+(deftest startup-config-unicode-includes-resolve-literal-and-octal-bytes
+    (with-physical-store-directory (root)
+      (let ((path (merge-pathnames "postgresql.conf" root)))
+        (write-startup-config (merge-pathnames "é.conf" root) "cluster_name='included'")
+        (dolist (line '("include='é.conf'" "include='\\303\\251.conf'"))
+          (write-startup-config path line)
+          (let ((table (make-hash-table :test #'equal)))
+            (pg::startup-read-config path table)
+            (ok (equal "included" (pg::startup-setting-value table "cluster_name")))))
+        (write-startup-config path "include='\\377'")
+        (ok (intake-fails-p
+             (lambda () (pg::startup-read-config path (make-hash-table :test #'equal))))))))
 
 (deftest startup-includes-auto-conf-and-cli-have-ordered-precedence
     (with-physical-store-directory (root)
@@ -518,14 +581,29 @@
              (pg::*max-slot-wal-keep-bytes* 1073741824)
              (pg::*wal-slot-retention-policy* nil)
              (pg::*max-replication-slots* 10))
-        (write-startup-config configuration (format nil "port=5454~%checkpoint_timeout='30s'~%"))
+        (write-startup-config configuration (format nil "port=5454~%cluster_name='original cluster'~%checkpoint_timeout='30s'~%"))
         (multiple-value-bind (native overrides) (pg::startup-cli-inputs (list "-D" (namestring root)))
           (pg::startup-install-settings (pg::startup-load-settings native overrides) native overrides))
-        (write-startup-config configuration (format nil "port=5455~%checkpoint_timeout='90s'~%"))
+        (write-startup-config configuration (format nil "port=5455~%cluster_name='replacement cluster'~%checkpoint_timeout='90s'~%"))
         (pg::startup-reload-settings)
         (ok (= 5454 (pg::startup-setting-value pg::*startup-server-settings* "port")))
         (ok (getf (gethash "port" pg::*startup-server-settings*) :pending-restart))
         (ok (= 90 pg::*physical-restartpoint-timeout*))
+        (ok (equal "original cluster" (pg::startup-setting-show-value "cluster_name")))
+        (ok (equal "replacement cluster"
+                   (pg::startup-configuration-output
+                    (list "-D" (namestring root) "-C" "cluster_name"))))
+        (let ((row (pg::startup-settings-row
+                    "cluster_name" (gethash "cluster_name" pg::*startup-server-settings*))))
+          (ok (equal "original cluster" (aref row 1)))
+          (ok (equal "postmaster" (aref row 3)))
+          (ok (aref row 8)))
+        (let ((installed pg::*startup-server-settings*))
+          (write-startup-config configuration
+                                (format nil "checkpoint_timeout='120s'~%data_directory='\\377'~%"))
+          (ok (intake-fails-p (lambda () (pg::startup-reload-settings))))
+          (ok (eq installed pg::*startup-server-settings*))
+          (ok (= 90 pg::*physical-restartpoint-timeout*)))
         (write-startup-config configuration (format nil "checkpoint_timeout='120s'~%unknown_parameter=1~%"))
         (ok (intake-fails-p (lambda () (pg::startup-reload-settings))))
         (ok (= 90 pg::*physical-restartpoint-timeout*))

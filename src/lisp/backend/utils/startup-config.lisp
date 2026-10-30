@@ -17,6 +17,7 @@
   '(("port" :postmaster :integer "5433" 1 65535 nil)
     ("listen_addresses" :postmaster :string "127.0.0.1")
     ("data_directory" :postmaster :string nil)
+    ("cluster_name" :postmaster :string "")
     ("restore_command" :sighup :string "")
     ("hot_standby" :postmaster :boolean "on")
     ("max_connections" :postmaster :integer "100" 1 262143 nil)
@@ -102,21 +103,40 @@
       (if value "on" "off")
       (princ-to-string value)))
 
-(defun startup-normalize-setting (name text)
-  (let ((spec (assoc name *startup-setting-specs* :test #'string=)))
+(defun guc-clean-ascii-octets (octets)
+  (with-output-to-string (output)
+    (loop for byte across octets
+          do (if (<= 32 byte 126)
+                 (write-char (code-char byte) output)
+                 (format output "\\x~(~2,'0x~)" byte)))))
+
+(defun startup-input-octets (input) (etypecase input
+                                      (string (string->bytes input))
+                                      ((vector (unsigned-byte 8)) (copy-seq input))))
+
+(defun startup-input-text (input) (bytes->string (startup-input-octets input)))
+
+(defun startup-normalize-setting (name input)
+  (let ((spec (assoc name *startup-setting-specs* :test #'string=))
+        (octets (startup-input-octets input)))
     (unless spec (error "unrecognized configuration parameter ~s" name))
-    (ecase (third spec)
-      (:integer (startup-parse-integer-setting spec text))
-      (:boolean (startup-parse-boolean-setting text))
-      (:string
-       (when (and (string= name "restore_command") (not (equal text "")))
-         (error "nonempty restore_command requires unimplemented archive recovery"))
-       (unless (and (stringp text) (or (string= name "restore_command") (plusp (length text)))
-                    (not (find (code-char 0) text)))
-         (error "invalid empty configuration parameter ~a" name))
-       (when (and (string= name "listen_addresses") (find #\, text))
-         (error "multiple listen_addresses are not implemented"))
-       text))))
+    (when (find 0 octets) (error "NUL in configuration parameter ~a" name))
+    (when (string= name "cluster_name")
+      ;; Postmaster GUC parsing uses SQL_ASCII, even for a UTF-8 cluster.
+      (return-from startup-normalize-setting
+        (guc-clean-ascii-octets (subseq octets 0 (min 63 (length octets))))))
+    (let ((text (startup-input-text octets)))
+      (ecase (third spec)
+        (:integer (startup-parse-integer-setting spec text))
+        (:boolean (startup-parse-boolean-setting text))
+        (:string
+         (when (and (string= name "restore_command") (not (equal text "")))
+           (error "nonempty restore_command requires unimplemented archive recovery"))
+         (unless (or (string= name "restore_command") (plusp (length text)))
+           (error "invalid empty configuration parameter ~a" name))
+         (when (and (string= name "listen_addresses") (find #\, text))
+           (error "multiple listen_addresses are not implemented"))
+         text)))))
 
 (defun startup-config-name-p (text)
   (and (plusp (length text))
@@ -181,7 +201,7 @@
     (make-pathname :directory (cons :absolute (nreverse parts)) :defaults absolute)))
 
 (defun startup-config-value (line position)
-  "Parse one literal value and comment; never invoke the Lisp reader."
+  "Parse a one-byte character view into literal octets, without the Lisp reader."
   (let ((length (length line)) (index position))
     (labels ((space-p (char) (find char '(#\Space #\Tab #\Return)))
              (skip () (loop while (and (< index length) (space-p (char line index))) do (incf index))))
@@ -218,7 +238,9 @@
         (skip)
         (unless (or (= index length) (char= (char line index) #\#))
           (error "trailing configuration tokens"))
-        value))))
+        ;; Deescaped literals enter C's GUC layer as NUL-terminated strings.
+        (map '(vector (unsigned-byte 8)) #'char-code
+             (subseq value 0 (position (code-char 0) value)))))))
 
 (defun startup-config-line (line)
   (let* ((text (string-left-trim '(#\Space #\Tab #\Return) line))
@@ -234,7 +256,7 @@
         (values name (startup-config-value text position))))))
 
 (defun startup-include-path (value parent)
-  (merge-pathnames value (uiop:pathname-directory-pathname parent)))
+  (merge-pathnames (startup-input-text value) (uiop:pathname-directory-pathname parent)))
 
 (defun startup-open-config (path)
   "Follow config symlinks, but reject special files without blocking the reload gate."
@@ -247,7 +269,7 @@
                         (<= (sb-posix:stat-size stat) (* 16 1024 1024)))
              (error "configuration input must be a regular file of at most 16 MiB"))
            (prog1 (sb-sys:make-fd-stream fd :input t :element-type 'character
-                                            :external-format :utf-8 :auto-close t)
+                                            :external-format :latin-1 :auto-close t)
              (setf success t)))
       (unless success (sb-posix:close fd)))))
 
