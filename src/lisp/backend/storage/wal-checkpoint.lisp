@@ -75,9 +75,7 @@ Unknown resources use 88 bytes; known resources extend PGCKPT02 to 136 bytes."
     (when (getf snapshot :next-oid) (wal-set-u32 bytes 80 1))
     (wal-set-u32 bytes 84 (logior (if next-exhausted 1 0) (if active-exhausted 2 0)))
     (when (getf snapshot :resource-parameters)
-      (replace bytes (wal-encode-resource-parameters (wal-control-resource-parameters snapshot)) :start1 88)
-      (wal-set-u64 bytes 120 (getf snapshot :resource-lsn))
-      (wal-set-u32 bytes 128 (getf snapshot :resource-timeline)))
+      (replace bytes (wal-encode-resource-fact (wal-copy-control-resource-fields snapshot)) :start1 88))
     bytes))
 
 (defun wal-decode-checkpoint-snapshot (bytes)
@@ -91,7 +89,7 @@ complete tuple and coordinates and a zero reserved word."
          (flags (wal-u32 bytes 84)))
     (unless (and version (if (= version 1) (zerop flags) (<= 0 flags 3))
                  (or (= (length bytes) +wal-checkpoint-snapshot-size+)
-                     (and (= version 2) (zerop (wal-u32 bytes 132))))
+                     (= version 2))
                  (member (wal-u32 bytes 80) '(0 1))
                  (or (= 1 (wal-u32 bytes 80)) (zerop (wal-u64 bytes 48)))
                  (or (not (logbitp 0 flags)) (zerop (wal-u64 bytes 32)))
@@ -109,9 +107,7 @@ complete tuple and coordinates and a zero reserved word."
       (when (= (length bytes) +wal-checkpoint-resource-snapshot-size+)
         (setf snapshot
               (append snapshot
-                      (list :resource-parameters
-                            (resource-parameters-values (wal-decode-resource-parameters (subseq bytes 88 120)))
-                            :resource-lsn (wal-u64 bytes 120) :resource-timeline (wal-u32 bytes 128)))))
+                      (wal-decode-resource-fact (subseq bytes 88)))))
       (unless (wal-checkpoint-snapshot-valid-p snapshot) (error "invalid native checkpoint snapshot"))
       snapshot)))
 

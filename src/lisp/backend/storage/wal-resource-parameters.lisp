@@ -234,3 +234,31 @@ values replace earlier ones even when they decrease."
                            (getf *wal-control-metadata* :resource-parameters)))
          (error "resource WAL differs from control at its published position")))))
   (values))
+
+(defconstant +wal-resource-fact-size+ 48)
+
+(declaim (ftype function wal-control-resource-fields-valid-p wal-control-resource-parameters))
+
+(defun wal-resource-fact-valid-p (fact)
+  (and (listp fact) (= 6 (length fact))
+       (equal (loop for (key value) on fact by #'cddr collect key)
+              '(:resource-parameters :resource-lsn :resource-timeline))
+       (wal-control-resource-fields-valid-p fact)))
+
+(defun wal-encode-resource-fact (fact)
+  (unless (wal-resource-fact-valid-p fact) (error "invalid positioned resource fact"))
+  (let ((bytes (make-array +wal-resource-fact-size+ :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace bytes (wal-encode-resource-parameters (wal-control-resource-parameters fact)))
+    (wal-set-u64 bytes 32 (getf fact :resource-lsn))
+    (wal-set-u32 bytes 40 (getf fact :resource-timeline))
+    bytes))
+
+(defun wal-decode-resource-fact (bytes)
+  (unless (and (typep bytes '(vector (unsigned-byte 8))) (= (length bytes) +wal-resource-fact-size+)
+               (zerop (wal-u32 bytes 44)))
+    (error "invalid positioned resource fact encoding"))
+  (let ((fact (list :resource-parameters
+                    (resource-parameters-values (wal-decode-resource-parameters (subseq bytes 0 32)))
+                    :resource-lsn (wal-u64 bytes 32) :resource-timeline (wal-u32 bytes 40))))
+    (unless (wal-resource-fact-valid-p fact) (error "invalid positioned resource fact"))
+    fact))
