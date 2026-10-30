@@ -259,8 +259,9 @@ CREATE TABLE
 CREATE INDEX
 INSERT 0 1
 ERROR:  duplicate key value violates unique constraint "text_unique_idx"
-ERROR:  value too long for type character varying(126)
+INSERT 0 1
 126
+127
 DROP TABLE
 CREATE TABLE
 INSERT 0 2
