@@ -237,6 +237,87 @@
 (defun extended-select-result-columns (ast)
   (mapcar #'target->result-column (getf (query-plan-prepared (plan-select-query ast)) :targets)))
 
+(defun extended-binary-type-p (type)
+  (member type '(:text :varchar :bytea :json :jsonb :numeric)))
+
+(defun extended-binary-numeric-output (value)
+  "Produce numeric_send's network-order base-10000 representation."
+  (let ((special (case value (:numeric-nan #xc000)
+                       (:numeric-positive-infinity #xd000)
+                       (:numeric-negative-infinity #xf000))))
+    (if special
+        (concatenate '(vector (unsigned-byte 8))
+                     (u16-to-bytes 0) (u16-to-bytes 0)
+                     (u16-to-bytes special) (u16-to-bytes (if (= special #xc000) 0 32)))
+        (let* ((packed (sql-numeric-to-packed-octets value))
+               (header (page-u16 packed 4))
+               (short (= (logand header #xc000) #x8000))
+               (offset (if short 6 8))
+               (weight (if short
+                           (let ((w (logand header #x7f))) (if (logbitp 6 w) (- w 128) w))
+                           (let ((w (page-u16 packed 6))) (if (logbitp 15 w) (- w 65536) w))))
+               (sign (if (if short (logbitp 13 header) (logbitp 14 header)) #x4000 0))
+               (count (/ (- (length packed) offset) 2))
+               (result (make-array (+ 8 (* 2 count)) :element-type '(unsigned-byte 8))))
+          (replace result (u16-to-bytes count))
+          (replace result (u16-to-bytes (logand weight #xffff)) :start1 2)
+          (replace result (u16-to-bytes sign) :start1 4)
+          (replace result (u16-to-bytes (sql-numeric-scale value)) :start1 6)
+          (dotimes (i count)
+            (replace result (u16-to-bytes (page-u16 packed (+ offset (* 2 i))))
+                     :start1 (+ 8 (* 2 i))))
+          result))))
+
+(defun extended-binary-numeric-input (bytes parameter-number)
+  "Read numeric_recv's base-10000 representation, truncating to display scale."
+  (labels ((u16 (offset)
+             (when (< (length bytes) (+ offset 2))
+               (ereport "08P01" "insufficient data left in message"))
+             (+ (ash (aref bytes offset) 8) (aref bytes (1+ offset)))))
+    (let* ((count (u16 0)) (encoded-weight (u16 2))
+                           (weight (if (logbitp 15 encoded-weight) (- encoded-weight 65536) encoded-weight))
+                           (sign (u16 4))
+                           (scale (progn
+                                    (unless (member sign '(#x0000 #x4000 #xc000 #xd000 #xf000))
+                                      (ereport "22P03" "invalid sign in external \"numeric\" value"))
+                                    (u16 6))))
+      (when (> scale #x3fff) (ereport "22P03" "invalid scale in external \"numeric\" value"))
+      (let ((acc 0))
+        (dotimes (i count)
+          (let ((digit (u16 (+ 8 (* 2 i)))))
+            (when (>= digit 10000) (ereport "22P03" "invalid digit in external \"numeric\" value"))
+            (setf acc (+ (* acc 10000) digit))))
+        (unless (= (length bytes) (+ 8 (* 2 count)))
+          (ereport "22P03" "incorrect binary data format in bind parameter ~d" parameter-number))
+        (case sign
+          (#xc000 :numeric-nan) (#xd000 :numeric-positive-infinity) (#xf000 :numeric-negative-infinity)
+          (otherwise
+           (let* ((exponent (+ scale (* 4 (- (1+ weight) count))))
+                  (coefficient (if (minusp exponent)
+                                   (floor acc (expt 10 (- exponent)))
+                                   (* acc (expt 10 exponent)))))
+             (when (and (not (zerop coefficient))
+                        (> (- (length (write-to-string coefficient :base 10)) scale) 131072))
+               (ereport "22003" "value overflows numeric format"))
+             (make-sql-decimal (if (= sign #x4000) (- coefficient) coefficient) scale))))))))
+
+(defun extended-binary-input (bytes type parameter-number)
+  (case type
+    (:bytea bytes)
+    (:numeric (extended-binary-numeric-input bytes parameter-number))
+    (otherwise
+     (let* ((start (if (eq type :jsonb)
+                       (progn
+                         (when (zerop (length bytes)) (ereport "08P01" "insufficient data left in message"))
+                         (unless (= (aref bytes 0) 1)
+                           (ereport "XX000" "unsupported jsonb version number ~d" (aref bytes 0)))
+                         1)
+                       0))
+            (text (handler-case (sb-ext:octets-to-string bytes :start start :external-format :utf-8)
+                    (sb-int:character-decoding-error () (ereport "22021" "invalid UTF-8 in binary parameter")))))
+       (when (position (code-char 0) text) (ereport "22021" "null byte in binary parameter"))
+       (sql-cast-value text :text type -1)))))
+
 (defun extended-select-result-formats (formats columns)
   (let ((count (length columns)))
     (unless (member (length formats) (list 0 1 count))
@@ -244,8 +325,8 @@
     (let ((result (make-array count)) (format-vector (coerce formats 'vector)))
       (loop for column in columns for index from 0
             for format = (case (length formats) (0 0) (1 (first formats)) (otherwise (aref format-vector index)))
-            do (unless (or (= format 0) (and (= format 1) (= (result-column-type-oid column) 17)))
-                 (ereport "0A000" "binary result format is supported only for bytea"))
+            do (unless (or (= format 0) (and (= format 1) (extended-binary-type-p (extended-type-from-oid (result-column-type-oid column)))))
+                 (ereport "0A000" "unsupported binary result format"))
                (setf (aref result index) format
                      (result-column-format column) format))
       result)))
@@ -311,7 +392,7 @@
              (loop for range in ranges for index from 0
                    for type = (aref types index)
                    for format = (extended-parameter-format format-vector index (length values))
-                   do (when (and (= format 1) (not (eq type :bytea)))
+                   do (when (and (= format 1) (not (extended-binary-type-p type)))
                         (ereport "0A000" "unsupported binary parameter format"))
                       (setf (aref values index)
                             (if (null range) +null+
@@ -327,7 +408,7 @@
                                                           (sb-int:character-decoding-error ()
                                                             (ereport "22021" "invalid UTF-8 in text parameter")))
                                                         :text type -1))
-                                      (if spooled bytes (subseq bytes start end)))))))
+                                      (extended-binary-input (if spooled bytes (subseq bytes start end)) type (1+ index)))))))
              (when (extended-bind-spool-p payload) (extended-verify-bind-spool payload))
              (setf (gethash portal (extended-query-state-portals state))
                    (make-extended-query-portal statement values select-p columns result-formats))

@@ -1938,7 +1938,7 @@
                  (rove:ok (= type (char-code #\D)))
                  (rove:ok (= (bytes-to-u32 length 0) 23))
                  (rove:ok (equalp payload #(0 3 0 0 0 2 52 50 0 0 0 3 0 128 255 255 255 255 255)))))
-             (let ((*select-result-formats* #(0 1 1)))
+             (let ((*select-result-formats* #(1 1 0)))
                (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
                  (rove:ok (handler-case (progn (send-select-data-row out values targets) nil) (error () t)))
                  (rove:ok (zerop (file-position out))))))

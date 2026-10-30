@@ -39,6 +39,7 @@ test_wait_owned_sql_server "$C_PID" "$REFERENCE_PORT" "${PSQL:-psql}"
     --control-socket "$ROOT/native.sock" >"$ROOT/native.log" 2>&1 &
 NATIVE=$!
 test_wait_owned_sql_server "$NATIVE" "$PORT" "${PSQL:-psql}"
+"$PYTHON" "$BASE/t/interop/binary_values.py" "$REFERENCE_PORT" "$PORT"
 timeout --foreground --kill-after=5 120 "$PYTHON" \
     "$BASE/t/interop/defaults_checks_aggregates.py" "$REFERENCE_PORT" "$PORT" "$BASE" "$ROOT/native.sock"
 

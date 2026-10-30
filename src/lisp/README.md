@@ -706,8 +706,8 @@ Close and Flush for a single INSERT, UPDATE or DELETE without RETURNING, and
 the plain `SELECT * FROM table` scan used for initial copy.
 Parse requires explicit supported built-in expression type OIDs for parameters;
 string literals in these statements are rejected in favor of parameters.
-Parameters use text format, except that bytea also supports binary format;
-SELECT result columns may use binary format only for bytea; limited portal execution is unsupported; each portal
+Parameters use text format; text, varchar, bytea, json, jsonb, and numeric also
+support binary Bind and SELECT result formats. Limited portal execution is unsupported; each portal
 can execute only once. This is a restricted DML interface, not general
 extended-query support. During reload drain, a Simple Query sent while an
 extended implicit transaction is open is rejected if it has statements after a

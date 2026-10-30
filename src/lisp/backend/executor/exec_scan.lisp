@@ -1943,6 +1943,19 @@ Keep detached per-row origins alongside spooled values when capture is active."
           do (funcall counting part) (when sink (funcall sink part)))
     (funcall metrics)))
 
+(defun select-row-binary-write (value type sink &optional (limit #x7fffffff))
+  "Count, checksum and optionally emit a supported binary field."
+  (multiple-value-bind (counting metrics) (logical-encoding-sink limit)
+    (flet ((emit (octets) (funcall counting octets) (when sink (funcall sink octets))))
+      (case type
+        (:bytea (select-row-binary-bytea-write value #'emit limit))
+        (:numeric (emit (extended-binary-numeric-output value)))
+        ((:text :varchar :json :jsonb)
+         (when (eq type :jsonb) (emit (vector 1)))
+         (select-row-utf8-write (select-row-field-writer value type) #'emit limit))
+        (otherwise (error "unsupported binary DataRow type"))))
+    (funcall metrics)))
+
 (defun send-select-data-row (stream values targets)
   "Preflight every field, then write one bounded DataRow."
   (unless (and (= (length values) (length targets)) (<= (length targets) #xffff))
@@ -1953,13 +1966,14 @@ Keep detached per-row origins alongside spooled values when capture is active."
     (loop for value across values for target in targets for index from 0
           for format = (if *select-result-formats* (aref *select-result-formats* index) 0)
           for binary = (= format 1)
-          for writer = (if (and binary (not (eq value +null+))) value
-                           (select-row-field-writer value (getf target :type)))
-          do (unless (or (= format 0) (and binary (eq (getf target :type) :bytea)))
+          for type = (getf target :type)
+          for writer = (if (and binary (not (eq value +null+))) (cons value type)
+                           (select-row-field-writer value type))
+          do (unless (or (= format 0) (and binary (extended-binary-type-p type)))
                (error "unsupported DataRow result format"))
              (multiple-value-bind (length checksum)
                  (cond ((null writer) (values nil nil))
-                       (binary (select-row-binary-bytea-write writer nil))
+                       (binary (select-row-binary-write (car writer) (cdr writer) nil))
                        (t (select-row-utf8-write writer nil)))
                (when (and length (> length #x7fffffff)) (error "DataRow field too large"))
                (when length (incf size length))
@@ -1983,7 +1997,7 @@ Keep detached per-row origins alongside spooled values when capture is active."
                      (emit (u32-to-bytes (if writer length #xffffffff)))
                      (when writer
                        (multiple-value-bind (actual actual-checksum)
-                           (if binary (select-row-binary-bytea-write writer #'emit length)
+                           (if binary (select-row-binary-write (car writer) (cdr writer) #'emit length)
                                (select-row-utf8-write writer #'emit length))
                          (unless (and (= length actual) (= checksum actual-checksum))
                            (error "DataRow field changed during output"))))))
