@@ -590,8 +590,9 @@ the old source before publication; its remote acknowledgment is not required."
 
 (defun physical-follow-operation-recover (operation)
   "Queue a saved preparation and restore the old workers when safe.
-An unattached standby resumes replay only. Ambiguous publication failures fence
-recovery for restart reconciliation."
+A healthy disabled configuration resumes replay only; an enabled configuration
+restores receipt and replay. Cancellation, shutdown and promotion can prevent
+restoration. Ambiguous publication failures fence recovery for restart reconciliation."
   (let ((context (physical-follow-operation-context operation)))
     (cond
       ((getf context :committed) nil)
