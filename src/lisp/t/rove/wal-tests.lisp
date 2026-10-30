@@ -1,6 +1,200 @@
 ;;;; wal-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(defun call-with-wal-scan-test-files (segments durable-lsn function)
+  "Run FUNCTION with isolated WAL files and a known durable boundary.
+Each entry in SEGMENTS contains a segment number followed by its byte vectors."
+  (let* ((*pgdata* (merge-pathnames
+                    (format nil "pg-wal-scan-~d-~d/" (sb-posix:getpid) (random 1000000))
+                    (uiop:temporary-directory)))
+         (*wal-checkpoint-lsn* 0)
+         (*wal-checkpoint-snapshot* nil)
+         (*wal-durable-lsn* durable-lsn)
+         (*wal-insert-timeline* 1)
+         (*wal-segment-namespace* :legacy))
+    (ensure-directories-exist (wal-directory))
+    (unwind-protect
+         (progn
+           (dolist (entry segments)
+             (with-open-file (stream (wal-segment-path (first entry))
+                                     :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :error)
+               (dolist (bytes (rest entry))
+                 (write-sequence bytes stream))))
+           (funcall function))
+      (uiop:delete-directory-tree *pgdata* :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-wal-scan-rejects-impossible-rotation-gap
+    (let* ((size +wal-segment-size+)
+           (end (+ size 64))
+           (segments
+             (list (list 0 (wal-encode-record +wal-record-batch-start+ 0 0 #())
+                         (wal-encode-record +wal-record-maintenance+ 0 32 #()))
+                   (list 1 (wal-encode-record +wal-record-batch-start+ 0 size #())
+                         (wal-encode-record +wal-record-maintenance+ 0 (+ size 32) #())))))
+      (call-with-wal-scan-test-files
+       segments end
+       (lambda ()
+         (let ((seen nil))
+           (rove:ok
+            (handler-case
+                (progn
+                  (wal-scan (lambda (record) (push (wal-record-start record) seen)))
+                  nil)
+              (error (condition)
+                (search "rotation gap" (princ-to-string condition))))
+            "CRC-valid short segments cannot hide a missing durable suffix")
+           (rove:ok (equal (reverse seen) '(0 32))
+                    "the impossible successor never reaches the recovery callback"))
+         (rove:ok
+          (handler-case
+              (progn
+                (wal-scan-lineage
+                 (lambda (&rest arguments) (declare (ignore arguments)))
+                 (list (make-timeline-history-entry :timeline 1 :begin 0))
+                 0 end :namespace :legacy)
+                nil)
+            (error (condition)
+              (search "rotation gap" (princ-to-string condition))))
+          "the primary and lineage readers reject the same impossible gap")
+         (dolist (entry segments)
+           (with-open-file (stream (wal-segment-path (first entry))
+                                   :element-type '(unsigned-byte 8))
+             (let ((expected (apply #'concatenate '(vector (unsigned-byte 8)) (rest entry)))
+                   (actual (make-array (file-length stream) :element-type '(unsigned-byte 8))))
+               (read-sequence actual stream)
+               (rove:ok (equalp actual expected) "gap rejection leaves segment bytes intact"))))
+         (rove:ok
+          (handler-case
+              (progn (wal-scan (constantly nil) 0 :end-lsn end) nil)
+            (error (condition)
+              (search "rotation gap" (princ-to-string condition))))
+          "a bounded scan must reject an impossible gap before its requested end")
+         (let ((*wal-durable-lsn* 64))
+           (rove:ok
+            (handler-case
+                (progn (wal-scan (constantly nil)) nil)
+              (error (condition)
+                (search "rotation gap" (princ-to-string condition))))
+            "a complete unflushed tail cannot be adopted across an impossible gap"))
+         (rove:ok (= 64 (wal-scan (constantly nil) 0 :end-lsn 64))
+                  "a bounded scan may stop before the damaged suffix")
+         (rove:ok (= 64 (wal-scan (lambda (record)
+                                    (when (= 64 (wal-record-end record)) :stop))))
+                  "a callback may stop before the damaged suffix")
+         (rove:ok (= end (wal-scan (constantly nil) size :end-lsn end))
+                  "an exact retained scan does not inspect the preceding prefix")))))
+
+(rove:deftest test-wal-scan-accepts-legal-rotation
+    (let* ((size +wal-segment-size+)
+           (prefix-end (- size 16))
+           (end (+ size 64))
+           (prefix (wal-encode-record
+                    +wal-record-maintenance+ 0 0
+                    (make-array (- prefix-end +wal-header-size+)
+                                :element-type '(unsigned-byte 8) :initial-element 0))))
+      (call-with-wal-scan-test-files
+       (list (list 0 prefix)
+             (list 1 (wal-encode-record +wal-record-batch-start+ 0 size #())
+                   (wal-encode-record +wal-record-maintenance+ 0 (+ size 32) #())))
+       end
+       (lambda ()
+         (let ((seen nil))
+           (rove:ok (= end (wal-scan
+                            (lambda (record) (push (wal-record-start record) seen)))))
+           (rove:ok (equal (nreverse seen) (list 0 size (+ size 32)))
+                    "a 32-byte successor may rotate past 16 bytes of unused capacity"))
+         (rove:ok (= end (wal-scan (constantly nil) prefix-end :end-lsn end))
+                  "an exact retained cursor may precede a legal rotation")
+         (rove:ok
+          (handler-case
+              (progn (wal-scan (constantly nil) 0 :end-lsn (1- size)) nil)
+            (error () t))
+          "a bounded scan cannot end inside unused rotation capacity")))))
+
+(rove:deftest test-wal-scan-exact-fit-and-full-segment-boundary
+    (let* ((size +wal-segment-size+)
+           (prefix-end (- size 32))
+           (end (+ size 32))
+           (prefix (wal-encode-record
+                    +wal-record-maintenance+ 0 0
+                    (make-array (- prefix-end +wal-header-size+)
+                                :element-type '(unsigned-byte 8) :initial-element 0)))
+           (fitting (wal-encode-record +wal-record-batch-start+ 0 prefix-end #()))
+           (successor (wal-encode-record +wal-record-maintenance+ 0 size #())))
+      (call-with-wal-scan-test-files
+       (list (list 0 prefix fitting) (list 1 successor)) end
+       (lambda ()
+         (let ((seen nil))
+           (rove:ok (= end (wal-scan
+                            (lambda (record) (push (wal-record-start record) seen)))))
+           (rove:ok (equal (nreverse seen) (list 0 prefix-end size))
+                    "a fitting record fills its segment before the next record rotates"))
+         (rove:ok (= end (wal-scan (constantly nil) prefix-end :end-lsn end)))
+         (rove:ok (= end (wal-scan (constantly nil) size :end-lsn end)))
+         (rove:ok (= size (wal-scan (constantly nil) 0 :end-lsn size)))))
+      (call-with-wal-scan-test-files
+       (list (list 0 prefix) (list 1 successor)) end
+       (lambda ()
+         (rove:ok
+          (handler-case
+              (progn (wal-scan (constantly nil)) nil)
+            (error (condition)
+              (search "rotation gap" (princ-to-string condition))))
+          "a successor that exactly fits the remaining capacity cannot rotate")))))
+
+(rove:deftest test-wal-scan-rejects-empty-intermediate-segment
+    (let* ((size +wal-segment-size+)
+           (prefix-end (- size 16))
+           (prefix (wal-encode-record
+                    +wal-record-maintenance+ 0 0
+                    (make-array (- prefix-end +wal-header-size+)
+                                :element-type '(unsigned-byte 8) :initial-element 0))))
+      (call-with-wal-scan-test-files
+       (list (list 0 prefix) (list 1)
+             (list 2 (wal-encode-record +wal-record-maintenance+ 0 (* 2 size) #())))
+       (+ (* 2 size) 32)
+       (lambda ()
+         (let ((seen nil))
+           (rove:ok
+            (handler-case
+                (progn
+                  (wal-scan (lambda (record) (push (wal-record-start record) seen)))
+                  nil)
+              (error (condition)
+                (search "rotation gap" (princ-to-string condition))))
+            "consecutive filenames cannot hide an empty intermediate segment")
+           (rove:ok (equal seen '(0)) "records after the empty segment are not visited"))))))
+
+(rove:deftest test-wal-scan-preserves-durable-tail-repair-boundary
+    (let* ((start (wal-encode-record +wal-record-batch-start+ 0 0 #()))
+           (terminal (wal-encode-record +wal-record-maintenance+ 0 32 #()))
+           (tail (wal-encode-record
+                  +wal-record-maintenance+ 0 64
+                  (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0)))
+           (bad-crc (copy-seq tail)))
+      (setf (aref bad-crc 28) (logxor 1 (aref bad-crc 28)))
+      (dolist (damaged (list (subseq tail 0 7) (subseq tail 0 35) bad-crc))
+        (call-with-wal-scan-test-files
+         (list (list 0 start terminal damaged)) 64
+         (lambda ()
+           (rove:ok (= 64 (wal-scan (constantly nil)))
+                    "an incomplete or corrupt unflushed tail is discarded")
+           (with-open-file (stream (wal-segment-path 0) :element-type '(unsigned-byte 8))
+             (rove:ok (= 64 (file-length stream))))))
+        (call-with-wal-scan-test-files
+         (list (list 0 start terminal damaged)) 104
+         (lambda ()
+           (rove:ok
+            (handler-case
+                (progn (wal-scan (constantly nil)) nil)
+              (error () t))
+            "the same damage before the durable boundary stops the scan")
+           (with-open-file (stream (wal-segment-path 0) :element-type '(unsigned-byte 8))
+             (rove:ok (= (+ 64 (length damaged)) (file-length stream))
+                      "durable corruption is never truncated")))))))
+
 (rove:deftest test-wal-catalog-codec-and-page-checksums
     (let* ((catalog (make-array 17 :element-type '(unsigned-byte 8)
                                    :initial-element 65))

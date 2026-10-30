@@ -1787,6 +1787,12 @@ Follow a symlink at the WAL directory itself. Enumeration errors are reported."
                      (wal-read-scan-record stream segment last-segment offset size)
                    (unless record (return))
                    (wal-require-ordinary-record-type (wal-record-type record))
+                   ;; Records stay within a segment; rotate only when this
+                   ;; record cannot fit after the preceding scanned record.
+                   ;; Check before accepting a checkpoint or invoking the callback.
+                   (unless (= (wal-record-start record)
+                              (wal-record-start-after scanned-end-lsn record-length))
+                     (error "invalid WAL segment rotation gap after ~d" scanned-end-lsn))
                    (when (and scan-end-lsn
                               (> (wal-record-end record) scan-end-lsn))
                      (error "WAL scan end ~a is not a record boundary"
