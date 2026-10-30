@@ -256,7 +256,10 @@ def exercise_same_timeline(upstream, sibling, port, timeline, count, other=None)
 
 
 def exercise_first_attachment(peer, socket_identity, sibling):
-    assert not (data / "physical-follow.control").exists()
+    if os.environ.get("FOLLOW_MANAGED_STARTUP") == "1":
+        control("sibling.sock", '(assert (and (getf *physical-recovery-state* :standard-follow-managed-p) (= 2 (getf *physical-recovery-state* :phase)) (physical-follow-unattached-p (physical-follow-read-config)) *physical-follow-runtime* (null (physical-follow-runtime-client *physical-follow-runtime*)) (null (physical-follow-runtime-receiver-thread *physical-follow-runtime*))))')
+    else:
+        assert not (data / "physical-follow.control").exists()
     with socket.socket() as unavailable:
         unavailable.bind(("127.0.0.1", 0))
         port = unavailable.getsockname()[1]
@@ -273,6 +276,22 @@ def exercise_first_attachment(peer, socket_identity, sibling):
     control("sibling.sock", retarget_form(source_port, "first_attach"))
     control("sibling.sock", '(let* ((config (physical-follow-read-config)) (state (sixth config))) (assert (eq :active (getf (fifth config) :phase))) (assert (null (getf state :mode))) (assert (null (getf state :cleanup))) (assert (equal "sibling_seed" (getf (getf state :unowned-bootstrap) :pin))))')
     print("follow-controller: unavailable first source, unattached SIGKILL restart, public first attachment PASS", flush=True)
+    return peer, socket_identity, sibling
+
+
+def exercise_managed_restart(peer, socket_identity, sibling):
+    accepted = control("sibling.sock", '(list (subseq (physical-follow-read-config) 0 5) (getf (sixth (physical-follow-read-config)) :source) (getf (sixth (physical-follow-read-config)) :unowned-bootstrap))')
+    sibling.close()
+    assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
+    peer, socket_identity = start_peer()
+    sibling = connect(replica_port)
+    control("sibling.sock", '(assert (and (getf *physical-recovery-state* :standard-follow-managed-p) (not (physical-follow-controller-enabled-p (physical-follow-read-config))) *physical-follow-runtime* (null (physical-follow-runtime-client *physical-follow-runtime*)) (null (physical-follow-runtime-receiver-thread *physical-follow-runtime*)) (sb-thread:thread-alive-p (physical-follow-runtime-replay-thread *physical-follow-runtime*))))')
+    assert accepted == control("sibling.sock", '(list (subseq (physical-follow-read-config) 0 5) (getf (sixth (physical-follow-read-config)) :source) (getf (sixth (physical-follow-read-config)) :unowned-bootstrap))')
+    (data / "standby.signal").unlink()
+    control("sibling.sock", '(reload)')
+    control("sibling.sock", '(assert (and (getf *physical-recovery-state* :standard-follow-managed-p) (not (physical-follow-controller-enabled-p (physical-follow-read-config))) (null (physical-follow-runtime-receiver-thread *physical-follow-runtime*))))')
+    control("sibling.sock", retarget_form(source_port, "managed_resume"))
+    print("follow-controller: marker phase-1 startup, disabled accepted cold restart and reload latch PASS", flush=True)
     return peer, socket_identity, sibling
 
 
@@ -403,6 +422,9 @@ connections = []
 try:
     data.mkdir(mode=0o700)
     control("source.sock", f'(physical-base-backup {lisp_string(str(data) + "/")} "sibling_seed")')
+    if os.environ.get("FOLLOW_MANAGED_STARTUP") == "1":
+        assert os.environ.get("FOLLOW_FIRST_ATTACH") == "1"
+        (data / "standby.signal").write_text("contents are ignored\n")
     if os.environ.get("FOLLOW_CLUSTER_NAME") == "1":
         assert os.environ.get("FOLLOW_LIBPQ") == "1"
         (data / "postgresql.conf").write_text("cluster_name='cluster-contract'\n")
@@ -416,6 +438,9 @@ try:
     if os.environ.get("FOLLOW_FIRST_ATTACH") == "1":
         peer, socket_identity, sibling = exercise_first_attachment(peer, socket_identity, sibling)
         connections.append(sibling)
+        if os.environ.get("FOLLOW_MANAGED_STARTUP") == "1":
+            peer, socket_identity, sibling = exercise_managed_restart(peer, socket_identity, sibling)
+            connections.append(sibling)
     else:
         control("sibling.sock", f'(physical-follow-start "127.0.0.1" {source_port} "sibling_seed")')
     if os.environ.get("FOLLOW_CLUSTER_NAME") == "1":
