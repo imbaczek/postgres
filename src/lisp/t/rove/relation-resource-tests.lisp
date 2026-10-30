@@ -1,10 +1,11 @@
 (in-package #:pg)
 
-(declaim (special *relation-lock-object-limit* *relation-lock-owner-limit*))
+(declaim (special *relation-lock-object-limit* *relation-lock-owner-limit* *relation-resource-requests*))
 
 (defun call-with-relation-resource-fixture (function &key (objects 8) (owners 16))
   (let ((*relation-lock-object-limit* objects)
         (*relation-lock-owner-limit* owners)
+        (*relation-resource-requests* (make-hash-table :test #'eq))
         (*relation-writers* (make-hash-table :test #'eql))
         (*relation-readers* (make-hash-table :test #'eql))
         (*relation-builders* (make-hash-table :test #'eql))
@@ -237,7 +238,8 @@
        (let* ((*active-xids* '(11))
               (variables '(*relation-readers* *relation-writers* *relation-builders*
                            *relation-reader-blockers* *relation-build-groups* *relation-maintainers*
-                           *relation-lock-object-limit* *relation-lock-owner-limit* *active-xids* *backend*))
+                           *relation-lock-object-limit* *relation-lock-owner-limit* *relation-resource-requests*
+                           *active-xids* *backend*))
               (bindings (mapcar #'symbol-value variables))
               (published (sb-thread:make-semaphore))
               (outcome nil)
@@ -274,3 +276,215 @@
              (sb-thread:join-thread worker :timeout 5 :default :timeout))
            (release-relation-writer-xid 11))))
      :objects 1 :owners 2))
+
+(defun call-with-relation-resource-waiter (function observer)
+  (let* ((variables '(*relation-readers* *relation-writers* *relation-builders*
+                      *relation-reader-blockers* *relation-build-groups* *relation-maintainers*
+                      *relation-lock-object-limit* *relation-lock-owner-limit* *relation-resource-requests*
+                      *active-xids* *backend*))
+         (bindings (mapcar #'symbol-value variables))
+         (outcome (list :running))
+         (worker (sb-thread:make-thread
+                  (lambda ()
+                    (handler-case
+                        (progv variables bindings
+                          (funcall function)
+                          (setf (car outcome) :returned))
+                      (error (condition) (setf (car outcome) condition))))
+                  :name "queued-relation-resource-test")))
+    (unwind-protect (funcall observer worker outcome)
+      (when (sb-thread:thread-alive-p worker)
+        (sb-thread:interrupt-thread worker (lambda () (error "fixture request cancelled"))))
+      (sb-thread:join-thread worker :timeout 5 :default :timeout)
+      (when (sb-thread:thread-alive-p worker)
+        (error "fixture request did not stop"))
+      (release-relation-writer-xid 22))))
+
+(defun await-relation-resource-request ()
+  (loop repeat 1000
+        when (sb-thread:with-mutex (*relation-lock-mutex*)
+               (= 1 (hash-table-count *relation-resource-requests*)))
+          do (return-from await-relation-resource-request t)
+        do (sleep 0.005))
+  (error "fixture request did not reserve queued ownership"))
+
+(rove:deftest relation-resource-queued-writer-reserves-capacity-and-transfers-on-grant
+    (call-with-relation-resource-fixture
+     (lambda ()
+       (let ((token (acquire-relation-build-locks '(1) 11 t)))
+         (unwind-protect
+              (call-with-relation-resource-waiter
+               (lambda () (register-relation-writer 1 22))
+               (lambda (worker outcome)
+                 (await-relation-resource-request)
+                 (rove:ok (equal '(1 2) (multiple-value-list (relation-resource-footprint))))
+                 (let ((condition (relation-resource-error
+                                   (lambda () (register-relation-reader 2 33)))))
+                   (rove:ok (typep condition 'pg-error))
+                   (when condition (rove:ok (string= "53200" (pg-error-sqlstate condition)))))
+                 (release-relation-build-locks '(1) token)
+                 (sb-thread:join-thread worker :timeout 5 :default :timeout)
+                 (rove:ok (eq :returned (car outcome)))
+                 (rove:ok (zerop (hash-table-count *relation-resource-requests*)))
+                 (rove:ok (equal '(1 1) (multiple-value-list (relation-resource-footprint))))))
+           (release-relation-build-locks '(1) token)))
+       (rove:ok (equal '(0 0) (multiple-value-list (relation-resource-footprint)))))
+     :objects 2 :owners 2))
+
+(rove:deftest relation-resource-queued-reader-cancellation-releases-the-whole-request
+    (call-with-relation-resource-fixture
+     (lambda ()
+       (let ((token (acquire-relation-build-locks '(1) 11 t)))
+         (unwind-protect
+              (call-with-relation-resource-waiter
+               (lambda () (register-relation-readers '(1 2) 22))
+               (lambda (worker outcome)
+                 (await-relation-resource-request)
+                 (rove:ok (equal '(2 3) (multiple-value-list (relation-resource-footprint))))
+                 (rove:ok (zerop (hash-table-count *relation-readers*)))
+                 (sb-thread:interrupt-thread worker (lambda () (error "fixture reader cancelled")))
+                 (sb-thread:join-thread worker :timeout 5 :default :timeout)
+                 (rove:ok (typep (car outcome) 'simple-error))
+                 (rove:ok (zerop (hash-table-count *relation-resource-requests*)))
+                 (rove:ok (equal '(1 1) (multiple-value-list (relation-resource-footprint))))))
+           (release-relation-build-locks '(1) token)))
+       (rove:ok (equal '(0 0) (multiple-value-list (relation-resource-footprint)))))
+     :objects 2 :owners 4))
+
+(rove:deftest relation-resource-queued-gates-release-capacity-before-publication
+    (dolist (kind '(:build :maintenance))
+      (call-with-relation-resource-fixture
+       (lambda ()
+         (let ((token (acquire-relation-build-locks '(1) 11 t)))
+           (unwind-protect
+                (call-with-relation-resource-waiter
+                 (lambda ()
+                   (ecase kind
+                     (:build
+                      (let ((acquired (acquire-relation-build-locks '(1) 22 t)))
+                        (release-relation-build-locks '(1) acquired)))
+                     (:maintenance
+                      (multiple-value-bind (relations acquired)
+                          (acquire-relation-maintenance-locks '(1))
+                        (release-relation-maintenance-locks relations acquired)))))
+                 (lambda (worker outcome)
+                   (await-relation-resource-request)
+                   (rove:ok (equal '(1 2) (multiple-value-list (relation-resource-footprint))))
+                   (rove:ok (= 1 (hash-table-count *relation-builders*)))
+                   (rove:ok (zerop (hash-table-count *relation-maintainers*)))
+                   (sb-thread:interrupt-thread worker (lambda () (error "fixture gate cancelled")))
+                   (sb-thread:join-thread worker :timeout 5 :default :timeout)
+                   (rove:ok (typep (car outcome) 'simple-error))
+                   (rove:ok (zerop (hash-table-count *relation-resource-requests*)))
+                   (rove:ok (equal '(1 1) (multiple-value-list (relation-resource-footprint))))))
+             (release-relation-build-locks '(1) token))))
+       :objects 1 :owners 2)))
+
+(rove:deftest relation-resource-exhaustion-precedes-the-conflict-wait
+    (call-with-relation-resource-fixture
+     (lambda ()
+       (let ((token (acquire-relation-build-locks '(1) 11 t)))
+         (unwind-protect
+              (call-with-relation-resource-waiter
+               (lambda () (register-relation-writer 1 22))
+               (lambda (worker outcome)
+                 (sb-thread:join-thread worker :timeout 5 :default :timeout)
+                 (rove:ok (typep (car outcome) 'pg-error))
+                 (when (typep (car outcome) 'pg-error)
+                   (rove:ok (string= "53200" (pg-error-sqlstate (car outcome)))))
+                 (rove:ok (zerop (hash-table-count *relation-resource-requests*)))
+                 (rove:ok (equal '(1 1) (multiple-value-list (relation-resource-footprint))))))
+           (release-relation-build-locks '(1) token))))
+     :objects 1 :owners 1))
+
+(rove:deftest relation-resource-pending-and-granted-owner-is-charged-once
+    (call-with-relation-resource-fixture
+     (lambda ()
+       (register-relation-reader 2 22)
+       (let ((token (acquire-relation-build-locks '(1) 11 t)))
+         (unwind-protect
+              (call-with-relation-resource-waiter
+               (lambda () (register-relation-readers '(1 2) 22))
+               (lambda (worker outcome)
+                 (declare (ignore outcome))
+                 (await-relation-resource-request)
+                 (rove:ok (equal '(2 3) (multiple-value-list (relation-resource-footprint))))
+                 (sb-thread:interrupt-thread worker (lambda () (error "fixture same owner cancelled")))
+                 (sb-thread:join-thread worker :timeout 5 :default :timeout)
+                 (rove:ok (equal '(2 2) (multiple-value-list (relation-resource-footprint))))))
+           (release-relation-build-locks '(1) token)))
+       (rove:ok (equal '(0 0) (multiple-value-list (relation-resource-footprint)))))
+     :objects 2 :owners 3))
+
+(cl-spec:defproperty relation-resource-pending-and-granted-union
+    ((count (range integer 0 50)) (offset (range integer 0 15)))
+  (:about relation-resource-footprint)
+  (:trials (:normal 200))
+  (call-with-relation-resource-fixture
+   (lambda ()
+     (let ((pairs nil) (tokens nil))
+       (dotimes (index count)
+         (let* ((node (mod (+ offset index) 9))
+                (owner (1+ (mod (+ offset (* index 3)) 7)))
+                (token (make-relation-gate-token owner)))
+           (when (evenp index) (register-relation-reader node owner))
+           (sb-thread:with-mutex (*relation-lock-mutex*)
+             (setf (gethash token *relation-resource-requests*) (list node node)))
+           (push token tokens)
+           (push (list node owner) pairs)))
+       (let* ((expected (list (length (remove-duplicates (mapcar #'first pairs)))
+                              (length (remove-duplicates pairs :test #'equal))))
+              (queued (multiple-value-list (relation-resource-footprint))))
+         (dolist (pair pairs) (register-relation-writer (first pair) (second pair)))
+         (sb-thread:with-mutex (*relation-lock-mutex*)
+           (dolist (token tokens) (remhash token *relation-resource-requests*)))
+         (and (equal expected queued)
+              (equal expected (multiple-value-list (relation-resource-footprint)))))))
+   :objects nil :owners nil))
+
+(rove:deftest generated-relation-resource-pending-union
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'relation-resource-pending-and-granted-union :seed 42))))
+      (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (rove:ok (= 200 (getf data :trials)))))
+
+(rove:deftest relation-resource-queued-gate-grant-and-callback-throw-release-reservations
+    (dolist (kind '(:build :maintenance))
+      (dolist (exit '(:return :throw))
+        (call-with-relation-resource-fixture
+         (lambda ()
+           (let ((token (acquire-relation-build-locks '(1) 11 t))
+                 (at-grant nil) (queued-at-grant nil) (result nil))
+             (unwind-protect
+                  (call-with-relation-resource-waiter
+                   (lambda ()
+                     (let ((callback
+                             (lambda (relations acquired)
+                               (declare (ignore relations acquired))
+                               (setf at-grant (multiple-value-list (relation-resource-footprint-under-lock))
+                                     queued-at-grant (hash-table-count *relation-resource-requests*))
+                               (when (eq exit :throw) (throw :queued-gate-exit :thrown)))))
+                       (setf result
+                             (catch :queued-gate-exit
+                               (ecase kind
+                                 (:build
+                                  (let ((acquired (acquire-relation-build-locks '(1) 22 t callback)))
+                                    (unwind-protect :returned
+                                      (release-relation-build-locks '(1) acquired))))
+                                 (:maintenance
+                                  (multiple-value-bind (relations acquired)
+                                      (acquire-relation-maintenance-locks '(1) callback)
+                                    (unwind-protect :returned
+                                      (release-relation-maintenance-locks relations acquired)))))))))
+                   (lambda (worker outcome)
+                     (await-relation-resource-request)
+                     (release-relation-build-locks '(1) token)
+                     (sb-thread:join-thread worker :timeout 5 :default :timeout)
+                     (rove:ok (eq :returned (car outcome)))
+                     (rove:ok (eq (if (eq exit :throw) :thrown :returned) result))
+                     (rove:ok (equal '(1 1) at-grant))
+                     (rove:ok (eql 0 queued-at-grant))
+                     (rove:ok (zerop (hash-table-count *relation-resource-requests*)))
+                     (rove:ok (equal '(0 0) (multiple-value-list (relation-resource-footprint))))))
+               (release-relation-build-locks '(1) token))))
+         :objects 1 :owners 2))))

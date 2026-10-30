@@ -299,6 +299,8 @@ max_locks_per_transaction setting is registered yet.")
 (defvar *relation-lock-owner-limit* nil
   "Private relation-owner pair cap, or NIL for no limit; see object cap.")
 
+(defvar *relation-resource-requests* (make-hash-table :test #'eq))
+
 (defun print-relation-gate-token (object stream depth)
   (declare (ignore depth))
   (print-unreadable-object (object stream :type t :identity t)))
@@ -344,6 +346,9 @@ counted here, although PostgreSQL C accounts for ownership before grant."
                  registrations))
       (dolist (registrations (list *relation-builders* *relation-maintainers*))
         (maphash #'note registrations))
+      (maphash (lambda (request nodes)
+                 (dolist (node nodes) (note node request)))
+               *relation-resource-requests*)
       (dolist (node requested) (note node owner))
       (values (hash-table-count objects)
               (loop for owners being the hash-values of objects
@@ -364,6 +369,26 @@ counted here, although PostgreSQL C accounts for ownership before grant."
         (ereport "53200" "out of shared memory"
                  :hint "You might need to increase \"max_locks_per_transaction\"."))))
   (values))
+
+(defun call-with-relation-resource-request (requested token function)
+  (when (sb-thread:holding-mutex-p *relation-lock-mutex*)
+    (error "relation requests must enter outside relation exclusion"))
+  (let ((nodes (remove-duplicates (copy-list requested) :test #'=))
+        (published nil))
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex (*relation-lock-mutex*)
+             (sb-sys:without-interrupts
+               (when (nth-value 1 (gethash token *relation-resource-requests*))
+                 (error "relation request is already queued"))
+               (relation-resource-check-under-lock nodes token)
+               (setf published t)
+               (setf (gethash token *relation-resource-requests*) nodes)))
+           (funcall function token))
+      (when published
+        (sb-sys:without-interrupts
+          (sb-thread:with-mutex (*relation-lock-mutex*)
+            (remhash token *relation-resource-requests*)))))))
 
 ;; Exported initial-copy snapshots pin a schema view across multiple relation
 ;; reads. PostgreSQL holds relation locks for DDL and AccessExclusiveLock for
@@ -834,22 +859,24 @@ holding a portal snapshot must be allowed to run so it can release its pin."
   "Admit a mutation and all subquery reads atomically, with writes taking precedence."
   (when (and write-relfilenodes *backend* (eql xid (backend-xid *backend*)))
     (logical-note-xid-mutation-needs-capture-p xid))
-  ;; Admission waits under the relation mutex without publishing a partial set;
-  ;; callers must not hold the writer lock while waiting for relation gates.
   (let* ((writes (sort (remove-duplicates (copy-list write-relfilenodes) :test #'=) #'<))
          (reads (sort (set-difference (copy-list read-relfilenodes) writes :test #'=) #'<)))
-    (sb-thread:with-mutex (*relation-lock-mutex*)
-      (loop
-        (when (and (every (lambda (node) (relation-writer-admissible-p node xid)) writes)
-                   (every (lambda (node) (relation-reader-admissible-p node xid)) reads))
-          (relation-resource-check-under-lock (append writes reads) xid)
-          (dolist (node writes)
-            (pushnew xid (gethash node *relation-writers*) :test #'=))
-          (dolist (node reads)
-            (pushnew xid (gethash node *relation-readers*) :test #'=))
-          (return))
-        (check-for-interrupts)
-        (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*))))
+    (call-with-relation-resource-request
+     (append writes reads) (make-relation-gate-token xid)
+     (lambda (request)
+       (sb-thread:with-mutex (*relation-lock-mutex*)
+         (loop
+           (when (and (every (lambda (node) (relation-writer-admissible-p node xid)) writes)
+                      (every (lambda (node) (relation-reader-admissible-p node xid)) reads))
+             (sb-sys:without-interrupts
+               (remhash request *relation-resource-requests*)
+               (dolist (node writes)
+                 (pushnew xid (gethash node *relation-writers*) :test #'=))
+               (dolist (node reads)
+                 (pushnew xid (gethash node *relation-readers*) :test #'=)))
+             (return))
+           (check-for-interrupts)
+           (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*))))))
   (values))
 
 (defun register-relation-writer (relfilenode xid)
@@ -972,43 +999,46 @@ must protect the return-to-owner handoff from interrupts; prefer the scoped macr
         (completed nil))
     (when (null relfilenodes)
       (return-from acquire-relation-build-locks nil))
-    (unwind-protect
-         (progn
-           (sb-thread:with-mutex (*relation-lock-mutex*)
-             (loop while (some (lambda (relfilenode)
-                                 (gethash relfilenode *relation-builders*))
-                               relfilenodes)
-                   do (check-for-interrupts)
-                      (condition-wait-with-timeout *relation-lock-cv*
-                                                   *relation-lock-mutex*))
-             (sb-sys:without-interrupts
-               (relation-resource-check-under-lock relfilenodes token)
-               ;; Own the complete set before any partial map update can fail.
-               (setf published t)
-               (setf (gethash token *relation-build-groups*)
-                     (list relfilenodes wait-readers-p))
-               (dolist (relfilenode relfilenodes)
-                 (setf (gethash relfilenode *relation-builders*) token)
-                 (when wait-readers-p
-                   (setf (gethash relfilenode *relation-reader-blockers*) token)))
-               (when on-acquired (funcall on-acquired relfilenodes token))))
-           (loop
-             (let ((user (sb-thread:with-mutex (*relation-lock-mutex*)
-                           (relation-build-user relfilenodes own-xid
-                                                wait-readers-p))))
-               (unless user (return))
-               (if (and (consp user) (eq (first user) :maintenance))
-                   (sb-thread:with-mutex (*relation-lock-mutex*)
-                     (condition-wait-with-timeout *relation-lock-cv*
-                                                  *relation-lock-mutex*))
-                   (wait-for-xid user))))
-           (setf completed t)
-           token)
-      ;; Also protect unscoped callers and non-error exits during acquisition.
-      ;; Release is token-checked and idempotent if the outer scope also owns it.
-      (when (and published (not completed))
-        (sb-sys:without-interrupts
-          (release-relation-build-locks relfilenodes token))))))
+    (call-with-relation-resource-request
+     relfilenodes token
+     (lambda (request)
+       (unwind-protect
+            (progn
+              (sb-thread:with-mutex (*relation-lock-mutex*)
+                (loop while (some (lambda (relfilenode)
+                                    (gethash relfilenode *relation-builders*))
+                                  relfilenodes)
+                      do (check-for-interrupts)
+                         (condition-wait-with-timeout *relation-lock-cv*
+                                                      *relation-lock-mutex*))
+                (sb-sys:without-interrupts
+                  (remhash request *relation-resource-requests*)
+                  ;; Own the complete set before any partial map update can fail.
+                  (setf published t)
+                  (setf (gethash token *relation-build-groups*)
+                        (list relfilenodes wait-readers-p))
+                  (dolist (relfilenode relfilenodes)
+                    (setf (gethash relfilenode *relation-builders*) token)
+                    (when wait-readers-p
+                      (setf (gethash relfilenode *relation-reader-blockers*) token)))
+                  (when on-acquired (funcall on-acquired relfilenodes token))))
+              (loop
+                (let ((user (sb-thread:with-mutex (*relation-lock-mutex*)
+                              (relation-build-user relfilenodes own-xid
+                                                   wait-readers-p))))
+                  (unless user (return))
+                  (if (and (consp user) (eq (first user) :maintenance))
+                      (sb-thread:with-mutex (*relation-lock-mutex*)
+                        (condition-wait-with-timeout *relation-lock-cv*
+                                                     *relation-lock-mutex*))
+                      (wait-for-xid user))))
+              (setf completed t)
+              token)
+         ;; Also protect unscoped callers and non-error exits during acquisition.
+         ;; Release is token-checked and idempotent if the outer scope also owns it.
+         (when (and published (not completed))
+           (sb-sys:without-interrupts
+             (release-relation-build-locks relfilenodes token))))))))
 
 (defun release-relation-build-locks (relfilenodes token)
   (sb-thread:with-mutex (*relation-lock-mutex*)
@@ -1062,29 +1092,32 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
         (completed nil))
     (when (null relfilenodes)
       (return-from acquire-relation-maintenance-locks nil))
-    (unwind-protect
-         (progn
-           (sb-thread:with-mutex (*relation-lock-mutex*)
-             (loop
-               (unless (some (lambda (relfilenode)
-                               (or (gethash relfilenode *relation-builders*)
-                                   (gethash relfilenode *relation-maintainers*)))
-                             relfilenodes)
-                 (sb-sys:without-interrupts
-                   (relation-resource-check-under-lock relfilenodes token)
-                   (setf published t)
-                   (dolist (relfilenode relfilenodes)
-                     (setf (gethash relfilenode *relation-maintainers*) token))
-                   (when on-acquired (funcall on-acquired relfilenodes token)))
-                 (return))
-               (check-for-interrupts)
-               (condition-wait-with-timeout *relation-lock-cv*
-                                            *relation-lock-mutex*)))
-           (setf completed t)
-           (values relfilenodes token))
-      (when (and published (not completed))
-        (sb-sys:without-interrupts
-          (release-relation-maintenance-locks relfilenodes token))))))
+    (call-with-relation-resource-request
+     relfilenodes token
+     (lambda (request)
+       (unwind-protect
+            (progn
+              (sb-thread:with-mutex (*relation-lock-mutex*)
+                (loop
+                  (unless (some (lambda (relfilenode)
+                                  (or (gethash relfilenode *relation-builders*)
+                                      (gethash relfilenode *relation-maintainers*)))
+                                relfilenodes)
+                    (sb-sys:without-interrupts
+                      (remhash request *relation-resource-requests*)
+                      (setf published t)
+                      (dolist (relfilenode relfilenodes)
+                        (setf (gethash relfilenode *relation-maintainers*) token))
+                      (when on-acquired (funcall on-acquired relfilenodes token)))
+                    (return))
+                  (check-for-interrupts)
+                  (condition-wait-with-timeout *relation-lock-cv*
+                                               *relation-lock-mutex*)))
+              (setf completed t)
+              (values relfilenodes token))
+         (when (and published (not completed))
+           (sb-sys:without-interrupts
+             (release-relation-maintenance-locks relfilenodes token))))))))
 
 (defun release-relation-maintenance-locks (relfilenodes token)
   (sb-thread:with-mutex (*relation-lock-mutex*)
