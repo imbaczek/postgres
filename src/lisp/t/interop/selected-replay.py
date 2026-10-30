@@ -276,6 +276,47 @@ def exercise_first_attachment(peer, socket_identity, sibling):
     return peer, socket_identity, sibling
 
 
+def observed_application(endpoint, expected):
+    form = (f'(if (= 1 (count {lisp_string(expected)} (list-backends) '
+            ":key #'backend-application-name :test #'equal)) :observed :waiting)")
+    return ":OBSERVED" in control(endpoint, form).upper()
+
+
+def exercise_cluster_name(sibling):
+    conninfo = (f'host=127.0.0.1 port={source_port} user=postgres dbname=postgres '
+                'sslmode=disable gssencmode=disable')
+
+    def attach(expected, extra="", fallback=None):
+        option = "" if fallback is None else f" :fallback {lisp_string(fallback)}"
+        control("sibling.sock", f'(physical-follow-retarget-conninfo {lisp_string(conninfo + extra)} :prefix "cluster_probe"{option})')
+        wait(lambda: observed_application("source.sock", expected))
+
+    attach("cluster-contract")
+    control("sibling.sock", '(defparameter *cluster-binding-before* (physical-follow-effective-config (physical-follow-read-config)))')
+    control("sibling.sock", '(defparameter *cluster-source-before* (physical-follow-config-source (physical-follow-read-config)))')
+    (data / "postgresql.conf").write_text("cluster_name='pending-cluster'\n")
+    control("sibling.sock", '(reload)')
+    assert query(sibling, "SHOW cluster_name") == [("cluster-contract",)]
+    assert query(sibling, "SELECT pending_restart FROM pg_settings WHERE name='cluster_name'") == [(True,)]
+    control("sibling.sock", '(unless (and (equal *cluster-binding-before* (physical-follow-effective-config (physical-follow-read-config))) (equal *cluster-source-before* (physical-follow-config-source (physical-follow-read-config)))) (error "reload changed accepted source"))')
+    assert observed_application("source.sock", "cluster-contract")
+    for sql in ("SET cluster_name='forbidden'", "RESET cluster_name"):
+        try:
+            query(sibling, sql)
+        except contract["psycopg2"].Error as error:
+            assert error.pgcode == "55P02", error
+        else:
+            raise AssertionError(f"postmaster setting accepted: {sql}")
+    assert query(sibling, "SHOW cluster_name") == [("cluster-contract",)]
+    attach("explicit-api", fallback="explicit-api")
+    attach("explicit-wire", extra=" application_name=explicit-wire", fallback="explicit-api")
+    (data / "postgresql.conf").write_text("cluster_name='cluster-contract'\n")
+    control("sibling.sock", '(reload)')
+    assert query(sibling, "SELECT pending_restart FROM pg_settings WHERE name='cluster_name'") == [(False,)]
+    attach("cluster-contract")
+    print("cluster-name: source observes installed fallback and explicit precedence; reload preserves owner PASS", flush=True)
+
+
 def exercise_controller(promoted, sibling):
     control("sibling.sock", '(defparameter *controller-original-runtime* *physical-follow-runtime*)')
     control("sibling.sock", retarget_form(1, 'unreachable'), expect_error=True)
@@ -335,7 +376,13 @@ def exercise_controller_parent_catchup():
         control("lagging.sock", '(assert (not *physical-recovery-failed-p*))')
         control("lagging.sock", '(defparameter *controller-attempts* nil)')
         control("lagging.sock", '(setf *physical-follow-test-hook* (lambda (point) (when (eq point :after-controller-proof) (let ((entry (getf (sixth (physical-follow-read-config)) :preparing))) (push (list (getf entry :pin) (getf (getf entry :request) :receive-lsn)) *controller-attempts*)))))')
-        control("lagging.sock", retarget_form(promoted_port, 'catchup'))
+        if os.environ.get("FOLLOW_CLUSTER_NAME") == "1":
+            conninfo = (f'host=127.0.0.1 port={promoted_port} user=postgres dbname=postgres '
+                        'sslmode=disable gssencmode=disable')
+            control("lagging.sock", f'(physical-follow-retarget-conninfo {lisp_string(conninfo)} :prefix "catchup")')
+            wait(lambda: observed_application("target.sock", "walreceiver"))
+        else:
+            control("lagging.sock", retarget_form(promoted_port, 'catchup'))
         wait(lambda: query(connection, "SELECT count(*) FROM promotion_sql_items") == [(4,)])
         control("lagging.sock", '(assert (= 2 (length *controller-attempts*)))')
         control("lagging.sock", '(assert (not (equal (first (first *controller-attempts*)) (first (second *controller-attempts*)))))')
@@ -356,6 +403,9 @@ connections = []
 try:
     data.mkdir(mode=0o700)
     control("source.sock", f'(physical-base-backup {lisp_string(str(data) + "/")} "sibling_seed")')
+    if os.environ.get("FOLLOW_CLUSTER_NAME") == "1":
+        assert os.environ.get("FOLLOW_LIBPQ") == "1"
+        (data / "postgresql.conf").write_text("cluster_name='cluster-contract'\n")
     if os.environ.get("SELECTED_REPLAY_CONTROLLER") == "1":
         lagging = root / "controller-lagging"
         lagging.mkdir(mode=0o700)
@@ -368,6 +418,8 @@ try:
         connections.append(sibling)
     else:
         control("sibling.sock", f'(physical-follow-start "127.0.0.1" {source_port} "sibling_seed")')
+    if os.environ.get("FOLLOW_CLUSTER_NAME") == "1":
+        exercise_cluster_name(sibling)
     query(source, "INSERT INTO promotion_sql_items VALUES (2,'shared-parent')")
     parent_end = query(source, "SELECT pg_current_wal_flush_lsn()")[0][0]
     for connection in (promoted, sibling):
