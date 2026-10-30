@@ -45,12 +45,14 @@ For a sender context also check the calling backend and source incarnation."
       (wal-invalid-input "physical sender no longer owns its retained source context"))
     pin))
 
+(declaim (ftype function physical-follow-pin-end-lsn))
+
 (defun physical-source-validate-receipt-under-lock (name owner lsn digest)
   "Validate private receipt against the current sender and durable WAL under WAL."
   (let* ((pin (physical-source-check-sender-under-lock name owner))
          (old (physical-source-pin-confirmed-lsn pin)))
     (unless (and (typep digest '(unsigned-byte 64))
-                 (<= (or old (physical-source-pin-consistent-lsn pin)) lsn *wal-durable-lsn*))
+                 (<= (or old (physical-source-pin-consistent-lsn pin)) lsn (physical-follow-pin-end-lsn pin)))
       (wal-invalid-input "physical receipt no longer belongs to a valid retained sender"))
     (when (and (eql old lsn) (/= digest (physical-source-pin-prefix-digest pin)))
       (wal-invalid-input "physical receipt digest changed at the same boundary"))

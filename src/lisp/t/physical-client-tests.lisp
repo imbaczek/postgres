@@ -258,6 +258,57 @@
                                            (list row) "PREPARE_FOLLOW")))))
        timeline)))
 
+(deftest retained-proof-wire-request-requires-an-explicit-valid-kind
+    (let* ((anchor (retained-timeline-follow-anchor 64 96))
+           (request (pg::physical-follow-anchor-request anchor)))
+      (dolist (verb '("PREPARE_FOLLOW" "RELEASE_FOLLOW"))
+        (let* ((query (pg::pg-client-native-request-query verb "bounded" request))
+               (command (pg::parse-replication-command query)))
+          (ok (equal request (pg::physical-follow-prepare-request command)))
+          (ok (search "proof_kind 'retained_timeline'" query))
+          (let* ((marker "'retained_timeline'")
+                 (position (search marker query))
+                 (unknown (concatenate 'string (subseq query 0 position) "'unknown'"
+                                       (subseq query (+ position (length marker))))))
+            (ok (signals (pg::parse-replication-command unknown) 'error)))
+          (dolist (suffix '(", proof_kind 'retained_timeline'" ", proof_kind 'unknown'"))
+            (let ((invalid (concatenate 'string (subseq query 0 (1- (length query))) suffix ")")))
+              (ok (signals (pg::parse-replication-command invalid) 'error))))))))
+
+(deftest physical-client-retained-proof-requires-null-eor-and-exact-parent-fork
+    (let* ((anchor (retained-timeline-follow-anchor 64 96))
+           (coordinates (pg::physical-follow-anchor-request anchor))
+           (row (list "bound" "42" "1" "0/00000000" "77" "2" "1"
+                      "0/00000040" "123" "0/00000000" "456"
+                      (getf anchor :history-text) "2" "0/00000060" nil)))
+      (call-with-physical-client-wire
+       (lambda (client query)
+         (declare (ignore query))
+         (ok (equal anchor (pg::pg-client-native-prepare client "bound" coordinates))))
+       (lambda (out)
+         (physical-client-test-result out (physical-client-test-prepare-schema)
+                                      (list row) "PREPARE_FOLLOW")))
+      (dolist (change '((12 nil) (12 "3") (13 nil) (13 "0/00000061") (14 "") (14 "00")))
+        (let ((invalid (copy-list row)))
+          (setf (nth (first change) invalid) (second change))
+          (call-with-physical-client-wire
+           (lambda (client query)
+             (declare (ignore query))
+             (ok (physical-client-test-protocol-error-p
+                  (lambda () (pg::pg-client-native-prepare client "bound" coordinates)))))
+           (lambda (out)
+             (physical-client-test-result out (physical-client-test-prepare-schema)
+                                          (list invalid) "PREPARE_FOLLOW")))))
+      (remf coordinates :kind)
+      (call-with-physical-client-wire
+       (lambda (client query)
+         (declare (ignore query))
+         (ok (physical-client-test-protocol-error-p
+              (lambda () (pg::pg-client-native-prepare client "bound" coordinates)))))
+       (lambda (out)
+         (physical-client-test-result out (physical-client-test-prepare-schema)
+                                      (list row) "PREPARE_FOLLOW")))))
+
 (deftest physical-client-same-timeline-proof-rejects-fake-fork-and-null-coordinates
     (dolist (change '((0 nil) (8 nil) (11 nil) (11 "# ignored")
                       (12 "1") (13 "0/00000060") (14 "")))

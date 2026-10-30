@@ -229,8 +229,7 @@ to identify the same PGDATA."
   (let* ((binding (fifth config))
          (request
            (if binding
-               (loop for key in (cons :version (mapcar #'second *physical-follow-wire-fields*))
-                     append (list key (getf (getf binding :anchor) key)))
+               (physical-follow-anchor-request (getf binding :anchor))
                (list :version 1 :system-id (getf base :system-id)
                      :source-timeline (getf base :timeline) :base (getf base :end)
                      :manifest-digest (getf base :manifest-digest)))))

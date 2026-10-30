@@ -39,15 +39,22 @@ eligibility for a future follow path; bootstrap START does not accept this pin."
   "Check and copy the shape and bounds of receiver coordinates.
 This does not prove their contents or authenticate the source; it needs no
 source history or WAL."
-  (let ((keys (remove-if (lambda (key) (member key '(:history-text :eor-octets)))
-                         *physical-follow-anchor-keys*)))
+  (let* ((kind (getf request :kind :absent))
+         (keys (remove-if (lambda (key) (member key '(:history-text :eor-octets)))
+                          *physical-follow-anchor-keys*)))
+    (unless (member kind '(:absent :retained-timeline))
+      (wal-invalid-input "invalid physical follow proof kind"))
+    (when (eq kind :retained-timeline)
+      (setf keys (append '(:version :kind) (rest keys))))
     (physical-follow-check-plist request keys)
     (unless (and (eql 1 (getf request :version))
                  (every (lambda (key) (typep (getf request key) '(unsigned-byte 64)))
                         '(:system-id :base :manifest-digest :receive-lsn :receive-digest
                           :overlap-start :overlap-digest))
                  (every (lambda (key) (typep (getf request key) '(integer 1 4294967295)))
-                        '(:base-timeline :source-timeline :receive-timeline)))
+                        '(:base-timeline :source-timeline :receive-timeline))
+                 (or (eq kind :absent)
+                     (> (getf request :source-timeline) (getf request :receive-timeline))))
       (wal-invalid-input "invalid receiver follow coordinates"))
     (loop for key in keys append (list key (getf request key)))))
 
@@ -66,7 +73,8 @@ source history or WAL."
   (physical-follow-request-copy request)
   (let ((source (getf request :source-timeline))
         (receive (getf request :receive-timeline)))
-    (cond ((= source receive) :same-timeline)
+    (cond ((eq :retained-timeline (getf request :kind)) :retained-timeline)
+          ((= source receive) :same-timeline)
           ((> source receive) :descendant)
           (t (wal-invalid-input "follow source timeline precedes the receive timeline")))))
 
@@ -74,7 +82,44 @@ source history or WAL."
   "An absent kind means the legacy descendant shape and preserves its digest."
   (ecase (getf anchor :kind :descendant)
     (:descendant :descendant)
-    (:same-timeline :same-timeline)))
+    (:same-timeline :same-timeline)
+    (:retained-timeline :retained-timeline)))
+
+(defun physical-follow-anchor-request (anchor)
+  (physical-follow-request-copy
+   (append (when (eq :retained-timeline (physical-follow-anchor-kind anchor))
+             (list :kind :retained-timeline))
+           (loop for key in *physical-follow-anchor-keys*
+                 unless (member key '(:history-text :eor-octets))
+                   append (list key (getf anchor key))))))
+
+(defun physical-follow-request-matches-anchor-p (request anchor)
+  (equal (physical-follow-request-copy request)
+         (physical-follow-anchor-request anchor)))
+
+(defun physical-follow-retained-timeline-anchor-check (anchor)
+  (physical-follow-check-plist anchor *physical-follow-same-timeline-anchor-keys*)
+  (let* ((request (physical-follow-anchor-request anchor))
+         (source (getf anchor :source-timeline))
+         (parent (getf anchor :receive-timeline))
+         (cursor (getf anchor :receive-lsn))
+         (start (getf anchor :overlap-start))
+         (text (getf anchor :history-text)))
+    (unless (and (eq :retained-timeline (physical-follow-request-kind request))
+                 (plusp cursor) (<= (getf anchor :base) cursor)
+                 (= start (* (floor (1- cursor) +wal-segment-size+) +wal-segment-size+))
+                 (stringp text))
+      (error "invalid retained-timeline follow anchor"))
+    (let* ((history (timeline-check-lineage (timeline-parse-history source text)))
+           (position (position parent history :key #'timeline-history-entry-timeline))
+           (entry (and position (nth position history)))
+           (fork (and entry (timeline-history-entry-end entry))))
+      (unless (and position (plusp position) fork (<= cursor fork)
+                   (timeline-prefix-boundary-p parent cursor history)
+                   (timeline-prefix-boundary-p (getf anchor :base-timeline)
+                                               (getf anchor :base) history))
+        (error "retained-timeline follow anchor is outside source ancestry"))
+      (values history fork nil))))
 
 (defun physical-follow-same-timeline-anchor-check (anchor)
   "Check the exact same-timeline fields, boundaries and ancestry without EOR.
@@ -148,12 +193,14 @@ which may differ from the source's retained archive base and manifest."
 Same-timeline anchors return NIL for fork and EOR. WAL bytes are checked separately."
   (ecase (physical-follow-anchor-kind anchor)
     (:descendant (physical-follow-descendant-anchor-check anchor))
-    (:same-timeline (physical-follow-same-timeline-anchor-check anchor))))
+    (:same-timeline (physical-follow-same-timeline-anchor-check anchor))
+    (:retained-timeline (physical-follow-retained-timeline-anchor-check anchor))))
 
 (defun physical-follow-anchor-copy (request)
   "Validate REQUEST and copy its mutable anchor values for pin ownership."
   (physical-follow-anchor-check request)
-  (loop for key in (if (eq :same-timeline (physical-follow-anchor-kind request))
+  (loop for key in (if (member (physical-follow-anchor-kind request)
+                               '(:same-timeline :retained-timeline))
                        *physical-follow-same-timeline-anchor-keys*
                        *physical-follow-anchor-keys*)
         for value = (getf request key)
@@ -161,6 +208,12 @@ Same-timeline anchors return NIL for fork and EOR. WAL bytes are checked separat
                            (string (copy-seq value))
                            (cons (copy-list value))
                            (t value)))))
+
+(defun physical-follow-pin-end-lsn (pin)
+  (if (and (physical-follow-pin-p pin)
+           (eq :retained-timeline (physical-follow-anchor-kind (physical-follow-pin-anchor pin))))
+      (nth-value 1 (physical-follow-anchor-check (physical-follow-pin-anchor pin)))
+      *wal-durable-lsn*))
 
 (defun physical-follow-anchor-digest (anchor)
   "Return the canonical immutable anchor identity checksum.
@@ -198,6 +251,8 @@ progress and lost state are not. This checksum identifies an anchor; it is not a
                          (= digest (getf request :receive-digest))))
                    (:ready
                     (and (typep confirmed '(unsigned-byte 64)) (<= cursor confirmed)
+                         (or (not (eq :retained-timeline (physical-follow-anchor-kind request)))
+                             (<= confirmed (physical-follow-pin-end-lsn pin)))
                          (eql (physical-source-pin-restart-lsn pin) confirmed)
                          (or (> confirmed cursor) (= digest (getf request :receive-digest)))))))
       (error "physical follow pin phase or progress contradicts its anchor")))
@@ -293,10 +348,11 @@ For a ready pin, scan its confirmed suffix; startup performs this before listene
   (when (physical-follow-pin-ready-p pin)
     (return-from physical-follow-pin-check-retained-wal
       (physical-follow-source-check-ready-range pin)))
-  (let ((floor (physical-source-pin-restart-lsn pin)))
-    (when (< floor *wal-durable-lsn*)
+  (let ((floor (physical-source-pin-restart-lsn pin))
+        (end (physical-follow-pin-end-lsn pin)))
+    (when (< floor end)
       (loop for segment from (floor floor +wal-segment-size+)
-              to (floor (1- *wal-durable-lsn*) +wal-segment-size+)
+              to (floor (1- end) +wal-segment-size+)
             do (physical-follow-source-segment
                 pin segment (max floor (physical-source-pin-consistent-lsn pin)
                                  (* segment +wal-segment-size+)))))))

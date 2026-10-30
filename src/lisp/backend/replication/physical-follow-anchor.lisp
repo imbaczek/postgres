@@ -133,7 +133,7 @@ require complete records and check any end-of-recovery transition at its fork."
          (end (with-live-operation
                 (sb-thread:with-mutex (*wal-lock*)
                   (physical-follow-pin-check-live pin)
-                  *wal-durable-lsn*)))
+                  (physical-follow-pin-end-lsn pin))))
          (gap nil)
          (logical-cursor cursor))
     (loop while (< cursor end)
@@ -201,8 +201,8 @@ before publishing the ready state in memory; a save failure fences the source."
                 (physical-source-pin-test-point :after-follow-ready pin)))))))
     pin))
 
-(defun physical-source-follow-same-timeline-anchor (request)
-  "Build a same-timeline anchor under WAL exclusion; no EOR is needed.
+(defun physical-source-follow-no-eor-anchor (request)
+  "Build a same-timeline or retained-timeline anchor under WAL exclusion.
 The provisional pin checks source identity and durable position, but is not
 published. Reservation and the independent overlap and suffix proof follow."
   (with-live-operation
@@ -212,7 +212,9 @@ published. Reservation and the independent overlap and suffix proof follow."
       (let* ((text (if (= *wal-insert-timeline* 1) ""
                        (bytes->string (timeline-history-bytes *wal-insert-timeline*))))
              (anchor (physical-follow-anchor-copy
-                      (append (copy-list request) (list :kind :same-timeline :history-text text))))
+                      (append (copy-list request)
+                              (unless (getf request :kind) (list :kind :same-timeline))
+                              (list :history-text text))))
              (pin (make-physical-follow-pin
                    :system-id (getf request :system-id) :timeline (getf request :source-timeline)
                    :consistent-lsn (getf request :receive-lsn) :anchor anchor)))
@@ -262,7 +264,7 @@ registered or serialized. Reservation and proof revalidate retention afterward."
   (setf request (physical-follow-request-copy request))
   (ecase (physical-follow-request-kind request)
     (:descendant (physical-source-follow-descendant-anchor request))
-    (:same-timeline (physical-source-follow-same-timeline-anchor request))))
+    ((:same-timeline :retained-timeline) (physical-source-follow-no-eor-anchor request))))
 
 (defun physical-source-follow-existing-anchor (name request)
   "Return a copy of the live saved anchor for an exact request retry.
@@ -276,8 +278,7 @@ The existing pin keeps any confirmation already advanced."
       (let ((pin (gethash name *physical-source-pins*)))
         (when pin
           (unless (and (physical-follow-pin-p pin)
-                       (loop for (key value) on request by #'cddr
-                             always (equal value (getf (physical-follow-pin-anchor pin) key))))
+                       (physical-follow-request-matches-anchor-p request (physical-follow-pin-anchor pin)))
             (wal-invalid-input "physical follow pin name is already bound to another request"))
           (physical-follow-pin-check-live pin)
           (physical-follow-anchor-copy (physical-follow-pin-anchor pin)))))))
@@ -341,8 +342,7 @@ limit fails before acknowledgment, unlink or retention release."
                        (unless (and (physical-follow-pin-p pin) (physical-follow-pin-p disk)
                                     (or request (physical-follow-pin-ready-p pin))
                                     (if request
-                                        (loop for (key value) on request by #'cddr
-                                              always (equal value (getf (physical-follow-pin-anchor pin) key)))
+                                        (physical-follow-request-matches-anchor-p request (physical-follow-pin-anchor pin))
                                         (= expected-digest
                                            (physical-follow-anchor-digest (physical-follow-pin-anchor pin)))))
                          (wal-invalid-input "physical follow release differs from its immutable identity"))

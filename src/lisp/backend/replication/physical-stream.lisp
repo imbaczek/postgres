@@ -44,6 +44,9 @@ the requested timeline may be an ancestor."
          (entry (when position (nth position history)))
          (limit (when entry (timeline-history-entry-end entry))))
     (unless (and entry
+                 (or (not (eq :retained-timeline
+                              (physical-follow-anchor-kind (physical-follow-pin-anchor pin))))
+                     (= timeline (getf (physical-follow-pin-anchor pin) :receive-timeline)))
                  (<= (* (floor (timeline-history-entry-begin entry) +wal-segment-size+)
                         +wal-segment-size+)
                      (logical-replication-command-requested-lsn command))
@@ -101,19 +104,21 @@ Missing, duplicate or unknown options fail before a sender is acquired."
 The same order defines the receiver fields in the result row.")
 
 (defun physical-follow-prepare-request (command)
-  "Decode receiver coordinates and check their wire types.
-Timelines must fit a nonzero unsigned 32-bit value; LSNs and other fields use
-their respective wire parsers. Source preparation checks ancestry and proof."
-  (cons :version
-        (cons 1
-              (loop for (name key kind) in *physical-follow-wire-fields*
-                    for text = (physical-stream-option command name)
-                    for value = (if (eq kind :lsn) (parse-replication-lsn text)
-                                    (physical-stream-u64 text))
-                    do (when (and (eq kind :timeline)
-                                  (not (typep value '(integer 1 4294967295))))
-                         (ereport "22023" "invalid native physical timeline"))
-                    append (list key value)))))
+  "Decode receiver coordinates and check their wire types."
+  (let ((proof (physical-stream-option command "proof_kind")))
+    (when (and proof (not (equal proof "retained_timeline")))
+      (ereport "22023" "invalid native physical proof kind"))
+    (physical-follow-request-copy
+     (append (list :version 1)
+             (when proof (list :kind :retained-timeline))
+             (loop for (name key kind) in *physical-follow-wire-fields*
+                   for text = (physical-stream-option command name)
+                   for value = (if (eq kind :lsn) (parse-replication-lsn text)
+                                   (physical-stream-u64 text))
+                   do (when (and (eq kind :timeline)
+                                 (not (typep value '(integer 1 4294967295))))
+                        (ereport "22023" "invalid native physical timeline"))
+                   append (list key value))))))
 
 (defun parse-native-physical-prepare (words)
   "Parse PREPARE_FOLLOW and require the native format and each receiver field once.
@@ -122,7 +127,8 @@ Reject unknown, duplicate or missing options before preparing a pin."
     (ereport "42601" "expected PREPARE_FOLLOW SLOT name (native options)"))
   (let* ((name (replication-command-identifier (third words)))
          (options (parse-replication-generic-options (nthcdr 3 words)))
-         (keys (cons "native_format" (mapcar #'first *physical-follow-wire-fields*))))
+         (keys (append (when (assoc "proof_kind" options :test #'equal) (list "proof_kind"))
+                       (cons "native_format" (mapcar #'first *physical-follow-wire-fields*)))))
     (unless (wal-valid-replication-slot-name-p name)
       (ereport "42602" "invalid physical follow pin name"))
     (unless (and (= (length keys) (length options))
@@ -145,7 +151,8 @@ has native_format and all ten receiver coordinates used for PREPARE_FOLLOW."
          (options (parse-replication-generic-options (nthcdr 3 words)))
          (digest-p (assoc "anchor_digest" options :test #'equal))
          (keys (if digest-p '("native_format" "anchor_digest")
-                   (cons "native_format" (mapcar #'first *physical-follow-wire-fields*)))))
+                   (append (when (assoc "proof_kind" options :test #'equal) (list "proof_kind"))
+                           (cons "native_format" (mapcar #'first *physical-follow-wire-fields*))))))
     (unless (wal-valid-replication-slot-name-p name)
       (ereport "42602" "invalid physical follow pin name"))
     (unless (and (= (length keys) (length options))
@@ -232,7 +239,8 @@ Same-timeline anchors return SQL NULL for next timeline, fork and EOR."
                                          :key #'timeline-history-entry-timeline))
                      (next (timeline-history-entry-timeline (nth (1- position) history))))
                 (list (format nil "~d" next) (wal-format-lsn fork)
-                      (format nil "~(~{~2,'0X~}~)" (getf anchor :eor-octets))))))))
+                      (when (eq :descendant (physical-follow-anchor-kind anchor))
+                        (format nil "~(~{~2,'0X~}~)" (getf anchor :eor-octets)))))))))
 
 (defun physical-follow-prepare-row (command)
   "Prepare and recheck a live ready pin, then copy its source-owned result.
@@ -342,7 +350,7 @@ base and bounds apply feedback, not the anchor cursor."
                                (physical-source-pin-consistent-lsn pin)))
                    (<= (or (physical-source-pin-confirmed-lsn pin)
                            (physical-source-pin-consistent-lsn pin))
-                       cursor *wal-durable-lsn*))
+                       cursor (physical-follow-pin-end-lsn pin)))
         (ereport "55000" "native source mode, identity, retained base or resume boundary mismatch"))
       (when (gethash name *physical-source-senders*)
         (ereport "55006" "source pin already has a sender"))
@@ -431,6 +439,13 @@ Explicit follow START admission acquires a ready follow pin."
 
 (defun physical-source-prove-range (name owner cursor requested digest &optional progress)
   "Hash only a newly acknowledged suffix, rejecting an interior record cursor."
+  (with-live-operation
+    (sb-thread:with-mutex (*wal-lock*)
+      (let ((pin (physical-source-retained-sender-pin name owner)))
+        (unless (<= (or (physical-source-pin-confirmed-lsn pin)
+                        (physical-source-pin-consistent-lsn pin))
+                    cursor requested (physical-follow-pin-end-lsn pin))
+          (ereport "22023" "physical proof range is outside its retained sender")))))
   (let ((last-heartbeat (get-internal-real-time))
         (*physical-follow-source-read-cache* (or *physical-follow-source-read-cache* (list nil))))
     (loop while (< cursor requested)

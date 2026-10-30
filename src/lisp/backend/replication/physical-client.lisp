@@ -279,6 +279,8 @@ The copied fields are shape-checked, not proof of source identity or history."
   (let ((request (physical-follow-request-copy coordinates)))
     (with-output-to-string (out)
       (format out "~a SLOT ~a (native_format '~a'" verb slot +physical-native-format+)
+      (when (eq :retained-timeline (getf request :kind))
+        (write-string ", proof_kind 'retained_timeline'" out))
       (loop for (name key kind) in *physical-follow-wire-fields*
             for value = (getf request key)
             do (format out ", ~a '~a'" name (if (eq kind :lsn) (wal-format-lsn value)
@@ -305,7 +307,9 @@ The caller must independently verify source identity and local durable witnesses
 This helper does not install history, redo WAL, update recovery state or admit a receiver.
 The caller owns network deadlines, cancellation and client cleanup; it must not
 perform network I/O under recovery quiescence."
-  (let* ((same (eq :same-timeline (physical-follow-request-kind coordinates)))
+  (let* ((kind (physical-follow-request-kind coordinates))
+         (same (eq :same-timeline kind))
+         (retained (eq :retained-timeline kind))
          (schema (append (list (list "slot_name" +textoid+))
                          (loop for (name key kind) in *physical-follow-wire-fields*
                                collect (list name (if (eq kind :timeline) +int8oid+ +textoid+)))
@@ -313,13 +317,15 @@ perform network I/O under recovery quiescence."
                          (loop for (name oid) in (list (list "next_tli" +int8oid+)
                                                        (list "next_tli_startpos" +textoid+)
                                                        (list "eor_hex" +textoid+))
-                               collect (if same (list name oid :nullable) (list name oid)))))
+                               collect (if (or same (and retained (equal name "eor_hex")))
+                                           (list name oid :nullable) (list name oid)))))
          (row (physical-client-query client (pg-client-native-prepare-query slot coordinates)
                                      schema "PREPARE_FOLLOW"
                                      :maximum +physical-client-proof-frame-maximum+))
          (anchor (append (copy-tree coordinates) (list :history-text (aref row 11))
-                         (if same (list :kind :same-timeline)
-                             (list :eor-octets (pg-client-native-eor (aref row 14)))))))
+                         (cond (same (list :kind :same-timeline))
+                               (retained nil)
+                               (t (list :eor-octets (pg-client-native-eor (aref row 14))))))))
     (unless (<= (if same 0 1) (length (string->bytes (aref row 11))) +physical-store-history-maximum-bytes+)
       (pg-client-native-reject "native preparation history exceeds its file bound"))
     (unless (equal slot (aref row 0)) (pg-client-native-reject "native source prepared a different pin"))
@@ -330,12 +336,17 @@ perform network I/O under recovery quiescence."
             do (pg-client-native-reject "native source changed a prepared receive coordinate"))
     (handler-case
         (multiple-value-bind (history fork eor) (physical-follow-anchor-check anchor)
+          (declare (ignore eor))
+          (when (and retained (aref row 14))
+            (pg-client-native-reject "retained-timeline preparation returned child EOR"))
           (if same
               (unless (every #'null (subseq row 12))
                 (pg-client-native-reject "same-timeline preparation returned descendant fields"))
               (unless (and (= fork (pg-client-native-lsn (aref row 13)))
                            (= (pg-client-native-u64 (aref row 12) t)
-                              (timeline-check-end-of-recovery eor (getf anchor :receive-timeline) history)))
+                              (timeline-history-entry-timeline
+                               (nth (1- (position (getf anchor :receive-timeline) history
+                                                  :key #'timeline-history-entry-timeline)) history))))
                 (pg-client-native-reject "native preparation next timeline or fork differs from its anchor"))))
       (pg-client-error (condition) (error condition))
       (error () (pg-client-native-reject "native preparation returned an invalid source anchor")))

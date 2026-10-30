@@ -15,6 +15,97 @@
         :overlap-digest overlap
         :history-text (if (= timeline 1) "" (format nil "1~c0/00000040~cpromotion~%" #\Tab #\Tab))))
 
+(defun retained-timeline-follow-anchor (cursor fork &optional (carried 123) (overlap 456))
+  (list :version 1 :kind :retained-timeline :system-id 42 :base-timeline 1 :base 0
+        :manifest-digest 77 :source-timeline 2 :receive-timeline 1
+        :receive-lsn cursor :receive-digest carried
+        :overlap-start (* (floor (1- cursor) pg::+wal-segment-size+) pg::+wal-segment-size+)
+        :overlap-digest overlap
+        :history-text (format nil "1~c~a~cretained parent~%" #\Tab (pg::wal-format-lsn fork) #\Tab)))
+
+(deftest retained-timeline-anchor-proves-only-a-finite-parent-prefix
+    (let ((anchor (retained-timeline-follow-anchor 64 96)))
+      (multiple-value-bind (history fork eor) (pg::physical-follow-anchor-check anchor)
+        (ok (= 2 (pg::timeline-history-entry-timeline (first history))))
+        (ok (= 96 fork))
+        (ok (null eor)))
+      (ok (equal anchor (pg::physical-follow-anchor-copy anchor)))
+      (ok (not (member :eor-octets anchor))))
+  (dolist (change '((:receive-lsn 97) (:receive-lsn 0) (:receive-timeline 2)
+                    (:source-timeline 1) (:base 65) (:base-timeline 2)
+                    (:kind :unknown) (:eor-octets nil)))
+    (let ((anchor (retained-timeline-follow-anchor 64 96)))
+      (setf (getf anchor (first change)) (second change))
+      (ok (signals (pg::physical-follow-anchor-check anchor) 'error)
+          (format nil "~s" change)))))
+
+(deftest retained-timeline-request-identity-cannot-match-a-descendant-request
+    (let* ((anchor (retained-timeline-follow-anchor 64 96))
+           (request (pg::physical-follow-anchor-request anchor))
+           (legacy (copy-list request)))
+      (remf legacy :kind)
+      (ok (eq :retained-timeline (pg::physical-follow-request-kind request)))
+      (ok (eq :descendant (pg::physical-follow-request-kind legacy)))
+      (ok (equal request (pg::physical-follow-request-copy request)))
+      (ok (pg::physical-follow-request-matches-anchor-p request anchor))
+      (ok (not (pg::physical-follow-request-matches-anchor-p legacy anchor)))
+      (let ((reordered (loop for (key value) on request by #'cddr
+                             nconc (list (cons key value)))))
+        (ok (equal request
+                   (pg::physical-follow-request-copy
+                    (loop for (key . value) in (reverse reordered) append (list key value))))))
+      (dolist (kind '(nil :unknown :descendant :same-timeline))
+        (setf (getf request :kind) kind)
+        (ok (signals (pg::physical-follow-request-copy request) 'error))))
+  (let* ((anchor (follow-anchor-request 123 456))
+         (request (pg::physical-follow-anchor-request anchor)))
+    (setf (getf request :kind) :retained-timeline)
+    (ok (not (pg::physical-follow-request-matches-anchor-p request anchor))))
+  (dolist (anchor (list (follow-anchor-request 123 456)
+                        (same-timeline-follow-anchor 96 123 456)))
+    (let ((request (pg::physical-follow-anchor-request anchor)))
+      (ok (not (member :kind request)))
+      (ok (pg::physical-follow-request-matches-anchor-p request anchor)))))
+
+(cl-spec:defproperty retained-timeline-pin-roundtrips-bounded-confirmation
+    ((fork (range integer 1 18446744073709551615))
+     (carried (range integer 0 18446744073709551615))
+     (overlap (range integer 0 18446744073709551615))
+     (ready boolean))
+  (:about pg::physical-follow-pin-decode)
+  (:trials (:normal 200))
+  (let* ((cursor (max 1 (floor fork 2)))
+         (anchor (retained-timeline-follow-anchor cursor fork carried overlap))
+         (pin (pg::make-physical-follow-pin
+               :name "retained_parent" :system-id 42 :timeline 2 :manifest-digest 77
+               :consistent-lsn cursor :restart-lsn (if ready fork (getf anchor :overlap-start))
+               :confirmed-lsn (when ready fork)
+               :prefix-digest (if (and ready (> fork cursor)) (logxor carried 1) carried)
+               :stage (if ready :ready :retaining) :anchor anchor))
+         (restored (pg::physical-follow-pin-decode (pg::physical-follow-pin-encode pin))))
+    (and (equal anchor (pg::physical-follow-pin-anchor restored))
+         (= (pg::physical-follow-anchor-digest anchor)
+            (pg::physical-follow-anchor-digest (pg::physical-follow-pin-anchor restored)))
+         (eql (pg::physical-source-pin-confirmed-lsn pin)
+              (pg::physical-source-pin-confirmed-lsn restored)))))
+
+(deftest generated-retained-timeline-pin-roundtrip
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'retained-timeline-pin-roundtrips-bounded-confirmation :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))
+      (ok (= 200 (getf data :trials)))))
+
+(deftest retained-timeline-pin-rejects-confirmation-beyond-its-fork
+    (let* ((anchor (retained-timeline-follow-anchor 64 96))
+           (pin (pg::make-physical-follow-pin
+                 :name "retained_parent" :system-id 42 :timeline 2 :manifest-digest 77
+                 :consistent-lsn 64 :restart-lsn 96 :confirmed-lsn 96
+                 :prefix-digest 999 :stage :ready :anchor anchor)))
+      (ok (pg::physical-follow-pin-check-fields pin))
+      (setf (pg::physical-source-pin-confirmed-lsn pin) 97
+            (pg::physical-source-pin-restart-lsn pin) 97)
+      (ok (signals (pg::physical-follow-pin-check-fields pin) 'error))))
+
 (deftest same-timeline-anchor-keeps-history-without-a-fork-or-eor
     (dolist (timeline '(1 2))
       (let ((anchor (same-timeline-follow-anchor 96 123 456 timeline)))
@@ -1192,6 +1283,152 @@
        (pg::wal-segment-path 0) (concatenate '(vector (unsigned-byte 8)) prefix eor))
       (pg::timeline-write-history 2 1 64 "promotion")
       (funcall function root request eor))))
+
+(deftest follow-attempt-retry-and-cleanup-preserve-the-explicit-proof-kind
+    (dolist (retained '(nil t))
+      (call-with-follow-anchor-source
+       (lambda (root descendant eor)
+         (declare (ignore root eor))
+         (let* ((pg::*physical-follow-aborted-attempts* (make-hash-table :test #'equal))
+                (anchor (copy-tree descendant)))
+           (when retained
+             (remf anchor :eor-octets)
+             (setf (getf anchor :kind) :retained-timeline))
+           (let* ((request (pg::physical-follow-anchor-request anchor))
+                  (other (copy-list request))
+                  (pin (pg::physical-source-follow-reserve "kind_exact" anchor)))
+             (if retained (remf other :kind)
+                 (setf (getf other :kind) :retained-timeline))
+             (ok (signals (pg::physical-source-follow-existing-anchor "kind_exact" other) 'error))
+             (ok (signals (pg::physical-source-follow-abort "kind_exact" other) 'error))
+             (ok (eq pin (gethash "kind_exact" pg::*physical-source-pins*)))
+             (ok (probe-file (pg::physical-source-pin-path "kind_exact")))
+             (ok (not pg::*wal-poisoned*))
+             (ok (equal (pg::physical-follow-anchor-copy anchor)
+                        (pg::physical-source-follow-existing-anchor "kind_exact" request)))
+             (ok (eq :released (pg::physical-source-follow-abort "kind_exact" request)))
+             (ok (not (gethash "kind_exact" pg::*physical-source-pins*)))))))))
+
+(deftest retained-source-proof-and-reopen-do-not-require-child-eor
+    (call-with-follow-anchor-source
+     (lambda (root descendant eor)
+       (declare (ignore root eor))
+       (let* ((pg::*physical-follow-aborted-attempts* (make-hash-table :test #'equal))
+              (request (pg::physical-follow-anchor-request descendant))
+              (path (pg::wal-segment-path 0))
+              (prefix (with-open-file (input path :element-type '(unsigned-byte 8))
+                        (let ((bytes (make-array 64 :element-type '(unsigned-byte 8))))
+                          (read-sequence bytes input)
+                          bytes))))
+         (setf (getf request :kind) :retained-timeline
+               (getf request :receive-lsn) 32
+               (getf request :receive-digest) #xCBF29CE484222325
+               (getf request :overlap-digest)
+               (pg::physical-store-update-digest #xCBF29CE484222325 (subseq prefix 0 32)))
+         (pg::wal-atomic-write-bytes path prefix)
+         (let ((pin (pg::physical-source-follow-prepare "bounded_ready" request)))
+           (ok (pg::physical-follow-pin-ready-p pin))
+           (ok (= 64 (pg::physical-follow-pin-end-lsn pin)))
+           (let* ((command (pg::parse-replication-command
+                            (pg::pg-client-native-prepare-query "bounded_ready" request)))
+                  (row (pg::physical-follow-prepare-row command)))
+             (ok (equal "2" (nth 12 row)))
+             (ok (equal "0/00000040" (nth 13 row)))
+             (ok (null (nth 14 row))))
+           (sb-thread:with-mutex (pg::*wal-lock*)
+             (let ((record (pg::physical-follow-source-read-next pin 32)))
+               (ok (= 64 (pg::wal-record-end record))))
+             (multiple-value-bind (record bytes end) (pg::physical-follow-source-read-next pin 64)
+               (ok (null record)) (ok (null bytes)) (ok (= 64 end)))
+             (ok (signals (pg::physical-follow-source-read-next pin 65) 'error)))
+           (clrhash pg::*physical-source-pins*)
+           (clrhash pg::*wal-snapshot-retention-pins*)
+           (pg::physical-source-pin-load)
+           (ok (pg::physical-follow-pin-ready-p
+                (gethash "bounded_ready" pg::*physical-source-pins*)))
+           (remf request :kind)
+           (ok (signals (pg::physical-source-follow-prepare "missing_child" request) 'error)))))))
+
+(deftest retained-source-sender-cannot-authorize-the-child-or-acknowledge-past-the-fork
+    (call-with-follow-anchor-source
+     (lambda (root descendant eor)
+       (declare (ignore root eor))
+       (let* ((pg::*physical-follow-aborted-attempts* (make-hash-table :test #'equal))
+              (request (pg::physical-follow-anchor-request descendant))
+              (seed #xCBF29CE484222325))
+         (setf (getf request :kind) :retained-timeline
+               (getf request :receive-lsn) 32
+               (getf request :receive-digest) seed
+               (getf request :overlap-digest)
+               (pg::physical-store-update-digest seed (legacy-checkpoint-record 0)))
+         (let* ((pin (pg::physical-source-follow-prepare "sibling" request))
+                (command
+                  (pg::parse-replication-command
+                   (format nil "START_REPLICATION PHYSICAL 0/00000020 (proof_pin 'sibling', native_format '~a', system_id '~d', timeline '1', base_lsn '0/00000020', prefix_digest '~d', manifest_digest '77', mode 'follow')"
+                           pg::+physical-native-format+ (getf request :system-id) seed)))
+                (owner (pg::physical-source-acquire-sender command)))
+           (unwind-protect
+                (progn
+                  (ok (= 32 (pg::physical-source-validate-resume command owner)))
+                  (ok (signals (pg::physical-source-prove-range "sibling" owner 32 65 seed) 'error))
+                  (ok (signals (pg::physical-source-prove-range "sibling" owner 65 65 seed) 'error))
+                  (sb-thread:with-mutex (pg::*wal-lock*)
+                    (ok (signals (pg::physical-source-validate-receipt-under-lock
+                                  "sibling" owner 65 seed) 'error))
+                    (ok (= 32 (pg::physical-source-pin-confirmed-lsn pin))))
+                  (setf (pg::logical-replication-command-requested-lsn command) 65)
+                  (ok (signals (pg::physical-source-validate-resume command owner) 'error))
+                  (let ((digest (pg::physical-store-update-digest seed (legacy-checkpoint-record 32))))
+                    (ok (= digest (pg::physical-source-prove-range "sibling" owner 32 64 seed)))
+                    (pg::physical-source-confirm-feedback command owner 64 digest)
+                    (ok (= 64 (pg::physical-source-pin-confirmed-lsn pin)))))
+             (pg::physical-source-release-sender "sibling" owner))
+           (setf (pg::logical-replication-command-requested-lsn command) 64)
+           (let ((child (assoc "timeline" (pg::logical-replication-command-options command) :test #'equal)))
+             (setf (cdr child) "'2'")
+             (ok (signals (pg::physical-source-acquire-sender command) 'error))
+             (ok (zerop (hash-table-count pg::*physical-source-senders*))))
+           (ok (not pg::*wal-poisoned*)))))))
+
+(deftest retained-source-at-the-fork-completes-without-copy-or-public-flush
+    (call-with-follow-anchor-source
+     (lambda (root descendant eor)
+       (declare (ignore root eor))
+       (let* ((pg::*physical-follow-aborted-attempts* (make-hash-table :test #'equal))
+              (pg::*wal-replication-slots* (make-hash-table :test #'equal))
+              (pg::*backend* (pg::make-backend :pid 3499))
+              (request (pg::physical-follow-anchor-request descendant))
+              (public (physical-slot-test-object :name "bounded_public"
+                                                 :system-id (pg::catalog-system-identifier)))
+              (names '(pg::send-copy-both-response pg::physical-source-read-next
+                       pg::physical-stream-switch-result))
+              (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
+              (switched nil))
+         (setf (getf request :kind) :retained-timeline
+               (gethash "bounded_public" pg::*wal-replication-slots*) public)
+         (let* ((pin (pg::physical-source-follow-prepare "sibling" request))
+                (command (follow-anchor-start-command request "follow")))
+           (setf (pg::logical-replication-command-slot-name command) "bounded_public"
+                 (cdr (assoc "timeline" (pg::logical-replication-command-options command) :test #'equal)) "1")
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::send-copy-both-response)
+                        (lambda (stream) (declare (ignore stream)) (error "unexpected CopyBoth at fork"))
+                        (symbol-function 'pg::physical-source-read-next)
+                        (lambda (&rest arguments) (declare (ignore arguments)) (error "unexpected read at fork"))
+                        (symbol-function 'pg::physical-stream-switch-result)
+                        (lambda (stream next limit)
+                          (declare (ignore stream))
+                          (ok (null (pg::wal-replication-slot-active-owner public)))
+                          (ok (null (gethash "sibling" pg::*physical-source-senders*)))
+                          (setf switched (list next limit))))
+                  (pg::start-native-physical-replication nil command)
+                  (ok (equal '(2 64) switched))
+                  (ok (= 64 (pg::physical-source-pin-confirmed-lsn pin)))
+                  (ok (null (pg::wal-replication-slot-restart-lsn public)))
+                  (ok (null (pg::wal-replication-slot-restart-timeline public))))
+             (dolist (entry saved)
+               (setf (symbol-function (car entry)) (cdr entry)))))))))
 
 (defun call-with-same-timeline-follow-source (function timeline)
   (with-physical-store-directory (root)
