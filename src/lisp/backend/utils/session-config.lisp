@@ -188,11 +188,14 @@ This changes in-memory state only; client reporting occurs later."
           +null+ +null+ nil))
 
 (defun session-set-extra-setting (name value)
+  "Set or reset a session setting, saving the transaction's settings before changes.
+The saved settings allow an abort to restore the values in effect at transaction start."
   (when (string= name "application_name")
     (return-from session-set-extra-setting (session-set-application-name value)))
   (let* ((settings (backend-settings *backend*))
          (reset-p (or (eq value :default) (eq value +null+)))
          (reset (backend-settings-reset *backend*)))
+    (session-remember-settings)
     (when (session-custom-setting-p name)
       (unless (nth-value 1 (gethash name reset))
         (setf (gethash name reset) "")))
