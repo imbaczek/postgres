@@ -1747,6 +1747,7 @@ VACUUM FULL wait for this scope."
                        ;; Mark cleanup ownership before touching backend state. A
                        ;; cancel can then never strand a partially initialized
                        ;; transaction in a reusable backend.
+                       (clear-backend-command-id-used backend)
                        (setf started t
                              (backend-explicit backend) t
                              (backend-isolation-level backend) :repeatable-read
@@ -1962,7 +1963,38 @@ READ WRITE outside recovery."
       (and backend (not (eq (backend-state backend) :idle))
            (backend-read-only backend))))
 
-(defun statement-start (registration)
+(defvar *backend-used-command-ids* (make-hash-table :test #'eq :weakness :key)
+  "Last command IDs used by modifying commands, cleared at Sync or transaction reset.")
+
+(defvar *backend-used-command-ids-lock*
+  (sb-thread:make-mutex :name "pg used command ids"))
+
+(defun note-backend-command-id-used (&optional (backend *backend*))
+  ;; ExecutorStart marks modifying commands even when no tuple qualifies.
+  (sb-thread:with-mutex (*backend-used-command-ids-lock*)
+    (setf (gethash backend *backend-used-command-ids*) (backend-command-id backend)))
+  (values))
+
+(defun clear-backend-command-id-used (backend)
+  (sb-thread:with-mutex (*backend-used-command-ids-lock*)
+    (remhash backend *backend-used-command-ids*))
+  (values))
+
+(defun advance-used-backend-command-id (&optional (backend *backend*))
+  ;; Sync completes a transaction command without completing a suspended portal.
+  ;; A Parse or completed Execute may already have advanced past this mark.
+  (sb-thread:with-mutex (*backend-used-command-ids-lock*)
+    (multiple-value-bind (used present) (gethash backend *backend-used-command-ids*)
+      (when (and present (= used (backend-command-id backend)))
+        (incf (backend-command-id backend)))
+      (remhash backend *backend-used-command-ids*)))
+  (values))
+
+(defvar *statement-command-start-advance-p* t)
+
+(defun statement-start (registration &optional (advance-command-p *statement-command-start-advance-p*))
+  ;; Portal initialization can retain the current command ID; callers that
+  ;; already advanced it must not advance it a second time here.
   (let ((b *backend*))
     (when (eq (backend-state b) :aborted)
       (ereport "25P02"
@@ -1971,12 +2003,13 @@ READ WRITE outside recovery."
       (prepare-xid-wraparound-for-statement b))
     (setf (backend-read-only b) (backend-transaction-read-only-p b))
     (when (eq (backend-state b) :idle)
+      (clear-backend-command-id-used b)
       (setf (backend-explicit b) nil
             (backend-command-id b) 0)
       (set-backend-state b :in-progress))
     (when (recovery-in-progress-p)
       (ensure-recovery-reader-identity b))
-    (incf (backend-command-id b))
+    (when advance-command-p (incf (backend-command-id b)))
     (let ((snap (if (eq (backend-isolation-level b) :repeatable-read)
                     (begin-transaction-snapshot
                      b (backend-command-id b) registration)
@@ -2004,6 +2037,7 @@ READ WRITE outside recovery."
 Mask interrupts until cleanup and the idle transition finish, so no interrupt
 can discard the owner of a virtual ID or its remaining relation locks."
   (sb-sys:without-interrupts
+    (clear-backend-command-id-used b)
     (when (backend-logical-spool b)
       (close-logical-spool (backend-logical-spool b))
       (setf (backend-logical-spool b) nil))
@@ -2025,14 +2059,24 @@ can discard the owner of a virtual ID or its remaining relation locks."
     (set-backend-state b :idle))
   (values))
 
+(defvar *preserve-failed-extended-portals* nil)
+
+(defun prepare-backend-portal-transaction-end (backend &optional commit-p)
+  ;; Retire portals before transaction resources; incomplete cleanup prevents
+  ;; commit, while abort can continue with the remaining cleanup paths.
+  (when (fboundp 'extended-clear-portals-for-backend)
+    (let ((pending (funcall 'extended-clear-portals-for-backend backend)))
+      (when (and pending commit-p)
+        (ereport "58030" "query execution cleanup remains incomplete"))))
+  (values))
+
 (defun finish-backend-transaction (backend commit-p)
   "Reset BACKEND and finish application_name state atomically.
 On commit, retire the saved settings snapshot; abort leaves it for whole-table undo."
   (sb-sys:without-interrupts
     (let ((*backend* backend))
       (reset-backend-transaction backend)
-      (when (fboundp 'extended-clear-portals-for-backend)
-        (funcall 'extended-clear-portals-for-backend backend))
+      ;; Portal resources retire before COMMIT enters WAL or ABORT releases XID locks.
       (session-finish-application-name commit-p)
       (when commit-p
         (setf (backend-settings-transaction-start backend) nil))))
@@ -2040,6 +2084,7 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
 
 (defun commit-transaction ()
   (ensure-exported-snapshot-scope-can-end *backend*)
+  (prepare-backend-portal-transaction-end *backend* t)
   (let ((b *backend*))
     (if (backend-xid b)
         (let ((changes
@@ -2071,19 +2116,21 @@ On commit, retire the saved settings snapshot; abort leaves it for whole-table u
 (defun abort-transaction ()
   (ensure-exported-snapshot-scope-can-end *backend*)
   (let ((b *backend*))
-    (sb-sys:without-interrupts
-      (when (backend-xid b)
-        ;; Never downgrade a commit that already reached the CLog.
-        (when (= (clog-get (backend-xid b)) +clog-in-progress+)
-          (clog-set (backend-xid b) +clog-aborted+ :fsync t))
-        (release-xid (backend-xid b)))
-      (finish-backend-transaction b nil)))
+    (unwind-protect
+         (prepare-backend-portal-transaction-end b)
+      (sb-sys:without-interrupts
+        (when (backend-xid b)
+          (when (= (clog-get (backend-xid b)) +clog-in-progress+)
+            (clog-set (backend-xid b) +clog-aborted+ :fsync t))
+          (release-xid (backend-xid b)))
+        (finish-backend-transaction b nil))))
   (values))
 
 (defun abort-transaction-block ()
   "Abort resources immediately while retaining the explicit failed-block status."
   (let ((explicit (backend-explicit *backend*)))
-    (abort-transaction)
+    (let ((*preserve-failed-extended-portals* explicit))
+      (abort-transaction))
     (when explicit
       (setf (backend-explicit *backend*) t)
       (set-backend-state *backend* :aborted)))

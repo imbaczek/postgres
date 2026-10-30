@@ -350,3 +350,399 @@
         (close-query-execution-owner owner)
         (uiop:delete-directory-tree *query-temp-instance-directory*
                                     :validate t :if-does-not-exist :ignore))))
+
+(defun call-with-select-portal-test (function)
+  (let* ((*backend* (make-backend :explicit t))
+         (*extended-query-state* (extended-query-state-for-backend *backend*))
+         (*active-snapshot-set* (make-hash-table :test #'eq))
+         (*active-snapshots* 0)
+         (*active-xids* nil) (*next-xid* 100)
+         (*xid-wrap-failure* nil) (*xid-wrap-pending* nil)
+         (*physical-recovery-state* nil) (*wal-ready* nil)
+         (prepare (symbol-function 'prepare-xid-wraparound-for-statement))
+         (path (merge-pathnames
+                (format nil "pg-select-fetch-~d-~d" (sb-posix:getpid) (random 1000000))
+                (uiop:temporary-directory))))
+    (set-backend-state *backend* :in-progress)
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'prepare-xid-wraparound-for-statement)
+                 (lambda (backend) (declare (ignore backend))))
+           (with-open-file (stream path :direction :io :element-type '(unsigned-byte 8)
+                                        :if-exists :supersede :if-does-not-exist :create)
+             (funcall function stream)))
+      (setf (symbol-function 'prepare-xid-wraparound-for-statement) prepare)
+      (forget-extended-query-state *backend*)
+      (when (probe-file path) (delete-file path)))))
+
+(defun select-portal-test-frames (stream)
+  (finish-output stream)
+  (file-position stream 0)
+  (loop for (type length payload) = (multiple-value-list (read-message-frame stream))
+        while type unless (= type (char-code #\S))
+        collect (cons (code-char type) payload)))
+
+(rove:deftest select-portal-exact-boundary-and-per-fetch-counts
+    (call-with-select-portal-test
+     (lambda (stream)
+       (extended-apply-operation
+        stream '(:parse "s" "SELECT $1::text UNION ALL SELECT $1::text UNION ALL SELECT $1::text" (25)) #())
+       (rove:ok (= 1 (backend-command-id *backend*)))
+       (extended-apply-operation stream '(:bind "p" "s" () ((0 . 1)) ()) (string->bytes "v"))
+       (let* ((portal (gethash "p" (extended-query-state-portals *extended-query-state*)))
+              (execution (extended-select-execution-for portal))
+              (plan (extended-select-execution-plan execution))
+              (snapshot (query-execution-owner-snapshot (extended-select-execution-owner execution))))
+         (rove:ok (= 1 (snapshot-curcid snapshot)))
+         (rove:ok (= 1 *active-snapshots*))
+         (extended-apply-operation stream '(:execute "p" 3) #())
+         (rove:ok (= 1 (backend-command-id *backend*)))
+         (rove:ok (not (extended-select-execution-at-end-p execution)))
+         (extended-apply-operation stream '(:sync) #())
+         (rove:ok (eq portal (gethash "p" (extended-query-state-portals *extended-query-state*))))
+         (extended-apply-operation stream '(:execute "p" -1) #())
+         (rove:ok (= 2 (backend-command-id *backend*)))
+         (rove:ok (eq plan (extended-select-execution-plan execution)))
+         (extended-apply-operation stream '(:execute "p" 0) #())
+         (rove:ok (= 3 (backend-command-id *backend*)))
+         (extended-apply-operation stream '(:close #\S "s") #())
+         (rove:ok (gethash "p" (extended-query-state-portals *extended-query-state*)))
+         (extended-apply-operation stream '(:close #\P "p") #())
+         (rove:ok (zerop *active-snapshots*)))
+       (let ((frames (select-portal-test-frames stream)))
+         (rove:ok (equal (mapcar #'car frames) '(#\1 #\2 #\D #\D #\D #\s #\Z #\C #\C #\3 #\3)))
+         (rove:ok
+          (every (lambda (frame) (equalp (cdr frame) (string->bytes (format nil "SELECT 0~c" (code-char 0)))))
+                 (remove-if-not (lambda (frame) (char= (car frame) #\C)) frames)))))))
+
+(rove:deftest select-portal-resume-emits-only-remaining-rows
+    (call-with-select-portal-test
+     (lambda (stream)
+       (extended-apply-operation
+        stream '(:parse "s" "SELECT $1::text UNION ALL SELECT $1::text UNION ALL SELECT $1::text" (25)) #())
+       (extended-apply-operation stream '(:bind "p" "s" () ((0 . 1)) (1)) (string->bytes "z"))
+       (extended-apply-operation stream '(:execute "p" 1) #())
+       (extended-apply-operation stream '(:execute "p" 0) #())
+       (let ((frames (select-portal-test-frames stream)))
+         (rove:ok (equal (mapcar #'car frames) '(#\1 #\2 #\D #\s #\D #\D #\C)))
+         (rove:ok (equalp (cdr (car (last frames)))
+                          (string->bytes (format nil "SELECT 2~c" (code-char 0)))))))))
+
+(rove:deftest select-portal-reused-bind-follows-simple-command-completion
+    (call-with-select-portal-test
+     (lambda (stream)
+       (extended-apply-operation stream '(:parse "s" "SELECT 1" ()) #())
+       (let ((execute (symbol-function 'execute-statement)) (write-cid nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'execute-statement)
+                      (lambda (output ast)
+                        (declare (ignore output ast))
+                        (with-statement-snapshot (snapshot #'statement-start)
+                          (setf write-cid (backend-command-id *backend*)))))
+                (execute-query-statements stream '((:type :update)) nil))
+           (setf (symbol-function 'execute-statement) execute))
+         (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+         (let* ((portal (gethash "p" (extended-query-state-portals *extended-query-state*)))
+                (owner (extended-select-execution-owner (extended-select-execution-for portal))))
+           (rove:ok (< write-cid (snapshot-curcid (query-execution-owner-snapshot owner)))))))))
+
+(rove:deftest select-portal-sync-publishes-used-command-id
+    (call-with-select-portal-test
+     (lambda (stream)
+       (extended-apply-operation stream '(:parse "s" "SELECT 1" ()) #())
+       (extended-apply-operation stream '(:bind "old" "s" () () ()) #())
+       (let ((insert (symbol-function 'exec-insert))
+             (write-cid (backend-command-id *backend*)))
+         (unwind-protect
+              (progn
+                ;; Simulate a zero-row DML executor: ExecutorStart still uses its CID.
+                (setf (symbol-function 'exec-insert)
+                      (lambda (output ast) (declare (ignore output ast))))
+                (let ((*statement-command-start-advance-p* nil))
+                  (execute-statement stream '(:type :insert))))
+           (setf (symbol-function 'exec-insert) insert))
+         (extended-apply-operation stream '(:flush) #())
+         (rove:ok (= write-cid (backend-command-id *backend*)))
+         (extended-apply-operation stream '(:bind "before" "s" () () ()) #())
+         (extended-apply-operation stream '(:sync) #())
+         (rove:ok (= (1+ write-cid) (backend-command-id *backend*)))
+         (extended-apply-operation stream '(:bind "after" "s" () () ()) #())
+         (flet ((portal-cid (name)
+                  (let* ((portal (gethash name (extended-query-state-portals *extended-query-state*)))
+                         (owner (extended-select-execution-owner (extended-select-execution-for portal))))
+                    (snapshot-curcid (query-execution-owner-snapshot owner)))))
+           (rove:ok (= write-cid (portal-cid "old") (portal-cid "before")))
+           (rove:ok (= (1+ write-cid) (portal-cid "after"))))
+         (extended-apply-operation stream '(:sync) #())
+         (rove:ok (= (1+ write-cid) (backend-command-id *backend*)))
+         ;; Existing Parse/completion advancement consumes an earlier use logically.
+         (note-backend-command-id-used)
+         (extended-apply-operation stream '(:parse "later" "SELECT 2" ()) #())
+         (let ((cid (backend-command-id *backend*)))
+           (extended-apply-operation stream '(:sync) #())
+           (rove:ok (= cid (backend-command-id *backend*))))
+         (note-backend-command-id-used)
+         (abort-transaction)
+         (rove:ok (not (gethash *backend* *backend-used-command-ids*)))))))
+
+(rove:deftest select-portal-sync-ignores-read-only-and-unexecuted-work
+    (call-with-select-portal-test
+     (lambda (stream)
+       (extended-apply-operation stream '(:parse "s" "SELECT 1 UNION ALL SELECT 2" ()) #())
+       (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+       (let ((cid (backend-command-id *backend*)))
+         (extended-apply-operation stream '(:sync) #())
+         (rove:ok (= cid (backend-command-id *backend*)))
+         (extended-apply-operation stream '(:execute "p" 1) #())
+         (extended-apply-operation stream '(:sync) #())
+         (extended-apply-operation stream '(:sync) #())
+         (rove:ok (= cid (backend-command-id *backend*)))))
+     ))
+
+(rove:deftest select-portal-missing-name-diagnostic
+    (call-with-select-portal-test
+     (lambda (stream)
+       (dolist (name '("edge_exact" ""))
+         (dolist (operation (list (list :execute name 1) (list :describe #\P name)))
+           (let ((condition
+                   (handler-case (progn (extended-apply-operation stream operation #()) nil)
+                     (pg-error (condition) condition))))
+             (rove:ok (and condition (string= (pg-error-sqlstate condition) "34000")))
+             (rove:ok (and condition
+                           (string= (pg-error-message condition)
+                                    (format nil "portal \"~a\" does not exist" name))))))))))
+
+(rove:deftest select-portal-abort-keeps-identity-until-rollback
+    (call-with-select-portal-test
+     (lambda (stream)
+       (extended-apply-operation stream '(:parse "s" "SELECT 1" ()) #())
+       (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+       (abort-transaction-block)
+       (rove:ok (eq :aborted (backend-state *backend*)))
+       (rove:ok (zerop *active-snapshots*))
+       (dolist (operation '((:execute "p" 1) (:describe #\P "p") (:describe #\S "s")))
+         (rove:ok
+          (handler-case (progn (extended-apply-operation stream operation #()) nil)
+            (pg-error (condition) (string= (pg-error-sqlstate condition) "25P02")))))
+       (abort-transaction)
+       (rove:ok (not (gethash "p" (extended-query-state-portals *extended-query-state*)))))))
+
+(rove:deftest select-portal-suspension-retains-deadline-until-sync
+    (call-with-select-portal-test
+     (lambda (stream)
+       (extended-apply-operation stream '(:parse "s" "SELECT 1" ()) #())
+       (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+       (let* ((deadline (+ (get-internal-real-time) (* 10 internal-time-units-per-second)))
+              (payload (concatenate '(vector (unsigned-byte 8))
+                                    (string->bytes (format nil "p~c" (code-char 0)))
+                                    (u32-to-bytes 1))))
+         (setf (extended-query-state-statement-deadline *extended-query-state*) deadline)
+         (handle-extended-query-frame stream (char-code #\E)
+                                      (u32-to-bytes (+ 4 (length payload))) payload)
+         (rove:ok (= deadline (extended-query-state-statement-deadline *extended-query-state*)))
+         (handle-extended-query-frame
+          stream (char-code #\S) (u32-to-bytes 4)
+          (make-array 0 :element-type '(unsigned-byte 8)))
+         (rove:ok (null (extended-query-state-statement-deadline *extended-query-state*)))
+         (rove:ok (gethash "p" (extended-query-state-portals *extended-query-state*)))
+         (setf (extended-query-state-statement-deadline *extended-query-state*)
+               (1- (get-internal-real-time)))
+         (handle-extended-query-frame stream (char-code #\E)
+                                      (u32-to-bytes (+ 4 (length payload))) payload)
+         (rove:ok (eq :aborted (backend-state *backend*)))
+         (rove:ok (extended-query-state-ignore-until-sync *extended-query-state*))
+         (rove:ok (zerop *active-snapshots*))))))
+
+(rove:deftest select-portal-implicit-sync-retires-owner
+    (call-with-select-portal-test
+     (lambda (stream)
+       (setf (backend-explicit *backend*) nil
+             (backend-implicit-query-block *backend*) t
+             (extended-query-state-implicit-p *extended-query-state*) t)
+       (extended-apply-operation stream '(:parse "s" "SELECT 1" ()) #())
+       (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+       (extended-apply-operation stream '(:execute "p" 1) #())
+       (rove:ok (= 1 *active-snapshots*))
+       (extended-apply-operation stream '(:sync) #())
+       (rove:ok (eq :idle (backend-state *backend*)))
+       (rove:ok (zerop *active-snapshots*))
+       (rove:ok (zerop (hash-table-count (extended-query-state-portals *extended-query-state*)))))))
+
+(rove:deftest select-portal-precommit-closes-before-wal-and-xid-release
+    (call-with-select-portal-test
+     (lambda (stream)
+       (let ((wal (symbol-function 'wal-commit-transaction))
+             (clog (symbol-function 'clog-set))
+             (release (symbol-function 'release-xid))
+             (events nil))
+         (unwind-protect
+              (progn
+                (extended-apply-operation stream '(:parse "s" "SELECT 1" ()) #())
+                (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+                (let* ((portal (gethash "p" (extended-query-state-portals *extended-query-state*)))
+                       (owner (extended-select-execution-owner (extended-select-execution-for portal))))
+                  (query-execution-owner-add-cleanup owner (lambda () (push :owner events))))
+                (setf (backend-xid *backend*) 777
+                      (symbol-function 'wal-commit-transaction)
+                      (lambda (xid after &optional changes)
+                        (declare (ignore xid changes))
+                        (push :wal events)
+                        (rove:ok (zerop *active-snapshots*))
+                        (funcall after))
+                      (symbol-function 'clog-set)
+                      (lambda (&rest arguments) (declare (ignore arguments)))
+                      (symbol-function 'release-xid)
+                      (lambda (&rest arguments) (declare (ignore arguments)) (push :release events)))
+                (commit-transaction)
+                (rove:ok (equal (nreverse events) '(:owner :wal :release))))
+           (setf (symbol-function 'wal-commit-transaction) wal
+                 (symbol-function 'clog-set) clog
+                 (symbol-function 'release-xid) release
+                 (backend-xid *backend*) nil))))))
+
+(rove:deftest select-portal-connection-finish-invalidates-before-retirement
+    (call-with-select-portal-test
+     (lambda (stream)
+       (let ((close (symbol-function 'close-connection))
+             (finished (symbol-function 'connection-finished))
+             (endpoint-closed nil) (visible-handle nil)
+             (*error-output* (make-string-output-stream)))
+         (unwind-protect
+              (progn
+                (extended-apply-operation stream '(:parse "s" "SELECT 1" ()) #())
+                (extended-apply-operation stream '(:bind "p" "s" () () ()) #())
+                (let* ((portal (gethash "p" (extended-query-state-portals *extended-query-state*)))
+                       (execution (extended-select-execution-for portal))
+                       (owner (extended-select-execution-owner execution)))
+                  (query-execution-owner-add-cleanup
+                   owner
+                   (lambda ()
+                     (unless endpoint-closed (error "endpoint still open"))
+                     (when (gethash "p" (extended-query-state-portals *extended-query-state*))
+                       (setf visible-handle t))
+                     (error "permanent terminal closer")))
+                  (setf (symbol-function 'close-connection)
+                        (lambda (socket output)
+                          (declare (ignore socket output))
+                          (setf endpoint-closed t))
+                        (symbol-function 'connection-finished) (lambda () nil))
+                  (finish-backend-connection *backend* nil stream)
+                  (rove:ok endpoint-closed)
+                  (rove:ok (not visible-handle))
+                  (rove:ok (extended-select-execution-failed-p execution))
+                  (rove:ok (query-execution-owner-closed-p owner))
+                  (rove:ok (zerop *active-snapshots*))
+                  (rove:ok (not (gethash *backend* *extended-query-state-registry*)))))
+           (setf (symbol-function 'close-connection) close
+                 (symbol-function 'connection-finished) finished))))))
+
+(cl-spec:defproperty select-portal-execute-limit-is-signed
+    ((limit (range integer -2147483648 2147483647)))
+  (:about extended-parse-frame)
+  (:trials (:normal 100))
+  (let ((payload
+          (concatenate '(vector (unsigned-byte 8))
+                       (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0)
+                       (u32-to-bytes (logand limit #xffffffff)))))
+    (equal (extended-parse-frame #\E payload) (list :execute "" limit))))
+
+(rove:deftest select-portal-generated-signed-limits
+    (unit-check-property 'select-portal-execute-limit-is-signed))
+
+(rove:deftest query-owner-promotion-census-includes-dormant-portal
+    (let* ((*active-snapshot-set* (make-hash-table :test #'eq))
+           (*active-snapshots* 0)
+           (*backend* (make-backend :thread sb-thread:*current-thread*))
+           (owner (make-query-execution-owner)))
+      (unwind-protect
+           (progn
+             (query-execution-owner-acquire-snapshot
+              owner (lambda (registration) (make-snapshot 15 :register registration)))
+             (rove:ok
+              (progn (physical-promotion-check-reader-snapshots (list *backend*) nil) t)))
+        (close-query-execution-owner owner))))
+
+(rove:deftest query-owner-terminal-retirement-drops-failed-executors
+    (let* ((*active-snapshot-set* (make-hash-table :test #'eq))
+           (*active-snapshots* 0)
+           (*backend* (make-backend))
+           (*error-output* (make-string-output-stream))
+           (a (make-query-execution-owner)) (b (make-query-execution-owner))
+           (next-calls 0))
+      (unwind-protect
+           (progn
+             (dolist (owner (list a b))
+               (query-execution-owner-acquire-snapshot
+                owner (lambda (registration) (make-snapshot 21 :register registration)))
+               (call-with-query-execution-owner
+                owner (lambda () (make-sql-iterator (lambda () (incf next-calls) (values #() t)))))
+               (query-execution-owner-add-cleanup owner (lambda () (error "permanent closer failure"))))
+             (rove:ok (not (close-query-execution-owner a)))
+             (rove:ok (= 2 *active-snapshots*))
+             (rove:ok (retire-query-execution-owners-for-backend *backend*))
+             (rove:ok (and (query-execution-owner-closed-p a) (query-execution-owner-closed-p b)))
+             (rove:ok (zerop *active-snapshots*))
+             (rove:ok (zerop next-calls))
+             (rove:ok (not (member a (query-execution-owner-reload-state))))
+             (rove:ok (call-with-live-operation-reload (lambda () t))))
+        (retire-query-execution-owners-for-backend *backend*))))
+
+(rove:deftest query-owner-terminal-retirement-releases-lease-without-spilling
+    (let* ((*backend* (make-backend))
+           (*error-output* (make-string-output-stream))
+           (owner (make-query-execution-owner))
+           (retired nil))
+      (unwind-protect
+           (call-with-btree-relation-read-lease
+            990021
+            (lambda (lease)
+              (setf (query-execution-owner-binding owner '*select-index-scans*)
+                    (list (make-select-index-scan :lease lease)))
+              (query-execution-owner-add-cleanup owner (lambda () (error "permanent failure")))
+              (retire-query-execution-owners-for-backend *backend*)
+              (setf retired t)
+              (rove:ok (not (btree-read-lease-active-p lease)))
+              (rove:ok (query-execution-owner-closed-p owner))))
+        (unless retired (retire-query-execution-owners-for-backend *backend*)))
+      (call-with-btree-relation-write-lock 990021 (lambda () (rove:ok t)))))
+
+(rove:deftest query-owner-terminal-retirement-retains-file-charge
+    (let* ((*backend* (make-backend))
+           (*active-snapshot-set* (make-hash-table :test #'eq))
+           (*active-snapshots* 0)
+           (*query-temp-pending-cleanups* nil)
+           (*error-output* (make-string-output-stream))
+           (*query-temp-directory*
+             (merge-pathnames
+              (format nil "pg-terminal-charge-~d-~d/" (sb-posix:getpid) (random 1000000))
+              (uiop:temporary-directory)))
+           (owner (make-query-execution-owner))
+           (quota (backend-query-temp-quota *backend*))
+           (unlink (symbol-function 'unlink-query-temp-file)))
+      (ensure-directories-exist *query-temp-directory*)
+      (unwind-protect
+           (progn
+             (query-execution-owner-acquire-snapshot
+              owner (lambda (registration) (make-snapshot 19 :register registration)))
+             (call-with-query-execution-owner
+              owner
+              (lambda ()
+                (let ((spool (make-query-row-spool 0)))
+                  (query-row-spool-append spool "retained terminal charge")
+                  (query-row-spool-seal spool))))
+             (query-execution-owner-add-cleanup owner (lambda () (error "permanent callback")))
+             (setf (symbol-function 'unlink-query-temp-file)
+                   (lambda (path) (declare (ignore path)) (error "injected unlink failure")))
+             (retire-query-execution-owners-for-backend *backend*)
+             (rove:ok (query-execution-owner-closed-p owner))
+             (rove:ok (zerop *active-snapshots*))
+             (rove:ok (plusp (query-temp-quota-used-bytes quota)))
+             (rove:ok (= 1 (getf (query-temp-pending-cleanup-status) :records)))
+             (setf (symbol-function 'unlink-query-temp-file) unlink)
+             (retry-pending-query-temp-cleanup)
+             (rove:ok (zerop (query-temp-quota-used-bytes quota))))
+        (setf (symbol-function 'unlink-query-temp-file) unlink)
+        (retire-query-execution-owners-for-backend *backend*)
+        (retry-pending-query-temp-cleanup)
+        (uiop:delete-directory-tree *query-temp-directory* :validate t :if-does-not-exist :ignore))))
