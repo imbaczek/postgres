@@ -452,6 +452,11 @@ this mode.
 
 ### Startup and timeout debugging
 
+- Lifecycle entrypoints use top-level special dispatch in the control REPL to
+  bypass ordinary live admission. Wrapping retarget in `handler-case` loses that
+  exemption and reports `requires own operation admission`. To assert an expected
+  error, use unwrapped `control(..., expect_error=True)`; otherwise run an owned
+  worker outside admission.
 - Check postmaster encoding behavior against a running C server with a UTF-8
   data directory as well as `-C`: `cluster_name` clips raw SQL_ASCII bytes at
   63 before cleaning, unlike session `application_name`'s whole-character clip.

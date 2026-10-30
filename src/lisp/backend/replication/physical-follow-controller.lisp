@@ -214,7 +214,8 @@ A retained binding carries no child history and cannot pass its fork."
 (defun physical-follow-controller-source-view (client &optional (policy (getf *physical-recovery-state* :timeline-policy)) observer)
   "Check source identity and history against the captured policy and local lineage.
 Return a non-attach decision when the source cannot serve the selected route;
-fetch child history only for a descendant attachment."
+fetch child history only for a descendant attachment.  After identity and
+source history validation, OBSERVER records the timeline before route selection."
   (multiple-value-bind (system-id source) (physical-follow-client-identity client)
     (let* ((local-history
              (with-live-operation
@@ -554,11 +555,14 @@ object remains the operation's authority until completion or cancellation."
 
 (define-condition physical-follow-observation-save-failed (error)
   ((cause :initarg :cause :reader physical-follow-observation-save-cause))
+  (:documentation "A retryable failure to persist an observed namespace bound.")
   (:report (lambda (condition stream)
              (format stream "could not save observed follow timeline: ~a"
                      (physical-follow-observation-save-cause condition)))))
 
 (defun physical-follow-operation-current-config (operation)
+  "Recheck operation ownership and effective route under command exclusion.
+Use the fresh saved config so namespace-only changes are retained."
   (unless (sb-thread:holding-mutex-p *physical-follow-command-lock*)
     (error "follow operation state check requires command exclusion"))
   (physical-follow-operation-check operation)
@@ -571,6 +575,9 @@ object remains the operation's authority until completion or cancellation."
     current))
 
 (defun physical-follow-operation-remember-source (operation timeline &optional (system-id (getf *physical-recovery-state* :system-id)))
+  "Record a checked source ID before attempting its durable config update.
+The process-local maximum survives cancellation or a pre-rename save failure.
+The saved bound grants no source or WAL authority and creates no PREPARE debt."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (unless (= system-id (getf *physical-recovery-state* :system-id))
       (error "observed follow source belongs to a different cluster"))

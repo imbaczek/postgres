@@ -113,14 +113,22 @@ KNOWN-TIMELINE is an optional nonzero 32-bit namespace bound, not replay state."
               (list :unowned-bootstrap
                     (physical-follow-unowned-bootstrap-copy (getf state :unowned-bootstrap)))))))
 
-(defvar *physical-follow-observed-namespace* nil)
+(defvar *physical-follow-observed-namespace* nil
+  "Process-local maximum for one canonical PGDATA and system ID.
+Protected by follow-command exclusion; live reload preserves it, a fresh process
+starts empty. It reserves namespace only, not source or WAL authority.")
 
 (defun physical-follow-observed-timeline (system-id)
+  "Return the observed maximum only for this data directory and system ID.
+Use follow-command exclusion when choosing a promotion child from this bound."
   (let ((identity (list (namestring (truename *pgdata*)) system-id)))
     (when (equal identity (first *physical-follow-observed-namespace*))
       (second *physical-follow-observed-namespace*))))
 
 (defun physical-follow-observe-timeline (system-id timeline)
+  "Remember a checked source timeline under follow-command exclusion.
+This process-local bound survives cancellation and a failed config save; it
+does not create a source binding, PREPARE debt or stop workers."
   (unless (and (typep system-id '(integer 0 18446744073709551615))
                (typep timeline '(integer 1 4294967295)))
     (error "invalid observed follow timeline identity"))
@@ -173,8 +181,8 @@ This is a namespace bound; it does not select ancestry or a replay position."
 
 (defun physical-follow-remember-config-timeline (config)
   "Preserve timeline IDs in the accepted anchor and checked saved requests.
-Do this before removing a binding, preparation or cleanup entry.  Unaccepted
-source discovery alone does not add a known timeline."
+Do this before removing a binding, preparation or cleanup entry.  Source
+discovery is recorded separately by the observation path."
   (let* ((state (physical-follow-controller-state config))
          (anchor (getf (fifth config) :anchor))
          (known (getf state :known-timeline)))

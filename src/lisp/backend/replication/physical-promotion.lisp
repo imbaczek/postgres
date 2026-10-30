@@ -194,9 +194,10 @@ Select the first free ID; the floor does not change the replay parent or fork."
 
 (defun physical-promotion-timeline-floor (state)
   "Return the promotion namespace floor without changing replay ancestry.
-Phase 2 combines the checked known IDs, receive selection, parent and policy
-target. Phase 3 uses the frozen floor and rejects a child colliding with
-observed IDs. Legacy pending state without a floor probes from the parent."
+Phase 2 combines saved and process-local observed IDs, receive selection, parent
+and policy target. Freeze that maximum before intent. Phase 3 uses the frozen
+floor and rejects a child colliding with observed IDs. Legacy pending state
+without a floor probes from the parent."
   (let* ((parent (physical-recovery-replay-timeline state))
          (config (when (probe-file (physical-follow-config-path)) (physical-follow-read-config)))
          (controller (when config (physical-follow-controller-state config)))
