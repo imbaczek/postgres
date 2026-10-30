@@ -712,6 +712,8 @@ lane must not run query or storage work."
          (open-live-operation-admission ,owner)))))
 
 (defun try-call-with-live-operation-reload (function)
+  ;; Check both censuses while admission is closed. Return their generations
+  ;; instead of waiting here, so the caller can reopen admission first.
   (sb-thread:with-mutex (*reload-run-lock*)
     (with-live-operation-quiescence
       (let ((generation
@@ -719,29 +721,37 @@ lane must not run query or storage work."
                (lambda ()
                  (when (plusp (hash-table-count *live-operation-parked*))
                    *live-operation-park-generation*)))))
-        (if generation
-            (values nil nil generation)
-            (values t (multiple-value-list (funcall function)) nil))))))
+        (multiple-value-bind (owners owner-generation)
+            (query-execution-owner-reload-state)
+          (cond
+            (owners (values nil nil generation owner-generation))
+            (generation (values nil nil generation nil))
+            (t (values t (multiple-value-list (funcall function)) nil nil))))))))
 
 (defun call-with-live-operation-reload (function)
-  "Run FUNCTION under reload exclusion after active and parked work has drained.
+  "Run FUNCTION after active, parked, and suspended query owners have drained.
 
-If parked owners remain after admission drains, reopen the gate and release the
-reload lock before waiting for a change and retrying."
-  (when (or (plusp *live-operation-depth*) *live-operation-parked-p*)
+Reopen admission and release the reload lock before waiting, so a client can
+resume or close a portal that retains executable state."
+  (when (or (plusp *live-operation-depth*) *live-operation-parked-p*
+            (query-execution-owner-thread-retains-state-p))
     (error "reload exclusion requires an outside caller"))
   (loop
-    (multiple-value-bind (finished values generation)
+    (multiple-value-bind (finished values generation owner-generation)
         (try-call-with-live-operation-reload function)
       (when finished (return (values-list values)))
-      (call-with-live-operation-lock
-       (lambda ()
-         (loop while (and (= generation *live-operation-park-generation*)
-                          (plusp (hash-table-count *live-operation-parked*)))
-               do (sb-thread:condition-wait *live-operation-cv* *live-operation-lock*)))))))
+      (if owner-generation
+          (wait-for-query-execution-owner-change owner-generation)
+          (call-with-live-operation-lock
+           (lambda ()
+             (loop while (and (= generation *live-operation-park-generation*)
+                              (plusp (hash-table-count *live-operation-parked*)))
+                   do (sb-thread:condition-wait *live-operation-cv*
+                                                *live-operation-lock*))))))))
 
 (defun reload ()
-  (when (or (plusp *live-operation-depth*) *live-operation-parked-p*)
+  (when (or (plusp *live-operation-depth*) *live-operation-parked-p*
+            (query-execution-owner-thread-retains-state-p))
     (request-reload)
     (return-from reload :queued))
   (format t "~&pg-lisp: reloading code...~%")
