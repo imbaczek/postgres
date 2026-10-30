@@ -7,19 +7,22 @@
   remains unsupported; coordination is outside this scope.
 
 - [ ] Complete the pinned Patroni writer and real `Postgresql.follow` acceptance.
-  Its current complete writer snapshots contain 11 unsupported settings:
-  `max_prepared_transactions`,
-  `track_commit_timestamp`, `wal_level`, `wal_log_hints`,
-  `hba_file`, `ident_file`, `recovery_target`, `recovery_target_lsn`,
+  Its current complete writer snapshots contain four unsupported settings:
+  `wal_level`, `wal_log_hints`, `hba_file` and `ident_file`. The seven other
+  names accept disabled or unset values: `max_prepared_transactions`,
+  `track_commit_timestamp`, `recovery_target`, `recovery_target_lsn`,
   `recovery_target_name`, `recovery_target_time` and `recovery_target_xid`.
-  Keep the complete writer oracle unchanged. Internal checks now derive shared
+  Positive prepared-transaction capacity, commit timestamp tracking and targeted
+  recovery remain unimplemented. Keep the complete writer oracle unchanged.
+  Internal checks now derive shared
   relation-object and owner counts from published registrations and waiting
   requests. Cold startup installs a finite shared object/owner pool together with
   the local resource tuple. `max_locks_per_transaction` now controls sizing and
   reporting, with default 128 and changes pending until restart.
   `max_worker_processes` installs and reports the managed-worker slot capacity;
-  changes are pending until restart. Prepared transactions remain disabled with
-  an internal capacity of zero. Expose that setting with supported semantics.
+  changes are pending until restart. The validated prepared-transaction setting
+  supplies zero to the installed capacity; implementing two-phase commit remains
+  open.
   C sizes a shared pool, not a per-transaction limit.
   Preserve atomic multi-relation admission, repeated
   acquisition, abort/cancellation/disconnect and virtual-reader cleanup.

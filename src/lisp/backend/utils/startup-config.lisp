@@ -18,7 +18,8 @@
 
 (defparameter *startup-recovery-target-settings*
   '("recovery_target" "recovery_target_lsn" "recovery_target_name"
-    "recovery_target_time" "recovery_target_xid"))
+    "recovery_target_time" "recovery_target_xid")
+  "Target selectors that must remain empty until targeted recovery is implemented.")
 
 (defparameter *startup-setting-specs*
   '(("port" :postmaster :integer "5433" 1 65535 nil)
@@ -495,6 +496,9 @@ A reload may record a different desired value, but does not change this goal."
     settings))
 
 (defun startup-check-feature-support (settings)
+  "Reject effective settings that enable unsupported features.
+Prepared transactions must be zero, commit timestamp tracking off, and each
+listed recovery target empty. Return SETTINGS after validation."
   (when (plusp (startup-setting-value settings "max_prepared_transactions"))
     (error "positive max_prepared_transactions requires unimplemented prepared transactions"))
   (when (startup-setting-value settings "track_commit_timestamp")
@@ -505,7 +509,8 @@ A reload may record a different desired value, but does not change this goal."
   settings)
 
 (defun startup-load-settings (native overrides &optional reload-directory)
-  "Read primary/includes, then auto.conf, then command-line overrides."
+  "Read primary/includes, then auto.conf, then command-line overrides.
+Check feature support after applying all sources, so later overrides take precedence."
   (let* ((directory (namestring (directory-pathname
                                  (or (gethash "pgdata" native) (uiop:getenv "PGDATA") "./pgdata"))))
          (explicit (gethash "config_file" native))
@@ -590,8 +595,8 @@ A reload may record a different desired value, but does not change this goal."
 
 (defun startup-resource-capacity-plan (settings)
   "Plan the installed tuple and relation lock capacities from startup settings.
-Connections, workers, WAL senders and locks per transaction use active settings.
-Prepared transactions remain disabled with an internal capacity of zero."
+All five fields use active settings. Prepared transactions are accepted only
+when the validated setting is zero."
   (startup-check-feature-support settings)
   (let ((parameters (make-resource-parameters
                      (startup-setting-value settings "max_connections")
@@ -655,7 +660,8 @@ follow generation are published together under live-operation quiescence."
 (defun startup-reload-settings ()
   "Validate a fresh input tree before replacing active values under quiescence.
 Postmaster settings retain their active values and record pending restart.  A
-setting added to a warm registry uses its boot default as the old value."
+setting added to a warm registry uses its boot default as the old value.
+Reject an unsupported effective candidate before publishing any reload changes."
   (when *startup-server-settings*
     (let ((candidate (startup-load-settings *startup-native-inputs* *startup-command-overrides* *pgdata*))
           (defaults (startup-default-settings (namestring *pgdata*))))
