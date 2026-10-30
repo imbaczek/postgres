@@ -12,6 +12,7 @@ import zlib
 
 SIZE = 16 * 1024 * 1024
 ARCHIVE = runpy.run_path(str(pathlib.Path(__file__).with_name("restartpoint-prefix-inspect.py")))
+CHECK_OPTIONAL_CONTROL = runpy.run_path(str(pathlib.Path(__file__).with_name("resource_control_fields.py")))["check_optional_fields"]
 
 
 def crc(data, offset):
@@ -23,8 +24,9 @@ def crc(data, offset):
 
 def control(root):
     fields = (root / "global/pg_wal_control").read_bytes().split()
-    assert fields[0] == b"PGWAL6" and len(fields) in (8, 11, 17)
+    assert fields[0] == b"PGWAL6" and len(fields) in (8, 11, 15, 17, 21)
     assert zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    CHECK_OPTIONAL_CONTROL(fields[:-1])
     return int(fields[1]), int(fields[2]), int(fields[3]), int(fields[4]), fields[5], bytes.fromhex(fields[6].decode())
 
 

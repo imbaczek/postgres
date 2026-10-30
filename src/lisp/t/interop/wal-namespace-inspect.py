@@ -3,7 +3,10 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import runpy
 import zlib
+
+CHECK_OPTIONAL_CONTROL = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["check_optional_fields"]
 
 
 def inspect(root):
@@ -12,7 +15,7 @@ def inspect(root):
     prefix, crc = raw.rstrip('\n').rsplit(' ', 1)
     assert zlib.crc32(prefix.encode()) == int(crc, 16)
     fields = prefix.split(' ')
-    assert len(fields) in (7, 10)
+    CHECK_OPTIONAL_CONTROL(fields)
     magic, checkpoint, durable, insertion, record_tli, namespace, payload = fields[:7]
     assert magic == 'PGWAL6' and insertion == record_tli == '1'
     assert namespace in ('legacy', 'timeline')

@@ -1,6 +1,7 @@
 import hashlib
 import os
 import pathlib
+import runpy
 import stat
 import struct
 import subprocess
@@ -8,6 +9,8 @@ import sys
 import zlib
 
 from patroni_native_node import native_node
+
+CHECK_OPTIONAL_CONTROL = runpy.run_path(str(pathlib.Path(__file__).with_name("resource_control_fields.py")))["check_optional_fields"]
 
 STATES = ("starting up", "shut down", "shut down in recovery", "shutting down",
           "in crash recovery", "in archive recovery", "in production")
@@ -36,9 +39,10 @@ def run(root, expected_state=None):
     rows = dict(line.split(":", 1) for line in result.stdout.splitlines())
     rows = {key: value.strip() for key, value in rows.items()}
     fields = (root / "global/pg_wal_control").read_bytes().split()
-    assert fields[0] == b"PGWAL6" and len(fields) in (8, 11, 17)
+    assert fields[0] == b"PGWAL6" and len(fields) in (8, 11, 15, 17, 21)
     assert zlib.crc32(b" ".join(fields[:-1])) == int(fields[-1], 16)
-    if len(fields) in (11, 17) and not (root / "physical-recovery.control").exists():
+    CHECK_OPTIONAL_CONTROL(fields[:-1])
+    if len(fields) in (11, 15, 17, 21) and not (root / "physical-recovery.control").exists():
         assert rows["Database system identifier"] == fields[7].decode()
         assert rows["Database cluster state"] == STATES[int(fields[8])]
         if fields[6] != b"-":
