@@ -8,7 +8,7 @@
 ;; As in PostgreSQL's temp_file_limit, NIL means unlimited. The command line
 ;; can set a per-query cap; nested spill scopes share one quota.
 (defparameter *query-temp-file-limit-bytes* nil
-  "Maximum live temporary-file bytes per query, or NIL for no limit.")
+  "Maximum live temporary-file bytes per backend, or NIL for no limit.")
 
 ;; *QUERY-TEMP-DIRECTORY* is a test override that names the exact directory for
 ;; spill files. Normal operation uses PGDATA/pgsql_tmp/<pid>-<start>-<pidns>/.
@@ -36,6 +36,23 @@
   (file-sizes (make-hash-table :test #'equal))
   (stream-paths (make-hash-table :test #'eq)))
 
+(defvar *backend-query-temp-quotas* (make-hash-table :test #'eq :weakness :key))
+
+(defvar *backend-query-temp-quota-lock*
+  (sb-thread:make-mutex :name "pg backend temporary quotas"))
+
+(defun backend-query-temp-quota (backend)
+  "Share live temporary-file charges across all queries and portals of BACKEND.
+A scope without a backend gets a private quota. Refresh the limit on reuse."
+  (if (null backend)
+      (make-query-temp-quota *query-temp-file-limit-bytes*)
+      (sb-thread:with-mutex (*backend-query-temp-quota-lock*)
+        (let ((quota (or (gethash backend *backend-query-temp-quotas*)
+                         (setf (gethash backend *backend-query-temp-quotas*)
+                               (make-query-temp-quota *query-temp-file-limit-bytes*)))))
+          (setf (query-temp-quota-limit quota) *query-temp-file-limit-bytes*)
+          quota))))
+
 (defstruct query-temp-stream-entry
   "Scope ownership of a temporary stream and, when required, its pathname."
   pathname stream delete-p)
@@ -59,6 +76,39 @@ Unresolved owners remain reachable for retry by their original thread."
                 :thread sb-thread:*current-thread* :quota quota :state :active)))
     (setf (query-temp-cleanup-owner-link owner) (list owner))
     owner))
+
+(defun call-with-query-temp-owner (owner function &optional (retry-pending-p t))
+  "Use an existing scope without cleaning it when FUNCTION returns.
+Restore its directory and shared quota for this thread, retaining the directory
+on exit unless cleanup has resolved the owner."
+  (unless (eq (query-temp-cleanup-owner-thread owner) sb-thread:*current-thread*)
+    (error "temporary scope belongs to another thread"))
+  (setf (query-temp-quota-limit (query-temp-cleanup-owner-quota owner))
+        *query-temp-file-limit-bytes*)
+  (if (eq owner *query-temp-cleanup-owner*)
+      (funcall function)
+      (let ((*query-temp-cleanup-owner* owner)
+            (*query-temp-quota* (query-temp-cleanup-owner-quota owner))
+            (*query-temp-scope-directory* (query-temp-cleanup-owner-directory owner))
+            (*query-temp-directory* (query-temp-cleanup-owner-temporary-directory owner))
+            (*query-temp-file-scope-active-p* t)
+            (*query-temp-files* nil))
+        (unwind-protect
+             (progn
+               (when retry-pending-p (retry-pending-query-temp-cleanup))
+               (funcall function))
+          (unless (eq (query-temp-cleanup-owner-state owner) :resolved)
+            (setf (query-temp-cleanup-owner-directory owner) *query-temp-scope-directory*))))))
+
+(defun close-query-temp-owner (owner)
+  "Transfer unresolved files to ordinary pending cleanup without losing charges."
+  (call-with-query-temp-owner
+   owner
+   (lambda ()
+     (case (query-temp-cleanup-owner-state owner)
+       (:active (finish-query-temp-scope))
+       (:pending (retry-pending-query-temp-cleanup)))))
+  (values))
 
 (defstruct query-temp-namespace-report
   pathname
@@ -724,8 +774,9 @@ Owners of dead threads remain reachable until process exit."
                   (eq (query-temp-cleanup-owner-thread owner) sb-thread:*current-thread*))
                 *query-temp-pending-cleanups*))
     (ereport "58030" "previous temporary file cleanup remains incomplete"))
-  (unless *query-temp-cleanup-owner*
-    (error "query temporary stream requires a scope owner")))
+  (unless (and *query-temp-cleanup-owner*
+               (eq (query-temp-cleanup-owner-state *query-temp-cleanup-owner*) :active))
+    (error "query temporary stream requires an active scope owner")))
 
 (defun query-temp-pending-cleanup-status (&optional (limit 10))
   "Return pending counts and up to LIMIT paths.
@@ -757,7 +808,7 @@ attempt bounded cleanup without replacing an error, FATAL or nonlocal exit."
               (*query-temp-file-scope-active-p* t)
               (*query-temp-scope-directory* nil)
               (*query-temp-quota* (or *query-temp-quota*
-                                      (make-query-temp-quota *query-temp-file-limit-bytes*)))
+                                      (backend-query-temp-quota *backend*)))
               (*query-temp-cleanup-owner* (make-query-temp-scope-owner *query-temp-quota*)))
          (setf (query-temp-cleanup-owner-temporary-directory *query-temp-cleanup-owner*)
                *query-temp-directory*)
