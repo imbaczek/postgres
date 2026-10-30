@@ -6,7 +6,7 @@
 
 (defstruct extended-portal statement values (executed-p nil))
 
-(defstruct extended-select-portal-metadata columns formats)
+(defstruct extended-select-portal-metadata columns formats snapshot registration)
 
 (defvar *extended-select-portal-metadata* (make-hash-table :test #'eq :weakness :key))
 
@@ -146,18 +146,82 @@
     (or (gethash backend *extended-query-state-registry*)
         (setf (gethash backend *extended-query-state-registry*) (make-extended-query-state)))))
 
+(defun extended-release-portal (portal)
+  "Release the SELECT portal's registered snapshot before discarding it."
+  (when portal
+    (let ((info (extended-select-portal-info portal)))
+      (when info
+        (sb-sys:without-interrupts
+          (let ((registration (extended-select-portal-metadata-registration info)))
+            (when registration
+              (release-snapshot-registration registration)
+              (setf (extended-select-portal-metadata-registration info) nil
+                    (extended-select-portal-metadata-snapshot info) nil)))))))
+  (values))
+
+(defun extended-remove-portal (state name)
+  (sb-sys:without-interrupts
+    (extended-release-portal (gethash name (extended-query-state-portals state)))
+    (remhash name (extended-query-state-portals state)))
+  (values))
+
+(defun extended-clear-portals (state)
+  (sb-sys:without-interrupts
+    (maphash (lambda (name portal)
+               (declare (ignore name))
+               (extended-release-portal portal))
+             (extended-query-state-portals state))
+    (clrhash (extended-query-state-portals state)))
+  (values))
+
+(defun extended-install-portal (state name portal)
+  "Publish a SELECT portal with its Bind-time snapshot and command ID.
+The registration protects its horizon from vacuum until portal cleanup.  Release
+it if installation fails; replacing a portal releases the old registration."
+  (let ((info (extended-select-portal-info portal)))
+    (if info
+        (with-statement-snapshot (snapshot #'statement-start)
+          (let ((registration (make-snapshot-registration))
+                (retained (copy-snapshot snapshot))
+                (installed nil))
+            (unwind-protect
+                 (sb-sys:without-interrupts
+                   (sb-thread:with-mutex (*xid-lock*)
+                     (register-active-snapshot retained registration))
+                   (extended-remove-portal state name)
+                   (setf (extended-select-portal-metadata-snapshot info) retained
+                         (extended-select-portal-metadata-registration info) registration
+                         (gethash name (extended-query-state-portals state)) portal
+                         installed t))
+              (unless installed (release-snapshot-registration registration)))))
+        (progn
+          (extended-remove-portal state name)
+          (setf (gethash name (extended-query-state-portals state)) portal))))
+  portal)
+
+(defun extended-backend-holds-snapshot-p (backend)
+  "Tell wraparound whether BACKEND must run to retire its own portal pins."
+  (sb-thread:with-mutex (*extended-query-state-registry-lock*)
+    (let ((state (gethash backend *extended-query-state-registry*)))
+      (when state
+        (loop for portal being the hash-values of (extended-query-state-portals state)
+              for info = (extended-select-portal-info portal)
+                thereis (and info (extended-select-portal-metadata-registration info)))))))
+
 (defun extended-clear-portals-for-backend (backend)
   (when backend
     (sb-thread:with-mutex (*extended-query-state-registry-lock*)
       (let ((state (gethash backend *extended-query-state-registry*)))
         (when state
-          (clrhash (extended-query-state-portals state))
+          (extended-clear-portals state)
           (setf (extended-query-state-executed-in-cycle-p state) nil)))))
   (values))
 
 (defun forget-extended-query-state (backend)
   (when backend
     (sb-thread:with-mutex (*extended-query-state-registry-lock*)
+      (let ((state (gethash backend *extended-query-state-registry*)))
+        (when state (extended-clear-portals state)))
       (remhash backend *extended-query-state-registry*)))
   (values))
 
@@ -223,8 +287,15 @@
                (push (car item) pending))
     nil))
 
-(defun extended-select-result-columns (ast)
-  (mapcar #'target->result-column (getf (query-plan-prepared (plan-select-query ast)) :targets)))
+(defun extended-select-result-columns (ast &optional register-p)
+  "Plan result columns and optionally retain relation readers for the transaction."
+  (let* ((prepared (query-plan-prepared (plan-select-query ast)))
+         (relations (getf prepared :relations))
+         (columns (mapcar #'target->result-column (getf prepared :targets))))
+    (when (and register-p relations)
+      (with-registered-select-relations (registered relations)
+        (declare (ignore registered))))
+    columns))
 
 (defvar *extended-statement-signatures* (make-hash-table :test #'eq :weakness :key))
 
@@ -365,14 +436,17 @@
              (ereport "0A000" "string literals in extended statements are not supported; use parameters"))
            (when (eq (backend-state *backend*) :aborted)
              (ereport "25P02" "current transaction is aborted, commands ignored until end of transaction block"))
-           (let* ((*query-parameter-types* types)
-                  (signature (if (eq (getf (first statements) :type) :select)
-                                 (extended-result-signature (extended-select-result-columns (first statements)))
-                                 (progn (prepare-dml-subqueries (first statements)) nil))))
-             (let ((statement (make-extended-statement :ast (first statements) :types types)))
-               (sb-thread:with-mutex (*extended-statement-signatures-lock*)
-                 (setf (gethash statement *extended-statement-signatures*) signature))
-               (setf (gethash name (extended-query-state-statements state)) statement)))
+           ;; Parse establishes the repeatable-read horizon; planned relation
+           ;; readers remain registered until transaction end.
+           (with-statement-snapshot (snapshot #'statement-start)
+             (let* ((*query-parameter-types* types)
+                    (signature (if (eq (getf (first statements) :type) :select)
+                                   (extended-result-signature (extended-select-result-columns (first statements) t))
+                                   (progn (prepare-dml-subqueries (first statements)) nil))))
+               (let ((statement (make-extended-statement :ast (first statements) :types types)))
+                 (sb-thread:with-mutex (*extended-statement-signatures-lock*)
+                   (setf (gethash statement *extended-statement-signatures*) signature))
+                 (setf (gethash name (extended-query-state-statements state)) statement))))
            (write-message stream #\1 #()))))
       (:bind
        (destructuring-bind (kind portal name formats ranges results) operation
@@ -396,7 +470,7 @@
                   (columns (when select-p
                              (let ((*query-parameter-types* (extended-statement-types statement)))
                                (extended-check-result-signature
-                                statement (extended-select-result-columns (extended-statement-ast statement))))))
+                                statement (extended-select-result-columns (extended-statement-ast statement) t)))))
                   (result-formats (when select-p (extended-select-result-formats results columns)))
                   (types (extended-statement-types statement))
                   (format-vector (coerce formats 'vector))
@@ -424,8 +498,9 @@
                                                         :text type -1))
                                       (extended-binary-input (if spooled bytes (subseq bytes start end)) type (1+ index)))))))
              (when (extended-bind-spool-p payload) (extended-verify-bind-spool payload))
-             (setf (gethash portal (extended-query-state-portals state))
-                   (make-extended-query-portal statement values select-p columns result-formats))
+             (extended-install-portal
+              state portal
+              (make-extended-query-portal statement values select-p columns result-formats))
              (write-message stream #\2 #())))))
       (:execute
        (destructuring-bind (kind name limit) operation
@@ -441,7 +516,10 @@
                  (*query-parameter-values* (extended-portal-values portal))
                  (*select-result-formats* (extended-portal-result-formats portal))
                  (*select-expected-result-columns* (extended-portal-result-columns portal))
-                 (*select-suppress-description* (extended-portal-select-p portal)))
+                 (*select-suppress-description* (extended-portal-select-p portal))
+                 (*statement-snapshot-override*
+                   (let ((info (extended-select-portal-info portal)))
+                     (and info (extended-select-portal-metadata-snapshot info)))))
              (execute-statement stream (extended-statement-ast (extended-portal-statement portal))))
            (setf (extended-portal-executed-p portal) t
                  (extended-query-state-executed-in-cycle-p state) t))))
@@ -476,16 +554,16 @@
          (declare (ignore kind))
          (case target
            (#\S (remhash name (extended-query-state-statements state)))
-           (#\P (remhash name (extended-query-state-portals state)))
+           (#\P (extended-remove-portal state name))
            (otherwise (ereport "08P01" "invalid close target")))
          (write-message stream #\3 #())))
       (:sync
        (when (extended-query-state-implicit-p state)
          (when (eq (backend-state *backend*) :in-progress) (commit-transaction))
          (setf (extended-query-state-implicit-p state) nil)
-         (clrhash (extended-query-state-portals state)))
+         (extended-clear-portals state))
        (when (eq (backend-state *backend*) :idle)
-         (clrhash (extended-query-state-portals state)))
+         (extended-clear-portals state))
        (setf (extended-query-state-ignore-until-sync state) nil
              (extended-query-state-in-cycle-p state) nil
              (extended-query-state-executed-in-cycle-p state) nil)

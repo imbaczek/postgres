@@ -1210,6 +1210,7 @@ cd src/lisp
 ./t/wal-crash-recovery.sh  # SIGKILL recovery at commit, page, update, split, and checkpoint boundaries
 python3 ./t/command-complete.py # autocommit reply ordering, commit errors, recovery and protocol boundaries
 python3 ./t/settings-rollback.py # transactional set_config undo, reset and successful persistence
+python3 ./t/portal-snapshot.py # Parse/Bind visibility, VACUUM protection and portal snapshot cleanup
 ./t/unique-index-concurrency.sh # unique-index build/drop writer races
 ./t/update-concurrency.sh # concurrent UPDATE chain and WHERE rechecks
 ./t/vacuum-update-concurrency.sh # ordinary VACUUM with same-page concurrent writers
