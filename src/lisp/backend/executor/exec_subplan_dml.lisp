@@ -151,8 +151,9 @@
   (when (and targets *dml-returning-spool*)
     (query-row-spool-seal *dml-returning-spool*)
     ;; The receiver gets the sealed spool and command tag after the mutations.
-    ;; Its handoff remains provisional until the outer execution finishes.
-    ;; The caller owns cleanup on errors; without a receiver, publish here.
+    ;; Its handoff remains provisional until outer execution finishes. The
+    ;; portal later reports its own per-fetch count; without a receiver, publish
+    ;; rows and the command tag here. The caller owns cleanup on errors.
     (when *dml-returning-receiver*
       (funcall *dml-returning-receiver* *dml-returning-spool* targets tag)
       (return-from finish-dml-command (values)))
@@ -277,12 +278,19 @@
     (plan-expression-subqueries prepared)
     (prepare-joined-dml-qualifications prepared)))
 
+(defvar *dml-bound-preparation* nil)
+
+(defun dml-execution-preparation (ast)
+  (if (and *dml-bound-preparation* (eq ast (car *dml-bound-preparation*)))
+      (cdr *dml-bound-preparation*)
+      (prepare-dml-subqueries ast)))
+
 (defun revalidate-subquery-relations (relations)
   "Revalidate DML subquery reader relations and return RELATIONS."
   (revalidate-select-relations relations)
   relations)
 
-(defun call-with-dml-subqueries (prepared function)
+(defun register-dml-subquery-relations (prepared &optional xid)
   ;; Admit the target write and every source read together. Registering the target
   ;; first can deadlock with an index builder waiting on that writer while blocking
   ;; a source reader. Admission also excludes target index DDL during revalidation.
@@ -304,8 +312,7 @@
                                       (getf (query-plan-prepared (getf prepared :dml-source-plan)) :relations))
                                     (expression-subquery-relations prepared)
                                     (query-cte-relations prepared))))
-         (xid (get-current-xid))
-         (snapshot *current-snapshot*))
+         (xid (or xid (get-current-xid))))
     (register-relation-accesses (list relfilenode)
                                 (append target-toast-nodes
                                         (select-relation-reader-relfilenodes relations)) xid)
@@ -323,29 +330,33 @@
       (revalidate-subquery-relations relations))
     (when (and target-toast-nodes (< (buf-nblocks (second target-toast-nodes)) 2))
       (ereport "XX001" "TOAST index is missing"))
-    (let* ((*dml-column-defaults* (getf prepared :column-defaults))
-           (*subquery-execution-active-p* t)
-           (*subquery-result-cache* (make-hash-table :test #'eq))
-           (*subquery-registered-relations* relations)
-           (*subquery-outer-frames* nil)
-           (*subquery-backend-entry* (query-plan-backend-entry :interpreter))
-           (*current-snapshot* snapshot)
-           (domain (append (when target-toast-nodes (list (second target-toast-nodes)))
-                           (query-plan-index-relfilenodes
-                            (%make-query-plan :physical '(:result)) relations))))
+    (values table relfilenode xid relations
+            (append (when target-toast-nodes (list (second target-toast-nodes)))
+                    (query-plan-index-relfilenodes
+                     (%make-query-plan :physical '(:result)) relations)))))
+
+(defun call-with-dml-subqueries (prepared function)
+  (multiple-value-bind (table relfilenode xid relations domain)
+      (register-dml-subquery-relations prepared)
+    (let ((*dml-column-defaults* (getf prepared :column-defaults))
+          (*subquery-execution-active-p* t)
+          (*subquery-result-cache* (make-hash-table :test #'eq))
+          (*subquery-registered-relations* relations)
+          (*subquery-outer-frames* nil)
+          (*subquery-backend-entry* (query-plan-backend-entry :interpreter)))
       (call-with-query-cte-execution
-       t
+       (null *query-execution-owner*)
        (lambda ()
          (call-with-select-index-lease-domain
           domain
           (lambda ()
-            ;; SQL expressions and target writes must not retain B-tree leases.
             (detach-select-index-scans)
-            (call-with-cte-definitions (getf prepared :ctes)
-                                       (lambda ()
-                                         (call-with-dml-returning-spool
-                                          (getf prepared :returning)
-                                          (lambda () (funcall function table relfilenode xid))))))))))))
+            (call-with-cte-definitions
+             (getf prepared :ctes)
+             (lambda ()
+               (call-with-dml-returning-spool
+                (getf prepared :returning)
+                (lambda () (funcall function table relfilenode xid))))))))))))
 
 (defun call-with-dml-expression-evaluation (function)
   ;; Release enclosing leases before evaluation; child plans acquire their own
@@ -416,7 +427,7 @@
 
 (defun exec-insert-subqueries (stream ast)
   (let ((*datum-origin-capture* nil) (*query-row-origins* nil)
-                                     (prepared (prepare-dml-subqueries ast)))
+                                     (prepared (dml-execution-preparation ast)))
     (call-with-dml-subqueries
      prepared
      (lambda (table rel xid)
@@ -498,7 +509,7 @@
          (finish-dml-command stream returning (format nil "INSERT 0 ~a" count)))))))
 
 (defun exec-delete-subqueries (stream ast)
-  (let* ((prepared (prepare-dml-subqueries ast))
+  (let* ((prepared (dml-execution-preparation ast))
          (where (or (getf prepared :dml-row-where) (getf prepared :where))))
     (call-with-dml-subqueries
      prepared
@@ -625,7 +636,7 @@
 (defun exec-update-subqueries (stream ast)
   (let* ((*datum-origin-capture* t)
          (*query-row-origins* nil)
-         (prepared (prepare-dml-subqueries ast))
+         (prepared (dml-execution-preparation ast))
          (where (or (getf prepared :dml-row-where) (getf prepared :where)))
          (sets (getf prepared :sets)))
     (call-with-dml-subqueries

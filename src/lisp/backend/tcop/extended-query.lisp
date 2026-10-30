@@ -10,6 +10,11 @@
 
 (defstruct extended-select-execution owner plan targets iterator (at-end-p nil) (failed-p nil))
 
+(defstruct extended-dml-execution owner prepared targets spool store iterator
+           (ready-p nil) (at-end-p nil) (failed-p nil))
+
+(defvar *extended-dml-executions* (make-hash-table :test #'eq :weakness :key))
+
 (defvar *extended-select-executions* (make-hash-table :test #'eq :weakness :key))
 
 (defvar *extended-execute-suspended-p* nil)
@@ -171,20 +176,44 @@
   (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
     (gethash portal *extended-select-executions*)))
 
+(defun extended-dml-execution-for (portal)
+  (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
+    (gethash portal *extended-dml-executions*)))
+
+(defun invalidate-extended-dml-execution (execution)
+  (setf (extended-dml-execution-failed-p execution) t
+        (extended-dml-execution-prepared execution) nil
+        (extended-dml-execution-targets execution) nil
+        (extended-dml-execution-iterator execution) nil
+        (extended-dml-execution-store execution) nil
+        (extended-dml-execution-spool execution) nil)
+  (values))
+
 (defun extended-close-portal (portal &optional failed-p)
   ;; Failed cleanup keeps its owner reachable for retry. A failed transaction
   ;; may retain portal identity after executable state has been closed.
   (let ((execution (extended-select-execution-for portal)))
     (when execution
       (when failed-p (setf (extended-select-execution-failed-p execution) t))
-      (unless (close-query-execution-owner (extended-select-execution-owner execution))
-        (return-from extended-close-portal nil))
+      (multiple-value-bind (closed failures)
+          (close-query-execution-owner (extended-select-execution-owner execution))
+        (unless closed (return-from extended-close-portal (values nil failures))))
       (setf (extended-select-execution-plan execution) nil
             (extended-select-execution-targets execution) nil
             (extended-select-execution-iterator execution) nil)
       (unless failed-p
         (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
           (remhash portal *extended-select-executions*)))))
+  (let ((execution (extended-dml-execution-for portal)))
+    (when execution
+      (when failed-p (setf (extended-dml-execution-failed-p execution) t))
+      (multiple-value-bind (closed failures)
+          (close-query-execution-owner (extended-dml-execution-owner execution))
+        (unless closed (return-from extended-close-portal (values nil failures))))
+      (invalidate-extended-dml-execution execution)
+      (unless failed-p
+        (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
+          (remhash portal *extended-dml-executions*)))))
   t)
 
 (defun extended-drop-portal (state name)
@@ -243,9 +272,22 @@
            portal)
       (unless complete (extended-close-portal portal)))))
 
+(defun extended-send-portal-rows (stream iterator targets limit &optional values-only-p)
+  ;; Observe EOF only through a pull allowed by LIMIT, even for a sealed store.
+  ;; The caller supplies its owner, snapshot and any lease domain around this loop.
+  (let ((count 0))
+    (loop while (or (<= limit 0) (< count limit))
+          do (check-for-interrupts)
+             (multiple-value-bind (row present) (sql-iterator-next iterator)
+               (unless present (return-from extended-send-portal-rows (values count t)))
+               (let ((*select-toast-demand* nil)
+                     (*select-toast-slice-plan* nil)
+                     (*toast-slice-current* nil))
+                 (send-select-row stream (if values-only-p (cons row row) row) targets))
+               (incf count)))
+    (values count nil)))
+
 (defun extended-execute-select-portal (stream portal limit)
-  ;; Resume the same iterator under its owner. Reaching the requested row count
-  ;; suspends without probing ahead; a later Execute can discover EOF.
   (let ((execution (extended-select-execution-for portal))
         (count 0))
     (unless execution (ereport "55000" "portal has no initialized SELECT execution"))
@@ -255,25 +297,164 @@
       (call-with-query-execution-owner
        (extended-select-execution-owner execution)
        (lambda ()
-         (let* ((plan (extended-select-execution-plan execution))
-                (relations *subquery-registered-relations*))
+         (let ((plan (extended-select-execution-plan execution))
+               (relations *subquery-registered-relations*))
            (call-with-select-index-lease-domain
             (query-plan-index-relfilenodes plan relations)
             (lambda ()
-              (loop while (or (<= limit 0) (< count limit))
-                    do (multiple-value-bind (row present)
-                           (sql-iterator-next (extended-select-execution-iterator execution))
-                         (unless present
-                           (setf (extended-select-execution-at-end-p execution) t)
-                           (return))
-                         (let ((*select-toast-demand* nil)
-                               (*select-toast-slice-plan* nil)
-                               (*toast-slice-current* nil))
-                           (send-select-row stream row (extended-select-execution-targets execution)))
-                         (incf count)))))))))
+              (multiple-value-bind (delivered at-end)
+                  (extended-send-portal-rows
+                   stream (extended-select-execution-iterator execution)
+                   (extended-select-execution-targets execution) limit)
+                (setf count delivered
+                      (extended-select-execution-at-end-p execution) at-end))))))))
     (if (extended-select-execution-at-end-p execution)
         (progn
           (send-command-complete stream (format nil "SELECT ~d" count))
+          t)
+        (progn
+          (setf *extended-execute-suspended-p* t)
+          (write-message stream #\s #())
+          nil))))
+
+(defun extended-initialize-dml-portal (portal)
+  ;; Publish the owner before preparing and admitting the target and sources.
+  ;; A failed Bind passes the partial execution to portal cleanup.
+  (let* ((statement (extended-portal-statement portal))
+         (owner (make-query-execution-owner
+                 :bindings
+                 (list (cons '*query-parameter-types* (extended-statement-types statement))
+                       (cons '*query-parameter-values* (extended-portal-values portal))
+                       (cons '*select-result-formats* (extended-portal-result-formats portal))
+                       (cons '*select-expected-result-columns* (extended-portal-result-columns portal))
+                       (cons '*select-suppress-description* t))))
+         (execution (make-extended-dml-execution :owner owner))
+         (complete nil))
+    (unwind-protect
+         (progn
+           (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
+             (setf (gethash portal *extended-dml-executions*) execution))
+           (call-with-query-execution-owner
+            owner
+            (lambda ()
+              (let ((prepared (prepare-dml-subqueries (extended-statement-ast statement))))
+                (setf (extended-dml-execution-prepared execution) prepared
+                      (extended-dml-execution-targets execution) (getf prepared :returning))
+                ;; Bind retains relation protection, but starts neither the
+                ;; executor nor its statement snapshot and never marks a CID used.
+                (unless (recovery-in-progress-p)
+                  (prepare-xid-wraparound-for-statement *backend*))
+                (register-dml-subquery-relations prepared (get-current-reader-xid)))))
+           (setf complete t)
+           portal)
+      (unless complete (extended-close-portal portal)))))
+
+(defun extended-materialize-dml-portal (stream portal execution)
+  ;; Run mutations once and retain a sealed result for later pulls. The receiver
+  ;; pins the statement snapshot while its original registration is still live;
+  ;; spool adoption and publication wait until statement execution returns.
+  (let ((owner (extended-dml-execution-owner execution))
+        (resource nil)
+        (closer #'close-query-row-spool)
+        (received nil)
+        (targets nil)
+        (complete nil)
+        (original-fatal nil))
+    (unwind-protect
+         (handler-case
+             (progn
+               (call-with-query-execution-owner
+                owner
+                (lambda ()
+                  ;; The closer owns a mutable resource cell before any acquisition.
+                  ;; Terminal invalidation may discard every runtime slot independently.
+                  (query-execution-owner-add-cleanup
+                   owner (lambda () (when resource (funcall closer resource))))
+                  (sb-sys:without-interrupts
+                    (setf resource (make-query-row-spool)
+                          (extended-dml-execution-spool execution) resource
+                          *dml-returning-spool* resource))
+                  (let* ((statement (extended-portal-statement portal))
+                         (*statement-command-start-advance-p* nil)
+                         (*dml-bound-preparation*
+                           (cons (extended-statement-ast statement)
+                                 (extended-dml-execution-prepared execution)))
+                         (*dml-returning-receiver*
+                           (lambda (spool result-targets result-tag)
+                             (declare (ignore result-tag))
+                             (when (or received (not (eq spool resource)))
+                               (error "unexpected deferred RETURNING receiver"))
+                             ;; Copy/register while the active statement token still pins
+                             ;; this snapshot. Publication waits for the outer unwind.
+                             (query-execution-owner-pin-snapshot owner *current-snapshot*)
+                             (setf received t targets result-targets))))
+                    (execute-statement stream (extended-statement-ast statement)))
+                  (unless received (error "RETURNING execution did not produce a sealed spool"))
+                  (sb-sys:without-interrupts
+                    (let ((store (adopt-sealed-query-row-spool resource)))
+                      (setf resource store
+                            closer #'close-query-replay-store
+                            (extended-dml-execution-store execution) store
+                            (extended-dml-execution-spool execution) nil
+                            *dml-returning-spool* nil)
+                      (setf (extended-dml-execution-iterator execution)
+                            (make-query-replay-reader store)
+                            (extended-dml-execution-targets execution) targets
+                            (extended-dml-execution-ready-p execution) t)))))
+               (setf complete t))
+           (pg-error (condition)
+             (when (fatal-error-p condition) (setf original-fatal condition))
+             (error condition)))
+      (sb-sys:without-interrupts
+        (unless complete
+          ;; Publish failure before another interrupt can preempt cleanup.
+          ;; If cleanup also signals FATAL, preserve an original FATAL.
+          (setf (extended-dml-execution-failed-p execution) t)
+          (flet ((report-cleanup (condition)
+                   (handler-case
+                       (format *error-output* "~&incomplete RETURNING cleanup: ~a~%" condition)
+                     (error (failure)
+                       (when (fatal-error-p failure) (error (or original-fatal failure))))
+                     (sb-ext:timeout () nil))))
+            (handler-case
+                (multiple-value-bind (closed failures)
+                    (sb-sys:with-local-interrupts (extended-close-portal portal t))
+                  (unless closed (report-cleanup failures)))
+              (error (condition)
+                (if (fatal-error-p condition)
+                    (error (or original-fatal condition))
+                    (report-cleanup condition)))
+              (sb-ext:timeout (condition) (report-cleanup condition))))))))
+  (values))
+
+(defun extended-execute-dml-portal (stream portal limit)
+  ;; The first Execute materializes the statement; subsequent calls only read
+  ;; its store. As with SELECT, an exact row limit suspends without an EOF probe.
+  (let ((execution (extended-dml-execution-for portal))
+        (count 0))
+    (unless execution (ereport "55000" "portal has no initialized RETURNING execution"))
+    (when (extended-dml-execution-failed-p execution)
+      (ereport "55000" "portal cannot be run"))
+    (unless (extended-dml-execution-ready-p execution)
+      (extended-materialize-dml-portal stream portal execution))
+    (unless (extended-dml-execution-at-end-p execution)
+      (call-with-query-execution-owner
+       (extended-dml-execution-owner execution)
+       (lambda ()
+         (multiple-value-bind (delivered at-end)
+             (extended-send-portal-rows
+              stream (extended-dml-execution-iterator execution)
+              (extended-dml-execution-targets execution) limit t)
+           (setf count delivered
+                 (extended-dml-execution-at-end-p execution) at-end)))))
+    (if (extended-dml-execution-at-end-p execution)
+        (progn
+          (send-command-complete
+           stream
+           (case (getf (extended-statement-ast (extended-portal-statement portal)) :type)
+             (:insert (format nil "INSERT 0 ~d" count))
+             (:update (format nil "UPDATE ~d" count))
+             (:delete (format nil "DELETE ~d" count))))
           t)
         (progn
           (setf *extended-execute-suspended-p* t)
@@ -323,6 +504,9 @@
                          (extended-select-execution-plan execution) nil
                          (extended-select-execution-targets execution) nil
                          (extended-select-execution-iterator execution) nil))
+        (loop for portal being the hash-values of (extended-query-state-portals state)
+              for execution = (extended-dml-execution-for portal)
+              when execution do (invalidate-extended-dml-execution execution))
         (clrhash (extended-query-state-portals state)))
       (retire-query-execution-owners-for-backend backend)
       (sb-thread:with-mutex (*extended-query-state-registry-lock*)
@@ -612,8 +796,10 @@
                                       (extended-binary-input (if spooled bytes (subseq bytes start end)) type (1+ index)))))))
              (when (extended-bind-spool-p payload) (extended-verify-bind-spool payload))
              (let ((bound (make-extended-query-portal statement values returns-rows-p columns result-formats)))
-               (when (extended-portal-select-p bound)
-                 (extended-initialize-select-portal bound))
+               (cond ((extended-portal-select-p bound)
+                      (extended-initialize-select-portal bound))
+                     ((extended-portal-returns-rows-p bound)
+                      (extended-initialize-dml-portal bound)))
                (sb-sys:without-interrupts
                  (setf (gethash portal (extended-query-state-portals state)) bound))
                (write-message stream #\2 #()))))))
@@ -630,21 +816,19 @@
              (begin-extended-implicit-query-block)
              (setf (extended-query-state-implicit-p state) t))
            (let ((completed
-                   (if (extended-portal-select-p portal)
-                       (extended-execute-select-portal stream portal limit)
-                       (progn
-                         (when (extended-portal-executed-p portal)
-                           (ereport "55000" "portal already executed"))
-                         (when (and (extended-portal-returns-rows-p portal) (> limit 0))
-                           (ereport "0A000" "limited RETURNING execution is not supported"))
-                         (let ((*statement-command-start-advance-p* nil)
-                               (*query-parameter-types* (extended-statement-types (extended-portal-statement portal)))
-                               (*query-parameter-values* (extended-portal-values portal))
-                               (*select-result-formats* (extended-portal-result-formats portal))
-                               (*select-expected-result-columns* (extended-portal-result-columns portal))
-                               (*select-suppress-description* (extended-portal-returns-rows-p portal)))
-                           (execute-statement stream (extended-statement-ast (extended-portal-statement portal))))
-                         t))))
+                   (cond
+                     ((extended-portal-select-p portal)
+                      (extended-execute-select-portal stream portal limit))
+                     ((extended-portal-returns-rows-p portal)
+                      (extended-execute-dml-portal stream portal limit))
+                     (t
+                      (when (extended-portal-executed-p portal)
+                        (ereport "55000" "portal already executed"))
+                      (let ((*statement-command-start-advance-p* nil)
+                            (*query-parameter-types* (extended-statement-types (extended-portal-statement portal)))
+                            (*query-parameter-values* (extended-portal-values portal)))
+                        (execute-statement stream (extended-statement-ast (extended-portal-statement portal))))
+                      t))))
              (setf (extended-portal-executed-p portal) t
                    (extended-query-state-executed-in-cycle-p state) t)
              (when completed
