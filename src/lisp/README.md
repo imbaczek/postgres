@@ -73,8 +73,21 @@ retarget an existing source through the private control REPL. For example:
 
 ```lisp
 (physical-follow-retarget-conninfo "host=127.0.0.1 port=5432 dbname=postgres user=replicator"
-                                  :prefix "follow" :fallback "walreceiver")
+                                  :prefix "follow" :fallback "walreceiver"
+                                  :slot "standby_slot")
 ```
+
+The optional public physical slot must already exist on the source. Its name has
+1 to 63 lowercase ASCII letters, digits or underscores. Omitting `:slot`, or
+passing `:slot nil`, requests no public slot. The receiver does not create or drop
+public slots. A separate private proof pin protects the native follow binding.
+Preparation retains the old accepted slot, as does a replacement failure before
+publication. After publication, acceptance follows the durable binding and any
+restart reconciliation; the old slot is not promised to be restored. Cold restart preserves
+the accepted configuration, and automatic handoff inherits its slot. Promotion
+removes the slot from follow configuration without dropping it on the source.
+The `slot_name` field of `pg_catalog.pg_stat_get_wal_receiver()` reports the public
+slot name, not the private proof pin.
 
 The target can be on the same timeline or a descendant. The direct endpoint API
 `(physical-follow-retarget "127.0.0.1" 5432 "follow")` is also available. If
@@ -98,9 +111,10 @@ which removes the names seen at startup, this also removes names added later so 
 cold retry cannot accidentally enter recovery. Symlink targets are left intact.
 
 Reconciliation of `primary_conninfo`, `primary_slot_name`, and
-`recovery_target_timeline` desired generations and use of persistent public
-slots by the receiver are not wired. There is no coordinator. Effective
-multihost profiles are unsupported.
+`recovery_target_timeline` desired generations remains unfinished; the
+`primary_slot_name` GUC is not registered or wired. Timeline policy remains
+future work, and coordination is outside this scope. Effective multihost profiles
+are unsupported.
 The original conninfo is resolved again on normal reconnects. If the selected
 route changes, the receiver prepares a new binding before querying or receiving
 WAL. Cleanup uses the saved selected route and credential; if that credential is
@@ -1586,6 +1600,7 @@ PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/postmaster-pid.sh
 PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/patroni-start.sh
 PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/physical-follow.sh
 FOLLOW_FIRST_ATTACH=1 FOLLOW_MANAGED_STARTUP=1 SELECTED_REPLAY_CONTROLLER=1 ./t/selected-replay.sh
+FOLLOW_PUBLIC_SLOT=1 FOLLOW_FIRST_ATTACH=1 ./t/libpq-follow.sh
 ```
 
 `./pg-lisp.sh -D EXISTING_PGDATA -C setting` prints a supported configuration

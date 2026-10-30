@@ -679,6 +679,9 @@ recovery for restart reconciliation."
           (setf *physical-follow-operation* nil))))))
 
 (defun physical-follow-start-operation (host port prefix &optional runtime profile (slot :inherit))
+  "Start a transition with a snapshot of the requested public slot.
+:INHERIT copies the runtime's accepted slot for automatic handoff; explicit NIL
+requests no slot. Capture the choice before the worker starts."
   (physical-follow-endpoint-check host port prefix)
   (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))
   (let* ((source (when runtime (physical-follow-config-source (physical-follow-runtime-config runtime))))
@@ -844,7 +847,12 @@ recovery cannot yet be enabled. A failed first connection leaves replay running.
 
 (defun physical-follow-retarget-conninfo (conninfo &key (prefix "follow") (fallback (physical-libpq-default-fallback)) slot)
   "Attach or retarget native follow using a libpq profile.
-Unless supplied, FALLBACK uses cluster_name or walreceiver when it is empty."
+Unless supplied, FALLBACK uses cluster_name or walreceiver when it is empty.
+SLOT is NIL or a normalized public slot name of 1 to 63 lowercase ASCII letters,
+digits or underscores. Omission and explicit NIL both request no public slot.
+The source slot must already exist. Preparation and failures before publication
+preserve the old accepted slot. After publication, acceptance follows the durable
+binding and restart reconciliation; the old slot may not be restored."
   (when (plusp *live-operation-depth*)
     (error "native follow retarget requires its own operation admission"))
   (let ((profile (make-physical-libpq-profile conninfo :fallback fallback))

@@ -74,6 +74,8 @@ It records debt but grants no authority to contact or retire a remote pin."
                         :manifest-digest (getf base :manifest-digest)))))
 
 (defun physical-follow-public-slot-copy (slot)
+  "Validate and copy a public slot name, or return NIL for no slot.
+Names contain 1 to 63 lowercase ASCII letters, digits or underscores."
   (when slot
     (unless (and (stringp slot) (wal-valid-replication-slot-name-p slot))
       (error "invalid public physical replication slot"))
@@ -157,6 +159,7 @@ It records debt but grants no authority to contact or retire a remote pin."
   config)
 
 (defun physical-follow-config-public-slot (config)
+  "Return a validated copy of CONFIG's accepted public slot, if any."
   (physical-follow-public-slot-copy (getf (sixth config) :public-slot)))
 
 (defun physical-follow-config-source (config)

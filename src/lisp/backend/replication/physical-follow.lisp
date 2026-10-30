@@ -997,7 +997,8 @@ Validation checks coherence, not durable state or source proof."
             (pg-client-native-lsn (aref row 2)))))
 
 (defun physical-follow-start-query (runtime cursor)
-  "Build an unnamed native START using the runtime's private proof pin."
+  "Build a native START with the private proof pin and optional public slot.
+The public slot is a separate persistent source slot, not the proof pin."
   (with-live-operation
     (format nil
             "START_REPLICATION~a PHYSICAL ~a (native_format '~a', proof_pin '~a', system_id '~d', timeline '~d', base_lsn '~a', prefix_digest '~d'~a~a)"
