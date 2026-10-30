@@ -547,6 +547,8 @@ Return the reconstructed state and durable control; do not install runtime state
 
 (defun physical-recovery-prepare-with-namespace (&key signal-mode (timeline-goal :latest))
   "Verify the base and reconcile saved follow state before ordinary startup.
+Resolve policy before active or unbound admission, then re-resolve after pending
+reconciliation and compare protected fields. Install the original policy object.
 Publish dirty recovery control before installing state and allowing redo."
   (physical-recovery-check-required-marker)
   (physical-follow-startup-owner-check)

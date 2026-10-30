@@ -73,7 +73,8 @@ reload exclusion and live-operation quiescence."
 
 (defun physical-follow-check-unbound-state (store base applied &key (policy (getf *physical-recovery-state* :timeline-policy)))
   "Validate an unbound receive store and replay prefix against the verified base.
-The caller excludes mutation; the scan protects retained data with a root lease."
+The caller excludes mutation; the scan protects retained data with a root lease.
+The returned semantic scan disposition does not update replay exhaustion."
   (physical-follow-call-with-receive-root
    store
    (lambda ()
@@ -130,7 +131,8 @@ reload exclusion and live-operation quiescence."
 
 (defun physical-follow-controller-snapshot-under-lease (view)
   "Capture the receive, replay and durable recovery witnesses under root protection.
-The receive timeline can differ from the applied replay timeline."
+The receive timeline can differ from the applied replay timeline.  A retained
+proof kind is included in the saved receiver coordinates."
   (let* ((base (physical-recovery-verify-base-state))
          (control (physical-recovery-read-control *pgdata*))
          (store (physical-follow-copy-checked-store *physical-receive-store*))
@@ -174,7 +176,8 @@ The receive timeline can differ from the applied replay timeline."
                             :restartpoint (when metadata (list (getf metadata :lsn) digest)))))))
 
 (defun physical-follow-controller-plan (snapshot anchor view)
-  "Build a binding; same-timeline follow keeps the entire receive tuple."
+  "Build a binding; same-timeline and retained follow keep the receive tuple.
+A retained binding carries no child history and cannot pass its fork."
   (let* ((before (getf snapshot :before)) (fork (getf view :fork))
                                           (after
                                             (if (or (member (physical-follow-anchor-kind anchor) '(:same-timeline :retained-timeline))
@@ -312,6 +315,11 @@ base provenance is removed; it does not identify a cleanup endpoint."
     (unwind-protect (funcall function store) (physical-store-close store))))
 
 (defun physical-follow-call-with-startup-candidate (base function)
+  "Call FUNCTION with the strictly checked prospective pending store, if any.
+Use the offline store when no pending selection exists. This permits numeric
+policy resolution before child history is published.  The
+pending check holds command and reload exclusion, quiescence and a root lease.
+The candidate owns no streams; the original offline store closes on unwind."
   (physical-follow-call-with-offline-store
    base
    (lambda (store)
@@ -333,7 +341,8 @@ base provenance is removed; it does not identify a cleanup endpoint."
 state before validating an active binding. For an unattached standby, validate
 the unowned base reference and unbound store before recovery control publication
 or redo.
-Protect the store and retained root."
+The resolved policy bounds active and unbound admission.  Pending reconciliation
+uses strict candidate proof; protect the store and retained root."
   (when (probe-file (physical-follow-config-path))
     (let ((config (physical-follow-read-config)))
       (when (= 4 (length config)) (return-from physical-follow-prepare-startup config))
@@ -557,7 +566,9 @@ that owner stays with the pin until a new publication, not a later reconnect."
 (defun physical-follow-operation-publish (operation view entry anchor)
   "Recheck a fresh snapshot and publish pending then active binding under quiescence.
 A restartpoint can advance during the RPC; use the final durable witness. Queue
-the old source before publication; its remote acknowledgment is not required."
+the old source before publication; its remote acknowledgment is not required.
+With workers quiesced, strictly validate the candidate before writing pending
+state. Receipt resumes only after activation."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (sb-thread:with-mutex (*reload-run-lock*)
       (with-live-operation-quiescence

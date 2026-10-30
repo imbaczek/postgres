@@ -74,6 +74,8 @@ not a public GUC."
             :startup-seed seed))))
 
 (defun physical-recovery-prepare-timeline-policy (state goal)
+  "Resolve the startup policy against the checked prospective receive selection.
+A pending candidate can supply numeric target history before its publication."
   (if (= 2 (getf state :phase))
       (physical-follow-call-with-startup-candidate
        state (lambda (store)

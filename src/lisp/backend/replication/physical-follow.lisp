@@ -129,6 +129,14 @@ STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
   "Exact keys of the optional version 1 binding.")
 
 (defun physical-follow-policy-selection (policy local-history &optional source-history)
+  "Choose a follow action from resolved policy and checked history intervals.
+Return :DISCOVER when source history is needed. Equal source and receive
+timelines use same-timeline proof. A source toward the target uses descendant
+proof; at the target, a later source
+uses retained-timeline proof.  A locally cached child past the target permits
+replay only. A different local branch returns :REPLAY-ONLY with an unavailable
+reason; an incompatible source returns :UNAVAILABLE. This pure planner is not
+yet wired to source selection or the controller lifecycle."
   (timeline-check-lineage local-history)
   (let* ((target (getf policy :target))
          (target-history (getf policy :history))
@@ -249,7 +257,8 @@ manifest and root fields, and validate the proposed selection digest."
 
 (defun physical-follow-binding-transition-check (anchor text before after)
   "Check the transition implied by the anchor kind.
-Same-timeline bindings retain all eleven control fields and have no child history."
+Same-timeline and retained bindings keep all eleven control fields and have no
+child history.  Retained receipt is bounded by the anchor's fork."
   (ecase (physical-follow-anchor-kind anchor)
     (:descendant (physical-follow-descendant-binding-transition-check anchor text before after))
     ((:same-timeline :retained-timeline)
@@ -352,7 +361,9 @@ APPLIED and REQUIRED are semantic recovery frontiers, observed at clean
 recovery group boundaries rather than arbitrary record ends. A REQUIRED point
 before SEED relies on the seed's visibility. WITNESS, when supplied, is a
 historical (LSN timeline next-XID) triple checked at a clean boundary. The
-caller owns the candidate and keeps its input stable during the scan."
+caller owns the candidate and keeps its input stable during the scan.  Return
+its disposition with the semantic result; this scan does not update replay's
+exhaustion cache.  A policy fence must leave a clean batch boundary."
   (destructuring-bind (start timeline next snapshot reservation source-xids) seed
     (let* ((*physical-recovery-state* (copy-tree verified-base))
            (*physical-receive-store* candidate)
@@ -432,7 +443,8 @@ caller owns the candidate and keeps its input stable during the scan."
 
 (defun physical-follow-validate-candidate-replay (candidate verified-base binding)
   "Validate a private pending candidate without redo or publication.
-Same-timeline receipt may have an open tail; complete records are still checked."
+Candidate proof remains strict for pending or new bindings. Same-timeline
+receipt may have an open tail; complete records are still checked."
   (physical-follow-binding-check binding)
   (physical-follow-check-source-history candidate (nth-value 0 (physical-follow-anchor-check (getf binding :anchor))))
   (unless (and (equal (physical-store-control-tuple candidate) (getf binding :after))
@@ -587,7 +599,11 @@ compaction has moved them into retained extents."
 
 (defun physical-follow-map-active-prefix (store index function start &optional policy)
   "Map retained WAL from the base to the current floor, then the spool.
-The caller supplies the checked current inventory and keeps its root protected."
+The caller supplies the checked current inventory, validates the whole spool
+before this mapper runs, and keeps the root protected.
+The archived prefix can be scanned in full because its floor is at or before
+the policy-checked usable restartpoint seed; legacy fallback has floor at base.
+The store validates its whole spool before callbacks stop at a policy fence."
   (unless (= start (physical-store-base-lsn store))
     (error "active historical scan must start at the verified base"))
   (when (> (physical-store-floor-lsn store) start)
@@ -602,6 +618,9 @@ The caller supplies the checked current inventory and keeps its root protected."
   (physical-recovery-map-permitted-records store function :start-lsn (physical-store-floor-lsn store) :policy policy))
 
 (defun physical-follow-scan-current-state (candidate base applied required control index minimum &optional policy)
+  "Check applied, required and seed positions, then scan their semantic history.
+A fixed policy bounds spool callbacks, while full durable validation still runs.
+Return the scan disposition; it is not a numeric reconciliation success value."
   (physical-recovery-check-store-point candidate (first applied) (second applied))
   (multiple-value-bind (metadata token)
       (physical-follow-check-current-restartpoint candidate base minimum)
@@ -650,7 +669,8 @@ Return a private read-only candidate; the caller keeps input and root stable."
 The caller must exclude concurrent recovery, reload and receive changes. This
 function copies a read-only candidate, holds a root reader lease when needed,
 and rechecks durable witnesses and the receive tuple after the scan. Startup
-and receiver launch call this before admitting a bound configuration."
+and receiver launch call this before admitting a bound configuration.  The
+result includes the scan disposition and does not alter replay exhaustion."
   (physical-follow-check-config config)
   (unless (and (member (length config) '(5 6)) (eq :active (getf (fifth config) :phase))
                (equal config (physical-follow-read-config)))

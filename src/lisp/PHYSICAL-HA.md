@@ -789,6 +789,12 @@ protocol tests, all 1,109 physical tests and strict compilation passed. Integrat
 raw and libpq tests of this new path belong to the next controller milestone;
 GUC generation reconciliation and controller integration remain open.
 
+Commit `508532acd70` adds policy-aware admission and a pure follow selection
+planner; the final physical suite passed all 1,119 tests. Controller operation
+policy capture, source-view routing, no-proof results, launch and completion,
+and GUC generation integration remain open. Owned raw and libpq experiments
+for the retained path have not yet been integrated.
+
 The native `-C` metadata path now prints supported static settings using
 configuration precedence and base units before storage ownership or listener
 startup, provided the data directory exists. The CLI oracle passes five C
