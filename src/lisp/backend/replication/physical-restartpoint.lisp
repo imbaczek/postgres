@@ -292,11 +292,13 @@ Older metadata without these fields uses the base timeline."
            store start (getf metadata :replay-timeline (getf metadata :timeline)))
           (unless (= (getf metadata :prefix-digest) (physical-store-prefix-digest store start))
             (error "restartpoint differs from its durable receive prefix")))
-        (let ((removed (physical-recovery-proven-drops
-                        store identity :start-lsn start :required-lsn (max required start)
-                        :policy (getf state :timeline-policy))))
+        (multiple-value-bind (removed terminal reset-forks)
+            (physical-recovery-proven-drops
+             store identity :start-lsn start :required-lsn (max required start)
+             :policy (getf state :timeline-policy))
+          (declare (ignore terminal))
           (physical-recovery-check-base-forks
-           (if metadata (list :files (getf metadata :forks)) state) removed))
+           (if metadata (list :files (getf metadata :forks)) state) removed reset-forks))
         (setf (getf *physical-recovery-state* :wal-prefix-lsn) (and metadata start)
               (getf *physical-recovery-state* :wal-prefix-bytes) (and metadata prefix))
         ;; Every check above precedes mutation. Later failure still leaves the

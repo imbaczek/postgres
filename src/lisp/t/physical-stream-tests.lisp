@@ -1,8 +1,8 @@
 (in-package #:pg-physical-tests)
 
 (defun native-test-start-query (&optional (cursor 64) (base 32) (identity 123))
-  (format nil "START_REPLICATION PHYSICAL ~a (proof_pin 'copy', native_format 'pg_lisp_wal_7', system_id '~d', timeline '1', base_lsn '~a', prefix_digest '14695981039346656037')"
-          (pg::wal-format-lsn cursor) identity (pg::wal-format-lsn base)))
+  (format nil "START_REPLICATION PHYSICAL ~a (proof_pin 'copy', native_format '~a', system_id '~d', timeline '1', base_lsn '~a', prefix_digest '14695981039346656037')"
+          (pg::wal-format-lsn cursor) pg::+physical-native-format+ identity (pg::wal-format-lsn base)))
 
 (cl-spec:defproperty native-start-keeps-public-slot-and-proof-identities-separate
     ((public-id (range integer 0 1024))
@@ -28,7 +28,7 @@
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
 (deftest native-start-requires-one-explicit-private-proof-pin
-    (let ((old "START_REPLICATION SLOT copy PHYSICAL 0/40 (native_format 'pg_lisp_wal_7', system_id '123', timeline '1', base_lsn '0/20', prefix_digest '14695981039346656037')"))
+    (let ((old (format nil "START_REPLICATION SLOT copy PHYSICAL 0/40 (native_format '~a', system_id '123', timeline '1', base_lsn '0/20', prefix_digest '14695981039346656037')" pg::+physical-native-format+)))
       (ok (equal "0A000" (recovery-state-of (lambda () (pg::parse-replication-command old))))))
   (dolist (options '("proof_pin 'first', proof_pin 'second'"
                      "proof_pin 'Invalid-Proof'"
@@ -432,14 +432,15 @@
     (let ((command (pg::parse-replication-command (native-test-start-query))))
       (ok (eq :physical-start (pg::logical-replication-command-type command)))
       (ok (= 64 (pg::logical-replication-command-requested-lsn command)))
-      (ok (equal "pg_lisp_wal_7" (pg::physical-stream-option command "native_format"))))
-  (dolist (query '("START_REPLICATION PHYSICAL 0/0"
-                   "START_REPLICATION SLOT copy PHYSICAL 0/0"
-                   "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'other')"
-                   "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'pg_lisp_wal_7', system_id '123', timeline '2', base_lsn '0/0')"
-                   "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'pg_lisp_wal_7', system_id '123', timeline '1', timeline '1')"
-                   "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'pg_lisp_wal_6', system_id '123', timeline '1', base_lsn '0/0', prefix_digest '14695981039346656037')"
-                   "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'pg_lisp_wal_5', system_id '123', timeline '1', base_lsn '0/0', prefix_digest '14695981039346656037')"))
+      (ok (equal pg::+physical-native-format+ (pg::physical-stream-option command "native_format"))))
+  (dolist (query (list "START_REPLICATION PHYSICAL 0/0"
+                       "START_REPLICATION SLOT copy PHYSICAL 0/0"
+                       "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'other')"
+                       (format nil "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format '~a', system_id '123', timeline '2', base_lsn '0/0')" pg::+physical-native-format+)
+                       (format nil "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format '~a', system_id '123', timeline '1', timeline '1')" pg::+physical-native-format+)
+                       "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'pg_lisp_wal_7', system_id '123', timeline '1', base_lsn '0/0', prefix_digest '14695981039346656037')"
+                       "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'pg_lisp_wal_6', system_id '123', timeline '1', base_lsn '0/0', prefix_digest '14695981039346656037')"
+                       "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'pg_lisp_wal_5', system_id '123', timeline '1', base_lsn '0/0', prefix_digest '14695981039346656037')"))
     (ok (intake-fails-p (lambda () (pg::parse-replication-command query))))))
 
 (deftest native-physical-start-rejects-transaction-blocks

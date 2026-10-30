@@ -457,8 +457,8 @@ The receiver's immutable `base_lsn` bounds apply feedback; it is not the anchor
 cursor. Resume prefix proof precedes WalData and runs outside the writer critical
 section. An exact early frontend CopyDone ends the stream normally without
 confirming an unproved receipt. Sender ownership is released before the result and
-ReadyForQuery, including cleanup after admission closes. Bootstrap behavior and
-native WAL format 7 remain unchanged; this is not C physical WAL compatibility.
+ReadyForQuery, including cleanup after admission closes. Bootstrap behavior is
+unchanged; current native WAL format 8 is not C physical WAL compatibility.
 
 The full run passed 732 physical tests and 170 interop tests, with a fresh cold
 compile. Native wire acceptance covered positive and negative cases, early
@@ -3005,9 +3005,10 @@ bytes. C's writer does not promise zero ABI padding, so this is native semantic
 layout, not C WAL binary compatibility. C references: `xlog_internal.h:305–311`,
 `CreateEndOfRecoveryRecord`, and `xlog.c:9489–9510`.
 
-The research project has no deployed compatibility contract: native record
-version 7 and the `pg_lisp_wal_7` negotiation token remain unchanged. EOR extends
-that experimental format directly. No protocol upgrade machinery is introduced.
+EOR was introduced in experimental native record version 7. Its payload layout
+remains readable in stored version-7 WAL; current writers and native streaming
+use version 8, which adds compact transactional storage resets. No protocol
+upgrade machinery is introduced.
 
 EOR syntax is checked after CRC validation and before receive callbacks, including
 zero XID, version/type/length, field bounds and record positions. The encoder is
@@ -3237,9 +3238,10 @@ their required-applied boundary while migrating visibility from the base actual
 counter. Startup reconstructs that boundary before SQL admission. New actual
 observed-XID floors remain monotonic across subsequent restarts.
 
-Stored WAL versions 2–6 remain readable, including v6 checkpoint payloads. Native
-streaming now negotiates `pg_lisp_wal_7`, derived from the writer version. Upgrade
-both live native peers; a v6 peer cannot consume reservation records.
+Stored WAL versions 2–7 remain readable, including v6 checkpoint payloads and v7
+reservation records. Native streaming negotiates `pg_lisp_wal_8`, derived from
+the writer version. Upgrade both live native peers; older peers cannot consume
+compact storage reset records.
 
 The new `t/xid-reservation.sh` kills the source after reservation WAL flush but
 before its XID control-file update, and again after bytes reach disk but before
@@ -3280,9 +3282,9 @@ timeline lineage and oldest active FullXID. Its versioned 88-byte payload binds
 to the containing version-6-or-newer checkpoint record and validates segment boundaries.
 Legacy version-2 through version-5 empty checkpoints retain unknown metadata.
 Checkpoint payloads introduced in version 6 have 88-byte payloads and 32-byte headers.
-The current native stream negotiation token is `pg_lisp_wal_7`; old live peers are
+The current native stream negotiation token is `pg_lisp_wal_8`; old live peers are
 rejected during negotiation, rather than accepted and sent unreadable WAL.
-Stored WAL versions 2–6 remain readable, including version-5 logical records.
+Stored WAL versions 2–7 remain readable, including version-5 logical records.
 Upgrade both native streaming peers before reconnecting them.
 
 As in C's `CheckPoint`/`ControlFileData`, `PGWAL4` keeps a CRC-bound copy alongside
@@ -4344,7 +4346,7 @@ base boundary, requested record end and cumulative received-prefix checksum:
 
 ```
 START_REPLICATION PHYSICAL lsn
- (native_format 'pg_lisp_wal_7', proof_pin 'private_pin', system_id '...', timeline '1',
+ (native_format 'pg_lisp_wal_8', proof_pin 'private_pin', system_id '...', timeline '1',
  base_lsn '...', prefix_digest '...')
 ```
 
@@ -4353,7 +4355,11 @@ receiver control. PREPARE and RELEASE also use private pins. An optional
 `SLOT public_slot` may precede `PHYSICAL` to claim an existing public physical
 slot. An old START without `proof_pin`
 also returns `0A000`; there is no fallback from SLOT to proof pin. The native
-WAL format remains version 7. Unnamed streaming is supported.
+WAL format is version 8. It adds a compact reset for each replaced relation fork
+so `TRUNCATE` does not emit empty images for the old tail. Resets stay in their
+transaction batch and apply before replacement pages only after the batch's
+durable terminal. Replay treats them as destructive storage operations and waits
+for conflicting readers. Unnamed streaming is supported.
 
 Source acquisition validates identity/base and claims the pin under the WAL
 mutex; pin release rejects active senders. The durable pin remains after network

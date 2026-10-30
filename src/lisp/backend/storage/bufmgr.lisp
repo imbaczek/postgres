@@ -9,9 +9,9 @@
 (defvar *backend* nil)
 
 (defstruct relation-replacement
-  ;; PAGES owns private dirty references; the original remains visible to others.
-  ;; OLD-NBLOCKS survives repeated replacement so commit clears the whole old tail.
-  relfilenode fork old-nblocks (nblocks 0)
+  ;; PAGES owns private dirty references until abort or commit cleanup; the
+  ;; original remains visible to other backends until publication.
+  relfilenode fork (nblocks 0)
   (pages (make-hash-table :test #'eql)))
 
 (defvar *transaction-relation-replacements*
@@ -72,46 +72,46 @@
        (dolist (fork '(:main :visibility))
          (let* ((key (list relfilenode fork))
                 (previous (gethash key replacements))
-                (old-nblocks
-                  (if previous (relation-replacement-old-nblocks previous)
-                      (wal-visible-nblocks-under-lock relfilenode fork))))
-           (let ((replacement
-                   (make-relation-replacement :relfilenode relfilenode :fork fork
-                                              :old-nblocks old-nblocks)))
-             (sb-sys:without-interrupts
-               (when previous (discard-replacement-pages previous))
-               (setf (gethash key replacements) replacement))))))))
+                (replacement (make-relation-replacement :relfilenode relfilenode :fork fork)))
+           (sb-sys:without-interrupts
+             (when previous (discard-replacement-pages previous))
+             (setf (gethash key replacements) replacement)))))))
   (when (fboundp 'heap-fsm-forget) (funcall 'heap-fsm-forget relfilenode))
   (values))
 
 (defun publish-transaction-replacements-under-wal-lock (backend &optional direct-p)
-  "Publish replacement pages and clear the old tail in the commit critical section.
-DIRECT-P writes without WAL and cannot make a multi-page replacement crash atomic."
-  (let ((replacements (gethash backend *transaction-relation-replacements*)))
+  "Publish private pages and return owned fork-reset descriptors for commit.
+The descriptors remain valid across the durable commit callback, which may
+release the private replacements. Discarding cached pages costs work in the
+staged cache, but does not scan the old physical relation."
+  (let ((replacements (gethash backend *transaction-relation-replacements*))
+        (resets nil))
     (when replacements
+      (let ((nodes nil))
+        (maphash (lambda (key replacement)
+                   (declare (ignore key))
+                   (pushnew (relation-replacement-relfilenode replacement) nodes :test #'eql))
+                 replacements)
+        (wal-discard-relation-pages-under-lock nodes))
       (maphash
        (lambda (key replacement)
          (declare (ignore key))
          (let ((node (relation-replacement-relfilenode replacement))
                (fork (relation-replacement-fork replacement)))
-           (dotimes (block (max (relation-replacement-old-nblocks replacement)
-                                (relation-replacement-nblocks replacement)))
-             (let* ((reference (gethash block (relation-replacement-pages replacement)))
-                    (page (if reference
-                              (wal-dirty-read-reference (wal-page-key node block fork) reference)
-                              (let ((empty (make-page)))
-                                (page-init empty)
-                                empty))))
-               (if direct-p
-                   (smgr-write node block page fork)
-                   ;; This non-row write receives marker 0, so physical replay
-                   ;; defers replacement while readers hold the relation.
-                   (let ((*wal-row-page-write-p* nil))
-                     (wal-dirty-install-page (wal-page-key node block fork)
-                                             (wal-copy-dirty-page page))))))
+           (push (list node fork) resets)
+           (when direct-p (smgr-reset-fork node fork))
+           (maphash
+            (lambda (block reference)
+              (let ((page (wal-dirty-read-reference (wal-page-key node block fork) reference)))
+                (if direct-p
+                    (smgr-write node block page fork)
+                    (let ((*wal-row-page-write-p* nil))
+                      (wal-dirty-install-page (wal-page-key node block fork)
+                                              (wal-copy-dirty-page page))))))
+            (relation-replacement-pages replacement))
            (when direct-p (smgr-fsync node fork))))
-       replacements)))
-  (values))
+       replacements))
+    (nreverse resets)))
 
 (defun discard-transaction-replacements (backend)
   "Release BACKEND's private references and close scratch when no references remain."

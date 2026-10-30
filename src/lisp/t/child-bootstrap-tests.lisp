@@ -220,8 +220,8 @@
          (ok (signals (pg::physical-source-pin-bind-manifest pin 457) 'error))
          (flet ((command (digest)
                   (pg::parse-replication-command
-                   (format nil "START_REPLICATION PHYSICAL 0/0 (proof_pin 'child', native_format 'pg_lisp_wal_7', system_id '~d', timeline '7', base_lsn '0/0', prefix_digest '14695981039346656037'~a)"
-                           (pg::catalog-system-identifier)
+                   (format nil "START_REPLICATION PHYSICAL 0/0 (proof_pin 'child', native_format '~a', system_id '~d', timeline '7', base_lsn '0/0', prefix_digest '14695981039346656037'~a)"
+                           pg::+physical-native-format+ (pg::catalog-system-identifier)
                            (if digest (format nil ", manifest_digest '~d'" digest) "")))))
            (dolist (digest '(nil 457))
              (ok (signals (pg::physical-source-acquire-sender (command digest)) 'error))
@@ -262,7 +262,7 @@
                 (symbol-function 'pg::physical-promotion-retire-recovery) retire)))))
 
 (deftest child-stream-manifest-option-boundaries
-    (let ((prefix "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'pg_lisp_wal_7', system_id '123', timeline '7', base_lsn '0/0', prefix_digest '14695981039346656037'"))
+    (let ((prefix (format nil "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format '~a', system_id '123', timeline '7', base_lsn '0/0', prefix_digest '14695981039346656037'" pg::+physical-native-format+)))
       (dolist (suffix '(", manifest_digest '-1')" ", manifest_digest '18446744073709551616')"
                         ", manifest_digest 'bad')" ", manifest_digest '1', manifest_digest '2')"
                         ", unknown_manifest '1')"))
@@ -284,8 +284,8 @@
                       :timeline timeline :manifest-digest (when (= timeline 1) 456)
                       :restart-lsn 0 :consistent-lsn 0))
                 (command (pg::parse-replication-command
-                          (format nil "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format 'pg_lisp_wal_7', system_id '~d', timeline '~d', base_lsn '0/0', prefix_digest '14695981039346656037')"
-                                  (pg::catalog-system-identifier) timeline))))
+                          (format nil "START_REPLICATION PHYSICAL 0/0 (proof_pin 'copy', native_format '~a', system_id '~d', timeline '~d', base_lsn '0/0', prefix_digest '14695981039346656037')"
+                                  pg::+physical-native-format+ (pg::catalog-system-identifier) timeline))))
            (setf (gethash "copy" pg::*physical-source-pins*) pin)
            (ok (signals (pg::physical-source-acquire-sender command) 'error))
            (ok (null (gethash "copy" pg::*physical-source-senders*)))

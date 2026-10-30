@@ -160,6 +160,22 @@ def run():
         server.start()
         b = connect()
         assert b.query("SELECT id,payload FROM truncate_rows") == [["9", "final"]]
+        # A durable compact reset must redo after a crash both before storage
+        # application and after the old files are reset but before new roots.
+        for point in ("after-wal-flush", "after-relation-resets"):
+            server.control(f'(setf pg::*wal-test-pause-at* "{point}" '
+                           'pg::*wal-test-pause-fired* nil)')
+            b.send(b"Q", b"TRUNCATE truncate_rows\0")
+            fixture.wait_for_file(server.data / f"pg_wal/test-paused-{point}",
+                                  server.process)
+            server.stop(immediate=True)
+            b.close()
+            connections.clear()
+            server.start()
+            b = connect()
+            assert b.query("SELECT id FROM truncate_rows") == []
+            b.query("INSERT INTO truncate_rows VALUES(9,'final')")
+            assert b.query("SELECT payload FROM truncate_rows WHERE id=9") == [["final"]]
         b.query("TRUNCATE truncate_rows")
         server.stop(immediate=True)
         b.close()

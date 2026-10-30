@@ -61,6 +61,24 @@ REDO permits an existing file and never truncates it, matching smgrcreate redo."
       (write-page stream block page)
       block)))
 
+(defun smgr-reset-fork (relfilenode fork)
+  "Reset one fork without reading or rewriting its old pages.
+The caller must make the reset WAL durable before calling this for WAL-backed
+storage, and is responsible for the eventual fsync. Reopen the cached stream
+under the smgr lock so buffered state cannot survive the truncation."
+  (sb-thread:with-mutex (*smgr-lock*)
+    (let* ((key (list relfilenode fork))
+           (stream (smgr-open-locked relfilenode fork)))
+      (finish-output stream)
+      (sb-posix:ftruncate (sb-sys:fd-stream-fd stream) 0)
+      ;; Reopen after truncation to discard both buffered input and output state.
+      (close stream)
+      (remhash key *relation-streams*)
+      (smgr-open-locked relfilenode fork)))
+  (when (and (eq fork :main) (fboundp 'heap-fsm-forget))
+    (funcall 'heap-fsm-forget relfilenode))
+  (values))
+
 (defun smgr-fsync (relfilenode &optional (fork :main))
   (sb-thread:with-mutex (*smgr-lock*)
     (let ((stream (gethash (list relfilenode fork) *relation-streams*)))

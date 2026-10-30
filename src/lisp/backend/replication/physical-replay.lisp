@@ -6,20 +6,23 @@
 (defun physical-recovery-spool-directory ()
   (merge-pathnames "pg_physical_receive/" *pgdata*))
 
-(defun physical-recovery-check-base-forks (manifest removed)
-  "Require every original fork unless complete durable WAL proves its deletion.
-Native same-identity shrinking is not implemented. The mutable disk catalog
-can be ahead after a crash and never grants a missing-file exemption."
+(defun physical-recovery-check-base-forks (manifest removed &optional reset-forks)
+  "Require live base forks, allowing shrink only with an exact durable reset proof.
+A reset proof permits a shorter existing file for that relation and fork; it
+does not excuse a missing file or a different fork."
   (dolist (entry (getf manifest :files))
     (let ((name (first entry)))
-      (when (and (uiop:string-prefix-p "base/" name)
-                 (not (gethash (parse-integer name :start 5 :junk-allowed t) removed)))
-        (let ((path (merge-pathnames name *pgdata*)))
-          (unless (probe-file path)
-            (error "still-live base relation fork is missing: ~a" name))
-          (with-open-file (stream path :element-type '(unsigned-byte 8))
-            (unless (>= (file-length stream) (second entry))
-              (error "still-live base relation fork is truncated: ~a" name))))))))
+      (when (uiop:string-prefix-p "base/" name)
+        (let* ((node (parse-integer name :start 5 :junk-allowed t))
+               (fork (if (string= (or (pathname-type name) "") "vm") :visibility :main)))
+          (unless (gethash node removed)
+            (let ((path (merge-pathnames name *pgdata*)))
+              (unless (probe-file path)
+                (error "still-live base relation fork is missing: ~a" name))
+              (with-open-file (stream path :element-type '(unsigned-byte 8))
+                (unless (or (>= (file-length stream) (second entry))
+                            (and reset-forks (gethash (list node fork) reset-forks)))
+                  (error "still-live base relation fork is truncated: ~a" name))))))))))
 
 (defun physical-recovery-check-streaming-base (manifest control)
   "Validate unchanged provenance; changed relation/CLOG/catalog bytes require redo."

@@ -163,7 +163,7 @@ def check_archive_records(data, segment, first, history, logical_start):
     while position < len(data):
         assert position + 32 <= len(data)
         magic, version, kind, size, start, _, _ = struct.unpack_from("<4sHHIQQI", data, position)
-        assert magic == b"PGWL" and version == 7 and size >= 32
+        assert magic == b"PGWL" and version in (7, 8) and size >= 32
         assert start == segment * 16 * 1024 * 1024 + position
         record = data[position:position + size]
         assert len(record) == size
@@ -444,7 +444,7 @@ def check_promotion_eor(target, source, expected):
         data = child_path(start).read_bytes()
         record = data[start % size:]
         assert len(record) == 56 and record[:4] == b"PGWL"
-        assert struct.unpack_from("<HHIQQ", record, 4) == (7, 13, 56, start, 0)
+        assert struct.unpack_from("<HHIQQ", record, 4) == (8, 13, 56, start, 0)
         checked_crc(record, 28)
         timestamp = (struct.unpack_from("<q", control, 60)[0] - 946684800) * 1000000
         assert struct.unpack_from("<qIIII", record, 32) == (timestamp, child, parent, 2, 0)

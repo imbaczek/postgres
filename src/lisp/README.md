@@ -148,7 +148,7 @@ Native WAL checkpoints (payload introduced in version 6) preserve source counter
 and explicit start/end/redo positions in the record and the CRC-checked WAL
 control copy. The copy advances only after data/CLOG sync. Stored legacy WAL and
 controls remain readable with unknown checkpoint facts until a new checkpoint.
-Native streaming uses the experimental `pg_lisp_wal_7` format. End-of-recovery
+Native streaming uses the experimental `pg_lisp_wal_8` format. End-of-recovery
 syntax and read-only timeline checks use that same format; operational promotion
 remains unfinished.
 This does not provide C WAL or control-file disk compatibility.
@@ -172,6 +172,14 @@ remain in memory and grow with dirty pages; temporary record buffers also use
 memory. This is not a total process memory bound and does not remove logical
 transaction size limits. WAL is flushed before commit visibility and page
 application.
+`TRUNCATE` records one compact storage reset per replaced fork instead of
+writing empty page images for its old blocks. Replacement pages remain private
+until commit; recovery applies the reset and replacement images only after the
+batch terminal is durable. Work includes discarding staged cache entries and
+private pages, as well as handling replaced relations and new pages. It does not
+walk old physical pages or log an image for each one. Stored WAL
+versions 2–7 remain readable. Both native streaming peers must support format 8;
+older peers are rejected during negotiation.
 `./t/checkpoint-snapshot.sh` covers legacy upgrade, both publication crash
 boundaries, control-copy mismatch rejection and standby restartpoint preservation.
 Version 7 additionally logs native XID reservations before allocation. Standby
@@ -1229,6 +1237,9 @@ python3 ./t/command-complete.py # autocommit reply ordering, commit errors, reco
 python3 ./t/settings-rollback.py # transactional set_config undo, reset and successful persistence
 python3 ./t/portal-snapshot.py # Parse/Bind visibility, VACUUM protection and portal snapshot cleanup
 python3 ./t/truncate.py # whole-relation truncation, rollback, exclusion, indexes/TOAST and crash recovery
+python3 ./t/truncate-replay.py # native replay, restart, promotion and backup after truncation
+python3 ./t/truncate-size.py # compare WAL and page writes across relation sizes
+python3 ./t/truncate-speed.py # check truncation of a large sparse relation
 ./t/unique-index-concurrency.sh # unique-index build/drop writer races
 ./t/update-concurrency.sh # concurrent UPDATE chain and WHERE rechecks
 ./t/vacuum-update-concurrency.sh # ordinary VACUUM with same-page concurrent writers
@@ -1749,7 +1760,8 @@ storage supports child timelines and promotion across crashes. Standard follow
 configuration and rewind/rejoin remain unfinished.
 
 Native follow starts an unnamed stream with `START_REPLICATION PHYSICAL <lsn>`
-and options including `native_format 'pg_lisp_wal_7'` and exactly one private
+and options including `native_format 'pg_lisp_wal_8'` and exactly one private
 `proof_pin`. The optional `SLOT <public>` form claims an existing public slot.
 START without `proof_pin` also returns `0A000`; PREPARE, RELEASE and saved
-control continue to use private pins. Native format version 7 is unchanged.
+control continue to use private pins. Format 8 adds compact transactional storage
+resets; stored older WAL remains readable, but live peers must use the same format.

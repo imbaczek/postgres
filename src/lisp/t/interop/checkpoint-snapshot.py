@@ -58,7 +58,7 @@ def read_copy(pgdata):
         stream.seek(facts["start"] % 16777216)
         record = bytearray(stream.read(120))
     magic, wal_version, kind, size, start, xid, crc = struct.unpack_from("<4sHHIQQI", record)
-    assert wal_version in (6, 7)
+    assert wal_version in (6, 7, 8)
     assert wal_version >= 7 or data[:8] == b"PGCKPT01"
     assert (magic, kind, size, start, xid) == (b"PGWL", 4, 120, facts["start"], 0)
     struct.pack_into("<I", record, 28, 0)

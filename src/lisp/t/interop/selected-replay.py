@@ -209,7 +209,7 @@ def reject_bootstrap_for_anchor(system_id, fork, manifest, seed):
         user="postgres", dbname="postgres", replication="database", connect_timeout=3)
     connection.autocommit = True
     query_text = (f"START_REPLICATION PHYSICAL {fork >> 32:X}/{fork & 0xffffffff:08X} "
-                  f"(native_format 'pg_lisp_wal_7', proof_pin 'selected_follow', system_id '{system_id}', timeline '2', "
+                   f"(native_format 'pg_lisp_wal_8', proof_pin 'selected_follow', system_id '{system_id}', timeline '2', "
                   f"base_lsn '{fork >> 32:X}/{fork & 0xffffffff:08X}', prefix_digest '{seed}', manifest_digest '{manifest}')")
     try:
         try:

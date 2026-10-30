@@ -33,11 +33,15 @@
 
 (defconstant +wal-version-v6+ 6)
 
+(defconstant +wal-version-v7+ 7)
+
+(defconstant +wal-record-relation-reset+ 15)
+
 (defconstant +wal-record-end-of-recovery+ 13)
 
 (declaim (ftype function wal-end-of-recovery-record-info))
 
-(defconstant +wal-version+ 7)
+(defconstant +wal-version+ 8)
 
 (defvar *wal-keep-size-mb* 0
   "Installed wal_keep_size in MB; reload may change the retention horizon.")
@@ -225,6 +229,10 @@ Owners are process-local; the appropriate codec stores durable slot fields."
 (defvar *wal-recovery-reservation-batch-clean-p* nil)
 
 (defvar *wal-recovery-page-images* '())
+
+(defvar *wal-recovery-relation-resets* nil)
+
+(defvar *wal-recovery-page-records-seen-p* nil)
 
 (defvar *wal-recovery-page-spool-enabled* nil)
 
@@ -1087,6 +1095,57 @@ Legacy 16-hex segment names always belong to timeline 1."
                        (make-array 0 :element-type '(unsigned-byte 8)))
     start))
 
+(defun wal-encode-relation-reset (relfilenode fork)
+  (unless (typep relfilenode '(integer 1 4294967295))
+    (error "invalid relation reset identity"))
+  (let ((payload (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (wal-set-u32 payload 0 relfilenode)
+    (wal-set-u32 payload 4 (ecase fork (:main 0) (:visibility 1)))
+    payload))
+
+(defun wal-decode-relation-reset (record)
+  (let ((payload (wal-record-payload record)))
+    (unless (and (>= (wal-record-version record) 8)
+                 (= (length payload) 8)
+                 (plusp (wal-u32 payload 0))
+                 (<= (wal-u32 payload 4) 1)
+                 (typep (wal-record-xid record) '(integer 3 18446744073709551615))
+                 (>= (logand (wal-record-xid record) #xffffffff) 3))
+      (error "invalid relation reset WAL record"))
+    (list (wal-u32 payload 0) (if (zerop (wal-u32 payload 4)) :main :visibility))))
+
+(defun wal-recovery-stage-relation-reset (record)
+  ;; Keep resets ahead of page images and retain their XIDs for terminal checks.
+  ;; An incomplete batch is discarded without applying any of its resets.
+  (unless (and *wal-recovery-group-active*
+               (not *wal-recovery-page-records-seen-p*)
+               (null *wal-recovery-catalog-chunk-count*)
+               (null *wal-recovery-logical-chunk-count*)
+               (not *wal-recovery-logical-catalog-event-p*))
+    (error "relation reset must precede page images in a WAL batch"))
+  (let ((reset (wal-decode-relation-reset record)))
+    (when (find reset *wal-recovery-relation-resets* :key #'cdr :test #'equal)
+      (error "duplicate relation reset in a WAL batch"))
+    (push (cons (wal-record-xid record) reset) *wal-recovery-relation-resets*))
+  (values))
+
+(defun wal-apply-relation-resets (resets)
+  (dolist (reset resets)
+    (smgr-reset-fork (first reset) (second reset)))
+  (values))
+
+(defun wal-discard-relation-pages-under-lock (relfilenodes)
+  (dolist (pair (list (cons *wal-page-cache* *wal-page-cache-xids*)
+                      (cons *wal-page-batch* *wal-page-batch-xids*)))
+    (let ((pages (car pair)) (contributors (cdr pair)) (keys nil))
+      (when (hash-table-p pages)
+        (maphash (lambda (key reference)
+                   (declare (ignore reference))
+                   (when (member (first key) relfilenodes :test #'eql) (push key keys)))
+                 pages)
+        (dolist (key keys) (wal-dirty-remove-page key pages contributors)))))
+  (values))
+
 (defun wal-forget-xid-under-xid-lock (xid)
   "Remove XID's retained WAL position while the caller holds *XID-LOCK*."
   (remhash xid *wal-xid-first-lsn*)
@@ -1275,19 +1334,7 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
 (defun wal-discard-relation-pages (relfilenodes)
   "Forget staged images for unpublished detached relations in RELFILENODES."
   (with-wal-page-state-lock
-    (dolist (pair (list (cons *wal-page-cache* *wal-page-cache-xids*)
-                        (cons *wal-page-batch* *wal-page-batch-xids*)))
-      (let ((pages (car pair))
-            (contributors (cdr pair)))
-        (when (hash-table-p pages)
-          (let ((keys '()))
-            (maphash (lambda (key image)
-                       (declare (ignore image))
-                       (when (member (first key) relfilenodes :test #'eql)
-                         (push key keys)))
-                     pages)
-            (dolist (key keys)
-              (wal-dirty-remove-page key pages contributors))))))
+    (wal-discard-relation-pages-under-lock relfilenodes)
     (wal-dirty-close-empty-store))
   (values))
 
@@ -1316,8 +1363,10 @@ the transaction (see SnapBuildCommitTxn and CreateInitDecodingContext)."
 (declaim (ftype function wal-validate-logical-binary-capability-under-lock))
 
 (defun wal-commit-transaction (xid after-durable-function &optional logical-changes)
-  "Flush page images, LOGICAL-CHANGES, and XID's commit as one WAL boundary.
-Replacement publication runs inside the same fail-stop WAL critical section."
+  "Flush storage resets, page images and XID's commit as one WAL boundary.
+The reset descriptors are owned here across AFTER-DURABLE-FUNCTION, which may
+release the transaction's private replacements. Preflight the page spool before
+the terminal, then flush WAL before truncating any relation fork."
   (unless *wal-ready*
     (when (fboundp 'publish-transaction-replacements-under-wal-lock)
       (with-wal-critical
@@ -1327,14 +1376,19 @@ Replacement publication runs inside the same fail-stop WAL critical section."
     (return-from wal-commit-transaction (values)))
   (with-wal-critical
     (wal-validate-logical-binary-capability-under-lock xid)
-    (when (fboundp 'publish-transaction-replacements-under-wal-lock)
-      (funcall 'publish-transaction-replacements-under-wal-lock
-               (when (boundp '*backend*) (symbol-value '*backend*))))
-    (let ((keys (wal-primary-page-keys)) (split-p *wal-pending-btree-split*))
+    (let* ((resets
+             (when (fboundp 'publish-transaction-replacements-under-wal-lock)
+               (funcall 'publish-transaction-replacements-under-wal-lock
+                        (when (boundp '*backend*) (symbol-value '*backend*)))))
+           (keys (wal-primary-page-keys))
+           (split-p *wal-pending-btree-split*))
       (wal-primary-preflight-page-keys keys)
       (with-wal-primary-page-spool (spool)
         (wal-append-running-xacts-under-lock xid)
         (wal-primary-record-page-xids keys (wal-append-batch-start))
+        (dolist (reset resets)
+          (wal-append-record +wal-record-relation-reset+ xid
+                             (wal-encode-relation-reset (first reset) (second reset))))
         (wal-primary-append-pages keys spool)
         (wal-primary-seal-page-spool spool)
         (when logical-changes (wal-append-logical-changes xid logical-changes))
@@ -1347,6 +1401,8 @@ Replacement publication runs inside the same fail-stop WAL critical section."
           (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn))
         (wal-test-pause :after-wal-flush)
         (funcall after-durable-function)
+        (wal-apply-relation-resets resets)
+        (when resets (wal-test-pause :after-relation-resets))
         (wal-primary-apply-page-spool spool :split-p split-p :fault-on-first-write t)
         (wal-clear-page-cache)
         (setf *wal-pending-btree-split* nil))))
@@ -1658,7 +1714,8 @@ Follow a symlink at the WAL directory itself. Enumeration errors are reported."
                               +wal-record-catalog-chunk+
                               +wal-record-catalog-commit+
                               +wal-record-maintenance+))
-           (and (= type +wal-record-xid-reservation+) (>= version 7))
+           (and (= type +wal-record-relation-reset+) (>= version 8))
+           (and (= type +wal-record-xid-reservation+) (>= version +wal-version-v7+))
            (and (= type +wal-record-running-xacts+) (>= version 7))
            (and (= type +wal-record-end-of-recovery+) (>= version 7))
            (and (= type +wal-record-logical-changes+)
@@ -1683,7 +1740,7 @@ Follow a symlink at the WAL directory itself. Enumeration errors are reported."
                                        +wal-version-v3+
                                        +wal-version-v4+
                                        +wal-version-v5+
-                                       +wal-version-v6+
+                                       +wal-version-v6+ +wal-version-v7+
                                        +wal-version+))
                  (= (wal-u32 bytes 8) (length bytes))
                  (= (wal-u64 bytes 12) expected-lsn)
@@ -1951,14 +2008,16 @@ src/backend/access/transam/xlogreader.c."
   (when (and *wal-recovery-catalog-chunk-count*
              (not catalog-chunks-p))
     (error "WAL catalog chunks lack a catalog commit record"))
-  ;; Decode and validate the terminal operation before touching any relation
-  ;; pages. Chunked catalog metadata must be reassembled and decoded first.
+  ;; Validate the terminal and every spooled page before destructive resets.
+  ;; Chunked catalog metadata must be reassembled and decoded first. Apply
+  ;; resets before the batch's page images; an incomplete batch applies neither.
   (let ((terminal-function (funcall terminal-preparer)))
     (unless (functionp terminal-function)
       (error "WAL terminal validation did not produce an apply operation"))
     (when *wal-recovery-page-spool*
       (logical-spool-seal *wal-recovery-page-spool*)
       (wal-recovery-map-page-spool (lambda (images) (declare (ignore images)))))
+    (wal-apply-relation-resets (mapcar #'cdr (reverse *wal-recovery-relation-resets*)))
     (if *wal-recovery-page-spool-enabled*
         (wal-recovery-map-page-spool #'wal-apply-page-images)
         (wal-apply-page-images (nreverse *wal-recovery-page-images*)))
@@ -1967,6 +2026,8 @@ src/backend/access/transam/xlogreader.c."
   (setf *wal-recovery-reservation-batch-clean-p* nil
         *wal-recovery-group-active* nil
         *wal-recovery-page-images* '()
+        *wal-recovery-relation-resets* nil
+        *wal-recovery-page-records-seen-p* nil
         *wal-recovery-catalog-chunks* '()
         *wal-recovery-catalog-chunk-count* nil
         *wal-recovery-catalog-next-chunk* 0)
@@ -1975,6 +2036,11 @@ src/backend/access/transam/xlogreader.c."
   (values))
 
 (defun wal-recovery-validate-logical-terminal (kind &optional xid)
+  ;; A reset belongs only to a commit terminal for the same transaction.
+  (when *wal-recovery-relation-resets*
+    (unless (and (eq kind :commit)
+                 (every (lambda (reset) (eql xid (car reset))) *wal-recovery-relation-resets*))
+      (error "relation resets require their transaction's commit terminal")))
   (ecase kind
     (:commit
      (when *wal-recovery-logical-catalog-event-p*
@@ -2011,16 +2077,21 @@ src/backend/access/transam/xlogreader.c."
        (wal-recovery-close-page-spool)
        (setf *wal-recovery-group-active* t
              *wal-recovery-page-images* '()
+             *wal-recovery-relation-resets* nil
+             *wal-recovery-page-records-seen-p* nil
              *wal-recovery-catalog-chunks* '()
              *wal-recovery-catalog-chunk-count* nil
              *wal-recovery-catalog-next-chunk* 0)
        (wal-recovery-reset-logical-change-batch)
        (setf *wal-recovery-logical-catalog-event-p* nil))
+      ((= (wal-record-type record) +wal-record-relation-reset+)
+       (wal-recovery-stage-relation-reset record))
       ((= (wal-record-type record) +wal-record-pages+)
        (unless *wal-recovery-group-active*
          (error "WAL page images appear outside a batch"))
        (when *wal-recovery-catalog-chunk-count*
          (error "WAL page images follow catalog chunks in a batch"))
+       (setf *wal-recovery-page-records-seen-p* t)
        (if *wal-recovery-page-spool-enabled*
            (wal-recovery-stage-page-record record)
            (setf *wal-recovery-page-images*
@@ -2125,6 +2196,8 @@ src/backend/access/transam/xlogreader.c."
   `(let ((*wal-recovery-reservation-batch-clean-p* nil)
          (*wal-recovery-group-active* nil)
          (*wal-recovery-page-images* '())
+         (*wal-recovery-relation-resets* nil)
+         (*wal-recovery-page-records-seen-p* nil)
          (*wal-recovery-page-spool* nil)
          (*wal-recovery-catalog-chunks* '())
          (*wal-recovery-catalog-chunk-count* nil)

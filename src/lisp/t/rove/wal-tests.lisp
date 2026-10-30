@@ -494,8 +494,8 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
              (smgr-forget 7310)
              (rove:ok (= 99 (aref (buf-read 7310 0) 100))
                       "committed replacement survives closing cached relation streams")
-             (rove:ok (zerop (aref (buf-read 7310 1) 100))
-                      "old physical tail is empty after commit")
+             (rove:ok (and (= 1 (smgr-nblocks 7310)) (null (buf-read 7310 1)))
+                      "old physical tail is removed after commit")
              (let ((*wal-ready* t)
                    (*wal-row-page-write-p* t))
                (transaction-replace-relation 7310)
@@ -508,6 +508,156 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                (wal-clear-page-cache)))
         (discard-transaction-replacements *backend*)
         (wal-clear-page-cache)
+        (smgr-close-all)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-wal-relation-reset-batches
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-reset-redo-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*pgdata* directory)
+           (*query-temp-directory* directory)
+           (*relation-streams* (make-hash-table :test #'equal))
+           (original (page-init (make-page)))
+           (replacement (page-init (make-page)))
+           (clog-set (symbol-function 'clog-set))
+           (committed nil))
+      (ensure-directories-exist (merge-pathnames "base/" directory))
+      (setf (aref original 100) 42 (aref replacement 100) 99)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'clog-set)
+                   (lambda (xid status) (push (list xid status) committed)))
+             (rove:ok (loop for version from 2 to 7
+                            never (wal-valid-type-p +wal-record-relation-reset+ version)))
+             (rove:ok (wal-valid-type-p +wal-record-relation-reset+ 8))
+             (rove:ok (wal-valid-type-p +wal-record-running-xacts+ 7))
+             (dolist (spool-p '(nil t))
+               (smgr-reset-fork 7311 :main)
+               (smgr-write 7311 0 original)
+               (smgr-write 7311 1 original)
+               (let ((*wal-recovery-page-spool-enabled* spool-p)
+                     (*wal-checkpoint-lsn* 0)
+                     (cursor 0))
+                 (with-wal-replay-staging ()
+                   (flet ((record (type xid payload)
+                            (prog1 (make-wal-record :version 8 :type type :xid xid
+                                                    :start cursor
+                                                    :end (+ cursor +wal-header-size+ (length payload))
+                                                    :payload payload)
+                              (incf cursor (+ +wal-header-size+ (length payload))))))
+                     (wal-replay-record (record +wal-record-batch-start+ 0 #()))
+                     (wal-replay-record (record +wal-record-relation-reset+ 44
+                                                (wal-encode-relation-reset 7311 :main)))
+                     (rove:ok (= 2 (smgr-nblocks 7311)) "an unterminated reset changes no storage")
+                     (rove:ok (handler-case
+                                  (progn (wal-recovery-validate-logical-terminal :other) nil)
+                                (error () t))
+                              "a reset cannot attach to a maintenance or catalog terminal")
+                     (rove:ok (handler-case
+                                  (progn (wal-recovery-validate-logical-terminal :commit 45) nil)
+                                (error () t))
+                              "a reset belongs to its exact committing transaction")
+                     ;; A new batch discards a reset left by a crashed transaction.
+                     (wal-replay-record (record +wal-record-batch-start+ 0 #()))
+                     (wal-replay-record (record +wal-record-commit+ 45
+                                                (wal-encode-commit-timestamp 0)))
+                     (rove:ok (= 2 (smgr-nblocks 7311)) "a new batch drops incomplete reset work")
+                     (wal-replay-record (record +wal-record-batch-start+ 0 #()))
+                     (wal-replay-record (record +wal-record-relation-reset+ 44
+                                                (wal-encode-relation-reset 7311 :main)))
+                     (let* ((image (make-wal-page-image :relfilenode 7311 :block 0
+                                                        :page (copy-seq replacement)))
+                            (length (wal-page-payload-length (list image)))
+                            (payload (wal-encode-page-images
+                                      (list image) (+ cursor +wal-header-size+ length))))
+                       (wal-replay-record (record +wal-record-pages+ 0 payload)))
+                     (rove:ok (handler-case
+                                  (progn
+                                    (wal-recovery-stage-relation-reset
+                                     (record +wal-record-relation-reset+ 44
+                                             (wal-encode-relation-reset 7311 :visibility)))
+                                    nil)
+                                (error () t))
+                              "reset records cannot follow page images")
+                     (wal-replay-record (record +wal-record-commit+ 44
+                                                (wal-encode-commit-timestamp 0)))
+                     (rove:ok (= 1 (smgr-nblocks 7311)))
+                     (rove:ok (= 99 (aref (smgr-read 7311 0) 100)))
+                     (rove:ok (null (smgr-read 7311 1)))
+                     (smgr-fsync-all)
+                     (smgr-forget 7311)
+                     (rove:ok (= 1 (smgr-nblocks 7311)) "reset survives closing buffered streams")))))
+             (rove:ok (member '(44 1) committed :test #'equal)))
+        (setf (symbol-function 'clog-set) clog-set)
+        (smgr-close-all)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-wal-relation-reset-rejects-invalid-storage-work
+    (let* ((directory (merge-pathnames
+                       (format nil "pg-reset-invalid-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*pgdata* directory) (*query-temp-directory* directory)
+           (*relation-streams* (make-hash-table :test #'equal))
+           (*wal-recovery-page-spool-enabled* t)
+           (*logical-capture-memory-bytes* 0)
+           (*wal-checkpoint-lsn* 0)
+           (original (page-init (make-page)))
+           (payload (wal-encode-relation-reset 7312 :main))
+           (start (make-wal-record :type +wal-record-batch-start+ :xid 0 :payload #() :end 10))
+           (reset (make-wal-record :version 8 :type +wal-record-relation-reset+
+                                   :xid 44 :payload payload :end 50)))
+      (ensure-directories-exist (merge-pathnames "base/" directory))
+      (unwind-protect
+           (progn
+             (setf (aref original 100) 42)
+             (smgr-write 7312 0 original)
+             (smgr-write 7312 1 original)
+             (dolist (bad (list
+                           (make-wal-record :version 8 :xid 44 :payload #(0))
+                           (make-wal-record :version 8 :xid 44
+                                            :payload (make-array 8 :element-type '(unsigned-byte 8)
+                                                                   :initial-element 0))
+                           (make-wal-record :version 8 :xid 44
+                                            :payload (let ((bytes (copy-seq payload)))
+                                                       (wal-set-u32 bytes 4 2) bytes))
+                           (make-wal-record :version 8 :xid 0 :payload payload)
+                           (make-wal-record :version 7 :xid 44 :payload payload)))
+               (rove:ok (handler-case (progn (wal-decode-relation-reset bad) nil) (error () t))))
+             (with-wal-replay-staging ()
+               (wal-replay-record start)
+               (wal-replay-record reset)
+               (rove:ok (handler-case (progn (wal-replay-record reset) nil) (error () t))
+                        "duplicate resets do not create ambiguous storage work"))
+             (with-wal-replay-staging ()
+               (wal-replay-record start)
+               (wal-replay-record reset)
+               (let* ((image (make-wal-page-image :relfilenode 7312 :block 0
+                                                  :page (page-init (make-page))))
+                      (one (make-wal-record :version 8 :type +wal-record-pages+ :end 100
+                                            :payload (wal-encode-page-images (list image) 100)))
+                      (two (make-wal-record :version 8 :type +wal-record-pages+ :end 200
+                                            :payload (wal-encode-page-images (list image) 200))))
+                 (wal-replay-record one)
+                 (wal-replay-record two)
+                 (let ((file (logical-spool-stream *wal-recovery-page-spool*))
+                       (offset (+ 8 12 (length (wal-record-payload one)) 8 12 20)))
+                   (finish-output file)
+                   (file-position file offset)
+                   (write-byte 99 file)
+                   (finish-output file))
+                 (rove:ok
+                  (handler-case
+                      (progn
+                        (wal-replay-record
+                         (make-wal-record :version 8 :type +wal-record-commit+ :xid 44 :end 300
+                                          :payload (wal-encode-commit-timestamp 0)))
+                        nil)
+                    (error (condition) (search "checksum mismatch" (princ-to-string condition))))
+                  "all page records validate before a committed reset touches storage")
+                 (rove:ok (= 2 (smgr-nblocks 7312)))
+                 (rove:ok (= 42 (aref (smgr-read 7312 0) 100)))
+                 (rove:ok (= 42 (aref (smgr-read 7312 1) 100))))))
         (smgr-close-all)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 

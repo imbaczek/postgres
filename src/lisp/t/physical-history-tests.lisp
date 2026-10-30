@@ -25,7 +25,7 @@
                    (pg::physical-store-input store cursor raw)
                    (incf cursor (length raw)))))
              (pg::physical-store-flush store)
-             (prog1 (pg::physical-recovery-proven-drops store "history-source")
+             (multiple-value-prog1 (pg::physical-recovery-proven-drops store "history-source")
                (ok (not (probe-file (merge-pathnames "global/pg_catalog.dat" root))))
                (ok (not (probe-file (merge-pathnames "base/" root))))
                (ok (not (probe-file (merge-pathnames "pg_xact" root))))))
@@ -134,3 +134,36 @@
                                     (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0))
         (ok (not (intake-fails-p
                   (lambda () (pg::physical-recovery-check-base-forks manifest removed))))))))
+
+(deftest physical-history-committed-resets-prove-shrink-only
+    (let* ((prefix (list (list pg::+wal-record-batch-start+ (empty-octets))
+                         (list pg::+wal-record-relation-reset+ (pg::wal-encode-relation-reset 900 :main) 44)
+                         (list pg::+wal-record-relation-reset+ (pg::wal-encode-relation-reset 900 :visibility) 44)))
+           (complete (append prefix
+                             (list (list pg::+wal-record-commit+ (pg::wal-encode-commit-timestamp 0) 44)))))
+      (multiple-value-bind (removed terminal resets) (history-drop-proof prefix)
+        (declare (ignore removed terminal))
+        (ok (zerop (hash-table-count resets))))
+      (ok (intake-fails-p
+           (lambda ()
+             (history-drop-proof
+              (append prefix
+                      (list (list pg::+wal-record-commit+ (pg::wal-encode-commit-timestamp 0) 45)))))))
+      (multiple-value-bind (removed terminal resets) (history-drop-proof complete)
+        (declare (ignore terminal))
+        (ok (not (gethash 900 removed)))
+        (ok (gethash '(900 :main) resets))
+        (ok (gethash '(900 :visibility) resets))
+        (with-physical-store-directory (root)
+          (let ((pg::*pgdata* root)
+                (manifest (list :files '(("base/900" 16 0) ("base/900.vm" 8 0)))))
+            (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
+            (dolist (name '("base/900" "base/900.vm"))
+              (pg::wal-atomic-write-bytes (merge-pathnames name root) (empty-octets)))
+            (ok (not (intake-fails-p
+                      (lambda () (pg::physical-recovery-check-base-forks manifest removed resets)))))
+            (ok (intake-fails-p
+                 (lambda () (pg::physical-recovery-check-base-forks manifest removed))))
+            (delete-file (merge-pathnames "base/900" root))
+            (ok (intake-fails-p
+                 (lambda () (pg::physical-recovery-check-base-forks manifest removed resets)))))))))

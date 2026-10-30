@@ -74,7 +74,7 @@ def save_expected(target, output):
 def read_record(root, child, start, length, kind):
     data = path_for(root, child, start).read_bytes()[start % SIZE:start % SIZE + length]
     assert len(data) == length and data[:4] == b"PGWL"
-    assert struct.unpack_from("<HHIQQ", data, 4) == (7, kind, length, start, 0)
+    assert struct.unpack_from("<HHIQQ", data, 4) == (8, kind, length, start, 0)
     crc(data, 28)
     return data
 
@@ -157,7 +157,7 @@ def checkpoint_bytes(expected):
                      floor if floor < (1 << 64) else 0, floor - 1, expected["oid"],
                      expected["time"], expected["child"], expected["parent"],
                      floor if floor < (1 << 64) else 0, 1, 3 if floor == (1 << 64) else 0)
-    record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 7, 4, 120, start, 0, 0) + snapshot)
+    record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 8, 4, 120, start, 0, 0) + snapshot)
     struct.pack_into("<I", record, 28, zlib.crc32(record))
     return start, record
 

@@ -1,6 +1,8 @@
 ;;;; Read-only native catalog history validation before standby redo.
 (in-package #:pg)
 
+(defvar *physical-history-reset-forks* nil)
+
 (defmacro with-physical-replay-staging (() &body body)
   `(let ((*wal-recovery-page-spool-enabled* t))
      (with-wal-replay-staging () ,@body)))
@@ -8,7 +10,9 @@
 (defun physical-history-reset (active)
   (wal-recovery-close-page-spool)
   (unless active (setf *wal-recovery-reservation-batch-clean-p* nil))
-  (setf *wal-recovery-page-images* nil
+  (setf *wal-recovery-page-records-seen-p* nil
+        *wal-recovery-relation-resets* nil
+        *wal-recovery-page-images* nil
         *wal-recovery-group-active* active
         *wal-recovery-catalog-chunks* nil
         *wal-recovery-catalog-chunk-count* nil
@@ -123,7 +127,10 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
     (cond
       ((= type +wal-record-commit+)
        (wal-decode-commit-timestamp payload)
-       (wal-recovery-validate-logical-terminal :commit (wal-record-xid record)))
+       (wal-recovery-validate-logical-terminal :commit (wal-record-xid record))
+       (when *physical-history-reset-forks*
+         (dolist (reset *wal-recovery-relation-resets*)
+           (setf (gethash (copy-list (cdr reset)) *physical-history-reset-forks*) t))))
       ((member type (list +wal-record-catalog+ +wal-record-catalog-commit+))
        (wal-recovery-validate-logical-terminal :catalog)
        (physical-history-accept-catalog
@@ -153,9 +160,11 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
   (let ((type (wal-record-type record)))
     (cond
       ((= type +wal-record-batch-start+) (physical-history-reset t))
+      ((= type +wal-record-relation-reset+) (wal-recovery-stage-relation-reset record))
       ((= type +wal-record-pages+)
        (unless (and *wal-recovery-group-active* (not *wal-recovery-catalog-chunk-count*))
          (error "page images outside a batch or after catalog chunks in history"))
+       (setf *wal-recovery-page-records-seen-p* t)
        (wal-decode-page-images (wal-record-payload record)
                                (wal-record-end record) (wal-record-version record)))
       ((= type +wal-record-logical-changes+)
@@ -172,11 +181,13 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
 
 (defun physical-recovery-proven-drops (store identity &key
                                                         (start-lsn (physical-store-floor-lsn store)) required-lsn (policy (getf *physical-recovery-state* :timeline-policy)))
-  "Certify drops only from complete catalog terminals in validated durable WAL.
+  "Certify drops and fork resets from complete terminals in validated durable WAL.
 An unfinished batch grants no exemption. REQUIRED-LSN must be a complete terminal.
-Return the deletion set and last terminal. No database files are written."
+Return three values: the deletion set, last terminal, and the set of exact
+relation/fork pairs with committed resets. No database files are written."
   (with-physical-replay-staging ()
-    (let ((removed (make-hash-table :test #'eql))
+    (let ((*physical-history-reset-forks* (make-hash-table :test #'equal))
+          (removed (make-hash-table :test #'eql))
           (terminal start-lsn)
           (timeline (physical-store-prefix-timeline store start-lsn))
           (required-found (eql required-lsn start-lsn)))
@@ -191,4 +202,4 @@ Return the deletion set and last terminal. No database files are written."
        :start-lsn start-lsn :policy policy)
       (when (and required-lsn (not required-found))
         (error "durable WAL lost a previously applied terminal"))
-      (values removed terminal))))
+      (values removed terminal *physical-history-reset-forks*))))

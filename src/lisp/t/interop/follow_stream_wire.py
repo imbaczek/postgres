@@ -11,7 +11,7 @@ def lsn(value):
 def start_query(proof_pin, system_id, base, cursor, timeline, manifest, seed, public_slot=None):
     public = f"SLOT {public_slot} " if public_slot is not None else ""
     return (f"START_REPLICATION {public}PHYSICAL {lsn(cursor)} "
-            f"(native_format 'pg_lisp_wal_7', proof_pin '{proof_pin}', mode 'follow', system_id '{system_id}', "
+             f"(native_format 'pg_lisp_wal_8', proof_pin '{proof_pin}', mode 'follow', system_id '{system_id}', "
             f"timeline '{timeline}', base_lsn '{lsn(base)}', prefix_digest '{seed}', "
             f"manifest_digest '{manifest}')")
 
@@ -26,7 +26,7 @@ def prepare_query(slot, system_id, base, cursor, manifest, seed, prefix):
     overlap = ((cursor - 1) // 16777216) * 16777216
     for byte in prefix[overlap:cursor]:
         digest = ((digest ^ byte) * 1099511628211) & ((1 << 64) - 1)
-    return (f"PREPARE_FOLLOW SLOT {slot} (native_format 'pg_lisp_wal_7', "
+    return (f"PREPARE_FOLLOW SLOT {slot} (native_format 'pg_lisp_wal_8', "
             f"system_id '{system_id}', base_timeline '1', base_lsn '{lsn(base)}', "
             f"manifest_digest '{manifest}', source_timeline '2', receive_timeline '1', "
             f"receive_lsn '{lsn(cursor)}', prefix_digest '{seed}', "
@@ -88,7 +88,7 @@ def prepare_rejections(port, system_id, base, fork, manifest, seed, prefix):
     cases = [(query[:-1] + ", history 'forged')", "0A000"),
              (query[:-1] + ", eor_hex '00')", "0A000"),
              (query[:-1] + f", system_id '{system_id}')", "0A000"),
-             (query.replace("pg_lisp_wal_7", "wrong_format"), "0A000"),
+              (query.replace("pg_lisp_wal_8", "wrong_format"), "0A000"),
              (query.replace(f"system_id '{system_id}'", f"system_id '{system_id ^ 1}'"), "55000"),
              (query.replace("source_timeline '2'", "source_timeline '3'"), "55000"),
              (query.replace("receive_timeline '1'", "receive_timeline '2'"), "55000"),
