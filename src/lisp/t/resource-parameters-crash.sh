@@ -106,10 +106,12 @@ for point in after-wal-flush after-control-save; do
         check_control 200,16,20,0,256
     fi
     start
-    check_control 200,16,20,0,256
+    check_control 100,8,10,0,64
+    python3 "$BASE/t/interop/resource-report-history.py" "$TMP/data" \
+        200,16,20,0,256 100,8,10,0,64
     [ "$(sql 'SELECT id FROM resource_crash_witness')" = 2 ]
     control '(let ((end *wal-end-lsn*))
-      (wal-report-resource-parameters (make-resource-parameters 200 16 20 0 256))
+      (wal-report-resource-parameters *installed-resource-parameters*)
       (assert (= end *wal-end-lsn*)))'
 done
 
@@ -129,6 +131,6 @@ kill "$SRV"
 wait "$SRV"
 SRV=
 start
-check_control 50,4,5,0,64
+check_control 100,8,10,0,64
 [ "$(sql 'SELECT id FROM resource_crash_witness')" = 2 ]
 echo 'resource-parameters-crash: PASS (flush/control SIGKILL, replay repair, decrease, checkpoint backup and restart)'

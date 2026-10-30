@@ -48,7 +48,7 @@ SOURCE=$!
 test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 sql "$PORT" 'CREATE TABLE data (id integer PRIMARY KEY); INSERT INTO data VALUES (1)'
 if [ "${RESOURCE_FACTS:-0}" = 1 ]; then
-    checked source '(wal-report-resource-parameters (make-resource-parameters 100 8 10 0 128))' resource-initial
+    checked source '(wal-report-resource-parameters (make-resource-parameters 100 8 10 0 64))' resource-initial
 fi
 checked source "(physical-base-backup \"$TMP/copy/\" \"online_promotion\")" backup
 start_target
@@ -152,7 +152,7 @@ wait_value 'SELECT pg_is_in_recovery()' f
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 12
 checked target '(assert (and (not *physical-follow-runtime*) (not *physical-restartpoint-worker*) (not *physical-promotion-stopping-p*) (not *physical-recovery-state*) (not *physical-recovery-failed-p*)))' primary
 if [ "${RESOURCE_FACTS:-0}" = 1 ]; then
-    checked target "(assert (equal '(50 4 5 0 64) (getf *wal-control-metadata* :resource-parameters)))" resource-promoted
+    checked target "(progn (assert (equal '(50 4 5 0 64) (getf *wal-checkpoint-snapshot* :resource-parameters))) (assert (equal '(100 8 10 0 64) (getf *wal-control-metadata* :resource-parameters))) (assert (= 2 (getf *wal-control-metadata* :resource-timeline))))" resource-promoted
 fi
 if [ "${LIVE_CHILD_ADOPTION:-0}" = 1 ]; then
     checked target '(assert *promotion-live-test-preserved*)' live-adoption-preserved
@@ -167,7 +167,7 @@ test "$(sql "$TARGET_PORT" 'SELECT pg_is_in_recovery()')" = f
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 12
 test "$(sql "$TARGET_PORT" 'SELECT id FROM after_promotion')" = 11
 if [ "${RESOURCE_FACTS:-0}" = 1 ]; then
-    checked target "(assert (equal '(50 4 5 0 64) (getf *wal-control-metadata* :resource-parameters)))" resource-restarted
+    checked target "(assert (equal '(100 8 10 0 64) (getf *wal-control-metadata* :resource-parameters)))" resource-restarted
 fi
 if [ -e "$TMP/copy/physical-follow.control" ]; then
     checked target '(let ((config (physical-follow-read-config))) (assert (physical-follow-cleanup-only-p config)) (assert (not (getf (physical-follow-controller-state config) :enabled))))' retired-follow
