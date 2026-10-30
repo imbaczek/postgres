@@ -25,6 +25,7 @@
     ("hot_standby" :postmaster :boolean "on")
     ("max_connections" :postmaster :integer "100" 1 262143 nil)
     ("max_wal_senders" :postmaster :integer "10" 0 262143 nil)
+    ("max_locks_per_transaction" :postmaster :integer "128" 10 2147483647 nil)
     ("reserved_connections" :postmaster :integer "0" 0 262143 nil)
     ("superuser_reserved_connections" :postmaster :integer "3" 0 262143 nil)
     ("max_replication_slots" :postmaster :integer "10" 0 262143 nil)
@@ -557,11 +558,11 @@ A reload may record a different desired value, but does not change this goal."
 
 (defun startup-resource-capacity-plan (settings)
   "Plan the installed tuple and relation lock capacities from startup settings.
-Worker processes, prepared transactions and locks per transaction currently use
-internal fixed values of 8, 0 and 64, respectively."
+Worker processes and prepared transactions currently use internal values 8 and 0."
   (let ((parameters (make-resource-parameters
                      (startup-setting-value settings "max_connections") 8
-                     (startup-setting-value settings "max_wal_senders") 0 64)))
+                     (startup-setting-value settings "max_wal_senders") 0
+                     (startup-setting-value settings "max_locks_per_transaction"))))
     (multiple-value-bind (objects owners) (resource-lock-capacities parameters)
       (values parameters objects owners))))
 

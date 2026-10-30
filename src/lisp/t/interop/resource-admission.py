@@ -208,9 +208,27 @@ def legacy_unknown():
     print("resource-admission: unknown legacy facts reject hot standby and permit OFF recovery PASS")
 
 
+def lock_setting_reload():
+    assert sql("source", "SHOW max_locks_per_transaction") == "128"
+    (ROOT / "source/postgresql.conf").write_text("max_locks_per_transaction=149\n")
+    control("source", "(reload)")
+    assert sql("source", "SHOW max_locks_per_transaction") == "128"
+    assert sql("source", "SELECT pending_restart FROM pg_settings WHERE name='max_locks_per_transaction'")
+    control("source", "(assert (and (= 128 (resource-parameters-locks *installed-resource-parameters*)) (= (* 128 136) *relation-lock-object-limit*) (= (* 2 128 136) *relation-lock-owner-limit*)))")
+    SERVERS["source"].send_signal(2)
+    assert SERVERS["source"].wait(timeout=45) == 0
+    start("source")
+    assert sql("source", "SHOW max_locks_per_transaction") == "149"
+    assert not sql("source", "SELECT pending_restart FROM pg_settings WHERE name='max_locks_per_transaction'")
+    control("source", "(assert (and (= 149 (resource-parameters-locks *installed-resource-parameters*)) (= (* 149 136) *relation-lock-object-limit*) (= (* 2 149 136) *relation-lock-owner-limit*) (= 149 (fifth (getf *wal-control-metadata* :resource-parameters)))))")
+    control("source", "(let ((end *wal-end-lsn*)) (wal-report-installed-resource-capacity) (assert (= end *wal-end-lsn*)))")
+    print("resource-admission: lock GUC reload retains installed pool; restart sizes and reports new pool PASS")
+
+
 try:
     exercise()
     legacy_unknown()
+    lock_setting_reload()
 finally:
     for process in SERVERS.values():
         if process.poll() is None:

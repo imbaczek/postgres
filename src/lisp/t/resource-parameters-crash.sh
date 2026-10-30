@@ -29,7 +29,8 @@ start() {
     # Every previous owned PID has been reaped; SIGKILL leaves its socket node.
     [ -z "$SRV" ]
     rm -f "$SOCK"
-    test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-socket "$SOCK"
+    test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-socket "$SOCK" \
+        -c max_locks_per_transaction=64
     test_wait_owned_sql_server "$SRV" "$PORT" psql 300
     control "(assert (equal (namestring *pgdata*) \"$TMP/data/\"))"
 }

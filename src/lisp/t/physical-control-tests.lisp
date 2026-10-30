@@ -55,13 +55,13 @@
           (pg::*relation-lock-object-limit* nil)
           (pg::*relation-lock-owner-limit* nil))
       (let ((installed (pg::startup-install-resource-capacity settings)))
-        (ok (equal '(100 8 10 0 64) (pg::resource-parameters-values installed)))
-        (ok (= 8704 pg::*relation-lock-object-limit*))
-        (ok (= 17408 pg::*relation-lock-owner-limit*))
+        (ok (equal '(100 8 10 0 128) (pg::resource-parameters-values installed)))
+        (ok (= 17408 pg::*relation-lock-object-limit*))
+        (ok (= 34816 pg::*relation-lock-owner-limit*))
         (ok (intake-fails-p (lambda () (pg::startup-install-resource-capacity settings))))
         (ok (eq installed pg::*installed-resource-parameters*))
-        (ok (= 8704 pg::*relation-lock-object-limit*))
-        (ok (= 17408 pg::*relation-lock-owner-limit*)))))
+        (ok (= 17408 pg::*relation-lock-object-limit*))
+        (ok (= 34816 pg::*relation-lock-owner-limit*)))))
 
 (deftest resource-recovery-admission-requires-known-adequate-facts-only-for-hot-standby
     (let* ((local (pg::make-resource-parameters 100 8 10 0 64))
