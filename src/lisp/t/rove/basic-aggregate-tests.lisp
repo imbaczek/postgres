@@ -1376,6 +1376,19 @@
            (statement (first (parse-statements sql))))
       (rove:ok (= typmod (getf (first (getf statement :columns)) :typmod)))))
 
+(rove:deftest json-variadic-canonical-replay
+    (let* ((table (make-pg-class :name "t" :columns #()))
+           (source (first (parse-statements "SELECT jsonb_build_array(VARIADIC ARRAY['2020-01-02'::date])")))
+           (raw (getf (first (getf source :targets)) :expr))
+           (cooked (analyze-expr raw table))
+           (sql (catalog-canonical-expression-sql cooked table))
+           (parsed (getf (first (getf (first (parse-statements (concatenate 'string "SELECT " sql))) :targets)) :expr))
+           (replayed (analyze-expr parsed table)))
+      (rove:ok (search "VARIADIC" sql))
+      (rove:ok (string= (sql-jsonb-output (eval-expr cooked #()))
+                        (sql-jsonb-output (eval-expr replayed #()))))
+      (rove:ok (string= "[\"2020-01-02\"]" (sql-jsonb-output (eval-expr replayed #()))))))
+
 (rove:deftest temporal-check-canonical-replay
     (let* ((*backend* (make-backend))
            (column (make-pg-column :name "d" :type :date :typmod -1 :attnum 1))

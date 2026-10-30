@@ -1182,6 +1182,10 @@ run -c 'analyze toast_index_demand' >/dev/null
 run -c 'create table toast_sort_demand (id int, v text)' >/dev/null
 run -c 'alter table toast_sort_demand alter column v set storage external' >/dev/null
 run -c "insert into toast_sort_demand values (1, 'c$big'), (2, 'a$big'), (3, 'b$big')" >/dev/null
+# Construction must consume external values and store the resulting JSON/JSONB.
+run -c 'create table toast_construct (j json, b jsonb)' >/dev/null
+run -c "insert into toast_construct select json_build_object('payload',v), jsonb_build_array(v) from toast_sort_demand where id=1" >/dev/null
+[ "$(run -c "select j->>'payload' = 'c$big', b->>0 = 'c$big' from toast_construct")" = 't|t' ]
 # Count actual TOAST fetches during live SQL execution. A query that needs only
 # id must not touch v; fetching v and using it in a filter must still work.
 printf '%s\n(quit)\n' '(let ((counter (intern "*TOAST-TEST-FETCH-COUNT*")) (original (symbol-function (quote toast-fetch-value)))) (setf (symbol-value counter) 0 (symbol-value (intern "*TOAST-TEST-FETCH-ORIGINAL*")) original) (setf (symbol-function (quote toast-fetch-value)) (lambda (&rest args) (incf (symbol-value counter)) (apply original args))))' | sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/toast-fetch-install.out"

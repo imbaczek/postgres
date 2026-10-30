@@ -293,6 +293,12 @@ text: `object`, `array`, `string`, `number`, `boolean`, or `null`.
 top-level array elements as an integer; objects and scalars raise SQLSTATE
 `22023`. All four return SQL NULL for SQL NULL input. JSON null is a JSON
 scalar, so its type is the text `null` and it is not an array.
+`to_json`, `json_build_array`, `json_build_object` and their JSONB builder
+counterparts construct values from supported SQL scalar and array types. JSON
+builders preserve nested JSON text, key order, and duplicate keys; JSONB
+builders normalize objects and keep the last duplicate key. Explicit VARIADIC
+array arguments are expanded, and SQL NULL values become JSON null. Construction
+materializes its result.
 JSONB `||` merges top-level objects with right-hand keys winning. Otherwise it
 concatenates arrays, treating each non-array root as a single element. The merge
 is not recursive. Generated values obey the 512-level nesting limit.

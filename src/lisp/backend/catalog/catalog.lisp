@@ -1125,8 +1125,11 @@ from advancing the shared WAL generation between a failed save and rollback."
                (:array-subscript (format nil "(~a)~{[~a]~}" (render (second node))
                                          (mapcar #'render (third node))))
                (:array-length (format nil "array_length(~a, ~a)" (render (second node)) (render (third node))))
-               ((:func :single-record) (format nil "~a(~{~a~^, ~})" (catalog-sql-quote-ident (second node))
-                                               (mapcar #'render (third node))))
+               ((:func :single-record)
+                (let ((arguments (mapcar #'render (third node))))
+                  (when (and arguments (getf (cdddr node) :variadic))
+                    (setf (car (last arguments)) (concatenate 'string "VARIADIC " (car (last arguments)))))
+                  (format nil "~a(~{~a~^, ~})" (catalog-sql-quote-ident (second node)) arguments)))
                (:coalesce (format nil "COALESCE(~{~a~^, ~})" (mapcar #'render (second node))))
                (:case (format nil "(CASE~{ WHEN ~a THEN ~a~} ELSE ~a END)"
                               (loop for (condition result) in (second node)

@@ -411,7 +411,7 @@ result is text for typeof and int4 for array_length."
                                        :numeric :float4 :float8 :json :jsonb :bytea :oid :char :bit :date
                                        :time :timetz :timestamp :timestamptz :interval :pg-lsn :int2vector)))
       (ereport "0A000" "to_jsonb for type ~a is not supported" type))
-    (list :func name arguments :type :jsonb :typmod -1)))
+    (list :func name arguments :type (if (string= name "to_json") :json :jsonb) :typmod -1)))
 
 (defun analyze-substr-function (name arguments)
   "Resolve text and bytea substring overloads."
@@ -1325,11 +1325,22 @@ so a nested argument error keeps its own diagnostics."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature)))
-      ((string= name "to_jsonb")
+      ((member name '("to_json" "to_jsonb") :test #'string=)
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-to-jsonb-function name args)))
+      ((member name '("json_build_array" "json_build_object" "jsonb_build_array" "jsonb_build_object") :test #'string=)
+       (when (> (length args) 100)
+         (ereport "54023" "cannot pass more than 100 arguments to a function"))
+       (when (getf (cdddr expr) :variadic)
+         (unless (= (length args) 1)
+           (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+         (unless (or (sql-array-element-type (expr-type (first args)))
+                     (eq (expr-type (first args)) :int2vector))
+           (ereport "42804" "VARIADIC argument must be an array")))
+       (list :func name args :type (if (search "jsonb_" name) :jsonb :json) :typmod -1
+                             :variadic (getf (cdddr expr) :variadic)))
       ((member name '("jsonb_set" "jsonb_insert") :test #'string=)
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
@@ -3428,7 +3439,8 @@ candidate selection."
                          (member (second form)
                                  '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                    "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
-                                   "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set" "jsonb_insert" "to_jsonb"
+                                   "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "json_build_array" "json_build_object"
+                                   "jsonb_build_array" "jsonb_build_object"
                                    "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid"
                                    "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                                    "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
@@ -4661,9 +4673,14 @@ truncate and interpret the result at TYPE's signed width."
      (let* ((name (second expr))
             (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr)))
             (type (expr-type expr)))
-       (if (string= name "to_jsonb")
-           (sql-to-jsonb (first arguments) (expr-type (first (third expr))))
-           (eval-analyzed-function name arguments type))))
+       (cond ((string= name "to_jsonb")
+              (sql-to-jsonb (first arguments) (expr-type (first (third expr)))))
+             ((string= name "to_json")
+              (if (eq (first arguments) +null+) +null+
+                  (sql-to-json (first arguments) (expr-type (first (third expr))))))
+             ((member name '("json_build_array" "json_build_object" "jsonb_build_array" "jsonb_build_object") :test #'string=)
+              (sql-json-build name arguments (mapcar #'expr-type (third expr)) (getf (cdddr expr) :variadic)))
+             (t (eval-analyzed-function name arguments type)))))
     (t
      (ereport "XX000" "cannot evaluate expression ~a" expr))))
 
@@ -4877,3 +4894,87 @@ truncate and interpret the result at TYPE's signed width."
                        ((jsonb-array-value-p item)
                         (loop for child across item do (push (cons child (1+ depth)) pending)))))
         (make-sql-jsonb root)))))
+
+(defun sql-to-json (value type)
+  "Convert a typed datum to JSON text, preserving JSON input verbatim."
+  (when (eq value +null+) (return-from sql-to-json "null"))
+  (with-output-to-string (out)
+    (labels ((scalar (item item-type)
+               (cond ((eq item +null+) (write-string "null" out))
+                     ((eq item-type :json) (write-string item out))
+                     ((member item-type '(:float4 :float8))
+                      (let ((text (value->text item item-type)))
+                        (if (or (sb-ext:float-nan-p item) (sb-ext:float-infinity-p item))
+                            (sql-jsonb-write-string text out)
+                            (write-string text out))))
+                     (t (sql-jsonb-write (sql-to-jsonb item item-type) out))))
+             (array-value (array item-type)
+               (let ((elements (sql-array-elements array)) (position 0))
+                 (labels ((dimension (dims depth)
+                            (when (> depth 512) (ereport "54001" "JSON nesting exceeds supported depth"))
+                            (write-char #\[ out)
+                            (dotimes (i (first dims))
+                              (when (zerop (mod position 4096)) (check-for-interrupts))
+                              (when (plusp i) (write-char #\, out))
+                              (if (rest dims) (dimension (rest dims) (1+ depth))
+                                  (progn (scalar (aref elements position) item-type) (incf position))))
+                            (write-char #\] out)))
+                   (if (null (sql-array-dimensions array)) (write-string "[]" out)
+                       (dimension (sql-array-dimensions array) 0))))))
+      (let ((element-type (sql-array-element-type type)))
+        (cond (element-type (array-value value element-type))
+              ((eq type :int2vector)
+               (if (sql-array-p value) (array-value value :int2)
+                   (progn (write-char #\[ out)
+                          (loop for number across value for first = t then nil for i from 0
+                                do (when (zerop (mod i 4096)) (check-for-interrupts))
+                                   (unless first (write-char #\, out))
+                                   (scalar number :int2))
+                          (write-char #\] out))))
+              (t (scalar value type)))))))
+
+(defun sql-json-build (name values types &optional variadic)
+  "Build JSON text or normalized JSONB, evaluating each argument once."
+  (when variadic
+    (let* ((array (car (last values))) (array-type (car (last types)))
+                                       (element-type (if (eq array-type :int2vector) :int2
+                                                         (sql-array-element-type array-type))))
+      (unless element-type (ereport "42804" "VARIADIC argument must be an array"))
+      (when (eq array +null+) (return-from sql-json-build +null+))
+      (let ((elements (if (sql-array-p array) (sql-array-elements array) array)))
+        (setf values (append (butlast values) (coerce elements 'list))
+              types (append (butlast types) (make-list (length elements) :initial-element element-type))))))
+  (let ((object-p (not (null (search "_object" name))))
+        (jsonb-p (not (null (search "jsonb_" name)))))
+    (when (and object-p (oddp (length values)))
+      (ereport "22023" "argument list must have even number of elements"))
+    (let ((text
+            (with-output-to-string (out)
+              (write-char (if object-p #\{ #\[) out)
+              (if object-p
+                  (loop for (key value) on values by #'cddr
+                        for (key-type value-type) on types by #'cddr
+                        for first = t then nil
+                        for position from 1 by 2
+                        do (when (zerop (mod (1- position) 4096)) (check-for-interrupts))
+                           (when (eq key +null+)
+                             (if jsonb-p (ereport "22023" "argument ~d: key must not be null" position)
+                                 (ereport "22004" "null value not allowed for object key")))
+                           (when (or (sql-array-element-type key-type) (member key-type '(:json :jsonb :int2vector)))
+                             (ereport "22023" "key value must be scalar, not array, composite, or json"))
+                           (unless first (write-string ", " out))
+                           (let* ((converted (sql-jsonb-value (sql-to-jsonb key key-type)))
+                                  (key-text (cond ((member key-type '(:float4 :float8)) (value->text key key-type))
+                                                  ((eq converted :json-true) "true")
+                                                  ((eq converted :json-false) "false")
+                                                  ((stringp converted) converted)
+                                                  (t (sql-numeric-output converted)))))
+                             (sql-jsonb-write-string key-text out))
+                           (write-string " : " out)
+                           (write-string (sql-to-json value value-type) out))
+                  (loop for value in values for type in types for first = t then nil for i from 0
+                        do (when (zerop (mod i 4096)) (check-for-interrupts))
+                           (unless first (write-string ", " out))
+                           (write-string (sql-to-json value type) out)))
+              (write-char (if object-p #\} #\]) out))))
+      (if jsonb-p (sql-jsonb-input text) text))))
