@@ -329,6 +329,8 @@ parent.  The phase check here alone does not establish that ownership."
 (declaim (ftype function physical-promotion-publish-retained-intent))
 
 (defun physical-promotion-frozen-resource-fact (control metadata)
+  "Check the frozen pending fact against its selected restartpoint generation.
+Older pending control may lack the fact; then the selected generation supplies it."
   (let ((frozen (getf control :resource-fact))
         (source (getf metadata :source-resource-fact)))
     (unless (and (or (null frozen) (wal-resource-fact-valid-p frozen))
@@ -339,7 +341,8 @@ parent.  The phase check here alone does not establish that ownership."
 
 (defun physical-promotion-make-pending (state metadata prefix generation namespace child time reference)
   "Build pending control bytes and runtime state for the selected archive.
-The caller publishes the bytes and installs the state after owner handoff."
+The caller publishes the bytes and installs the state after owner handoff.
+Freeze the selected generation's source fact in pending control when present."
   (let* ((fork (getf metadata :lsn))
          (next (getf metadata :next-xid))
          (bytes (physical-recovery-control-image

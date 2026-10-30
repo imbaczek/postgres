@@ -240,12 +240,14 @@ values replace earlier ones even when they decrease."
 (declaim (ftype function wal-control-resource-fields-valid-p wal-control-resource-parameters))
 
 (defun wal-resource-fact-valid-p (fact)
+  "Check the canonical tuple, record end LSN and origin timeline together."
   (and (listp fact) (= 6 (length fact))
        (equal (loop for (key value) on fact by #'cddr collect key)
               '(:resource-parameters :resource-lsn :resource-timeline))
        (wal-control-resource-fields-valid-p fact)))
 
 (defun wal-encode-resource-fact (fact)
+  "Encode a positioned fact in 48 bytes: tuple, end LSN, timeline and zero reserved word."
   (unless (wal-resource-fact-valid-p fact) (error "invalid positioned resource fact"))
   (let ((bytes (make-array +wal-resource-fact-size+ :element-type '(unsigned-byte 8) :initial-element 0)))
     (replace bytes (wal-encode-resource-parameters (wal-control-resource-parameters fact)))
@@ -254,6 +256,7 @@ values replace earlier ones even when they decrease."
     bytes))
 
 (defun wal-decode-resource-fact (bytes)
+  "Decode exactly one positioned fact, rejecting a nonzero reserved word."
   (unless (and (typep bytes '(vector (unsigned-byte 8))) (= (length bytes) +wal-resource-fact-size+)
                (zerop (wal-u32 bytes 44)))
     (error "invalid positioned resource fact encoding"))

@@ -33,10 +33,11 @@
   Ordinary checkpoints now carry an optional positioned tuple, and verified base
   images require exact agreement with copied control and a valid ancestor origin.
   Their manifest hashes bind the checkpoint facts without extra manifest fields.
-  Next carry exact facts with applied/required positions, restartpoint seeds,
-  private follow scans and pending promotion control. The child checkpoint writer
-  still emits unknown facts; preserve the frozen parent fact before enabling
-  resource admission or automatic reporting. Missing legacy
+  Exact facts now follow applied/required positions, restartpoint seeds, private
+  follow scans and durable follow witnesses. Pending promotion freezes the parent
+  fact, and its child checkpoint and primary control preserve it across restart.
+  Legacy seeds reconstruct facts from available durable WAL before restoring storage when
+  a known durable requirement needs proof. Missing legacy
   facts stay unknown; do not substitute current defaults or newer received facts
   for an older replay seed. Cold hot-standby admission needs positive proof;
   online insufficiency needs its own pause, promotion refusal and shutdown on

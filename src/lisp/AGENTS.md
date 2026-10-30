@@ -502,3 +502,9 @@ this mode.
   worker loses ASDF registrations as well as definitions; register the project's
   `.asd` and load the system before interpreting a missing-dependency result as
   a source or dependency regression.
+- Repeated forced compilation can exhaust SBCL's immobile code space in a
+  long-lived worker. When compilation reports that failure, tests whose system
+  load fails have not run. After all owned operations are terminal, reset the
+  worker, restore its ASDF registrations and private cache, and reload saved source
+  before testing again. A fresh external process also needs dependency discovery:
+  the worker's `cl-spec` registration does not configure a shell test runner.

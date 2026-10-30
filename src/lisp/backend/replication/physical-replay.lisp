@@ -4,6 +4,10 @@
 (defvar *physical-replay-test-hook* nil)
 
 (defun physical-resource-fact-next (prior record timeline history)
+  "Derive the fact at a terminal without changing replay state.
+A parameter change replaces it; a known checkpoint must agree with a known prior fact.
+An unknown checkpoint preserves the last reported fact.
+Check the fact's origin against the selected history."
   (when prior
     (unless (and (wal-resource-fact-valid-p prior)
                  (<= (getf prior :resource-lsn) (wal-record-start record)))
@@ -31,6 +35,8 @@
         (timeline-read-history (getf state :timeline)))))
 
 (defun physical-recovery-scan-resource-fact (store start end seed state)
+  "Reconstruct a fact through complete terminals in a durable prefix without redo.
+The seed belongs to START; selected end-of-recovery records advance the timeline."
   (unless (<= (physical-store-floor-lsn store) start end (physical-store-flushed-lsn store))
     (error "resource proof prefix is unavailable; take a fresh base backup"))
   (let ((fact (wal-copy-control-resource-fields seed))
@@ -136,6 +142,7 @@ does not excuse a missing file or a different fork."
                                         &key (replay-timeline (getf *physical-recovery-state* :replay-timeline
                                                                     (getf *physical-recovery-state* :timeline)))
                                           (resource-fact (getf *physical-recovery-state* :source-resource-fact)))
+  "Publish the replay position and its source resource fact together."
   (let ((candidate (copy-list *physical-recovery-state*)))
     (setf (getf candidate :replay-timeline) replay-timeline)
     (when (or resource-fact (getf candidate :source-resource-fact))

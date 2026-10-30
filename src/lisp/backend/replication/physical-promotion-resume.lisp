@@ -26,7 +26,8 @@
 (defun physical-promotion-read-pending-state ()
   "Read provenance and exact selected generation before opening or restoring storage.
 Check the frozen namespace floor and reject collisions with observed IDs, even
-for legacy pending state that has no saved floor."
+for legacy pending state that has no saved floor.
+Restore the frozen fact after checking it against the selected generation."
   (physical-recovery-check-required-marker)
   (let ((control (physical-recovery-read-control *pgdata*)))
     (unless (and (eql 4 (getf control :control-version)) (eql 3 (getf control :phase)))

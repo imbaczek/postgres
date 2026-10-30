@@ -57,7 +57,8 @@ Numeric timeline bounds alone do not prove the resource record's ancestry."
 
 (defun wal-encode-checkpoint-snapshot (snapshot)
   "V2 uses explicit flags for one-past FullXIDs, without truncating the sentinel.
-Unknown resources use 88 bytes; known resources extend PGCKPT02 to 136 bytes."
+Unknown resources use 88 bytes; known resources extend PGCKPT02 to 136 bytes.
+The extension is the shared 48-byte positioned resource fact."
   (unless (wal-checkpoint-snapshot-valid-p snapshot) (error "invalid native checkpoint snapshot"))
   (let* ((bytes (make-array (- (wal-checkpoint-record-size snapshot) +wal-header-size+)
                             :element-type '(unsigned-byte 8) :initial-element 0))
@@ -81,7 +82,8 @@ Unknown resources use 88 bytes; known resources extend PGCKPT02 to 136 bytes."
 (defun wal-decode-checkpoint-snapshot (bytes)
   "Containing WAL/control supplies CRC; reject ambiguous flags and hidden values.
 The 88-byte form has unknown resources. The 136-byte PGCKPT02 form requires a
-complete tuple and coordinates and a zero reserved word."
+complete tuple and coordinates and a zero reserved word.
+The extension uses the shared fact decoder used by recovery control."
   (unless (member (length bytes) (list +wal-checkpoint-snapshot-size+ +wal-checkpoint-resource-snapshot-size+))
     (error "invalid checkpoint snapshot length"))
   (let* ((version (cond ((equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 49)) 1)

@@ -246,11 +246,27 @@ hashes bind the copied checkpoint WAL and control image. Verified base state
 contains the facts inside `:source-checkpoint`, with fresh tuple lists. That is
 proof at the base checkpoint, not at a later received or applied position.
 
-Applied/required recovery control, restartpoint generations and private follow
-witnesses still need resource facts. The promotion checkpoint writer still emits
-unknown facts and must preserve its frozen parent fact through pending retries.
-Complete those paths before enabling resource admission, startup sizing or
-automatic reporting.
+Recovery control now carries the fact at its durable required position. Replay
+keeps the current source fact separate while rebuilding an older seed. Restartpoint
+generations carry their own source fact; legacy generations reconstruct it from
+retained WAL when a known durable requirement needs proof. The scan does not
+restore older catalog state or borrow a fact from after the required boundary.
+
+Private follow scans capture facts at the applied and required boundaries,
+independently of later received records. Durable follow witnesses preserve the
+required fact. Promotion freezes the selected generation's parent fact in pending
+control and carries it into the deterministic child checkpoint and primary
+control. This records the last source report; it does not prove the child's
+installed capacity. Resource admission, startup sizing and automatic reporting
+remain unfinished.
+
+The recovery propagation milestone passed 1,232 physical tests, followed by 102
+focused tests after the final historical-witness check. The external unit runner
+finished with 1,159 checks and no failures. Eight independent Python tests and
+fresh strict compilation passed. Owned-server tests covered reporter SIGKILL
+boundaries, repair from WAL, a decrease, checkpoint backup, and online promotion
+with a known backup fact and streamed decrease. Promotion preserved the fact
+through paused backlog, reader drain and primary crash/restart.
 
 Validation passed 680 unit tests and 1,211 physical tests. After adding the shared
 origin check to the child reader, 211 related physical tests, all 680 unit tests

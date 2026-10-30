@@ -91,6 +91,7 @@
   (values))
 
 (defun physical-restartpoint-check-source-resources (metadata)
+  "Validate an optional version 4 source fact at the restartpoint's replay position."
   (when (loop for key in metadata by #'cddr thereis (eq key :source-resource-fact))
     (let ((fact (getf metadata :source-resource-fact))
           (timeline (getf metadata :replay-timeline (getf metadata :timeline))))
@@ -101,6 +102,8 @@
   (values))
 
 (defun physical-restartpoint-resource-seed (metadata state store start)
+  "Recover the fact at START from the restartpoint, checkpoint or retained WAL.
+Prove the separately saved required fact at its own recovery boundary before use."
   (let* ((checkpoint (if metadata (getf metadata :source-checkpoint) (getf state :source-checkpoint)))
          (timeline (if metadata (getf metadata :replay-timeline (getf metadata :timeline))
                        (getf state :timeline)))

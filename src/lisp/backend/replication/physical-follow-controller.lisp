@@ -142,7 +142,8 @@ reload exclusion and live-operation quiescence."
 (defun physical-follow-controller-snapshot-under-lease (view)
   "Capture the receive, replay and durable recovery witnesses under root protection.
 The receive timeline can differ from the applied replay timeline.  A retained
-proof kind is included in the saved receiver coordinates."
+proof kind is included in the saved receiver coordinates.
+Copy the durable resource fact into the recovery witness when present."
   (let* ((base (physical-recovery-verify-base-state))
          (control (physical-recovery-read-control *pgdata*))
          (store (physical-follow-copy-checked-store *physical-receive-store*))

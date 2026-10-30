@@ -103,6 +103,8 @@ the referenced archive."
                                           (state-time (- (get-universal-time) 2208988800))
                                           (applied-timeline timeline) history-target history-digest
                                           promotion-child promotion-generation promotion-source-namespace retained-reference resource-fact)
+  "Encode recovery progress and its optional extensions under one CRC.
+Ordinary and pending images may append a 48-byte positioned resource fact."
   (let* ((pending (= phase 3)) (version (if pending 4 3))
                                (extension-start (if pending 84 68))
                                (selected (not (null history-target)))
@@ -145,11 +147,11 @@ the referenced archive."
       bytes)))
 
 (defun physical-recovery-decode-control (bytes)
-  "Decode recovery control by its magic and length.
-
-The old pending and selected ordinary images are both 88 bytes; their magic
-separates them. Selected pending control uses 104 bytes. A pending retained
-reference adds 44 bytes, giving 132 or 148 bytes."
+  "Decode recovery control by magic and exact length, then verify its CRC.
+Legacy versions use 60 or 72 bytes. Ordinary v3 uses 72 or 88 bytes;
+pending v4 uses 88 or 104 bytes, or 132 or 148 with a retained reference.
+The v3 and v4 layouts can add a 48-byte resource fact before the CRC.
+Magic distinguishes the overlapping 88-byte and 136-byte layouts."
 
   (unless (member (length bytes) '(60 72 88 104 120 132 136 148 152 180 196))
     (error "invalid physical recovery control length"))
@@ -241,6 +243,10 @@ reference adds 44 bytes, giving 132 or 148 bytes."
       (write-sequence bytes stream))))
 
 (defun physical-recovery-control-frontier (state applied)
+  "Check current and required facts at their respective replay positions.
+Before required replay is reached, preserve its durable fact and position.
+A known required fact must match at the boundary; later facts may have lower
+resource values, but their reporting position cannot move backward."
   (let* ((base (getf state :timeline))
          (runtime (getf state :replay-timeline base))
          (required (getf state :required-applied))
