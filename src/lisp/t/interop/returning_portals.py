@@ -81,7 +81,11 @@ def select_plan_cases(peers):
                    ','.join(f'({i},{i})' for i in range(1000)))
         peer.query('ANALYZE portal_index_plan')
         peer.query('CREATE PUBLICATION portal_plan_pub FOR TABLE portal_plans')
+        peer.query('CREATE PUBLICATION portal_empty_pub FOR TABLE portal_plans')
+        peer.query('ALTER PUBLICATION portal_empty_pub DROP TABLE portal_plans')
+        peer.query('CREATE PUBLICATION portal_two_pub FOR TABLE portal_plans,portal_index_plan')
         peer.query('CREATE SEQUENCE portal_pull_seq')
+        peer.query('CREATE SEQUENCE portal_key_seq')
         peer.query('BEGIN')
 
     # No sort or other blocking node may evaluate later rows during a pull.
@@ -108,6 +112,207 @@ def select_plan_cases(peers):
             for peer in peers:
                 assert peer.query("SELECT currval('portal_pull_seq')") == [[str(i)]]
         expect_kinds(compare(peers, [execute(1, portal)], ('ordered end', suffix)), [b'C', b'Z'])
+        for peer in peers:
+            assert peer.query("SELECT currval('portal_pull_seq')") == [[str(count)]]
+
+    for peer in peers:
+        peer.query("SELECT setval('portal_pull_seq',1,false)")
+    sql = ('SELECT id,nextval($1),(pg_get_publication_tables('
+           'CASE WHEN id=1 THEN $2 ELSE $3 END)).relid IS NOT NULL '
+           'FROM portal_plans ORDER BY id LIMIT 2')
+    compare(peers, [parse(sql, (25, 25, 25), name=b'srf_empty_first'),
+                    bind((), (b'portal_pull_seq', b'portal_empty_pub', b'portal_plan_pub'),
+                         portal=b'srf_empty_first', statement=b'srf_empty_first')], 'empty-first setup')
+    for i in (1, 2):
+        result = compare(peers, [execute(1, b'srf_empty_first')], ('empty-first fetch', i))
+        expect_kinds(result, [b'D', b's', b'Z'])
+        assert peers[0].data_row(result[0][1]) == [str(i + 1), str(i), 't'], result
+        for peer in peers:
+            assert peer.query("SELECT currval('portal_pull_seq')") == [[str(i)]]
+    expect_kinds(compare(peers, [execute(1, b'srf_empty_first')], 'empty-first end'), [b'C', b'Z'])
+
+    sql = ('SELECT id,(pg_get_publication_tables($1)).relid IS NOT NULL,'
+           '(pg_get_publication_tables($2)).relid IS NOT NULL FROM portal_plans WHERE id=1')
+    compare(peers, [parse(sql, (25, 25), name=b'srf_zip'),
+                    bind((), (b'portal_two_pub', b'portal_plan_pub'), portal=b'srf_zip', statement=b'srf_zip')],
+            'SRF zip setup')
+    for expected in (['1', 't', 't'], ['1', 't', 'f']):
+        result = compare(peers, [execute(1, b'srf_zip')], ('SRF zip', expected))
+        expect_kinds(result, [b'D', b's', b'Z'])
+        assert peers[0].data_row(result[0][1]) == expected, result
+    expect_kinds(compare(peers, [execute(1, b'srf_zip')], 'SRF zip end'), [b'C', b'Z'])
+
+    sql = ('SELECT id,(pg_get_publication_tables($1)).relid IS NOT NULL,'
+           '(pg_get_publication_tables($2)).relid IS NOT NULL AS b '
+           'FROM portal_plans ORDER BY id,b DESC LIMIT 3')
+    expect_kinds(compare(peers, [parse(sql, (25, 25), name=b'srf_zip_sort'),
+                                 bind((), (b'portal_two_pub', b'portal_plan_pub'),
+                                      portal=b'srf_zip_sort', statement=b'srf_zip_sort')], 'sorted zip setup'),
+                 [b'1', b'2', b'Z'])
+    for expected in (['1', 't', 't'], ['1', 't', 'f'], ['2', 't', 't']):
+        result = compare(peers, [execute(1, b'srf_zip_sort')], ('sorted zip', expected))
+        expect_kinds(result, [b'D', b's', b'Z'])
+        assert peers[0].data_row(result[0][1]) == expected, result
+    expect_kinds(compare(peers, [execute(1, b'srf_zip_sort')], 'sorted zip end'), [b'C', b'Z'])
+
+    for peer in peers:
+        peer.query("SELECT setval('portal_key_seq',1,false)")
+        peer.query("SELECT setval('portal_pull_seq',1,false)")
+    sql = ('SELECT id,nextval($3),(pg_get_publication_tables($2)).relid IS NOT NULL '
+           'FROM portal_plans ORDER BY nextval($1)+0 LIMIT 3')
+    expect_kinds(compare(peers, [parse(sql, (25, 25, 25), name=b'srf_hidden_key'),
+                                 bind((), (b'portal_key_seq', b'portal_two_pub', b'portal_pull_seq'),
+                                      portal=b'srf_hidden_key', statement=b'srf_hidden_key')], 'hidden key setup'),
+                 [b'1', b'2', b'Z'])
+    for i, source_id in enumerate((1, 1, 2), 1):
+        result = compare(peers, [execute(1, b'srf_hidden_key')], ('hidden key fetch', i))
+        expect_kinds(result, [b'D', b's', b'Z'])
+        assert peers[0].data_row(result[0][1]) == [str(source_id), str(i), 't'], result
+        for peer in peers:
+            assert peer.query("SELECT currval('portal_key_seq')") == [['4']]
+            assert peer.query("SELECT currval('portal_pull_seq')") == [[str(i)]]
+    expect_kinds(compare(peers, [execute(1, b'srf_hidden_key')], 'hidden key end'), [b'C', b'Z'])
+    for peer in peers:
+        assert peer.query("SELECT currval('portal_key_seq')") == [['4']]
+        assert peer.query("SELECT currval('portal_pull_seq')") == [['3']]
+
+    for peer in peers:
+        peer.query("SELECT setval('portal_key_seq',1,false)")
+    sql = ('SELECT id,(pg_get_publication_tables($1)).relid IS NOT NULL AS k,'
+           '(pg_get_publication_tables(CASE WHEN nextval($2)>0 THEN $3 ELSE $3 END)).relid IS NOT NULL '
+           'FROM portal_plans ORDER BY k,id LIMIT 4')
+    expect_kinds(compare(peers, [parse(sql, (25, 25, 25), name=b'srf_key_with_volatile'),
+                                 bind((), (b'portal_two_pub', b'portal_key_seq', b'portal_plan_pub'),
+                                      portal=b'srf_key_with_volatile', statement=b'srf_key_with_volatile')],
+                         'SRF key and volatile SRF setup'), [b'1', b'2', b'Z'])
+    # Equal sort keys permit either order of the NULL-padded rows within each id.
+    rows_by_peer = [[] for _ in peers]
+    for i in range(4):
+        for index, peer in enumerate(peers):
+            result = cycle(peer, [execute(1, b'srf_key_with_volatile')])
+            expect_kinds(result, [b'D', b's', b'Z'])
+            rows_by_peer[index].append(peer.data_row(result[0][1]))
+            assert peer.query("SELECT currval('portal_key_seq')") == [['4']]
+    for rows in rows_by_peer:
+        assert sorted(rows) == [['1', 't', 'f'], ['1', 't', 't'], ['2', 't', 'f'], ['2', 't', 't']], rows
+    expect_kinds(compare(peers, [execute(1, b'srf_key_with_volatile')], 'SRF key and volatile SRF end'), [b'C', b'Z'])
+
+    for name, order in ((b'srf_alias', 'z,id'), (b'srf_ordinal', '2,id')):
+        for peer in peers:
+            peer.query("SELECT setval('portal_pull_seq',1,false)")
+        sql = f'SELECT nextval($1),(pg_get_publication_tables($2)).relid IS NOT NULL AS z FROM portal_plans ORDER BY {order} LIMIT 2'
+        compare(peers, [parse(sql, (25, 25), name=name),
+                        bind((), (b'portal_pull_seq', b'portal_plan_pub'), portal=name, statement=name)],
+                ('SRF sort setup', order))
+        for i in (1, 2):
+            result = compare(peers, [execute(1, name)], ('SRF sort fetch', order, i))
+            expect_kinds(result, [b'D', b's', b'Z'])
+            assert peers[0].data_row(result[0][1]) == [str(i), 't'], result
+            for peer in peers:
+                assert peer.query("SELECT currval('portal_pull_seq')") == [[str(i)]]
+        expect_kinds(compare(peers, [execute(1, name)], ('SRF sort end', order)), [b'C', b'Z'])
+
+    for name, publication, suffix in ((b'srf_empty', b'portal_empty_pub', ''),
+                                      (b'srf_limit_zero', b'portal_plan_pub', ' LIMIT 0')):
+        before = [peer.query("SELECT currval('portal_pull_seq')") for peer in peers]
+        sql = ('SELECT nextval($1),(pg_get_publication_tables($2)).relid IS NOT NULL '
+               'FROM portal_plans ORDER BY id' + suffix)
+        result = compare(peers, [parse(sql, (25, 25), name=name),
+                                 bind((), (b'portal_pull_seq', publication), portal=name, statement=name),
+                                 execute(1, name)], ('empty SRF or limit zero', suffix))
+        expect_kinds(result, [b'1', b'2', b'C', b'Z'])
+        assert [peer.query("SELECT currval('portal_pull_seq')") for peer in peers] == before
+
+    # The bare record contains database-specific OIDs. Check frame types and
+    # sequence values independently, leaving that record field opaque.
+    for peer in peers:
+        peer.query("SELECT setval('portal_pull_seq',1,false)")
+    sql = 'SELECT nextval($1),pg_get_publication_tables($2) FROM portal_plans ORDER BY id LIMIT 2'
+    frames = [parse(sql, (25, 25), name=b'srf_bare'),
+              bind((), (b'portal_pull_seq', b'portal_plan_pub'), portal=b'srf_bare', statement=b'srf_bare')]
+    expect_kinds(compare(peers, frames, 'bare SRF setup'), [b'1', b'2', b'Z'])
+    for expected in (1, 3):
+        results = [cycle(peer, [execute(1, b'srf_bare')]) for peer in peers]
+        for peer, result in zip(peers, results):
+            expect_kinds(result, [b'D', b's', b'Z'])
+            row = peer.data_row(result[0][1])
+            assert row[0] == str(expected) and row[1], row
+            assert peer.query("SELECT currval('portal_pull_seq')") == [[str(expected)]]
+    expect_kinds(compare(peers, [execute(1, b'srf_bare')], 'bare SRF end'), [b'C', b'Z'])
+    for peer in peers:
+        assert peer.query("SELECT currval('portal_pull_seq')") == [['3']]
+        peer.query("SELECT setval('portal_pull_seq',1,false)")
+    result = compare(peers, [parse(sql, (25, 25), name=b'srf_bare_empty'),
+                             bind((), (b'portal_pull_seq', b'portal_empty_pub'),
+                                  portal=b'srf_bare_empty', statement=b'srf_bare_empty'),
+                             execute(1, b'srf_bare_empty')], 'bare empty SRF')
+    expect_kinds(result, [b'1', b'2', b'C', b'Z'])
+    for peer in peers:
+        assert peer.query("SELECT currval('portal_pull_seq')") == [['4']]
+
+    for peer in peers:
+        peer.query("SELECT setval('portal_pull_seq',1,false)")
+    sql = 'SELECT nextval($1),pg_get_publication_tables($2) FROM portal_plans ORDER BY id'
+    expect_kinds(compare(peers, [parse(sql, (25, 25), name=b'srf_bare_all'),
+                                 bind((), (b'portal_pull_seq', b'portal_plan_pub'),
+                                      portal=b'srf_bare_all', statement=b'srf_bare_all')],
+                         'bare unlimited SRF setup'), [b'1', b'2', b'Z'])
+    for expected in (1, 3, 5, 7):
+        results = [cycle(peer, [execute(1, b'srf_bare_all')]) for peer in peers]
+        for peer, result in zip(peers, results):
+            expect_kinds(result, [b'D', b's', b'Z'])
+            row = peer.data_row(result[0][1])
+            assert row[0] == str(expected) and row[1], row
+            assert peer.query("SELECT currval('portal_pull_seq')") == [[str(expected)]]
+    expect_kinds(compare(peers, [execute(1, b'srf_bare_all')], 'bare unlimited SRF end'), [b'C', b'Z'])
+    for peer in peers:
+        assert peer.query("SELECT currval('portal_pull_seq')") == [['8']]
+
+    srf = 'pg_get_publication_tables(CASE WHEN nextval($1)>0 THEN $2 ELSE $2 END)'
+    for name, targets, scalar_column, expected in (
+        (b'srf_arg_scalar_first', 'nextval($1),' + srf, 0, (1, 4)),
+        (b'srf_arg_scalar_last', srf + ',nextval($1)', 1, (2, 5)),
+    ):
+        for peer in peers:
+            peer.query("SELECT setval('portal_pull_seq',1,false)")
+        sql = 'SELECT ' + targets + ' FROM portal_plans ORDER BY id LIMIT 2'
+        expect_kinds(compare(peers, [parse(sql, (25, 25), name=name),
+                                     bind((), (b'portal_pull_seq', b'portal_plan_pub'),
+                                          portal=name, statement=name)], ('volatile SRF argument setup', name)),
+                     [b'1', b'2', b'Z'])
+        for value, current in zip(expected, (2, 5)):
+            for peer in peers:
+                result = cycle(peer, [execute(1, name)])
+                expect_kinds(result, [b'D', b's', b'Z'])
+                row = peer.data_row(result[0][1])
+                assert row[scalar_column] == str(value) and row[1-scalar_column], row
+                assert peer.query("SELECT currval('portal_pull_seq')") == [[str(current)]]
+        expect_kinds(compare(peers, [execute(1, name)], ('volatile SRF argument end', name)), [b'C', b'Z'])
+        for peer in peers:
+            assert peer.query("SELECT currval('portal_pull_seq')") == [['5']]
+
+    # A bare record used as a sort key is produced before sorting; the separate
+    # volatile scalar is evaluated only for each returned row.
+    for name, order, suffix, count in ((b'bare_sort_alias', 'r', '', 4),
+                                       (b'bare_sort_ordinal', '2', '', 4),
+                                       (b'bare_sort_alias_limit', 'r', ' LIMIT 2', 2),
+                                       (b'bare_sort_ordinal_limit', '2', ' LIMIT 2', 2)):
+        for peer in peers:
+            peer.query("SELECT setval('portal_pull_seq',1,false)")
+        sql = ('SELECT nextval($1),pg_get_publication_tables($2) AS r '
+               f'FROM portal_plans ORDER BY {order}' + suffix)
+        expect_kinds(compare(peers, [parse(sql, (25, 25), name=name),
+                                     bind((), (b'portal_pull_seq', b'portal_plan_pub'),
+                                          portal=name, statement=name)], ('bare sort setup', name)),
+                     [b'1', b'2', b'Z'])
+        for expected in range(1, count + 1):
+            results = [cycle(peer, [execute(1, name)]) for peer in peers]
+            for peer, result in zip(peers, results):
+                expect_kinds(result, [b'D', b's', b'Z'])
+                row = peer.data_row(result[0][1])
+                assert row[0] == str(expected) and row[1], row
+                assert peer.query("SELECT currval('portal_pull_seq')") == [[str(expected)]]
+        expect_kinds(compare(peers, [execute(1, name)], ('bare sort end', name)), [b'C', b'Z'])
         for peer in peers:
             assert peer.query("SELECT currval('portal_pull_seq')") == [[str(count)]]
 
@@ -181,6 +386,53 @@ def select_plan_cases(peers):
                 assert peer.query("SELECT currval('portal_pull_seq')") == [['4']]
         expect_kinds(compare(peers, [execute(1, name)], ('volatile key end', ordering)), [b'C', b'Z'])
 
+    wide_project_sets = (
+        (b'srf_window', 'SELECT id,row_number() OVER(ORDER BY id),nextval($1),'
+         '(pg_get_publication_tables($2)).relid IS NOT NULL FROM portal_plans ORDER BY id+0',
+         [['1', '1', '1', 't'], ['2', '2', '2', 't'], ['3', '3', '3', 't'], ['4', '4', '4', 't']]),
+        (b'srf_aggregate', 'SELECT grp,count(*),nextval($1),'
+         '(pg_get_publication_tables($2)).relid IS NOT NULL FROM portal_plans GROUP BY grp ORDER BY grp',
+         [['1', '2', '1', 't'], ['2', '2', '2', 't']]),
+        (b'srf_nested', 'WITH q AS MATERIALIZED(SELECT id,(pg_get_publication_tables($2)).relid IS NOT NULL AS b '
+         'FROM portal_plans) SELECT id,b,nextval($1) FROM q ORDER BY id',
+         [['1', 't', '1'], ['2', 't', '2'], ['3', 't', '3'], ['4', 't', '4']]),
+    )
+    for name, sql, expected_rows in wide_project_sets:
+        for peer in peers:
+            peer.query("SELECT setval('portal_pull_seq',1,false)")
+        expect_kinds(compare(peers, [parse(sql, (25, 25), name=name),
+                                     bind((), (b'portal_pull_seq', b'portal_plan_pub'),
+                                          portal=name, statement=name)], ('wide ProjectSet setup', name)),
+                     [b'1', b'2', b'Z'])
+        for i, expected in enumerate(expected_rows, 1):
+            result = compare(peers, [execute(1, name)], ('wide ProjectSet fetch', name, i))
+            expect_kinds(result, [b'D', b's', b'Z'])
+            assert peers[0].data_row(result[0][1]) == expected, result
+            for peer in peers:
+                assert peer.query("SELECT currval('portal_pull_seq')") == [[str(i)]]
+        expect_kinds(compare(peers, [execute(1, name)], ('wide ProjectSet end', name)), [b'C', b'Z'])
+        for peer in peers:
+            assert peer.query("SELECT currval('portal_pull_seq')") == [[str(len(expected_rows))]]
+
+    for name, order in ((b'srf_no_from_constant', '1+0'), (b'srf_no_from_key', 'z')):
+        for peer in peers:
+            peer.query("SELECT setval('portal_pull_seq',1,false)")
+        sql = ('SELECT nextval($1),(pg_get_publication_tables($2)).relid IS NOT NULL AS z '
+               'ORDER BY ' + order)
+        expect_kinds(compare(peers, [parse(sql, (25, 25), name=name),
+                                     bind((), (b'portal_pull_seq', b'portal_two_pub'),
+                                          portal=name, statement=name)], ('no-FROM ProjectSet setup', order)),
+                     [b'1', b'2', b'Z'])
+        for expected in (1, 2):
+            result = compare(peers, [execute(1, name)], ('no-FROM ProjectSet fetch', order, expected))
+            expect_kinds(result, [b'D', b's', b'Z'])
+            assert peers[0].data_row(result[0][1]) == [str(expected), 't'], result
+            for peer in peers:
+                assert peer.query("SELECT currval('portal_pull_seq')") == [[str(expected)]]
+        expect_kinds(compare(peers, [execute(1, name)], ('no-FROM ProjectSet end', order)), [b'C', b'Z'])
+        for peer in peers:
+            assert peer.query("SELECT currval('portal_pull_seq')") == [['2']]
+
     for peer in peers:
         peer.query("SET application_name='portal_before'")
     stable = ('SELECT current_setting($1),id FROM portal_plans ORDER BY id')
@@ -231,6 +483,25 @@ def select_plan_cases(peers):
     expect_kinds(result, [b'D', b'D', b'D', b'C', b'Z'])
     assert [peers[0].data_row(body) for kind, body in result if kind == b'D'] == [
         ['2', 't'], ['3', 't'], ['4', 't']]
+
+    for suffix, count in (('', 4), (' LIMIT 2', 2)):
+        for peer in peers:
+            peer.query("SELECT setval('portal_pull_seq',1,false)")
+        name = b'project_set_volatile' if not suffix else b'project_set_volatile_limit'
+        sql = ('SELECT nextval($1),(pg_get_publication_tables($2)).relid IS NOT NULL '
+               'FROM portal_plans ORDER BY id' + suffix)
+        compare(peers, [parse(sql, (25, 25), name=name),
+                        bind((), (b'portal_pull_seq', b'portal_plan_pub'), portal=name, statement=name)],
+                ('project-set volatile setup', suffix))
+        for i in range(1, count + 1):
+            result = compare(peers, [execute(1, name)], ('project-set volatile fetch', suffix, i))
+            expect_kinds(result, [b'D', b's', b'Z'])
+            assert peers[0].data_row(result[0][1]) == [str(i), 't'], result
+            for peer in peers:
+                assert peer.query("SELECT currval('portal_pull_seq')") == [[str(i)]]
+        expect_kinds(compare(peers, [execute(1, name)], ('project-set volatile end', suffix)), [b'C', b'Z'])
+        for peer in peers:
+            assert peer.query("SELECT currval('portal_pull_seq')") == [[str(count)]]
 
     for name, sql in ((b'left', 'SELECT id FROM portal_plans'),
                       (b'right', 'SELECT grp FROM portal_plans')):

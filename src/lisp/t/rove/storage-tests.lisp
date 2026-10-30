@@ -353,6 +353,38 @@
               (symbol-function 'toast-fetch-value-slice) old-slice
               (symbol-function 'toast-fetch-value) old-fetch))))
 
+(cl-spec:defgenerator project-set-dependency-arguments ()
+  (let* ((width (1+ (random 20)))
+         (count (1+ (random 5)))
+         (set-slot (+ width 1))
+         (targets (list (list :expr (list :col set-slot)) (list :expr '(:col 1)))))
+    (list (nth (random 4) (list (list :col set-slot) '(:col 1)
+                                '(:sort-output 1) '(:sort-output 2)))
+          width count targets)))
+
+(cl-spec:defspec-function project-set-expression-dependent-p
+  "Resolve sort output references while distinguishing base and appended SRF slots."
+  (:args (expression (type list)) (width (type integer)) (count (type integer))
+         (targets (type list)))
+  (:args-generator project-set-dependency-arguments)
+  (:returns (type boolean))
+  (:post (eql result
+              (or (equal expression (list :col (1+ width)))
+                  (equal expression '(:sort-output 1))))))
+
+(cl-spec:defproperty project-set-dependency-survives-scalar-wrappers
+    ((width (range integer 1 20)) (count (range integer 1 5))
+                                  (depth (range integer 0 12)))
+  (:about project-set-expression-dependent-p)
+  (:trials (:normal 100))
+  (let ((set (list :col (1+ width))) (base '(:col 1)))
+    (dotimes (i depth)
+      (setf set (list :cast set :type :text)
+            base (list :cast base :type :text)))
+    (and (project-set-expression-dependent-p set width count nil)
+         (not (project-set-expression-dependent-p base width count nil))
+         (not (project-set-expression-dependent-p (list :subplan set) width count nil)))))
+
 (cl-spec:defgenerator sort-projection-expression-arguments ()
   (list (nth (random 7)
              '((:func "nextval" ((:const "s")))
@@ -474,6 +506,158 @@
                         (rove:ok (= calls 3)))
                    (close-sql-iterator iterator)))))
         (setf (symbol-function 'eval-expr) old-eval))))
+
+(defun call-with-sorted-project-set-fixture (function)
+  (let* ((*query-temp-directory* (uiop:temporary-directory))
+         (*query-work-memory-bytes* 1)
+         (*datum-origin-capture* nil)
+         (table (make-pg-class :oid 42 :name "sets" :columns
+                               (vector (make-pg-column :name "id" :type :int4 :attnum 1))))
+         (relations (list (list :table table :row-source (lambda () (list #(4) #(2) #(3) #(1))))))
+         (volatile '(:func "nextval" ((:const "s")) :type :int8))
+         (stable '(:func "current_setting" ((:const "application_name")) :type :text))
+         (argument '(:func "nextval" ((:const "arg")) :type :int8))
+         (state (vector 0 0 "before"))
+         (rows (list (cons "set" (lambda (id) (list id)))))
+         (old-eval (symbol-function 'eval-expr))
+         (old-set (symbol-function 'make-sql-set-function-iterator)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'eval-expr)
+                 (lambda (expression environment)
+                   (cond ((or (eq expression volatile) (eq expression argument)) (incf (aref state 0)))
+                         ((eq expression stable) (incf (aref state 1)) (aref state 2))
+                         (t (funcall old-eval expression environment))))
+                 (symbol-function 'make-sql-set-function-iterator)
+                 (lambda (call environment)
+                   (dolist (expression (third call)) (eval-expr expression environment))
+                   (let ((values (funcall (cdr (assoc (second call) rows :test #'string=))
+                                          (aref environment 0))))
+                     (lambda ()
+                       (when values (values (pop values) t))))))
+           (with-query-temp-files
+             (funcall function relations volatile stable argument state
+                      (lambda (new-rows) (setf rows new-rows)))))
+      (setf (symbol-function 'eval-expr) old-eval
+            (symbol-function 'make-sql-set-function-iterator) old-set))))
+
+(rove:deftest test-sorted-project-set-postpones-whole-group
+    (call-with-sorted-project-set-fixture
+     (lambda (relations volatile stable argument state set-rows)
+       (declare (ignore argument))
+       (funcall set-rows
+                (list (cons "set" (lambda (id) (when (> id 1) (list (* id 10) (1+ (* id 10))))))
+                      (cons "other" (lambda (id) (when (> id 1) (list (- id)))))))
+       (let* ((calls '((:set-func "set" nil) (:set-func "other" nil)))
+              (wrapped '(:binop "+" (:col 2 :type :int4) (:const 0 :type :int4) :type :int4))
+              (targets (list (list :expr volatile) (list :expr '(:col 1 :type :int4))
+                             (list :expr wrapped) (list :expr '(:col 3 :type :int4))
+                             (list :expr stable)))
+              (node (list :top-n (list (cons '(:col 1 :type :int4) nil)) 2
+                          (list :project targets (list :project-set calls '(:seq-scan 0 42) 1))))
+              (iterator (make-resumable-query-plan-iterator (%make-query-plan :physical node) relations)))
+         (unwind-protect
+              (progn
+                (multiple-value-bind (row present) (sql-iterator-next iterator)
+                  (rove:ok present)
+                  (rove:ok (equalp (car row) #(1 2 20 -2 "before")))
+                  (rove:ok (= 4 (aref state 1)))
+                  (setf (aref state 2) "after"))
+                (multiple-value-bind (row present) (sql-iterator-next iterator)
+                  (rove:ok present)
+                  (rove:ok (equalp (car row) (vector 2 2 21 +null+ "before"))))
+                (rove:ok (= 2 (aref state 0)))
+                (rove:ok (not (nth-value 1 (sql-iterator-next iterator))))
+                (rove:ok (= 2 (aref state 0))))
+           (close-sql-iterator iterator))))))
+
+(rove:deftest test-sorted-project-set-bare-attempt-order
+    (dolist (before '(t nil))
+      (call-with-sorted-project-set-fixture
+       (lambda (relations volatile stable argument state set-rows)
+         (declare (ignore stable set-rows))
+         (let* ((set-output '(:col 2 :type :int4))
+                (targets (mapcar (lambda (expression) (list :expr expression))
+                                 (if before (list volatile set-output) (list set-output volatile))))
+                (node (list :top-n (list (cons '(:col 1 :type :int4) nil)) 2
+                            (list :project targets
+                                  (list :project-set (list (list :set-func "set" (list argument)))
+                                        '(:seq-scan 0 42) 1))))
+                (iterator (make-resumable-query-plan-iterator (%make-query-plan :physical node) relations)))
+           (unwind-protect
+                (progn
+                  (multiple-value-bind (row present) (sql-iterator-next iterator)
+                    (rove:ok present)
+                    (rove:ok (= (aref (car row) (if before 0 1)) (if before 1 2)))
+                    (rove:ok (= 2 (aref state 0))))
+                  (multiple-value-bind (row present) (sql-iterator-next iterator)
+                    (rove:ok present)
+                    (rove:ok (= (aref (car row) (if before 0 1)) (if before 4 5)))
+                    (rove:ok (= 5 (aref state 0))))
+                  (rove:ok (not (nth-value 1 (sql-iterator-next iterator))))
+                  (rove:ok (= 5 (aref state 0))))
+             (close-sql-iterator iterator)))))))
+
+(rove:deftest test-sorted-project-set-keeps-key-srfs-below-sort
+    (call-with-sorted-project-set-fixture
+     (lambda (relations volatile stable argument state set-rows)
+       (declare (ignore stable argument set-rows))
+       (let* ((targets (list (list :expr volatile) (list :expr '(:col 2 :type :int4))))
+              (node (list :sort (list (cons '(:sort-output 2 :type :int4) nil))
+                          (list :project targets (list :project-set '((:set-func "set" nil))
+                                                       '(:seq-scan 0 42) 1))))
+              (iterator (make-resumable-query-plan-iterator (%make-query-plan :physical node) relations)))
+         (unwind-protect
+              (progn
+                (dotimes (i 4)
+                  (multiple-value-bind (row present) (sql-iterator-next iterator)
+                    (rove:ok present)
+                    (rove:ok (equalp (car row) (vector (1+ i) (1+ i))))))
+                (rove:ok (= 4 (aref state 0)))
+                (rove:ok (not (nth-value 1 (sql-iterator-next iterator))))
+                (rove:ok (= 4 (aref state 0))))
+           (close-sql-iterator iterator))))))
+
+(rove:deftest test-sorted-project-set-empty-and-limit-zero
+    (dolist (limit '(nil 0))
+      (call-with-sorted-project-set-fixture
+       (lambda (relations volatile stable argument state set-rows)
+         (declare (ignore stable argument))
+         (funcall set-rows (list (cons "set" (lambda (id) (declare (ignore id)) nil))))
+         (let* ((targets (list (list :expr volatile) (list :expr '(:col 2 :type :int4))))
+                (project (list :project targets (list :project-set '((:set-func "set" nil))
+                                                      '(:seq-scan 0 42) 1)))
+                (order (list (cons '(:col 1 :type :int4) nil)))
+                (node (if limit (list :top-n order limit project) (list :sort order project)))
+                (iterator (make-resumable-query-plan-iterator (%make-query-plan :physical node) relations)))
+           (unwind-protect
+                (progn
+                  (rove:ok (not (nth-value 1 (sql-iterator-next iterator))))
+                  (rove:ok (= (if limit 0 4) (aref state 0))))
+             (close-sql-iterator iterator)))))))
+
+(rove:deftest test-sorted-project-set-caches-raw-order-expressions
+    (call-with-sorted-project-set-fixture
+     (lambda (relations volatile stable argument state set-rows)
+       (declare (ignore set-rows))
+       (let* ((wrapped '(:binop "+" (:col 2 :type :int4) (:const 0 :type :int4) :type :int4))
+              (targets (list (list :expr volatile) (list :expr wrapped) (list :expr stable)))
+              (node (list :sort (list (cons argument nil))
+                          (list :project targets (list :project-set '((:set-func "set" nil))
+                                                       '(:seq-scan 0 42) 1))))
+              (iterator (make-resumable-query-plan-iterator (%make-query-plan :physical node) relations)))
+         (unwind-protect
+              (progn
+                (multiple-value-bind (row present) (sql-iterator-next iterator)
+                  (rove:ok present)
+                  (rove:ok (equalp (car row) #(5 4 "before")))
+                  (rove:ok (= 5 (aref state 0)))
+                  (rove:ok (= 4 (aref state 1))))
+                (multiple-value-bind (row present) (sql-iterator-next iterator)
+                  (rove:ok present)
+                  (rove:ok (equalp (car row) #(6 2 "before")))
+                  (rove:ok (= 6 (aref state 0)))))
+           (close-sql-iterator iterator))))))
 
 (rove:deftest test-toast-chunk-assembly
     (let ((chunks (list (cons 0 (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(0 1 2 3)))
