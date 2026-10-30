@@ -13,6 +13,10 @@ PROMOTION = runpy.run_path(str(HERE / "promotion-primary-inspect.py"))["control"
 CHECKPOINT = runpy.run_path(str(HERE / "checkpoint-snapshot.py"))["read_copy"]
 DECODE_CHECKPOINT = runpy.run_path(str(HERE / "checkpoint-snapshot.py"))["checkpoint"]
 NAMESPACE = runpy.run_path(str(HERE / "wal-namespace-inspect.py"))["inspect"]
+RECOVERY_LAYOUT = runpy.run_path(str(HERE / "resource_control_fields.py"))["recovery_control_layout"]
+DECODE_RECOVERY = runpy.run_path(str(HERE / "recovery-control-state.py"))["decode"]
+PENDING = runpy.run_path(str(HERE / "restartpoint-prefix-inspect.py"))
+PROMOTION_FIXTURE = runpy.run_path(str(HERE / "promotion-primary-inspect.py"))["checkpoint_bytes"]
 
 
 class ResourceControlTests(unittest.TestCase):
@@ -147,6 +151,65 @@ class ResourceControlTests(unittest.TestCase):
         for data in (bad, snapshot[:-1], snapshot + b"\0"):
             with self.assertRaises(AssertionError):
                 DECODE_CHECKPOINT(data)
+
+    def test_promotion_utility_reads_all_recovery_resource_layouts(self):
+        for pending, layouts in ((False, (72, 88)), (True, (88, 104, 132, 148))):
+            for layout in layouts:
+                for known in (False, True):
+                    with self.subTest(pending=pending, layout=layout, known=known):
+                        data = bytearray(layout + (48 if known else 0))
+                        data[:8] = b"PGRSTAT4" if pending else b"PGRSTAT3"
+                        struct.pack_into("<IIQQQQQ", data, 8, 3 if pending else 2, 1,
+                                         123, 456, 32, 256, 1003)
+                        struct.pack_into("<Iq", data, 56, 5, 0)
+                        selected = layout in ((104, 148) if pending else (88,))
+                        if pending:
+                            struct.pack_into("<IIQ", data, 68, 3, 0, 7)
+                        offset = 84 if pending else 68
+                        if selected:
+                            struct.pack_into("<IIQ", data, offset, 2, 2, 99)
+                            offset += 16
+                        if pending and layout in (132, 148):
+                            struct.pack_into("<QIQQQQ", data, offset, 9, 1, 32, 456, 256, 8)
+                        if known:
+                            fact = (b"PGRES001" + struct.pack("<5I", 100, 8, 10, 0, 128)
+                                    + bytes(4) + struct.pack("<QII", 64, 1, 0))
+                            data[-52:-4] = fact
+                        struct.pack_into("<I", data, len(data) - 4, zlib.crc32(data))
+                        path = self.root / "physical-recovery.control"
+                        path.write_bytes(data)
+                        self.assertEqual(3 if pending else 2, CTL["recovery_phase"](self.root))
+                        decoded_size, decoded_fact = RECOVERY_LAYOUT(data)
+                        self.assertEqual(layout, decoded_size)
+                        self.assertEqual(known, decoded_fact is not None)
+                        if pending:
+                            self.assertEqual(data, PENDING["checked_pending_control"](self.root))
+                            if layout in (132, 148):
+                                self.assertEqual((9, 1, 32, 456, 256, 8), PENDING["retained_reference"](data))
+                        else:
+                            self.assertEqual(256, DECODE_RECOVERY(data)["applied"])
+                            self.assertEqual(decoded_fact, DECODE_RECOVERY(data).get("resource_fact"))
+                        if known:
+                            for relative, value in ((0, 0), (28, 1), (32, 257), (40, 3), (44, 1)):
+                                bad = data.copy()
+                                struct.pack_into("<I", bad, len(bad) - 52 + relative, value)
+                                struct.pack_into("<I", bad, len(bad) - 4, 0)
+                                struct.pack_into("<I", bad, len(bad) - 4, zlib.crc32(bad))
+                                path.write_bytes(bad)
+                                with self.assertRaises(ValueError):
+                                    CTL["recovery_phase"](self.root)
+                                with self.assertRaises(AssertionError):
+                                    RECOVERY_LAYOUT(bad)
+
+    def test_promotion_fixture_preserves_frozen_resources_in_checkpoint_bytes(self):
+        expected = dict(fork=256, floor=1003, oid=16384, time=0, child=3, parent=2)
+        for known in (False, True):
+            if known:
+                expected["resource_fact"] = dict(parameters=[50, 4, 5, 0, 64], lsn=192, timeline=1)
+            start, record = PROMOTION_FIXTURE(expected)
+            self.assertEqual(168 if known else 120, len(record))
+            self.assertEqual(start, struct.unpack_from("<Q", record, 12)[0])
+            self.assertEqual(expected.get("resource_fact"), DECODE_CHECKPOINT(record[32:]).get("resource_fact"))
 
 
 if __name__ == "__main__":

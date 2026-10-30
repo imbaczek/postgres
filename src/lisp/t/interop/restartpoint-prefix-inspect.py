@@ -11,6 +11,7 @@ import sys
 import zlib
 
 CHECK_RESOURCES = runpy.run_path(str(pathlib.Path(__file__).with_name("resource_control_fields.py")))["checkpoint_resource_fact"]
+RECOVERY_LAYOUT = runpy.run_path(str(pathlib.Path(__file__).with_name("resource_control_fields.py")))["recovery_control_layout"]
 
 def fnv(data, value=0xCBF29CE484222325):
     for byte in data:
@@ -78,15 +79,17 @@ def plist(values):
 
 def checked_pending_control(root):
     control = (root / "physical-recovery.control").read_bytes()
-    assert len(control) in (88, 104, 132, 148) and control[:8] == b"PGRSTAT4"
+    layout, _ = RECOVERY_LAYOUT(control)
+    assert layout in (88, 104, 132, 148) and control[:8] == b"PGRSTAT4"
     checked_crc(control, len(control) - 4)
     assert struct.unpack_from("<I", control, 8)[0] & 0x7FFFFFFF == 3
     return control
 
 
 def retained_reference(control):
-    assert len(control) in (132, 148), "publisher omitted its retained archive"
-    offset = 100 if len(control) == 148 else 84
+    layout, _ = RECOVERY_LAYOUT(control)
+    assert layout in (132, 148), "publisher omitted its retained archive"
+    offset = 100 if layout == 148 else 84
     root_id, timeline, base, manifest, end, digest = struct.unpack_from("<QIQQQQ", control, offset)
     assert timeline == struct.unpack_from("<I", control, 12)[0]
     assert base == struct.unpack_from("<Q", control, 32)[0] <= end
@@ -132,12 +135,13 @@ def parsed_history(target, text):
 
 
 def pending_parent_history(root, control):
+    layout, _ = RECOVERY_LAYOUT(control)
     base = struct.unpack_from("<I", control, 12)[0]
-    parent = struct.unpack_from("<I", control, 84)[0] if len(control) == 148 else base
+    parent = struct.unpack_from("<I", control, 84)[0] if layout == 148 else base
     text = (root / "pg_wal" / f"{parent:08X}.history").read_text() if parent > 1 else ""
     if parent == base:
         return text, None
-    assert len(control) == 148
+    assert layout == 148
     target, digest = struct.unpack_from("<IQ", control, 88)
     for _ in range(256):
         assert target >= parent and digest is not None
@@ -234,7 +238,7 @@ def check_retained_archive(root, source, control, generation_text, *, parent_his
                 ":BASE-TIMELINE": timeline, ":BASE": base, ":MANIFEST-DIGEST": manifest}
     _, _, index, _ = archive_object(root, "inventory", root_id)
     assert plist(index[":IDENTITY"]) == identity
-    parent = struct.unpack_from("<I", control, 84)[0] if len(control) == 148 else timeline
+    parent = struct.unpack_from("<I", control, 84)[0] if RECOVERY_LAYOUT(control)[0] == 148 else timeline
     assert index[":HISTORY-TARGET"] == parent
     if parent_history is None:
         parent_history, parent_digest = pending_parent_history(root, control)

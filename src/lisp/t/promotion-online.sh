@@ -47,6 +47,9 @@ mkdir -m 700 "$TMP/copy"
 SOURCE=$!
 test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 sql "$PORT" 'CREATE TABLE data (id integer PRIMARY KEY); INSERT INTO data VALUES (1)'
+if [ "${RESOURCE_FACTS:-0}" = 1 ]; then
+    checked source '(wal-report-resource-parameters (make-resource-parameters 100 8 10 0 128))' resource-initial
+fi
 checked source "(physical-base-backup \"$TMP/copy/\" \"online_promotion\")" backup
 start_target
 checked target '(physical-recovery-enable-streaming)' streaming
@@ -69,6 +72,12 @@ fi
 checked target "(physical-follow-start \"127.0.0.1\" $PORT \"online_promotion\")" follow
 sql "$PORT" 'INSERT INTO data VALUES (2),(3),(4),(5)'
 wait_value 'SELECT count(*) FROM data' 5
+if [ "${RESOURCE_FACTS:-0}" = 1 ]; then
+    checked source '(wal-report-resource-parameters (make-resource-parameters 50 4 5 0 64))' resource-decrease
+    resource_end=$(sql "$PORT" 'SELECT pg_current_wal_flush_lsn()')
+    wait_value "SELECT pg_last_wal_replay_lsn() >= '$resource_end'::pg_lsn" t
+    checked target "(assert (equal '(50 4 5 0 64) (getf (getf *physical-recovery-state* :source-resource-fact) :resource-parameters)))" resource-applied
+fi
 sql "$TARGET_PORT" 'SELECT pg_wal_replay_pause()'
 "$PATRONI_PYTHON" "$BASE/t/interop/promotion-idle-client.py" "$TARGET_PORT" "$TMP" >"$TMP/reader.log" 2>&1 &
 READER=$!
@@ -142,6 +151,9 @@ exec 3>&-
 wait_value 'SELECT pg_is_in_recovery()' f
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 12
 checked target '(assert (and (not *physical-follow-runtime*) (not *physical-restartpoint-worker*) (not *physical-promotion-stopping-p*) (not *physical-recovery-state*) (not *physical-recovery-failed-p*)))' primary
+if [ "${RESOURCE_FACTS:-0}" = 1 ]; then
+    checked target "(assert (equal '(50 4 5 0 64) (getf *wal-control-metadata* :resource-parameters)))" resource-promoted
+fi
 if [ "${LIVE_CHILD_ADOPTION:-0}" = 1 ]; then
     checked target '(assert *promotion-live-test-preserved*)' live-adoption-preserved
     echo 'promotion-online: live child adoption preserves catalog, CLOG and runtime tables PASS'
@@ -154,7 +166,12 @@ start_target
 test "$(sql "$TARGET_PORT" 'SELECT pg_is_in_recovery()')" = f
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM data')" = 12
 test "$(sql "$TARGET_PORT" 'SELECT id FROM after_promotion')" = 11
-test ! -e "$TMP/copy/physical-follow.control"
+if [ "${RESOURCE_FACTS:-0}" = 1 ]; then
+    checked target "(assert (equal '(50 4 5 0 64) (getf *wal-control-metadata* :resource-parameters)))" resource-restarted
+fi
+if [ -e "$TMP/copy/physical-follow.control" ]; then
+    checked target '(let ((config (physical-follow-read-config))) (assert (physical-follow-cleanup-only-p config)) (assert (not (getf (physical-follow-controller-state config) :enabled))))' retired-follow
+fi
 test ! -e "$TMP/copy/promote"
 if "$BASE/bin/pg_ctl" promote -D "$TMP/copy" -W >"$TMP/primary-reject.log" 2>&1; then exit 1; fi
 grep -q 'server is not in standby mode' "$TMP/primary-reject.log"

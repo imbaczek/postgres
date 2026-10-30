@@ -1,18 +1,24 @@
 """Independent native control decoding; this is not C pg_control disk format."""
 import argparse
+import runpy
 import struct
 import zlib
 from pathlib import Path
 
+RECOVERY_LAYOUT = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["recovery_control_layout"]
 
 def decode(raw):
-    assert len(raw) in (60, 72), ('length', len(raw))
     legacy = len(raw) == 60
     versions = {b'PGRSTATE': 1} if legacy else {b'PGRSTAT2': 2, b'PGRSTAT3': 3}
     magic = bytes(raw[:8])
     assert magic in versions, 'magic'
     version = versions[magic]
-    crc_offset = 56 if legacy else 68
+    if version == 3:
+        layout, resources = RECOVERY_LAYOUT(raw)
+    else:
+        assert len(raw) == (60 if legacy else 72)
+        layout, resources = len(raw), None
+    crc_offset = len(raw) - 4
     expected, = struct.unpack_from('<I', raw, crc_offset)
     checked = bytearray(raw)
     struct.pack_into('<I', checked, crc_offset, 0)
@@ -22,7 +28,11 @@ def decode(raw):
         assert xid == 0, 'hidden exhausted XID value'
         xid = 1 << 64
         phase &= ~(1 << 31)
-    assert phase in (0, 1, 2) and timeline == 1
+    assert phase in (0, 1, 2) and 1 <= timeline < 2**32
+    assert version == 3 or timeline == 1
+    if layout == 88:
+        applied_timeline, target, _ = struct.unpack_from('<IIQ', raw, 68)
+        assert phase == 2 and timeline <= applied_timeline <= target and target > timeline
     assert 32 <= checkpoint <= applied and xid >= 3
     assert phase == 2 or checkpoint == applied
     assert phase != 0 or digest == 0
@@ -31,8 +41,11 @@ def decode(raw):
     if not legacy:
         assert state in ((0,) if phase == 0 else (2, 5)), 'DBState'
         assert -(2**63) <= when < 2**63, 'state time'
-    return dict(version=version, phase=phase, system_id=system_id,
-                applied=applied, next_xid=xid, state=state, time=when)
+    result = dict(version=version, phase=phase, system_id=system_id,
+                  applied=applied, next_xid=xid, state=state, time=when)
+    if resources is not None:
+        result['resource_fact'] = resources
+    return result
 
 
 def main():

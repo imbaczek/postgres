@@ -45,6 +45,7 @@ def path_for(root, child, start):
 def save_expected(target, output):
     root = pathlib.Path(target)
     state = ARCHIVE["checked_pending_control"](root)
+    layout, resources = ARCHIVE["RECOVERY_LAYOUT"](state)
     fork = struct.unpack_from("<Q", state, 40)[0]
     actual = (1 << 64) if struct.unpack_from("<I", state, 8)[0] & (1 << 31) else struct.unpack_from("<Q", state, 48)[0]
     generation = struct.unpack_from("<Q", state, 76)[0]
@@ -66,11 +67,13 @@ def save_expected(target, output):
     expected = {"fork": fork, "actual": actual, "floor": floor, "oid": int(oids[0]),
                 "system_id": struct.unpack_from("<Q", state, 16)[0],
                 "child": struct.unpack_from("<I", state, 68)[0],
-                "parent": struct.unpack_from("<I", state, 84 if len(state) == 148 else 12)[0],
+                "parent": struct.unpack_from("<I", state, 84 if layout == 148 else 12)[0],
                 "time": struct.unpack_from("<q", state, 60)[0], "parents": parents(root),
                 "parent_history": parent_history, "parent_digest": parent_digest,
                 "pending_control": state.hex(),
                 "retained_reference": ARCHIVE["retained_reference"](state)}
+    if resources is not None:
+        expected["resource_fact"] = resources
     pathlib.Path(output).write_text(json.dumps(expected, sort_keys=True))
 
 
@@ -119,6 +122,7 @@ def check_primary(target, expected_path, initial):
     ARCHIVE["check_retained_archive"](root, None, state, f"(:PREFIX-DIGEST {digest})",
                                      parent_history=parent_history, parent_digest=expected["parent_digest"])
     if initial == "initial":
+        assert CHECK_RESOURCES(snapshot) == expected.get("resource_fact")
         eor_start = after(expected["fork"], 56)
         batch_start = after(eor_start + 56, 32)
         checkpoint_start = after(batch_start + 32, record_size)
@@ -152,17 +156,22 @@ def drop_retired(target):
 
 
 def checkpoint_bytes(expected):
+    resources = expected.get("resource_fact")
+    size = 168 if resources is not None else 120
     eor = after(expected["fork"], 56)
     batch = after(eor + 56, 32)
-    start = after(batch + 32, 120)
-    snapshot = bytearray(88)
+    start = after(batch + 32, size)
+    snapshot = bytearray(size - 32)
     snapshot[:8] = b"PGCKPT02"
     floor = expected["floor"]
-    struct.pack_into("<QQQQQQqIIQII", snapshot, 8, start, start + 120, start,
+    struct.pack_into("<QQQQQQqIIQII", snapshot, 8, start, start + size, start,
                      floor if floor < (1 << 64) else 0, floor - 1, expected["oid"],
                      expected["time"], expected["child"], expected["parent"],
                      floor if floor < (1 << 64) else 0, 1, 3 if floor == (1 << 64) else 0)
-    record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 8, 4, 120, start, 0, 0) + snapshot)
+    if resources is not None:
+        snapshot[88:120] = b"PGRES001" + struct.pack("<5I", *resources["parameters"]) + bytes(4)
+        struct.pack_into("<QII", snapshot, 120, resources["lsn"], resources["timeline"], 0)
+    record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 8, 4, size, start, 0, 0) + snapshot)
     struct.pack_into("<I", record, 28, zlib.crc32(record))
     return start, record
 

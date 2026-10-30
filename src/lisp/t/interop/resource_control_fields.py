@@ -1,4 +1,5 @@
 """Independent optional-field checks for native control inspection oracles."""
+import zlib
 
 
 def resource_values(data):
@@ -21,6 +22,25 @@ def checkpoint_resource_fact(data):
     assert 1 <= lsn <= int.from_bytes(data[8:16], "little")
     assert 1 <= timeline <= int.from_bytes(data[64:68], "little")
     return dict(parameters=list(values), lsn=lsn, timeline=timeline)
+
+
+def recovery_control_layout(data):
+    ordinary, pending = data[:8] == b"PGRSTAT3", data[:8] == b"PGRSTAT4"
+    known = ((ordinary and len(data) in (120, 136))
+             or (pending and len(data) in (136, 152, 180, 196)))
+    size = len(data) - (48 if known else 0)
+    assert (ordinary and size in (72, 88)) or (pending and size in (88, 104, 132, 148))
+    assert zlib.crc32(data[:-4] + bytes(4)) == int.from_bytes(data[-4:], "little")
+    if not known:
+        return size, None
+    fact = data[-52:-4]
+    values = resource_values(fact[:32])
+    lsn, timeline = int.from_bytes(fact[32:40], "little"), int.from_bytes(fact[40:44], "little")
+    selected = size in ((104, 148) if pending else (88,))
+    offset = (84 if pending else 68) if selected else 12
+    assert not any(fact[44:]) and 1 <= lsn <= int.from_bytes(data[40:48], "little")
+    assert 1 <= timeline <= int.from_bytes(data[offset:offset + 4], "little")
+    return size, dict(parameters=list(values), lsn=lsn, timeline=timeline)
 
 
 def check_optional_fields(fields):

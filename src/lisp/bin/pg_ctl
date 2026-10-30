@@ -35,12 +35,27 @@ def read_regular(path, limit):
 
 def recovery_phase(root):
     """Read and check native recovery control; do not infer a role from file names."""
-    data = read_regular(root / "physical-recovery.control", 88)
-    if (len(data), data[:8]) not in ((72, b"PGRSTAT3"), (88, b"PGRSTAT4")):
+    data = read_regular(root / "physical-recovery.control", 196)
+    ordinary = data[:8] == b"PGRSTAT3"
+    pending = data[:8] == b"PGRSTAT4"
+    known = ((ordinary and len(data) in (120, 136))
+             or (pending and len(data) in (136, 152, 180, 196)))
+    size = len(data) - (48 if known else 0)
+    if not ((ordinary and size in (72, 88)) or (pending and size in (88, 104, 132, 148))):
         raise ValueError("invalid native recovery control")
     saved = struct.unpack_from("<I", data, len(data) - 4)[0]
     if zlib.crc32(data[:-4] + b"\0" * 4) != saved:
         raise ValueError("native recovery control checksum mismatch")
+    if known:
+        fact = data[-52:-4]
+        validate_resource_tuple(fact[:32])
+        origin, timeline, reserved = struct.unpack_from("<QII", fact, 32)
+        applied = struct.unpack_from("<Q", data, 40)[0]
+        selected = size in ((104, 148) if pending else (88,))
+        timeline_offset = (84 if pending else 68) if selected else 12
+        applied_timeline = struct.unpack_from("<I", data, timeline_offset)[0]
+        if not (reserved == 0 and 1 <= origin <= applied and 1 <= timeline <= applied_timeline):
+            raise ValueError("invalid native recovery resource fact")
     return struct.unpack_from("<I", data, 8)[0] & 0x7FFFFFFF
 
 
@@ -79,6 +94,16 @@ def open_postmaster(root):
         raise
 
 
+def validate_resource_tuple(data):
+    if len(data) != 32 or data[:8] != b"PGRES001" or data[28:] != b"\0" * 4:
+        raise ValueError("invalid native resource parameter encoding")
+    connections, workers, senders, prepared, locks = struct.unpack_from("<5I", data, 8)
+    if not (1 <= connections <= 262143 and 0 <= workers <= 262143
+            and 0 <= senders <= 262143 and 0 <= prepared <= 262143
+            and 10 <= locks <= 2147483647 and connections + workers + senders + 3 <= 262143):
+        raise ValueError("invalid native resource parameters")
+
+
 def validate_resource_fields(fields):
     if len(fields) not in (15, 21):
         return
@@ -86,16 +111,10 @@ def validate_resource_fields(fields):
     if fields[offset] != b"R" or len(fields[offset + 1]) != 64:
         raise ValueError("invalid native resource control extension")
     data = bytes.fromhex(fields[offset + 1].decode("ascii"))
-    if data[:8] != b"PGRES001" or data[28:] != b"\0" * 4:
-        raise ValueError("invalid native resource parameter encoding")
+    validate_resource_tuple(data)
     if any(re.fullmatch(rb"\+?[0-9]+", token) is None for token in fields[offset + 2:offset + 4]):
         raise ValueError("invalid native resource position encoding")
-    connections, workers, senders, prepared, locks = struct.unpack_from("<5I", data, 8)
-    if not (1 <= connections <= 262143 and 0 <= workers <= 262143
-            and 0 <= senders <= 262143 and 0 <= prepared <= 262143
-            and 10 <= locks <= 2147483647
-            and connections + workers + senders + 3 <= 262143
-            and 1 <= int(fields[offset + 2]) <= min(int(fields[2]), 2**64 - 1)
+    if not (1 <= int(fields[offset + 2]) <= min(int(fields[2]), 2**64 - 1)
             and 1 <= int(fields[offset + 3]) <= min(int(fields[3]), 2**32 - 1)):
         raise ValueError("invalid native resource parameter facts")
 
