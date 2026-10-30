@@ -445,6 +445,113 @@ result is text for typeof and int4 for array_length."
                     (when set-p (list (coerce-common-expression (third arguments) :int4))))
             :type (if set-p input-type :int4) :typmod -1))))
 
+(defun analyze-render-function (name arguments)
+  "Resolve chr, string_to_array and array_to_string against supported types."
+  (when (and (string= name "array_to_string") (member (length arguments) '(2 3))
+             (in-unknown-constant-p (first arguments)))
+    (ereport "42804" "could not determine polymorphic type because input has type unknown"))
+  (let ((types (cond ((string= name "chr") '(:int4))
+                     ((string= name "string_to_array") '(:text :text :text))
+                     (t '(nil :text :text)))))
+    (unless (and (if (string= name "chr") (= (length arguments) 1)
+                     (member (length arguments) '(2 3)))
+                 (loop for argument in arguments for type in types
+                       always (if type
+                                  (or (in-unknown-constant-p argument)
+                                      (sql-implicit-coercion-p (expr-type argument) type))
+                                  (or (eq (expr-type argument) :int2vector)
+                                      (sql-array-element-type (expr-type argument))))))
+      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+    (list :func name
+          (loop for argument in arguments for type in types
+                collect (cond (type (coerce-common-expression argument type))
+                              ((eq (expr-type argument) :int2vector)
+                               (list :cast argument :type :int2-array :typmod -1))
+                              (t argument)))
+          :type (if (string= name "string_to_array") :text-array :text) :typmod -1)))
+
+(defun eval-string-to-array (arguments)
+  "Split text at delimiters, replacing fields equal to the optional NULL string.
+A NULL delimiter splits at character boundaries; empty input yields an empty array."
+  (let ((text (first arguments))
+        (separator (second arguments))
+        (null-string (third arguments))
+        (elements (make-array 0 :adjustable t :fill-pointer 0)))
+    (when (eq text +null+) (return-from eval-string-to-array +null+))
+    (labels ((emit (field)
+               (check-for-interrupts)
+               (when (>= (length elements) +max-varlena-array-elements+)
+                 (ereport "54000" "array size exceeds the maximum allowed"))
+               (vector-push-extend
+                (if (and null-string (not (eq null-string +null+))
+                         (string= field null-string))
+                    +null+ field)
+                elements)))
+      (cond
+        ((zerop (length text)) nil)
+        ((eq separator +null+)
+         (loop for character across text do (emit (string character))))
+        ((zerop (length separator)) (emit text))
+        (t
+         (loop with start = 0
+               for end = (search separator text :start2 start)
+               do (emit (subseq text start end))
+               while end
+               do (setf start (+ end (length separator))))))
+      (let ((size (length elements)))
+        (make-sql-array :element-type-id :text :elements (coerce elements 'simple-vector)
+                        :dimensions (when (plusp size) (list size))
+                        :lower-bounds (when (plusp size) '(1)))))))
+
+(defun eval-render-function (name arguments)
+  "Render a UTF-8 codepoint or join unquoted array elements as PostgreSQL text.
+Omit NULL elements unless a non-NULL replacement is supplied."
+  (if (string= name "chr")
+      (sql-strict-let ((code (first arguments)))
+        (cond ((minusp code) (ereport "22023" "character number must be positive"))
+              ((zerop code) (ereport "54000" "null character not permitted"))
+              ((> code #x10ffff)
+               (ereport "54000" "requested character too large for encoding: ~d" code))
+              ((<= #xd800 code #xdfff)
+               (ereport "54000" "requested character not valid for encoding: ~d" code))
+              (t (string (code-char code)))))
+      (sql-strict-let ((array (first arguments)) (separator (second arguments)))
+        (let ((replacement (third arguments))
+              (printed nil))
+          (with-output-to-string (stream)
+            (loop for value across (sql-array-elements array)
+                  for index from 0
+                  do (when (zerop (mod index 4096)) (check-for-interrupts))
+                     (unless (and (eq value +null+)
+                                  (or (null replacement) (eq replacement +null+)))
+                       (when printed (write-string separator stream))
+                       (write-string (if (eq value +null+) replacement
+                                         (value->text value (sql-array-element-type-id array)))
+                                     stream)
+                       (setf printed t))))))))
+
+(defun analyze-minmax-function (name arguments)
+  "Coerce GREATEST and LEAST inputs to a common, orderable type."
+  (let* ((type (common-expression-type arguments (string-upcase name)))
+         (coerced (mapcar (lambda (argument) (coerce-common-expression argument type))
+                          arguments)))
+    (when (analyzed-expression-contains-set-p arguments)
+      (ereport "0A000" "set-returning functions are not allowed in ~a" (string-upcase name)))
+    (when (member type '(:json :json-array))
+      (json-equality-or-order-error type t))
+    (list :func name coerced :type type :typmod (common-expression-typmod coerced))))
+
+(defun eval-minmax-function (name arguments)
+  "Evaluate all inputs, ignoring NULL unless every input is NULL."
+  (let ((result +null+))
+    (dolist (value arguments result)
+      (unless (eq value +null+)
+        (when (or (eq result +null+)
+                  (if (string= name "greatest")
+                      (plusp (compare-3way value result))
+                      (minusp (compare-3way value result))))
+          (setf result value))))))
+
 (defun analyze-substr-function (name arguments)
   "Resolve text and bytea substring overloads."
   (unless (and (member (length arguments) '(2 3))
@@ -1332,6 +1439,13 @@ so a nested argument error keeps its own diagnostics."
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (check-qualified-numeric-function-call expr table)
+  (when (and (getf (cdddr expr) :minmax-syntax-p)
+             (or (null (third expr))
+                 (getf (cdddr expr) :call-distinct)
+                 (getf (cdddr expr) :call-order)
+                 (getf (cdddr expr) :variadic)
+                 (some (lambda (argument) (eq (first argument) :named-arg)) (third expr))))
+    (ereport "42601" "invalid GREATEST or LEAST syntax"))
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
          (random-signature nil)
          (args (multiple-value-bind (arguments signature)
@@ -1393,6 +1507,13 @@ so a nested argument error keeps its own diagnostics."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-substr-function name args)))
+      ((member name '("chr" "array_to_string" "string_to_array") :test #'string=)
+       (let ((*defer-function-constant-coercion-p*
+               (or (getf (cdddr expr) :call-distinct)
+                   (getf (cdddr expr) :call-order))))
+         (analyze-render-function name args)))
+      ((getf (cdddr expr) :minmax-syntax-p)
+       (analyze-minmax-function name args))
       ((string= name "pg_wal_lsn_diff") (analyze-wal-lsn-diff name args))
       ((string= name "pg_walfile_name") (analyze-wal-filename name args))
       ((member name '("lower" "current_setting") :test #'string=)
@@ -3476,6 +3597,7 @@ candidate selection."
                                    "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "json_build_array" "json_build_object"
                                    "jsonb_build_array" "jsonb_build_object" "get_byte" "set_byte" "get_bit" "set_bit"
                                    "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid"
+                                   "chr" "array_to_string" "string_to_array" "greatest" "least"
                                    "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                                    "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                                    "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
@@ -4185,6 +4307,10 @@ aliases share the corresponding numeric operator implementation."
              ((string= name "json_array_length") (sql-json-source-array-length value))
              (t (sql-jsonb-array-length value)))))
     ((member name '("substr" "substring") :test #'string=) (eval-substr-function args))
+    ((member name '("chr" "array_to_string") :test #'string=)
+     (eval-render-function name args))
+    ((member name '("greatest" "least") :test #'string=) (eval-minmax-function name args))
+    ((string= name "string_to_array") (eval-string-to-array args))
     ((string= name "pg_wal_lsn_diff") (eval-wal-lsn-diff args))
     ((string= name "pg_walfile_name") (eval-wal-filename args))
     ((member name '("lower" "current_setting") :test #'string=)

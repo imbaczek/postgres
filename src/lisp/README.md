@@ -289,6 +289,14 @@ smart/fast/immediate shutdown and escalation.
 
 ## Supported SQL
 
+Single-row `VALUES` queries are supported as standalone queries, set-operation
+arms, and derived tables, including recursive CTE seeds. Multiple rows in a
+`VALUES` query are rejected with SQLSTATE `0A000`; this does not change
+`INSERT ... VALUES` support. `GREATEST` and `LEAST` choose a common supported
+type and ignore NULL inputs unless all inputs are NULL. `chr`, `array_to_string`
+and `string_to_array` support the corresponding text and array operations,
+including optional NULL replacement arguments.
+
 Table columns support `smallint`/`int2`, `int`/`integer`/`int4`, `bigint`/`int8`,
 `numeric`/`decimal` (including precision and scale), `real`/`float4`,
 `double precision`/`float8`, `date`, `time` and `timestamp` with or without time

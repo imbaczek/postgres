@@ -1058,11 +1058,21 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                                 (analyze-group-keys (getf ast :group-by) scope (getf ast :targets)))))
            (aggregate-analysis
              (progn
-               (setf (getf *select-analysis-frame* :kind) (if (getf ast :from-function) :from-function :select-target)
+               (setf (getf *select-analysis-frame* :kind) (cond ((getf ast :values-query-p) :values)
+                                                                ((getf ast :from-function) :from-function)
+                                                                (t :select-target))
                      (getf *select-analysis-frame* :group-keys) group-keys)
                (multiple-value-list
                 (analyze-aggregate-targets (getf ast :targets) scope group-keys))))
            (targets (progn
+                      (when (getf ast :values-query-p)
+                        (dolist (target (first aggregate-analysis))
+                          (when (in-unknown-constant-p (getf target :expr))
+                            (setf (getf target :expr)
+                                  (list :const (second (getf target :expr))
+                                        :type :text :typmod -1 :explicit-cast t)
+                                  (getf target :type) :text
+                                  (getf target :typmod) -1))))
                       (setf *window-analysis-targets* (first aggregate-analysis))
                       (resolve-query-window-specifications scope (first aggregate-analysis))
                       (first aggregate-analysis)))
@@ -1105,6 +1115,8 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                targets order
                (+ width (length *select-window-functions*))
                (getf ast :distinct)))))
+      (when (and (getf ast :values-query-p) (third set-analysis))
+        (ereport "0A000" "set-returning functions are not allowed in VALUES"))
       (let ((item (find-if (lambda (item) (member (expr-type (car item)) '(:json :json-array)))
                            (second set-analysis))))
         (when item (json-equality-or-order-error (expr-type (car item)) t)))

@@ -17,7 +17,75 @@ SETUP = (
     "CREATE TABLE rc_target(id int)",
 )
 
+MANDELBROT = Path(__file__).with_name("mandelbrot.sql").read_text()
+
 CASES = [
+    "SELECT chr(27),chr(233),chr(128512),chr(NULL)",
+    "SELECT chr(-1)",
+    "SELECT chr(0)",
+    "SELECT chr(55296)",
+    "SELECT chr(1114112)",
+    "SELECT chr(27::smallint)",
+    "SELECT chr(27::bigint)",
+    "SELECT chr(1,2)",
+    "SELECT array_to_string(ARRAY['a',NULL,'b'],','),array_to_string(ARRAY['a',NULL,'b'],',','?')",
+    "SELECT array_to_string(ARRAY[1,2,3],':'),array_to_string(ARRAY[true,false],':')",
+    "SELECT array_to_string(ARRAY[[1,2],[3,4]],':')",
+    "SELECT array_to_string('{}'::text[],','),array_to_string(ARRAY[NULL::text],',')",
+    "SELECT array_to_string(ARRAY['a',NULL],',',NULL),array_to_string(NULL::int[],','),array_to_string(ARRAY[1],NULL)",
+    "SELECT array_to_string('[0:1]={a,b}'::text[],':')",
+    "SELECT array_to_string(ARRAY[1])",
+    "SELECT array_to_string(1,',')",
+    "SELECT greatest(1,2,NULL),greatest(NULL,NULL),greatest(1::smallint,2::bigint),greatest(1,2.5)",
+    "SELECT greatest('b','a'),greatest('NaN'::float8,1::float8)",
+    "SELECT greatest(NULL,1/0)",
+    "SELECT greatest()",
+    "SELECT greatest(1,true)",
+    "SELECT pg_catalog.greatest(1,2)",
+    "SELECT array_to_string(NULL,',' )",
+    "SELECT greatest(DISTINCT 1,2)",
+    "SELECT greatest(VARIADIC ARRAY[1,2])",
+    "SELECT greatest(a=>1)",
+    "SELECT greatest('a'::varchar(3),'b'::varchar(3))",
+    "SELECT array_to_string('1 2'::int2vector,',')",
+    "VALUES(1,'a')",
+    "VALUES(NULL)",
+    "VALUES('1') UNION ALL SELECT 1",
+    "VALUES(sum(1))",
+    "VALUES(row_number() OVER())",
+    "VALUES(pg_get_publication_tables(VARIADIC ARRAY[]::text[]))",
+    "WITH RECURSIVE r(n) AS(VALUES(0) UNION ALL SELECT n+1 FROM r WHERE n<3) SELECT n FROM r",
+    "SELECT (VALUES(7))",
+    "SELECT greatest(ALL 1,2)",
+    'SELECT "greatest"(1,2)',
+    "SELECT chr(DISTINCT 'bad')",
+    "SELECT chr('bad' ORDER BY 1)",
+    "SELECT least(1,2,NULL),least(NULL,NULL),least(1::smallint,2::bigint),least(1,2.5)",
+    "SELECT least('b','a'),least('NaN'::float8,1::float8)",
+    "SELECT least('a'::varchar(3),'b'::varchar(3))",
+    "SELECT least(NULL,1/0)",
+    "SELECT least()",
+    "SELECT least(1,true)",
+    "SELECT least(ALL 1,2)",
+    "SELECT least(DISTINCT 1,2)",
+    'SELECT "least"(1,2)',
+    "SELECT pg_catalog.least(1,2)",
+    "SELECT string_to_array('a,b,c',','),string_to_array(',a,,',',')",
+    "SELECT string_to_array('a--b--c','--'),string_to_array('aaaaa','aa')",
+    "SELECT string_to_array('abc',''),string_to_array('',''),string_to_array('',','),string_to_array('',NULL)",
+    "SELECT string_to_array('aé😀',NULL),string_to_array('é😀é','😀')",
+    "SELECT string_to_array('a,NULL,b',',','NULL'),string_to_array(',a,,',',','')",
+    "SELECT string_to_array('abc',NULL,'b'),string_to_array('abc','','abc')",
+    "SELECT string_to_array(NULL,','),string_to_array('a,b',',',NULL)",
+    "SELECT string_to_array('a,b'::varchar,','::varchar)",
+    "SELECT string_to_array('abc')",
+    "SELECT string_to_array(1,',')",
+    "SELECT array_to_string(string_to_array('a,b,c',','),'|')",
+    "VALUES(1) ORDER BY column1+1",
+    "VALUES(1) ORDER BY (SELECT column1)",
+    "SELECT least(1,2) OVER ()",
+    "SELECT greatest(1,2) FILTER (WHERE true)",
+    MANDELBROT,
     "WITH RECURSIVE t(n) AS(SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<100) SELECT sum(n) FROM t",
     "WITH RECURSIVE t(n) AS(SELECT 1 UNION SELECT n FROM t) SELECT n FROM t",
     "WITH RECURSIVE t(n) AS(SELECT 1 UNION SELECT 10-n FROM t) SELECT n FROM t ORDER BY n",
@@ -90,6 +158,12 @@ def check(reference, native, base, socket):
         failures = []
         for index, sql in enumerate(CASES, 1):
             outcomes = [peer.observe(sql) for peer in peers]
+            if sql == MANDELBROT:
+                for outcome in outcomes:
+                    assert outcome[0] == "rows", outcome
+                    assert len(outcome[2]) == 102, len(outcome[2])
+                    assert all(len(re.findall(r"\x1b\[48;5;\d+m \x1b\[0m", row[0])) == 102
+                               for row in outcome[2]), "incomplete Mandelbrot image"
             if outcomes[0] != outcomes[1]:
                 failures.append((index, sql, outcomes))
                 print(f"recursive-ctes: FAIL {failures[-1]!r}", flush=True)

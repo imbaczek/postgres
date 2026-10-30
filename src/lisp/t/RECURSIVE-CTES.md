@@ -26,8 +26,10 @@ stores can also spill to temporary files.
 
 `SEARCH` and `CYCLE`, data-modifying CTE bodies and top-level `WITH` on DML
 are deferred (`0A000`). Mutual recursion is unsupported (`0A000`), as in C
-PostgreSQL. Existing restrictions on `VALUES`, `INTERSECT`, `EXCEPT` and
-locking syntax remain. Full optimizer constant folding remains unavailable.
+PostgreSQL. Single-row `VALUES` queries can appear as seeds and derived tables;
+multirow `VALUES` queries are rejected with `0A000`. Restrictions on
+`INTERSECT`, `EXCEPT` and locking syntax remain. Full optimizer constant folding
+remains unavailable.
 See [nonrecursive CTEs](CTES.md) for materialization and planning boundaries.
 
 From `src/lisp`, with an installed C PostgreSQL peer, run:
@@ -36,7 +38,9 @@ From `src/lisp`, with an installed C PostgreSQL peer, run:
 PG_C_BINDIR=/path/to/installed/postgres/bin ./t/recursive-ctes.sh
 ```
 
-The harness compares 60 SQL cases with C and exercises forced frontier, result
-and seen-set spill, cycles, cancellation, temporary quota errors and recovery.
+The harness compares recursive SQL cases with C, including the full 102 by 102
+Mandelbrot fixture and cases for `chr`, `array_to_string`, `string_to_array`,
+`GREATEST`, and `LEAST`. It also exercises forced frontier, result and seen-set
+spill, cycles, cancellation, temporary quota errors and recovery.
 See [test inventory](TEST-INVENTORY.md#recursive-cte-coverage) for the recorded
 verification and disposition.

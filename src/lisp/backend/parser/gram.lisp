@@ -136,6 +136,7 @@
     ((match-kw p "explain") (parse-explain p))
     ((kw-p p "with") (parse-with-select p))
     ((match-kw p "select") (parse-select p))
+    ((kw-p p "values") (parse-select-expression p))
     ((punct-p p #\() (parse-select-expression p))
     ((match-kw p "copy") (parse-copy-to p))
     ((match-kw p "insert") (parse-insert p))
@@ -204,7 +205,7 @@
         (ereport "0A000" "EXPLAIN currently supports only the ANALYZE option"))
       (expect-punct p #\))
       (setf analyze-p t))
-    (if (or (kw-p p "select") (kw-p p "with") (punct-p p #\())
+    (if (or (kw-p p "select") (kw-p p "with") (kw-p p "values") (punct-p p #\())
         (list :type :explain :analyze-p analyze-p
               :statement (parse-select-expression p))
         (ereport "0A000" "EXPLAIN currently supports SELECT only"))))
@@ -229,10 +230,23 @@
             :joins joins :where where :group-by group-by :having having :distinct distinct
             :windows (when (match-kw p "window") (parse-window-clause p))))))
 
+(defun parse-values-query (p)
+  "Parse one VALUES row as a SELECT with PostgreSQL's default column names."
+  (expect-kw p "values")
+  (let ((row (parse-values-row p)))
+    (when (punct-p p #\,)
+      (ereport "0A000" "multiple rows in a VALUES query are not supported"))
+    (list :type :select :values-query-p t
+          :targets (loop for expression in row
+                         for index from 1
+                         collect (list :expr expression
+                                       :alias (format nil "column~d" index))))))
+
 (defun parse-select-operand (p)
-  (if (match-punct p #\()
-      (with-parens (p :opening-consumed t) (parse-select-expression p))
-      (progn (expect-kw p "select") (parse-select-core p))))
+  (cond ((match-punct p #\()
+         (with-parens (p :opening-consumed t) (parse-select-expression p)))
+        ((kw-p p "values") (parse-values-query p))
+        (t (expect-kw p "select") (parse-select-core p))))
 
 (defun parse-select-expression (p)
   (let ((query (if (kw-p p "with") (parse-with-select p)
@@ -257,7 +271,18 @@
   (when (match-kw p "limit")
     (when (getf left :limit) (syntax-error p "multiple LIMIT clauses"))
     (setf (getf left :limit) (parse-integer-literal p)))
-  left)
+  ;; Sort the projected VALUES row so its expressions are evaluated only once.
+  (if (and (getf left :values-query-p) (getf left :order-by))
+      (let ((inner (copy-list left)))
+        (remf inner :order-by)
+        (remf inner :limit)
+        (remf inner :with)
+        (remf inner :with-recursive)
+        (list :type :select :targets (list (list :star t))
+              :from (make-sql-derived-relation :query inner)
+              :order-by (getf left :order-by) :limit (getf left :limit)
+              :with (getf left :with) :with-recursive (getf left :with-recursive)))
+      left))
 
 (defun parse-select (p)
   (parse-select-tail p (parse-select-core p)))
@@ -1322,10 +1347,13 @@
 (defun select-start-p (p)
   ;; Look through parentheses only when they form a complete query operand.
   "Recognize a complete subquery operand, preserving scalar expression continuations."
-  (when (or (kw-p p "select") (kw-p p "with")) (return-from select-start-p t))
+  (when (or (kw-p p "select") (kw-p p "with") (kw-p p "values"))
+    (return-from select-start-p t))
   (let ((lookahead (copy-sql-parser p)))
     (loop while (match-punct lookahead #\())
-    (unless (or (kw-p lookahead "select") (kw-p lookahead "with")) (return-from select-start-p nil)))
+    (unless (or (kw-p lookahead "select") (kw-p lookahead "with")
+                (kw-p lookahead "values"))
+      (return-from select-start-p nil)))
   (let ((lookahead (copy-sql-parser p)))
     (handler-case
         (progn (parse-select-expression lookahead) (punct-p lookahead #\)))
@@ -1619,8 +1647,10 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
         (expect-punct p #\))
         (values (nreverse arguments) variadic order))))
 
-(defun parse-function-call (p name &optional schema)
-  "Parse an ordinary call or an OVER expression."
+(defun parse-function-call (p name &optional schema minmax-syntax-p)
+  "Parse a call or OVER expression, preserving special GREATEST/LEAST syntax."
+  (when (and minmax-syntax-p (kw-p p "all"))
+    (syntax-error p))
   (let* ((distinct (match-kw p "distinct"))
          (all (and (not distinct) (match-kw p "all")))
          (call
@@ -1636,10 +1666,13 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
                  (when (and (or distinct all) (null arguments))
                    (syntax-error p))
                  (append (list :func name arguments)
+                         (when minmax-syntax-p (list :minmax-syntax-p t))
                          (when schema (list :schema schema))
                          (when variadic (list :variadic t))
                          (when distinct (list :call-distinct t))
                          (when order (list :call-order order)))))))
+    (when (and minmax-syntax-p (or (kw-p p "filter") (kw-p p "over")))
+      (syntax-error p))
     (when (and (kw-p p "filter")
                (let ((probe (copy-sql-parser p)))
                  (pnext probe)
@@ -1685,7 +1718,7 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
      (list :const (token-value (pnext p))))
     ((match-punct p #\()
      (with-parens (p :opening-consumed t)
-       (if (or (kw-p p "select") (kw-p p "with"))
+       (if (or (kw-p p "select") (kw-p p "with") (kw-p p "values"))
            (list :sublink :scalar (parse-select-expression p) nil nil)
            (let ((expression (parse-expr p)))
              (if (and (eq (first expression) :sublink)
@@ -1736,7 +1769,8 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
             (if (match-punct p #\()
                 (parse-function-call p col name)
                 (list :column name col))))
-         ((match-punct p #\() (parse-function-call p name))
+         ((match-punct p #\()
+          (parse-function-call p name nil (and (not quoted) (member name '("greatest" "least") :test #'string=))))
          ((and (not quoted) (member name '("current_user" "session_user" "user"
                                            "current_database" "current_schema" "current_catalog")
                                     :test #'string=))
