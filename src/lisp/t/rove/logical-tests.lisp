@@ -1563,7 +1563,7 @@
              (extended-apply-operation out '(:sync) #())
              (rove:ok committed)
              (rove:ok (eq :idle (backend-state *backend*))))
-        (extended-clear-portals *extended-query-state*)
+        (extended-clear-portals-for-backend *backend*)
         (setf (symbol-function 'statement-start) original-start
               (symbol-function 'prepare-dml-subqueries) original-prepare
               (symbol-function 'execute-statement) original-execute
@@ -1964,78 +1964,78 @@
         (when (probe-file path) (delete-file path)))))
 
 (rove:deftest test-extended-select-portal-formats-and-description
-  (let* ((*backend* (make-backend))
-         (*extended-query-state* (make-extended-query-state))
-         (*active-snapshots* 0)
-         (*active-snapshot-set* (make-hash-table :test #'eq))
-         (old-start (symbol-function 'statement-start))
-         (path (merge-pathnames
-                (format nil "pg-select-portal-~d-~d" (sb-posix:getpid) (random 1000000))
-                (uiop:temporary-directory)))
-         (old-columns (symbol-function 'extended-select-result-columns))
-         (old-execute (symbol-function 'extended-initialize-select-portal))
-         (observed nil))
-    (unwind-protect
-         (progn
-           (setf (symbol-function 'statement-start) #'logical-test-extended-statement-start
-                 (symbol-function 'extended-select-result-columns)
-                 (lambda (ast &optional register-p)
-                   (declare (ignore ast register-p))
-                   (list (make-result-column :name "i" :type-oid 23)
-                         (make-result-column :name "b" :type-oid 17)))
-                 (symbol-function 'extended-initialize-select-portal)
-                 (lambda (portal)
-                   (let* ((owner (make-query-execution-owner
-                                  :bindings
-                                  (list (cons '*select-result-formats*
-                                              (extended-portal-result-formats portal))
-                                        (cons '*select-suppress-description* t))))
-                          (execution (make-extended-select-execution
-                                      :owner owner
-                                      :plan (%make-query-plan :physical '(:result)))))
-                     (setf (gethash portal *extended-select-executions*) execution)
-                     (query-execution-owner-acquire-snapshot
-                      owner (lambda (registration) (statement-start registration nil)))
-                     (call-with-query-execution-owner
-                      owner
-                      (lambda ()
-                        (setf (extended-select-execution-iterator execution)
-                              (make-sql-iterator
-                               (lambda ()
-                                 (setf observed
-                                       (list *select-suppress-description*
-                                             (copy-seq *select-result-formats*)))
-                                 (values nil nil))))))
-                     portal)))
-           (with-open-file (out path :direction :io :element-type '(unsigned-byte 8)
-                                     :if-exists :supersede :if-does-not-exist :create)
-             (extended-apply-operation out '(:parse "s" "SELECT * FROM t" ()) #())
-             (extended-apply-operation out '(:bind "p" "s" () () (0 1)) #())
-             (rove:ok (= 1 (backend-command-id *backend*)))
-             (rove:ok (= 1 *active-snapshots*))
-             (extended-apply-operation out '(:describe #\P "p") #())
-             (extended-apply-operation out '(:execute "p" 0) #())
-             (rove:ok (and (first observed) (equalp (second observed) #(0 1))))
-             (finish-output out)
-             (file-position out 0)
-             (multiple-value-bind (type length payload) (read-message-frame out)
-               (declare (ignore length payload))
-               (rove:ok (= type (char-code #\1))))
-             (multiple-value-bind (type length payload) (read-message-frame out)
-               (declare (ignore length payload))
-               (rove:ok (= type (char-code #\2))))
-             (multiple-value-bind (type length payload) (read-message-frame out)
-               (declare (ignore length))
-               (rove:ok (= type (char-code #\T)))
-               (let ((columns (pg-client-read-column-description payload)))
-                 (rove:ok (equal (mapcar #'pg-client-column-format columns) '(0 1)))))))
-      (extended-clear-portals-for-backend *backend*)
-      (rove:ok (zerop *active-snapshots*))
-      (setf (symbol-function 'statement-start) old-start
-            (symbol-function 'extended-select-result-columns) old-columns
-            (symbol-function 'extended-initialize-select-portal) old-execute)
-      (close-query-execution-owners-for-backend *backend*)
-      (when (probe-file path) (delete-file path)))))
+    (let* ((*backend* (make-backend))
+           (*extended-query-state* (make-extended-query-state))
+           (*active-snapshots* 0)
+           (*active-snapshot-set* (make-hash-table :test #'eq))
+           (old-start (symbol-function 'statement-start))
+           (path (merge-pathnames
+                  (format nil "pg-select-portal-~d-~d" (sb-posix:getpid) (random 1000000))
+                  (uiop:temporary-directory)))
+           (old-columns (symbol-function 'extended-select-result-columns))
+           (old-execute (symbol-function 'extended-initialize-select-portal))
+           (observed nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'statement-start) #'logical-test-extended-statement-start
+                   (symbol-function 'extended-select-result-columns)
+                   (lambda (ast &optional register-p)
+                     (declare (ignore ast register-p))
+                     (list (make-result-column :name "i" :type-oid 23)
+                           (make-result-column :name "b" :type-oid 17)))
+                   (symbol-function 'extended-initialize-select-portal)
+                   (lambda (portal)
+                     (let* ((owner (make-query-execution-owner
+                                    :bindings
+                                    (list (cons '*select-result-formats*
+                                                (extended-portal-result-formats portal))
+                                          (cons '*select-suppress-description* t))))
+                            (execution (make-extended-select-execution
+                                        :owner owner
+                                        :plan (%make-query-plan :physical '(:result)))))
+                       (setf (gethash portal *extended-select-executions*) execution)
+                       (query-execution-owner-acquire-snapshot
+                        owner (lambda (registration) (statement-start registration nil)))
+                       (call-with-query-execution-owner
+                        owner
+                        (lambda ()
+                          (setf (extended-select-execution-iterator execution)
+                                (make-sql-iterator
+                                 (lambda ()
+                                   (setf observed
+                                         (list *select-suppress-description*
+                                               (copy-seq *select-result-formats*)))
+                                   (values nil nil))))))
+                       portal)))
+             (with-open-file (out path :direction :io :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede :if-does-not-exist :create)
+               (extended-apply-operation out '(:parse "s" "SELECT * FROM t" ()) #())
+               (extended-apply-operation out '(:bind "p" "s" () () (0 1)) #())
+               (rove:ok (= 1 (backend-command-id *backend*)))
+               (rove:ok (= 1 *active-snapshots*))
+               (extended-apply-operation out '(:describe #\P "p") #())
+               (extended-apply-operation out '(:execute "p" 0) #())
+               (rove:ok (and (first observed) (equalp (second observed) #(0 1))))
+               (finish-output out)
+               (file-position out 0)
+               (multiple-value-bind (type length payload) (read-message-frame out)
+                 (declare (ignore length payload))
+                 (rove:ok (= type (char-code #\1))))
+               (multiple-value-bind (type length payload) (read-message-frame out)
+                 (declare (ignore length payload))
+                 (rove:ok (= type (char-code #\2))))
+               (multiple-value-bind (type length payload) (read-message-frame out)
+                 (declare (ignore length))
+                 (rove:ok (= type (char-code #\T)))
+                 (let ((columns (pg-client-read-column-description payload)))
+                   (rove:ok (equal (mapcar #'pg-client-column-format columns) '(0 1)))))))
+        (extended-clear-portals-for-backend *backend*)
+        (rove:ok (zerop *active-snapshots*))
+        (setf (symbol-function 'statement-start) old-start
+              (symbol-function 'extended-select-result-columns) old-columns
+              (symbol-function 'extended-initialize-select-portal) old-execute)
+        (close-query-execution-owners-for-backend *backend*)
+        (when (probe-file path) (delete-file path)))))
 
 (rove:deftest test-extended-select-describe-aborted-transaction
     (let* ((*backend* (make-backend)) (*extended-query-state* (make-extended-query-state))
