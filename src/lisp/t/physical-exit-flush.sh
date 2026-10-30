@@ -23,7 +23,7 @@ checked() {
 cleanup() {
     status=$?
     trap - EXIT
-    for phase in disconnect stop failure; do : >"$TMP/$phase.release"; done
+    for phase in disconnect stop failure poisoned; do : >"$TMP/$phase.release"; done
     if [ -n "$STOP" ]; then wait "$STOP" 2>/dev/null || :; fi
     if [ "$status" -ne 0 ] && [ -S "$TMP/target.sock" ]; then
         control target '(list :follow *physical-follow-runtime* :receive (getf *physical-recovery-state* :receive-lsn) :failed *physical-recovery-failed-p*)' >"$TMP/failure-state.log" 2>&1 || :
@@ -70,6 +70,8 @@ arm_pending_write() {
     extra=
     if [ "$phase" = failure ]; then
         extra='(setf *physical-store-test-hook* (lambda (point store) (declare (ignore store)) (when (eq point :before-control-fsync) (setf *physical-store-test-hook* nil) (error "exit control fsync failpoint"))))'
+    elif [ "$phase" = poisoned ]; then
+        extra='(with-physical-store (*physical-receive-store*) (error "receiver transport poisoned store failpoint"))'
     elif [ "$phase" = stop ]; then
         # Emulate an active frame compiled before exit flushing was installed.
         # Restore the helper before stop's post-join fallback calls it.
@@ -81,6 +83,12 @@ arm_pending_write() {
 }
 restart_target_without_follow() {
     kill -KILL "$TARGET"; wait "$TARGET" 2>/dev/null || :; TARGET=
+    # A failed stop retains its saved follow configuration. Disable auto-follow
+    # while offline so restart checks observe only the previously durable spool.
+    if [ -n "${1:-}" ]; then
+        test -e "$TMP/copy/physical-follow.control"
+        mv "$TMP/copy/physical-follow.control" "$TMP/$1-follow-before-restart.control"
+    fi
     start_target
     test ! -e "$TMP/copy/physical-follow.control"
 }
@@ -150,11 +158,34 @@ grep -q ';; error:' "$TMP/failure-stop.log"
 checked target "(assert (and *physical-recovery-failed-p* (physical-store-failed-p *physical-receive-store*) (physical-follow-runtime-stopped-p *physical-follow-runtime*) (null (physical-follow-runtime-client *physical-follow-runtime*)) (null (physical-follow-statistics)) (search \"exit control fsync failpoint\" (physical-follow-runtime-last-error *physical-follow-runtime*)) (= (physical-store-flushed-lsn *physical-receive-store*) (parse-replication-lsn \"$baseline\")) (= (getf *physical-recovery-state* :receive-lsn) (parse-replication-lsn \"$baseline\"))))" failure-latched
 if sql "$TARGET_PORT" 'SELECT 1' >"$TMP/failed-sql.log" 2>&1; then exit 1; fi
 grep -q 57P03 "$TMP/failed-sql.log"
-restart_target_without_follow
+restart_target_without_follow failure
 checked target "(assert (= (physical-store-flushed-lsn *physical-receive-store*) (parse-replication-lsn \"$baseline\")))" failure-reopened
 test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM exit_data')" = 3
 follow failure-resume
 wait_target 'SELECT count(*) FROM exit_data' 4
+
+# A fault before cleanup has already poisoned the store. Stop the maintenance
+# worker at its next iteration boundary so it cannot close SQL admission for us.
+# Replay is paused too; only receiver cleanup can latch the recovery failure.
+sql "$TARGET_PORT" 'SELECT pg_wal_replay_pause()' >/dev/null
+checked target '(let ((original (symbol-function (quote physical-restartpoint-worker-step)))) (setf (symbol-function (quote physical-restartpoint-worker-step)) (lambda () (setf (symbol-function (quote physical-restartpoint-worker-step)) original) (sb-thread:return-from-thread :test-stopped))))' poisoned-stop-maintenance
+checked target '(loop repeat 100 while (sb-thread:thread-alive-p *physical-restartpoint-worker*) do (sleep 0.02) finally (assert (not (sb-thread:thread-alive-p *physical-restartpoint-worker*))))' poisoned-maintenance-stopped
+baseline=$(sql "$TARGET_PORT" 'SELECT pg_last_wal_receive_lsn()')
+arm_pending_write poisoned
+sql "$PORT" 'INSERT INTO exit_data VALUES (5)'
+wait_file "$TMP/poisoned.end"
+checked target '(assert (not *physical-recovery-failed-p*))' poisoned-before-cleanup
+: >"$TMP/poisoned.release"
+checked target '(loop repeat 100 until (physical-follow-runtime-stopped-p *physical-follow-runtime*) do (sleep 0.02) finally (assert (physical-follow-runtime-stopped-p *physical-follow-runtime*)))' poisoned-receiver-stopped
+if sql "$TARGET_PORT" 'SELECT 1' >"$TMP/poisoned-sql.log" 2>&1; then
+    echo 'poisoned store admitted SELECT after receiver cleanup' >&2; exit 1
+fi
+grep -q 57P03 "$TMP/poisoned-sql.log"
+checked target "(assert (and *physical-recovery-failed-p* (physical-store-failed-p *physical-receive-store*) (null (physical-follow-runtime-client *physical-follow-runtime*)) (search \"receiver transport poisoned store failpoint\" (physical-follow-runtime-last-error *physical-follow-runtime*)) (= (physical-store-flushed-lsn *physical-receive-store*) (parse-replication-lsn \"$baseline\"))))" poisoned-latched
+restart_target_without_follow poisoned
+test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM exit_data')" = 4
+follow poisoned-resume
+wait_target 'SELECT count(*) FROM exit_data' 5
 checked target '(physical-follow-stop)' final-stop
 checked source '(physical-source-pin-release "exit_flush_base")' release
-echo 'physical-exit-flush: disconnect/stop durability, restart, and exit-fsync failure PASS'
+echo 'physical-exit-flush: disconnect/stop durability, restart, exit-fsync and poisoned-store failure PASS'

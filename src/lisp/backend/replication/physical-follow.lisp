@@ -1099,7 +1099,12 @@ The public slot is a separate persistent source slot, not the proof pin."
               (sb-thread:with-mutex ((physical-store-mutex store))
                 (values (or (physical-store-failed-p store) (physical-store-closed-p store))
                         (physical-store-written-lsn store) (physical-store-flushed-lsn store)))
-            (cond (failed :failed)
+            (cond (failed
+                   ;; Like C's WAL write PANIC, a failed or closed spool must
+                   ;; stop global admission. Return without signaling so an
+                   ;; existing transport unwind retains its original condition.
+                   (setf *physical-recovery-failed-p* t)
+                   :failed)
                   ((= written flushed) flushed)
                   (t (physical-recovery-flush)))))
       (error (condition)
