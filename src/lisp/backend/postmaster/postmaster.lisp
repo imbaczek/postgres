@@ -314,7 +314,9 @@ command (idle) is ignored; the connection and its transaction state survive."
 (declaim (ftype function managed-worker-request-shutdown managed-worker-shutdown))
 
 (defun prepare-postmaster-shutdown ()
-  "Stop controller work and finalize storage from MAIN outside live admission."
+  "Stop managed workers and controller work before finalizing storage from MAIN.
+Wait outside live admission so workers can finish; a worker timeout prevents
+storage finalization. The signal worker remains available for immediate shutdown."
   (when (plusp *live-operation-depth*)
     (error "postmaster shutdown finalization requires an unadmitted main thread"))
   (unless *shutdown-finalizing-p*

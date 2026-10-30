@@ -577,8 +577,10 @@ has default 128 and range 10 through INT_MAX, and requires a restart to change."
       (values parameters objects owners))))
 
 (defun startup-install-resource-capacity (settings)
-  "Install the tuple and relation limits once under the relation lock.
-Check existing registrations fit before publishing either limit."
+  "Install the tuple, relation limits and managed-worker slots once at startup.
+Check existing relation registrations before publishing under the relation and
+worker locks. The current internal worker capacity is eight; auxiliary services
+have separate lifecycles and do not consume these slots."
   (multiple-value-bind (parameters objects owners) (startup-resource-capacity-plan settings)
     (let ((slots (make-array (resource-parameters-workers parameters) :initial-element nil)))
       (sb-thread:with-mutex (*relation-lock-mutex*)
