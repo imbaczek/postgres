@@ -670,6 +670,12 @@ try:
     peer, socket_identity = start_peer()
     source, promoted, sibling = [connect(p) for p in (source_port, promoted_port, replica_port)]
     connections.extend((source, promoted, sibling))
+    if os.environ.get('FOLLOW_CONFIGURED') == '1':
+        configured = runpy.run_path(str(base / 't/interop/configured-follow.py'))
+        peer, socket_identity, sibling = configured['exercise'](
+            globals(), peer, socket_identity, sibling, source, promoted)
+        connections.append(sibling)
+        raise SystemExit(0)
     if os.environ.get("FOLLOW_FIRST_ATTACH") == "1":
         peer, socket_identity, sibling = exercise_first_attachment(peer, socket_identity, sibling)
         connections.append(sibling)
