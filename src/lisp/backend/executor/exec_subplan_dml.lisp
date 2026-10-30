@@ -108,11 +108,28 @@
 
 (defvar *dml-returning-spool* nil)
 
+(defvar *dml-returning-receiver* nil)
+
 (defun send-dml-returning-description (stream targets)
   ;; Extended Execute sends rows without a RowDescription; clients may Describe
   ;; the bound portal separately.
   (when (and targets (not *dml-returning-spool*) (not *select-suppress-description*))
     (send-row-description stream (mapcar #'target->result-column targets))))
+
+(defun call-with-dml-returning-spool (targets function)
+  ;; A deferred receiver borrows the caller's spool, including on error; the
+  ;; caller retains its temporary-file scope and remains responsible for
+  ;; closing it. Otherwise own a local spool for the ordinary command.
+  (let ((borrowed-p (and targets *dml-returning-receiver*)))
+    (when (and borrowed-p (null *dml-returning-spool*))
+      (error "deferred RETURNING requires a caller-owned spool"))
+    (let ((*dml-returning-spool*
+            (when targets
+              (if borrowed-p *dml-returning-spool* (make-query-row-spool)))))
+      (unwind-protect (funcall function)
+        (unless borrowed-p
+          (when *dml-returning-spool*
+            (close-query-row-spool *dml-returning-spool*)))))))
 
 (defun emit-dml-returning (stream targets values &key old-values (new-values values) (source-values #()))
   ;; Evaluate against the mutation's row now, while its original snapshot is active.
@@ -133,6 +150,12 @@
   (check-for-interrupts)
   (when (and targets *dml-returning-spool*)
     (query-row-spool-seal *dml-returning-spool*)
+    ;; The receiver gets the sealed spool and command tag after the mutations.
+    ;; Its handoff remains provisional until the outer execution finishes.
+    ;; The caller owns cleanup on errors; without a receiver, publish here.
+    (when *dml-returning-receiver*
+      (funcall *dml-returning-receiver* *dml-returning-spool* targets tag)
+      (return-from finish-dml-command (values)))
     (unless *select-suppress-description*
       (send-row-description stream (mapcar #'target->result-column targets)))
     (map-query-row-spool *dml-returning-spool*
@@ -320,9 +343,9 @@
             (detach-select-index-scans)
             (call-with-cte-definitions (getf prepared :ctes)
                                        (lambda ()
-                                         (let ((*dml-returning-spool* (when (getf prepared :returning) (make-query-row-spool))))
-                                           (unwind-protect (funcall function table relfilenode xid)
-                                             (when *dml-returning-spool* (close-query-row-spool *dml-returning-spool*)))))))))))))
+                                         (call-with-dml-returning-spool
+                                          (getf prepared :returning)
+                                          (lambda () (funcall function table relfilenode xid))))))))))))
 
 (defun call-with-dml-expression-evaluation (function)
   ;; Release enclosing leases before evaluation; child plans acquire their own
