@@ -5,7 +5,8 @@
 (defconstant +wal-segment-size+ (* 16 1024 1024))
 (defconstant +wal-header-size+ 32)
 
-(defconstant +wal-control-maximum-bytes+ 1024)
+(defconstant +wal-control-maximum-bytes+ 1024
+  "Maximum control line characters, excluding its terminating newline.")
 
 (defconstant +wal-max-page-images-per-record+ 512)
 (defconstant +wal-record-pages+ 1)

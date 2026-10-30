@@ -143,11 +143,14 @@
        (<= (getf reference :base) (getf reference :end))))
 
 (defun wal-control-resource-parameters (metadata)
+  "Reconstruct a checked read-only tuple from the canonical five-integer list.
+An absent key means unknown; a present NIL is malformed."
   (let ((keys (loop for (key value) on metadata by #'cddr collect key)))
     (when (member :resource-parameters keys)
       (resource-parameters-from-values (getf metadata :resource-parameters)))))
 
 (defun wal-control-resource-fields-valid-p (metadata)
+  "Require either no resource fields or a valid tuple and both coordinates."
   (let* ((keys (loop for (key value) on metadata by #'cddr collect key))
          (present (intersection keys '(:resource-parameters :resource-lsn :resource-timeline))))
     (or (null present)
@@ -157,17 +160,23 @@
              (typep (getf metadata :resource-timeline) '(integer 1 4294967295))))))
 
 (defun wal-control-resource-position-valid-p (metadata durable timeline)
+  "Check numeric bounds against durable LSN and insertion timeline only.
+These bounds do not prove ancestry or application at a recovery seed."
   (or (null (getf metadata :resource-parameters))
       (and (<= (getf metadata :resource-lsn) durable)
            (<= (getf metadata :resource-timeline) timeline))))
 
 (defun wal-copy-control-resource-fields (metadata)
+  "Copy the tuple list so refreshed metadata cannot alias its input."
   (when (getf metadata :resource-parameters)
     (list :resource-parameters (copy-list (getf metadata :resource-parameters))
           :resource-lsn (getf metadata :resource-lsn)
           :resource-timeline (getf metadata :resource-timeline))))
 
 (defun wal-decode-control-metadata (fields)
+  "Decode lifecycle metadata and optional retained and resource extensions.
+The resource extension uses tag R, encoded tuple, LSN and timeline. Store the
+five integers as a list so EQUAL compares metadata without case-folding strings."
   (when (member (length fields) '(11 15 17 21))
     (let ((metadata
             (make-wal-control-metadata
@@ -228,9 +237,10 @@
                                    (checkpoint-timeline (if snapshot (getf snapshot :timeline) 1)))
   "Encode a CRC-bound control image with independent insertion/checkpoint TLIs.
 
-PGWAL6 has eight fields without metadata, eleven with lifecycle metadata and
-seventeen when a retained reference is present. Reference values follow the
-fixed key order. The CRC covers every supplied field."
+PGWAL6 has eight fields without metadata and eleven with lifecycle metadata.
+A retained reference adds six fields; resource metadata adds R, tuple hex, LSN
+and timeline, giving 15 fields alone or 21 with a reference. Reference values
+follow the fixed key order. The CRC covers every supplied field."
   (unless (and (typep checkpoint '(unsigned-byte 64))
                (typep durable '(unsigned-byte 64)) (<= checkpoint durable)
                (typep timeline '(integer 1 4294967295))

@@ -21,9 +21,11 @@
   acquisition, abort/cancellation/disconnect and virtual-reader cleanup.
   Include persisted source resource requirements and standby validation, following
   C's `XLogReportParameters` and `CheckRequiredParameterValues`.
-  The shared five-field value, strict native codec, floor comparison and capacity
-  arithmetic are implemented. Next emit a parameter-change terminal in an empty
-  WAL batch and flush it before updating existing primary control metadata.
+  The shared five-field value, strict native codec, floor comparison, capacity
+  arithmetic and optional positioned control metadata are implemented. Native
+  utilities and independent control readers accept the extension. Next emit a
+  parameter-change terminal in an empty WAL batch and flush it before updating
+  primary control metadata; automatic source reporting is not wired yet.
   Carry exact resource facts with applied/required positions, checkpoint and
   restartpoint seeds, backup validation and private follow scans. Missing legacy
   facts stay unknown; do not substitute current defaults or newer received facts

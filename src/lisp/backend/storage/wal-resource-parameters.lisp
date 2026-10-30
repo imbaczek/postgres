@@ -46,6 +46,7 @@ capacity calculation checks the actual autovacuum slot count separately."
     parameters))
 
 (defun resource-parameters-from-values (values)
+  "Validate five explicit values and reconstruct an immutable tuple."
   (unless (and (listp values) (= 5 (length values)))
     (error "resource parameters require five explicit values"))
   (apply #'make-resource-parameters values))
@@ -104,11 +105,13 @@ capacity is twice N. The default autovacuum slot count is 16."
     (values objects (* 2 objects))))
 
 (defun wal-resource-parameters-hex (parameters)
+  "Render the fixed native tuple as hexadecimal for control metadata."
   (with-output-to-string (stream)
     (loop for byte across (wal-encode-resource-parameters parameters)
           do (format stream "~2,'0X" byte))))
 
 (defun wal-resource-parameters-from-hex (text)
+  "Decode exactly one hexadecimal tuple and validate its reserved word."
   (unless (and (stringp text) (= (length text) (* 2 +resource-parameters-size+))
                (every (lambda (character) (digit-char-p character 16)) text))
     (error "invalid resource parameter hex encoding"))

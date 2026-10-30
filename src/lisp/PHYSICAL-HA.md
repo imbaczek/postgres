@@ -140,12 +140,39 @@ Local capacity sizing checks its actual autovacuum slot count. Prepared
 transactions contribute to lock capacity, not to MaxBackends. Floor comparison
 checks each field separately and allows requirements to decrease.
 
-This codec does not yet report parameters in WAL or carry them through control,
-backup, checkpoint or restartpoint state. Those integrations, safe hot-standby
-admission and online resource-pause behavior remain prerequisites for the GUC.
+This codec does not yet report parameters in WAL or propagate replay requirements
+through backup, checkpoint or restartpoint seeds. Those integrations, safe
+hot-standby admission and online resource-pause behavior remain prerequisites for
+the GUC. The control transport below supports the value without enabling reporting.
 Validation passed 668 unit Rove tests, including seven new codec/policy tests and
 200 generated cases at seed 42, plus fresh strict compilation recorded in
 `/tmp/pg-resource-parameters-final-compile.log`.
+
+### Positioned resource control metadata
+
+Native control now supports an optional resource tuple with its LSN and timeline.
+The `PGWAL6` extension is tagged `R` and CRC-covered; old controls remain readable
+with unknown resource facts. A present tuple must be complete and valid, and its
+position cannot exceed the control's durable LSN or insertion timeline. These are
+numeric bounds, not proof of the tuple's WAL origin or lineage. The forthcoming
+reporting and recovery paths must establish that association.
+
+Control metadata uses a fresh five-integer list. Runtime consumers reconstruct
+the checked immutable value. This preserves existing `equal` provenance checks
+without making unrelated string comparisons case-insensitive. Decoding and
+lifecycle refresh do not alias the tuple's list. The native file bound is 1024
+characters plus its newline; a valid 524-byte fixture covers the enlarged readers.
+
+`pg_ctl` and four independent inspection oracles accept old and extended shapes.
+They validate the resource extension, including decimal position syntax; Python's
+underscore-separated integers are rejected to match the Lisp parser. Synthetic
+tests exercise utility role checks, three oracle readers, malformed fields with
+valid CRCs and checksum failure. They do not establish source emission or recovery
+admission. No parameter-change WAL record or automatic reporting is wired yet.
+
+Validation passed 673 unit Rove tests, 12 resource value/control tests, 101 related
+physical tests and four Python tests, plus fresh strict compilation at
+`/tmp/pg-resource-control-compile.log`.
 
 ### Child follow and rejoin intake
 

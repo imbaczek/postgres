@@ -105,9 +105,9 @@ def primary_committed(root):
 
     This is a control-file wait, like C pg_ctl's production-state wait. It does
     not probe a SQL listener or establish synchronous replication durability.
-    The current 17-field control includes a retained reference. The 11- and
-    17-field forms require valid checksums and committed-child state; promote
-    also verifies the PGDATA owner.
+    Lifecycle metadata may include a retained reference, resource metadata,
+    or both. All forms require a valid checksum; committed-child state also
+    requires lifecycle metadata. Promote also verifies the PGDATA owner.
     """
     fields = read_regular(root / "global/pg_wal_control", 1025).split()
     if len(fields) not in (8, 11, 15, 17, 21) or fields[0] != b"PGWAL6":
