@@ -414,6 +414,8 @@ Child images may include history files no newer than their selected timeline."
           (unless (= digest actual) (error "physical recovery file checksum mismatch: ~a" name)))))))
 
 (defun physical-recovery-check-checkpoint-resources (snapshot metadata)
+  "Require checkpoint and coherent control resource facts to agree.
+For known facts, check the claimed origin timeline against selected history."
   (unless (and (wal-control-resource-fields-valid-p snapshot)
                (wal-control-resource-fields-valid-p metadata)
                (equal (wal-copy-control-resource-fields snapshot)
@@ -489,7 +491,9 @@ A nonpending standby cannot fall back to primary startup when validation fails."
 
 (defun physical-recovery-verify-base-with-namespace ()
   "Verify base provenance in the selected namespace without publishing control.
-Return the reconstructed state and durable control; do not install runtime state."
+Return the reconstructed state and durable control; do not install runtime state.
+The nested source checkpoint records base facts, not later applied resources;
+the manifest does not add another authority for those facts."
   (physical-recovery-check-required-marker)
   (let ((control (physical-recovery-read-control *pgdata*)))
     ;; Pending control must never fall through the ordinary phase rewrite/redo path.

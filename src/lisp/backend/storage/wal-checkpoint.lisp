@@ -3,12 +3,15 @@
 
 (defconstant +wal-checkpoint-snapshot-size+ 88)
 
-(defconstant +wal-checkpoint-resource-snapshot-size+ 136)
+(defconstant +wal-checkpoint-resource-snapshot-size+ 136
+  "PGCKPT02 payload size with a complete resource tuple and coordinates.")
 
 (declaim (ftype function wal-control-resource-fields-valid-p wal-control-resource-parameters
                 wal-copy-control-resource-fields))
 
 (defun wal-checkpoint-record-size (&optional resource-facts)
+  "Plan header and payload size from a complete resource group, or unknown facts.
+The known version 8 record occupies 168 bytes."
   (unless (wal-control-resource-fields-valid-p resource-facts)
     (error "invalid checkpoint resource facts"))
   (+ +wal-header-size+
@@ -17,11 +20,14 @@
          +wal-checkpoint-snapshot-size+)))
 
 (defun wal-checkpoint-record-length-p (length)
+  "Recognize legacy empty and both snapshot record lengths before reading."
   (member length (list +wal-header-size+
                        (+ +wal-header-size+ +wal-checkpoint-snapshot-size+)
                        (+ +wal-header-size+ +wal-checkpoint-resource-snapshot-size+)) :test #'=))
 
 (defun wal-checkpoint-snapshot-valid-p (snapshot)
+  "Check checkpoint coordinates and the complete optional resource group.
+Numeric timeline bounds alone do not prove the resource record's ancestry."
   (let ((version (getf snapshot :version))
         (start (getf snapshot :start)) (end (getf snapshot :end))
         (redo (getf snapshot :redo)) (next (getf snapshot :next-xid))
@@ -50,7 +56,8 @@
          (<= (getf snapshot :prev-timeline) (getf snapshot :timeline)))))
 
 (defun wal-encode-checkpoint-snapshot (snapshot)
-  "V2 uses explicit flags for one-past FullXIDs, without truncating the sentinel."
+  "V2 uses explicit flags for one-past FullXIDs, without truncating the sentinel.
+Unknown resources use 88 bytes; known resources extend PGCKPT02 to 136 bytes."
   (unless (wal-checkpoint-snapshot-valid-p snapshot) (error "invalid native checkpoint snapshot"))
   (let* ((bytes (make-array (- (wal-checkpoint-record-size snapshot) +wal-header-size+)
                             :element-type '(unsigned-byte 8) :initial-element 0))
@@ -74,7 +81,9 @@
     bytes))
 
 (defun wal-decode-checkpoint-snapshot (bytes)
-  "Containing WAL/control supplies CRC; reject ambiguous flags and hidden values."
+  "Containing WAL/control supplies CRC; reject ambiguous flags and hidden values.
+The 88-byte form has unknown resources. The 136-byte PGCKPT02 form requires a
+complete tuple and coordinates and a zero reserved word."
   (unless (member (length bytes) (list +wal-checkpoint-snapshot-size+ +wal-checkpoint-resource-snapshot-size+))
     (error "invalid checkpoint snapshot length"))
   (let* ((version (cond ((equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 49)) 1)
@@ -127,6 +136,7 @@
         snapshot)))
 
 (defun wal-read-checkpoint-record (start end)
+  "Read the exact supported record length and validate the decoded snapshot."
   (unless (and (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
                (wal-checkpoint-record-length-p (- end start))
                (= (floor start +wal-segment-size+) (floor (1- end) +wal-segment-size+)))
@@ -148,11 +158,13 @@
         (t (- end +wal-header-size+))))
 
 (defun wal-checkpoint-snapshot-hex (snapshot)
+  "Encode either supported snapshot length for control metadata."
   (with-output-to-string (stream)
     (loop for byte across (wal-encode-checkpoint-snapshot snapshot)
           do (format stream "~2,'0X" byte))))
 
 (defun wal-checkpoint-snapshot-from-hex (text)
+  "Decode and validate either supported snapshot length from control metadata."
   (unless (and (member (length text) (list (* 2 +wal-checkpoint-snapshot-size+)
                                            (* 2 +wal-checkpoint-resource-snapshot-size+)))
                (every (lambda (char) (digit-char-p char 16)) text))
@@ -371,7 +383,9 @@ its archive before mutation."
 (declaim (notinline catalog-next-oid))
 
 (defun wal-capture-checkpoint-snapshot (start &optional resource-facts)
-  "Called with writer and WAL locks; sample counters under XID lock, as C does."
+  "Called with writer and WAL locks; sample counters under XID lock, as C does.
+Copy explicit resource facts into the snapshot; omission leaves them unknown.
+The caller must freeze facts and plan the record size before choosing START."
   (sb-thread:with-mutex (*xid-lock*)
     (let* ((next *next-xid*)
            (active (reduce #'min *active-xids* :initial-value next))

@@ -17,7 +17,9 @@
 Return the checkpoint snapshot and parsed history. This check must precede WAL
 scanning or tail repair. It deliberately needs no old generation, receive spool
 or backup manifest: child control is now the recovery authority.  An optional
-retained archive is checked against the child history, including its fixed fork."
+retained archive is checked against the child history, including its fixed fork.
+Read the checkpoint's actual encoded size and check any resource origin against
+that history before accepting the control copy."
   (multiple-value-bind (checkpoint durable snapshot timeline checkpoint-id namespace metadata) (wal-read-control-fields)
     (unless (and (typep insertion '(integer 2 4294967295))
                  (= insertion checkpoint-timeline timeline checkpoint-id)

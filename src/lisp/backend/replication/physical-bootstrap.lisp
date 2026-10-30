@@ -209,7 +209,8 @@ The new base receives its own archive; the old primary archive is not copied."
 (declaim (ftype function physical-recovery-check-checkpoint-resources))
 
 (defun physical-bootstrap-copy-under-quiescence (target pin-name)
-  "Checkpoint and capture one complete native image while mutation admission is closed."
+  "Checkpoint and capture one complete native image while mutation admission is closed.
+Check checkpoint resource facts against control before creating the source pin."
   (unless (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
     (error "physical base copy requires operation quiescence ownership"))
   ;; An admitted control operation could enable Swank while this caller drains.

@@ -216,6 +216,53 @@ Fresh strict compilation passed at `/tmp/pg-parameter-wal-final-compile.log`.
 control publication, verifies repair in fresh images, and checks a decrease across
 checkpoint/restart. The final run passed at `/tmp/pg-parameter-wal-owned-v3.log`.
 
+### Resource facts in checkpoints and base images
+
+An ordinary native checkpoint now carries known resource facts in an optional
+48-byte suffix. The existing 88-byte `PGCKPT01`/`PGCKPT02` snapshots remain readable
+with unknown facts. A known tuple uses a 136-byte `PGCKPT02` snapshot and a 168-byte
+WAL record in the existing version 8 format. The suffix contains the checked
+32-byte tuple, its originating parameter-record end and timeline, and a zero
+reserved word. Partial facts, future positions and malformed suffixes are errors.
+
+Checkpoint creation copies the resource facts under the WAL lock before choosing
+the record's size and placement. The same copy supplies snapshot capture and
+encoding; the encoded size must match the plan. This matters near a segment end,
+where the larger record can require rotation. Later parameter reports do not
+change the older checkpoint's facts.
+
+Source pins, backup manifests, retained overlap and child-primary readers accept
+the larger checkpoint boundary. Paths that read checkpoint WAL validate its
+payload. The primary control's hexadecimal copy also preserves the suffix.
+At a quiescent base backup, checkpoint facts must exactly match copied control.
+Both base verification
+and child-primary checkpoint validation check the originating timeline at the
+claimed parameter-record end minus one against the selected history. A numerically
+older timeline alone is not sufficient proof; a valid parent origin can survive
+a fork.
+
+No extra resource fields were added to the backup manifest. Its existing file
+hashes bind the copied checkpoint WAL and control image. Verified base state
+contains the facts inside `:source-checkpoint`, with fresh tuple lists. That is
+proof at the base checkpoint, not at a later received or applied position.
+
+Applied/required recovery control, restartpoint generations and private follow
+witnesses still need resource facts. The promotion checkpoint writer still emits
+unknown facts and must preserve its frozen parent fact through pending retries.
+Complete those paths before enabling resource admission, startup sizing or
+automatic reporting.
+
+Validation passed 680 unit tests and 1,211 physical tests. After adding the shared
+origin check to the child reader, 211 related physical tests, all 680 unit tests
+and 185 interop tests passed. The new checkpoint property ran 200 trials with seed
+42. Six independent Python tests cover old/new snapshots, parent origins and
+malformed extensions; the retained-prefix oracle fixtures also passed. Fresh
+strict compilation passed at `/tmp/pg-resource-checkpoint-final-compile.log`.
+`t/resource-parameters-crash.sh` additionally creates a real known-fact backup,
+compares source and target checkpoint facts through the independent decoder, and
+verifies the base without changing it. Its final crash/backup/restart run passed
+at `/tmp/pg-resource-checkpoint-owned-final.log`.
+
 ### Child follow and rejoin intake
 
 A fresh backup from a promoted child now records its actual timeline and copies

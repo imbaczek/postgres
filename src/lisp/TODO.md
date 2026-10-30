@@ -30,8 +30,13 @@
   validate the terminal without publishing applied resource facts. Owned-server
   SIGKILL tests cover both publication boundaries. Automatic startup reporting
   is not wired yet: its tuple must describe actual installed capacity.
-  Carry exact resource facts with applied/required positions, checkpoint and
-  restartpoint seeds, backup validation and private follow scans. Missing legacy
+  Ordinary checkpoints now carry an optional positioned tuple, and verified base
+  images require exact agreement with copied control and a valid ancestor origin.
+  Their manifest hashes bind the checkpoint facts without extra manifest fields.
+  Next carry exact facts with applied/required positions, restartpoint seeds,
+  private follow scans and pending promotion control. The child checkpoint writer
+  still emits unknown facts; preserve the frozen parent fact before enabling
+  resource admission or automatic reporting. Missing legacy
   facts stay unknown; do not substitute current defaults or newer received facts
   for an older replay seed. Cold hot-standby admission needs positive proof;
   online insufficiency needs its own pause, promotion refusal and shutdown on

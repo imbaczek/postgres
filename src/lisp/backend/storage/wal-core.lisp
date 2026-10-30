@@ -2972,7 +2972,9 @@ Refresh its modification time. Update memory only after atomic publication."
   (values))
 
 (defun wal-checkpoint-core ()
-  "Write all cached pages, sync durable state, and advance the redo pointer."
+  "Write all cached pages, sync durable state, and advance the redo pointer.
+Under the WAL lock, freeze resource facts before planning placement and rotation.
+Check the encoded size against that plan before appending the checkpoint."
   ;; CHECKPOINT follows the global write-lock -> WAL-lock order.
   (with-write-lock
     (with-wal-critical
