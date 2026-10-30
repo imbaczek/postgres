@@ -291,6 +291,65 @@ These identities never enter the real active-XID set, CLOG or WAL.")
 
 (defvar *relation-maintainers* (make-hash-table :test #'eql))
 
+(defvar *relation-lock-object-limit* nil)
+
+(defvar *relation-lock-owner-limit* nil)
+
+(defun print-relation-gate-token (object stream depth)
+  (declare (ignore depth))
+  (print-unreadable-object (object stream :type t :identity t)))
+
+(defstruct (relation-gate-token
+            (:constructor make-relation-gate-token (owner))
+            (:print-function print-relation-gate-token))
+  (owner nil :read-only t))
+
+(defun relation-resource-footprint-under-lock (&optional requested owner)
+  (unless (sb-thread:holding-mutex-p *relation-lock-mutex*)
+    (error "relation resource accounting requires relation exclusion"))
+  (let ((objects (make-hash-table :test #'eql))
+        (backends (make-hash-table :test #'eq)))
+    (labels ((identity-of (value)
+               (cond
+                 ((relation-gate-token-p value)
+                  (let ((actor (relation-gate-token-owner value)))
+                    (if actor (identity-of actor) value)))
+                 ((backend-p value)
+                  (or (gethash value backends)
+                      (setf (gethash value backends)
+                            (or (backend-virtual-reader-xid value)
+                                (backend-xid value) value))))
+                 (t value)))
+             (note (node actor)
+               (let ((owners (or (gethash node objects)
+                                 (setf (gethash node objects)
+                                       (make-hash-table :test #'eql)))))
+                 (setf (gethash (identity-of actor) owners) t))))
+      (dolist (registrations (list *relation-readers* *relation-writers*))
+        (maphash (lambda (node owners)
+                   (dolist (actor owners) (note node actor)))
+                 registrations))
+      (dolist (registrations (list *relation-builders* *relation-maintainers*))
+        (maphash #'note registrations))
+      (dolist (node requested) (note node owner))
+      (values (hash-table-count objects)
+              (loop for owners being the hash-values of objects
+                    sum (hash-table-count owners))))))
+
+(defun relation-resource-footprint ()
+  (sb-thread:with-mutex (*relation-lock-mutex*)
+    (relation-resource-footprint-under-lock)))
+
+(defun relation-resource-check-under-lock (requested owner)
+  (when (or *relation-lock-object-limit* *relation-lock-owner-limit*)
+    (multiple-value-bind (objects owners)
+        (relation-resource-footprint-under-lock requested owner)
+      (when (or (and *relation-lock-object-limit* (> objects *relation-lock-object-limit*))
+                (and *relation-lock-owner-limit* (> owners *relation-lock-owner-limit*)))
+        (ereport "53200" "out of shared memory"
+                 :hint "You might need to increase \"max_locks_per_transaction\"."))))
+  (values))
+
 ;; Exported initial-copy snapshots pin a schema view across multiple relation
 ;; reads. PostgreSQL holds relation locks for DDL and AccessExclusiveLock for
 ;; VACUUM FULL. This global gate excludes exported snapshot scopes from schema
@@ -768,6 +827,7 @@ holding a portal snapshot must be allowed to run so it can release its pin."
       (loop
         (when (and (every (lambda (node) (relation-writer-admissible-p node xid)) writes)
                    (every (lambda (node) (relation-reader-admissible-p node xid)) reads))
+          (relation-resource-check-under-lock (append writes reads) xid)
           (dolist (node writes)
             (pushnew xid (gethash node *relation-writers*) :test #'=))
           (dolist (node reads)
@@ -779,22 +839,7 @@ holding a portal snapshot must be allowed to run so it can release its pin."
 
 (defun register-relation-writer (relfilenode xid)
   "Register XID as a writer, waiting if an index build owns the relation."
-  (when (and *backend* (eql xid (backend-xid *backend*)))
-    (logical-note-xid-mutation-needs-capture-p xid))
-  (sb-thread:with-mutex (*relation-lock-mutex*)
-    (loop
-      (let* ((writers (gethash relfilenode *relation-writers*))
-             (token (gethash relfilenode *relation-builders*))
-             (group (gethash token *relation-build-groups*)))
-        (when (or (null (gethash relfilenode *relation-builders*))
-                  (member xid writers :test #'=)
-                  (relation-build-group-has-user-p
-                   token xid t (and group (second group))))
-          (pushnew xid (gethash relfilenode *relation-writers*) :test #'=)
-          (return)))
-      (check-for-interrupts)
-      (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*)))
-  (values))
+  (register-relation-accesses (list relfilenode) nil xid))
 
 (defun relation-reader-admissible-p (relfilenode xid)
   (let ((readers (gethash relfilenode *relation-readers*))
@@ -807,22 +852,8 @@ holding a portal snapshot must be allowed to run so it can release its pin."
         (relation-build-group-has-user-p token xid t t))))
 
 (defun register-relation-readers (relfilenodes xid)
-  "Atomically register XID on every relation, waiting without partial state.
-
-Multi-table readers must not hold one relation registration while waiting for
-another. Otherwise opposite-order JOINs can deadlock with separate DDL gates."
-  (let ((relfilenodes (remove-duplicates (copy-list relfilenodes) :test #'=)))
-    (sb-thread:with-mutex (*relation-lock-mutex*)
-      (loop
-        (when (every (lambda (relfilenode)
-                       (relation-reader-admissible-p relfilenode xid))
-                     relfilenodes)
-          (dolist (relfilenode relfilenodes)
-            (pushnew xid (gethash relfilenode *relation-readers*) :test #'=))
-          (return))
-        (check-for-interrupts)
-        (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*))))
-  (values))
+  "Register every relation together, waiting without partial ownership."
+  (register-relation-accesses nil relfilenodes xid))
 
 (defun register-relation-reader (relfilenode xid)
   "Register XID as a reader, waiting if relation DDL excludes readers."
@@ -921,7 +952,7 @@ must protect the return-to-owner handoff from interrupts; prefer the scoped macr
                                                        (transaction-held-relation-lock-p node *backend*)))
                                                 (copy-list relfilenodes)) :test #'=)
                             #'<))
-        (token (gensym "RELATION-BUILD-"))
+        (token (make-relation-gate-token (or own-xid *backend*)))
         (published nil)
         (completed nil))
     (when (null relfilenodes)
@@ -936,6 +967,7 @@ must protect the return-to-owner handoff from interrupts; prefer the scoped macr
                       (condition-wait-with-timeout *relation-lock-cv*
                                                    *relation-lock-mutex*))
              (sb-sys:without-interrupts
+               (relation-resource-check-under-lock relfilenodes token)
                ;; Own the complete set before any partial map update can fail.
                (setf published t)
                (setf (gethash token *relation-build-groups*)
@@ -1010,7 +1042,7 @@ Without it raw callers must protect the return-to-owner handoff from interrupts;
 prefer WITH-RELATION-MAINTENANCE-LOCKS."
   (let ((relfilenodes (sort (remove-duplicates (copy-list relfilenodes) :test #'=)
                             #'<))
-        (token (gensym "RELATION-MAINTENANCE-"))
+        (token (make-relation-gate-token *backend*))
         (published nil)
         (completed nil))
     (when (null relfilenodes)
@@ -1024,6 +1056,7 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
                                    (gethash relfilenode *relation-maintainers*)))
                              relfilenodes)
                  (sb-sys:without-interrupts
+                   (relation-resource-check-under-lock relfilenodes token)
                    (setf published t)
                    (dolist (relfilenode relfilenodes)
                      (setf (gethash relfilenode *relation-maintainers*) token))
