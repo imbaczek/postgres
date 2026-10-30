@@ -110,11 +110,12 @@ names found during cleanup, with directory synchronization. Unlike C PostgreSQL,
 which removes the names seen at startup, this also removes names added later so a
 cold retry cannot accidentally enter recovery. Symlink targets are left intact.
 
-Reconciliation of `primary_conninfo`, `primary_slot_name`, and
-`recovery_target_timeline` desired generations remains unfinished; the
-`primary_slot_name` GUC is not registered or wired. Timeline policy remains
-future work, and coordination is outside this scope. Effective multihost profiles
-are unsupported.
+`recovery_target_timeline` accepts `current`, `latest` (the default), or a numeric
+timeline ID. It is a POSTMASTER setting: cold startup applies it, and reload
+reports changes as pending restart. `SHOW` and `pg_settings` retain its spelling.
+The `primary_conninfo` and `primary_slot_name` GUCs are not implemented yet, so
+full Patroni follow remains unfinished. Coordination is outside this scope.
+Effective multihost profiles are unsupported.
 The original conninfo is resolved again on normal reconnects. If the selected
 route changes, the receiver prepares a new binding before querying or receiving
 WAL. Cleanup uses the saved selected route and credential; if that credential is

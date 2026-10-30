@@ -62,7 +62,8 @@ Recovery artifacts without recovery control are an error: pending control is
 retired last, so their presence cannot safely select primary startup. Nonpending
 standby control requires recovery validation. A pending request is reconciled
 against parent or committed child control. Return :PRIMARY-READY when pending
-completion already initialized storage. Invalid proof is an error."
+completion already initialized storage. Invalid proof is an error. Resolve the
+active timeline goal before recovery preparation or redo."
   (let ((signal-mode (physical-recovery-read-signal-mode))
         (timeline-goal (startup-recovery-timeline-goal)))
     (when (and (not (wal-namespace-file-stat (physical-recovery-control-path) t))

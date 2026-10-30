@@ -315,8 +315,8 @@ empty overlap, mismatched identity/history/bytes, lost retention, reconnect
 after confirmed progress, and crashes around pin publication and child
 selection. Both direct follow commands and Patroni's existing recovery
 configuration/reload path need the same admission checks. Native autostart
-currently reads `physical-follow.control`; `primary_conninfo`,
-`primary_slot_name` and `recovery_target_timeline` are not implemented settings.
+reads `physical-follow.control`. `recovery_target_timeline` is applied at cold
+startup; standard conninfo and slot desired-generation reconciliation remains open.
 Patroni 4.1.5 constructs those recovery parameters in
 `ConfigHandler.build_recovery_params` and writes them before
 `Postgresql.follow` calls reload, restart or start. The native private control
@@ -615,11 +615,11 @@ clear; Sol medium's shared root lease and checked snapshot consolidation is appl
 C references remain `walreceiver.c:691-819` for historic stream completion and
 startup instructions, `walsender.c:906-970` for timeline bounds, and
 `slot.c:1075-1101,1129-1164` for durable pin retirement before memory release.
-Standard `primary_conninfo`, `primary_slot_name` and
-`recovery_target_timeline` configuration/reload still need to use this admission
-path before claiming Patroni `follow` support. Synchronous commit waits and an
-independent acknowledgment-loss oracle remain separate required work; these
-tests do not establish zero-loss failover.
+Standard `primary_conninfo` and `primary_slot_name` desired-generation
+reconciliation still needs integration before claiming Patroni `follow` support.
+`recovery_target_timeline` is active at cold startup and requires restart to change.
+Synchronous commit waits and an independent acknowledgment-loss oracle remain
+separate required work; these tests do not establish zero-loss failover.
 
 ### Libpq profile receiver integration — completed milestone
 
@@ -778,22 +778,11 @@ alone would not provide that behavior. The implementation must cover first
 attachment, same-timeline changes, descendant transitions, clearing conninfo,
 failed replacement, cold restart and shutdown/promotion races.
 
-The internal timeline policy foundation (`19102902196`, `a1b6456b069`)
-resolves startup goals and fences replay against selected ancestry. Its owned
-raw and libpq experiments passed. It does not yet expose a recovery target GUC
-or integrate receiver target selection and completion with the controller.
-
-The retained-timeline source capability (`1f72a21c8cd`) provides an explicit
-fork-bounded proof and streaming path for ancestral WAL. Focused source and raw
-protocol tests, all 1,109 physical tests and strict compilation passed. Integrated
-raw and libpq tests of this new path belong to the next controller milestone;
-GUC generation reconciliation and controller integration remain open.
-
-Commit `508532acd70` adds policy-aware admission and a pure follow selection
-planner; the final physical suite passed all 1,119 tests. Controller operation
-policy capture, source-view routing, no-proof results, launch and completion,
-and GUC generation integration remain open. Owned raw and libpq experiments
-for the retained path have not yet been integrated.
+Timeline policy resolves the cold-start `recovery_target_timeline`, fences replay
+and routes fixed-target follow through bounded ancestral receipt. Changes to the
+setting on reload remain pending restart. Owned raw and libpq tests cover cold
+startup, reload and promotion; conninfo and slot desired-generation reconciliation
+and full Patroni follow remain open.
 
 The native `-C` metadata path now prints supported static settings using
 configuration precedence and base units before storage ownership or listener
@@ -878,10 +867,10 @@ A Sol xhigh source audit identified these connected requirements:
   user, passfile, application name and negotiation. Keep native WAL negotiation
   explicit and the stable direct-endpoint identity assumption. Do not silently
   discard unsupported multihost connection semantics.
-- Implement `standby.signal`, the three recovery settings and other fields the
-  real Patroni writer emits. `primary_conninfo` and `primary_slot_name` are SIGHUP
-  settings; `recovery_target_timeline` is POSTMASTER. A signal cannot create native
-  base provenance or bypass committed promotion.
+- Complete the recovery settings and other fields the real Patroni writer emits.
+  `recovery_target_timeline` is implemented as a POSTMASTER setting; conninfo and
+  slot desired-generation reconciliation remains open. A signal cannot create
+  native base provenance or bypass committed promotion.
 
 References: C `slotfuncs.c`, `slot.h:248-269`, `walsender.c:PhysicalConfirmReceivedLocation`,
 `startup.c:StartupRereadConfig`, `libpqwalreceiver.c:libpqrcv_connect`, and

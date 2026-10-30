@@ -43,6 +43,8 @@
   (text (* sb-alien:char)) (end (* (* sb-alien:char))) (base sb-alien:int))
 
 (defun startup-recovery-timeline-number (begin end)
+  "Parse an unsigned base-zero value with the libc behavior used by C.
+Use the C23 entry point when available, otherwise the older strtoull."
   (let ((address (sb-sys:find-foreign-symbol-address "__isoc23_strtoull")))
     (setf (sb-alien:deref (startup-errno-location)) 0)
     (if address
@@ -55,6 +57,9 @@
         (startup-strtoull begin end 0))))
 
 (defun startup-parse-recovery-timeline (text)
+  "Parse exact current or latest, or a complete nonzero 32-bit timeline ID.
+Numeric input uses unsigned base-zero libc parsing; units and integer GUC
+rounding do not apply."
   (when (find (code-char 0) text) (error "NUL in recovery_target_timeline"))
   (cond ((string= text "current") :current)
         ((string= text "latest") :latest)
@@ -159,7 +164,8 @@
 (defun startup-normalize-setting (name input)
   "Normalize a startup setting from text or literal octets.
 For cluster_name, postmaster SQL_ASCII clips 63 raw bytes before ASCII cleaning,
-even with a UTF-8 database. Other settings decode their input as UTF-8."
+even with a UTF-8 database. Other settings decode their input as UTF-8.
+Timeline input is validated but its original spelling is retained."
   (let ((spec (assoc name *startup-setting-specs* :test #'string=))
         (octets (startup-input-octets input)))
     (unless spec (error "unrecognized configuration parameter ~s" name))
@@ -420,6 +426,8 @@ other values request configuration output. The last -C selects between these use
   (getf (gethash name settings) :value))
 
 (defun startup-recovery-timeline-goal ()
+  "Return the active cold-start timeline goal, defaulting to latest.
+A reload may record a different desired value, but does not change this goal."
   (startup-parse-recovery-timeline
    (or (when *startup-server-settings*
          (startup-setting-value *startup-server-settings* "recovery_target_timeline"))
@@ -545,7 +553,9 @@ hot_standby retain their active values until restart."
   settings)
 
 (defun startup-reload-settings ()
-  "Validate a fresh input tree before replacing active values under quiescence."
+  "Validate a fresh input tree before replacing active values under quiescence.
+Postmaster settings retain their active values and record pending restart.  A
+setting added to a warm registry uses its boot default as the old value."
   (when *startup-server-settings*
     (let ((candidate (startup-load-settings *startup-native-inputs* *startup-command-overrides* *pgdata*))
           (defaults (startup-default-settings (namestring *pgdata*))))

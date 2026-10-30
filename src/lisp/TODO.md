@@ -1,10 +1,15 @@
 # Development TODO
 
-- [ ] Implement desired-generation reconciliation for `primary_conninfo`,
-  `primary_slot_name` and `recovery_target_timeline` for standard follow.
+- [ ] Implement desired-generation reconciliation for `primary_conninfo` and
+  `primary_slot_name` for standard follow. `recovery_target_timeline` is active
+  at cold startup and changes require restart.
   Signal-managed startup currently prepares a verified native standby for replay
   only. Archive-only recovery remains unsupported future work; coordination is
   outside this scope. This does not provide full Patroni follow support.
+
+- [ ] Fix signed integer GUC parsing for C23 binary prefixes independently of
+  the unsigned recovery timeline parser. C reports `100` for
+  `max_connections=0b1100100`; the Lisp normalizer reports an invalid unit.
 
 - [ ] After implementation, tests and code reviews are complete, document modules,
   functions and structures in the style of the original C source. Use simple,
