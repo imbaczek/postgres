@@ -138,8 +138,15 @@
     (ok (signals (pg::physical-follow-anchor-check anchor) 'error))))
 
 (deftest same-timeline-proof-extension-preserves-descendant-anchor-identity
-    (ok (= 15144333420950785491
-           (pg::physical-follow-anchor-digest (follow-anchor-request 123 456))))
+    ;; Independent native-frame CRC32 and canonical UTF-8/FNV-1a fixtures.
+    ;; Retain the stored v7 identity while the current encoder emits v8 bytes.
+    (let ((legacy (follow-anchor-request 123 456)))
+      (setf (getf legacy :eor-octets)
+            '(80 71 87 76 7 0 13 0 56 0 0 0 96 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+              18 39 251 14 42 0 0 0 0 0 0 0 2 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0))
+      (ok (= 15144333420950785491 (pg::physical-follow-anchor-digest legacy))))
+  (ok (= 16393646900456083562
+         (pg::physical-follow-anchor-digest (follow-anchor-request 123 456))))
   (ok (= 15813853048420144424
          (pg::physical-follow-anchor-digest (same-timeline-follow-anchor 96 123 456)))))
 
