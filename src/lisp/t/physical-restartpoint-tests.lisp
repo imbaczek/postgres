@@ -77,6 +77,41 @@
                 (pg::physical-store-prefix-digest store pg::*last-replay-lsn*))))
       (when legacy (setf pg::*physical-recovery-state* before)))))
 
+(deftest reader-safe-resource-pause-persists-the-report-and-stops-before-later-wal
+    (call-with-resource-restartpoint-fixture
+     (lambda (root store)
+       (let ((pg::*installed-resource-parameters* (pg::make-resource-parameters 100 8 10 0 128))
+             (pg::*physical-resource-pause* nil)
+             (pg::*physical-replay-restarting-p* nil)
+             (pg::*enable-hot-standby* t))
+         (append-resource-test-parameter store 200)
+         (append-resource-test-parameter store 50)
+         (ok (eq :resource-paused (pg::physical-row-replay-prefix 0)))
+         (ok (= 288 pg::*last-replay-lsn*))
+         (ok (= 384 (pg::physical-store-flushed-lsn store)))
+         (ok (equal '(200 8 10 0 128)
+                    (getf (getf pg::*physical-resource-pause* :fact) :resource-parameters)))
+         (ok (equal (getf pg::*physical-resource-pause* :fact)
+                    (getf (pg::physical-recovery-read-control root) :resource-fact)))
+         (ok (not pg::*physical-recovery-failed-p*))
+         (ok (eq :resource-paused (pg::physical-row-replay-prefix 0)))
+         (ok (= 288 pg::*last-replay-lsn*))))))
+
+(deftest reader-safe-replay-applies-an-empty-resource-terminal
+    (call-with-resource-restartpoint-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (let ((catalog pg::*catalog*) (clog pg::*clog-stream*)
+                                     (streams pg::*relation-streams*))
+         (append-resource-test-parameter store 50)
+         (ok (= 288 (pg::physical-row-replay-prefix 0)))
+         (ok (equal '(50 8 10 0 128)
+                    (getf (getf pg::*physical-recovery-state* :source-resource-fact)
+                          :resource-parameters)))
+         (ok (eq catalog pg::*catalog*))
+         (ok (eq clog pg::*clog-stream*))
+         (ok (eq streams pg::*relation-streams*))))))
+
 (deftest follow-historical-resource-witness-distinguishes-unknown-from-legacy
     (call-with-resource-restartpoint-fixture
      (lambda (root store)

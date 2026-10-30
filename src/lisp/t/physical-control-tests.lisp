@@ -11,6 +11,76 @@
 (defun sample-resource-fact (&optional (connections 100) (lsn 64))
   (list :resource-parameters (list connections 8 10 0 128) :resource-lsn lsn :resource-timeline 1))
 
+(deftest cold-resource-readiness-requires-proof-after-reconstruction
+    (let* ((fact (list :resource-parameters (list 100 8 10 0 64)
+                       :resource-lsn 192 :resource-timeline 1))
+           (pg::*installed-resource-parameters* (pg::make-resource-parameters 100 8 10 0 64))
+           (pg::*enable-hot-standby* t)
+           (pg::*last-replay-lsn* 192)
+           (pg::*physical-recovery-state*
+             (list :timeline 1 :replay-timeline 1 :required-applied 192 :required-timeline 1
+                   :source-resource-fact fact :required-resource-fact fact)))
+      (ok (eq :ready (pg::physical-recovery-check-resource-readiness)))
+      (dolist (values '((101 8 10 0 64) (100 9 10 0 64) (100 8 11 0 64)
+                        (100 8 10 1 64) (100 8 10 0 65)))
+        (setf (getf fact :resource-parameters) (copy-list values))
+        (ok (equal "22023" (recovery-state-of #'pg::physical-recovery-check-resource-readiness))))
+      (setf (getf pg::*physical-recovery-state* :source-resource-fact) nil
+            (getf pg::*physical-recovery-state* :required-resource-fact) nil)
+      (ok (equal "22023" (recovery-state-of #'pg::physical-recovery-check-resource-readiness)))
+      (let ((pg::*enable-hot-standby* nil))
+        (ok (eq :disabled (pg::physical-recovery-check-resource-readiness))))))
+
+(deftest resource-pause-resume-requests-shutdown-without-clearing-the-latch
+    (let ((pg::*physical-recovery-state* (list :phase 2))
+          (pg::*physical-recovery-failed-p* nil)
+          (pg::*physical-shutdown-state* nil)
+          (pg::*physical-promotion-stopping-p* nil)
+          (pg::*physical-resource-pause* (list :fact nil :shortfalls nil :resume-requested nil))
+          (pg::*physical-replay-paused-p* nil)
+          (pg::*pm-requested-mode* 0))
+      (ok (pg::physical-replay-pause-command "pg_is_wal_replay_paused"))
+      (ok (string= "paused" (pg::physical-replay-pause-command "pg_get_wal_replay_pause_state")))
+      (ok (equal "22023" (recovery-state-of #'pg::check-physical-resource-promotion)))
+      (pg::physical-replay-pause-command "pg_wal_replay_resume")
+      (ok (= pg::+fast-shutdown+ pg::*pm-requested-mode*))
+      (ok (getf pg::*physical-resource-pause* :resume-requested))
+      (ok (pg::physical-replay-pause-command "pg_is_wal_replay_paused"))
+      (ok (not pg::*physical-recovery-failed-p*))
+      (ok (not pg::*physical-replay-paused-p*))))
+
+(deftest startup-resource-capacity-installs-one-consistent-tuple-and-lock-pool
+    (let ((settings (pg::startup-default-settings "/tmp/resource-capacity-test/"))
+          (pg::*installed-resource-parameters* nil)
+          (pg::*relation-lock-object-limit* nil)
+          (pg::*relation-lock-owner-limit* nil))
+      (let ((installed (pg::startup-install-resource-capacity settings)))
+        (ok (equal '(100 8 10 0 64) (pg::resource-parameters-values installed)))
+        (ok (= 8704 pg::*relation-lock-object-limit*))
+        (ok (= 17408 pg::*relation-lock-owner-limit*))
+        (ok (intake-fails-p (lambda () (pg::startup-install-resource-capacity settings))))
+        (ok (eq installed pg::*installed-resource-parameters*))
+        (ok (= 8704 pg::*relation-lock-object-limit*))
+        (ok (= 17408 pg::*relation-lock-owner-limit*)))))
+
+(deftest resource-recovery-admission-requires-known-adequate-facts-only-for-hot-standby
+    (let* ((local (pg::make-resource-parameters 100 8 10 0 64))
+           (fact (list :resource-parameters (list 100 8 10 0 64)
+                       :resource-lsn 192 :resource-timeline 1)))
+      (ok (eq :disabled (pg::resource-recovery-admission local nil nil)))
+      (ok (eq :unknown (pg::resource-recovery-admission local nil t)))
+      (ok (eq :ready (pg::resource-recovery-admission local fact t)))
+      (setf (first (getf fact :resource-parameters)) 200)
+      (multiple-value-bind (decision shortfalls)
+          (pg::resource-recovery-admission local fact t)
+        (ok (eq :insufficient decision))
+        (ok (equal (pg::resource-parameters-shortfalls
+                    local (pg::make-resource-parameters 200 8 10 0 64))
+                   shortfalls)))
+      (ok (eq :disabled (pg::resource-recovery-admission local fact nil)))
+      (setf (first (getf fact :resource-parameters)) 50)
+      (ok (eq :ready (pg::resource-recovery-admission local fact t)))))
+
 (deftest recovery-control-resources-roundtrip-all-current-layouts
     (dolist (pending '(nil t))
       (dolist (selected '(nil t))

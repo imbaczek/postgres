@@ -1394,7 +1394,7 @@ Receipt ends there; replay remains free to reach its own policy fence."
   (loop until (or (physical-follow-runtime-stopped-p runtime) (shutdown-in-progress-p))
         do (handler-case
                (when (and (not (sb-thread:with-mutex (*physical-replay-pause-lock*)
-                                 *physical-replay-paused-p*))
+                                 (or *physical-replay-paused-p* *physical-resource-pause*)))
                           (physical-recovery-replay-pending-p))
                  (physical-recovery-replay))
              (error (condition)

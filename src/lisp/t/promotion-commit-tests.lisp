@@ -26,6 +26,36 @@
         (ok (equal snapshot (pg::wal-checkpoint-record-snapshot
                              (pg::wal-decode-record (second (third frames)) (first (third frames)))))))))
 
+(deftest promotion-resource-pause-restores-workers-without-fencing-recovery
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root store))
+       (let ((attempt (symbol-function 'pg::physical-promotion-try-online))
+             (restore (symbol-function 'pg::physical-promotion-resume-recovery-workers))
+             (pg::*physical-resource-pause* nil)
+             (restored nil))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-promotion-try-online)
+                      (lambda ()
+                        (setf pg::*physical-resource-pause*
+                              (list :fact nil :shortfalls nil :resume-requested nil))
+                        :resource-paused)
+                      (symbol-function 'pg::physical-promotion-resume-recovery-workers)
+                      (lambda (config paused restartpoint)
+                        (declare (ignore config paused restartpoint))
+                        (ok pg::*physical-resource-pause*)
+                        (setf restored t pg::*physical-promotion-stopping-p* nil)))
+                (call-with-current-promotion-owner
+                 (lambda ()
+                   (ok (eq :resource-paused (pg::physical-recovery-promote)))))
+                (ok restored)
+                (ok (not pg::*physical-recovery-failed-p*))
+                (ok (not pg::*physical-promotion-stopping-p*))
+                (ok (= 2 (getf pg::*physical-recovery-state* :phase))))
+           (setf (symbol-function 'pg::physical-promotion-try-online) attempt
+                 (symbol-function 'pg::physical-promotion-resume-recovery-workers) restore))))))
+
 (deftest pending-intent-encodes-and-owns-its-known-resource-fact
     (with-promotion-fixture (root store)
       (declare (ignore root store))

@@ -15,11 +15,12 @@
 ;;;; After intent, an uncertain failure requires restart from durable control.
 (in-package #:pg)
 
-(defun physical-promotion-check-online ()
+(defun physical-promotion-check-online (&key allow-resource-pause)
   "Require owned, healthy phase-2 streaming recovery before changing lifecycle state.
 Call under admission or owned quiescence. Report shutdown separately so the
 orchestrator can yield before intent without marking recovery failed."
   (check-recovery-available)
+  (unless allow-resource-pause (check-physical-resource-promotion))
   (when (shutdown-in-progress-p) (error 'physical-promotion-shutdown))
   (unless (and *postmaster-data-lock* (postmaster-pid-owned-p)
                (eql 2 (getf *physical-recovery-state* :phase))
@@ -60,16 +61,18 @@ An unsafe complete batch defers the attempt; otherwise publish the child."
         (return-from physical-promotion-try-online :awaiting-child-initialization))
       (call-with-physical-promotion-readers
        (lambda ()
-         (if (not (physical-promotion-replay-backlog))
-             :deferred
-             (progn
-               (physical-recovery-restartpoint-core)
-               (physical-promotion-test-point :before-online-intent)
-               (physical-promotion-publish-intent)
-               (physical-promotion-test-point :after-online-intent)
-               (physical-promotion-install-prefix)
-               (prog1 (physical-promotion-complete-child)
-                 (setf *physical-promotion-stopping-p* nil)))))))))
+         (let ((drained (physical-promotion-replay-backlog)))
+           (cond
+             (*physical-resource-pause* :resource-paused)
+             ((not drained) :deferred)
+             (t (progn
+                  (physical-recovery-restartpoint-core)
+                  (physical-promotion-test-point :before-online-intent)
+                  (physical-promotion-publish-intent)
+                  (physical-promotion-test-point :after-online-intent)
+                  (physical-promotion-install-prefix)
+                  (prog1 (physical-promotion-complete-child)
+                    (setf *physical-promotion-stopping-p* nil)))))))))))
 
 (defun physical-promotion-awaiting-child-initialization-p ()
   "Scan the durable suffix without applying it to check child initialization.
@@ -110,7 +113,9 @@ Restore pause state before clearing stopping under restartpoint-start, then
 pause lock. Acknowledged pause commands cannot be overwritten by this restore.
 An unattached or disabled standby resumes replay without starting a receiver."
   (with-live-operation
-    (physical-promotion-check-online)
+    (if *physical-resource-pause*
+        (physical-promotion-check-online :allow-resource-pause t)
+        (physical-promotion-check-online))
     (sb-thread:with-mutex (*physical-restartpoint-start-lock*)
       (sb-thread:with-mutex (*physical-replay-pause-lock*)
         (setf *physical-replay-paused-p* paused
@@ -177,7 +182,7 @@ before intent.  Other failures after work starts fence the process for restart."
                       (physical-promotion-test-point :after-online-worker-join)
                       (loop for result = (physical-promotion-try-online)
                             unless (eq result :deferred)
-                              do (when (eq result :awaiting-child-initialization)
+                              do (when (member result '(:awaiting-child-initialization :resource-paused))
                                    (physical-promotion-resume-recovery-workers config paused restartpoint))
                                  (setf finished t) (return result)
                             do (sleep 0.05)))

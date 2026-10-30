@@ -890,6 +890,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
           *query-sort-arena-limit-bytes* sort-arena-limit-bytes
           *max-slot-wal-keep-bytes* max-slot-wal-keep-bytes)
     (startup-install-settings startup-settings startup-native startup-overrides)
+    (startup-install-resource-capacity startup-settings)
     (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
     (postmaster-own-data-directory host port)
     (physical-promotion-initialize-requests)
@@ -904,7 +905,11 @@ CL's RENAME-FILE merges a relative target with the source's directory."
             (physical-recovery-open-storage)
             (initialize-primary-storage)))
       (physical-follow-prepare-managed-startup)
-      (unless (recovery-in-progress-p) (wal-note-primary-ready))
+      (if (recovery-in-progress-p)
+          (physical-recovery-check-resource-readiness)
+          (progn
+            (wal-report-installed-resource-capacity)
+            (wal-note-primary-ready)))
       (enable-reload)
       (enable-shutdown-handlers)
       (start-swank-listener swank-port swank-bind-address)

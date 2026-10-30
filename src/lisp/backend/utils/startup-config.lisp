@@ -539,15 +539,31 @@ A reload may record a different desired value, but does not change this goal."
   "Check reserved-slot and C process-budget bounds before installing settings.
 The other worker pools use their C defaults in the process-budget calculation."
   (let ((connections (startup-setting-value settings "max_connections"))
-        (senders (startup-setting-value settings "max_wal_senders"))
         (reserved (startup-setting-value settings "reserved_connections"))
         (superuser (startup-setting-value settings "superuser_reserved_connections")))
     (unless (< (+ reserved superuser) connections)
       (error "reserved_connections plus superuser_reserved_connections must be less than max_connections"))
-    ;; Other C worker pools still have their defaults: autovacuum 16,
-    ;; configurable background workers 8 and special workers 2.
-    (when (> (+ connections senders 16 8 2) 262143)
-      (error "too many server processes configured"))))
+    (startup-resource-capacity-plan settings)))
+
+(defun startup-resource-capacity-plan (settings)
+  (let ((parameters (make-resource-parameters
+                     (startup-setting-value settings "max_connections") 8
+                     (startup-setting-value settings "max_wal_senders") 0 64)))
+    (multiple-value-bind (objects owners) (resource-lock-capacities parameters)
+      (values parameters objects owners))))
+
+(defun startup-install-resource-capacity (settings)
+  (multiple-value-bind (parameters objects owners) (startup-resource-capacity-plan settings)
+    (sb-thread:with-mutex (*relation-lock-mutex*)
+      (when *installed-resource-parameters*
+        (error "resource capacity is already installed; restart is required"))
+      (multiple-value-bind (used-objects used-owners) (relation-resource-footprint-under-lock)
+        (unless (and (<= used-objects objects) (<= used-owners owners))
+          (error "installed resource capacity cannot cover existing relation registrations")))
+      (setf *relation-lock-object-limit* objects
+            *relation-lock-owner-limit* owners
+            *installed-resource-parameters* parameters))
+    parameters))
 
 (defun startup-install-settings (settings native overrides)
   "Validate and install settings, including session quotas before listen.

@@ -34,6 +34,8 @@
             (pg::*wal-replication-slots* (make-hash-table :test #'equal))
             (pg::*physical-source-pins* (make-hash-table :test #'equal))
             (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
+            (pg::*installed-resource-parameters*
+              (or pg::*installed-resource-parameters* (pg::make-resource-parameters 100 8 10 0 64)))
             (pg::*wal-ready* t) (pg::*wal-insert-timeline* 1) (pg::*wal-checkpoint-timeline* 1)
             (pg::*wal-checkpoint-lsn* 152) (pg::*wal-end-lsn* 152) (pg::*wal-durable-lsn* 152)
             (pg::*wal-segment-namespace* namespace) (pg::*last-replay-lsn* applied))

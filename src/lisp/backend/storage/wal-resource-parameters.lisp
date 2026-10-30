@@ -265,3 +265,14 @@ values replace earlier ones even when they decrease."
                     :resource-lsn (wal-u64 bytes 32) :resource-timeline (wal-u32 bytes 40))))
     (unless (wal-resource-fact-valid-p fact) (error "invalid positioned resource fact"))
     fact))
+
+(defun resource-recovery-admission (local fact hot-standby)
+  (unless (resource-parameters-valid-p local) (error "invalid installed resource parameters"))
+  (when (and fact (not (wal-resource-fact-valid-p fact)))
+    (error "invalid recovery resource fact"))
+  (cond
+    ((not hot-standby) :disabled)
+    ((null fact) :unknown)
+    (t
+     (let ((shortfalls (resource-parameters-shortfalls local (wal-control-resource-parameters fact))))
+       (values (if shortfalls :insufficient :ready) shortfalls)))))

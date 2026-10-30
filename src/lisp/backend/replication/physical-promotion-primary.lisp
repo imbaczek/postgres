@@ -406,6 +406,7 @@ recovery; restart must classify durable control."
     (wal-refresh-logical-capture-slot-mirror-under-wal-lock))
   (setf *physical-recovery-state* nil *physical-recovery-failed-p* nil
         *physical-replay-seen-relfilenodes* nil)
+  (wal-report-installed-resource-capacity)
   (wal-note-primary-ready)
   (physical-promotion-test-point :after-child-primary-ready))
 

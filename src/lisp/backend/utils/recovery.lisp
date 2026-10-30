@@ -18,6 +18,8 @@
 (defvar *enable-hot-standby* t
   "Installed hot_standby setting; controls client startup during recovery.")
 
+(defvar *installed-resource-parameters* nil)
+
 (defvar *physical-recovery-state* nil
   "Verified native recovery image metadata, preserved across code reloads.")
 
@@ -25,6 +27,8 @@
 
 (defvar *physical-replay-paused-p* nil
   "Process-local replay pause; preserved across reload, cleared by process restart.")
+
+(defvar *physical-resource-pause* nil)
 
 (defvar *physical-replay-pause-lock*
   (sb-thread:make-mutex :name "native replay pause"))
@@ -73,6 +77,11 @@
   "Process-local native standby shutdown phase; reset only by process restart.")
 
 (defvar *physical-shutdown-lock* (sb-thread:make-mutex :name "native standby shutdown"))
+
+(defun check-physical-resource-promotion ()
+  (when *physical-resource-pause*
+    (ereport "22023" "promotion is not possible because of insufficient parameter settings"
+             :hint "Restart the server after making the necessary configuration changes.")))
 
 (defun check-physical-recovery-work ()
   (check-recovery-available)

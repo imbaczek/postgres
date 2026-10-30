@@ -422,9 +422,50 @@ Updating source membership does not change existing snapshots."
     (catalog-refresh-oldest-relfrozenxid)
     (wal-clear-page-cache))
   (when *physical-replay-test-hook*
-    (funcall *physical-replay-test-hook* :after-progress record)))
+    (funcall *physical-replay-test-hook* :after-progress record))
+  (physical-recovery-note-resource-limits))
 
 (declaim (ftype function physical-replay-selected-eor physical-replay-check-child-initialization))
+
+(defun physical-recovery-check-resource-readiness ()
+  (unless (resource-parameters-valid-p *installed-resource-parameters*)
+    (error "resource capacity was not installed before recovery admission"))
+  (physical-recovery-control-frontier *physical-recovery-state* *last-replay-lsn*)
+  (when (< *last-replay-lsn* (getf *physical-recovery-state* :required-applied 0))
+    (error "resource admission has not reached required recovery"))
+  (multiple-value-bind (decision shortfalls)
+      (resource-recovery-admission *installed-resource-parameters*
+                                   (getf *physical-recovery-state* :source-resource-fact)
+                                   *enable-hot-standby*)
+    (case decision
+      (:unknown
+       (ereport "22023" "hot standby requires known source resource parameters"
+                :hint "Use a backup with resource metadata or recover with hot_standby=off."))
+      (:insufficient
+       (ereport "22023" "recovery aborted because of insufficient parameter settings"
+                :detail (format nil "~{~a~^; ~}" shortfalls)
+                :hint "Restart the server after making the necessary configuration changes.")))
+    decision))
+
+(defun wal-report-installed-resource-capacity ()
+  (unless (resource-parameters-valid-p *installed-resource-parameters*)
+    (error "resource capacity was not installed before primary readiness"))
+  (unless *wal-control-metadata* (wal-set-primary-state +db-in-crash-recovery+))
+  (wal-report-resource-parameters *installed-resource-parameters*))
+
+(defun physical-recovery-note-resource-limits ()
+  (when (and *installed-resource-parameters* *enable-hot-standby*
+             (not *physical-replay-restarting-p*))
+    (multiple-value-bind (decision shortfalls)
+        (resource-recovery-admission *installed-resource-parameters*
+                                     (getf *physical-recovery-state* :source-resource-fact) t)
+      (sb-thread:with-mutex (*physical-replay-pause-lock*)
+        (when (eq decision :insufficient)
+          (unless *physical-resource-pause*
+            (setf *physical-resource-pause*
+                  (list :fact (copy-tree (getf *physical-recovery-state* :source-resource-fact))
+                        :shortfalls (copy-tree shortfalls) :resume-requested nil))))
+        (when *physical-resource-pause* :resource-paused)))))
 
 (defun physical-replay-from (start-lsn)
   "Called only before listeners or under operation quiescence, with no old readers."
@@ -441,6 +482,8 @@ Updating source membership does not change existing snapshots."
        (physical-recovery-map-permitted-records
         *physical-receive-store*
         (lambda (record raw)
+          (when *physical-resource-pause*
+            (return-from physical-replay-from :resource-paused))
           (when *physical-replay-test-hook*
             (funcall *physical-replay-test-hook* :before-record record))
           (if (= (wal-record-type record) +wal-record-end-of-recovery+)
@@ -462,30 +505,34 @@ Updating source membership does not change existing snapshots."
                          record next-xid reservation source-xids :resource-fact resource-fact)
                         (physical-replay-publish-terminal record next-xid reservation source-xids)))))))
         :start-lsn start-lsn) *physical-receive-store*)))
-  *last-replay-lsn*)
+  (if *physical-resource-pause* :resource-paused *last-replay-lsn*))
 
 (defun physical-replay-pause-command (name)
-  "Control replay under admission; native redo cannot overlap an admitted caller."
   (with-live-operation
     (check-recovery-available)
     (when (member name '("pg_wal_replay_pause" "pg_wal_replay_resume") :test #'string=)
       (check-physical-recovery-work))
-    (unless (recovery-in-progress-p)
-      (ereport "55000" "recovery is not in progress"))
-    (sb-thread:with-mutex (*physical-replay-pause-lock*)
-      (when (and *physical-promotion-stopping-p*
-                 (member name '("pg_wal_replay_pause" "pg_wal_replay_resume") :test #'string=))
-        (ereport "55000" "standby promotion is ongoing"
-                 :hint (format nil "~a() cannot be executed after promotion is triggered." name)))
-      ;; Native redo runs exclusively behind this admission gate. A request is
-      ;; already at a complete applied boundary and can acknowledge PAUSED here.
-      (cond
-        ((string= name "pg_wal_replay_pause") (setf *physical-replay-paused-p* t) "")
-        ((string= name "pg_wal_replay_resume") (setf *physical-replay-paused-p* nil) "")
-        ((string= name "pg_is_wal_replay_paused") *physical-replay-paused-p*)
-        ((string= name "pg_get_wal_replay_pause_state")
-         (if *physical-replay-paused-p* "paused" "not paused"))
-        (t (error "unknown replay control function: ~a" name))))))
+    (unless (recovery-in-progress-p) (ereport "55000" "recovery is not in progress"))
+    (let ((shutdown nil))
+      (prog1
+          (sb-thread:with-mutex (*physical-replay-pause-lock*)
+            (when (and *physical-promotion-stopping-p*
+                       (member name '("pg_wal_replay_pause" "pg_wal_replay_resume") :test #'string=))
+              (ereport "55000" "standby promotion is ongoing"
+                       :hint (format nil "~a() cannot be executed after promotion is triggered." name)))
+            (cond
+              ((string= name "pg_wal_replay_pause") (setf *physical-replay-paused-p* t) "")
+              ((string= name "pg_wal_replay_resume")
+               (setf *physical-replay-paused-p* nil)
+               (when *physical-resource-pause*
+                 (setf (getf *physical-resource-pause* :resume-requested) t shutdown t))
+               "")
+              ((string= name "pg_is_wal_replay_paused")
+               (not (null (or *physical-replay-paused-p* *physical-resource-pause*))))
+              ((string= name "pg_get_wal_replay_pause_state")
+               (if (or *physical-replay-paused-p* *physical-resource-pause*) "paused" "not paused"))
+              (t (error "unknown replay control function: ~a" name))))
+        (when shutdown (request-fast-shutdown))))))
 
 (defun physical-recovery-replay-core ()
   "Replay complete durable batches while owning a closed admission gate.
@@ -519,6 +566,8 @@ already writable; fence any error or nonlocal exit once replay starts."
       (check-physical-recovery-work)
       (when *swank-listener-enabled-p* (error "native replay requires Swank to be off"))
       (sb-thread:with-mutex (*physical-replay-pause-lock*)
+        (when *physical-resource-pause*
+          (return-from physical-recovery-replay :resource-paused))
         (when *physical-replay-paused-p*
           (return-from physical-recovery-replay :paused)))
       (if (physical-recovery-reader-conflict-p)

@@ -380,6 +380,7 @@ Publish the retained parent prefix and pending control under the receive-store
 mutex.  Install pending runtime state only after control readback and owner
 handoff.  Failure during publication fences recovery."
   (with-physical-promotion-exclusion (2)
+    (check-physical-resource-promotion)
     (physical-follow-promotion-cleanup-config)
     (physical-recovery-publish-selected-history *physical-receive-store*)
     (let* ((state *physical-recovery-state*)

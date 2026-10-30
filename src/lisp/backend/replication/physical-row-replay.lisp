@@ -37,7 +37,7 @@ Zero is valid when every registered snapshot is covered."
             (>= (xid32-of xid) 3) (>= xid horizon)))
       (t (member type (list +wal-record-batch-start+ +wal-record-pages+
                             +wal-record-logical-changes+ +wal-record-xid-reservation+
-                            +wal-record-running-xacts+))))))
+                            +wal-record-running-xacts+ +wal-record-parameter-change+))))))
 
 (defun physical-row-replay-check-covered-commit (record snapshots)
   "Check a source COMMIT against each covered snapshot before applying images.
@@ -124,14 +124,18 @@ A violation is an error; the outer replay path fences recovery."
 ;;; The reader-safe replay path uses the same durable terminal publication as
 ;;; full replay; prospective per-record membership is not visible before it.
 
-(defun physical-row-replay-publish-terminal (record next-xid reservation source-xids)
+(defun physical-row-replay-publish-terminal (record next-xid reservation source-xids
+                                             &key (resource-fact (getf *physical-recovery-state* :source-resource-fact)))
   ;; Publish progress only after redo; restart can repeat an unpublished batch.
   (when *physical-replay-test-hook*
     (funcall *physical-replay-test-hook* :after-redo record))
-  (physical-replay-publish-progress record next-xid reservation source-xids)
+  (if (or resource-fact (getf *physical-recovery-state* :source-resource-fact))
+      (physical-replay-publish-progress record next-xid reservation source-xids :resource-fact resource-fact)
+      (physical-replay-publish-progress record next-xid reservation source-xids))
   (wal-clear-page-cache)
   (when *physical-replay-test-hook*
-    (funcall *physical-replay-test-hook* :after-progress record)))
+    (funcall *physical-replay-test-hook* :after-progress record))
+  (physical-recovery-note-resource-limits))
 
 (defun physical-row-replay-prefix (horizon &optional covered)
   ;; Publish each safe terminal in order, and defer at the first unsafe batch.
@@ -141,6 +145,7 @@ A violation is an error; the outer replay path fences recovery."
   ;; revisiting row certification and conflicts.
   (with-physical-replay-staging ()
     (let ((next-xid *next-xid*)
+          (resource-fact (copy-tree (getf *physical-recovery-state* :source-resource-fact)))
           (source-xids (copy-tree (getf *physical-recovery-state* :source-xids)))
           (reservation (copy-list (getf *physical-recovery-state* :source-reservation))))
       (physical-recovery-note-policy-exhaustion
@@ -148,6 +153,8 @@ A violation is an error; the outer replay path fences recovery."
         *physical-receive-store*
         (lambda (record raw)
           (declare (ignore raw))
+          (when *physical-resource-pause*
+            (return-from physical-row-replay-prefix :resource-paused))
           (unless (physical-row-replay-allowed-p record horizon)
             (return-from physical-row-replay-prefix :deferred))
           (when *physical-replay-test-hook*
@@ -163,11 +170,19 @@ A violation is an error; the outer replay path fences recovery."
                 (unless (physical-row-replay-spool-allowed-p horizon)
                   (return-from physical-row-replay-prefix :deferred))
                 (physical-row-replay-preflight-with-map #'wal-recovery-map-page-spool)
-                (wal-replay-record record)
-                (physical-row-replay-publish-terminal record next-xid reservation source-xids))
+                (let ((candidate (physical-resource-fact-next
+                                  resource-fact record (physical-recovery-replay-timeline *physical-recovery-state*)
+                                  (lambda () (physical-recovery-resource-history
+                                              *physical-receive-store* *physical-recovery-state*)))))
+                  (wal-replay-record record)
+                  (setf resource-fact candidate))
+                (if (or resource-fact (getf *physical-recovery-state* :source-resource-fact))
+                    (physical-row-replay-publish-terminal record next-xid reservation source-xids
+                                                          :resource-fact resource-fact)
+                    (physical-row-replay-publish-terminal record next-xid reservation source-xids)))
               (wal-replay-record record)))
         :start-lsn *last-replay-lsn*) *physical-receive-store*)))
-  *last-replay-lsn*)
+  (if *physical-resource-pause* :resource-paused *last-replay-lsn*))
 
 (defun physical-replay-with-readers ()
   ;; Run between statements under closed admission, retaining idle snapshots and
