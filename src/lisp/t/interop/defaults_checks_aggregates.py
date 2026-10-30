@@ -7,6 +7,23 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    r"SELECT get_byte('\x00ff'::bytea,1),get_bit('\x0081'::bytea,8),get_bit('\x0081'::bytea,15)",
+    r"SELECT set_byte('\x00ff'::bytea,0,258),set_bit('\x0081'::bytea,9,1)",
+    "SELECT get_bit(B'101',0),set_bit(B'101',1,1),get_bit('101',0)",
+    r"SELECT get_byte('\x00'::bytea,-1)",
+    r"SELECT set_bit('\x00'::bytea,8,3)",
+    r"SELECT get_byte('\x'::bytea,0)",
+    r"SELECT get_bit('\x00'::bytea,9223372036854775807)",
+    r"SELECT set_byte('\x00'::bytea,0,-1)",
+    r"SELECT set_bit('\x00'::bytea,0,3)",
+    "SELECT get_bit('101',0::smallint)",
+    "SELECT set_bit('101',0::smallint,1::bigint)",
+    "SELECT set_bit('101','0',true)",
+    "SELECT get_byte(NULL::bytea,1/0)",
+    "CREATE TABLE dc_byte_op(v bytea)",
+    r"INSERT INTO dc_byte_op VALUES ('\x00ff'::bytea)",
+    "SELECT v,set_byte(v,0,42),set_bit(v,15,0),v FROM dc_byte_op",
+    "SELECT v FROM dc_byte_op",
     'SELECT json_build_array(' + ','.join(['1'] * 100) + ')',
     'SELECT json_build_array(' + ','.join(['1'] * 101) + ')',
     'SELECT json_build_array(' + ','.join(['1'] * 100 + ['missing_column']) + ')',

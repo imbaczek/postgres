@@ -989,6 +989,22 @@ binary_multi="$binary_block$binary_block$binary_block"
 run -c 'alter table toast_bytes alter column v set storage extended' >/dev/null
 run -c "insert into toast_bytes values (2, '\\x$binary_multi')" >/dev/null
 [ "$(run -c 'select length(v) from toast_bytes where id = 2')" = 6300 ]
+[ "$(run -c 'select get_byte(v,0),get_byte(set_byte(v,0,255),0),get_byte(v,0),get_bit(set_bit(v,0,1),0) from toast_bytes where id=2')" = '42|255|42|1' ]
+# A computed equal bytea is a new datum and cannot inherit compression from
+# the source under a PLAIN destination policy.
+byte_zero=$(awk 'BEGIN { for(i=0;i<12000;i++) printf "00" }')
+run -c 'create table byte_origin_source (v bytea)' >/dev/null
+run -c 'create table byte_origin_plain (v bytea)' >/dev/null
+run -c 'alter table byte_origin_plain alter v set storage plain' >/dev/null
+run -c "insert into byte_origin_source values ('\\x$byte_zero')" >/dev/null
+run -c 'insert into byte_origin_plain select v from byte_origin_source' >/dev/null
+if run -v VERBOSITY=verbose -c 'insert into byte_origin_plain select set_byte(v,0,get_byte(v,0)) from byte_origin_source' >"$TMP/byte-origin.out" 2>&1; then
+    echo 'toast-dml: computed equal bytea retained source compression' >&2; exit 1
+fi
+case $(cat "$TMP/byte-origin.out") in
+    *54000*) ;;
+    *) echo 'toast-dml: computed bytea overflow did not report SQLSTATE 54000' >&2; exit 1 ;;
+esac
 [ "$(run -c 'select substr(v,200,30) from toast_bytes where id = 2')" = "\\x$(printf '%s' "$binary_multi" | cut -c 399-458)" ]
 [ "$(run -c "delete from toast_bytes where id = 2 returning v")" = "\\x$binary_multi" ]
 run -c 'create table toast_text (id int primary key, v text)' >/dev/null

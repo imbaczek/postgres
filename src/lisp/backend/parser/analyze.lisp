@@ -413,6 +413,38 @@ result is text for typeof and int4 for array_length."
       (ereport "0A000" "to_jsonb for type ~a is not supported" type))
     (list :func name arguments :type (if (string= name "to_json") :json :jsonb) :typmod -1)))
 
+(defun analyze-byte-bit-function (name arguments)
+  "Resolve the bytea and fixed-bit get/set overloads."
+  (let* ((bit-p (member name '("get_bit" "set_bit") :test #'string=))
+         (set-p (member name '("set_byte" "set_bit") :test #'string=))
+         (arity (if set-p 3 2)))
+    (unless (and (= (length arguments) arity)
+                 (or (not set-p) (in-unknown-constant-p (third arguments))
+                     (sql-implicit-coercion-p (expr-type (third arguments)) :int4)))
+      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+    (let* ((first-arg (first arguments)) (index (second arguments))
+                                         (first-type (expr-type first-arg))
+                                         (unknown (in-unknown-constant-p first-arg))
+                                         (index-unknown (in-unknown-constant-p index))
+                                         (index-type (expr-type index))
+                                         (input-type (cond ((not bit-p) :bytea)
+                                                           ((eq first-type :bit) :bit)
+                                                           ((eq first-type :bytea) :bytea)
+                                                           ((and unknown (eq index-type :int8) (not index-unknown)) :bytea)
+                                                           ((and unknown (eq index-type :int4) (not index-unknown)) :bit)
+                                                           ((and unknown (or index-unknown (eq index-type :int2)))
+                                                            (ereport "42725" "function ~a(~a) is not unique" name (call-signature arguments)))
+                                                           (t :bytea)))
+                                         (position-type (if (and bit-p (eq input-type :bytea)) :int8 :int4)))
+      (unless (and (or unknown (eq first-type input-type))
+                   (or index-unknown (sql-implicit-coercion-p index-type position-type)))
+        (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+      (list :func name
+            (append (list (coerce-common-expression first-arg input-type)
+                          (coerce-common-expression index position-type))
+                    (when set-p (list (coerce-common-expression (third arguments) :int4))))
+            :type (if set-p input-type :int4) :typmod -1))))
+
 (defun analyze-substr-function (name arguments)
   "Resolve text and bytea substring overloads."
   (unless (and (member (length arguments) '(2 3))
@@ -1341,6 +1373,8 @@ so a nested argument error keeps its own diagnostics."
            (ereport "42804" "VARIADIC argument must be an array")))
        (list :func name args :type (if (search "jsonb_" name) :jsonb :json) :typmod -1
                              :variadic (getf (cdddr expr) :variadic)))
+      ((member name '("get_byte" "set_byte" "get_bit" "set_bit") :test #'string=)
+       (analyze-byte-bit-function name args))
       ((member name '("jsonb_set" "jsonb_insert") :test #'string=)
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
@@ -3440,7 +3474,7 @@ candidate selection."
                                  '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                    "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
                                    "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "json_build_array" "json_build_object"
-                                   "jsonb_build_array" "jsonb_build_object"
+                                   "jsonb_build_array" "jsonb_build_object" "get_byte" "set_byte" "get_bit" "set_bit"
                                    "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid"
                                    "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                                    "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
@@ -4433,6 +4467,37 @@ and the selected CASE or COALESCE branch retain origin. Other computations clear
          (ereport "22023" "lower bound must be less than or equal to upper bound"))
        (sql-prng-range (first arguments) (second arguments)))))
 
+(defun sql-byte-bit-function (name arguments input-type)
+  "Apply the C bytea or bit indexing and copy-on-write semantics."
+  (when (member +null+ arguments) (return-from sql-byte-bit-function +null+))
+  (let* ((value (first arguments)) (index (second arguments))
+                                   (bit-p (member name '("get_bit" "set_bit") :test #'string=))
+                                   (set-p (member name '("set_byte" "set_bit") :test #'string=))
+                                   (limit (if (and bit-p (eq input-type :bytea)) (* 8 (length value)) (length value))))
+    (unless (<= 0 index (1- limit))
+      (if (eq input-type :bit)
+          (ereport "2202E" "bit index ~d out of valid range (0..~d)" index (1- limit))
+          (ereport "2202E" "index ~d out of valid range, 0..~d" index (1- limit))))
+    (when (and set-p bit-p (not (member (third arguments) '(0 1))))
+      (ereport "22023" "new bit must be 0 or 1"))
+    (if (eq input-type :bit)
+        (if set-p
+            (let ((copy (copy-seq value)))
+              (setf (char copy index) (if (zerop (third arguments)) #\0 #\1)) copy)
+            (if (char= (char value index) #\1) 1 0))
+        (let* ((byte-index (if bit-p (floor index 8) index))
+               (byte (aref value byte-index))
+               (bit (and bit-p (mod index 8))))
+          (if set-p
+              (let ((copy (copy-seq value)))
+                (setf (aref copy byte-index)
+                      (if bit-p
+                          (if (zerop (third arguments)) (logandc2 byte (ash 1 bit))
+                              (logior byte (ash 1 bit)))
+                          (logand (third arguments) 255)))
+                copy)
+              (if bit-p (if (logbitp bit byte) 1 0) byte))))))
+
 (defun eval-analyzed-function (name arguments type)
   "Evaluate a resolved call using its coerced argument values and result type.
 Arguments have already been evaluated in order, including for strict calls.
@@ -4673,7 +4738,9 @@ truncate and interpret the result at TYPE's signed width."
      (let* ((name (second expr))
             (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr)))
             (type (expr-type expr)))
-       (cond ((string= name "to_jsonb")
+       (cond ((member name '("get_byte" "set_byte" "get_bit" "set_bit") :test #'string=)
+              (sql-byte-bit-function name arguments (expr-type (first (third expr)))))
+             ((string= name "to_jsonb")
               (sql-to-jsonb (first arguments) (expr-type (first (third expr)))))
              ((string= name "to_json")
               (if (eq (first arguments) +null+) +null+

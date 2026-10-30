@@ -1102,8 +1102,11 @@ The `substr` and `substring`
 function forms also accept `bytea`, where positions count bytes. Bytea `||`
 concatenates octets; when one operand is bytea, an unknown literal on the
 other side is read as bytea. The result allocation, including its four-byte
-header, is limited to 1073741823 bytes. Interpreted
-direct substring projections with constant bounds over one base-table sequential
+header, is limited to 1073741823 bytes. `get_byte`, `set_byte`, `get_bit` and
+`set_bit` support bytea indexing, with
+bits numbered least significant first within each byte; setters return copies.
+The bit-string overloads of `get_bit` and `set_bit` number from the left.
+Interpreted direct substring projections with constant bounds over one base-table sequential
 scan can read only the needed uncompressed TOAST chunks when the column is not
 otherwise needed in full. Multiple slices and other recognized projections,
 filters, and LIMIT are supported. A column used in full by a projection or filter
