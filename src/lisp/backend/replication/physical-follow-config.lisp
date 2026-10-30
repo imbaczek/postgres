@@ -113,6 +113,22 @@ KNOWN-TIMELINE is an optional nonzero 32-bit namespace bound, not replay state."
               (list :unowned-bootstrap
                     (physical-follow-unowned-bootstrap-copy (getf state :unowned-bootstrap)))))))
 
+(defvar *physical-follow-observed-namespace* nil)
+
+(defun physical-follow-observed-timeline (system-id)
+  (let ((identity (list (namestring (truename *pgdata*)) system-id)))
+    (when (equal identity (first *physical-follow-observed-namespace*))
+      (second *physical-follow-observed-namespace*))))
+
+(defun physical-follow-observe-timeline (system-id timeline)
+  (unless (and (typep system-id '(integer 0 18446744073709551615))
+               (typep timeline '(integer 1 4294967295)))
+    (error "invalid observed follow timeline identity"))
+  (let* ((identity (list (namestring (truename *pgdata*)) system-id))
+         (known (max timeline (or (physical-follow-observed-timeline system-id) 1))))
+    (setf *physical-follow-observed-namespace* (list identity known))
+    known))
+
 (defun physical-follow-remember-timeline (state timeline)
   "Return a checked copy with the greatest known timeline ID preserved.
 This is a namespace bound; it does not select ancestry or a replay position."

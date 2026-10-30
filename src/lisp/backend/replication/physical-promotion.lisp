@@ -217,6 +217,7 @@ observed IDs. Legacy pending state without a floor probes from the parent."
           (error "pending promotion has inconsistent known timeline metadata")))
       (return-from physical-promotion-timeline-floor (or known parent)))
     (max parent (or observed 1) selected
+         (or (physical-follow-observed-timeline (getf state :system-id)) 1)
          (or (getf (getf state :timeline-policy) :target) 1))))
 
 (defun physical-promotion-freeze-timeline-floor (floor)

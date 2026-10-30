@@ -211,7 +211,7 @@ A retained binding carries no child history and cannot pass its fork."
     (physical-follow-binding-check binding)
     binding))
 
-(defun physical-follow-controller-source-view (client &optional (policy (getf *physical-recovery-state* :timeline-policy)))
+(defun physical-follow-controller-source-view (client &optional (policy (getf *physical-recovery-state* :timeline-policy)) observer)
   "Check source identity and history against the captured policy and local lineage.
 Return a non-attach decision when the source cannot serve the selected route;
 fetch child history only for a descendant attachment."
@@ -228,7 +228,9 @@ fetch child history only for a descendant attachment."
       (let* ((text (if (= source 1) (string->bytes "")
                        (sb-ext:with-timeout 10 (pg-client-native-history client source))))
              (history (timeline-check-lineage (timeline-parse-history source (bytes->string text))))
-             (view (physical-follow-policy-selection policy local-history history)))
+             (view (progn
+                     (when observer (funcall observer source system-id))
+                     (physical-follow-policy-selection policy local-history history))))
         (unless (eq :attach (getf view :action))
           (return-from physical-follow-controller-source-view view))
         (setf (getf view :history-text) (bytes->string text))
@@ -550,19 +552,53 @@ object remains the operation's authority until completion or cancellation."
     (if slot (setf (getf copy :public-slot) slot) (remf copy :public-slot))
     copy))
 
+(define-condition physical-follow-observation-save-failed (error)
+  ((cause :initarg :cause :reader physical-follow-observation-save-cause))
+  (:report (lambda (condition stream)
+             (format stream "could not save observed follow timeline: ~a"
+                     (physical-follow-observation-save-cause condition)))))
+
+(defun physical-follow-operation-current-config (operation)
+  (unless (sb-thread:holding-mutex-p *physical-follow-command-lock*)
+    (error "follow operation state check requires command exclusion"))
+  (physical-follow-operation-check operation)
+  (let ((current (physical-follow-read-config))
+        (expected (physical-follow-operation-config operation)))
+    (unless (and (equal (physical-follow-effective-config current)
+                        (physical-follow-effective-config expected))
+                 (eq *physical-follow-runtime* (physical-follow-operation-runtime operation)))
+      (error "current follow receiver changed during source discovery"))
+    current))
+
+(defun physical-follow-operation-remember-source (operation timeline &optional (system-id (getf *physical-recovery-state* :system-id)))
+  (sb-thread:with-mutex (*physical-follow-command-lock*)
+    (unless (= system-id (getf *physical-recovery-state* :system-id))
+      (error "observed follow source belongs to a different cluster"))
+    (when (eql 2 (getf *physical-recovery-state* :phase))
+      (physical-follow-observe-timeline system-id timeline))
+    (with-live-operation
+      (let ((current (physical-follow-operation-current-config operation)))
+        (let* ((state (physical-follow-remember-timeline
+                       (physical-follow-remember-config-timeline current)
+                       (or (physical-follow-observed-timeline system-id) timeline)))
+               (known (getf state :known-timeline)))
+          (when (> known (or (getf (physical-follow-controller-state current) :known-timeline) 1))
+            (setf current (physical-follow-with-controller current state))
+            (physical-follow-config-image current)
+            (handler-case (physical-follow-controller-save-config current)
+              (error (condition)
+                (error 'physical-follow-observation-save-failed :cause condition))))
+          (setf (physical-follow-operation-config operation) current)
+          (physical-follow-operation-check operation)
+          known)))))
+
 (defun physical-follow-operation-intent (operation view)
   "Stop the old runtime and save preparation intent before contacting PREPARE.
 Hold command exclusion; snapshot under reload and live-operation quiescence.
 The preparation entry records the selected owner before the RPC. Once accepted,
 that owner stays with the pin until a new publication, not a later reconnect."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
-    (physical-follow-operation-check operation)
-    (let* ((current (physical-follow-read-config))
-           (expected (physical-follow-operation-config operation)))
-      (unless (and (equal (physical-follow-effective-config current)
-                          (physical-follow-effective-config expected))
-                   (eq *physical-follow-runtime* (physical-follow-operation-runtime operation)))
-        (error "current follow receiver changed during source discovery"))
+    (let ((current (physical-follow-operation-current-config operation)))
       (setf (physical-follow-operation-config operation) current)
       (handler-case (physical-follow-quiesce-runtime)
         (error (condition) (setf *physical-recovery-failed-p* t) (error condition)))
@@ -746,7 +782,9 @@ result; restore stopped workers when needed."
                      (physical-follow-operation-not-attached operation local))))
                (setf client (physical-follow-operation-connect operation))
                (let ((view (physical-follow-controller-source-view
-                            client (getf (physical-follow-operation-context operation) :timeline-policy))))
+                            client (getf (physical-follow-operation-context operation) :timeline-policy)
+                            (lambda (timeline system-id)
+                              (physical-follow-operation-remember-source operation timeline system-id)))))
                  (unless (eq :attach (getf view :action))
                    (return-from physical-follow-operation-run
                      (physical-follow-operation-not-attached operation view)))
@@ -786,6 +824,7 @@ result; restore stopped workers when needed."
                  (admin-log "native follow transition recovery failed: ~a" recovery-error)))
              (physical-follow-controller-record-error :transition condition)
              (unless (or (physical-client-retryable-condition-p condition)
+                         (typep condition 'physical-follow-observation-save-failed)
                          (physical-follow-operation-cancelled-condition-p operation condition))
                (setf *physical-follow-auto-error*
                      (list (and (physical-follow-operation-config operation)

@@ -145,7 +145,12 @@ before intent.  Other failures after work starts fence the process for restart."
                 (runtime *physical-follow-runtime*)
                 (config (let ((saved (when (probe-file (physical-follow-config-path))
                                        (physical-follow-read-config))))
-                          (cond ((and saved (physical-follow-controller-enabled-p saved)) saved)
+                          (when (and saved runtime (physical-follow-runtime-config runtime)
+                                     (not (equal (physical-follow-effective-config saved)
+                                                 (physical-follow-effective-config
+                                                  (physical-follow-runtime-config runtime)))))
+                            (error "saved follow route differs from the promotion runtime"))
+                          (cond (saved saved)
                                 (runtime
                                  (or (physical-follow-runtime-config runtime)
                                      (list 1 (physical-follow-runtime-host runtime)
