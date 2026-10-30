@@ -292,14 +292,16 @@ These identities never enter the real active-XID set, CLOG or WAL.")
 (defvar *relation-maintainers* (make-hash-table :test #'eql))
 
 (defvar *relation-lock-object-limit* nil
-  "Private object cap, or NIL for no limit. Keep unbounded until queued owners
-and startup, resource and source-floor policy are wired. No
+  "Private object cap, or NIL for no limit. Keep unbounded until startup sizing
+and durable checks of the primary's resource requirements are implemented. No
 max_locks_per_transaction setting is registered yet.")
 
 (defvar *relation-lock-owner-limit* nil
   "Private relation-owner pair cap, or NIL for no limit; see object cap.")
 
-(defvar *relation-resource-requests* (make-hash-table :test #'eq))
+(defvar *relation-resource-requests* (make-hash-table :test #'eq)
+  "Pending gate tokens and copied relation sets, protected by the relation mutex.
+These reserve capacity only; they do not grant conflict permissions.")
 
 (defun print-relation-gate-token (object stream depth)
   (declare (ignore depth))
@@ -314,12 +316,12 @@ OWNER may be an XID or backend; a token without an owner identifies itself."
 
 (defun relation-resource-footprint-under-lock (&optional requested owner)
   "Count distinct relations and relation-owner pairs under relation exclusion.
-Published reader, writer, builder and maintainer registrations are authoritative.
+Count published reader, writer, builder and maintainer registrations together
+with pending requests.
 Modes and upgrades for the same pair count once. REQUESTED adds the whole
 prospective set. Resolve each backend once per count, using its virtual or real
 XID if present, otherwise the backend itself; do not force XID allocation.
-Recounting after release needs no separate ledger. Queued requests are not yet
-counted here, although PostgreSQL C accounts for ownership before grant."
+Recounting after release needs no separate ledger."
   (unless (sb-thread:holding-mutex-p *relation-lock-mutex*)
     (error "relation resource accounting requires relation exclusion"))
   (let ((objects (make-hash-table :test #'eql))
@@ -371,6 +373,13 @@ counted here, although PostgreSQL C accounts for ownership before grant."
   (values))
 
 (defun call-with-relation-resource-request (requested token function)
+  "Reserve capacity for REQUESTED before calling FUNCTION outside the mutex.
+TOKEN is fresh and carries the eventual owner's identity. Initial mutex entry is
+interruptible; the check and insertion are masked. FUNCTION waits for conflicts
+and, under the mutex with interrupts masked, removes the request and publishes
+the actual registrations together. It owns cleanup of any granted gates. On
+exit this wrapper removes any remaining request with interrupts masked, so
+cancellation and the grant handoff both leave no pending reservation."
   (when (sb-thread:holding-mutex-p *relation-lock-mutex*)
     (error "relation requests must enter outside relation exclusion"))
   (let ((nodes (remove-duplicates (copy-list requested) :test #'=))
@@ -856,7 +865,8 @@ holding a portal snapshot must be allowed to run so it can release its pin."
        t))))
 
 (defun register-relation-accesses (write-relfilenodes read-relfilenodes xid)
-  "Admit a mutation and all subquery reads atomically, with writes taking precedence."
+  "Admit a mutation and all subquery reads atomically, with writes taking precedence.
+Reserve the complete set before waiting; transaction cleanup owns granted access."
   (when (and write-relfilenodes *backend* (eql xid (backend-xid *backend*)))
     (logical-note-xid-mutation-needs-capture-p xid))
   (let* ((writes (sort (remove-duplicates (copy-list write-relfilenodes) :test #'=) #'<))

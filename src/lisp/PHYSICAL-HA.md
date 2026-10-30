@@ -89,7 +89,7 @@ also need durable source reporting and standby checks, following C's
 Archive recovery, rejoin/reseed, synchronous durability and coordination remain
 outside this checkpoint; no coordinator or election mechanism was added.
 
-### Relation resource accounting foundation
+### Relation resource accounting
 
 Relation admission now checks the complete proposed set against private object
 and owner limits before publishing registrations. Counts come from the existing
@@ -99,19 +99,30 @@ second accounting ledger. Gate tokens retain their accounting owner independentl
 of build-group metadata. A backend-owned gate can reuse its later real or virtual
 transaction identity without allocating an XID for accounting.
 
-This is an internal foundation. Limits remain unbounded in normal startup, and
-`max_locks_per_transaction` is not registered. C accounts for waiting requests
-before grant; native requests blocked before publication still need an ownership
-registry. That registry, startup sizing and durable source resource requirements
-must precede production enforcement. Native counts also do not reproduce C's
-fast-path storage or every C lock tag.
+Waiting requests now reserve the complete proposed ownership set before checking
+conflicts, following C's `SetupLockInTable` ordering. The pending registry affects
+capacity, not permission to access a relation. Pending and granted registrations
+share the same object/owner union, so overlaps are charged once. Grant removes
+the request and publishes actual registrations under one mutex with interrupts
+masked. Cancellation and nonlocal exits remove reservations; existing transaction
+or scope cleanup still owns granted resources. Acquiring the reservation mutex
+remains interruptible.
 
-Validation passed all 654 unit Rove tests, 13 new resource tests including 200
+This remains an internal foundation. Limits are unbounded in normal startup, and
+`max_locks_per_transaction` is not registered. Startup sizing and durable source
+resource requirements must precede production enforcement. Native counts also do
+not reproduce C's fast-path storage or every C lock tag.
+
+Validation passed all 661 unit Rove tests, 20 resource tests including 400
 generated cases at seed 42, 10 physical reader/cleanup tests and a fresh strict
 compile. Tests cover whole-group rejection, shared and reusable capacity, upgrades,
 late XID assignment, virtual readers, transaction gate/writer publication,
 partial gate release, callback errors and cancellation of a published builder.
-The compile log is `/tmp/pg-relation-resource-compile.log`.
+Queued cases cover capacity before a conflict wait, whole-request cancellation,
+same-owner pending/granted overlap, and build and maintenance grants with normal
+returns or callback throws. The latter inspect the exact grant point: one granted
+object/owner pair and no pending request. The compile log is
+`/tmp/pg-queued-resource-final-compile.log`.
 
 ### Child follow and rejoin intake
 
