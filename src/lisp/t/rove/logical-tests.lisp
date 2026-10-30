@@ -1994,34 +1994,29 @@
         (when (probe-file path) (delete-file path)))))
 
 (rove:deftest test-extended-select-guard-and-schema-drift
-    (rove:ok (extended-copy-select-p (first (parse-statements "SELECT * FROM t"))))
-  (rove:ok (extended-copy-select-p (first (parse-statements "SELECT * FROM public.t"))))
-  (rove:ok (not (extended-copy-select-p (first (parse-statements "SELECT * FROM other.t")))))
-  (rove:ok (not (extended-copy-select-p (first (parse-statements "WITH q AS (SELECT 1) SELECT * FROM q")))))
-  (rove:ok (not (extended-copy-select-p (first (parse-statements "SELECT * FROM t ORDER BY x")))))
-  (let* ((path (merge-pathnames (format nil "pg-select-drift-~d-~d" (sb-posix:getpid) (random 1000000)) (uiop:temporary-directory)))
-         (old-plan (symbol-function 'plan-select-query))
-         (old-column (symbol-function 'target->result-column))
-         (old-run (symbol-function 'execute-query-plan))
-         (*select-suppress-description* t)
-         (*select-expected-result-columns* (list (make-result-column :name "old" :type-oid 17)))
-         (calls 0))
-    (unwind-protect
-         (progn
-           (setf (symbol-function 'plan-select-query)
-                 (lambda (ast) (declare (ignore ast))
-                   (%make-query-plan :prepared '(:relations nil :targets ((:type :bytea)))))
-                 (symbol-function 'target->result-column)
-                 (lambda (target) (declare (ignore target)) (make-result-column :name "new" :type-oid 17))
-                 (symbol-function 'execute-query-plan)
-                 (lambda (&rest args) (declare (ignore args)) (incf calls)))
-           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
-             (rove:ok (handler-case (progn (exec-select out nil) nil) (error () t)))
-             (rove:ok (zerop calls)) (rove:ok (zerop (file-position out)))))
-      (setf (symbol-function 'plan-select-query) old-plan
-            (symbol-function 'target->result-column) old-column
-            (symbol-function 'execute-query-plan) old-run)
-      (when (probe-file path) (delete-file path)))))
+    (let* ((path (merge-pathnames (format nil "pg-select-drift-~d-~d" (sb-posix:getpid) (random 1000000)) (uiop:temporary-directory)))
+           (old-plan (symbol-function 'plan-select-query))
+           (old-column (symbol-function 'target->result-column))
+           (old-run (symbol-function 'execute-query-plan))
+           (*select-suppress-description* t)
+           (*select-expected-result-columns* (list (make-result-column :name "old" :type-oid 17)))
+           (calls 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'plan-select-query)
+                   (lambda (ast) (declare (ignore ast))
+                     (%make-query-plan :prepared '(:relations nil :targets ((:type :bytea)))))
+                   (symbol-function 'target->result-column)
+                   (lambda (target) (declare (ignore target)) (make-result-column :name "new" :type-oid 17))
+                   (symbol-function 'execute-query-plan)
+                   (lambda (&rest args) (declare (ignore args)) (incf calls)))
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+               (rove:ok (handler-case (progn (exec-select out nil) nil) (error () t)))
+               (rove:ok (zerop calls)) (rove:ok (zerop (file-position out)))))
+        (setf (symbol-function 'plan-select-query) old-plan
+              (symbol-function 'target->result-column) old-column
+              (symbol-function 'execute-query-plan) old-run)
+        (when (probe-file path) (delete-file path)))))
 
 (rove:deftest test-empty-copy-row-description-validation
     (let ((columns (list (make-pg-client-column :name "b" :type-oid 17)))

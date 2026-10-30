@@ -703,13 +703,12 @@ are `READ COMMITTED` and `REPEATABLE READ`; client encoding is UTF8 and
 `standard_conforming_strings = on`.
 The extended query protocol supports Parse, Bind, Execute, Sync, Describe,
 Close and Flush for a single INSERT, UPDATE or DELETE without RETURNING, and
-the plain `SELECT * FROM table` scan used for initial copy.
+supported SELECT statements.
 Parse requires explicit supported built-in expression type OIDs for parameters;
 string literals in these statements are rejected in favor of parameters.
 Parameters use text format; text, varchar, bytea, json, jsonb, and numeric also
 support binary Bind and SELECT result formats. Limited portal execution is unsupported; each portal
-can execute only once. This is a restricted DML interface, not general
-extended-query support. During reload drain, a Simple Query sent while an
+can execute only once. During reload drain, a Simple Query sent while an
 extended implicit transaction is open is rejected if it has statements after a
 transaction-ending statement. An old protocol handler also fails closed for
 extended message suffixes during a mixed live reload.

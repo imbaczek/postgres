@@ -23,13 +23,13 @@ def cycle(conn, frames, with_message=False):
             messages.append((kind, body))
 
 
-def parse(sql, oids=()):
-    return frame(b'P', b'\0' + sql.encode() + b'\0' + struct.pack('!H', len(oids)) +
+def parse(sql, oids=(), name=b''):
+    return frame(b'P', name + b'\0' + sql.encode() + b'\0' + struct.pack('!H', len(oids)) +
                  b''.join(struct.pack('!I', x) for x in oids))
 
 
-def bind(values=(), formats=(), results=()):
-    body = b'\0\0' + struct.pack('!H', len(formats))
+def bind(values=(), formats=(), results=(), statement=b''):
+    body = b'\0' + statement + b'\0' + struct.pack('!H', len(formats))
     body += b''.join(struct.pack('!H', f) for f in formats)
     body += struct.pack('!H', len(values))
     for v in values:
@@ -94,6 +94,34 @@ def main(ports):
             assert outputs[0] == outputs[1] and outputs[0][0][0] == b'E', (value, outputs)
         for p in peers:
             assert p.query('ANALYZE binary_values') == []
+        for query, oids, params, expected_count in (
+            ('SELECT $1::text, $2::numeric', (25, 1700), ('żółć'.encode(), numbers[0]), 1),
+            ('SELECT t,n FROM binary_values WHERE t=$1', (25,), ('żółć'.encode(),), 7),
+            ('SELECT n FROM binary_values WHERE t=$1 ORDER BY n LIMIT 1', (25,), ('żółć'.encode(),), 1),
+        ):
+            frames = [parse(query, oids), bind(params, (1,), (1,)),
+                      frame(b'D', b'P\0'), frame(b'E', b'\0' + struct.pack('!I', 0))]
+            outcomes = [cycle(p, frames) for p in peers]
+            rows = [[body for kind, body in out if kind == b'D'] for out in outcomes]
+            assert rows[0] == rows[1] and len(rows[0]) == expected_count, (query, outcomes)
+        frames = [parse('SELECT $1::text, $2::numeric', (25, 1700)),
+                  frame(b'D', b'S\0'), bind(('abc'.encode(), numbers[0]), (1,), (1,)),
+                  frame(b'D', b'P\0'), frame(b'E', b'\0' + struct.pack('!I', 0))]
+        outcomes = [cycle(p, frames) for p in peers]
+        assert outcomes[0] == outcomes[1], outcomes
+        for p in peers:
+            p.query('CREATE TABLE binary_drift (v text)')
+            assert cycle(p, [parse('SELECT v FROM binary_drift', name=b'drift')]) == []
+            p.query('DROP TABLE binary_drift')
+            p.query('CREATE TABLE binary_drift (v text)')
+            assert cycle(p, [bind(statement=b'drift'), frame(b'E', b'\0' + struct.pack('!I', 0))]) == []
+            p.query('DROP TABLE binary_drift')
+            p.query('CREATE TABLE binary_drift (v numeric)')
+        for p in peers:
+            assert cycle(p, [bind(statement=b'drift')], with_message=True) == [
+                (b'E', '0A000', 'cached plan must not change result type')]
+            assert cycle(p, [frame(b'D', b'Sdrift\0')], with_message=True) == [
+                (b'E', '0A000', 'cached plan must not change result type')]
         print('binary-values: scalar Bind and DataRow C comparisons PASS', flush=True)
     finally:
         for p in peers:
