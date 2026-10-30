@@ -56,6 +56,8 @@ The tuple identifies a pin; it does not authenticate the remote endpoint."
              (list :connection (getf (physical-follow-source-copy source) :owner))))))
 
 (defun physical-follow-unowned-bootstrap-copy (record)
+  "Check and copy the bounded reference to a bootstrap pin of unknown ownership.
+It records debt but grants no authority to contact or retire a remote pin."
   (physical-follow-check-plist record '(:pin :request))
   (unless (and (stringp (getf record :pin))
                (wal-valid-replication-slot-name-p (getf record :pin)))
@@ -64,6 +66,7 @@ The tuple identifies a pin; it does not authenticate the remote endpoint."
         :request (physical-follow-bootstrap-request-copy (getf record :request))))
 
 (defun physical-follow-unowned-bootstrap-from-base (base)
+  "Build the unowned reference from verified base provenance."
   (physical-follow-unowned-bootstrap-copy
    (list :pin (getf base :source-pin)
          :request (list :version 1 :system-id (getf base :system-id)
@@ -100,10 +103,12 @@ The tuple identifies a pin; it does not authenticate the remote endpoint."
        (every #'null (subseq config 1 5))))
 
 (defun physical-follow-unattached-p (config)
+  "Recognize a standby with replay but no accepted source."
   (and (physical-follow-no-source-p config)
        (eq :standby-unattached (getf (sixth config) :mode))))
 
 (defun physical-follow-cleanup-only-p (config)
+  "Recognize primary cleanup state, distinct from an unattached standby."
   (and (physical-follow-no-source-p config)
        (not (getf (sixth config) :mode))))
 
@@ -125,6 +130,7 @@ The tuple identifies a pin; it does not authenticate the remote endpoint."
       (list :version 1 :enabled t :preparing nil :cleanup nil)))
 
 (defun physical-follow-check-unowned-bootstrap-base (config base)
+  "Require any unowned reference and preparation to agree with the verified base."
   (let* ((state (physical-follow-controller-state config))
          (record (getf state :unowned-bootstrap))
          (preparing (getf state :preparing)))

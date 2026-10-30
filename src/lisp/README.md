@@ -68,18 +68,23 @@ PG_CONFIG=/path/to/pg_config t/build-libpq-helper.sh /absolute/path/libpq-helper
 PG_LIBPQ_HELPER=/absolute/path/libpq-helper ./pg-lisp.sh -p 5439 -D /tmp/pgdata --control-port 7439
 ```
 
-With an existing native bootstrap or active follow configuration, a private
-control REPL can request a transition using a literal conninfo, for example:
+A standby with a verified native recovery base can attach its first source or
+retarget an existing source through the private control REPL. For example:
 
 ```lisp
 (physical-follow-retarget-conninfo "host=127.0.0.1 port=5432 dbname=postgres user=replicator"
                                   :prefix "follow" :fallback "walreceiver")
 ```
 
-This retargets an existing configuration to a source on the same timeline or a
-descendant timeline. Initial attachment without a follow configuration is not
-provided; standard Patroni GUC desired-generation handling and use of persistent
-public slots by the receiver are not wired. There is no coordinator. Effective
+The target can be on the same timeline or a descendant. The direct endpoint API
+`(physical-follow-retarget "127.0.0.1" 5432 "follow")` is also available. If
+the first connection fails, the unattached standby continues replay without a
+receiver. `physical-follow-stop` rejects an unattached standby; use replay pause
+to pause replay. The original bootstrap pin remains of unknown ownership and is
+not retired by this attachment.
+
+Standard Patroni GUC desired-generation handling and use of persistent public
+slots by the receiver are not wired. There is no coordinator. Effective
 multihost profiles are unsupported.
 The original conninfo is resolved again on normal reconnects. If the selected
 route changes, the receiver prepares a new binding before querying or receiving

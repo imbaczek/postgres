@@ -645,7 +645,8 @@ password revocation returning `08001`. Luna max and Sol high code reviews were
 clear; Sol medium's refactor review was addressed and clear.
 
 The route-change guard has not yet been exercised end to end with a DNS or
-service reroute followed by re-PREPARE. Retarget does not provide first bootstrap.
+service reroute followed by re-PREPARE. This checkpoint did not provide first attachment;
+the later first-attachment milestone below covers it.
 Patroni configuration integration, synchronous replication, rejoin, the full
 acceptance matrix and cold audit remain unfinished; this milestone adds no
 coordinator. The earlier libpq references below describe the prior checkpoint.
@@ -697,10 +698,33 @@ The new cl-spec property passed 200 trials for each of seeds 42, 43 and
 3374323980364780765. No Function Spec is registered for
 `physical-follow-pin-decode`; rejection counts and input coverage were not
 measured. Luna, Sol high and Sol medium reviews were clear; all production
-definitions remained under 120 lines. Initial attachment without
-an existing follow configuration, standard Patroni GUC desired-generation
-handling and receiver use of persistent public slots remain unwired. This does
-not provide a coordinator.
+definitions remained under 120 lines. At this checkpoint initial attachment was
+not yet wired; see the first-attachment milestone below. Standard Patroni GUC
+desired-generation handling and receiver use of persistent public slots remain
+unwired. This does not provide a coordinator.
+
+### First attachment from an unattached standby — completed milestone
+
+A standby with a verified recovery base can attach its first source through the
+raw endpoint or libpq profile API without an existing follow configuration. An
+unattached standby has replay but no accepted source; it is distinct from a
+primary's cleanup-only state. A failed first connection leaves replay running.
+The bounded reference to the original bootstrap pin records unknown ownership;
+it grants no authority to retire that remote pin. Startup checks the reference
+against the base and validates the unbound store before publishing recovery
+control or running redo.
+Promotion preserves this debt in cleanup state before deleting base provenance.
+Follow stop rejects an unattached standby; replay pause remains available.
+
+The full physical suite passed 1061 tests with zero failures or pending, and
+strict compilation passed. Raw and libpq end-to-end runs passed unavailable first
+source, cold unattached restart, first attachment, same-timeline 1 and 2,
+descendant follow, receiver-only stop, lagging catch-up with two fresh pins,
+active crash, promotion cleanup transfer and primary restart with a write.
+PostgreSQL's `xlogrecovery.c:1087-1096` describes standby operation without
+conninfo, and `xlogrecovery.c:3851-3852` gates receiver launch on conninfo.
+Standard Patroni configuration integration and desired-generation handling remain
+follow-up work.
 
 ### Standard follow configuration integration — in progress
 
@@ -725,7 +749,7 @@ and escaping, connection options, slot name, local configuration and signal
 files. The C run passes; the full native comparison currently fails on unsupported
 `cluster_name`. This is a writer and metadata oracle, not a `Postgresql.follow`
 or receiver test. Full GUC behavior, desired-generation reconciliation, automatic
-Patroni conninfo wiring through libpq, first attachment, standard GUC-driven
+Patroni conninfo wiring through libpq, GUC-driven first attachment and
 same-timeline follow and the follow acceptance matrix remain open.
 
 Native startup now installs independent `max_connections` (default 100) and

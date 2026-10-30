@@ -779,7 +779,7 @@ state. The active config still needs durable-state validation before admission."
   "Reconcile a saved pending binding privately before storage or workers start.
 Require owned PGDATA and exclude reload and live operations. Open and close a
 temporary store without contacting the source, running redo or installing runtime
-state. An active result does not yet make a bound service restartable."
+state. An active result still requires startup validation before workers launch."
   (unless (and *postmaster-data-lock* (postmaster-pid-owned-p)
                (zerop *live-operation-depth*) (not *wal-ready*)
                (not *physical-receive-store*) (not *physical-follow-runtime*)
@@ -1248,6 +1248,8 @@ reload exclusion and quiescence before workers can read it."
   config)
 
 (defun physical-follow-launch-workers (config receive-p)
+  "Publish replay and, when RECEIVE-P, receipt workers together.
+The caller holds the command mutex outside admission and has validated CONFIG."
   (unless (and (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*))
     (error "follow worker launch requires command exclusion outside admission"))
@@ -1360,7 +1362,8 @@ owns its transition."
   :stopped)
 
 (defun physical-follow-stop ()
-  "Stop receipt and replay while preserving accepted bindings and cleanup work."
+  "Stop receipt and replay while preserving accepted bindings and cleanup work.
+An unattached standby rejects this operation; use replay pause instead."
   (when (plusp *live-operation-depth*)
     (error "follow stop must join outside operation admission"))
   (with-live-operation
@@ -1427,7 +1430,7 @@ A failure after selection work begins fences recovery; this does not admit a net
             (unless finished (setf *physical-recovery-failed-p* t))))))))
 
 (defun physical-follow-autostart ()
-  "Launch an enabled, admitted receiver after startup validation."
+  "Launch admitted workers after startup validation, or replay alone if unattached."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (check-physical-recovery-worker-start)
     (when (probe-file (physical-follow-config-path))

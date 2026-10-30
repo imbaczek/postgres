@@ -72,6 +72,8 @@ reload exclusion and live-operation quiescence."
    *physical-receive-store* (lambda () (physical-follow-controller-snapshot-under-lease view))))
 
 (defun physical-follow-check-unbound-state (store base applied)
+  "Validate an unbound receive store and replay prefix against the verified base.
+The caller excludes mutation; the scan protects retained data with a root lease."
   (physical-follow-call-with-receive-root
    store
    (lambda ()
@@ -100,6 +102,9 @@ The caller excludes concurrent mutation and protects the selected store."
          (list *last-replay-lsn* (physical-recovery-replay-timeline))))))
 
 (defun physical-follow-launch-replay-only (config)
+  "Validate an unattached standby and start replay without a receiver.
+The caller holds the command mutex outside admission; validation also takes
+reload exclusion and live-operation quiescence."
   (check-physical-recovery-worker-start)
   (physical-follow-check-config config)
   (unless (and (physical-follow-unattached-p config)
@@ -228,6 +233,7 @@ to identify the same PGDATA."
      (getf (physical-follow-controller-state config) :source))))
 
 (defun physical-follow-unattached-config-for-base (base)
+  "Create a no-source standby configuration retaining the unowned base pin."
   (physical-follow-check-config
    (list 1 nil nil nil nil
          (list :version 1 :enabled nil :preparing nil :cleanup nil
@@ -235,6 +241,8 @@ to identify the same PGDATA."
                :unowned-bootstrap (physical-follow-unowned-bootstrap-from-base base)))))
 
 (defun physical-follow-promotion-base ()
+  "Check base provenance while the manifest and recovery control still exist.
+This also runs after child commit, before recovery artifacts are removed."
   (multiple-value-bind (manifest digest) (recovery-read-manifest *pgdata*)
     (recovery-check-manifest-schema manifest)
     (let ((control (physical-recovery-read-control *pgdata*)))
@@ -250,7 +258,8 @@ to identify the same PGDATA."
 (defun physical-follow-promotion-cleanup-config ()
   "Build the post-promotion cleanup image before retiring base provenance.
 The caller must save it durably before removing recovery artifacts. Remote
-retirement may finish later."
+retirement may finish later. Preserve the unowned bootstrap reference even after
+base provenance is removed; it does not identify a cleanup endpoint."
   (let* ((base (unless (probe-file (physical-follow-config-path))
                  (physical-follow-promotion-base)))
          (config (if base (physical-follow-unattached-config-for-base base)
@@ -295,7 +304,10 @@ retirement may finish later."
 
 (defun physical-follow-prepare-startup (base)
   "Under cold PGDATA ownership, queue unfinished preparation and reconcile pending
-state before validating an active binding. Protect the store and retained root."
+state before validating an active binding. For an unattached standby, validate
+the unowned base reference and unbound store before recovery control publication
+or redo.
+Protect the store and retained root."
   (when (probe-file (physical-follow-config-path))
     (let ((config (physical-follow-read-config)))
       (when (= 4 (length config)) (return-from physical-follow-prepare-startup config))
@@ -566,8 +578,9 @@ the old source before publication; its remote acknowledgment is not required."
             active))))))
 
 (defun physical-follow-operation-recover (operation)
-  "Queue a saved preparation and restore the old receiver when safe. Ambiguous
-publication failures fence recovery for restart reconciliation."
+  "Queue a saved preparation and restore the old workers when safe.
+An unattached standby resumes replay only. Ambiguous publication failures fence
+recovery for restart reconciliation."
   (let ((context (physical-follow-operation-context operation)))
     (cond
       ((getf context :committed) nil)
@@ -719,6 +732,9 @@ The caller must not hold command, reload or live-operation admission locks."
                     *physical-follow-controller-block-owner* nil)))))))
 
 (defun physical-follow-ensure-attachment-state ()
+  "Establish checked replay-only state before a first source attachment.
+Preserve the unowned bootstrap reference; return :DEFERRED when streaming
+recovery cannot yet be enabled. A failed first connection leaves replay running."
   (when (plusp *live-operation-depth*)
     (error "follow initialization requires its own operation admission"))
   (sb-thread:with-mutex (*physical-follow-command-lock*)
@@ -757,7 +773,7 @@ The caller must not hold command, reload or live-operation admission locks."
       config)))
 
 (defun physical-follow-retarget (host port &optional (prefix "follow"))
-  "Synchronously request a transition to the direct endpoint on a fresh pin."
+  "Attach or retarget to the direct endpoint on a fresh pin, synchronously."
   (when (plusp *live-operation-depth*) (error "follow retarget requires its own operation admission"))
   (physical-follow-endpoint-check host port prefix)
   (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))
@@ -771,7 +787,7 @@ The caller must not hold command, reload or live-operation admission locks."
     (physical-follow-operation-result operation)))
 
 (defun physical-follow-retarget-conninfo (conninfo &key (prefix "follow") (fallback "walreceiver"))
-  "Retarget an existing native follow configuration using a libpq profile."
+  "Attach or retarget native follow using a libpq profile."
   (when (plusp *live-operation-depth*)
     (error "native follow retarget requires its own operation admission"))
   (let ((profile (make-physical-libpq-profile conninfo :fallback fallback)))
