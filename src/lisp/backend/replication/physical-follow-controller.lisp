@@ -286,6 +286,7 @@ base provenance is removed; it does not identify a cleanup endpoint."
         (setf state (physical-follow-enqueue-cleanup state retired))))
     (remf state :mode)
     (remf state :source)
+    (remf state :public-slot)
     (physical-follow-check-config (list 1 nil nil nil nil state))))
 
 (defun physical-follow-startup-owner-check ()
@@ -480,10 +481,13 @@ Protect the store and retained root."
 
 (defun physical-follow-operation-source-state (operation state)
   (let ((copy (physical-follow-controller-copy state))
-        (source (getf (physical-follow-operation-context operation) :accepted-source)))
+        (source (getf (physical-follow-operation-context operation) :accepted-source))
+        (slot (physical-follow-public-slot-copy
+               (getf (physical-follow-operation-context operation) :requested-slot))))
     (if source
         (setf (getf copy :source) (physical-follow-source-copy source))
         (remf copy :source))
+    (if slot (setf (getf copy :public-slot) slot) (remf copy :public-slot))
     copy))
 
 (defun physical-follow-operation-intent (operation view)
@@ -674,7 +678,7 @@ recovery for restart reconciliation."
         (when (eq operation *physical-follow-operation*)
           (setf *physical-follow-operation* nil))))))
 
-(defun physical-follow-start-operation (host port prefix &optional runtime profile)
+(defun physical-follow-start-operation (host port prefix &optional runtime profile (slot :inherit))
   (physical-follow-endpoint-check host port prefix)
   (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))
   (let* ((source (when runtime (physical-follow-config-source (physical-follow-runtime-config runtime))))
@@ -682,10 +686,16 @@ recovery for restart reconciliation."
                         (when source
                           (make-physical-libpq-profile (getf source :conninfo)
                                                        :fallback (getf source :fallback)))))
+         (public-slot (physical-follow-public-slot-copy
+                       (if (eq slot :inherit)
+                           (when runtime
+                             (physical-follow-config-public-slot (physical-follow-runtime-config runtime)))
+                           slot)))
          (ready nil)
          (operation (make-physical-follow-operation
                      :host (copy-seq host) :port port :prefix (copy-seq prefix) :runtime runtime
-                     :context (when requested (list :requested-profile requested)))))
+                     :context (append (list :requested-slot public-slot)
+                                      (when requested (list :requested-profile requested))))))
     (sb-thread:with-mutex (*physical-follow-lock*)
       (when (or *physical-follow-operation* *physical-follow-controller-blocked-p*
                 *physical-follow-controller-stopping-p*)
@@ -832,18 +842,19 @@ recovery cannot yet be enabled. A failed first connection leaves replay running.
       (error "native follow transition failed: ~a" (physical-follow-operation-error operation)))
     (physical-follow-operation-result operation)))
 
-(defun physical-follow-retarget-conninfo (conninfo &key (prefix "follow") (fallback (physical-libpq-default-fallback)))
+(defun physical-follow-retarget-conninfo (conninfo &key (prefix "follow") (fallback (physical-libpq-default-fallback)) slot)
   "Attach or retarget native follow using a libpq profile.
 Unless supplied, FALLBACK uses cluster_name or walreceiver when it is empty."
   (when (plusp *live-operation-depth*)
     (error "native follow retarget requires its own operation admission"))
-  (let ((profile (make-physical-libpq-profile conninfo :fallback fallback)))
+  (let ((profile (make-physical-libpq-profile conninfo :fallback fallback))
+        (slot (physical-follow-public-slot-copy slot)))
     (physical-follow-endpoint-check "libpq" 5432 prefix)
     (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))
     (when (eq :deferred (physical-follow-ensure-attachment-state))
       (return-from physical-follow-retarget-conninfo :deferred))
     (physical-follow-controller-start-worker :force t)
-    (let ((operation (physical-follow-start-operation "libpq" 5432 prefix nil profile)))
+    (let ((operation (physical-follow-start-operation "libpq" 5432 prefix nil profile slot)))
       (sb-thread:join-thread (physical-follow-operation-thread operation))
       (when (physical-follow-operation-error operation)
         (error "native follow transition failed: ~a" (physical-follow-operation-error operation)))

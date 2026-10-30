@@ -353,6 +353,50 @@
                (ok (equal "copy" (pg::physical-stream-proof-pin command))))
           (pg::physical-store-close store)))))
 
+(deftest native-named-receiver-start-keeps-public-slot-separate-from-proof
+    (with-physical-store-directory (root)
+      (let* ((store (pg::physical-store-open root 123 1 :create t :start-lsn 32))
+             (pg::*physical-receive-store* store)
+             (pg::*physical-recovery-state* (list :system-id 123 :timeline 1 :end 32))
+             (config (pg::physical-follow-with-controller
+                      '(1 "127.0.0.1" 5432 "private_proof")
+                      '(:version 1 :enabled t :preparing nil :cleanup nil :public-slot "public_slot")))
+             (runtime (pg::make-physical-follow-runtime :pin "private_proof" :config config))
+             (pg::*physical-follow-runtime* runtime)
+             (pg::*physical-follow-statistics* nil))
+        (unwind-protect
+             (progn
+               (let ((command (pg::parse-replication-command (pg::physical-follow-start-query runtime 32))))
+                 (ok (equal "public_slot" (pg::logical-replication-command-slot-name command)))
+                 (ok (equal "private_proof" (pg::physical-stream-proof-pin command))))
+               (pg::physical-follow-monitor-start runtime 32)
+               (ok (equal "public_slot" (aref (pg::sql-record-values (pg::wal-receiver-result)) 11))))
+          (pg::physical-store-close store)))))
+
+(deftest native-retarget-slot-control-dispatch-keeps-literal-arguments-outside-admission
+    (let ((original (symbol-function 'pg::physical-follow-retarget-conninfo))
+          (seen nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-follow-retarget-conninfo)
+                   (lambda (&rest arguments)
+                     (setf seen (list pg::*live-operation-depth* arguments))
+                     :started))
+             (dolist (slot '(nil "public_slot"))
+               (setf seen nil)
+               (with-output-to-string (out)
+                 (pg::control-eval out
+                                   (list 'pg::physical-follow-retarget-conninfo "host=localhost"
+                                         :prefix "follow" :fallback "receiver" :slot slot)))
+               (ok (zerop (first seen)))
+               (ok (equal slot (getf (rest (second seen)) :slot))))
+             (dolist (form '((pg::physical-follow-retarget-conninfo "host=localhost" :slot (progn "public_slot"))
+                             (pg::physical-follow-retarget-conninfo "host=localhost" :slot "one" :slot "two")))
+               (setf seen nil)
+               (with-output-to-string (out) (pg::control-eval out form))
+               (ok (plusp (first seen)))))
+        (setf (symbol-function 'pg::physical-follow-retarget-conninfo) original))))
+
 (deftest unnamed-native-stream-keeps-same-spelled-public-slot-unclaimed
     (call-with-physical-source-fixture
      (lambda ()

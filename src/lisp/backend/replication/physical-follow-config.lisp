@@ -73,10 +73,16 @@ It records debt but grants no authority to contact or retire a remote pin."
                         :source-timeline (getf base :timeline) :base (getf base :end)
                         :manifest-digest (getf base :manifest-digest)))))
 
+(defun physical-follow-public-slot-copy (slot)
+  (when slot
+    (unless (and (stringp slot) (wal-valid-replication-slot-name-p slot))
+      (error "invalid public physical replication slot"))
+    (copy-seq slot)))
+
 (defun physical-follow-controller-copy (state)
   "Check and copy durable controller state. A preparation reserves one queue slot."
   (let ((keys '(:version :enabled :preparing :cleanup)))
-    (dolist (key '(:source :mode :unowned-bootstrap))
+    (dolist (key '(:source :mode :unowned-bootstrap :public-slot))
       (when (getf state key) (setf keys (append keys (list key)))))
     (physical-follow-check-plist state keys))
   (unless (and (eql 1 (getf state :version)) (member (getf state :enabled) '(nil t))
@@ -91,6 +97,8 @@ It records debt but grants no authority to contact or retire a remote pin."
                  (= (length queue) (length (remove-duplicates queue :test #'equal))))
       (error "native follow cleanup capacity, preparation or duplicate entry is invalid"))
     (append (list :version 1 :enabled (getf state :enabled) :preparing preparing :cleanup queue)
+            (when (getf state :public-slot)
+              (list :public-slot (physical-follow-public-slot-copy (getf state :public-slot))))
             (when (getf state :source)
               (list :source (physical-follow-source-copy (getf state :source))))
             (when (getf state :mode) (list :mode (getf state :mode)))
@@ -120,9 +128,11 @@ It records debt but grants no authority to contact or retire a remote pin."
   (unless (physical-follow-no-source-p config)
     (let ((core (subseq config 0 (if (fifth config) 5 4)))
           (source (when (= 6 (length config)) (getf (sixth config) :source))))
-      (if source
-          (append core (list :source (physical-follow-source-copy source)))
-          core))))
+      (append core
+              (when source (list :source (physical-follow-source-copy source)))
+              (when (getf (sixth config) :public-slot)
+                (list :public-slot
+                      (physical-follow-public-slot-copy (getf (sixth config) :public-slot))))))))
 
 (defun physical-follow-controller-state (config)
   (if (= 6 (length config))
@@ -145,6 +155,9 @@ It records debt but grants no authority to contact or retire a remote pin."
                        (= (getf request :manifest-digest) (getf base :manifest-digest)))
             (error "unattached preparation differs from the verified base"))))))
   config)
+
+(defun physical-follow-config-public-slot (config)
+  (physical-follow-public-slot-copy (getf (sixth config) :public-slot)))
 
 (defun physical-follow-config-source (config)
   (when (= 6 (length config))

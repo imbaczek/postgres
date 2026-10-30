@@ -893,9 +893,11 @@ this listener evaluates arbitrary Lisp."
                   (physical-follow-retarget (second form) (third form)
                                             (if (= (length form) 4) (fourth form) "follow")))
                  ((and (consp form) (eq (first form) 'physical-follow-retarget-conninfo)
-                       (member (length form) '(2 4 6)) (stringp (second form))
+                       (member (length form) '(2 4 6 8)) (stringp (second form))
                        (loop for (key value) on (cddr form) by #'cddr
-                             always (and (member key '(:prefix :fallback)) (stringp value)))
+                             always (case key
+                                      ((:prefix :fallback) (stringp value))
+                                      (:slot (or (null value) (stringp value)))))
                        (= (length (cddr form))
                           (* 2 (length (remove-duplicates
                                         (loop for (key value) on (cddr form) by #'cddr

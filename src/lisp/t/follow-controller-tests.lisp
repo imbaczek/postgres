@@ -69,19 +69,25 @@
        (let* ((view (list :source 1 :parent 1 :history-text ""
                           :history (pg::timeline-parse-history 1 "")))
               (operation (pg::make-physical-follow-operation
-                          :host "127.0.0.1" :port 5433 :prefix "same"))
+                          :host "127.0.0.1" :port 5433 :prefix "same"
+                          :context (list :requested-slot "next_public")))
               (pg::*physical-follow-operation* operation)
               (pg::*physical-follow-controller-blocked-p* nil)
               (pg::*physical-follow-controller-stopping-p* nil)
               (before (pg::physical-store-control-tuple store)))
-         (pg::physical-follow-save-config '(1 "127.0.0.1" 5432 "old_bootstrap"))
+         (pg::physical-follow-save-config
+          (pg::physical-follow-with-controller
+           '(1 "127.0.0.1" 5432 "old_bootstrap")
+           '(:version 1 :enabled t :preparing nil :cleanup nil :public-slot "old_public")))
          (pg::physical-follow-operation-initial-config operation)
          (multiple-value-bind (entry snapshot) (pg::physical-follow-operation-intent operation view)
            (declare (ignore snapshot))
+           (ok (equal "old_public" (pg::physical-follow-config-public-slot (pg::physical-follow-read-config))))
            (let* ((anchor (append (copy-list (getf entry :request))
                                   (list :kind :same-timeline :history-text "")))
                   (active (pg::physical-follow-operation-publish operation view entry anchor))
                   (binding (fifth active)))
+             (ok (equal "next_public" (pg::physical-follow-config-public-slot active)))
              (ok (equal before (getf binding :before)))
              (ok (equal before (getf binding :after)))
              (ok (equal before (pg::physical-store-control-tuple store)))
@@ -240,6 +246,38 @@
          (ok (equal (list entry) (getf (sixth saved) :cleanup)))
          (ok (null pg::*physical-follow-runtime*))
          (ok (not pg::*physical-recovery-failed-p*))))))
+
+(deftest follow-failed-slot-replacement-restores-old-slot-and-private-cleanup-only
+    (let ((original (symbol-function 'pg::physical-follow-launch))
+          (resumed nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-follow-launch)
+                   (lambda (config) (setf resumed config) :started))
+             (call-with-controller-intent
+              (lambda (root store operation view entry snapshot)
+                (declare (ignore root store view snapshot))
+                (ok (equal "public_a" (pg::physical-follow-config-public-slot (pg::physical-follow-read-config))))
+                (pg::physical-follow-operation-recover operation)
+                (let* ((saved (pg::physical-follow-read-config))
+                       (runtime (pg::make-physical-follow-runtime :pin (fourth saved) :config resumed))
+                       (command (pg::parse-replication-command (pg::physical-follow-start-query runtime 152))))
+                  (ok (equal "public_a" (pg::physical-follow-config-public-slot saved)))
+                  (ok (equal saved resumed))
+                  (ok (equal "public_a" (pg::logical-replication-command-slot-name command)))
+                  (ok (equal "old_bootstrap" (pg::physical-stream-proof-pin command)))
+                  (ok (equal (list entry) (getf (sixth saved) :cleanup)))
+                  (ok (null (getf entry :public-slot)))
+                  (ok (null (getf (sixth saved) :preparing)))
+                  (ok (not pg::*physical-recovery-failed-p*))))
+              :before-intent
+              (lambda (operation)
+                (setf (pg::physical-follow-operation-context operation) (list :requested-slot "public_b"))
+                (pg::physical-follow-save-config
+                 (pg::physical-follow-with-controller
+                  (pg::physical-follow-read-config)
+                  '(:version 1 :enabled t :preparing nil :cleanup nil :public-slot "public_a"))))))
+        (setf (symbol-function 'pg::physical-follow-launch) original))))
 
 (deftest follow-controller-uncertain-pending-publication-fences-without-resuming-old-source
     (call-with-controller-intent
@@ -756,6 +794,78 @@
           (ok (equal (list entry) (getf (sixth aborted) :cleanup)))
           (ok (getf (sixth aborted) :enabled))
           (ok (equal entry (getf (sixth config) :preparing)))))))
+
+(deftest follow-public-slot-is-durable-effective-state-without-cleanup-authority
+    (let* ((state (follow-controller-test-state :queue (list (follow-controller-test-entry))))
+           (plain (pg::physical-follow-with-controller '(1 "127.0.0.1" 5432 "private_proof") state)))
+      (setf (getf state :public-slot) "public_slot")
+      (let* ((config (pg::physical-follow-with-controller plain state))
+             (decoded (pg::physical-follow-decode-config (pg::physical-follow-config-image config))))
+        (ok (equal config decoded))
+        (ok (equal "public_slot" (getf (sixth decoded) :public-slot)))
+        (ok (equal (getf (sixth plain) :cleanup) (getf (sixth decoded) :cleanup)))
+        (ok (not (equal (pg::physical-follow-effective-config plain)
+                        (pg::physical-follow-effective-config decoded))))
+        (ok (not (equal (fourth decoded) (getf (sixth decoded) :public-slot)))))
+      (dolist (bad '("" "INVALID" "bad-name" "slot'; SELECT 1" 42))
+        (setf (getf state :public-slot) bad)
+        (ok (intake-fails-p (lambda () (pg::physical-follow-with-controller plain state)))))
+      (let ((unattached (follow-unattached-test-config)))
+        (setf (getf (sixth unattached) :public-slot) "public_slot")
+        (ok (intake-fails-p (lambda () (pg::physical-follow-check-config unattached)))))))
+
+(deftest follow-operation-publication-installs-or-clears-only-requested-slot
+    (dolist (slot '(nil "next_public"))
+      (let* ((state (follow-controller-test-state))
+             (operation (pg::make-physical-follow-operation :context (list :requested-slot slot))))
+        (setf (getf state :public-slot) "old_public")
+        (let ((accepted (pg::physical-follow-operation-source-state operation state)))
+          (ok (equal slot (getf accepted :public-slot)))
+          (ok (equal "old_public" (getf state :public-slot)))
+          (ok (equal (getf state :cleanup) (getf accepted :cleanup)))))))
+
+(cl-spec:defproperty follow-public-slot-roundtrip-does-not-alias-private-pin
+    ((identifier (range integer 0 18446744073709551615))
+     (enabled (range integer 0 1)))
+  (:about pg::physical-follow-config-public-slot)
+  (:trials (:normal 200))
+  (let* ((slot (string-downcase (format nil "public_~16,'0x" identifier)))
+         (state (list :version 1 :enabled (plusp enabled) :preparing nil :cleanup nil
+                      :public-slot slot))
+         (config (pg::physical-follow-with-controller '(1 "127.0.0.1" 5432 "private_proof") state))
+         (decoded (pg::physical-follow-decode-config (pg::physical-follow-config-image config))))
+    (and (equal slot (pg::physical-follow-config-public-slot decoded))
+         (equal "private_proof" (fourth decoded))
+         (null (getf (sixth decoded) :cleanup))
+         (equal config decoded))))
+
+(deftest generated-follow-public-slot-roundtrip
+    (let ((data (cl-spec:result-data
+                 (cl-spec:run-property 'follow-public-slot-roundtrip-does-not-alias-private-pin :seed 42))))
+      (ok (eq :passed (getf data :status)) (format nil "~s" data))))
+
+(deftest follow-operation-captures-slot-inheritance-once-and-can-clear-it
+    (let ((original (symbol-function 'pg::physical-follow-operation-run))
+          (pg::*physical-follow-operation* nil)
+          (pg::*physical-follow-controller-blocked-p* nil)
+          (pg::*physical-follow-controller-stopping-p* nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'pg::physical-follow-operation-run)
+                   (lambda (operation) (declare (ignore operation)) :done))
+             (dolist (requested '(:inherit nil "next_public"))
+               (let* ((config (pg::physical-follow-with-controller
+                               '(1 "127.0.0.1" 5432 "private_proof")
+                               '(:version 1 :enabled t :preparing nil :cleanup nil :public-slot "old_public")))
+                      (runtime (pg::make-physical-follow-runtime :config config))
+                      (operation (pg::physical-follow-start-operation
+                                  "127.0.0.1" 5432 "follow" runtime nil requested))
+                      (expected (if (eq requested :inherit) "old_public" requested)))
+                 (sb-thread:join-thread (pg::physical-follow-operation-thread operation))
+                 (setf (aref (getf (sixth config) :public-slot) 0) #\x)
+                 (ok (equal expected (getf (pg::physical-follow-operation-context operation) :requested-slot)))
+                 (setf pg::*physical-follow-operation* nil))))
+        (setf (symbol-function 'pg::physical-follow-operation-run) original))))
 
 (deftest follow-controller-capacity-is-reserved-before-remote-preparation
     (let* ((queue (loop for index below (1- pg::+physical-follow-cleanup-capacity+)

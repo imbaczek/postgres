@@ -229,7 +229,7 @@
                            (value :written-lsn t) (value :flushed-lsn t) (value :received-tli)
                            (value :last-send-time t) (value :last-receipt-time t)
                            (value :latest-end-lsn t) (value :latest-end-time t)
-                           +null+ (value :host) (value :port) (value :conninfo))))))
+                           (value :public-slot) (value :host) (value :port) (value :conninfo))))))
     +null+))
 
 (defun publication-table-result-rows (names &optional (relation-id nil relation-p))

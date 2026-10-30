@@ -50,6 +50,7 @@ STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
     (sb-thread:with-mutex (*physical-follow-lock*)
       (setf *physical-follow-statistics*
             (list :runtime runtime :pid (sb-thread:thread-os-tid sb-thread:*current-thread*)
+                  :public-slot (physical-follow-config-public-slot (physical-follow-runtime-config runtime))
                   :receive-start-lsn cursor :receive-start-tli (physical-follow-runtime-receive-timeline runtime)
                   :last-send-time now :last-receipt-time now
                   :latest-end-lsn *physical-follow-last-end-lsn*
@@ -817,8 +818,9 @@ state. An active result still requires startup validation before workers launch.
                            (not (getf state :enabled))
                            (getf state :unowned-bootstrap))))
         (error "invalid unattached standby controller state"))
-      (when (and (physical-follow-no-source-p config) (getf state :source))
-        (error "a controller without a source cannot carry an accepted connection"))
+      (when (and (physical-follow-no-source-p config)
+                 (or (getf state :source) (getf state :public-slot)))
+        (error "a controller without a source cannot carry accepted receipt settings"))
       (when (getf state :unowned-bootstrap)
         (let ((pin (getf (getf state :unowned-bootstrap) :pin)))
           (when (or (equal pin (fourth config))
@@ -998,7 +1000,9 @@ Validation checks coherence, not durable state or source proof."
   "Build an unnamed native START using the runtime's private proof pin."
   (with-live-operation
     (format nil
-            "START_REPLICATION PHYSICAL ~a (native_format '~a', proof_pin '~a', system_id '~d', timeline '~d', base_lsn '~a', prefix_digest '~d'~a~a)"
+            "START_REPLICATION~a PHYSICAL ~a (native_format '~a', proof_pin '~a', system_id '~d', timeline '~d', base_lsn '~a', prefix_digest '~d'~a~a)"
+            (let ((slot (physical-follow-config-public-slot (physical-follow-runtime-config runtime))))
+              (if slot (format nil " SLOT \"~a\"" slot) ""))
             (wal-format-lsn cursor) +physical-native-format+
             (physical-follow-runtime-pin runtime) (getf *physical-recovery-state* :system-id)
             (physical-follow-runtime-receive-timeline runtime)
