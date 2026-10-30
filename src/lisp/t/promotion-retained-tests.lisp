@@ -817,7 +817,8 @@
            (pg::wal-atomic-write-bytes (pg::wal-control-path) original))))))
 
 (deftest committed-archive-ownership-precedes-cleanup-and-survives-interruptions
-    (dolist (cut '(:after-primary-retained-registration :after-retire-required
+    (dolist (cut '(:after-primary-retained-registration
+                   :after-retire-standby-signal :after-retire-recovery-signal :after-retire-required
                    :after-retire-manifest :after-retire-follow-transfer :after-retire-pointer
                    :after-retire-pending :after-pending-retained-retirement))
       (handoff-test-committed
@@ -829,6 +830,8 @@
                 (pending (pg::physical-promotion-retained-owner :pending))
                 (primary (pg::physical-promotion-retained-owner :primary))
                 (events nil))
+           (dolist (name '("standby.signal" "recovery.signal"))
+             (pg::wal-atomic-write-bytes (merge-pathnames name root) (empty-octets)))
            (ok (eql id (pg::physical-retained-root-current pending)))
            (ok (null (pg::physical-retained-root-current primary)))
            (call-with-current-promotion-owner
@@ -865,10 +868,51 @@
                 (ok (equal unowned (getf state :unowned-bootstrap)))
                 (ok (null (getf state :cleanup)))
                 (ok (null (getf state :source))))
-              (dolist (name '("recovery.required" "physical-backup.manifest"
+              (dolist (name '("standby.signal" "recovery.signal"
+                              "recovery.required" "physical-backup.manifest"
                               "physical-restartpoint.control"
                               "physical-recovery.control"))
                 (ok (null (probe-file (merge-pathnames name root))))))))))))
+
+(deftest committed-promotion-retires-signal-names-without-unlinking-targets
+    (handoff-test-committed
+     (lambda (root store reference)
+       (declare (ignore store reference))
+       (let ((target (merge-pathnames "signal-target" root))
+             (standby (merge-pathnames "standby.signal" root))
+             (archive (merge-pathnames "recovery.signal" root))
+             (bytes (pg::string->bytes "preserve signal target")))
+         (pg::wal-atomic-write-bytes target bytes)
+         (sb-posix:symlink (namestring target) (namestring standby))
+         (pg::wal-atomic-write-bytes archive (empty-octets))
+         (call-with-current-promotion-owner
+          (lambda () (call-with-promotion-exclusion #'pg::physical-promotion-retire-recovery)))
+         (ok (equalp bytes (lineage-test-bytes target)))
+         (dolist (path (list standby archive))
+           (ok (handler-case (progn (sb-posix:lstat (namestring path)) nil)
+                 (sb-posix:syscall-error (condition)
+                   (= sb-posix:enoent (sb-posix:syscall-errno condition))))))
+         (ok (null (probe-file (pg::physical-recovery-control-path))))))))
+
+(deftest committed-promotion-preflights-all-signal-names-before-unlinking
+    (handoff-test-committed
+     (lambda (root store reference)
+       (declare (ignore store reference))
+       (let ((standby (merge-pathnames "standby.signal" root))
+             (control (lineage-test-bytes (pg::physical-recovery-control-path)))
+             (manifest (lineage-test-bytes (merge-pathnames "physical-backup.manifest" root))))
+         (pg::wal-atomic-write-bytes standby (empty-octets))
+         (ensure-directories-exist (merge-pathnames "recovery.signal/entry" root))
+         (call-with-current-promotion-owner
+          (lambda ()
+            (ok (intake-fails-p
+                 (lambda () (call-with-promotion-exclusion
+                             #'pg::physical-promotion-retire-recovery))))))
+         (ok (probe-file standby))
+         (ok (probe-file (merge-pathnames "recovery.required" root)))
+         (ok (equalp control (lineage-test-bytes (pg::physical-recovery-control-path))))
+         (ok (equalp manifest (lineage-test-bytes
+                               (merge-pathnames "physical-backup.manifest" root))))))))
 
 (deftest committed-archive-cannot-retire-rootless-pending-control
     (handoff-test-committed

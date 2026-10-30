@@ -14,6 +14,36 @@
           (write-line "incomplete manifest" stream))
         (ok (intake-fails-p #'pg::physical-bootstrap-check-startup)))))
 
+(deftest physical-standard-recovery-signals-cannot-create-native-base-provenance
+    (dolist (name '("standby.signal" "recovery.signal"))
+      (with-physical-store-directory (root)
+        (let ((pg::*pgdata* root)
+              (pg::*physical-recovery-state* nil))
+          (pg::wal-atomic-write-bytes (merge-pathnames name root) (empty-octets))
+          (ok (intake-fails-p #'pg::physical-bootstrap-check-startup))
+          (ok (probe-file (merge-pathnames name root)))
+          (ok (null pg::*physical-recovery-state*))))))
+
+(deftest physical-recovery-signals-follow-stat-and-prefer-standby
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (standby (merge-pathnames "standby.signal" root))
+             (archive (merge-pathnames "recovery.signal" root))
+             (target (merge-pathnames "signal-target" root)))
+        (ok (null (pg::physical-recovery-read-signal-mode)))
+        (pg::wal-atomic-write-bytes archive (pg::string->bytes "ignored contents"))
+        (ok (eq :archive (pg::physical-recovery-read-signal-mode)))
+        (pg::wal-atomic-write-bytes target (pg::string->bytes "also ignored"))
+        (sb-posix:symlink (namestring target) (namestring standby))
+        (ok (eq :standby (pg::physical-recovery-read-signal-mode)))
+        (delete-file target)
+        (ok (eq :archive (pg::physical-recovery-read-signal-mode)))
+        (delete-file archive)
+        (ok (null (pg::physical-recovery-read-signal-mode)))
+        (sb-posix:unlink (namestring standby))
+        (ensure-directories-exist (merge-pathnames "standby.signal/entry" root))
+        (ok (eq :standby (pg::physical-recovery-read-signal-mode))))))
+
 (deftest physical-bootstrap-target-is-separate-and-empty
     (with-physical-store-directory (root)
       (let* ((source (merge-pathnames "source/" root))

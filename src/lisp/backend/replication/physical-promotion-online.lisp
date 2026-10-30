@@ -115,9 +115,9 @@ An unattached standby resumes replay without starting a receiver."
         (setf *physical-replay-paused-p* paused
               *physical-promotion-stopping-p* nil))))
   (when config
-    (if (physical-follow-unattached-p config)
-        (physical-follow-launch-replay-only config)
-        (physical-follow-launch config)))
+    (if (physical-follow-controller-enabled-p config)
+        (physical-follow-launch config)
+        (physical-follow-launch-replay-only config)))
   (when restartpoint (physical-restartpoint-start-worker))
   :awaiting-child-initialization)
 

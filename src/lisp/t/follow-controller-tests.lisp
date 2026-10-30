@@ -397,7 +397,12 @@
                  (lambda ()
                    (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
                      (ok (eq :awaiting-child-initialization
-                             (pg::physical-promotion-resume-recovery-workers config t nil))))))
+                             (progn
+                               (pg::physical-promotion-resume-recovery-workers config t nil)
+                               (setf config (pg::physical-follow-with-controller
+                                             '(1 "127.0.0.1" 5432 "accepted_bootstrap")
+                                             (follow-controller-test-state :enabled nil)))
+                               (pg::physical-promotion-resume-recovery-workers config t nil)))))))
                 (ok (equal config seen)))
            (setf (symbol-function 'pg::physical-follow-launch) receiver
                  (symbol-function 'pg::physical-follow-launch-replay-only) replay))))
@@ -955,6 +960,88 @@
                   (ok (pg::physical-follow-check-startup-admission pg::*physical-recovery-state*))
                   (ok (null pg::*physical-follow-runtime*))
                   (ok (null pg::*physical-receive-store*))))))))
+       :system-id 42)))
+
+(deftest standard-recovery-signal-policy-is-latched-only-after-base-verification
+    (dolist (mode '(nil :standby :both :archive))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root))
+         (ok (= 42 (pg::physical-store-system-id store)))
+         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+         (when (member mode '(:standby :both))
+           (pg::wal-atomic-write-bytes (merge-pathnames "standby.signal" pg::*pgdata*)
+                                       (empty-octets)))
+         (when (member mode '(:archive :both))
+           (pg::wal-atomic-write-bytes (merge-pathnames "recovery.signal" pg::*pgdata*)
+                                       (empty-octets)))
+         (pg::physical-store-close store)
+         (sb-posix:rename (namestring (pg::physical-store-directory store))
+                          (namestring (pg::physical-recovery-spool-directory)))
+         (call-with-current-promotion-owner
+          (lambda ()
+            (let ((pg::*wal-ready* nil)
+                  (pg::*physical-receive-store* nil)
+                  (pg::*physical-recovery-state* nil)
+                  (pg::*physical-follow-runtime* nil)
+                  (pg::*physical-restartpoint-worker* nil))
+              (if (eq mode :archive)
+                  (progn
+                    (ok (intake-fails-p #'pg::physical-bootstrap-check-startup))
+                    (ok (null pg::*physical-recovery-state*)))
+                  (progn
+                    (pg::physical-bootstrap-check-startup)
+                    (ok (eql 2 (getf pg::*physical-recovery-state* :phase)))
+                    (ok (eql (not (null mode))
+                             (getf pg::*physical-recovery-state* :standard-follow-managed-p)))
+                    (ok (null pg::*physical-follow-runtime*))))))))
+       :system-id 42)))
+
+(deftest managed-follow-startup-disables-saved-receipt-before-autostart
+    (dolist (kind '(:unattached :bootstrap :bound))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root))
+         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+         (let* ((base (pg::physical-recovery-verify-base-state))
+                (config
+                  (case kind
+                    (:bootstrap '(1 "127.0.0.1" 5432 "accepted_bootstrap"))
+                    (:bound
+                     (let ((pending (pg::physical-follow-with-controller
+                                     (follow-pending-proof-config-for-store store base)
+                                     (follow-controller-test-state))))
+                       (pg::physical-follow-save-config pending)
+                       (call-with-promotion-exclusion
+                        (lambda () (pg::physical-follow-reconcile-pending-store store base pending)))))))
+                (full (symbol-function 'pg::physical-follow-launch))
+                (replay (symbol-function 'pg::physical-follow-launch-replay-only))
+                (full-starts 0) (replay-starts 0))
+           (when config (pg::physical-follow-save-config config))
+           (setf (getf pg::*physical-recovery-state* :standard-follow-managed-p) t
+                 (getf pg::*physical-recovery-state* :follow-startup-config) config)
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'pg::physical-follow-launch)
+                        (lambda (saved) (declare (ignore saved)) (incf full-starts))
+                        (symbol-function 'pg::physical-follow-launch-replay-only)
+                        (lambda (saved)
+                          (ok (not (pg::physical-follow-controller-enabled-p saved)))
+                          (incf replay-starts)))
+                  (call-with-current-promotion-owner #'pg::physical-follow-prepare-managed-startup)
+                  (let ((saved (pg::physical-follow-read-config)))
+                    (ok (not (pg::physical-follow-controller-enabled-p saved)))
+                    (if config
+                        (ok (equal (subseq config 0 (min 5 (length config)))
+                                   (subseq saved 0 (min 5 (length config)))))
+                        (ok (pg::physical-follow-unattached-p saved)))
+                    (ok (equal saved (getf pg::*physical-recovery-state* :follow-startup-config))))
+                  (ok (zerop (+ full-starts replay-starts)))
+                  (pg::physical-follow-autostart)
+                  (ok (zerop full-starts))
+                  (ok (= 1 replay-starts)))
+             (setf (symbol-function 'pg::physical-follow-launch) full
+                   (symbol-function 'pg::physical-follow-launch-replay-only) replay))))
        :system-id 42)))
 
 (deftest follow-unattached-cold-start-rejects-required-progress-beyond-durable-spool

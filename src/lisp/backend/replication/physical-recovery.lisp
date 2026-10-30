@@ -459,7 +459,9 @@ Child images may include history files no newer than their selected timeline."
                                :restart-lsn (physical-manifest-checkpoint-start manifest)))
     *catalog*))
 
-(defun physical-recovery-prepare ()
+(declaim (ftype function physical-recovery-read-signal-mode))
+
+(defun physical-recovery-prepare (&key (signal-mode (physical-recovery-read-signal-mode)))
   "Select the base WAL namespace while verifying immutable provenance.
 A nonpending standby cannot fall back to primary startup when validation fails."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace)
@@ -468,7 +470,7 @@ A nonpending standby cannot fall back to primary startup when validation fails."
     (let ((*wal-segment-namespace* namespace)
           (*wal-insert-timeline* insertion)
           (*wal-checkpoint-timeline* checkpoint-timeline))
-      (physical-recovery-prepare-with-namespace)
+      (physical-recovery-prepare-with-namespace :signal-mode signal-mode)
       (setf (getf *physical-recovery-state* :wal-namespace) namespace))))
 
 (declaim (ftype function physical-follow-check-startup-config))
@@ -541,15 +543,19 @@ Return the reconstructed state and durable control; do not install runtime state
 (declaim (ftype function physical-follow-startup-owner-check physical-follow-prepare-startup
                 physical-follow-check-startup-admission))
 
-(defun physical-recovery-prepare-with-namespace ()
+(defun physical-recovery-prepare-with-namespace (&key signal-mode)
   "Verify the base and reconcile saved follow state before ordinary startup.
 Publish dirty recovery control before installing state and allowing redo."
   (physical-recovery-check-required-marker)
   (physical-follow-startup-owner-check)
   (let* ((manifest (physical-recovery-verify-base-with-namespace))
-         (config (physical-follow-prepare-startup manifest)))
+         (config (progn
+                   (when (eq signal-mode :archive)
+                     (error "archive recovery requested by recovery.signal is not implemented"))
+                   (physical-follow-prepare-startup manifest))))
     (setf manifest (physical-recovery-verify-base-with-namespace)
-          (getf manifest :follow-startup-config) config)
+          (getf manifest :follow-startup-config) config
+          (getf manifest :standard-follow-managed-p) (eq signal-mode :standby))
     (setf *physical-recovery-state*
           (physical-recovery-write-control
            manifest (getf manifest :phase) (getf manifest :end)

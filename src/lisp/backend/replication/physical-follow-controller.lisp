@@ -738,6 +738,41 @@ The caller must not hold command, reload or live-operation admission locks."
               (setf *physical-follow-controller-blocked-p* nil
                     *physical-follow-controller-block-owner* nil)))))))
 
+(defun physical-follow-prepare-managed-startup ()
+  (when (getf *physical-recovery-state* :standard-follow-managed-p)
+    (unless (and *postmaster-data-lock* (postmaster-pid-owned-p) *wal-ready*
+                 (zerop *n-connections*) (zerop *n-backends*)
+                 (zerop *live-operation-depth*) (not *physical-follow-runtime*))
+      (error "managed follow preparation requires owned startup before listeners"))
+    (sb-thread:with-mutex (*physical-follow-command-lock*)
+      (check-physical-recovery-worker-start)
+      (unless *physical-receive-store*
+        (when (eq :deferred (physical-recovery-enable-streaming))
+          (error "managed standby streaming setup was deferred during startup")))
+      (sb-thread:with-mutex (*reload-run-lock*)
+        (with-live-operation-quiescence
+          (check-physical-recovery-worker-start)
+          (unless (and *physical-receive-store*
+                       (eql 2 (getf *physical-recovery-state* :phase)))
+            (error "managed follow preparation requires streaming recovery"))
+          (physical-follow-check-startup-admission *physical-recovery-state*)
+          (let* ((base (physical-recovery-verify-base-state))
+                 (config (if (probe-file (physical-follow-config-path))
+                             (physical-follow-read-config)
+                             (physical-follow-unattached-config-for-base base)))
+                 (state (physical-follow-controller-state config)))
+            (when (or (physical-follow-cleanup-only-p config)
+                      (getf state :preparing)
+                      (and (fifth config) (not (eq :active (getf (fifth config) :phase)))))
+              (error "managed follow startup requires reconciled standby metadata"))
+            (physical-follow-check-unowned-bootstrap-base config base)
+            (physical-follow-controller-check-current config)
+            (setf (getf state :enabled) nil
+                  config (physical-follow-with-controller config state))
+            (physical-follow-controller-save-config config)
+            (setf (getf *physical-recovery-state* :follow-startup-config) config)))))
+    :prepared))
+
 (defun physical-follow-ensure-attachment-state ()
   "Establish checked replay-only state before a first source attachment.
 Preserve the unowned bootstrap reference; return :DEFERRED when streaming

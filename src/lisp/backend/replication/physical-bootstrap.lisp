@@ -15,6 +15,40 @@ Malformed control is an error, not permission to fall back to primary startup."
   (when (wal-namespace-file-stat (physical-recovery-control-path) t)
     (member (getf (physical-recovery-read-control *pgdata*) :phase) '(0 1 2))))
 
+(defun physical-recovery-signal-found-p (name)
+  (let ((path (namestring (merge-pathnames name *pgdata*))))
+    (handler-case (sb-posix:stat path)
+      (sb-posix:syscall-error () (return-from physical-recovery-signal-found-p nil)))
+    (handler-case
+        (let ((fd (sb-posix:open path
+                                 (logior sb-posix:o-rdwr sb-posix:o-nonblock
+                                         +postmaster-o-cloexec+))))
+          (unwind-protect
+               (when (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:fstat fd)))
+                 (sb-posix:fsync fd))
+            (sb-posix:close fd)))
+      (sb-posix:syscall-error () nil))
+    t))
+
+(defun physical-recovery-read-signal-mode ()
+  (let ((standby (physical-recovery-signal-found-p "standby.signal"))
+        (archive (physical-recovery-signal-found-p "recovery.signal")))
+    (cond (standby :standby) (archive :archive))))
+
+(defun physical-recovery-signal-retirement-stat (name)
+  (handler-case
+      (let ((stat (sb-posix:lstat (namestring (merge-pathnames name *pgdata*)))))
+        (when (sb-posix:s-isdir (sb-posix:stat-mode stat))
+          (error "recovery signal cannot be retired as a file: ~a" name))
+        stat)
+    (sb-posix:syscall-error (condition)
+      (unless (= sb-posix:enoent (sb-posix:syscall-errno condition))
+        (error condition)))))
+
+(defun physical-recovery-unlink-signal (name)
+  (when (physical-recovery-signal-retirement-stat name)
+    (sb-posix:unlink (namestring (merge-pathnames name *pgdata*)))))
+
 (defun physical-bootstrap-check-startup ()
   "Choose recovery or primary startup before listeners or ordinary storage setup.
 Recovery artifacts without recovery control are an error: pending control is
@@ -22,25 +56,27 @@ retired last, so their presence cannot safely select primary startup. Nonpending
 standby control requires recovery validation. A pending request is reconciled
 against parent or committed child control. Return :PRIMARY-READY when pending
 completion already initialized storage. Invalid proof is an error."
-  (when (and (not (wal-namespace-file-stat (physical-recovery-control-path) t))
-             (or (wal-namespace-file-stat (merge-pathnames "recovery.required" *pgdata*) t)
-                 (wal-namespace-file-stat (merge-pathnames "physical-backup.manifest" *pgdata*) t)
-                 (and (wal-namespace-file-stat (physical-follow-config-path) t)
-                      (not (physical-follow-cleanup-only-p (physical-follow-read-config))))
-                 (wal-namespace-file-stat (merge-pathnames "physical-restartpoint.control" *pgdata*) t)))
-    (error "recovery metadata is incomplete: recovery control is missing"))
-  (cond
-    ((physical-bootstrap-standby-control-p) (physical-recovery-prepare) (values))
-    ((physical-promotion-startup-primary-p) (values))
-    ((physical-promotion-startup-pending-p) :primary-ready)
-    (t
-     (if (or (probe-file (merge-pathnames "recovery.required" *pgdata*))
-             (probe-file (merge-pathnames "physical-backup.manifest" *pgdata*))
-             (probe-file (merge-pathnames "physical-recovery.control" *pgdata*)))
-         (physical-recovery-prepare)
-         (when (recovery-in-progress-p)
-           (error "cannot clear recovery role by removing its metadata")))
-     (values))))
+  (let ((signal-mode (physical-recovery-read-signal-mode)))
+    (when (and (not (wal-namespace-file-stat (physical-recovery-control-path) t))
+               (or signal-mode
+                   (wal-namespace-file-stat (merge-pathnames "recovery.required" *pgdata*) t)
+                   (wal-namespace-file-stat (merge-pathnames "physical-backup.manifest" *pgdata*) t)
+                   (and (wal-namespace-file-stat (physical-follow-config-path) t)
+                        (not (physical-follow-cleanup-only-p (physical-follow-read-config))))
+                   (wal-namespace-file-stat (merge-pathnames "physical-restartpoint.control" *pgdata*) t)))
+      (error "recovery metadata is incomplete: recovery control is missing"))
+    (cond
+      ((physical-bootstrap-standby-control-p) (physical-recovery-prepare :signal-mode signal-mode) (values))
+      ((physical-promotion-startup-primary-p) (values))
+      ((physical-promotion-startup-pending-p) :primary-ready)
+      (t
+       (if (or (probe-file (merge-pathnames "recovery.required" *pgdata*))
+               (probe-file (merge-pathnames "physical-backup.manifest" *pgdata*))
+               (probe-file (merge-pathnames "physical-recovery.control" *pgdata*)))
+           (physical-recovery-prepare :signal-mode signal-mode)
+           (when (recovery-in-progress-p)
+             (error "cannot clear recovery role by removing its metadata")))
+       (values)))))
 
 (defun physical-bootstrap-target (directory)
   "Require an existing empty target outside the source directory hierarchy."

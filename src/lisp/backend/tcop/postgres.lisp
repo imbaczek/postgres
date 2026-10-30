@@ -891,6 +891,7 @@ CL's RENAME-FILE merges a relative target with the source's directory."
         (if (recovery-in-progress-p)
             (physical-recovery-open-storage)
             (initialize-primary-storage)))
+      (physical-follow-prepare-managed-startup)
       (unless (recovery-in-progress-p) (wal-note-primary-ready))
       (enable-reload)
       (enable-shutdown-handlers)
