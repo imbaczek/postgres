@@ -85,19 +85,14 @@ def start_peer(directory=None, port=None, socket_name="sibling.sock", log_name="
     registry = root / "extra-peers"
     registry.mkdir(mode=0o700, exist_ok=True)
     launcher = [str(base / "pg-lisp.sh")]
-    environment = None
     if timeline_goal is not None:
-        environment = os.environ.copy()
-        environment["PG_TEST_TIMELINE_GOAL"] = timeline_goal
-        interpreter = shutil.which(environment.get("SBCL", "sbcl"))
-        assert interpreter is not None, "SBCL executable is unavailable"
-        launcher = [str(Path(interpreter).resolve()), "--script", str(base / "t/timeline-policy-boot.lisp")]
+        launcher.extend(["-c", f"recovery_target_timeline={timeline_goal}"])
     with (root / log_name).open("a") as output:
         process = subprocess.Popen([sys.executable, str(base / "t/interop/owned-peer.py"),
                                     "start", str(registry), str(directory), *launcher,
                                     "-p", str(port), "-D", str(directory),
                                     "--control-socket", str(root / socket_name)],
-                                   stdout=output, stderr=subprocess.STDOUT, env=environment)
+                                   stdout=output, stderr=subprocess.STDOUT)
     peer_parameters[process] = (directory, socket_name)
     def ready():
         assert process.poll() is None, (root / log_name).read_text()
@@ -352,8 +347,11 @@ def exercise_retained_policy(peer, socket_identity, sibling, source, promoted):
     sibling.close()
     assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
     (data / "standby.signal").write_text("")
-    peer, socket_identity = start_peer(timeline_goal="current")
+    (data / "postgresql.auto.conf").write_text("recovery_target_timeline='current'\n")
+    peer, socket_identity = start_peer()
     sibling = connect(replica_port)
+    assert query(sibling, "SHOW recovery_target_timeline") == [('current',)]
+    assert query(sibling, "SELECT context,vartype,pending_restart FROM pg_settings WHERE name='recovery_target_timeline'") == [('postmaster', 'string', False)]
     query(sibling, "SELECT pg_wal_replay_pause()")
     query(source, "INSERT INTO promotion_sql_items VALUES (2,'retained-parent')")
     parent_end = query(source, "SELECT pg_current_wal_flush_lsn()::text")[0][0]
@@ -394,13 +392,16 @@ def exercise_retained_policy(peer, socket_identity, sibling, source, promoted):
         wait(lambda: psutil.Process(promoted_pid).status() == psutil.STATUS_STOPPED)
         sibling.close()
         assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
-        peer, socket_identity = start_peer(timeline_goal="current")
+        peer, socket_identity = start_peer()
         sibling = connect(replica_port)
         assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(True, 2)]
         assert saved == (data / "physical-follow.control").read_bytes()
         control("sibling.sock", '(assert (and (physical-follow-controller-enabled-p (physical-follow-read-config)) (null (physical-follow-runtime-receiver-thread *physical-follow-runtime*)) (physical-follow-runtime-receiver-stopped-p *physical-follow-runtime*) (not *physical-recovery-failed-p*)))')
         control("sibling.sock", '(defparameter *retained-policy-live-state* (list (getf *physical-recovery-state* :timeline-policy) (physical-follow-runtime-replay-thread *physical-follow-runtime*)))')
+        (data / "postgresql.auto.conf").write_text("recovery_target_timeline='latest'\n")
         control("sibling.sock", '(reload)')
+        assert query(sibling, "SHOW recovery_target_timeline") == [('current',)]
+        assert query(sibling, "SELECT setting,pending_restart FROM pg_settings WHERE name='recovery_target_timeline'") == [('current', True)]
         control("sibling.sock", '(assert (and (eq (first *retained-policy-live-state*) (getf *physical-recovery-state* :timeline-policy)) (eq (second *retained-policy-live-state*) (physical-follow-runtime-replay-thread *physical-follow-runtime*)) (sb-thread:thread-alive-p (second *retained-policy-live-state*)) (null (physical-follow-runtime-receiver-thread *physical-follow-runtime*))))')
     finally:
         subprocess.run([*signaler, "CONT"], check=True)
@@ -426,6 +427,7 @@ def exercise_retained_policy(peer, socket_identity, sibling, source, promoted):
     sibling = connect(replica_port)
     assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(False, 3)]
     print("retained-policy: parent-only receipt completion, paused replay/resume, source-offline cold startup and live reload PASS", flush=True)
+    print("retained-policy: standard recovery_target_timeline cold policy and pending-restart reload PASS", flush=True)
     print("retained-policy: observed namespace save failure preserves replay and accepted route, manual retry PASS", flush=True)
     print("retained-policy: parent promotion skips known source timeline, intent SIGKILL and cold primary restart PASS", flush=True)
     return peer, socket_identity, sibling
