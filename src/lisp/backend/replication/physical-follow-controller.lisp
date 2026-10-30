@@ -739,6 +739,10 @@ The caller must not hold command, reload or live-operation admission locks."
                     *physical-follow-controller-block-owner* nil)))))))
 
 (defun physical-follow-prepare-managed-startup ()
+  "Prepare a signal-managed standby under cold ownership before listeners start.
+Enable streaming recovery and durably disable receipt while preserving the saved
+endpoint, binding, owner and cleanup debt. Startup can then launch replay only;
+an explicit retarget can attach a receiver later."
   (when (getf *physical-recovery-state* :standard-follow-managed-p)
     (unless (and *postmaster-data-lock* (postmaster-pid-owned-p) *wal-ready*
                  (zerop *n-connections*) (zerop *n-backends*)

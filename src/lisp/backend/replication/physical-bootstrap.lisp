@@ -16,6 +16,9 @@ Malformed control is an error, not permission to fall back to primary startup."
     (member (getf (physical-recovery-read-control *pgdata*) :phase) '(0 1 2))))
 
 (defun physical-recovery-signal-found-p (name)
+  "Check NAME for a recovery request, following symlinks as stat does.
+Contents and size do not matter. Once stat succeeds, an open or fsync failure
+does not cancel the request. Open nonblocking and fsync only regular files."
   (let ((path (namestring (merge-pathnames name *pgdata*))))
     (handler-case (sb-posix:stat path)
       (sb-posix:syscall-error () (return-from physical-recovery-signal-found-p nil)))
@@ -31,11 +34,14 @@ Malformed control is an error, not permission to fall back to primary startup."
     t))
 
 (defun physical-recovery-read-signal-mode ()
+  "Read both signal names once at cold startup; standby takes precedence."
   (let ((standby (physical-recovery-signal-found-p "standby.signal"))
         (archive (physical-recovery-signal-found-p "recovery.signal")))
     (cond (standby :standby) (archive :archive))))
 
 (defun physical-recovery-signal-retirement-stat (name)
+  "Inspect the signal name itself before retirement, rejecting directories.
+A missing name is harmless; other lstat failures stop cleanup."
   (handler-case
       (let ((stat (sb-posix:lstat (namestring (merge-pathnames name *pgdata*)))))
         (when (sb-posix:s-isdir (sb-posix:stat-mode stat))
@@ -46,6 +52,7 @@ Malformed control is an error, not permission to fall back to primary startup."
         (error condition)))))
 
 (defun physical-recovery-unlink-signal (name)
+  "Unlink the signal name if present, leaving any symlink target untouched."
   (when (physical-recovery-signal-retirement-stat name)
     (sb-posix:unlink (namestring (merge-pathnames name *pgdata*)))))
 

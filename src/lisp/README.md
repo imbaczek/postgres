@@ -83,7 +83,22 @@ receiver. `physical-follow-stop` rejects an unattached standby; use replay pause
 to pause replay. The original bootstrap pin remains of unknown ownership and is
 not retired by this attachment.
 
-Standard Patroni GUC desired-generation handling and use of persistent public
+An existing verified native recovery base and control can also start with
+`standby.signal`. Startup samples the signal names once, enables streaming recovery
+before listeners open, and durably disables receipt while retaining the saved
+binding and cleanup obligations. Replay starts without a receiver; an explicit
+retarget can attach one. Adding or removing a signal and reloading does not change
+the startup choice. Without a signal the existing manual behavior remains.
+`recovery.signal` alone requests archive-only recovery, which is rejected because
+it is not implemented; when both names are present, standby takes precedence.
+Signal files do not supply missing native base provenance, and missing recovery
+control fails startup. Committed promotion takes precedence and retires both signal
+names found during cleanup, with directory synchronization. Unlike C PostgreSQL,
+which removes the names seen at startup, this also removes names added later so a
+cold retry cannot accidentally enter recovery. Symlink targets are left intact.
+
+Reconciliation of `primary_conninfo`, `primary_slot_name`, and
+`recovery_target_timeline` desired generations and use of persistent public
 slots by the receiver are not wired. There is no coordinator. Effective
 multihost profiles are unsupported.
 The original conninfo is resolved again on normal reconnects. If the selected
@@ -1570,6 +1585,7 @@ uv pip install --python /tmp/pg-patroni-4.1.5-venv/bin/python3 -r t/interop/patr
 PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/postmaster-pid.sh
 PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/patroni-start.sh
 PATRONI_PYTHON=/tmp/pg-patroni-4.1.5-venv/bin/python3 ./t/physical-follow.sh
+FOLLOW_FIRST_ATTACH=1 FOLLOW_MANAGED_STARTUP=1 SELECTED_REPLAY_CONTROLLER=1 ./t/selected-replay.sh
 ```
 
 `./pg-lisp.sh -D EXISTING_PGDATA -C setting` prints a supported configuration

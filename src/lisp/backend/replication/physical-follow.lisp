@@ -1430,7 +1430,7 @@ A failure after selection work begins fences recovery; this does not admit a net
             (unless finished (setf *physical-recovery-failed-p* t))))))))
 
 (defun physical-follow-autostart ()
-  "Launch admitted workers after startup validation, or replay alone if unattached."
+  "Launch admitted startup workers, using replay only for managed or unattached state."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (check-physical-recovery-worker-start)
     (when (probe-file (physical-follow-config-path))

@@ -107,7 +107,7 @@ checkpoint before stopping workers and rechecks after their final flush."
   "Restore prior workers after a healthy pre-intent wait for child initialization.
 Restore pause state before clearing stopping under restartpoint-start, then
 pause lock. Acknowledged pause commands cannot be overwritten by this restore.
-An unattached standby resumes replay without starting a receiver."
+An unattached or disabled standby resumes replay without starting a receiver."
   (with-live-operation
     (physical-promotion-check-online)
     (sb-thread:with-mutex (*physical-restartpoint-start-lock*)

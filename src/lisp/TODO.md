@@ -1,5 +1,11 @@
 # Development TODO
 
+- [ ] Implement desired-generation reconciliation for `primary_conninfo`,
+  `primary_slot_name` and `recovery_target_timeline` for standard follow.
+  Signal-managed startup currently prepares a verified native standby for replay
+  only. Archive-only recovery remains unsupported future work; coordination is
+  outside this scope. This does not provide full Patroni follow support.
+
 - [ ] After implementation, tests and code reviews are complete, document modules,
   functions and structures in the style of the original C source. Use simple,
   straightforward language; explain purpose, assumptions, invariants, ownership
