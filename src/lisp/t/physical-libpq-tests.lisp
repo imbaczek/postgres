@@ -240,6 +240,25 @@
           :owner (pg::physical-libpq-frozen-profile-datum
                   (pg::make-physical-libpq-frozen-profile info)))))
 
+(deftest physical-libpq-replay-only-preserves-disabled-binding-and-frozen-owner
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((base (pg::physical-recovery-verify-base-state))
+              (source (libpq-test-source "replay-owner-marker" 5433))
+              (state (append (follow-controller-test-state :enabled nil)
+                             (list :source source)))
+              (pending (pg::physical-follow-with-controller
+                        (follow-pending-proof-config-for-store store base) state)))
+         (pg::physical-follow-save-config pending)
+         (let ((active (call-with-promotion-exclusion
+                        (lambda () (pg::physical-follow-reconcile-pending-store store base pending)))))
+           (check-replay-only-test-launch active t)
+           (ok (equal source (pg::physical-follow-config-source
+                              (pg::physical-follow-read-config)))))))
+     :system-id 42))
+
 (deftest physical-follow-first-attachment-keeps-frozen-owner-separate-from-unowned-backup
     (call-with-promotion-fixture
      (lambda (root store)

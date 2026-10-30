@@ -102,21 +102,24 @@ The caller excludes concurrent mutation and protects the selected store."
          (list *last-replay-lsn* (physical-recovery-replay-timeline))))))
 
 (defun physical-follow-launch-replay-only (config)
-  "Validate an unattached standby and start replay without a receiver.
+  "Validate disabled standby state and start replay without a receiver.
 The caller holds the command mutex outside admission; validation also takes
 reload exclusion and live-operation quiescence."
   (check-physical-recovery-worker-start)
   (physical-follow-check-config config)
-  (unless (and (physical-follow-unattached-p config)
+  (unless (and (not (physical-follow-cleanup-only-p config))
+               (not (physical-follow-controller-enabled-p config))
+               (not (getf (physical-follow-controller-state config) :preparing))
+               (or (null (fifth config)) (eq :active (getf (fifth config) :phase)))
                (recovery-in-progress-p) *physical-receive-store*
                (eql 2 (getf *physical-recovery-state* :phase))
                (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*))
-    (error "replay-only launch requires an unattached streaming standby"))
+    (error "replay-only launch requires reconciled disabled streaming recovery"))
   (sb-thread:with-mutex (*reload-run-lock*)
     (with-live-operation-quiescence
       (unless (equal config (physical-follow-read-config))
-        (error "unattached configuration changed before replay launch"))
+        (error "follow configuration changed before replay-only launch"))
       (physical-follow-check-unowned-bootstrap-base config (physical-recovery-verify-base-state))
       (physical-follow-controller-check-current config)))
   (physical-follow-launch-workers config nil))

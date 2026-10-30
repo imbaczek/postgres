@@ -507,39 +507,110 @@
            (ok (signals (pg::physical-follow-check-unowned-bootstrap-base bad base) 'error)))))
      :system-id 42))
 
+(defun check-replay-only-test-launch (config paused)
+  (let ((pg::*physical-replay-paused-p* paused)
+        (original (symbol-function 'pg::physical-follow-replay-loop)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'pg::physical-follow-replay-loop)
+                 (lambda (runtime)
+                   (loop until (pg::physical-follow-runtime-stopped-p runtime)
+                         do (sleep 0.005))))
+           (pg::physical-follow-controller-save-config config)
+           (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+             (ok (eq :started (pg::physical-follow-launch-replay-only config)))
+             (let ((runtime pg::*physical-follow-runtime*))
+               (ok runtime)
+               (ok (not (pg::physical-follow-controller-enabled-p config)))
+               (ok (equal config (pg::physical-follow-read-config)))
+               (ok (equal config (pg::physical-follow-runtime-config runtime)))
+               (ok (null (pg::physical-follow-runtime-receiver-thread runtime)))
+               (ok (null (pg::physical-follow-runtime-client runtime)))
+               (ok (pg::physical-follow-runtime-receiver-stopped-p runtime))
+               (ok (not (pg::physical-follow-runtime-stopped-p runtime)))
+               (ok (sb-thread:thread-alive-p (pg::physical-follow-runtime-replay-thread runtime)))
+               (ok (eql paused pg::*physical-replay-paused-p*)))
+             (ok (intake-fails-p
+                  (lambda () (pg::physical-follow-launch-replay-only config))))))
+      (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
+        (pg::physical-follow-quiesce-runtime))
+      (setf (symbol-function 'pg::physical-follow-replay-loop) original))))
+
 (deftest follow-unattached-launches-only-replay-and-preserves-pause
     (dolist (paused '(nil t))
       (call-with-promotion-fixture
        (lambda (root store)
          (declare (ignore root store))
          (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
-         (let* ((config (pg::physical-follow-unattached-config-for-base
-                         (pg::physical-recovery-verify-base-state)))
-                (pg::*physical-replay-paused-p* paused)
-                (original (symbol-function 'pg::physical-follow-replay-loop)))
-           (unwind-protect
-                (progn
-                  (setf (symbol-function 'pg::physical-follow-replay-loop)
-                        (lambda (runtime)
-                          (loop until (pg::physical-follow-runtime-stopped-p runtime)
-                                do (sleep 0.005))))
+         (check-replay-only-test-launch
+          (pg::physical-follow-unattached-config-for-base
+           (pg::physical-recovery-verify-base-state)) paused))
+       :system-id 42)))
+
+(deftest follow-disabled-source-launches-only-replay-and-preserves-proof
+    (dolist (paused '(nil t))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root))
+         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+         (let* ((base (pg::physical-recovery-verify-base-state))
+                (pending (pg::physical-follow-with-controller
+                          (follow-pending-proof-config-for-store store base)
+                          (follow-controller-test-state :enabled nil))))
+           (pg::physical-follow-save-config pending)
+           (check-replay-only-test-launch
+            (call-with-promotion-exclusion
+             (lambda () (pg::physical-follow-reconcile-pending-store store base pending)))
+            paused)))
+       :system-id 42)))
+
+(deftest follow-disabled-bootstrap-launches-only-replay-without-losing-source
+    (dolist (paused '(nil t))
+      (call-with-promotion-fixture
+       (lambda (root store)
+         (declare (ignore root store))
+         (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+         (check-replay-only-test-launch
+          (pg::physical-follow-with-controller
+           '(1 "127.0.0.1" 5432 "accepted_bootstrap")
+           (follow-controller-test-state :enabled nil)) paused))
+       :system-id 42)))
+
+(deftest follow-replay-only-rejects-enabled-unresolved-and-primary-cleanup-states
+    (call-with-promotion-fixture
+     (lambda (root store)
+       (declare (ignore root))
+       (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+       (let* ((base (pg::physical-recovery-verify-base-state))
+              (pending (pg::physical-follow-with-controller
+                        (follow-pending-proof-config-for-store store base)
+                        (follow-controller-test-state :enabled nil)))
+              (enabled (pg::physical-follow-with-controller
+                        '(1 "127.0.0.1" 5432 "accepted_bootstrap")
+                        (follow-controller-test-state)))
+              (preparing (pg::physical-follow-with-controller
+                          '(1 "127.0.0.1" 5432 "accepted_bootstrap")
+                          (follow-controller-test-state
+                           :enabled nil :preparing (follow-controller-test-entry))))
+              (primary (pg::physical-follow-check-config
+                        (list 1 nil nil nil nil (follow-controller-test-state :enabled nil))))
+              (launch (symbol-function 'pg::physical-follow-launch-workers))
+              (calls 0))
+         (unwind-protect
+              (progn
+                (setf (symbol-function 'pg::physical-follow-launch-workers)
+                      (lambda (config receive-p)
+                        (declare (ignore config receive-p)) (incf calls) :started))
+                (dolist (config (list enabled pending preparing primary))
                   (pg::physical-follow-controller-save-config config)
                   (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
-                    (ok (eq :started (pg::physical-follow-launch-replay-only config)))
-                    (let ((runtime pg::*physical-follow-runtime*))
-                      (ok runtime)
-                      (ok (null (pg::physical-follow-runtime-receiver-thread runtime)))
-                      (ok (null (pg::physical-follow-runtime-client runtime)))
-                      (ok (pg::physical-follow-runtime-receiver-stopped-p runtime))
-                      (ok (not (pg::physical-follow-runtime-stopped-p runtime)))
-                      (ok (sb-thread:thread-alive-p (pg::physical-follow-runtime-replay-thread runtime)))
-                      (ok (eql paused pg::*physical-replay-paused-p*)))
                     (ok (intake-fails-p
-                         (lambda () (pg::physical-follow-launch-replay-only config))))))
-             (sb-thread:with-mutex (pg::*physical-follow-command-lock*)
-               (pg::physical-follow-quiesce-runtime))
-             (setf (symbol-function 'pg::physical-follow-replay-loop) original))))
-       :system-id 42)))
+                         (lambda () (pg::physical-follow-launch-replay-only config)))))
+                  (ok (equal config (pg::physical-follow-read-config)))
+                  (ok (null pg::*physical-follow-runtime*)))
+                (ok (zerop calls)))
+           (setf (symbol-function 'pg::physical-follow-launch-workers) launch))))
+     :system-id 42))
 
 (deftest follow-unattached-autostart-resumes-replay-without-a-receiver
     (dolist (paused '(nil t))
