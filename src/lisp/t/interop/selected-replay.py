@@ -2,6 +2,7 @@
 import os
 import runpy
 import signal
+import socket
 import shutil
 import stat
 import subprocess
@@ -100,11 +101,18 @@ def start_peer(directory=None, port=None, socket_name="sibling.sock", log_name="
                             for c in owner.net_connections(kind="unix")))
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             return False
-    wait(ready)
-    assert int((directory / "postmaster.pid").read_text().splitlines()[0]) == process.pid
-    node = (root / socket_name).lstat()
-    assert stat.S_ISSOCK(node.st_mode)
-    return process, (node.st_dev, node.st_ino)
+    try:
+        wait(ready)
+        assert int((directory / "postmaster.pid").read_text().splitlines()[0]) == process.pid
+        node = (root / socket_name).lstat()
+        assert stat.S_ISSOCK(node.st_mode)
+        return process, (node.st_dev, node.st_ino)
+    except BaseException:
+        # This Popen child has not been reaped, so its PID cannot be reused.
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+        raise
 
 
 def stop_peer(process, socket_identity, crash=False):
@@ -247,6 +255,27 @@ def exercise_same_timeline(upstream, sibling, port, timeline, count, other=None)
     print(f"follow-controller: same-timeline {timeline} retarget preserves selection and streams new WAL PASS", flush=True)
 
 
+def exercise_first_attachment(peer, socket_identity, sibling):
+    assert not (data / "physical-follow.control").exists()
+    with socket.socket() as unavailable:
+        unavailable.bind(("127.0.0.1", 0))
+        port = unavailable.getsockname()[1]
+        control("sibling.sock", retarget_form(port, "first_unavailable"), expect_error=True)
+    control("sibling.sock", '(let ((config (physical-follow-read-config)) (runtime *physical-follow-runtime*)) (assert (physical-follow-unattached-p config)) (assert (equal "sibling_seed" (getf (getf (sixth config) :unowned-bootstrap) :pin))) (assert (null (getf (sixth config) :source))) (assert runtime) (assert (null (physical-follow-runtime-receiver-thread runtime))) (assert (sb-thread:thread-alive-p (physical-follow-runtime-replay-thread runtime))))')
+    saved = (data / "physical-follow.control").read_bytes()
+    sibling.close()
+    assert stop_peer(peer, socket_identity, crash=True) == -signal.SIGKILL
+    peer, socket_identity = start_peer()
+    sibling = connect(replica_port)
+    assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(True, 1)]
+    assert saved == (data / "physical-follow.control").read_bytes()
+    control("sibling.sock", '(assert (and *physical-follow-runtime* (null (physical-follow-runtime-receiver-thread *physical-follow-runtime*)) (sb-thread:thread-alive-p (physical-follow-runtime-replay-thread *physical-follow-runtime*))))')
+    control("sibling.sock", retarget_form(source_port, "first_attach"))
+    control("sibling.sock", '(let* ((config (physical-follow-read-config)) (state (sixth config))) (assert (eq :active (getf (fifth config) :phase))) (assert (null (getf state :mode))) (assert (null (getf state :cleanup))) (assert (equal "sibling_seed" (getf (getf state :unowned-bootstrap) :pin))))')
+    print("follow-controller: unavailable first source, unattached SIGKILL restart, public first attachment PASS", flush=True)
+    return peer, socket_identity, sibling
+
+
 def exercise_controller(promoted, sibling):
     control("sibling.sock", '(defparameter *controller-original-runtime* *physical-follow-runtime*)')
     control("sibling.sock", retarget_form(1, 'unreachable'), expect_error=True)
@@ -299,12 +328,11 @@ def exercise_receiver_only_stop(promoted, sibling):
 def exercise_controller_parent_catchup():
     directory = root / "controller-lagging"
     process, identity = start_peer(directory, replica_port + 1, "lagging.sock", "lagging.log")
-    connection = connect(replica_port + 1)
+    connection = None
     try:
-        control("lagging.sock", retarget_form(promoted_port, 'too_early'), expect_error=True)
+        connection = connect(replica_port + 1)
+        assert not (directory / "physical-follow.control").exists()
         control("lagging.sock", '(assert (not *physical-recovery-failed-p*))')
-        control("lagging.sock", '(physical-recovery-enable-streaming)')
-        control("lagging.sock", f'(physical-follow-save-config (list 1 "127.0.0.1" {source_port} "controller_lag_seed"))')
         control("lagging.sock", '(defparameter *controller-attempts* nil)')
         control("lagging.sock", '(setf *physical-follow-test-hook* (lambda (point) (when (eq point :after-controller-proof) (let ((entry (getf (sixth (physical-follow-read-config)) :preparing))) (push (list (getf entry :pin) (getf (getf entry :request) :receive-lsn)) *controller-attempts*)))))')
         control("lagging.sock", retarget_form(promoted_port, 'catchup'))
@@ -313,10 +341,12 @@ def exercise_controller_parent_catchup():
         control("lagging.sock", '(assert (not (equal (first (first *controller-attempts*)) (first (second *controller-attempts*)))))')
         control("lagging.sock", '(assert (< (second (second *controller-attempts*)) (second (first *controller-attempts*))))')
         control("lagging.sock", '(assert (and (= 2 (physical-recovery-replay-timeline)) (not *physical-recovery-failed-p*)))')
+        control("lagging.sock", '(assert (equal "controller_lag_seed" (getf (getf (sixth (physical-follow-read-config)) :unowned-bootstrap) :pin)))')
         wait(lambda: ':CLEANUP-COUNT 0' in control("lagging.sock", '(physical-follow-controller-status)'))
         print("follow-controller: lagging parent CopyDone and automatic fresh-pin child handoff PASS", flush=True)
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
         stop_peer(process, identity)
 
 
@@ -333,7 +363,11 @@ try:
     peer, socket_identity = start_peer()
     source, promoted, sibling = [connect(p) for p in (source_port, promoted_port, replica_port)]
     connections.extend((source, promoted, sibling))
-    control("sibling.sock", f'(physical-follow-start "127.0.0.1" {source_port} "sibling_seed")')
+    if os.environ.get("FOLLOW_FIRST_ATTACH") == "1":
+        peer, socket_identity, sibling = exercise_first_attachment(peer, socket_identity, sibling)
+        connections.append(sibling)
+    else:
+        control("sibling.sock", f'(physical-follow-start "127.0.0.1" {source_port} "sibling_seed")')
     query(source, "INSERT INTO promotion_sql_items VALUES (2,'shared-parent')")
     parent_end = query(source, "SELECT pg_current_wal_flush_lsn()")[0][0]
     for connection in (promoted, sibling):
