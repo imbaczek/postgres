@@ -78,12 +78,12 @@ strict compile (`/tmp/pg-configured-follow-final2-compile.log`). Process-kill te
 do not establish power-loss behavior.
 
 This completes the native configured-source path, not the complete pinned
-Patroni interface. The unchanged full writer oracle still identifies 13 missing
-settings, listed in TODO.md. Its next resource milestone must implement shared
-lock-object and owner admission before accepting `max_locks_per_transaction`.
+Patroni interface. Twelve writer settings remain unsupported, as listed in TODO.md;
+the complete writer oracle is unchanged. Shared lock-object and owner admission
+now enforces capacity sized by `max_locks_per_transaction`.
 C sizes shared capacity from that value and backend/prepared-transaction counts;
 it does not cap each transaction at that number. Native resource requirements
-also need durable source reporting and standby checks, following C's
+also have durable source reporting and standby checks, following C's
 `XLogReportParameters` and `CheckRequiredParameterValues`. Real
 `Postgresql.follow` acceptance remains separate from the writer metadata oracle.
 Archive recovery, rejoin/reseed, synchronous durability and coordination remain
@@ -108,10 +108,10 @@ masked. Cancellation and nonlocal exits remove reservations; existing transactio
 or scope cleanup still owns granted resources. Acquiring the reservation mutex
 remains interruptible.
 
-This remains an internal foundation. Limits are unbounded in normal startup, and
-`max_locks_per_transaction` is not registered. Startup sizing and durable source
-resource requirements must precede production enforcement. Native counts also do
-not reproduce C's fast-path storage or every C lock tag.
+Normal startup installs finite limits from the active resource settings.
+`max_locks_per_transaction` is registered, and durable source requirements are
+checked before hot-standby admission. Native counts do not reproduce C's
+fast-path storage or every C lock tag.
 
 Validation passed all 661 unit Rove tests, 20 resource tests including 400
 generated cases at seed 42, 10 physical reader/cleanup tests and a fresh strict
@@ -199,15 +199,14 @@ preserves that tuple after checkpoint/restart.
 
 Logical decoding, catalog-history validation and logical-slot resume checks share
 the empty-metadata validator. They reject malformed or mixed parameter batches
-without publishing resource facts. The concurrent row-replay path keeps a parameter
-change as a barrier. Standby applied progress and its resource tuple still need to
-be persisted together in replay and restartpoint seeds before reader admission can
-use them.
+without publishing resource facts. The reader-safe replay path accepts a strictly
+validated empty parameter batch and publishes its fact with applied progress.
+Replay, restartpoint seeds and durable required positions keep separate facts.
 
-This reporter is not called automatically at startup yet. Startup sizing, truthful
-installed capacity, resource floors and the online insufficient-resource pause
-remain prerequisites. The crash script invokes the internal API on an isolated
-server; its supplied tuples do not install resource limits.
+Ordinary startup and child-primary completion report installed capacity before
+production readiness. Source floors and the online resource pause protect standby
+admission. The crash script also invokes the internal API on an isolated server;
+its supplied tuples do not install resource limits.
 
 Validation passed 676 unit tests and 1,207 physical tests. After the final resume
 and cancellation fixes, 157 related physical tests and all 676 unit tests passed.
@@ -262,8 +261,9 @@ change the tuple without changing the deterministic checkpoint's retry bytes.
 
 Cold startup now installs finite relation-object and owner limits together with
 the local tuple. Connections and senders use their active startup settings;
-workers, prepared transactions and locks use internal values 8, 0 and 64. These
-three public GUCs remain unregistered. Hot-standby admission requires a known,
+workers and prepared transactions use internal values 8 and 0. Their public GUCs
+remain unregistered. Locks use the active `max_locks_per_transaction`, whose
+default is 128 and range is 10 through INT_MAX. Hot-standby admission requires a known,
 adequate fact after reconstruction reaches the required replay boundary.
 `hot_standby=off` permits recovery with unknown facts and continues to reject SQL
 startup.
@@ -282,6 +282,16 @@ and UNKNOWN/OFF recovery. `t/promotion-online.sh` with `RESOURCE_FACTS=1` checks
 frozen parent checkpoint and the new local child report through crash/restart.
 The reporter SIGKILL test independently decodes WAL to check that the crashed
 report remains durable and precedes the new installed-capacity report.
+
+The public lock setting retains the active value, installed tuple and pool sizes
+on reload while exposing `pending_restart`. Restart installs and reports the new
+value. The signed integer parser separately uses libc's C23 entry point when
+available, with the classic signed converter as fallback; unsigned timeline
+parsing is unchanged. This passed 89 related tests, 200 signed int32 property
+trials with seed 42 and no rejections, C/native metadata comparisons including
+binary prefixes and malformed inputs, and fresh strict compilation. Owned tests
+also cover lock-setting reload/restart/reporting, reporter SIGKILL recovery and
+promotion with the new default.
 
 The recovery propagation milestone passed 1,232 physical tests, followed by 102
 focused tests after the final historical-witness check. The external unit runner

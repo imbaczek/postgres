@@ -7,17 +7,18 @@
   remains unsupported; coordination is outside this scope.
 
 - [ ] Complete the pinned Patroni writer and real `Postgresql.follow` acceptance.
-  Its current complete writer snapshots contain 13 unsupported settings:
-  `max_locks_per_transaction`, `max_prepared_transactions`,
+  Its current complete writer snapshots contain 12 unsupported settings:
+  `max_prepared_transactions`,
   `max_worker_processes`, `track_commit_timestamp`, `wal_level`, `wal_log_hints`,
   `hba_file`, `ident_file`, `recovery_target`, `recovery_target_lsn`,
   `recovery_target_name`, `recovery_target_time` and `recovery_target_xid`.
   Keep the complete writer oracle unchanged. Internal checks now derive shared
   relation-object and owner counts from published registrations and waiting
   requests. Cold startup installs a finite shared object/owner pool together with
-  the local resource tuple. Workers, prepared transactions and locks still use
-  internal values 8, 0 and 64; their public GUCs remain unregistered. Next expose
-  those settings with supported semantics and preserve pending-restart behavior.
+  the local resource tuple. `max_locks_per_transaction` now controls sizing and
+  reporting, with default 128 and changes pending until restart. Workers and
+  prepared transactions still use internal values 8 and 0. Next expose their
+  settings with supported semantics and preserve pending-restart behavior.
   C sizes a shared pool, not a per-transaction limit.
   Preserve atomic multi-relation admission, repeated
   acquisition, abort/cancellation/disconnect and virtual-reader cleanup.
@@ -47,9 +48,10 @@
   refuses promotion and shuts down on resume. Owned tests cover direct pauses,
   insufficiency discovered during promotion backlog replay, and adequate restart.
 
-- [ ] Fix signed integer GUC parsing for C23 binary prefixes independently of
-  the unsigned recovery timeline parser. C reports `100` for
-  `max_connections=0b1100100`; the Lisp normalizer reports an invalid unit.
+- [x] Fix signed integer GUC parsing for C23 binary prefixes independently of
+  the unsigned recovery timeline parser. The signed converter uses C23 strtol
+  when available and clears errno after symbol lookup. C/native metadata tests
+  cover signs, units and malformed forms; 200 generated int32 cases pass.
 
 - [ ] After implementation, tests and code reviews are complete, document modules,
   functions and structures in the style of the original C source. Use simple,

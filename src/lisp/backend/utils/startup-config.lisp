@@ -82,6 +82,9 @@ rounding do not apply."
                    timeline))))))))
 
 (defun startup-integer-number (begin end)
+  "Parse a signed base-zero integer using C23 strtol when available, otherwise strtol.
+Clear errno after symbol lookup so lookup errors do not contaminate conversion.
+Recovery timeline parsing uses its separate unsigned conversion."
   (let ((address (sb-sys:find-foreign-symbol-address "__isoc23_strtol")))
     (setf (sb-alien:deref (startup-errno-location)) 0)
     (if address
@@ -93,7 +96,9 @@ rounding do not apply."
         (startup-strtol begin end 0))))
 
 (defun startup-numeric-prefix (text)
-  "Use the same C numeric conversions as guc.c:parse_int, without Lisp READ."
+  "Use C numeric conversions as in guc.c:parse_int, without Lisp READ.
+Try the signed integer path first; overflow or a fractional or exponent suffix
+uses strtod. Return the remaining unit for the caller's conversion and rounding."
   (when (find (code-char 0) text) (error "NUL in configuration value"))
   (let ((bytes (concatenate '(vector (unsigned-byte 8)) (string->bytes text) #(0))))
     (sb-sys:with-pinned-objects (bytes)
@@ -558,7 +563,9 @@ A reload may record a different desired value, but does not change this goal."
 
 (defun startup-resource-capacity-plan (settings)
   "Plan the installed tuple and relation lock capacities from startup settings.
-Worker processes and prepared transactions currently use internal values 8 and 0."
+Connections, WAL senders and locks per transaction use active settings; worker
+processes and prepared transactions use internal values 8 and 0. The lock setting
+has default 128 and range 10 through INT_MAX, and requires a restart to change."
   (let ((parameters (make-resource-parameters
                      (startup-setting-value settings "max_connections") 8
                      (startup-setting-value settings "max_wal_senders") 0

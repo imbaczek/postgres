@@ -293,7 +293,8 @@ These identities never enter the real active-XID set, CLOG or WAL.")
 
 (defvar *relation-lock-object-limit* nil
   "Private object cap, or NIL before startup installs the relation limits.
-The current startup plan uses an internal fixed locks-per-transaction value.")
+Startup sizes this shared pool from the active max_locks_per_transaction setting;
+a pending change leaves the installed pool in use until restart.")
 
 (defvar *relation-lock-owner-limit* nil
   "Private relation-owner pair cap, or NIL for no limit; see object cap.")
