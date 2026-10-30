@@ -481,6 +481,7 @@ object remains the operation's authority until completion or cancellation."
   client)
 
 (defun physical-follow-operation-connect (operation)
+  "Connect the requested source and register its client for cancellation."
   (let ((client nil) (accepted nil)
                      (profile (getf (physical-follow-operation-context operation) :requested-profile)))
     (unwind-protect

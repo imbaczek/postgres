@@ -868,6 +868,7 @@ state. An active result still requires startup validation before workers launch.
               (physical-store-close store))))))))
 
 (defun physical-follow-check-config (config)
+  "Validate follow state, including private source and cleanup ownership."
   (unless (and (listp config) (member (length config) '(4 5 6)) (eql 1 (first config)))
     (error "invalid native physical follow configuration"))
   (unless (physical-follow-no-source-p config)

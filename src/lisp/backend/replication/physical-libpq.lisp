@@ -39,7 +39,8 @@
             (:conc-name %physical-libpq-profile-)
             (:print-function physical-libpq-print-private-object))
   "Copied connection settings; printing the profile does not expose secrets.
-FALLBACK supplies libpq's fallback application name. Libpq resolves service and
+CONNINFO is copied as a string or as raw octets. FALLBACK supplies libpq's
+fallback application name. Libpq resolves service and
 environment settings for each connection attempt. Effective multihost connections
 are unsupported by the helper."
   (conninfo "" :type (or string (vector (unsigned-byte 8))) :read-only t)
@@ -51,6 +52,9 @@ are unsupported by the helper."
     (if (and name (plusp (length name))) name "walreceiver")))
 
 (defun make-physical-libpq-profile (conninfo &key (fallback (physical-libpq-default-fallback)))
+  "Copy settings and reject NULs or a helper open body over 1 MiB.
+The bound includes both encoded values and their length fields. Errors are
+opaque because the supplied settings may contain credentials."
   (unless (and (typep conninfo '(or string (vector (unsigned-byte 8)))) (stringp fallback))
     (error "invalid libpq connection profile"))
   (let ((conninfo-size (length conninfo)) (fallback-size (length fallback)))
@@ -70,9 +74,11 @@ are unsupported by the helper."
       (error () (error "invalid libpq connection profile")))))
 
 (defun physical-libpq-profile-conninfo (profile)
+  "Return a copy in the original string or octet representation."
   (copy-seq (%physical-libpq-profile-conninfo profile)))
 
 (defun physical-libpq-profile-conninfo-octets (profile)
+  "Return copied raw octets, encoding a legacy string with STRING->BYTES."
   (let ((conninfo (%physical-libpq-profile-conninfo profile)))
     (etypecase conninfo
       (string (string->bytes conninfo))
@@ -161,6 +167,7 @@ are unsupported by the helper."
   payload)
 
 (defun physical-libpq-octets-datum (bytes)
+  "Encode bytes as lowercase hex for private durable metadata, not encryption."
   (when bytes
     (list :bytes
           (let ((text (make-string (* 2 (length bytes))))
@@ -171,6 +178,7 @@ are unsupported by the helper."
             text))))
 
 (defun physical-libpq-check-byte-datum (datum &optional (maximum 16384))
+  "Check canonical hex and its byte bound; frozen options default to 16 KiB."
   (when datum
     (unless (and (consp datum) (eq (first datum) :bytes)
                  (consp (cdr datum)) (null (cddr datum)) (stringp (second datum))
@@ -203,6 +211,7 @@ are unsupported by the helper."
   datum)
 
 (defun physical-libpq-datum-octets (datum &optional (maximum 16384))
+  "Decode checked canonical hex without changing its bytes."
   (physical-libpq-check-byte-datum datum maximum)
   (when datum
     (let* ((text (second datum))
@@ -214,10 +223,12 @@ are unsupported by the helper."
       bytes)))
 
 (defun physical-libpq-profile-conninfo-datum (profile)
+  "Keep legacy strings and encode raw conninfo as private byte metadata."
   (let ((conninfo (%physical-libpq-profile-conninfo profile)))
     (if (stringp conninfo) (copy-seq conninfo) (physical-libpq-octets-datum conninfo))))
 
 (defun physical-libpq-profile-from-conninfo-datum (datum fallback)
+  "Restore either legacy string or raw byte conninfo and validate the profile."
   (make-physical-libpq-profile
    (if (stringp datum) datum (physical-libpq-datum-octets datum 1048576))
    :fallback fallback))

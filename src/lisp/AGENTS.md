@@ -176,6 +176,9 @@ appropriate instead of replacing the native C peer or adding a message relay.
 
 ### Reader and test-discovery checks
 
+- Run the full physical package with `rove:run-suite :pg-physical-tests` in a
+  tracked background thread and verify the actual test count. `rove:run` on
+  the system found zero tests in this worker despite reporting success.
 - Use cl-mcp structural edits for Lisp. A rejected patch that would add an extra
   closing parenthesis leaves the source intact; correct the patch rather than
   bypassing that guard.
@@ -452,6 +455,9 @@ this mode.
 
 ### Startup and timeout debugging
 
+- Special control dispatch requires literal arguments. A computed raw conninfo
+  retarget goes through ordinary admission; schedule it on an owned worker and
+  do not join that worker while holding admission.
 - Lifecycle entrypoints use top-level special dispatch in the control REPL to
   bypass ordinary live admission. Wrapping retarget in `handler-case` loses that
   exemption and reports `requires own operation admission`. To assert an expected

@@ -14,6 +14,7 @@
     (error "invalid native physical follow endpoint")))
 
 (defun physical-follow-source-copy (source)
+  "Validate and copy private source settings and the frozen cleanup owner."
   (physical-follow-check-plist source '(:conninfo :fallback :owner))
   (let* ((profile (physical-libpq-profile-from-conninfo-datum
                    (getf source :conninfo) (getf source :fallback)))

@@ -784,6 +784,14 @@ setting on reload remain pending restart. Owned raw and libpq tests cover cold
 startup, reload and promotion; conninfo and slot desired-generation reconciliation
 and full Patroni follow remain open.
 
+The private libpq follow API now accepts raw conninfo octets as well as legacy
+strings. Raw bytes survive durable metadata and reconnect; lowercase hex is a
+lossless representation, not encryption. The full physical suite passed 1160
+tests, strict fresh compilation passed, and owned libpq experiments passed for
+raw and legacy first attachment, retained timeline follow and cold restart.
+This does not implement the standard `primary_conninfo` GUC; the helper still
+uses `replication=database`, so physical replication mode parity remains open.
+
 The native `-C` metadata path now prints supported static settings using
 configuration precedence and base units before storage ownership or listener
 startup, provided the data directory exists. The CLI oracle passes five C
