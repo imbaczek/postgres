@@ -637,10 +637,13 @@ Take the relation lock before the XID lock, as in transaction cleanup."
 (defun backend-xid-wrap-resource-free-p (backend)
   "Return true if BACKEND holds no resource that wraparound must drain.
 
-Both wraparound waiting and coordinator selection use this test."
+Both wraparound waiting and coordinator selection use this test.  A backend
+holding a portal snapshot must be allowed to run so it can release its pin."
   (and (null (backend-xid backend))
        (null (backend-virtual-reader-xid backend))
-       (null (backend-transaction-snapshot backend))))
+       (null (backend-transaction-snapshot backend))
+       (not (and (fboundp 'extended-backend-holds-snapshot-p)
+                 (funcall 'extended-backend-holds-snapshot-p backend)))))
 
 (defun wait-for-xid-wraparound (backend &optional ready-function)
   (loop
@@ -1962,7 +1965,12 @@ READ WRITE outside recovery."
       (and backend (not (eq (backend-state backend) :idle))
            (backend-read-only backend))))
 
+(defvar *statement-snapshot-override* nil
+  "The Bind-time SELECT snapshot to use for this portal's Execute.")
+
 (defun statement-start (registration)
+  "Start a statement and register its snapshot in REGISTRATION.
+A portal override retains the Bind-time horizon and command ID for Execute."
   (let ((b *backend*))
     (when (eq (backend-state b) :aborted)
       (ereport "25P02"
@@ -1977,11 +1985,15 @@ READ WRITE outside recovery."
     (when (recovery-in-progress-p)
       (ensure-recovery-reader-identity b))
     (incf (backend-command-id b))
-    (let ((snap (if (eq (backend-isolation-level b) :repeatable-read)
-                    (begin-transaction-snapshot
-                     b (backend-command-id b) registration)
-                    (begin-statement-snapshot b (backend-command-id b)
-                                              registration))))
+    (let ((snap (cond
+                  (*statement-snapshot-override*
+                   (let ((snapshot (copy-snapshot *statement-snapshot-override*)))
+                     (sb-thread:with-mutex (*xid-lock*)
+                       (register-active-snapshot snapshot registration))
+                     snapshot))
+                  ((eq (backend-isolation-level b) :repeatable-read)
+                   (begin-transaction-snapshot b (backend-command-id b) registration))
+                  (t (begin-statement-snapshot b (backend-command-id b) registration)))))
       (setf (backend-first-snapshot-set b) t)
       (setf (backend-snapshot b) snap)
       snap)))

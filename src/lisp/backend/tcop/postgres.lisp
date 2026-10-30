@@ -473,7 +473,7 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
               (note-query-error)
               (setf (extended-query-state-statement-deadline state) nil
                     (extended-query-state-executed-in-cycle-p state) nil)
-              (clrhash (extended-query-state-portals state))
+              (extended-clear-portals state)
               (when implicit
                 (unless (eq (backend-state *backend*) :idle) (abort-transaction))
                 (restore-session-settings stream))
@@ -489,7 +489,7 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
               (note-query-error)
               (setf (extended-query-state-statement-deadline state) nil
                     (extended-query-state-executed-in-cycle-p state) nil)
-              (clrhash (extended-query-state-portals state))
+              (extended-clear-portals state)
               (when implicit
                 (unless (eq (backend-state *backend*) :idle) (abort-transaction))
                 (restore-session-settings stream))
