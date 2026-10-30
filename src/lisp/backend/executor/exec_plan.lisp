@@ -2254,23 +2254,25 @@ Compare the advertised column shape, independently of result format codes."
       (unless complete (ignore-errors (close stream :abort t))))))
 
 (defun copy-text-field (text output)
+  "Append a text COPY field to an octet payload.
+Escape control bytes and backslashes, preserving all other bytes unchanged."
   (if (null text)
-      (write-string "\\N" output)
-      (loop for character across text
-            for code = (char-code character)
+      (payload-push output (string->bytes "\\N"))
+      (loop for code across (if (stringp text) (string->bytes text) text)
             for escaped = (case code
-                            (8 #\b) (9 #\t) (10 #\n) (11 #\v) (12 #\f) (13 #\r) (92 #\\))
+                            (8 98) (9 116) (10 110) (11 118) (12 102) (13 114) (92 92))
             do (when (zerop code) (ereport "22021" "COPY text cannot contain a zero byte"))
-               (when escaped (write-char #\\ output))
-               (write-char (or escaped character) output))))
+               (when escaped (payload-push-byte output 92))
+               (payload-push-byte output (or escaped code)))))
 
 (defun copy-text-row (values targets)
-  (string->bytes
-   (with-output-to-string (output)
-     (loop for value across values for target in targets for index from 0
-           do (when (plusp index) (write-char #\Tab output))
-              (copy-text-field (value->text value (getf target :type)) output))
-     (write-char #\Newline output))))
+  "Build a COPY row as bytes so raw text does not pass through character encoding."
+  (let ((output (make-payload)))
+    (loop for value across values for target in targets for index from 0
+          do (when (plusp index) (payload-push-byte output 9))
+             (copy-text-field (value->text value (getf target :type)) output))
+    (payload-push-byte output 10)
+    output))
 
 (defun send-copy-out-response (stream column-count)
   (let ((payload (make-payload)))
