@@ -104,40 +104,28 @@ Lisp path also limits the reservoir's retained shallow-copy payload to 4 MiB."
           (setf (aref sample slot) (copy-seq row)))))
   sample)
 
-(defun analyze-sample-visible-rows (table relfilenode snapshot)
-  "Count visible rows exactly and retain a bounded reservoir sample.
+(defconstant +analyze-wide-value+ :analyze-wide-value
+  "Marker for a non-NULL datum exceeding PostgreSQL's ANALYZE width cutoff.")
 
-This follows PostgreSQL's analyze.c:acquire_sample_rows shape: a streaming heap
-scan with reservoir replacement, so early pages do not dominate the sample.
-Rows are copied only while both the 300-row and 4 MiB retained-object budgets
-allow them. Reservoir capacity shrinks uniformly when wider rows reduce the
-number of samples that fit; the raw rows are not persisted. Unlike PostgreSQL's
-compute_distinct_stats, which skips only a too-wide datum, this path excludes
-an entire row when its estimated copy exceeds 4 MiB. That can bias statistics
-for every column. The limit estimates retained sample storage; it is not an
-exact SBCL heap cap and does not include transient decode allocations."
+(defun analyze-sample-visible-rows (table relfilenode snapshot)
+  "Count visible rows and retain an owned bounded physical tuple reservoir."
+  (declare (ignore table))
   (let ((row-count 0)
-        (eligible-row-count 0)
-        (maximum-row-bytes 0)
-        (sample-capacity +analyze-sample-size+)
-        (sample (make-array +analyze-sample-size+
-                            :adjustable t :fill-pointer 0)))
-    (heapam-scan relfilenode (pg-class-columns table) snapshot
-                 (lambda (tuple)
-                   (incf row-count)
-                   (materialize-select-tuple table tuple snapshot)
-                   (let* ((values (htup-values tuple))
-                          (row-bytes (analyze-row-memory-estimate values)))
-                     (when (<= row-bytes +analyze-sample-memory-bytes+)
-                       (setf maximum-row-bytes (max maximum-row-bytes row-bytes))
-                       (let ((new-capacity
-                               (analyze-sample-capacity maximum-row-bytes)))
-                         (when (< new-capacity sample-capacity)
-                           (analyze-shrink-reservoir sample new-capacity)
-                           (setf sample-capacity new-capacity)))
-                       (incf eligible-row-count)
-                       (analyze-add-reservoir-row
-                        values eligible-row-count sample sample-capacity)))))
+        (sample (make-array +analyze-sample-size+ :adjustable t :fill-pointer 0)))
+    (dotimes (block (buf-nblocks relfilenode))
+      (check-for-interrupts)
+      (let ((page (buf-read relfilenode block)))
+        (when page
+          (do-live-page-items (page offnum off len)
+            (let ((xmin (full-xid-from-32 (page-u32 page (+ off +heap-tuple-xmin-off+))))
+                  (xmax (full-xid-from-32 (page-u32 page (+ off +heap-tuple-xmax-off+))))
+                  (cid (page-u32 page (+ off +heap-tuple-cid-off+)))
+                  (infomask (page-u16 page (+ off +heap-tuple-infomask-off+))))
+              (when (heap-tuple-visible-p xmin xmax cid snapshot
+                                          (and *backend* (backend-xid *backend*)) infomask)
+                (incf row-count)
+                (analyze-add-reservoir-row (subseq page off (+ off len))
+                                           row-count sample +analyze-sample-size+)))))))
     (values row-count (coerce sample 'vector))))
 
 (defun analyze-estimate-distinct-count (row-count sample-count observed
@@ -198,6 +186,22 @@ exact SBCL heap cap and does not include transient decode allocations."
         ((analyze-byte-vector-p value) (analyze-byte-vector-content-hash value))
         (t (sxhash value))))
 
+(defun analyze-finish-column-statistics (row-count sample-count null-count wide-count counts mcv)
+  "Finish shared NULL and distinct estimates for logical or physical samples."
+  (let* ((singletons (+ wide-count (count 1 counts :key #'cdr)))
+         (doubletons (count 2 counts :key #'cdr))
+         (nonnull (if (zerop sample-count) 0
+                      (ceiling (* row-count (- sample-count null-count)) sample-count))))
+    (make-pg-column-statistics
+     :null-fraction (if (zerop sample-count) 0.0d0
+                        (/ (float null-count 1.0d0) sample-count))
+     :distinct-count (if (and (plusp wide-count) (null counts))
+                         nonnull
+                         (min nonnull (analyze-estimate-distinct-count
+                                       row-count sample-count (+ wide-count (length counts))
+                                       singletons doubletons)))
+     :most-common-values mcv)))
+
 (defun analyze-column-statistics (sample column-index row-count
                                   &key
                                     (value-hash
@@ -210,28 +214,28 @@ values retain the existing EQUAL behavior.  VALUE-HASH permits a forced
 collision test without changing the production hash implementation."
   (let ((frequencies (make-hash-table :test #'equal))
         (values-in-order '())
-        (null-count 0))
+        (null-count 0)
+        (wide-count 0))
     (loop for row across sample
           for value = (aref row column-index)
           do (if (eq value +null+)
                  (incf null-count)
-                 (let* ((key (list (if (analyze-byte-vector-p value)
-                                       :byte-vector
-                                       :equal)
-                                   (funcall value-hash value)))
-                        (bucket (gethash key frequencies))
-                        (entry (find value bucket
-                                     :key #'car
-                                     :test #'analyze-statistics-value-equal-p)))
-                   (if entry
-                       (incf (cdr entry))
-                       (let ((new-entry (cons value 1)))
-                         (push new-entry values-in-order)
-                         (push new-entry (gethash key frequencies)))))))
+                 (if (eq value +analyze-wide-value+) (incf wide-count)
+                     (let* ((key (list (if (analyze-byte-vector-p value)
+                                           :byte-vector
+                                           :equal)
+                                       (funcall value-hash value)))
+                            (bucket (gethash key frequencies))
+                            (entry (find value bucket
+                                         :key #'car
+                                         :test #'analyze-statistics-value-equal-p)))
+                       (if entry
+                           (incf (cdr entry))
+                           (let ((new-entry (cons value 1)))
+                             (push new-entry values-in-order)
+                             (push new-entry (gethash key frequencies))))))))
     (let* ((sample-count (length sample))
            (counts (nreverse values-in-order))
-           (singletons (count 1 counts :key #'cdr))
-           (doubletons (count 2 counts :key #'cdr))
            (mcv-counts
              (stable-sort
               (remove-if-not (lambda (entry) (> (cdr entry) 1))
@@ -242,29 +246,71 @@ collision test without changing the production hash implementation."
                    for rank from 0 below +analyze-mcv-count+
                    collect (cons value (/ (float count 1.0d0)
                                           (max 1 sample-count))))))
-      (make-pg-column-statistics
-       :null-fraction (if (zerop sample-count)
-                          0.0d0
-                          (/ (float null-count 1.0d0) sample-count))
-       :distinct-count
-       (analyze-estimate-distinct-count
-        row-count sample-count (length counts) singletons doubletons)
-       :most-common-values mcv))))
+      (analyze-finish-column-statistics row-count sample-count null-count wide-count counts mcv))))
+
+(defun analyze-physical-column-value (table bytes index snapshot)
+  "Decode only INDEX from an owned sampled tuple under the parent snapshot."
+  (let* ((values (deform-heap-tuple bytes (pg-class-columns table) :demand index
+                                                                   :max-varlena-size 1024 :wide-value +analyze-wide-value+))
+         (tuple (make-htup :values values)))
+    (materialize-select-tuple table tuple snapshot :demand (cons table (list (1+ index))))
+    (aref values index)))
+
+(defun analyze-physical-column-statistics (table sample index row-count snapshot remaining
+                                           &key (value-hash #'analyze-statistics-value-hash))
+  "Count values using physical tuple references for representatives.
+REMAINING limits decoded MCV values retained across all columns."
+  (let ((buckets (make-hash-table :test #'equal))
+        (entries nil) (null-count 0) (wide-count 0))
+    (loop for bytes across sample for row-index from 0
+          for value = (analyze-physical-column-value table bytes index snapshot)
+          do (check-for-interrupts)
+             (cond ((eq value +null+) (incf null-count))
+                   ((eq value +analyze-wide-value+) (incf wide-count))
+                   (t (let* ((key (list (if (analyze-byte-vector-p value) :byte-vector :equal)
+                                        (funcall value-hash value)))
+                             (entry (find-if
+                                     (lambda (candidate)
+                                       (analyze-statistics-value-equal-p
+                                        value (analyze-physical-column-value
+                                               table (aref sample (car candidate)) index snapshot)))
+                                     (gethash key buckets))))
+                        (if entry (incf (cdr entry))
+                            (let ((new (cons row-index 1)))
+                              (push new entries)
+                              (push new (gethash key buckets))))))))
+    (let* ((count (length sample))
+           (ordered (nreverse entries))
+           (ranked (stable-sort (remove-if-not (lambda (entry) (> (cdr entry) 1)) (copy-list ordered))
+                                #'> :key #'cdr))
+           (mcv nil))
+      (loop for (row-index . frequency) in ranked for rank from 0 below +analyze-mcv-count+
+            for value = (analyze-physical-column-value table (aref sample row-index) index snapshot)
+            for size = (analyze-value-memory-estimate value)
+            when (<= size (car remaining))
+              do (decf (car remaining) size)
+                 (push (cons value (/ (float frequency 1.0d0) (max 1 count))) mcv))
+      (analyze-finish-column-statistics row-count count null-count wide-count ordered (nreverse mcv)))))
 
 (defun analyze-table-statistics (table relfilenode snapshot)
-  "Persist derived statistics after analyzing at most 300 sampled rows."
+  "Sample owned physical tuples and derive each column independently."
   (multiple-value-bind (row-count sample)
       (analyze-sample-visible-rows table relfilenode snapshot)
-    (make-pg-table-statistics
-     :row-count row-count
-     :sample-count (length sample)
-     :columns (loop for index below (length (pg-class-columns table))
-                    collect (if (eq (pg-column-type (aref (pg-class-columns table) index)) :json-array)
-                                (make-pg-column-statistics
-                                 :null-fraction (if (zerop (length sample)) 0.0d0
-                                                    (/ (float (count +null+ sample :key (lambda (row) (aref row index))) 1.0d0)
-                                                       (length sample)))
-                                 :distinct-count 0 :most-common-values nil)
-                                (analyze-column-statistics sample index row-count))
-                      into columns
-                    finally (return (coerce columns 'vector))))))
+    (let* ((columns (pg-class-columns table))
+           (statistics (make-array (length columns)))
+           (remaining (list +analyze-sample-memory-bytes+)))
+      (dotimes (index (length columns))
+        (setf (aref statistics index)
+              (if (member (pg-column-type (aref columns index)) '(:json :json-array))
+                  (let ((null-count
+                          (count-if (lambda (bytes)
+                                      (and (logtest (page-u16 bytes +heap-tuple-infomask-off+) +heap-hasnull+)
+                                           (logbitp (mod index 8)
+                                                    (aref bytes (+ +size-of-heap-tuple-header+ (floor index 8))))))
+                                    sample)))
+                    (make-pg-column-statistics
+                     :null-fraction (if (zerop (length sample)) 0.0d0
+                                        (/ (float null-count 1.0d0) (length sample)))
+                     :distinct-count 0 :most-common-values nil))
+                  (analyze-physical-column-statistics table sample index row-count snapshot remaining))))
+      (make-pg-table-statistics :row-count row-count :sample-count (length sample) :columns statistics))))

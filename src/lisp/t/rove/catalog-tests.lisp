@@ -341,6 +341,53 @@
                   3)
                "column distinct count persists through the class catalog codec")))
 
+(rove:deftest test-analyze-physical-column-width-and-distinct
+    (let* ((column (make-pg-column :name "v" :type :text))
+           (columns (vector column))
+           (table (make-pg-class :columns columns))
+           (narrow (make-string 1020 :initial-element #\a))
+           (wide (make-string 1021 :initial-element #\b))
+           (sample (map 'vector (lambda (value)
+                                  (form-heap-tuple (vector value) columns 1 0 0 0 1))
+                        (vector narrow narrow wide +null+)))
+           (stats (analyze-physical-column-statistics table sample 0 4 nil (list +analyze-sample-memory-bytes+))))
+      (rove:ok (= (pg-column-statistics-null-fraction stats) 0.25d0))
+      (rove:ok (= (pg-column-statistics-distinct-count stats) 2))
+      (rove:ok (= (cdar (pg-column-statistics-most-common-values stats)) 0.5d0))
+      (rove:ok (string= (caar (pg-column-statistics-most-common-values stats)) narrow))))
+
+(rove:deftest test-analyze-wide-external-keeps-other-column
+    (let* ((columns (vector (make-pg-column :name "id" :type :int4)
+                            (make-pg-column :name "v" :type :text)))
+           (table (make-pg-class :columns columns))
+           (pointer (make-heap-external-varlena :raw-size 1100004 :external-info 1100000
+                                                :value-id 1 :relation-id 1 :id-width 4))
+           (bytes (form-heap-tuple (vector 7 pointer) columns 1 0 0 0 1))
+           (sample (vector bytes bytes bytes))
+           (id-stats (analyze-physical-column-statistics table sample 0 3 nil (list +analyze-sample-memory-bytes+)))
+           (wide-stats (analyze-physical-column-statistics table sample 1 300000 nil (list +analyze-sample-memory-bytes+))))
+      (rove:ok (= (pg-column-statistics-distinct-count id-stats) 1))
+      (rove:ok (= (cdar (pg-column-statistics-most-common-values id-stats)) 1.0d0))
+      (rove:ok (= (pg-column-statistics-distinct-count wide-stats) 300000))
+      (rove:ok (null (pg-column-statistics-most-common-values wide-stats)))))
+
+(rove:deftest test-analyze-physical-large-array-late-majority
+    (let* ((columns (vector (make-pg-column :name "v" :type :bytea-array)))
+           (table (make-pg-class :columns columns))
+           (sample (make-array 300)))
+      (dotimes (i 300)
+        (let* ((elements (make-array 7800 :initial-element +null+))
+               (tag (if (< i 67) i 67)))
+          (setf (aref elements 0) (make-array 1 :element-type '(unsigned-byte 8) :initial-element tag))
+          (let ((array (make-sql-array :element-type-id :bytea :elements elements
+                                       :dimensions '(7800) :lower-bounds '(1))))
+            (setf (aref sample i) (form-heap-tuple (vector array) columns 1 0 0 0 1)))))
+      (let ((stats (analyze-physical-column-statistics table sample 0 300 nil
+                                                       (list +analyze-sample-memory-bytes+)
+                                                       :value-hash (constantly 1))))
+        (rove:ok (= (pg-column-statistics-distinct-count stats) 68))
+        (rove:ok (= (cdar (pg-column-statistics-most-common-values stats)) (/ 233.0d0 300))))))
+
 (rove:deftest test-analyze-byte-vector-statistics-and-planner
     (let* ((first (make-array 3 :element-type '(unsigned-byte 8)
                                 :initial-contents '(0 255 1)))

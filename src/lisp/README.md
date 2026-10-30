@@ -1465,7 +1465,10 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   uses bounded in-memory runs with external merge when needed.
 - Foreign keys and `NOT NULL`/`UNIQUE` beyond what is listed above are unsupported.
 - `ANALYZE table` scans visible heap rows to count them exactly and keeps a
-  transient reservoir capped at 300 rows and about 4 MiB. It persists row count,
+  transient reservoir of at most 300 physical tuples. It skips individual values
+  over 1024 bytes for equality statistics, keeps narrow columns from the same
+  rows, and limits retained decoded most-common values across columns to about
+  4 MiB. It persists row count,
   NULL fraction, distinct-count estimate, and up to ten most-common values per
   column; raw sample rows are not stored. These estimates feed a small cost
   model for SeqScan, single-column equality IndexScan, parameterized INNER/LEFT

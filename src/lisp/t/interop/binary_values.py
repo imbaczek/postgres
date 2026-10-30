@@ -92,6 +92,8 @@ def main(ports):
                       bind((value,), (1,)), frame(b'E', b'\0' + struct.pack('!I', 0))]
             outputs = [cycle(p, frames, with_message=True) for p in peers]
             assert outputs[0] == outputs[1] and outputs[0][0][0] == b'E', (value, outputs)
+        for p in peers:
+            assert p.query('ANALYZE binary_values') == []
         print('binary-values: scalar Bind and DataRow C comparisons PASS', flush=True)
     finally:
         for p in peers:
