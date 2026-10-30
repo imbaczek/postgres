@@ -26,6 +26,9 @@ peer_parameters = {}
 
 
 def control(socket, form, expect_error=False):
+    if (os.environ.get('FOLLOW_LIBPQ_RAW_CONNINFO') == '1'
+            and form.startswith('(physical-follow-retarget-conninfo (concatenate ')):
+        return raw_retarget_control(socket, form, expect_error)
     result = subprocess.run([os.environ.get("SBCL", "sbcl"), "--script",
                              str(base / "t/control-client.lisp"), "unix", str(root / socket)],
                             input=form + "\n(quit)\n", capture_output=True, text=True,
@@ -77,6 +80,40 @@ signal.signal(signal.SIGINT, interrupted)
 
 def lisp_string(value):
     return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def raw_retarget_control(socket, form, expect_error):
+    gate = root / f"raw-retarget-go-{time.monotonic_ns()}"
+    finished = False
+    setup = f'''(progn
+      (defvar *raw-retarget-worker* nil)
+      (assert (or (null *raw-retarget-worker*)
+                  (not (sb-thread:thread-alive-p *raw-retarget-worker*))))
+      (defparameter *raw-retarget-result* nil)
+      (setf *raw-retarget-worker*
+            (sb-thread:make-thread
+             (lambda ()
+               (loop until (probe-file #p{lisp_string(gate)}) do (sleep 0.01))
+               (handler-case
+                   (setf *raw-retarget-result* (list :ok {form}))
+                 (error (condition)
+                   (setf *raw-retarget-result*
+                         (list :error (princ-to-string condition))))))
+             :name "raw conninfo retarget")))'''
+    try:
+        control(socket, setup)
+        gate.touch()
+        wait(lambda: 'RAW-RETARGET-DONE' in control(socket,
+             '(when (not (sb-thread:thread-alive-p *raw-retarget-worker*)) (format t "RAW-RETARGET-DONE~%"))'))
+        finished = True
+        return control(socket,
+            '(progn (assert *raw-retarget-result*) (if (eq :error (first *raw-retarget-result*)) (error "~a" (second *raw-retarget-result*)) (second *raw-retarget-result*)))',
+            expect_error=expect_error)
+    finally:
+        # An interrupted client must still let its owned worker leave the gate.
+        gate.touch()
+        if finished:
+            gate.unlink()
 
 
 def start_peer(directory=None, port=None, socket_name="sibling.sock", log_name="sibling.log", timeline_goal=None):
@@ -238,7 +275,12 @@ def retarget_form(port, prefix):
     if os.environ.get('FOLLOW_LIBPQ') == '1':
         conninfo = (f'host=127.0.0.1 port={port} user=postgres dbname=postgres '
                     'sslmode=disable gssencmode=disable password=private-acceptance-marker')
-        return (f'(physical-follow-retarget-conninfo "{conninfo}" '
+        argument = f'"{conninfo}"'
+        if os.environ.get('FOLLOW_LIBPQ_RAW_CONNINFO') == '1':
+            argument = ("(concatenate '(vector (unsigned-byte 8)) "
+                        f'(string->bytes "{conninfo}") '
+                        "(make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(255 128)))")
+        return (f'(physical-follow-retarget-conninfo {argument} '
                 f':prefix "{prefix}" :fallback "controller-libpq")')
     return f'(physical-follow-retarget "127.0.0.1" {port} "{prefix}")'
 
@@ -266,7 +308,8 @@ def exercise_first_attachment(peer, socket_identity, sibling):
     with socket.socket() as unavailable:
         unavailable.bind(("127.0.0.1", 0))
         port = unavailable.getsockname()[1]
-        control("sibling.sock", retarget_form(port, "first_unavailable"), expect_error=True)
+        unavailable_result = control("sibling.sock", retarget_form(port, "first_unavailable"), expect_error=True)
+        assert (data / "physical-follow.control").exists(), unavailable_result
     control("sibling.sock", '(let ((config (physical-follow-read-config)) (runtime *physical-follow-runtime*)) (assert (physical-follow-unattached-p config)) (assert (equal "sibling_seed" (getf (getf (sixth config) :unowned-bootstrap) :pin))) (assert (null (getf (sixth config) :source))) (assert runtime) (assert (null (physical-follow-runtime-receiver-thread runtime))) (assert (sb-thread:thread-alive-p (physical-follow-runtime-replay-thread runtime))))')
     saved = (data / "physical-follow.control").read_bytes()
     sibling.close()
@@ -371,6 +414,8 @@ def exercise_retained_policy(peer, socket_identity, sibling, source, promoted):
     control("sibling.sock", '(assert (and (null *physical-follow-test-hook*) (eq (first *observation-before*) *physical-follow-runtime*) (equal (second *observation-before*) (physical-follow-read-config)) (equal (third *observation-before*) (physical-store-control-tuple *physical-receive-store*)) (eq (fourth *observation-before*) (physical-follow-runtime-replay-thread *physical-follow-runtime*)) (sb-thread:thread-alive-p (fourth *observation-before*)) (= 2 (physical-follow-observed-timeline (getf *physical-recovery-state* :system-id))) (not *physical-recovery-failed-p*) (null *physical-follow-auto-error*)))')
     assert query(sibling, "SELECT pg_is_wal_replay_paused(),count(*) FROM promotion_sql_items") == [(True, 1)]
     control("sibling.sock", form)
+    if os.environ.get('FOLLOW_LIBPQ_RAW_CONNINFO') == '1':
+        control("sibling.sock", '(let* ((source (physical-follow-config-source (physical-follow-read-config))) (datum (getf source :conninfo)) (profile (physical-libpq-profile-from-conninfo-datum datum (getf source :fallback))) (bytes (physical-libpq-profile-conninfo profile))) (assert (eq :bytes (first datum))) (assert (= 255 (aref bytes (- (length bytes) 2)))) (assert (= 128 (aref bytes (1- (length bytes))))))')
     wait(lambda: query(sibling, f"SELECT pg_last_wal_receive_lsn()='{fork}'::pg_lsn") == [(True,)])
     wait(lambda: ':RECEIVER-STOPPED T' in control("sibling.sock", '(list :receiver-stopped (physical-follow-runtime-receiver-stopped-p *physical-follow-runtime*))'))
     assert query(sibling, "SELECT pg_is_wal_replay_paused(),count(*) FROM promotion_sql_items") == [(True, 1)]
@@ -428,6 +473,8 @@ def exercise_retained_policy(peer, socket_identity, sibling, source, promoted):
     assert query(sibling, "SELECT pg_is_in_recovery(),count(*) FROM promotion_sql_items") == [(False, 3)]
     print("retained-policy: parent-only receipt completion, paused replay/resume, source-offline cold startup and live reload PASS", flush=True)
     print("retained-policy: standard recovery_target_timeline cold policy and pending-restart reload PASS", flush=True)
+    if os.environ.get('FOLLOW_LIBPQ_RAW_CONNINFO') == '1':
+        print("retained-policy: non-UTF-8 original conninfo survives helper transport and saved source reload PASS", flush=True)
     print("retained-policy: observed namespace save failure preserves replay and accepted route, manual retry PASS", flush=True)
     print("retained-policy: parent promotion skips known source timeline, intent SIGKILL and cold primary restart PASS", flush=True)
     return peer, socket_identity, sibling
