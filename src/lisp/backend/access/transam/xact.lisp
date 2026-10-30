@@ -878,19 +878,26 @@ and BODY remain interruptible; RELEASE-FUNCTION runs after every exit."
         (gethash backend *transaction-exclusive-relation-locks*)))
 
 (defun acquire-transaction-relation-locks (nodes)
-  "Keep exclusive relation admission gates until this transaction finishes."
+  "Keep exclusive relation admission gates until this transaction finishes.
+
+Wait for the complete set before registering the transaction as a writer.
+Publishing writers while waiting for gates could make competing requests wait
+for each other.  Gate ownership and writer registrations are published together
+under the relation mutex, with interrupts disabled."
   (let* ((backend *backend*)
          (xid (get-current-xid))
          (requested (remove-if (lambda (node)
                                  (transaction-held-relation-lock-p node backend))
                                nodes)))
     (when requested
-      (register-relation-accesses requested nil xid)
+      (logical-note-xid-mutation-needs-capture-p xid)
       (acquire-relation-build-locks
        requested xid t
        (lambda (relations token)
          (push (cons relations token)
-               (gethash backend *transaction-exclusive-relation-locks*))))))
+               (gethash backend *transaction-exclusive-relation-locks*))
+         (dolist (node relations)
+           (pushnew xid (gethash node *relation-writers*) :test #'=))))))
   (values))
 
 (defun release-transaction-relation-locks (backend)
