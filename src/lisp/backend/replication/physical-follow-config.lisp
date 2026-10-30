@@ -82,7 +82,8 @@ Names contain 1 to 63 lowercase ASCII letters, digits or underscores."
     (copy-seq slot)))
 
 (defun physical-follow-controller-copy (state)
-  "Check and copy durable controller state. A preparation reserves one queue slot."
+  "Check and copy durable controller state. A preparation reserves one queue slot.
+KNOWN-TIMELINE is an optional nonzero 32-bit namespace bound, not replay state."
   (let ((keys '(:version :enabled :preparing :cleanup)))
     (dolist (key '(:source :mode :unowned-bootstrap :public-slot :known-timeline))
       (when (getf state key) (setf keys (append keys (list key)))))
@@ -113,6 +114,8 @@ Names contain 1 to 63 lowercase ASCII letters, digits or underscores."
                     (physical-follow-unowned-bootstrap-copy (getf state :unowned-bootstrap)))))))
 
 (defun physical-follow-remember-timeline (state timeline)
+  "Return a checked copy with the greatest known timeline ID preserved.
+This is a namespace bound; it does not select ancestry or a replay position."
   (unless (typep timeline '(integer 1 4294967295))
     (error "invalid known follow timeline"))
   (let ((copy (physical-follow-controller-copy state)))
@@ -153,6 +156,9 @@ Names contain 1 to 63 lowercase ASCII letters, digits or underscores."
       (list :version 1 :enabled t :preparing nil :cleanup nil)))
 
 (defun physical-follow-remember-config-timeline (config)
+  "Preserve timeline IDs in the accepted anchor and checked saved requests.
+Do this before removing a binding, preparation or cleanup entry.  Unaccepted
+source discovery alone does not add a known timeline."
   (let* ((state (physical-follow-controller-state config))
          (anchor (getf (fifth config) :anchor))
          (known (getf state :known-timeline)))

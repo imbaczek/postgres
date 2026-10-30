@@ -184,7 +184,8 @@ phase-2 recovery can yield to shutdown."
       (unless finished (setf *physical-recovery-failed-p* t)))))
 
 (defun physical-promotion-select-child (parent)
-  "Match C findNewestTimeLine's consecutive local history probe, then select +1."
+  "Probe consecutive local history files above the namespace floor, as C does.
+Select the first free ID; the floor does not change the replay parent or fork."
   (unless (typep parent '(integer 1 4294967295)) (error "invalid promotion parent timeline"))
   (loop for child from (1+ parent) to 4294967295
         unless (wal-namespace-file-stat (timeline-history-path child *pgdata*) t)
@@ -192,6 +193,10 @@ phase-2 recovery can yield to shutdown."
   (error "no representable child timeline remains"))
 
 (defun physical-promotion-timeline-floor (state)
+  "Return the promotion namespace floor without changing replay ancestry.
+Phase 2 combines the checked known IDs, receive selection, parent and policy
+target. Phase 3 uses the frozen floor and rejects a child colliding with
+observed IDs. Legacy pending state without a floor probes from the parent."
   (let* ((parent (physical-recovery-replay-timeline state))
          (config (when (probe-file (physical-follow-config-path)) (physical-follow-read-config)))
          (controller (when config (physical-follow-controller-state config)))
@@ -215,6 +220,9 @@ phase-2 recovery can yield to shutdown."
          (or (getf (getf state :timeline-policy) :target) 1))))
 
 (defun physical-promotion-freeze-timeline-floor (floor)
+  "Save and read back the phase 2 namespace floor before publishing intent.
+Keep this bound fixed through phase 3; do not add the new child until pending
+promotion has been retired."
   (let* ((config (if (probe-file (physical-follow-config-path))
                      (physical-follow-read-config)
                      (physical-follow-unattached-config-for-base (physical-follow-promotion-base))))
@@ -333,6 +341,8 @@ Before publishing intent, check the saved catalog against any live catalog and
 preflight the runtime allocation and retention state. A preflight rejection
 leaves phase 2 unchanged. The caller owns PGDATA and follow-command, reload
 and quiescence in that order; worker shutdown and join occur outside this call.
+After preflight, freeze the namespace floor before publishing pending intent;
+the selected child still forks from the actual replay parent.
 Publish the retained parent prefix and pending control under the receive-store
 mutex.  Install pending runtime state only after control readback and owner
 handoff.  Failure during publication fences recovery."
@@ -381,6 +391,8 @@ handoff.  Failure during publication fences recovery."
                              (unless (= 1 parent) (timeline-history-bytes parent)))))
 
 (defun physical-promotion-check-history (state allow-history)
+  "Check the pending child against the frozen floor and local history files.
+A published child must match the saved history and the intervening probe."
   (let* ((floor (physical-promotion-timeline-floor state)) (child (getf state :promotion-child))
                                                            (path (timeline-history-path child *pgdata*)))
     (unless (> child floor) (error "pending child does not exceed known timeline floor"))
