@@ -7,18 +7,19 @@
   remains unsupported; coordination is outside this scope.
 
 - [ ] Complete the pinned Patroni writer and real `Postgresql.follow` acceptance.
-  Its current complete writer snapshots contain 12 unsupported settings:
+  Its current complete writer snapshots contain 11 unsupported settings:
   `max_prepared_transactions`,
-  `max_worker_processes`, `track_commit_timestamp`, `wal_level`, `wal_log_hints`,
+  `track_commit_timestamp`, `wal_level`, `wal_log_hints`,
   `hba_file`, `ident_file`, `recovery_target`, `recovery_target_lsn`,
   `recovery_target_name`, `recovery_target_time` and `recovery_target_xid`.
   Keep the complete writer oracle unchanged. Internal checks now derive shared
   relation-object and owner counts from published registrations and waiting
   requests. Cold startup installs a finite shared object/owner pool together with
   the local resource tuple. `max_locks_per_transaction` now controls sizing and
-  reporting, with default 128 and changes pending until restart. Workers and
-  prepared transactions still use internal values 8 and 0. Next expose their
-  settings with supported semantics and preserve pending-restart behavior.
+  reporting, with default 128 and changes pending until restart.
+  `max_worker_processes` installs and reports the managed-worker slot capacity;
+  changes are pending until restart. Prepared transactions remain disabled with
+  an internal capacity of zero. Expose that setting with supported semantics.
   C sizes a shared pool, not a per-transaction limit.
   Preserve atomic multi-relation admission, repeated
   acquisition, abort/cancellation/disconnect and virtual-reader cleanup.
@@ -68,8 +69,8 @@
   durable receive-history selection, source-side follow anchors, the read-only
   extent layer, immutable inventory publication, local retained-root ownership and
   receive-control inventory validation, receive-compaction sealing and configured
-  native follow have completed this pass and its review. Keep the same order for
-  the remaining HA work.
+  native follow, and managed-worker lifecycle and shutdown have completed this
+  pass and its review. Keep the same order for the remaining HA work.
 
 - [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker
   retained `*active-xids* = (3)` after 1,598 passing checks, causing later physical

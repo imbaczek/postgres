@@ -199,12 +199,14 @@ archive without registering it or changing files."
 
 (defun native-control-facts (capture)
   "Validate CAPTURE and return the facts used by native pg_controldata.
-Captured recovery artifacts without recovery control are an error. A standby
-uses recovery control for its state and applied floor, even on a child timeline.
-Phase 0 has not yet bound the manifest digest. A phase-3 request remains pending
-when insertion equals its parent timeline. A committed child must agree with its
-history and ignores retired recovery files. Report checkpoint starts, though WAL
-control stores ends."
+Without recovery control, a validated cleanup-only follow config may remain;
+a recovery marker, manifest, restartpoint pointer, active or malformed follow
+config still fails. A standby uses recovery control for its state and applied
+floor, even on a child timeline. Phase 0 has not yet bound the manifest digest.
+A phase-3 request remains pending when insertion equals its parent timeline.
+A committed child must agree with its history; while phase-3 control remains,
+retired recovery files are ignored.
+Report checkpoint starts, though WAL control stores ends."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-id namespace metadata)
       (wal-decode-control-line (bytes->string (first capture)))
     (declare (ignore durable namespace))
