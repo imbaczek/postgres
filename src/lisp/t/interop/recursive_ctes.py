@@ -83,6 +83,8 @@ CASES = [
     "SELECT array_to_string(string_to_array('a,b,c',','),'|')",
     "VALUES(1) ORDER BY column1+1",
     "VALUES(1) ORDER BY (SELECT column1)",
+    "WITH q(n) AS (VALUES (7)) VALUES ((SELECT n FROM q))",
+    "WITH RECURSIVE q(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM q WHERE n<3) VALUES ((SELECT sum(n) FROM q))",
     "SELECT least(1,2) OVER ()",
     "SELECT greatest(1,2) FILTER (WHERE true)",
     MANDELBROT,

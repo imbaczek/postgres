@@ -220,7 +220,8 @@
                  while (match-punct p #\,))))
     (when (or (kw-p p "search") (kw-p p "cycle"))
       (ereport "0A000" "recursive SEARCH and CYCLE clauses are not supported"))
-    (unless (or (kw-p p "select") (punct-p p #\()
+    ;; VALUES is a SELECT operand, so it can follow WITH directly.
+    (unless (or (kw-p p "select") (kw-p p "values") (punct-p p #\()
                 (kw-p p "insert") (kw-p p "update") (kw-p p "delete"))
       (ereport "0A000" "unsupported statement after WITH"))
     (let ((query (if (or (kw-p p "insert") (kw-p p "update") (kw-p p "delete"))
