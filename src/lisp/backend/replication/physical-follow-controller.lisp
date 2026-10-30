@@ -4,6 +4,10 @@
 ;;; Save preparation before remote proof and reconcile pending state before use.
 ;;; Cancel sockets and join operations outside command, reload and admission locks.
 
+(declaim (ftype function physical-follow-check-desired-active
+                physical-follow-call-with-desired-paused physical-follow-call-with-manual-source
+                physical-follow-desired-stop-worker physical-follow-activate-standard-desired))
+
 (defstruct (physical-follow-operation (:print-function physical-libpq-print-private-object))
   "One transition and its socket, thread, saved intent and failure context."
   host port prefix runtime config client thread cancelled-p result error context)
@@ -416,6 +420,9 @@ uses strict candidate proof; protect the store and retained root."
   "Require the current uncancelled operation and its captured policy.
 A policy replacement cancels the operation before it can publish or launch."
   (sb-thread:with-mutex (*physical-follow-lock*)
+    (physical-follow-require-generation (getf (physical-follow-operation-context operation) :generation))
+    (when (getf (physical-follow-operation-context operation) :configured-p)
+      (physical-follow-check-desired-active (getf (physical-follow-operation-context operation) :generation)))
     (unless (and (eq operation *physical-follow-operation*)
                  (not (physical-follow-operation-cancelled-p operation))
                  (not *physical-follow-controller-blocked-p*)
@@ -473,6 +480,9 @@ object remains the operation's authority until completion or cancellation."
 (defun physical-follow-operation-register-client (operation client)
   "Publish the child early so cancellation can stop it, checking for late cancellation."
   (sb-thread:with-mutex (*physical-follow-lock*)
+    (physical-follow-require-generation (getf (physical-follow-operation-context operation) :generation))
+    (when (getf (physical-follow-operation-context operation) :configured-p)
+      (physical-follow-check-desired-active (getf (physical-follow-operation-context operation) :generation)))
     (when (or (physical-follow-operation-cancelled-p operation)
               *physical-follow-controller-blocked-p* *physical-follow-controller-stopping-p*)
       (error 'physical-follow-controller-cancelled
@@ -719,23 +729,27 @@ restoration. Ambiguous publication failures fence recovery for restart reconcili
                  (physical-follow-controller-save-config config)
                  (setf (physical-follow-operation-config operation) config))
                (physical-follow-controller-check-current config)))
-           (unless (or *physical-follow-controller-blocked-p*
+           (unless (or (not (physical-follow-generation-current-p (getf context :generation)))
+                       *physical-follow-controller-blocked-p*
                        *physical-follow-controller-stopping-p*
                        (physical-follow-operation-cancelled-p operation)
                        *physical-shutdown-state* *physical-promotion-stopping-p*
                        (shutdown-in-progress-p))
              (if (physical-follow-controller-enabled-p config)
-                 (physical-follow-launch config)
+                 (physical-follow-launch config (getf context :generation) (getf context :configured-p))
                  (physical-follow-launch-replay-only config)))))))))
 
 (declaim (special *physical-follow-prepare-timeout*))
 
 (defun physical-follow-operation-cancelled-condition-p (operation condition)
   "Treat a stopped client as cancellation only when OPERATION was cancelled."
-  (or (typep condition 'physical-follow-controller-cancelled)
+  (or (typep condition 'physical-follow-generation-changed)
+      (typep condition 'physical-follow-controller-cancelled)
       (and (typep condition 'physical-client-stopped)
            (sb-thread:with-mutex (*physical-follow-lock*)
-             (physical-follow-operation-cancelled-p operation)))))
+             (or (physical-follow-operation-cancelled-p operation)
+                 (not (physical-follow-generation-current-p
+                       (getf (physical-follow-operation-context operation) :generation))))))))
 
 (defun physical-follow-wait-for-policy (runtime reason &optional retry-source)
   "Stop receipt under command exclusion; preserve replay and its pause state.
@@ -769,7 +783,7 @@ result; restore stopped workers when needed."
         (unless *physical-follow-runtime*
           (let ((config (physical-follow-read-config)))
             (if (physical-follow-controller-enabled-p config)
-                (physical-follow-launch config)
+                (physical-follow-launch config (getf (physical-follow-operation-context operation) :generation))
                 (physical-follow-launch-replay-only config))))
         (physical-follow-wait-for-policy
          *physical-follow-runtime* reason
@@ -808,7 +822,9 @@ result; restore stopped workers when needed."
                    (unless (equal (physical-follow-effective-config current)
                                   (physical-follow-effective-config (physical-follow-operation-result operation)))
                      (error "active follow configuration changed before worker launch"))
-                   (physical-follow-launch current)))
+                   (physical-follow-launch current
+                                           (getf (physical-follow-operation-context operation) :generation)
+                                           (getf (physical-follow-operation-context operation) :configured-p))))
                (setf *physical-follow-auto-error* nil
                      (physical-follow-operation-result operation) :started))
            (physical-follow-route-unavailable (condition)
@@ -828,10 +844,13 @@ result; restore stopped workers when needed."
                (setf *physical-recovery-failed-p* t))
              (handler-case (physical-follow-operation-recover operation)
                (error (recovery-error)
-                 (setf *physical-recovery-failed-p* t)
-                 (admin-log "native follow transition recovery failed: ~a" recovery-error)))
+                 (unless (or (physical-follow-operation-cancelled-condition-p operation recovery-error)
+                             (typep recovery-error 'physical-recovery-worker-shutdown))
+                   (setf *physical-recovery-failed-p* t)
+                   (admin-log "native follow transition recovery failed: ~a" recovery-error))))
              (physical-follow-controller-record-error :transition condition)
-             (unless (or (physical-client-retryable-condition-p condition)
+             (unless (or (getf (physical-follow-operation-context operation) :configured-p)
+                         (physical-client-retryable-condition-p condition)
                          (typep condition 'physical-follow-observation-save-failed)
                          (physical-follow-operation-cancelled-condition-p operation condition))
                (setf *physical-follow-auto-error*
@@ -846,7 +865,7 @@ result; restore stopped workers when needed."
         (when (eq operation *physical-follow-operation*)
           (setf *physical-follow-operation* nil))))))
 
-(defun physical-follow-start-operation (host port prefix &optional runtime profile (slot :inherit))
+(defun physical-follow-start-operation (host port prefix &optional runtime profile (slot :inherit) generation configured-p)
   "Start a transition with a snapshot of the requested public slot.
 :INHERIT copies the runtime's accepted slot for automatic handoff; explicit NIL
 requests no slot. Capture the choice before the worker starts."
@@ -861,12 +880,20 @@ requests no slot. Capture the choice before the worker starts."
                            (when runtime
                              (physical-follow-config-public-slot (physical-follow-runtime-config runtime)))
                            slot)))
+         (captured-generation (or generation
+                                  (if runtime (physical-follow-runtime-generation runtime)
+                                      *physical-follow-desired*)))
          (ready nil)
          (operation (make-physical-follow-operation
                      :host (copy-seq host) :port port :prefix (copy-seq prefix) :runtime runtime
-                     :context (append (list :requested-slot public-slot :automatic-p (not (null runtime)))
+                     :context (append (list :requested-slot public-slot :automatic-p (not (null runtime))
+                                            :generation captured-generation :configured-p configured-p)
                                       (when requested (list :requested-profile requested))))))
     (sb-thread:with-mutex (*physical-follow-lock*)
+      (physical-follow-require-generation captured-generation)
+      (when (and runtime *physical-follow-manual-reservation*)
+        (error 'physical-follow-controller-cancelled))
+      (when configured-p (physical-follow-check-desired-active captured-generation))
       (when (or *physical-follow-operation* *physical-follow-controller-blocked-p*
                 *physical-follow-controller-stopping-p*)
         (error "native follow controller is busy or stopping"))
@@ -903,20 +930,22 @@ live-operation admission locks. A failed join fences recovery."
 (defun physical-follow-call-with-controller-blocked (function)
   "Block new transitions, cancel and join the current operation, then run FUNCTION.
 The caller must not hold command, reload or live-operation admission locks."
-  (let ((nested nil))
-    (sb-thread:with-mutex (*physical-follow-lock*)
-      (cond ((eq *physical-follow-controller-block-owner* sb-thread:*current-thread*)
-             (setf nested t))
-            (*physical-follow-controller-blocked-p* (error "native follow lifecycle operation is already active"))
-            (t (setf *physical-follow-controller-blocked-p* t
-                     *physical-follow-controller-block-owner* sb-thread:*current-thread*))))
-    (if nested (funcall function)
-        (unwind-protect
-             (progn (physical-follow-controller-cancel-join) (funcall function))
-          (sb-thread:with-mutex (*physical-follow-lock*)
-            (unless *physical-follow-controller-stopping-p*
-              (setf *physical-follow-controller-blocked-p* nil
-                    *physical-follow-controller-block-owner* nil)))))))
+  (physical-follow-call-with-desired-paused
+   (lambda ()
+     (let ((nested nil))
+       (sb-thread:with-mutex (*physical-follow-lock*)
+         (cond ((eq *physical-follow-controller-block-owner* sb-thread:*current-thread*)
+                (setf nested t))
+               (*physical-follow-controller-blocked-p* (error "native follow lifecycle operation is already active"))
+               (t (setf *physical-follow-controller-blocked-p* t
+                        *physical-follow-controller-block-owner* sb-thread:*current-thread*))))
+       (if nested (funcall function)
+           (unwind-protect
+                (progn (physical-follow-controller-cancel-join) (funcall function))
+             (sb-thread:with-mutex (*physical-follow-lock*)
+               (unless *physical-follow-controller-stopping-p*
+                 (setf *physical-follow-controller-blocked-p* nil
+                       *physical-follow-controller-block-owner* nil))))))) ))
 
 (defun physical-follow-prepare-managed-startup ()
   "Prepare a signal-managed standby under cold ownership before listeners start.
@@ -928,6 +957,7 @@ an explicit retarget can attach a receiver later."
                  (zerop *n-connections*) (zerop *n-backends*)
                  (zerop *live-operation-depth*) (not *physical-follow-runtime*))
       (error "managed follow preparation requires owned startup before listeners"))
+    (physical-follow-activate-standard-desired)
     (sb-thread:with-mutex (*physical-follow-command-lock*)
       (check-physical-recovery-worker-start)
       (unless *physical-receive-store*
@@ -1000,17 +1030,20 @@ recovery cannot yet be enabled. A failed first connection leaves replay running.
 
 (defun physical-follow-retarget (host port &optional (prefix "follow"))
   "Attach or retarget to the direct endpoint on a fresh pin, synchronously."
-  (when (plusp *live-operation-depth*) (error "follow retarget requires its own operation admission"))
-  (physical-follow-endpoint-check host port prefix)
-  (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))
-  (when (eq :deferred (physical-follow-ensure-attachment-state))
-    (return-from physical-follow-retarget :deferred))
-  (physical-follow-controller-start-worker :force t)
-  (let ((operation (physical-follow-start-operation host port prefix)))
-    (sb-thread:join-thread (physical-follow-operation-thread operation))
-    (when (physical-follow-operation-error operation)
-      (error "native follow transition failed: ~a" (physical-follow-operation-error operation)))
-    (physical-follow-operation-result operation)))
+  (physical-follow-call-with-manual-source
+   (lambda (generation)
+
+     (physical-follow-endpoint-check host port prefix)
+     (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))
+     (when (eq :deferred (physical-follow-ensure-attachment-state))
+       (return-from physical-follow-retarget :deferred))
+     (physical-follow-controller-start-worker :force t)
+     (let ((operation (physical-follow-start-operation host port prefix nil nil :inherit generation)))
+       (sb-thread:join-thread (physical-follow-operation-thread operation))
+       (when (physical-follow-operation-error operation)
+         (error "native follow transition failed: ~a" (physical-follow-operation-error operation)))
+       (physical-follow-operation-result operation))
+     )))
 
 (defun physical-follow-retarget-conninfo (conninfo &key (prefix "follow") (fallback (physical-libpq-default-fallback)) slot (mode :database))
   "Attach or retarget native follow using a libpq profile.
@@ -1021,20 +1054,22 @@ digits or underscores. Omission and explicit NIL both request no public slot.
 The source slot must already exist. Preparation and failures before publication
 preserve the old accepted slot. After publication, acceptance follows the durable
 binding and restart reconciliation; the old slot may not be restored."
-  (when (plusp *live-operation-depth*)
-    (error "native follow retarget requires its own operation admission"))
-  (let ((profile (make-physical-libpq-profile conninfo :fallback fallback :mode mode))
-        (slot (physical-follow-public-slot-copy slot)))
-    (physical-follow-endpoint-check "libpq" 5432 prefix)
-    (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))
-    (when (eq :deferred (physical-follow-ensure-attachment-state))
-      (return-from physical-follow-retarget-conninfo :deferred))
-    (physical-follow-controller-start-worker :force t)
-    (let ((operation (physical-follow-start-operation "libpq" 5432 prefix nil profile slot)))
-      (sb-thread:join-thread (physical-follow-operation-thread operation))
-      (when (physical-follow-operation-error operation)
-        (error "native follow transition failed: ~a" (physical-follow-operation-error operation)))
-      (physical-follow-operation-result operation))))
+  (physical-follow-call-with-manual-source
+   (lambda (generation)
+
+     (let ((profile (make-physical-libpq-profile conninfo :fallback fallback :mode mode))
+           (slot (physical-follow-public-slot-copy slot)))
+       (physical-follow-endpoint-check "libpq" 5432 prefix)
+       (unless (<= (length prefix) 30) (error "follow pin prefix exceeds 30 characters"))
+       (when (eq :deferred (physical-follow-ensure-attachment-state))
+         (return-from physical-follow-retarget-conninfo :deferred))
+       (physical-follow-controller-start-worker :force t)
+       (let ((operation (physical-follow-start-operation "libpq" 5432 prefix nil profile slot generation)))
+         (sb-thread:join-thread (physical-follow-operation-thread operation))
+         (when (physical-follow-operation-error operation)
+           (error "native follow transition failed: ~a" (physical-follow-operation-error operation)))
+         (physical-follow-operation-result operation)))
+     )))
 
 (defvar *physical-follow-cleanup-retry-after* (make-hash-table :test #'equal))
 
@@ -1162,6 +1197,7 @@ old credential leaves the entry queued for a later retry."
 (defun physical-follow-controller-stop-worker ()
   "Stop cleanup and transitions, cancel sockets and join their workers.
 Call outside command, reload and live-operation admission locks."
+  (physical-follow-desired-stop-worker)
   (let ((worker nil) (client nil))
     (sb-thread:with-mutex (*physical-follow-lock*)
       (setf *physical-follow-controller-stopping-p* t
@@ -1201,6 +1237,11 @@ Call outside command, reload and live-operation admission locks."
 
 (defun physical-follow-controller-fence-receipt (runtime config decision)
   (sb-thread:with-mutex (*physical-follow-command-lock*)
+    ;; Manual reservations use command -> follow ordering too. Keep the
+    ;; reservation check and the receiver stop on the same side of that gate.
+    (sb-thread:with-mutex (*physical-follow-lock*)
+      (when *physical-follow-manual-reservation*
+        (return-from physical-follow-controller-fence-receipt nil)))
     (unless (and (eq runtime *physical-follow-runtime*)
                  (equal (physical-follow-effective-config config)
                         (physical-follow-effective-config (physical-follow-read-config))))
@@ -1213,21 +1254,24 @@ An empty cleanup-only configuration stops the worker but remains on disk."
   (let ((config (with-live-operation
                   (check-recovery-available)
                   (when (probe-file (physical-follow-config-path)) (physical-follow-read-config))))
-        (runtime nil) (busy nil) (blocked nil) (auto-error nil) (decision nil))
+        (runtime nil) (busy nil) (blocked nil) (manual nil) (auto-error nil) (decision nil))
     (sb-thread:with-mutex (*physical-follow-lock*)
       (setf runtime *physical-follow-runtime* busy *physical-follow-operation*
             blocked (or *physical-follow-controller-blocked-p* *physical-follow-controller-stopping-p*)
-            auto-error *physical-follow-auto-error*))
+            auto-error *physical-follow-auto-error*
+            manual *physical-follow-manual-reservation*))
     (cond
       ((or (null config) blocked busy) nil)
       ((and (physical-follow-cleanup-only-p config)
             (null (getf (physical-follow-controller-state config) :cleanup))) :idle)
-      ((and runtime (physical-follow-runtime-transition runtime)
+      ((and (not manual) runtime (physical-follow-generation-current-p (physical-follow-runtime-generation runtime))
+            (physical-follow-runtime-transition runtime)
             (not (physical-follow-receiver-stopped-p runtime))
             (eq :replay-only (getf (setf decision (physical-follow-launch-decision config)) :action)))
        (physical-follow-controller-fence-receipt
         runtime config decision))
-      ((and runtime (physical-follow-runtime-transition runtime)
+      ((and (not manual) runtime (physical-follow-generation-current-p (physical-follow-runtime-generation runtime))
+            (physical-follow-runtime-transition runtime)
             (or (not (physical-follow-receiver-stopped-p runtime))
                 (eq :policy-refresh (first (physical-follow-runtime-transition runtime)))
                 (let ((transition (physical-follow-runtime-transition runtime)))

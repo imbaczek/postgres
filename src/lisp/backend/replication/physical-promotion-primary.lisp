@@ -93,6 +93,7 @@ are no longer required for primary startup."
         (names '(("standby.signal" :after-retire-standby-signal)
                  ("recovery.signal" :after-retire-recovery-signal)
                  ("recovery.required" :after-retire-required)
+                 ("physical-follow-managed.control" :after-retire-follow-managed)
                  ("physical-backup.manifest" :after-retire-manifest)
                  ("physical-follow.control" :after-retire-follow)
                  ("physical-restartpoint.control" :after-retire-pointer)

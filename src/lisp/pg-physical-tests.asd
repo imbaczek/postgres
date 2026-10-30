@@ -16,6 +16,7 @@
                (:file "t/follow-controller-tests")
                (:file "t/physical-client-tests")
                (:file "t/physical-libpq-tests")
+               (:file "t/follow-desired-tests")
                (:file "t/follow-release-tests")
                (:file "t/retained-extent-tests")
                (:file "t/retained-inventory-tests")

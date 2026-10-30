@@ -24,6 +24,10 @@
                      (pg::physical-store-open (merge-pathnames "promotion-spool/" root) system-id 1
                                               :create t :start-lsn 152)))
             (pg::*physical-receive-store* store) (pg::*physical-follow-runtime* nil)
+            (pg::*physical-follow-desired* nil) (pg::*physical-follow-desired-applied* nil)
+            (pg::*physical-follow-manual-generation* nil) (pg::*physical-follow-manual-reservation* nil)
+            (pg::*physical-follow-desired-worker* nil) (pg::*physical-follow-desired-stopping-p* nil)
+            (pg::*physical-follow-desired-last-error* nil)
             (pg::*physical-restartpoint-worker* nil) (pg::*physical-shutdown-state* nil)
             (pg::*shutdown-mode* nil) (pg::*shutdown-requested* nil)
             (pg::*swank-listener-enabled-p* nil)

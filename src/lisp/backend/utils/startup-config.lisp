@@ -19,6 +19,8 @@
     ("data_directory" :postmaster :string nil)
     ("cluster_name" :postmaster :string "")
     ("restore_command" :sighup :string "")
+    ("primary_conninfo" :sighup :conninfo "")
+    ("primary_slot_name" :sighup :slot "")
     ("recovery_target_timeline" :postmaster :timeline "latest")
     ("hot_standby" :postmaster :boolean "on")
     ("max_connections" :postmaster :integer "100" 1 262143 nil)
@@ -137,11 +139,20 @@ rounding do not apply."
     (error "invalid boolean configuration value ~s" text))
   (sql-cast-boolean-input text))
 
+(declaim (ftype function physical-follow-configured-slot physical-follow-plan-settings
+                physical-follow-call-with-desired-install))
+
+(defun startup-render-conninfo (bytes)
+  (handler-case
+      (let ((text (bytes->string bytes)))
+        (if (equalp bytes (string->bytes text)) text (copy-seq bytes)))
+    (error () (copy-seq bytes))))
+
 (defun startup-setting-text (name value)
-  "Render Boolean settings as on or off for SHOW, -C and pg_settings."
-  (if (eq :boolean (third (assoc name *startup-setting-specs* :test #'string=)))
-      (if value "on" "off")
-      (princ-to-string value)))
+  (case (third (assoc name *startup-setting-specs* :test #'string=))
+    (:boolean (if value "on" "off"))
+    (:conninfo (startup-render-conninfo value))
+    (t (princ-to-string value))))
 
 (defun guc-clean-ascii-octets (octets)
   "Render printable ASCII directly and escape each other byte as hexadecimal."
@@ -174,7 +185,12 @@ Timeline input is validated but its original spelling is retained."
       ;; Postmaster GUC parsing uses SQL_ASCII, even for a UTF-8 cluster.
       (return-from startup-normalize-setting
         (guc-clean-ascii-octets (subseq octets 0 (min 63 (length octets))))))
+    (when (eq :conninfo (third spec))
+      (return-from startup-normalize-setting octets))
     (let ((text (startup-input-text octets)))
+      (when (eq :slot (third spec))
+        (physical-follow-configured-slot text)
+        (return-from startup-normalize-setting text))
       (ecase (third spec)
         (:integer (startup-parse-integer-setting spec text))
         (:boolean (startup-parse-boolean-setting text))
@@ -295,6 +311,7 @@ as in a C string. Do not reencode the byte view as UTF-8."
              (subseq value 0 (position (code-char 0) value)))))))
 
 (defun startup-config-line (line)
+  (when (find (code-char 0) line) (error "literal NUL in configuration input"))
   (let* ((text (string-left-trim '(#\Space #\Tab #\Return) line))
          (end (position-if (lambda (char) (or (find char '(#\Space #\Tab #\Return))
                                               (char= char #\=))) text)))
@@ -538,18 +555,22 @@ hot_standby retain their active values until restart."
   (startup-check-connection-limits settings)
   (let ((timeout (startup-setting-value settings "checkpoint_timeout"))
         (wal-bytes (* 1024 1024 (startup-setting-value settings "max_wal_size")))
-        (slot-policy (startup-effective-slot-policy settings native)))
-    (setf *startup-server-settings* settings
-          *startup-native-inputs* native *startup-command-overrides* overrides
-          *enable-hot-standby* (startup-setting-value settings "hot_standby")
-          *wal-keep-size-mb* (startup-setting-value settings "wal_keep_size")
-          *physical-restartpoint-timeout* timeout
-          *physical-restartpoint-wal-bytes* wal-bytes
-          *max-slot-wal-keep-bytes* (wal-slot-retention-policy-limit slot-policy)
-          *wal-slot-retention-policy* slot-policy
-          *max-replication-slots* (startup-setting-value settings "max_replication_slots")
-          *max-connections* (startup-setting-value settings "max_connections")
-          *max-wal-senders* (startup-setting-value settings "max_wal_senders")))
+        (slot-policy (startup-effective-slot-policy settings native))
+        (desired (physical-follow-plan-settings settings)))
+    (physical-follow-call-with-desired-install desired
+                                               (lambda ()
+                                                 (setf *startup-server-settings* settings
+                                                       *startup-native-inputs* native *startup-command-overrides* overrides
+                                                       *enable-hot-standby* (startup-setting-value settings "hot_standby")
+                                                       *wal-keep-size-mb* (startup-setting-value settings "wal_keep_size")
+                                                       *physical-restartpoint-timeout* timeout
+                                                       *physical-restartpoint-wal-bytes* wal-bytes
+                                                       *max-slot-wal-keep-bytes* (wal-slot-retention-policy-limit slot-policy)
+                                                       *wal-slot-retention-policy* slot-policy
+                                                       *max-replication-slots* (startup-setting-value settings "max_replication_slots")
+                                                       *max-connections* (startup-setting-value settings "max_connections")
+                                                       *max-wal-senders* (startup-setting-value settings "max_wal_senders")))
+                                               ))
   settings)
 
 (defun startup-reload-settings ()
@@ -660,6 +681,17 @@ installing settings, taking PGDATA ownership or starting listeners."
                 (string-right-trim "/" value)
                 (startup-setting-text (string-downcase name) value))))))))
 
+(defun startup-print-configuration-value (value)
+  (finish-output *standard-output*)
+  (let ((bytes (etypecase value
+                 (string (string->bytes value))
+                 ((vector (unsigned-byte 8)) value)))
+        (output (sb-sys:make-fd-stream 1 :output t :element-type '(unsigned-byte 8)
+                                         :buffering :none :auto-close nil)))
+    (write-sequence bytes output)
+    (write-byte 10 output)
+    (finish-output output)))
+
 (defun startup-handle-meta-request (argv)
   "Print and exit for version or configuration requests before server startup."
   (when (or (equal argv '("--version")) (equal argv '("-V")))
@@ -668,6 +700,5 @@ installing settings, taking PGDATA ownership or starting listeners."
     (sb-ext:exit :code 0))
   (let ((value (startup-configuration-output argv)))
     (when value
-      (format t "~a~%" value)
-      (finish-output)
+      (startup-print-configuration-value value)
       (sb-ext:exit :code 0))))

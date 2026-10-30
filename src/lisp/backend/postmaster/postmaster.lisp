@@ -291,12 +291,15 @@ command (idle) is ignored; the connection and its transaction state survive."
 
 (declaim (ftype function physical-promotion-start-worker))
 
+(declaim (ftype function physical-follow-desired-start-worker))
+
 (defun start-postmaster-recovery-workers ()
   "Start admitted recovery services and cleanup, tolerating concurrent shutdown."
   (handler-case
       (progn
         (physical-follow-autostart)
         (physical-follow-controller-start-worker)
+        (physical-follow-desired-start-worker)
         (physical-restartpoint-start-worker)
         (physical-promotion-start-worker))
     (physical-recovery-worker-shutdown (condition)

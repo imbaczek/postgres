@@ -2,11 +2,14 @@
 (in-package #:pg)
 
 (define-condition physical-follow-terminal-error (simple-error) ())
+
+(declaim (ftype function physical-follow-call-with-manual-source))
+
 (defstruct (physical-follow-runtime (:print-function physical-libpq-print-private-object))
   "CONFIG is the runtime's private saved configuration; TRANSITION requests a
 controller handoff. Lifecycle and client ownership use the follow lock.
 STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
-  host port pin config transition limit next-timeline
+  host port pin config generation transition limit next-timeline
   (stopped-p nil) (receiver-stopped-p nil) (connected-p nil) last-error client receiver-thread replay-thread)
 
 (define-condition physical-follow-receiver-stopped (physical-client-stopped) ()
@@ -16,6 +19,15 @@ STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
   "Whether either the receiver-only or the all-workers stop was requested."
   (or (physical-follow-runtime-stopped-p runtime)
       (physical-follow-runtime-receiver-stopped-p runtime)))
+
+(defun physical-follow-require-runtime-generation (runtime)
+  (physical-follow-require-generation (physical-follow-runtime-generation runtime)))
+
+(defun physical-follow-authorize-receiver (runtime)
+  (with-live-operation
+    (physical-follow-require-runtime-generation runtime)
+    (check-recovery-available))
+  t)
 
 (defvar *physical-follow-runtime* nil)
 (defvar *physical-follow-lock* (sb-thread:make-mutex :name "native physical follow lifecycle"))
@@ -48,6 +60,7 @@ STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
   "Publish C's connecting state with stale sender details cleared."
   (let ((now (postgres-current-timestamp)))
     (sb-thread:with-mutex (*physical-follow-lock*)
+      (physical-follow-require-runtime-generation runtime)
       (setf *physical-follow-statistics*
             (list :runtime runtime :pid (sb-thread:thread-os-tid sb-thread:*current-thread*)
                   :public-slot (physical-follow-config-public-slot (physical-follow-runtime-config runtime))
@@ -60,6 +73,7 @@ STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
 (defun physical-follow-monitor-connected (runtime)
   "Publish sender details only after native streaming is established."
   (sb-thread:with-mutex (*physical-follow-lock*)
+    (physical-follow-require-runtime-generation runtime)
     (when (eq runtime (getf *physical-follow-statistics* :runtime))
       (let* ((client (physical-follow-runtime-client runtime))
              (info (when (typep client 'physical-libpq-channel)
@@ -77,6 +91,7 @@ STOPPED-P stops both workers; RECEIVER-STOPPED-P stops receipt alone."
   "Match ProcessWalSndrMessage without using source end as local progress."
   (let ((now (postgres-current-timestamp)))
     (sb-thread:with-mutex (*physical-follow-lock*)
+      (physical-follow-require-runtime-generation runtime)
       (when (eq runtime (getf *physical-follow-statistics* :runtime))
         (when (< (getf *physical-follow-statistics* :latest-end-lsn) end)
           (setf (getf *physical-follow-statistics* :latest-end-time) send-time))
@@ -977,11 +992,12 @@ Validation checks coherence, not durable state or source proof."
   (when (probe-file (physical-follow-config-path))
     (physical-follow-require-bootstrap-config (physical-follow-read-config))))
 
-(defun physical-follow-feedback (client)
+(defun physical-follow-feedback (client &optional runtime)
   "Snapshot independent write/flush/apply, then perform socket I/O outside admission."
   (when *physical-stream-test-hook* (funcall *physical-stream-test-hook* :before-feedback))
   (let ((payload (with-live-operation
                    (let ((store *physical-receive-store*) (result (make-payload)))
+                     (when runtime (physical-follow-require-runtime-generation runtime))
                      (check-recovery-available)
                      (sb-thread:with-mutex ((physical-store-mutex store))
                        (physical-store-check-live store)
@@ -996,6 +1012,7 @@ Validation checks coherence, not durable state or source proof."
       (physical-client-feedback client payload))))
 
 (defun physical-follow-process-frame (payload &optional runtime)
+  (when runtime (physical-follow-require-runtime-generation runtime))
   (unless (and payload (plusp (length payload))) (physical-follow-reject "empty native physical frame"))
   (case (code-char (aref payload 0))
     (#\w
@@ -1125,6 +1142,7 @@ The public slot is a separate persistent source slot, not the proof pin."
 
 (defun physical-follow-register-runtime-client (runtime client)
   (sb-thread:with-mutex (*physical-follow-lock*)
+    (physical-follow-require-runtime-generation runtime)
     (unless (eq runtime *physical-follow-runtime*)
       (setf (physical-follow-runtime-stopped-p runtime) t)
       (error "native physical receiver no longer owns its runtime"))
@@ -1183,6 +1201,7 @@ is not authentication or proof of source identity."
     (unless (and limit next)
       (physical-follow-reject "unexpected completion of an open source timeline"))
     (with-live-operation
+      (physical-follow-require-runtime-generation runtime)
       (physical-recovery-flush)
       (let ((store *physical-receive-store*))
         (sb-thread:with-mutex ((physical-store-mutex store))
@@ -1190,8 +1209,9 @@ is not authentication or proof of source identity."
           (physical-store-check-complete-input store)
           (unless (= limit (physical-store-flushed-lsn store))
             (physical-follow-reject "parent stream ended before its durable fork")))))
-    (physical-follow-feedback client)
-    (sb-ext:with-timeout 10 (physical-client-finish client next limit))))
+    (physical-follow-feedback client runtime)
+    (prog1 (sb-ext:with-timeout 10 (physical-client-finish client next limit))
+      (with-live-operation (physical-follow-require-runtime-generation runtime)))))
 
 (defun physical-follow-copy-stream (client runtime)
   (physical-follow-monitor-connected runtime)
@@ -1207,11 +1227,12 @@ is not authentication or proof of source identity."
                   (physical-follow-finish-bound-stream client runtime)))
                (:idle nil)
                (otherwise (physical-follow-reject "unexpected native replication frame"))))
-           (physical-follow-feedback client)))
+           (physical-follow-feedback client runtime)))
 
 (defun physical-follow-bound-completion (runtime result)
   "Accept retained completion only at the bound next timeline and fork.
 Receipt ends there; replay remains free to reach its own policy fence."
+  (with-live-operation (physical-follow-require-runtime-generation runtime))
   (when (and (eq :retained-timeline
                  (physical-follow-anchor-kind (getf (physical-follow-runtime-binding runtime) :anchor)))
              result)
@@ -1225,7 +1246,9 @@ Receipt ends there; replay remains free to reach its own policy fence."
   result)
 
 (defun physical-follow-bound-stream (client runtime cursor)
+  (physical-follow-authorize-receiver runtime)
   (multiple-value-bind (system-id timeline) (physical-follow-client-identity client)
+    (with-live-operation (physical-follow-require-runtime-generation runtime))
     (unless (= system-id (getf *physical-recovery-state* :system-id))
       (physical-follow-reject "native source system identity changed"))
     (let ((expected (getf (getf (physical-follow-runtime-binding runtime) :anchor) :source-timeline)))
@@ -1238,7 +1261,8 @@ Receipt ends there; replay remains free to reach its own policy fence."
     (setf (physical-follow-runtime-limit runtime) limit
           (physical-follow-runtime-next-timeline runtime) next)
     (let* ((query (physical-follow-start-query runtime cursor))
-           (result (sb-ext:with-timeout 10 (physical-client-start client query))))
+           (result (progn (physical-follow-authorize-receiver runtime)
+                          (sb-ext:with-timeout 10 (physical-client-start client query)))))
       (physical-follow-bound-completion runtime
                                         (if (eq :copy-both result)
                                             (physical-follow-copy-stream client runtime)
@@ -1254,8 +1278,10 @@ Receipt ends there; replay remains free to reach its own policy fence."
      (if (physical-follow-runtime-binding runtime)
          (physical-follow-bound-stream client runtime cursor)
          (let ((query (physical-follow-start-query runtime cursor)))
+           (physical-follow-authorize-receiver runtime)
            (sb-ext:with-timeout 10
              (physical-follow-check-identity (list (physical-client-identity-row client)))
+             (physical-follow-authorize-receiver runtime)
              (unless (eq :copy-both (physical-client-start client query))
                (physical-follow-reject "unbound native stream returned a timeline switch")))
            (physical-follow-copy-stream client runtime))))))
@@ -1273,35 +1299,36 @@ Receipt ends there; replay remains free to reach its own policy fence."
   (admin-log "native physical receiver ~a: ~a" (if terminal "stopped" "retrying")
              (physical-follow-runtime-last-error runtime)))
 
+(defun physical-follow-publish-transition (runtime transition)
+  (sb-thread:with-mutex (*physical-follow-lock*)
+    (when (and (physical-follow-generation-current-p (physical-follow-runtime-generation runtime))
+               (eq runtime *physical-follow-runtime*)
+               (not (physical-follow-receiver-stopped-p runtime)))
+      (setf (physical-follow-runtime-transition runtime) transition))))
+
 (defun physical-follow-receiver-loop (runtime)
   (loop until (or (physical-follow-receiver-stopped-p runtime) (shutdown-in-progress-p))
         do (handler-case
                (let ((cursor (with-live-operation
+                               (physical-follow-require-runtime-generation runtime)
                                (check-recovery-available)
                                (physical-store-reset-unflushed *physical-receive-store*))))
                  (let ((result (physical-follow-session runtime cursor)))
                    (when result
-                     (sb-thread:with-mutex (*physical-follow-lock*)
-                       (when (and (eq runtime *physical-follow-runtime*)
-                                  (not (physical-follow-receiver-stopped-p runtime)))
-                         (setf (physical-follow-runtime-transition runtime) result)))
+                     (physical-follow-publish-transition runtime result)
                      (return-from physical-follow-receiver-loop :switch))))
              (physical-follow-source-changed (condition)
-               (sb-thread:with-mutex (*physical-follow-lock*)
-                 (when (and (eq runtime *physical-follow-runtime*)
-                            (not (physical-follow-receiver-stopped-p runtime)))
-                   (setf (physical-follow-runtime-transition runtime)
-                         (list :refresh (physical-follow-changed-timeline condition)))))
+               (physical-follow-publish-transition
+                runtime (list :refresh (physical-follow-changed-timeline condition)))
                (return-from physical-follow-receiver-loop :refresh))
              (physical-follow-route-changed ()
-               (sb-thread:with-mutex (*physical-follow-lock*)
-                 (when (and (eq runtime *physical-follow-runtime*)
-                            (not (physical-follow-receiver-stopped-p runtime)))
-                   (setf (physical-follow-runtime-transition runtime) '(:refresh-route))))
+               (physical-follow-publish-transition runtime '(:refresh-route))
                (return-from physical-follow-receiver-loop :refresh))
              (physical-client-stopped ()
                (return-from physical-follow-receiver-loop :stopped))
              ((or error sb-ext:timeout) (condition)
+               (unless (physical-follow-generation-current-p (physical-follow-runtime-generation runtime))
+                 (return-from physical-follow-receiver-loop :superseded))
                (let ((terminal (physical-follow-terminal-p condition)))
                  (when (or (not (physical-follow-receiver-stopped-p runtime))
                            (and terminal (not *physical-recovery-failed-p*)))
@@ -1338,16 +1365,19 @@ reload exclusion and quiescence before workers can read it."
          *physical-receive-store* (physical-recovery-verify-base-state) config))))
   config)
 
-(defun physical-follow-launch-workers (config receive-p &optional transition)
+(defun physical-follow-launch-workers (config receive-p &optional transition generation configured-p)
   "Publish replay and, when RECEIVE-P, receipt workers together.
 The caller holds the command mutex outside admission and has validated CONFIG."
   (unless (and (zerop *live-operation-depth*)
                (sb-thread:holding-mutex-p *physical-follow-command-lock*))
     (error "follow worker launch requires command exclusion outside admission"))
   (sb-thread:with-mutex (*physical-follow-lock*)
+    (when receive-p
+      (physical-follow-require-generation generation)
+      (when configured-p (physical-follow-check-desired-active generation)))
     (when *physical-follow-runtime* (error "native physical follow already has a runtime; stop it first"))
     (let ((runtime (make-physical-follow-runtime :host (second config) :port (third config)
-                                                 :pin (fourth config) :config (copy-tree config)
+                                                 :pin (fourth config) :generation generation :config (copy-tree config)
                                                  :receiver-stopped-p (not receive-p) :transition transition))
           (ready nil) (success nil))
       (unwind-protect
@@ -1396,48 +1426,50 @@ A completed retained fork launches replay without contacting the source."
                   (list :action :replay-only :reason :timeline-target-reached)))))
           (list :action :receive))))))
 
-(defun physical-follow-launch (config)
+(defun physical-follow-launch (config &optional generation configured-p)
   "Launch an admitted bootstrap or active bound config with the command mutex held."
   (check-physical-recovery-worker-start)
   (physical-follow-check-launch config)
   (let ((decision (physical-follow-launch-decision config)))
     (if (eq :receive (getf decision :action))
-        (physical-follow-launch-workers config t)
+        (physical-follow-launch-workers config t nil generation configured-p)
         (physical-follow-launch-workers
          config nil (if (eq :refresh (getf decision :action))
                         '(:policy-refresh)
-                        (list :waiting (getf decision :reason)))))))
+                        (list :waiting (getf decision :reason))) generation))))
 
 (defun physical-follow-start (host port pin)
   "Enable an accepted endpoint without replacing its binding or cleanup queue."
-  (when (plusp *live-operation-depth*)
-    (error "follow start requires its own operation admission"))
-  (physical-follow-endpoint-check host port pin)
-  (physical-follow-call-with-controller-blocked
-   (lambda ()
-     (sb-thread:with-mutex (*physical-follow-command-lock*)
-       (check-physical-recovery-worker-start)
-       (let* ((saved (when (probe-file (physical-follow-config-path))
-                       (physical-follow-read-config)))
-              (config (list 1 host port pin)))
-         (when *physical-follow-runtime*
-           (error "stop the existing native physical follow runtime first"))
-         (when (and saved (> (length saved) 4))
-           (unless (equal (subseq saved 0 4) config)
-             (error "use follow retarget to replace an accepted endpoint"))
-           (let ((state (physical-follow-controller-state saved)))
-             (when (or (getf state :preparing)
-                       (eq :pending (getf (fifth saved) :phase)))
-               (error "follow start requires a reconciled binding"))
-             (setf (getf state :enabled) t
-                   config (physical-follow-with-controller saved state))))
-         (when (eq :deferred (physical-recovery-enable-streaming))
-           (return-from physical-follow-start :deferred))
-         (physical-follow-check-launch config)
-         (with-live-operation (physical-follow-controller-save-config config))
-         (physical-follow-launch config)))))
-  (physical-follow-controller-start-worker)
-  :started)
+  (physical-follow-call-with-manual-source
+   (lambda (generation)
+
+     (physical-follow-endpoint-check host port pin)
+     (physical-follow-call-with-controller-blocked
+      (lambda ()
+        (sb-thread:with-mutex (*physical-follow-command-lock*)
+          (check-physical-recovery-worker-start)
+          (let* ((saved (when (probe-file (physical-follow-config-path))
+                          (physical-follow-read-config)))
+                 (config (list 1 host port pin)))
+            (when *physical-follow-runtime*
+              (error "stop the existing native physical follow runtime first"))
+            (when (and saved (> (length saved) 4))
+              (unless (equal (subseq saved 0 4) config)
+                (error "use follow retarget to replace an accepted endpoint"))
+              (let ((state (physical-follow-controller-state saved)))
+                (when (or (getf state :preparing)
+                          (eq :pending (getf (fifth saved) :phase)))
+                  (error "follow start requires a reconciled binding"))
+                (setf (getf state :enabled) t
+                      config (physical-follow-with-controller saved state))))
+            (when (eq :deferred (physical-recovery-enable-streaming))
+              (return-from physical-follow-start :deferred))
+            (physical-follow-check-launch config)
+            (with-live-operation (physical-follow-controller-save-config config))
+            (physical-follow-launch config generation)))))
+     (physical-follow-controller-start-worker)
+     :started
+     )))
 
 (defun physical-follow-quiesce-receiver ()
   "Stop and join receipt, preserving replay, pause state, config and runtime.
@@ -1489,39 +1521,42 @@ owns its transition."
 (defun physical-follow-stop ()
   "Stop receipt and replay while preserving accepted bindings and cleanup work.
 An unattached standby rejects this operation; use replay pause instead."
-  (when (plusp *live-operation-depth*)
-    (error "follow stop must join outside operation admission"))
-  (with-live-operation
-    (check-recovery-available)
-    (when *physical-shutdown-state* (check-physical-recovery-work)))
-  (physical-follow-call-with-controller-blocked
-   (lambda ()
-     (sb-thread:with-mutex (*physical-follow-command-lock*)
-       (with-live-operation
-         (check-recovery-available)
-         (when *physical-shutdown-state* (check-physical-recovery-work)))
-       (when (and (probe-file (physical-follow-config-path))
-                  (physical-follow-unattached-p (physical-follow-read-config)))
-         (error "unattached standby replay cannot be disabled by follow stop"))
-       (physical-follow-quiesce-runtime)
-       (sb-thread:with-mutex (*reload-run-lock*)
-         (with-live-operation-quiescence
-           (check-recovery-available)
-           (when (probe-file (physical-follow-config-path))
-             (let* ((config (physical-follow-read-config))
-                    (state (physical-follow-controller-state config)))
-               (when (or (getf state :preparing)
-                         (eq (getf (fifth config) :phase) :pending))
-                 (error "follow stop cannot discard an unresolved transition"))
-               (when (fifth config) (physical-follow-controller-check-current config))
-               (if (= (length config) 4)
-                   (progn (delete-file (physical-follow-config-path))
-                          (fsync-directory *pgdata*))
-                   (progn
-                     (setf (getf state :enabled) nil)
-                     (physical-follow-controller-save-config
-                      (physical-follow-with-controller config state))))))))
-       :stopped))))
+  (physical-follow-call-with-manual-source
+   (lambda (generation)
+     (declare (ignore generation))
+
+     (with-live-operation
+       (check-recovery-available)
+       (when *physical-shutdown-state* (check-physical-recovery-work)))
+     (physical-follow-call-with-controller-blocked
+      (lambda ()
+        (sb-thread:with-mutex (*physical-follow-command-lock*)
+          (with-live-operation
+            (check-recovery-available)
+            (when *physical-shutdown-state* (check-physical-recovery-work)))
+          (when (and (probe-file (physical-follow-config-path))
+                     (physical-follow-unattached-p (physical-follow-read-config)))
+            (error "unattached standby replay cannot be disabled by follow stop"))
+          (physical-follow-quiesce-runtime)
+          (sb-thread:with-mutex (*reload-run-lock*)
+            (with-live-operation-quiescence
+              (check-recovery-available)
+              (when (probe-file (physical-follow-config-path))
+                (let* ((config (physical-follow-read-config))
+                       (state (physical-follow-controller-state config)))
+                  (when (or (getf state :preparing)
+                            (eq (getf (fifth config) :phase) :pending))
+                    (error "follow stop cannot discard an unresolved transition"))
+                  (when (fifth config) (physical-follow-controller-check-current config))
+                  (if (= (length config) 4)
+                      (progn (delete-file (physical-follow-config-path))
+                             (fsync-directory *pgdata*))
+                      (progn
+                        (setf (getf state :enabled) nil)
+                        (physical-follow-controller-save-config
+                         (physical-follow-with-controller config state))))))))
+          :stopped)))
+     )))
 
 (defun physical-recovery-select-history (target history-text eor-bytes)
   "Select receive history under follow-command, reload and quiescence exclusion.

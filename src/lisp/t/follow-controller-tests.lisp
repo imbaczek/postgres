@@ -330,7 +330,7 @@
                           (ok (= 2 next)) (ok (= fork limit))
                           (list :switch next limit))
                         (symbol-function 'pg::physical-follow-feedback)
-                        (lambda (client) (declare (ignore client)) (incf feedback)))
+                        (lambda (client &optional runtime) (declare (ignore client runtime)) (incf feedback)))
                   (ok (equal (list :timeline-end :timeline 1 :fork fork :next 2)
                              (pg::physical-follow-bound-stream nil runtime fork)))
                   (ok (= (if copy 1 0) feedback finished))
@@ -492,7 +492,7 @@
                           (setf prepared request)
                           (append (copy-list request) (list :history-text source)))
                         (symbol-function 'pg::physical-follow-launch)
-                        (lambda (config) (setf launched config) :started))
+                        (lambda (config &optional generation configured-p) (declare (ignore generation configured-p)) (setf launched config) :started))
                   (pg::physical-follow-operation-run operation)
                   (ok (null (pg::physical-follow-operation-error operation)))
                   (ok (equal before (pg::physical-store-control-tuple store)))
@@ -1518,7 +1518,7 @@
       (unwind-protect
            (progn
              (setf (symbol-function 'pg::physical-follow-launch)
-                   (lambda (config) (setf resumed config) :started))
+                   (lambda (config &optional generation configured-p) (declare (ignore generation configured-p)) (setf resumed config) :started))
              (call-with-controller-intent
               (lambda (root store operation view entry snapshot)
                 (declare (ignore root store view snapshot))

@@ -545,6 +545,8 @@ Return the reconstructed state and durable control; do not install runtime state
 
 (declaim (ftype function physical-recovery-prepare-timeline-policy))
 
+(declaim (ftype function physical-follow-standard-management-p))
+
 (defun physical-recovery-prepare-with-namespace (&key signal-mode (timeline-goal :latest))
   "Verify the base and reconcile saved follow state before ordinary startup.
 Resolve policy before active or unbound admission, then re-resolve after pending
@@ -555,7 +557,8 @@ Publish dirty recovery control before installing state and allowing redo."
   (let ((manifest (physical-recovery-verify-base-with-namespace)))
     (when (eq signal-mode :archive)
       (error "archive recovery requested by recovery.signal is not implemented"))
-    (let* ((policy (physical-recovery-prepare-timeline-policy manifest timeline-goal))
+    (let* ((managed (physical-follow-standard-management-p manifest signal-mode))
+           (policy (physical-recovery-prepare-timeline-policy manifest timeline-goal))
            (config (physical-follow-prepare-startup manifest :policy policy)))
       (setf manifest (physical-recovery-verify-base-with-namespace))
       (let ((checked (physical-recovery-prepare-timeline-policy manifest timeline-goal)))
@@ -564,7 +567,7 @@ Publish dirty recovery control before installing state and allowing redo."
                          :startup-seed :history))
           (error "follow startup reconciliation changed the recovery timeline policy")))
       (setf (getf manifest :follow-startup-config) config
-            (getf manifest :standard-follow-managed-p) (eq signal-mode :standby)
+            (getf manifest :standard-follow-managed-p) managed
             (getf manifest :timeline-policy) policy)
       (setf *physical-recovery-state*
             (physical-recovery-write-control
