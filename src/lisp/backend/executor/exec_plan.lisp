@@ -1454,13 +1454,9 @@ on an abnormal exit."
     ((:filter :project :project-set :limit :window-input)
      (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
     ((:sort :top-n)
-     (let ((child (if (eq (first node) :top-n) (fourth node) (third node)))
-           (*datum-origin-capture* nil))
-       ;; These paths do not carry origins through the sort. Disable origin
-       ;; capture rather than change when targets or set-returning functions run.
-       (and (not (sort-projection-deferred-slots node child))
-            (not (sort-project-set-info node child))
-            (simple-datum-origin-plan-p child relations iterator-p worktable seen))))
+     (simple-datum-origin-plan-p
+      (if (eq (first node) :top-n) (fourth node) (third node))
+      relations iterator-p worktable seen))
     (:window
      (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
     (:hash-distinct (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen))
@@ -1571,9 +1567,9 @@ Expressions wrapping a set result must remain in a separate projection."
   "Choose volatile targets to evaluate after sorting in either executor.
 
 Sort keys must be computed before sorting.  Keep targets that depend on
-ProjectSet output there too, and use the ordinary path when datum origins are
-needed.  Deferred targets run only for rows delivered by the sort or top-N."
-  (when (and (not *datum-origin-capture*) (member (first node) '(:sort :top-n))
+ProjectSet output there too.  Deferred targets run only for rows delivered by
+the sort or top-N, with their source datum origins."
+  (when (and (member (first node) '(:sort :top-n))
              (eq (first child) :project))
     (let* ((targets (second child))
            (set-node (and (eq (first (third child)) :project-set) (third child)))
@@ -1597,23 +1593,49 @@ needed.  Deferred targets run only for rows delivered by the sort or top-N."
       (when (find t slots) slots))))
 
 (defun make-sort-project-input-row (environment targets deferred)
-  "Compute sort input targets and retain ENVIRONMENT for deferred targets.
+  "Compute sort input and retain source origins for deferred targets.
 
-The sort owns this row and its environment until it delivers or discards it."
-  (let ((values (make-array (length targets) :initial-element +null+)))
+The row remains (projected values . source environment).  Its private origin
+sidecar contains target origins followed by source origins; ordinary sort and
+spill ownership therefore cover both sets without retaining page pointers."
+  (let* ((count (length targets))
+         (values (make-array count :initial-element +null+))
+         (source-origins *query-row-origins*)
+         (origins (and *datum-origin-capture*
+                       (make-array (+ count (length environment)) :initial-element nil))))
+    (when (and origins source-origins)
+      (replace origins source-origins :start1 count
+                                      :end2 (min (length environment) (length source-origins))))
     (loop for target in targets for i from 0
           unless (aref deferred i)
-            do (setf (aref values i) (eval-expr (getf target :expr) environment)))
-    (cons values environment)))
+            do (multiple-value-bind (value origin)
+                   (if *datum-origin-capture*
+                       (eval-expr-with-origin (getf target :expr) environment source-origins)
+                       (values (eval-expr (getf target :expr) environment) nil))
+                 (setf (aref values i) value)
+                 (when origins (setf (aref origins i) origin))))
+    (values (cons values environment) origins)))
 
 (defun finish-sort-project-row (row targets deferred)
-  "Evaluate deferred targets once, in target order, when a sorted row is delivered."
-  (let ((values (copy-seq (car row)))
-        (environment (cdr row)))
+  "Evaluate deferred targets once and return the final projected origins.
+
+The incoming private sidecar contains target origins followed by origins for
+ROW's source environment.  Only final target origins leave this projection."
+  (let* ((count (length targets))
+         (values (copy-seq (car row)))
+         (environment (cdr row))
+         (packed-origins (and *datum-origin-capture* *query-row-origins*))
+         (origins (and packed-origins (subseq packed-origins 0 count)))
+         (source-origins (and packed-origins (subseq packed-origins count))))
     (loop for target in targets for i from 0
           when (aref deferred i)
-            do (setf (aref values i) (eval-expr (getf target :expr) environment)))
-    (cons values environment)))
+            do (multiple-value-bind (value origin)
+                   (if *datum-origin-capture*
+                       (eval-expr-with-origin (getf target :expr) environment source-origins)
+                       (values (eval-expr (getf target :expr) environment) nil))
+                 (setf (aref values i) value)
+                 (when origins (setf (aref origins i) origin))))
+    (values (cons values environment) origins)))
 
 (defun execute-physical-plan-node (node registered-relations outer-environment
                                    emit run-child run-node)
@@ -1760,7 +1782,10 @@ The sort owns this row and its environment until it delivers or discards it."
                   (cond
                     (set-node (funcall emit environment))
                     (deferred
-                        (funcall emit (make-sort-project-input-row environment targets deferred)))
+                        (multiple-value-bind (row origins)
+                            (make-sort-project-input-row environment targets deferred)
+                          (let ((*query-row-origins* origins))
+                            (funcall emit row))))
                     (*datum-origin-capture*
                      (let ((values (make-array (length targets)))
                            (origins (make-array (length targets) :initial-element nil)))
@@ -1789,9 +1814,12 @@ The sort owns this row and its environment until it delivers or discards it."
           (funcall run-child child sort-callback))
         (second node)
         (lambda (row)
-          (funcall emit (if deferred
-                            (finish-sort-project-row row (second child) deferred)
-                            row))))))
+          (if deferred
+              (multiple-value-bind (projected origins)
+                  (finish-sort-project-row row (second child) deferred)
+                (let ((*query-row-origins* origins))
+                  (funcall emit projected)))
+              (funcall emit row))))))
     (:top-n
      (let* ((order (second node))
             (limit (third node))
@@ -1802,11 +1830,16 @@ The sort owns this row and its environment until it delivers or discards it."
                    (lambda (callback)
                      (funcall run-child input callback))
                    order limit *datum-origin-capture*)))
-       (loop for row in rows
-             do (let ((*query-row-origins* (and *datum-origin-capture* (cdr row))))
-                  (when (eq (funcall emit (cond (deferred (finish-sort-project-row row (second input) deferred))
-                                                (*datum-origin-capture* (car row))
-                                                (t row))) :stop)
+       (loop for stored in rows
+             for row = (if *datum-origin-capture* (car stored) stored)
+             do (let ((*query-row-origins* (and *datum-origin-capture* (cdr stored))))
+                  (when (eq (if deferred
+                                (multiple-value-bind (projected origins)
+                                    (finish-sort-project-row row (second input) deferred)
+                                  (let ((*query-row-origins* origins))
+                                    (funcall emit projected)))
+                                (funcall emit row))
+                            :stop)
                     (return :stop))))))
     (:limit
      (let ((limit (second node))

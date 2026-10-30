@@ -2,6 +2,7 @@
 (in-package #:pg)
 
 (defun make-mapping-sql-iterator (input function &key preserve-toast-context)
+  ;; FUNCTION returns the output row, whether to keep it, and its origins.
   ;; The fourth iterator value is a TOAST slice context for the current row.
   ;; Bind it only while evaluating that row; pass it on only when requested.
   (make-sql-iterator
@@ -42,8 +43,8 @@
 
 (defun sort-project-set-info (node child)
   ;; Only this shape can sort source rows before expanding the set results.
-  ;; Origin capture keeps the ordinary path, which preserves datum origins.
-  (when (and (not *datum-origin-capture*) (member (first node) '(:sort :top-n))
+  ;; The sorted path retains both source and projected datum origins.
+  (when (and (member (first node) '(:sort :top-n))
              (eq (first child) :project) (eq (first (third child)) :project-set))
     (let* ((set-node (third child)) (width (fourth set-node))
                                     (calls (second set-node)) (targets (second child)))
@@ -306,18 +307,20 @@ all sets are empty and no row is emitted.  Closing the result closes INPUT."
 (defun make-sorted-project-set-iterator (node project set-node width calls relations &key source-streamer)
   "Sort source rows before expansion when no sort key depends on a set result.
 
-Cache ordinary targets and sort keys per source row.  Evaluate deferred targets
-as expanded rows are pulled; bare set targets use target-list attempt order,
-while expressions wrapping set results remain a separate projection.
-SOURCE-STREAMER, when supplied, streams the source through the caller's
-instrumented push execution; otherwise the sort owns and closes a pull iterator.
-Closing the returned iterator releases the buffered sort and its source."
+Cache ordinary targets and their origins per source row.  Source origins travel
+through the sort after the target origins, then accompany each expanded input.
+Bare set targets use target-list attempt order; wrapped set results remain a
+separate projection.  SOURCE-STREAMER, when supplied, passes each source row to
+its callback with that row's origins bound.  Otherwise the iterator reads the
+source itself.  Closing the result closes the sort and its source."
   (let* ((targets (second project))
          (target-count (length targets))
+         (capture-p *datum-origin-capture*)
          (deferred
            (map 'vector
                 (lambda (target)
-                  (or (project-set-expression-dependent-p (getf target :expr) width (length calls) targets)
+                  (or (project-set-expression-dependent-p
+                       (getf target :expr) width (length calls) targets)
                       (sort-projection-volatile-p (getf target :expr))))
                 targets))
          (bare-p (project-set-projection-targets-p targets width (length calls)))
@@ -336,14 +339,18 @@ Closing the returned iterator releases the buffered sort and its source."
                                    :type (expr-type expression) :typmod -1)
                              (cdr entry))))))
          (cache nil)
+         (cache-origins nil)
          (attempt-values nil)
+         (attempt-origins nil)
          (transform
            (lambda (environment)
-             (let* ((row (make-sort-project-input-row environment targets deferred))
-                    (keys (map 'vector (lambda (expression) (eval-expr expression environment))
-                               (reverse extra))))
-               (setf (car row) (concatenate 'vector (car row) keys))
-               (values row t nil))))
+             (multiple-value-bind (row origins)
+                 (make-sort-project-input-row environment targets deferred)
+               (let ((keys (map 'vector
+                                (lambda (expression) (eval-expr expression environment))
+                                (reverse extra))))
+                 (setf (car row) (concatenate 'vector (car row) keys))
+                 (values row t origins)))))
          (source
            (unless source-streamer
              (make-mapping-sql-iterator
@@ -355,7 +362,12 @@ Closing the returned iterator releases the buffered sort and its source."
                (lambda (callback)
                  (if source-streamer
                      (funcall source-streamer
-                              (lambda (environment) (funcall callback (funcall transform environment))))
+                              (lambda (environment)
+                                (multiple-value-bind (row keep origins)
+                                    (funcall transform environment)
+                                  (declare (ignore keep))
+                                  (let ((*query-row-origins* origins))
+                                    (funcall callback row)))))
                      (map-sql-iterator source callback)))
                order emit))
             source))
@@ -365,36 +377,52 @@ Closing the returned iterator releases the buffered sort and its source."
             (lambda (row)
               (unless (= (length (cdr row)) width)
                 (error "ProjectSet input width differs from its plan"))
-              (setf cache (subseq (car row) 0 target-count))
-              (values (cdr row) t nil))))
+              (setf cache (subseq (car row) 0 target-count)
+                    cache-origins (and capture-p
+                                       (subseq *query-row-origins* 0 target-count)))
+              (values (cdr row) t
+                      (and capture-p (subseq *query-row-origins* target-count))))))
          (expanded
-           (instrument-physical-plan-iterator set-node
-                                              (make-project-set-iterator
-                                               input calls
-                                               :attempt-function
-                                               (when bare-p
-                                                 (lambda (environment set-values step-set)
-                                                   (setf attempt-values (copy-seq cache))
-                                                   (loop for target in targets for index from 0
-                                                         for expression = (getf target :expr)
-                                                         do (cond
-                                                              ((and (eq (first expression) :col)
-                                                                    (< width (second expression))
-                                                                    (<= (second expression) (+ width (length calls))))
-                                                               (let ((slot (- (second expression) width 1)))
-                                                                 (funcall step-set slot)
-                                                                 (setf (aref attempt-values index) (aref set-values slot))))
-                                                              ((aref deferred index)
-                                                               (setf (aref attempt-values index) (eval-expr expression environment))))))))))
+           (instrument-physical-plan-iterator
+            set-node
+            (make-project-set-iterator
+             input calls
+             :attempt-function
+             (when bare-p
+               (lambda (environment set-values step-set)
+                 (setf attempt-values (copy-seq cache)
+                       attempt-origins (and capture-p (copy-seq cache-origins)))
+                 (loop for target in targets for index from 0
+                       for expression = (getf target :expr)
+                       do (cond
+                            ((and (eq (first expression) :col)
+                                  (< width (second expression))
+                                  (<= (second expression) (+ width (length calls))))
+                             (let ((slot (- (second expression) width 1)))
+                               (funcall step-set slot)
+                               (setf (aref attempt-values index) (aref set-values slot))))
+                            ((aref deferred index)
+                             (multiple-value-bind (value origin)
+                                 (if capture-p
+                                     (eval-expr-with-origin expression environment *query-row-origins*)
+                                     (values (eval-expr expression environment) nil))
+                               (setf (aref attempt-values index) value)
+                               (when attempt-origins
+                                 (setf (aref attempt-origins index) origin)))))))))))
          (output
-           (instrument-physical-plan-iterator project
-                                              (make-mapping-sql-iterator
-                                               expanded
-                                               (lambda (environment)
-                                                 (values (if bare-p
-                                                             (cons attempt-values environment)
-                                                             (finish-sort-project-row (cons cache environment) targets deferred))
-                                                         t nil))))))
+           (instrument-physical-plan-iterator
+            project
+            (make-mapping-sql-iterator
+             expanded
+             (lambda (environment)
+               (if bare-p
+                   (values (cons attempt-values environment) t attempt-origins)
+                   (let ((*query-row-origins*
+                           (and capture-p
+                                (concatenate 'vector cache-origins *query-row-origins*))))
+                     (multiple-value-bind (row origins)
+                         (finish-sort-project-row (cons cache environment) targets deferred)
+                       (values row t origins)))))))))
     (if (eq (first node) :top-n)
         (let ((remaining (third node)))
           (make-sql-iterator
@@ -611,7 +639,10 @@ Closing the returned iterator releases the buffered sort and its source."
         (lambda (row)
           (cond
             (set-node (values row t *query-row-origins*))
-            (deferred (values (make-sort-project-input-row row (second node) deferred) t nil))
+            (deferred
+                (multiple-value-bind (projected origins)
+                    (make-sort-project-input-row row (second node) deferred)
+                  (values projected t origins)))
             (*datum-origin-capture*
              (let ((values (make-array (length (second node))))
                    (origins (make-array (length (second node)) :initial-element nil)))
@@ -696,6 +727,10 @@ Closing the returned iterator releases the buffered sort and its source."
                input)))
        (if deferred
            (make-mapping-sql-iterator
-            buffer (lambda (row) (values (finish-sort-project-row row (second child) deferred) t nil)))
+            buffer
+            (lambda (row)
+              (multiple-value-bind (projected origins)
+                  (finish-sort-project-row row (second child) deferred)
+                (values projected t origins))))
            buffer)))
     (otherwise (ereport "0A000" "unsupported resumable producer node ~a" (first node)))))

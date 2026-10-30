@@ -1,7 +1,10 @@
 """Regression: Simple and Extended Query share post-sort volatile projection."""
 import importlib.util
+import os
 from pathlib import Path
+import re
 import struct
+import subprocess
 import sys
 
 spec = importlib.util.spec_from_file_location(
@@ -130,6 +133,65 @@ def check_dml(connection):
     print("projection-order: INSERT, RETURNING, scalar UPDATE and sorted ProjectSet PASS")
 
 
+def check_compressed_origins(connection, control=None):
+    connection.query("CREATE TABLE projection_compressed(id int,v text)")
+    connection.query("CREATE TABLE projection_plain(id int,v text,n bigint,x text)")
+    connection.query("ALTER TABLE projection_plain ALTER COLUMN v SET STORAGE PLAIN")
+    connection.query("INSERT INTO projection_compressed VALUES " +
+                     ",".join(f"({i},'{chr(96 + i) * 20000}')" for i in range(8, 0, -1)))
+    assert connection.query("SELECT count(*) FROM projection_compressed WHERE length(v)=20000") == [["8"]]
+    cases = (
+        ("id,v", "id,v", 1, False),
+        ("id,v,n", "id,v,nextval('projection_seq')", 1, True),
+        ("id,v", "id,CASE WHEN nextval('projection_seq')>0 THEN v ELSE v END", 1, True),
+        ("id,v,n,x", "id,v,nextval('projection_seq'),pg_get_publication_tables('projection_pub')", 2, False),
+        ("id,v,n,x", "id,v,nextval('projection_seq'),"
+         "(pg_get_publication_tables('projection_pub')).relid IS NOT NULL", 2, False),
+    )
+
+    def control_integer(expression):
+        output = control(f'(format t "PROJECTION_VALUE=~d~%" {expression})')
+        return int(re.search(r"PROJECTION_VALUE=(\d+)", output)[1])
+
+    old_memory = (control_integer("pg::*query-work-memory-bytes*") if control else
+                  connection.query("SHOW work_mem")[0][0])
+    try:
+        # Decoded source values and cached projections exceed 64kB, forcing
+        # Lisp's full sort and sorted ProjectSet through their spill paths.
+        for memory in (4 * 1024 * 1024, 64 * 1024):
+            if control:
+                control(f"(setf pg::*query-work-memory-bytes* {memory})")
+            else:
+                connection.query(f"SET work_mem='{memory // 1024}kB'")
+            spill_before = (control_integer("pg::*query-temp-file-sequence*")
+                            if control and memory == 64 * 1024 else None)
+            for query in (connection.query, lambda sql: extended(connection, sql)):
+                for suffix in ("ORDER BY id", "ORDER BY id LIMIT 1"):
+                    for columns, targets, expansion, scalar_sequence in cases:
+                        connection.query("DELETE FROM projection_plain")
+                        connection.query("SELECT setval('projection_seq',1,false)")
+                        sql = (f"INSERT INTO projection_plain({columns}) SELECT {targets} "
+                               f"FROM projection_compressed {suffix} RETURNING id")
+                        ids = [1] if "LIMIT" in suffix else [i for i in range(1, 9) for _ in range(expansion)]
+                        assert query(sql) == [[str(i)] for i in ids], sql
+                        # A 20k PLAIN datum fits only if its existing inline
+                        # compression survives; new compression is disallowed.
+                        expected = [[str(i), "20000", chr(96 + i)] for i in ids]
+                        actual = connection.query("SELECT id,length(v),substr(v,1,1) "
+                                                  "FROM projection_plain ORDER BY id")
+                        assert actual == expected, (sql, memory, actual, expected)
+                        if scalar_sequence or "LIMIT" in suffix and "nextval" in targets:
+                            assert connection.query("SELECT currval('projection_seq')") == [[str(len(ids))]], sql
+            if spill_before is not None:
+                assert control_integer("pg::*query-temp-file-sequence*") > spill_before
+    finally:
+        if control:
+            control(f"(setf pg::*query-work-memory-bytes* {old_memory})")
+        else:
+            connection.query(f"SET work_mem='{old_memory}'")
+    print("projection-order: compressed origins survive deferred projection, ProjectSet and spill PASS")
+
+
 def run():
     server = None if len(sys.argv) > 1 else wire.OwnedLisp()
     connection = None
@@ -139,6 +201,18 @@ def run():
         connection = wire.Connection(int(sys.argv[1]) if server is None else server.port)
         check(connection)
         check_dml(connection)
+        control = server.control if server else None
+        if not server and len(sys.argv) > 2:
+            def control(expression):
+                result = subprocess.run(
+                    [os.environ.get("SBCL", "sbcl"), "--script",
+                     str(Path(__file__).with_name("control-client.lisp")), "unix", sys.argv[2]],
+                    input=expression + "\n(quit)\n", text=True,
+                    capture_output=True, check=True, timeout=15)
+                output = result.stdout + result.stderr
+                assert ";; error:" not in output, output
+                return output
+        check_compressed_origins(connection, control)
     finally:
         if connection:
             connection.close()
